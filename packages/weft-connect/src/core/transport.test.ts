@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { MemberDoor, MemberDoorError } from './transport';
+import { InstanceDoor, InstanceDoorError } from './transport';
 
 /** A fetch that records what it was asked and answers from a table. */
 function fakeFetch(answers: Record<string, unknown>) {
@@ -20,16 +20,16 @@ function fakeFetch(answers: Record<string, unknown>) {
 	return { fetcher, calls };
 }
 
-describe('the member door', () => {
-	it('asks every question as the member, under /member', async () => {
+describe('the instance door', () => {
+	it('asks every question inside the instance, under /instance', async () => {
 		const { fetcher, calls } = fakeFetch({
-			'GET /member/connections?service=slack': [],
-			'PUT /member/values': { rearmed: ['digest'] },
-			'GET /member/fields': [{ step: 'post', field: 'account', nodeType: 'SlackAccess', input: { name: 'account' }, needed: true, connection: 'none' }],
-			'POST /member/lookup': { items: [{ id: 's-1', label: 'Budget' }], next_cursor: null },
-			'POST /member/picker': { state: 'st', url: 'https://weft.example/access/picker/st' },
+			'GET /instance/connections?service=slack': [],
+			'PUT /instance/values': { rearmed: ['digest'] },
+			'GET /instance/fields': [{ step: 'post', field: 'account', nodeType: 'SlackAccess', input: { name: 'account' }, needed: true, connection: 'none' }],
+			'POST /instance/lookup': { items: [{ id: 's-1', label: 'Budget' }], next_cursor: null },
+			'POST /instance/picker': { state: 'st', url: 'https://weft.example/access/picker/st' },
 		});
-		const door = new MemberDoor('wft-a-b', { base: 'https://weft.example/', fetcher, opener: () => {} });
+		const door = new InstanceDoor('wft-a-b', { base: 'https://weft.example/', fetcher, opener: () => {} });
 		expect(await door.connections('slack')).toEqual([]);
 		const changed = await door.setValues([{ step: 'post', field: 'account', value: { id: 'c1' } }], [{ step: 'read', field: 'tab' }]);
 		expect(changed.rearmed).toEqual(['digest']);
@@ -49,15 +49,15 @@ describe('the member door', () => {
 		expect(calls[4].body).toEqual({ step: 'one.read', field: 'spreadsheet', source: 2 });
 	});
 
-	it('never offers the shared key or a mint to a member', () => {
-		const door = new MemberDoor('t', { base: 'https://weft.example' });
+	it('never offers the shared key or a mint to an instance', () => {
+		const door = new InstanceDoor('t', { base: 'https://weft.example' });
 		expect(door.allowsSharedKey).toBe(false);
 		expect('mintApp' in door).toBe(false);
 	});
 
 	it("says what the door answered when it refuses", async () => {
 		const { fetcher } = fakeFetch({});
-		const door = new MemberDoor('t', { base: 'https://weft.example', fetcher });
+		const door = new InstanceDoor('t', { base: 'https://weft.example', fetcher });
 		await expect(door.fields()).rejects.toThrow('no such route');
 	});
 
@@ -67,18 +67,18 @@ describe('the member door', () => {
 			urls.push(url);
 			return new Response('[]', { status: 200 });
 		}) as unknown as typeof fetch;
-		await new MemberDoor('t', { fetcher }).fields();
-		expect(urls).toEqual(['/weft/member/fields']);
+		await new InstanceDoor('t', { fetcher }).fields();
+		expect(urls).toEqual(['/weft/instance/fields']);
 	});
 
-	it('tells a token that is not a member token from a door that failed', async () => {
+	it('tells a token that is not an instance token from a door that failed', async () => {
 		const answering = (status: number) =>
 			(async () => new Response('refused', { status })) as unknown as typeof fetch;
 		const refusal = (status: number) =>
-			new MemberDoor('t', { base: 'https://weft.example', fetcher: answering(status) }).fields().catch((e: unknown) => e);
-		const notMember = await refusal(403);
-		expect(notMember).toBeInstanceOf(MemberDoorError);
-		expect((notMember as MemberDoorError).notAMemberToken).toBe(true);
-		expect(((await refusal(502)) as MemberDoorError).notAMemberToken).toBe(false);
+			new InstanceDoor('t', { base: 'https://weft.example', fetcher: answering(status) }).fields().catch((e: unknown) => e);
+		const notInstance = await refusal(403);
+		expect(notInstance).toBeInstanceOf(InstanceDoorError);
+		expect((notInstance as InstanceDoorError).notAnInstanceToken).toBe(true);
+		expect(((await refusal(502)) as InstanceDoorError).notAnInstanceToken).toBe(false);
 	});
 });

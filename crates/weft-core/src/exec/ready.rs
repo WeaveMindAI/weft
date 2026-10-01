@@ -1,8 +1,8 @@
 //! Readiness. Find which nodes have enough pending pulses to fire at
-//! a matching `(color, frames)`, aggregate their inputs, return as
+//! a matching `(execution_id, frames)`, aggregate their inputs, return as
 //! `ReadyGroup`s.
 //!
-//! Matching is exact-frame: a firing at `(color, frames)` only sees
+//! Matching is exact-frame: a firing at `(execution_id, frames)` only sees
 //! pulses whose `frames` are exactly the firing's frame stack. Loops
 //! emit broadcast inputs and the implicit `self.index` at the body's
 //! own frame stack directly, one pulse per iteration.
@@ -16,9 +16,9 @@ use crate::exec::skip::{check_flow_permission, check_should_skip, SkipReason};
 use crate::frames::{Located, LoopFrames};
 use crate::project::{Edge, EdgeIndex, GroupBoundaryRole, NodeDefinition, ProjectDefinition};
 use crate::primitive::Phase;
-use crate::pulse::{Pulse, PulseStatus, PulseTable};
+use crate::pulse::{Failure, Pulse, PulseStatus, PulseTable};
 use crate::weft_type::WeftType;
-use crate::Color;
+use crate::ExecutionId;
 
 /// A firing's input ports and the values on them, shared with the
 /// pulses that carried them. The node body gets its own copy
@@ -35,7 +35,7 @@ pub fn owned_bag(bag: &InputBag) -> Map<String, Value> {
 /// commits the dispatch.
 pub struct ReadyGroup {
     pub frames: LoopFrames,
-    pub color: Color,
+    pub execution_id: ExecutionId,
     pub received: FiringInput,
     /// Set when this firing must NOT run its body, and why. `None`
     /// means run it.
@@ -51,7 +51,7 @@ pub struct ReadyGroup {
 
 /// THE single rule for "which pulse does a firing see on `port`?".
 /// `group_pulses` are the pulses this firing sees: the pending ones at
-/// its exact `(color, frames)` when readiness forms the group, or the
+/// its exact `(execution_id, frames)` when readiness forms the group, or the
 /// ones a record absorbed when the journal fold rebuilds its input.
 /// Exact-frame matching happens where that slice is built.
 ///
@@ -61,7 +61,7 @@ pub struct ReadyGroup {
 /// later sibling emitted real data; per "data outranks
 /// structural-nothing", both stay in the table and this resolver
 /// prefers the non-closed one). `find_groups_for_node` absorbs every
-/// pulse at the firing's exact `(color, frames)` together, so the
+/// pulse at the firing's exact `(execution_id, frames)` together, so the
 /// closure does not leak across ticks. This shape makes live and
 /// replay agree by construction.
 ///
@@ -87,7 +87,7 @@ pub fn effective_input_pulses(
     wired: &HashSet<&str>,
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
-    color: Color,
+    execution_id: ExecutionId,
     frames: &LoopFrames,
 ) -> Vec<Pulse> {
     let mut effective: Vec<_> = actual.iter().map(|pulse| (*pulse).clone()).collect();
@@ -96,7 +96,7 @@ pub fn effective_input_pulses(
     for port in &node.inputs {
         if !selection.includes_port(&at, node, &port.name) { continue; }
         let winner = resolve_port_value(actual, &port.name);
-        if winner.is_some_and(|pulse| !pulse.closed || pulse.close_error.is_some()) { continue; }
+        if winner.is_some_and(|pulse| !pulse.closed || pulse.failure.is_some()) { continue; }
         if winner.is_none() && selection.has_supplier(project, &at, &port.name) { continue; }
         if winner.is_none() && !wired.contains(port.name.as_str())
             && node.port_literals.get(&port.name).is_some_and(|v| literal_is_data(node, &port.name, v))
@@ -104,13 +104,13 @@ pub fn effective_input_pulses(
         if matches!(port.port_type, WeftType::Generator(_)) { continue; }
         let backup = selection.input.get(&at).and_then(|ports| ports.get(&port.name));
         if let Some(value) = backup {
-            let mut pulse = Pulse::new(uuid::Uuid::nil(), color, frames.clone(), &node.id, &port.name, Arc::new(value.clone()));
+            let mut pulse = Pulse::new(uuid::Uuid::nil(), execution_id, frames.clone(), &node.id, &port.name, Arc::new(value.clone()));
             pulse.provided = true;
             pulse.backup = true;
             pulse.inherited_from = selection.input_origins.get(&at).and_then(|ports| ports.get(&port.name)).copied();
             effective.push(pulse);
         } else if winner.is_none() && wired.contains(port.name.as_str()) {
-            effective.push(Pulse::closure(uuid::Uuid::nil(), color, frames.clone(), &node.id, &port.name));
+            effective.push(Pulse::closure(uuid::Uuid::nil(), execution_id, frames.clone(), &node.id, &port.name));
         }
     }
     effective
@@ -257,19 +257,19 @@ pub fn find_ready_among<'a>(
         if pending.is_empty() {
             continue;
         }
-        // Group pulses by (color, frames). A firing is one exact point in
+        // Group pulses by (execution, frames). A firing is one exact point in
         // frame space; matching is exact, and which wires feed the node
         // is a fact of that point too (a node of an included file is
         // wired by the call it fires under).
-        let mut groups: Vec<((Color, LoopFrames), Vec<&Pulse>)> = Vec::new();
+        let mut groups: Vec<((ExecutionId, LoopFrames), Vec<&Pulse>)> = Vec::new();
         for p in pending {
-            let key = (p.color, p.frames.clone());
+            let key = (p.execution_id, p.frames.clone());
             match groups.iter_mut().find(|(k, _)| *k == key) {
                 Some((_, group)) => group.push(p),
                 None => groups.push((key, vec![p])),
             }
         }
-        for ((color, frames), group_pulses) in groups {
+        for ((execution_id, frames), group_pulses) in groups {
             let out_of_scope = dispatchable.is_some_and(|s| !s.contains(&Located::at(&node.id, &frames)));
             let wired = wired_inputs(project, edge_idx, &node.id, &frames);
             let required: HashSet<&str> = node
@@ -280,7 +280,7 @@ pub fn find_ready_among<'a>(
                 .collect();
             let literal_filled = literal_filled_ports(node, &wired, &frames, edge_idx);
             if let Some(group) = ready_group_at(
-                node, &group_pulses, color, &frames, &required, &wired, &literal_filled, out_of_scope, project, edge_idx,
+                node, &group_pulses, execution_id, &frames, &required, &wired, &literal_filled, out_of_scope, project, edge_idx,
             ) {
                 result.push((node, group));
             }
@@ -294,14 +294,14 @@ pub fn find_ready_among<'a>(
 // Per-firing matching
 // ---------------------------------------------------------------------------
 
-/// The ready group the pending pulses at one exact `(color, frames)`
+/// The ready group the pending pulses at one exact `(execution_id, frames)`
 /// form for `node`, if they make it ready. `wired` are the ports a wire
 /// feeds at that point, `required` the required ones the run reads.
 #[allow(clippy::too_many_arguments)]
 fn ready_group_at(
     node: &NodeDefinition,
     group_pulses: &[&Pulse],
-    color: Color,
+    execution_id: ExecutionId,
     frames: &LoopFrames,
     required: &HashSet<&str>,
     wired: &HashSet<&str>,
@@ -311,7 +311,7 @@ fn ready_group_at(
     edge_idx: &EdgeIndex,
 ) -> Option<ReadyGroup> {
     let has_incoming = !wired.is_empty();
-    let effective = effective_input_pulses(node, group_pulses, wired, project, edge_idx, color, frames);
+    let effective = effective_input_pulses(node, group_pulses, wired, project, edge_idx, execution_id, frames);
     let effective_refs: Vec<_> = effective.iter().collect();
     let all_satisfied = wired.iter().all(|port_name| {
         effective_refs.iter().any(|p| p.target_port == *port_name)
@@ -354,7 +354,7 @@ fn ready_group_at(
 
     Some(ReadyGroup {
         frames: frames.clone(),
-        color,
+        execution_id,
         error: received.error(),
         received,
         skip,
@@ -376,12 +376,12 @@ pub fn kicked_group(
     node: &NodeDefinition,
     kick: &crate::primitive::KickedNode,
     frames: &LoopFrames,
-    color: Color,
+    execution_id: ExecutionId,
     project: &ProjectDefinition,
     edge_idx: &EdgeIndex,
 ) -> ReadyGroup {
     let wired = wired_inputs(project, edge_idx, &node.id, frames);
-    let effective = effective_input_pulses(node, &[], &wired, project, edge_idx, color, frames);
+    let effective = effective_input_pulses(node, &[], &wired, project, edge_idx, execution_id, frames);
     let effective_refs: Vec<_> = effective.iter().collect();
     let received = if kick.firing {
         let (input, errors) = build_kicked_input(node, kick.port_snapshot.as_ref());
@@ -402,7 +402,7 @@ pub fn kicked_group(
     };
     ReadyGroup {
         frames: frames.clone(),
-        color,
+        execution_id,
         error: received.error(),
         received,
         skip,
@@ -439,15 +439,15 @@ pub struct FiringInput {
     pub closed_ports: Vec<String>,
     /// The subset of `closed_ports` whose closure carries WHY: the
     /// producer failed (or was cancelled) rather than declining to emit,
-    /// keyed by port, with the error text. A boundary forwarding a
-    /// closure keeps this on the same-named output, so "broke" never
-    /// reads as "nothing there" one scope level up (the inverted gate
-    /// tells the two apart).
-    pub closed_with_error: BTreeMap<String, String>,
+    /// keyed by port, with the failure the closure carried. A boundary
+    /// forwarding a closure keeps this on the same-named output, so
+    /// "broke" never reads as "nothing there" one scope level up (the
+    /// inverted gate tells the two apart).
+    pub closed_failures: BTreeMap<String, Failure>,
     pub type_errors: Vec<String>,
     pub provided_ports: Vec<String>,
     pub backup_ports: Vec<String>,
-    pub inherited_ports: BTreeMap<String, Color>,
+    pub inherited_ports: BTreeMap<String, ExecutionId>,
 }
 
 impl FiringInput {
@@ -505,12 +505,12 @@ pub fn firing_input(
         .map(|p| p.to_string())
         .collect();
     closed_ports.sort();
-    let closed_with_error: BTreeMap<String, String> = closed_ports
+    let closed_failures: BTreeMap<String, Failure> = closed_ports
         .iter()
         .filter_map(|port| {
             resolve_port_value(group_pulses, port)
-                .and_then(|p| p.close_error.clone())
-                .map(|error| (port.clone(), error))
+                .and_then(|p| p.failure.clone())
+                .map(|failure| (port.clone(), failure))
         })
         .collect();
 
@@ -524,7 +524,7 @@ pub fn firing_input(
             if let Some(origin) = winner.inherited_from { inherited_ports.insert(port.to_string(), origin); }
         }
     }
-    FiringInput { input: obj, closed_ports, closed_with_error, type_errors, provided_ports, backup_ports, inherited_ports }
+    FiringInput { input: obj, closed_ports, closed_failures, type_errors, provided_ports, backup_ports, inherited_ports }
 }
 
 /// Runtime type enforcement on input ports: the single check point
@@ -584,10 +584,11 @@ enum InputCheck {
 /// kick-driven dispatch path (`build_kicked_input` below) so the two
 /// paths can't disagree on what counts as "body-supplied".
 ///
-/// A `@member_filled` literal is left out: it names no value until the
-/// engine swaps in what the run's member provides (checked against the
-/// port when the run was born), so judging the marker itself against
-/// the port's type here would refuse every such field. It still counts
+/// An `@instance_filled` literal (and a connection picked on the install) is
+/// left out: it names no value until the engine swaps in what the run's
+/// instance provides or the install picked (checked when the run was born),
+/// so judging the marker itself against the port's type here would refuse
+/// every such field. It still counts
 /// as filled for readiness, since a run is only born once every such
 /// field it needs has a value or a fallback.
 pub fn fill_input_from_literals(
@@ -599,7 +600,7 @@ pub fn fill_input_from_literals(
         if wired.contains(name.as_str())
             || obj.contains_key(name)
             || !literal_is_data(node, name, value)
-            || crate::member::as_member_filled(value).is_some()
+            || crate::picks::fills_later(value)
         {
             continue;
         }
@@ -608,13 +609,13 @@ pub fn fill_input_from_literals(
 }
 
 /// The unwired ports a written constant fills at `frames`: what keeps a
-/// node with no live wire alive in the skip rules. A `@member_filled`
+/// node with no live wire alive in the skip rules. An `@instance_filled`
 /// literal counts, since a run is only born once each such field it
-/// needs has the member's value or a fallback; it is left out of the
+/// needs has the instance's value or a fallback; it is left out of the
 /// bag itself ([`fill_input_from_literals`]) only until the engine puts
 /// that value in. The ONE reading both the pulse path and a kicked
 /// scope root use: reading it off the bag instead made a step whose
-/// every setting is `@member_filled` look like it had nothing, and skip.
+/// every setting is `@instance_filled` look like it had nothing, and skip.
 pub fn literal_filled_ports<'a>(
     node: &'a NodeDefinition,
     wired: &HashSet<&str>,
@@ -758,8 +759,8 @@ mod tests {
         Frame::Loop { index: i }
     }
 
-    fn data(color: uuid::Uuid, frames: Vec<Frame>, node: &str, port: &str, value: serde_json::Value) -> Pulse {
-        Pulse::new(uuid::Uuid::new_v4(), color, frames, node, port, std::sync::Arc::new(value))
+    fn data(execution_id: uuid::Uuid, frames: Vec<Frame>, node: &str, port: &str, value: serde_json::Value) -> Pulse {
+        Pulse::new(uuid::Uuid::new_v4(), execution_id, frames, node, port, std::sync::Arc::new(value))
     }
 
     /// The settle pass absorbs what lands outside the run's node set
@@ -788,11 +789,11 @@ mod tests {
             "createdAt": "1970-01-01T00:00:00Z", "updatedAt": "1970-01-01T00:00:00Z"
         }))
         .unwrap();
-        let color = uuid::Uuid::nil();
+        let execution_id = uuid::Uuid::nil();
         let table = || {
             let mut t = crate::pulse::PulseTable::default();
             for node in ["trig", "inside", "outside"] {
-                t.entry(node.into()).or_default().push(data(color, vec![], node, "in", json!("v")));
+                t.entry(node.into()).or_default().push(data(execution_id, vec![], node, "in", json!("v")));
             }
             t
         };
@@ -819,28 +820,28 @@ mod tests {
     }
 
     /// A firing sees only the pulses at its own frame stack: the group
-    /// is formed by exact `(color, frames)`, so a shallower pulse is
+    /// is formed by exact `(execution_id, frames)`, so a shallower pulse is
     /// never in its view.
     #[test]
     fn groups_form_at_the_exact_frame_only() {
-        let color = uuid::Uuid::nil();
+        let execution_id = uuid::Uuid::nil();
         let firing_frames = vec![frame(0), frame(1)];
         let node = kicked_node("X", vec![port("String", true)], json!({}));
         let pulses = [
-            data(color, vec![], "k", "p", json!("shallow")),
-            data(color, vec![frame(0)], "k", "p", json!("mid")),
-            data(color, firing_frames.clone(), "k", "p", json!("exact")),
+            data(execution_id, vec![], "k", "p", json!("shallow")),
+            data(execution_id, vec![frame(0)], "k", "p", json!("mid")),
+            data(execution_id, firing_frames.clone(), "k", "p", json!("exact")),
         ];
         let wired: std::collections::HashSet<&str> = ["p"].into_iter().collect();
         let project = ProjectDefinition {
-            id: color, nodes: vec![node.clone()], edges: vec![], groups: vec![],
+            id: execution_id, nodes: vec![node.clone()], edges: vec![], groups: vec![],
             created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
         };
         let index = EdgeIndex::build(&project);
         let groups: Vec<_> = pulses.iter().map(|p| p.frames.clone()).collect::<std::collections::BTreeSet<_>>().into_iter()
             .filter_map(|frames| {
                 let at: Vec<&Pulse> = pulses.iter().filter(|p| p.frames == frames).collect();
-                super::ready_group_at(&node, &at, color, &frames, &std::collections::HashSet::new(), &wired,
+                super::ready_group_at(&node, &at, execution_id, &frames, &std::collections::HashSet::new(), &wired,
                     &std::collections::HashSet::new(), false, &project, &index)
             }).collect();
         assert_eq!(groups.len(), 3, "one group per frame stack");
@@ -851,11 +852,11 @@ mod tests {
 
     #[test]
     fn resolve_port_value_prefers_data_over_closure_at_same_key() {
-        let color = uuid::Uuid::nil();
+        let execution_id = uuid::Uuid::nil();
         let frames = vec![];
         let pulses = [
-            Pulse::closure(uuid::Uuid::new_v4(), color, frames.clone(), "n", "p"),
-            data(color, frames.clone(), "n", "p", json!(42)),
+            Pulse::closure(uuid::Uuid::new_v4(), execution_id, frames.clone(), "n", "p"),
+            data(execution_id, frames.clone(), "n", "p", json!(42)),
         ];
         let view: Vec<&Pulse> = pulses.iter().collect();
         let winner = resolve_port_value(&view, "p").expect("a winner");
@@ -926,17 +927,17 @@ mod tests {
                 other => panic!("{bad} must be refused by the widget, got {other:?}"),
             }
         }
-        // A widget's OPTION LIST is what the editor offers, not a
-        // domain rule: a node's code routinely takes more than the list
-        // names (any HTTP method, a model id shipped after the list was
-        // written), so a wired value outside it runs and the node's own
-        // code decides.
+        // A select's options are a domain rule too: a wired value
+        // outside them is refused the way a written one is.
         let mode: InputDefinition = serde_json::from_value(json!({
             "name": "mode", "portType": "String", "required": false,
             "widget": { "kind": "select", "options": ["added", "removed", "both"] }
         })).unwrap();
         assert_eq!(check_input(&mode, &json!("both")), InputCheck::Ok);
-        assert_eq!(check_input(&mode, &json!("sideways")), InputCheck::Ok);
+        match check_input(&mode, &json!("sideways")) {
+            InputCheck::Fail(msg) => assert!(msg.contains("'mode'") && msg.contains("'added'"), "{msg}"),
+            other => panic!("a value outside the options must be refused, got {other:?}"),
+        }
     }
 
     /// A whole-number step means the input takes whole numbers. A
@@ -1026,12 +1027,12 @@ mod tests {
         assert_eq!(input.get("account").map(|v| &**v), Some(&handle), "the handle reaches the bag intact");
     }
 
-    /// A `@member_filled` field reaches the bag only once the engine swaps
-    /// in the member's value: the marker itself is never judged against
+    /// An `@instance_filled` field reaches the bag only once the engine swaps
+    /// in the instance's value: the marker itself is never judged against
     /// the port (a String port would refuse the marker's object).
     #[test]
-    fn a_member_filled_literal_waits_for_the_members_value() {
-        let marker = crate::member::member_filled_literal(Some(json!("0 0 3 * * *")));
+    fn an_instance_filled_literal_waits_for_the_instances_value() {
+        let marker = crate::instance::instance_filled_literal(Some(json!("0 0 3 * * *")));
         let node = kicked_node("Cron", vec![port("String", true)], json!({ "p": marker }));
         let (input, refusals) = build_kicked_input(&node, None);
         assert!(refusals.is_empty(), "{refusals:?}");
@@ -1069,12 +1070,12 @@ mod tests {
             features: NodeFeatures::default(),
             scope: Vec::new(),
             group_boundary: None,
-            requires_infra: false, per_member: None,
+            requires_infra: false, per_instance: None,
             images: Vec::new(),
             fires_with: Default::default(),
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -1116,14 +1117,14 @@ mod tests {
         assert!(received.type_errors.is_empty(), "the excluded invalid literal cannot fail this boundary");
     }
 
-    /// A scope root whose only setting is `@member_filled` runs when its
+    /// A scope root whose only setting is `@instance_filled` runs when its
     /// scope starts, like one with a written value: the marker stays out
-    /// of the bag until the engine puts the member's value in, and must
+    /// of the bag until the engine puts the instance's value in, and must
     /// not read as "nothing will ever come" (it used to skip with every
     /// input closed, silently, in a completed run).
     #[test]
-    fn a_kicked_root_whose_setting_each_member_fills_runs() {
-        let marker = crate::member::member_filled_literal(None);
+    fn a_kicked_root_whose_setting_each_instance_fills_runs() {
+        let marker = crate::instance::instance_filled_literal(None);
         let node = kicked_node("X", vec![port("String", true)], json!({ "p": marker }));
         let project = ProjectDefinition {
             id: uuid::Uuid::nil(), nodes: vec![node.clone()], edges: vec![], groups: vec![],
@@ -1135,7 +1136,7 @@ mod tests {
         };
         let group = super::kicked_group(&node, &kick, &vec![], project.id, &project, &index);
         assert!(group.skip.is_none(), "{:?}", group.skip);
-        assert!(!group.received.input.contains_key("p"), "the marker waits for the member's value");
+        assert!(!group.received.input.contains_key("p"), "the marker waits for the instance's value");
     }
 
     #[test]
@@ -1152,31 +1153,32 @@ mod tests {
         selection.input.entry(Located::top("k")).or_default().insert("p".into(), json!("backup"));
         let index = EdgeIndex::selected(&project, selection.clone());
         let wired = HashSet::from(["p"]);
-        let color = project.id;
-        let effective = effective_input_pulses(&node, &[], &wired, &project, &index, color, &vec![]);
+        let execution_id = project.id;
+        let effective = effective_input_pulses(&node, &[], &wired, &project, &index, execution_id, &vec![]);
         assert!(effective.is_empty(), "a selected supplier is still pending");
-        let real = data(color, vec![], "k", "p", json!("real"));
-        let closure = Pulse::closure(uuid::Uuid::new_v4(), color, vec![], "k", "p");
+        let real = data(execution_id, vec![], "k", "p", json!("real"));
+        let closure = Pulse::closure(uuid::Uuid::new_v4(), execution_id, vec![], "k", "p");
         for actual in [vec![&real], vec![&closure, &real]] {
-            let effective = effective_input_pulses(&node, &actual, &wired, &project, &index, color, &vec![]);
+            let effective = effective_input_pulses(&node, &actual, &wired, &project, &index, execution_id, &vec![]);
             let view = firing_input(&node, &effective.iter().collect::<Vec<_>>(), &wired, &vec![], &index);
             assert_eq!(*view.input["p"], json!("real"));
             assert!(!effective.iter().any(|p| p.provided));
         }
-        let effective = effective_input_pulses(&node, &[&closure], &wired, &project, &index, color, &vec![]);
+        let effective = effective_input_pulses(&node, &[&closure], &wired, &project, &index, execution_id, &vec![]);
         assert_eq!(*firing_input(&node, &effective.iter().collect::<Vec<_>>(), &wired, &vec![], &index).input["p"], json!("backup"));
         selection.nodes.remove(&Located::top("source"));
         let index = EdgeIndex::selected(&project, selection);
-        let effective = effective_input_pulses(&node, &[], &wired, &project, &index, color, &vec![]);
+        let effective = effective_input_pulses(&node, &[], &wired, &project, &index, execution_id, &vec![]);
         assert_eq!(*firing_input(&node, &effective.iter().collect::<Vec<_>>(), &wired, &vec![], &index).input["p"], json!("backup"));
-        let null = data(color, vec![], "k", "p", Value::Null);
-        let effective = effective_input_pulses(&node, &[&null], &wired, &project, &index, color, &vec![]);
+        let null = data(execution_id, vec![], "k", "p", Value::Null);
+        let effective = effective_input_pulses(&node, &[&null], &wired, &project, &index, execution_id, &vec![]);
         assert!(!firing_input(&node, &effective.iter().collect::<Vec<_>>(), &wired, &vec![], &index).type_errors.is_empty());
         assert!(!effective.iter().any(|p| p.provided), "invalid real data does not choose a backup");
-        let failed = Pulse::closure_with_error(uuid::Uuid::new_v4(), color, vec![], "k", "p", Some("producer failed".into()));
-        let effective = effective_input_pulses(&node, &[&failed], &wired, &project, &index, color, &vec![]);
+        let failure = crate::pulse::Failure { node: "producer".into(), error: "producer failed".into() };
+        let failed = Pulse::closure_with_failure(uuid::Uuid::new_v4(), execution_id, vec![], "k", "p", Some(failure.clone()));
+        let effective = effective_input_pulses(&node, &[&failed], &wired, &project, &index, execution_id, &vec![]);
         assert!(effective.iter().all(|p| !p.backup));
-        assert_eq!(effective[0].close_error.as_deref(), Some("producer failed"));
+        assert_eq!(effective[0].failure.as_ref(), Some(&failure));
     }
 
     /// Regression: a kicked orphan node (entry node with no incoming

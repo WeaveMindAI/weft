@@ -104,4 +104,4 @@ rig.attach_caller(conn);
 ```
 
 The fake rig gives you a caller to talk to, so a route node's behaviour is
-testable without a cluster or a real socket.
+testable without an install or a real socket.

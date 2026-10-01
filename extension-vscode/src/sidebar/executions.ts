@@ -27,12 +27,17 @@ import type { CancelCause, ExecutionPhase } from '../../../packages/weft-graph/s
 
 export type ExecutionsMode = 'flat' | 'byVersion';
 
-// SYNC: ExecutionSummary <-> crates/weft-dispatcher/src/journal/mod.rs (ExecutionSummary), weavemind/website/src/routes/(app)/executions/+page.ts (Execution)
+/** Where a run stands, or `corrupt` when its journal row no longer
+ *  decodes (then `entry_node` is empty). */
+// SYNC: SummaryStatus <-> crates/weft-core/src/program.rs SummaryStatus (and RunStatus)
+export type SummaryStatus = 'running' | 'waiting_for_input' | 'completed' | 'failed' | 'cancelled' | 'corrupt';
+
+// SYNC: ExecutionSummary <-> crates/weft-core/src/program.rs (ExecutionSummary), weavemind/website/src/routes/(app)/executions/+page.ts (Execution)
 export interface ExecutionSummary {
-  color: string;
+  execution_id: string;
   project_id: string;
   entry_node: string;
-  status: string;
+  status: SummaryStatus;
   /** A trigger fire or manual run (`fire`), or one of the two setup
    *  runs an activate / resync / infra start makes. */
   phase: ExecutionPhase;
@@ -44,6 +49,8 @@ export interface ExecutionSummary {
   /** For a cancelled run: who or what stopped it. Decides the row's
    *  icon (a person stopping it is not the runtime cutting it). */
   cancel_cause?: CancelCause | null;
+  /** For a failed run: what failed it. */
+  error?: string;
   /** Node firings the run skipped; said beside `completed`, never
    *  drawn as a different icon (a skipped branch is a normal run). */
   skipped_nodes?: number;
@@ -72,7 +79,12 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
   // was started under: a pin CHANGE must start a fresh fetch, not
   // join the old pin's.
   private inFlightRefresh:
-    | { projectId: string | undefined; mode: ExecutionsMode; promise: Promise<string | undefined> }
+    | {
+        projectId: string | undefined;
+        mode: ExecutionsMode;
+        installGeneration: number;
+        promise: Promise<string | undefined>;
+      }
     | undefined;
   // Monotonic rebuild ordering: only a rebuild at least as new as the
   // last committed one may write, so an older same-pin rebuild
@@ -94,11 +106,26 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
   /// project's version ids to branch, diff-with-head and the graph
   /// banner.
   private treeProjectId: string | undefined;
+  /// Which install `tree` was read on (an `installGeneration`).
+  private treeInstallGeneration = 0;
+  /// Bumped each time the client moves to another install. A rebuild
+  /// started on the previous install answers for the wrong one: it is
+  /// never joined, never committed, and its tree never reused.
+  private installGeneration = 0;
   /// The group the editor is focused inside (an include's alias chain),
   /// so the runs scoped to it are marked. Set by the graph view.
   private focusedGroup: string | null = null;
 
-  constructor(private readonly client: DispatcherClient) {}
+  /// `installArgs` answers the `--on` the tree's CLI call carries: the
+  /// install the graph shows the pinned project on.
+  constructor(
+    private readonly client: DispatcherClient,
+    private readonly installArgs: () => string[] = () => [],
+  ) {
+    client.onInstallChange(() => {
+      this.installGeneration++;
+    });
+  }
 
   currentMode(): ExecutionsMode {
     return this.mode;
@@ -160,7 +187,7 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
    *  explicit project filter keeps the answer scoped even if the
    *  cached list ever holds other projects' rows. */
   newestRunningFor(projectId: string): string | undefined {
-    return this.cache.find((e) => e.status === 'running' && e.project_id === projectId)?.color;
+    return this.cache.find((e) => e.status === 'running' && e.project_id === projectId)?.execution_id;
   }
 
   /** How often the version tree may be re-read from the CLI. */
@@ -199,7 +226,7 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
 
   /** Re-fetch the whole currently-loaded span, page by page (so no single
    *  request exceeds the server cap), rebuilding the cache newest-first with no
-   *  duplicate colors (a live insert can shift the window between pages).
+   *  duplicate executions (a live insert can shift the window between pages).
    *  Never rejects: a fetch failure keeps the last successful list and
    *  surfaces as an error row in the tree. Concurrent callers share the
    *  in-flight refresh instead of racing their rebuilds. Resolves the
@@ -216,7 +243,12 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
     // fetched no tree and committed `tree: undefined`, and the view then
     // drew "no versions yet" for a project that has them until some
     // unrelated refresh happened along.
-    if (inFlight && inFlight.projectId === target && inFlight.mode === this.mode) {
+    if (
+      inFlight &&
+      inFlight.projectId === target &&
+      inFlight.mode === this.mode &&
+      inFlight.installGeneration === this.installGeneration
+    ) {
       return inFlight.promise;
     }
     return this.startRefresh(target);
@@ -226,10 +258,11 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
    *  just-grown window; an in-flight rebuild may already be past it). */
   private startRefresh(target: string | undefined): Promise<string | undefined> {
     const seq = ++this.refreshSeq;
-    const promise = this.doRefresh(target, seq).finally(() => {
+    const installGeneration = this.installGeneration;
+    const promise = this.doRefresh(target, installGeneration, seq).finally(() => {
       if (this.inFlightRefresh?.promise === promise) this.inFlightRefresh = undefined;
     });
-    this.inFlightRefresh = { projectId: target, mode: this.mode, promise };
+    this.inFlightRefresh = { projectId: target, mode: this.mode, installGeneration, promise };
     return promise;
   }
 
@@ -240,6 +273,7 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
    *  refresh) or that an even newer rebuild already superseded. */
   private async doRefresh(
     projectId: string | undefined,
+    installGeneration: number,
     seq: number,
   ): Promise<string | undefined> {
     let rebuilt: ExecutionSummary[] | undefined;
@@ -260,12 +294,13 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
         // is reused and one more refresh is booked for when the floor
         // lifts, so the view still ends up current.
         const age = Date.now() - this.treeFetchedAt;
-        const reusable = this.tree && this.treeProjectId === projectId;
+        const reusable =
+          this.tree && this.treeProjectId === projectId && this.treeInstallGeneration === installGeneration;
         if (reusable && age < ExecutionsProvider.TREE_MIN_INTERVAL_MS) {
           tree = this.tree;
           this.scheduleRefresh(ExecutionsProvider.TREE_MIN_INTERVAL_MS - age);
         } else {
-          tree = await runWeftJson<TreeJson>(['tree', '--json'], this.pinnedProject.rootPath);
+          tree = await runWeftJson<TreeJson>([...this.installArgs(), 'tree', '--json'], this.pinnedProject.rootPath);
           treeFetchedAt = Date.now();
         }
       }
@@ -279,8 +314,8 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
         const page = await this.fetchPage(offset, projectId);
         total = page.total;
         for (const e of page.executions) {
-          if (!seen.has(e.color)) {
-            seen.add(e.color);
+          if (!seen.has(e.execution_id)) {
+            seen.add(e.execution_id);
             rebuilt.push(e);
           }
         }
@@ -291,7 +326,12 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
       rebuilt = undefined;
       error = err instanceof Error ? err.message : String(err);
     }
-    if (this.disposed || this.pinnedProject?.id !== projectId || seq < this.settledSeq) {
+    if (
+      this.disposed ||
+      this.pinnedProject?.id !== projectId ||
+      this.installGeneration !== installGeneration ||
+      seq < this.settledSeq
+    ) {
       return undefined;
     }
     this.settledSeq = seq;
@@ -305,6 +345,7 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
       // fetch time would label a DISCARDED refresh's project onto the
       // tree still in hand, and the next refresh would reuse it.
       this.treeProjectId = tree ? projectId : undefined;
+      this.treeInstallGeneration = installGeneration;
       this.treeFetchedAt = treeFetchedAt;
       this.lastError = undefined;
     } else {
@@ -325,7 +366,7 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
   /// Everything the view draws, as one string, for deciding whether a
   /// refresh actually changed anything.
   private drawnState(): string {
-    const runs = this.tree?.runs.map((r) => `${r.color}:${r.status}:${r.example ?? ''}`).join(',') ?? '';
+    const runs = this.tree?.runs.map((r) => `${r.execution_id}:${r.status}:${r.example ?? ''}`).join(',') ?? '';
     const versions = this.tree?.versions.map((v) => `${v.id}:${v.parent_id ?? ''}:${v.label ?? ''}`).join(',') ?? '';
     const head = this.tree ? `${this.tree.head.head_version ?? ''}/${this.tree.head.head_run ?? ''}` : '';
     return [
@@ -335,7 +376,7 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
       this.total,
       this.loaded,
       this.lastError ?? '',
-      this.cache.map((e) => `${e.color}:${e.status}`).join(','),
+      this.cache.map((e) => `${e.execution_id}:${e.status}`).join(','),
       versions,
       runs,
       head,
@@ -460,7 +501,8 @@ export class VersionNode extends vscode.TreeItem {
 /** One run under a version. Opens in the graph like a flat row; carries
  *  its version so the graph can say when the code on disk differs. */
 export class RunNode extends vscode.TreeItem {
-  readonly summary: ExecutionSummary;
+  /** What opening this run needs: its project and its id. */
+  readonly summary: Pick<ExecutionSummary, 'project_id' | 'execution_id'>;
   constructor(
     public readonly run: RunSummary,
     public readonly versionId: string,
@@ -471,34 +513,23 @@ export class RunNode extends vscode.TreeItem {
     headRun: string | null,
     scopedToFocus: boolean,
   ) {
-    super(`${scopedToFocus ? '◉ ' : ''}${run.color.slice(0, 8)}`, vscode.TreeItemCollapsibleState.None);
-    this.id = `run:${run.color}`;
-    this.summary = {
-      color: run.color,
-      project_id: projectId,
-      entry_node: run.spec?.name ?? '',
-      status: run.status,
-      phase: 'fire',
-      started_at: run.started_at,
-      completed_at: run.completed_at,
-      tags: [],
-      cancel_cause: run.cancel_cause,
-      skipped_nodes: run.skipped_nodes,
-    };
+    super(`${scopedToFocus ? '◉ ' : ''}${run.execution_id.slice(0, 8)}`, vscode.TreeItemCollapsibleState.None);
+    this.id = `run:${run.execution_id}`;
+    this.summary = { execution_id: run.execution_id, project_id: projectId };
     this.description = runDescription(run, headRun);
     this.tooltip = new vscode.MarkdownString(
       [
-        `**run** ${run.color}`,
+        `**run** ${run.execution_id}`,
         `**version** ${versionId}`,
-        `**status** ${run.status}`,
-        ...(run.seed_color ? [`**seed** ${run.seed_color} (stale: ${run.stale.join(', ') || 'none'})`] : []),
+        `**status** ${run.status ?? 'unknown'}`,
+        ...(run.seed_execution_id ? [`**seed** ${run.seed_execution_id} (stale: ${run.stale.join(', ') || 'none'})`] : []),
         ...(run.spec ? [`**spec** ${run.spec.name}`] : []),
         ...(run.example ? [`**example** ${run.example}`] : []),
         `**started** ${new Date(run.started_at * 1000).toLocaleString()}`,
       ].join('\n\n'),
     );
-    this.contextValue = `weftRun-${run.status.toLowerCase()}`;
-    this.iconPath = statusThemeIcon(run.status, run.cancel_cause);
+    this.contextValue = `weftRun-${run.status ?? 'unknown'}`;
+    this.iconPath = statusThemeIcon(run.status ?? 'unknown', run.cancel_cause);
     this.command = { command: 'weft.viewExecution', title: 'View', arguments: [this] };
   }
 }
@@ -515,7 +546,7 @@ export class LoadMoreNode extends vscode.TreeItem {
 }
 
 /** The `/executions` response: a page plus the total matching count. */
-// SYNC: ExecutionPage <-> crates/weft-dispatcher/src/journal/mod.rs (ExecutionPage), weavemind/website/src/routes/(app)/executions/+page.ts (ExecutionPage)
+// SYNC: ExecutionPage <-> crates/weft-core/src/program.rs (ExecutionPage), weavemind/website/src/routes/(app)/executions/+page.ts (ExecutionPage)
 interface ExecutionPage {
   executions: ExecutionSummary[];
   total: number;
@@ -530,16 +561,17 @@ export class ExecutionNode extends vscode.TreeItem {
     // reference in a label renders as its literal `$(name)`).
     const name = summary.status === 'corrupt' ? '(corrupt journal)' : summary.entry_node;
     super(`${name} (${started})`, vscode.TreeItemCollapsibleState.None);
-    this.id = summary.color;
+    this.id = summary.execution_id;
     const tags = summary.tags;
     const tagged = tags.length > 0 ? `  ·  ${tags.join(', ')}` : '';
     this.description = `${describeOutcome(summary.status, summary.cancel_cause, summary.skipped_nodes)}${tagged}`;
     this.tooltip = new vscode.MarkdownString(
       [
-        `**exec** ${summary.color}`,
+        `**exec** ${summary.execution_id}`,
         `**project** ${summary.project_id}`,
         `**entry** ${summary.entry_node}`,
         `**status** ${summary.status}`,
+        ...(summary.error ? [`**error** ${summary.error}`] : []),
         ...(tags.length > 0 ? [`**tags** ${tags.join(', ')}`] : []),
         `**started** ${started}`,
       ].join('\n\n'),

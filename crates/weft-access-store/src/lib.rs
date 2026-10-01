@@ -17,19 +17,21 @@
 
 mod crypt;
 mod flows;
+mod picks;
 mod resolve;
 mod subscriptions;
 
 pub use crypt::{open_json, open_str, seal_json, seal_str};
 
 pub use flows::{
-    begin_oauth, begin_picker, own_connection_gate, change_member_values, complete_oauth, connection_handle, connect_direct, delete_grant,
-    delete_published_grants, finish_picker, forget_member_grants, forget_project_members, list_grants, load_picker,
-    member_connection_counts, member_value_counts, member_values, publish_grant, published_connection, sweep_expired_connects,
-    ConnectionValue, MemberValueWrite,
+    begin_oauth, begin_picker, own_connection_gate, change_instance_values, complete_oauth, connection_handle, connect_direct, delete_grant,
+    delete_published_grants, finish_picker, forget_instance_grants, forget_project_access, list_grants, load_picker,
+    instance_connection_counts, instance_value_counts, instance_values, publish_grant, published_connection, sweep_expired_connects,
+    ConnectionValue, InstanceValueWrite,
     take_connect_result, BeginPicker, GrantOwnerScope, OAuthComplete, PickerSession,
     PublishAccess,
 };
+pub use picks::{change_install_picks, install_picks, move_stored, stored_fields, PickWrite};
 pub use subscriptions::{
     drop_subscriptions_for_signal, ensure_subscription, needs_renewal, no_public_url_error,
     run_connect_call, subscription_by_id, EnsureSubscription, EnsuredSubscription, Subscription,
@@ -106,7 +108,8 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "access_grant",
     tables: &[
         "access_grant",
-        "member_value",
+        "instance_value",
+        "install_pick",
         "access_connect",
         "access_picker",
         "access_connect_result",
@@ -183,15 +186,15 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             published_by_node TEXT,
             -- Whose connection, inside a project: NULL for one the
             -- author made (the project's, or a tenant-wide shared one),
-            -- else the member of `project_id` who connected it (or whose
-            -- copy of a node published it). A member is always a
-            -- project's, so a member's connection always names one.
-            member_id TEXT,
+            -- else the instance of `project_id` that connected it (or whose
+            -- copy of a node published it). An instance is always a
+            -- project's, so an instance's connection always names one.
+            instance_id TEXT,
             expires_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            CONSTRAINT access_grant_member_has_project
-                CHECK (member_id IS NULL OR project_id IS NOT NULL)
+            CONSTRAINT access_grant_instance_has_project
+                CHECK (instance_id IS NULL OR project_id IS NOT NULL)
         );
         CREATE INDEX IF NOT EXISTS access_grant_tenant_service
             ON access_grant (tenant_id, service);
@@ -199,31 +202,46 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         -- republishing is a lookup on this key, and two racing runs
         -- cannot leave two rows behind.
         CREATE UNIQUE INDEX IF NOT EXISTS access_grant_published
-            ON access_grant (tenant_id, project_id, published_by_node, service, member_id) NULLS NOT DISTINCT
+            ON access_grant (tenant_id, project_id, published_by_node, service, instance_id) NULLS NOT DISTINCT
             WHERE published_by_node IS NOT NULL;
-        -- A member's connections, for their picker and their forget.
-        CREATE INDEX IF NOT EXISTS access_grant_member
-            ON access_grant (project_id, member_id) WHERE member_id IS NOT NULL;
-        -- What a member provides for the fields their program writes
-        -- `@member_filled`: the value a run for them puts where the
+        -- An instance's connections, for its picker and its forget.
+        CREATE INDEX IF NOT EXISTS access_grant_instance
+            ON access_grant (project_id, instance_id) WHERE instance_id IS NOT NULL;
+        -- What an instance provides for the fields its program writes
+        -- `@instance_filled`: the value a run for it puts where the
         -- source would hold one. The step is its place, spelled the
         -- way the program reads it (`read`, `one.read`), and the field
         -- one of its inputs. A value that is a connection (the
         -- `{id, identity}` handle an access field holds) names its
         -- grant, so removing the connection removes every value using
         -- it, and its identity is read fresh from the grant.
-        CREATE TABLE IF NOT EXISTS member_value (
+        CREATE TABLE IF NOT EXISTS instance_value (
             tenant_id TEXT NOT NULL,
             project_id UUID NOT NULL,
-            member_id TEXT NOT NULL,
+            instance_id TEXT NOT NULL,
             step TEXT NOT NULL,
             field TEXT NOT NULL,
             value JSONB NOT NULL,
             grant_id UUID REFERENCES access_grant(id) ON DELETE CASCADE,
             set_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            PRIMARY KEY (project_id, member_id, step, field)
+            PRIMARY KEY (project_id, instance_id, step, field)
         );
-        CREATE INDEX IF NOT EXISTS member_value_grant ON member_value (grant_id) WHERE grant_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS instance_value_grant ON instance_value (grant_id) WHERE grant_id IS NOT NULL;
+        -- The connection each of a program's access nodes uses on this
+        -- install (`weft_core::picks`): picked here, never written in the
+        -- source, since a connection's id means nothing on another
+        -- install. One of the author's own connections (no instance's),
+        -- and removing the connection removes the pick with it.
+        CREATE TABLE IF NOT EXISTS install_pick (
+            tenant_id TEXT NOT NULL,
+            project_id UUID NOT NULL,
+            step TEXT NOT NULL,
+            field TEXT NOT NULL,
+            grant_id UUID NOT NULL REFERENCES access_grant(id) ON DELETE CASCADE,
+            set_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (project_id, step, field)
+        );
+        CREATE INDEX IF NOT EXISTS install_pick_grant ON install_pick (grant_id);
         -- The inbound-event lookup: an incoming push names a service
         -- and an account, and must find every connection to it
         -- without knowing a tenant (which is the point: the push
@@ -231,13 +249,13 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         CREATE INDEX IF NOT EXISTS access_grant_service_account
             ON access_grant (service, provider_account);
         -- One in-flight OAuth connect per state nonce. Postgres-backed so
-        -- the callback may land on any dispatcher pod.
+        -- the callback may land on any dispatcher replica.
         CREATE TABLE IF NOT EXISTS access_connect (
             state TEXT PRIMARY KEY,
             tenant_id TEXT NOT NULL,
             service TEXT NOT NULL,
             -- The resolved app credentials for the code exchange, carried
-            -- from begin to callback (any dispatcher pod completes it).
+            -- from begin to callback (any dispatcher replica completes it).
             -- SEALED (crypt.rs).
             registration_sealed TEXT NOT NULL,
             project_id UUID,
@@ -252,11 +270,11 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- Set when this connect upgrades/rotates an existing
             -- exclusive-class grant in place.
             upgrade_grant_id UUID,
-            -- The member this connect is for (their browser went
-            -- through a member token, or their backend named them):
+            -- The instance this connect is for (its browser went
+            -- through an instance token, or the program's backend named it):
             -- recorded onto the grant at completion. NULL for the
             -- author's own connect.
-            member_id TEXT,
+            instance_id TEXT,
             redirect_uri TEXT NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
@@ -280,11 +298,11 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- declared `grants`), parked with the session; a finished
             -- pick unions them into the grant row's granted_scopes.
             grants JSONB NOT NULL DEFAULT '[]',
-            -- The member the pick is for, when it opened at their own
+            -- The instance the pick is for, when it opened at its own
             -- door: the chooser then signs in with a connection only
-            -- that member may use.
+            -- that instance may use.
             project_id UUID,
-            member_id TEXT,
+            instance_id TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         CREATE INDEX IF NOT EXISTS access_picker_created
@@ -328,10 +346,10 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- (resource id, anything the unsubscribe call needs).
             captures_json JSONB NOT NULL DEFAULT '{}',
             expires_at TIMESTAMPTZ,
-            -- The member whose signal this is, when the connection is
+            -- The instance whose signal this is, when the connection is
             -- theirs: stopping the channel signs in as them.
             project_id UUID,
-            member_id TEXT,
+            instance_id TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
@@ -386,18 +404,18 @@ pub(crate) fn values_of(
 
 /// The DB string of an owner, and back. The column says where the
 /// credential comes from: `ours` (the runtime's own key) or `their-own`
-/// (material the row stores). WHOSE own it is, the author's or a
-/// member's, is the row's `member_id`, so reading an owner takes both.
+/// (material the row stores). WHOSE own it is, the author's or an
+/// instance's, is the row's `instance_id`, so reading an owner takes both.
 pub(crate) fn owner_str(owner: &weft_core::CredentialOwner) -> &'static str {
     if owner.is_platform() { "ours" } else { "their-own" }
 }
 
-pub(crate) fn owner_of(s: &str, member: Option<&str>) -> anyhow::Result<weft_core::CredentialOwner> {
+pub(crate) fn owner_of(s: &str, instance: Option<&str>) -> anyhow::Result<weft_core::CredentialOwner> {
     match s {
         "ours" => Ok(weft_core::CredentialOwner::Platform),
         "their-own" => Ok(weft_core::CredentialOwner::own(
-            member
-                .map(|m| weft_core::member::MemberId::new(m).map_err(anyhow::Error::msg))
+            instance
+                .map(|m| weft_core::instance::InstanceId::new(m).map_err(anyhow::Error::msg))
                 .transpose()?,
         )),
         other => anyhow::bail!("connection row has an unknown owner '{other}'"),

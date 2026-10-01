@@ -188,7 +188,7 @@
         async fn body() {
             for (selected, count, failed) in [(true, 0, false), (true, 2, false), (true, 1, true), (false, 0, false)] {
                 let project = stream_project();
-                let color = uuid::Uuid::new_v4();
+                let execution_id = uuid::Uuid::new_v4();
                 let log: Log = Arc::new(StdMutex::new(Vec::new()));
                 let cat = catalog(vec![
                     ("Yielder", Box::new(Yielder { count, delivered: false, fail_after: failed.then_some(0), log: log.clone() })),
@@ -200,13 +200,14 @@
                 let root = if selected { "producer" } else { "consumer" };
                 let rows = vec![
                     ExecEvent::ExecutionStarted {
-                        color, project_id: project.id, entry_node: root.into(),
+                        execution_id, project_id: project.id, entry_node: root.into(),
                         phase: Phase::Fire, definition_hash: Some("test-hash".into()), program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
-                        subgraph: Some(selection), seed: None, member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
+                        subgraph: Some(selection), seed: None, instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+                        run_class: weft_core::run_class::RunClass::Short,
                     },
-                    ExecEvent::NodeKicked { color, node_id: root.into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0 },
+                    ExecEvent::NodeKicked { execution_id, node_id: root.into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0 },
                 ];
-                let (drove, events) = super::engine_test_rig::drive_journal_observed(project.clone(), cat, color, rows, CancellationFlag::new_arc()).await;
+                let (drove, events) = super::engine_test_rig::drive_journal_observed(project.clone(), cat, execution_id, rows, CancellationFlag::new_arc()).await;
                 let drove = drove.expect("stream run drives");
                 super::engine_test_rig::assert_fold_matches_live(&project, &events, &weft_journal::SeedChain::default(), &drove);
                 let entries = log.lock().unwrap().clone();

@@ -1,10 +1,12 @@
-//! Trait + registry shape for both pickers (dispatcher-side and
-//! worker-side). Each side's main.rs builds a registry, then spawns
-//! the matching picker loop.
+//! Running claimed tasks under their lease.
 //!
-//! The registry is generic over the context type the executor takes
-//! (`DispatcherState` for dispatcher-side, `WorkerContext` for
-//! worker-side) so both ends share one piece of plumbing.
+//! The dispatcher claims its own tasks in a picker loop
+//! ([`dispatcher_picker_loop`]) and runs each through a registry keyed by
+//! kind. A worker never picks: it is called for one execution, claims
+//! that execution's task, and runs it through [`run_claimed_worker_task`].
+//! Both share one lease guard: the claim is renewed while the work runs,
+//! and the task ends `complete`, `failed`, or back to `pending` when the
+//! lease could not be renewed.
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -19,40 +21,12 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::tasks::{claim_duration_secs, claim_heartbeat_interval, ClaimFilter, Task};
+
 use crate::traits::TaskStoreClient;
 
 #[async_trait]
 pub trait TaskExecutor<Ctx: Send + Sync>: Send + Sync {
     async fn execute(&self, ctx: &Ctx, task: &Task) -> Result<Value>;
-}
-
-/// Worker idle self-exit. After the picker has been idle (no task
-/// claimed) for the idle window, it calls `try_idle_exit`. The impl
-/// attempts the guarded `alive -> done` CAS (no pending/claimed work
-/// for the project); returning `true` means the pod won the flip and
-/// the picker should stop. The CAS, not the picker's idle timer, is
-/// the correctness boundary: a task in flight (claimed) or queued
-/// (pending) fails the CAS, so the picker keeps running.
-#[async_trait]
-pub trait IdleExit: Send + Sync {
-    async fn try_idle_exit(&self) -> Result<bool>;
-}
-
-#[async_trait]
-pub trait WorkerTaskKind<Ctx: Send + Sync>: Send + Sync {
-    /// Synchronous handler: runs to completion before the picker
-    /// claims the next task. Return `Ok(())` for `complete`,
-    /// `Err(_)` for `fail`. Use this for fire-and-forget kinds
-    /// like `cancel_execution` that take milliseconds.
-    async fn handle(&self, ctx: &Ctx, task: &Task) -> Result<()>;
-
-    /// If true, the picker spawns this kind on a tokio task instead
-    /// of awaiting it inline. Used for `execute` / `resume` kinds
-    /// whose body runs for the whole execution lifetime; the picker
-    /// must keep claiming to multiplex many concurrent executions.
-    fn spawn_in_background(&self) -> bool {
-        false
-    }
 }
 
 pub struct TaskRegistry<Ctx: Send + Sync> {
@@ -119,177 +93,98 @@ impl<Ctx: Send + Sync> TaskRegistryBuilder<Ctx> {
     }
 }
 
-pub struct WorkerTaskRegistry<Ctx: Send + Sync> {
-    inner: HashMap<String, Arc<dyn WorkerTaskKind<Ctx>>>,
-}
-
-impl<Ctx: Send + Sync> Clone for WorkerTaskRegistry<Ctx> {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-impl<Ctx: Send + Sync> Default for WorkerTaskRegistry<Ctx> {
-    fn default() -> Self {
-        Self {
-            inner: HashMap::new(),
-        }
-    }
-}
-
-impl<Ctx: Send + Sync> WorkerTaskRegistry<Ctx> {
-    pub fn builder() -> WorkerTaskRegistryBuilder<Ctx> {
-        WorkerTaskRegistryBuilder { map: HashMap::new() }
-    }
-
-    pub fn get(&self, kind: &str) -> Option<Arc<dyn WorkerTaskKind<Ctx>>> {
-        self.inner.get(kind).cloned()
-    }
-}
-
-pub struct WorkerTaskRegistryBuilder<Ctx: Send + Sync> {
-    map: HashMap<String, Arc<dyn WorkerTaskKind<Ctx>>>,
-}
-
-impl<Ctx: Send + Sync> WorkerTaskRegistryBuilder<Ctx> {
-    pub fn register(
-        mut self,
-        kind: crate::kinds::TaskKind,
-        kind_impl: Arc<dyn WorkerTaskKind<Ctx>>,
-    ) -> Self {
-        self.map.insert(kind.as_str().to_string(), kind_impl);
-        self
-    }
-
-    /// Register a worker kind by its raw kind STRING, the same add-a-string-kind
-    /// seam the dispatcher-side builder exposes: dispatch on both sides is
-    /// string-keyed on `Task.kind`, so an added worker-target kind slots in
-    /// without widening the built-in enum.
-    pub fn register_str(
-        mut self,
-        kind: impl Into<String>,
-        kind_impl: Arc<dyn WorkerTaskKind<Ctx>>,
-    ) -> Self {
-        self.map.insert(kind.into(), kind_impl);
-        self
-    }
-
-    pub fn build(self) -> WorkerTaskRegistry<Ctx> {
-        WorkerTaskRegistry { inner: self.map }
-    }
-}
-
-/// Maximum concurrent dispatcher tasks per Pod. Tasks like
-/// `register_signal` (HTTP to listener) and `spawn_pod`
-/// (image pull + kubectl apply + boot wait) can take seconds;
-/// running them sequentially would head-of-line-block the picker. 8
-/// is enough that one slow op doesn't park everything else, low
-/// enough that we don't open arbitrarily many DB connections at once.
+/// Most dispatcher tasks one process runs at once. Tasks like
+/// `register_signal` (HTTP to the listener) or a build can take a while;
+/// running them one after another would head-of-line-block the claims. 8
+/// is enough that one slow op doesn't park everything else, low enough
+/// that we don't open arbitrarily many DB connections at once.
 pub const DISPATCHER_PICKER_CONCURRENCY: usize = 8;
 
-/// How long the dispatcher picker holds one claim open waiting for a
-/// task to be announced before it asks again. Also the longest a task
-/// whose claim lapsed (its pod died) waits to be rescued, since a lapse
-/// announces nothing.
-pub const DISPATCHER_CLAIM_WAIT: Duration = Duration::from_secs(30);
+/// A dispatcher task that became claimable.
+const DISPATCHER_READY: &[crate::drain::WakeOn] = &[crate::drain::WakeOn {
+    channel: crate::tasks::TASK_READY_CHANNEL,
+    concerns: |payload| payload == "dispatcher",
+}];
 
-/// Dispatcher picker: claims `target=dispatcher` tasks and runs each
-/// on a tokio task, capped at `DISPATCHER_PICKER_CONCURRENCY`.
-/// Per-claim heartbeat renews the lease while the executor runs. With
-/// nothing to claim it sleeps inside the claim until a task is
-/// announced.
-pub async fn run_dispatcher_picker<Ctx>(
+/// The dispatcher's picker as a drain loop: each pass claims one task and
+/// runs it on a task of its own (under the concurrency cap), until none
+/// is claimable. Woken by a task becoming claimable; the safety look also
+/// rescues a task whose claim lapsed (its claimant died), which nothing
+/// announces.
+pub fn dispatcher_picker_loop<Ctx>(
     store: Arc<dyn TaskStoreClient>,
     ctx: Ctx,
     registry: TaskRegistry<Ctx>,
-    pod_id: String,
-) where
+    replica: String,
+) -> crate::drain::DrainLoop
+where
     Ctx: Send + Sync + Clone + 'static,
 {
-    let mut in_flight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-    loop {
-        // Reap finished tasks first so the in_flight count reflects
-        // reality before we decide whether to claim.
-        while in_flight.try_join_next().is_some() {}
-
-        if in_flight.len() >= DISPATCHER_PICKER_CONCURRENCY {
-            // At capacity: wait for one to finish before claiming.
-            let _ = in_flight.join_next().await;
-            continue;
-        }
-
-        match store.claim_one(&pod_id, ClaimFilter::Dispatcher, DISPATCHER_CLAIM_WAIT).await {
-            Ok(Some(task)) => {
-                spawn_dispatcher_task(
-                    &mut in_flight,
-                    store.clone(),
-                    ctx.clone(),
-                    registry.clone(),
-                    pod_id.clone(),
-                    task,
-                );
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!(
-                    target: "weft_task_store::executor",
-                    error = %e,
-                    "dispatcher picker error; backing off"
-                );
-                tokio::time::sleep(Duration::from_secs(1)).await;
+    let slots = Arc::new(tokio::sync::Semaphore::new(DISPATCHER_PICKER_CONCURRENCY));
+    crate::drain::DrainLoop::new("dispatcher_picker", DISPATCHER_READY, crate::drain::SAFETY_POLL_INTERVAL, move || {
+        let (store, ctx, registry, replica, slots) = (store.clone(), ctx.clone(), registry.clone(), replica.clone(), slots.clone());
+        async move {
+            // At capacity: wait for a running task to finish before claiming
+            // another.
+            let slot = slots.acquire_owned().await.expect("the picker's semaphore is never closed");
+            match store.claim_one(&replica, ClaimFilter::Dispatcher, Duration::ZERO).await? {
+                Some(task) => {
+                    tokio::spawn(async move {
+                        let _slot = slot;
+                        run_dispatcher_task(store, ctx, registry, replica, task).await;
+                    });
+                    Ok(crate::drain::DrainStep::More)
+                }
+                None => Ok(crate::drain::DrainStep::Done),
             }
         }
-    }
+    })
 }
 
-fn spawn_dispatcher_task<Ctx>(
-    in_flight: &mut tokio::task::JoinSet<()>,
+/// Run one claimed dispatcher task through its executor, under its lease.
+async fn run_dispatcher_task<Ctx>(
     store: Arc<dyn TaskStoreClient>,
     ctx: Ctx,
     registry: TaskRegistry<Ctx>,
-    pod_id: String,
+    replica: String,
     task: Task,
 ) where
     Ctx: Send + Sync + Clone + 'static,
 {
-    in_flight.spawn(async move {
-        let Some(executor) = registry.get(&task.kind) else {
-            let err = format!("no executor for task kind '{}'", task.kind);
-            tracing::error!(
-                target: "weft_task_store::executor",
-                id = %task.id, kind = %task.kind, error = %err,
-                "rejecting unknown task kind"
-            );
-            if let Err(e) = store.fail(task.id, &pod_id, err).await {
-                tracing::warn!(
-                    target: "weft_task_store::executor",
-                    id = %task.id, error = %e,
-                    "fail write failed for unknown-kind reject; row sits claimed until lease expiry"
-                );
-            }
-            return;
-        };
-        let task_id = task.id;
-        let kind = task.kind.clone();
-        let lease = LeaseSignal::new();
-        let heartbeat = spawn_claim_heartbeat(
-            store.clone(),
-            task_id,
-            pod_id.clone(),
-            lease.clone(),
+    let Some(executor) = registry.get(&task.kind) else {
+        let err = format!("no executor for task kind '{}'", task.kind);
+        tracing::error!(
+            target: "weft_task_store::executor",
+            id = %task.id, kind = %task.kind, error = %err,
+            "rejecting unknown task kind"
         );
-        let outcome = run_with_lease_guard(
-            executor.execute(&ctx, &task),
-            lease,
-            task_id,
-            &kind,
-        )
-        .await;
-        heartbeat.abort();
-        finalize_task(store.as_ref(), task_id, &pod_id, &kind, outcome).await;
-    });
+        if let Err(e) = store.fail(task.id, &replica, err).await {
+            tracing::warn!(
+                target: "weft_task_store::executor",
+                id = %task.id, error = %e,
+                "fail write failed for unknown-kind reject; row sits claimed until lease expiry"
+            );
+        }
+        return;
+    };
+    let task_id = task.id;
+    let kind = task.kind.clone();
+    let lease = LeaseSignal::new();
+    let heartbeat = spawn_claim_heartbeat(
+        store.clone(),
+        task_id,
+        replica.clone(),
+        lease.clone(),
+    );
+    let outcome = run_with_lease_guard(
+        executor.execute(&ctx, &task),
+        lease,
+        task_id,
+        &kind,
+    )
+    .await;
+    heartbeat.abort();
+    finalize_task(store.as_ref(), task_id, &replica, &kind, outcome).await;
 }
 
 /// Why the heartbeat task told the executor to stop. Typed so the
@@ -298,12 +193,12 @@ fn spawn_dispatcher_task<Ctx>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LeaseLoss {
     /// The heartbeat came back "row no longer claimed by us": a
-    /// sibling pod already re-claimed it (our lease lapsed and was
+    /// sibling process already re-claimed it (our lease lapsed and was
     /// taken). The thief owns the task now; we touch nothing.
     Stolen,
     /// The heartbeat could not REACH the store past the lease window.
     /// The work did not fail, WE lost the ability to prove liveness,
-    /// so the task is surrendered: requeued to `pending` for any pod
+    /// so the task is surrendered: requeued to `pending` for any process
     /// (including us) to claim again.
     Unrenewable,
 }
@@ -386,7 +281,7 @@ where
 ///   - `Finished(Ok(Err(e)))`: → `tasks::fail` with the error message.
 ///   - `Finished(Err(panic))`: → `tasks::fail` with a "panic: ..."
 ///     prefix so clients can flag it visibly. Without this
-///     layering, a panicking executor would ride the JoinSet's
+///     layering, a panicking executor would ride the spawned task's
 ///     JoinError up and get discarded by `try_join_next`, and the row
 ///     would sit `claimed` until the lease expired.
 ///   - `LeaseLost(Unrenewable)`: → `tasks::requeue` (guarded on our
@@ -398,22 +293,22 @@ where
 async fn finalize_task(
     store: &dyn TaskStoreClient,
     task_id: uuid::Uuid,
-    pod_id: &str,
+    replica: &str,
     kind: &str,
     outcome: ExecOutcome,
-) {
+) -> TaskEnd {
     let outcome = match outcome {
         ExecOutcome::Finished(finished) => finished,
         ExecOutcome::LeaseLost(LeaseLoss::Stolen) => {
             tracing::warn!(
                 target: "weft_task_store::executor",
                 id = %task_id, kind = %kind,
-                "lease stolen by a sibling pod; it owns the task, standing down"
+                "lease stolen by another claimant; it owns the task, standing down"
             );
-            return;
+            return TaskEnd::LeaseLost;
         }
         ExecOutcome::LeaseLost(LeaseLoss::Unrenewable) => {
-            match store.requeue(task_id, pod_id).await {
+            match store.requeue(task_id, replica).await {
                 Ok(true) => tracing::warn!(
                     target: "weft_task_store::executor",
                     id = %task_id, kind = %kind,
@@ -432,28 +327,30 @@ async fn finalize_task(
                      expires, then claim_one rescues it"
                 ),
             }
-            return;
+            return TaskEnd::LeaseLost;
         }
     };
     match outcome {
         Ok(Ok(result)) => {
-            if let Err(e) = store.complete(task_id, pod_id, result).await {
+            if let Err(e) = store.complete(task_id, replica, result).await {
                 tracing::warn!(
                     target: "weft_task_store::executor",
                     id = %task_id, kind = %kind, error = %e,
                     "complete write failed; row may have been re-claimed"
                 );
             }
+            TaskEnd::Completed
         }
         Ok(Err(e)) => {
             let msg = format!("{e:#}");
-            if let Err(e2) = store.fail(task_id, pod_id, msg).await {
+            if let Err(e2) = store.fail(task_id, replica, msg.clone()).await {
                 tracing::warn!(
                     target: "weft_task_store::executor",
                     id = %task_id, kind = %kind, error = %e2,
                     "fail write failed"
                 );
             }
+            TaskEnd::Failed(msg)
         }
         Err(panic) => {
             let panic_msg = panic_message(&panic);
@@ -463,15 +360,28 @@ async fn finalize_task(
                 "task panicked; writing tasks::fail"
             );
             let msg = format!("panic: {panic_msg}");
-            if let Err(e) = store.fail(task_id, pod_id, msg).await {
+            if let Err(e) = store.fail(task_id, replica, msg.clone()).await {
                 tracing::warn!(
                     target: "weft_task_store::executor",
                     id = %task_id, kind = %kind, error = %e,
                     "fail write after panic also failed"
                 );
             }
+            TaskEnd::Failed(msg)
         }
     }
+}
+
+/// How a claimed task ended, as its claimant saw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskEnd {
+    Completed,
+    /// The work failed (or panicked); the task was failed with this.
+    Failed(String),
+    /// The claim was lost mid-work: taken by another claimant, or given
+    /// back because it could not be renewed. Whoever claims it next runs
+    /// it again.
+    LeaseLost,
 }
 
 fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
@@ -484,257 +394,16 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// What a worker pod knows about its own standing: whether it is
-/// shutting down, and whether it is draining. The heartbeat learns both
-/// off the pod's row (the pod cannot know it any other way: a drain is
-/// decided on its row by a replacement or a scale-down); the picker acts
-/// on them the moment they change, even while it is holding a claim
-/// open.
-#[derive(Default)]
-pub struct PodStanding {
-    shutdown: std::sync::atomic::AtomicBool,
-    draining: std::sync::atomic::AtomicBool,
-    changed: tokio::sync::Notify,
-}
-
-impl PodStanding {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-
-    pub fn shut_down(&self) {
-        if !self.shutdown.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            self.changed.notify_waiters();
-        }
-    }
-
-    pub fn is_shut_down(&self) -> bool {
-        self.shutdown.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Mark the pod draining; true the first time, so the caller can
-    /// say so once.
-    pub fn start_draining(&self) -> bool {
-        let first = !self.draining.swap(true, std::sync::atomic::Ordering::SeqCst);
-        if first {
-            self.changed.notify_waiters();
-        }
-        first
-    }
-
-    pub fn is_draining(&self) -> bool {
-        self.draining.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-/// How long a draining pod stays up once idle. A warm pod keeps its
-/// idle window so the next burst reuses it instead of paying a cold
-/// spawn; a draining pod gets no next burst (nothing new is admitted to
-/// it), so the only thing a grace would buy is a replacement waiting on
-/// it.
-pub const DRAINING_IDLE_WINDOW: Duration = Duration::from_secs(1);
-
-/// How long one claim may hold open, having been idle for `idle_for` of
-/// an idle `window`: never past the moment the pod should try to exit,
-/// and never past what a held request may last.
-pub fn worker_claim_wait(idle_for: Duration, window: Duration) -> Duration {
-    window.saturating_sub(idle_for).min(crate::pg_signal::MAX_HOLD)
-}
-
-/// Worker picker: claims `target=worker` tasks scoped to one
-/// `project_id` and dispatches each through the registry. Kinds
-/// that opt in to `spawn_in_background` get tokio-spawned (with their
-/// own heartbeat); the picker keeps claiming. Synchronous kinds
-/// (cancel) run inline. With nothing to claim it sleeps inside the
-/// claim, which the broker holds open until a task is announced.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_worker_picker<Ctx>(
-    store: Arc<dyn TaskStoreClient>,
-    ctx: Ctx,
-    registry: WorkerTaskRegistry<Ctx>,
-    pod_name: String,
-    project_id: uuid::Uuid,
-    standing: Arc<PodStanding>,
-    idle_exit: Arc<dyn IdleExit>,
-    idle_window: Duration,
-    background: Arc<weft_core::in_flight::InFlight>,
-) where
-    Ctx: Send + Sync + Clone + 'static,
-{
-    // When the picker went idle: the start of the first claim that came
-    // back empty. Reset on every successful claim. When idle longer
-    // than the window, attempt the guarded idle-exit CAS. Uses
-    // `tokio::time::Instant` (not `std`) so the idle window is
-    // virtualized under `tokio::time::pause()` in tests; in prod it's
-    // the same monotonic clock.
-    let mut idle_since: Option<tokio::time::Instant> = None;
-    let filter = ClaimFilter::Worker { project_id };
-    loop {
-        // Armed before the standing is read, so a change that lands
-        // between the read and the wait still ends the wait.
-        let changed = standing.changed.notified();
-        tokio::pin!(changed);
-        changed.as_mut().enable();
-        if standing.is_shut_down() {
-            break;
-        }
-        let window = if standing.is_draining() { DRAINING_IDLE_WINDOW } else { idle_window };
-        let idle_for = idle_since.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
-        if idle_since.is_some() && idle_for >= window {
-            // Attempt the guarded exit. The CAS fails if any
-            // pending/claimed work exists (incl. a background exec
-            // holding a claimed task), so this is safe even though the
-            // picker only sees the claim queue.
-            match idle_exit.try_idle_exit().await {
-                Ok(true) => {
-                    standing.shut_down();
-                    break;
-                }
-                // Lost the race (work arrived / in flight). Reset the
-                // timer and keep claiming.
-                Ok(false) => idle_since = None,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "weft_task_store::executor",
-                        error = %e,
-                        "idle-exit CAS failed; will retry"
-                    );
-                    idle_since = None;
-                }
-            }
-            continue;
-        }
-        let asked_at = tokio::time::Instant::now();
-        // A change of standing ends the hold at once: a pod shutting
-        // down stops claiming, and a pod that starts draining moves to
-        // its short window. Dropping the claim can in a rare race lose
-        // one the broker had just made; that task sits claimed until its
-        // lease lapses and is then claimed again, like any claim whose
-        // pod died.
-        let claimed = tokio::select! {
-            _ = &mut changed => continue,
-            claimed = store.claim_one(&pod_name, filter.clone(), worker_claim_wait(idle_for, window)) => claimed,
-        };
-        match claimed {
-            Ok(Some(task)) => {
-                idle_since = None;
-                run_worker_task(&store, &ctx, &registry, &pod_name, &background, task).await;
-            }
-            Ok(None) => {
-                idle_since.get_or_insert(asked_at);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "weft_task_store::executor",
-                    error = %e,
-                    "worker picker error; backing off"
-                );
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
-}
-
-/// Run one claimed worker task through its handler: detached for kinds
-/// that drive an execution, inline for the rest.
-async fn run_worker_task<Ctx>(
-    store: &Arc<dyn TaskStoreClient>,
-    ctx: &Ctx,
-    registry: &WorkerTaskRegistry<Ctx>,
-    pod_name: &str,
-    background: &Arc<weft_core::in_flight::InFlight>,
-    task: Task,
-) where
-    Ctx: Send + Sync + Clone + 'static,
-{
-    let Some(handler) = registry.get(&task.kind) else {
-        let err = format!("no worker handler for task kind '{}'", task.kind);
-        tracing::error!(
-            target: "weft_task_store::executor",
-            id = %task.id, kind = %task.kind, error = %err,
-            "rejecting unknown worker task kind"
-        );
-        if let Err(e) = store.fail(task.id, pod_name, err).await {
-            tracing::warn!(
-                target: "weft_task_store::executor",
-                id = %task.id, error = %e,
-                "fail write failed for unknown-kind reject; row sits claimed until lease expiry"
-            );
-        }
-        return;
-    };
-
-    let task_id = task.id;
-    let kind = task.kind.clone();
-
-    if handler.spawn_in_background() {
-        let store_inner = store.clone();
-        let pod_inner = pod_name.to_string();
-        let ctx_inner = ctx.clone();
-        let handler_inner = handler.clone();
-        let kind_inner = kind.clone();
-        // Held for the whole of the detached run, so the pod's shutdown
-        // can wait for what it just cancelled to write its ending down.
-        // A guard rather than a manual pair: this future is dropped
-        // wholesale if the runtime goes away, and a leaked token would
-        // hold the exit gate shut for ever.
-        let token = background.token();
-        tokio::spawn(async move {
-            let _token = token;
-            let lease = LeaseSignal::new();
-            let heartbeat = spawn_claim_heartbeat(
-                store_inner.clone(),
-                task_id,
-                pod_inner.clone(),
-                lease.clone(),
-            );
-            // The worker's WorkerTaskKind returns Result<()>; map to
-            // the Result<Value> shape the shared guard + finalizer
-            // expect so both pickers share one lease/complete/fail/
-            // requeue path.
-            let kind_value = kind_inner.clone();
-            let fut = async {
-                handler_inner
-                    .handle(&ctx_inner, &task)
-                    .await
-                    .map(|()| serde_json::json!({"kind": kind_value}))
-            };
-            let outcome = run_with_lease_guard(fut, lease, task_id, &kind_inner).await;
-            heartbeat.abort();
-            finalize_task(store_inner.as_ref(), task_id, &pod_inner, &kind_inner, outcome).await;
-        });
-        return;
-    }
-
-    let lease = LeaseSignal::new();
-    let heartbeat = spawn_claim_heartbeat(
-        store.clone(),
-        task_id,
-        pod_name.to_string(),
-        lease.clone(),
-    );
-    let kind_value = kind.clone();
-    let fut = async {
-        handler
-            .handle(ctx, &task)
-            .await
-            .map(|()| serde_json::json!({"kind": kind_value}))
-    };
-    let outcome = run_with_lease_guard(fut, lease, task_id, &kind).await;
-    heartbeat.abort();
-    finalize_task(store.as_ref(), task_id, pod_name, &kind, outcome).await;
-}
-
 /// Renew the claim every [`claim_heartbeat_interval`] until the
 /// owning future finishes (which aborts this handle).
 ///
 /// Two exit conditions fire the lease signal, each with its cause:
 ///   - heartbeat returns `Ok(false)`: the row is no longer claimed by
-///     us (sibling pod took the lease): `LeaseLoss::Stolen`, the
+///     us (sibling process took the lease): `LeaseLoss::Stolen`, the
 ///     finalizer stands down.
 ///   - heartbeat errors past `claim_duration_secs() / interval` ticks:
 ///     the lease has lapsed at this point regardless of what the DB
-///     says; a sibling pod can re-claim, so we must stop or risk
+///     says; a sibling process can re-claim, so we must stop or risk
 ///     parallel execution of the same row. `LeaseLoss::Unrenewable`,
 ///     the finalizer requeues the row.
 /// A stalled executor is NOT an exit: the heartbeat keeps renewing,
@@ -742,7 +411,7 @@ async fn run_worker_task<Ctx>(
 fn spawn_claim_heartbeat(
     store: Arc<dyn TaskStoreClient>,
     task_id: uuid::Uuid,
-    pod_id: String,
+    replica: String,
     lease: LeaseSignal,
 ) -> tokio::task::JoinHandle<()> {
     let interval = claim_heartbeat_interval();
@@ -752,7 +421,7 @@ fn spawn_claim_heartbeat(
         let mut consecutive_errors: u32 = 0;
         loop {
             tokio::time::sleep(interval).await;
-            match store.heartbeat(task_id, &pod_id).await {
+            match store.heartbeat(task_id, &replica).await {
                 Ok(true) => {
                     consecutive_errors = 0;
                 }
@@ -787,184 +456,25 @@ fn spawn_claim_heartbeat(
     })
 }
 
-#[cfg(test)]
-mod idle_exit_tests {
-    use super::*;
-    use crate::tasks::ClaimFilter;
-    use std::sync::atomic::{AtomicU32, Ordering as AtOrd};
-    use std::sync::Mutex;
-    use uuid::Uuid;
-
-    /// TaskStoreClient that never yields a task (the worker is idle).
-    /// A claim holds for the budget it was given, as the broker does,
-    /// and the budgets are recorded. Only the picker's claim path is
-    /// exercised; the enqueue/wait methods are never reached by
-    /// `run_worker_picker`.
-    #[derive(Default)]
-    struct IdleStore {
-        budgets: Mutex<Vec<Duration>>,
-    }
-    #[async_trait]
-    impl TaskStoreClient for IdleStore {
-        async fn enqueue_dedup(&self, _spec: crate::tasks::NewTask) -> Result<crate::tasks::DedupOutcome> {
-            unreachable!("picker never enqueues")
-        }
-        async fn wait_for_terminal(
-            &self,
-            _id: Uuid,
-            _timeout: Duration,
-        ) -> Result<crate::tasks::TaskOutcome> {
-            unreachable!("picker never waits for terminal")
-        }
-        async fn claim_one(&self, _pod: &str, _f: ClaimFilter, wait: Duration) -> Result<Option<Task>> {
-            self.budgets.lock().unwrap().push(wait);
-            tokio::time::sleep(wait).await;
-            Ok(None)
-        }
-        async fn heartbeat(&self, _id: Uuid, _pod: &str) -> Result<bool> {
-            Ok(true)
-        }
-        async fn requeue(&self, _id: Uuid, _pod: &str) -> Result<bool> {
-            unreachable!("idle picker never surrenders (heartbeat always renews)")
-        }
-        async fn complete(&self, _id: Uuid, _pod: &str, _r: Value) -> Result<()> {
-            Ok(())
-        }
-        async fn fail(&self, _id: Uuid, _pod: &str, _e: String) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    /// Records how many times the picker attempted the idle-exit
-    /// CAS, and returns a configurable result.
-    struct CountingIdleExit {
-        attempts: Arc<AtomicU32>,
-        win: bool,
-    }
-    #[async_trait]
-    impl IdleExit for CountingIdleExit {
-        async fn try_idle_exit(&self) -> Result<bool> {
-            self.attempts.fetch_add(1, AtOrd::Relaxed);
-            Ok(self.win)
-        }
-    }
-
-    fn idle_picker(
-        store: Arc<IdleStore>,
-        idle_exit: Arc<dyn IdleExit>,
-        standing: Arc<PodStanding>,
-        window: Duration,
-    ) -> impl std::future::Future<Output = ()> {
-        run_worker_picker(
-            store,
-            (),
-            WorkerTaskRegistry::<()>::builder().build(),
-            "wp-1".into(),
-            uuid::Uuid::from_u128(1),
-            standing,
-            idle_exit,
-            window,
-            // Nothing runs in the background here: this picker claims
-            // no work, which is the whole point of an idle-exit test.
-            weft_core::in_flight::InFlight::new("worker execution"),
-        )
-    }
-
-    #[test]
-    fn a_claim_never_holds_past_the_idle_window_or_the_longest_hold() {
-        let window = Duration::from_secs(30);
-        assert_eq!(worker_claim_wait(Duration::ZERO, window), crate::pg_signal::MAX_HOLD);
-        assert_eq!(worker_claim_wait(Duration::from_secs(20), window), Duration::from_secs(10));
-        assert_eq!(worker_claim_wait(Duration::from_secs(40), window), Duration::ZERO);
-        assert_eq!(worker_claim_wait(Duration::ZERO, DRAINING_IDLE_WINDOW), DRAINING_IDLE_WINDOW);
-    }
-
-    /// The picker must NOT attempt the idle-exit CAS before the idle
-    /// window elapses, and MUST attempt + stop once it does (when the
-    /// CAS wins). Its holds add up to exactly the window.
-    #[tokio::test(start_paused = true)]
-    async fn attempts_idle_exit_after_window_and_stops_on_win() {
-        let attempts = Arc::new(AtomicU32::new(0));
-        let standing = PodStanding::new();
-        let store = Arc::new(IdleStore::default());
-        let idle_exit = Arc::new(CountingIdleExit {
-            attempts: attempts.clone(),
-            win: true,
-        });
-        let started = tokio::time::Instant::now();
-        // Picker runs to completion: it idles, crosses the 30s
-        // window, the CAS wins, it shuts down and returns.
-        idle_picker(store.clone(), idle_exit, standing.clone(), Duration::from_secs(30)).await;
-        assert_eq!(attempts.load(AtOrd::Relaxed), 1, "exactly one winning CAS");
-        assert!(standing.is_shut_down(), "picker shut down on win");
-        assert_eq!(started.elapsed(), Duration::from_secs(30), "exits when the window ends, not later");
-        assert_eq!(
-            *store.budgets.lock().unwrap(),
-            vec![crate::pg_signal::MAX_HOLD, Duration::from_secs(5)],
-        );
-    }
-
-    /// When the CAS loses (work arrived/in-flight), the picker keeps
-    /// running: it does NOT stop, and retries on the next window.
-    #[tokio::test(start_paused = true)]
-    async fn keeps_running_when_cas_loses() {
-        let attempts = Arc::new(AtomicU32::new(0));
-        let standing = PodStanding::new();
-        let idle_exit = Arc::new(CountingIdleExit {
-            attempts: attempts.clone(),
-            win: false,
-        });
-        let handle = tokio::spawn(idle_picker(
-            Arc::new(IdleStore::default()),
-            idle_exit,
-            standing.clone(),
-            Duration::from_secs(30),
-        ));
-        // Virtual sleep past three idle windows. The picker keeps
-        // attempting the CAS (losing each time) and never stops.
-        tokio::time::sleep(Duration::from_secs(95)).await;
-        assert!(!standing.is_shut_down(), "lost CAS must not stop the picker");
-        assert_eq!(attempts.load(AtOrd::Relaxed), 3, "one attempt per window");
-        standing.shut_down();
-        handle.await.unwrap();
-    }
-
-    /// A pod told to drain mid-hold stops holding and exits after the
-    /// short window, instead of finishing a hold sized for a warm pod.
-    #[tokio::test(start_paused = true)]
-    async fn draining_mid_hold_moves_to_the_short_window_at_once() {
-        let attempts = Arc::new(AtomicU32::new(0));
-        let standing = PodStanding::new();
-        let idle_exit = Arc::new(CountingIdleExit { attempts: attempts.clone(), win: true });
-        let started = tokio::time::Instant::now();
-        let handle = tokio::spawn(idle_picker(
-            Arc::new(IdleStore::default()),
-            idle_exit,
-            standing.clone(),
-            Duration::from_secs(30),
-        ));
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        assert!(standing.start_draining());
-        handle.await.unwrap();
-        assert_eq!(attempts.load(AtOrd::Relaxed), 1);
-        assert!(started.elapsed() <= Duration::from_secs(4), "{:?}", started.elapsed());
-    }
-
-    /// Shutting down ends a hold at once.
-    #[tokio::test(start_paused = true)]
-    async fn shutting_down_ends_the_hold_at_once() {
-        let standing = PodStanding::new();
-        let idle_exit = Arc::new(CountingIdleExit { attempts: Arc::default(), win: false });
-        let handle = tokio::spawn(idle_picker(
-            Arc::new(IdleStore::default()),
-            idle_exit,
-            standing.clone(),
-            Duration::from_secs(30),
-        ));
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let stopped_at = tokio::time::Instant::now();
-        standing.shut_down();
-        handle.await.unwrap();
-        assert_eq!(stopped_at.elapsed(), Duration::ZERO);
-    }
+/// Run one task a worker claimed for the execution it was called for,
+/// under the same lease guard the dispatcher's tasks run under: the claim
+/// is renewed while `work` runs, and the task ends `complete`, `failed`,
+/// or back to `pending` when the claim could not be renewed. Answers how
+/// it ended, for the worker to tell whoever called it.
+pub async fn run_claimed_worker_task<F>(
+    store: Arc<dyn TaskStoreClient>,
+    replica: &str,
+    task: &Task,
+    work: F,
+) -> TaskEnd
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    let lease = LeaseSignal::new();
+    let heartbeat = spawn_claim_heartbeat(store.clone(), task.id, replica.to_string(), lease.clone());
+    let kind = task.kind.clone();
+    let result = serde_json::json!({ "kind": kind });
+    let outcome = run_with_lease_guard(async { work.await.map(|()| result) }, lease, task.id, &kind).await;
+    heartbeat.abort();
+    finalize_task(store.as_ref(), task.id, replica, &kind, outcome).await
 }

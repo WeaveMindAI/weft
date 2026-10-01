@@ -37,17 +37,26 @@
 //!   wrapped back into its marker from its mime type, and the engine
 //!   strips the link on the way out as it does for every node.
 //!
-//! - The return value must be a dict keyed by output port name.
-//!   A missing key OR a key set to `None` means "no pulse on
-//!   that port": the port is left out of the node's output
-//!   entirely, nothing travels down it, and the normal skip
-//!   propagation kicks in (this is how the weather example's
-//!   `{"weather": None, "error": "..."}` closes one branch and
-//!   opens the other).
+//! - The return value must be a dict keyed by declared output port
+//!   name. A missing key means "no pulse on that port": the port is
+//!   left out of the node's output entirely, nothing travels down
+//!   it, and the normal skip propagation kicks in. A key set to
+//!   `None` is the same on a port whose type does not take `Null`
+//!   (`{"weather": None, "reason": "..."}` closes one branch and
+//!   opens the other); on a `T | Null` port it sends a real null,
+//!   which flows as data. `return {}` emits nothing at all.
 //!
-//! - Python exceptions become node failures with the full traceback
-//!   in the message so the UI modal shows what actually went wrong
-//!   instead of a bare `ValueError`.
+//! - Failures come in two kinds. An exception the script raises while
+//!   it runs (a network call it makes failing, a `raise` of its own)
+//!   carries its type, message and traceback; with the optional
+//!   `error` output wired that message comes out there and every
+//!   other output closes, unwired it fails the run. A mistake in the
+//!   program itself fails the run either way: code that does not
+//!   compile (an input error), and an answer that is not a dict of
+//!   declared outputs holding values their types accept (a type
+//!   error: no return, a key that is no output, `error` among the
+//!   keys, a string on a number port). `error` is weft's, so a script
+//!   that wants to fail on purpose raises.
 //!
 //! Isolation: the worker the node runs in IS the isolation boundary;
 //! the Python executes there with the same access that worker already
@@ -60,10 +69,12 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyList, PyString};
 use pyo3::ToPyObject;
 use serde_json::{Map, Number, Value};
+use std::collections::HashMap;
 
 use weft::node::NodeOutput;
 use weft::storage::media::{media_slots, substitute_media};
 use weft::weft_type::FileKind;
+use weft::context::ERROR_PORT;
 use weft::{node_error, ExecutionContext, Node, NodeErrExt, NodeManifest, StoredFile, WeftError, WeftResult, WeftType};
 
 #[derive(NodeManifest)]
@@ -80,6 +91,12 @@ impl Node for ExecPythonNode {
     }
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        // An exception the script raises is a failure of the step,
+        // which the runtime puts on `error` when it is wired. A mistake
+        // in the program itself (the code does not compile, the answer
+        // is not a dict of declared outputs of the right types) is an
+        // input or type error, which fails the run whether or not
+        // `error` is wired.
         let code: String = ctx.inputs.get("code")?;
 
         // Bind every DECLARED data input under its name in the Python
@@ -111,23 +128,55 @@ impl Node for ExecPythonNode {
             .await
             .node_err("ExecPython blocking task panicked")??;
 
-        // Assemble NodeOutput. `None` / missing keys produce no
-        // pulse, matching the Python contract where returning
-        // {"x": None} skips port x. A file handed back on a
-        // file-typed port goes out as the marker the wire expects.
-        let mut out = NodeOutput::new();
-        for (port, value) in result {
-            if matches!(value, Value::Null) {
-                continue;
-            }
-            let value = match ctx.output_type(&port) {
-                Some(ty) if ty.references_file() => wrap_files(&value, &ty)?,
-                _ => value,
-            };
-            out = out.set(port, value);
-        }
-        ctx.pulse_downstream(out).await
+        // Check the whole answer before anything goes out, so a wrong
+        // key or type refuses the firing as the program mistake it is
+        // (the engine's own refusal of an emission is a failure `error`
+        // would catch).
+        ctx.pulse_downstream(answer_output(&ctx.data_outputs(), result)?).await
     }
+}
+
+/// The script's answer as the firing's output. A missing key produces
+/// no pulse; `None` is a null on a port whose type takes `Null` and no
+/// pulse on any other, so `{"x": None}` skips a plain port x. A file handed back on a file-typed port
+/// goes out as the marker the wire expects. A key that is not a declared
+/// data output, `error` included (weft fills it with the script's
+/// failure; a script fails on purpose by raising), and a value its port
+/// does not accept are type errors naming the port.
+fn answer_output(outputs: &HashMap<String, WeftType>, result: Vec<(String, Value)>) -> WeftResult<NodeOutput> {
+    let mut out = NodeOutput::new();
+    for (port, value) in result {
+        if port == ERROR_PORT {
+            return Err(WeftError::Type(format!(
+                "the script returned '{ERROR_PORT}', which is where weft puts the script's own failure; \
+                 to fail on purpose, raise an exception (its message comes out on '{ERROR_PORT}' when that is wired)"
+            )));
+        }
+        let Some(ty) = outputs.get(&port) else {
+            let mut declared: Vec<&str> = outputs.keys().map(String::as_str).collect();
+            declared.sort_unstable();
+            return Err(WeftError::Type(format!(
+                "the script returned '{port}', which is not an output of this node (its outputs: {}); \
+                 declare it in the node's header, `-> ({port}: T)`, or drop the key",
+                if declared.is_empty() { "none".to_string() } else { declared.join(", ") }
+            )));
+        };
+        // `None` sends a real null where the port takes one (`T | Null`),
+        // and sends nothing anywhere else.
+        if matches!(value, Value::Null) && !ty.accepts_runtime_value(&value) {
+            continue;
+        }
+        let value = if ty.references_file() { wrap_files(&value, ty)? } else { value };
+        if !ty.accepts_runtime_value(&value) {
+            let why = ty.validate_value(&value).err().unwrap_or_else(|| format!("expected {ty}"));
+            return Err(WeftError::Type(format!(
+                "the script returned {} on '{port}', which takes {ty}: {why}",
+                weft::truncate_user_string(&value.to_string(), 120)
+            )));
+        }
+        out = out.set(port, value);
+    }
+    Ok(out)
 }
 
 /// The inside of every stored-file marker sitting where the port's
@@ -162,8 +211,8 @@ fn wrap_files(value: &Value, ty: &WeftType) -> WeftResult<Value> {
     let mut replacements = std::collections::HashMap::new();
     for slot in media_slots(value, ty) {
         let Some(obj) = slot.as_object() else {
-            return Err(node_error(format!(
-                "ExecPython returned {} on a file port; return the dict the file arrived as",
+            return Err(WeftError::Type(format!(
+                "the script returned {} on a file port; return the dict the file arrived as",
                 weft::truncate_user_string(&slot.to_string(), 120)
             )));
         };
@@ -188,17 +237,19 @@ fn wrap_files(value: &Value, ty: &WeftType) -> WeftResult<Value> {
             continue;
         }
         let file: StoredFile = serde_json::from_value(slot.clone()).map_err(|e| {
-            node_error(format!("ExecPython returned a dict on a file port that is not a stored file ({e}); return the dict the file arrived as"))
+            WeftError::Type(format!("the script returned a dict on a file port that is not a stored file ({e}); return the dict the file arrived as"))
         })?;
         replacements.insert(slot.to_string(), file.to_value());
     }
     Ok(substitute_media(value, ty, &replacements))
 }
 
-/// Execute `code` with the given input bindings and return the
-/// raw key-value pairs the user returned. The engine drops pulses
-/// on ports that aren't wired downstream, so filtering here would
-/// be a duplicate guard.
+/// Execute `code` with the given input bindings and return the raw
+/// key-value pairs the script returned. Each way it can go wrong has
+/// its own kind: code that does not compile is an input error, an
+/// answer that is not a dict of plain values is a type error (both are
+/// the program's own mistakes), and an exception the script raises while
+/// it runs is a node failure, the one kind `error` catches.
 fn run_python(code: &str, inputs: Vec<(String, Value)>) -> WeftResult<Vec<(String, Value)>> {
     Python::with_gil(|py| -> WeftResult<Vec<(String, Value)>> {
         // Build the wrapper source once per call. Wrapping in a
@@ -213,12 +264,14 @@ fn run_python(code: &str, inputs: Vec<(String, Value)>) -> WeftResult<Vec<(Strin
             body = indent_block(code, "    "),
         );
 
+        // Running the wrapper only defines the function, so what fails
+        // here is the code not compiling (a syntax or indentation error).
         let globals = PyDict::new_bound(py);
         py.run_bound(&wrapper_source, Some(&globals), None)
-            .map_err(|err| py_error_to_weft(py, err, "compiling user code"))?;
+            .map_err(|err| WeftError::Input(format!("the code does not compile: {}", python_error(py, &err))))?;
         let user_fn = globals
             .get_item("__weft_user_fn")
-            .map_err(|err| py_error_to_weft(py, err, "locating __weft_user_fn"))?
+            .map_err(|err| node_error(format!("locating __weft_user_fn: {}", python_error(py, &err))))?
             .node_err("internal: ExecPython wrapper did not define __weft_user_fn")?;
 
         // Convert each input into a Python value and call the
@@ -226,39 +279,51 @@ fn run_python(code: &str, inputs: Vec<(String, Value)>) -> WeftResult<Vec<(Strin
         let args = PyList::empty_bound(py);
         for (_, v) in &inputs {
             let py_val = json_to_py(py, v)
-                .map_err(|err| py_error_to_weft(py, err, "converting input to Python"))?;
+                .map_err(|err| node_error(format!("converting an input to Python: {}", python_error(py, &err))))?;
             args.append(py_val)
-                .map_err(|err| py_error_to_weft(py, err, "building arg list"))?;
+                .map_err(|err| node_error(format!("building the argument list: {}", python_error(py, &err))))?;
         }
         let ret = user_fn
             .call1(args.to_tuple())
-            .map_err(|err| py_error_to_weft(py, err, "running user code"))?;
+            .map_err(|err| node_error(format!("the script raised {}", python_error(py, &err))))?;
 
-        // `return` with no value or `return None` yields no pulses.
+        // Falling off the end, a bare `return` and `return None` are one
+        // thing to Python, and none of them says which ports get what.
         if ret.is_none() {
-            return Ok(Vec::new());
+            return Err(WeftError::Type(
+                "the script ended without returning a dict; end it with `return {...}` keyed by \
+                 output port (`return {}` emits nothing)"
+                    .into(),
+            ));
         }
 
         let dict = ret.downcast::<PyDict>().map_err(|_| {
-            let type_name = ret
-                .get_type()
-                .name()
-                .map(|n| n.to_string())
-                .unwrap_or_else(|_| "<unknown>".to_string());
-            node_error(format!("ExecPython: expected a dict return, got {type_name}"))
+            WeftError::Type(format!(
+                "the script returned {}; it must return a dict keyed by output port",
+                python_type_name(&ret)
+            ))
         })?;
 
         let mut out: Vec<(String, Value)> = Vec::new();
         for (k, v) in dict.iter() {
-            let key: String = k.extract().map_err(|err| {
-                py_error_to_weft(py, err, "reading output dict key")
+            let key: String = k.extract().map_err(|_| {
+                WeftError::Type(format!(
+                    "the script returned a dict with a {} key; its keys are output port names",
+                    python_type_name(&k)
+                ))
             })?;
-            let json_val = py_to_json(py, &v)
-                .map_err(|err| py_error_to_weft(py, err, "converting output to JSON"))?;
+            let json_val = py_to_json(py, &v).map_err(|err| {
+                WeftError::Type(format!("the script returned '{key}' as {}", err.value_bound(py)))
+            })?;
             out.push((key, json_val));
         }
         Ok(out)
     })
+}
+
+/// A Python object's type name, for a message.
+fn python_type_name(obj: &Bound<'_, PyAny>) -> String {
+    obj.get_type().name().map(|n| n.to_string()).unwrap_or_else(|_| "<unknown>".to_string())
 }
 
 /// Indent every line of `s` with `prefix`. Used so the user's code
@@ -273,24 +338,21 @@ fn indent_block(s: &str, prefix: &str) -> String {
         .join("\n")
 }
 
-/// Format a PyErr into a node failure carrying the full Python
-/// traceback. Users debugging their own Python code rely on this
-/// to see line numbers and the exception type.
-fn py_error_to_weft(py: Python<'_>, err: PyErr, stage: &str) -> WeftError {
-    // Capture the Python-side formatted traceback. If that fails
-    // (because e.g. the traceback module can't be imported on some
-    // exotic embedding), fall back to Debug repr.
+/// A Python exception as a person debugging their script needs it: the
+/// exception's type and message, then the traceback with line numbers
+/// when there is one.
+fn python_error(py: Python<'_>, err: &PyErr) -> String {
     let traceback = err
         .traceback_bound(py)
         .and_then(|tb| tb.format().ok())
         .unwrap_or_default();
-    let value_repr = err.value_bound(py).to_string();
-    let message = if traceback.trim().is_empty() {
-        format!("ExecPython failed {stage}: {value_repr}")
+    let kind = err.get_type_bound(py).name().map(|n| n.to_string()).unwrap_or_else(|_| "Exception".to_string());
+    let summary = format!("{kind}: {}", err.value_bound(py));
+    if traceback.trim().is_empty() {
+        summary
     } else {
-        format!("ExecPython failed {stage}: {value_repr}\n{traceback}")
-    };
-    node_error(message)
+        format!("{summary}\n{}", traceback.trim_end())
+    }
 }
 
 /// Convert a serde_json Value to a Python object. Types:
@@ -356,7 +418,7 @@ fn py_to_json(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     if let Ok(f) = obj.extract::<f64>() {
         return Number::from_f64(f)
             .map(Value::Number)
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("non-finite float"));
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!("{f}, a float JSON cannot carry")));
     }
     if let Ok(s) = obj.extract::<String>() {
         return Ok(Value::String(s));
@@ -380,12 +442,8 @@ fn py_to_json(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     // stringified `repr()`. A user wiring a downstream port expecting
     // a Dict gets a structured failure instead of a `"<set {...}>"`
     // string that pretends to be data.
-    let type_name = obj
-        .get_type()
-        .name()
-        .map(|n| n.to_string())
-        .unwrap_or_else(|_| "<unknown>".to_string());
+    let type_name = python_type_name(obj);
     Err(pyo3::exceptions::PyTypeError::new_err(format!(
-        "ExecPython: unsupported return type `{type_name}` (supported: None, bool, int, float, str, list, dict)"
+        "a `{type_name}`, which has no value on a port (return None, bool, int, float, str, list or dict)"
     )))
 }

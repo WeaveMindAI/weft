@@ -1,10 +1,10 @@
 //! BaileyBridge: infra node.
 //!
-//! - `provision_infra` returns an `InfraSpec` declaring a Deployment +
-//!   Service + PVC for the Baileys bridge. The dispatcher's apply task
-//!   compiles + applies the manifests and writes the `infra_node` row,
-//!   then `run` forwards the bridge's `/outputs` to the node's pulse
-//!   output ports.
+//! - `provision_infra` returns an `InfraSpec` declaring one unit (the
+//!   Baileys bridge container) with a small disk for its WhatsApp
+//!   session, and the `api` endpoint the node calls. The supervisor
+//!   runs it and writes the `infra_node` row, then `run` forwards the
+//!   bridge's `/outputs` to the node's pulse output ports.
 //! - On later invocations (trigger setup, a normal firing) provisioning
 //!   is skipped (infra is already up) and `run` queries
 //!   `endpoint_url("api")` and forwards `/outputs` as before.
@@ -12,9 +12,8 @@
 use async_trait::async_trait;
 
 use weft::infra::{
-    AccessMode, Container, ContainerPort, Endpoint, EnvEntry, Expose, Image, InfraSpec, Lifecycle,
-    Mount, Probe, Protocol, Resources, TerminateBehavior, Unit, UnitKind, UpgradeBehavior, Volume,
-    VolumeKind,
+    Container, ContainerPort, Endpoint, EndpointTarget, EnvEntry, Expose, Image, InfraSpec, Limits, Mount, Probe,
+    Protocol, Unit, Volume, VolumeKind,
 };
 use weft::{ExecutionContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
 
@@ -37,76 +36,31 @@ impl Node for BaileyBridgeNode {
         _input: ValueBag,
     ) -> WeftResult<InfraSpec> {
         // No programmatic inputs; the bridge is parameterless.
+        // One unit, one copy: WhatsApp's session cannot tolerate two
+        // bridges at once, and a unit never runs beside its own next
+        // version.
+        const BRIDGE_PORT: u16 = 8090;
         Ok(InfraSpec {
             units: vec![Unit {
                 name: "bridge".into(),
-                kind: UnitKind::Deployment,
-                // WhatsApp's session can't tolerate two pod replicas
-                // simultaneously, so use Recreate for upgrades. The
-                // strategy is per-Unit; this node has only one Unit,
-                // so all upgrades use it.
-                on_upgrade: UpgradeBehavior::Recreate,
-                containers: vec![{
-                    // Bridge port. One source of truth : the env
-                    // var, the ContainerPort, and the readiness
-                    // probe all derive from this constant.
-                    const BRIDGE_PORT: u16 = 8090;
-                    Container::new("whatsapp", Image::Local { name: "bridge".into() })
-                        .with_env(vec![
-                            EnvEntry::Literal {
-                                name: "PORT".into(),
-                                value: BRIDGE_PORT.to_string(),
-                            },
-                            EnvEntry::Literal {
-                                name: "AUTH_DIR".into(),
-                                value: "/data/auth".into(),
-                            },
-                        ])
-                        .with_ports(vec![ContainerPort {
-                            name: "http".into(),
-                            port: BRIDGE_PORT,
-                            protocol: Protocol::Tcp,
-                        }])
-                        .with_resources(Resources {
-                            cpu_request: Some("100m".into()),
-                            memory_request: Some("128Mi".into()),
-                            cpu_limit: Some("500m".into()),
-                            memory_limit: Some("512Mi".into()),
-                            ..Default::default()
-                        })
-                        .with_mounts(vec![Mount {
-                            volume: "auth".into(),
-                            path: "/data/auth".into(),
-                            ..Default::default()
-                        }])
-                        .with_readiness(
-                            Probe::http("/health", BRIDGE_PORT).with_initial_delay(5),
-                        )
-                }],
+                containers: vec![Container::new("whatsapp", Image::Local { name: "bridge".into() })
+                    .with_env(vec![
+                        EnvEntry::new("PORT", BRIDGE_PORT.to_string()),
+                        EnvEntry::new("AUTH_DIR", "/data/auth"),
+                    ])
+                    .with_ports(vec![ContainerPort { name: "http".into(), port: BRIDGE_PORT, protocol: Protocol::Tcp }])
+                    .with_limits(Limits { cpu: Some("0.5".into()), memory: Some("512Mi".into()) })
+                    .with_mounts(vec![Mount::new("auth", "/data/auth")])
+                    .with_readiness(Probe::http("/health", BRIDGE_PORT).with_initial_delay(5))],
                 ..Default::default()
             }],
-            volumes: vec![Volume {
-                name: "auth".into(),
-                kind: VolumeKind::Persistent {
-                    size: "100Mi".into(),
-                    storage_class: None,
-                    access_modes: vec![AccessMode::ReadWriteOnce],
-                },
-            }],
+            volumes: vec![Volume { name: "auth".into(), kind: VolumeKind::Disk { size: "100Mi".into(), class: None } }],
             endpoints: vec![Endpoint {
                 name: "api".into(),
-                unit: "bridge".into(),
-                container: "whatsapp".into(),
-                port: "http".into(),
-                expose: Expose::ClusterInternal,
+                target: EndpointTarget::Unit { unit: "bridge".into(), container: "whatsapp".into(), port: "http".into() },
+                expose: Expose::Project,
             }],
-            lifecycle: Lifecycle {
-                on_terminate: TerminateBehavior {
-                    preserve_pvcs: Vec::new(),
-                },
-                ..Default::default()
-            },
-            ..Default::default()
+            keep_on_terminate: Vec::new(),
         })
     }
 

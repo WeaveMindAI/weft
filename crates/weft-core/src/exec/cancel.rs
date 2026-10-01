@@ -7,14 +7,14 @@
 //! One structured value instead of a free-text reason, because the
 //! inspector has to tell a DECISION apart from a CONSEQUENCE the same way
 //! it does for skips: "you pressed Stop", "a sibling run with your tag
-//! killed you", and "the worker pod was shutting down" all end in
+//! killed you", and "the worker was shutting down" all end in
 //! `ExecutionCancelled`, and a person reading the run needs to know
 //! which without parsing a sentence. The sentence still exists
 //! ([`CancelCause`]'s `Display`), for the places that render text.
 
 use serde::{Deserialize, Serialize};
 
-use crate::Color;
+use crate::ExecutionId;
 
 /// The cause behind an execution's cancellation.
 // SYNC: CancelCause <-> packages/weft-graph/src/protocol.ts CancelCause
@@ -28,11 +28,11 @@ pub enum CancelCause {
     /// Another execution of the same project stopped this one through
     /// `ctx.stop_tagged`: `by` is the execution that asked, `tag` is
     /// the tag that matched.
-    Execution { by: Color, tag: String },
+    Execution { by: ExecutionId, tag: String },
     /// The live caller this run was tied to dropped its connection, so
     /// the run had nobody left to answer.
     CallerGone,
-    /// The runtime itself, for a reason no person chose: a worker pod
+    /// The runtime itself, for a reason no person chose: a worker
     /// shutting down mid-run, a build superseding the image a queued
     /// run needed, an orphaned setup run swept away. `detail` says
     /// which, in words for the inspector.
@@ -61,7 +61,7 @@ mod tests {
     /// text a person reads is fixed per variant.
     #[test]
     fn every_cause_round_trips_and_reads() {
-        let by: Color = "9d3f8f4e-9a1a-4a9b-8c1d-2f3e4a5b6c7d".parse().unwrap();
+        let by: ExecutionId = "9d3f8f4e-9a1a-4a9b-8c1d-2f3e4a5b6c7d".parse().unwrap();
         let cases = [
             (CancelCause::User, "Cancelled by user".to_string()),
             (
@@ -70,8 +70,8 @@ mod tests {
             ),
             (CancelCause::CallerGone, "Caller disconnected".to_string()),
             (
-                CancelCause::Runtime { detail: "worker pod shutting down".into() },
-                "worker pod shutting down".to_string(),
+                CancelCause::Runtime { detail: "worker instance shutting down".into() },
+                "worker instance shutting down".to_string(),
             ),
         ];
         for (cause, text) in cases {

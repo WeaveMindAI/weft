@@ -53,7 +53,7 @@
       },
       "default": "json",
       "label": "Body shape",
-      "description": "What the body is. `json`: the body parses as JSON and its top-level keys land on the ports you declare, one port per key you want; there is no port for the whole object, so a caller sending anything but an object (a bare list or string) is refused by name. `text`: the whole body is a String on the one port you declare. `bytes`: the whole body is stored as a file and its stored-file value lands on the one port you declare (declare it `File`, or the kind you expect: `Image` for an image upload, which is checked against the file's own bytes and refused if they are something else). The same shape applies to what Reply and Stream send back."
+      "description": "What the body is. `json`: the body parses as JSON and its top-level keys land on the ports you declare, one port per key you want; there is no port for the whole object, so a caller sending anything but an object (a bare list or string) is refused by name. `text`: the whole body is a String on the one port you declare (a port named like a path capture reads the capture and does not count). `bytes`: the whole body is stored as a file and its stored-file value lands on the one port you declare, captures aside (declare it `File`, or the kind you expect: `Image` for an image upload, which is checked against the file's own bytes and refused if they are something else). Reply and Stream answer in the same shape unless their own `Answer as` says otherwise, so a GET with no body can still answer bytes."
     },
     {
       "name": "auth",
@@ -131,6 +131,11 @@
   ],
   "outputs": [
     {
+      "name": "fired",
+      "type": "Boolean",
+      "description": "Always true when the route is called. Wire it to gate work on \"the route was called\" without reading any request part."
+    },
+    {
       "name": "method",
       "type": "String",
       "description": "The HTTP method the caller used."
@@ -173,10 +178,12 @@
     "query?": "Dict[String, String]",
     "headers?": "List[List[String]]",
     "caller?": "JsonDict",
+    "base_url?": "String",
     "body?": "JsonDict | String"
   },
   "features": {
     "isTrigger": true,
+    "liveConnection": "http",
     "canAddOutputPorts": true
   },
   "validate": [
@@ -199,17 +206,25 @@
         "of": {
           "kind": "run_reaches",
           "direction": "downstream",
-          "types": [
-            "Reply",
-            "Stream",
-            "Close"
-          ]
+          "with": {
+            "answersCaller": true
+          }
         }
       },
       "then": {
-        "message": "Route '{id}' starts a run that never answers its caller: no Reply, Stream or Close is in it. Wire the answering node so the run reaches it (through data, or `_should_flow` on the node or on the group it sits in); a custom node answering through the ctx is the one case to ignore this.",
+        "message": "Route '{id}' starts a run that never answers its caller: no node that answers it (a Reply, a Stream, a Close) is in it. Wire the answering node so the run reaches it (through data, or `_should_flow` on the node or on the group it sits in).",
         "level": "structural",
         "severity": "warning"
+      }
+    },
+    {
+      "when": {
+        "kind": "per_instance"
+      },
+      "then": {
+        "message": "Route '{id}' would exist once per instance, because {per_instance_reason}, but its public address is one for every instance. Keep the route shared and pick the instance per call: the `Weft-Instance` header on a route gated by a connection, or an instance token.",
+        "level": "structural",
+        "severity": "error"
       }
     }
   ]

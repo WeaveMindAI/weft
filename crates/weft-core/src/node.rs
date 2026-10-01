@@ -50,7 +50,7 @@ mod node_trait {
         }
 
         /// Build the desired infrastructure for this node. Returns the
-        /// desired k8s state as a typed value; the engine has it applied,
+        /// desired state as a typed value; the engine has it applied,
         /// then calls `run`. The default impl returns Err; nodes that
         /// declare `requires_infra=true` MUST override.
         async fn provision_infra(
@@ -202,7 +202,7 @@ pub struct NodeMetadata {
     #[serde(default)]
     pub outputs: Vec<OutputSpec>,
     /// Whether this node implements `Node::provision_infra` and needs
-    /// dispatcher-driven infrastructure (k8s pods, services, etc).
+    /// dispatcher-driven infrastructure (containers, disks, endpoints).
     /// Explicit flag in metadata.json; mirrored to
     /// `NodeDefinition.requires_infra` at enrich time.
     #[serde(default)]
@@ -375,7 +375,7 @@ pub struct ClaimsRoute {
     #[serde(rename = "pathField")]
     pub path_field: String,
     /// The config field holding the HTTP method, when the node has
-    /// one. Absent, or empty on the instance, means every method.
+    /// one. Absent, or empty on the node in the program, means every method.
     #[serde(default, rename = "methodField", skip_serializing_if = "Option::is_none")]
     pub method_field: Option<String>,
 }
@@ -713,13 +713,13 @@ impl NodeMetadata {
         self.inputs.iter().find(|i| matches!(i.effective_widget(), Widget::Access { .. }))
     }
 
-    /// Whether a node of this type may be marked `@per_member`: it runs a
-    /// container of its own (`requires_infra`), and each member gets one.
-    /// Anything a member PROVIDES (their connection, their sheet) is a
-    /// field written `@member_filled` instead. The one definition the
+    /// Whether a node of this type may be marked `@per_instance`: it runs a
+    /// container of its own (`requires_infra`), and each instance gets one.
+    /// Anything an instance PROVIDES (its connection, its sheet) is a
+    /// field written `@instance_filled` instead. The one definition the
     /// compiler's check and the editor's right-click toggle both read.
-    // SYNC: per_member_eligible <-> packages/weft-graph/src/webview/lib/utils/node-roles.ts canBePerMember
-    pub fn per_member_eligible(&self) -> bool {
+    // SYNC: per_instance_eligible <-> packages/weft-graph/src/webview/lib/utils/node-roles.ts canBePerInstance
+    pub fn per_instance_eligible(&self) -> bool {
         self.requires_infra
     }
 
@@ -753,8 +753,75 @@ impl NodeMetadata {
         }
         refuse_removed_metadata_keys(&value)
             .unwrap_or_else(|e| panic!("{site}: metadata.json: {e}"));
-        serde_json::from_value(value)
-            .unwrap_or_else(|e| panic!("{site}: metadata.json does not fit NodeMetadata: {e}"))
+        let mut metadata: Self = serde_json::from_value(value)
+            .unwrap_or_else(|e| panic!("{site}: metadata.json does not fit NodeMetadata: {e}"));
+        metadata
+            .add_language_ports()
+            .unwrap_or_else(|e| panic!("{site}: metadata.json: {e}"));
+        metadata
+    }
+
+    /// Give a trigger the settings the LANGUAGE owns, so no node
+    /// declares them and the ctx reads them when the node registers its
+    /// signal. Every trigger is an entry the dispatcher limits, so every
+    /// trigger gets the per-minute and at-once limits; one somebody
+    /// outside calls ([`NodeFeatures::has_outside_caller`]) also gets the
+    /// per-caller limit, the only one that needs a caller to count
+    /// ([`crate::signal::EntryLimits::node_inputs`]). A trigger whose run
+    /// does not answer a live caller (no `features.liveConnection`) also
+    /// gets the long-runs switch
+    /// ([`crate::run_class::RunClass::node_input`]). A trigger that
+    /// declares one of the names it receives is refused, so each setting
+    /// has exactly one spelling; a node that receives none of them may
+    /// use those names for its own inputs. A node with
+    /// `features.catchErrors` gets the [`ERROR_PORT`]
+    /// output the runtime fills with its failure, and is refused when it
+    /// declares that output itself. Run once, on the authored document,
+    /// by both loaders (the catalog's and the derive's `parse_embedded`),
+    /// so the editor, the compiler and the worker all see the same
+    /// ports.
+    pub fn add_language_ports(&mut self) -> Result<(), String> {
+        let features = &self.features;
+        if (features.live_connection.is_some() || features.called_from_outside) && !features.is_trigger {
+            return Err("features.liveConnection and features.calledFromOutside are only for a trigger (features.isTrigger)".into());
+        }
+        if features.live_connection.is_some() && features.called_from_outside {
+            return Err("features.liveConnection already means somebody outside calls the trigger; remove features.calledFromOutside".into());
+        }
+        let mut added: Vec<InputSpec> = Vec::new();
+        if features.is_trigger {
+            added.extend(crate::signal::EntryLimits::node_inputs(features.has_outside_caller()));
+            if features.live_connection.is_none() {
+                added.push(crate::run_class::RunClass::node_input());
+            }
+        }
+        for name in added.iter().map(|i| &i.name) {
+            if self.inputs.iter().any(|i| i.name == *name) {
+                return Err(format!(
+                    "input '{name}' is a setting the language gives every trigger that \
+                     needs it; remove it from this node's inputs"
+                ));
+            }
+        }
+        self.inputs.extend(added);
+        if features.catch_errors {
+            let port = ERROR_PORT;
+            if self.outputs.iter().any(|o| o.name == port) {
+                return Err(format!(
+                    "output '{port}' is the port the language gives a node with \
+                     features.catchErrors; remove it from this node's outputs"
+                ));
+            }
+            self.outputs.push(OutputSpec {
+                name: port.to_string(),
+                port_type: WeftType::primitive(WeftPrimitive::String),
+                description: Some(
+                    "Why the step failed, when this output is wired. Unwired, a failure stops the run."
+                        .to_string(),
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Semantic metadata rules serde cannot express. One name = one
@@ -851,7 +918,7 @@ impl NodeMetadata {
                         input.name
                     ));
                 }
-                Widget::Select { options } | Widget::Multiselect { options }
+                Widget::Select { options, .. } | Widget::Multiselect { options, .. }
                     if options.is_empty() =>
                 {
                     return Err(format!(
@@ -1448,6 +1515,23 @@ fn compact_wiring_view(value: &mut serde_json::Value) {
     }
 }
 
+/// How many options a refusal names before it says how many more there
+/// are: a time zone picker's six hundred would bury the message.
+const REFUSAL_OPTIONS_SHOWN: usize = 12;
+
+/// Whether `picked` is one of a select's `options`, and if not, a refusal
+/// naming the ones it may be.
+fn check_option(options: &[String], picked: &str) -> Result<(), String> {
+    if options.iter().any(|o| o == picked) {
+        return Ok(());
+    }
+    let mut allowed: Vec<String> = options.iter().take(REFUSAL_OPTIONS_SHOWN).map(|o| format!("'{o}'")).collect();
+    if options.len() > REFUSAL_OPTIONS_SHOWN {
+        allowed.push(format!("and {} more", options.len() - REFUSAL_OPTIONS_SHOWN));
+    }
+    Err(format!("'{picked}' is not one of the options; give one of {}", allowed.join(", ")))
+}
+
 /// How many of a select's options the compact view shows before it
 /// says how many more there are.
 const COMPACT_OPTIONS_SHOWN: usize = 8;
@@ -1702,22 +1786,85 @@ pub enum Condition {
     /// Braced (`{}`) so a stray field on it is refused like on every
     /// other kind.
     CustomOutputsDeclared {},
-    /// The run this node is part of holds a node of one of `types`, in
+    /// The run this node is part of holds a node `with` a feature, in
     /// the given direction. `downstream`: every run started from this
     /// node (a trigger's fire, or a run seeded at the node) contains
-    /// one of them; the check a trigger makes to know its caller gets
-    /// answered. `upstream`: this node is in the run of some node of
-    /// one of `types`; the check an answering node makes to know a
-    /// caller exists. Computed on the same program selection a fire
-    /// uses, so the diagnostic and the run cannot disagree.
-    ///
-    RunReaches { direction: RunDirection, types: Vec<String> },
+    /// one; the check a trigger makes to know its caller gets answered
+    /// (`{"answersCaller": true}`). `upstream`: this node is in the run
+    /// of some such node; the check an answering node makes to know a
+    /// caller exists (`{"liveConnection": true}`). Computed on the same
+    /// program selection a fire uses, so the diagnostic and the run
+    /// cannot disagree.
+    RunReaches { direction: RunDirection, with: NodeWith },
+    /// A node `with` a feature sits upstream of this one along the
+    /// wires (data or `_should_flow`, through group, loop and include
+    /// boundaries), so it runs first in any run holding both. The
+    /// check for an order that breaks: a second response head after a
+    /// `{"answersCaller": ["stream"]}`. Unlike `run_reaches upstream`,
+    /// a node the other one merely needs (wired INTO it) is not
+    /// upstream here. `{with}` in the message names the nodes found.
+    DownstreamOf { with: NodeWith },
+    /// This node exists once per instance: marked `@per_instance`, has
+    /// an `@instance_filled` field, or reads one of those downstream
+    /// (the compiler's per-instance slice). For a node that cannot be
+    /// copied per instance, like a trigger serving one public address.
+    /// `{per_instance_reason}` in the message says why, path included
+    /// ("it reads 'blender'", "it sits inside group 'work', which
+    /// receives 'blender'").
+    /// Braced (`{}`) so a stray field on it is refused.
+    PerInstance {},
+    /// Every name the input's written value holds is something of this
+    /// program. Where the names come from follows the value's shape: a
+    /// String is one name, a list each String in it, an object each of
+    /// its keys (`{"send.model": "claude"}`). What they name is `names`:
+    /// a node, spelled the way the program writes it (`bridge`,
+    /// `one.bridge` inside an included file), or a node's field, written
+    /// `node.field` (`send.model`, `one.send.model`).
+    /// Nothing written is nothing named, so true. A wired input, or an
+    /// `@instance_filled` one, holds names nobody knows yet: no answer,
+    /// the rule does not fire. Wrap in `not` to refuse a bad name;
+    /// `{names}` in the message lists the ones that fail.
+    InputNames { port: String, names: Named },
     /// All sub-conditions must hold.
     All { of: Vec<Condition> },
     /// At least one sub-condition must hold.
     Any { of: Vec<Condition> },
     /// Negation.
     Not { of: Box<Condition> },
+}
+
+/// What the names of an `input_names` condition name, and what each
+/// must be: `{"node": {"role": "infra", "per_instance": true}}` or
+/// `{"field": {"instance_filled": true}}`. Each narrowing is optional
+/// (`{"node": {}}` is any node).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum Named {
+    /// A node. `role` narrows it to an infra node or a trigger;
+    /// `per_instance` to a node that is (or is not) per instance.
+    Node {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<NodeRole>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        per_instance: Option<bool>,
+    },
+    /// A field of a node, `node.field`: the node exists and has that
+    /// field (an input, or a key written on it). `instance_filled`
+    /// narrows it to a field written (or not written) `@instance_filled`.
+    Field {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance_filled: Option<bool>,
+    },
+}
+
+/// What kind of node `input_names` with `{"node": {"role": ..}}` requires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeRole {
+    /// A node with infrastructure (`requires_infra`).
+    Infra,
+    /// A trigger (`features.isTrigger`).
+    Trigger,
 }
 
 /// Which way `run_reaches` looks from the node it is evaluated on.
@@ -1750,8 +1897,14 @@ mod condition_tests {
                     { "kind": "config_nonempty", "field": "model" },
                     { "kind": "config_in_set", "field": "mode", "values": ["a", "b"] },
                     { "kind": "config_matches", "field": "path", "regex": "^/" },
-                    { "kind": "run_reaches", "direction": "downstream", "types": ["Reply", "Stream"] },
-                    { "kind": "run_reaches", "direction": "upstream", "types": ["Route"] }
+                    { "kind": "run_reaches", "direction": "downstream", "with": { "answersCaller": true } },
+                    { "kind": "run_reaches", "direction": "upstream", "with": { "liveConnection": ["http"] } },
+                    { "kind": "downstream_of", "with": { "answersCaller": ["stream"] } },
+                    { "kind": "per_instance" },
+                    { "kind": "input_names", "port": "node", "names": { "node": {} } },
+                    { "kind": "input_names", "port": "infra", "names": { "node": { "role": "infra", "per_instance": true } } },
+                    { "kind": "input_names", "port": "values", "names": { "field": { "instance_filled": true } } },
+                    { "kind": "input_names", "port": "clear", "names": { "field": {} } }
                 ] }
             ]
         }))
@@ -1759,6 +1912,35 @@ mod condition_tests {
         let again: Condition = serde_json::from_value(serde_json::to_value(&rule).unwrap()).unwrap();
         assert_eq!(serde_json::to_value(&again).unwrap(), serde_json::to_value(&rule).unwrap());
         assert!(serde_json::from_value::<Condition>(serde_json::json!({ "kind": "custom_outputs_declared", "port": "x" })).is_err(), "no fields");
+        assert!(serde_json::from_value::<Condition>(serde_json::json!({ "kind": "per_instance", "port": "x" })).is_err(), "no fields");
+        let names = |named: serde_json::Value| {
+            serde_json::from_value::<Condition>(serde_json::json!({ "kind": "input_names", "port": "x", "names": named }))
+        };
+        assert!(names(serde_json::json!({ "field": { "role": "infra" } })).is_err(), "a field has no role");
+        assert!(names(serde_json::json!({ "node": { "instance_filled": true } })).is_err(), "a node is not filled");
+        assert!(names(serde_json::json!("node")).is_err(), "what is named is an object");
+    }
+
+    /// A selector names exactly one feature, and matches something:
+    /// `false`, an empty list, two features at once, or a feature the
+    /// language does not know are refused when the metadata loads.
+    #[test]
+    fn a_node_selector_names_one_feature_that_matches_something() {
+        let parse = |with: serde_json::Value| {
+            serde_json::from_value::<Condition>(serde_json::json!({ "kind": "downstream_of", "with": with }))
+        };
+        assert!(parse(serde_json::json!({ "answersCaller": true })).is_ok());
+        assert!(parse(serde_json::json!({ "liveConnection": ["http", "websocket"] })).is_ok());
+        for bad in [
+            serde_json::json!({ "answersCaller": false }),
+            serde_json::json!({ "answersCaller": [] }),
+            serde_json::json!({ "answersCaller": ["loudly"] }),
+            serde_json::json!({ "answersCaller": true, "liveConnection": true }),
+            serde_json::json!({ "nodeType": "Reply" }),
+            serde_json::json!({}),
+        ] {
+            assert!(parse(bad.clone()).is_err(), "{bad} must be refused");
+        }
     }
 }
 
@@ -1814,6 +1996,11 @@ pub enum DisplayKind {
     Link,
 }
 
+/// The output the language gives a node with `features.catchErrors`
+/// ([`NodeMetadata::add_language_ports`]), which the runtime fills with
+/// the node's failure (`context::caught_failure`).
+pub const ERROR_PORT: &str = "error";
+
 // SYNC: NodeFeatures <-> packages/weft-graph/src/protocol.ts NodeFeaturesWire
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1852,6 +2039,46 @@ pub struct NodeFeatures {
     /// events rather than running as part of an execution).
     #[serde(default, rename = "isTrigger", skip_serializing_if = "std::ops::Not::not")]
     pub is_trigger: bool,
+    /// The node reaches outside (a service, a database, a file, a
+    /// model), so a failure of its body is an outcome the program may
+    /// want to handle. The language gives it an [`ERROR_PORT`]
+    /// output ([`NodeMetadata::add_language_ports`]) and the runtime
+    /// does the catching (`context::caught_failure`): with
+    /// `error` wired, the failure's message goes there and the step
+    /// completes; unwired, the failure stops the run. The node's own
+    /// code writes no error handling.
+    #[serde(default, rename = "catchErrors", skip_serializing_if = "std::ops::Not::not")]
+    pub catch_errors: bool,
+    /// The trigger's run answers a caller who holds the connection
+    /// open for it, over the named wire (`"http"` for a route,
+    /// `"websocket"` for a socket), so the run is always one request
+    /// long and the caller's own traffic is what needs bounding.
+    /// Decides which settings the language gives the trigger
+    /// ([`NodeMetadata::add_language_ports`]): the entry limits, and
+    /// never the long-runs switch. The wire is what a rule asks when
+    /// its advice depends on it (`run_reaches` with `liveConnection`).
+    /// Backend-only: the editor never reads it, it only sees the
+    /// inputs it produces.
+    #[serde(default, rename = "liveConnection", skip_serializing_if = "Option::is_none")]
+    pub live_connection: Option<LiveWire>,
+    /// The node answers the live caller of the run it is in, and how
+    /// (see [`CallerAnswer`]). What the language knows about an
+    /// answering node, in place of its type name: a trigger's "never
+    /// answers its caller" rule asks for a node declaring it
+    /// downstream, and "a second response head" asks which one ran
+    /// first. Any node answering through the ctx declares it, a
+    /// catalog one or a project's own. Backend-only, like
+    /// `liveConnection`.
+    #[serde(default, rename = "answersCaller", skip_serializing_if = "Option::is_none")]
+    pub answers_caller: Option<CallerAnswer>,
+    /// The trigger fires when somebody outside calls its address and
+    /// the call ends there (a form somebody submits), so a caller exists
+    /// to count per caller. A `liveConnection` trigger is called from
+    /// outside already and never declares it; a trigger that picks its
+    /// events up itself (a schedule, a feed, a provider's push) has no
+    /// caller and does not either. Backend-only, like `liveConnection`.
+    #[serde(default, rename = "calledFromOutside", skip_serializing_if = "std::ops::Not::not")]
+    pub called_from_outside: bool,
     /// Webview hint: render the node's latest output as a JSON
     /// preview inline on the node body. Used by Debug.
     #[serde(default, rename = "showDebugPreview", skip_serializing_if = "std::ops::Not::not")]
@@ -1883,6 +2110,113 @@ pub struct NodeFeatures {
     /// not catalog nodes, they're inline-dispatched in the engine.)
     #[serde(default, rename = "hidden", skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
+}
+
+impl NodeFeatures {
+    /// Whether somebody outside calls this trigger, so a caller exists
+    /// to count: a live connection, or a trigger that says so.
+    pub fn has_outside_caller(&self) -> bool {
+        self.live_connection.is_some() || self.called_from_outside
+    }
+}
+
+/// The wire a live caller holds open (`features.liveConnection`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LiveWire {
+    /// An HTTP request waiting for its response.
+    Http,
+    /// A WebSocket, open until either side closes it.
+    Websocket,
+}
+
+/// How a node answers its run's live caller (`features.answersCaller`).
+/// Told apart by what each does to an HTTP response, the one wire where
+/// the order matters: its head (status and headers) goes out once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CallerAnswer {
+    /// The head and the whole body in one go, which ends the response.
+    Whole,
+    /// The head, then the body piece by piece, the response open until
+    /// the pieces stop. Anything that sends a head after it fails.
+    Stream,
+    /// The end of the exchange, with a head of its own only when
+    /// nothing went out before it.
+    End,
+}
+
+/// Which values of one feature a rule looks for: `true` for any node
+/// that declares the feature at all, or the list of values that count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeatureValues<T> {
+    Any,
+    OneOf(Vec<T>),
+}
+
+impl<T: PartialEq> FeatureValues<T> {
+    /// Whether a node declaring `declared` (None: not declaring the
+    /// feature) is one of them.
+    pub fn includes(&self, declared: Option<&T>) -> bool {
+        match (self, declared) {
+            (_, None) => false,
+            (FeatureValues::Any, Some(_)) => true,
+            (FeatureValues::OneOf(values), Some(v)) => values.contains(v),
+        }
+    }
+}
+
+impl<T: Serialize> Serialize for FeatureValues<T> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            FeatureValues::Any => s.serialize_bool(true),
+            FeatureValues::OneOf(values) => values.serialize(s),
+        }
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for FeatureValues<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw<T> {
+            Flag(bool),
+            List(Vec<T>),
+        }
+        match Raw::deserialize(d).map_err(|_| {
+            serde::de::Error::custom("expected `true` (any value) or a non-empty list of the values that count")
+        })? {
+            Raw::Flag(true) => Ok(FeatureValues::Any),
+            Raw::List(values) if !values.is_empty() => Ok(FeatureValues::OneOf(values)),
+            Raw::Flag(false) | Raw::List(_) => Err(serde::de::Error::custom(
+                "matches no node: write `true` for any value, or list the values that count",
+            )),
+        }
+    }
+}
+
+/// The nodes a graph rule looks for, by a feature they declare. One
+/// feature per selector, keyed by the feature's own metadata name, so a
+/// rule reads the way the node it looks for declares itself:
+/// `{"answersCaller": true}`, `{"liveConnection": ["http"]}`. A rule
+/// never names a node type: a project's own node declaring the feature
+/// counts exactly like a catalog one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum NodeWith {
+    #[serde(rename = "answersCaller")]
+    AnswersCaller(FeatureValues<CallerAnswer>),
+    #[serde(rename = "liveConnection")]
+    LiveConnection(FeatureValues<LiveWire>),
+}
+
+impl NodeWith {
+    pub fn matches(&self, features: &NodeFeatures) -> bool {
+        match self {
+            NodeWith::AnswersCaller(values) => values.includes(features.answers_caller.as_ref()),
+            NodeWith::LiveConnection(values) => values.includes(features.live_connection.as_ref()),
+        }
+    }
 }
 
 /// Where a node's ports come from when they come from its own config:
@@ -2248,12 +2582,13 @@ pub trait MetadataCatalog: Send + Sync {
     fn lookup(&self, node_type: &str) -> Option<&NodeMetadata>;
     /// Every known node's metadata.
     fn all(&self) -> Vec<&NodeMetadata>;
-    /// Why a type the catalog has SEEN is not in it: a node folder whose
-    /// `metadata.json` exists but whose code does not yet. Such a node is
-    /// left out of the catalog (a program that never names it builds),
-    /// and a program that does name it is told this instead of "unknown
-    /// node type". `None` for a type the catalog never saw.
-    fn not_ready(&self, _node_type: &str) -> Option<String> {
+    /// Why a type the catalog has SEEN is not in it, as the whole
+    /// sentence to show: a node whose code is not written yet, or one
+    /// that failed to load (and why). Such a node is left out of the
+    /// catalog (a program that never names it builds), and a program
+    /// that does name it is told this instead of "unknown node type".
+    /// `None` for a type the catalog never saw.
+    fn unavailable(&self, _node_type: &str) -> Option<String> {
         None
     }
     /// The type registry this catalog's metadata was loaded under
@@ -2532,8 +2867,24 @@ pub enum Widget {
     /// it (`2026-09-03T11:00:00+02:00`), so the source says which
     /// eleven o'clock it means.
     Datetime,
-    Select { options: Vec<String> },
-    Multiselect { options: Vec<String> },
+    /// `free_text`: the options are suggestions, not a closed set (a
+    /// provider's model ids, voices, effort levels: one released after
+    /// the list was written must still pass). The editor still shows
+    /// the list and lets the user type a value outside it, and
+    /// [`Widget::check_value`] takes any string. Default false: the
+    /// options are the input's domain, because the node's code matches
+    /// on them.
+    Select {
+        options: Vec<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        free_text: bool,
+    },
+    /// `free_text` as on [`Widget::Select`], per item.
+    Multiselect {
+        options: Vec<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        free_text: bool,
+    },
     /// A list of short text values the author adds and removes one at a
     /// time (a select's options, the values a case matches).
     TextList,
@@ -2641,28 +2992,40 @@ impl Widget {
         Ok(())
     }
 
-    /// What a number widget refuses: a value below `min`, above `max`,
-    /// or off `step` counting from `min` (or from zero when there is no
-    /// min). `Ok(())` for every other widget and for a value that is not
-    /// a number, which the type check owns.
+    /// What a widget's domain refuses: a number below `min`, above
+    /// `max`, or off a whole-number `step`; a `Select` value that is not
+    /// one of its closed `options`; a `Multiselect` item that is not
+    /// (a `free_text` list is suggestions and refuses nothing). `Ok(())`
+    /// for every other widget and for a value of the wrong shape, which
+    /// the type check owns.
     ///
     /// This is a DOMAIN rule, not a drawing hint: the node's own code
-    /// relies on it (a poll interval of zero, a spreadsheet row zero),
-    /// so it binds a value that arrived over a wire exactly as it binds
-    /// one written in the source. The compiler holds the written
-    /// constant to it and the runtime holds the wired value to it,
-    /// through this one function, so a program that compiles is a
-    /// program that runs.
-    ///
-    /// An option list (`Select`, `Multiselect`) is deliberately NOT a
-    /// rule here: it is what the editor offers, and a node's code
-    /// routinely accepts more than the list names (`http.request` takes
-    /// any method, a model id can ship after the list was written).
-    /// A node that really does take a closed set says so in its own
-    /// code, where the message can say what to do about it.
+    /// relies on it (a poll interval of zero, a spreadsheet row zero, a
+    /// mode it matches on), so it binds a value that arrived over a wire,
+    /// or one an instance provides, exactly as it binds one written in
+    /// the source. The compiler holds the written constant to it and the
+    /// runtime holds the wired value to it, through this one function,
+    /// so a program that compiles is a program that runs. A list a
+    /// provider can extend (model ids, voices) is declared `free_text`,
+    /// so a value released after the node was written still passes.
     pub fn check_value(&self, value: &Value) -> Result<(), String> {
-        let Widget::Number { min, max, step } = self else {
-            return Ok(());
+        let (min, max, step) = match self {
+            Widget::Number { min, max, step } => (min, max, step),
+            // Suggestions bind nothing: any string of the right type passes.
+            Widget::Select { free_text: true, .. } | Widget::Multiselect { free_text: true, .. } => {
+                return Ok(());
+            }
+            Widget::Select { options, free_text: false } => {
+                return match value.as_str() {
+                    Some(picked) => check_option(options, picked),
+                    None => Ok(()),
+                };
+            }
+            Widget::Multiselect { options, free_text: false } => {
+                let Some(items) = value.as_array() else { return Ok(()) };
+                return items.iter().filter_map(Value::as_str).try_for_each(|picked| check_option(options, picked));
+            }
+            _ => return Ok(()),
         };
         let Some(n) = value.as_f64() else {
             return Ok(());
@@ -2685,6 +3048,12 @@ impl Widget {
             return Err(format!("{n} is not a whole number"));
         }
         Ok(())
+    }
+
+    /// Whether a refusal of [`Widget::check_value`] is about a list of
+    /// options (the compiler reports it under its own slug).
+    pub fn has_options(&self) -> bool {
+        matches!(self, Widget::Select { free_text: false, .. } | Widget::Multiselect { free_text: false, .. })
     }
 
     /// Is the widget itself satisfiable, or is the node's metadata
@@ -3201,6 +3570,67 @@ mod deny_unknown_tests {
         }
     }
 
+    /// A select's options are its domain: a value outside them is
+    /// refused naming the ones allowed, each item of a multiselect is
+    /// held to them, and a value of another shape is the type check's.
+    #[test]
+    fn a_select_refuses_a_value_outside_its_options() {
+        let select = Widget::Select { options: vec!["plain".into(), "markdown".into()], free_text: false };
+        assert_eq!(select.check_value(&json!("plain")), Ok(()));
+        assert_eq!(
+            select.check_value(&json!("html")),
+            Err("'html' is not one of the options; give one of 'plain', 'markdown'".to_string())
+        );
+        assert_eq!(select.check_value(&json!(3)), Ok(()));
+
+        let multi = Widget::Multiselect { options: vec!["a".into(), "b".into()], free_text: false };
+        assert_eq!(multi.check_value(&json!(["a", "b"])), Ok(()));
+        assert_eq!(multi.check_value(&json!([])), Ok(()));
+        assert!(multi.check_value(&json!(["a", "c"])).unwrap_err().starts_with("'c' is not one of the options"));
+
+        let long = Widget::Select { options: (0..20).map(|i| format!("z{i}")).collect(), free_text: false };
+        let why = long.check_value(&json!("nowhere")).unwrap_err();
+        assert!(why.ends_with("'z11', and 8 more"), "{why}");
+    }
+
+    /// A `free_text` list is suggestions: a model id released after the
+    /// list was written passes, on a select and on each multiselect item,
+    /// the flag loads from metadata JSON, and it is not reported under
+    /// the options slug.
+    #[test]
+    fn a_free_text_select_takes_a_value_outside_its_options() {
+        let select: Widget =
+            serde_json::from_value(json!({"kind": "select", "options": ["m1"], "free_text": true}))
+                .expect("free_text select loads");
+        assert_eq!(select, Widget::Select { options: vec!["m1".into()], free_text: true });
+        assert_eq!(select.check_value(&json!("m1")), Ok(()));
+        assert_eq!(select.check_value(&json!("released_tomorrow")), Ok(()));
+        assert!(!select.has_options());
+
+        let multi = Widget::Multiselect { options: vec!["a".into()], free_text: true };
+        assert_eq!(multi.check_value(&json!(["a", "z"])), Ok(()));
+
+        // Round trip: a closed list serializes without the flag.
+        let closed = Widget::Select { options: vec!["a".into()], free_text: false };
+        assert_eq!(serde_json::to_value(&closed).unwrap(), json!({"kind": "select", "options": ["a"]}));
+        assert_eq!(serde_json::to_value(&select).unwrap()["free_text"], json!(true));
+    }
+
+    /// A default outside the select's options is a metadata error when
+    /// the node loads, since it is the value that arrives when nothing
+    /// else does.
+    #[test]
+    fn a_default_outside_the_options_fails_the_load() {
+        let mut meta = base();
+        meta.as_object_mut().unwrap().insert("inputs".into(), json!([{
+            "name": "mode", "type": "String", "default": "loud",
+            "widget": {"kind": "select", "options": ["quiet", "normal"]}
+        }]));
+        let parsed: NodeMetadata = serde_json::from_value(meta).expect("the shape loads");
+        let err = parsed.validate_semantics().expect_err("the default is no option");
+        assert!(err.contains("'loud' is not one of the options"), "{err}");
+    }
+
     #[test]
     fn unknown_feature_key_rejected() {
         let mut meta = base();
@@ -3312,7 +3742,7 @@ mod widget_default_tests {
         let strings = WeftType::List(Box::new(WeftType::Primitive(WeftPrimitive::String)));
         assert_eq!(Widget::default_for_type(&strings).kind_name(), "text_list");
 
-        let numbers = WeftType::List(Box::new(WeftType::Primitive(WeftPrimitive::Number)));
+        let numbers = WeftType::List(Box::new(WeftType::primitive(WeftPrimitive::Number)));
         assert_eq!(Widget::default_for_type(&numbers).kind_name(), "textarea");
 
         // A plain String is a single line; a prose field declares
@@ -3571,6 +4001,117 @@ mod input_semantics_tests {
             m
         })
         .unwrap()
+    }
+
+    /// The language owns the long-runs switch and the entry limits:
+    /// every trigger gets the per-minute and at-once limits, one called
+    /// from outside also the per-caller one, a non-live one also the
+    /// long-runs switch, a plain node none of them. A trigger declaring a name it receives is
+    /// refused; a plain node may use those names for its own inputs.
+    #[test]
+    fn a_trigger_gets_the_settings_the_language_owns() {
+        let names = |m: &NodeMetadata| m.inputs.iter().map(|i| i.name.clone()).collect::<Vec<_>>();
+        let mut plain = metadata_with(vec![]);
+        plain.add_language_ports().unwrap();
+        assert!(plain.inputs.is_empty());
+
+        let mut trigger = metadata_with(vec![]);
+        trigger.features.is_trigger = true;
+        trigger.add_language_ports().unwrap();
+        // Nobody calls a schedule: no per-caller limit.
+        let mut expected: Vec<&str> = crate::signal::EntryLimits::NODE_FIELDS[1..].to_vec();
+        expected.push(crate::run_class::LONG_RUNS_FIELD);
+        assert_eq!(names(&trigger), expected);
+        trigger.validate_semantics().expect("the added inputs pass the semantic rules");
+
+        let mut form = metadata_with(vec![]);
+        form.features.is_trigger = true;
+        form.features.called_from_outside = true;
+        form.add_language_ports().unwrap();
+        let mut expected: Vec<&str> = crate::signal::EntryLimits::NODE_FIELDS.to_vec();
+        expected.push(crate::run_class::LONG_RUNS_FIELD);
+        assert_eq!(names(&form), expected);
+
+        let mut both = metadata_with(vec![]);
+        both.features.is_trigger = true;
+        both.features.called_from_outside = true;
+        both.features.live_connection = Some(LiveWire::Http);
+        assert!(both.add_language_ports().unwrap_err().contains("calledFromOutside"));
+
+        let mut live = metadata_with(vec![]);
+        live.features.is_trigger = true;
+        live.features.live_connection = Some(LiveWire::Http);
+        live.add_language_ports().unwrap();
+        assert_eq!(names(&live), crate::signal::EntryLimits::NODE_FIELDS);
+        live.validate_semantics().expect("the added inputs pass the semantic rules");
+
+        let mut not_a_trigger = metadata_with(vec![]);
+        not_a_trigger.features.live_connection = Some(LiveWire::Http);
+        assert!(not_a_trigger.add_language_ports().is_err());
+        let mut not_a_trigger = metadata_with(vec![]);
+        not_a_trigger.features.called_from_outside = true;
+        assert!(not_a_trigger.add_language_ports().is_err());
+
+        let mut declares_it = metadata_with(vec![crate::run_class::RunClass::node_input()]);
+        declares_it.features.is_trigger = true;
+        let e = declares_it.add_language_ports().unwrap_err();
+        assert!(e.contains("longRuns"), "{e}");
+
+        let mut declares_a_limit = metadata_with(vec![input("callsAtOnce", WeftType::primitive(WeftPrimitive::Number))]);
+        declares_a_limit.features.is_trigger = true;
+        declares_a_limit.features.live_connection = Some(LiveWire::Http);
+        let e = declares_a_limit.add_language_ports().unwrap_err();
+        assert!(e.contains("callsAtOnce"), "{e}");
+
+        // A rate limiter is no trigger: its own `callsPerMinute` and
+        // `longRuns` inputs are its own.
+        let own = vec![
+            input("callsPerMinute", WeftType::primitive(WeftPrimitive::Number)),
+            crate::run_class::RunClass::node_input(),
+        ];
+        let mut limiter = metadata_with(own.clone());
+        limiter.add_language_ports().expect("a plain node keeps its own names");
+        assert_eq!(limiter.inputs.len(), own.len());
+    }
+
+    /// `catchErrors` gives the node the language's `error` output; a
+    /// node declaring it itself is refused, and without the flag
+    /// `error` is an ordinary name.
+    #[test]
+    fn catch_errors_adds_the_error_output() {
+        let error_output = || OutputSpec {
+            name: ERROR_PORT.into(),
+            port_type: WeftType::primitive(WeftPrimitive::String),
+            description: None,
+        };
+        let mut catching = metadata_with(vec![]);
+        catching.features.catch_errors = true;
+        catching.add_language_ports().unwrap();
+        assert_eq!(catching.outputs.len(), 1);
+        assert_eq!(catching.outputs[0].name, ERROR_PORT);
+        assert_eq!(catching.outputs[0].port_type, WeftType::primitive(WeftPrimitive::String));
+        catching.validate_semantics().expect("the added output passes the semantic rules");
+
+        let mut declares_it = metadata_with(vec![]);
+        declares_it.features.catch_errors = true;
+        declares_it.outputs.push(error_output());
+        let e = declares_it.add_language_ports().unwrap_err();
+        assert!(e.contains("catchErrors"), "{e}");
+
+        let mut plain = metadata_with(vec![]);
+        plain.outputs.push(error_output());
+        plain.add_language_ports().expect("without the flag, `error` is the node's own name");
+        assert_eq!(plain.outputs.len(), 1);
+    }
+
+    /// The flag's wire spelling.
+    #[test]
+    fn catch_errors_round_trips() {
+        let features: NodeFeatures = serde_json::from_str(r#"{ "catchErrors": true }"#).unwrap();
+        assert!(features.catch_errors);
+        assert_eq!(serde_json::to_value(&features).unwrap(), serde_json::json!({ "catchErrors": true }));
+        let none: NodeFeatures = serde_json::from_str("{}").unwrap();
+        assert!(!none.catch_errors);
     }
 
     /// A node whose ports come from a config list: the list has to live
@@ -3842,7 +4383,7 @@ mod input_semantics_tests {
             (serde_json::json!({ "kind": "number", "min": 5, "max": 1 }), "minimum of 5 above"),
             (serde_json::json!({ "kind": "number", "step": 0 }), "step of 0"),
         ] {
-            let mut n = input("count", WeftType::Primitive(WeftPrimitive::Number));
+            let mut n = input("count", WeftType::primitive(WeftPrimitive::Number));
             n.widget = Some(serde_json::from_value(widget).unwrap());
             let e = metadata_with(vec![n]).validate_semantics().unwrap_err();
             assert!(e.contains("count") && e.contains(wanted), "{e}");
@@ -3853,7 +4394,7 @@ mod input_semantics_tests {
     /// the message reading as one sentence.
     #[test]
     fn a_default_outside_its_own_number_box_is_refused() {
-        let mut n = input("count", WeftType::Primitive(WeftPrimitive::Number));
+        let mut n = input("count", WeftType::primitive(WeftPrimitive::Number));
         n.widget = Some(serde_json::from_value(
             serde_json::json!({ "kind": "number", "min": 1, "max": 8, "step": 1 }),
         ).unwrap());
@@ -3960,8 +4501,8 @@ mod input_semantics_tests {
             Widget::Number { min: None, max: None, step: None },
             Widget::Checkbox,
             Widget::Datetime,
-            Widget::Select { options: vec!["a".into()] },
-            Widget::Multiselect { options: vec!["a".into()] },
+            Widget::Select { options: vec!["a".into()], free_text: false },
+            Widget::Multiselect { options: vec!["a".into()], free_text: false },
             Widget::Password,
             Widget::Access { service: None, optional: false },
             Widget::RemoteSelect {

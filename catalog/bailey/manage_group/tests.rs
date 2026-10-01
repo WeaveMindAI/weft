@@ -15,7 +15,44 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_create_round_trip_emits_the_minted_id", creates),
         NodeTest::fake("an_edit_passes_the_group_id_through", edits),
         NodeTest::fake("a_soft_bridge_error_fails_loud", soft_error),
+        NodeTest::fake("a_bridge_refusal_comes_out_on_error_when_it_is_wired", refused_wired),
+        NodeTest::fake("a_missing_setting_fails_the_run_even_with_error_wired", mistake_wired),
     ]
+}
+
+async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
+    rig.respond("POST", "/action", json!({ "result": { "error": "WhatsApp not connected" } }));
+    rig.wire_output("error");
+    let outcome = rig
+        .run(
+            &BaileyManageGroupNode,
+            json!({
+                "endpointUrl": "http://b:1",
+                "action": "add",
+                "groupId": "123@g.us",
+                "participants": ["49@s.whatsapp.net"],
+            }),
+        )
+        .await
+        .ok()?;
+    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    assert!(error.contains("WhatsApp not connected"), "{error}");
+    assert!(!outcome.outputs.contains_key("groupId"), "a caught failure emits nothing on groupId");
+    Ok(())
+}
+
+async fn mistake_wired(rig: FakeRig) -> WeftResult<()> {
+    rig.wire_output("error");
+    let err = rig
+        .run(
+            &BaileyManageGroupNode,
+            json!({ "endpointUrl": "http://b:1", "action": "add", "participants": ["49@s.whatsapp.net"] }),
+        )
+        .await
+        .failure()?;
+    assert!(err.starts_with("input error") && err.contains("needs groupId"), "{err}");
+    assert!(rig.requests().is_empty(), "a program mistake refuses before anything is sent");
+    Ok(())
 }
 
 fn maps() -> WeftResult<()> {

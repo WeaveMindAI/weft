@@ -58,8 +58,8 @@ describe('a weft block', () => {
     expect(paint('@require_one_of(a, b)')).toContain(
       '<span class="hljs-meta">@require_one_of</span>',
     );
-    expect(paint('b = Bridge {\n  @per_member\n}')).toContain(
-      '<span class="hljs-meta">@per_member</span>',
+    expect(paint('b = Bridge {\n  @per_instance\n}')).toContain(
+      '<span class="hljs-meta">@per_instance</span>',
     );
   });
 

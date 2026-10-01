@@ -16,7 +16,7 @@ async fn a_group_gated_by_a_route_answers_it() -> anyhow::Result<()> {
     let mut project = Project::prepare("gated_include", disp.clone()).await?;
     let base = project.unique_live_path()?;
     project.activate().await?;
-    let before = run::execution_colors(&disp, &project.id()).await?;
+    let before = run::executions(&disp, &project.id()).await?;
 
     let (status, _, body) =
         live::http_json(&disp, Method::POST, &format!("{base}/grouped"), &[], &json!({})).await?;
@@ -31,10 +31,10 @@ async fn a_group_gated_by_a_route_answers_it() -> anyhow::Result<()> {
     assert_eq!(v, json!({ "where": "include" }));
 
     // Each fire ran the nodes behind its door and nothing behind the other.
-    let colors = run::wait_for_triggered_executions(&disp, &project.id(), &before, 2, std::time::Duration::from_secs(60)).await?;
+    let execution_ids = run::wait_for_triggered_executions(&disp, &project.id(), &before, 2, std::time::Duration::from_secs(60)).await?;
     let mut seen = (false, false);
-    for color in colors {
-        let settled = project.settled(color).await?;
+    for execution_id in execution_ids {
+        let settled = project.settled(execution_id).await?;
         settled.completed()?;
         // `body` has no wire into it: the pre-run root list and the
         // group's own launcher both kick it, at the same place, and the

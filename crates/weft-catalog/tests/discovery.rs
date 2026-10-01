@@ -1,11 +1,13 @@
 //! Discovery over a synthetic `nodes/` tree. Proves the two unit
 //! forms (bare node, package), arbitrary nesting depth, auto-detected
-//! package members, and the collision-is-a-hard-error rule.
+//! package members, and the rule that a clash leaves every claimant out
+//! while the rest of the tree loads.
 
 use std::fs;
 use std::path::Path;
 
-use weft_catalog::{CatalogError, DiscoverPolicy, FsCatalog};
+use weft_catalog::{CatalogError, FsCatalog};
+use weft_core::node::MetadataCatalog;
 
 /// Write a minimal valid `metadata.json` declaring `node_type`.
 fn write_node(dir: &Path, node_type: &str) {
@@ -109,32 +111,44 @@ fn package_does_not_nest() {
 }
 
 /// Two units declaring the same `node_type` is ambiguous, not a
-/// shadow: it fails loudly with both paths.
+/// shadow: both are left out, the one problem names both folders, and
+/// a program naming the type is told so. Other nodes load.
 #[test]
-fn duplicate_node_type_is_hard_error() {
+fn duplicate_node_type_leaves_both_out() {
     let tmp = tempfile::tempdir().unwrap();
     let nodes = tmp.path().join("nodes");
     write_node(&nodes.join("first"), "Dup");
     write_node(&nodes.join("second"), "Dup");
+    write_node(&nodes.join("third"), "Fine");
 
-    let err = FsCatalog::discover(&nodes).expect_err("collision must error");
-    match err {
-        CatalogError::Collision { node_type, .. } => assert_eq!(node_type, "Dup"),
-        other => panic!("expected Collision, got {other:?}"),
+    let cat = FsCatalog::discover(&nodes).expect("a collision never fails the catalog");
+    assert!(cat.entry("Dup").is_none(), "neither claimant wins");
+    assert!(!cat.packages().any(|p| p.node_types.iter().any(|t| t == "Dup")));
+    assert!(cat.entry("Fine").is_some());
+    match cat.problems() {
+        [problem] => match &problem.error {
+            CatalogError::Collision { node_type, dirs } => {
+                assert_eq!(node_type, "Dup");
+                assert_eq!(dirs, &[nodes.join("first"), nodes.join("second")]);
+            }
+            other => panic!("expected Collision, got {other:?}"),
+        },
+        other => panic!("expected one problem, got {other:?}"),
     }
+    let told = cat.unavailable("Dup").expect("named");
+    assert!(told.contains("failed to load") && told.contains("first") && told.contains("second"), "{told}");
 }
 
 /// Two nodes claiming the same SERVICE is ambiguous the same way two
 /// claiming one type is: everything that stores or publishes a
 /// connection finds the service by name alone, so a second claimant
-/// would make that a coin toss.
+/// would make that a coin toss. Both claimants are left out.
 ///
-/// The names in the message are pinned too. The walk decides who is
-/// the original by arriving there first, and the filesystem's own
-/// order is not the tree's, so an unsorted walk would blame a
-/// different node per machine.
+/// The names in the message are pinned too, in the tree's order: the
+/// filesystem's own order is not the tree's, so an unsorted walk would
+/// word the message differently per machine.
 #[test]
-fn duplicate_service_is_hard_error() {
+fn duplicate_service_leaves_both_out() {
     fn write_service_node(dir: &Path, node_type: &str, service: &str) {
         fs::create_dir_all(dir).unwrap();
         fs::write(
@@ -159,28 +173,20 @@ fn duplicate_service_is_hard_error() {
         write_service_node(&nodes.join("bbb"), "Second", "shared");
         write_service_node(&nodes.join("aaa"), "First", "shared");
 
-        let err = FsCatalog::discover(&nodes).expect_err("service collision must error");
-        match err {
-            CatalogError::ServiceCollision { service, first, second } => {
-                assert_eq!(service, "shared");
-                assert_eq!(first, "First", "the node the walk reaches first, every time");
-                assert_eq!(second, "Second");
-            }
-            other => panic!("expected ServiceCollision, got {other:?}"),
+        let cat = FsCatalog::discover(&nodes).expect("a service clash never fails the catalog");
+        assert!(cat.entry("First").is_none() && cat.entry("Second").is_none());
+        match cat.problems() {
+            [problem] => match &problem.error {
+                CatalogError::ServiceCollision { service, node_types } => {
+                    assert_eq!(service, "shared");
+                    assert_eq!(node_types, &["First", "Second"], "the tree's order, every time");
+                }
+                other => panic!("expected ServiceCollision, got {other:?}"),
+            },
+            other => panic!("expected one problem, got {other:?}"),
         }
+        assert!(cat.unavailable("Second").is_some_and(|t| t.contains("'shared' service")));
     }
-}
-
-/// A package with no member nodes (no subdir with metadata.json) is an
-/// error: an empty package is almost certainly a mistake.
-#[test]
-fn empty_package_is_error() {
-    let tmp = tempfile::tempdir().unwrap();
-    let nodes = tmp.path().join("nodes");
-    write_package_toml(&nodes.join("empty"), "empty");
-
-    let err = FsCatalog::discover(&nodes).expect_err("empty package must error");
-    assert!(matches!(err, CatalogError::Parse { .. }));
 }
 
 /// `package_roots_for` (the build-staging source) returns the deduped
@@ -213,26 +219,27 @@ fn package_roots_for_dedupes_by_package() {
     assert!(cat.package_roots_for(&unknown).is_empty());
 }
 
-/// Under Lenient, a collision is a warning, not an error: the first
-/// entry is kept, and the losing package must NOT list the colliding
-/// type (its `node_types` and `entries` stay consistent).
+/// A collision inside packages takes out only the clashing type: each
+/// package keeps its other members and lists only what it serves.
 #[test]
-fn lenient_collision_warns_and_keeps_first() {
+fn a_collision_takes_out_only_the_clashing_members() {
     let tmp = tempfile::tempdir().unwrap();
     let nodes = tmp.path().join("nodes");
-    write_node(&nodes.join("first"), "Dup");
-    write_node(&nodes.join("second"), "Dup");
+    write_package_toml(&nodes.join("one"), "one");
+    write_node(&nodes.join("one/dup"), "Dup");
+    write_node(&nodes.join("one/own"), "OwnA");
+    write_package_toml(&nodes.join("two"), "two");
+    write_node(&nodes.join("two/dup"), "Dup");
+    write_node(&nodes.join("two/own"), "OwnB");
 
-    let cat = FsCatalog::discover_with_policy(&nodes, DiscoverPolicy::Lenient)
-        .expect("lenient never hard-errors on a collision");
-    assert!(cat.entry("Dup").is_some(), "the first Dup is kept");
-    assert!(!cat.warnings().is_empty(), "collision recorded as a warning");
-    // Exactly one package should claim `Dup`; the loser dropped it.
+    let cat = FsCatalog::discover(&nodes).unwrap();
+    assert!(cat.entry("Dup").is_none());
+    assert!(cat.entry("OwnA").is_some() && cat.entry("OwnB").is_some());
     let claimers = cat
         .packages()
         .filter(|p| p.node_types.iter().any(|t| t == "Dup"))
         .count();
-    assert_eq!(claimers, 1, "only the winning package lists Dup");
+    assert_eq!(claimers, 0, "no package lists a type it does not serve");
 }
 
 /// Discovery follows symlinks anywhere in a node tree, so a project's
@@ -293,22 +300,25 @@ fn symlinked_marker_defines_a_unit() {
     assert!(cat.entry("Sneaky").is_some(), "symlink-marked node discovered");
 }
 
-/// A symlink cycle in a node tree fails loudly instead of walking
-/// forever.
+/// A symlink cycle in a node tree is recorded as a problem instead of
+/// walking forever, and the rest of the tree loads.
 #[test]
 #[cfg(unix)]
-fn symlink_cycle_errors_loudly() {
+fn symlink_cycle_is_a_recorded_problem() {
     use std::os::unix::fs::symlink;
     let tmp = tempfile::tempdir().unwrap();
     let nodes = tmp.path().join("nodes");
     let a = nodes.join("a");
     fs::create_dir_all(&a).unwrap();
     symlink(&nodes, a.join("back")).unwrap();
+    write_node(&nodes.join("fine"), "Fine");
 
-    let err = FsCatalog::discover(&nodes).expect_err("cycle must error");
+    let cat = FsCatalog::discover(&nodes).expect("a cycle never fails the catalog");
+    assert!(cat.entry("Fine").is_some());
     assert!(
-        err.to_string().contains("symlink cycle"),
-        "error names the cycle: {err}",
+        cat.problems().iter().any(|p| p.error.to_string().contains("symlink cycle")),
+        "the problem names the cycle: {:?}",
+        cat.problems()
     );
 }
 
@@ -410,8 +420,8 @@ fn package_metadata_defaults_merge_key_by_key_member_wins() {
 
 /// A package-level `metadata.json` that sets an IDENTITY key (`type`,
 /// `label`, or `description`, the things that name one node) is a
-/// contradiction, never a shared default, and must fail discovery loudly
-/// under Strict, never be merged. The refusal lives in
+/// contradiction, never a shared default: the package is left out with
+/// that error, never merged. The refusal lives in
 /// `weft_core::node::merge_package_defaults`, so the catalog and the
 /// `#[derive(NodeManifest)]` runtime path enforce the identical rule.
 #[test]
@@ -424,16 +434,18 @@ fn package_metadata_defaults_refuse_identity_keys() {
         fs::write(pkg.join("metadata.json"), format!(r#"{{ "{key}": "shared" }}"#)).unwrap();
         write_node(&pkg.join("member"), "Member");
 
-        let err = FsCatalog::discover(&nodes).unwrap_err().to_string();
+        let cat = FsCatalog::discover(&nodes).unwrap();
+        assert!(cat.entry("Member").is_none());
+        let err = cat.unavailable("Member").expect("the member is told why");
         assert!(err.contains(key), "the error names the offending key `{key}`: {err}");
+        assert!(err.contains(&pkg.join("metadata.json").display().to_string()), "and the package's file: {err}");
     }
 }
 
 /// The `types` metadata key: declared at a package root, harvested
 /// into the catalog's registry BEFORE metadata parses, so member port
 /// types may use the declared names; a project-level declaration with
-/// a conflicting body fails loudly under Strict and warns under
-/// Lenient (builtin-only fallback).
+/// a conflicting body leaves both declarers out, each told of the clash.
 #[test]
 fn types_declarations_resolve_member_port_types() {
     let tmp = tempfile::tempdir().unwrap();
@@ -476,7 +488,7 @@ fn types_declarations_resolve_member_port_types() {
     assert_eq!(cat.type_registry().nominal_entries().len(), 2);
 
     // A second declaration of the same name with a DIFFERENT body:
-    // Strict fails loudly, Lenient warns and falls back to builtin.
+    // Both declarers are out, neither outranks the other.
     let clash = root.join("other");
     fs::create_dir_all(&clash).unwrap();
     fs::write(
@@ -489,8 +501,10 @@ fn types_declarations_resolve_member_port_types() {
     )
     .unwrap();
     fs::write(clash.join("mod.rs"), "// impl\n").unwrap();
-    let err = FsCatalog::discover(&root).unwrap_err();
-    assert!(err.to_string().contains("declared twice"), "{err}");
-    let lenient = FsCatalog::discover_with_policy(&root, DiscoverPolicy::Lenient).unwrap();
-    assert!(lenient.warnings().iter().any(|w| w.contains("declared twice")), "{:?}", lenient.warnings());
+    let cat = FsCatalog::discover(&root).unwrap();
+    for node_type in ["Ask", "Other"] {
+        assert!(cat.entry(node_type).is_none());
+        let told = cat.unavailable(node_type).expect("told why");
+        assert!(told.contains("declared twice"), "{told}");
+    }
 }

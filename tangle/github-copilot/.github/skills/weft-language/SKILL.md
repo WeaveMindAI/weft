@@ -37,7 +37,9 @@ Right to left: the value flows from `source.output_port` into
 `target.input_port`, and the types must be compatible. Every required input
 gets a wire or a literal; an optional one (`port?`) can stay unwired. This
 line is the longhand; [the shorthand] (next section) is the same wire inside
-the target's braces, and the longhand survives only where the language
+the target's braces, and the one you write (`answer = Reply { body:
+work.answer }`, never `answer = Reply` with `answer.body = work.answer` under
+it). The longhand survives only where the language
 leaves no choice: a [boundary port], one of the ports a group, a loop, or an
 `@include` alias declares in its signature.
 
@@ -45,9 +47,11 @@ If you want one key of a record value, keep going with dots
 (`wpm: reader.profile.stats.wpm` in the braces, or
 `speed.wpm = reader.profile.stats.wpm`). Still one wire; the compiler checks
 every key against the record type at that level and the wire carries the
-last key's type. A source typed `JsonDict` or a scalar has no keys to read
-(`deref-path`): narrow the source port to the shape it carries (next), or
-`Cast` first. At run time a `?` key found absent (or `null`) closes that
+last key's type. Only a record type has keys to read: a source typed
+`JsonDict`, a `Dict[String, String]` (a route's `query` or `headers`) or a
+scalar has none (`deref-path`), and nothing reads one for you. Narrow the
+source port to the shape it carries (next), or cast it to a record type
+first. At run time a `?` key found absent (or `null`) closes that
 wire alone; a required key absent fails the firing.
 
 ### Narrowing a port to the shape it carries
@@ -79,22 +83,25 @@ column empty fails the node with `emitted a value on port 'rows' that its
 declared type 'List[Card]' does not accept (got List[Dict[String, String |
 Null]])`; the fix is the `| Null` on that field, never a looser row type.
 
-`Cast` is for a value that has to CHANGE type while it travels. A value that
+A cast (a node carrying `features.castPorts`, the catalog's `Cast` being
+one) is for a value that has to CHANGE type while it travels. A value that
 already fits needs no node at all, only a port that names the type. If you
-catch yourself adding a `Cast` to put a shape on a value that already has
+catch yourself adding a cast to put a shape on a value that already has
 it, stop and write: "Wait. Narrow the port." Then write the type on the
-arrow and delete the `Cast`.
+arrow and delete the cast.
 
 **Narrow only what you control the shape of.** A port fed by the outside
 world (a query string, request headers) holds whatever the caller sent, and
 a record refuses a key it does not declare, at run time, on the real
 request. Narrowing those compiles and then fails the first time somebody
-appends a tracking parameter. Leave them as the loose type the node declares
-and read the one key you want with a node.
+appends a tracking parameter, and a cast to a record is just as strict (an
+undeclared key fails the cast). So either declare every key the caller may
+send, optional ones with `?`, or leave the port as the loose type the node
+declares and read the one key you want with a node.
 
 When the opaque value comes from a node that lets you ADD OUTPUT PORTS, name
 the pieces you want on the arrow instead. Each arrives on its own port under
-the type you wrote, so there is nothing to unpack and nothing to Cast:
+the type you wrote, so there is nothing to unpack and nothing to cast:
 
 ```weft
 look = PostgresExecuteQuery(id: String) -> (title: String, seen: Number) {
@@ -125,12 +132,19 @@ Commas between fields are optional; a field per line with no commas reads
 the same. `null` is never a literal: omit the field instead
 (`config-null-literal`).
 
+A field with a fixed list of choices (a dropdown in the editor) takes one of
+them and nothing else: any other written value is `literal-not-an-option`,
+and the message lists the choices. A list the node marks `free_text` (model
+ids, voices) only suggests: any value is accepted there.
+
 A list or object literal holds plain values only, so `params: [self.chatId,
 self.pushName]` is refused. When a node needs several values from the graph,
 each one is its own input port. When a node accepts however many values you
 give it, declare them in its inline signature:
 `PostgresExecuteQuery(chat_id: String, push_name: String) { ... }` and the
 SQL reads `$chat_id`; `Format(user: String) { template: "Hi {{user}}" }`.
+How a node reads those ports (a query's parameters, a template's slots) is
+in that node's description.
 
 A Python node whose code has no branch, no loop and no call is moving
 values, not deciding anything, and the language moves values. Read the code
@@ -146,9 +160,9 @@ Calling a library, parsing what no type describes, reshaping a list in
 memory: that is processing, and Python is the right answer for it. A branch
 or a loop that decides what the program does next (whether a step runs,
 which service is called, a call made once per item) is coordination, and it
-belongs in the graph, where each step is visible and journaled: a `Switch`
-with `_should_flow` for the branch, a `Loop` for the repetition, one node
-per call.
+belongs in the graph, where each step is visible and journaled: a Boolean
+on `_should_flow` for the branch, a `Loop` for the repetition, one node per
+call.
 
 Building an object out of values you already hold (a reply body, a payload)
 is the case you will meet most, and it has its own node: wire a value onto
@@ -196,10 +210,22 @@ step = ExecPython -> (out: String) {
 ````
 
 Created ports keep written order, and whether a node reads that order is the
-node's own business, stated in its description. `FirstInOrder` is the
-catalog node that does: its first input that carried a value is the one it
-emits, so reordering its lines changes which branch wins. That is the only
-way line order changes what a program does.
+node's own business, stated in its description. Two catalog examples:
+`FirstInOrder` emits its first input that carried a value, so reordering its
+lines changes which branch wins, and `List` puts its inputs into one list, in port order, and you declare the list's
+type on its output. An optional port (`name?:`) that got nothing is left out.
+If you want several wired values as one list (several `LlmTool`s into
+`LlmInference`'s `tools`), that is `List`, never a Python node that returns
+`[a, b]`:
+
+````weft
+tools = List(search: JsonDict, fetch: JsonDict) -> (list: List[JsonDict]) {
+  search: searchTool.tool
+  fetch: fetchTool.tool
+}
+````
+
+Those two are the only ways line order changes what a program does.
 
 ### Literals on a connection line
 
@@ -266,14 +292,54 @@ effect.
 
 A FAILURE is not an absence. When the node it watches fails, its ports close
 too, but that closure carries the error, and the gate reads it: the node
-stays off (skipped with `the node its _should_not_flow watches did not finish
-(...)`, the error in the brackets) and the run reports the failure. So a
+stays off (skipped with `what its _should_not_flow watches did not finish
+('<node>' failed: <error>)`, naming the node that broke) and the run reports
+the failure. So a
 route's "no rows, answer 404" branch never fires over a database that is
 down; the caller gets the failure instead. A group's or a loop's outputs
 close the same way when something inside failed, so the rule holds one scope
 up, and a node that SKIPPED because its input closed on a failure closes its
-own ports with that failure too (its skip reason ends in `: a node before it
-failed (...)`), so the rule holds any number of skips down the line.
+own ports with that failure too (its skip reason names where it started:
+`the required input 'value' closed because 'query' failed: ...`), so the rule
+holds any number of skips down the line, and every skip in that chain still
+names `query`, the node that broke.
+
+### Handling a failure: the `error` output
+
+If you want the program to do something when a step that reaches outside
+fails (mark a row `error` with the reason, answer the caller with a message,
+try another branch), wire that step's `error` output. A node that declares
+`catchErrors` among its features gets an `error` output added by weft; read
+the node's interface to see whether it has one.
+
+- Wired: a failure becomes its message on `error`, the run goes on, and the
+  node's other outputs close, so the success branch simply gets nothing.
+- Unwired: the failure fails the run.
+
+A bad setting, a bad input or a type error always fails the run, wired or
+not: those are the program's own shape, never an outcome to route around.
+What counts as a failure for a given node (an answer with an error status,
+say) is in that node's description.
+
+A step never runs twice by itself. If the worker running it goes away
+mid-step, the step may have partly happened, so it is failed rather than run
+again, and with `error` wired that failure goes there like any other. The
+run's log then says `the worker running '<node>' went away while it was
+running`.
+
+````weft
+ask = LlmInference { provider: prov.provider, prompt: job.text }
+mark = PostgresExecuteQuery(reason: String, id: String) {
+  account: db.access
+  query: "update jobs set state = 'error', reason = $reason where id = $id::uuid"
+  reason: ask.error
+  id: job.id
+}
+````
+
+`mark` runs only when `ask` failed: its `reason` input arrives only then.
+
+This is how a program records a failure. Never catch it inside Python.
 
 A node carries one gate, never both: wiring `_should_flow` and
 `_should_not_flow` on the same node is a compile error, `two-gates`. The
@@ -293,8 +359,7 @@ That is also how a node with nothing to receive gets its turn. `Close` takes
 no data at all, so ending a branch early is one wire from any port on it:
 
 ````weft
-bye = Close { status: 204 }
-bye._should_flow = cleanup.removed
+bye = Close { status: 204, _should_flow: cleanup.removed }
 ````
 
 A branch that skipped closes its ports, so whatever hangs off it by
@@ -308,12 +373,30 @@ route's run takes the whole group along, and everything the group needs
 live = Route { path: "live/count", method: "GET" }
 work = Group(db: Access) {
   rows = PostgresExecuteQuery { account: self.db, query: "select count(*) from cards" }
-  out = Reply
-  out.body = rows.rows
+  out = Reply { body: rows.rows }
 }
 work.db = db.access
-work._should_flow = live.method     # the route runs the group; nothing else connects them
+work._should_flow = live.fired      # the route runs the group; nothing else connects them
 ````
+
+`Route` and `Socket` have a `fired` output, always `true` when called: gate
+work on `route.fired`, never on a request port like `method`.
+
+A group, and so an included file, starts only once everything the run wires
+into it has arrived, `_should_flow` included. A closed input counts as
+arrived: the group still starts and the closure goes inside to whatever
+reads it. Only a closed or `false` `_should_flow` skips the whole group.
+
+A node with no inputs at all inside a group runs when the group starts, so it
+needs no `_should_flow` to get its turn, and it never runs before the group's
+slowest input lands. It runs only in a run that takes it along, though: a
+trigger's run holds what the trigger feeds plus what those nodes read, so it
+takes the node along when something that run uses reads it, or when the run
+feeds the group's `_should_flow`, which brings in the whole group. If several
+routes feed one include, a route that did not fire never holds it up: it is
+left out of the run, or closes its outputs, which counts as arrived. At the
+top level of a file, an unconnected node with no inputs runs only on a
+manual run; a trigger's run never takes it along.
 
 ### Running something once, when the program goes live
 
@@ -373,9 +456,9 @@ answer = LlmInference -> (response: String)
 ok     = Cast -> (value: Boolean)
 ````
 
-Inputs arrive in Python as variables named after ports; the code returns a
-dict keyed by output port name; `None` or a missing key emits no [pulse] on
-that port. Write only the ports the type leaves open (a `MustOverride`
+What the node does with the ports you named is its own business, and its
+description says it (how `ExecPython` hands inputs to the script and reads
+its outputs back is in that node's description). Write only the ports the type leaves open (a `MustOverride`
 output must be pinned once something reads it; one nothing reads can stay
 unpinned). An empty body equals no body.
 
@@ -415,15 +498,18 @@ custom ports, a name is a port once the header declares it, a wire lands on
 it, or a config key names it); at run time the node skips when every port in
 the group arrives [closed].
 
-`@per_member` on its own line in an infra node (no arguments; anything else is
-`per-member-ineligible`) gives each member of the program their own copy of
-that node. `@member_filled` (or `@member_filled(<fallback>)`) where a field's
-value goes makes that value each member's own, a connection included
-(`account: @member_filled`); the fallback may be a value, `@file(...)` or
-`@asset(...)`; never on a wired field (`member-filled-wired`) or
-a group's own port (`member-filled-boundary`). Every node reading either
-follows, per member. The `weft-members` skill has what that means and the shape
-a program with members takes.
+`@per_instance` on its own line in an infra node (no arguments; anything else is
+`per-instance-ineligible`) gives each instance of the program (a separate
+running copy under its own id, one per person or per session, say) its own
+container for that node. `@instance_filled` (or `@instance_filled(<fallback>)`) where a field's
+value goes makes that value each instance's own, a connection included
+(`account: @instance_filled`); the fallback may be a value, `@file(...)` or
+`@asset(...)`; never on a wired field (`instance-filled-wired`) or
+a group's own port (`instance-filled-boundary`). Every node reading either
+follows, per instance. A `Route` or `Socket` that would follow is a compile
+error: routes stay shared and pick the instance per call. The
+`weft-instances` skill has what all of that means and the shape a program
+with instances takes; `weft-members` adds the shape for several people.
 
 ## Types
 
@@ -461,28 +547,35 @@ file and whatever that file includes, so a record several files share is
 declared once, at the highest scope that includes them all. An included file's
 own types never reach back up. Never inside a node's braces. A visible name cannot be declared again (no
 shadowing). Named types are nominal: the name is the contract, nothing
-unnamed wires into a named target, and the door between the two is `Cast`.
+unnamed wires into a named target, and the door between the two is a cast.
 
 `?` goes on the name and means "may be absent": `here?: String` on an input
 port (accepts a [closed] pulse, fires with the input absent), `name?: String`
 on a record field, `notes?: review.notes` on a config key that creates a port.
-`here: String?` is refused. An output port takes no `?`: emitting nothing on
+On a key, `?` only works when that key CREATES the port (a node like
+`ExecPython` that lets you invent inputs). On a port the node already declares,
+`width?: self.width` is refused with "'width?' marks a port optional, but
+'width' is not a port this node creates": whether a declared port is optional
+is the node's own decision. `here: String?` is refused. An output port takes no `?`: emitting nothing on
 it closes it, and no marker changes that.
 
-`Cast` CONVERTS a value to the type declared on its output:
-`history = Cast() -> (value: ChatHistory)`. The conversion table is checked
-at compile time (`cast-not-allowed` for impossible pairs); record and named
-targets are validated at run time, errors name the offending field.
+A cast CONVERTS a value to the type declared on its output. Any node can be
+one: its metadata names one input and one output under `features.castPorts`,
+and the compiler checks that pair against weft's conversion table
+(`cast-not-allowed` for impossible pairs); record and named targets are
+validated at run time, errors name the offending field. The standard
+node that implements it is `Cast`, the one to use:
+`card = Cast() -> (value: Card)`.
 
 Reach for it when a value has to CHANGE type while it travels, and only
 then. It is not how you put a type on a value: a port you declare already
 carries the type you wrote on it, and the value is checked against that on
 arrival, so a shape that fits flows and one that does not fails loudly. If
-the node can name the port, name it there and skip the `Cast`. And a value
-that already fits its target passes through a `Cast` untouched, so one
+the node can name the port, name it there and skip the cast. And a value
+that already fits its target passes through a cast untouched, so one
 written "to be safe" is a node that does nothing.
 
-If you have a file and the port wants one kind of file, that is a Cast too:
+If you have a file and the port wants one kind of file, that is a cast too:
 a node that fetches whatever a message held emits `File` (any stored file),
 a transcriber takes only `Audio`, and `File` into `Audio` is
 `type-mismatch`, because the kind is only known once the bytes are there. Say
@@ -494,11 +587,11 @@ say   = ElevenLabsTranscribeFile { account: key.access, audio: voice.value }
 ```
 
 A file that really is audio passes through untouched; one that is not fails
-the Cast loudly, naming what it got.
+the cast loudly, naming what it got.
 
 Compatibility: identical types; unions member-wise; `JsonDict` with any
 string dict; a named type only with the same name (a `JsonDict` into it is
-`type-mismatch`, and the door is a Cast, which checks the shape; a group that
+`type-mismatch`, and the door is a cast, which checks the shape; a group that
 carries an `LlmProvider` declares its port `LlmProvider`, never `JsonDict`);
 containers element-wise; type variables unify. Everything else is
 `type-mismatch` naming both types.
@@ -506,7 +599,7 @@ containers element-wise; type variables unify. Everything else is
 ## How a program runs
 
 A node fires when every required input holds a [pulse] that agrees on
-[color] (one run: every run gets one color, and a re-run is a new color) and
+the execution and
 on frames (loop iterations).
 
 A node that emits on some outputs and not others closes the rest. A [closed]
@@ -519,32 +612,27 @@ input is the recovery path.
 Branching is only this: a branch in weft is a node that ran or a port that
 closed, and nothing else. Any Boolean reaches a `_should_flow`, so a node of
 any kind decides a branch by emitting one (a moderation check's `flagged`, a
-request's `ok`, a lookup's `found`). Four nodes exist to shape the decision
-itself, and you reach for them rather than deriving them: `Switch` tests a
-value against its `cases` config and emits `true` on the winning case's
-port, closing the rest; wire a case port into the branch's `_should_flow`.
-`FirstInOrder` does not decide anything, it MERGES: it emits the first of
-its inputs that carried a value, in written order, so alternative paths
-rejoin into one wire. `All` says
-yes only when every input wired onto it arrived and none of them is `false`,
-and closes its output otherwise; it is where the second answer goes when a
-gate takes one wire and the permission has two parts. `Not` flips one Boolean, for
-the step that should run when the answer was `false`.
+request's `ok`, a lookup's `found`). The standard nodes below implement
+the decision itself, and they are the ones to use. `Switch` tests a value against
+its `cases` config and emits `true` on the winning case's port, closing the
+rest; wire a case port into the branch's `_should_flow`. `FirstInOrder`
+does not decide anything, it MERGES: it emits the first of its inputs that
+carried a value, in written order, so alternative paths rejoin into one
+wire. `All` says yes only when every input wired onto it arrived and none
+of them is `false`, and closes its output otherwise; it is where the second
+answer goes when a gate takes one wire and the permission has two parts.
+`Not` flips one Boolean, for the step that should run when the answer was
+`false`.
 
-Three shapes come up constantly, so reach for them rather than deriving them
-again:
+Three shapes come up constantly:
 
 ````weft
 # One gate, two conditions: delete only if the model said rude AND said sure.
-agreed = All
-agreed.rude = judge.rude
-agreed.sure = judge.sure
+agreed = All { rude: judge.rude, sure: judge.sure }
 remove._should_flow = agreed.yes
 
 # A default: the caller's `limit` when they sent one, else 20.
-limit = FirstInOrder
-limit.asked = door.limit
-limit.fallback = 20
+limit = FirstInOrder { asked: door.limit, fallback: 20 }
 
 # An object out of values the graph computed: one key per wire.
 body = JsonObject {
@@ -564,7 +652,7 @@ anything else is a yes, and a branch that closed never arrives at all, which
 is a no as well. That makes it the AND of decisions and of arrivals in one
 node. `FirstInOrder`'s written order is priority, so the fallback goes last.
 
-A node can also branch by ABSENCE, which is often shorter than a `Switch`.
+A node can also branch by ABSENCE, which often needs no deciding node at all.
 A port that emits nothing is closed, and a closed port skips what hangs off
 it, so one query whose columns are null except the one that applies picks the
 branch by itself:
@@ -597,6 +685,29 @@ than a value (a file, an audio clip, a long document) travels as a stored
 file: the node puts it in storage and emits the file value, a few hundred
 bytes whatever the file weighs. A program that would carry a big value on a
 good day and fail on a long one is not done until the bound is written.
+
+If the big value is text (a long document), keep it in a stored file.
+`TextToFile` turns text into a stored file and `FileToText` reads one back as
+text (both in the `storage` package; `FileToText` only works while the text
+fits on a wire).
+
+A value that grows with use (a conversation, a log) passes 100 KB one day, so
+it never rides a wire at all: it lives in a stored file that each step edits
+in place. A node that keeps such a value takes it on a file input and gives
+the same file back on a file output, the next version of it. Two steps
+editing one file at once (a parallel loop, two runs on one project file)
+never lose each other's change, and each edit shows in the graph, under the
+step's "Files edited", as the lines it added. A node that keeps a value this
+way names the file ports in its own description, as the AI nodes do for a
+conversation. If you want a file that later runs keep adding to, store its
+first content in the project scope with `TextToFile` and wire that file in.
+
+If you want an agent that calls tools until it is done, the shape is a
+sequential `Loop` that carries the one conversation file: each turn asks the
+model, the tools it asked for run, each result is added to the file in
+place, and the next turn reads the file. The turns stop when the model asks
+for no tool. Which ports carry the file, the tools and the model's tool
+calls is in the descriptions of the AI nodes.
 
 What runs: a manual run starts ordinary roots within its selection. A trigger
 requires one explicit fire or supplied emitted outputs. `--target <node>` runs
@@ -679,7 +790,7 @@ connection from it stops the one before, so a reconnect REPLACES its run
 instead of stacking on it.
 
 A stopped run ends cancelled, and its journal names who did it:
-`Stopped by execution <color> (tag <tag>)`. Any string is a tag: a Telegram
+`Stopped by execution <execution-id> (tag <tag>)`. Any string is a tag: a Telegram
 chat id, a WhatsApp address (`49151@s.whatsapp.net`), a phone number with a
 `+` and spaces. Both nodes clean it the same way (unsafe characters become
 `_`, a short fingerprint of the original is appended, so two different
@@ -689,14 +800,35 @@ and `ctx.stop_tagged`, which take a tag already clean (letters, digits, `_`,
 `-`, at most 64) and refuse anything else, naming the character; for those,
 go and read `weft-node-authoring`.
 
+### Asking which runs are going
+
+If a page has to say "still working" or "failed", ask weft about the runs
+instead of keeping a status column: a column the run sets at the end stays
+stuck at "working" when the run fails before it gets there. `ListRuns`
+(the runs themselves, newest first, with their `status`, and on a failed
+run its `error`, what failed it) and `CountRuns`
+(how many) in the `logic` package take the same filters: `instance`,
+`status` (`running`, `completed`, `failed`, `cancelled`; `running` includes
+a run parked on a wait), `node` (the trigger or node that started it), `tag`
+and `olderThanSecs`. `tag` reads a tag the way `TagRun` wrote it: wire the
+same value and you find the same runs. Inside a node of your own the same
+question is `ctx.runs()` with those filters, ending in `.list(limit)` or
+`.count()`.
+
 ## Groups
 
 A group is the unit of readable size, what [the level rule] asks for: every
-level of the graph, the file and the inside of every group, holds at most
+level of the graph, the file and the inside of every group, aims for
 six items, nodes or groups; past fifteen the compiler warns
-`level-too-large`. At the file's top level the count is per connected
-branch, the items one wire walk reaches plus the infra nodes it touches
-(worked example below). Growing work goes down into a nested group, never
+`level-too-large`. At the file's top level the count is per connected part:
+everything a wire links counts together, a shared database or a connection
+node (a key set, a provider) included, and only pieces that share no wire at
+all count apart (worked example below). The inside of a group, a loop and an
+included file is counted whole. The warning names what it counted: "one
+connected part of the top level holds N items", or "this included file holds
+N items". A level holding a per-instance node and its routes is the one
+expected exception (`weft-instances`, "Routes stay shared").
+Growing work goes down into a nested group, never
 wide across a level, and a group's boundary stays small: a group with a
 dozen ports is two groups, or the wrong split.
 
@@ -747,8 +879,7 @@ card = Group(body: String, picture?: Image) -> (saved: String) {
 card.body = look.text
 card.picture = look.photo
 
-answer = Reply
-answer.body = card.saved
+answer = Reply { body: card.saved }
 ````
 
 Post a card with no picture. `look` emits nothing on `photo`, so `photo`
@@ -771,13 +902,13 @@ fails with `required-port-unmet`, naming the group's port and the
 input inside that needs it. A `?` on the group's own port changes nothing: the
 node that reads the value is what decides.
 
-Worked, for the per-branch count: a file holding `db = PostgresDatabase`, a
+Worked, for the top-level count: a file holding `db = PostgresDatabase`, a
 `cards` group (four nodes inside), a `gallery` group (three nodes inside) and
-a `stats` group (two nodes inside), each of the three wired to `db`, is three
-branches of two items each (the group and the database), well inside the
-rule, whatever the groups hold inside; the inside of each group answers for
-itself. Twelve flat nodes all wired to `db` is one branch of thirteen, and
-the answer is those three groups.
+a `stats` group (two nodes inside), each of the three wired to `db`, is one
+connected part of four items (the three groups and the database), well inside
+the rule, whatever the groups hold inside; the inside of each group answers
+for itself. Twelve flat nodes all wired to `db` is one part of thirteen, and
+the answer is those three groups, never a wider `main.weft`.
 
 ### Included files
 
@@ -868,10 +999,28 @@ carry), sequential map, fold (carry), while (no over, stop vote or
 parallel with empty over; parallel with any `self.done` write; a port in both
 `over` and `carry`; a sequential loop with nothing that can end it.
 
+When something inside an iteration fails: a carried value the failure left
+unwritten stops the loop and fails it: `loop '<loop>' stopped at iteration
+N: its carried value '<port>' could not be updated because '<node>' failed:
+<error>`. A carry closed because a gate or a branch did not run
+keeps its previous value, and the loop goes on. A gathered output of a failed
+iteration is a `null` slot, and the loop goes on. So if one bad item must not
+end a fold, wire the failing node's `error` output (under Handling a failure)
+and write the carry on both branches.
+
 A `Generator[T]` port in `over` pulls the stream (must be the only over
-port). A loop is a launcher, not an owner: work started in an iteration keeps
-running after the loop emits; only the branch wired to the outputs holds the
-emit back.
+port).
+
+What the language promises about timing is this: the next iteration starts
+once every value of this one has reached the loop's edge (its outputs: a
+carry, a gather, `self.done`). Nothing else holds it back. A loop is a
+launcher, not an owner: work started inside an iteration that is not wired
+to the edge keeps running after the loop moves on, and even after the loop
+exits. That is on purpose: a loop can start twenty agents and return their
+buses, and the nodes after the loop coordinate them. So if the next
+iteration has to wait for some work (a database write the next iteration
+reads), wire that work's result to the edge, into a carry, a gather or
+`self.done`.
 
 ## Files and reuse
 
@@ -887,8 +1036,22 @@ and size), never as bytes. Inside the node that receives it the reference
 also carries a `url`, a download link minted for that one firing; the link
 is stripped from everything that leaves the node and is never written to
 the journal, so `weft events` shows the reference without it, and that is
-expected. `ExecPython` hands the reference over unwrapped, as a plain dict
-(`photo["url"]`); its description says how.
+expected. A node that runs your code may hand the reference over in its own
+shape (`ExecPython` passes a plain dict, `photo["url"]`), and its
+description says how.
+
+A stored file lives as long as its scope says: a run's files are swept when
+the run ends, a project's stay. The storage nodes `TextToFile`,
+`FetchToStorage` and `KeepFile` all take `scope` (`execution` or `project`)
+and `ttl_days`, and emit `file`, `filename`, `mimeType` and `sizeBytes` like
+every node that makes a file. `ttl_days` works in both scopes: the file
+expires that many days after anybody last touched it, since every read,
+download or link resets the clock, and `0` keeps it for ever. Any other node
+that makes a file (an S3, Slack or Drive download, a generated picture)
+stores it for its run only: if you want it longer, or in a later run, wire
+it through `KeepFile`. Every write makes a new file, except where a node
+keeps a growing value: it edits the file it was handed, in place, and its
+description says so.
 
 `@file` is bidirectional (the editor writes edits back into the file), so
 binary types are refused; it is the marker for `assets/prompts/` and

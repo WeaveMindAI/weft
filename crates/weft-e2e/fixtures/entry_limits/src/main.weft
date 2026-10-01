@@ -1,0 +1,6 @@
+# A route that lets one caller in twice a minute. The rig calls it three
+# times and expects the third to be refused before any run starts.
+
+ping = Route { path: "__E2E_PATH__/ping", method: "GET", callsPerMinutePerCaller: 2 }
+pong = Reply { status: 200 }
+pong.body = ping.path

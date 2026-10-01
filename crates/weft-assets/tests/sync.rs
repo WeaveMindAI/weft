@@ -74,13 +74,14 @@ struct FakeStore {
 }
 
 fn key_for(hash: &str) -> String {
-    format!("t/asset/p/{hash}")
+    format!("t/asset/{hash}")
 }
 
 #[async_trait::async_trait]
 impl AssetStore for FakeStore {
-    async fn list(&self) -> anyhow::Result<BTreeMap<String, String>> {
-        Ok(self.existing.lock().unwrap().clone())
+    async fn held(&self, hashes: &[String]) -> anyhow::Result<BTreeMap<String, String>> {
+        let existing = self.existing.lock().unwrap();
+        Ok(hashes.iter().filter_map(|h| existing.get(h).map(|k| (h.clone(), k.clone()))).collect())
     }
     async fn upload(
         &self,
@@ -152,9 +153,12 @@ fn wav(tag: &[u8]) -> Vec<u8> {
 #[test]
 fn source_asset_references_include_nested_and_key_selected_files_but_not_generated_files() {
     let project_id = "00000000-0000-0000-0000-000000000001";
-    let own_key = format!("t/asset/{project_id}/{}", "a".repeat(64));
+    let own_key = format!("t/asset/{}", "a".repeat(64));
+    // Stored by another project of the tenant: the same plane, so it counts.
+    let shared_key = format!("t/asset/{}", "b".repeat(64));
     let file = |key: String| StoredFile {
         key, mime_type: "image/png".into(), filename: "cat.png".into(), size_bytes: 3,
+        version: weft_core::storage::FIRST_FILE_VERSION,
     }.to_value();
     let mut project: ProjectDefinition = serde_json::from_value(json!({
         "id": project_id,
@@ -165,14 +169,14 @@ fn source_asset_references_include_nested_and_key_selected_files_but_not_generat
             "portLiterals": {"photos": [
                 file(own_key.clone()), file(own_key.clone()),
                 file("t/exec/c/generated".into()),
-                file(format!("t/asset/another-project/{}", "b".repeat(64)))
+                file(shared_key.clone())
             ]}
         }]
     })).unwrap();
-    assert_eq!(referenced_asset_keys(&project).unwrap(), vec![own_key.clone()]);
+    assert_eq!(referenced_asset_keys(&project).unwrap(), vec![own_key.clone(), shared_key.clone()]);
     let value = project.nodes[0].port_literals.remove("photos").unwrap();
     project.nodes[0].config = json!({"photos": value});
-    assert_eq!(referenced_asset_keys(&project).unwrap(), vec![own_key]);
+    assert_eq!(referenced_asset_keys(&project).unwrap(), vec![own_key, shared_key]);
     project.nodes[0].config = json!({});
     assert!(referenced_asset_keys(&project).unwrap().is_empty());
 }
@@ -279,16 +283,16 @@ async fn an_upload_failure_aborts_loudly_naming_the_path() {
         ("a.png".to_string(), png(b"A")),
         ("b.png".to_string(), png(b"B")),
     ]));
-    // Refs hash in order, so failing `a.png`'s hash stops the pass before
-    // `b.png` uploads: an aborted sync moves nothing further.
+    // Uploads run side by side, so `b.png` may land before `a.png` fails;
+    // that is harmless (content-addressed, nothing references it yet). What
+    // the abort guarantees is a loud error naming the file that failed.
     let store = FakeStore { fail_upload_of: Some(sha(&png(b"A"))), ..FakeStore::default() };
     let err = sync_assets(&[image_ref("a.png"), image_ref("b.png")], &source, &store)
         .await
         .unwrap_err()
         .to_string();
     assert!(err.contains("a.png"), "the failed path is named: {err}");
-    assert!(store.uploads.lock().unwrap().is_empty(), "no upload landed after the abort");
-    assert!(store.existing.lock().unwrap().is_empty());
+    assert!(!store.existing.lock().unwrap().contains_key(&sha(&png(b"A"))), "the failed file is not stored");
 }
 
 #[tokio::test]

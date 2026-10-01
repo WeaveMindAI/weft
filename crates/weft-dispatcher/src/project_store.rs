@@ -4,7 +4,7 @@
 //! (`activation_store`).
 //!
 //! Default impl is Postgres-backed (`PostgresProjectStore`), so
-//! every dispatcher Pod reads/writes the same `project` table.
+//! every dispatcher reads/writes the same `project` table.
 //! Tests use `FakeProjectStore` (in-memory HashMap).
 
 use std::sync::Arc;
@@ -20,8 +20,9 @@ use std::collections::HashMap;
 use tokio::sync::RwLock;
 
 /// The complete per-node infra image-tag map: `node_id -> { image_name ->
-/// image_ref }`. Written atomically alongside the running hashes (see
-/// `ProjectStoreOps::set_running_hashes`); the supervisor reads it per node
+/// image_ref }`. Written atomically alongside the running hashes by the
+/// build that made the images (`ProjectStoreOps::register_with_hashes`);
+/// the supervisor reads it per node
 /// (through the broker) to resolve `Image::Local { name }`. The column's
 /// canonical decode is `weft_broker_client::protocol::decode_infra_image_tags`
 /// (shared with the broker's read so the two cannot drift).
@@ -36,7 +37,7 @@ pub trait ProjectStoreOps: Send + Sync {
     /// Atomic register-and-hash-advance. Wraps every write of the
     /// register path (project row insert, project_definition history
     /// insert, running-hash pointer advance) in a single transaction
-    /// so a pod crash mid-sequence can't leave the project row
+    /// so a process crash mid-sequence can't leave the project row
     /// partially advanced (the earlier shape ran each write
     /// standalone; a crash between the history insert and the
     /// pointer advance left the history row written but the pointer
@@ -51,11 +52,7 @@ pub trait ProjectStoreOps: Send + Sync {
     /// `has_infra` (derived from the definition via
     /// `weft_core::has_infra`) is stored on the row and refreshed on
     /// every register/sync, so it tracks edits that add or remove
-    /// infra. It is the single fact that decides worker placement: the
-    /// worker namespace is computed on demand from it
-    /// (`project_namespace::worker_namespace`), never stored, so adding
-    /// or removing infra moves the worker to the right namespace
-    /// without a stale stored value to reconcile.
+    /// infra.
     /// `infra_image_tags`: the COMPLETE infra image-tag map to persist in the
     /// SAME transaction as the row + definition history + hashes (`None` leaves
     /// it untouched). A build that stamps the project runnable
@@ -87,7 +84,7 @@ pub trait ProjectStoreOps: Send + Sync {
     // means "DB failure" (callers MUST surface). Earlier this trait
     // returned bare `Option<T>` / `Vec<T>` / `bool`; transient DB
     // hiccups silently looked like "no rows" and led to wrong
-    // decisions downstream (kill a healthy pod, show "no projects",
+    // decisions downstream (kill a healthy process, show "no projects",
     // etc).
 
     async fn tenant_for(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>>;
@@ -102,47 +99,6 @@ pub trait ProjectStoreOps: Send + Sync {
     /// such row (caller decides whether to 404). `Err` = DB failure.
     async fn remove(&self, id: uuid::Uuid) -> anyhow::Result<bool>;
     async fn project(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectDefinition>>;
-
-    /// Persist the running-hash pointers the user just built, in ONE
-    /// ATOMIC write (a single UPDATE). `None` leaves a pointer
-    /// untouched. The hashes:
-    ///
-    /// - binary: the worker docker image tag suffix (k8s manifest
-    ///   builder reads it back on spawn). Flips only when something
-    ///   binary-affecting changes (engine, node implementations,
-    ///   node-type set, `weft.toml` build config).
-    /// - definition: identifies the runtime project shape (topology +
-    ///   configs). Workers fetch the definition by `(project_id,
-    ///   definition_hash)`, so the row must already exist in the
-    ///   `project_definition` history: setting a definition hash with
-    ///   no history row is REFUSED loudly (the project must be
-    ///   registered with that definition first; registering is the
-    ///   only writer of history rows).
-    /// - infra: drives the upgrade drift signal.
-    ///
-    /// - infra_image_tags: the COMPLETE per-node infra image-tag map
-    ///   (`node_id -> { image_name -> image_ref }`) the supervisor
-    ///   reads to resolve `Image::Local { name }`. `None` leaves the
-    ///   stored map untouched; `Some(map)` REPLACES it wholesale
-    ///   (every build/apply recomputes the whole set, so a merge would
-    ///   only strand tags for nodes the current source no longer has).
-    ///
-    /// Atomicity is the point: writing the trio of hashes AND the infra
-    /// tags as separate statements opens a window where a crash (or a
-    /// sibling Pod's `/run` between two writes) observes a project
-    /// already stamped runnable (new binary hash) but with the infra
-    /// image tags absent or half-written, so a supervisor apply
-    /// resolves `Image::Local { name }` to nothing and dangles. One
-    /// UPDATE writes hashes + tags together: either the project becomes
-    /// runnable WITH its complete infra tags, or nothing changes.
-    async fn set_running_hashes(
-        &self,
-        id: uuid::Uuid,
-        binary_hash: Option<&str>,
-        definition_hash: Option<&str>,
-        infra_hash: Option<&str>,
-        infra_image_tags: Option<&InfraImageTags>,
-    ) -> anyhow::Result<()>;
 
     /// Read the stored binary hash. `Ok(None)` if never set
     /// (project registered but never built / activated /
@@ -198,6 +154,11 @@ pub trait ProjectStoreOps: Send + Sync {
     /// `running_binary_hash`.
     async fn running_infra_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>>;
 
+    /// The infra image tags the last build registered (empty before the
+    /// first build, or for a program without infra). `Ok(None)` = no such
+    /// project.
+    async fn running_infra_image_tags(&self, id: uuid::Uuid) -> anyhow::Result<Option<InfraImageTags>>;
+
     /// Read the project's verb-transition marker (the build axis,
     /// orthogonal to `status`). `Ok(None)` = no such project.
     async fn transition(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectTransition>>;
@@ -211,7 +172,7 @@ pub trait ProjectStoreOps: Send + Sync {
     async fn try_begin_building(&self, id: uuid::Uuid) -> anyhow::Result<bool>;
 
     /// Request cancellation of the in-flight build: CAS `transition`
-    /// building → cancelling_build. The pod driving the build polls
+    /// building → cancelling_build. The process driving the build polls
     /// this (via `transition`) and interrupts the builder. `Ok(false)`
     /// = no build in flight (already finished, or never started).
     async fn request_cancel_build(&self, id: uuid::Uuid) -> anyhow::Result<bool>;
@@ -223,13 +184,13 @@ pub trait ProjectStoreOps: Send + Sync {
     async fn finish_building(&self, id: uuid::Uuid) -> anyhow::Result<bool>;
 
     /// Bump the transition heartbeat. Called on an interval by the
-    /// pod DRIVING an in-process transitional state (an activation
+    /// process DRIVING an in-process transitional state (an activation
     /// window, a build) so the stuck-transition reaper only repairs
     /// transitions whose driver actually died.
     async fn bump_transition_heartbeat(&self, id: uuid::Uuid) -> anyhow::Result<()>;
 
     /// Projects stuck in a build transition whose heartbeat went stale
-    /// before `stale_before`: the driving pod died mid-build. The
+    /// before `stale_before`: the driving process died mid-build. The
     /// stuck-transition reaper lands each back at rest. (An activation
     /// stuck the same way lives on its own row:
     /// `ActivationStoreOps::list_stuck`.)
@@ -238,35 +199,20 @@ pub trait ProjectStoreOps: Send + Sync {
         stale_before: i64,
     ) -> anyhow::Result<Vec<StuckTransition>>;
 
-    /// Whether the project declares infrastructure, by string-id (used
-    /// by task executors that only see the project_id string to compute
-    /// the worker namespace via `project_namespace::worker_namespace`).
-    /// `Ok(Some(has_infra))` for any registered project; `Ok(None)` ONLY
-    /// when the project doesn't exist; `Err` on DB failure.
+    /// The project's own worker levers (`Ok(None)` when the project does
+    /// not exist).
+    async fn worker_overrides(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_platform_traits::WorkerOverrides>>;
+
+    /// Replace the project's own worker levers.
+    async fn set_worker_overrides(&self, id: uuid::Uuid, overrides: &weft_platform_traits::WorkerOverrides) -> anyhow::Result<()>;
+
+    /// Whether the project declares infrastructure. `Ok(Some(has_infra))`
+    /// for any registered project; `Ok(None)` ONLY when the project
+    /// doesn't exist; `Err` on DB failure.
     async fn project_has_infra(&self, id: uuid::Uuid) -> anyhow::Result<Option<bool>>;
 
-    /// The project's OWN k8s namespace (where its infra pods live), or
-    /// `Ok(Some(""))` / `Ok(None)` when it has none. EMPTY string means
-    /// "no per-project namespace provisioned" (a no-infra project, or an
-    /// infra project whose namespace hasn't been created yet); callers
-    /// that need it for infra teardown treat empty as "nothing to
-    /// delete". `Ok(None)` ONLY when the project doesn't exist. This is
-    /// the INFRA namespace, NOT the worker namespace: for worker
-    /// placement use `project_has_infra` + `worker_namespace`.
-    async fn project_namespace(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>>;
-
-    /// Set the project's own k8s namespace, called when the per-project
-    /// namespace is provisioned (first infra apply). Idempotent.
-    async fn set_project_namespace(&self, id: uuid::Uuid, namespace: &str) -> anyhow::Result<()>;
-
-    /// Clear the project's own k8s namespace back to empty, called when
-    /// infra is torn down (project removed, or last infra node deleted),
-    /// so the broker's supervisor-claim (`project_namespace <> ''`) stops
-    /// managing it. Idempotent.
-    async fn clear_project_namespace(&self, id: uuid::Uuid) -> anyhow::Result<()>;
-
     // NOTE: the infra image-tag map is written ONLY through
-    // `set_running_hashes` (atomically alongside the running hashes), never
+    // `register_with_hashes` (atomically alongside the running hashes), never
     // as a standalone per-node write, so a project can never be stamped
     // runnable with its infra tags missing/half-written. See that method.
     // The map has no per-node reader on the store: the supervisor reads it
@@ -276,46 +222,15 @@ pub trait ProjectStoreOps: Send + Sync {
 }
 
 /// The verb-transition marker on the project row: the BUILD axis,
-/// orthogonal to the trigger lifecycle (`status`). A project is
-/// `Building` while a verb's image build is in flight;
-/// `CancellingBuild` after the user requested cancel and before the
-/// driving pod lands the transition back at `None`. Both are
-/// transitional: the reconciliation offers only `cancel_build`.
-///
-/// SYNC: ProjectTransition <-> packages/weft-graph/src/protocol.ts ProjectTransition,
-///       packages/weft-graph/src/status.ts VALID_TRANSITIONS,
-///       crates/weft-dispatcher/src/api/project.rs ProjectStatusResponse.transition
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProjectTransition {
-    None,
-    Building,
-    CancellingBuild,
-}
-
-impl ProjectTransition {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Building => "building",
-            Self::CancellingBuild => "cancelling_build",
-        }
-    }
-
-    /// True while a build transition is in flight (either phase).
-    pub fn is_building(self) -> bool {
-        matches!(self, Self::Building | Self::CancellingBuild)
-    }
-}
+/// orthogonal to the trigger lifecycle (`status`). weft-core's, since the
+/// status answer carries it.
+pub use weft_core::projects::ProjectTransition;
 
 /// Decode a `project.transition` column string. Unknown values are
 /// schema drift and fail loud, mirroring `project_status_from_str`.
 pub fn project_transition_from_str(s: &str) -> anyhow::Result<ProjectTransition> {
-    match s {
-        "none" => Ok(ProjectTransition::None),
-        "building" => Ok(ProjectTransition::Building),
-        "cancelling_build" => Ok(ProjectTransition::CancellingBuild),
-        other => Err(anyhow::anyhow!("unknown project.transition column value '{other}'")),
-    }
+    ProjectTransition::parse(s)
+        .ok_or_else(|| anyhow::anyhow!("unknown project.transition column value '{s}'"))
 }
 
 /// One project stuck in a build transition (stale heartbeat).
@@ -335,13 +250,10 @@ pub struct PostgresProjectStore {
     pool: PgPool,
 }
 
-/// Re-export the wire-typed `ProjectStatus` so the dispatcher
-/// reads/writes the same enum the broker + supervisor see over
-/// HTTP. A single source of truth, generated by the `wire_enum!`
-/// macro: adding a variant in `weft-broker-client::protocol`
-/// shows up everywhere as a compile error. The macro also gives
-/// us `as_str()`, `parse(s) -> Option<Self>`, and `Display`.
-pub use weft_broker_client::protocol::ProjectStatus;
+/// The wire-typed `ProjectStatus` (weft-core's): the dispatcher
+/// reads and writes the same enum the broker, the supervisor and the
+/// CLI see.
+pub use weft_core::projects::ProjectStatus;
 
 /// Decode a `project.status` column string into the typed enum.
 /// Returns `Err` on unknown values rather than silently coercing
@@ -380,22 +292,13 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     //
     // Which triggers listen, and how the ones that stopped went down,
     // is per trigger per owner in `trigger_activation`
-    // (`crate::activation_store`). The lifecycle columns this row still
-    // carries (`status`, `accepting_fires`, `fires_visible_to_consumers`,
-    // `fires_deadline_unix`, `deactivated_by_health`,
-    // `activating_ts_color`, `drain_deadline_unix`, `activation_version`,
-    // `activation_program`) are no longer read or written past the
-    // insert's `status = 'registered'`; they go in a later release, once
-    // no running dispatcher reads them. The `trigger_activation` group's
-    // seed (`crate::activation_store::GROUP`) reads them to carry an old
-    // database's lifecycle onto its triggers, so it goes in the same
-    // release as the columns.
+    // (`crate::activation_store`).
     //
     // running_binary_hash / running_definition_hash /
     // running_infra_hash drive drift detection + image tagging:
     //   - running_binary_hash: worker docker image tag suffix.
     //     Flips on engine / node-impl / node-type-set / weft.toml
-    //     edits; selects the image when spawning a fresh pod.
+    //     edits; selects the image when spawning a fresh process.
     //   - running_definition_hash: identifies the runtime project
     //     shape (topology + configs). Workers fetch the
     //     definition at execution claim time keyed by
@@ -403,11 +306,10 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     //   - running_infra_hash: drives the Upgrade button when the
     //     CLI's freshly-computed infra hash drifts.
     //
-    // tenant_id pins each project to its isolation namespace.
-    // The broker uses it for scoping every user-pod-issued
-    // request: a worker / listener / infra token authenticates
-    // as a tenant, and any project_id it references must resolve
-    // to the same tenant.
+    // tenant_id pins each project to its tenant. The broker scopes
+    // every worker's request by it: a worker proves which project it
+    // is, and every project_id it references must resolve to the same
+    // tenant.
     ddl: &[
         r#"CREATE TABLE IF NOT EXISTS project (
                 id UUID PRIMARY KEY,
@@ -423,53 +325,21 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 running_definition_hash TEXT,
                 running_infra_hash TEXT,
                 running_source JSONB,
-                accepting_fires BOOLEAN NOT NULL DEFAULT TRUE,
-                fires_visible_to_consumers BOOLEAN NOT NULL DEFAULT TRUE,
-                fires_deadline_unix BIGINT,
-                -- True iff the CURRENT deactivation was performed by the
-                -- health loop (autonomous park), not the user. Gates the
-                -- health auto-recover reactivate so it never overrides a
-                -- user-initiated stop/deactivate. Cleared by every
-                -- non-health lifecycle write.
-                deactivated_by_health BOOLEAN NOT NULL DEFAULT FALSE,
-                -- The TriggerSetup color the CURRENT activation started,
-                -- recorded before the run starts; NULL outside Activating.
-                -- Cancel-activate and the reaper cancel exactly this run
-                -- with the true cause, and treat any other non-terminal
-                -- setup run as a leftover of an older, dead activation.
-                activating_ts_color UUID,
                 tenant_id TEXT NOT NULL,
                 -- Whether this project DECLARES infrastructure (any node
                 -- with requires_infra). Derived from the definition and
                 -- refreshed on every register/sync, so it tracks edits
-                -- that add or remove infra. Decides WORKER placement: an
-                -- infra project's worker runs in the project's own k8s
-                -- namespace (next to its infra pods), a no-infra
-                -- project's worker runs in the shared worker namespace.
-                -- The worker namespace is computed from this on demand
-                -- (project_namespace::worker_namespace), never stored, so
-                -- there is no stale worker-namespace value to reconcile.
-                -- Set true the instant infra is declared, which is BEFORE
-                -- the per-project namespace below is provisioned, so it
-                -- cannot be replaced by `project_namespace <> ''`.
+                -- that add or remove infra.
                 has_infra BOOLEAN NOT NULL DEFAULT FALSE,
-                -- The project's OWN k8s namespace
-                -- (wft-project-<tenant>--<project>), where its INFRA pods
-                -- and its worker live. Distinct concept from has_infra:
-                -- this is the namespace string the supervisor runs
-                -- kubectl against, EMPTY until the namespace is actually
-                -- provisioned (first infra apply) and re-emptied when
-                -- infra is torn down. The broker's supervisor-claim
-                -- filters `project_namespace <> ''` to manage only
-                -- projects whose namespace exists. A no-infra project
-                -- keeps this empty forever (its worker lives in the
-                -- shared namespace, which is not project-owned).
-                project_namespace TEXT NOT NULL DEFAULT '',
                 -- Per-(project, node) image hash maps for Image::Local
                 -- references in InfraSpecs. CLI ships these in /sync;
                 -- supervisor reads them.
                 -- Shape: { "<node_id>": { "<image_name>": "<tag>" } }
                 infra_image_tags_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                -- The project's own worker levers, each one it sets
+                -- replacing the install's (`WorkerOverrides`); empty
+                -- runs on the install's.
+                worker_settings_json JSONB NOT NULL DEFAULT '{}'::jsonb,
                 -- Per-project health protocols overriding the weft
                 -- default. NULL = use default. Schema per
                 -- weft_infra_supervisor::protocol::HealthProtocols.
@@ -481,31 +351,19 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 -- finish_building), never by lifecycle writes, so a
                 -- deactivate can't stomp an in-flight build marker.
                 transition TEXT NOT NULL DEFAULT 'none',
-                -- While status='deactivating' with runningPolicy=wait:
-                -- the unix second past which the drain gives up (the
-                -- reaper cancels the remaining executions and the
-                -- drain-watcher lands the row). NULL elsewhere.
-                drain_deadline_unix BIGINT,
-                -- Heartbeat for driver-backed transitional states
-                -- (status='activating', transition='building'/
-                -- 'cancelling_build'): the pod driving the transition
-                -- bumps this on an interval; the stuck-transition
-                -- reaper repairs rows whose heartbeat went stale
-                -- (the driver died mid-transition). Per-project and
-                -- status-guarded: this replaces the old boot-time
-                -- blind bulk downgrade, which wiped live status for
-                -- every tenant's projects on any Pod restart.
+                -- Heartbeat for the build transition
+                -- (transition='building'/'cancelling_build'): the replica
+                -- driving it bumps this on an interval; the stuck-transition
+                -- reaper repairs rows whose heartbeat went stale (the
+                -- driver died mid-transition).
                 transition_heartbeat_unix BIGINT NOT NULL DEFAULT 0,
                 -- The version tree's HEAD (`crate::versions`): the version
                 -- the next checkpoint or run parents on, the run the next
                 -- `--seed` inherits from (NULL when head is a bare
-                -- version), and the version the triggers were activated
-                -- on (NULL while inactive). Moved by checkpoint, run,
-                -- branch and activate; nothing lives on disk.
+                -- version). Moved by checkpoint, run and branch; nothing
+                -- lives on disk.
                 head_version TEXT,
-                head_run UUID,
-                activation_version TEXT,
-                activation_program JSONB
+                head_run UUID
             )"#,
         "CREATE INDEX IF NOT EXISTS idx_project_tenant ON project(tenant_id)",
         // Append-only definition-version history. Workers fetch by
@@ -520,13 +378,13 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // CLI / VS Code; the dispatcher tracks no version chain for it.
         //
         // NO boot-time status touch-up here. Recovery of a project
-        // interrupted mid-transition (a pod died while activating /
+        // interrupted mid-transition (a process died while activating /
         // building / deactivating) is the stuck-transition reaper's
         // job (`reaper::sweep_stuck_transitions`): per-project,
         // heartbeat-gated, and status-guarded, so it never wipes
-        // another Pod's live state. A constructor-time bulk downgrade
+        // another process's live state. A constructor-time bulk downgrade
         // would run in EVERY replica on EVERY boot and reset live
-        // status for all tenants (a multi-Pod correctness bug).
+        // status for all tenants (a multi-process correctness bug).
         r#"CREATE TABLE IF NOT EXISTS project_code (
             project_id UUID NOT NULL REFERENCES project(id) ON DELETE CASCADE,
             binary_hash TEXT NOT NULL,
@@ -555,9 +413,8 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 
 /// THE running-hash pointer advance: ONE atomic UPDATE of the trio of hashes
 /// PLUS the complete infra image-tag map, with the definition-history EXISTS
-/// guard. Both writers go through here: `set_running_hashes` on a pool
-/// connection, `register_with_hashes` inside its transaction (after the history
-/// INSERT, which the same-snapshot EXISTS check then sees). A `None` argument
+/// guard. Its one writer is `register_with_hashes`, inside its transaction
+/// (after the history INSERT, which the same-snapshot EXISTS check then sees). A `None` argument
 /// leaves that field untouched; `Some(tags)` REPLACES the whole infra tag map.
 /// Folding the tags into this one statement is what guarantees a project is
 /// never observed stamped runnable (new binary hash) with its infra tags absent
@@ -819,40 +676,15 @@ impl ProjectStoreOps for PostgresProjectStore {
         crate::infra_node::remove_project(&mut *tx, id).await?;
         crate::infra_event::remove_project(&mut *tx, id).await?;
         crate::infra_lifecycle_command::remove_project(&mut *tx, id).await?;
-        // A member is a member of this project only: their connections,
-        // picks and tokens reach nothing once it is gone, and neither the
-        // author nor the member could list them to delete them.
-        weft_access_store::forget_project_members(&mut tx, id).await?;
-        crate::journal::postgres::revoke_project_member_tokens(&mut *tx, id).await?;
+        // An instance lives inside this project only: its connections,
+        // picks and tokens reach nothing once the project is gone, and
+        // nobody could list them to delete them.
+        weft_access_store::forget_project_access(&mut tx, id).await?;
+        crate::journal::postgres::revoke_project_instance_tokens(&mut *tx, id).await?;
         tx.commit().await?;
         Ok(res.rows_affected() > 0)
     }
 
-    async fn set_running_hashes(
-        &self,
-        id: uuid::Uuid,
-        binary_hash: Option<&str>,
-        definition_hash: Option<&str>,
-        infra_hash: Option<&str>,
-        infra_image_tags: Option<&InfraImageTags>,
-    ) -> anyhow::Result<()> {
-        // ONE UPDATE = atomic trio of hashes PLUS the infra tag map: a crash
-        // (or a sibling Pod's /run between statements) can never observe a
-        // half-advanced pointer set, nor a runnable project whose infra tags
-        // are missing/half-written. The definition-history precondition and the
-        // loud zero-rows failure live in `advance_running_hashes`, shared with
-        // `register_with_hashes`' transaction.
-        let mut conn = self.pool.acquire().await?;
-        advance_running_hashes(
-            &mut conn,
-            id,
-            binary_hash,
-            definition_hash,
-            infra_hash,
-            infra_image_tags,
-        )
-        .await
-    }
 
     async fn running_binary_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
         let row: Option<(Option<String>,)> = sqlx::query_as(
@@ -929,6 +761,19 @@ impl ProjectStoreOps for PostgresProjectStore {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.and_then(|(h,)| h))
+    }
+
+    async fn running_infra_image_tags(&self, id: uuid::Uuid) -> anyhow::Result<Option<InfraImageTags>> {
+        let row: Option<(serde_json::Value,)> =
+            sqlx::query_as("SELECT infra_image_tags_json FROM project WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+        row.map(|(value,)| {
+            let tags = weft_broker_client::protocol::decode_infra_image_tags(value, &format!("project {id}"))?;
+            Ok(tags.into_iter().map(|(place, images)| (place, images.into_iter().collect())).collect())
+        })
+        .transpose()
     }
 
     async fn transition(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectTransition>> {
@@ -1039,32 +884,24 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(row.map(|(b,)| b))
     }
 
-    async fn project_namespace(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT project_namespace FROM project WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.map(|(s,)| s))
+    async fn worker_overrides(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_platform_traits::WorkerOverrides>> {
+        let row: Option<(serde_json::Value,)> =
+            sqlx::query_as("SELECT worker_settings_json FROM project WHERE id = $1").bind(id).fetch_optional(&self.pool).await?;
+        row.map(|(v,)| {
+            serde_json::from_value(v).map_err(|e| anyhow::anyhow!("project {id}'s worker settings are not valid: {e}"))
+        })
+        .transpose()
     }
 
-    async fn set_project_namespace(&self, id: uuid::Uuid, namespace: &str) -> anyhow::Result<()> {
-        sqlx::query("UPDATE project SET project_namespace = $2 WHERE id = $1")
+    async fn set_worker_overrides(&self, id: uuid::Uuid, overrides: &weft_platform_traits::WorkerOverrides) -> anyhow::Result<()> {
+        let done = sqlx::query("UPDATE project SET worker_settings_json = $2 WHERE id = $1")
             .bind(id)
-            .bind(namespace)
+            .bind(serde_json::to_value(overrides)?)
             .execute(&self.pool)
             .await?;
+        anyhow::ensure!(done.rows_affected() == 1, "no project {id}");
         Ok(())
     }
-
-    async fn clear_project_namespace(&self, id: uuid::Uuid) -> anyhow::Result<()> {
-        sqlx::query("UPDATE project SET project_namespace = '' WHERE id = $1")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
 }
 
 // Canonical wall-clock helper lives in `crate::lease::now_unix`.
@@ -1079,6 +916,8 @@ pub struct FakeProjectStore {
     implementations: RwLock<HashMap<(uuid::Uuid, String), std::collections::BTreeMap<String, String>>>,
     definition_hashes: RwLock<HashMap<uuid::Uuid, String>>,
     infra_hashes: RwLock<HashMap<uuid::Uuid, String>>,
+    /// Mirror of `infra_image_tags_json`, what the last build registered.
+    infra_image_tags: RwLock<HashMap<uuid::Uuid, InfraImageTags>>,
     /// In-memory mirror of the `project_definition` history table:
     /// keyed by `(project_id, definition_hash)`, value is the
     /// `project_json` registered under that hash.
@@ -1089,9 +928,7 @@ pub struct FakeProjectStore {
     /// tuple's many destructure sites stay untouched.
     descriptions: RwLock<HashMap<uuid::Uuid, String>>,
     has_infra: RwLock<HashMap<uuid::Uuid, bool>>,
-    /// The project's own infra namespace, empty until provisioned. Set
-    /// by `set_project_namespace`, cleared by `clear_project_namespace`.
-    namespaces: RwLock<HashMap<uuid::Uuid, String>>,
+    worker_overrides: RwLock<HashMap<uuid::Uuid, weft_platform_traits::WorkerOverrides>>,
     /// Mirror of the `transition` + `transition_heartbeat_unix`
     /// columns. Missing entry = (None, 0), matching the column
     /// defaults on a fresh row.
@@ -1108,11 +945,12 @@ impl FakeProjectStore {
             implementations: RwLock::new(HashMap::new()),
             definition_hashes: RwLock::new(HashMap::new()),
             infra_hashes: RwLock::new(HashMap::new()),
+            infra_image_tags: RwLock::new(HashMap::new()),
             definition_versions: RwLock::new(HashMap::new()),
             tenants: RwLock::new(HashMap::new()),
             descriptions: RwLock::new(HashMap::new()),
             has_infra: RwLock::new(HashMap::new()),
-            namespaces: RwLock::new(HashMap::new()),
+            worker_overrides: RwLock::new(HashMap::new()),
             transitions: RwLock::new(HashMap::new()),
         }
     }
@@ -1137,11 +975,7 @@ impl ProjectStoreOps for FakeProjectStore {
         binary_hash: Option<&str>,
         definition_hash: Option<&str>,
         infra_hash: Option<&str>,
-        // The fake does not model the infra image-tag column (the real
-        // readers are SQL-direct: the broker handler and the
-        // referenced-images keep-set); accepted to satisfy the trait,
-        // ignored.
-        _infra_image_tags: Option<&InfraImageTags>,
+        infra_image_tags: Option<&InfraImageTags>,
         implementations: Option<&std::collections::BTreeMap<String, String>>,
         source: Option<&weft_core::project::hash::Manifest>,
     ) -> anyhow::Result<StoredProjectSummary> {
@@ -1198,6 +1032,9 @@ impl ProjectStoreOps for FakeProjectStore {
         }
         if let Some(h) = infra_hash {
             self.infra_hashes.write().await.insert(id, h.to_string());
+        }
+        if let Some(tags) = infra_image_tags {
+            self.infra_image_tags.write().await.insert(id, tags.clone());
         }
         if binary_hash.is_some() || definition_hash.is_some() {
             let mut sources = self.sources.write().await;
@@ -1263,7 +1100,7 @@ impl ProjectStoreOps for FakeProjectStore {
     async fn remove(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
         // Mirror Postgres FK CASCADE: removing a project clears every
         // per-id side-map (binary/definition/infra hashes,
-        // tenants, has_infra, namespaces, transitions). Without this the
+        // tenants, has_infra, transitions). Without this the
         // fake diverges from production: a test that re-registers under
         // the same id, or asserts cleanup, would see ghost state
         // Postgres does not have.
@@ -1280,7 +1117,7 @@ impl ProjectStoreOps for FakeProjectStore {
         self.infra_hashes.write().await.remove(&id);
         self.tenants.write().await.remove(&id);
         self.has_infra.write().await.remove(&id);
-        self.namespaces.write().await.remove(&id);
+        self.worker_overrides.write().await.remove(&id);
         self.transitions.write().await.remove(&id);
         Ok(was_present)
     }
@@ -1294,53 +1131,6 @@ impl ProjectStoreOps for FakeProjectStore {
             .map(|(_, project)| project.clone()))
     }
 
-    async fn set_running_hashes(
-        &self,
-        id: uuid::Uuid,
-        binary_hash: Option<&str>,
-        definition_hash: Option<&str>,
-        infra_hash: Option<&str>,
-        // The fake does not model the infra image-tag column (the real
-        // readers are SQL-direct: the broker handler and the
-        // referenced-images keep-set); accepted to satisfy the trait,
-        // ignored.
-        _infra_image_tags: Option<&InfraImageTags>,
-    ) -> anyhow::Result<()> {
-        if !self.inner.read().await.contains_key(&id) {
-            anyhow::bail!("set_running_hashes: project {id} not found");
-        }
-        // Mirror the Postgres precondition BEFORE any write: refuse to
-        // advance the pointer to a hash with no history row, leaving
-        // the trio untouched (the production statement is one atomic
-        // UPDATE, so a refused definition also never advances binary /
-        // infra).
-        if let Some(hash) = definition_hash {
-            if !self
-                .definition_versions
-                .read()
-                .await
-                .contains_key(&(id, hash.to_string()))
-            {
-                anyhow::bail!(
-                    "refuse to set running_definition_hash to {hash} for project {id}: \
-                     no project_definition history row exists for that hash; \
-                     register the project with this definition first"
-                );
-            }
-        }
-        if let Some(h) = binary_hash {
-            let old = self.binary_hashes.write().await.insert(id, h.to_string());
-            if old.as_deref() != Some(h) { self.sources.write().await.remove(&id); }
-        }
-        if let Some(h) = definition_hash {
-            let old = self.definition_hashes.write().await.insert(id, h.to_string());
-            if old.as_deref() != Some(h) { self.sources.write().await.remove(&id); }
-        }
-        if let Some(h) = infra_hash {
-            self.infra_hashes.write().await.insert(id, h.to_string());
-        }
-        Ok(())
-    }
 
     async fn running_binary_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
         Ok(self.binary_hashes.read().await.get(&id).cloned())
@@ -1389,6 +1179,13 @@ impl ProjectStoreOps for FakeProjectStore {
 
     async fn running_infra_hash(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
         Ok(self.infra_hashes.read().await.get(&id).cloned())
+    }
+
+    async fn running_infra_image_tags(&self, id: uuid::Uuid) -> anyhow::Result<Option<InfraImageTags>> {
+        if !self.inner.read().await.contains_key(&id) {
+            return Ok(None);
+        }
+        Ok(Some(self.infra_image_tags.read().await.get(&id).cloned().unwrap_or_default()))
     }
 
     async fn transition(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectTransition>> {
@@ -1472,25 +1269,16 @@ impl ProjectStoreOps for FakeProjectStore {
         Ok(self.has_infra.read().await.get(&id).copied())
     }
 
-    async fn project_namespace(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
-        // Mirror Postgres: a registered project always has a row (empty
-        // string until its namespace is provisioned); only an
-        // unregistered project returns None.
+    async fn worker_overrides(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_platform_traits::WorkerOverrides>> {
         if !self.inner.read().await.contains_key(&id) {
             return Ok(None);
         }
-        Ok(Some(
-            self.namespaces.read().await.get(&id).cloned().unwrap_or_default(),
-        ))
+        Ok(Some(self.worker_overrides.read().await.get(&id).cloned().unwrap_or_default()))
     }
 
-    async fn set_project_namespace(&self, id: uuid::Uuid, namespace: &str) -> anyhow::Result<()> {
-        self.namespaces.write().await.insert(id, namespace.to_string());
-        Ok(())
-    }
-
-    async fn clear_project_namespace(&self, id: uuid::Uuid) -> anyhow::Result<()> {
-        self.namespaces.write().await.insert(id, String::new());
+    async fn set_worker_overrides(&self, id: uuid::Uuid, overrides: &weft_platform_traits::WorkerOverrides) -> anyhow::Result<()> {
+        anyhow::ensure!(self.inner.read().await.contains_key(&id), "no project {id}");
+        self.worker_overrides.write().await.insert(id, overrides.clone());
         Ok(())
     }
 

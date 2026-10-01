@@ -15,6 +15,13 @@
       "default": false,
       "label": "Reachable from this machine",
       "description": "Let a client that is not part of this program reach the sidecar directly, at an address on the machine the runtime runs on. Off by default; `weft infra list-doors` prints the address when it is on."
+    },
+    {
+      "name": "public",
+      "type": "Boolean",
+      "default": false,
+      "label": "Public",
+      "description": "Open the sidecar to the internet through the install's own address, at `/infra/<project>/<instance>/svc`."
     }
   ],
   "outputs": [

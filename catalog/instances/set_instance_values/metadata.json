@@ -1,0 +1,64 @@
+{
+  "type": "SetInstanceValues",
+  "label": "Set instance values",
+  "description": "Give one instance values for the fields the program writes `@instance_filled` (its sheet, its schedule, its connection), and clear others, all at once. Each value is checked against its field and the node's rules first, and nothing is stored if one is refused. A live trigger of the instance that reads a changed value is set up again with it before `rearmed` fires, so the new schedule or connection takes effect without anyone re-arming by hand.",
+  "tags": [
+    "instances",
+    "values",
+    "settings"
+  ],
+  "icon": "SlidersHorizontal",
+  "color": "#0ea5e9",
+  "inputs": [
+    {
+      "name": "instance",
+      "type": "String",
+      "required": true,
+      "description": "The instance, by the id your program gives it (`user-42`)."
+    },
+    {
+      "name": "values",
+      "type": "JsonDict",
+      "description": "The values to give, by `node.field` the way the program writes it: `{\"read.spreadsheet\": \"1AbC...\", \"digest.cron\": \"0 0 7 * * *\"}`. A connection field takes one of the instance's connections: `{\"slack.account\": {\"id\": \"<connection id>\"}}`."
+    },
+    {
+      "name": "clear",
+      "type": "List[String]",
+      "description": "The fields to clear, as `node.field`: each then falls back as if never given."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "rearmed",
+      "type": "List[String]",
+      "description": "The instance's triggers that were set up again because they read a changed value."
+    }
+  ],
+  "requires_infra": false,
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": { "kind": "input_names", "port": "values", "names": { "field": { "instance_filled": true } } }
+      },
+      "then": {
+        "message": "SetInstanceValues '{id}' gives {names} in `values`, which is no field this program writes `@instance_filled`. Key each value by `node.field` the way the program writes it (`read.spreadsheet`, or `one.read.spreadsheet` inside an included file), naming a field written `@instance_filled`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "values"
+      }
+    },
+    {
+      "when": {
+        "kind": "not",
+        "of": { "kind": "input_names", "port": "clear", "names": { "field": { "instance_filled": true } } }
+      },
+      "then": {
+        "message": "SetInstanceValues '{id}' clears {names}, which is no field this program writes `@instance_filled`. Name each as `node.field` the way the program writes it (`read.spreadsheet`, or `one.read.spreadsheet` inside an included file), naming a field written `@instance_filled`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "clear"
+      }
+    }
+  ]
+}

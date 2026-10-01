@@ -3,21 +3,21 @@
 //! worker dies; parked work must survive).
 //!
 //! Shape: reuse the `human_form` fixture (an event starts a flow that suspends
-//! at a HumanQuery). While suspended, KILL the worker pod from the host (a fake
-//! crash). Then answer the form: the resume task is NOT pinned to the dead pod,
+//! at a HumanQuery). While suspended, KILL the worker container from the host (a
+//! fake crash). Then answer the form: the resume task is NOT pinned to the dead
+//! worker,
 //! so a worker (fresh, re-seeded from the journal) picks it up and completes.
 //!
 //! Proof is by INFERENCE, and airtight: we kill the ONLY live worker while the
 //! execution is parked at the form (before we send the answer, so it provably
 //! had not finished), then assert it still completed with the right approval. A
 //! dead worker cannot finish a job, so a fresh one must have resumed it. We do
-//! NOT additionally fingerprint the new worker instance: a respawn reuses the
-//! worker's deterministic name and the dead row is GC'd within seconds, so every
-//! such marker is timing-flaky (see the NOTE in platform.rs).
+//! NOT additionally fingerprint the new worker: a respawn reuses the worker's
+//! deterministic container name, so no marker tells the two apart.
 //!
 //! Why this fixture: only a resumable park (a signal/form) survives a worker
-//! death; a node holding a gateway-routed live-caller connection is terminally
-//! cancelled when its pod dies (the external connection died with it), so it is
+//! death; a node holding a live-caller connection is terminally
+//! cancelled when its worker dies (the external connection died with it), so it is
 //! the wrong shape for a resume test. A HumanQuery suspension is unpinned and
 //! resumes anywhere.
 #![cfg(feature = "e2e")]
@@ -41,15 +41,15 @@ async fn worker_crash_resumes_on_fresh_worker() -> anyhow::Result<()> {
     project.activate().await?;
 
     // Start a fresh execution that runs to HumanQuery and suspends.
-    let before = run::execution_colors(&disp, &pid).await?;
+    let before = run::executions(&disp, &pid).await?;
     tokio::time::sleep(Duration::from_secs(2)).await;
     feed.push_event("go", &json!({ "value": "the change" }).to_string());
-    let color =
+    let execution_id =
         run::wait_for_triggered_execution(&disp, &pid, &before, Duration::from_secs(60)).await?;
 
     // Wait until the execution is genuinely parked at the form (the worker has
     // registered the suspension), THEN kill its worker to fake a crash. We kill
-    // by exact pod name read from `worker_pod`; an empty kill set would mean the
+    // every worker container of the project; an empty kill set would mean the
     // worker already idle-exited (also a valid resume path), but we assert at
     // least one was live so this test exercises the abrupt-crash path on
     // purpose, not by accident.
@@ -61,7 +61,7 @@ async fn worker_crash_resumes_on_fresh_worker() -> anyhow::Result<()> {
          killed none (the worker idle-exited before we caught it). Widen the window."
     );
 
-    // Answer the form. The resume task is not pinned to the dead pod, so a
+    // Answer the form. The resume task is not pinned to the dead worker, so a
     // worker (fresh, re-seeded from the journal) picks it up and finishes.
     human::answer_form(&disp, &review, &json!({ "decision": "approve" })).await?;
 
@@ -70,10 +70,10 @@ async fn worker_crash_resumes_on_fresh_worker() -> anyhow::Result<()> {
     // (before we sent the answer, so it provably had not finished), yet the
     // execution still completed with the correct approval. A dead worker cannot
     // finish a job; a fresh one re-seeded from the journal must have. We do NOT
-    // additionally fingerprint the new worker instance: a respawn reuses the
+    // additionally fingerprint the new worker replica: a respawn reuses the
     // worker's deterministic name and the dead row is GC'd within seconds, so
-    // any "a different instance did it" marker is timing-flaky (see platform.rs).
-    let settled = SettledRun::observe(&disp, color).await?;
+    // any "a different replica did it" marker is timing-flaky (see platform.rs).
+    let settled = SettledRun::observe(&disp, execution_id).await?;
     settled.completed()?;
     settled.assert_input("out", "data", &json!(true))?;
 

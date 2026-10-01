@@ -38,5 +38,8 @@
       "type": "Number"
     }
   ],
+  "features": {
+    "catchErrors": true
+  },
   "requires_infra": false
 }

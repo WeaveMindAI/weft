@@ -221,7 +221,7 @@ async fn full_consent(
             registration: Some(oauth_app()),
             permissions: scopes.iter().map(|s| s.to_string()).collect(),
             project_id: Some(PROJECT_1),
-            member: None,
+            instance: None,
             upgrade_grant_id: upgrade,
             redirect_uri: "http://disp.example/access/oauth/callback".into(),
         },
@@ -267,7 +267,7 @@ async fn paste_connect_on_a_consent_service_stores_the_static_variant(pool: PgPo
             label: Some("Hand-made bot".into()),
             permissions: vec!["read".into()],
             project_id: None,
-            member: None,
+            instance: None,
         },
     )
     .await
@@ -303,7 +303,7 @@ async fn paste_connect_on_a_consent_service_stores_the_static_variant(pool: PgPo
             label: None,
             permissions: Vec::new(),
             project_id: None,
-            member: None,
+            instance: None,
         },
     )
     .await
@@ -329,7 +329,7 @@ async fn static_connect_runs_the_test_call_and_stores_identity(pool: PgPool) {
             label: Some("My token".into()),
             permissions: Vec::new(),
             project_id: Some(PROJECT_1),
-            member: None,
+            instance: None,
         },
     )
     .await
@@ -353,7 +353,7 @@ async fn static_connect_runs_the_test_call_and_stores_identity(pool: PgPool) {
             label: None,
             permissions: Vec::new(),
             project_id: None,
-            member: None,
+            instance: None,
         },
     )
     .await
@@ -379,7 +379,7 @@ async fn the_tenant_wall_holds_on_every_surface(pool: PgPool) {
             label: None,
             permissions: Vec::new(),
             project_id: None,
-            member: None,
+            instance: None,
         },
     )
     .await
@@ -428,7 +428,7 @@ async fn a_poll_on_a_state_with_nothing_live_answers_gone(pool: PgPool) {
             registration: Some(oauth_app()),
             permissions: vec!["read".into()],
             project_id: Some(PROJECT_1),
-            member: None,
+            instance: None,
             upgrade_grant_id: None,
             redirect_uri: "http://disp.example/access/oauth/callback".into(),
         },
@@ -481,7 +481,7 @@ async fn oauth_consent_records_granted_scopes_and_enforces_the_echo(pool: PgPool
             registration: Some(oauth_app()),
             permissions: vec!["not-a-scope".into()],
             project_id: None,
-            member: None,
+            instance: None,
             upgrade_grant_id: None,
             redirect_uri: "http://disp.example/cb".into(),
         },
@@ -501,7 +501,7 @@ async fn oauth_consent_records_granted_scopes_and_enforces_the_echo(pool: PgPool
             registration: None,
             permissions: vec!["read".into()],
             project_id: None,
-            member: None,
+            instance: None,
             upgrade_grant_id: None,
             redirect_uri: "http://disp.example/cb".into(),
         },
@@ -567,7 +567,7 @@ async fn an_exclusive_grant_rotates_in_place_and_upgrades_by_union(pool: PgPool)
             registration: Some(oauth_app()),
             permissions: vec!["read".into()],
             project_id: Some(PROJECT_1),
-            member: None,
+            instance: None,
             upgrade_grant_id: Some(first.id),
             redirect_uri: "http://disp.example/access/oauth/callback".into(),
         },
@@ -592,7 +592,7 @@ async fn an_exclusive_grant_rotates_in_place_and_upgrades_by_union(pool: PgPool)
             registration: Some(other_app),
             permissions: vec!["read".into()],
             project_id: Some(PROJECT_1),
-            member: None,
+            instance: None,
             upgrade_grant_id: Some(first.id),
             redirect_uri: "http://disp.example/access/oauth/callback".into(),
         },
@@ -746,7 +746,7 @@ async fn lookups_run_authed_substitute_and_paginate(pool: PgPool) {
             label: None,
             permissions: Vec::new(),
             project_id: None,
-            member: None,
+            instance: None,
         },
     )
     .await
@@ -831,7 +831,7 @@ async fn a_shared_key_connect_stores_a_runtime_owned_row(pool: PgPool) {
             label: None,
             permissions: Vec::new(),
             project_id: None,
-            member: None,
+            instance: None,
         },
     )
     .await
@@ -859,7 +859,7 @@ async fn a_shared_key_connect_stores_a_runtime_owned_row(pool: PgPool) {
             label: None,
             permissions: Vec::new(),
             project_id: None,
-            member: None,
+            instance: None,
         },
     )
     .await
@@ -887,7 +887,7 @@ async fn a_claimed_shortfall_is_let_through_at_resolution(pool: PgPool) {
             label: None,
             permissions: Vec::new(),
             project_id: None,
-            member: None,
+            instance: None,
         },
     )
     .await
@@ -939,7 +939,7 @@ async fn granted_items_read_the_stored_list_behind_the_wall(pool: PgPool) {
             label: None,
             permissions: Vec::new(),
             project_id: None,
-            member: None,
+            instance: None,
         },
     )
     .await
@@ -1158,7 +1158,7 @@ async fn subscriptions_subscribe_once_and_stop_at_the_provider(pool: PgPool) {
         service: "fakeoauth".into(),
         topic: "things".into(),
         access_id: grant.id,
-        for_member: None,
+        for_instance: None,
         signal_token: "sig-1".into(),
         params: [("target".to_string(), "file-9".to_string())].into_iter().collect(),
         receiver_url: Some("https://public.example/events/fakeoauth/things".into()),
@@ -1251,7 +1251,7 @@ async fn a_subscribe_topic_without_a_public_address_teaches_the_fix(pool: PgPool
             service: "fakeoauth".into(),
             topic: "things".into(),
             access_id: grant.id,
-            for_member: None,
+            for_instance: None,
             signal_token: "sig-x".into(),
             params: [("target".to_string(), "f".to_string())].into_iter().collect(),
             receiver_url: None,
@@ -1289,7 +1289,7 @@ async fn an_eventless_service_resolves_with_an_empty_recipe_map(pool: PgPool) {
             label: None,
             permissions: Vec::new(),
             project_id: None,
-            member: None,
+            instance: None,
         },
     )
     .await
@@ -1405,7 +1405,7 @@ async fn a_shared_app_connection_never_carries_the_operators_app_secret(pool: Pg
             registration: Some(oauth_app()),
             permissions: vec!["read".into()],
             project_id: Some(PROJECT_1),
-            member: None,
+            instance: None,
             upgrade_grant_id: None,
             redirect_uri: "http://disp.example/access/oauth/callback".into(),
         },
@@ -1502,7 +1502,7 @@ async fn optional_field_groups_gate_what_a_connection_can_do(pool: PgPool) {
                     label: None,
                     permissions: Vec::new(),
                     project_id: None,
-                    member: None,
+                    instance: None,
                 },
             )
             .await
@@ -1596,7 +1596,7 @@ async fn a_finished_pick_lands_its_grants_on_the_row(pool: PgPool) {
             label: None,
             permissions: vec!["base.read".into()],
             project_id: None,
-            member: None,
+            instance: None,
         },
     )
     .await
@@ -1609,7 +1609,7 @@ async fn a_finished_pick_lands_its_grants_on_the_row(pool: PgPool) {
         TENANT_A,
         weft_access_store::BeginPicker {
             access_id: grant.id,
-            for_member: None,
+            for_instance: None,
             service: "fakestatic".into(),
             script: "https://chooser.example.com/api.js".into(),
             code: "weft.done({id: 'x', label: 'X'})".into(),
@@ -1640,11 +1640,11 @@ async fn a_finished_pick_lands_its_grants_on_the_row(pool: PgPool) {
     assert!(!row.permissions_verified, "the pick never upgrades verification");
 }
 
-/// A picker opens only on the caller's own connection: a member
+/// A picker opens only on the caller's own connection: an instance
 /// parking one on the author's connection is refused at begin, so no
 /// pick can ever widen the author's row.
 #[sqlx::test]
-async fn a_member_cannot_open_a_picker_on_the_authors_connection(pool: PgPool) {
+async fn a_instance_cannot_open_a_picker_on_the_authors_connection(pool: PgPool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
@@ -1660,7 +1660,7 @@ async fn a_member_cannot_open_a_picker_on_the_authors_connection(pool: PgPool) {
             label: None,
             permissions: Vec::new(),
             project_id: None,
-            member: None,
+            instance: None,
         },
     )
     .await
@@ -1670,9 +1670,9 @@ async fn a_member_cannot_open_a_picker_on_the_authors_connection(pool: PgPool) {
         TENANT_A,
         weft_access_store::BeginPicker {
             access_id: done.grant.id,
-            for_member: Some(weft_core::member::MemberScope {
+            for_instance: Some(weft_core::instance::InstanceScope {
                 project_id: PROJECT_1,
-                member: weft_core::member::MemberId::new("ada").unwrap(),
+                instance: weft_core::instance::InstanceId::new("ada").unwrap(),
             }),
             service: "fakestatic".into(),
             script: "https://chooser.example.com/api.js".into(),
@@ -1682,7 +1682,7 @@ async fn a_member_cannot_open_a_picker_on_the_authors_connection(pool: PgPool) {
         },
     )
     .await
-    .expect_err("the author's connection is not the member's");
+    .expect_err("the author's connection is not the instance's");
     assert!(err.to_string().contains("your own connection"), "{err}");
 }
 
@@ -1707,7 +1707,7 @@ fn publish(values: &[(&str, &str)]) -> weft_access_store::PublishAccess {
     weft_access_store::PublishAccess {
         spec: published_spec(),
         project_id: PROJECT_1,
-        member: None,
+        instance: None,
         node_id: "db".into(),
         values: values.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
         label: Some("db".into()),
@@ -1875,7 +1875,7 @@ async fn cleanup_removes_what_a_node_published_and_nothing_else(pool: PgPool) {
             registration: None,
             paste: false,
             project_id: Some(PROJECT_1),
-            member: None,
+            instance: None,
         },
     )
     .await
@@ -1907,22 +1907,22 @@ async fn cleanup_removes_what_a_node_published_and_nothing_else(pool: PgPool) {
     assert_eq!(left[0].id, theirs.grant.id);
 }
 
-/// A member's connection is theirs alone: only they see it, use it as a
+/// An instance's connection is its own alone: only it sees it, use it as a
 /// value, or forget it, and forgetting it takes the values naming it
-/// along. A member's values are theirs, set together or not at all.
+/// along. An instance's values are its own, set together or not at all.
 #[sqlx::test]
-async fn a_members_connection_and_values_stay_theirs(pool: PgPool) {
+async fn a_instances_connection_and_values_stay_theirs(pool: PgPool) {
     use weft_access_store::{
-        change_member_values, forget_member_grants, member_values, ConnectionValue,
-        GrantOwnerScope, MemberValueWrite,
+        change_instance_values, forget_instance_grants, instance_values, ConnectionValue,
+        GrantOwnerScope, InstanceValueWrite,
     };
-    use weft_core::member::MemberId;
+    use weft_core::instance::InstanceId;
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     let fake = FakeProvider::new();
     let base = fake.serve().await;
-    let ada = MemberId::new("ada").unwrap();
-    let bob = MemberId::new("bob").unwrap();
-    let connect = |member: &MemberId, token: &str| ConnectDirect {
+    let ada = InstanceId::new("ada").unwrap();
+    let bob = InstanceId::new("bob").unwrap();
+    let connect = |instance: &InstanceId, token: &str| ConnectDirect {
         paste: false,
         spec: static_spec(&base),
         door: Door::Own,
@@ -1931,45 +1931,45 @@ async fn a_members_connection_and_values_stay_theirs(pool: PgPool) {
         label: None,
         permissions: Vec::new(),
         project_id: Some(PROJECT_1),
-        member: Some(member.clone()),
+        instance: Some(instance.clone()),
     };
     let adas = connect_direct(&pool, TENANT_A, connect(&ada, "tok-ada")).await.expect("ada connects").grant;
-    assert_eq!(adas.owner, CredentialOwner::Member(ada.clone()));
+    assert_eq!(adas.owner, CredentialOwner::Instance(ada.clone()));
     let bobs = connect_direct(&pool, TENANT_A, connect(&bob, "tok-bob")).await.expect("bob connects").grant;
     let mut both_doors = static_spec(&base);
     both_doors.doors = vec![Door::Shared, Door::Own];
     let err = connect_direct(&pool, TENANT_A, ConnectDirect { door: Door::Shared, spec: both_doors, ..connect(&bob, "unused") })
         .await
-        .expect_err("a member never spends the shared key");
+        .expect_err("an instance never spends the shared key");
     assert!(err.to_string().contains("the shared door is the program author's"), "{err}");
 
-    let as_ada = GrantOwnerScope::Member { project_id: PROJECT_1, member: &ada };
+    let as_ada = GrantOwnerScope::Instance { project_id: PROJECT_1, instance: &ada };
     let seen: Vec<_> = list_grants(&pool, TENANT_A, None, as_ada).await.unwrap().into_iter().map(|g| g.id).collect();
     assert_eq!(seen, vec![adas.id]);
     assert!(list_grants(&pool, TENANT_A, None, GrantOwnerScope::Author).await.unwrap().is_empty(),
-        "the author's list holds no member's connection");
+        "the author's list holds no instance's connection");
 
-    let pick = |step: &str, grant: uuid::Uuid, service: &str| MemberValueWrite {
+    let pick = |step: &str, grant: uuid::Uuid, service: &str| InstanceValueWrite {
         step: step.into(),
         field: "account".into(),
         value: serde_json::json!({ "id": grant }),
         connection: Some(ConnectionValue { grant_id: grant, service: service.into() }),
     };
-    let plain = |step: &str, value: serde_json::Value| MemberValueWrite {
+    let plain = |step: &str, value: serde_json::Value| InstanceValueWrite {
         step: step.into(),
         field: "sheet".into(),
         value,
         connection: None,
     };
     let mut conn = pool.acquire().await.unwrap();
-    let err = change_member_values(&mut conn, TENANT_A, PROJECT_1, &ada, &[plain("read", serde_json::json!("s-1")), pick("post", bobs.id, "fakestatic")], &[])
+    let err = change_instance_values(&mut conn, TENANT_A, PROJECT_1, &ada, &[plain("read", serde_json::json!("s-1")), pick("post", bobs.id, "fakestatic")], &[])
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("not one of member 'ada''s connections"), "{err}");
-    assert!(member_values(&pool, TENANT_A, PROJECT_1, &ada).await.unwrap().is_empty(), "a refused write stores none of it");
-    let err = change_member_values(&mut conn, TENANT_A, PROJECT_1, &ada, &[pick("post", adas.id, "slack")], &[]).await.unwrap_err();
+    assert!(err.to_string().contains("not one of instance 'ada''s connections"), "{err}");
+    assert!(instance_values(&pool, TENANT_A, PROJECT_1, &ada).await.unwrap().is_empty(), "a refused write stores none of it");
+    let err = change_instance_values(&mut conn, TENANT_A, PROJECT_1, &ada, &[pick("post", adas.id, "slack")], &[]).await.unwrap_err();
     assert!(err.to_string().contains("connects to 'slack'"), "{err}");
-    change_member_values(
+    change_instance_values(
         &mut conn,
         TENANT_A,
         PROJECT_1,
@@ -1979,43 +1979,43 @@ async fn a_members_connection_and_values_stay_theirs(pool: PgPool) {
     )
     .await
     .unwrap();
-    change_member_values(&mut conn, TENANT_A, PROJECT_1, &bob, &[pick("post", bobs.id, "fakestatic")], &[]).await.unwrap();
-    let steps = |values: weft_core::member::MemberValues| values.into_keys().collect::<Vec<_>>();
-    let adas_values = member_values(&pool, TENANT_A, PROJECT_1, &ada).await.unwrap();
+    change_instance_values(&mut conn, TENANT_A, PROJECT_1, &bob, &[pick("post", bobs.id, "fakestatic")], &[]).await.unwrap();
+    let steps = |values: weft_core::instance::InstanceValues| values.into_keys().collect::<Vec<_>>();
+    let adas_values = instance_values(&pool, TENANT_A, PROJECT_1, &ada).await.unwrap();
     assert_eq!(steps(adas_values.clone()), vec!["post", "read", "reply"]);
     assert_eq!(adas_values["post"]["account"]["id"], serde_json::json!(adas.id));
     assert!(adas_values["post"]["account"].get("identity").is_some(), "a connection value reads back as its handle");
     assert_eq!(adas_values["read"]["sheet"], serde_json::json!("s-1"));
-    assert!(member_values(&pool, TENANT_B, PROJECT_1, &ada).await.unwrap().is_empty(), "another tenant reads nothing");
+    assert!(instance_values(&pool, TENANT_B, PROJECT_1, &ada).await.unwrap().is_empty(), "another tenant reads nothing");
     let clear = [("reply".to_string(), "account".to_string())];
-    change_member_values(&mut conn, TENANT_A, PROJECT_1, &ada, &[], &clear).await.unwrap();
-    change_member_values(&mut conn, TENANT_A, PROJECT_1, &ada, &[], &clear).await.unwrap();
-    assert_eq!(steps(member_values(&pool, TENANT_A, PROJECT_1, &ada).await.unwrap()), vec!["post", "read"]);
+    change_instance_values(&mut conn, TENANT_A, PROJECT_1, &ada, &[], &clear).await.unwrap();
+    change_instance_values(&mut conn, TENANT_A, PROJECT_1, &ada, &[], &clear).await.unwrap();
+    assert_eq!(steps(instance_values(&pool, TENANT_A, PROJECT_1, &ada).await.unwrap()), vec!["post", "read"]);
 
-    let err = delete_grant(&pool, TENANT_A, adas.id, GrantOwnerScope::Member { project_id: PROJECT_1, member: &bob })
+    let err = delete_grant(&pool, TENANT_A, adas.id, GrantOwnerScope::Instance { project_id: PROJECT_1, instance: &bob })
         .await
         .unwrap_err();
     assert!(matches!(err.downcast_ref::<AccessError>(), Some(AccessError::NotFound)), "{err}");
     assert!(delete_grant(&pool, TENANT_A, adas.id, GrantOwnerScope::Author).await.is_err(), "the author cannot forget it either");
     delete_grant(&pool, TENANT_A, adas.id, as_ada).await.unwrap();
     assert_eq!(
-        steps(member_values(&pool, TENANT_A, PROJECT_1, &ada).await.unwrap()),
+        steps(instance_values(&pool, TENANT_A, PROJECT_1, &ada).await.unwrap()),
         vec!["read"],
         "the connection values went with the connection, the plain one stays"
     );
-    assert_eq!(steps(member_values(&pool, TENANT_A, PROJECT_1, &bob).await.unwrap()), vec!["post"]);
-    change_member_values(&mut conn, TENANT_A, PROJECT_1, &ada, &[], &[("read".to_string(), "sheet".to_string())])
+    assert_eq!(steps(instance_values(&pool, TENANT_A, PROJECT_1, &bob).await.unwrap()), vec!["post"]);
+    change_instance_values(&mut conn, TENANT_A, PROJECT_1, &ada, &[], &[("read".to_string(), "sheet".to_string())])
         .await
         .unwrap();
-    assert!(member_values(&pool, TENANT_A, PROJECT_1, &ada).await.unwrap().is_empty());
+    assert!(instance_values(&pool, TENANT_A, PROJECT_1, &ada).await.unwrap().is_empty());
 
-    forget_member_grants(&pool, TENANT_A, PROJECT_1, &bob).await.unwrap();
-    assert!(member_values(&pool, TENANT_A, PROJECT_1, &bob).await.unwrap().is_empty());
-    let as_bob = GrantOwnerScope::Member { project_id: PROJECT_1, member: &bob };
+    forget_instance_grants(&pool, TENANT_A, PROJECT_1, &bob).await.unwrap();
+    assert!(instance_values(&pool, TENANT_A, PROJECT_1, &bob).await.unwrap().is_empty());
+    let as_bob = GrantOwnerScope::Instance { project_id: PROJECT_1, instance: &bob };
     assert!(list_grants(&pool, TENANT_A, None, as_bob).await.unwrap().is_empty(), "bob's connection is gone");
 
     let orphan = sqlx::query(
-        "INSERT INTO access_grant (id, tenant_id, service, spec_json, values_sealed, member_id) \
+        "INSERT INTO access_grant (id, tenant_id, service, spec_json, values_sealed, instance_id) \
          VALUES ($1, $2, 'fakestatic', '{}', '', 'ada')",
     )
     .bind(uuid::Uuid::new_v4())
@@ -2023,30 +2023,30 @@ async fn a_members_connection_and_values_stay_theirs(pool: PgPool) {
     .execute(&pool)
     .await
     .unwrap_err();
-    assert!(orphan.to_string().contains("access_grant_member_has_project"), "{orphan}");
+    assert!(orphan.to_string().contains("access_grant_instance_has_project"), "{orphan}");
 }
 
-/// A member is a name inside ONE project: the same name in another
+/// An instance is a name inside ONE project: the same name in another
 /// project is another person. A consent there never upgrades nor
-/// rotates the first one's grant, and a member never picks the shared
+/// rotates the first one's grant, and an instance never picks the shared
 /// door, refused before anything is written.
 #[sqlx::test]
-async fn a_members_consent_stays_in_their_project(pool: PgPool) {
-    use weft_core::member::MemberId;
+async fn a_instances_consent_stays_in_their_project(pool: PgPool) {
+    use weft_core::instance::InstanceId;
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     const PROJECT_2: uuid::Uuid = uuid::Uuid::from_u128(0xc0df);
     let fake = FakeProvider::new();
     let base = fake.serve().await;
     let spec = oauth_spec(&base, "exclusive");
     *fake.scope_echo.lock().unwrap() = Some("read".into());
-    let ada = MemberId::new("ada").unwrap();
+    let ada = InstanceId::new("ada").unwrap();
     let begin = |project: uuid::Uuid, door: Door, upgrade: Option<uuid::Uuid>| BeginOAuth {
         spec: spec.clone(),
         door,
         registration: Some(oauth_app()),
         permissions: vec!["read".into()],
         project_id: Some(project),
-        member: Some(ada.clone()),
+        instance: Some(ada.clone()),
         upgrade_grant_id: upgrade,
         redirect_uri: "http://disp.example/access/oauth/callback".into(),
     };
@@ -2068,12 +2068,12 @@ async fn a_members_consent_stays_in_their_project(pool: PgPool) {
     // The same account consented from P2 is a new row; P1's is untouched.
     *fake.next_token.lock().unwrap() = "tok-p2".into();
     let in_p2 = consent(begin(PROJECT_2, Door::Own, None)).await.expect("ada consents in P2");
-    assert_ne!(in_p2.id, in_p1.id, "another project's member never rotates this one's row");
+    assert_ne!(in_p2.id, in_p1.id, "another project's instance never rotates this one's row");
     assert_eq!(in_p2.project_id, Some(PROJECT_2));
     let p1 = resolve_for_worker(
         &pool,
         TENANT_A,
-        GrantUser::Member { project_id: PROJECT_1, member: &ada },
+        GrantUser::Instance { project_id: PROJECT_1, instance: &ada },
         in_p1.id,
         "fakeoauth",
         &[],
@@ -2088,4 +2088,123 @@ async fn a_members_consent_stays_in_their_project(pool: PgPool) {
     assert!(err.to_string().contains("the shared door is the program author's"), "{err}");
     let parked: (i64,) = sqlx::query_as("SELECT count(*) FROM access_connect").fetch_one(&pool).await.unwrap();
     assert_eq!(parked.0, 0, "the refused consent parked nothing");
+}
+
+/// The install keeps each access node's pick: only one of the author's
+/// own connections, of the field's service, can be picked (never an
+/// instance's), a change is all or none, and forgetting a connection takes
+/// every pick of it along.
+#[sqlx::test]
+async fn the_install_keeps_the_authors_picks(pool: PgPool) {
+    use weft_access_store::{change_install_picks, install_picks, PickWrite};
+    use weft_core::instance::InstanceId;
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let connect = |instance: Option<InstanceId>, token: &str| ConnectDirect {
+        paste: false,
+        spec: static_spec(&base),
+        door: Door::Own,
+        registration: None,
+        values: [("token".to_string(), token.to_string())].into_iter().collect(),
+        label: None,
+        permissions: Vec::new(),
+        project_id: instance.as_ref().map(|_| PROJECT_1),
+        instance,
+    };
+    let mine = connect_direct(&pool, TENANT_A, connect(None, "tok-mine")).await.expect("the author connects").grant;
+    let adas = connect_direct(&pool, TENANT_A, connect(Some(InstanceId::new("ada").unwrap()), "tok-ada"))
+        .await
+        .expect("ada connects")
+        .grant;
+    let pick = |step: &str, grant: uuid::Uuid, service: &str| PickWrite {
+        step: step.into(),
+        field: "account".into(),
+        grant_id: grant,
+        service: service.into(),
+    };
+    let mut conn = pool.acquire().await.unwrap();
+    let err = change_install_picks(&mut conn, TENANT_A, PROJECT_1, &[pick("post", mine.id, "fakestatic"), pick("read", adas.id, "fakestatic")], &[])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not one of your connections"), "an instance's is refused: {err}");
+    assert!(install_picks(&pool, TENANT_A, PROJECT_1).await.unwrap().is_empty(), "all or none");
+    let err = change_install_picks(&mut conn, TENANT_A, PROJECT_1, &[pick("post", mine.id, "slack")], &[]).await.unwrap_err();
+    assert!(err.to_string().contains("is a 'fakestatic' one"), "{err}");
+    assert!(change_install_picks(&mut conn, TENANT_B, PROJECT_1, &[pick("post", mine.id, "fakestatic")], &[]).await.is_err(),
+        "another tenant's connection is nobody's to pick");
+
+    change_install_picks(&mut conn, TENANT_A, PROJECT_1, &[pick("post", mine.id, "fakestatic"), pick("one.post", mine.id, "fakestatic")], &[])
+        .await
+        .unwrap();
+    let picks = install_picks(&pool, TENANT_A, PROJECT_1).await.unwrap();
+    assert_eq!(picks["post"]["account"]["id"], serde_json::json!(mine.id));
+    assert!(picks.contains_key("one.post"), "each place keeps its own pick");
+    change_install_picks(&mut conn, TENANT_A, PROJECT_1, &[], &[("one.post".to_string(), "account".to_string())]).await.unwrap();
+    assert!(!install_picks(&pool, TENANT_A, PROJECT_1).await.unwrap().contains_key("one.post"));
+
+    delete_grant(&pool, TENANT_A, mine.id, weft_access_store::GrantOwnerScope::Author).await.unwrap();
+    assert!(install_picks(&pool, TENANT_A, PROJECT_1).await.unwrap().is_empty(), "the pick goes with its connection");
+}
+
+/// A move carries a place's pick and every instance's values to the new
+/// place at once, and reading back shows them there with their services.
+#[sqlx::test]
+async fn a_move_carries_a_places_picks_and_every_instances_values(pool: PgPool) {
+    use weft_access_store::{
+        change_install_picks, change_instance_values, move_stored, stored_fields, ConnectionValue, InstanceValueWrite, PickWrite,
+    };
+    use weft_core::instance::InstanceId;
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let connect = |instance: Option<InstanceId>, token: &str| ConnectDirect {
+        paste: false,
+        spec: static_spec(&base),
+        door: Door::Own,
+        registration: None,
+        values: [("token".to_string(), token.to_string())].into_iter().collect(),
+        label: None,
+        permissions: Vec::new(),
+        project_id: instance.as_ref().map(|_| PROJECT_1),
+        instance,
+    };
+    let ada = InstanceId::new("ada").unwrap();
+    let mine = connect_direct(&pool, TENANT_A, connect(None, "tok-mine")).await.expect("the author connects").grant;
+    let adas = connect_direct(&pool, TENANT_A, connect(Some(ada.clone()), "tok-ada")).await.expect("ada connects").grant;
+    let mut conn = pool.acquire().await.unwrap();
+    change_install_picks(
+        &mut conn,
+        TENANT_A,
+        PROJECT_1,
+        &[PickWrite { step: "chat.agent".into(), field: "account".into(), grant_id: mine.id, service: "fakestatic".into() }],
+        &[],
+    )
+    .await
+    .unwrap();
+    change_instance_values(
+        &mut conn,
+        TENANT_A,
+        PROJECT_1,
+        &ada,
+        &[InstanceValueWrite {
+            step: "chat.agent".into(),
+            field: "other".into(),
+            value: serde_json::json!({ "id": adas.id }),
+            connection: Some(ConnectionValue { grant_id: adas.id, service: "fakestatic".into() }),
+        }],
+        &[],
+    )
+    .await
+    .unwrap();
+
+    let (picks, values) = move_stored(&mut conn, TENANT_A, PROJECT_1, "chat.agent", "studio.chat.agent").await.unwrap();
+    assert_eq!((picks, values), (1, 1));
+    let mut stored = stored_fields(&pool, TENANT_A, PROJECT_1).await.unwrap();
+    stored.sort_by(|a, b| a.field.cmp(&b.field));
+    assert!(stored.iter().all(|s| s.step == "studio.chat.agent"), "{stored:?}");
+    assert_eq!(stored[0].instance, None);
+    assert_eq!(stored[0].service.as_deref(), Some("fakestatic"));
+    assert_eq!(stored[1].instance, Some(ada));
+    assert!(stored_fields(&pool, TENANT_B, PROJECT_1).await.unwrap().is_empty(), "another tenant sees nothing");
 }

@@ -14,15 +14,13 @@
 //!     [`crate::project::E2E_PROJECT_PREFIX`], which every fixture's is;
 //!   - connections on the default install the ledger still lists
 //!     ([`crate::kept`]);
-//!   - pooled-pod clones on the default install (`e2e` in their name);
 //!   - the fixture copies under the temp directory (`weft-e2e-*`);
 //!   - and, once those are gone, `weft clean --images --all`, which is NOT
 //!     limited to e2e: on this machine it removes every worker image no
 //!     project on the default install references (yours included, once
 //!     nothing runs them), dangling worker leftovers, infra images no
-//!     project references, the kind node's cached worker and infra images
-//!     outside that set, every builder base but the current one, and the
-//!     worker compile caches of a retired key that sat unused.
+//!     project references, every builder base and runtime but the current
+//!     one, and the worker compile caches of a retired key that sat unused.
 
 use anyhow::{Context, Result};
 
@@ -35,7 +33,7 @@ pub async fn clean_kept() -> Result<()> {
         println!("removing cell {cell}");
         let out = tokio::process::Command::new("weft")
             .args(["daemon", "remove"])
-            .env(weft_core::infra::INSTANCE_ENV, &cell)
+            .env(weft_core::infra::INSTALL_ENV, &cell)
             .stdin(std::process::Stdio::null())
             .output()
             .await
@@ -48,10 +46,9 @@ pub async fn clean_kept() -> Result<()> {
     }
 
     let disp = crate::ensure::up().await?;
-    let projects: Vec<serde_json::Value> = disp.get_json("/projects").await?;
+    let projects: Vec<weft_core::projects::ProjectSummary> = disp.get_json("/projects").await?;
     for p in &projects {
-        let name = p.get("name").and_then(|v| v.as_str()).unwrap_or_default();
-        let Some(id) = p.get("id").and_then(|v| v.as_str()) else { continue };
+        let (name, id) = (&p.name, &p.id);
         if name.starts_with(crate::project::E2E_PROJECT_PREFIX) {
             println!("removing project {name} ({id})");
             // Forced: a kept project may sit in any state, and the force
@@ -78,36 +75,33 @@ pub async fn clean_kept() -> Result<()> {
         crate::kept::grant_gone(&grant)?;
     }
 
-    crate::platform::Platform::connect(&disp).await?.sweep_e2e_clones().await?;
     remove_fixture_copies()?;
     cli_ok(&disp, &root, &["clean", "--images", "--all"]).await?;
     Ok(())
 }
 
-/// The names of every cell on the cluster, read off their system
-/// namespaces (`weft-<name>-system`).
+/// The names of every cell on this machine, read off the named installs'
+/// directories.
 async fn kept_cells() -> Result<Vec<String>> {
-    let out = tokio::process::Command::new("kubectl")
-        .args(["get", "namespaces", "-o", "jsonpath={.items[*].metadata.name}"])
-        .output()
-        .await
-        .context("spawn kubectl")?;
-    anyhow::ensure!(
-        out.status.success(),
-        "listing namespaces failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Ok(cells_in(&String::from_utf8_lossy(&out.stdout)))
+    let dir = crate::ensure::install_dir(&weft_core::infra::Install::default_install()).join("installs");
+    let names = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(anyhow::Error::from(e).context(format!("read {}", dir.display()))),
+    };
+    Ok(cells_in(names))
 }
 
 /// Pure half of [`kept_cells`].
-fn cells_in(listing: &str) -> Vec<String> {
-    listing
-        .split_whitespace()
-        .filter_map(|ns| ns.strip_prefix("weft-")?.strip_suffix("-system"))
+fn cells_in(names: Vec<String>) -> Vec<String> {
+    names
+        .into_iter()
         .filter(|name| name.starts_with(crate::cell::CELL_NAME_PREFIX))
-        .filter(|name| weft_core::infra::Instance::named(name).is_ok())
-        .map(str::to_string)
+        .filter(|name| weft_core::infra::Install::named(name).is_ok())
         .collect()
 }
 
@@ -129,8 +123,7 @@ fn remove_fixture_copies() -> Result<()> {
 mod tests {
     #[test]
     fn only_cells_are_taken_for_cells() {
-        let listing = "weft-system weft-db weft-e2e1234abcd-system weft-e2e1234abcd-db \
-                       weft-mine-system weft-e2eshort-system wft-e2e1234abcd-shared-workers";
-        assert_eq!(super::cells_in(listing), vec!["e2e1234abcd", "e2eshort"]);
+        let names = ["e2e1234abcd", "mine", "e2eshort", "e2e-bad"].map(String::from).to_vec();
+        assert_eq!(super::cells_in(names), vec!["e2e1234abcd", "e2eshort"]);
     }
 }

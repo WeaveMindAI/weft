@@ -9,10 +9,6 @@ repository.workspace = true
 name = "weft_infra_supervisor"
 path = "src/lib.rs"
 
-[[bin]]
-name = "weft-infra-supervisor"
-path = "src/main.rs"
-
 [features]
 default = []
 # Pulls in FakeBroker + the testing rig so other crates (and tests
@@ -32,8 +28,6 @@ futures = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-clap = { workspace = true }
 reqwest = { workspace = true }
 uuid = { workspace = true }
 # Optional: only the FakeBroker's Mutex needs it. parking_lot's

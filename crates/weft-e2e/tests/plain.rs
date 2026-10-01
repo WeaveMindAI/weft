@@ -1,5 +1,5 @@
 //! Plain run: a literal flows into Debug. Proves the run + assert core end to
-//! end against a live cluster.
+//! end against a live install.
 #![cfg(feature = "e2e")]
 
 use serde_json::json;

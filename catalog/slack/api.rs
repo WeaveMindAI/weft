@@ -115,7 +115,9 @@ pub fn required_str<'a>(answer: &'a Value, method: &str, name: &str) -> WeftResu
 /// Slack takes text, blocks, or both (text doubles as the notification
 /// fallback when blocks are present), and NEITHER is a loud error.
 /// One Slack rule, stated once for the post and update nodes; `doing`
-/// words the refusal ("send", "update with").
+/// words the refusal ("send", "update with"). Missing content is a
+/// mistake in the program, so it is an input error `error` never
+/// catches.
 pub fn set_content(
     payload: &mut Value,
     text: Option<String>,
@@ -123,7 +125,9 @@ pub fn set_content(
     doing: &str,
 ) -> WeftResult<()> {
     if text.is_none() && blocks.is_none() {
-        return Err(node_error(format!("nothing to {doing}: provide text, blocks, or both")));
+        return Err(weft::WeftError::Input(format!(
+            "nothing to {doing}: provide text, blocks, or both"
+        )));
     }
     if let Some(t) = text {
         payload["text"] = Value::String(t);

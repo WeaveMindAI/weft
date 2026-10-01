@@ -113,7 +113,7 @@ Applies to every architecture, refactor, and code-quality discussion, in any mod
 **Push for the better design.** See a better design than what's there or what's proposed: say so, explain it carefully, push. Don't defer, don't soften with "this is taste-level", don't bury it under "worth revisiting later". Draw the current shape and the alternative, explain what the better design buys and what the worse one costs (even when the cost is just "shape that hides a category of future problems"). If the [user] says no with a real reason (architectural constraint, a milestone, a property you missed), stop. If they say no without a reason, keep pushing; it is cheaper to argue and lose than to ship the wrong thing and revert. The asymmetry is intentional.
 
 **The decision tree**, in order:
-1. Does it scale cleanly (1M+ users, multi-tenant, multi-Pod)?
+1. Does it scale cleanly (1M+ users, multi-tenant, many runtime instances)?
 2. Is it DRY, with responsibility cleanly separated?
 3. Is the API honest about what it does?
 4. Does it compose with future features without forcing awkward shapes?

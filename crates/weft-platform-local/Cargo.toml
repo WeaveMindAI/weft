@@ -1,0 +1,47 @@
+[package]
+name = "weft-platform-local"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The local implementation of the translation layer's traits
+# (`weft-platform-traits`): plain processes and the local Docker daemon.
+
+[features]
+default = []
+# The fakes (`docker::fake`) for other crates' tests.
+test-helpers = []
+# The tests that need a real Postgres (`tests/db_*.rs`).
+db-tests = []
+
+[dependencies]
+weft-platform-traits = { workspace = true }
+weft-core = { workspace = true }
+# Container log instants (`docker logs --timestamps`).
+chrono = { workspace = true }
+# The `alarm` table the local alarm keeps its wakes in.
+weft-task-store = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "tls-rustls"] }
+tokio = { workspace = true, features = ["process"] }
+uuid = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+hex = "0.4"
+getrandom = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+axum = { workspace = true }
+weft-platform-traits = { workspace = true, features = ["test-helpers"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "macros", "migrate"] }
+parking_lot = { workspace = true }
+
+[lints]
+workspace = true

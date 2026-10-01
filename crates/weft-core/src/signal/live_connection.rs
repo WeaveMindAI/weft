@@ -49,7 +49,7 @@ impl Protocol {
 }
 
 /// How outbound talk behaves when the connection is congested (a slow
-/// caller). A multiplexing pod must never OOM on one slow caller.
+/// caller). A multiplexing process must never OOM on one slow caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Backpressure {
@@ -518,6 +518,10 @@ pub struct Socket {
 
 impl Signal for Route {
     const TAG: &'static str = "route";
+    const CALLER: Option<Protocol> = Some(Protocol::Http);
+    fn live_connection(&self) -> Option<&LiveConnectionConfig> {
+        Some(&self.common)
+    }
     fn validate(&self) -> Result<(), String> {
         self.common.validate(Self::TAG)
     }
@@ -525,6 +529,10 @@ impl Signal for Route {
 
 impl Signal for Socket {
     const TAG: &'static str = "socket";
+    const CALLER: Option<Protocol> = Some(Protocol::Websocket);
+    fn live_connection(&self) -> Option<&LiveConnectionConfig> {
+        Some(&self.common)
+    }
     fn validate(&self) -> Result<(), String> {
         if !self.common.methods.is_empty() {
             return Err(format!(
@@ -533,18 +541,6 @@ impl Signal for Socket {
             ));
         }
         self.common.validate(Self::TAG)
-    }
-}
-
-/// Map a live-caller signal tag onto its wire protocol. The single place
-/// the kind->protocol relationship lives, used by the dispatcher and worker
-/// to recover the protocol from a fired spec without a config field. Returns
-/// `None` for any non-live-caller tag.
-pub fn protocol_for_tag(tag: &str) -> Option<Protocol> {
-    match tag {
-        t if t == Route::TAG => Some(Protocol::Http),
-        t if t == Socket::TAG => Some(Protocol::Websocket),
-        _ => None,
     }
 }
 
@@ -610,11 +606,10 @@ mod tests {
     fn both_kinds_share_body_and_differ_only_by_protocol() {
         assert_eq!(Route::TAG, "route");
         assert_eq!(Socket::TAG, "socket");
-        assert_eq!(protocol_for_tag("route"), Some(Protocol::Http));
-        assert_eq!(protocol_for_tag("socket"), Some(Protocol::Websocket));
-        assert_eq!(protocol_for_tag("webhook"), None);
-        assert_eq!(protocol_for_tag("api_endpoint"), None, "the old tags are gone");
-        assert_eq!(protocol_for_tag("live_socket"), None);
+        assert_eq!(super::super::caller_protocol("route"), Some(Protocol::Http));
+        assert_eq!(super::super::caller_protocol("socket"), Some(Protocol::Websocket));
+        assert_eq!(super::super::caller_protocol("timer"), None, "a kind nobody waits on declares no caller");
+        assert_eq!(super::super::caller_protocol("api_endpoint"), None, "the old tags are gone");
     }
 
     /// The suspend block round-trips FLAT on the wire (no nesting), next to

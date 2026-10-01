@@ -1,6 +1,6 @@
 //! Terminal progress for a live node-test run.
 //!
-//! A live run is long (each test is its own cluster pod) and
+//! A live run is long (each test is its own process) and
 //! concurrent, so a silent wait reads as a hang. This renders a
 //! stacked, in-place-updating status block on stderr while tests run:
 //!
@@ -22,7 +22,7 @@
 //! and the long-wait breadcrumbs (`note`) print instead of the bars,
 //! so a buffered log stays legible without ANSI garbage.
 //!
-//! This runs beside pod drivers spending real provider money, so its
+//! This runs beside process drivers spending real provider money, so its
 //! contract is: NEVER panic a run over presentation bookkeeping, and
 //! never let a late render undo the final cleanup.
 
@@ -57,7 +57,7 @@ struct State {
     done: bool,
 }
 
-/// Shared progress sink for one live run. Concurrent pod drivers call
+/// Shared progress sink for one live run. Concurrent process drivers call
 /// `started` / `finished` / `note`; every call re-renders.
 pub struct LiveProgress {
     tty: bool,
@@ -96,7 +96,7 @@ impl LiveProgress {
     /// The one way in to the state. A poisoned lock (a panic elsewhere
     /// while holding it) is RECOVERED, not propagated: the state is
     /// plain counters with no invariant a torn update can break, and a
-    /// progress panic here would unwind the pod-driving task and skip
+    /// progress panic here would unwind the process-driving task and skip
     /// the run's credential cleanup, which is the wrong failure to
     /// trade for a cosmetic glitch.
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -127,7 +127,7 @@ impl LiveProgress {
         }
         let elapsed = match elapsed {
             Some(d) => format!("  {:.1}s", d.as_secs_f64()),
-            // A run that broke before its pod started has no start
+            // A run that broke before its process started has no start
             // mark; the line still records the outcome.
             None => String::new(),
         };

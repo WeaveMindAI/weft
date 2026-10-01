@@ -12,9 +12,10 @@ pub enum InfraNodeStatus {
     /// Mid-apply: the apply task started but hasn't successfully
     /// written `Running` yet.
     Provisioning,
-    /// Infra node is up, supervisor sees at least one Pod Ready.
+    /// Infra node is up: the supervisor sees its units ready.
     Running,
-    /// Deployment scaled to 0 (user clicked Stop). PVCs preserved.
+    /// Stopped by the user: each unit stopped or left running per its
+    /// `onStop`, disks kept.
     Stopped,
     /// Supervisor declared the node below its readiness threshold.
     Flaky,
@@ -66,21 +67,21 @@ impl InfraNodeStatus {
         }
     }
 
-    /// Statuses where the node is expected to have running replicas
+    /// Statuses where the node is expected to have running units
     /// the health loop should observe. Used by the supervisor's
     /// health tick: a node mid-apply or mid-stop has no SLO; only
     /// `Running` / `Flaky` does.
-    pub fn expects_running_replicas(self) -> bool {
+    pub fn expects_running_units(self) -> bool {
         matches!(self, Self::Running | Self::Flaky)
     }
 
-    /// Statuses where re-apply can reuse the existing instance_id
-    /// (PVCs may already be bound, services may already exist).
-    /// `Terminating` cannot: we're tearing it down, not reapplying.
-    /// Every other status either has live state to reattach to
-    /// (Running/Flaky/Stopped/Stopping) or is mid-failure that
-    /// sweep+re-apply handles idempotently (Provisioning/Failed).
-    pub fn permits_instance_id_reuse(self) -> bool {
+    /// Statuses an apply can work on in place, keeping the units that
+    /// are up. `Terminating` cannot: a terminate stamped it and did not
+    /// finish, so the apply finishes that terminate first and starts the
+    /// copy fresh. Every other status either has live state to reattach
+    /// to (Running/Flaky/Stopped/Stopping) or is mid-failure that
+    /// re-apply handles idempotently (Provisioning/Failed).
+    pub fn applies_in_place(self) -> bool {
         !matches!(self, Self::Terminating)
     }
 

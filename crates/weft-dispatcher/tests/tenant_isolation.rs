@@ -102,18 +102,18 @@ async fn list_executions_is_scoped_to_the_caller_tenant() {
     let journal = FakeJournal::new();
     let proj_a = Uuid::new_v4();
     let proj_b = Uuid::new_v4();
-    // Mirror the project->tenant mapping the Postgres execution_color seed reads.
+    // Mirror the project->tenant mapping the Postgres execution seed reads.
     journal.set_project_tenant(proj_a, TENANT_A);
     journal.set_project_tenant(proj_b, TENANT_B);
 
-    let color_a = Uuid::new_v4();
-    let color_b = Uuid::new_v4();
+    let execution_id_a = Uuid::new_v4();
+    let execution_id_b = Uuid::new_v4();
     journal
-        .record_event(&started(color_a, proj_a))
+        .record_event(&started(execution_id_a, proj_a))
         .await
         .unwrap();
     journal
-        .record_event(&started(color_b, proj_b))
+        .record_event(&started(execution_id_b, proj_b))
         .await
         .unwrap();
 
@@ -121,12 +121,12 @@ async fn list_executions_is_scoped_to_the_caller_tenant() {
     let a = journal.list_executions(TENANT_A, &q).await.unwrap();
     assert_eq!(a.total, 1, "A sees only its execution");
     assert_eq!(a.executions.len(), 1);
-    assert_eq!(a.executions[0].color, color_a);
+    assert_eq!(a.executions[0].execution_id, execution_id_a);
 
     let b = journal.list_executions(TENANT_B, &q).await.unwrap();
     assert_eq!(b.total, 1, "B sees only its execution");
     assert_eq!(b.executions.len(), 1);
-    assert_eq!(b.executions[0].color, color_b);
+    assert_eq!(b.executions[0].execution_id, execution_id_b);
 }
 
 #[tokio::test]
@@ -136,7 +136,7 @@ async fn an_executions_owner_outlives_its_project() {
     // `weft clean` is what removes the record. So ownership must be
     // answerable from the execution's OWN row forever.
     //
-    // The regression: authorization used to resolve the color to a
+    // The regression: authorization used to resolve the execution to a
     // project and then ask the PROJECT STORE who owned it. After a
     // `weft rm` that store has no answer, so every execution of a
     // removed project became un-replayable and UNDELETABLE, listed
@@ -149,10 +149,10 @@ async fn an_executions_owner_outlives_its_project() {
     let project_id = project;
     register(&store, project, "doomed", TENANT_A).await;
     journal.set_project_tenant(project_id, TENANT_A);
-    let color = Uuid::new_v4();
-    journal.record_event(&started(color, project_id)).await.unwrap();
+    let execution_id = Uuid::new_v4();
+    journal.record_event(&started(execution_id, project_id)).await.unwrap();
 
-    let owner = journal.execution_owner(color).await.unwrap().expect("owner while alive");
+    let owner = journal.execution_owner(execution_id).await.unwrap().expect("owner while alive");
     assert_eq!(owner.tenant, TENANT_A);
     assert_eq!(owner.project_id, project_id);
 
@@ -161,7 +161,7 @@ async fn an_executions_owner_outlives_its_project() {
     assert_eq!(store.tenant_for(project).await.unwrap(), None, "project really gone");
 
     // The execution's ownership is unchanged.
-    let after = journal.execution_owner(color).await.unwrap().expect("owner after removal");
+    let after = journal.execution_owner(execution_id).await.unwrap().expect("owner after removal");
     assert_eq!(after, owner, "ownership is stamped, not re-derived");
     // And it is still listed, so what the listing shows stays actionable.
     let q = ExecutionQuery { limit: 100, ..Default::default() };
@@ -169,20 +169,20 @@ async fn an_executions_owner_outlives_its_project() {
 
     // THE gate itself, with no project store in reach at all: the
     // owner is authorized (so replay and `weft clean` work), and a
-    // stranger gets the same 404 an unknown color gets.
-    let granted = authorize_execution(&journal, &TenantId(TENANT_A.to_string()), color)
+    // stranger gets the same 404 an unknown execution gets.
+    let granted = authorize_execution(&journal, &TenantId(TENANT_A.to_string()), execution_id)
         .await
         .expect("the owner may still reach its execution");
     assert_eq!(granted.project_id, project_id);
     let (refused, _) =
-        authorize_execution(&journal, &TenantId(TENANT_B.to_string()), color)
+        authorize_execution(&journal, &TenantId(TENANT_B.to_string()), execution_id)
             .await
             .expect_err("a stranger may not");
     assert_eq!(refused, axum::http::StatusCode::NOT_FOUND);
     let (unknown, _) =
         authorize_execution(&journal, &TenantId(TENANT_A.to_string()), Uuid::new_v4())
             .await
-            .expect_err("an unknown color is refused the same way");
+            .expect_err("an unknown execution is refused the same way");
     assert_eq!(unknown, axum::http::StatusCode::NOT_FOUND, "no existence leak");
 }
 
@@ -254,8 +254,8 @@ async fn a_program_is_retired_only_when_no_run_still_names_it() {
         .register_with_hashes(definition(project), "doomed", "", TENANT_A, None, Some("never-ran"), None, None, None, None)
         .await
         .expect("record a version nothing ran");
-    let color = Uuid::new_v4();
-    let mut birth = started(color, project_id);
+    let execution_id = Uuid::new_v4();
+    let mut birth = started(execution_id, project_id);
     if let weft_journal::ExecEvent::ExecutionStarted { definition_hash, .. } = &mut birth {
         *definition_hash = Some("ran".to_string());
     }
@@ -277,7 +277,7 @@ async fn a_program_is_retired_only_when_no_run_still_names_it() {
     );
 
     // `weft clean` on that last run: now nothing needs the version.
-    journal.delete_execution(color).await.unwrap();
+    journal.delete_execution(execution_id).await.unwrap();
     let in_use = journal.definition_hashes_in_use(project_id).await.unwrap();
     assert!(in_use.is_empty(), "no run left to need a version");
     store.retire_unused_definitions(project, &in_use).await.unwrap();
@@ -288,9 +288,9 @@ async fn a_program_is_retired_only_when_no_run_still_names_it() {
     );
 }
 
-fn started(color: Uuid, project_id: uuid::Uuid) -> weft_journal::ExecEvent {
+fn started(execution_id: Uuid, project_id: uuid::Uuid) -> weft_journal::ExecEvent {
     weft_journal::ExecEvent::ExecutionStarted {
-        color,
+        execution_id,
         project_id,
         entry_node: "entry".to_string(),
         phase: weft_core::context::Phase::Fire,
@@ -298,13 +298,15 @@ fn started(color: Uuid, project_id: uuid::Uuid) -> weft_journal::ExecEvent {
         program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
         subgraph: None,
         seed: None,
-        member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
+        instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+        run_class: weft_core::run_class::RunClass::Short,
     }
 }
 
 fn token(hash: &str, tenant: &str) -> SignalToken {
     SignalToken {
         id: uuid::Uuid::new_v4(),
+        kind: weft_core::signal_token::TokenKind::Caller,
         token_hash: hash.to_string(),
         recognizer: "wft-test-…".to_string(),
         tenant_id: tenant.to_string(),
@@ -314,7 +316,7 @@ fn token(hash: &str, tenant: &str) -> SignalToken {
         allowed_displays: vec![],
         all_displays: false,
         created_at: 0,
-        member: None,
+        instance: None,
         expires_at: None,
     }
 }

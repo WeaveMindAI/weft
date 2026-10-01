@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::Color;
+use crate::ExecutionId;
 
 // ----- Wake signals (unified trigger + suspension mechanism) ----------
 //
@@ -13,7 +13,7 @@ use crate::Color;
 // a node." When it fires, the dispatcher either spawns a fresh run
 // (entry path: `register_signal`) or resumes a paused firing (resume
 // path: `await_signal`). The kind doesn't know which; the
-// dispatcher's `RegisterRequest` and the journal's signal row carry
+// dispatcher's `PrepareRequest` and the journal's signal row carry
 // that lifecycle metadata.
 //
 // `SignalSpec` is the wire shape: `kind` is a string tag and
@@ -29,8 +29,8 @@ use crate::Color;
 // or match dispatch.
 
 /// A wake-signal instance ready to be registered. Per-kind config
-/// only; lifecycle metadata (entry vs resume, owning execution color)
-/// rides the dispatcher's `RegisterRequest`, not the spec.
+/// only; lifecycle metadata (entry vs resume, owning execution)
+/// rides the dispatcher's `PrepareRequest`, not the spec.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalSpec {
     /// Kind tag (e.g. `"route"`, `"timer"`). Matched against the
@@ -61,6 +61,16 @@ pub struct SignalSpec {
     /// everything.
     #[serde(default, rename = "match", skip_serializing_if = "Vec::is_empty")]
     pub match_predicates: Vec<crate::signal::Predicate>,
+    /// How often and how many at once outside callers may use this
+    /// entry, when it is on a public URL (`crate::signal::limits`).
+    /// Kind-independent like `match`: the dispatcher enforces it for
+    /// every public entry. Default = the language defaults.
+    #[serde(default, skip_serializing_if = "crate::signal::EntryLimits::is_default")]
+    pub limits: crate::signal::EntryLimits,
+    /// How long the executions this signal starts may run
+    /// (`crate::run_class`). Set by whatever registers the signal.
+    #[serde(default, rename = "runClass", alias = "run_class", skip_serializing_if = "crate::run_class::RunClass::is_default")]
+    pub run_class: crate::run_class::RunClass,
 }
 
 /// Preparing an entry captures it; waiting on a signal registers a live token.
@@ -83,6 +93,8 @@ impl SignalSpec {
             consumer_kind: None,
             access: None,
             match_predicates: Vec::new(),
+            limits: crate::signal::EntryLimits::default(),
+            run_class: crate::run_class::RunClass::default(),
         }
     }
 }
@@ -150,7 +162,7 @@ pub enum SignalSurface {
     /// Internal: no external HTTP surface at all. The signal fires
     /// from inside the listener (timer expires, SSE event arrives)
     /// and routes via a FireSignal broker task that a dispatcher
-    /// Pod picks up. Used by Timer and SSE.
+    /// process picks up. Used by Timer and SSE.
     Internal,
 }
 
@@ -197,7 +209,7 @@ impl SignalSurface {
 }
 
 /// Listener-computed routing + auth metadata returned from
-/// `/register`. The dispatcher copies these fields onto the
+/// `/prepare`. The dispatcher copies these fields onto the
 /// signal row.
 ///
 /// `auth_config` is a kind-specific JSON blob the dispatcher's
@@ -252,13 +264,13 @@ impl SignalRouting {
 #[cfg(feature = "runtime")]
 #[derive(Debug, Clone)]
 pub struct ExecutionSnapshot {
-    pub color: Color,
+    pub execution_id: ExecutionId,
     /// The immutable selection and supplied inputs recorded at birth.
     pub selection: Option<crate::project::selection::RunSelection>,
     pub program: Option<crate::project::hash::ProgramIdentity>,
     /// Chosen history includes bodies of zero-iteration loops, which have no
     /// firing record on which to store an origin.
-    pub inherited_origins: std::collections::BTreeMap<crate::frames::Located, Color>,
+    pub inherited_origins: std::collections::BTreeMap<crate::frames::Located, ExecutionId>,
     pub pulses: crate::pulse::PulseTable,
     pub executions: crate::exec::NodeExecutionTable,
     pub suspensions: HashMap<String, SuspensionInfo>,
@@ -544,7 +556,7 @@ pub struct KickedNode {
 pub struct LoopInstanceKey {
     pub group_id: String,
     pub parent_frames: crate::frames::LoopFrames,
-    pub color: Color,
+    pub execution_id: ExecutionId,
 }
 
 /// Why a stream ended: the wire vocabulary shared by the generator
@@ -574,7 +586,7 @@ pub enum LoopTerminationReason {
 }
 
 /// Which lifecycle phase this invocation belongs to. Three-runtime
-/// model: infra setup provisions long-lived resources (infra pods),
+/// model: infra setup provisions long-lived resources (infra processes),
 /// trigger setup captures settings for listeners, and fire runs the
 /// regular execution subgraph. Activation arms the captured listeners.
 ///

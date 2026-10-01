@@ -36,7 +36,7 @@ describe('recipe', () => {
 		expect(permissionSummary(oauth, ['mail', 'cal', 'drive', 'docs'])).toBe('Read mail, Calendar, Drive, ...');
 		expect(canDo(oauth, row({ scopes: ['mail'], permissions_verified: false }))).toBe('Read mail (claimed)');
 		expect(canDo(oauth, row({ owner: 'platform', has_credential: false }))).toContain('NO KEY');
-		expect(canDo(oauth, row({ owner: { member: 'ada' } }))).toBe('full access of its credential');
+		expect(canDo(oauth, row({ owner: { instance: 'ada' } }))).toBe('full access of its credential');
 	});
 
 	it('refuses a half-filled own app rather than ignoring the typed secret', () => {

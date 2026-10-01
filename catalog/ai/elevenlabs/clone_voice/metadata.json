@@ -55,5 +55,8 @@
       "type": "String",
       "description": "The minted voice's id: what the speak nodes take."
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

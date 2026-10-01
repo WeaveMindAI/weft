@@ -1,7 +1,7 @@
 {
   "type": "ChatHistoryAppend",
   "label": "Chat Message",
-  "description": "Append one message to a chat history (or start a new one when no history is wired). The history is a typed value any chat-capable AI node consumes and re-emits, so a conversation is built by chaining this node and the AI calls; media attachments ride inside messages as stored files. Role 'tool' feeds a tool call's result back (wire the call's id to toolCallId).",
+  "description": "Append one message to a conversation kept in a file (`historyFile`), in place: the same file an LLM node reads and adds its turns to, so a conversation is built by chaining this node and the AI calls on one file. With no file in, the message starts a new conversation file, kept past the run. Media attachments ride inside messages as stored files. Role 'tool' feeds a tool call's result back: in an agent's tool loop, set `role: \"tool\"`, wire the tool's result to `text`, the call's `id` to `toolCallId` and the loop's carried file to `historyFile`; this node's `historyFile` output is the loop's next carry.",
   "tags": [
     "ai",
     "chat",
@@ -13,10 +13,12 @@
   "color": "#7c6f9f",
   "inputs": [
     {
-      "name": "history",
-      "type": "ChatHistory",
-      "accepts": ["wire"],
-      "description": "The conversation so far. Unwired, this message starts a new history."
+      "name": "historyFile",
+      "type": "File",
+      "accepts": [
+        "wire"
+      ],
+      "description": "The conversation so far, kept in a stored file (an LLM node's or another Chat Message's `historyFile` output, or a file holding `[]`). The message is added to this same file, in place. Unwired, the message starts a new conversation file."
     },
     {
       "name": "role",
@@ -50,13 +52,14 @@
       "widget": { "kind": "checkbox" },
       "default": false,
       "label": "Cache up to here",
-      "description": "Mark this message as a prompt-cache breakpoint: everything up to and including it is cached by providers that support it, and the next call reuses it. Put the stable part of a conversation (persona, reference material) before the mark and the volatile part after. A history carrying any mark of its own turns the LLM node's automatic marks off."
+      "description": "Mark this message as a prompt-cache breakpoint: everything up to and including it is cached by providers that support it, and the next call reuses it. Put the stable part of a conversation (persona, reference material) before the mark and the volatile part after. A conversation carrying any mark of its own turns the LLM node's automatic marks off."
     }
   ],
   "outputs": [
     {
-      "name": "history",
-      "type": "ChatHistory"
+      "name": "historyFile",
+      "type": "File",
+      "description": "The conversation including this message: the file that came in (next version), or the new one this message started. Wire it into the next node's `historyFile`."
     }
   ],
   "features": {

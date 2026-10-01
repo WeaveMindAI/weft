@@ -4,15 +4,18 @@
 //! Flow (proven by hand during the live-caller feature):
 //!   1. Handshake: `/connect/<tenant>/{path}` on the dispatcher, any method. For a WebSocket the
 //!      response is `200 { "url": "...", "protocol": "websocket" }`; the URL is
-//!      a per-pod gateway URL carrying a signed routing token. For HTTP it is a
-//!      `307` whose `Location` is the same kind of URL.
-//!   2. Connect: open the URL. The gateway routes to the pinned worker pod. WS
-//!      clients must swap the `http(s)` scheme to `ws(s)`.
+//!      a live URL (`/live/<project>/...` on the front door) carrying a
+//!      signed routing ticket. For HTTP it is a `307` whose `Location` is the
+//!      same kind of URL.
+//!   2. Connect: open the URL. The dispatcher forwards it to one of the
+//!      project's workers. WS clients must swap the `http(s)` scheme to
+//!      `ws(s)`.
 //!   3. Exchange: send / receive messages (the data type is whatever the
 //!      trigger declared; JSON by default, so a text payload must be JSON).
 //!
-//! The handshake URL points at the gateway (port 9097), NOT the dispatcher, so
-//! these helpers hit absolute URLs.
+//! The handshake URL points at the front door (the install's configured
+//! base when the handshake came straight to the dispatcher's port), NOT
+//! the dispatcher, so these helpers hit absolute URLs.
 
 use anyhow::{bail, Context, Result};
 use futures::{SinkExt, StreamExt};
@@ -22,7 +25,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::client::Dispatcher;
 
-/// Perform the live-caller handshake for `mount_path` and return the per-pod
+/// Perform the live-caller handshake for `mount_path` and return the live
 /// connection URL (as the dispatcher hands it out, `http(s)://...`). The caller
 /// then connects via [`open_ws`] (WebSocket) or by streaming the URL (HTTP).
 pub async fn handshake(disp: &Dispatcher, mount_path: &str) -> Result<String> {
@@ -61,9 +64,16 @@ pub async fn open_ws(disp: &Dispatcher, mount_path: &str) -> Result<LiveWs> {
     let ws_url = http_url
         .replacen("https://", "wss://", 1)
         .replacen("http://", "ws://", 1);
-    let (stream, _resp) = tokio_tungstenite::connect_async(&ws_url)
-        .await
-        .with_context(|| format!("WebSocket connect to {ws_url}"))?;
+    let (stream, _resp) = match tokio_tungstenite::connect_async(&ws_url).await {
+        Ok(opened) => opened,
+        // A refused handshake carries the reason in its body: say it.
+        Err(tokio_tungstenite::tungstenite::Error::Http(refused)) => anyhow::bail!(
+            "WebSocket connect to {ws_url} answered {}: {}",
+            refused.status(),
+            refused.body().as_deref().map(String::from_utf8_lossy).unwrap_or_default()
+        ),
+        Err(e) => return Err(e).with_context(|| format!("WebSocket connect to {ws_url}")),
+    };
     Ok(LiveWs { stream })
 }
 
@@ -449,7 +459,7 @@ pub async fn http_json(
 /// Unlike the WebSocket path, the HTTP live connection is NOT a two-step
 /// handshake: the `/connect/{path}` request itself carries the caller's body
 /// and yields the response. The dispatcher answers with a `307` whose Location
-/// is the per-pod gateway URL; reqwest follows it, re-sending the POST body
+/// is the live URL; reqwest follows it, re-sending the POST body
 /// (307 preserves method + body), and the worker's responder reads the body,
 /// streams progress chunks, and sends a final body. We return the whole stream
 /// (chunks + final concatenated), so callers parse what they expect.

@@ -39,11 +39,11 @@ pub async fn data_source_id(
         several => {
             let names: Vec<&str> =
                 several.iter().filter_map(|s| s["name"].as_str()).collect();
-            weft::node_bail!(
+            Err(weft::WeftError::Input(format!(
                 "notion database {database} has several data sources ({}); pick one on \
                  the node's Source field",
                 names.join(", ")
-            )
+            )))
         }
     }
 }
@@ -71,7 +71,9 @@ pub fn paragraph_blocks(content: &str) -> Vec<Value> {
 pub fn children_of(content: Option<&str>, blocks: Option<&Value>) -> WeftResult<Vec<Value>> {
     if let Some(blocks) = blocks {
         let Some(list) = blocks.as_array() else {
-            weft::node_bail!("blocks must be a list of Notion block objects");
+            return Err(weft::WeftError::Input(
+                "blocks must be a list of Notion block objects".to_string(),
+            ));
         };
         if !list.is_empty() {
             return Ok(list.clone());
@@ -79,7 +81,9 @@ pub fn children_of(content: Option<&str>, blocks: Option<&Value>) -> WeftResult<
     }
     let paragraphs = content.map(paragraph_blocks).unwrap_or_default();
     if paragraphs.is_empty() {
-        weft::node_bail!("nothing to write: set content (plain text) or blocks");
+        return Err(weft::WeftError::Input(
+            "nothing to write: set content (plain text) or blocks".to_string(),
+        ));
     }
     Ok(paragraphs)
 }

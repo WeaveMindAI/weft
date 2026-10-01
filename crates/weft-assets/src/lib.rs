@@ -5,7 +5,8 @@
 //!
 //!   1. hash every referenced file (streamed; the content hash IS the asset's
 //!      identity and its storage id),
-//!   2. diff against the project's existing `asset/` keys,
+//!   2. ask which of those contents the tenant already stores, from any of
+//!      its projects,
 //!   3. upload the missing content without deleting older versions,
 //!   4. return the `path -> stored-file value` map the compiler substitutes
 //!      (see `weft_compiler::file_reader::AssetMode::Resolve`).
@@ -15,24 +16,27 @@
 //! resolve inline to url-form values).
 //!
 //! After resolving ALL file references, the driver publishes the complete
-//! set of [`referenced_asset_keys`] to storage. Current assets do not expire;
-//! removed ones receive the usual access-renewed TTL. Old executions keep
-//! their original keys and may read those files until they expire.
+//! set of [`referenced_asset_keys`] to storage. An asset some project of the
+//! tenant references does not expire; one nothing references any more
+//! receives the usual access-renewed TTL. Old executions keep their original
+//! keys and may read those files until they expire.
 //!
 //! I/O is behind two traits so the sync's orchestration is contract-testable
 //! with fakes: [`AssetSource`] (where the project's files live) and
-//! [`AssetStore`] (the project's asset plane in runtime storage).
+//! [`AssetStore`] (the tenant's assets in runtime storage).
 //!
 //! The hash-diff-upload core is [`publish_hashed`], and it is not only
 //! the asset sync's: a version snapshot (`weft checkpoint`, every `weft
 //! run`) publishes the project's files through [`publish_files`] into
 //! the same content-addressed plane, so a file identical to one any
-//! earlier version held costs nothing to record again.
+//! version of any of the tenant's projects held costs nothing to record
+//! again, and neither does the standard library the install preloads.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Seek};
 
 use anyhow::{bail, Context, Result};
+use futures::{StreamExt, TryStreamExt};
 use sha2::Digest;
 use weft_core::project::{FileRef, ProjectDefinition};
 use weft_core::storage::{FileHandle, StoredFile};
@@ -60,11 +64,13 @@ pub trait AssetSource: Send + Sync {
     fn snapshot(&self, path: &str) -> Result<Box<dyn AssetReader>>;
 }
 
-/// The project's asset plane in runtime storage.
+/// The tenant's assets in runtime storage: one file per content, whichever
+/// of the tenant's projects stored it.
 #[async_trait::async_trait]
 pub trait AssetStore: Send + Sync {
-    /// Every existing asset of the project: `content hash -> full storage key`.
-    async fn list(&self) -> Result<BTreeMap<String, String>>;
+    /// Which of `hashes` the tenant already stores whole: `content hash ->
+    /// full storage key`.
+    async fn held(&self, hashes: &[String]) -> Result<BTreeMap<String, String>>;
     /// Upload one asset's bytes under its content hash. MUST be idempotent
     /// for an already-ACTIVE identical hash (same content = same asset),
     /// and MUST error for anything else.
@@ -81,12 +87,11 @@ pub trait AssetStore: Send + Sync {
     ) -> Result<String>;
 }
 
-/// This project's uploaded files used by the resolved definition, including
-/// nested file values and files selected by stored key instead of disk path.
+/// The tenant's assets the resolved definition uses, including nested file
+/// values and files selected by stored key instead of disk path.
 /// Execution/project/shared files keep their own lifetime rules.
 pub fn referenced_asset_keys(project: &ProjectDefinition) -> Result<Vec<String>> {
     let mut keys = BTreeSet::new();
-    let project_id = project.id.to_string();
     for node in &project.nodes {
         for port in &node.inputs {
             let Some(value) = node.written_value(&port.name).or(port.default.as_ref()) else { continue };
@@ -95,7 +100,7 @@ pub fn referenced_asset_keys(project: &ProjectDefinition) -> Result<Vec<String>>
                     classify_media_slot(&slot).map_err(anyhow::Error::msg)?
                 {
                     let parsed = parse_key(&key).map_err(anyhow::Error::msg)?;
-                    if matches!(parsed.scope, KeyScope::Asset { project_id: owner } if owner == project_id) {
+                    if parsed.scope == KeyScope::Asset {
                         keys.insert(key);
                     }
                 }
@@ -201,35 +206,52 @@ pub async fn publish_hashed(
     source: &dyn AssetSource,
     store: &dyn AssetStore,
 ) -> Result<BTreeMap<String, String>> {
-    // 1. Diff against what the store already holds.
-    let existing = store.list().await.context("list existing assets")?;
+    // 1. Diff against what the tenant already stores.
+    let hashes: Vec<String> = hashed.iter().map(|f| f.hash.clone()).collect::<BTreeSet<_>>().into_iter().collect();
+    let existing = store.held(&hashes).await.context("ask which contents are already stored")?;
 
-    // 2. Verify each missing file's snapshot against the earlier hash,
-    //    then rewind and upload those exact bytes. Record every key.
+    // 2. Upload each missing content once (two paths with identical
+    //    bytes share one upload), up to UPLOADS_IN_FLIGHT at a time. Each
+    //    upload verifies its snapshot against the earlier hash, then
+    //    rewinds and sends those exact bytes. Record every key.
     let mut keys: BTreeMap<String, String> = BTreeMap::new();
-    for HashedFile { path, hash, size, mime } in hashed {
-        if let Some(key) = existing.get(hash.as_str()) {
-            keys.insert(hash.clone(), key.clone());
-            continue;
+    let mut missing: BTreeMap<&str, &HashedFile> = BTreeMap::new();
+    for file in hashed {
+        match existing.get(file.hash.as_str()) {
+            Some(key) => {
+                keys.insert(file.hash.clone(), key.clone());
+            }
+            None => {
+                missing.entry(file.hash.as_str()).or_insert(file);
+            }
         }
-        if keys.contains_key(hash.as_str()) {
-            continue; // two paths, identical bytes: already uploaded this pass
-        }
-        let mut reader = source
-            .snapshot(path)
-            .with_context(|| format!("snapshot {path} for upload"))?;
-        let (actual_hash, actual_size) = hash_reader(&mut reader)?;
-        anyhow::ensure!(actual_hash == *hash && actual_size == *size,
-            "{path} changed while it was being published; rerun the command");
-        reader.rewind().with_context(|| format!("rewind verified snapshot of {path}"))?;
-        let uploaded = store
-            .upload(hash, mime, path, *size, reader.as_mut())
-            .await
-            .with_context(|| format!("upload {path}"))?;
-        keys.insert(hash.clone(), uploaded);
     }
+    let uploaded: Vec<(String, String)> = futures::stream::iter(missing.into_values())
+        .map(|HashedFile { path, hash, size, mime }| async move {
+            let mut reader = source
+                .snapshot(path)
+                .with_context(|| format!("snapshot {path} for upload"))?;
+            let (actual_hash, actual_size) = hash_reader(&mut reader)?;
+            anyhow::ensure!(actual_hash == *hash && actual_size == *size,
+                "{path} changed while it was being published; rerun the command");
+            reader.rewind().with_context(|| format!("rewind verified snapshot of {path}"))?;
+            let key = store
+                .upload(hash, mime, path, *size, reader.as_mut())
+                .await
+                .with_context(|| format!("upload {path}"))?;
+            Ok::<_, anyhow::Error>((hash.clone(), key))
+        })
+        .buffer_unordered(UPLOADS_IN_FLIGHT)
+        .try_collect()
+        .await?;
+    keys.extend(uploaded);
     Ok(keys)
 }
+
+/// How many uploads [`publish_hashed`] keeps in flight. A version holds
+/// hundreds of small files (its `nodes/base_catalog/` included), so one
+/// at a time spends the whole publish on round trips.
+const UPLOADS_IN_FLIGHT: usize = 16;
 
 /// Publish every file in `paths` and answer where each one landed:
 /// `path -> Published { hash, key }`. [`hash_files`] then
@@ -318,6 +340,8 @@ pub async fn sync_assets(
             mime_type: h.mime.clone(),
             size_bytes: h.size,
             filename: r.path.clone(),
+            // An asset is addressed by its content and never replaced.
+            version: weft_core::storage::FIRST_FILE_VERSION,
         };
         map.insert(r.resolution_key(), weft_core::storage::typed_file_value(&file, &r.ty));
     }

@@ -7,8 +7,10 @@ description: "Read when the user asks about connections, API keys, sign-ins, per
 
 A [connection] is an account hooked up to an outside service: an OAuth
 sign-in, a pasted API key, a mail server login, all one concept. The
-runtime's access store holds the secret; the project's source holds only a
-bare id, so a credential never reaches git history. What flows through
+runtime's access store holds the secret, and the install keeps which
+connection each [access node] uses (its pick); the project's source holds
+neither, so a credential never reaches git history and each install (this
+machine, a cloud one) keeps picks of its own. What flows through
 the graph is an `Access` value, a sealed handle that resolves to the
 signed-in client when a node fires, never a secret.
 
@@ -41,9 +43,13 @@ interactive menus: first the project's [access node]s (including nodes
 inside `@include`d files; each file is one target, and `--node` takes a
 bare id or `file.weft:node` when the id is ambiguous), then the [door]s: paste a key (hidden input), browser
 sign-in (URL printed, polled), the one-click shared app, `--mint` for a
-created own app. A pick is written into the `.weft` source through the
-compiler's structural edit, exactly as the editor writes it, so it
-survives and diffs like any edit.
+created own app. A pick is kept by the install, per place of the node (a
+file included twice gives its node two places, each picked on its own),
+never written into the `.weft` source: a connection's id means nothing on
+another install, so `--on <target>` picks for that one. A connection
+written in the source (`account: {"id": ...}`, an older weft's way) is
+refused by the build and by `weft connect`: the line is erased and the node
+connected again.
 
 The flags you run:
 
@@ -51,15 +57,13 @@ The flags you run:
   [access node]s with their stored connections (the picked one marked);
   outside a project, or in one with no [access node], every stored
   [connection] across all services.
-- `--node <id> --grant <grant>` picks a stored [connection]; no secrets
-  travel. It edits the `.weft` source and prints the edit as an edit tool
-  would (`main.weft:15`, then `- old` and `+ new` lines). You read that
-  block and update your picture of the file: the node's braces now carry
-  the pick, and your next edit of that node builds on the printed line.
-  `--disconnect` prints the same block for the removal.
-- `--forget <id>` deletes a stored [connection] and clears every node in
-  the current project that pointed at it (under `--json` it reports
-  `{"forgot": ..., "cleared": [...]}`; declining reports
+- `--node <id> --grant <grant>` picks a stored [connection] on this
+  install; no secrets travel and no file changes. A live trigger that
+  reads the node is set up again with it, and the answer names it.
+  `--disconnect` forgets the pick.
+- `--forget <id>` deletes a stored [connection] and every pick of it
+  goes with it (under `--json` it reports the current project's places
+  that lose their pick: `{"forgot": ..., "cleared": [...]}`; declining reports
   `{"forgot": null, "cleared": []}`). `--upgrade` manages the rest.
 - `--json` works with the flag-driven actions only; the interactive
   walkthrough refuses it. Prompts print to stderr, and any non-interactive

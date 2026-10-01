@@ -75,8 +75,8 @@ nothing else, which is what lets one meter work identically on a pasted key and
 on a sign-in.
 
 Each record also says whose credential paid. For what each value means and how
-to read one member's costs, go and read
-[who paid for a call](../running/members.md#who-paid-for-a-call).
+to read one instance's costs, go and read
+[who paid for a call](../running/instances.md#who-paid-for-a-call).
 
 ## Where the number surfaces
 

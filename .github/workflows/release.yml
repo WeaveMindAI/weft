@@ -1,12 +1,12 @@
 # Publish everything a `./setup.sh` can consume, on every push to the release
 # branch:
 #
-#   - the four system images, worker builder-base and full-library worker, pushed to ghcr under
+#   - the runtime image and the worker builder base, pushed to ghcr under
 #     their content-addressed tags (the SAME tags a local install computes, so
 #     a clean checkout pulls instead of compiling; any local edit changes the
 #     hash and builds locally), one native build per architecture stitched
 #     into a multi-arch tag,
-#   - CLI binaries and the .vsix, attached to the rolling `latest`
+#   - CLI and runtime binaries and the .vsix, attached to the rolling `latest`
 #     release with a manifest.json naming the exact commit and a sha256 per
 #     asset (setup.sh downloads them when its checkout matches); the browser
 #     zips ride along as the record of what went to the stores and for
@@ -64,7 +64,7 @@ jobs:
   # content-addressed tag. The tag itself hashes source content only, so
   # both legs compute the identical ref (the stitch job verifies it).
   images:
-    name: system images + builder base (${{ matrix.arch }})
+    name: runtime image + builder base (${{ matrix.arch }})
     needs: [ci]
     strategy:
       # One architecture failing must not kill the other's build
@@ -194,12 +194,25 @@ jobs:
       # third-party toolchain action).
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo build --release --locked -p weft-cli
-      - run: cp target/release/weft "${{ matrix.asset }}"
+      # The CLI and the runtime it installs, side by side: a local
+      # install runs `weft-runtime` as a process next to `weft`.
+      # SYNC: the runtime asset name (weft- -> weft-runtime-) <-> setup.sh
+      #       (prebuilt artifacts block: runtime_asset)
+      - run: cargo build --release --locked -p weft-cli -p weft-runtime
+      - run: |
+          cp target/release/weft "${{ matrix.asset }}"
+          runtime_asset="${{ matrix.asset }}"
+          cp target/release/weft-runtime "weft-runtime-${runtime_asset#weft-}"
+          echo "RUNTIME_ASSET=weft-runtime-${runtime_asset#weft-}" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.RUNTIME_ASSET }}
+          path: ${{ env.RUNTIME_ASSET }}
           if-no-files-found: error
 
   # ---- VS Code extension ----------------------------------------------

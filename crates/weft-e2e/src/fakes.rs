@@ -1,27 +1,21 @@
 //! Throwaway servers for triggers the system dials OUT to.
 //!
-//! `PollEndpoint`, `SseSubscribe`, and `SocketListen` are processed by the
-//! LISTENER pod inside the kind cluster: the pod reaches out to a URL and fires
-//! per event. To test them, the rig stands up a tiny server the listener can
-//! connect to, then drives events from the test.
+//! `PollFake` and `SseFake` serve the `PollEndpoint` and `SseSubscribe`
+//! kinds, which the LISTENER dials, and it runs in the install's runtime
+//! process on the host; the other fakes are dialled by node code in a
+//! WORKER container. To test them, the
+//! rig stands up a tiny server both can connect to, then drives events from
+//! the test.
 //!
-//! ## Cluster reachability (the load-bearing detail)
+//! ## Reachability
 //!
-//! A server bound on the test host's `127.0.0.1` is NOT reachable from a pod:
-//! a pod's default route is the pod network, and `host.docker.internal` does
-//! not resolve in kind. The reachable path is the kind node container's
-//! host-gateway IP on the docker bridge (e.g. `172.19.0.1`), which a pod CAN
-//! reach (verified). So a fake:
+//! A server bound on the test host's `127.0.0.1` is NOT reachable from a
+//! container. The address both sides reach is the gateway of the install's
+//! Docker network (`weft`): the host owns that address, and every worker
+//! sits on that network. So a fake:
 //!   - binds on `0.0.0.0:<port>` on the host, and
-//!   - advertises its URL as `http://<gateway-ip>:<port>` (the cluster-reachable
-//!     address), which the test injects into the fixture's trigger URL.
-//!
-//! The tenant pod egress policy is `0.0.0.0/0 except {pod_cidr, service_cidr}`,
-//! so a WORKER reaches the host gateway freely. The pooled LISTENER's
-//! egress excludes every private range (user-typed watch URLs reach the
-//! public internet only); it reaches the host gateway through the one
-//! opened CIDR (`WEFT_LISTENER_ALLOW_CIDR`, defaulted to the gateway on
-//! a local kind cluster by the daemon).
+//!   - advertises its URL as `http://<gateway-ip>:<port>`, which the test
+//!     injects into the fixture's trigger URL.
 
 use std::sync::Arc;
 
@@ -47,12 +41,12 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Bind a fake's listener: discover the cluster-reachable host-gateway IP, bind
+/// Bind a fake's listener: discover the host's address on the network, bind
 /// `0.0.0.0:<ephemeral>` on the host, and return the gateway IP, the bound
 /// listener, and the chosen port. The single place the bind + gateway dance
 /// lives, so the four fakes don't each restate it.
 async fn bind_host(what: &str) -> Result<(String, TcpListener, u16)> {
-    let gateway = cluster_host_gateway().await?;
+    let gateway = host_address().await?;
     let listener = TcpListener::bind(("0.0.0.0", 0))
         .await
         .with_context(|| format!("bind {what} fake"))?;
@@ -69,42 +63,19 @@ fn serve_axum(listener: TcpListener, app: Router) -> AbortOnDrop {
     }))
 }
 
-/// The kind node container's host-gateway IP, discovered from docker. This is
-/// the address a pod uses to reach a server bound on the host. Resolved once;
-/// the cluster name follows the daemon's default (`weft-local`) unless
-/// `WEFT_CLUSTER_NAME` overrides it.
-pub async fn cluster_host_gateway() -> Result<String> {
-    // The docker container the cluster node runs in. KIND names it
-    // `<cluster>-control-plane` (the default below); a minikube docker-driver
-    // node IS the profile name, so a minikube-based harness sets
-    // `WEFT_CLUSTER_NODE_CONTAINER=<profile>` directly. Either way we inspect
-    // the node container's docker-bridge gateway, which its pods can reach.
-    let node = std::env::var("WEFT_CLUSTER_NODE_CONTAINER").unwrap_or_else(|_| {
-        let cluster =
-            std::env::var("WEFT_CLUSTER_NAME").unwrap_or_else(|_| "weft-local".to_string());
-        format!("{cluster}-control-plane")
-    });
-    let out = tokio::process::Command::new("docker")
-        .args([
-            "inspect",
-            &node,
-            "--format",
-            "{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}",
-        ])
-        .output()
-        .await
-        .context("docker inspect for kind node gateway")?;
+/// The gateway of the install's Docker network: the host's own address on
+/// that network, which the runtime and every worker reach.
+pub async fn host_address() -> Result<String> {
+    let args = ["network", "inspect", weft_platform_local::docker::NETWORK, "--format", "{{range .IPAM.Config}}{{.Gateway}}{{end}}"];
+    let out = tokio::process::Command::new("docker").args(args).output().await.context("spawn docker")?;
     if !out.status.success() {
-        bail!(
-            "docker inspect {node} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        bail!("docker {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr));
     }
-    let gw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if gw.is_empty() {
-        bail!("could not determine host-gateway IP for kind node {node}");
+    let ip = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if ip.is_empty() {
+        bail!("the install's Docker network has no gateway; is the install up?");
     }
-    Ok(gw)
+    Ok(ip)
 }
 
 /// A fake HTTP endpoint the listener POLLS (`PollEndpoint`). Each poll returns
@@ -117,7 +88,7 @@ pub struct PollFake {
 
 impl PollFake {
     /// Bind a poll fake on an ephemeral host port and return it. `base_url` is
-    /// the cluster-reachable URL to put in the fixture's `PollEndpoint.url`.
+    /// the reachable URL to put in the fixture's `PollEndpoint.url`.
     pub async fn start(initial_body: &str) -> Result<Self> {
         let body = Arc::new(Mutex::new(initial_body.to_string()));
         let (gateway, listener, port) = bind_host("poll").await?;
@@ -131,7 +102,7 @@ impl PollFake {
         })
     }
 
-    /// The cluster-reachable URL of the poll endpoint (`<base>/poll`).
+    /// The reachable URL of the poll endpoint (`<base>/poll`).
     pub fn url(&self) -> String {
         format!("{}/poll", self.base_url)
     }
@@ -149,8 +120,8 @@ async fn poll_handler(State(body): State<Arc<Mutex<String>>>) -> impl IntoRespon
 
 /// A fake HTTP server that serves fixed bytes at `/bytes`. Used by the storage
 /// fixture: a FetchToStorage node fetches FROM here, so the rig controls the
-/// exact content it can then download back and assert. Cluster-reachable like
-/// the other fakes (bound on the host, advertised at the kind host-gateway IP).
+/// exact content it can then download back and assert. Reachable like
+/// the other fakes (bound on the host, advertised at the host's address on the network).
 pub struct BytesFake {
     base_url: String,
     served: Arc<std::sync::atomic::AtomicUsize>,
@@ -180,7 +151,7 @@ impl BytesFake {
         })
     }
 
-    /// The cluster-reachable URL of the served bytes (`<base>/bytes`).
+    /// The reachable URL of the served bytes (`<base>/bytes`).
     pub fn url(&self) -> String {
         format!("{}/bytes", self.base_url)
     }
@@ -241,7 +212,7 @@ impl QueueFake {
         })
     }
 
-    /// The cluster-reachable base a connection's stored base points at.
+    /// The reachable base a connection's stored base points at.
     pub fn base(&self) -> String {
         self.base_url.clone()
     }
@@ -330,7 +301,7 @@ impl HangingBytesFake {
         })
     }
 
-    /// The cluster-reachable URL of the served (truncated) bytes.
+    /// The reachable URL of the served (truncated) bytes.
     pub fn url(&self) -> String {
         format!("{}/bytes", self.base_url)
     }
@@ -408,7 +379,7 @@ impl SseFake {
         })
     }
 
-    /// The cluster-reachable SSE URL.
+    /// The reachable SSE URL.
     pub fn url(&self) -> String {
         format!("{}/events", self.base_url)
     }
@@ -428,10 +399,8 @@ impl SseFake {
     /// reading (or the deadline elapses, which is a real failure: the
     /// expected connection(s) never armed). Call before `push_event` so the
     /// event is never pushed before the connection(s) the test depends on
-    /// are reading. `n = 1` is the normal single-holder case; `n = 2` is
-    /// the move-overlap case (the test needs BOTH the old and new pod
-    /// reading so the generation fence is actually exercised by one event
-    /// reaching both).
+    /// are reading. `n = 1` is the normal case; a test with several
+    /// subscriptions on one feed waits for all of them.
     pub async fn wait_for_subscribers(
         &self,
         n: usize,
@@ -439,16 +408,15 @@ impl SseFake {
     ) -> Result<()> {
         // The count must reach `n` AND HOLD there for a short window before we
         // call it ready. The reading-count is a scalar (it can't tell which
-        // pod each connection belongs to), and a listener's SSE client briefly
+        // subscription each connection belongs to), and a listener's SSE client briefly
         // holds TWO connections while it reconnects (old not yet dropped, new
-        // already reading). For n >= 2 that transient could let ONE pod's
-        // reconnect satisfy the count while the OTHER pod isn't reading yet, so
+        // already reading). For n >= 2 that transient could let ONE
+        // subscription's reconnect satisfy the count while another isn't reading yet, so
         // a single observation of `>= n` is not enough. A reconnect blip
         // collapses back within ~1-2s (the old connection drops), whereas a
         // genuine set of `n` distinct readers stays put, so requiring the count
         // to stay `>= n` continuously across `STABLE_FOR` rules out the blip
-        // without needing per-pod identity (which the host-gateway NAT hides:
-        // every pod's traffic arrives from the one kind-node bridge address).
+        // without needing per-connection identity.
         const STABLE_FOR: std::time::Duration = std::time::Duration::from_secs(3);
         const POLL: std::time::Duration = std::time::Duration::from_millis(100);
         let start = std::time::Instant::now();
@@ -507,7 +475,7 @@ async fn sse_handler(State(state): State<SseState>) -> impl IntoResponse {
     let rx = state.tx.subscribe();
     // RAII: increment the reading-count when this connection's stream
     // starts being consumed, decrement when it is dropped (connection
-    // closed / pod reaped). `wait_for_subscribers` waits on this count.
+    // closed / listener gone). `wait_for_subscribers` waits on this count.
     struct ReadingGuard(Arc<std::sync::atomic::AtomicUsize>);
     impl Drop for ReadingGuard {
         fn drop(&mut self) {
@@ -546,117 +514,3 @@ async fn sse_handler(State(state): State<SseState>) -> impl IntoResponse {
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-
-/// A fake WebSocket gateway the listener DIALS (`SocketListen`). The listener
-/// connects, sends its configured handshake frame, and the fake can push
-/// frames back (each fires the listener's signal). Inbound frames (the
-/// handshake + heartbeats) are recorded so a test can assert the listener spoke
-/// the configured protocol.
-pub struct SocketFake {
-    base_url: String,
-    /// Frames the test wants pushed to the next connected client, drained in
-    /// order as the connection accepts them.
-    outbound: Arc<Mutex<Vec<String>>>,
-    /// Frames received from the listener (handshake, heartbeats), in order.
-    inbound: Arc<Mutex<Vec<String>>>,
-    _server: AbortOnDrop,
-}
-
-impl SocketFake {
-    /// Bind a WS fake. `ws_url()` goes in `SocketListen.url`.
-    pub async fn start() -> Result<Self> {
-        let outbound: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let inbound: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let (gateway, listener, port) = bind_host("socket").await?;
-        let out_c = outbound.clone();
-        let in_c = inbound.clone();
-        let server = AbortOnDrop(tokio::spawn(async move {
-            // Spawn each connection into a JoinSet OWNED by this task, so when
-            // the fake drops (AbortOnDrop aborts this task) the JoinSet is
-            // dropped too, which aborts every per-connection task. Spawning them
-            // detached (bare tokio::spawn) would leak any connection still open
-            // at drop, breaking the "AbortOnDrop tears down all it spawned"
-            // invariant. We `select!` between accepting and reaping completions
-            // so finished connection tasks are drained from the set as they end,
-            // rather than piling up for the life of the fake (a JoinSet only
-            // frees a task's slot when it is joined, not when it completes).
-            let mut conns = tokio::task::JoinSet::new();
-            loop {
-                tokio::select! {
-                    accepted = listener.accept() => {
-                        let Ok((stream, _peer)) = accepted else { break };
-                        let out_c = out_c.clone();
-                        let in_c = in_c.clone();
-                        conns.spawn(async move {
-                            let Ok(ws) = tokio_tungstenite::accept_async(stream).await else {
-                                return;
-                            };
-                            serve_socket(ws, out_c, in_c).await;
-                        });
-                    }
-                    // Reap a finished connection task. `join_next` is `None` only
-                    // when the set is empty; that branch then parks (the accept
-                    // arm drives progress), so this never busy-spins.
-                    Some(_) = conns.join_next() => {}
-                }
-            }
-        }));
-        Ok(Self {
-            base_url: format!("ws://{gateway}:{port}"),
-            outbound,
-            inbound,
-            _server: server,
-        })
-    }
-
-    /// The cluster-reachable `ws://` URL.
-    pub fn ws_url(&self) -> String {
-        format!("{}/socket", self.base_url)
-    }
-
-    /// Queue a text frame to push to the connected listener (fires its signal).
-    pub async fn push_frame(&self, text: &str) {
-        self.outbound.lock().await.push(text.to_string());
-    }
-
-    /// The frames the listener has sent us so far (handshake, heartbeats).
-    pub async fn received(&self) -> Vec<String> {
-        self.inbound.lock().await.clone()
-    }
-}
-
-/// Drive one accepted WS connection: record inbound text frames, and push any
-/// queued outbound frames. Runs until the socket closes.
-async fn serve_socket(
-    mut ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-    outbound: Arc<Mutex<Vec<String>>>,
-    inbound: Arc<Mutex<Vec<String>>>,
-) {
-    use futures::{SinkExt, StreamExt};
-    use tokio_tungstenite::tungstenite::Message;
-    loop {
-        // Push any queued frames first so a test that queued before connect
-        // still delivers.
-        let pending: Vec<String> = {
-            let mut q = outbound.lock().await;
-            std::mem::take(&mut *q)
-        };
-        for frame in pending {
-            if ws.send(Message::Text(frame)).await.is_err() {
-                return;
-            }
-        }
-        // Then wait briefly for an inbound frame; loop to keep draining the
-        // outbound queue as the test pushes more.
-        match tokio::time::timeout(std::time::Duration::from_millis(100), ws.next()).await {
-            Ok(Some(Ok(Message::Text(t)))) => inbound.lock().await.push(t.to_string()),
-            Ok(Some(Ok(Message::Binary(b)))) => {
-                inbound.lock().await.push(String::from_utf8_lossy(&b).into_owned())
-            }
-            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => return,
-            Ok(Some(Ok(_))) => {} // ping/pong/other: ignore
-            Ok(Some(Err(_))) => return,
-            Err(_) => {} // timeout: loop to drain outbound again
-        }
-    }
-}

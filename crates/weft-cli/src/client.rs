@@ -1,33 +1,99 @@
 //! Thin HTTP client against the dispatcher.
 
+use std::sync::{Arc, RwLock};
+
 use anyhow::Context;
+
+/// In an error's chain when the store refused because the upload is being
+/// completed by another caller right now
+/// ([`weft_core::storage::COMPLETING_HEADER`]): the file is about to land.
+#[derive(Debug)]
+pub struct StoreCompleting;
+
+impl std::fmt::Display for StoreCompleting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the upload is being completed by another caller")
+    }
+}
+
+impl std::error::Error for StoreCompleting {}
 
 #[derive(Clone)]
 pub struct DispatcherClient {
     base: String,
+    /// The bearer every request carries: the operator key, when this
+    /// person holds one for the install (see `crate::credentials`; the
+    /// local install needs none), or an instance token (`with_bearer`).
+    /// Shared by every clone, so `replace_bearer` reaches all of them:
+    /// that is how a command outlives one instance token.
+    bearer: Option<Arc<RwLock<String>>>,
     http: reqwest::Client,
 }
 
 impl DispatcherClient {
-    pub fn new(base: impl Into<String>) -> Self {
-        Self { base: base.into(), http: reqwest::Client::new() }
+    pub fn new(base: impl Into<String>, operator_key: Option<String>) -> Self {
+        Self { base: base.into(), bearer: operator_key.map(|key| Arc::new(RwLock::new(key))), http: reqwest::Client::new() }
     }
 
     /// The same dispatcher, with every request carrying `token` as its
-    /// bearer: how the CLI speaks at a door that answers to a token
-    /// rather than to the local operator (the member door).
-    pub fn with_bearer(&self, token: &str) -> anyhow::Result<Self> {
-        let mut headers = reqwest::header::HeaderMap::new();
-        let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-            .context("the token is not a valid header value")?;
-        value.set_sensitive(true);
-        headers.insert(reqwest::header::AUTHORIZATION, value);
-        let http = reqwest::Client::builder().default_headers(headers).build().context("build the HTTP client")?;
-        Ok(Self { base: self.base.clone(), http })
+    /// bearer in place of the operator key: how the CLI speaks at a door
+    /// that answers to a token rather than to the operator (the
+    /// instance door).
+    pub fn with_bearer(&self, token: &str) -> Self {
+        Self::new(self.base.clone(), Some(token.to_string()))
+    }
+
+    /// Swap the bearer this client and every clone of it carry from the
+    /// next request on (a renewed instance token). A client built with
+    /// no bearer has nothing to swap, which is a caller bug.
+    pub fn replace_bearer(&self, token: &str) -> anyhow::Result<()> {
+        let cell = self.bearer.as_ref().context("this client carries no bearer to replace")?;
+        *cell.write().map_err(|_| anyhow::anyhow!("the bearer lock was poisoned"))? = token.to_string();
+        Ok(())
+    }
+
+    fn current_bearer(&self) -> anyhow::Result<Option<String>> {
+        self.bearer
+            .as_ref()
+            .map(|cell| cell.read().map(|key| key.clone()).map_err(|_| anyhow::anyhow!("the bearer lock was poisoned")))
+            .transpose()
     }
 
     pub fn base(&self) -> &str {
         &self.base
+    }
+
+    /// A live-updates (SSE) stream at `path` on this install, carrying
+    /// the same bearer as every other request. The SSE library owns its
+    /// own connection, so this is the one door out of this client that
+    /// is not `send`, and it still cannot leave without the key.
+    pub fn event_stream(&self, path: &str) -> anyhow::Result<eventsource_client::ClientBuilder> {
+        let url = format!("{}{}", self.base, path);
+        let builder = eventsource_client::ClientBuilder::for_url(&url).context("build sse client")?;
+        match self.current_bearer()? {
+            Some(key) => builder.header("Authorization", &format!("Bearer {key}")).context("build sse client"),
+            None => Ok(builder),
+        }
+    }
+
+    /// Every request to the install goes out here, so none can leave
+    /// without the key: the inner `reqwest::Client` is touched nowhere
+    /// else, and every public verb is a thin reading of this response.
+    async fn send(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> anyhow::Result<reqwest::Response> {
+        let url = format!("{}{}", self.base, path);
+        let mut builder = self.http.request(method.clone(), &url);
+        if let Some(key) = self.current_bearer()? {
+            builder = builder.bearer_auth(key);
+        }
+        if let Some(body) = body {
+            builder = builder.json(body);
+        }
+        builder.send().await.with_context(|| format!("{method} {url}"))
     }
 
     /// The ONE place any client method turns an HTTP failure into an
@@ -43,18 +109,19 @@ impl DispatcherClient {
         if status.is_success() {
             return Ok(resp);
         }
+        let completing = status == reqwest::StatusCode::CONFLICT
+            && resp.headers().contains_key(weft_core::storage::COMPLETING_HEADER);
         let body = resp.text().await.unwrap_or_default();
         let msg = body.trim();
-        anyhow::bail!(if msg.is_empty() {
-            format!("dispatcher returned {status}")
-        } else {
-            msg.to_string()
-        });
+        let msg = if msg.is_empty() { format!("dispatcher returned {status}") } else { msg.to_string() };
+        if completing {
+            return Err(anyhow::Error::new(StoreCompleting).context(msg));
+        }
+        anyhow::bail!(msg)
     }
 
     pub async fn get_json(&self, path: &str) -> anyhow::Result<serde_json::Value> {
-        let url = format!("{}{}", self.base, path);
-        let resp = self.http.get(&url).send().await.with_context(|| format!("GET {url}"))?;
+        let resp = self.send(reqwest::Method::GET, path, None).await?;
         Self::check(resp).await?.json().await.context("parse response")
     }
 
@@ -65,8 +132,7 @@ impl DispatcherClient {
     /// the route) still fails loudly through `check`, so a missing
     /// route can never read as "not registered yet".
     pub async fn get_json_if_found(&self, path: &str) -> anyhow::Result<Option<serde_json::Value>> {
-        let url = format!("{}{}", self.base, path);
-        let resp = self.http.get(&url).send().await.with_context(|| format!("GET {url}"))?;
+        let resp = self.send(reqwest::Method::GET, path, None).await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND
             && resp.headers().contains_key("x-weft-not-found")
         {
@@ -76,14 +142,12 @@ impl DispatcherClient {
     }
 
     pub async fn post_json(&self, path: &str, body: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
-        let url = format!("{}{}", self.base, path);
-        let resp = self.http.post(&url).json(body).send().await.with_context(|| format!("POST {url}"))?;
+        let resp = self.send(reqwest::Method::POST, path, Some(body)).await?;
         Self::check(resp).await?.json().await.context("parse response")
     }
 
     pub async fn delete(&self, path: &str) -> anyhow::Result<()> {
-        let url = format!("{}{}", self.base, path);
-        let resp = self.http.delete(&url).send().await.with_context(|| format!("DELETE {url}"))?;
+        let resp = self.send(reqwest::Method::DELETE, path, None).await?;
         Self::check(resp).await?;
         Ok(())
     }
@@ -94,8 +158,7 @@ impl DispatcherClient {
     /// end state. Makes a retried delete (whose first response was lost) land on
     /// success instead of a confusing 404. Any other error stays loud.
     pub async fn delete_idempotent(&self, path: &str) -> anyhow::Result<()> {
-        let url = format!("{}{}", self.base, path);
-        let resp = self.http.delete(&url).send().await.with_context(|| format!("DELETE {url}"))?;
+        let resp = self.send(reqwest::Method::DELETE, path, None).await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND
             && resp.headers().contains_key("x-weft-not-found")
         {
@@ -106,31 +169,27 @@ impl DispatcherClient {
     }
 
     pub async fn post_empty(&self, path: &str) -> anyhow::Result<()> {
-        let url = format!("{}{}", self.base, path);
-        let resp = self.http.post(&url).send().await.with_context(|| format!("POST {url}"))?;
+        let resp = self.send(reqwest::Method::POST, path, None).await?;
         Self::check(resp).await?;
         Ok(())
     }
 
     /// PUT with a JSON body, returning JSON.
     pub async fn put_json(&self, path: &str, body: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
-        let url = format!("{}{}", self.base, path);
-        let resp = self.http.put(&url).json(body).send().await.with_context(|| format!("PUT {url}"))?;
+        let resp = self.send(reqwest::Method::PUT, path, Some(body)).await?;
         Self::check(resp).await?.json().await.context("parse response")
     }
 
     /// PUT with a JSON body, discard the response (a 204).
     pub async fn put_with_body(&self, path: &str, body: &serde_json::Value) -> anyhow::Result<()> {
-        let url = format!("{}{}", self.base, path);
-        let resp = self.http.put(&url).json(body).send().await.with_context(|| format!("PUT {url}"))?;
+        let resp = self.send(reqwest::Method::PUT, path, Some(body)).await?;
         Self::check(resp).await?;
         Ok(())
     }
 
     /// DELETE returning JSON (a prune answers what it removed).
     pub async fn delete_json(&self, path: &str) -> anyhow::Result<serde_json::Value> {
-        let url = format!("{}{}", self.base, path);
-        let resp = self.http.delete(&url).send().await.with_context(|| format!("DELETE {url}"))?;
+        let resp = self.send(reqwest::Method::DELETE, path, None).await?;
         Self::check(resp).await?.json().await.context("parse response")
     }
 
@@ -145,8 +204,7 @@ impl DispatcherClient {
         path: &str,
         body: &serde_json::Value,
     ) -> anyhow::Result<Result<serde_json::Value, String>> {
-        let url = format!("{}{}", self.base, path);
-        let resp = self.http.post(&url).json(body).send().await.with_context(|| format!("POST {url}"))?;
+        let resp = self.send(reqwest::Method::POST, path, Some(body)).await?;
         if resp.status() == reqwest::StatusCode::PRECONDITION_REQUIRED
             && resp.headers().contains_key(weft_core::TRIGGER_CHOICE_REQUIRED_HEADER)
         {
@@ -160,8 +218,7 @@ impl DispatcherClient {
     /// refusal (the run endpoint's 422 carries a JSON `Refusal`) and
     /// treats every other failure as `check` would.
     pub async fn post_json_status(&self, path: &str, body: &serde_json::Value) -> anyhow::Result<(u16, String)> {
-        let url = format!("{}{}", self.base, path);
-        let resp = self.http.post(&url).json(body).send().await.with_context(|| format!("POST {url}"))?;
+        let resp = self.send(reqwest::Method::POST, path, Some(body)).await?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         Ok((status.as_u16(), text))
@@ -174,8 +231,7 @@ impl DispatcherClient {
         path: &str,
         body: &serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
-        let url = format!("{}{}", self.base, path);
-        let resp = self.http.delete(&url).json(body).send().await.with_context(|| format!("DELETE {url}"))?;
+        let resp = self.send(reqwest::Method::DELETE, path, Some(body)).await?;
         Self::check(resp).await?.json().await.context("parse response")
     }
 
@@ -186,8 +242,7 @@ impl DispatcherClient {
         path: &str,
         body: &serde_json::Value,
     ) -> anyhow::Result<()> {
-        let url = format!("{}{}", self.base, path);
-        let resp = self.http.post(&url).json(body).send().await.with_context(|| format!("POST {url}"))?;
+        let resp = self.send(reqwest::Method::POST, path, Some(body)).await?;
         Self::check(resp).await?;
         Ok(())
     }

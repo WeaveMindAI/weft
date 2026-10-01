@@ -6,11 +6,15 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+hex = "0.4"
 weft-core = { workspace = true }
 weft-journal = { workspace = true }
 weft-task-store = { workspace = true }
 weft-broker-client = { path = "../weft-broker-client" }
 weft-platform-traits = { workspace = true }
+# A worker on Google Cloud asks the metadata server for its identity;
+# only that module, none of the platform's control side.
+weft-platform-gcp = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 # The node-test runner (`test_runner`, behind the `node-tests`

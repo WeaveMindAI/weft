@@ -80,23 +80,15 @@ Some providers, Slack among them, only accept https callbacks.
 
 ## Making it take effect
 
-The installer hands the file to the runtime, so `./setup.sh` picks it up. After
-that:
+On your machine, weft reads the file each time it needs one of its keys, so an
+edit takes effect at once. If the file is gone, weft has no shared apps or
+keys until it is back. On a cloud install the file is the `WEFT_ACCESS_APPS`
+secret of your fork: if you want to change it, update that secret and run
+**install on GCP** again ([deploying to your cloud](../running/cloud.md#once-by-hand)).
 
-```bash
-weft daemon start
-```
-
-That re-applies it and restarts the piece holding it, in a few seconds.
-
-If the file is gone, the runtime keeps the keys it already has and tells you
-so. To actually empty them, `weft daemon start --clear-access-apps`.
-
-Nothing reads your local disk at run time. The file is copied in, so an edit
-does nothing until you re-apply it.
-
-To keep it somewhere else, point `WEFT_ACCESS_APPS_FILE` at it. A file named
-that way and unreadable is a hard error rather than a silent nothing, because
+If you want to keep it somewhere else, point `WEFT_ACCESS_APPS_FILE` at it
+and run `weft daemon start`. If the file is there but cannot be read or parsed, every lookup of its keys
+fails with an error naming the file, because
 shipping no apps quietly shows up later as a service nobody can connect on a
 node the operator thought was configured.
 

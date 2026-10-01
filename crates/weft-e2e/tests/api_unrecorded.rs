@@ -24,8 +24,10 @@ async fn an_unrecorded_route_answers_and_only_its_failures_list() -> anyhow::Res
     project.activate().await?;
     let pid = project.id();
 
-    // A page polling the status: every call answers.
-    for _ in 0..3 {
+    // A page polling the status: every call answers. Three runs at once
+    // are allowed, so twenty calls in a row only fit when each ended run
+    // gave its slot back (an unrecorded run once kept it for a minute).
+    for _ in 0..20 {
         let (status, _, body) =
             live::http_request(&disp, Method::GET, &format!("{base}/status"), &[], None).await?;
         assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
@@ -48,15 +50,32 @@ async fn an_unrecorded_route_answers_and_only_its_failures_list() -> anyhow::Res
     .await?;
     assert_eq!(failed["status"], "failed", "{failed}");
 
+    // A route whose only answer was skipped tells its caller so, and its
+    // run counts as failed: written down, with the reason on it.
+    let (status, _, body) =
+        live::http_request(&disp, Method::GET, &format!("{base}/silent"), &[], None).await?;
+    let said = String::from_utf8_lossy(&body).to_string();
+    assert_eq!(status.as_u16(), 500, "{said}");
+    assert!(said.contains("the run ended without answering"), "{said}");
+    let silent = poll_until("the unanswered run to list", Duration::from_secs(60), Duration::from_millis(250), || {
+        let disp = disp.clone();
+        async move {
+            let rows = listed(&disp, pid).await?;
+            Ok(rows.into_iter().find(|row| row["entry_node"] == "silent"))
+        }
+    })
+    .await?;
+    assert_eq!(silent["status"], "failed", "{silent}");
+
     // The successful calls left nothing, whatever time has passed.
     let rows = listed(&disp, pid).await?;
     assert!(
         !rows.iter().any(|row| row["entry_node"] == "status"),
         "a successful unrecorded run is never listed: {rows:?}"
     );
-    let color = failed["color"].as_str().unwrap_or_default();
+    let execution_id = failed["execution_id"].as_str().unwrap_or_default();
     let cli = project.weft(&["executions", "--project", &pid.to_string()]).await?;
-    assert!(cli.contains(&color[..8.min(color.len())]), "`weft executions` lists the failed run {color}: {cli}");
+    assert!(cli.contains(&execution_id[..8.min(execution_id.len())]), "`weft executions` lists the failed run {execution_id}: {cli}");
 
     project.finish().await
 }

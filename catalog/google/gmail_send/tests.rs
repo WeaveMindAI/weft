@@ -14,6 +14,9 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("sends_the_assembled_raw_message", sends),
         NodeTest::fake("attachments_and_reply_threading_ride_the_raw_message", attachments_and_reply),
         NodeTest::fake("no_recipient_refuses_before_any_call", no_recipient),
+        NodeTest::fake("a_refused_send_fails_the_run_when_error_is_unwired", refused_unwired),
+        NodeTest::fake("a_refused_send_comes_out_on_error_when_it_is_wired", refused_wired),
+        NodeTest::fake("a_missing_recipient_is_never_caught_by_error", mistake_not_caught),
         NodeTest::live("one_real_send", "google", live_send).with_fixture(fixture_spec(
             "GMAIL_TO",
             "Recipient address",
@@ -116,6 +119,59 @@ async fn no_recipient(rig: FakeRig) -> WeftResult<()> {
         )
         .await;
     let err = outcome.result.expect_err("no recipient must refuse").to_string();
+    assert!(err.contains("no recipient"), "{err}");
+    assert!(rig.requests().is_empty(), "nothing was sent");
+    Ok(())
+}
+
+/// Gmail refuses the send, the way it does past the daily quota.
+fn refuse_the_send(rig: &FakeRig) {
+    rig.respond_status(
+        "POST",
+        "/gmail/v1/users/me/messages/send",
+        429,
+        json!({ "error": { "message": "Daily sending quota exceeded" } }),
+    );
+}
+
+fn a_mail(rig: &FakeRig) -> serde_json::Value {
+    json!({
+        "account": rig.access("google"),
+        "to": "ada@example.com",
+        "subject": "hello",
+        "text": "body text",
+    })
+}
+
+async fn refused_unwired(rig: FakeRig) -> WeftResult<()> {
+    refuse_the_send(&rig);
+    let err = rig.run(&GmailSendNode, a_mail(&rig)).await.failure()?;
+    assert!(err.contains("Daily sending quota exceeded"), "{err}");
+    Ok(())
+}
+
+async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
+    refuse_the_send(&rig);
+    rig.wire_output("error");
+    let outcome = rig.run(&GmailSendNode, a_mail(&rig)).await.ok()?;
+    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    assert!(error.contains("Daily sending quota exceeded"), "{error}");
+    for port in ["id", "threadId"] {
+        assert!(!outcome.outputs.contains_key(port), "a caught failure emits nothing on {port}");
+    }
+    Ok(())
+}
+
+async fn mistake_not_caught(rig: FakeRig) -> WeftResult<()> {
+    rig.wire_output("error");
+    let err = rig
+        .run(
+            &GmailSendNode,
+            json!({ "account": rig.access("google"), "subject": "s", "text": "t" }),
+        )
+        .await
+        .failure()?;
+    assert!(err.starts_with("input error"), "a program mistake fails the run: {err}");
     assert!(err.contains("no recipient"), "{err}");
     assert!(rig.requests().is_empty(), "nothing was sent");
     Ok(())

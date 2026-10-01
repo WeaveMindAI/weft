@@ -16,6 +16,7 @@
     "service": "google",
     "label": "Google",
     "grants": "coexisting",
+    "callback": "domain",
     "doors": [
       "shared",
       "own"

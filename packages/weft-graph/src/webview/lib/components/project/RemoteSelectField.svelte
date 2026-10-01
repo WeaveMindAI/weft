@@ -2,8 +2,8 @@
 	// The editor's `remote_select` field: the connect library's
 	// `ResourceSelect`, with the transport that signs every source with the
 	// author's connection the parent traced through the graph (the
-	// editor's `/access/*` as the tenant). A member's page draws the same
-	// control over the member door.
+	// editor's `/access/*` as the tenant). An instance's page draws the same
+	// control over the instance door.
 	import { ResourceSelect } from '@weft/connect/svelte';
 	import type { FieldDefinition } from '../../types';
 	import { editorResources } from './editor-connect';

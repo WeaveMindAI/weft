@@ -63,13 +63,13 @@ async fn email_roundtrip_sends_over_smtp_and_the_imap_trigger_fires() -> Result<
     // The watcher first, so the mailbox is idling before the send.
     let mut receiver = Project::prepare("email_receive", disp.clone()).await?;
     let rid = receiver.id();
-    set_account(&receiver, "mb", "account", conn.handle())?;
+    set_account(&receiver, "mb", conn.handle()).await?;
     receiver.set_node_config("recv", "subjectContains", &format!("{marker:?}"))?;
     receiver.activate().await?;
-    let before = run::execution_colors(&disp, &rid).await?;
+    let before = run::executions(&disp, &rid).await?;
 
     let mut sender = Project::prepare("email_send", disp.clone()).await?;
-    set_account(&sender, "mb", "account", conn.handle())?;
+    set_account(&sender, "mb", conn.handle()).await?;
     sender.set_node_config("send", "to", &format!("{user:?}"))?;
     sender.set_node_config("send", "subject", &format!("{marker:?}"))?;
     let sent = run::run_and_settle(&mut sender).await?;
@@ -77,9 +77,9 @@ async fn email_roundtrip_sends_over_smtp_and_the_imap_trigger_fires() -> Result<
 
     // Provider delivery to the same mailbox is usually seconds; the
     // generous window absorbs a slow one.
-    let color =
+    let execution_id =
         run::wait_for_triggered_execution(&disp, &rid, &before, Duration::from_secs(180)).await?;
-    let settled = SettledRun::observe(&disp, color).await?;
+    let settled = SettledRun::observe(&disp, execution_id).await?;
     settled.completed()?;
     let subject = settled
         .input_of("out")
@@ -111,15 +111,13 @@ async fn a_send_only_connection_cannot_arm_the_mail_trigger() -> Result<()> {
     .await?;
 
     let mut project = Project::prepare("email_receive", disp.clone()).await?;
-    set_account(&project, "mb", "account", conn.handle())?;
+    set_account(&project, "mb", conn.handle()).await?;
     project.activate().await?;
 
-    // Generous window: when this is the suite's FIRST trigger after a
-    // bring-up rollout, the pooled listener pod is spawned from
-    // nothing before any prepare (and its refusal) can run.
+    // Generous window: the whole suite may be running at once.
     let platform = Platform::connect(&disp).await?;
     platform
-        .wait_for_listener_log(
+        .wait_for_runtime_log(
             "the listener to refuse the send-only connection (imap_host shortfall in its log)",
             "needs the connection's 'imap_host'",
             Duration::from_secs(240),

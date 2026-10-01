@@ -1,0 +1,110 @@
+#cloud-config
+# The machine's boot, on Container-Optimized OS: mount the data disk,
+# read the config and the secrets, then run Postgres and weft's runtime.
+# cloud-init runs this on every boot (COS keeps /etc and the units only
+# for the life of a boot), so a replaced or resized machine comes back the
+# same way.
+
+write_files:
+  - path: /var/lib/weft/config.json
+    permissions: "0644"
+    content: |
+      ${indent(6, config)}
+
+  - path: /var/lib/weft/prepare.sh
+    permissions: "0700"
+    content: |
+      #!/bin/bash
+      # Mount the data disk (formatting it the first time only), then
+      # write the runtime's secrets where only root reads them.
+      set -euo pipefail
+      disk=/dev/disk/by-id/google-weft-data
+      data=/mnt/disks/data
+      if ! blkid "$disk" >/dev/null 2>&1; then
+        mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard "$disk"
+      fi
+      mkdir -p "$data"
+      mountpoint -q "$data" || mount -o discard,defaults "$disk" "$data"
+      # A disk grown since the last boot (the disk lever) grows its
+      # filesystem too.
+      resize2fs "$disk" >/dev/null 2>&1 || true
+      mkdir -p "$data/postgres" "$data/tls"
+      cp /var/lib/weft/config.json "$data/config.json"
+
+      token=$(curl -sf -H 'Metadata-Flavor: Google' \
+        http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token \
+        | sed -E 's/.*"access_token":"([^"]+)".*/\1/')
+      secret() {
+        curl -sf -H "Authorization: Bearer $token" \
+          "https://secretmanager.googleapis.com/v1/projects/${project}/secrets/$1/versions/latest:access" \
+          | tr -d ' \n' | sed -E 's/.*"data":"([^"]+)".*/\1/' | base64 -d
+      }
+      umask 077
+      : > "$data/secrets.env"
+      for pair in ${secrets}; do
+        printf '%s=%s\n' "$${pair%%=*}" "$(secret "$${pair#*=}")" >> "$data/secrets.env"
+      done
+      printf 'POSTGRES_PASSWORD=%s\n' "$(secret ${postgres_secret})" > "$data/postgres.env"
+%{ if access_apps != "" ~}
+      secret ${access_apps} > "$data/access-apps.json"
+      printf 'WEFT_ACCESS_APPS_FILE=%s\n' "$data/access-apps.json" >> "$data/secrets.env"
+%{ endif ~}
+      # COS keeps root's home read-only, so Docker's credentials live
+      # here, where the units point HOME.
+      HOME=/var/lib/weft docker-credential-gcr configure-docker --registries ${registry_host}
+
+  - path: /etc/systemd/system/weft-prepare.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=weft: mount the data disk and read the secrets
+      Wants=network-online.target
+      After=network-online.target
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      # Through bash: Container-Optimized OS mounts /var noexec, so the
+      # script cannot be run directly.
+      ExecStart=/bin/bash /var/lib/weft/prepare.sh
+
+  - path: /etc/systemd/system/weft-postgres.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=weft: Postgres
+      Requires=weft-prepare.service docker.service
+      After=weft-prepare.service docker.service
+      [Service]
+      ExecStartPre=-/usr/bin/docker rm -f weft-postgres
+      ExecStart=/usr/bin/docker run --rm --name weft-postgres \
+        -p 127.0.0.1:5432:5432 -p ${private_ip}:5432:5432 \
+        -v /mnt/disks/data/postgres:/var/lib/postgresql/data \
+        -e POSTGRES_USER=weft -e POSTGRES_DB=weft -e PGDATA=/var/lib/postgresql/data/pgdata \
+        --env-file /mnt/disks/data/postgres.env \
+        postgres:18-alpine
+      ExecStop=/usr/bin/docker stop weft-postgres
+      Restart=always
+      RestartSec=5
+
+  - path: /etc/systemd/system/weft-runtime.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=weft: the runtime
+      Requires=weft-prepare.service weft-postgres.service docker.service
+      After=weft-prepare.service weft-postgres.service docker.service
+      [Service]
+      Environment=HOME=/var/lib/weft
+      ExecStartPre=-/usr/bin/docker rm -f weft-runtime
+      ExecStart=/usr/bin/docker run --rm --name weft-runtime --network host \
+        --env-file /mnt/disks/data/secrets.env \
+        -e WEFT_CONFIG=/mnt/disks/data/config.json \
+        -v /mnt/disks/data:/mnt/disks/data \
+        ${runtime_image} serve
+      ExecStop=/usr/bin/docker stop weft-runtime
+      Restart=always
+      RestartSec=5
+
+runcmd:
+  - systemctl daemon-reload
+  - systemctl start weft-runtime.service

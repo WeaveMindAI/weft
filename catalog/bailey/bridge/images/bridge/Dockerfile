@@ -16,10 +16,10 @@ COPY . .
 ENV CI=true
 RUN rm -rf node_modules && pnpm install --prod
 
-# PORT is set by the bridge node's Rust spec (BRIDGE_PORT = 8090);
-# the JS default is 8090 too for docker-run-outside-k8s. No
-# Dockerfile ENV so there's exactly one source of truth (the spec)
-# in cluster, and one default (js fallback) in dev.
+# PORT is set by the bridge node's Rust spec (BRIDGE_PORT = 8090)
+# whenever weft runs the image; the JS default is 8090 too, for a
+# plain `docker run` by hand. No Dockerfile ENV, so the spec stays
+# the one source of truth.
 ENV AUTH_DIR=/data/auth
 
 EXPOSE 8090

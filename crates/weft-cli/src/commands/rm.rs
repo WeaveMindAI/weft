@@ -6,7 +6,7 @@
 //! | flag        | action                                                  |
 //! |-------------|---------------------------------------------------------|
 //! | (none)      | unregister: the dispatcher deactivates the project,     |
-//! |             | terminates its infra pods (PVCs included), reclaims its |
+//! |             | terminates its infra containers and disks, reclaims its     |
 //! |             | stored data, and drops the row                          |
 //! | `--journal` | also drop this project's execution + log rows           |
 //! | `--local`   | also wipe this project's build artifacts on the host    |
@@ -64,7 +64,7 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
     }
 
     // The base verb is already the big one: triggers wiped, runs
-    // cancelled, infra pods terminated, stored data reclaimed. Nothing
+    // cancelled, infra processes terminated, stored data reclaimed. Nothing
     // that irreversible runs on a bare command: a terminal is asked,
     // and a script has to say `--yes`.
     let project_id = resolve_project_id(&ctx, project)?;
@@ -86,9 +86,9 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
     let ctx_inner = ctx.clone();
     ctx.with_progress(ActionVerb::Rm, |progress| async move {
         let ctx = ctx_inner;
-        let client = ctx.client();
+        let client = ctx.client()?;
 
-        // Journal rows BEFORE unregistering: deleting a color is
+        // Journal rows BEFORE unregistering: deleting an execution is
         // authorized through its project row, so once the project is
         // unregistered its rows become undeletable until the project
         // re-registers.
@@ -98,11 +98,11 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
 
         // ONE call is the whole dispatcher-side teardown: the dispatcher
         // deactivates the project (wipes its signals, cancels running
-        // executions), terminates its infra pods, reclaims its stored
+        // executions), terminates its infra processes, reclaims its stored
         // data, then drops the row. `--force` flips on the dispatcher's
         // skip-the-wait switch: without it, the dispatcher waits up to
         // 120s for the supervisor to confirm the terminate command
-        // landed before deleting the project namespace (cf docs §13.10).
+        // landed before deleting the project.
         let unregister_path = if force {
             format!("/projects/{project_id}?force=true")
         } else {
@@ -127,27 +127,17 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
     .await
 }
 
-/// One page of the project's journal listing: the colors on the first
+/// One page of the project's journal listing: the executions on the first
 /// page, newest first.
 async fn journal_page(
     client: &crate::client::DispatcherClient,
     project_id: &str,
 ) -> Result<Vec<String>> {
-    let page: serde_json::Value = client
-        .get_json(&format!("/executions?project_id={project_id}"))
-        .await
-        .context("list executions")?;
-    let Some(arr) = page.get("executions").and_then(|v| v.as_array()) else {
-        anyhow::bail!("/executions returned no `executions` array: {page}");
-    };
-    arr.iter()
-        .map(|e| {
-            e.get("color")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .ok_or_else(|| anyhow::anyhow!("/executions row without a color: {e}"))
-        })
-        .collect()
+    let page: weft_core::program::ExecutionPage = serde_json::from_value(
+        client.get_json(&format!("/executions?project_id={project_id}")).await.context("list executions")?,
+    )
+    .context("read the executions listing")?;
+    Ok(page.executions.iter().map(|e| e.execution_id.to_string()).collect())
 }
 
 async fn drop_journal_rows(
@@ -155,16 +145,16 @@ async fn drop_journal_rows(
     client: &crate::client::DispatcherClient,
     project_id: &str,
 ) -> Result<()> {
-    // Walk the execution list and delete colors individually (the
+    // Walk the execution list and delete executions individually (the
     // dispatcher has no bulk DELETE for a project's journal rows).
     // Deleting shifts offsets, so re-fetch the FIRST page after each
     // batch until it comes back empty. Termination is structural:
-    // every round must list at least one color we have not deleted
-    // yet; a page of only already-deleted colors means DELETE
+    // every round must list at least one execution we have not deleted
+    // yet; a page of only already-deleted executions means DELETE
     // reported success while the row survived, so bail loudly
     // instead of spinning. (Progress is measured on the drained set,
     // never on the live total: a run started mid-drop is just a new
-    // color the next round deletes.)
+    // execution the next round deletes.)
     let mut dropped: HashSet<String> = HashSet::new();
     loop {
         let rows = journal_page(client, project_id).await?;
@@ -174,14 +164,14 @@ async fn drop_journal_rows(
         let fresh: Vec<&String> = rows.iter().filter(|c| !dropped.contains(*c)).collect();
         if fresh.is_empty() {
             anyhow::bail!(
-                "journal drop stalled: the dispatcher still lists {} colors whose \
+                "journal drop stalled: the dispatcher still lists {} execution_ids whose \
                  DELETE already reported success",
                 rows.len()
             );
         }
         if dropped.is_empty() {
             // Quiesce before the first delete: a run still going would
-            // keep appending events to a color mid-erase. The dispatcher
+            // keep appending events to an execution mid-erase. The dispatcher
             // wipes every trigger and cancels EVERY live run of the
             // project (started by a trigger, by hand, or unrecorded),
             // and answers only once none is live. Only reached when
@@ -201,12 +191,12 @@ async fn drop_journal_rows(
                 ))?;
             progress.dispatcher_call_done(serde_json::json!({ "step": "quiesce" }));
         }
-        for color in fresh {
+        for execution_id in fresh {
             client
-                .delete(&format!("/executions/{color}"))
+                .delete(&format!("/executions/{execution_id}"))
                 .await
-                .with_context(|| format!("delete execution {color}"))?;
-            dropped.insert(color.clone());
+                .with_context(|| format!("delete execution {execution_id}"))?;
+            dropped.insert(execution_id.clone());
         }
     }
     progress.dispatcher_call_done(serde_json::json!({

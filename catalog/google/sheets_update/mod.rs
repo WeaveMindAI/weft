@@ -52,13 +52,21 @@ impl Node for GoogleSheetsUpdateNode {
             // cast into a nonsense address.
             (Some(n), None) if n <= MAX_SHEET_ROW => format!("A{}", n as u64),
             (Some(n), None) => {
-                weft::node_bail!("rowNumber {n} is past the last row a sheet can have")
+                return Err(weft::WeftError::Input(format!(
+                    "rowNumber {n} is past the last row a sheet can have"
+                )))
             }
             (None, Some(r)) => r,
             (Some(_), Some(_)) => {
-                weft::node_bail!("pick ONE addressing: rowNumber or range, not both")
+                return Err(weft::WeftError::Input(
+                    "pick ONE addressing: rowNumber or range, not both".to_string(),
+                ))
             }
-            (None, None) => weft::node_bail!("pick an addressing: rowNumber or range"),
+            (None, None) => {
+                return Err(weft::WeftError::Input(
+                    "pick an addressing: rowNumber or range".to_string(),
+                ))
+            }
         };
 
         let url = format!(

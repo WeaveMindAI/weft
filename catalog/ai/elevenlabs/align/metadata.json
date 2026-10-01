@@ -42,5 +42,8 @@
       "type": "Number",
       "description": "How well the transcript matched the audio (lower is better)."
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

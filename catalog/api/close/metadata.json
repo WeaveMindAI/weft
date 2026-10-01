@@ -56,6 +56,9 @@
     }
   ],
   "requires_infra": false,
+  "features": {
+    "answersCaller": "end"
+  },
   "validate": [
     {
       "when": {
@@ -63,14 +66,11 @@
         "of": {
           "kind": "run_reaches",
           "direction": "upstream",
-          "types": [
-            "Route",
-            "Socket"
-          ]
+          "with": { "liveConnection": true }
         }
       },
       "then": {
-        "message": "Close '{id}' answers nobody: no Route or Socket starts a run that reaches it. Wire it from the trigger's run (through data, or `_should_flow`), or put it in a group the trigger's `_should_flow` runs.",
+        "message": "Close '{id}' answers nobody: no trigger with a live caller (a Route, a Socket) starts a run that reaches it. Wire it from the trigger's run (through data, or `_should_flow`), or put it in a group the trigger's `_should_flow` runs.",
         "level": "structural",
         "severity": "warning"
       }
@@ -79,15 +79,8 @@
       "when": {
         "kind": "all",
         "of": [
-          {
-            "kind": "config_present",
-            "field": "reason"
-          },
-          {
-            "kind": "config_equals",
-            "field": "status",
-            "equals": 204
-          }
+          { "kind": "config_present", "field": "reason" },
+          { "kind": "config_equals", "field": "status", "equals": 204 }
         ]
       },
       "then": {
@@ -100,31 +93,16 @@
       "when": {
         "kind": "all",
         "of": [
-          {
-            "kind": "config_present",
-            "field": "code"
-          },
-          {
-            "kind": "run_reaches",
-            "direction": "upstream",
-            "types": [
-              "Route"
-            ]
-          },
+          { "kind": "config_present", "field": "code" },
+          { "kind": "run_reaches", "direction": "upstream", "with": { "liveConnection": ["http"] } },
           {
             "kind": "not",
-            "of": {
-              "kind": "run_reaches",
-              "direction": "upstream",
-              "types": [
-                "Socket"
-              ]
-            }
+            "of": { "kind": "run_reaches", "direction": "upstream", "with": { "liveConnection": ["websocket"] } }
           }
         ]
       },
       "then": {
-        "message": "Close '{id}' sets `code`, the WebSocket close code, but a Route starts the run that reaches it. Say how it ended with `status` (and `reason`) instead.",
+        "message": "Close '{id}' sets `code`, the WebSocket close code, but an HTTP caller (a Route) starts the run that reaches it. Say how it ended with `status` (and `reason`) instead.",
         "level": "structural",
         "severity": "error"
       }
@@ -133,31 +111,16 @@
       "when": {
         "kind": "all",
         "of": [
-          {
-            "kind": "config_present",
-            "field": "status"
-          },
-          {
-            "kind": "run_reaches",
-            "direction": "upstream",
-            "types": [
-              "Socket"
-            ]
-          },
+          { "kind": "config_present", "field": "status" },
+          { "kind": "run_reaches", "direction": "upstream", "with": { "liveConnection": ["websocket"] } },
           {
             "kind": "not",
-            "of": {
-              "kind": "run_reaches",
-              "direction": "upstream",
-              "types": [
-                "Route"
-              ]
-            }
+            "of": { "kind": "run_reaches", "direction": "upstream", "with": { "liveConnection": ["http"] } }
           }
         ]
       },
       "then": {
-        "message": "Close '{id}' sets `status`, an HTTP status, but a Socket starts the run that reaches it. A close frame carries `code` and `reason` instead.",
+        "message": "Close '{id}' sets `status`, an HTTP status, but a WebSocket caller (a Socket) starts the run that reaches it. A close frame carries `code` and `reason` instead.",
         "level": "structural",
         "severity": "error"
       }

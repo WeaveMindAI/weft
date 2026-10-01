@@ -74,6 +74,9 @@
       "description": "The upscaled image."
     }
   ],
+  "features": {
+    "catchErrors": true
+  },
   "display": {
     "kind": "media",
     "output": "image"

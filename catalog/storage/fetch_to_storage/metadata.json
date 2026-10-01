@@ -23,13 +23,6 @@
       "description": "Override the stored filename. Defaults to the URL's last path segment."
     },
     {
-      "name": "keep",
-      "type": "Boolean",
-      "default": false,
-      "label": "Keep past the run",
-      "description": "Store the file already flagged to survive the execution-end sweep (30-day access-extended TTL). Only with `scope: execution`: a project file outlives the run already, and the pair is refused."
-    },
-    {
       "name": "scope",
       "type": "String",
       "default": "execution",
@@ -41,7 +34,17 @@
         ]
       },
       "label": "Store in",
-      "description": "`execution`: the file belongs to this run (swept when it ends unless kept). `project`: it belongs to the project and outlives the run, shared by every run."
+      "description": "`execution`: the file belongs to this run, and only this run can read it. `project`: it belongs to the project, and every later run can read it."
+    },
+    {
+      "name": "ttl_days",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 0
+      },
+      "label": "Keep for (days, 0 = forever)",
+      "description": "How long the file lives once nobody touches it: any access (read, download, presign) resets the clock, and 0 means never expire. Empty means an execution file is swept shortly after its run ends, and a project file lives until deleted."
     },
     {
       "name": "identity",
@@ -54,16 +57,26 @@
     {
       "name": "file",
       "type": "File",
-      "description": "Self-describing reference to the stored file (any type)."
+      "description": "The stored file's reference."
     },
     {
-      "name": "sizeBytes",
-      "type": "Number"
+      "name": "filename",
+      "type": "String",
+      "description": "The name the file is stored under."
     },
     {
       "name": "mimeType",
-      "type": "String"
+      "type": "String",
+      "description": "The file's media type."
+    },
+    {
+      "name": "sizeBytes",
+      "type": "Number",
+      "description": "The file's size in bytes."
     }
   ],
+  "features": {
+    "catchErrors": true
+  },
   "requires_infra": false
 }

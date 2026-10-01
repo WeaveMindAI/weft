@@ -7,13 +7,13 @@ use serde_json::Value;
 use weft::node::NodeOutput;
 use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
 
-use super::postgres::{connect, query_json, quote_ident};
+use super::postgres::{connect, mistake, query_json, quote_ident};
 
 /// The INSERT for a table and its column names: quoted identifiers,
 /// one placeholder per column, RETURNING *.
 pub fn insert_sql(table: &str, columns: &[String]) -> WeftResult<String> {
     if columns.is_empty() {
-        weft::node_bail!("values holds no columns; nothing to insert");
+        mistake!("values holds no columns; nothing to insert");
     }
     let cols: Vec<String> =
         columns.iter().map(|c| quote_ident(c)).collect::<WeftResult<_>>()?;
@@ -45,7 +45,7 @@ impl Node for PostgresInsertRowNode {
         let values: Value = ctx.inputs.get("values")?;
 
         let Some(obj) = values.as_object() else {
-            weft::node_bail!("values must be an object of column: value pairs");
+            mistake!("values must be an object of column: value pairs");
         };
         let columns: Vec<String> = obj.keys().cloned().collect();
         let params: Vec<Value> = obj.values().cloned().collect();

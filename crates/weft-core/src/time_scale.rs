@@ -1,7 +1,7 @@
 //! How fast an install's own clocks run.
 //!
 //! Every protocol timer the runtime keeps for itself (a heartbeat, the
-//! silence after which a pod counts as dead, a lease, a reaper's tick, a
+//! silence after which a process counts as dead, a lease, a reaper's tick, a
 //! scale-down's grace) is read through [`scaled`], so one factor speeds
 //! all of them up together. Scaling them together keeps every ratio the
 //! protocol leans on (a heartbeat always beats several times inside its
@@ -9,16 +9,17 @@
 //! makes a fast install the same system as a normal one, only quicker.
 //!
 //! The factor comes from `WEFT_TIME_SCALE`, set on every process of one
-//! install: the daemon puts it on the dispatcher, and the dispatcher puts
-//! it on every pod it spawns, because a worker's heartbeat and the
-//! dispatcher's stale check must agree on it. Unset means `1`, real time.
+//! install: `weft daemon start` puts it in the runtime's environment (every
+//! role reads it there), and the local worker runner passes it on to each
+//! worker container, because a worker's heartbeat and the dispatcher's
+//! stale check must agree on it. Unset means `1`, real time.
 //! A test cell sets something like `0.05` so a sixty-second scale-down
 //! tick comes round in three seconds.
 //!
 //! Two kinds of duration are never scaled. Durations a PERSON chose (a
 //! project's grace period, a wait node's timeout, a poll interval in a
 //! trigger's config) are the program's behaviour, not the runtime's
-//! housekeeping. And budgets for REAL work (a new pod's spawn grace, a
+//! housekeeping. And budgets for REAL work (a new process's spawn grace, a
 //! boot deadline, a claim held while a verb runs) wait for something that
 //! takes as long in a fast install as in any other.
 
@@ -26,9 +27,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 /// The variable every process of an install reads its factor from.
-// SYNC: TIME_SCALE_ENV <-> crates/weft-cli/src/commands/daemon.rs (the
-//       dispatcher manifest's substitution), deploy/k8s/dispatcher.yaml,
-//       deploy/k8s/broker.yaml
+// SYNC: TIME_SCALE_ENV <-> crates/weft-cli/src/commands/daemon.rs (secrets:
+//       the runtime's environment), crates/weft-platform-local/src/runner.rs
+//       (worker_env: what a worker container starts with)
 pub const TIME_SCALE_ENV: &str = "WEFT_TIME_SCALE";
 
 /// This process's factor: `1` unless [`TIME_SCALE_ENV`] says otherwise.
@@ -36,7 +37,7 @@ pub const TIME_SCALE_ENV: &str = "WEFT_TIME_SCALE";
 /// Read once. A value that is not a positive number stops the process
 /// with a message naming the variable, at the first timer that asks,
 /// which every binary makes happen at startup through [`announce`]: a
-/// typo must never quietly become real time in one pod and fast time in
+/// typo must never quietly become real time in one process and fast time in
 /// the next.
 pub fn factor() -> f64 {
     static FACTOR: OnceLock<f64> = OnceLock::new();

@@ -11,24 +11,68 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("fetches_into_storage_and_emits_the_reference", fetches),
         NodeTest::fake("an_identity_makes_the_fetch_once_per_project", once),
-        NodeTest::fake("keep_with_project_scope_is_refused", keep_in_project),
+        NodeTest::fake("ttl_days_keeps_a_run_file_that_long", ttl_keeps_a_run_file),
+        NodeTest::fake("a_refused_download_fails_the_run_when_error_is_unwired", refused_unwired),
+        NodeTest::fake("a_refused_download_comes_out_on_error_when_it_is_wired", refused_wired),
+        NodeTest::fake("a_contradictory_setting_fails_the_run_even_with_error_wired", mistake_wired),
     ]
 }
 
-/// A project file already outlives the run, so `keep` there is a
-/// contradiction named before anything is fetched.
-async fn keep_in_project(rig: FakeRig) -> WeftResult<()> {
+fn refuse_the_download(rig: &FakeRig) {
+    rig.respond_raw("GET", "/files/gone.pdf", 404, "text/plain", b"not found".to_vec());
+}
+
+async fn refused_unwired(rig: FakeRig) -> WeftResult<()> {
+    refuse_the_download(&rig);
+    let err = rig
+        .run(&FetchToStorageNode, json!({ "url": "https://cdn.example/files/gone.pdf" }))
+        .await
+        .failure()?;
+    assert!(err.contains("404"), "{err}");
+    Ok(())
+}
+
+async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
+    refuse_the_download(&rig);
+    rig.wire_output("error");
+    let outcome = rig
+        .run(&FetchToStorageNode, json!({ "url": "https://cdn.example/files/gone.pdf" }))
+        .await
+        .ok()?;
+    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    assert!(error.contains("404"), "{error}");
+    for port in ["file", "sizeBytes", "mimeType"] {
+        assert!(!outcome.outputs.contains_key(port), "a caught failure emits nothing on {port}");
+    }
+    Ok(())
+}
+
+async fn mistake_wired(rig: FakeRig) -> WeftResult<()> {
+    rig.wire_output("error");
     let err = rig
         .run(
             &FetchToStorageNode,
-            json!({ "url": "https://cdn.example/files/logo.png", "scope": "project", "keep": true }),
+            json!({ "url": "https://cdn.example/files/logo.png", "scope": "everywhere" }),
         )
         .await
-        .result
-        .expect_err("keep in project scope refuses")
-        .to_string();
-    assert!(err.contains("`keep`") && err.contains("scope: project"), "{err}");
-    assert!(rig.requests().is_empty(), "refused before fetching");
+        .failure()?;
+    assert!(err.starts_with("input error") && err.contains("`scope`"), "{err}");
+    Ok(())
+}
+
+/// `ttl_days` reads as on every storage node: an execution file given
+/// one outlives its run for that long.
+async fn ttl_keeps_a_run_file(rig: FakeRig) -> WeftResult<()> {
+    rig.respond_raw("GET", "/files/logo.png", 200, "image/png", b"PNG!".to_vec());
+    let outcome = rig
+        .run(&FetchToStorageNode, json!({ "url": "https://cdn.example/files/logo.png", "ttl_days": 2 }))
+        .await
+        .ok()?;
+    let key = weft::storage::StoredFile::from_value(&outcome.outputs["file"])?.key;
+    let meta = rig.stored_meta(&key)?;
+    assert!(meta.keep, "kept past the run: {meta:?}");
+    assert_eq!(meta.keep_ttl_secs, Some(2 * 24 * 3600));
+    assert_eq!(outcome.outputs["filename"], json!("logo.png"), "the four ports a stored file travels as");
     Ok(())
 }
 

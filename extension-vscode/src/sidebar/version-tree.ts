@@ -5,9 +5,10 @@
 
 import { specScopedTo, type RunSpec } from '../../../packages/weft-graph/src/run-spec';
 import type { CancelCause } from '../../../packages/weft-graph/src/protocol';
+import type { SummaryStatus } from './executions';
 import { describeOutcome } from './outcome';
 
-// SYNC: TreeJson, VersionSummary, RunSummary <-> crates/weft-cli/src/commands/versions.rs Tree, VersionSummary, RunSummary (the shape `weft tree --json` prints, with `disk_version` added by crates/weft-cli/src/commands/tree.rs), crates/weft-dispatcher/src/api/versions.rs TreeResponse, VersionSummary, RunSummary
+// SYNC: TreeJson, VersionSummary, RunSummary <-> crates/weft-core/src/versions.rs VersionTree, Head, VersionSummary, RunSummary (the shape `weft tree --json` prints, with `disk_version` added by crates/weft-cli/src/commands/tree.rs)
 export interface TreeJson {
   head: { head_version: string | null; head_run: string | null; activated_versions: string[] };
   versions: VersionSummary[];
@@ -26,14 +27,16 @@ export interface VersionSummary {
 }
 
 export interface RunSummary {
-  color: string;
+  execution_id: string;
   version_id: string;
   definition_hash: string;
-  seed_color: string | null;
+  seed_execution_id: string | null;
   stale: string[];
   spec: RunSpec | null;
   example: string | null;
-  status: string;
+  /** The run's listing status, or null when its journal is gone. */
+  // SYNC: RunSummary.status <-> crates/weft-core/src/versions.rs RunSummary.status
+  status: SummaryStatus | null;
   started_at: number;
   completed_at: number | null;
   /** For a cancelled run: who or what stopped it. */
@@ -180,11 +183,11 @@ export function versionMarks(node: VersionTreeNode): string[] {
 
 /** A run's description: status, seed, scope, example. */
 export function runDescription(run: RunSummary, headRun: string | null): string {
-  const parts = [describeOutcome(run.status, run.cancel_cause, run.skipped_nodes)];
-  if (run.seed_color) parts.push(`seed ${shortId(run.seed_color)} (${run.stale.length} stale)`);
+  const parts = [describeOutcome(run.status ?? 'unknown', run.cancel_cause, run.skipped_nodes)];
+  if (run.seed_execution_id) parts.push(`seed ${shortId(run.seed_execution_id)} (${run.stale.length} stale)`);
   if (run.spec) parts.push(`spec ${run.spec.name}`);
   if (run.example) parts.push(`example ${run.example}`);
-  if (headRun === run.color) parts.push('HEAD run');
+  if (headRun === run.execution_id) parts.push('HEAD run');
   return parts.join('  ·  ');
 }
 

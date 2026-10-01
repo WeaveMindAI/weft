@@ -1,15 +1,15 @@
 # Fetch a file into storage and keep it. A Text node supplies the source URL the
 # rig injects (a fake server serving known bytes); FetchToStorage downloads it
-# into execution-scoped storage; `keep: true` flags the file to survive the
+# into execution-scoped storage; `ttl_days: 1` keeps the file past the
 # run's terminate sweep so the rig can download it back and assert its contents.
 #
 # __E2E_FAKE_URL__ is substituted by the test with the fake server's
-# cluster-reachable URL before building.
+# reachable URL before building.
 
 src = Text { value: "__E2E_FAKE_URL__" }
 
 fetch = FetchToStorage {
-  keep: true
+  ttl_days: 1
 }
 fetch.url = src.value
 

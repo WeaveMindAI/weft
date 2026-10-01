@@ -13,8 +13,10 @@
 //! matches the one it wants by node. The token's scope IS the isolation; the rig
 //! never best-effort filters the (often project_id-less) payload after the fact.
 
-use anyhow::{bail, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{bail, Result};
+use serde_json::Value;
+
+use weft_core::signal_token::{MintTokenRequest, MintedToken};
 
 use crate::client::Dispatcher;
 
@@ -61,17 +63,9 @@ pub async fn mint_project_token(
     project_id: &uuid::Uuid,
     name: &str,
 ) -> Result<String> {
-    let body = json!({
-        "name": name,
-        "style": "hard",
-        "allowedProjects": [project_id.to_string()],
-        "allowedTags": [],
-    });
-    let resp: Value = disp.post_json("/signal-tokens", &body).await?;
-    resp.get("token")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .context("mint token response missing `token`")
+    let body = MintTokenRequest { allowed_projects: vec![*project_id], ..MintTokenRequest::caller(name) };
+    let minted: MintedToken = disp.post_json("/signal-tokens", &serde_json::to_value(&body)?).await?;
+    Ok(minted.token)
 }
 
 /// Enumerate every signal a signal token can see. The token authenticates via

@@ -6,9 +6,9 @@
 //! Each returns a `Result` so a test can `?` them; a failed check is an `Err`
 //! carrying enough of the replay to see why, never a silent pass.
 //!
-//! Field-name knowledge (which event carries which value) lives in [`crate::event`]
-//! and is SYNC'd by string against the dispatcher's DispatcherEvent. These
-//! helpers stay above that, reading through the [`Replay`] accessors.
+//! Field-name knowledge (which event carries which value) lives in
+//! [`crate::event`]. These helpers stay above that, reading through the
+//! [`Replay`] accessors.
 
 use anyhow::{bail, Result};
 use serde_json::Value;
@@ -24,15 +24,15 @@ impl SettledRun {
             "completed" => Ok(self),
             "failed" => bail!(
                 "execution {} FAILED: {}",
-                self.color,
+                self.execution_id,
                 self.failure_message().unwrap_or_else(|| "<no error text>".into())
             ),
             "cancelled" => bail!(
                 "execution {} was CANCELLED: {}",
-                self.color,
+                self.execution_id,
                 self.cancel_reason().unwrap_or_else(|| "<no reason>".into())
             ),
-            other => bail!("execution {} has unexpected status {other}", self.color),
+            other => bail!("execution {} has unexpected status {other}", self.execution_id),
         }
     }
 
@@ -49,7 +49,7 @@ impl SettledRun {
         if self.status != "failed" {
             bail!(
                 "expected execution {} to FAIL, but status is {}",
-                self.color,
+                self.execution_id,
                 self.status
             );
         }
@@ -57,7 +57,7 @@ impl SettledRun {
         if !msg.contains(needle) {
             bail!(
                 "execution {} failed but error did not contain '{needle}': {msg}",
-                self.color
+                self.execution_id
             );
         }
         Ok(self)

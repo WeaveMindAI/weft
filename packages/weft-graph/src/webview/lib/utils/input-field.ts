@@ -100,13 +100,16 @@ export function inputRendersField(
 /// it. ONE definition, read by both the node renderer (chevron/toggle)
 /// and the projection's build step (which overlays `expanded` from it),
 /// so the drawn state and the computed sizing can never disagree.
-/// The handle is read from the node's port literals: the picker is
-/// compiler-read (an inline value only), and like every port's constant
-/// it lives there.
+/// The handle is what the node's port literal stands for (`resolve`): the
+/// install's pick, since the compiler marks the field picked on the
+/// install rather than holding a connection in the source.
 export function hasUnpickedAccess(
 	inputs: PortDefinition[],
 	portLiterals: Record<string, unknown> | undefined,
 	wiredInputPorts: ReadonlySet<string>,
+	// What a connection field's literal stands for: the install's pick
+	// when it is the install-picked marker (`effectiveAccessValue`).
+	resolve: (field: string, literal: unknown) => unknown = (_, literal) => literal,
 ): boolean {
 	for (const input of inputs) {
 		if (input.widget?.kind !== 'access') continue;
@@ -118,7 +121,7 @@ export function hasUnpickedAccess(
 			hasWrittenValue: false,
 		});
 		if (!rendered) continue;
-		if (ownValue(portLiterals, input.name) == null) return true;
+		if (resolve(input.name, ownValue(portLiterals, input.name)) == null) return true;
 	}
 	return false;
 }
@@ -145,6 +148,7 @@ function fieldFromWidget(key: string, label: string, w: Widget): FieldDefinition
 		case 'select':
 		case 'multiselect':
 			field.options = w.options;
+			if (w.free_text) field.freeText = true;
 			break;
 		case 'number':
 			if (w.min != null) field.min = w.min;

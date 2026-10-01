@@ -72,82 +72,82 @@ fn validate_scoped(
     check_double_driven_ports(project, &mut d);
     check_two_gates(project, &mut d);
     check_warnings(project, &mut d);
-    check_level_sizes(project, catalog, &mut d);
+    check_level_sizes(project, &mut d);
     check_declarative_rules(project, catalog, mode, &mut d);
     check_reserved_names(project, catalog, &mut d);
     check_graph_shape(project, &mut d);
     check_generator_wiring(project, &mut d);
     check_named_type_conflicts(project, &mut d);
     check_route_claims(project, catalog, &mut d);
-    check_per_member(project, catalog, &mut d);
-    check_member_filled(project, &mut d);
+    check_per_instance(project, catalog, &mut d);
+    check_instance_filled(project, &mut d);
     d
 }
 
-/// per-member-ineligible: `@per_member` marks a node that RUNS something
+/// per-instance-ineligible: `@per_instance` marks a node that RUNS something
 /// of its own, which the node's metadata says, never its name: an infra
-/// node (`requiresInfra`), one container per member. What a member
-/// provides (their connection, their sheet) is a field written
-/// `@member_filled`, and a step that reads a per-member value runs per
-/// member without a mark, which the compiler already follows.
-fn check_per_member(project: &ProjectDefinition, catalog: &dyn MetadataCatalog, d: &mut Vec<Diagnostic>) {
-    for node in project.nodes.iter().filter(|n| n.per_member == Some(weft_core::member::PerMember::Marked)) {
+/// node (`requiresInfra`), one container per instance. What an instance
+/// provides (its connection, its sheet) is a field written
+/// `@instance_filled`, and a step that reads a per-instance value runs per
+/// instance without a mark, which the compiler already follows.
+fn check_per_instance(project: &ProjectDefinition, catalog: &dyn MetadataCatalog, d: &mut Vec<Diagnostic>) {
+    for node in project.nodes.iter().filter(|n| n.per_instance == Some(weft_core::instance::PerInstance::Marked)) {
         let Some(meta) = catalog.lookup(&node.node_type) else { continue };
-        if meta.per_member_eligible() {
+        if meta.per_instance_eligible() {
             continue;
         }
         let name = author_name(node);
         let instead = match meta.access_input() {
             Some(input) => format!(
-                "To have each member connect their own account, write `{}: @member_filled` instead",
+                "To have each instance connect its own account, write `{}: @instance_filled` instead",
                 input.name
             ),
-            None => "Remove the mark: it already runs in a member's runs whenever it reads a per-member \
-                     value, and a field each member provides is written `@member_filled`"
+            None => "Remove the mark: it already runs in an instance's runs whenever it reads a per-instance \
+                     value, and a field each instance provides is written `@instance_filled`"
                 .to_string(),
         };
-        push(d, node.source_file.as_deref(), node.header_span_or_default(), Severity::Error, "per-member-ineligible",
+        push(d, node.source_file.as_deref(), node.header_span_or_default(), Severity::Error, "per-instance-ineligible",
             format!(
-                "'{name}' is marked `@per_member`, but only an infra node exists once per member (one \
+                "'{name}' is marked `@per_instance`, but only an infra node exists once per instance (one \
                  container each); a {} runs nothing of its own to copy. {instead}",
                 node.node_type,
             ));
     }
 }
 
-/// The places a `@member_filled` cannot stand, each refused where it is
+/// The places an `@instance_filled` cannot stand, each refused where it is
 /// written:
-/// - member-filled-wired: the field also has a wire into it, so two things
+/// - instance-filled-wired: the field also has a wire into it, so two things
 ///   would drive one value;
-/// - member-filled-boundary: a group's, loop's or included file's own port
+/// - instance-filled-boundary: a group's, loop's or included file's own port
 ///   (write it on the node inside that reads the value);
-/// - member-filled-not-an-input: a key that is not one of the node's
+/// - instance-filled-not-an-input: a key that is not one of the node's
 ///   inputs, which no value from outside can reach.
-fn check_member_filled(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
+fn check_instance_filled(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     for node in &project.nodes {
         let name = author_name(node);
         if let Some(config) = node.config.as_object() {
             for (key, value) in config {
-                if weft_core::member::as_member_filled(value).is_some() {
+                if weft_core::instance::as_instance_filled(value).is_some() {
                     let (file, span) = cfg_anchor(node, key);
-                    push(d, file, span, Severity::Error, "member-filled-not-an-input",
-                        format!("'{name}.{key}' is not an input of '{name}', so no member's value can reach it; \
-                                 only an input can be `@member_filled`"));
+                    push(d, file, span, Severity::Error, "instance-filled-not-an-input",
+                        format!("'{name}.{key}' is not an input of '{name}', so no instance's value can reach it; \
+                                 only an input can be `@instance_filled`"));
                 }
             }
         }
-        for (field, _) in weft_core::member::member_filled_fields(node) {
+        for (field, _) in weft_core::instance::instance_filled_fields(node) {
             let (file, span) = cfg_anchor(node, field);
             if node.group_boundary.is_some() {
-                push(d, file, span, Severity::Error, "member-filled-boundary",
+                push(d, file, span, Severity::Error, "instance-filled-boundary",
                     format!("'{name}.{field}' is the port of a group, a loop or an included file, so it passes a value \
-                             on rather than using one; write `@member_filled` on the input of the node inside \
+                             on rather than using one; write `@instance_filled` on the input of the node inside \
                              that reads it"));
                 continue;
             }
             if has_incoming_edge(node, project, field) {
-                push(d, file, span, Severity::Error, "member-filled-wired",
-                    format!("'{name}.{field}' is `@member_filled` and also wired: each member provides this \
+                push(d, file, span, Severity::Error, "instance-filled-wired",
+                    format!("'{name}.{field}' is `@instance_filled` and also wired: each instance provides this \
                              value, so nothing else can drive it. Remove the wire, or the marker"));
             }
         }
@@ -202,12 +202,12 @@ fn check_route_claims(
             continue;
         };
         let written = node.written_value(&spec.path_field);
-        // A path or method each member provides is, like a wired one,
-        // known only when that member's trigger sets up; activation
+        // A path or method each instance provides is, like a wired one,
+        // known only when that instance's trigger sets up; activation
         // compares it.
-        let member_filled =
-            |field: &str| node.written_value(field).is_some_and(|value| weft_core::member::as_member_filled(value).is_some());
-        if member_filled(&spec.path_field) || spec.method_field.as_deref().is_some_and(member_filled) {
+        let instance_filled =
+            |field: &str| node.written_value(field).is_some_and(|value| weft_core::instance::as_instance_filled(value).is_some());
+        if instance_filled(&spec.path_field) || spec.method_field.as_deref().is_some_and(instance_filled) {
             continue;
         }
         let raw = match written.map(|value| value.as_str()) {
@@ -273,6 +273,18 @@ fn check_route_claims(
             .and_then(|value| value.as_str())
             .map(str::trim)
             .filter(|method| !method.is_empty());
+        // A method outside the field's own options is already refused
+        // (`literal-not-an-option`), naming the ones there are: one
+        // finding for one mistake, and the broken claim stays out of the
+        // overlap comparison.
+        let off_the_options = spec.method_field.as_deref().is_some_and(|field| {
+            let widget = node.inputs.iter().find(|i| i.name == field).and_then(|i| i.widget.as_ref());
+            let value = node.written_value(field);
+            widget.zip(value).is_some_and(|(widget, value)| widget.has_options() && widget.check_value(value).is_err())
+        });
+        if off_the_options {
+            continue;
+        }
         let mut methods = Vec::new();
         if let Some(method) = written_method {
             match weft_core::route::normalize_method(method) {
@@ -663,7 +675,7 @@ fn check_generator_wiring(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) 
         // The target arm needs no generator guard: the early return
         // above already proved one endpoint of this edge is a stream.
         let banned_endpoint =
-            tgt.node_type == "LoopOut" || (src.node_type == "LoopOut" && src_generator);
+            tgt.node_type == weft_core::project::boundary_types::LOOP_OUT || (src.node_type == weft_core::project::boundary_types::LOOP_OUT && src_generator);
         if banned_endpoint {
             push(d, file, span, Severity::Error, "generator-through-group",
                 format!(
@@ -924,11 +936,12 @@ fn check_declarative_rules(
     mode: ValidationMode,
     out: &mut Vec<Diagnostic>,
 ) {
-    // A field written `@member_filled` needs no special case here: the
+    // A field written `@instance_filled` needs no special case here: the
     // evaluator reads it as present with a value nobody knows yet, so a
     // "no connection picked" or "has no model" rule holds off, and a rule
-    // about the value's content waits for the member's value, when it is
+    // about the value's content waits for the instance's value, when it is
     // asked again with that value in (`weft_core::rules`).
+    let rules = weft_core::rules::RuleContext::new(project);
     for node in &project.nodes {
         let Some(meta) = catalog.lookup(&node.node_type) else { continue };
         let custom = node_custom_outputs(node, meta);
@@ -942,8 +955,8 @@ fn check_declarative_rules(
             {
                 continue;
             }
-            if weft_core::rules::fires(rule, node, project, &custom) {
-                emit_rule_diagnostic(node, meta, rule, out);
+            if weft_core::rules::fires(rule, node, &rules, &custom) {
+                emit_rule_diagnostic(node, &rules, meta, rule, out);
             }
         }
     }
@@ -956,8 +969,8 @@ fn check_declarative_rules(
 /// always fails, so the LANGUAGE synthesizes that runtime rule instead of
 /// every node's metadata restating it. Opt-out for the genuine
 /// can-run-unauthenticated case: `connection_optional: true` on the
-/// recipe. The ONE list both the compiler's check and a member's value
-/// check (`MemberRules`, filled at enrich) read.
+/// recipe. The ONE list both the compiler's check and an instance's value
+/// check (`InstanceRules`, filled at enrich) read.
 pub(crate) fn node_rules(meta: &weft_core::node::NodeMetadata, node: &NodeDefinition) -> Vec<ValidationRule> {
     let mut rules = meta.validate.clone();
     rules.extend(implicit_connection_rule(meta, node));
@@ -1021,6 +1034,7 @@ pub(crate) fn node_custom_outputs(node: &NodeDefinition, meta: &weft_core::node:
 
 fn emit_rule_diagnostic(
     node: &NodeDefinition,
+    rules: &weft_core::rules::RuleContext,
     meta: &weft_core::node::NodeMetadata,
     rule: &ValidationRule,
     out: &mut Vec<Diagnostic>,
@@ -1032,7 +1046,7 @@ fn emit_rule_diagnostic(
         RuleSeverity::Info => Severity::Info,
         RuleSeverity::Hint => Severity::Hint,
     };
-    let message = weft_core::rules::message(rule, node, &node_custom_outputs(node, meta));
+    let message = weft_core::rules::message(rule, node, rules, &node_custom_outputs(node, meta));
     let code = match rule.then.level {
         ValidationLevel::Structural => "rule-structural",
         ValidationLevel::Runtime => "rule-runtime",
@@ -1307,7 +1321,7 @@ fn enclosing_scope_hint(
             .get(weft_core::project::boundary_in_id(g).as_str())
             .is_some_and(|n| n.outputs.iter().any(|p| p.name == handle))
     })?;
-    let inner_kind = if src.node_type == "LoopIn" { "loop" } else { "group" };
+    let inner_kind = if src.node_type == weft_core::project::boundary_types::LOOP_IN { "loop" } else { "group" };
     let inner = &boundary.group_id;
     let inner_short = inner.rsplit('.').next().unwrap_or(inner);
     Some(format!(
@@ -1326,15 +1340,20 @@ fn enclosing_scope_hint(
 /// by construction. `None` for a runnable project, including one that
 /// puts an anonymous group beside loose nodes: an include refuses that
 /// file, so it is a program and the group is one more of its items.
-/// One answer per file, so every rule reads the same root.
+/// The body of a file it includes sits at the top level too, beside the
+/// root rather than in it, and is no loose item: it is that file's own
+/// page. One answer per file, so every rule reads the same root.
 fn component_root(project: &ProjectDefinition) -> Option<&str> {
     let root = project
         .groups
         .iter()
         .find(|g| g.parent_group_id.is_none() && g.anonymous)
         .map(|g| g.id.as_str())?;
+    let body = |id: &str| {
+        project.groups.iter().any(|g| g.id == id && matches!(g.kind, weft_core::project::GroupKind::Body))
+    };
     let alone = project.nodes.iter().all(|n| {
-        !n.scope.is_empty() || n.group_boundary.as_ref().is_some_and(|b| b.group_id == root)
+        !n.scope.is_empty() || n.group_boundary.as_ref().is_some_and(|b| b.group_id == root || body(&b.group_id))
     });
     alone.then_some(root)
 }
@@ -1680,10 +1699,15 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         // (`literal_type`), so `@asset("a.png", Image)` on an Image port
         // is a match and on a Video port a mismatch.
         for (key, value) in &node.port_literals {
-            // A `@member_filled` field is checked through its fallback,
-            // the one value of it known now; the member's own value is
-            // checked when they give it (`weft_core::member`).
-            let value = match weft_core::member::as_member_filled(value) {
+            // A connection picked on the install holds no value in the
+            // program: the install checks the pick when it is made.
+            if weft_core::picks::is_install_picked(value) {
+                continue;
+            }
+            // An `@instance_filled` field is checked through its fallback,
+            // the one value of it known now; the instance's own value is
+            // checked when it is given (`weft_core::instance`).
+            let value = match weft_core::instance::as_instance_filled(value) {
                 Some(filled) => match filled.fallback {
                     Some(fallback) => fallback,
                     None => continue,
@@ -1757,17 +1781,22 @@ fn check_type_compat(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
 /// (whether a group runs is its gate's call alone, and a closed port
 /// flows inside like any closure), so a port nothing inside needs may
 /// stay unconnected. A loop's iterated and carried ports are required on
-/// the loop itself and fall under the node rule instead.
+/// the loop itself and fall under the node rule instead. A component
+/// file's root is skipped: its inputs are the file's interface, and
+/// whether they are connected is each include site's question, asked
+/// there (`root` is `component_root`).
 fn check_container_inputs(
     project: &ProjectDefinition,
+    root: Option<&str>,
     node: &NodeDefinition,
     driven: &std::collections::HashSet<(String, String)>,
     d: &mut Vec<Diagnostic>,
 ) {
     use weft_core::project::boundary_types::{CALL_IN, LOOP_IN, PASSTHROUGH};
-    let is_door = node.group_boundary.as_ref().is_some_and(|b| b.role == weft_core::project::GroupBoundaryRole::In)
+    let Some(boundary) = node.group_boundary.as_ref() else { return };
+    let is_door = boundary.role == weft_core::project::GroupBoundaryRole::In
         && matches!(node.node_type.as_str(), PASSTHROUGH | CALL_IN | LOOP_IN);
-    if !is_door {
+    if !is_door || root == Some(boundary.group_id.as_str()) {
         return;
     }
     for input in &node.inputs {
@@ -1861,8 +1890,9 @@ fn check_port_coverage(
         .filter_map(|e| Some((e.target.clone(), e.target_handle.clone()?)))
         .collect();
 
+    let root = component_root(project);
     for node in &project.nodes {
-        check_container_inputs(project, node, &driven, d);
+        check_container_inputs(project, root, node, &driven, d);
         if weft_core::project::boundary_types::is_forwarding(&node.node_type) {
             continue;
         }
@@ -2003,16 +2033,21 @@ fn check_port_coverage(
 
             // The widget-level literal checks read the one home.
             let literal_value = node.port_literals.get(&input.name).and_then(|value| {
-                match weft_core::member::as_member_filled(value) {
+                if weft_core::picks::is_install_picked(value) {
+                    return None;
+                }
+                match weft_core::instance::as_instance_filled(value) {
                     Some(filled) => filled.fallback,
                     None => Some(value),
                 }
             });
             let literal_span = literal_anchor;
             // literal-out-of-range: the number widget's domain (min,
-            // max, step) bounds the literal at compile time. The rule
-            // itself lives on the widget (`Widget::check_value`), the
-            // same one the runtime holds a WIRED value to, so a source
+            // max, step) bounds the literal at compile time;
+            // literal-not-an-option: a select's options bound it (each
+            // item, for a multiselect). The rule itself lives on the
+            // widget (`Widget::check_value`), the same one the runtime
+            // holds a WIRED value and an instance's value to, so a source
             // that compiles cannot be refused at run time.
             if let Some(widget) = &input.widget {
                 // Range-check the CAST value so a stringified number
@@ -2027,7 +2062,7 @@ fn check_port_coverage(
                         lit_file,
                         lit_span,
                         Severity::Error,
-                        "literal-out-of-range",
+                        if widget.has_options() { "literal-not-an-option" } else { "literal-out-of-range" },
                         format!("input '{}.{}': {why}", author_name(node), input.name),
                     );
                 }
@@ -2043,11 +2078,11 @@ fn check_port_coverage(
             if group.is_empty() {
                 continue;
             }
-            // Every name has to be a port of this instance, on every
+            // Every name has to be a port of this node, on every
             // node type. Where the author can ADD input ports, a name
             // becomes one by being declared in the header, wired, or
             // configured; a name that is none of those is not an
-            // alternative the instance did not take, it is a port that
+            // alternative the node did not take, it is a port that
             // does not exist, and a guard over a port that does not
             // exist is a typo whichever way it happened.
             let unknown: Vec<&str> = group
@@ -2122,7 +2157,7 @@ fn check_port_coverage(
         // declared inputs at all, so every config key would
         // false-positive here.
         if !node.features.can_add_input_ports
-            && !matches!(node.node_type.as_str(), "LoopIn" | "LoopOut")
+            && !matches!(node.node_type.as_str(), weft_core::project::boundary_types::LOOP_IN | weft_core::project::boundary_types::LOOP_OUT)
             && catalog.lookup(&node.node_type).is_some()
         {
             let Some(obj) = node.config.as_object() else { continue };
@@ -2593,8 +2628,8 @@ fn check_loop_config(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
     for n in &project.nodes {
         let Some(gb) = &n.group_boundary else { continue };
         match n.node_type.as_str() {
-            "LoopIn" => { ins.insert(gb.group_id.as_str(), n); }
-            "LoopOut" => { outs.insert(gb.group_id.as_str(), n); }
+            weft_core::project::boundary_types::LOOP_IN => { ins.insert(gb.group_id.as_str(), n); }
+            weft_core::project::boundary_types::LOOP_OUT => { outs.insert(gb.group_id.as_str(), n); }
             _ => {}
         }
     }
@@ -3015,16 +3050,15 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
 /// names the move the language has for it (group the nodes cooperating
 /// on one job; let nesting absorb size).
 ///
-/// The file's top level is measured per BRANCH: the items one wire walk
-/// reaches, where a plain infra or connection node at that level ends
-/// the walk (a database both branches talk to, or the one key set gating
-/// every route, joins nothing; a group holding one is an item like any
-/// other). A branch counts its own items plus the shared nodes it
-/// touches, so two unrelated pipelines sharing one file
-/// each answer for their own width. The inside of a group or loop is
-/// one job by construction, so it is measured whole.
-fn check_level_sizes(project: &ProjectDefinition, catalog: &dyn MetadataCatalog, d: &mut Vec<Diagnostic>) {
-    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+/// The file's top level is split only into parts that share no wire at
+/// all, each measured on its own: two programs that happen to sit in one
+/// file answer for their own width. Anything linked, a database or a
+/// key set both branches use included, is one part, so a file whose
+/// routes share a supply groups its work instead of growing wide. The
+/// inside of a group or loop is one job by construction, so it is
+/// measured whole, and so is an included file's page.
+fn check_level_sizes(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
     /// A level holds more than this many items and the warning fires.
     /// Six is the readable size the language asks for; fifteen is the
@@ -3035,9 +3069,10 @@ fn check_level_sizes(project: &ProjectDefinition, catalog: &dyn MetadataCatalog,
     // file's members all live under its root group, whose boundaries
     // are the file's own interface rather than an item, so THAT scope
     // is the component's top level and is measured the same way.
-    // Either way every node's scope starts with `top`, which the rest
-    // relies on (`component_root` reads a file with loose nodes beside
-    // its anonymous group as a program).
+    // Either way every node's scope starts with `top`, save an included
+    // body's members, which sit beside a component's root on their own
+    // page (`component_root` reads a file with loose nodes beside its
+    // anonymous group as a program).
     let root = component_root(project);
     let top: Vec<String> = root.map(|r| vec![r.to_string()]).unwrap_or_default();
 
@@ -3060,7 +3095,6 @@ fn check_level_sizes(project: &ProjectDefinition, catalog: &dyn MetadataCatalog,
     // reaching into a group from outside names the inner node, and the
     // branch walk has to see that as the group joining.
     let mut top_item_of: HashMap<&str, &str> = HashMap::new();
-    let mut shared: HashSet<&str> = HashSet::new();
 
     // An included file's body is its own level (the file's page), not an
     // item on the page of the program that includes it: there the item
@@ -3082,18 +3116,7 @@ fn check_level_sizes(project: &ProjectDefinition, catalog: &dyn MetadataCatalog,
                 }
                 b.group_id.as_str()
             }
-            None => {
-                // Only a plain shared supply AT the top level ends the
-                // walk: an infra node, or a connection node (one whose
-                // type declares a service: a key set gating several
-                // routes, one provider serving several model calls). A
-                // group holding one is an item like any other.
-                let connection = catalog.lookup(&node.node_type).is_some_and(|m| m.service.is_some());
-                if (node.requires_infra || connection) && node.scope == top {
-                    shared.insert(node.id.as_str());
-                }
-                node.id.as_str()
-            }
+            None => node.id.as_str(),
         };
         let scope = node.scope.as_slice();
         if seated.insert((scope, item)) {
@@ -3104,7 +3127,13 @@ fn check_level_sizes(project: &ProjectDefinition, catalog: &dyn MetadataCatalog,
         if scope == top.as_slice() {
             top_item_of.insert(node.id.as_str(), item);
         } else {
-            let ancestor = scope.get(top.len()).expect("every node's scope starts with `top`");
+            // Under `top`, the item holding it there; an included body's
+            // member sits beside a component's root rather than in it,
+            // and its item is the body itself (its own page).
+            let ancestor = match scope.strip_prefix(top.as_slice()) {
+                Some(below) => &below[0],
+                None => &scope[0],
+            };
             top_item_of.insert(node.id.as_str(), ancestor.as_str());
         }
     }
@@ -3140,7 +3169,7 @@ fn check_level_sizes(project: &ProjectDefinition, catalog: &dyn MetadataCatalog,
         // Every sub level is one unit; the top level splits by branch.
         let is_top = *scope == top.as_slice();
         let units: Vec<Vec<&str>> = if is_top {
-            branches(level_items, &shared, &top_item_of, project)
+            parts(level_items, &top_item_of, project)
         } else {
             vec![level_items.clone()]
         };
@@ -3150,15 +3179,24 @@ fn check_level_sizes(project: &ProjectDefinition, catalog: &dyn MetadataCatalog,
                 continue;
             }
             let (name, anchor) = if is_top {
-                // The top level has no header of its own; the branch's
+                // The top level has no header of its own; the part's
                 // first item carries the warning.
                 let first = unit.first().expect("a crowded branch has a first item");
-                ("one connected branch at the top level".to_string(), anchor_of[first])
+                ("one connected part of the top level".to_string(), anchor_of[first])
             } else {
                 // A sub level is a group's inside, and the group is an
                 // item of its parent level: its header carries the warning.
+                // An included file's body has no header in any file (its
+                // site's header is in the includer's), so its first item
+                // carries it, on the file's own page.
                 let gid = scope.last().expect("a sub level is a group's scope");
-                (format!("the inside of '{gid}'"), anchor_of[gid.as_str()])
+                match anchor_of.get(gid.as_str()) {
+                    Some(group) => (format!("the inside of '{gid}'"), *group),
+                    None => {
+                        let first = unit.first().expect("a crowded level has a first item");
+                        ("this included file".to_string(), anchor_of[first])
+                    }
+                }
             };
             push(
                 d,
@@ -3175,21 +3213,17 @@ fn check_level_sizes(project: &ProjectDefinition, catalog: &dyn MetadataCatalog,
         }
     }
 
-    /// The top level's items split into branches: the items one wire
-    /// walk reaches without passing through a shared node (infra or a
-    /// connection), each branch listed in source order with the shared
-    /// nodes it touches appended. A shared node wired to nothing counts
-    /// nowhere. `top_item_of`
-    /// maps every node id an edge may name to its item at this level,
-    /// so a wire into a group's inside joins the group.
-    fn branches<'a>(
+    /// The top level's items split into the parts no wire links, each
+    /// listed in source order. `top_item_of` maps every node id an edge
+    /// may name to its item at this level, so a wire into a group's
+    /// inside joins the group.
+    fn parts<'a>(
         level_items: &[&'a str],
-        shared: &HashSet<&'a str>,
         top_item_of: &HashMap<&'a str, &'a str>,
         project: &'a ProjectDefinition,
     ) -> Vec<Vec<&'a str>> {
-        // Union-find over the level's non-shared items, by position in
-        // `level_items` so branches come out in source order.
+        // Union-find by position in `level_items`, so parts come out in
+        // source order.
         let index: HashMap<&str, usize> =
             level_items.iter().enumerate().map(|(i, id)| (*id, i)).collect();
         let mut parent: Vec<usize> = (0..level_items.len()).collect();
@@ -3201,42 +3235,19 @@ fn check_level_sizes(project: &ProjectDefinition, catalog: &dyn MetadataCatalog,
             }
             i
         }
-        // An edge joins its ends when both are items of this level and
-        // neither is shared; an edge onto a shared node only marks the
-        // touch, resolved to the branch once every join is in.
-        let mut touches: Vec<(usize, &str)> = Vec::new();
         for edge in &project.edges {
             let ends =
                 (top_item_of.get(edge.source.as_str()), top_item_of.get(edge.target.as_str()));
             let (Some(&a), Some(&b)) = ends else { continue };
             let (Some(&ia), Some(&ib)) = (index.get(a), index.get(b)) else { continue };
-            match (shared.contains(a), shared.contains(b)) {
-                (false, false) => {
-                    let (ra, rb) = (find(&mut parent, ia), find(&mut parent, ib));
-                    parent[ra.max(rb)] = ra.min(rb);
-                }
-                (true, false) => touches.push((ib, a)),
-                (false, true) => touches.push((ia, b)),
-                (true, true) => {}
-            }
+            let (ra, rb) = (find(&mut parent, ia), find(&mut parent, ib));
+            parent[ra.max(rb)] = ra.min(rb);
         }
         let mut members: BTreeMap<usize, Vec<&str>> = BTreeMap::new();
         for (i, id) in level_items.iter().enumerate() {
-            if !shared.contains(id) {
-                members.entry(find(&mut parent, i)).or_default().push(id);
-            }
+            members.entry(find(&mut parent, i)).or_default().push(id);
         }
-        let mut touched: BTreeMap<usize, BTreeSet<&str>> = BTreeMap::new();
-        for (i, shared_id) in touches {
-            touched.entry(find(&mut parent, i)).or_default().insert(shared_id);
-        }
-        members
-            .into_iter()
-            .map(|(root, mut branch)| {
-                branch.extend(touched.remove(&root).into_iter().flatten());
-                branch
-            })
-            .collect()
+        members.into_values().collect()
     }
 }
 

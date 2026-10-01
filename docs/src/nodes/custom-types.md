@@ -12,7 +12,7 @@ Give a shape a name and every node can use it.
 Then in any node's ports, including other people's:
 
 ```json
-"inputs": [ { "name": "history", "type": "ChatHistory", "required": true } ]
+"inputs": [ { "name": "messages", "type": "ChatHistory", "required": true } ]
 ```
 
 ## They are global, and compared by name

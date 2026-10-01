@@ -38,7 +38,7 @@ export function describeOutcome(
 /// The icon a row draws: a spinner while it runs, green for done,
 /// red for failed, a plain stop sign for a run a person stopped, and
 /// an orange crossed circle for one the runtime ended on its own (the
-/// caller left, a pod went down): after the drainers stopped cancelling
+/// caller left, an instance went down): after the drainers stopped cancelling
 /// answered runs, each of those is rare and worth a look.
 export function statusThemeIcon(status: string, cancelCause?: CancelCause | null): vscode.ThemeIcon {
   switch (status.toLowerCase()) {

@@ -63,8 +63,11 @@ pub fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
 /// resolver, never asserted by a client.
 ///
 /// The two older spellings (`ours`, `their-own`) still read, as
-/// `Platform` and `Author`: journal rows written before members existed
-/// carry them, and a journal row is never rewritten.
+/// `Platform` and `Author`: journal rows written before instances existed
+/// carry them. The rename of member to instance rewrote stored rows once
+/// (`{"member": id}` became `{"instance": id}`, in the
+/// `*_rename_member_keys_in_json.sql` migrations), so no alias reads the
+/// old spelling.
 // SYNC: CredentialOwner <-> packages/weft-connect/src/core/wire.ts CredentialOwner, crates/weft-core/src/program.rs PaidBy
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -77,9 +80,9 @@ pub enum CredentialOwner {
     /// calls spend their money, so a measured figure is informational.
     #[serde(alias = "their-own")]
     Author,
-    /// A member's own credential, connected by that member: calls spend
-    /// the member's money.
-    Member(crate::member::MemberId),
+    /// An instance's own credential, connected for that instance: calls
+    /// spend the money of whoever connected it.
+    Instance(crate::instance::InstanceId),
 }
 
 impl CredentialOwner {
@@ -89,10 +92,10 @@ impl CredentialOwner {
     }
 
     /// The owner of a connection somebody connected themselves: the
-    /// member's when it is a member's connection, the author's otherwise.
-    pub fn own(member: Option<crate::member::MemberId>) -> Self {
-        match member {
-            Some(member) => CredentialOwner::Member(member),
+    /// instance's when it is an instance's connection, the author's otherwise.
+    pub fn own(instance: Option<crate::instance::InstanceId>) -> Self {
+        match instance {
+            Some(instance) => CredentialOwner::Instance(instance),
             None => CredentialOwner::Author,
         }
     }
@@ -396,11 +399,11 @@ mod owner_tests {
     }
 
     #[test]
-    fn a_members_own_names_the_member() {
-        let ada = crate::member::MemberId::new("ada").unwrap();
+    fn an_instances_own_names_the_instance() {
+        let ada = crate::instance::InstanceId::new("ada").unwrap();
         let owner = CredentialOwner::own(Some(ada.clone()));
-        assert_eq!(serde_json::to_value(&owner).unwrap(), serde_json::json!({ "member": "ada" }));
-        assert_eq!(serde_json::from_value::<CredentialOwner>(serde_json::json!({ "member": "ada" })).unwrap(), owner);
+        assert_eq!(serde_json::to_value(&owner).unwrap(), serde_json::json!({ "instance": "ada" }));
+        assert_eq!(serde_json::from_value::<CredentialOwner>(serde_json::json!({ "instance": "ada" })).unwrap(), owner);
         assert!(!owner.is_platform());
         assert_eq!(CredentialOwner::own(None), CredentialOwner::Author);
     }

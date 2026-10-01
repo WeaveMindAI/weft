@@ -1,17 +1,19 @@
-//! Postgres-backed task queue + worker-pod registry shared by the
-//! dispatcher and the engine. Both sides go through the same SQL
+//! Postgres-backed task queue shared by the dispatcher, the broker and the
+//! engine. Both sides go through the same SQL
 //! helpers; the boot applies the schema via `schema_guard::apply_groups`
 //! over each module's `GROUP`.
 //!
 //! Modules:
+//!   - `alarm`: the wakes a local install has set and not yet
+//!     delivered.
 //!   - `tasks`: the `task` table (enqueue, claim, heartbeat,
-//!     complete, fail, sweep).
-//!   - `worker_pod`: the `worker_pod` table + journal-fencing trigger
-//!     (register, heartbeat, mark_done, list_stale). Its trigger on
-//!     `exec_event` requires `exec_event` to exist first, so the
-//!     journal schema must be applied BEFORE this group.
-//!   - `executor`: `TaskExecutor` and `WorkerTaskKind` traits, plus
-//!     the dispatcher and worker picker loops.
+//!     complete, fail, sweep), and the trigger that makes an execution's
+//!     owner follow its task's claim.
+//!   - `executor`: `TaskExecutor` and `WorkerTaskKind` traits, the
+//!     dispatcher's picker loop, and the worker's run of one claimed
+//!     task.
+//!   - `drain`: the wake-and-drain loop every role's background work
+//!     runs, on the machine or, scaled to zero, once per tick.
 //!   - `pg_signal`: the process's one Postgres `LISTEN` connection,
 //!     which every wait on a row sleeps on (`terminal` is the task
 //!     waiter built on it).
@@ -20,6 +22,8 @@
 //!     `CREATE TABLE` text and carries an existing one forward with the
 //!     group's migration files.
 
+pub mod alarm;
+pub mod drain;
 pub mod executor;
 pub mod kinds;
 pub mod pg_signal;
@@ -27,31 +31,19 @@ pub mod schema_guard;
 pub mod tasks;
 pub mod terminal;
 pub mod traits;
-pub mod worker_pod;
 
 pub use schema_guard::{apply_groups, Migration, SchemaGroup};
 
 pub use executor::{
-    run_dispatcher_picker, run_worker_picker, PodStanding, TaskExecutor, TaskRegistry, TaskRegistryBuilder,
-    WorkerTaskKind, WorkerTaskRegistry, WorkerTaskRegistryBuilder,
+    dispatcher_picker_loop, run_claimed_worker_task, TaskEnd, TaskExecutor, TaskRegistry, TaskRegistryBuilder,
 };
 pub use kinds::{
     CancelExecutionPayload, ExecutionPayload, FireSignalPayload, RecordCostPayload,
-    RecordLogPayload, SpawnPodPayload, StopTaggedPayload, TaskKind, UpdateSignalKindStatePayload,
+    RecordLogPayload, StopTaggedPayload, TaskKind,
 };
 pub use tasks::{
-    claim_one, complete, enqueue, enqueue_dedup, fail, heartbeat, sweep_terminal,
-    ClaimFilter, DedupOutcome, NewTask, Task, TaskOutcome, TaskStatus,
+    bind_execution_id_owner, claim_one, complete, enqueue, enqueue_dedup, fail, heartbeat, sweep_terminal, take_deliveries,
+    CancelAsked, ClaimFilter, DedupOutcome, Delivery, NewTask, Task, TaskOutcome, TaskStatus,
     TaskTarget, claim_duration_secs, claim_heartbeat_interval, TERMINAL_RETENTION_SECS,
 };
-pub use traits::{
-    InfraReader, PostgresInfraReader, PostgresTaskStoreClient, PostgresWorkerPodClient,
-    TaskStoreClient, WorkerPodClient,
-};
-pub use worker_pod::{
-    delete_row, has_live_for_project,
-    insert_spawning, list_orphaned_node_test, list_stale, list_stale_spawning, list_terminal,
-    mark_dead, mark_done, mark_done_if_idle, register_alive, AliveTransition, PodStatus,
-    WorkerPodRow, WorkerStanding, heartbeat_interval, heartbeat_stale_secs,
-    SPAWN_BOOT_DEADLINE_SECS,
-};
+pub use traits::{InfraReader, PostgresInfraReader, PostgresTaskStoreClient, TaskStoreClient};

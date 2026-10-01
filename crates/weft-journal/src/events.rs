@@ -20,29 +20,17 @@
 //!
 //! There is no compatibility decoding: a journal row written to an
 //! older shape does not decode, the read that hits it fails naming
-//! the color, and `weft clean` removes the execution.
-
-use std::collections::BTreeMap;
+//! the execution, and `weft clean` removes the execution.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use weft_core::frames::{Located, LoopFrames};
+use weft_core::frames::LoopFrames;
 use weft_core::primitive::{LoopTerminationReason, SignalSpec};
-use weft_core::Color;
+use weft_core::ExecutionId;
 
-/// The chosen origin of each reused result, independent of which nodes
-/// execute in the child. Readers reconstruct each origin under its own
-/// birth context and import history without replaying its scheduling.
-// SYNC: Seed <-> packages/weft-graph/src/protocol.ts Seed
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Seed {
-    pub parent: Color,
-    /// Per place (a node under the calls that reach it): the run whose
-    /// result it keeps.
-    pub origins: BTreeMap<Located, Color>,
-}
+/// A run's seed: weft-core's, since the live events carry it too.
+pub use weft_core::run_spec::Seed;
 
 /// One event in the execution log. Append-only; events are never
 /// edited or deleted by the dispatcher. User-initiated cleanup
@@ -51,12 +39,12 @@ pub struct Seed {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExecEvent {
     ExecutionStarted {
-        color: Color,
+        execution_id: ExecutionId,
         project_id: uuid::Uuid,
         entry_node: String,
         phase: weft_core::context::Phase,
         /// `running_definition_hash` snapshotted at execution-start
-        /// time. Resumes of this color use THIS hash (not the
+        /// time. Resumes of this execution use THIS hash (not the
         /// project row's current hash) to fetch the project
         /// definition from the broker, so a webhook-triggered
         /// resume after a config edit runs the suspended execution
@@ -64,8 +52,8 @@ pub enum ExecEvent {
         /// this, a resume folds the OLD journal state but executes
         /// against the NEW topology / config, which is undefined
         /// behavior. `None` for a run that executes no project
-        /// definition (a node self-test): a resume against such a
-        /// color fails loudly as NotFound instead of resuming
+        /// definition (a node self-test): a resume against such an
+        /// execution fails loudly as NotFound instead of resuming
         /// against a sentinel hash.
         definition_hash: Option<String>,
         /// Graph and production implementation identity for reuse and bake.
@@ -73,7 +61,7 @@ pub enum ExecEvent {
         /// Immutable source version used to start this execution.
         source_version: Option<String>,
         /// What the run is (`weft_core::exec::RunKind`): a project
-        /// run, a node self-test (real color, lifecycle owned by the
+        /// run, a node self-test (real execution, lifecycle owned by the
         /// test task, so project sweeps never touch it), or an
         /// unrecorded run (its rows live in the worker's memory and
         /// reach the journal only if it fails). Rows written before the
@@ -96,42 +84,55 @@ pub enum ExecEvent {
         /// The run this one was seeded from and what it may not take
         /// from it (`weft run --seed`). `None` for a run that starts
         /// from nothing. Rows this run inherited never exist under its
-        /// color: they are read off the seed's journal at fold time.
+        /// execution: they are read off the seed's journal at fold time.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seed: Option<Seed>,
-        /// Who the run is for: the member whatever started it named (a
-        /// `--member`, a member token, the `Weft-Member` header on a gated
-        /// route, a firing through a member's copy). `None` for a run for
-        /// nobody in particular. Written ONCE here, at birth; the
-        /// `execution_color` row copies it in the same transaction so the
-        /// member filters read a column, and the engine folds it into
-        /// `ctx.member()`.
+        /// Which instance the run belongs to: the one whatever started it
+        /// named (an `--instance`, an instance token, the `Weft-Instance`
+        /// header on a gated route, a firing through an instance's copy).
+        /// `None` for a run of no instance in particular. Written ONCE
+        /// here, at birth; the `execution` row copies it in the same
+        /// transaction so the instance filters read a column, and the
+        /// engine folds it into `ctx.instance()`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        member: Option<weft_core::member::MemberId>,
-        /// What that member provides for the run's `@member_filled`
+        instance: Option<weft_core::instance::InstanceId>,
+        /// What that instance provides for the run's `@instance_filled`
         /// fields, by place and field, read and checked ONCE here, at
-        /// birth (`weft_core::run_spec::member_run_values`). Every firing
+        /// birth (`weft_core::run_spec::instance_run_values`). Every firing
         /// reads these, never the live store, so a replay sees the values
         /// the run was born with and a value changed meanwhile reaches the
         /// next run.
         /// Boxed: most runs carry none, and the birth event is the
         /// enum's largest variant already.
-        #[serde(default, skip_serializing_if = "no_member_values")]
-        member_values: Box<weft_core::member::MemberValues>,
+        #[serde(default, skip_serializing_if = "no_instance_values")]
+        instance_values: Box<weft_core::instance::InstanceValues>,
+        /// The install's picks for the run's access nodes whose
+        /// connection is picked on the install (`weft_core::picks`), by
+        /// place and field, read and checked ONCE here, at birth
+        /// (`weft_core::picks::run_picks`), like the instance's values
+        /// above: every firing reads these, so a pick changed meanwhile
+        /// reaches the next run.
+        #[serde(default, skip_serializing_if = "no_instance_values")]
+        picks: Box<weft_core::picks::Picks>,
         /// The trigger whose firing started this run, spelled the way the
         /// program reads it (`door`, `one.door`): a listener fire, a
         /// route call, a replayed parked fire, or `weft run --fire`.
         /// `None` for a run started by hand and for every setup run. The
-        /// run belongs to that trigger's activation (for the member
+        /// run belongs to that trigger's activation (for the instance
         /// above): taking the activation down takes the run's waits with
-        /// it, and `execution_color.fired_by` copies it for that join.
+        /// it, and `execution.fired_by` copies it for that join.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fired_trigger: Option<String>,
+        /// How long the run may run (`weft_core::run_class`), fixed here
+        /// at birth from whatever started it: every task that drives the
+        /// run (its execute and each resume) runs under it.
+        #[serde(default, skip_serializing_if = "weft_core::run_class::RunClass::is_default")]
+        run_class: weft_core::run_class::RunClass,
         at_unix: u64,
     },
 
     NodeKicked {
-        color: Color,
+        execution_id: ExecutionId,
         node_id: String,
         /// The frames the kick fires under: empty for a root at the top;
         /// the call frames of the site chain for a root inside an
@@ -160,7 +161,7 @@ pub enum ExecEvent {
     /// frames, minus the items on its generator ports, which its live
     /// feed takes one by one).
     NodeStarted {
-        color: Color,
+        execution_id: ExecutionId,
         node_id: String,
         frames: LoopFrames,
         at_unix: u64,
@@ -172,7 +173,7 @@ pub enum ExecEvent {
     /// the closures from the program), and a generator output's
     /// closure is the stream's clean end.
     NodeCompleted {
-        color: Color,
+        execution_id: ExecutionId,
         node_id: String,
         frames: LoopFrames,
         at_unix: u64,
@@ -182,7 +183,7 @@ pub enum ExecEvent {
     /// values; every other output closes, a generator output's closure
     /// carrying the error as a FAILED stream end.
     NodeFailed {
-        color: Color,
+        execution_id: ExecutionId,
         node_id: String,
         frames: LoopFrames,
         error: String,
@@ -197,7 +198,7 @@ pub enum ExecEvent {
     /// the screen. A `ScopeSkipped` skip closes nothing: the scope's In
     /// boundary already closed the scope's outward surface.
     NodeSkipped {
-        color: Color,
+        execution_id: ExecutionId,
         node_id: String,
         frames: LoopFrames,
         reason: weft_core::exec::skip::SkipReason,
@@ -205,7 +206,7 @@ pub enum ExecEvent {
     },
 
     NodeSuspended {
-        color: Color,
+        execution_id: ExecutionId,
         node_id: String,
         frames: LoopFrames,
         token: String,
@@ -213,7 +214,7 @@ pub enum ExecEvent {
     },
 
     NodeResumed {
-        color: Color,
+        execution_id: ExecutionId,
         node_id: String,
         frames: LoopFrames,
         /// Resume cause:
@@ -221,23 +222,25 @@ pub enum ExecEvent {
         ///   `SuspensionResolved` for `token` arrived (its value is on
         ///   that row). The fold clears the `suspensions` and
         ///   `pending_deliveries` entries for `token`.
-        /// - `None`: crashed-Running recovery (the firing was
-        ///   Running when the worker crashed; a fresh worker is
-        ///   re-driving it). No suspension token to clear.
+        /// - `None`: a group boundary the worker was firing when it
+        ///   went away, re-fired by the next worker (its state is all
+        ///   journaled, so the re-fire is safe; a STEP a dead worker
+        ///   left running is failed, never re-run). No suspension
+        ///   token to clear.
         /// Either way the fold absorbs every pulse pending at the
         /// location, as it does for a `NodeStarted`: a resume can
         /// absorb fresh pulses that arrived while the firing was
-        /// waiting, and the un-absorb path on a later crashed-Running
-        /// recovery needs every absorbed pulse, not just the original
-        /// dispatch's. Always written (`null` for a crash recovery): a
-        /// missing field is a truncated row and fails to decode.
+        /// waiting, and the un-absorb path on a later re-fire needs
+        /// every absorbed pulse, not just the original dispatch's.
+        /// Always written (`null` for a re-fire): a missing field is a
+        /// truncated row and fails to decode.
         #[serde(deserialize_with = "present")]
         token: Option<String>,
         at_unix: u64,
     },
 
     NodeCancelled {
-        color: Color,
+        execution_id: ExecutionId,
         node_id: String,
         frames: LoopFrames,
         reason: String,
@@ -253,7 +256,7 @@ pub enum ExecEvent {
     /// launch) resolves the same live and on replay. One row per port
     /// per `pulse_downstream` call; a stream item is one row.
     PortEmitted {
-        color: Color,
+        execution_id: ExecutionId,
         emission_id: uuid::Uuid,
         node_id: String,
         frames: LoopFrames,
@@ -276,7 +279,7 @@ pub enum ExecEvent {
     /// output this is the stream's early end. A fact the body decided,
     /// so it has its own row; the termination sweep's closures do not.
     PortClosed {
-        color: Color,
+        execution_id: ExecutionId,
         emission_id: uuid::Uuid,
         node_id: String,
         frames: LoopFrames,
@@ -299,7 +302,7 @@ pub enum ExecEvent {
     /// windowed writes (the bus already batches its appends this way)
     /// before that volume is real.
     PulsesConsumed {
-        color: Color,
+        execution_id: ExecutionId,
         /// The consuming node (the pulses' target).
         node_id: String,
         frames: LoopFrames,
@@ -313,7 +316,7 @@ pub enum ExecEvent {
     /// a function of the LoopIn's own firing, which the fold rebuilds
     /// from the LoopIn's absorbed pulses plus the program.
     LoopInstantiated {
-        color: Color,
+        execution_id: ExecutionId,
         group_id: String,
         parent_frames: LoopFrames,
         at_unix: u64,
@@ -327,7 +330,7 @@ pub enum ExecEvent {
     /// the instance and the program say they are at this point; the
     /// fold puts them on the wires from this row.
     LoopIterationLaunched {
-        color: Color,
+        execution_id: ExecutionId,
         group_id: String,
         parent_frames: LoopFrames,
         index: u32,
@@ -350,7 +353,7 @@ pub enum ExecEvent {
     /// the LoopOut firing absorbed; the fold reads them off that
     /// record.
     LoopOutFired {
-        color: Color,
+        execution_id: ExecutionId,
         group_id: String,
         parent_frames: LoopFrames,
         index: u32,
@@ -364,7 +367,7 @@ pub enum ExecEvent {
     /// loop that waits forever for a close that can never arrive
     /// again. Folds onto the instance's stream source.
     LoopStreamEnded {
-        color: Color,
+        execution_id: ExecutionId,
         group_id: String,
         parent_frames: LoopFrames,
         end: weft_core::primitive::StreamEnd,
@@ -377,7 +380,7 @@ pub enum ExecEvent {
     /// gather lists + final carries) go on the wires from this row; on
     /// a failed or cancelled end its outward ports close instead.
     LoopTerminated {
-        color: Color,
+        execution_id: ExecutionId,
         group_id: String,
         parent_frames: LoopFrames,
         reason: LoopTerminationReason,
@@ -386,7 +389,7 @@ pub enum ExecEvent {
 
     /// Setup evaluated this trigger without arming a listener.
     TriggerCaptured {
-        color: Color,
+        execution_id: ExecutionId,
         node_id: String,
         spec: SignalSpec,
         port_snapshot: Value,
@@ -394,7 +397,7 @@ pub enum ExecEvent {
     },
 
     SuspensionRegistered {
-        color: Color,
+        execution_id: ExecutionId,
         node_id: String,
         frames: LoopFrames,
         token: String,
@@ -404,14 +407,14 @@ pub enum ExecEvent {
     },
 
     SuspensionResolved {
-        color: Color,
+        execution_id: ExecutionId,
         token: String,
         value: Value,
         at_unix: u64,
     },
 
     RunOutput {
-        color: Color,
+        execution_id: ExecutionId,
         node_id: String,
         frames: LoopFrames,
         call_index: u32,
@@ -428,7 +431,7 @@ pub enum ExecEvent {
     /// measurement on a key the user holds; a data-model distinction for
     /// debugging and the ledger, not a UI one.
     CostReported {
-        color: Color,
+        execution_id: ExecutionId,
         node_id: String,
         frames: LoopFrames,
         /// The record's stable identity (from the durable task that carried
@@ -448,7 +451,7 @@ pub enum ExecEvent {
     },
 
     LogLine {
-        color: Color,
+        execution_id: ExecutionId,
         /// The node that wrote it, and the iteration it was in: a log
         /// line is about one firing, and a graph where ten nodes log
         /// is unreadable without it. An empty id is a run-level line.
@@ -469,13 +472,26 @@ pub enum ExecEvent {
         at_unix: u64,
     },
 
+    /// A node changed a stored file's content in place
+    /// (`ctx.storage().edit` / `replace`): which file, from which version
+    /// to which, and a readable diff cut to a readable size. For the
+    /// inspector's card on that firing; not folded, since nothing a
+    /// resume needs depends on it.
+    FileEdited {
+        execution_id: ExecutionId,
+        node_id: String,
+        frames: LoopFrames,
+        edit: weft_core::storage::FileEdit,
+        at_unix: u64,
+    },
+
     /// A node tagged its own execution (`ctx.tag_execution`). The
     /// record of the act, for the inspector; the SELECTABLE copy a
     /// sibling's `ctx.stop_tagged` reads lives beside the execution row
     /// (`execution_tag`), written in the same transaction as this event.
     /// Not folded: tags are not execution state a resume rebuilds.
     ExecutionTagged {
-        color: Color,
+        execution_id: ExecutionId,
         tags: Vec<String>,
         at_unix: u64,
     },
@@ -484,18 +500,18 @@ pub enum ExecEvent {
     /// nodes emitted (the `PortEmitted` rows); the row is the terminal
     /// marker and nothing else.
     ExecutionCompleted {
-        color: Color,
+        execution_id: ExecutionId,
         at_unix: u64,
     },
 
     ExecutionFailed {
-        color: Color,
+        execution_id: ExecutionId,
         error: String,
         at_unix: u64,
     },
 
     ExecutionCancelled {
-        color: Color,
+        execution_id: ExecutionId,
         /// The cause in words, what a person reads (`cause.to_string()`
         /// when `cause` is set).
         reason: String,
@@ -509,7 +525,7 @@ pub enum ExecEvent {
     },
 
     BusJoined {
-        color: Color,
+        execution_id: ExecutionId,
         bus_id: String,
         offset: u64,
         name: String,
@@ -517,7 +533,7 @@ pub enum ExecEvent {
     },
 
     BusLeft {
-        color: Color,
+        execution_id: ExecutionId,
         bus_id: String,
         offset: u64,
         name: String,
@@ -531,9 +547,9 @@ pub enum ExecEvent {
     /// `messages` are empty and the `totals` rollup is the whole
     /// journaled story. A quiet bus degenerates to one message per
     /// window, so slow traffic reads exactly as before.
-    // SYNC: BusWindow <-> crates/weft-dispatcher/src/events.rs BusWindow, packages/weft-graph/src/protocol.ts BusInspectorEvent 'window', extension-vscode/src/execFollower.ts DispatcherEvent 'bus_window'
+    // SYNC: BusWindow <-> crates/weft-core/src/live_event.rs BusWindow, packages/weft-graph/src/protocol.ts BusInspectorEvent 'window', extension-vscode/src/execFollower.ts DispatcherEvent 'bus_window'
     BusWindow {
-        color: Color,
+        execution_id: ExecutionId,
         bus_id: String,
         first_offset: u64,
         last_offset: u64,
@@ -543,7 +559,7 @@ pub enum ExecEvent {
     },
 
     BusClosed {
-        color: Color,
+        execution_id: ExecutionId,
         bus_id: String,
         offset: u64,
         at_unix: u64,
@@ -552,8 +568,8 @@ pub enum ExecEvent {
     // ----- Live caller connection (mirrors the Bus* family) ----------
     //
     // A live `live_connection` run holds ONE caller for the execution, so
-    // there is no `bus_id`: the color IS the connection's identity. The
-    // exchange is recorded as a replayable per-color event stream the
+    // there is no `bus_id`: the execution IS the connection's identity. The
+    // exchange is recorded as a replayable per-execution event stream the
     // graph view replays exactly like a bus. `offset` is the monotonic
     // per-execution position in the caller stream. Message payloads use
     // the same wire vocabulary as the bus's window rows
@@ -562,7 +578,7 @@ pub enum ExecEvent {
 
     /// The caller attached. The first event in any caller stream.
     CallerConnected {
-        color: Color,
+        execution_id: ExecutionId,
         offset: u64,
         /// `"http"` | `"websocket"` (the `Protocol` wire tag).
         protocol: String,
@@ -585,9 +601,9 @@ pub enum ExecEvent {
     /// even when it does not say what it was. What decides that lives
     /// in one place for every channel in the language
     /// ([`weft_core::stream_journal`]).
-    // SYNC: CallerWindow <-> crates/weft-dispatcher/src/events.rs CallerWindow, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'window', extension-vscode/src/execFollower.ts DispatcherEvent 'caller_window'
+    // SYNC: CallerWindow <-> crates/weft-core/src/live_event.rs CallerWindow, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'window', extension-vscode/src/execFollower.ts DispatcherEvent 'caller_window'
     CallerWindow {
-        color: Color,
+        execution_id: ExecutionId,
         first_offset: u64,
         last_offset: u64,
         messages: Vec<weft_core::stream_journal::WindowedCallerMessage>,
@@ -599,7 +615,7 @@ pub enum ExecEvent {
     /// status/body before streaming, in-band error chunk after, WS close
     /// frame). Recorded so the exchange replay shows where it broke.
     CallerErrored {
-        color: Color,
+        execution_id: ExecutionId,
         offset: u64,
         message: String,
         at_unix: u64,
@@ -608,7 +624,7 @@ pub enum ExecEvent {
     /// The caller is gone (response complete OR disconnected, the same
     /// event from the run's view). Last event in the caller stream.
     CallerDisconnected {
-        color: Color,
+        execution_id: ExecutionId,
         offset: u64,
         reason: String,
         at_unix: u64,
@@ -626,13 +642,43 @@ where
     Option::<T>::deserialize(deserializer)
 }
 
+/// The terminal event kinds as a SQL list, `('a', 'b', 'c')`, for a
+/// `kind IN` filter on `exec_event`. A macro so a query written as one
+/// string literal can take it through `concat!`; a query built with
+/// `format!` uses [`EXECUTION_TERMINAL_KINDS_SQL`]. Every SQL filter on
+/// the terminal set goes through one of the two, and a test pins it to
+/// [`ExecEvent::is_execution_terminal`].
+// SYNC: EXECUTION_TERMINAL_KINDS_SQL <-> crates/weft-journal/src/events.rs ExecEvent::is_execution_terminal, crates/weft-core/src/live_event.rs DispatcherEvent::is_execution_terminal
+#[macro_export]
+macro_rules! execution_terminal_kinds_sql {
+    () => {
+        "('execution_completed', 'execution_failed', 'execution_cancelled')"
+    };
+}
+
+/// See [`execution_terminal_kinds_sql!`].
+pub const EXECUTION_TERMINAL_KINDS_SQL: &str = execution_terminal_kinds_sql!();
+
+/// THE rule for "this run is parked on a wait", as a SQL predicate over
+/// an `execution` row aliased `ec`: a resume signal is registered for it.
+/// A macro so a query written as one string literal can take it through
+/// `concat!`; a query built with `format!` uses [`RUN_PARKED_SQL`].
+// SYNC: run_parked_sql <-> crates/weft-core/src/program.rs SummaryStatus::parked
+#[macro_export]
+macro_rules! run_parked_sql {
+    () => {
+        "EXISTS (SELECT 1 FROM signal parked WHERE parked.execution_id = ec.execution_id AND parked.is_resume)"
+    };
+}
+
+/// See [`run_parked_sql!`].
+pub const RUN_PARKED_SQL: &str = run_parked_sql!();
+
 impl ExecEvent {
     /// Whether this event ends the execution: completed, failed, or
-    /// cancelled. The ONE definition of the terminal set in Rust; the
-    /// SQL that filters on it lives in
-    /// `weft-dispatcher/src/api/execution.rs` (`terminal_outcome`) and
-    /// carries a marker back here.
-    // SYNC: ExecEvent::is_execution_terminal <-> crates/weft-dispatcher/src/api/execution.rs terminal_outcome (SQL kind list), crates/weft-cli/src/commands/follow.rs is_terminal (SSE kind list), crates/weft-journal/src/tags.rs live_tagged_executions (SQL kind list)
+    /// cancelled. The ONE definition of the terminal set in Rust; every
+    /// SQL filter on it uses [`EXECUTION_TERMINAL_KINDS_SQL`].
+    // SYNC: ExecEvent::is_execution_terminal <-> crates/weft-core/src/live_event.rs DispatcherEvent::is_execution_terminal, crates/weft-journal/src/events.rs EXECUTION_TERMINAL_KINDS_SQL
     pub fn is_execution_terminal(&self) -> bool {
         matches!(
             self,
@@ -642,43 +688,44 @@ impl ExecEvent {
         )
     }
 
-    pub fn color(&self) -> Color {
+    pub fn execution_id(&self) -> ExecutionId {
         match self {
-            Self::ExecutionStarted { color, .. }
-            | Self::NodeKicked { color, .. }
-            | Self::NodeStarted { color, .. }
-            | Self::NodeCompleted { color, .. }
-            | Self::NodeFailed { color, .. }
-            | Self::NodeSkipped { color, .. }
-            | Self::NodeSuspended { color, .. }
-            | Self::NodeResumed { color, .. }
-            | Self::NodeCancelled { color, .. }
-            | Self::PortEmitted { color, .. }
-            | Self::PortClosed { color, .. }
-            | Self::PulsesConsumed { color, .. }
-            | Self::LoopInstantiated { color, .. }
-            | Self::LoopIterationLaunched { color, .. }
-            | Self::LoopOutFired { color, .. }
-            | Self::LoopStreamEnded { color, .. }
-            | Self::LoopTerminated { color, .. }
-            | Self::SuspensionRegistered { color, .. }
-            | Self::TriggerCaptured { color, .. }
-            | Self::SuspensionResolved { color, .. }
-            | Self::RunOutput { color, .. }
-            | Self::CostReported { color, .. }
-            | Self::LogLine { color, .. }
-            | Self::ExecutionTagged { color, .. }
-            | Self::ExecutionCompleted { color, .. }
-            | Self::ExecutionFailed { color, .. }
-            | Self::ExecutionCancelled { color, .. }
-            | Self::BusJoined { color, .. }
-            | Self::BusLeft { color, .. }
-            | Self::BusWindow { color, .. }
-            | Self::BusClosed { color, .. }
-            | Self::CallerConnected { color, .. }
-            | Self::CallerWindow { color, .. }
-            | Self::CallerErrored { color, .. }
-            | Self::CallerDisconnected { color, .. } => *color,
+            Self::ExecutionStarted { execution_id, .. }
+            | Self::NodeKicked { execution_id, .. }
+            | Self::NodeStarted { execution_id, .. }
+            | Self::NodeCompleted { execution_id, .. }
+            | Self::NodeFailed { execution_id, .. }
+            | Self::NodeSkipped { execution_id, .. }
+            | Self::NodeSuspended { execution_id, .. }
+            | Self::NodeResumed { execution_id, .. }
+            | Self::NodeCancelled { execution_id, .. }
+            | Self::PortEmitted { execution_id, .. }
+            | Self::PortClosed { execution_id, .. }
+            | Self::PulsesConsumed { execution_id, .. }
+            | Self::LoopInstantiated { execution_id, .. }
+            | Self::LoopIterationLaunched { execution_id, .. }
+            | Self::LoopOutFired { execution_id, .. }
+            | Self::LoopStreamEnded { execution_id, .. }
+            | Self::LoopTerminated { execution_id, .. }
+            | Self::SuspensionRegistered { execution_id, .. }
+            | Self::TriggerCaptured { execution_id, .. }
+            | Self::SuspensionResolved { execution_id, .. }
+            | Self::RunOutput { execution_id, .. }
+            | Self::CostReported { execution_id, .. }
+            | Self::LogLine { execution_id, .. }
+            | Self::FileEdited { execution_id, .. }
+            | Self::ExecutionTagged { execution_id, .. }
+            | Self::ExecutionCompleted { execution_id, .. }
+            | Self::ExecutionFailed { execution_id, .. }
+            | Self::ExecutionCancelled { execution_id, .. }
+            | Self::BusJoined { execution_id, .. }
+            | Self::BusLeft { execution_id, .. }
+            | Self::BusWindow { execution_id, .. }
+            | Self::BusClosed { execution_id, .. }
+            | Self::CallerConnected { execution_id, .. }
+            | Self::CallerWindow { execution_id, .. }
+            | Self::CallerErrored { execution_id, .. }
+            | Self::CallerDisconnected { execution_id, .. } => *execution_id,
         }
     }
 
@@ -708,6 +755,7 @@ impl ExecEvent {
             | Self::RunOutput { at_unix, .. }
             | Self::CostReported { at_unix, .. }
             | Self::LogLine { at_unix, .. }
+            | Self::FileEdited { at_unix, .. }
             | Self::ExecutionTagged { at_unix, .. }
             | Self::ExecutionCompleted { at_unix, .. }
             | Self::ExecutionFailed { at_unix, .. }
@@ -748,6 +796,7 @@ impl ExecEvent {
             Self::RunOutput { .. } => "run_output",
             Self::CostReported { .. } => "cost_reported",
             Self::LogLine { .. } => "log_line",
+            Self::FileEdited { .. } => "file_edited",
             Self::ExecutionTagged { .. } => "execution_tagged",
             Self::ExecutionCompleted { .. } => "execution_completed",
             Self::ExecutionFailed { .. } => "execution_failed",
@@ -765,8 +814,8 @@ impl ExecEvent {
 }
 
 
-/// Whether a birth carries no member values (then the field is left out).
-fn no_member_values(values: &weft_core::member::MemberValues) -> bool {
+/// Whether a birth carries no instance values (then the field is left out).
+fn no_instance_values(values: &weft_core::instance::InstanceValues) -> bool {
     values.is_empty()
 }
 
@@ -774,9 +823,11 @@ fn no_member_values(values: &weft_core::member::MemberValues) -> bool {
 mod wire_tests {
     use super::*;
     use serde_json::json;
+    use std::collections::BTreeMap;
+    use weft_core::frames::Located;
     use uuid::Uuid;
 
-    fn color() -> Color {
+    fn execution_id() -> ExecutionId {
         Uuid::nil()
     }
 
@@ -788,6 +839,20 @@ mod wire_tests {
         serde_json::from_str(&s).expect("json")
     }
 
+    /// The SQL terminal list names exactly the kinds
+    /// `is_execution_terminal` accepts.
+    #[test]
+    fn terminal_kinds_sql_names_the_terminal_events() {
+        let terminal = [
+            ExecEvent::ExecutionCompleted { execution_id: execution_id(), at_unix: 0 },
+            ExecEvent::ExecutionFailed { execution_id: execution_id(), error: String::new(), at_unix: 0 },
+            ExecEvent::ExecutionCancelled { execution_id: execution_id(), reason: String::new(), cause: None, at_unix: 0 },
+        ];
+        assert!(terminal.iter().all(ExecEvent::is_execution_terminal));
+        let listed = terminal.iter().map(|e| format!("'{}'", e.kind_str())).collect::<Vec<_>>().join(", ");
+        assert_eq!(EXECUTION_TERMINAL_KINDS_SQL, format!("({listed})"));
+    }
+
     /// Every reshaped row round-trips, and its kind tag is what the
     /// SQL readers filter on.
     #[test]
@@ -795,20 +860,20 @@ mod wire_tests {
         let frames = vec![weft_core::frames::Frame::Loop { index: 2 }];
         let emission = Uuid::new_v4();
         let rows = vec![
-            ExecEvent::NodeStarted { color: color(), node_id: "n".into(), frames: frames.clone(), at_unix: 1 },
-            ExecEvent::NodeCompleted { color: color(), node_id: "n".into(), frames: frames.clone(), at_unix: 1 },
-            ExecEvent::NodeFailed { color: color(), node_id: "n".into(), frames: frames.clone(), error: "e".into(), at_unix: 1 },
+            ExecEvent::NodeStarted { execution_id: execution_id(), node_id: "n".into(), frames: frames.clone(), at_unix: 1 },
+            ExecEvent::NodeCompleted { execution_id: execution_id(), node_id: "n".into(), frames: frames.clone(), at_unix: 1 },
+            ExecEvent::NodeFailed { execution_id: execution_id(), node_id: "n".into(), frames: frames.clone(), error: "e".into(), at_unix: 1 },
             ExecEvent::NodeSkipped {
-                color: color(),
+                execution_id: execution_id(),
                 node_id: "n".into(),
                 frames: frames.clone(),
                 reason: weft_core::exec::skip::SkipReason::ScopeSkipped { scope: "g".into() },
                 at_unix: 1,
             },
-            ExecEvent::NodeResumed { color: color(), node_id: "n".into(), frames: frames.clone(), token: None, at_unix: 1 },
-            ExecEvent::NodeCancelled { color: color(), node_id: "n".into(), frames: frames.clone(), reason: "r".into(), at_unix: 1 },
+            ExecEvent::NodeResumed { execution_id: execution_id(), node_id: "n".into(), frames: frames.clone(), token: None, at_unix: 1 },
+            ExecEvent::NodeCancelled { execution_id: execution_id(), node_id: "n".into(), frames: frames.clone(), reason: "r".into(), at_unix: 1 },
             ExecEvent::PortEmitted {
-                color: color(),
+                execution_id: execution_id(),
                 emission_id: emission,
                 node_id: "n".into(),
                 frames: frames.clone(),
@@ -817,14 +882,14 @@ mod wire_tests {
                 provided: false,
                 at_unix: 1,
             },
-            ExecEvent::PortClosed { color: color(), emission_id: emission, node_id: "n".into(), frames: frames.clone(), port: "out".into(), provided: false, at_unix: 1 },
-            ExecEvent::LoopInstantiated { color: color(), group_id: "lp".into(), parent_frames: frames.clone(), at_unix: 1 },
-            ExecEvent::LoopIterationLaunched { color: color(), group_id: "lp".into(), parent_frames: frames.clone(), index: 3, stream_pulse: Some(Uuid::nil().to_string()), at_unix: 1 },
-            ExecEvent::LoopOutFired { color: color(), group_id: "lp".into(), parent_frames: frames.clone(), index: 3, at_unix: 1 },
-            ExecEvent::LoopTerminated { color: color(), group_id: "lp".into(), parent_frames: frames.clone(), reason: LoopTerminationReason::DoneVoted, at_unix: 1 },
-            ExecEvent::LoopStreamEnded { color: color(), group_id: "lp".into(), parent_frames: frames.clone(), end: weft_core::generator::StreamEnd::Failed { error: "e".into() }, at_unix: 1 },
-            ExecEvent::PulsesConsumed { color: color(), node_id: "n".into(), frames: frames.clone(), pulse_ids: vec![Uuid::nil().to_string()], at_unix: 1 },
-            ExecEvent::ExecutionCompleted { color: color(), at_unix: 1 },
+            ExecEvent::PortClosed { execution_id: execution_id(), emission_id: emission, node_id: "n".into(), frames: frames.clone(), port: "out".into(), provided: false, at_unix: 1 },
+            ExecEvent::LoopInstantiated { execution_id: execution_id(), group_id: "lp".into(), parent_frames: frames.clone(), at_unix: 1 },
+            ExecEvent::LoopIterationLaunched { execution_id: execution_id(), group_id: "lp".into(), parent_frames: frames.clone(), index: 3, stream_pulse: Some(Uuid::nil().to_string()), at_unix: 1 },
+            ExecEvent::LoopOutFired { execution_id: execution_id(), group_id: "lp".into(), parent_frames: frames.clone(), index: 3, at_unix: 1 },
+            ExecEvent::LoopTerminated { execution_id: execution_id(), group_id: "lp".into(), parent_frames: frames.clone(), reason: LoopTerminationReason::DoneVoted, at_unix: 1 },
+            ExecEvent::LoopStreamEnded { execution_id: execution_id(), group_id: "lp".into(), parent_frames: frames.clone(), end: weft_core::generator::StreamEnd::Failed { error: "e".into() }, at_unix: 1 },
+            ExecEvent::PulsesConsumed { execution_id: execution_id(), node_id: "n".into(), frames: frames.clone(), pulse_ids: vec![Uuid::nil().to_string()], at_unix: 1 },
+            ExecEvent::ExecutionCompleted { execution_id: execution_id(), at_unix: 1 },
         ];
         for row in rows {
             let kind = row.kind_str();
@@ -837,7 +902,7 @@ mod wire_tests {
     /// fails to decode instead of reading as a list launch.
     #[test]
     fn a_launch_row_always_carries_its_stream_pulse_field() {
-        let row = ExecEvent::LoopIterationLaunched { color: color(), group_id: "lp".into(), parent_frames: vec![], index: 0, stream_pulse: None, at_unix: 1 };
+        let row = ExecEvent::LoopIterationLaunched { execution_id: execution_id(), group_id: "lp".into(), parent_frames: vec![], index: 0, stream_pulse: None, at_unix: 1 };
         let json = round_trip(row);
         assert!(json.get("stream_pulse").is_some_and(Value::is_null));
         let mut without = json.clone();
@@ -846,38 +911,38 @@ mod wire_tests {
     }
 
     /// A resume row always carries its token field (`null` for a
-    /// crash re-run), so a row that lacks it is a truncated row and
-    /// fails to decode instead of reading as a crash re-run.
+    /// boundary re-fire), so a row that lacks it is a truncated row and
+    /// fails to decode instead of reading as a re-fire.
     #[test]
     fn a_resume_row_always_carries_its_token_field() {
-        let row = ExecEvent::NodeResumed { color: color(), node_id: "n".into(), frames: vec![], token: None, at_unix: 1 };
+        let row = ExecEvent::NodeResumed { execution_id: execution_id(), node_id: "n".into(), frames: vec![], token: None, at_unix: 1 };
         let json = round_trip(row);
         assert!(json.get("token").is_some_and(Value::is_null));
         let mut without = json.clone();
         without.as_object_mut().unwrap().remove("token");
         assert!(serde_json::from_value::<ExecEvent>(without).is_err());
-        let with = ExecEvent::NodeResumed { color: color(), node_id: "n".into(), frames: vec![], token: Some("t".into()), at_unix: 1 };
+        let with = ExecEvent::NodeResumed { execution_id: execution_id(), node_id: "n".into(), frames: vec![], token: Some("t".into()), at_unix: 1 };
         assert_eq!(round_trip(with)["token"], json!("t"));
     }
 
     /// A row written to the old shape (a value copy on a lifecycle row,
     /// a row kind that no longer exists) does not decode: there is no
-    /// compatibility path, the read fails naming the color.
+    /// compatibility path, the read fails naming the execution.
     #[test]
     fn old_shapes_are_refused() {
         let old_started = json!({
-            "kind": "node_started", "color": color(), "node_id": "n", "frames": [],
+            "kind": "node_started", "execution_id": execution_id(), "node_id": "n", "frames": [],
             "input": { "in": 1 }, "closed_ports": [], "pulses_absorbed": [], "at_unix": 1
         });
         assert!(serde_json::from_value::<ExecEvent>(old_started).is_err(), "a copied input is refused");
         let old_pulse = json!({
-            "kind": "pulse_emitted", "color": color(), "pulse_id": "x", "source_node": "a", "source_port": "o",
+            "kind": "pulse_emitted", "execution_id": execution_id(), "pulse_id": "x", "source_node": "a", "source_port": "o",
             "target_node": "b", "target_port": "i", "frames": [], "value": 1, "closed": false, "close_error": null, "at_unix": 1
         });
         assert!(serde_json::from_value::<ExecEvent>(old_pulse).is_err(), "the per-wire row is gone");
-        let old_scope = json!({ "kind": "scope_launched", "color": color(), "group_id": "g", "frames": [], "roots": [], "at_unix": 1 });
+        let old_scope = json!({ "kind": "scope_launched", "execution_id": execution_id(), "group_id": "g", "frames": [], "roots": [], "at_unix": 1 });
         assert!(serde_json::from_value::<ExecEvent>(old_scope).is_err(), "boundaries are never journaled");
-        let err = crate::decode_event(color(), &old_started_text()).unwrap_err();
+        let err = crate::decode_event(execution_id(), &old_started_text()).unwrap_err();
         assert!(err.contains("weft clean"), "{err}");
     }
 
@@ -888,7 +953,7 @@ mod wire_tests {
     fn a_birth_reads_its_run_kind_old_and_new() {
         let birth = |extra: Value| {
             let mut row = json!({
-                "kind": "execution_started", "color": color(), "project_id": Uuid::nil(),
+                "kind": "execution_started", "execution_id": execution_id(), "project_id": Uuid::nil(),
                 "entry_node": "n", "phase": "fire", "definition_hash": null,
                 "program": null, "source_version": null, "at_unix": 1
             });
@@ -908,7 +973,7 @@ mod wire_tests {
     }
 
     fn old_started_text() -> String {
-        json!({ "kind": "node_started", "color": color(), "node_id": "n", "frames": [], "input": {}, "at_unix": 1 }).to_string()
+        json!({ "kind": "node_started", "execution_id": execution_id(), "node_id": "n", "frames": [], "input": {}, "at_unix": 1 }).to_string()
     }
 
     /// Every row round-trips, and carries the kind tag the SQL readers
@@ -926,7 +991,7 @@ mod wire_tests {
         });
         let rows = vec![
             ExecEvent::ExecutionStarted {
-                color: color(),
+                execution_id: execution_id(),
                 project_id: uuid::Uuid::nil(),
                 entry_node: "trigger".into(),
                 phase: weft_core::context::Phase::Fire,
@@ -936,13 +1001,14 @@ mod wire_tests {
                     nodes: [Located::top("out"), Located::top("src")].into_iter().collect(),
                     ..Default::default()
                 }),
-                seed: Some(Seed { parent: color(), origins: BTreeMap::from([(Located::top("source"), color())]) }),
-                member: Some(weft_core::member::MemberId::new("user-42").unwrap()),
-                fired_trigger: Some("trigger".into()), member_values: Default::default(),
+                seed: Some(Seed { parent: execution_id(), origins: BTreeMap::from([(Located::top("source"), execution_id())]) }),
+                instance: Some(weft_core::instance::InstanceId::new("user-42").unwrap()),
+                fired_trigger: Some("trigger".into()), instance_values: Default::default(), picks: Default::default(),
+                run_class: weft_core::run_class::RunClass::Short,
                 at_unix: 7,
             },
             ExecEvent::ExecutionStarted {
-                color: color(),
+                execution_id: execution_id(),
                 project_id: uuid::Uuid::nil(),
                 entry_node: "node-test:MyNode::my_test".into(),
                 phase: weft_core::context::Phase::Fire,
@@ -950,10 +1016,10 @@ mod wire_tests {
                 program: None, source_version: None, run_kind: weft_core::exec::RunKind::NodeTest,
                 subgraph: None,
                 seed: None,
-                member: None, fired_trigger: None, member_values: Default::default(), at_unix: 7,
+                instance: None, fired_trigger: None, run_class: weft_core::run_class::RunClass::Short, instance_values: Default::default(), picks: Default::default(), at_unix: 7,
             },
             ExecEvent::ExecutionStarted {
-                color: color(),
+                execution_id: execution_id(),
                 project_id: uuid::Uuid::nil(),
                 entry_node: "node-test:MyNode::my_test".into(),
                 phase: weft_core::context::Phase::Fire,
@@ -961,32 +1027,34 @@ mod wire_tests {
                 program: None, source_version: None, run_kind: weft_core::exec::RunKind::Unrecorded,
                 subgraph: None,
                 seed: None,
-                member: None, fired_trigger: None, member_values: Default::default(), at_unix: 7,
+                instance: None, fired_trigger: None, run_class: weft_core::run_class::RunClass::Short, instance_values: Default::default(), picks: Default::default(), at_unix: 7,
             },
-            ExecEvent::NodeKicked { color: color(), node_id: "sock".into(), frames: vec![], firing: true, payload: Some(json!({"body": "late"})), port_snapshot: Some(json!({"url": "u"})), at_unix: 0 },
-            ExecEvent::NodeStarted { color: color(), node_id: "n".into(), frames: vec![weft_core::frames::Frame::Loop { index: 2 }], at_unix: 1 },
-            ExecEvent::NodeCompleted { color: color(), node_id: "n".into(), frames: vec![], at_unix: 1 },
-            ExecEvent::NodeFailed { color: color(), node_id: "n".into(), frames: vec![], error: "boom".into(), at_unix: 1 },
-            ExecEvent::NodeSkipped { color: color(), node_id: "n".into(), frames: vec![], reason: weft_core::exec::skip::SkipReason::RequiredInputClosed { port: "in".into(), failure: None }, at_unix: 1 },
-            ExecEvent::NodeSuspended { color: color(), node_id: "n".into(), frames: vec![], token: "t".into(), at_unix: 1 },
-            ExecEvent::NodeResumed { color: color(), node_id: "n".into(), frames: vec![], token: Some("t".into()), at_unix: 1 },
-            ExecEvent::NodeResumed { color: color(), node_id: "n".into(), frames: vec![], token: None, at_unix: 1 },
-            ExecEvent::NodeCancelled { color: color(), node_id: "n".into(), frames: vec![], reason: "stopped".into(), at_unix: 1 },
-            ExecEvent::PortEmitted { color: color(), emission_id: Uuid::nil(), node_id: "n".into(), frames: vec![], port: "out".into(), value: std::sync::Arc::new(json!({"k": [1, null]})), provided: true, at_unix: 1 },
-            ExecEvent::PortClosed { color: color(), emission_id: Uuid::nil(), node_id: "n".into(), frames: vec![], port: "out".into(), provided: false, at_unix: 1 },
-            ExecEvent::PulsesConsumed { color: color(), node_id: "n".into(), frames: vec![], pulse_ids: vec![Uuid::nil().to_string()], at_unix: 1 },
-            ExecEvent::LoopInstantiated { color: color(), group_id: "lp".into(), parent_frames: vec![], at_unix: 1 },
-            ExecEvent::LoopIterationLaunched { color: color(), group_id: "lp".into(), parent_frames: vec![], index: 3, stream_pulse: Some(Uuid::nil().to_string()), at_unix: 1 },
-            ExecEvent::LoopIterationLaunched { color: color(), group_id: "lp".into(), parent_frames: vec![], index: 3, stream_pulse: None, at_unix: 1 },
-            ExecEvent::LoopOutFired { color: color(), group_id: "lp".into(), parent_frames: vec![weft_core::frames::Frame::Loop { index: 0 }], index: 3, at_unix: 1 },
-            ExecEvent::LoopStreamEnded { color: color(), group_id: "lp".into(), parent_frames: vec![], end: weft_core::primitive::StreamEnd::Failed { error: "upstream".into() }, at_unix: 1 },
-            ExecEvent::LoopTerminated { color: color(), group_id: "lp".into(), parent_frames: vec![], reason: LoopTerminationReason::DoneVoted, at_unix: 1 },
-            ExecEvent::ExecutionCompleted { color: color(), at_unix: 1 },
-            ExecEvent::SuspensionRegistered { color: color(), node_id: "n".into(), frames: vec![], token: "t".into(), spec, call_index: 2, at_unix: 1 },
-            ExecEvent::SuspensionResolved { color: color(), token: "t".into(), value: json!("v"), at_unix: 1 },
-            ExecEvent::RunOutput { color: color(), node_id: "n".into(), frames: vec![], call_index: 1, name: "decide".into(), value: json!("go-left"), at_unix: 1 },
+            ExecEvent::NodeKicked { execution_id: execution_id(), node_id: "sock".into(), frames: vec![], firing: true, payload: Some(json!({"body": "late"})), port_snapshot: Some(json!({"url": "u"})), at_unix: 0 },
+            ExecEvent::NodeStarted { execution_id: execution_id(), node_id: "n".into(), frames: vec![weft_core::frames::Frame::Loop { index: 2 }], at_unix: 1 },
+            ExecEvent::NodeCompleted { execution_id: execution_id(), node_id: "n".into(), frames: vec![], at_unix: 1 },
+            ExecEvent::NodeFailed { execution_id: execution_id(), node_id: "n".into(), frames: vec![], error: "boom".into(), at_unix: 1 },
+            ExecEvent::NodeSkipped { execution_id: execution_id(), node_id: "n".into(), frames: vec![], reason: weft_core::exec::skip::SkipReason::RequiredInputClosed { port: "in".into(), failure: None }, at_unix: 1 },
+            ExecEvent::NodeSkipped { execution_id: execution_id(), node_id: "n".into(), frames: vec![], reason: weft_core::exec::skip::SkipReason::RequiredInputClosed { port: "in".into(), failure: Some(weft_core::pulse::Failure { node: "auth.query".into(), error: "down".into() }) }, at_unix: 1 },
+            ExecEvent::NodeSkipped { execution_id: execution_id(), node_id: "n".into(), frames: vec![], reason: weft_core::exec::skip::SkipReason::WatchedNodeFailed { failure: weft_core::pulse::Failure { node: "q".into(), error: "down".into() } }, at_unix: 1 },
+            ExecEvent::NodeSuspended { execution_id: execution_id(), node_id: "n".into(), frames: vec![], token: "t".into(), at_unix: 1 },
+            ExecEvent::NodeResumed { execution_id: execution_id(), node_id: "n".into(), frames: vec![], token: Some("t".into()), at_unix: 1 },
+            ExecEvent::NodeResumed { execution_id: execution_id(), node_id: "n".into(), frames: vec![], token: None, at_unix: 1 },
+            ExecEvent::NodeCancelled { execution_id: execution_id(), node_id: "n".into(), frames: vec![], reason: "stopped".into(), at_unix: 1 },
+            ExecEvent::PortEmitted { execution_id: execution_id(), emission_id: Uuid::nil(), node_id: "n".into(), frames: vec![], port: "out".into(), value: std::sync::Arc::new(json!({"k": [1, null]})), provided: true, at_unix: 1 },
+            ExecEvent::PortClosed { execution_id: execution_id(), emission_id: Uuid::nil(), node_id: "n".into(), frames: vec![], port: "out".into(), provided: false, at_unix: 1 },
+            ExecEvent::PulsesConsumed { execution_id: execution_id(), node_id: "n".into(), frames: vec![], pulse_ids: vec![Uuid::nil().to_string()], at_unix: 1 },
+            ExecEvent::LoopInstantiated { execution_id: execution_id(), group_id: "lp".into(), parent_frames: vec![], at_unix: 1 },
+            ExecEvent::LoopIterationLaunched { execution_id: execution_id(), group_id: "lp".into(), parent_frames: vec![], index: 3, stream_pulse: Some(Uuid::nil().to_string()), at_unix: 1 },
+            ExecEvent::LoopIterationLaunched { execution_id: execution_id(), group_id: "lp".into(), parent_frames: vec![], index: 3, stream_pulse: None, at_unix: 1 },
+            ExecEvent::LoopOutFired { execution_id: execution_id(), group_id: "lp".into(), parent_frames: vec![weft_core::frames::Frame::Loop { index: 0 }], index: 3, at_unix: 1 },
+            ExecEvent::LoopStreamEnded { execution_id: execution_id(), group_id: "lp".into(), parent_frames: vec![], end: weft_core::primitive::StreamEnd::Failed { error: "upstream".into() }, at_unix: 1 },
+            ExecEvent::LoopTerminated { execution_id: execution_id(), group_id: "lp".into(), parent_frames: vec![], reason: LoopTerminationReason::DoneVoted, at_unix: 1 },
+            ExecEvent::ExecutionCompleted { execution_id: execution_id(), at_unix: 1 },
+            ExecEvent::SuspensionRegistered { execution_id: execution_id(), node_id: "n".into(), frames: vec![], token: "t".into(), spec, call_index: 2, at_unix: 1 },
+            ExecEvent::SuspensionResolved { execution_id: execution_id(), token: "t".into(), value: json!("v"), at_unix: 1 },
+            ExecEvent::RunOutput { execution_id: execution_id(), node_id: "n".into(), frames: vec![], call_index: 1, name: "decide".into(), value: json!("go-left"), at_unix: 1 },
             ExecEvent::CostReported {
-                color: color(),
+                execution_id: execution_id(),
                 node_id: "n".into(),
                 frames: vec![],
                 cost_id: "c".into(),
@@ -998,15 +1066,28 @@ mod wire_tests {
                 metadata: json!({}),
                 at_unix: 1,
             },
-            ExecEvent::LogLine { color: color(), node_id: "n".into(), frames: vec![], level: "info".into(), message: "hi".into(), at_unix_ms: None, seq: None, at_unix: 1 },
-            ExecEvent::ExecutionTagged { color: color(), tags: vec!["user_1".into()], at_unix: 3 },
-            ExecEvent::ExecutionFailed { color: color(), error: "boom".into(), at_unix: 1 },
-            ExecEvent::ExecutionCancelled { color: color(), reason: "stopped".into(), cause: Some(weft_core::exec::CancelCause::User), at_unix: 1 },
-            ExecEvent::ExecutionCancelled { color: color(), reason: "stopped".into(), cause: None, at_unix: 1 },
-            ExecEvent::BusJoined { color: color(), bus_id: "b".into(), offset: 0, name: "a".into(), at_unix: 1 },
-            ExecEvent::BusLeft { color: color(), bus_id: "b".into(), offset: 1, name: "a".into(), at_unix: 1 },
+            ExecEvent::LogLine { execution_id: execution_id(), node_id: "n".into(), frames: vec![], level: "info".into(), message: "hi".into(), at_unix_ms: None, seq: None, at_unix: 1 },
+            ExecEvent::FileEdited {
+                execution_id: execution_id(),
+                node_id: "n".into(),
+                frames: vec![weft_core::frames::Frame::Loop { index: 1 }],
+                edit: weft_core::storage::FileEdit {
+                    key: "t/project/p/f".into(),
+                    filename: "chat.jsonl".into(),
+                    from_version: Some(4),
+                    to_version: 5,
+                    diff: "@@ -1,1 +1,2 @@\n a\n+b\n".into(),
+                },
+                at_unix: 1,
+            },
+            ExecEvent::ExecutionTagged { execution_id: execution_id(), tags: vec!["user_1".into()], at_unix: 3 },
+            ExecEvent::ExecutionFailed { execution_id: execution_id(), error: "boom".into(), at_unix: 1 },
+            ExecEvent::ExecutionCancelled { execution_id: execution_id(), reason: "stopped".into(), cause: Some(weft_core::exec::CancelCause::User), at_unix: 1 },
+            ExecEvent::ExecutionCancelled { execution_id: execution_id(), reason: "stopped".into(), cause: None, at_unix: 1 },
+            ExecEvent::BusJoined { execution_id: execution_id(), bus_id: "b".into(), offset: 0, name: "a".into(), at_unix: 1 },
+            ExecEvent::BusLeft { execution_id: execution_id(), bus_id: "b".into(), offset: 1, name: "a".into(), at_unix: 1 },
             ExecEvent::BusWindow {
-                color: color(),
+                execution_id: execution_id(),
                 bus_id: "b".into(),
                 first_offset: 0,
                 last_offset: 1,
@@ -1014,10 +1095,10 @@ mod wire_tests {
                 totals: Default::default(),
                 at_unix: 1,
             },
-            ExecEvent::BusClosed { color: color(), bus_id: "b".into(), offset: 2, at_unix: 1 },
-            ExecEvent::CallerConnected { color: color(), offset: 0, protocol: "websocket".into(), at_unix: 7 },
+            ExecEvent::BusClosed { execution_id: execution_id(), bus_id: "b".into(), offset: 2, at_unix: 1 },
+            ExecEvent::CallerConnected { execution_id: execution_id(), offset: 0, protocol: "websocket".into(), at_unix: 7 },
             ExecEvent::CallerWindow {
-                color: color(),
+                execution_id: execution_id(),
                 first_offset: 1,
                 last_offset: 4,
                 messages: vec![
@@ -1075,13 +1156,13 @@ mod wire_tests {
                 ],
                 at_unix: 10,
             },
-            ExecEvent::CallerErrored { color: color(), offset: 4, message: "node blew up".into(), at_unix: 11 },
-            ExecEvent::CallerDisconnected { color: color(), offset: 5, reason: "response complete".into(), at_unix: 12 },
+            ExecEvent::CallerErrored { execution_id: execution_id(), offset: 4, message: "node blew up".into(), at_unix: 11 },
+            ExecEvent::CallerDisconnected { execution_id: execution_id(), offset: 5, reason: "response complete".into(), at_unix: 12 },
         ];
         let mut kinds: Vec<&'static str> = rows.iter().map(|r| r.kind_str()).collect();
         kinds.sort_unstable();
         kinds.dedup();
-        assert_eq!(kinds.len(), 34, "a variant has no row above: {kinds:?}");
+        assert_eq!(kinds.len(), 35, "a variant has no row above: {kinds:?}");
         for row in rows {
             let kind = row.kind_str();
             let json = round_trip(row);
@@ -1095,19 +1176,19 @@ mod wire_tests {
     /// written before the field existed is an old row; neither decodes.
     #[test]
     fn present_optional_fields_are_required_on_the_row() {
-        let cancelled = round_trip(ExecEvent::ExecutionCancelled { color: color(), reason: "r".into(), cause: None, at_unix: 1 });
+        let cancelled = round_trip(ExecEvent::ExecutionCancelled { execution_id: execution_id(), reason: "r".into(), cause: None, at_unix: 1 });
         assert!(cancelled.get("cause").is_some_and(Value::is_null));
         let mut without = cancelled.clone();
         without.as_object_mut().unwrap().remove("cause");
         assert!(serde_json::from_value::<ExecEvent>(without).is_err(), "an old cancel row without its cause is refused");
-        let line = round_trip(ExecEvent::LogLine { color: color(), node_id: "n".into(), frames: vec![], level: "info".into(), message: "m".into(), at_unix_ms: None, seq: None, at_unix: 1 });
+        let line = round_trip(ExecEvent::LogLine { execution_id: execution_id(), node_id: "n".into(), frames: vec![], level: "info".into(), message: "m".into(), at_unix_ms: None, seq: None, at_unix: 1 });
         for field in ["node_id", "frames", "at_unix_ms", "seq"] {
             let mut without = line.clone();
             without.as_object_mut().unwrap().remove(field);
             assert!(serde_json::from_value::<ExecEvent>(without).is_err(), "a log row without '{field}' is refused");
         }
         let mut old_skip = round_trip(ExecEvent::NodeSkipped {
-            color: color(),
+            execution_id: execution_id(),
             node_id: "n".into(),
             frames: vec![],
             reason: weft_core::exec::skip::SkipReason::DidNotFlow,

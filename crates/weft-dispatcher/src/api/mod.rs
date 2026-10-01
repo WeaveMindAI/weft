@@ -36,6 +36,104 @@ pub struct HoldQuery {
     wait_ms: u64,
 }
 
+/// Who is calling an outside door, as far as the network can tell: the
+/// address read off `X-Forwarded-For` through the trusted proxies in
+/// front of the listener the call came in on (`entry_limits::caller_address`).
+pub struct CallerAddress(pub std::net::IpAddr);
+
+/// How many proxies in front of the listener a request came in on append
+/// to `X-Forwarded-For` (the install's `edge.trustedProxyHops` for that
+/// listener). Each listener's router puts it on every request, so the
+/// same door reads its caller right whichever port it was reached on.
+#[derive(Debug, Clone, Copy)]
+struct TrustedHops(usize);
+
+impl CallerAddress {
+    /// The key a per-caller count is kept under.
+    pub fn key(&self) -> String {
+        format!("ip:{}", self.0)
+    }
+
+    fn from_parts(parts: &axum::http::request::Parts) -> Result<Self, (axum::http::StatusCode, String)> {
+        let Some(TrustedHops(hops)) = parts.extensions.get::<TrustedHops>().copied() else {
+            // Every listener's router sets it; a request without it is a
+            // wiring bug, refused rather than read with a guessed count.
+            return Err((axum::http::StatusCode::INTERNAL_SERVER_ERROR, "no trusted proxy hops on the request".to_string()));
+        };
+        let peer = parts
+            .extensions
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|c| c.0.ip())
+            .ok_or_else(|| {
+                // The server is always started with connection info; a
+                // request without it is a wiring bug, refused rather than
+                // counted under a made-up address.
+                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "no peer address on the request".to_string())
+            })?;
+        let forwarded = parts.headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
+        Ok(Self(crate::entry_limits::caller_address(forwarded, peer, hops)))
+    }
+}
+
+impl axum::extract::FromRequestParts<DispatcherState> for CallerAddress {
+    type Rejection = (axum::http::StatusCode, String);
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &DispatcherState,
+    ) -> Result<Self, Self::Rejection> {
+        Self::from_parts(parts)
+    }
+}
+
+/// Whether a path is one of the token doors, where a refused answer
+/// means somebody presented a token that does not work.
+fn is_token_door(path: &str) -> bool {
+    ["/signal/", "/signal-token/", "/connect/", "/instance/"].iter().any(|p| path.starts_with(p))
+}
+
+/// The layer over the outside-caller surface that stops token guessing:
+/// an address past the install's bound of refused tokens this minute is
+/// answered 429 on every token door until the minute ends, and each
+/// refusal a token door gives (401, 403, or a 404 for an unknown
+/// `/signal/` token) counts toward it.
+async fn guard_token_doors(
+    axum::extract::State(state): axum::extract::State<DispatcherState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let path = request.uri().path().to_string();
+    if !is_token_door(&path) || state.edge.invalid_tokens_per_minute.is_none() {
+        return next.run(request).await;
+    }
+    let (parts, body) = request.into_parts();
+    let address = match CallerAddress::from_parts(&parts) {
+        Ok(a) => a.0,
+        Err(e) => return e.into_response(),
+    };
+    let now = crate::lease::now_unix();
+    match crate::entry_limits::token_guessing_blocked(&state.pg_pool, &state.edge, address, now).await {
+        Ok(Some(refused)) => return crate::entry_limits::too_many(refused),
+        Ok(None) => {}
+        Err(e) => {
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("rate limit: {e:#}")).into_response()
+        }
+    }
+    let response = next.run(axum::extract::Request::from_parts(parts, body)).await;
+    let status = response.status();
+    let refused_token = matches!(status, axum::http::StatusCode::UNAUTHORIZED | axum::http::StatusCode::FORBIDDEN)
+        || (status == axum::http::StatusCode::NOT_FOUND && path.starts_with("/signal/"));
+    if refused_token {
+        if let Err(e) = crate::entry_limits::note_invalid_token(&state.pg_pool, &state.edge, address, now).await {
+            // The answer is already decided; a lost count only lets one
+            // more guess through.
+            tracing::warn!(target: "weft_dispatcher::api", error = %e, "could not count a refused token");
+        }
+    }
+    response
+}
+
 impl HoldQuery {
     pub fn hold(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.wait_ms).min(weft_task_store::pg_signal::MAX_HOLD)
@@ -43,6 +141,7 @@ impl HoldQuery {
 }
 
 pub mod project;
+pub mod domains;
 // `pub` (not `pub(crate)`) like `project` above: `cancel_terminal_events`
 // is exercised by the db-test rig in `tests/db_tags.rs` against a real
 // Postgres.
@@ -58,50 +157,67 @@ mod display;
 // exercises against a real Postgres.
 pub mod signal;
 pub mod access;
-pub mod member_door;
+pub mod instance_door;
+mod picks;
+mod workers;
 pub mod node_tests;
 pub mod storage;
 pub mod versions;
 mod public_page;
 
-/// The dispatcher routes, not yet bound to state. Additional routes can be
-/// `.merge`d onto this `Router<DispatcherState>` before binding state (so the
-/// merged routes resolve against the same `DispatcherState`), then `.with_state(state)`.
+/// The dispatcher routes, not yet bound to state.
+///
+/// The admin surface (everything but `/health` and [`outside_caller_routes`])
+/// sits behind [`crate::authenticator::require_caller`] as one layer, so a
+/// route added here is authenticated whether or not its handler asks who is
+/// calling.
 ///
 /// `cors` is a COMPOSITION-TIME input, never a baked-in constant, so the right
 /// browser-origin policy for the tenant/admin surface is chosen where the router
 /// is assembled: [`permissive_cors`] when browsers hit this surface directly
-/// (localhost-only deployments), or a tight policy (e.g. `CorsLayer::new()`,
-/// which emits no CORS headers at all) when browsers only arrive through a
-/// same-origin proxy. The outside-caller surface ([`outside_caller_routes`]:
-/// fire URLs, signal tokens, live connect, public mounts) is exempt: its
-/// callers are cross-origin by design, so it always carries [`permissive_cors`].
-pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
+/// (the loopback-bound local install), or `CorsLayer::new()` (no CORS headers
+/// at all) on a shared install, where a frontend calls from its own server.
+/// The outside-caller surface ([`outside_caller_routes`]: fire URLs, signal
+/// tokens, live connect, public mounts) is exempt: its callers are
+/// cross-origin by design, so it always carries [`permissive_cors`].
+fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherState> {
     Router::new()
-        .route("/health", get(|| async { "ok" }))
-        .route("/projects", get(project::list))
+        .route("/install", get(project::install))
+        .route("/install/domains", get(domains::list).post(domains::add))
+        .route("/install/domains/{name}", axum::routing::delete(domains::remove))
+        .route("/projects", get(project::list).post(project::declare))
+        // Build one version inside the install and register it: the one
+        // way a project's program and images come to exist.
+        .route("/projects/{id}/builds", post(project::build))
         .route("/projects/{id}", get(project::get).delete(project::remove))
         // The version tree: checkpoint, the run that records itself
         // (THE start path for the CLI and the editor), the tree, head,
         // the activation version, per-run bookkeeping, and prune.
         .route("/projects/{id}/versions", post(versions::checkpoint))
         .route("/projects/{id}/versions/runs", post(versions::run))
-        .route("/projects/{id}/versions/runs/{color}", axum::routing::put(versions::update_run))
+        .route("/projects/{id}/versions/runs/{execution_id}", axum::routing::put(versions::update_run))
         .route("/projects/{id}/versions/tree", get(versions::tree))
+        .route("/projects/{id}/versions/running", get(versions::running))
         .route("/projects/{id}/versions/sweep", post(versions::sweep))
         .route("/projects/{id}/versions/head", axum::routing::put(versions::set_head))
         .route("/projects/{id}/trigger-bakes", get(versions::trigger_bakes))
         .route("/projects/{id}/versions/{version}", axum::routing::delete(versions::prune))
         .route("/projects/{id}/status", get(project::status))
+        // The connections the program's own access nodes use on this
+        // install, never written in the source.
+        .route("/projects/{id}/picks", get(picks::list).put(picks::change))
+        .route("/projects/{id}/picks/move", post(picks::move_picks))
+        // The project's own worker levers.
+        .route("/projects/{id}/workers", get(workers::get).put(workers::put))
         .route("/projects/{id}/executions/latest", get(execution::latest_for_project))
         .route("/projects/{id}/activate", post(project::activate))
         .route("/projects/{id}/bake", post(project::bake))
         // Cancel an in-flight activate (status=Activating). Wipes
         // every signal row registered so far, cancels the
-        // TriggerSetup color, CASes status to Inactive.
+        // TriggerSetup execution, CASes status to Inactive.
         .route("/projects/{id}/cancel-activate", post(project::cancel_activate))
         // Cancel an in-flight build (transition=building). CASes the
-        // transition to cancelling_build (the durable cross-Pod signal
+        // transition to cancelling_build (the durable cross-process signal
         // the build gate polls) + interrupts the local builder job.
         .route("/projects/{id}/cancel-build", post(project::cancel_build))
         .route("/projects/{id}/deactivate", post(project::deactivate))
@@ -121,37 +237,38 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
         .route("/projects/{id}/infra/stop", post(infra::stop))
         .route("/projects/{id}/infra/terminate", post(infra::terminate))
         // Cancel in-flight infra work: halt claimed lifecycle commands
-        // between kubectl steps, cancel unclaimed ones outright, and
+        // between platform calls, cancel unclaimed ones outright, and
         // interrupt the InfraSetup provisioning execution. HALT, not
         // rollback: per-node partial state stays visible.
         .route("/projects/{id}/infra/cancel", post(infra::cancel))
         // Per-node verbs for partial-state recovery.
-        // `{node}` on every per-node infra route is the instance's
-        // PLACE as a person spells it (`one.db`): an infra node inside
-        // a file included twice is two instances with two names.
+        // `{node}` on every per-node infra route is the node's
+        // PLACEMENT as a person spells it (`one.db`): an infra node inside
+        // a file included twice is two placements with two names.
         .route("/projects/{id}/infra/nodes/{node}/stop", post(infra::stop_node))
         .route("/projects/{id}/infra/nodes/{node}/terminate", post(infra::terminate_node))
         .route("/projects/{id}/infra/status", get(infra::status))
         .route("/projects/{id}/infra/doors", get(infra::doors))
+        .route("/projects/{id}/infra/logs", get(infra::logs))
         .route("/projects/{id}/infra/commands/{cmd_id}", get(infra::command_status))
         .route("/projects/{id}/infra/nodes/{node}/live", get(infra::live))
         .route("/projects/{id}/infra/nodes/{node}/action", post(infra::action))
-        .route("/executions/resolve/{prefix}", get(execution::resolve_color))
-        .route("/executions/{color}/cancel", post(execution::cancel))
+        .route("/executions/resolve/{prefix}", get(execution::resolve_execution_id))
+        .route("/executions/{execution_id}/cancel", post(execution::cancel))
         // Resolve a pure time wait now (`weft wake`).
-        .route("/executions/{color}/wake/{node}", post(execution::wake))
-        .route("/executions/{color}/logs", get(execution::list_logs))
-        .route("/executions/{color}/replay", get(execution::replay))
-        .route("/executions/{color}/outputs", get(execution::outputs))
+        .route("/executions/{execution_id}/wake/{node}", post(execution::wake))
+        .route("/executions/{execution_id}/logs", get(execution::list_logs))
+        .route("/executions/{execution_id}/replay", get(execution::replay))
+        .route("/executions/{execution_id}/outputs", get(execution::outputs))
         .route(
-            "/executions/{color}",
+            "/executions/{execution_id}",
             get(execution::get).delete(execution::delete_execution),
         )
         .route("/executions", get(execution::list_executions))
         .route("/executions/clean", post(execution::clean))
         .route("/events/project/{id}", get(events::project_stream))
         .route("/events/project/{id}/displays", get(events::display_stream))
-        .route("/events/execution/{color}", get(events::execution_stream))
+        .route("/events/execution/{execution_id}", get(events::execution_stream))
         // Token administration (tenant-authenticated): mint returns the value
         // ONCE, list returns metadata only, revoke addresses the id.
         .route(
@@ -159,8 +276,7 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
             get(signal_token::list_tokens).post(signal_token::mint_token),
         )
         .route("/signal-tokens/{id}", axum::routing::delete(signal_token::revoke_token))
-        .route("/listener/inspect", get(signal::listener_inspect))
-        .route("/images/referenced", get(project::referenced_images))
+        .route("/images/prune", post(project::prune_images))
         // Storage plane: the `weft files` CLI surface (list, usage, download
         // handshake, remove). The dispatcher resolves the acting tenant and
         // proxies each verb to the broker (which owns the bucket + metadata);
@@ -174,7 +290,7 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
         // URLs are caller-facing so bytes go straight to the bucket.
         .route("/storage/upload/begin", post(storage::upload_begin))
         // The pre-build asset sync's diff input: the project's published assets.
-        .route("/storage/assets/list", post(storage::assets_list))
+        .route("/storage/assets/held", post(storage::assets_held))
         .route("/storage/assets/references", post(storage::asset_references))
         .route("/storage/upload/parts", post(storage::upload_parts))
         .route("/storage/upload/part-done", post(storage::upload_part_done))
@@ -196,7 +312,7 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
         .route("/access/lookup", post(access::lookup))
         .route("/access/granted", post(access::granted))
         .route("/access/picker/begin", post(access::picker_begin))
-        // Node self-test runs (a short-lived test pod per run).
+        // Node self-test runs (a short-lived test process per run).
         .route("/projects/{id}/node-tests/run", post(node_tests::run))
         .route(
             "/projects/{id}/node-tests/runs/{task}",
@@ -211,8 +327,14 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
             "/projects/{id}/signals/{node}/live",
             get(signal::live_signal),
         )
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::authenticator::require_caller,
+        ))
+        // Probes carry no credential.
+        .route("/health", get(|| async { "ok" }))
         .layer(cors)
-        .merge(outside_caller_routes())
+        .merge(outside_caller_routes(state))
 }
 
 /// The outside-caller surface: routes whose callers are external by design
@@ -224,7 +346,7 @@ pub fn core_routes(cors: CorsLayer) -> Router<DispatcherState> {
 /// composition-time `cors` on [`core_routes`] governs only the tenant/admin
 /// surface.
 // SYNC: the doors <-> packages/weft-connect/src/server/passthrough.ts PASSED_DOORS
-fn outside_caller_routes() -> Router<DispatcherState> {
+fn outside_caller_routes(state: DispatcherState) -> Router<DispatcherState> {
     Router::new()
         .route(
             "/signal/{token}",
@@ -249,19 +371,19 @@ fn outside_caller_routes() -> Router<DispatcherState> {
             get(signal::signal_file_for_token),
         )
         .route("/signal-token/health", get(signal::signal_token_health))
-        // The member door: one member of one program, with their member
-        // token in `Authorization: Bearer` (see `api/member_door.rs`).
-        .route("/member/fields", get(member_door::fields))
-        .route("/member/values", axum::routing::put(member_door::set_values))
-        .route("/member/lookup", post(member_door::lookup))
-        .route("/member/picker", post(member_door::picker))
-        .route("/member/connections", get(member_door::list_connections))
-        .route("/member/connections/{id}", axum::routing::delete(member_door::delete_connection))
-        .route("/member/connections/direct", post(member_door::connect_direct))
-        .route("/member/connections/begin", post(member_door::connect_begin))
-        .route("/member/connections/status", get(member_door::connect_status))
-        .route("/member/doors", post(member_door::doors))
-        .route("/member/runs", get(member_door::runs))
+        // The instance door: one instance of one program, with that instance's
+        // token in `Authorization: Bearer` (see `api/instance_door.rs`).
+        .route("/instance/fields", get(instance_door::fields))
+        .route("/instance/values", axum::routing::put(instance_door::set_values))
+        .route("/instance/lookup", post(instance_door::lookup))
+        .route("/instance/picker", post(instance_door::picker))
+        .route("/instance/connections", get(instance_door::list_connections))
+        .route("/instance/connections/{id}", axum::routing::delete(instance_door::delete_connection))
+        .route("/instance/connections/direct", post(instance_door::connect_direct))
+        .route("/instance/connections/begin", post(instance_door::connect_begin))
+        .route("/instance/connections/status", get(instance_door::connect_status))
+        .route("/instance/doors", post(instance_door::doors))
+        .route("/instance/runs", get(instance_door::runs))
         // What a node is SHOWING, for a client built on top of a weft
         // program (a website that renders the bridge's QR code rather
         // than sending its user to the editor). The same two feeds the
@@ -283,16 +405,16 @@ fn outside_caller_routes() -> Router<DispatcherState> {
         // media link here; the unguessable expiring token in the path
         // is the credential (see api/storage.rs public_file).
         .route("/public/files/{token}", get(storage::public_file))
-        // The public trigger surface's root page, which the front door's
-        // public listener rewrites `/` onto.
-        .route(&format!("{}/index.html", public_page::PUBLIC_PAGE_PREFIX), get(public_page::index))
-        .route(&format!("{}/logo.png", public_page::PUBLIC_PAGE_PREFIX), get(public_page::logo))
+        // The root page, so a person checking the address sees
+        // something deliberate.
+        .route("/", get(public_page::index))
+        .route("/index.html", get(public_page::index))
+        .route("/logo.png", get(public_page::logo))
         // Live caller connection handshake: an outside caller hits
         // `/connect/<tenant>/<path>` to open a held connection. The
         // handler matches the route (pattern + method), gates the
-        // caller, ensures a worker pod is up, starts a fresh execution
-        // pinned to it, and points the caller at the gateway URL for
-        // that pod (307 for HTTP, return-URL for WebSocket). ANY method:
+        // caller, and points them at the live door below with a ticket
+        // (307 for HTTP, return-URL for WebSocket). ANY method:
         // a WS handshake is a GET and a route serves whatever verbs it
         // declared; the handler answers 405 itself. `/connect/*` is more
         // specific than the catch-all, so it never falls through to
@@ -301,6 +423,15 @@ fn outside_caller_routes() -> Router<DispatcherState> {
             "/connect/{*path}",
             any(signal::connect_live).layer(DefaultBodyLimit::max(PUBLIC_FIRE_BODY_LIMIT)),
         )
+        // The live door: a caller holding a handshake's ticket, forwarded
+        // to one of the project's workers (`live_relay`). ANY method, and
+        // a WebSocket upgrade. The ticket is the credential.
+        .route(&format!("{}/{{project}}", crate::live_relay::LIVE_PREFIX), any(crate::live_relay::forward))
+        .route(&format!("{}/{{project}}/", crate::live_relay::LIVE_PREFIX), any(crate::live_relay::forward))
+        .route(&format!("{}/{{project}}/{{*rest}}", crate::live_relay::LIVE_PREFIX), any(crate::live_relay::forward))
+        // The public endpoints of infra nodes (`Expose::Public`).
+        .route(&format!("{}/{{project}}/{{instance}}", crate::infra_door::INFRA_PREFIX), any(crate::infra_door::forward))
+        .route(&format!("{}/{{project}}/{{instance}}/{{*rest}}", crate::infra_door::INFRA_PREFIX), any(crate::infra_door::forward))
         // The OAuth callback door: the provider redirects the user's
         // browser here after consent. No tenant bearer rides a
         // provider redirect; the state nonce's pending row (minted by
@@ -334,6 +465,7 @@ fn outside_caller_routes() -> Router<DispatcherState> {
             "/{*mount_path}",
             post(signal::fire_public_entry).layer(DefaultBodyLimit::max(PUBLIC_FIRE_BODY_LIMIT)),
         )
+        .layer(axum::middleware::from_fn_with_state(state, guard_token_doors))
         .layer(permissive_cors())
 }
 
@@ -342,28 +474,44 @@ fn outside_caller_routes() -> Router<DispatcherState> {
 /// popup / task page (origins like `moz-extension://<id>` or
 /// `chrome-extension://<id>`, which no allowlist can enumerate). A publicly
 /// exposed surface wants a tight `CorsLayer` instead.
+///
+/// Every response header is exposed to the page (a live route's program
+/// sets its own), and a preflight is remembered for a day, so a page
+/// calling a route asks once rather than before every call.
 pub fn permissive_cors() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
         .allow_methods(tower_http::cors::Any)
         .allow_headers(tower_http::cors::Any)
+        .expose_headers(tower_http::cors::Any)
+        .max_age(std::time::Duration::from_secs(24 * 3600))
 }
 
-/// The CLI-only door. `/projects/register` takes a pre-assembled
-/// `ProjectDefinition` with locally-computed hashes + source: a developer
-/// registers a project from a folder the CLI already BUILT on their machine.
-/// Because it trusts caller-supplied definition + hashes, it is a TRUSTED-caller
-/// door and must be mounted ONLY where every caller is trusted (`router` below).
-/// It MUST NOT be exposed to untrusted browsers, which could otherwise register
-/// an arbitrary definition + hashes bypassing any scaffold / build / quota checks.
-pub fn cli_routes() -> Router<DispatcherState> {
-    Router::new().route("/projects/register", post(project::register))
+/// Build the dispatcher router, bound to `state`, with `cors` on the admin
+/// surface (see [`core_routes`]).
+pub fn router(state: DispatcherState, cors: CorsLayer) -> Router {
+    let hops = TrustedHops(state.edge.trusted_proxy_hops.public);
+    core_routes(cors, state.clone()).layer(axum::Extension(hops)).with_state(state)
 }
 
-/// Build the trusted-caller dispatcher router: the core routes PLUS the CLI door,
-/// bound to `state`. Assemblies that face untrusted browsers compose
-/// `core_routes()` WITHOUT `cli_routes()`, so the trusted-caller register door is
-/// never reachable there.
-pub fn router(state: DispatcherState) -> Router {
-    core_routes(permissive_cors()).merge(cli_routes()).with_state(state)
+/// Only the doors outside callers use (the public trigger surface, the
+/// live and infra doors, the OAuth callback), for an address the open
+/// internet reaches while the management API must stay off it (a local
+/// install's tunnel).
+pub fn outside_router(state: DispatcherState) -> Router {
+    let hops = TrustedHops(state.edge.trusted_proxy_hops.outside);
+    outside_caller_routes(state.clone()).layer(axum::Extension(hops)).with_state(state)
+}
+
+#[cfg(test)]
+mod token_door_tests {
+    #[test]
+    fn only_the_token_doors_count_refusals() {
+        for door in ["/signal/abc", "/signal-token/signals", "/connect/local/chat"] {
+            assert!(super::is_token_door(door), "{door}");
+        }
+        for other in ["/public/files/x", "/events/slack/message", "/local/hook", "/signals"] {
+            assert!(!super::is_token_door(other), "{other}");
+        }
+    }
 }

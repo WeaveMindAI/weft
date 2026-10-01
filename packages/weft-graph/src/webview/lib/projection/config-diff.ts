@@ -8,7 +8,7 @@
 // Diffing against the node's current (projected) config keeps source ops to
 // exactly what changed.
 
-import type { ConfigFieldSpan, EditOp } from '../../../protocol';
+import { installPicked, type ConfigFieldSpan, type EditOp } from '../../../protocol';
 import { formatConfigValue } from '../value-format';
 
 /// Keys that are view-state (layout file) or webview plumbing, never source.
@@ -103,7 +103,13 @@ export function diffPortLiteralOps(
   firstForm: ConfigFieldSpan['origin'],
 ): EditOp[] {
   const ops: EditOp[] = [];
+  // A connection the install keeps is marked by the compiler, never
+  // written in the source. An updated marker is the compiled marker
+  // echoed back: no value to write. A real value over a marker (turning
+  // on `@instance_filled`) is written; a marker the update drops is no
+  // literal to remove.
   for (const [key, value] of Object.entries(updated)) {
+    if (installPicked(value)) continue;
     if (sameConfigValue(value, current[key])) continue;
     const form = spans[key]?.origin ?? firstForm;
     if (value === undefined || value === null) {
@@ -113,7 +119,7 @@ export function diffPortLiteralOps(
     }
   }
   for (const key of Object.keys(current)) {
-    if (!(key in updated)) {
+    if (!(key in updated) && !installPicked(current[key])) {
       ops.push({ op: 'removeConfig', node: nodeId, key, form: spans[key]?.origin ?? firstForm });
     }
   }

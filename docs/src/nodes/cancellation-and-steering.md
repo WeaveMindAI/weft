@@ -94,7 +94,7 @@ assert_eq!(rig.stops().len(), 1);
 project down (`ctx.infra("bridge").stop(..)`, `terminate(..)`,
 `ctx.trigger("receive").deactivate(..)`, `ctx.runs().clean(..)`). For what
 `Keep` and `Include` do there, go and read
-[taking something down from a run](../running/members.md#taking-something-down-from-a-run).
+[taking something down from a run](../running/instances.md#taking-something-down-from-a-run).
 
 In a test, `rig.program_calls()` lists every such call with the `StopSelf` it
 passed. If your node reads something back, such as an infra copy's status,

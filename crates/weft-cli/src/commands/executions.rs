@@ -3,9 +3,9 @@
 //! the scripting surface.
 
 use anyhow::Context;
+use weft_core::program::ExecutionPage;
 
 use super::{local_time, Ctx};
-use crate::commands::daemon::ClusterBackend;
 
 /// A value put into a query string. A node id is the author's own
 /// spelling, so it can hold anything they typed; only the handful of
@@ -26,13 +26,13 @@ fn query_escaped(value: &str) -> String {
         .collect()
 }
 
-/// One page of the dispatcher's execution listing. The body is
-/// `{"executions": [...], "total": N}`; anything else is a broken
-/// contract and fails loudly rather than reading as "no executions".
+/// One page of the dispatcher's execution listing. Anything that does
+/// not read as one is a broken contract and fails loudly rather than
+/// reading as "no executions".
 async fn executions_page(
     client: &crate::client::DispatcherClient,
     filter: &ListFilter,
-) -> anyhow::Result<(Vec<serde_json::Value>, u64)> {
+) -> anyhow::Result<ExecutionPage> {
     let mut path =
         format!("/executions?limit={}&offset={}", filter.limit, filter.offset);
     if let Some(p) = &filter.project {
@@ -50,25 +50,13 @@ async fn executions_page(
     if let Some(status) = &filter.status {
         path.push_str(&format!("&status={status}"));
     }
-    if let Some(member) = &filter.member {
-        path.push_str(&format!("&member={member}"));
+    if let Some(instance) = &filter.instance {
+        path.push_str(&format!("&instance={instance}"));
     }
     if let Some(tag) = &filter.tag {
         path.push_str(&format!("&tag={}", query_escaped(tag)));
     }
-    let resp: serde_json::Value = client.get_json(&path).await?;
-    let rows = resp
-        .get("executions")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .ok_or_else(|| {
-            anyhow::anyhow!("/executions returned no `executions` array: {resp}")
-        })?;
-    let total = resp
-        .get("total")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow::anyhow!("/executions returned no `total`: {resp}"))?;
-    Ok((rows, total))
+    serde_json::from_value(client.get_json(&path).await?).context("read the executions listing")
 }
 
 /// What `weft executions` narrows the listing to. One struct rather
@@ -84,64 +72,53 @@ pub struct ListFilter {
     pub node: Option<String>,
     /// Unix second: only runs that started at or after it.
     pub since: Option<u64>,
-    /// How the run ended: completed, failed, cancelled, or running.
-    pub status: Option<String>,
-    /// Who the run is for.
-    pub member: Option<weft_core::member::MemberId>,
+    /// Where the run stands.
+    pub status: Option<weft_core::program::RunStatus>,
+    /// Which instance the run is in.
+    pub instance: Option<weft_core::instance::InstanceId>,
     /// A tag the run carries.
     pub tag: Option<String>,
 }
 
 pub async fn list(ctx: Ctx, filter: ListFilter) -> anyhow::Result<()> {
-    let client = ctx.client();
-    let (arr, total) = executions_page(&client, &filter).await?;
-    if ctx.json_out(&serde_json::json!({ "executions": arr, "total": total }))? {
+    let client = ctx.client()?;
+    let page = executions_page(&client, &filter).await?;
+    if ctx.json_out(&serde_json::to_value(&page)?)? {
         return Ok(());
     }
-    if arr.is_empty() {
+    if page.executions.is_empty() {
         println!("(no executions)");
         return Ok(());
     }
     println!(
         "{:<36}  {:<9}  {:<13}  {:<19}  {:<36}  entry_node  tags",
-        "color", "status", "phase", "started", "project_id"
+        "execution_id", "status", "phase", "started", "project_id"
     );
-    for row in &arr {
-        let color = row.get("color").and_then(|v| v.as_str()).unwrap_or("?");
-        let project = row.get("project_id").and_then(|v| v.as_str()).unwrap_or("?");
-        let status = row.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-        let phase = row.get("phase").and_then(|v| v.as_str()).unwrap_or("?");
-        let started = row.get("started_at").and_then(|v| v.as_u64()).unwrap_or(0);
-        let entry = row.get("entry_node").and_then(|v| v.as_str()).unwrap_or("?");
+    for row in &page.executions {
+        let execution_id = row.execution_id.to_string();
+        let project = row.project_id.to_string();
+        let (status, phase, entry) = (&row.status, row.phase.as_str(), &row.entry_node);
         // The tags the run put on itself (`ctx.tag_execution`), the
         // handle a sibling's `ctx.stop_tagged` selects on.
-        let tags: Vec<&str> = row
-            .get("tags")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|t| t.as_str()).collect())
-            .unwrap_or_default();
-        let tags = if tags.is_empty() { String::new() } else { format!("  {}", tags.join(",")) };
-        // Who the run is for, when it is for a member.
-        let member = row
-            .get("member")
-            .and_then(|v| v.as_str())
-            .map(|m| format!("  (member {m})"))
-            .unwrap_or_default();
+        let tags = if row.tags.is_empty() { String::new() } else { format!("  {}", row.tags.join(",")) };
+        // Which instance the run is in, when it is in one.
+        let instance = row.instance.as_ref().map(|m| format!("  (instance {m})")).unwrap_or_default();
         println!(
-            "{color:<36}  {status:<9}  {phase:<13}  {:<19}  {project:<36}  {entry}{tags}{member}",
-            local_time(started)
+            "{execution_id:<36}  {status:<9}  {phase:<13}  {:<19}  {project:<36}  {entry}{tags}{instance}",
+            local_time(row.started_at)
         );
     }
     // The server clamps the page size, so a big --limit can come back
     // short; say so rather than letting the page read as the total.
     // It does NOT say "raise --limit": past the server's cap that is
     // advice the CLI knows will not work.
-    if (arr.len() as u64) < total {
+    let shown = page.executions.len() as u64;
+    if shown < page.total {
         println!(
-            "showing {} of {total} (one page; the dispatcher caps how many a page can hold, \
+            "showing {shown} of {} (one page; the dispatcher caps how many a page can hold, \
              so walk the rest with --offset {}, or narrow with --node / --since)",
-            arr.len(),
-            filter.offset as u64 + arr.len() as u64
+            page.total,
+            filter.offset as u64 + shown
         );
     }
     Ok(())
@@ -159,7 +136,26 @@ pub struct EventsFilter {
     /// id (`Auth.check` under `["auth"]`). Empty = any, or none.
     pub call_path: Vec<String>,
     pub kind: Option<String>,
+    /// Loop iterations, outermost first (`--iteration 3` or `3.0` for the
+    /// first inner iteration inside the fourth outer one): only the rows
+    /// fired inside them pass. Empty = any.
+    pub iteration: Vec<u32>,
     pub full: bool,
+}
+
+/// Read `--iteration`: iteration numbers from 0, outermost loop first,
+/// joined by `.` (`3`, `3.0`).
+pub fn parse_iteration(text: &str) -> anyhow::Result<Vec<u32>> {
+    text.split('.')
+        .map(|part| {
+            part.trim().parse::<u32>().map_err(|_| {
+                anyhow::anyhow!(
+                    "--iteration takes loop iteration numbers from 0, outermost loop first, joined by '.' \
+                     (`3`, or `3.0` for an inner loop's first iteration); got '{text}'"
+                )
+            })
+        })
+        .collect()
 }
 
 impl EventsFilter {
@@ -194,21 +190,26 @@ impl EventsFilter {
     /// that call path pass. A kind filter matches the kind exactly or
     /// as a substring, so `failed` finds both `node_failed` and
     /// `execution_failed`, and `loop` finds the loop lifecycle.
-    pub fn keeps(&self, row: &serde_json::Value) -> bool {
+    /// `row` is `event` as it reads on the wire: the kind and node filters
+    /// read the wire spelling, the frame filters the typed firing.
+    pub fn keeps(&self, event: &weft_core::live_event::DispatcherEvent, row: &serde_json::Value) -> bool {
         let kind = row.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         let kind_ok = self.kind.as_deref().is_none_or(|k| kind == k || kind.contains(k));
         // `--node gate` names the group: its own two boundaries are
         // its rows too.
         let node_ok = self.node.as_deref().is_none_or(|n| row_node(row).is_some_and(|id|
             id == n || id == weft_core::project::boundary_in_id(n) || id == weft_core::project::boundary_out_id(n)));
-        let call_ok = self.call_path.is_empty() || {
-            let frames: weft_core::frames::LoopFrames = row
-                .get("frames")
-                .and_then(|f| serde_json::from_value(f.clone()).ok())
-                .unwrap_or_default();
-            weft_core::frames::call_path(&frames) == self.call_path.iter().map(String::as_str).collect::<Vec<_>>()
-        };
-        kind_ok && node_ok && call_ok
+        let frames = event.firing_frames();
+        let call_ok = self.call_path.is_empty()
+            || frames.is_some_and(|frames| {
+                weft_core::frames::call_path(frames) == self.call_path.iter().map(String::as_str).collect::<Vec<_>>()
+            });
+        // A row inside the named iterations: its own iterations, outermost
+        // first, start with them (an inner loop's rows belong to the outer
+        // iteration they ran in). A run-level row is inside none.
+        let iteration_ok = self.iteration.is_empty()
+            || frames.is_some_and(|frames| weft_core::frames::loop_indices(frames).starts_with(&self.iteration));
+        kind_ok && node_ok && call_ok && iteration_ok
     }
 }
 
@@ -219,8 +220,8 @@ const SUMMARY_CHARS: usize = 120;
 
 /// The columns every line prints in its own place, plus the two every
 /// row of one run repeats (they name the run, which you already have:
-/// you asked for it by color). Nothing here reaches the generic tail.
-const COLUMNS: &[&str] = &["kind", "node", "node_id", "at_unix", "color", "project_id"];
+/// you asked for it by execution). Nothing here reaches the generic tail.
+const COLUMNS: &[&str] = &["kind", "node", "node_id", "at_unix", "execution_id", "project_id"];
 
 /// The node a replay row is about. Most rows name it `node`; the two
 /// that come off a pulse rather than a journal row (`cost_reported`,
@@ -340,9 +341,9 @@ fn field_text(value: &serde_json::Value, full: bool) -> String {
     format!("{cut}...")
 }
 
-pub async fn events(ctx: Ctx, color: String, mut filter: EventsFilter) -> anyhow::Result<()> {
-    let color = super::resolve_color(&ctx, &color).await?;
-    let client = ctx.client();
+pub async fn events(ctx: Ctx, execution_id: String, mut filter: EventsFilter) -> anyhow::Result<()> {
+    let execution_id = super::resolve_execution_id(&ctx, &execution_id).await?;
+    let client = ctx.client()?;
     // `--node` is spelled through the call sites, the way the program
     // reads; the project's compiled definition says which id and which
     // call path that is, and the rows print their node the same way.
@@ -363,23 +364,22 @@ pub async fn events(ctx: Ctx, color: String, mut filter: EventsFilter) -> anyhow
     });
     let definition = match loaded {
         Ok(Some((project, definition))) => {
-            let summary: serde_json::Value = client.get_json(&format!("/executions/{color}")).await?;
-            let run_project = summary
-                .get("project_id")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("/executions/{color} named no project_id: {summary}"))?;
-            if run_project == definition.id.to_string() {
+            let detail: weft_core::program::ExecutionDetail =
+                serde_json::from_value(client.get_json(&format!("/executions/{execution_id}")).await?)
+                    .context("read the run")?;
+            let run_project = detail.summary.project_id;
+            if run_project == definition.id {
                 filter.resolve_node(project, &definition)?;
                 Some(definition)
             } else if filter.node.is_some() {
                 anyhow::bail!(
-                    "run {color} belongs to project {run_project}, not to this folder's project {}; `--node` is read \
+                    "run {execution_id} belongs to project {run_project}, not to this folder's project {}; `--node` is read \
                      through this folder's program, so run `weft events` from that project's folder",
                     definition.id
                 );
             } else {
                 eprintln!(
-                    "warning: nodes show as ids, because run {color} belongs to project {run_project}, not to this folder's project {}",
+                    "warning: nodes show as ids, because run {execution_id} belongs to project {run_project}, not to this folder's project {}",
                     definition.id
                 );
                 None
@@ -394,13 +394,14 @@ pub async fn events(ctx: Ctx, color: String, mut filter: EventsFilter) -> anyhow
             None
         }
     };
-    let resp: serde_json::Value = client
-        .get_json(&format!("/executions/{color}/replay"))
-        .await?;
-    let arr = resp
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("/executions/{color}/replay returned no array: {resp}"))?;
-    let kept: Vec<serde_json::Value> = arr.iter().filter(|row| filter.keeps(row))
+    // Typed first, so a row the dispatcher and this CLI disagree on
+    // fails here by name; the printing below then reads each row as the
+    // JSON object it is on the wire, since its generic tail prints
+    // whatever fields a kind carries.
+    let typed = super::versions::replay_rows(&client, &execution_id).await?;
+    let arr = typed.iter().map(serde_json::to_value).collect::<Result<Vec<_>, _>>()?;
+    let kept: Vec<serde_json::Value> = typed.iter().zip(&arr).filter(|(event, row)| filter.keeps(&event.event, row))
+        .map(|(_, row)| row)
         .filter_map(|row| match &definition { Some(definition) => spell_node(row.clone(), definition), None => Some(row.clone()) })
         .collect();
     if ctx.json_out(&kept)? {
@@ -511,8 +512,8 @@ pub fn spell_node(mut row: serde_json::Value, project: &weft_core::ProjectDefini
 /// program's `ctx.runs()` takes (`weft_core::program::RunFilter`).
 #[derive(Debug, Default)]
 pub struct CleanNarrowing {
-    pub member: Option<weft_core::member::MemberId>,
-    pub status: Option<String>,
+    pub instance: Option<weft_core::instance::InstanceId>,
+    pub status: Option<weft_core::program::RunStatus>,
     pub node: Option<String>,
     pub tag: Option<String>,
     /// Cancel matching runs still going, instead of leaving them.
@@ -521,7 +522,7 @@ pub struct CleanNarrowing {
 
 pub async fn clean(
     ctx: Ctx,
-    color: Option<String>,
+    execution_id: Option<String>,
     keep_days: Option<u32>,
     all: bool,
     images: bool,
@@ -555,35 +556,40 @@ pub async fn clean(
         Ok(ok)
     };
 
-    let client = ctx.client();
-    if let Some(c) = color {
+    let client = ctx.client()?;
+    let project = project
+        .map(|p| p.parse::<uuid::Uuid>().map_err(|_| anyhow::anyhow!("--project takes a project id, and '{p}' is not one")))
+        .transpose()?;
+    if let Some(c) = execution_id {
         anyhow::ensure!(
             project.is_none(),
-            "a color names ONE execution, so --project cannot narrow it further: \
+            "an execution names ONE execution, so --project cannot narrow it further: \
              drop one of them"
         );
-        let c = super::resolve_color(&ctx, &c).await?;
+        let c = super::resolve_execution_id(&ctx, &c).await?;
         if !confirm(format!("execution {c}"))? {
             return Ok(());
         }
-        let deleted = client.delete_json(&format!("/executions/{c}")).await?;
+        let deleted: weft_core::program::DeletedExecution =
+            serde_json::from_value(client.delete_json(&format!("/executions/{c}")).await?)
+                .context("read what the delete removed")?;
         println!("deleted {c}");
         // The sweep of whatever version this run left bare happens on the
         // dispatcher, inside the delete: the run's own project is the one
-        // to sweep, and a color can be cleaned from anywhere, so no
+        // to sweep, and an execution can be cleaned from anywhere, so no
         // client is in a position to know it. This just reports it.
-        let swept = deleted.get("swept").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+        let swept = deleted.swept.len();
         if swept > 0 {
             println!("dropped {swept} bare versions");
         }
         return Ok(());
     }
 
-    // Bulk clean. Naming a SUBJECT means you mean all of it (a color
-    // deletes outright; a project, a member or a tag takes every run it
+    // Bulk clean. Naming a SUBJECT means you mean all of it (an execution
+    // deletes outright; a project, an instance or a tag takes every run it
     // names), so the 30-day default guards only the sweep that names
     // nothing. `--keep-days` still narrows any of them when asked for.
-    let named = project.is_some() || narrow.member.is_some() || narrow.tag.is_some();
+    let named = project.is_some() || narrow.instance.is_some() || narrow.tag.is_some();
     let days = match (keep_days, all, named) {
         (Some(d), _, _) => Some(d),
         (None, true, _) => None,  // --all: no cutoff
@@ -594,8 +600,8 @@ pub async fn clean(
         Some(p) => format!(" of project {p}"),
         None => String::new(),
     };
-    if let Some(member) = &narrow.member {
-        scope.push_str(&format!(" for member {member}"));
+    if let Some(instance) = &narrow.instance {
+        scope.push_str(&format!(" in instance {instance}"));
     }
     if let Some(tag) = &narrow.tag {
         scope.push_str(&format!(" tagged {tag}"));
@@ -614,7 +620,7 @@ pub async fn clean(
         return Ok(());
     }
     let filter = weft_core::program::RunFilter {
-        member: narrow.member,
+        instance: narrow.instance,
         status: narrow.status,
         node: narrow.node,
         tag: narrow.tag,
@@ -624,12 +630,12 @@ pub async fn clean(
     // versions the deletes left bare, project by project; a run still
     // going follows `--cancel-running` (stopped now, its rows gone with
     // the next clean) or is left to finish.
-    let body = serde_json::json!({
-        "project": project,
-        "filter": filter,
-        "running": if narrow.cancel_running { "cancel" } else { "wait" },
-    });
-    let answer: weft_core::program::CleanOutcome = serde_json::from_value(client.post_json("/executions/clean", &body).await?)
+    let body = weft_core::program::CleanRequest {
+        project,
+        filter,
+        running: if narrow.cancel_running { weft_core::RunningPolicy::Cancel } else { weft_core::RunningPolicy::Wait },
+    };
+    let answer: weft_core::program::CleanOutcome = serde_json::from_value(client.post_json("/executions/clean", &serde_json::to_value(&body)?).await?)
         .map_err(|e| anyhow::anyhow!("unexpected /executions/clean answer: {e}"))?;
     if ctx.json_out(&serde_json::to_value(&answer)?)? {
         return Ok(());
@@ -648,83 +654,45 @@ pub async fn clean(
 }
 
 
-/// Reclaim the images a build produces (worker images, infra images,
-/// old builder bases under `--all`) that nothing runs any more. Five
-/// layers of junk, each its own sweep, none gating another (a layer
-/// that fails is reported at the end, after every other layer ran):
+/// Reclaim the images builds produce that nothing runs any more (worker
+/// and infra images, node-test leftovers, and under `--all` old builder
+/// bases, runtimes and compile caches). Each layer is its own sweep, none
+/// gating another (a layer that fails is reported at the end, after every
+/// other layer ran):
 ///
-///   1. TAGGED `weft-worker:<binary_hash>` images on host docker whose
-///      hash the dispatcher's `GET /images/referenced` set does not
-///      cover (a rebuilt project leaves its old tag behind; a deleted
-///      project leaves all of them; a draining pod's image stays covered
-///      until the pod is terminal). The daemon must be up; failing that
-///      is a loud error before any layer runs, never a guess (guessing
-///      "nothing is referenced" would nuke live images).
-///   2. Dangling (untagged) leftovers, under the same project scope as
-///      layer 1 (the `weft.dev/project` label value, or any value with
-///      `--all`).
-///   3. With `--all` only: host `weft-infra-<name>:<hash>` images whose
-///      full ref the referenced set's `infraRefs` does not cover (every
-///      project's complete tag map plus every recorded unit ref; one
-///      image per infra-node content change, nothing else evicts them).
-///      The supervisor's repo is excluded: `gc_stale_system_images`
-///      (daemon start) owns its stale tags. `--all` only because infra
-///      images are content-addressed and deduped ACROSS projects, so a
-///      cwd-project scope over them is a fiction.
-///   4. With `--all` only, kind backend only: the kind node's own cached
-///      worker AND infra images outside the referenced set, in one pass
-///      over the node's OWN image list (the node can hold tags the host
-///      already dropped, so mirroring the host's stale set would miss
-///      them). `--all` only because crictl cannot see docker build
-///      labels, so the node sweep is inherently global.
-///   5. With `--all` only: builder-base tags other than the current one
-///      (each engine bump mints a fresh ~1.4GB base; only the current ref
-///      is ever FROMed, and the base is shared across every project, so
-///      reclaiming it is inherently global). Needs the weft repo root to
-///      compute the current ref.
-///
-/// Without `--all`, the host side is scoped to the cwd project's images
-/// (label filter).
-///
-/// An image docker or containerd refuses to drop because something
-/// still runs it is not an error: it is reported as kept, and the next
-/// clean gets it once nothing runs it. That is expected traffic here,
-/// not only a race: a unit stamped before image refs were recorded
-/// contributes nothing to the keep-set while it keeps running its
-/// image.
-///
-/// Not concurrent-safe with an in-flight `weft build`/`run` on this host: a
-/// freshly built image is referenced by nothing until its register lands,
-/// so a clean racing that window deletes it and that run fails loudly
-/// (rebuild heals). Run cleans between builds, not during.
+///   1. The images the install built: it deletes each one its keep-set
+///      does not cover (`POST /images/prune`), the cwd project's or, with
+///      `--all`, every project's. The install is the only one that
+///      deletes them: every build claims the images it relies on until
+///      they are registered, so a prune never takes an image a build just
+///      found or made (it reports it in use), and it forgets what it
+///      deleted from its ledger.
+///   2. Dangling (untagged) leftovers of the node-test images this host
+///      built (`weft test-node`), which the install never saw: those
+///      carrying the cwd project's `weft.dev/project` label, or any value
+///      with `--all`.
+///   3. With `--all` only: builder-base and runtime tags other than the
+///      current ones (each engine change mints fresh ones, and both are
+///      shared across every project). Needs the weft repo root to compute
+///      the current refs.
+///   4. With `--all` only: compile caches under a retired key.
 async fn clean_build_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
-    // Referenced set: the dispatcher's authoritative answer (see
-    // `images::referenced_images`: worker hashes + infra refs). Loud
-    // error if the daemon is down; guessing "nothing is referenced"
-    // would nuke live images.
-    let mut referenced = crate::images::referenced_images(&ctx.client()).await?;
-    // The host scope, settled BEFORE any layer runs: a scoped clean
-    // that cannot name its project must delete nothing, not run the
-    // global layers and report the error afterwards.
+    // The scope, settled BEFORE any layer runs: a scoped clean that cannot
+    // name its project must delete nothing, not run the global layers and
+    // report the error afterwards.
     let scope = if all {
-        // The full-library worker carries no project label, so only the
-        // unscoped sweep can meet it; it is every stock project's image
-        // and stays whether or not a project references it right now.
-        let standard = crate::images::standard_worker_ref()?;
-        let (_, hash) = crate::images::ref_repo_tag(&standard)?;
-        referenced.worker_hashes.insert(hash.to_string());
-        println!("reclaiming worker images no live project references");
-        HostScope::All
+        println!("reclaiming the images no live project references");
+        Scope::All
     } else {
         let project = ctx.project().map_err(|e| {
             anyhow::anyhow!("{e}; pass --all to clean every project's images")
         })?;
         println!(
-            "reclaiming worker images for project {} ({})",
+            "reclaiming the images of project {} ({}) nothing references",
             project.manifest.package.name,
             project.id()
         );
-        HostScope::Project(project.id().to_string())
+        Scope::Project(project.id())
     };
 
     let mut failures: Vec<anyhow::Error> = Vec::new();
@@ -733,12 +701,11 @@ async fn clean_build_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
             failures.push(e.context(name.to_string()));
         }
     };
-    layer("worker images", host_worker_sweep(&referenced, &scope).await);
-    layer("dangling build leftovers", dangling_prune(&scope).await);
+    layer("built images", registry_prune(ctx, &scope).await);
+    layer("dangling node-test leftovers", dangling_prune(&scope).await);
     if all {
-        layer("infra images", host_infra_sweep(&referenced).await);
-        layer("kind node images", node_sweep(&referenced).await);
-        layer("builder-base images", builder_base_sweep().await);
+        layer("builder-base images", current_only_sweep(crate::images::builder_base_ref()?, "builder-base").await);
+        layer("runtime images", current_only_sweep(crate::images::runtime_image_ref()?, "runtime").await);
         layer("retired compile caches", retired_compile_cache_sweep().await);
     }
     // The compile cache every worker build shares is not an image, but it
@@ -757,54 +724,52 @@ async fn clean_build_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
     anyhow::bail!("{msg}");
 }
 
-/// Which host images layers 1 and 2 may touch: every project's, or
-/// one project's through the `weft.dev/project` label every build
-/// stamps.
-enum HostScope {
-    All,
-    Project(String),
-}
-
-impl HostScope {
-    /// The `docker` label filter for this scope: the label with its
-    /// value for one project, the label's presence for all.
-    fn label_filter(&self) -> String {
-        match self {
-            HostScope::All => "label=weft.dev/project".to_string(),
-            HostScope::Project(id) => format!("label=weft.dev/project={id}"),
-        }
-    }
-}
-
-/// Layer 1: host `weft-worker` tags outside the referenced set, within
-/// the scope's label filter, through the one host matcher.
-async fn host_worker_sweep(
-    referenced: &crate::images::ReferencedImages,
-    scope: &HostScope,
-) -> anyhow::Result<()> {
-    let repo = weft_compiler::build::WORKER_IMAGE_REPO;
-    let listing = match scope {
-        HostScope::All => host_image_listing(&[]).await?,
-        HostScope::Project(_) => host_image_listing(&["--filter", &scope.label_filter()]).await?,
+/// Layer 1: the install deletes the images it built that nothing references.
+async fn registry_prune(ctx: &Ctx, scope: &Scope) -> anyhow::Result<()> {
+    let request = weft_core::images::PruneRequest {
+        project: match scope {
+            Scope::All => None,
+            Scope::Project(id) => Some(*id),
+        },
     };
-    let stale = crate::images::host_images_matching(
-        &listing,
-        |r, t| r == repo && !referenced.is_referenced(r, t),
-    );
-    if stale.is_empty() {
-        println!("no unreferenced worker images");
-        return Ok(());
+    let body = serde_json::to_value(&request).context("encode the prune request")?;
+    let report: weft_core::images::PruneReport = serde_json::from_value(ctx.client()?.post_json("/images/prune", &body).await?)
+        .context("read the install's prune report")?;
+    for image in &report.removed {
+        println!("  removed {image}");
     }
-    println!("{}", reclaim_host_images(&stale).await?.report("unreferenced worker image(s)"));
+    for image in &report.in_use {
+        println!("  kept {image}: a container still runs from it, or a build is about to register it; a later clean takes it");
+    }
+    if report.removed.is_empty() && report.in_use.is_empty() && report.failed.is_empty() {
+        println!("no unreferenced built images");
+    }
+    anyhow::ensure!(
+        report.failed.is_empty(),
+        "{} image(s) could not be deleted:\n  {}",
+        report.failed.len(),
+        report.failed.iter().map(|(image, why)| format!("{image}: {why}")).collect::<Vec<_>>().join("\n  ")
+    );
     Ok(())
 }
 
-/// Layer 2: dangling (untagged) leftovers from rebuilds under the same
-/// tag, within the scope's label filter.
-async fn dangling_prune(scope: &HostScope) -> anyhow::Result<()> {
+/// Every project's images, or one project's.
+enum Scope {
+    All,
+    Project(uuid::Uuid),
+}
+
+/// Layer 2: dangling (untagged) leftovers of this host's node-test builds,
+/// through the `weft.dev/project` label `weft test-node` stamps on them.
+async fn dangling_prune(scope: &Scope) -> anyhow::Result<()> {
+    // SYNC: the label <-> crates/weft-cli/src/commands/test_node/mod.rs (the node-test image labels)
+    let filter = match scope {
+        Scope::All => "label=weft.dev/project".to_string(),
+        Scope::Project(id) => format!("label=weft.dev/project={id}"),
+    };
     let status = crate::images::docker()
         .args(["image", "prune", "--force", "--filter", "dangling=true", "--filter"])
-        .arg(scope.label_filter())
+        .arg(filter)
         .status()
         .await?;
     if !status.success() {
@@ -813,90 +778,27 @@ async fn dangling_prune(scope: &HostScope) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Layer 3: host `weft-infra-<name>:<hash>` images outside the
-/// referenced set (see `clean_build_images` for why `--all`-only and
-/// why the supervisor's repo is excluded).
-async fn host_infra_sweep(referenced: &crate::images::ReferencedImages) -> anyhow::Result<()> {
-    let stale = crate::images::host_images_matching(&host_image_listing(&[]).await?, |r, t| {
-        crate::images::is_infra_node_repo(r) && !referenced.is_referenced(r, t)
-    });
+/// Layer 3: old builder bases and runtime images. Each engine or
+/// toolchain change mints a fresh `weft-builder-base:<hash>` (about
+/// 1.4GB) and `weft-runtime:<hash>`, and nothing evicts the previous one
+/// implicitly (an implicit sweep would race a build FROMing it or a unit
+/// agent running it), so this explicit clean is where they go. Everything
+/// but `current` (the ref this checkout uses) is dead.
+async fn current_only_sweep(current: String, what: &str) -> anyhow::Result<()> {
+    let stale = crate::images::host_images_matching(&host_image_listing().await?, crate::images::outside_current(&current)?);
     if stale.is_empty() {
-        println!("no stale infra images");
+        println!("no stale {what} images");
         return Ok(());
     }
-    println!("{}", reclaim_host_images(&stale).await?.report("stale infra image(s)"));
+    println!("{}", reclaim_host_images(&stale).await?.report(&format!("stale {what} image(s)")));
     Ok(())
 }
 
-/// Layer 4: the kind node's own cached worker and infra images outside
-/// the referenced set, computed from the node's OWN image list through
-/// the one node matcher (per IMAGE, never per tag: a group mixing a
-/// kept and a stale tag of the same content survives whole; digest-only
-/// groups never match). Only worker and infra-node refs are ever
-/// touched. Never a blanket `crictl rmi --prune`: "unused right now"
-/// includes the system images (listener pods spawn on demand, so
-/// between spawns nothing uses the listener image), and pruning those
-/// leaves the next on-demand pod in ImagePullBackOff (the exact
-/// incident that shaped this). Kind backend only: a k8s backend has no
-/// local node cache to clean, so it skips quietly; on kind a failure
-/// here is a real error (leftover node images are exactly what this
-/// verb exists to reclaim).
-async fn node_sweep(referenced: &crate::images::ReferencedImages) -> anyhow::Result<()> {
-    let cfg = crate::commands::daemon::cluster_config();
-    if cfg.backend != ClusterBackend::Kind {
-        return Ok(());
-    }
-    let node_stale = crate::images::node_images_matching(
-        &crate::images::kind_node_image_tag_groups(&cfg.cluster_name).await?,
-        |r, t| {
-            (r == weft_compiler::build::WORKER_IMAGE_REPO || crate::images::is_infra_node_repo(r))
-                && !referenced.is_referenced(r, t)
-        },
-    );
-    if node_stale.is_empty() {
-        println!("no stale worker or infra images on the kind node");
-        return Ok(());
-    }
-    let node = format!("{}-control-plane", cfg.cluster_name);
-    println!(
-        "{}",
-        crictl_rmi_refs(&node, &node_stale)
-            .await?
-            .report(&format!("stale worker/infra image(s) from the {node} node"))
-    );
-    Ok(())
-}
-
-/// Layer 5: old builder bases. Each engine/toolchain bump mints a
-/// fresh ~1.4GB `weft-builder-base:<hash>` and nothing evicts the
-/// previous one implicitly (an implicit GC would race an in-flight
-/// build FROMing it), so this explicit clean is where they go.
-/// Everything except the CURRENT ref (the one the next build FROMs) is
-/// dead. Host docker on any backend (a k8s backend still builds bases
-/// here).
-async fn builder_base_sweep() -> anyhow::Result<()> {
-    let current_base = crate::images::builder_base_ref()?;
-    let stale_bases = crate::images::host_images_matching(
-        &host_image_listing(&[]).await?,
-        crate::images::outside_current(&current_base)?,
-    );
-    if stale_bases.is_empty() {
-        println!("no stale builder-base images");
-        return Ok(());
-    }
-    println!(
-        "{}",
-        reclaim_host_images(&stale_bases).await?.report("stale builder-base image(s)")
-    );
-    Ok(())
-}
-
-/// Every host image (narrowed by `filters`, e.g. a label filter) as one
-/// `repo:tag` line, the listing the host-side matcher reads.
-async fn host_image_listing(filters: &[&str]) -> anyhow::Result<String> {
+/// Every host image as one `repo:tag` line, the listing the host-side
+/// matcher reads.
+async fn host_image_listing() -> anyhow::Result<String> {
     let listing = crate::images::docker()
         .args(["images"])
-        .args(filters)
         .args(["--format", "{{.Repository}}:{{.Tag}}"])
         .output()
         .await?;
@@ -921,8 +823,8 @@ struct Reclaimed {
 }
 
 impl Reclaimed {
-    /// The one report line every sweep prints, so the five report
-    /// sites cannot drift in wording: "removed N <what>", then only the
+    /// The one report line every host sweep prints, so the report sites
+    /// cannot drift in wording: "removed N <what>", then only the
     /// tails that happened.
     fn report(&self, what: &str) -> String {
         let mut line = format!("removed {} {what}", self.removed);
@@ -936,64 +838,7 @@ impl Reclaimed {
     }
 }
 
-/// Remove images on the kind node through `crictl rmi`, per-ref so one
-/// refused tag cannot abort the others. A refusal is classified by
-/// OBSERVING presence (`crictl inspecti`), never by parsing error
-/// prose: still present means containerd refused because a pod runs
-/// it (kept, with the refusal printed so a permission problem is not
-/// invisible); absent means a concurrent cleaner already reclaimed it,
-/// which only counts while the node's runtime itself still answers.
-/// The liveness probe is `crictl info`, which CONTACTS containerd: a
-/// wedged runtime inside a live node fails rmi and inspecti through
-/// the socket but still answers `--version` (a client-only print), so
-/// a version probe would read as "node up" and report a live image as
-/// already reclaimed. A node failing all three through the same
-/// transport must not read as success.
-async fn crictl_rmi_refs(node: &str, images: &[String]) -> anyhow::Result<Reclaimed> {
-    let mut done = Reclaimed::default();
-    for image in images {
-        let out = crate::images::docker()
-            .args(["exec", node, "crictl", "rmi", image])
-            .output()
-            .await?;
-        if out.status.success() {
-            done.removed += 1;
-            continue;
-        }
-        let present = crate::images::docker()
-            .args(["exec", node, "crictl", "inspecti", image])
-            .output()
-            .await?
-            .status
-            .success();
-        if present {
-            println!(
-                "kept {image} on {node}: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-            done.in_use += 1;
-            continue;
-        }
-        let node_up = crate::images::docker()
-            .args(["exec", node, "crictl", "info"])
-            .output()
-            .await?
-            .status
-            .success();
-        if node_up {
-            done.already_gone += 1;
-            continue;
-        }
-        anyhow::bail!(
-            "the {node} node stopped answering while removing {image}; check \
-             the kind cluster and rerun `weft clean --images`"
-        );
-    }
-    Ok(done)
-}
-
-/// Remove host docker images one by one, the host twin of
-/// `crictl_rmi_refs`: a tag a concurrent clean already reclaimed is a
+/// Remove host docker images one by one: a tag a concurrent clean already reclaimed is a
 /// success, and a tag docker refuses to drop because a container still
 /// uses it is kept, both detected by observing presence rather than
 /// parsing error prose. No `-f`: force would untag a live container's
@@ -1055,8 +900,10 @@ async fn report_compile_cache_size() -> anyhow::Result<()> {
     }
     let sizes: Vec<String> = caches.iter().map(|cache| {
         let mut line = if cache.idle_days == 0 { cache.size.clone() } else { format!("{} (unused for {} days)", cache.size, cache.idle_days) };
-        if let Some(suffix) = &cache.unreadable_lane {
-            line.push_str(&format!(" (record {} has lane '{suffix}', not a number)", cache.id));
+        match cache.unreadable_lane.as_deref() {
+            Some("") => line.push_str(&format!(" (record {} has no lane number)", cache.id)),
+            Some(suffix) => line.push_str(&format!(" (record {} has lane '{suffix}', not a number)", cache.id)),
+            None => {}
         }
         line
     }).collect();
@@ -1293,28 +1140,73 @@ mod tests {
     use super::{event_line, EventsFilter, Reclaimed};
     use serde_json::json;
 
+    /// One replay row, typed and as it reads on the wire, from the fields
+    /// that matter to a filter (the rest filled with throwaway values).
+    fn replay_row(mut fields: serde_json::Value) -> (weft_core::live_event::DispatcherEvent, serde_json::Value) {
+        let row = fields.as_object_mut().unwrap();
+        let filler = json!({
+            "execution_id": "00000000-0000-0000-0000-000000000001",
+            "project_id": "00000000-0000-0000-0000-000000000002",
+            "at_unix": 1u64, "frames": [], "error": "e", "output": null, "outputs": null,
+        });
+        let kind = row["kind"].as_str().unwrap().to_string();
+        for (key, value) in filler.as_object().unwrap() {
+            let wanted = match key.as_str() {
+                "frames" | "output" => kind.starts_with("node_") && (key != "output" || kind == "node_completed"),
+                "error" => kind.ends_with("_failed"),
+                "outputs" => kind == "execution_completed",
+                _ => true,
+            };
+            if wanted {
+                row.entry(key.clone()).or_insert(value.clone());
+            }
+        }
+        let event: weft_core::live_event::DispatcherEvent = serde_json::from_value(fields.clone()).unwrap();
+        let wire = serde_json::to_value(&event).unwrap();
+        (event, wire)
+    }
+
+    fn keeps(filter: &EventsFilter, (event, row): &(weft_core::live_event::DispatcherEvent, serde_json::Value)) -> bool {
+        filter.keeps(event, row)
+    }
+
     /// The kind filter matches exactly or by substring, the node filter
     /// exactly, and a run-level row (no node) never passes a node filter.
     #[test]
     fn events_filter_narrows_by_node_and_kind() {
-        let failed = json!({"kind": "node_failed", "node": "llm"});
-        let done = json!({"kind": "node_completed", "node": "reply"});
-        let run_failed = json!({"kind": "execution_failed"});
+        let failed = replay_row(json!({"kind": "node_failed", "node": "llm"}));
+        let done = replay_row(json!({"kind": "node_completed", "node": "reply"}));
+        let run_failed = replay_row(json!({"kind": "execution_failed"}));
         let all = EventsFilter::default();
-        assert!(all.keeps(&failed) && all.keeps(&done) && all.keeps(&run_failed));
+        assert!(keeps(&all, &failed) && keeps(&all, &done) && keeps(&all, &run_failed));
         let by_kind = EventsFilter { kind: Some("failed".into()), ..Default::default() };
-        assert!(by_kind.keeps(&failed) && by_kind.keeps(&run_failed) && !by_kind.keeps(&done));
+        assert!(keeps(&by_kind, &failed) && keeps(&by_kind, &run_failed) && !keeps(&by_kind, &done));
         let exact = EventsFilter { kind: Some("node_completed".into()), ..Default::default() };
-        assert!(exact.keeps(&done) && !exact.keeps(&failed));
+        assert!(keeps(&exact, &done) && !keeps(&exact, &failed));
         let by_node = EventsFilter { node: Some("llm".into()), ..Default::default() };
-        assert!(by_node.keeps(&failed) && !by_node.keeps(&done) && !by_node.keeps(&run_failed));
+        assert!(keeps(&by_node, &failed) && !keeps(&by_node, &done) && !keeps(&by_node, &run_failed));
         // Named through a call site, only the rows under that call pass.
-        let in_call = json!({"kind": "node_completed", "node": "Auth.check", "frames": [{"site": "auth"}]});
-        let other_call = json!({"kind": "node_completed", "node": "Auth.check", "frames": [{"index": 1}, {"site": "again"}]});
+        let in_call = replay_row(json!({"kind": "node_completed", "node": "Auth.check", "frames": [{"site": "auth"}]}));
+        let other_call = replay_row(json!({"kind": "node_completed", "node": "Auth.check", "frames": [{"index": 1}, {"site": "again"}]}));
         let by_call = EventsFilter { node: Some("Auth.check".into()), call_path: vec!["auth".into()], ..Default::default() };
-        assert!(by_call.keeps(&in_call) && !by_call.keeps(&other_call));
+        assert!(keeps(&by_call, &in_call) && !keeps(&by_call, &other_call));
         let any_call = EventsFilter { node: Some("Auth.check".into()), ..Default::default() };
-        assert!(any_call.keeps(&in_call) && any_call.keeps(&other_call));
+        assert!(keeps(&any_call, &in_call) && keeps(&any_call, &other_call));
+    }
+
+    /// `--iteration` keeps the rows fired inside those loop iterations,
+    /// an inner loop's rows under the outer iteration they ran in.
+    #[test]
+    fn events_filter_narrows_by_loop_iteration() {
+        let outer_three = replay_row(json!({"kind": "node_completed", "node": "step", "frames": [{"index": 3}]}));
+        let inner = replay_row(json!({"kind": "node_completed", "node": "step", "frames": [{"index": 3}, {"site": "auth"}, {"index": 0}]}));
+        let outer_one = replay_row(json!({"kind": "node_completed", "node": "step", "frames": [{"index": 1}]}));
+        let run_level = replay_row(json!({"kind": "execution_completed"}));
+        let third = EventsFilter { iteration: super::parse_iteration("3").unwrap(), ..Default::default() };
+        assert!(keeps(&third, &outer_three) && keeps(&third, &inner) && !keeps(&third, &outer_one) && !keeps(&third, &run_level));
+        let nested = EventsFilter { iteration: super::parse_iteration("3.0").unwrap(), ..Default::default() };
+        assert!(keeps(&nested, &inner) && !keeps(&nested, &outer_three));
+        assert!(super::parse_iteration("x").is_err() && super::parse_iteration("3.").is_err());
     }
 
     /// The compact line cuts a long value at the summary width on a

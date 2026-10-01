@@ -31,6 +31,7 @@
             mime_type: "image/png".into(),
             filename: "cat.png".into(),
             size_bytes: 3,
+            version: weft_core::storage::FIRST_FILE_VERSION,
         };
         let project: ProjectDefinition = serde_json::from_value(json!({
             "id": uuid::Uuid::new_v4(), "edges": [],
@@ -135,13 +136,13 @@
         project: ProjectDefinition,
         events: &[ExecEvent],
     ) -> (weft_core::primitive::ExecutionSnapshot, Vec<(String, Option<SkipReason>)>) {
-        let color = events.first().expect("journal has rows").color();
-        let mut fold = weft_journal::Fold::new(color, Arc::new(project));
+        let execution_id = events.first().expect("journal has rows").execution_id();
+        let mut fold = weft_journal::Fold::new(execution_id, Arc::new(project));
         let mut boundaries = Vec::new();
         for e in events {
             for b in fold.apply(e).boundaries {
                 if let weft_core::exec::boundary::BoundaryOutcome::Fired { skip_reason, .. } = b.outcome {
-                    boundaries.push((b.node_id, skip_reason));
+                    boundaries.push((b.node_id, skip_reason.map(|reason| *reason)));
                 }
             }
         }
@@ -334,8 +335,8 @@
             ran.lock().unwrap()
         );
         match skip_reason(&events, "guarded") {
-            Some(SkipReason::WatchedNodeFailed { error }) => {
-                assert!(error.contains("the database is down"), "the reason names the failure: {error}");
+            Some(SkipReason::WatchedNodeFailed { failure }) => {
+                assert!(failure.error.contains("the database is down"), "the reason names the failure: {failure}");
             }
             other => panic!("expected the watched-node-failed reason, got {other:?}"),
         }
@@ -616,12 +617,12 @@
         assert!(text.contains("theirs has value, still waiting on go"), "{text}");
     }
 
-    /// A color whose journal already holds a terminal when the worker
+    /// An execution whose journal already holds a terminal when the worker
     /// boots (cancelled in the dispatcher's route window, or a late
-    /// second execute task for a color that already ran) is not driven:
+    /// second execute task for an execution that already ran) is not driven:
     /// no body runs, and nothing is journaled on top of the terminal.
     #[tokio::test]
-    async fn a_color_with_a_terminal_is_not_driven_again() {
+    async fn a_execution_id_with_a_terminal_is_not_driven_again() {
         use super::engine_test_rig::drive_settled;
         let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
         let (outcome, events) =
@@ -1139,8 +1140,8 @@
             ran.lock().unwrap()
         );
         match skip_reason(&events, "watcher") {
-            Some(SkipReason::WatchedNodeFailed { error }) => {
-                assert!(error.contains("the database is down"), "the boundary kept the error: {error}");
+            Some(SkipReason::WatchedNodeFailed { failure }) => {
+                assert!(failure.error.contains("the database is down"), "the boundary kept the error: {failure}");
             }
             other => panic!("expected the watched-node-failed reason through the group, got {other:?}"),
         }
@@ -1200,13 +1201,17 @@
         match skip_reason(&events, "middle") {
             Some(SkipReason::RequiredInputClosed { port, failure: Some(failure) }) => {
                 assert_eq!(port, "value");
-                assert!(failure.contains("the database is down"), "the skip names the failure it inherited: {failure}");
+                assert_eq!(failure.node, "boom", "the skip names the node that broke: {failure}");
+                assert!(failure.error.contains("the database is down"), "the skip names the failure it inherited: {failure}");
             }
             other => panic!("expected the required input closed ON A FAILURE, got {other:?}"),
         }
+        // Two hops out (boom failed, middle skipped, watcher reads
+        // middle's closure), the failure still names `boom`, not `middle`.
         match skip_reason(&events, "watcher") {
-            Some(SkipReason::WatchedNodeFailed { error }) => {
-                assert!(error.contains("the database is down"), "the skipped node passed the error on: {error}");
+            Some(SkipReason::WatchedNodeFailed { failure }) => {
+                assert_eq!(failure.node, "boom", "the origin survives two hops: {failure}");
+                assert!(failure.error.contains("the database is down"), "the skipped node passed the error on: {failure}");
             }
             other => panic!("expected the watched-node-failed reason two hops out, got {other:?}"),
         }
@@ -1282,13 +1287,17 @@
         let (_, boundaries) = fold_with_boundaries(failure_gated_group_project(), &events);
         match boundary_skip_reason(&boundaries, "g__in") {
             Some(SkipReason::FlowClosed { failure: Some(failure) }) => {
-                assert!(failure.contains("the database is down"), "the gate's skip names the failure: {failure}");
+                assert_eq!(failure.node, "boom", "the gate's skip names the node that broke: {failure}");
+                assert!(failure.error.contains("the database is down"), "and its error: {failure}");
             }
             other => panic!("expected the gate closed ON A FAILURE, got {other:?}"),
         }
+        // Two hops on (the scope's gate skipped, its outward closure
+        // reached the watcher), the failure still names `boom`.
         match skip_reason(&events, "watcher") {
-            Some(SkipReason::WatchedNodeFailed { error }) => {
-                assert!(error.contains("the database is down"), "the scope teardown kept the error: {error}");
+            Some(SkipReason::WatchedNodeFailed { failure }) => {
+                assert_eq!(failure.node, "boom", "the origin survives the skips: {failure}");
+                assert!(failure.error.contains("the database is down"), "the scope teardown kept the error: {failure}");
             }
             other => panic!("expected the watched-node-failed reason outside the gated scope, got {other:?}"),
         }
@@ -1726,7 +1735,7 @@
     /// wrote its terminal first.
     #[tokio::test]
     async fn worker_terminal_names_the_recorded_cancel_cause() {
-        let by = weft_core::Color::new_v4();
+        let by = weft_core::ExecutionId::new_v4();
         let cause = weft_core::exec::CancelCause::Execution { by, tag: "user_7".into() };
         let project: ProjectDefinition = serde_json::from_value(json!({
             "id": uuid::Uuid::new_v4(),

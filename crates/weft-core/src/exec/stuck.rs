@@ -14,7 +14,7 @@ use std::fmt;
 use crate::frames::LoopFrames;
 use crate::project::{EdgeIndex, ProjectDefinition};
 use crate::pulse::PulseTable;
-use crate::Color;
+use crate::ExecutionId;
 
 /// One firing that can never complete: the pulses it holds and the
 /// wired ports it is still waiting on, at one exact frame stack.
@@ -51,12 +51,12 @@ pub fn stuck_report(
             continue;
         };
         // One entry per exact firing point: pulses only meet when their
-        // color and frames agree, so that is the unit that is stuck.
+        // execution and frames agree, so that is the unit that is stuck.
         // Kept in first-seen order (the table's own), which is what a
         // reader following the run expects.
-        let mut groups: Vec<((Color, LoopFrames), Vec<String>)> = Vec::new();
+        let mut groups: Vec<((ExecutionId, LoopFrames), Vec<String>)> = Vec::new();
         for p in node_pulses.iter().filter(|p| p.status.is_pending()) {
-            let key = (p.color, p.frames.clone());
+            let key = (p.execution_id, p.frames.clone());
             let holding = match groups.iter_mut().find(|(k, _)| *k == key) {
                 Some((_, holding)) => holding,
                 None => {
@@ -163,8 +163,8 @@ mod tests {
         .expect("project")
     }
 
-    fn pulse(color: Color, frames: LoopFrames, node: &str, port: &str) -> Pulse {
-        Pulse::new(uuid::Uuid::new_v4(), color, frames, node, port, std::sync::Arc::new(json!("x")))
+    fn pulse(execution_id: ExecutionId, frames: LoopFrames, node: &str, port: &str) -> Pulse {
+        Pulse::new(uuid::Uuid::new_v4(), execution_id, frames, node, port, std::sync::Arc::new(json!("x")))
     }
 
     #[test]
@@ -174,9 +174,9 @@ mod tests {
             &[("src", "theirs", "value"), ("src", "theirs", "go")],
         );
         let idx = EdgeIndex::build(&p);
-        let color = uuid::Uuid::new_v4();
+        let execution_id = uuid::Uuid::new_v4();
         let mut pulses = PulseTable::new();
-        pulses.insert("theirs".into(), vec![pulse(color, vec![], "theirs", "value")]);
+        pulses.insert("theirs".into(), vec![pulse(execution_id, vec![], "theirs", "value")]);
         let report = stuck_report(&p, &idx, &pulses);
         assert_eq!(
             report.firings,
@@ -200,16 +200,16 @@ mod tests {
             &[("src", "step", "a"), ("src", "step", "b")],
         );
         let idx = EdgeIndex::build(&p);
-        let color = uuid::Uuid::new_v4();
+        let execution_id = uuid::Uuid::new_v4();
         let f2 = vec![Frame::Loop { index: 2 }];
         let f5 = vec![Frame::Loop { index: 5 }];
         let mut pulses = PulseTable::new();
         pulses.insert(
             "step".into(),
             vec![
-                pulse(color, f2.clone(), "step", "a"),
-                pulse(color, f5.clone(), "step", "a"),
-                pulse(color, f5.clone(), "step", "b"),
+                pulse(execution_id, f2.clone(), "step", "a"),
+                pulse(execution_id, f5.clone(), "step", "a"),
+                pulse(execution_id, f5.clone(), "step", "b"),
             ],
         );
         let report = stuck_report(&p, &idx, &pulses);
@@ -224,8 +224,8 @@ mod tests {
     fn absorbed_pulses_are_not_stuck() {
         let p = project(vec![node("src", &[]), node("sink", &["value"])], &[("src", "sink", "value")]);
         let idx = EdgeIndex::build(&p);
-        let color = uuid::Uuid::new_v4();
-        let mut absorbed = pulse(color, vec![], "sink", "value");
+        let execution_id = uuid::Uuid::new_v4();
+        let mut absorbed = pulse(execution_id, vec![], "sink", "value");
         absorbed.status = crate::pulse::PulseStatus::Absorbed;
         let mut pulses = PulseTable::new();
         pulses.insert("sink".into(), vec![absorbed]);

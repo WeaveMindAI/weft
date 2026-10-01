@@ -67,10 +67,11 @@ pub async fn header_for_row(http: &ClientWithMiddleware,
         return Ok(None);
     }
     if !has_header {
-        node_bail!(
+        return Err(weft::WeftError::Input(
             "the row is keyed by column name but 'First row is a header' is off; \
              order is undefined. Pass a list of cells, or turn the header on"
-        );
+                .to_string(),
+        ));
     }
     let cells = read_cells(http, id, title).await?;
     match cells.into_iter().next() {
@@ -141,10 +142,11 @@ pub fn row_to_cells(row: &Value, headers: Option<&[String]>) -> WeftResult<Vec<V
         Value::Array(cells) => Ok(cells.clone()),
         Value::Object(map) => {
             let Some(headers) = headers else {
-                node_bail!(
+                return Err(weft::WeftError::Input(
                     "the row is an object keyed by column name, but the sheet has no header \
                      row to order by; pass a list of cells instead (or add a header)"
-                );
+                        .to_string(),
+                ));
             };
             for key in map.keys() {
                 if !headers.iter().any(|h| h == key) {
@@ -159,9 +161,9 @@ pub fn row_to_cells(row: &Value, headers: Option<&[String]>) -> WeftResult<Vec<V
                 .map(|h| map.get(h).cloned().unwrap_or(Value::String(String::new())))
                 .collect())
         }
-        other => node_bail!(
+        other => Err(weft::WeftError::Input(format!(
             "a row is an object keyed by column name or a list of cells, got: {other}"
-        ),
+        ))),
     }
 }
 

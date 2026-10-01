@@ -9,7 +9,7 @@ use serde_json::json;
 
 use weft::access::client::{get_json, post_json};
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
 
 use super::elevenlabs::API;
 
@@ -45,10 +45,15 @@ impl Node for ElevenLabsAgentCallNode {
         let route = match number["provider"].as_str().unwrap_or_default() {
             "twilio" => "twilio",
             "sip_trunk" => "sip-trunk",
-            other => weft::node_bail!(
-                "phone number {phone_number} has provider '{other}', which this node does \
-                 not know how to dial through"
-            ),
+            // The number is the program's own choice, so a number this
+            // node cannot dial is the program's mistake: an input error,
+            // which `error` never catches.
+            other => {
+                return Err(WeftError::Input(format!(
+                    "phone number {phone_number} has provider '{other}', which this node does \
+                     not know how to dial through; pick a Twilio or SIP trunk number"
+                )))
+            }
         };
 
         let mut body = json!({

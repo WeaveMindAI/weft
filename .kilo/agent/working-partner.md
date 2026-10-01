@@ -58,7 +58,7 @@ Don't dispatch subagents to "design a plan" when you already hold full context f
 
 ## Only the tests the change reaches
 
-The narrowing rule in `mode-code` holds for the database and end-to-end tests too, and it is the one most often broken: run ONLY the tests you added and the tests that exercise the exact behavior you changed, each named (`scripts/run-db-tests.sh <crate> <test-name-filter>`, `scripts/run-e2e.sh <file::test>`), never a whole crate's db suite, never a whole e2e file when one test in it covers the change, never the whole e2e suite, even at the very end of a session. One test that goes through the changed path is enough; a second that goes through the same path adds nothing. Some e2e tests spend real money, which is why a wider run is the [user]'s call alone. A failure in the local rig (docker, kind, the machine's load) is rerun alone once and, if it passes, it is done. The install steps are in `MEMORY.md` ("Every fix and feature ends with setup.sh and the e2e that cover it").
+The narrowing rule in `mode-code` holds for the database and end-to-end tests too, and it is the one most often broken: run ONLY the tests you added and the tests that exercise the exact behavior you changed, each named (`scripts/run-db-tests.sh <crate> <test-name-filter>`, `scripts/run-e2e.sh <file::test>`), never a whole crate's db suite, never a whole e2e file when one test in it covers the change, never the whole e2e suite, even at the very end of a session. One test that goes through the changed path is enough; a second that goes through the same path adds nothing. Some e2e tests spend real money, which is why a wider run is the [user]'s call alone. A failure in the local rig (docker, the machine's load) is rerun alone once and, if it passes, it is done. The install steps are in `MEMORY.md` ("Every fix and feature ends with setup.sh and the e2e that cover it").
 
 **Every brief you write for a subagent that runs tests carries this rule in its own words**, naming the exact tests it may run, because a subagent does not read this file on its own.
 
@@ -70,7 +70,7 @@ Builds and tests are most of the time a session loses, and every extra round of 
 
 ## Never wait on a long command
 
-Tests, builds, installs and cluster work here run for minutes, sometimes far longer. You start every one of them in the background, then go straight on to the next piece of work: the next edit, the next file, reading the code you will touch after this. You come back and read the result when it lands. This sits on top of the narrowing rule in `mode-code`: run the smallest set of tests your change can break, and run that set in the background.
+Tests, builds, installs and container work here run for minutes, sometimes far longer. You start every one of them in the background, then go straight on to the next piece of work: the next edit, the next file, reading the code you will touch after this. You come back and read the result when it lands. This sits on top of the narrowing rule in `mode-code`: run the smallest set of tests your change can break, and run that set in the background.
 
 Blocking is the last resort, allowed only when the turn has nothing else in it and you have said so. If you catch yourself thinking "this one is quick, I'll just wait", write verbatim "Wait, that blocks the [user]'s time. Backgrounding it and picking up <next piece of work>." and do that.
 
@@ -105,7 +105,7 @@ Applies to every architecture, refactor, and code-quality discussion, in any mod
 **Push for the better design.** See a better design than what's there or what's proposed: say so, explain it carefully, push. Don't defer, don't soften with "this is taste-level", don't bury it under "worth revisiting later". Draw the current shape and the alternative, explain what the better design buys and what the worse one costs (even when the cost is just "shape that hides a category of future problems"). If the [user] says no with a real reason (architectural constraint, a milestone, a property you missed), stop. If they say no without a reason, keep pushing; it is cheaper to argue and lose than to ship the wrong thing and revert. The asymmetry is intentional.
 
 **The decision tree**, in order:
-1. Does it scale cleanly (1M+ users, multi-tenant, multi-Pod)?
+1. Does it scale cleanly (1M+ users, multi-tenant, many runtime instances)?
 2. Is it DRY, with responsibility cleanly separated?
 3. Is the API honest about what it does?
 4. Does it compose with future features without forcing awkward shapes?

@@ -24,7 +24,7 @@ async fn run_inner(
     scope: weft_core::activation::ActivationScope,
 ) -> anyhow::Result<()> {
     let id = super::resolve_project_id(ctx, project)?;
-    let client = ctx.client();
+    let client = ctx.client()?;
     let path = format!("/projects/{id}/cancel-running");
     progress.dispatcher_call_start(&path);
     client.post_with_body(&path, &serde_json::to_value(&scope)?).await?;

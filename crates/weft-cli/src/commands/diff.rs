@@ -1,5 +1,5 @@
 //! `weft diff <ref> <ref>`: what two runs put on their wires, compared.
-//! A ref is a color (or the start of one) or `example:<name>` (a frozen
+//! A ref is an execution (or the start of one) or `example:<name>` (a frozen
 //! spec's `expected`). Per node by default ("classify: 3 of 10000
 //! frames differ"), per wire with both values under `--full`; media
 //! compares by the stored bytes' content hash.
@@ -15,7 +15,7 @@ use super::Ctx;
 pub async fn wires_of(ctx: &Ctx, client: &crate::client::DispatcherClient, reference: &str) -> anyhow::Result<(String, Expected)> {
     let project = ctx.project()?;
     let project_id = project.id().to_string();
-    let mut resolved_color = String::new();
+    let mut resolved_execution_id = String::new();
     let wires = if let Some(name) = reference.strip_prefix("example:") {
         let spec = read_spec(project, name)?;
         let Some(expected) = spec.expected else {
@@ -25,18 +25,18 @@ pub async fn wires_of(ctx: &Ctx, client: &crate::client::DispatcherClient, refer
     } else {
         let tree = fetch_tree(client, &project_id).await?;
         let run = resolve_run(&tree, reference)?;
-        resolved_color = run.color.clone();
-        super::versions::output_wires(client, &project_id, &run.color).await?
+        resolved_execution_id = run.execution_id.to_string();
+        super::versions::output_wires(client, &run.execution_id.to_string()).await?
     };
-    // Label with the RESOLVED color, not the prefix the user typed, so
+    // Label with the RESOLVED execution, not the prefix the user typed, so
     // `weft diff 3f a1b2c3d4` does not print one side as `3f` and the
     // other as `a1b2c3d`.
-    let label = if reference.starts_with("example:") { reference.to_string() } else { short(&resolved_color).to_string() };
+    let label = if reference.starts_with("example:") { reference.to_string() } else { short(&resolved_execution_id).to_string() };
     Ok((label, wires))
 }
 
 pub async fn run(ctx: Ctx, left: String, right: String, full: bool) -> anyhow::Result<()> {
-    let client = ctx.client();
+    let client = ctx.client()?;
     let (left_label, left_outputs) = wires_of(&ctx, &client, &left).await?;
     let (right_label, right_outputs) = wires_of(&ctx, &client, &right).await?;
     let focus: BTreeSet<_> = left_outputs.focus.iter().chain(&right_outputs.focus).cloned().collect();
@@ -106,7 +106,7 @@ pub fn render(left: &str, right: &str, diff: &WiresDiff, left_wires: &[ExpectedW
 fn output_text(wire: Option<&ExpectedWire>) -> String {
     match wire {
         None => "(missing)".into(),
-        Some(wire) if wire.closed => wire.error.as_ref().map(|error| format!("(closed: {error})")).unwrap_or_else(|| "(closed)".into()),
+        Some(wire) if wire.closed => wire.failure.as_ref().map(|failure| format!("(closed: {failure})")).unwrap_or_else(|| "(closed)".into()),
         Some(wire) => wire.value.to_string(),
     }
 }

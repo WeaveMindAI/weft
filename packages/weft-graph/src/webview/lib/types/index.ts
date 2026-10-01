@@ -402,7 +402,7 @@ export interface FieldDefinition {
 	access?: string; // For remote_select fields: the Access input authenticating sources needing one
 	sources?: import('../../../protocol').ResourceSource[]; // For remote_select fields: the fill sources, in preference order
 	dependsOn?: string[]; // For remote_select fields: parent inputs for drill-down
-	freeText?: boolean; // For remote_select fields: a typed value outside the fetched list is legal
+	freeText?: boolean; // For select, multiselect and remote_select fields: the list is suggestions, a typed value outside it is legal
 }
 
 // =============================================================================
@@ -448,8 +448,11 @@ export interface NodeExecution {
 	/// follow/reconnect (replay + live overlap), so the reducer dedups on
 	/// these.
 	costIds?: string[];
+	/// The changes this firing made to stored files, in the order they
+	/// landed (deduped on key + produced version across replay and live).
+	fileEdits?: import('../../../protocol').FileEditWire[];
 	logs: unknown[];
-	color: string;
+	executionId: string;
 	frames: Frame[];
 	/// Frame stack serialized as JSON, used to correlate completion
 	/// events to the right running row when several firings run
@@ -459,7 +462,7 @@ export interface NodeExecution {
 	inheritedFrom?: string;
 	/// Input ports whose value a person provided (a scoped run).
 	providedPorts?: string[];
-	// SYNC: input origins <-> crates/weft-dispatcher/src/events.rs DispatcherEvent, extension-vscode/src/execFollower.ts DispatcherEvent, packages/weft-graph/src/protocol.ts NodeExecEvent
+	// SYNC: input origins <-> crates/weft-core/src/live_event.rs DispatcherEvent, extension-vscode/src/execFollower.ts DispatcherEvent, packages/weft-graph/src/protocol.ts NodeExecEvent
 	backupPorts?: string[];
 	inheritedPorts?: Record<string, string>;
 }
@@ -636,10 +639,10 @@ export interface NodeInstance {
 	/// added in the editor and not yet parsed carries none, and the
 	/// catalog answers for it (`nodeRequiresInfra`).
 	requiresInfra?: boolean;
-	/// Set when the node exists once per member of the program: `marked`
-	/// where the source says `@per_member`, `derived` for a node the
+	/// Set when the node exists once per instance of the program: `marked`
+	/// where the source says `@per_instance`, `derived` for a node the
 	/// compiler found reached from one.
-	perMember?: import('../../../protocol').PerMember;
+	perInstance?: import('../../../protocol').PerInstance;
 	scope?: string[];
 	groupBoundary?: GroupBoundary | null;
 	// Source line where this node was declared in the weft code. Populated

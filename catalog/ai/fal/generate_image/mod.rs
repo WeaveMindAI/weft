@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
 use weft::storage::{KeepTtl, StorageScope};
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
 
 use super::fal::{merge_params, run_queued};
 
@@ -45,9 +45,9 @@ impl Node for FalGenerateImageNode {
             // seed would silently become u64::MAX, and past 2^53 the
             // number the author typed is not the number that arrived.
             if s.fract() != 0.0 || s < 0.0 || s > 9_007_199_254_740_992.0 {
-                weft::node_bail!(
+                return Err(weft::WeftError::Input(format!(
                     "seed must be a whole number between 0 and 9007199254740992, got {s}"
-                );
+                )));
             }
             payload["seed"] = json!(s as u64);
         }
@@ -65,7 +65,7 @@ impl Node for FalGenerateImageNode {
         if urls.is_empty() {
             weft::node_bail!("fal answered no images for this generation");
         }
-        let ty = ctx.output_type("images").node_err("the images port declares no type")?;
+        let ty = ctx.output_type("images")?;
         let stored = ctx
             .storage(StorageScope::Execution)
             // A generated image is the run's product: keep it past the

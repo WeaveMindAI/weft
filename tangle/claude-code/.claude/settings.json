@@ -25,7 +25,6 @@
       "Bash(weft validate:*)",
       "Bash(weft parse:*)",
       "Bash(weft build)",
-      "Bash(weft build-base:*)",
       "Bash(weft run:*)",
       "Bash(weft describe-nodes:*)",
       "Bash(weft executions:*)",

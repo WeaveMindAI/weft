@@ -11,6 +11,9 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("sends_with_buttons_and_reply_threading", sends),
         NodeTest::fake("a_button_without_a_url_refuses", bad_button),
+        NodeTest::fake("a_refused_send_fails_the_run_when_error_is_unwired", refused_unwired),
+        NodeTest::fake("a_refused_send_comes_out_on_error_when_it_is_wired", refused_wired),
+        NodeTest::fake("a_bad_button_fails_the_run_even_with_error_wired", bad_button_wired),
         NodeTest::live("one_real_send", "telegram", live_send).with_fixture(fixture_spec(
             "TELEGRAM_CHAT_ID",
             "Chat id",
@@ -81,5 +84,54 @@ async fn live_send(rig: LiveRig) -> WeftResult<()> {
         .await
         .ok()?;
     assert!(outcome.output("messageId")?.is_i64(), "a real message id came back");
+    Ok(())
+}
+
+/// Telegram refusing the send, the failure both `error` tests read.
+fn refuse_the_send(rig: &FakeRig) {
+    rig.respond(
+        "POST",
+        "/sendMessage",
+        json!({ "ok": false, "description": "Forbidden: bot was blocked by the user" }),
+    );
+}
+
+fn send_inputs(rig: &FakeRig) -> serde_json::Value {
+    json!({ "account": rig.access("telegram"), "chatId": "12345", "text": "hello" })
+}
+
+async fn refused_unwired(rig: FakeRig) -> WeftResult<()> {
+    refuse_the_send(&rig);
+    let err = rig.run(&TelegramSendMessageNode, send_inputs(&rig)).await.failure()?;
+    assert!(err.contains("bot was blocked"), "{err}");
+    Ok(())
+}
+
+async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
+    refuse_the_send(&rig);
+    rig.wire_output("error");
+    let outcome = rig.run(&TelegramSendMessageNode, send_inputs(&rig)).await.ok()?;
+    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    assert!(error.contains("bot was blocked"), "{error}");
+    assert!(!outcome.outputs.contains_key("messageId"), "a caught failure emits no messageId");
+    Ok(())
+}
+
+async fn bad_button_wired(rig: FakeRig) -> WeftResult<()> {
+    rig.wire_output("error");
+    let err = rig
+        .run(
+            &TelegramSendMessageNode,
+            json!({
+                "account": rig.access("telegram"),
+                "chatId": "12345",
+                "text": "hello",
+                "buttons": [{ "label": "no url" }],
+            }),
+        )
+        .await
+        .failure()?;
+    assert!(err.starts_with("input error"), "a program mistake is never caught: {err}");
+    assert!(rig.requests().is_empty(), "refused before any call");
     Ok(())
 }

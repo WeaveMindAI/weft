@@ -1,7 +1,7 @@
 {
   "type": "ExecPython",
   "label": "Python",
-  "description": "Run a Python snippet. Declare the node's inputs and outputs inline: `ExecPython(x: Number) -> (result: String) { code: \"...\" }`. Every declared input is a Python variable of the same name; one that received nothing is `None`, so an optional input reads as `if problem is None`. A file input (Image, Audio, Video, Blob, File) arrives as a plain dict with `url` (a download link minted for this firing, never written to the journal, so do not look for it there), `filename`, `mimeType`, `sizeBytes` and `key`: read `photo['url']` and fetch it. Return a file on a file-typed output by returning that same dict. The code returns a dict keyed by output port name; a key set to None (or missing) emits no pulse on that port. Exceptions fail the node with the full traceback.",
+  "description": "Run a Python snippet. Declare the node's inputs and outputs inline: `ExecPython(x: Number) -> (result: String) { code: \"...\" }`. Every declared input is a Python variable of the same name; one that received nothing is `None`, so an optional input reads as `if problem is None`. A file input (Image, Audio, Video, Blob, File) arrives as a plain dict with `url` (a download link minted for this firing, never written to the journal, so do not look for it there), `filename`, `mimeType`, `sizeBytes` and `key`: read `photo['url']` and fetch it. Return a file on a file-typed output by returning that same dict. The code must return a dict keyed by output port name; a missing key emits no pulse on that port, and `return {}` emits nothing. A key set to None sends a real null on a port whose type takes it (`last: JsonDict | Null`), and emits no pulse on any other port. An exception the script raises (a request it makes failing, a `raise` of its own) fails the node with its traceback, or, with `error` wired, comes out on `error` instead. Mistakes in the program always fail the run, `error` wired or not: code that does not compile, no dict returned, a key that is not a declared output (`error` included: raise to fail on purpose), a value of the wrong type for its port.",
   "tags": [
     "python",
     "script",
@@ -24,6 +24,7 @@
   "outputs": [],
   "requires_infra": false,
   "features": {
+    "catchErrors": true,
     "canAddInputPorts": true,
     "canAddOutputPorts": true
   }

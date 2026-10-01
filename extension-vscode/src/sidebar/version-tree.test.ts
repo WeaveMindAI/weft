@@ -23,10 +23,10 @@ const version = (id: string, parent: string | null, at: number, changed: string[
   manifest: {},
 });
 
-const run = (color: string, version: string, at: number, extra: Partial<RunSummary> = {}): RunSummary => ({
-  color: `${color}00000000`,
+const run = (executionId: string, version: string, at: number, extra: Partial<RunSummary> = {}): RunSummary => ({
+  execution_id: `${executionId}00000000`,
   version_id: `${version}00000000`,
-  seed_color: null,
+  seed_execution_id: null,
   stale: [],
   spec: null,
   example: null,
@@ -42,7 +42,7 @@ const tree: TreeJson = {
   disk_version: id('v3'),
   // In the dispatcher's order: the order they were recorded.
   versions: [version('v1', null, 1, [], 'base'), version('v2', 'v1', 2, ['main.weft']), version('v3', 'v1', 3, ['prompts/p.txt'])],
-  runs: [run('c1', 'v1', 4), run('c2', 'v2', 5, { seed_color: id('c1'), stale: ['b'] })],
+  runs: [run('c1', 'v1', 4), run('c2', 'v2', 5, { seed_execution_id: id('c1'), stale: ['b'] })],
 };
 
 describe('version tree', () => {
@@ -50,8 +50,8 @@ describe('version tree', () => {
     const roots = buildVersionTree(tree);
     expect(roots.map((r) => r.version.id)).toEqual([id('v1')]);
     expect(roots[0].children.map((c) => c.version.id)).toEqual([id('v2'), id('v3')]);
-    expect(roots[0].runs.map((r) => r.color)).toEqual([id('c1')]);
-    expect(roots[0].children[0].runs.map((r) => r.color)).toEqual([id('c2')]);
+    expect(roots[0].runs.map((r) => r.execution_id)).toEqual([id('c1')]);
+    expect(roots[0].children[0].runs.map((r) => r.execution_id)).toEqual([id('c2')]);
   });
 
   it('draws every version once, even in a cycle', () => {

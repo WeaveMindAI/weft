@@ -6,9 +6,11 @@
 //! - dispatcher relays each stateless fire to the listener's
 //!   `/process` endpoint, which returns a `ProcessOutcome` (value +
 //!   target) the dispatcher acts on.
-//! - dispatcher calls the listener's `/render` once at register time
-//!   to compute the consumer-facing payload for a token; the result
-//!   is cached on the signal row.
+//! - a registration is two calls: `/prepare` computes what the signal
+//!   row holds (routing, kind state, the consumer-facing payload) and
+//!   starts nothing; once the dispatcher has committed the row,
+//!   `/start` brings the signal up (its first wake, its held
+//!   connection), so whatever starts always finds its row.
 //! - listener owns kind-specific state (timer schedules, SSE
 //!   connections, held sockets). When a held event fires,
 //!   the listener enqueues a `FireSignal` task via the broker; the
@@ -20,23 +22,18 @@ use serde_json::Value;
 use crate::primitive::{SignalRouting, SignalSpec};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisterRequest {
+pub struct PrepareRequest {
     /// Opaque token the dispatcher minted. Used as the routing key.
     pub token: String,
-    /// Tenant this signal belongs to. A pooled listener pod holds
+    /// Tenant this signal belongs to. A pooled listener process holds
     /// signals from many tenants, so tenancy is a property of each
-    /// signal, not of the pod. The listener stamps this tenant onto the
+    /// signal, not of the process. The listener stamps this tenant onto the
     /// `FireSignal` task it enqueues when the signal fires, so the
     /// broker authorizes the cross-tenant write (the listener is a
     /// trusted control-plane caller) and the dispatcher routes the fire
     /// to the right tenant. The dispatcher already knows the tenant at
     /// register time (it ran `TenantRouter`); it puts it on the wire.
     pub tenant_id: String,
-    /// Whose signal it is: the member whose trigger or run registered
-    /// it, or `None` for a shared one. The dispatcher's word, trusted
-    /// the same way as `tenant_id`; a member's trigger reads through
-    /// that member's connections alone.
-    pub for_member: Option<crate::member::MemberScope>,
     /// The resolved signal spec. Carries everything kind-specific.
     pub spec: SignalSpec,
     /// The PLACE this signal is registered at, spelled the way a person
@@ -53,107 +50,107 @@ pub struct RegisterRequest {
     /// kinds like Form can't tell resume from entry.
     #[serde(default)]
     pub is_resume: bool,
-    /// Color of the suspended execution to resume, present iff
+    /// Execution of the suspended execution to resume, present iff
     /// `is_resume`. Echoed back into `ProcessTarget::Resume`.
     #[serde(default)]
-    pub color: Option<String>,
-    /// The placement generation under which this pod holds the signal.
-    /// The dispatcher bumps it on every (re)placement and tells the
-    /// holding pod its value here. The pod stamps it on every held-event
-    /// `FireSignal` it enqueues; the broker drops a fire whose generation
-    /// is below the signal row's current one, so a stale old-pod fire
-    /// during a scale-down move overlap is fenced out (no double-fire).
-    pub placement_generation: i64,
-    /// Where routing and kind_state come from (see [`RegisterSource`]).
-    pub source: RegisterSource,
+    pub execution_id: Option<String>,
+    /// Where the registration's kind_state starts from (see
+    /// [`PrepareSource`]).
+    pub source: PrepareSource,
 }
 
-/// Where a registration's routing and kind_state come from.
-///
-/// `Fresh` is the register/reactivate path: the kind computes routing
-/// and its initial state; `prior_kind_state`
-/// carries the token's previously-persisted state when the row already
-/// exists (entry tokens are reused across reactivates), so a kind
-/// whose state is a feed cursor can carry it forward instead of
-/// re-priming and silently discarding everything that arrived while
-/// the project was inactive.
-///
-/// `Restore` is the pod-move path (scale-down drain, fire
-/// re-placement): both values come from the durable row VERBATIM. The
-/// row is what the dispatcher routes by, so a recomputed routing could
-/// drift from what fires actually arrive at; recomputing state would
-/// reset a timer's clock mid-schedule. A move is not a user action, so
-/// nothing may change.
+/// Where a registration's kind_state starts from: the kind computes
+/// routing and its initial state; `prior_kind_state` carries the token's
+/// previously-persisted state when the row already exists (entry tokens
+/// are reused across reactivates), so a kind whose state is a feed cursor
+/// can carry it forward instead of re-priming and silently discarding
+/// everything that arrived while the project was inactive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RegisterSource {
-    Fresh {
-        #[serde(default)]
-        prior_kind_state: Option<serde_json::Value>,
-        /// The kind_state write-fence version the prior state was
-        /// read at (0 for a brand-new token). The spawned task's
-        /// durable cursor writes continue at `seq + 1` so a
-        /// reactivate can never regress the fence.
-        #[serde(default)]
-        prior_seq: i64,
-        /// When the registration was asked for, in ms since the epoch:
-        /// the moment a node called `await_signal`, or the activation.
-        /// A relative wait counts from here, so the trip through the
-        /// dispatcher to this pod is not added to it.
-        asked_at_unix_ms: i64,
-    },
-    Restore {
-        routing: SignalRouting,
-        kind_state: serde_json::Value,
-        /// The row's `kind_state_seq` at restore time.
-        #[serde(default)]
-        seq: i64,
-    },
+pub struct PrepareSource {
+    #[serde(default)]
+    pub prior_kind_state: Option<serde_json::Value>,
+    /// When the registration was asked for, in ms since the epoch: the
+    /// moment a node called `await_signal`, or the activation. A relative
+    /// wait counts from here, so the trip through the dispatcher to the
+    /// listener is not added to it.
+    pub asked_at_unix_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RegisterResponse {
+pub struct PrepareResponse {
     /// Listener-computed routing + auth metadata for this signal.
     /// The dispatcher copies surface_kind, mount_path, mount_methods,
     /// auth_kind, auth_config onto the signal row. No secret ever
     /// rides here: a gated route names the connection that holds it.
     pub routing: SignalRouting,
-    /// Opaque per-kind state computed at register time. The
-    /// dispatcher persists it on the signal row and ships it back
-    /// on rehydrate so stateful kinds (Timer) survive a listener
-    /// restart without resetting their schedule. `{}` for kinds
-    /// that don't need it.
+    /// Opaque per-kind state the kind starts from (or carries forward
+    /// from `PrepareSource::prior_kind_state`). The dispatcher writes it
+    /// on the signal row; a listener that restarts reads it back off the
+    /// row (`list_held`), so stateful kinds (Timer) keep their schedule.
+    /// `{}` for kinds that don't need it.
     #[serde(default)]
     pub kind_state: serde_json::Value,
+    /// What a consumer needs to answer this signal (a form's fields),
+    /// `Null` for a kind nobody answers by hand. The dispatcher caches
+    /// it on the signal row.
+    pub rendered: serde_json::Value,
 }
 
-/// Load report for `GET /load`. The dispatcher's placement reads this
-/// to decide whether a listener can accept another signal. `saturated`
-/// is the listener's OWN call from real measurements (the dispatcher
-/// never second-guesses it with a count): when true, placement skips
-/// this pod and tries another / spawns one. The raw counts are for
-/// observability and tie-breaking among non-saturated pods (prefer the
-/// least-loaded).
+/// Body for `POST /rehydrate` on the listener: bring up every held
+/// signal of `project` it is not running, except those in `skip`. Only
+/// the activating project's rows: another project's broken row is not
+/// this activation's to fail on, and the walk stays the size of one
+/// project. The dispatcher's activate names the rows it is about to
+/// delete (triggers the source no longer has), so a row on its way out
+/// is never brought up, and one that could not come up does not fail the
+/// activation deleting it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoadReport {
-    /// True when the pod has hit its memory saturation threshold
-    /// (`mem_pressure >= SATURATION_MEM_FRACTION`) and must not accept
-    /// new signals. `/register` also returns 503 when this is true, so a
-    /// placement race that registers anyway fails loudly rather than
-    /// overloading the pod.
-    pub saturated: bool,
-    /// Real memory pressure (usage/limit) in `[0.0, 1.0]`. The metric
-    /// `saturated` is derived from, and the headroom the scale-down
-    /// planner uses to decide whether a drained pod's load fits on the
-    /// survivors. 0.0 when uncapped (local dev) or on a read glitch.
-    pub mem_pressure: f64,
-    /// Total signals held (placement count). Observability + tie-break
-    /// among non-saturated pods (prefer the least-loaded).
-    pub signals: u32,
-    /// Signals running a live held-connection loop (Timer/SSE/poll/
-    /// socket): the resource-heavy subset. Observability only now that
-    /// saturation is memory-based.
-    pub held_connections: u32,
+pub struct RehydrateRequest {
+    pub project: uuid::Uuid,
+    pub skip: Vec<String>,
+}
+
+/// Body for `POST /start` on the listener: bring up the signal whose row
+/// the dispatcher just committed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartRequest {
+    pub token: String,
+    pub mode: StartMode,
+}
+
+/// What the row being started is, which decides how hard the kind may
+/// fail to come up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartMode {
+    /// A registration the dispatcher just wrote: the kind may make broker
+    /// and provider calls and refuse loudly, which fails the registration.
+    New,
+    /// A row the listener finds held and not running here (boot,
+    /// rehydrate, a first use, the retry of a down row): it comes up and
+    /// its task retries a transient failure. A connection already running
+    /// under the token is left as it is: it came up from this same row.
+    Restore,
+    /// A row the dispatcher put back (the undo of a registration that
+    /// replaced it). Whatever runs under the token was started from the
+    /// replacement, so it is replaced like `New`; the row ran before, so
+    /// it comes up and retries like `Restore`, because refusing here would
+    /// turn off a trigger that was live.
+    PutBack,
+}
+
+impl StartMode {
+    /// Whether the kind may make broker and provider calls and refuse
+    /// loudly, failing the registration.
+    pub fn fresh(self) -> bool {
+        self == StartMode::New
+    }
+
+    /// Whether a failure to come up is the listener's to retry (the row
+    /// was live before), rather than the registering caller's to handle.
+    pub fn retried(self) -> bool {
+        matches!(self, StartMode::Restore | StartMode::PutBack)
+    }
 }
 
 /// Body for `POST /live` on the listener. The dispatcher proxies a
@@ -234,9 +231,9 @@ pub struct PushEvent {
 }
 
 /// Body sent by the dispatcher to listener `/match_push`: one push,
-/// and the signals held by THIS pod that might be fed by it.
+/// and the signals held by THIS process that might be fed by it.
 ///
-/// Batched per pod rather than per signal, because one account-routed
+/// Batched per process rather than per signal, because one account-routed
 /// push can feed many subscriptions and a call each would make the
 /// provider wait on a round trip per candidate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -252,7 +249,7 @@ pub struct MatchedPush {
     pub payload: Value,
 }
 
-/// Which of the offered signals the push feeds. A token this pod does
+/// Which of the offered signals the push feeds. A token this process does
 /// not hold, whose kind is not fed by pushes, whose kind says the push
 /// does not address it, or whose filter refuses the payload, is simply
 /// absent: a push that feeds nothing here is an empty list, never an
@@ -292,7 +289,7 @@ pub enum ProcessTarget {
     /// SuspensionResolved + enqueues a resume task. node_id is
     /// looked up from the signal row by token; it isn't echoed
     /// here.
-    Resume { color: String },
+    Resume { execution_id: String },
     /// Start a fresh execution as an entry trigger. Dispatcher
     /// enqueues route_entry; node_id is looked up from the signal
     /// row by token.
@@ -303,17 +300,6 @@ pub enum ProcessTarget {
     /// is for ops logging only; the dispatcher treats every Drop the
     /// same.
     Drop { reason: Option<String> },
-    /// This pod does NOT hold the signal for `token` in its registry.
-    /// Distinct from `Drop` (a deliberate consume): it means the
-    /// dispatcher routed the fire to the wrong pod, which happens during
-    /// a scale-down move (the signal was re-placed onto another pod and
-    /// the routing column flipped between the dispatcher's resolve and
-    /// its POST). The dispatcher re-resolves the holder from the durable
-    /// row and retries ONCE; because a move flips the routing column to
-    /// the new pod BEFORE unregistering the old one, the re-resolve is
-    /// guaranteed to find the live holder. If the signal row is gone, the
-    /// re-resolve fails loud (a real inconsistency, not a silent drop).
-    NotHeld,
 }
 
 #[cfg(test)]
@@ -324,127 +310,70 @@ mod tests {
         SignalSpec::of_kind("timer", serde_json::json!({ "interval_secs": 60 }))
     }
 
-    /// `RegisterRequest` crosses the dispatcher -> listener HTTP boundary
-    /// and gained two REQUIRED fields in the pooled rework (`tenant_id`,
-    /// `placement_generation`, neither `#[serde(default)]`). Round-trip
-    /// pins them on the wire so a rename / drop is a test failure, not a
-    /// runtime deserialize error on the listener.
+    /// `PrepareRequest` crosses the dispatcher -> listener HTTP
+    /// boundary; round-trip pins its required fields on the wire so a
+    /// rename or drop is a test failure, not a runtime deserialize error
+    /// on the listener.
     #[test]
-    fn register_request_round_trips_with_tenant_and_generation() {
-        let req = RegisterRequest {
+    fn register_request_round_trips() {
+        let req = PrepareRequest {
             token: "tok-1".into(),
             tenant_id: "acme".into(),
-            for_member: None,
             spec: spec(),
             node_id: "node-1".into(),
             is_resume: false,
-            color: Some("c-1".into()),
-            placement_generation: 7,
-            source: RegisterSource::Fresh {
+            execution_id: Some("c-1".into()),
+            source: PrepareSource {
                 prior_kind_state: Some(serde_json::json!({"cursor": 42})),
-                prior_seq: 9,
                 asked_at_unix_ms: 1_700_000_000_123,
             },
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["tenant_id"], "acme");
-        assert_eq!(json["placement_generation"], 7);
         assert_eq!(json["source"]["prior_kind_state"]["cursor"], 42);
-        let back: RegisterRequest = serde_json::from_value(json).unwrap();
+        let back: PrepareRequest = serde_json::from_value(json).unwrap();
         assert_eq!(back.tenant_id, "acme");
-        assert_eq!(back.placement_generation, 7);
         assert_eq!(back.token, "tok-1");
-        match back.source {
-            RegisterSource::Fresh { prior_kind_state, prior_seq, asked_at_unix_ms } => {
-                assert_eq!(prior_kind_state.unwrap()["cursor"], 42);
-                assert_eq!(prior_seq, 9);
-                assert_eq!(asked_at_unix_ms, 1_700_000_000_123);
-            }
-            RegisterSource::Restore { .. } => panic!("round trip flipped the source"),
-        }
+        assert_eq!(back.source.prior_kind_state.unwrap()["cursor"], 42);
+        assert_eq!(back.source.asked_at_unix_ms, 1_700_000_000_123);
     }
 
-    /// A request must say where its state comes from, and a fresh one
-    /// when it was asked for: without it a relative timer would count
-    /// from a guess. A Restore round-trips its routing and state
-    /// verbatim.
+    /// A request must say when it was asked for: without it a relative
+    /// timer would count from a guess.
     #[test]
-    fn register_source_is_required_and_restore_round_trips() {
+    fn register_source_needs_its_asked_at() {
         let mut json = serde_json::json!({
             "token": "tok-1",
             "tenant_id": "acme",
             "spec": { "kind": "timer", "config": {} },
-            "node_id": "node-1",
-            "placement_generation": 7
+            "node_id": "node-1"
         });
-        assert!(serde_json::from_value::<RegisterRequest>(json.clone()).is_err(), "no source");
-        json["source"] = serde_json::json!({ "kind": "fresh" });
-        assert!(serde_json::from_value::<RegisterRequest>(json).is_err(), "a fresh source with no asked_at");
-
-        let restore = RegisterSource::Restore {
-            routing: SignalRouting {
-                surface: crate::primitive::SignalSurface::Internal,
-                auth: crate::primitive::SignalAuth::None,
-                auth_config: serde_json::Value::Null,
-            },
-            kind_state: serde_json::json!({"cursor": 7}),
-            seq: 12,
-        };
-        let json = serde_json::to_value(&restore).unwrap();
-        let back: RegisterSource = serde_json::from_value(json).unwrap();
-        match back {
-            RegisterSource::Restore { kind_state, seq, .. } => {
-                assert_eq!(kind_state["cursor"], 7);
-                assert_eq!(seq, 12);
-            }
-            RegisterSource::Fresh { .. } => panic!("round trip flipped the source"),
-        }
+        assert!(serde_json::from_value::<PrepareRequest>(json.clone()).is_err(), "no source");
+        json["source"] = serde_json::json!({});
+        assert!(serde_json::from_value::<PrepareRequest>(json.clone()).is_err(), "no asked_at");
+        json["source"] = serde_json::json!({ "asked_at_unix_ms": 1 });
+        assert!(serde_json::from_value::<PrepareRequest>(json).is_ok());
     }
 
-    /// A required new field must be a hard deserialize failure when
-    /// absent (the dispatcher and listener must agree on the contract).
+    /// A start must say what it starts: a restore that read as a new
+    /// registration would refuse on a transient error and turn off a live
+    /// trigger.
     #[test]
-    fn register_request_missing_generation_fails() {
-        let json = serde_json::json!({
-            "token": "tok-1",
-            "tenant_id": "acme",
-            "spec": { "kind": "timer", "config": {} },
-            "node_id": "node-1",
-            "is_resume": false,
-            "color": null
-            // placement_generation omitted
-        });
-        assert!(serde_json::from_value::<RegisterRequest>(json).is_err());
+    fn start_request_needs_its_mode() {
+        assert!(serde_json::from_value::<StartRequest>(serde_json::json!({ "token": "t" })).is_err());
+        let back: StartRequest =
+            serde_json::from_value(serde_json::json!({ "token": "t", "mode": "restore" })).unwrap();
+        assert_eq!(back.mode, StartMode::Restore);
     }
 
-    /// `LoadReport` is deserialized from the listener's `GET /load` by
-    /// the dispatcher's placement; round-trip pins every field.
+    /// `ProcessTarget` is serialized over the fire path; every variant
+    /// must keep its tag spelling (the dispatcher matches on them).
     #[test]
-    fn load_report_round_trips() {
-        let lr = LoadReport {
-            saturated: true,
-            mem_pressure: 0.83,
-            signals: 12,
-            held_connections: 3,
-        };
-        let json = serde_json::to_string(&lr).unwrap();
-        let back: LoadReport = serde_json::from_str(&json).unwrap();
-        assert!(back.saturated);
-        assert_eq!(back.mem_pressure, 0.83);
-        assert_eq!(back.signals, 12);
-        assert_eq!(back.held_connections, 3);
-    }
-
-    /// `ProcessTarget` is serialized over the fire path; the new
-    /// `NotHeld` variant and the `Drop { reason }` shape must keep their
-    /// tag spelling (the dispatcher matches on them).
-    #[test]
-    fn process_target_round_trips_including_not_held() {
+    fn process_target_round_trips() {
         for target in [
             ProcessTarget::Entry,
-            ProcessTarget::Resume { color: "c-1".into() },
+            ProcessTarget::Resume { execution_id: "c-1".into() },
             ProcessTarget::Drop { reason: Some("dup".into()) },
-            ProcessTarget::NotHeld,
         ] {
             let json = serde_json::to_string(&target).unwrap();
             let back: ProcessTarget = serde_json::from_str(&json).unwrap();

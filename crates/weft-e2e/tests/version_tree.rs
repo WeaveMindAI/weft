@@ -21,7 +21,7 @@
 
 mod common;
 
-use common::{color_of, inherited, summary_of, tree_of, warnings_of};
+use common::{execution_id_of, inherited, summary_of, tree_of, warnings_of};
 
 use serde_json::{json, Value};
 use weft_e2e::{ensure, project::Project, run::SettledRun};
@@ -32,7 +32,7 @@ async fn every_run_records_a_version_and_a_seeded_run_inherits_the_unchanged_nod
     let project = Project::prepare("version_tree", disp).await?;
 
     let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
-    let first = color_of(&stdout)?;
+    let first = execution_id_of(&stdout)?;
     let settled = SettledRun::observe(project.dispatcher(), first).await?;
     settled.completed()?;
     settled.assert_completed("src")?.assert_completed("mid")?.assert_completed("out")?;
@@ -41,13 +41,13 @@ async fn every_run_records_a_version_and_a_seeded_run_inherits_the_unchanged_nod
     // The tree holds the run under the version the disk is.
     let tree: Value = serde_json::from_str(project.weft(&["tree", "--json"]).await?.trim())?;
     let runs = tree["runs"].as_array().expect("runs");
-    anyhow::ensure!(runs.iter().any(|r| r["color"] == json!(first.to_string())), "the run is in the tree: {tree}");
+    anyhow::ensure!(runs.iter().any(|r| r["execution_id"] == json!(first.to_string())), "the run is in the tree: {tree}");
     anyhow::ensure!(tree["disk_version"].is_string(), "the files on disk are a recorded version: {tree}");
     anyhow::ensure!(tree["head"]["head_run"] == json!(first.to_string()), "head's run is the run: {tree}");
 
     // Seeded: `out` re-runs by name, `src` and `mid` are inherited.
     let stdout = project.weft(&["run", "--json", "--target", "out", "--seed", "--seed-before", "out"]).await?;
-    let second = color_of(&stdout)?;
+    let second = execution_id_of(&stdout)?;
     let summary = summary_of(&stdout);
     anyhow::ensure!(summary.contains("inherited from") && summary.contains("1 ran (out)"), "summary: {summary}");
     let settled = SettledRun::observe(project.dispatcher(), second).await?;
@@ -55,7 +55,7 @@ async fn every_run_records_a_version_and_a_seeded_run_inherits_the_unchanged_nod
     settled.assert_completed("out")?;
     anyhow::ensure!(inherited(&settled, "src"), "src is painted inherited");
     anyhow::ensure!(inherited(&settled, "mid"), "mid is painted inherited");
-    anyhow::ensure!(!inherited(&settled, "out"), "out ran in this color");
+    anyhow::ensure!(!inherited(&settled, "out"), "out ran in this execution");
     settled.assert_input("out", "data", &json!("hello"))?;
 
     project.finish().await
@@ -69,8 +69,8 @@ async fn a_scoped_run_takes_a_value_by_hand_and_a_spec_fires_a_trigger_without_a
     let stdout = project
         .weft(&["run", "--json", "--from", "mid={\"value\":\"by hand\"}"])
         .await?;
-    let color = color_of(&stdout)?;
-    let settled = SettledRun::observe(project.dispatcher(), color).await?;
+    let execution_id = execution_id_of(&stdout)?;
+    let settled = SettledRun::observe(project.dispatcher(), execution_id).await?;
     settled.completed()?;
     settled.assert_untouched("src")?;
     settled.assert_input("mid", "value", &json!("by hand"))?;
@@ -81,8 +81,8 @@ async fn a_scoped_run_takes_a_value_by_hand_and_a_spec_fires_a_trigger_without_a
     let stdout = project
         .weft(&["run", "--json", "--fire", "tick={\"scheduledTime\":\"2026-01-01T00:00:00Z\",\"actualTime\":\"2026-01-01T00:00:00Z\"}", "--save", "tick-once"])
         .await?;
-    let color = color_of(&stdout)?;
-    let settled = SettledRun::observe(project.dispatcher(), color).await?;
+    let execution_id = execution_id_of(&stdout)?;
+    let settled = SettledRun::observe(project.dispatcher(), execution_id).await?;
     settled.completed()?;
     settled.assert_completed("tick")?;
     settled.assert_input("stamp", "data", &json!("2026-01-01T00:00:00Z"))?;
@@ -98,15 +98,15 @@ async fn a_frozen_example_runs_current_code_and_can_be_compared() -> anyhow::Res
     let project = Project::prepare("version_tree", disp).await?;
 
     let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
-    let color = color_of(&stdout)?;
-    SettledRun::observe(project.dispatcher(), color).await?.completed()?;
+    let execution_id = execution_id_of(&stdout)?;
+    SettledRun::observe(project.dispatcher(), execution_id).await?.completed()?;
 
-    let frozen: Value = serde_json::from_str(project.weft(&["freeze", "chain", &color.to_string(), "--json"]).await?.trim())?;
+    let frozen: Value = serde_json::from_str(project.weft(&["freeze", "chain", &execution_id.to_string(), "--json"]).await?.trim())?;
     anyhow::ensure!(frozen["wires"].as_u64().unwrap_or(0) >= 2, "the example holds the chain's wires: {frozen}");
     let spec: Value = serde_json::from_str(&std::fs::read_to_string(project.dir().join("examples/chain.json"))?)?;
     anyhow::ensure!(spec["expected"]["wires"].is_array(), "examples/chain.json is frozen: {spec}");
 
-    let rerun = color_of(&project.weft(&["run", "chain", "--json"]).await?)?;
+    let rerun = execution_id_of(&project.weft(&["run", "chain", "--json"]).await?)?;
     SettledRun::observe(project.dispatcher(), rerun).await?.completed()?;
     let diff: Value = serde_json::from_str(project.weft(&["diff", &rerun.to_string(), "example:chain", "--json"]).await?.trim())?;
     anyhow::ensure!(diff["differing"].as_array().unwrap().is_empty(), "same outputs: {diff}");
@@ -130,7 +130,7 @@ async fn checkpoint_branch_and_prune_move_the_tree() -> anyhow::Result<()> {
     let project = Project::prepare("version_tree", disp).await?;
 
     let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
-    let first = color_of(&stdout)?;
+    let first = execution_id_of(&stdout)?;
     SettledRun::observe(project.dispatcher(), first).await?.completed()?;
     let v1 = tree_of(&project).await?["head"]["head_version"].as_str().unwrap().to_string();
 
@@ -199,12 +199,12 @@ async fn seeding_follows_the_edit_and_a_wholly_reused_run_executes_no_bodies() -
     let project = Project::prepare("version_tree", disp).await?;
 
     let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
-    let first = color_of(&stdout)?;
+    let first = execution_id_of(&stdout)?;
     SettledRun::observe(project.dispatcher(), first).await?.completed()?;
 
     // Nothing changed: the run retains the complete history without executing it.
     let stdout = project.weft(&["run", "--json", "--target", "out", "--seed"]).await?;
-    let reused = SettledRun::observe(project.dispatcher(), color_of(&stdout)?).await?;
+    let reused = SettledRun::observe(project.dispatcher(), execution_id_of(&stdout)?).await?;
     reused.completed()?;
     for node in ["src", "mid", "out"] {
         anyhow::ensure!(inherited(&reused, node), "{node} is reused");
@@ -215,7 +215,7 @@ async fn seeding_follows_the_edit_and_a_wholly_reused_run_executes_no_bodies() -
     // An edit upstream of everything: nothing is inherited.
     project.write_file("prompts/greeting.txt", "changed")?;
     let stdout = project.weft(&["run", "--json", "--target", "out", "--seed"]).await?;
-    let second = color_of(&stdout)?;
+    let second = execution_id_of(&stdout)?;
     let summary = summary_of(&stdout);
     anyhow::ensure!(summary.contains("0 nodes inherited") && summary.contains("3 ran"), "summary: {summary}");
     let settled = SettledRun::observe(project.dispatcher(), second).await?;
@@ -224,7 +224,7 @@ async fn seeding_follows_the_edit_and_a_wholly_reused_run_executes_no_bodies() -
 
     // A run without a seed inherits nothing.
     let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
-    let third = color_of(&stdout)?;
+    let third = execution_id_of(&stdout)?;
     let fresh = SettledRun::observe(project.dispatcher(), third).await?;
     fresh.completed()?.assert_input("out", "data", &json!("changed"))?;
     anyhow::ensure!(!inherited(&fresh, "src") && !inherited(&fresh, "mid") && !inherited(&fresh, "out"), "an unseeded run executes the chain");
@@ -234,12 +234,12 @@ async fn seeding_follows_the_edit_and_a_wholly_reused_run_executes_no_bodies() -
     let stdout = project.weft(&["run", "--json", "--target", "out", "--seed", "--seed-before", "out"]).await?;
     let summary = summary_of(&stdout);
     anyhow::ensure!(summary.contains(&format!("inherited from {}", &third.to_string()[..8])), "seeded from the newest run: {summary}");
-    SettledRun::observe(project.dispatcher(), color_of(&stdout)?).await?.completed()?;
+    SettledRun::observe(project.dispatcher(), execution_id_of(&stdout)?).await?.completed()?;
 
     // A cleaned seed breaks nothing already settled, but the tree forgets the run.
     project.weft(&["clean", &third.to_string(), "--yes"]).await?;
     let tree = tree_of(&project).await?;
-    anyhow::ensure!(!tree["runs"].as_array().unwrap().iter().any(|r| r["color"] == json!(third.to_string())), "the run row went with the journal: {tree}");
+    anyhow::ensure!(!tree["runs"].as_array().unwrap().iter().any(|r| r["execution_id"] == json!(third.to_string())), "the run row went with the journal: {tree}");
 
     project.finish().await
 }
@@ -253,7 +253,7 @@ async fn scoped_runs_refuse_plainly_and_a_saved_spec_runs_by_name() -> anyhow::R
 
     let refused = project.weft_refused(&["run", "--json", "--target", "missing"]).await?;
     anyhow::ensure!(refused.contains("unknown node 'missing'"), "{refused}");
-    for phase in ["build_start", "build_skip", "image_push_start", "dispatcher_call_start"] {
+    for phase in ["build_start", "dispatcher_call_start"] {
         anyhow::ensure!(!refused.contains(phase), "a refused cut must not build or register: {refused}");
     }
 
@@ -270,26 +270,26 @@ async fn scoped_runs_refuse_plainly_and_a_saved_spec_runs_by_name() -> anyhow::R
     anyhow::ensure!(refused.contains("is not a trigger"), "{refused}");
     // Saved, then run by name: the value by hand reaches `mid`, `src` never runs.
     let stdout = project.weft(&["run", "--json", "--from", "mid={\"value\":\"by hand\"}", "--save", "mid-only"]).await?;
-    let saved_run = color_of(&stdout)?;
+    let saved_run = execution_id_of(&stdout)?;
     SettledRun::observe(project.dispatcher(), saved_run).await?.completed()?;
     let tree = tree_of(&project).await?;
-    anyhow::ensure!(tree["runs"].as_array().unwrap().iter().any(|run| run["color"] == saved_run.to_string() && run["example"] == "mid-only"), "--save links its first run: {tree}");
+    anyhow::ensure!(tree["runs"].as_array().unwrap().iter().any(|run| run["execution_id"] == saved_run.to_string() && run["example"] == "mid-only"), "--save links its first run: {tree}");
     let seeded = project.weft(&["run", "mid-only", "--json", "--seed"]).await?;
-    let seeded = SettledRun::observe(project.dispatcher(), color_of(&seeded)?).await?;
+    let seeded = SettledRun::observe(project.dispatcher(), execution_id_of(&seeded)?).await?;
     seeded.completed()?;
     anyhow::ensure!(inherited(&seeded, "mid") && inherited(&seeded, "out"), "identical carved backups reuse the selected work");
     let stdout = project.weft(&["run", "--json", "mid-only"]).await?;
-    let settled = SettledRun::observe(project.dispatcher(), color_of(&stdout)?).await?;
+    let settled = SettledRun::observe(project.dispatcher(), execution_id_of(&stdout)?).await?;
     settled.completed()?.assert_input("mid", "value", &json!("by hand"))?.assert_untouched("src")?;
     let stdout = project.weft(&["run", "mid-only", "--json", "--from", "mid={\"value\":\"override\",\"removed_port\":123}"]).await?;
-    SettledRun::observe(project.dispatcher(), color_of(&stdout)?).await?.completed()?.assert_input("mid", "value", &json!("override"))?;
+    SettledRun::observe(project.dispatcher(), execution_id_of(&stdout)?).await?.completed()?.assert_input("mid", "value", &json!("override"))?;
     anyhow::ensure!(warnings_of(&stdout).iter().any(|warning| warning.contains("removed_port")), "removed ports warn and are ignored: {stdout}");
 
     // With `--seed`, the crossing input needs no value: its source is inherited.
     let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
-    SettledRun::observe(project.dispatcher(), color_of(&stdout)?).await?.completed()?;
+    SettledRun::observe(project.dispatcher(), execution_id_of(&stdout)?).await?.completed()?;
     let stdout = project.weft(&["run", "--json", "--from", "out", "--seed", "--seed-before", "out"]).await?;
-    let settled = SettledRun::observe(project.dispatcher(), color_of(&stdout)?).await?;
+    let settled = SettledRun::observe(project.dispatcher(), execution_id_of(&stdout)?).await?;
     settled.completed()?.assert_completed("out")?;
     anyhow::ensure!(inherited(&settled, "src") && inherited(&settled, "mid"), "the source chain is inherited");
 
@@ -303,19 +303,19 @@ async fn a_frozen_example_drifts_and_is_frozen_again() -> anyhow::Result<()> {
     let project = Project::prepare("version_tree", disp).await?;
 
     let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
-    let first = color_of(&stdout)?;
+    let first = execution_id_of(&stdout)?;
     SettledRun::observe(project.dispatcher(), first).await?.completed()?;
     project.weft(&["freeze", "chain", &first.to_string(), "--json"]).await?;
     let refused = project.weft_refused(&["run", "nothing-here"]).await?;
     anyhow::ensure!(refused.contains("no spec at") && refused.contains("nothing-here"), "{refused}");
     project.weft(&["run", "--json", "--from", "mid={\"value\":\"x\"}", "--save", "plain-spec"]).await?;
-    let plain = color_of(&project.weft(&["run", "plain-spec", "--json"]).await?)?;
+    let plain = execution_id_of(&project.weft(&["run", "plain-spec", "--json"]).await?)?;
     SettledRun::observe(project.dispatcher(), plain).await?.completed()?.assert_input("mid", "value", &json!("x"))?;
     let accepted = project.read_file("examples/chain.json")?;
 
     // Run the new code with frozen parameters, leaving the accepted file alone.
     project.write_file("prompts/greeting.txt", "moved")?;
-    let drifted = color_of(&project.weft(&["run", "chain", "--json"]).await?)?;
+    let drifted = execution_id_of(&project.weft(&["run", "chain", "--json"]).await?)?;
     SettledRun::observe(project.dispatcher(), drifted).await?.completed()?.assert_input("out", "data", &json!("moved"))?;
     let examples: Value = serde_json::from_str(project.weft(&["examples", "--json"]).await?.trim())?;
     let chain = examples.as_array().unwrap().iter().find(|e| e["name"] == json!("chain")).cloned().unwrap();
@@ -355,7 +355,7 @@ async fn a_fired_trigger_uses_baked_inputs_and_emit_bypasses_its_body() -> anyho
 
     // An explicit extra start may run, but the trigger keeps its baked ports.
     let stdout = project.weft(&["run", "--json", "--fire", fire, "--from", "sched"]).await?;
-    let settled = SettledRun::observe(project.dispatcher(), color_of(&stdout)?).await?;
+    let settled = SettledRun::observe(project.dispatcher(), execution_id_of(&stdout)?).await?;
     settled.completed()?.assert_completed("sched")?.assert_completed("wired")?;
     settled.assert_input("beat", "data", &json!("2026-02-02T00:00:00Z"))?;
 
@@ -365,7 +365,7 @@ async fn a_fired_trigger_uses_baked_inputs_and_emit_bypasses_its_body() -> anyho
     let stdout = project
         .weft(&["run", "--json", "--emit", "wired={\"scheduledTime\":\"2026-03-03T00:00:00Z\"}"])
         .await?;
-    let settled = SettledRun::observe(project.dispatcher(), color_of(&stdout)?).await?;
+    let settled = SettledRun::observe(project.dispatcher(), execution_id_of(&stdout)?).await?;
     settled.completed()?;
     settled.assert_input("beat", "data", &json!("2026-03-03T00:00:00Z"))?;
     settled.assert_untouched("wired")?;
@@ -393,16 +393,16 @@ out.data = scope.stamp
 "#;
     project.write_file("src/main.weft", graph)?;
     let bake = project.weft(&["bake", "--json"]).await?;
-    SettledRun::observe(project.dispatcher(), color_of(&bake)?).await?.completed()?
+    SettledRun::observe(project.dispatcher(), execution_id_of(&bake)?).await?.completed()?
         .assert_completed("scope.sched")?.assert_completed("scope.tick")?
         .assert_untouched("scope.after")?.assert_untouched("scope.unrelated")?.assert_untouched("out")?;
     let fire = r#"scope.tick={"scheduledTime":"2026-04-04T00:00:00Z","actualTime":"2026-04-04T00:00:00Z"}"#;
     let output = project.weft(&["run", "--json", "--fire", fire]).await?;
-    SettledRun::observe(project.dispatcher(), color_of(&output)?).await?.completed()?
+    SettledRun::observe(project.dispatcher(), execution_id_of(&output)?).await?.completed()?
         .assert_completed("scope.tick")?.assert_input("out", "data", &json!("2026-04-04T00:00:00Z"))?
         .assert_untouched("scope.sched")?.assert_untouched("scope.unrelated")?;
     let output = project.weft(&["run", "--json", "--fire", fire, "--before", "scope.after"]).await?;
-    SettledRun::observe(project.dispatcher(), color_of(&output)?).await?.completed()?
+    SettledRun::observe(project.dispatcher(), execution_id_of(&output)?).await?.completed()?
         .assert_completed("scope.tick")?.assert_untouched("scope.after")?.assert_untouched("out")?;
     // A shared producer feeds both trigger setup and the trigger's consumer.
     // Setup must exclude the consumer; firing must execute the producer again.
@@ -416,11 +416,11 @@ out.data = scope.stamp
     );
     project.write_file("src/main.weft", &shared)?;
     let bake = project.weft(&["bake", "--json"]).await?;
-    SettledRun::observe(project.dispatcher(), color_of(&bake)?).await?.completed()?
+    SettledRun::observe(project.dispatcher(), execution_id_of(&bake)?).await?.completed()?
         .assert_completed("scope.sched")?.assert_completed("scope.tick")?
         .assert_untouched("scope.after")?.assert_untouched("scope.unrelated")?.assert_untouched("out")?;
     let output = project.weft(&["run", "--json", "--fire", fire]).await?;
-    let shared_run = SettledRun::observe(project.dispatcher(), color_of(&output)?).await?;
+    let shared_run = SettledRun::observe(project.dispatcher(), execution_id_of(&output)?).await?;
     shared_run.completed()?.assert_completed("scope.sched")?.assert_completed("scope.tick")?
         .assert_completed("scope.after")?
         .assert_input("scope.after", "schedule", &json!("0 0 * * * *"))?
@@ -430,7 +430,7 @@ out.data = scope.stamp
 
     // Emitting the trigger's output still gathers the consumer's side input.
     let output = project.weft(&["run", "--json", "--emit", r#"scope.tick={"scheduledTime":"manual"}"#]).await?;
-    SettledRun::observe(project.dispatcher(), color_of(&output)?).await?.completed()?
+    SettledRun::observe(project.dispatcher(), execution_id_of(&output)?).await?.completed()?
         .assert_untouched("scope.tick")?.assert_completed("scope.sched")?
         .assert_input("scope.after", "schedule", &json!("0 0 * * * *"))?
         .assert_input("scope.after", "stamp", &json!("manual"))?
@@ -438,7 +438,7 @@ out.data = scope.stamp
 
     project.write_file("src/main.weft", &graph.replace("  sched =", "  _should_flow: false\n  sched ="))?;
     let bake = project.weft(&["bake", "--json"]).await?;
-    SettledRun::observe(project.dispatcher(), color_of(&bake)?).await?.completed()?
+    SettledRun::observe(project.dispatcher(), execution_id_of(&bake)?).await?.completed()?
         .assert_skipped("scope.tick")?.assert_untouched("scope.after")?.assert_untouched("scope.unrelated")?;
     let refused = project.weft_refused(&["run", "--fire", fire]).await?;
     anyhow::ensure!(refused.contains("scope.tick"), "{refused}");
@@ -475,12 +475,12 @@ async fn never_baked_triggers_refuse_and_baking_allows_fire_without_activation()
     let tree = tree_of(&project).await?;
     anyhow::ensure!(tree["head"]["activated_versions"] == json!([]), "bake does not activate: {tree}");
     let stdout = project.weft(&["run", "--json", "--fire", tick]).await?;
-    let settled = SettledRun::observe(project.dispatcher(), color_of(&stdout)?).await?;
+    let settled = SettledRun::observe(project.dispatcher(), execution_id_of(&stdout)?).await?;
     settled.completed()?.assert_completed("tick")?;
     settled.assert_input("stamp", "data", &json!("2026-04-04T00:00:00Z"))?;
 
     let stdout = project.weft(&["run", "--json", "--fire", wired]).await?;
-    SettledRun::observe(project.dispatcher(), color_of(&stdout)?).await?.completed()?
+    SettledRun::observe(project.dispatcher(), execution_id_of(&stdout)?).await?.completed()?
         .assert_completed("wired")?.assert_untouched("sched")?;
 
     // Even a change outside the fired branch changes the baked program identity.
@@ -509,14 +509,14 @@ async fn a_hand_fired_trigger_replays_what_activation_registered() -> anyhow::Re
 
     let fire = "wired={\"scheduledTime\":\"2026-03-03T00:00:00Z\",\"actualTime\":\"2026-03-03T00:00:00Z\"}";
     let stdout = project.weft(&["run", "--json", "--fire", fire]).await?;
-    let settled = SettledRun::observe(project.dispatcher(), color_of(&stdout)?).await?;
+    let settled = SettledRun::observe(project.dispatcher(), execution_id_of(&stdout)?).await?;
     settled.completed()?.assert_completed("wired")?;
     settled.assert_input("beat", "data", &json!("2026-03-03T00:00:00Z"))?;
     settled.assert_untouched("sched")?;
 
     project.weft(&["deactivate", "--mode", "wipe", "--running-policy", "cancel"]).await?;
     let stdout = project.weft(&["run", "--json", "--fire", fire]).await?;
-    SettledRun::observe(project.dispatcher(), color_of(&stdout)?).await?.completed()?.assert_completed("wired")?;
+    SettledRun::observe(project.dispatcher(), execution_id_of(&stdout)?).await?.completed()?.assert_completed("wired")?;
     project.finish().await
 }
 
@@ -561,19 +561,19 @@ async fn removing_a_project_takes_its_runs_with_it() -> anyhow::Result<()> {
     let mut project = Project::prepare("version_tree", disp.clone()).await?;
 
     let stdout = project.weft(&["run", "--json", "--target", "out"]).await?;
-    let color = color_of(&stdout)?;
-    SettledRun::observe(project.dispatcher(), color).await?.completed()?;
+    let execution_id = execution_id_of(&stdout)?;
+    SettledRun::observe(project.dispatcher(), execution_id).await?.completed()?;
 
     // The run is there to be lost: a test that asserted absence
     // without this would pass against a run that never happened.
-    let before = weft_e2e::run::status_of(&disp, color).await?;
+    let before = weft_e2e::run::status_of(&disp, execution_id).await?;
     anyhow::ensure!(before == "completed", "the run finished before the removal: {before}");
 
     project.remove().await?;
 
     // The run's journal is gone, not merely hidden: nothing answers
-    // for that color any more.
-    let after = weft_e2e::run::status_of(&disp, color).await;
+    // for that execution any more.
+    let after = weft_e2e::run::status_of(&disp, execution_id).await;
     anyhow::ensure!(
         after.is_err(),
         "the run outlived its project and is still holding its space: {after:?}"

@@ -1,8 +1,9 @@
-//! `weft cancel-activate [project]`. Cancel an in-flight `activate`
-//! (status=Activating). Wipes every signal row registered so far,
-//! cancels the TriggerSetup color, CAS-flips status to Inactive.
+//! `weft cancel-activate [project]`. Cancel an in-flight `activate`:
+//! the dispatcher cancels the setup run of each trigger still
+//! activating, wipes every signal it registered so far, and leaves
+//! those triggers inactive.
 //!
-//! 412 from the dispatcher when the project isn't Activating.
+//! 412 from the dispatcher when none of them is activating.
 
 use super::Ctx;
 use crate::progress::ActionVerb;
@@ -22,7 +23,7 @@ async fn run_inner(
     scope: weft_core::activation::ActivationScope,
 ) -> anyhow::Result<()> {
     let id = super::resolve_project_id(ctx, project)?;
-    let client = ctx.client();
+    let client = ctx.client()?;
     let path = format!("/projects/{id}/cancel-activate");
     progress.dispatcher_call_start(&path);
     client.post_with_body(&path, &serde_json::to_value(&scope)?).await?;

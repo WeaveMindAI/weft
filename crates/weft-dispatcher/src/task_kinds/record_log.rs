@@ -1,8 +1,8 @@
 //! `record_log` task: durable handoff for a worker's `ctx.log`.
 //! Same shape as `record_cost`: worker enqueues atomically, dies if
-//! it wants, a dispatcher pod writes the journal event later. The
+//! it wants, a dispatcher writes the journal event later. The
 //! line's time and order are the worker's, carried in the payload:
-//! the drain happens whenever a pod gets to it, in whatever order
+//! the drain happens whenever a process gets to it, in whatever order
 //! eight pickers race to the insert.
 
 use anyhow::Result;
@@ -21,10 +21,10 @@ pub struct RecordLogExecutor;
 impl TaskExecutor<DispatcherState> for RecordLogExecutor {
     async fn execute(&self, state: &DispatcherState, task: &Task) -> Result<Value> {
         let payload: RecordLogPayload = serde_json::from_value(task.payload.clone())?;
-        let color: weft_core::Color = payload
-            .color
+        let execution_id: weft_core::ExecutionId = payload
+            .execution_id
             .parse()
-            .map_err(|e| anyhow::anyhow!("bad color in record_log payload: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("bad execution in record_log payload: {e}"))?;
         // A task from a worker that carried no clock reads at the
         // drain: the moment it is journaled, which is what such a
         // worker's lines always said.
@@ -35,7 +35,7 @@ impl TaskExecutor<DispatcherState> for RecordLogExecutor {
             .journal
             .record_event_dedup(
                 &weft_journal::ExecEvent::LogLine {
-                    color,
+                    execution_id,
                     node_id: payload.node_id,
                     frames: payload.frames,
                     level: payload.level,

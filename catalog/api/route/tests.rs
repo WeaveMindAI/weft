@@ -19,6 +19,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_bytes_body_is_stored_and_its_file_flows", bytes_body),
         NodeTest::fake("the_request_ports_win_over_a_body_key", request_wins),
         NodeTest::fake("a_declared_port_named_like_a_capture_reads_the_capture", capture_port),
+        NodeTest::fake("a_capture_port_on_a_bytes_route_is_never_the_body", bytes_route_capture),
         NodeTest::fake("a_picture_in_a_json_body_is_stored_and_its_file_flows", inline_picture),
         NodeTest::fake("bare_base64_is_typed_by_its_bytes_and_held_to_the_port", bare_base64),
         NodeTest::fake("a_json_body_that_is_not_an_object_is_refused", json_body_not_an_object),
@@ -70,6 +71,7 @@ async fn fired_body_comes_from_the_wake(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(outcome.outputs["user_id"], json!("u-1"));
     assert_eq!(outcome.outputs["text"], json!("hi"));
     assert_eq!(outcome.outputs["path"], json!("chat/room7"), "and the request still arrives");
+    assert_eq!(outcome.outputs["fired"], json!(true), "a program can gate on the call alone");
     Ok(())
 }
 
@@ -124,6 +126,23 @@ async fn capture_port(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(outcome.outputs["room"], json!("room7"), "the capture, never the body key");
     assert_eq!(outcome.outputs["text"], json!("hi"));
     assert_eq!(outcome.outputs["params"], json!({ "room": "room7" }), "the fixed port still carries every capture");
+    Ok(())
+}
+
+/// A `GET preview/{view}` that answers bytes reads `view` from the path;
+/// with no body there is nothing else, and a declared body port beside it
+/// still takes the whole body.
+async fn bytes_route_capture(rig: FakeRig) -> WeftResult<()> {
+    let mut request = request();
+    request.headers = vec![("content-type".into(), "image/png".into())];
+    rig.wake(serde_json::to_value(&request).expect("request serializes"));
+    rig.attach_caller(http_caller(DataType::Bytes, request, InboundMessage::Bytes(png_bytes())));
+    rig.output_type("room", WeftType::parse("String").expect("parses"));
+    rig.output_type("upload", WeftType::parse("Image").expect("parses"));
+    let outcome = rig.run(&RouteNode, json!({ "path": "chat/{room}", "dataType": "bytes" })).await.ok()?;
+    assert_eq!(outcome.outputs["room"], json!("room7"), "the capture");
+    let file = weft::storage::StoredFile::from_value(&outcome.outputs["upload"])?;
+    assert_eq!(file.mime_type, "image/png", "and the body on the other port");
     Ok(())
 }
 

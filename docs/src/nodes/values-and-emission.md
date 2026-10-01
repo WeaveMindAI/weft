@@ -120,9 +120,51 @@ as: `file`, `filename`, `mimeType` and `sizeBytes`.
 | To fail on something you worked out | `weft::node_bail!("pick a channel or a user")` |
 | The same, as an expression | `node_error(format!("..."))` |
 
-Your node never names a weft error type. Those, plus `?` on anything the ctx
-returns, are the whole story.
+Those, plus `?` on anything the ctx returns, cover every failure except a
+mistake in the program itself, which you return as `Err(WeftError::Input(..))`
+(see [Letting the program handle a failure](#letting-the-program-handle-a-failure)).
 
 Write the message as an instruction to whoever is building the program, because
 that is who reads it. "pick a destination: a channel or a user" beats "invalid
 configuration".
+
+## Letting the program handle a failure
+
+If your node reaches outside, it can fail for reasons the program might want
+to deal with: a model refusing a prompt, a host that does not answer, a
+database rejecting a row. If you want a
+program to be able to handle those, set this in the node's metadata:
+
+```json
+"features": { "catchErrors": true }
+```
+
+weft then gives the node an `error` output, and your body just returns its
+errors with `?` as usual. If the program wires `error`, the failure's message comes out there,
+the step counts as done, and every output the body had not sent yet closes. If
+nobody wired it, the failure fails the run.
+
+If a step fails because its worker went away, that failure goes to `error` too
+(go and read [surviving a restart](durable-execution.md#when-the-worker-dies-mid-step)).
+
+weft owns `error`: your node cannot declare it, and a body that emits on it
+fails. If your node only shapes values (a cast, a switch, a template), leave
+the flag off: it has nothing outside to fail on.
+
+Only failures of the call itself are caught: what `node_err`, `node_bail!` and
+outside errors produce. A bad setting, a bad input or a bad type always fails
+the run, wired or not, because the fix for those is in the program. The ctx
+sorts its own refusals the same way: `ctx.output_type` on a port your node does
+not declare fails the run, so just use `?` on it. A cancel, or a step pausing to
+wait for an answer, never becomes an `error` value.
+
+So when your node spots a mistake in the program itself (SQL it cannot run, a
+value of the wrong shape, an empty field it needs), fail with
+`Err(WeftError::Input(..))`. If a program could sensibly retry or route around
+the failure while it runs, use `node_bail!` instead. If your node talks to a
+server, decide the same way for each kind of refusal: the Postgres nodes fail
+the run on a syntax error or a missing table, and put a broken constraint on
+`error`.
+
+In a test, `rig.wire_output("error")` wires `error` the way a program would.
+Without it the rig wires nothing, so the same node fails loudly.

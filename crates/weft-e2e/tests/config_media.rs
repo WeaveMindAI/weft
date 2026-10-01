@@ -50,7 +50,7 @@ async fn a_url_file_ref_is_fetched_by_the_worker_at_runtime() -> anyhow::Result<
     // The URL form of the same source line (what the field's paste-URL writes):
     // the sync uploads NOTHING for it; the build resolves it to a url-form file
     // value, and the WORKER fetches the URL at run time inside its isolated
-    // network. Stand up a fake serving known bytes at a cluster-reachable URL.
+    // network. Stand up a fake serving known bytes at a reachable URL.
     let payload = b"weft-e2e url asset; fetched by the worker, never the server".to_vec();
     let fake = BytesFake::start(payload.clone()).await?;
     project.set_node_config("sized", "file", &format!("@asset(\"{}\", Blob)", fake.url()))?;

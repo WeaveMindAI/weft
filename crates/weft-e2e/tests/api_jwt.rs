@@ -58,7 +58,7 @@ async fn a_genuine_token_is_admitted_and_its_claims_reach_the_run() -> anyhow::R
 
     let values = json!({ "issuer": issuer, "jwks_url": jwks_url, "audience": audience });
     let conn = connect_direct(&disp, catalog_spec("api", "jwt_auth")?, "own", values).await?;
-    set_account(&project, "issuer", "account", conn.handle())?;
+    set_account(&project, "issuer", conn.handle()).await?;
     project.activate().await?;
 
     let me = format!("{base}/me");

@@ -21,11 +21,12 @@ it remembers.
 | Something else | `--assistant agents`, which writes a plain `AGENTS.md` |
 | Nothing | `--assistant none` |
 
-If you use more than one, pass `--assistant` once for each. Whichever you pick
-is remembered, so your next `weft new` installs the same one with no flag.
+If you use more than one, pass `--assistant` once for each. The pick is for
+this project only. If you want your next `weft new` to install the same one
+with no flag, add `--remember`, as here:
 
 ```bash
-weft new hello --assistant claude-code
+weft new hello --assistant claude-code --remember
 cd hello
 weft run
 ```
@@ -35,13 +36,13 @@ every step as it starts and finishes, then a tick:
 
 ```text
 registered hello (3f2a1c4e-9b81-4d0a-8e55-7c2f1a6b30de)
-started color 9b81d0a2-4e17-4a33-bc90-51d8e2f4a7c1 on version a1b2c3d
-→ started color=9b81d0a2 entry=greeting
+started execution 9b81d0a2-4e17-4a33-bc90-51d8e2f4a7c1 on version a1b2c3d
+→ started execution=9b81d0a2 entry=greeting
   …
-✓ completed color=9b81d0a2
+✓ completed execution=9b81d0a2
 ```
 
-That long id after `started color` is the run's **color**, and it is how you
+That long id after `started execution` is the run's execution id, and it is how you
 point at this one run later. Everything that reads a run takes it, and the
 first eight characters are enough as long as they name only one.
 

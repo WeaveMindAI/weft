@@ -7,7 +7,6 @@
 
 
 use serde_json::Value;
-use tokio::task::JoinHandle;
 use anyhow::Result;
 use weft_core::primitive::{SignalAuth, SignalRouting, SignalSpec, SignalSurface};
 use weft_core::signal::{Form, Signal};
@@ -17,7 +16,7 @@ use crate::registry::RegisteredSignal;
 
 use async_trait::async_trait;
 
-use super::{KindHandler, LiveCtx, SpawnCtx};
+use super::{BetweenFires, KindHandler, LiveCtx};
 use weft_core::live::{LiveFeed, LiveItem};
 
 pub struct FormHandler;
@@ -28,6 +27,10 @@ impl KindHandler for FormHandler {
         Form::TAG
     }
 
+    fn between_fires(&self) -> BetweenFires {
+        BetweenFires::Called
+    }
+
     fn compute_routing(&self, _spec: &SignalSpec) -> Result<SignalRouting> {
         Ok(SignalRouting {
             surface: SignalSurface::TaskCallback,
@@ -36,14 +39,6 @@ impl KindHandler for FormHandler {
         })
     }
 
-    async fn spawn_task(
-        &self,
-        _spec: &SignalSpec,
-        _kind_state: &Value,
-        _ctx: SpawnCtx,
-    ) -> Result<Option<JoinHandle<()>>> {
-        Ok(None)
-    }
 
     fn process_entry(
         &self,
@@ -159,9 +154,9 @@ mod tests {
             node_id: "node-7".into(),
             tenant_id: "t".into(),
             is_resume: true,
-            color: Some("c".into()),
-            placement_generation: 0,
+            execution_id: Some("c".into()),
             task: None,
+            kind_state: None,
             routing: SignalRouting {
                 surface: SignalSurface::TaskCallback,
                 auth: SignalAuth::None,

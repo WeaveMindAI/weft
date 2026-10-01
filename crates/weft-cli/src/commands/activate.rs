@@ -14,14 +14,16 @@
 
 use anyhow::Context;
 
-use super::ensure::{parse_running_choice, running_choice_fields};
+use weft_core::activation::{ActivateRequest, ActivateResponse, ActivationTarget, ReactivateChoice};
+
+use super::ensure::{parse_running_choice, running_choice};
 use super::Ctx;
 use crate::progress::ActionVerb;
 
 pub async fn run(
     ctx: Ctx,
     project: Option<String>,
-    reactivate_choice_flag: Option<String>,
+    reactivate_choice_flag: Option<ReactivateChoice>,
     running_policy: Option<String>,
     drain_timeout: Option<u64>,
     scope: weft_core::activation::ActivationScope,
@@ -46,7 +48,7 @@ async fn run_inner(
     ctx: &Ctx,
     progress: &crate::progress::Progress,
     project: Option<String>,
-    reactivate_choice_flag: Option<String>,
+    reactivate_choice_flag: Option<ReactivateChoice>,
     running_policy: Option<String>,
     drain_timeout: Option<u64>,
     scope: weft_core::activation::ActivationScope,
@@ -56,29 +58,19 @@ async fn run_inner(
     // minute.
     let (running_policy, drain_timeout) =
         parse_running_choice(running_policy.as_deref(), drain_timeout)?;
-    let (client, id, name, binary_hash, definition_hash, infra_hash, image_hashes) = match project {
+    // The hashes of the build just made, which the dispatcher checks is
+    // still the registered one. The "activate by id" path builds nothing
+    // and sends none: it activates whatever is registered.
+    let (client, id, name, target) = match project {
         // Activate-by-id skips the build/discover step entirely.
-        Some(id) => (ctx.client(), id.clone(), id, None, None, None, None),
+        Some(id) => (ctx.client()?, id.clone(), id, ActivationTarget::default()),
         None => {
-            let handle = super::ensure::ensure_registered(ctx, progress, weft_compiler::codegen::NodeSet::Full).await?;
-            // A program with per-member infra starts its members' copies
-            // itself, whenever it likes, and a copy is applied from the
-            // recorded image tags: they are built and recorded here, so
-            // no `weft infra start` has to come first.
-            let image_hashes = if has_per_member_infra(&handle.plan)? {
-                Some(super::infra::build_infra_images(progress, &handle.plan, &handle.id, &handle.client).await?)
-            } else {
-                None
-            };
-            (
-                handle.client,
-                handle.id,
-                handle.name,
-                Some(handle.plan.binary_hash),
-                Some(handle.plan.definition_hash),
-                Some(handle.plan.infra_hash),
-                image_hashes,
-            )
+            // The build makes every place's images, an instance's copies
+            // included, so a program starting an instance's copy later finds
+            // its images there.
+            let handle = super::ensure::ensure_registered(ctx, progress, weft_core::builds::NodeSet::Full).await?;
+            let target = handle.activation_target();
+            (handle.client, handle.id, handle.name, target)
         }
     };
 
@@ -87,9 +79,8 @@ async fn run_inner(
     //     if present so the caller (extension) is forced to pass an
     //     explicit choice. No silent default.
     //   - TTY mode: interactive prompt iff preserved state.
-    let reactivate_choice = if let Some(c) = reactivate_choice_flag {
-        validate_reactivate_choice(&c)?;
-        Some(c)
+    let reactivate_choice = if reactivate_choice_flag.is_some() {
+        reactivate_choice_flag
     } else if ctx.json() {
         require_choice_when_preserved(&client, &id).await?
     } else {
@@ -97,75 +88,75 @@ async fn run_inner(
     };
 
     let path = format!("/projects/{id}/activate");
-    let mut body = serde_json::Map::new();
-    // Only forward hashes when we actually computed them. The
-    // "activate by id" path skips the build/discover step and has
-    // no hashes to send; posting `null` here would overwrite the
-    // dispatcher's stored running hashes and silently flip drift
-    // state to "Resync needed".
-    super::ensure::inject_hash_fields_opt(
-        &mut body,
-        binary_hash.as_deref(),
-        definition_hash.as_deref(),
-        infra_hash.as_deref(),
-    );
-    if let Some(choice) = reactivate_choice {
-        body.insert("reactivateChoice".into(), serde_json::Value::String(choice));
-    }
-    // SYNC: imageHashes <-> crates/weft-dispatcher/src/api/project.rs ActivationTarget::image_hashes
-    if let Some(tags) = image_hashes {
-        body.insert("imageHashes".into(), serde_json::to_value(tags)?);
-    }
-    body.extend(running_choice_fields(running_policy, drain_timeout));
-    body.insert("scope".into(), serde_json::to_value(&scope)?);
+    let body = ActivateRequest {
+        target: ActivationTarget { reactivate_choice, ..target },
+        running: running_choice(running_policy, drain_timeout),
+        scope,
+    };
     // The one line that says the call may now sit for a while (only
-    // under a wait: the progress reads the policy off the body), so a
-    // quiet terminal is a wait and not a hang.
-    progress.drain_wait(&serde_json::Value::Object(body.clone()), drain_timeout);
+    // under a wait), so a quiet terminal is a wait and not a hang.
+    progress.drain_wait(running_policy, drain_timeout);
     progress.trigger_register_start();
     progress.dispatcher_call_start(&path);
-    let answer: serde_json::Value = client.post_json(&path, &serde_json::Value::Object(body)).await?;
+    let answer: ActivateResponse = serde_json::from_value(client.post_json(&path, &serde_json::to_value(&body)?).await?)
+        .context("read the activate answer")?;
     progress.dispatcher_call_done(serde_json::json!({ "project_id": id }));
     progress.trigger_register_done();
-    // SYNC: infra_not_running <-> crates/weft-dispatcher/src/api/project.rs ActivateResponse::infra_not_running
-    if let Some(note) = answer.get("infra_not_running").and_then(|v| v.as_str()) {
+    if let Some(note) = &answer.infra_not_running {
         progress.warn(note);
+    }
+    let left_out = answer.per_instance_left_out;
+    if let Some(note) = left_out_note(&left_out) {
+        progress.warn(&note);
     }
     if !ctx.json() {
         println!("activated {name} ({id})");
     }
-    progress.complete(&format!("activated {name}"));
+    progress.complete_with(&format!("activated {name}"), serde_json::json!({ "per_instance_left_out": left_out }));
     Ok(())
+}
+
+/// What a person is told about the per-instance triggers a plain activate
+/// left off: each exists once per instance, so an instance has to be named.
+fn left_out_note(left_out: &[String]) -> Option<String> {
+    if left_out.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "left off: {} run once per instance, so they stay off until an instance is named. \
+         Switch one instance's on with `weft activate --instance <id>`, or have the program switch \
+         them on itself once it knows the instance (a node like ActivateInstanceTriggers does it)",
+        left_out.iter().map(|t| format!("'{t}'")).collect::<Vec<_>>().join(", ")
+    ))
 }
 
 /// Read the project's preserved state from `/status`. Returns
 /// `Some((parked, suspended))` only when the project is `inactive`
 /// AND at least one count is non-zero; `None` when the project is in no
 /// state that preserves anything, or preserved nothing. A status that
-/// cannot be read, or an inactive project whose answer carries no
-/// preservation counts, is an error: guessing "nothing preserved" would
-/// skip the choice and drop the parked work on the default.
+/// cannot be read is an error: guessing "nothing preserved" would skip
+/// the choice and drop the parked work on the default.
 async fn fetch_preserved_state(
     client: &crate::client::DispatcherClient,
     id: &str,
-) -> anyhow::Result<Option<(u64, u64)>> {
+) -> anyhow::Result<Option<(usize, usize)>> {
     let path = format!("/projects/{id}/status");
-    let resp: serde_json::Value = client
-        .get_json(&path)
-        .await
-        .context("read the project's status to see what its inactive window preserved")?;
-    let mismatch = || {
-        anyhow::anyhow!(
-            "the dispatcher's status for {id} does not say what it preserved: {resp}; upgrade the \
+    let resp: weft_core::projects::ProjectStatusResponse = serde_json::from_value(
+        client
+            .get_json(&path)
+            .await
+            .context("read the project's status to see what its inactive window preserved")?,
+    )
+    .with_context(|| {
+        format!(
+            "the dispatcher's status for {id} does not read as this CLI expects; upgrade the \
              dispatcher or this CLI so the versions match"
         )
-    };
-    let status = resp.get("status").and_then(|v| v.as_str()).ok_or_else(mismatch)?;
-    if status != "inactive" {
+    })?;
+    if resp.status != weft_core::projects::ProjectStatus::Inactive {
         return Ok(None);
     }
-    let count = |key: &str| resp.pointer(&format!("/preservation/{key}")).and_then(|v| v.as_u64()).ok_or_else(mismatch);
-    let (parked, suspended) = (count("parked")?, count("suspended")?);
+    let weft_core::projects::PreservationCounts { parked, suspended } = resp.preservation;
     if parked == 0 && suspended == 0 {
         return Ok(None);
     }
@@ -178,24 +169,15 @@ async fn fetch_preserved_state(
 async fn require_choice_when_preserved(
     client: &crate::client::DispatcherClient,
     id: &str,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<ReactivateChoice>> {
     let Some((parked, suspended)) = fetch_preserved_state(client, id).await? else {
         return Ok(None);
     };
     anyhow::bail!(
         "project {id} has preserved state (parked={parked}, suspended={suspended}); \
-         pass --reactivate-choice (execute_parked_keep_suspended | keep_suspended_only | wipe_all)"
+         pass --reactivate-choice ({})",
+        ReactivateChoice::VARIANTS.iter().map(|choice| choice.as_str()).collect::<Vec<_>>().join(" | ")
     )
-}
-
-fn validate_reactivate_choice(choice: &str) -> anyhow::Result<()> {
-    match choice {
-        "execute_parked_keep_suspended" | "keep_suspended_only" | "wipe_all" => Ok(()),
-        other => anyhow::bail!(
-            "invalid --reactivate-choice '{other}'; expected one of: \
-             execute_parked_keep_suspended, keep_suspended_only, wipe_all"
-        ),
-    }
 }
 
 /// TTY mode: if the project has preserved state, prompt the user.
@@ -204,7 +186,7 @@ fn validate_reactivate_choice(choice: &str) -> anyhow::Result<()> {
 async fn prompt_reactivate_choice(
     client: &crate::client::DispatcherClient,
     id: &str,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<ReactivateChoice>> {
     let Some((parked, suspended)) = fetch_preserved_state(client, id).await? else {
         return Ok(None);
     };
@@ -218,22 +200,10 @@ async fn prompt_reactivate_choice(
     println!("  3) wipe_all                       drop everything, fresh start");
     let line = crate::prompt::prompt_line("> ", "--reactivate-choice <choice>")?;
     let choice = match line.as_str() {
-        "1" | "execute_parked_keep_suspended" => "execute_parked_keep_suspended",
-        "2" | "keep_suspended_only" => "keep_suspended_only",
-        "3" | "wipe_all" => "wipe_all",
-        _ => anyhow::bail!("invalid reactivate choice '{line}'; expected 1, 2, or 3"),
+        "1" => ReactivateChoice::ExecuteParkedKeepSuspended,
+        "2" => ReactivateChoice::KeepSuspendedOnly,
+        "3" => ReactivateChoice::WipeAll,
+        named => named.parse().map_err(|_| anyhow::anyhow!("invalid reactivate choice '{line}'; expected 1, 2, or 3"))?,
     };
-    Ok(Some(choice.to_string()))
-}
-
-/// Whether the compiled program has an infra node each member gets a copy
-/// of: one marked `@per_member`, one with a `@member_filled` field, or one
-/// reached from either (the compiler marks all three `per_member`).
-fn has_per_member_infra(plan: &weft_compiler::build_plan::BuildPlan) -> anyhow::Result<bool> {
-    let definition: weft_core::ProjectDefinition = serde_json::from_str(&plan.definition_json)
-        .map_err(|e| anyhow::anyhow!("read the build plan's compiled program: {e}"))?;
-    Ok(definition
-        .nodes
-        .iter()
-        .any(|n| n.requires_infra && n.per_member.is_some()))
+    Ok(Some(choice))
 }

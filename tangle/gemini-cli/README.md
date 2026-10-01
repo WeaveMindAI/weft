@@ -10,7 +10,7 @@ for other assistants.
 
 The persona is `GEMINI.md` at the project root. Gemini does **not** read
 `AGENTS.md`, so this is the only file that carries it. Skills sit in
-`.gemini/skills/`, the specialists in `.gemini/agents/`, and the six commands
+`.gemini/skills/`, the specialists in `.gemini/agents/`, and the seven commands
 are TOML in `.gemini/commands/`.
 
 Two things this copy uses.
@@ -30,7 +30,7 @@ shell command inside a prompt with `!{...}` and pull in a file with `@{...}`.
 
 ## What is here
 
-Tangle is one persona plus sixteen skills, five specialists and six commands.
+Tangle is one persona plus seventeen skills, six specialists and seven commands.
 The persona holds the program: the graph shape, the typed contracts, the weft
 source. The skills are the big knowledge, loaded only when the work calls for
 them. The specialists take the heavy scoped jobs. The commands are the loop's

@@ -1,0 +1,28 @@
+{
+  "type": "GetInstanceValues",
+  "label": "Get instance values",
+  "description": "Read what one instance was given for the fields the program writes `@instance_filled` (its model, its sheet, its schedule, its connection). A field left empty is not listed: a run for that instance uses its fallback, or the node's default. For a manager's overview of each instance's settings, or to decide something from them.",
+  "tags": [
+    "instances",
+    "values",
+    "settings"
+  ],
+  "icon": "SlidersHorizontal",
+  "color": "#0ea5e9",
+  "inputs": [
+    {
+      "name": "instance",
+      "type": "String",
+      "required": true,
+      "description": "The instance, by the id your program gives it (`user-42`)."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "values",
+      "type": "JsonDict",
+      "description": "What it was given, by `node.field` the way the program writes it, the same keys `SetInstanceValues` takes: `{\"answer.model\": \"deepseek/deepseek-chat\", \"digest.cron\": \"0 0 7 * * *\"}`. A connection reads as its `{\"id\", \"identity\"}` handle."
+    }
+  ],
+  "requires_infra": false
+}

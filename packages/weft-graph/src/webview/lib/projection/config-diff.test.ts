@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { diffConfigOps, diffPortLiteralOps } from './config-diff';
-import type { ConfigFieldSpan } from '../../../protocol';
+import { instanceFilledValue, type ConfigFieldSpan } from '../../../protocol';
 
 describe('diffConfigOps', () => {
 	it('a full-config spread with nothing changed emits ZERO ops (the toggle regression)', () => {
@@ -57,6 +57,19 @@ describe('diffConfigOps', () => {
 describe('diffPortLiteralOps', () => {
 	const span = (origin: ConfigFieldSpan['origin']): ConfigFieldSpan =>
 		({ origin, span: { startLine: 1, startColumn: 0, endLine: 1, endColumn: 1 } });
+
+	it('never writes or removes a connection the install keeps', () => {
+		const marker = { __weft_install_picked__: {} };
+		expect(diffPortLiteralOps('copy', { account: marker }, {}, {}, 'inline')).toEqual([]);
+		expect(diffPortLiteralOps('n', {}, { account: marker }, {}, 'inline')).toEqual([]);
+	});
+
+	it('writes a real value set over the install-picked marker', () => {
+		const marker = { __weft_install_picked__: {} };
+		const ops = diffPortLiteralOps('n', { account: instanceFilledValue() }, { account: marker }, {}, 'inline');
+		expect(ops).toHaveLength(1);
+		expect(ops[0]).toMatchObject({ op: 'setConfig', node: 'n', key: 'account', form: 'inline' });
+	});
 
 	it('a value already in source keeps its written form, whatever the first form is', () => {
 		expect(diffPortLiteralOps('n', { text: 'new' }, { text: 'old' }, { text: span('connection') }, 'inline'))

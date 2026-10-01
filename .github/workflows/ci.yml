@@ -1,7 +1,7 @@
 # The checks CONTRIBUTING asks you to run locally, run again on every PR.
 #
-# Deliberately NOT here: the end-to-end suite (needs a real cluster, driven by
-# scripts/run-e2e.sh) and the live node-test tier (spends real money). Both are
+# Deliberately NOT here: the end-to-end suite (needs a local weft install and
+# Docker, driven by scripts/run-e2e.sh) and the live node-test tier (spends real money). Both are
 # run by hand before a release.
 name: ci
 
@@ -63,7 +63,12 @@ jobs:
 
       # No compile-time query macros anywhere, so the workspace suite needs no
       # database. The tests that do want one are behind the `db-tests` feature.
-      - run: cargo test --workspace --locked
+      # Under cargo-nextest, as developers run it: each test in its own
+      # process, which tests that set the process's env vars rely on. Doc
+      # tests are the one kind nextest does not run.
+      - run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+      - run: cargo nextest run --workspace --locked
+      - run: cargo test --workspace --locked --doc
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # The parse-only build (weft-core without its `runtime` layer, what a
       # WASM parser links). A workspace build always turns `runtime` on, so

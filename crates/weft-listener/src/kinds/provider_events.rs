@@ -5,7 +5,7 @@
 //!
 //!   - **dial-out**: the service declares a socket recipe and the
 //!     connection holds every value its mint call needs. ONE shared
-//!     socket per (connection, topic) on this pod, fanning every
+//!     socket per (connection, topic) on this process, fanning every
 //!     inbound event to all of that pair's subscriptions; the engine
 //!     re-resolves the connection and re-mints the address on every
 //!     reconnect.
@@ -45,7 +45,7 @@ use weft_core::signal::listener_protocol::{ProcessOutcome, ProcessTarget, PushEv
 use crate::registry::{RegisteredSignal, ServingState, TaskGuard, Transport};
 use crate::socket_engine::{self, CyclePlan, PrepareError};
 
-use super::{KindHandler, LiveCtx, SpawnCtx};
+use super::{BetweenFires, KindHandler, LiveCtx, SpawnCtx};
 use weft_core::live::{LiveFeed, LiveItem};
 
 pub struct ProviderEventsHandler;
@@ -54,6 +54,10 @@ pub struct ProviderEventsHandler;
 impl KindHandler for ProviderEventsHandler {
     fn tag(&self) -> &'static str {
         ProviderEvents::TAG
+    }
+
+    fn between_fires(&self) -> BetweenFires {
+        BetweenFires::Holds
     }
 
     fn broad_push_routed(&self) -> bool {
@@ -67,7 +71,7 @@ impl KindHandler for ProviderEventsHandler {
     /// subscription decides whether it was meant.
     ///
     /// The connection was already matched by the dispatcher (a push
-    /// reaches this signal's pod only because the signal hangs off one
+    /// reaches this signal's process only because the signal hangs off one
     /// of the connections the broker named). What is left is this kind's
     /// own vocabulary, and it is the reason this decision cannot live
     /// anywhere else:
@@ -94,7 +98,7 @@ impl KindHandler for ProviderEventsHandler {
     }
 
     fn compute_routing(&self, _spec: &SignalSpec) -> Result<SignalRouting> {
-        // Fires arrive internally: from this pod's shared socket, or
+        // Fires arrive internally: from this process's shared socket, or
         // from the public events receiver (which routes by content,
         // not by a mount path).
         Ok(SignalRouting {
@@ -199,7 +203,7 @@ impl KindHandler for ProviderEventsHandler {
     /// A dial-in subscription holds provider-side state (the provider
     /// keeps posting to a channel weft asked for); drop it at the
     /// provider too. A socket-served signal never subscribed, and one
-    /// whose transport was never recorded holds nothing this pod
+    /// whose transport was never recorded holds nothing this process
     /// arranged; either way there is nothing to drop, and a provider
     /// channel that outlives its signal lapses on its own expiry.
     async fn on_unregister(
@@ -375,9 +379,9 @@ fn serve_subscription(
 
 // ---------- Dial-out: the shared per-(connection, topic) socket ----------
 
-/// One pod-wide socket per (connection, topic), fanning events to all
-/// of that pair's subscriptions. Keyed by pod too, so several
-/// in-process listeners (tests) never cross wires.
+/// One socket per (connection, topic) in this process, fanning events
+/// to all of that pair's subscriptions. Keyed by the listener replica
+/// too, so several in-process listeners (tests) never cross wires.
 static SOCKETS: LazyLock<DashMap<String, SocketShare>> = LazyLock::new(DashMap::new);
 
 /// One subscription on a shared socket: its fire plumbing plus what
@@ -438,7 +442,7 @@ async fn serve_socket(
     provider_account: Option<String>,
     ctx: &SpawnCtx,
 ) {
-    let key = format!("{}|{}|{}", ctx.config.pod_name, access.id, cfg.topic);
+    let key = format!("{}|{}|{}", ctx.config.replica, access.id, cfg.topic);
     let _guard = SubscriberGuard { key: key.clone(), token: ctx.fire.token().to_string() };
     {
         let share = SOCKETS.entry(key.clone()).or_insert_with(|| {
@@ -620,7 +624,7 @@ async fn ensure_via_broker(
             topic: cfg.topic.clone(),
             access_id: access.id.clone(),
             signal_token: ctx.fire.token().to_string(),
-            for_member: ctx.fire.for_member().cloned(),
+            for_instance: ctx.fire.for_instance().cloned(),
             params: cfg.params.clone(),
         })
         .await

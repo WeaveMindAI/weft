@@ -1,7 +1,7 @@
 //! Graph-level project types. Describes a weft program as a graph:
-//! nodes (instances of a node type), edges (connections between port
+//! nodes (uses of a node type), edges (connections between port
 //! refs). Port and field shapes live on the node TYPE (NodeMetadata),
-//! not on the instance. `NodeFeatures` is preserved on each node.
+//! not on the node. `NodeFeatures` is preserved on each node.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,7 @@ use crate::weft_type::WeftType;
 
 /// The canonical form of a program and the digests over it.
 pub mod hash;
+pub mod graph;
 pub mod selection;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,22 +301,21 @@ pub struct NodeDefinition {
     /// NodeMetadata.requires_infra at enrich time.
     #[serde(default, rename = "requiresInfra")]
     pub requires_infra: bool,
-    /// Whether this node exists once per member of the program, and why:
-    /// `Marked` when the source says `@per_member` in its braces (only an
-    /// infra node may, see `NodeMetadata::per_member_eligible`), `Filled`
-    /// when one of its fields is written `@member_filled`, `Derived` when
-    /// it reads a value that comes from a per-member node, found by the
-    /// compiler along the wires. `None` for a node every member shares. Written by the
+    /// Whether this node exists once per instance of the program, and why:
+    /// `Marked` when the source says `@per_instance` in its braces (only an
+    /// infra node may, see `NodeMetadata::per_instance_eligible`), `Filled`
+    /// when one of its fields is written `@instance_filled`, `Derived` when
+    /// it reads a value that comes from a per-instance node, found by the
+    /// compiler along the wires. `None` for a node every instance shares. Written by the
     /// lowering (the mark) and the compiler's propagation (the rest), and
     /// only ever READ downstream: the runtime and the editor never
     /// recompute it.
-    // SYNC: per_member <-> packages/weft-graph/src/protocol.ts NodeDefinition.perMember
-    #[serde(default, rename = "perMember", skip_serializing_if = "Option::is_none")]
-    pub per_member: Option<crate::member::PerMember>,
-    /// Image source dirs the CLI builds for this node. Mirrored from
-    /// NodeMetadata.images at enrich time. The CLI walks this to know
-    /// which Dockerfiles to build before sending imageHashes to
-    /// the dispatcher.
+    // SYNC: per_instance <-> packages/weft-graph/src/protocol.ts NodeDefinition.perInstance
+    #[serde(default, rename = "perInstance", skip_serializing_if = "Option::is_none")]
+    pub per_instance: Option<crate::instance::PerInstance>,
+    /// Image source dirs built for this node. Mirrored from
+    /// NodeMetadata.images at enrich time. A version build walks this to
+    /// know which Dockerfiles to build (`weft-dispatcher::build`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
     /// What this TRIGGER wakes with: field name to weft type, mirrored
@@ -336,19 +336,19 @@ pub struct NodeDefinition {
     #[serde(default, rename = "publishedService", skip_serializing_if = "Option::is_none")]
     pub published_service: Option<crate::access::spec::AccessSpec>,
     /// The recipe of the service this access node's connection field
-    /// connects to, carried when that field is `@member_filled`: a member
-    /// connects through the member door (their browser, never the
-    /// editor), and that door has only the program to read the recipe
-    /// from. It drives the member's connect page exactly as the catalog
+    /// connects to, carried when that field is `@instance_filled`: an instance's
+    /// connection is made through the instance door (a browser holding its
+    /// token, never the editor), and that door has only the program to read
+    /// the recipe from. It drives the instance's connect page exactly as the catalog
     /// entry drives the editor's.
-    #[serde(default, rename = "memberService", skip_serializing_if = "Option::is_none")]
-    pub member_service: Option<crate::access::spec::AccessSpec>,
+    #[serde(default, rename = "instanceService", skip_serializing_if = "Option::is_none")]
+    pub instance_service: Option<crate::access::spec::AccessSpec>,
     /// The node type's validation rules, carried when a field of this
-    /// node is `@member_filled`: a member's value is checked against them
+    /// node is `@instance_filled`: an instance's value is checked against them
     /// with the value swapped in (`weft_core::rules`), where no catalog
     /// is at hand. Resolved at enrich time from the catalog.
-    #[serde(default, rename = "memberRules", skip_serializing_if = "Option::is_none")]
-    pub member_rules: Option<MemberRules>,
+    #[serde(default, rename = "instanceRules", skip_serializing_if = "Option::is_none")]
+    pub instance_rules: Option<InstanceRules>,
     /// Full source range of the node declaration (including config
     /// block if present). Set by the parser.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -437,8 +437,8 @@ pub struct IncludedContents {
     /// deeply included file re-parses the graph that depends on it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
-    /// The types of the SHARED nodes found inside (a `@per_member` node
-    /// is its members' to run, so it is left out), before the catalog was
+    /// The types of the SHARED nodes found inside (a `@per_instance` node
+    /// is its instances' to run, so it is left out), before the catalog was
     /// consulted. The parser has no catalog, so it records the types and
     /// enrich settles the two booleans above from them.
     #[serde(default, rename = "nodeTypes", skip_serializing_if = "Vec::is_empty")]
@@ -600,7 +600,7 @@ pub struct InputDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub widget: Option<crate::node::Widget>,
     /// The input's declared default value, if any (mirrored from the
-    /// metadata so the runtime and the editor read it off the instance).
+    /// metadata so the runtime and the editor read it off the node).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<Value>,
     /// Editor label override (mirrored from the metadata).
@@ -686,7 +686,7 @@ impl std::ops::DerefMut for InputDefinition {
     }
 }
 
-/// A pure WIRE port on a node instance's OUTPUT side or a group/loop
+/// A pure WIRE port on a node's OUTPUT side or a group/loop
 /// interface: a named, typed dock for edges. Inputs are the richer
 /// [`InputDefinition`].
 // SYNC: PortDefinition <-> packages/weft-graph/src/protocol.ts PortDefinition, packages/weft-connect/src/core/wire.ts PortDefinition
@@ -817,12 +817,10 @@ impl EdgeIndex {
 }
 
 /// Whether this project declares ANY infrastructure: true iff at least
-/// one node has `requires_infra`. The single project-level fact that
-/// decides namespace placement: an infra project gets its own k8s
-/// namespace (its worker must sit next to its infra pods), a no-infra
-/// project's worker runs in the shared worker namespace. Pure walk over
-/// the node list; the one copy of this predicate so the dispatcher and
-/// any other consumer can't drift on what "has infra" means.
+/// one node has `requires_infra`: what a project's status reports and its
+/// infra verbs are offered on. Pure walk over the node list; the one copy
+/// of this predicate so the dispatcher and any other consumer can't drift
+/// on what "has infra" means.
 pub fn has_infra(project: &ProjectDefinition) -> bool {
     project.nodes.iter().any(|n| n.requires_infra)
 }
@@ -834,8 +832,8 @@ pub fn has_infra(project: &ProjectDefinition) -> bool {
 /// sorted by `(infra, trigger)`.
 ///
 /// Per place, because that is what runs: a file included twice holds
-/// two infra instances and two registered triggers, and the trigger
-/// under `one` reads its address off the instance under `one` alone.
+/// two infra placements and two registered triggers, and the trigger
+/// under `one` reads its address off the placement under `one` alone.
 /// The spelling is the key every infra row and signal row is stored
 /// under, so a reader compares this against those directly.
 ///
@@ -858,10 +856,11 @@ pub fn has_infra(project: &ProjectDefinition) -> bool {
 /// Pure walk over `ProjectDefinition`; no I/O.
 pub fn compute_trigger_deps(project: &ProjectDefinition) -> Vec<(String, String)> {
     let is_infra = |place: &Located| project.nodes.iter().any(|n| n.id == place.id && n.requires_infra);
+    let graph = graph::ProjectGraph::new(project);
     let mut out: Vec<(String, String)> = Vec::new();
     for trigger in trigger_places(project) {
         let spelled_trigger = address_of(project, &trigger.id, &trigger.path);
-        for place in selection::upstream_by_wires(project, std::slice::from_ref(&trigger)) {
+        for place in selection::upstream_by_wires(&graph, std::slice::from_ref(&trigger)) {
             if is_infra(&place) {
                 out.push((address_of(project, &place.id, &place.path), spelled_trigger.clone()));
             }
@@ -1161,20 +1160,20 @@ pub fn infra_places(project: &ProjectDefinition) -> Vec<Located> {
     selection::every_place(project).into_iter().filter(|place| ids.contains(&place.id)).collect()
 }
 
-/// Whether the node `id` exists once per member (`@per_member`): every
-/// copy of it (its infra, its trigger's activation) is a member's, and
+/// Whether the node `id` exists once per instance (`@per_instance`): every
+/// copy of it (its infra, its trigger's activation) is an instance's, and
 /// none is shared. Asked of a place by its `id`, of a spelled place
 /// after `resolve_address`.
-pub fn is_per_member(project: &ProjectDefinition, id: &str) -> bool {
-    project.nodes.iter().any(|n| n.id == id && n.per_member.is_some())
+pub fn is_per_instance(project: &ProjectDefinition, id: &str) -> bool {
+    project.nodes.iter().any(|n| n.id == id && n.per_instance.is_some())
 }
 
-/// A node's validation rules, for checking a member's values on it.
+/// A node's validation rules, for checking an instance's values on it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct MemberRules {
+pub struct InstanceRules {
     /// Every rule of the node type (the declared ones, and the ones the
     /// language adds, like "no connection picked"), at every level: a
-    /// run for a member is a run, so runtime-level rules hold too.
+    /// run for an instance is a run, so runtime-level rules hold too.
     pub rules: Vec<crate::node::ValidationRule>,
     /// The output ports the source added beyond the type's own, which
     /// `custom_outputs_declared` and `{custom_outputs}` read.
@@ -1182,22 +1181,22 @@ pub struct MemberRules {
     pub custom_outputs: Vec<String>,
 }
 
-/// Every place of a node with a `@member_filled` field, spelled, with the
-/// node: what the member door lists, and what a member's values are keyed
-/// by. A node inside a file included twice is at two places, and a member
-/// fills each on its own.
-pub fn member_filled_places(project: &ProjectDefinition) -> Vec<(String, &NodeDefinition)> {
+/// Every place of a node with a `@instance_filled` field, spelled, with the
+/// node: what the instance door lists, and what an instance's values are
+/// keyed by. A node inside a file included twice is at two places, and an
+/// instance fills each on its own.
+pub fn instance_filled_places(project: &ProjectDefinition) -> Vec<(String, &NodeDefinition)> {
     selection::every_place(project)
         .into_iter()
         .filter_map(|place| {
             let node = project.nodes.iter().find(|n| n.id == place.id)?;
-            crate::member::member_filled_fields(node).next()?;
+            crate::instance::instance_filled_fields(node).next()?;
             Some((address_of(project, &place.id, &place.path), node))
         })
         .collect()
 }
 
-/// Every infra INSTANCE the program declares, each spelled the way a
+/// Every infra PLACEMENT the program declares, each spelled the way a
 /// person writes its place (`db`, or `one.db` inside the file the site
 /// `one` includes): the key its `infra_node` row is stored under. THE
 /// set every reader of those rows checks the rows against (what is
@@ -1210,23 +1209,55 @@ pub fn infra_place_spellings(project: &ProjectDefinition) -> std::collections::B
         .collect()
 }
 
+/// Which copies of its infra the program declares: each place (spelled
+/// as [`infra_place_spellings`] spells it) and whether it has one copy
+/// per instance or one shared copy. A copy it does not declare is gone
+/// from the program for good: the node was removed, or it changed sides
+/// (a node no longer per instance leaves its instances' copies behind, a
+/// node now per instance leaves its shared one).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredInfra {
+    /// Place -> whether it is per instance.
+    places: std::collections::BTreeMap<String, bool>,
+}
+
+impl DeclaredInfra {
+    pub fn of(project: &ProjectDefinition) -> Self {
+        let places = infra_place_spellings(project)
+            .into_iter()
+            .map(|spelled| {
+                let (id, _) = resolve_address(project, &spelled);
+                let per_instance = is_per_instance(project, &id);
+                (spelled, per_instance)
+            })
+            .collect();
+        Self { places }
+    }
+
+    /// Whether the program has a copy of `spelled` of this kind: a
+    /// an instance's (`instance_copy`) or the shared one.
+    pub fn declares(&self, spelled: &str, instance_copy: bool) -> bool {
+        self.places.get(spelled) == Some(&instance_copy)
+    }
+
+    /// Whether the program still declares the copy a host names.
+    pub fn declares_copy(&self, copy: &crate::infra::NodeRef) -> bool {
+        self.declares(&copy.node, copy.is_instance_copy())
+    }
+}
 
 /// Every node `seeds` depend on by following wires backward, seeds
 /// included, over the whole program (no run selection, so the frames
 /// are the root's). The scope of a setup phase (everything the
 /// triggers, or the infra nodes, need) and of an untargeted manual run.
-pub fn upstream_closure(
-    project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
-    seeds: &[String],
-) -> std::collections::HashSet<String> {
+pub fn upstream_closure(g: &impl graph::GraphView, seeds: &[String]) -> std::collections::HashSet<String> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut frontier: Vec<String> = seeds.to_vec();
     while let Some(id) = frontier.pop() {
         if !seen.insert(id.clone()) {
             continue;
         }
-        for edge in edge_idx.get_incoming(project, &id, &Vec::new()) {
+        for edge in g.edges_into(&id) {
             if !seen.contains(&edge.source) {
                 frontier.push(edge.source.clone());
             }
@@ -1299,11 +1330,11 @@ mod infra_triggers_depend_on_tests {
             outputs: vec![],
             features: NodeFeatures { is_trigger, ..Default::default() },
             requires_infra,
-            per_member: None,
+            per_instance: None,
             images: vec![],
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -1541,9 +1572,9 @@ mod infra_triggers_depend_on_tests {
     }
 
     /// Both questions are answered per PLACE, spelled: the trigger under
-    /// `one` depends on the instance under `one` and on the top-level
+    /// `one` depends on the placement under `one` and on the top-level
     /// node wired into `one`'s door; the trigger under `two` depends on
-    /// its own instance alone, because the top-level node feeds only
+    /// its own placement alone, because the top-level node feeds only
     /// `one`.
     #[test]
     fn a_file_included_twice_depends_per_call() {
@@ -1631,12 +1662,12 @@ mod project_wire_tests {
             inputs: vec![input.clone()],
             outputs: vec![],
             features: Default::default(),
-            requires_infra: false, per_member: None,
+            requires_infra: false, per_instance: None,
             images: vec![],
             fires_with: Default::default(),
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: Some(Span::single_line(1, 0, 5)),
             header_span: Some(Span::single_line(1, 0, 3)),
             config_spans: Default::default(),
@@ -1731,12 +1762,12 @@ mod project_wire_tests {
             outputs: vec![],
             features: Default::default(),
             requires_infra,
-            per_member: None,
+            per_instance: None,
             images: vec![],
             fires_with: Default::default(),
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -1776,6 +1807,32 @@ mod project_wire_tests {
             node_with_infra("c", true),
         ]);
         assert!(has_infra(&with_infra), "one infra node flips it true");
+    }
+
+    #[test]
+    fn declared_infra_names_each_place_and_its_side() {
+        let mut per_instance = node_with_infra("mine", true);
+        per_instance.per_instance = Some(crate::instance::PerInstance::Marked);
+        let project = project_with_nodes(vec![node_with_infra("db", true), per_instance, node_with_infra("plain", false)]);
+        let declared = DeclaredInfra::of(&project);
+        assert!(declared.declares("db", false));
+        assert!(!declared.declares("db", true), "a shared node has no instance copies");
+        assert!(declared.declares("mine", true));
+        assert!(!declared.declares("mine", false), "a per-instance node has no shared copy");
+        assert!(!declared.declares("plain", false), "a node without infra has no copy");
+        assert!(!declared.declares("gone", false));
+
+        let alice = crate::instance::InstanceId::new("alice").unwrap();
+        let copy = |node: &str, of: Option<&crate::instance::InstanceId>| crate::infra::NodeRef {
+            tenant: "t".into(),
+            project: project.id,
+            node: node.into(),
+            copy_id: crate::infra::NodeRef::copy_id(project.id, node, of),
+        };
+        assert!(declared.declares_copy(&copy("db", None)));
+        assert!(!declared.declares_copy(&copy("db", Some(&alice))));
+        assert!(declared.declares_copy(&copy("mine", Some(&alice))));
+        assert!(!declared.declares_copy(&copy("mine", None)));
     }
 }
 

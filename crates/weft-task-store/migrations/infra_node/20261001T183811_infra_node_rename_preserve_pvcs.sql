@@ -1,0 +1,3 @@
+ALTER TABLE infra_node RENAME COLUMN preserve_pvcs_json TO keep_disks_json;
+
+ALTER TABLE infra_node RENAME CONSTRAINT infra_node_preserve_pvcs_json_not_null TO infra_node_keep_disks_json_not_null;

@@ -20,7 +20,7 @@ import type {
   Edge as V1Edge,
   PortDefinition as V1Port,
 } from './lib/types';
-import { memberFilled, memberFilledValue } from '../protocol';
+import { instanceFilled, instanceFilledValue } from '../protocol';
 
 // THE TypeScript spelling of a group's boundary-node ids (the Rust
 // compiler mints these when it flattens a group). The two suffix
@@ -188,13 +188,13 @@ function toV1Node(n: HostNode, groupIds: Set<string>): NodeInstance {
   // MARKER ({path, type}), never resolved content, so it serializes
   // safely and renders file-backed. Put the structural ref back from
   // `fileRefs`; the resolved content is shown separately via the host's
-  // fileContents map. A `@member_filled(@file(...))` field gets its ref
+  // fileContents map. An `@instance_filled(@file(...))` field gets its ref
   // back inside the marker, as its fallback.
   const portLiterals = { ...((n.portLiterals as Record<string, unknown> | undefined) ?? {}) };
   if (n.fileRefs) {
     for (const [key, ref] of Object.entries(n.fileRefs)) {
       const marker = { __weftFileRef: { path: ref.path, type: ref.type, marker: ref.marker } };
-      portLiterals[key] = memberFilled(portLiterals[key]) ? memberFilledValue(marker) : marker;
+      portLiterals[key] = instanceFilled(portLiterals[key]) ? instanceFilledValue(marker) : marker;
     }
   }
   const parentId = resolveParentGroup(n, groupIds);
@@ -222,7 +222,7 @@ function toV1Node(n: HostNode, groupIds: Set<string>): NodeInstance {
     outputs: n.outputs.map(copyPort),
     features: n.features,
     requiresInfra: n.requiresInfra,
-    perMember: n.perMember,
+    perInstance: n.perInstance,
     scope: n.scope,
     groupBoundary: n.groupBoundary ?? undefined,
     includePath: n.includePath,

@@ -1,14 +1,15 @@
-//! weft-broker: scoped HTTP frontend in front of Postgres for
-//! tenant pods. Every endpoint validates the caller's k8s SA token
-//! via TokenReview, derives `(tenant, role)`, and runs a scope check
-//! before delegating to the underlying Postgres-direct client.
+//! weft-broker: the scoped HTTP door to Postgres for everything that is
+//! not the dispatcher. Every endpoint verifies the caller's platform
+//! identity (`weft_platform_traits::CallerIdentity`), derives what it may
+//! act for, and runs a scope check before delegating to the underlying
+//! Postgres-direct client.
 //!
 //! Trust model:
-//!   - tenant pods: untrusted; their SA token says who they are, the
-//!     broker enforces what they can touch.
-//!   - dispatcher: skips the broker entirely (god-mode DB).
-//!   - broker: trusted, has the DB credentials, isolated in its own
-//!     namespace `weft-db` with k8s NetworkPolicy.
+//!   - workers: untrusted (they run the user's program); their identity
+//!     says which project they are, the broker enforces what they touch.
+//!   - the listener and the supervisor: weft's own code, trusted to act
+//!     for any tenant, still checked per op against the resource.
+//!   - the dispatcher: reaches Postgres directly.
 
 pub mod auth;
 pub mod credential;
@@ -23,7 +24,7 @@ pub mod events;
 pub mod runtime_storage;
 pub mod runtime_store;
 pub mod scope;
-pub mod signal_placement;
+pub mod held_signals;
 pub mod state;
 
 use std::sync::Arc;
@@ -33,59 +34,43 @@ use axum::{routing::post, Router};
 pub use auth::AuthConfig;
 pub use state::BrokerState;
 
-/// Spawn the periodic expiry sweep for kept runtime files, when an
-/// object-store slot is configured. The broker owns the store, so it runs
-/// the sweep itself (not the dispatcher). Stateless + idempotent, so every
-/// broker replica may run it concurrently.
-pub fn spawn_expiry_sweep(state: Arc<BrokerState>) {
-    let Some(store) = state.runtime_store.clone() else {
-        return;
-    };
-    tokio::spawn(async move {
-        // The sweep cadence: kept files are access-bumped, so only genuinely
-        // idle survivors expire; a minute's granularity is plenty.
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
-        loop {
-            tick.tick().await;
-            match store.sweep_expired().await {
-                Ok(n) if n > 0 => tracing::info!(
-                    target: "weft_broker::runtime_store", swept = n, "expired kept runtime files"
-                ),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(
-                    target: "weft_broker::runtime_store", error = %format!("{e:#}"),
-                    "runtime-file expiry sweep failed; will retry next tick"
-                ),
+/// The broker's background loops: the expiry of kept runtime files and of
+/// abandoned connect rows. Neither is announced by any write (they are
+/// about time passing), so each runs on its interval alone. Both are
+/// stateless and idempotent, so every copy of the broker may run them.
+/// The runtime runs them where the broker is placed
+/// (`weft_task_store::drain`).
+pub fn drain_loops(state: Arc<BrokerState>) -> Vec<weft_task_store::drain::DrainLoop> {
+    use weft_task_store::drain::{DrainLoop, DrainStep};
+    let files = state.clone();
+    let connects = state;
+    vec![
+        // Kept files are access-bumped, so only idle survivors expire; a
+        // minute's granularity is plenty.
+        DrainLoop::new("runtime_file_expiry", &[], std::time::Duration::from_secs(60), move || {
+            let store = files.runtime_store.clone();
+            async move {
+                let n = store.sweep_expired().await?;
+                if n > 0 {
+                    tracing::info!(target: "weft_broker::runtime_store", swept = n, "expired kept runtime files");
+                }
+                Ok(DrainStep::Done)
             }
-        }
-    });
-}
-
-/// Spawn the periodic sweep for abandoned connect rows (a consent the
-/// user never finished, a parked outcome the editor never polled).
-/// Their TTL was only ever checked on read, so without this they live
-/// forever. Stateless + idempotent, so every broker replica may run it
-/// concurrently.
-pub fn spawn_connect_sweep(state: Arc<BrokerState>) {
-    tokio::spawn(async move {
-        // The rows go stale after 15 minutes; a five-minute cadence
-        // keeps the backlog at most a handful of rows.
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
-        loop {
-            tick.tick().await;
-            match weft_access_store::sweep_expired_connects(&state.pool).await {
-                Ok(n) if n > 0 => tracing::info!(
-                    target: "weft_broker::access_admin", swept = n,
-                    "abandoned connect rows deleted"
-                ),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(
-                    target: "weft_broker::access_admin", error = %format!("{e:#}"),
-                    "connect-row sweep failed; will retry next tick"
-                ),
+        }),
+        // Their TTL was only ever checked on read, so without this they
+        // live forever. The rows go stale after 15 minutes; a five-minute
+        // cadence keeps the backlog at most a handful of rows.
+        DrainLoop::new("connect_expiry", &[], std::time::Duration::from_secs(300), move || {
+            let pool = connects.pool.clone();
+            async move {
+                let n = weft_access_store::sweep_expired_connects(&pool).await?;
+                if n > 0 {
+                    tracing::info!(target: "weft_broker::access_admin", swept = n, "abandoned connect rows deleted");
+                }
+                Ok(DrainStep::Done)
             }
-        }
-    });
+        }),
+    ]
 }
 
 /// The most one journal record may weigh. A record is one event; the
@@ -140,23 +125,8 @@ pub fn router(state: Arc<BrokerState>) -> Router {
         .route("/v1/task/requeue", post(handlers::task_requeue))
         .route("/v1/task/complete", post(handlers::task_complete))
         .route("/v1/task/fail", post(handlers::task_fail))
-        // worker_pod
-        .route(
-            "/v1/worker_pod/register_alive",
-            post(handlers::worker_pod_register_alive),
-        )
-        .route(
-            "/v1/worker_pod/heartbeat",
-            post(handlers::worker_pod_heartbeat),
-        )
-        .route(
-            "/v1/worker_pod/mark_done",
-            post(handlers::worker_pod_mark_done),
-        )
-        .route(
-            "/v1/worker_pod/mark_done_if_idle",
-            post(handlers::worker_pod_mark_done_if_idle),
-        )
+        // The cancels for the executions a worker drives.
+        .route("/v1/task/wait_cancels", post(handlers::task_wait_cancels))
         // Infra reads
         .route(
             "/v1/infra/endpoint_url",
@@ -181,12 +151,11 @@ pub fn router(state: Arc<BrokerState>) -> Router {
         // publishing can never reach the runtime's.
         .route("/v1/access/publish", post(handlers::publish_access))
         .route("/v1/access/published", post(handlers::published_access))
-        .route("/v1/program/mint_member_token", post(program_tokens::mint_member_token))
-        // Signals (listener-only rehydrate read, by placement = pod)
-        .route(
-            "/v1/signal/list_for_pod",
-            post(handlers::signal_list_for_pod),
-        )
+        .route("/v1/program/mint_instance_token", post(program_tokens::mint_instance_token))
+        // Signals (the listener's rehydrate read)
+        .route("/v1/signal/list_held", post(handlers::signal_list_held))
+        .route("/v1/signal/get_held", post(handlers::signal_get_held))
+        .route("/v1/signal/write_kind_state", post(handlers::signal_write_kind_state))
         // Supervisor surface (pooled, trusted control-plane;
         // InfraSupervisor role only). A supervisor acts only on the
         // projects whose infra it owns (the `infra_owner` exclusive
@@ -199,6 +168,7 @@ pub fn router(state: Arc<BrokerState>) -> Router {
             "/v1/supervisor/owned_projects",
             post(handlers::supervisor_owned_projects),
         )
+        .route("/v1/supervisor/gone_copies", post(handlers::supervisor_gone_copies))
         .route(
             "/v1/supervisor/infra_nodes",
             post(handlers::supervisor_infra_nodes),
@@ -218,10 +188,6 @@ pub fn router(state: Arc<BrokerState>) -> Router {
         .route(
             "/v1/supervisor/set_status",
             post(handlers::supervisor_set_status),
-        )
-        .route(
-            "/v1/supervisor/set_scaled",
-            post(handlers::supervisor_set_scaled),
         )
         .route(
             "/v1/supervisor/remove_node",

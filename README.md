@@ -141,11 +141,11 @@ The whole thing is a runnable project in [`examples/whatsapp-support-bot/`](exam
 
 ## Try it
 
-You need [Docker](https://docs.docker.com/get-docker/),
-[kubectl](https://kubernetes.io/docs/tasks/tools/),
-[kind](https://kind.sigs.k8s.io/) and [Rust](https://rustup.rs/).
-The installer sets up a local Kubernetes cluster, the `weft` command and
-the VS Code extension. The extension also installs from the store in VS Code
+You need [Docker](https://docs.docker.com/get-docker/), and
+[Rust](https://rustup.rs/) if the installer has to build the CLI itself (it
+tells you when). The installer sets up weft's runtime on your machine, the
+`weft` command and the VS Code extension. The extension also installs from
+the store in VS Code
 forks such as Devin Desktop. We are working on a CLI-only version, support for other IDEs and a cloud hosted version. If the extension does not install
 automatically, follow the manual instructions the installer prints.
 
@@ -153,7 +153,7 @@ automatically, follow the manual instructions the installer prints.
 git clone https://github.com/WeaveMindAI/weft.git
 cd weft
 ./setup.sh
-weft new hello --assistant claude-code
+weft new hello --assistant claude-code --remember
 cd hello
 weft run
 ```
@@ -161,7 +161,7 @@ weft run
 Open `hello/main.weft` in VS Code to see the program as a graph. Open the
 same project in your coding assistant and tell Tangle what you want to build.
 Claude Code is the example here; you pick your assistant with `--assistant`, and
-weft remembers it for your next project.
+`--remember` makes it the default, so your next `weft new` needs no flag.
 
 If the installer reports a missing tool, it prints where to get it. If your
 shell cannot find `weft`, use the PATH line it printed. For installation
@@ -303,9 +303,7 @@ Weft is early, and breaking changes are still possible. This is what we are work
 - implementing our own Tangle cli. In a proof-of-concept, our Tangle prototype wrote
   a working program from a brief in under five minutes. The released version is
   slower because existing coding ai spent too much time on fluff that are worthless for weft.
-- running outside Kubernetes (a local LLM, or an AWS, GCP or Azure service) and
-  connecting it to the rest of the runtime;
-- a guide to deploying weft on your cloud provider.
+- installing weft on AWS and Azure, the way it installs on GCP today.
 
 For more detail, read [the roadmap](https://weavemindai.github.io/weft/appendix/roadmap.html).
 

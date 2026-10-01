@@ -78,15 +78,28 @@ pub struct LiveRequest {
     pub headers: Vec<(String, String)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller: Option<Value>,
+    /// The address the caller reached this install at (its request's own
+    /// `Host` / `X-Forwarded-*`, [`crate::net::request_base_url_of`]),
+    /// stated by the birth that read the arriving request. What a link
+    /// this caller will fetch is built on (a route's answer carrying a
+    /// file): a browser on the loopback port gets a loopback link, one
+    /// on the tunnel a tunnel link. `None` for a run no real request
+    /// started (`weft run --fire`), whose links fall back to the
+    /// install's configured address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+}
+
+/// A header's value out of a name/value list, case-insensitively, as
+/// HTTP headers are read.
+fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
 }
 
 impl LiveRequest {
     /// Read a header case-insensitively, as HTTP headers are.
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
+        find_header(&self.headers, name)
     }
 }
 
@@ -133,9 +146,55 @@ impl ResponseHead {
         self
     }
 
+    /// Read a header the head carries, case-insensitively.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        find_header(&self.headers, name)
+    }
+
     /// Does the head already name a content type?
     pub fn has_content_type(&self) -> bool {
-        self.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+        self.header("content-type").is_some()
+    }
+
+    /// The content type the head names, without its parameters, lower
+    /// case (`application/x-ndjson` for `application/x-ndjson; charset=utf-8`).
+    fn content_type_essence(&self) -> Option<String> {
+        self.header("content-type").map(|v| v.split(';').next().unwrap_or("").trim().to_ascii_lowercase())
+    }
+
+    /// The bytes that tell a reader of this body the program failed,
+    /// once the status line is already out: in the body's own framing,
+    /// so a reader parsing it gets the error as an item it can read.
+    /// JSON lines get one line `{"error": "..."}`, server-sent events an
+    /// `error` event, anything else a text line `[error] ...`. Each
+    /// starts on a fresh line, since the last item may not have ended
+    /// one (a blank line is skipped by a JSON-lines or SSE reader).
+    pub fn in_band_error(&self, message: &str) -> Vec<u8> {
+        const JSON_LINES: &[&str] = &[
+            "application/x-ndjson",
+            "application/ndjson",
+            "application/jsonl",
+            "application/x-jsonl",
+            "application/jsonlines",
+            "application/x-jsonlines",
+        ];
+        let essence = self.content_type_essence();
+        match essence.as_deref() {
+            Some(ct) if JSON_LINES.contains(&ct) => {
+                format!("\n{}\n", serde_json::json!({ "error": message })).into_bytes()
+            }
+            Some("text/event-stream") => {
+                let mut out = String::from("\nevent: error\n");
+                for line in message.split('\n') {
+                    out.push_str("data: ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                out.push('\n');
+                out.into_bytes()
+            }
+            _ => format!("\n[error] {message}").into_bytes(),
+        }
     }
 
     /// The head with a content type matching the chunk's shape
@@ -243,8 +302,8 @@ pub const DEFAULT_INBOUND_WINDOW: usize = 64;
 /// that may be suspended outlives the caller, so it keeps running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisconnectAction {
-    /// Cancel THIS execution (via the per-execution cancel-by-color
-    /// path). Never the pod, which multiplexes many runs.
+    /// Cancel THIS execution (via the per-execution cancel-by-execution
+    /// path). Never the process, which multiplexes many runs.
     CancelExecution,
     /// Keep running to completion; further sends to the caller go into
     /// the void.
@@ -385,6 +444,11 @@ pub fn try_send_head(wire_started: bool) -> Result<(), CallerError> {
     }
 }
 
+/// Why a run whose HTTP caller never heard a word ended badly: every path
+/// to its answer closed. Said to the caller and recorded on the run.
+pub const NO_ANSWER: &str = "the run ended without answering: every path to its Reply (or Stream, or Close) \
+     was skipped, usually because a value it waited on never arrived";
+
 /// One outbound message the node hands the connection layer. The layer
 /// encodes it to the wire per the declared `DataType`. A general
 /// send-value the connection adapts, rather than a per-protocol shape.
@@ -440,13 +504,23 @@ pub trait CallerConnection: Send + Sync {
     /// can pick the right terminal without a refusal round-trip.
     fn wire_started(&self) -> bool;
 
+    /// Is an HTTP caller still on the line with nothing sent to it yet?
+    /// A run that completes in that state answered nobody, which is a
+    /// bug in its graph, so the run is recorded as failed (and its
+    /// caller gets the error) rather than as a clean completion. Only a
+    /// real caller is owed an answer: a fired run's stand-in and the
+    /// test fake are not.
+    fn owes_answer(&self) -> bool {
+        false
+    }
+
     /// Is the caller still attached? Returns immediately, never waits:
     /// `Ok(())` when the socket is there, otherwise the resolved
     /// disconnect outcome (under `cancel` a `Disconnected`, under
     /// `keep-running` an `Ok(())` into the void).
     ///
     /// The bounded wait for a caller to show up happens once, earlier:
-    /// `run_pod::attach_live_caller` waits on `wait_for_attach` for
+    /// `run_instance::attach_live_caller` waits on `wait_for_attach` for
     /// `connect_timeout_secs` before the run starts. A no-show leaves
     /// the run with no caller at all, and `ctx.caller()` fails.
     async fn ensure_connected(&self) -> Result<(), CallerError>;
@@ -1216,6 +1290,26 @@ mod tests {
     }
 
     #[test]
+    fn in_band_error_speaks_the_body_framing() {
+        let head = |ct: &str| ResponseHead::new(200).with_header("Content-Type", ct);
+        let line = head("application/x-ndjson; charset=utf-8").in_band_error("the model \"failed\"");
+        let text = String::from_utf8(line).unwrap();
+        assert!(text.starts_with('\n') && text.ends_with('\n'), "{text:?}");
+        let parsed: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(parsed, serde_json::json!({ "error": "the model \"failed\"" }));
+        for ct in ["application/ndjson", "application/jsonl", "APPLICATION/X-JSONLINES"] {
+            let text = String::from_utf8(head(ct).in_band_error("boom")).unwrap();
+            assert_eq!(text, "\n{\"error\":\"boom\"}\n", "{ct}");
+        }
+        assert_eq!(
+            String::from_utf8(head("text/event-stream").in_band_error("a\nb")).unwrap(),
+            "\nevent: error\ndata: a\ndata: b\n\n",
+        );
+        assert_eq!(head("text/plain; charset=utf-8").in_band_error("boom"), b"\n[error] boom");
+        assert_eq!(ResponseHead::new(200).in_band_error("boom"), b"\n[error] boom", "no content type is text");
+    }
+
+    #[test]
     fn inbound_size_cap() {
         assert!(check_inbound_size(100, 100).is_ok(), "at cap is allowed");
         assert!(check_inbound_size(99, 100).is_ok());
@@ -1410,8 +1504,10 @@ mod tests {
         let mut req = LiveRequest { method: "GET".into(), path: "users/me".into(), ..Default::default() };
         req.query.insert("verbose".into(), "1".into());
         req.caller = Some(serde_json::json!({"key": 0}));
+        req.base_url = Some("http://127.0.0.1:14111".into());
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["method"], "GET");
+        assert_eq!(v["base_url"], "http://127.0.0.1:14111");
         assert!(v.get("params").is_none(), "empty maps are omitted on the wire");
         assert_eq!(serde_json::from_value::<LiveRequest>(v).unwrap(), req);
 

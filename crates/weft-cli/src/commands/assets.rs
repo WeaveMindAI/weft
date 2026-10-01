@@ -14,30 +14,50 @@ use weft_assets::{AssetSource, AssetStore};
 
 use crate::client::DispatcherClient;
 
-/// Collect, sync, and resolve the definition's `@asset` refs, in place.
-/// Even an empty reference set is published, so removing the last uploaded
-/// file starts its expiry countdown. A text-typed `@asset` from a URL or a stored
-/// key is fetched here, at build, and cast to its declared type (the same
-/// cast a project-file `@file` gets at parse).
-///
-/// Hands back the publish's warnings (a version whose stored file is
-/// gone), for the caller to show; empty without `publish`.
-pub async fn resolve_project_assets(
+/// What the author's machine resolves of a definition's `@asset` refs
+/// before a build: every file ref's stored-file value (the files synced to
+/// the tenant's assets first), every stored-key ref's, and every text
+/// ref's fetched-and-cast value, by resolution key. The build sends the map
+/// with the version; the install re-reads each stored file it names.
+pub struct AssetResolutions {
+    pub map: BTreeMap<String, serde_json::Value>,
+    /// Stored-key refs whose SOURCE file a future build still needs, even
+    /// when this build inlined its content (a text-typed stored asset).
+    source_refs: Vec<weft_core::project::FileRef>,
+}
+
+/// Resolve the definition's `@asset` refs to the map a build sends
+/// (see [`AssetResolutions`]). With `publish`, a referenced file the asset
+/// plane lacks is uploaded; without, it is an error naming `weft bake`.
+pub async fn asset_resolutions(
     client: &DispatcherClient,
     project_root: &std::path::Path,
-    definition: &mut weft_core::project::ProjectDefinition,
-    sources: Option<&weft_core::project::hash::Manifest>,
+    definition: &weft_core::project::ProjectDefinition,
     publish: bool,
+) -> Result<AssetResolutions> {
+    let (map, key_refs, text_refs) = resolve_asset_map(client, project_root, definition, publish).await?;
+    let source_refs = key_refs
+        .into_iter()
+        .chain(text_refs.into_iter().filter(weft_compiler::file_ref::is_runtime_key_ref))
+        .collect();
+    Ok(AssetResolutions { map, source_refs })
+}
+
+/// Tell the store which assets the project's current source references,
+/// so a file no source uses any more starts expiring. `definition` is the
+/// RESOLVED program (its stored-file values name what it uses); `sources`
+/// adds the version's own blobs. Answers the store's warnings (a version
+/// whose stored file is gone), for the caller to show.
+pub async fn publish_references(
+    client: &DispatcherClient,
+    definition: &weft_core::project::ProjectDefinition,
+    resolutions: &AssetResolutions,
+    sources: Option<&weft_core::project::hash::Manifest>,
 ) -> Result<Vec<String>> {
-    let project_id = definition.id.to_string();
-    let (key_refs, text_refs) = resolve_assets(client, project_root, &project_id, definition, publish).await?;
-    if !publish { return Ok(Vec::new()); }
-    // Publish only after every reference resolved successfully. This includes
-    // uploaded files selected by stored key, not just this build's disk refs.
-    let mut references = asset_references(definition, key_refs.iter().chain(text_refs.iter().filter(|r| weft_compiler::file_ref::is_runtime_key_ref(r))))?;
+    let mut references = asset_references(definition, resolutions.source_refs.iter())?;
     if let Some(sources) = sources {
-        let scope = weft_core::storage::key::KeyScope::Asset { project_id: definition.id.to_string() };
-        for hash in sources.values().filter(|hash| !hash.is_empty()) {
+        let scope = weft_core::storage::key::KeyScope::Asset;
+        for hash in sources.values() {
             references.keys.push(weft_core::storage::key::scope_key(&scope, hash).map_err(anyhow::Error::msg)?);
         }
     }
@@ -46,7 +66,7 @@ pub async fn resolve_project_assets(
     if !(200..300).contains(&status) {
         // The build's own file is what is missing here (a version's is a
         // warning, never a refusal): the upload just made did not land.
-        bail!("update project asset lifetimes: {}\nRun the command again; if it repeats, `weft files ls` shows what storage holds for this project",
+        bail!("update project asset lifetimes: {}\nRun the command again; if it repeats, `weft files ls` shows what storage holds for your account",
             if text.trim().is_empty() { format!("dispatcher returned {status}") } else { text.trim().to_string() });
     }
     let published: weft_core::storage::AssetsPublished = serde_json::from_str(&text).context("parse the publish answer")?;
@@ -55,42 +75,42 @@ pub async fn resolve_project_assets(
 
 /// Resolve the `@file` and `@asset` markers in a run's handed values
 /// (`--emit`, `--from`, `--group`, `--fire`, or a saved example) exactly
-/// as the build resolves the same markers written in source: a `@file`
+/// as a build resolves the same markers written in source: a `@file`
 /// read from the project and cast to its type, an `@asset` uploaded into
-/// the project's asset storage (or fetched, or looked up) and replaced by
+/// the tenant's assets (or fetched, or looked up) and replaced by
 /// the value its declared type stands for. An uploaded file is not added
 /// to the project's published assets, so it lives on the store's own
 /// countdown, which every read of it pushes back.
 pub async fn resolve_run_values(
     client: &DispatcherClient,
     project_root: &std::path::Path,
-    project_id: &str,
     spec: &mut weft_core::run_spec::RunSpec,
 ) -> Result<()> {
     let fs = weft_compiler::CompileFs::disk(project_root);
     weft_compiler::file_ref::resolve_file_markers(spec, &fs)
         .map_err(|errs| anyhow::anyhow!("a run value cannot be read:\n  {}", errs.join("\n  ")))?;
-    resolve_assets(client, project_root, project_id, spec, true).await?;
+    let (map, _, _) = resolve_asset_map(client, project_root, &*spec, true).await?;
+    weft_compiler::file_ref::apply_asset_resolutions(spec, &map)
+        .map_err(|errs| anyhow::anyhow!("unresolved assets:\n  {}", errs.join("\n  ")))?;
     Ok(())
 }
 
 /// The asset step both callers share: sync the file-kind `@asset`s on
-/// disk, look up the stored-key ones, fetch and cast the text ones, and
-/// put every resolved value in place of its marker. Hands back the
-/// stored-key and text refs, which the build's publish names.
-async fn resolve_assets(
+/// disk, look up the stored-key ones, fetch and cast the text ones. Hands
+/// back every resolved value by resolution key, and the stored-key and
+/// text refs, which a build's publish names.
+async fn resolve_asset_map(
     client: &DispatcherClient,
     project_root: &std::path::Path,
-    project_id: &str,
-    target: &mut impl weft_compiler::file_ref::MarkedValues,
+    target: &impl weft_compiler::file_ref::MarkedValues,
     publish: bool,
-) -> Result<(Vec<weft_core::project::FileRef>, Vec<weft_core::project::FileRef>)> {
+) -> Result<(BTreeMap<String, serde_json::Value>, Vec<weft_core::project::FileRef>, Vec<weft_core::project::FileRef>)> {
     let refs = weft_compiler::file_ref::collect_asset_refs(target);
     let mut map = if refs.is_empty() {
         BTreeMap::new()
     } else {
         let source = DiskSource::new(project_root.to_path_buf());
-        let mut store = DispatcherStore::new(client, project_id.to_string());
+        let mut store = DispatcherStore::new(client);
         store.publish = publish;
         weft_assets::sync_assets(&refs, &source, &store).await.context("sync project assets")?
     };
@@ -114,14 +134,13 @@ async fn resolve_assets(
     // is inlined into the build, so no stored copy would be referenced.
     let text_refs = weft_compiler::file_ref::collect_text_refs(target);
     if !text_refs.is_empty() {
-        let project = Some(project_id.to_string());
         let http = reqwest::Client::new();
         let mut failed: Vec<String> = Vec::new();
         for r in &text_refs {
             let fetched: Result<Vec<u8>> = if weft_compiler::file_ref::is_url_ref(r) {
                 fetch_url_bytes(&http, &r.path).await
             } else if weft_compiler::file_ref::is_runtime_key_ref(r) {
-                crate::commands::files::download_bytes(client, &r.path, &project).await
+                crate::commands::files::download_bytes(client, &r.path).await
             } else {
                 let path = std::path::Path::new(&r.path);
                 let full = if path.is_absolute() { path.to_path_buf() } else { project_root.join(path) };
@@ -140,9 +159,27 @@ async fn resolve_assets(
             bail!("text assets could not be fetched:\n  {}", failed.join("\n  "));
         }
     }
-    weft_compiler::file_ref::apply_asset_resolutions(target, &map)
+    Ok((map, key_refs, text_refs))
+}
+
+/// Resolve the definition's `@asset` refs in place (for a caller that
+/// hashes or reads the resolved program itself: `weft status`'s drift,
+/// the editor's preview), and with `publish`, record the references.
+/// Hands back the publish's warnings; empty without `publish`.
+pub async fn resolve_project_assets(
+    client: &DispatcherClient,
+    project_root: &std::path::Path,
+    definition: &mut weft_core::project::ProjectDefinition,
+    publish: bool,
+) -> Result<Vec<String>> {
+    let resolutions = asset_resolutions(client, project_root, definition, publish).await?;
+    weft_compiler::file_ref::apply_asset_resolutions(definition, &resolutions.map)
         .map_err(|errs| anyhow::anyhow!("unresolved assets:\n  {}", errs.join("\n  ")))?;
-    Ok((key_refs, text_refs))
+    if !publish {
+        return Ok(Vec::new());
+    }
+    // Published only after every reference resolved.
+    publish_references(client, definition, &resolutions, None).await
 }
 
 fn asset_references<'a>(
@@ -157,9 +194,8 @@ fn asset_references<'a>(
     // A text-typed stored asset is read at build time and becomes plain text
     // in the definition. Its SOURCE still needs the file for future builds.
     // Keep those source keys too; the dispatcher adds the authenticated tenant.
-    let asset_prefix = format!("asset/{}/", definition.id);
     for reference in source_refs {
-        if reference.path.starts_with(&asset_prefix)
+        if reference.path.starts_with("asset/")
             && weft_core::storage::key::is_scope_key(&reference.path)
         {
             references.keys.push(reference.path.clone());
@@ -222,49 +258,48 @@ impl AssetSource for DiskSource {
     }
 }
 
-/// The dispatcher-backed asset plane: control calls go to the dispatcher's
-/// storage surface, bytes go straight to the bucket on the presigned part
-/// URLs it returns (the same contract the editor's upload field drives).
+/// The dispatcher-backed assets of the caller's tenant: control calls go to
+/// the dispatcher's storage surface, bytes go straight to the bucket on the
+/// presigned part URLs it returns (the same contract the editor's upload
+/// field drives).
 pub(crate) struct DispatcherStore<'a> {
     publish: bool,
     client: &'a DispatcherClient,
-    project: String,
     /// For the presigned part PUTs (bucket-direct; not dispatcher traffic).
     http: reqwest::Client,
 }
 
 impl<'a> DispatcherStore<'a> {
-    pub(crate) fn new(client: &'a DispatcherClient, project: String) -> Self {
-        Self { client, project, http: reqwest::Client::new(), publish: true }
+    pub(crate) fn new(client: &'a DispatcherClient) -> Self {
+        Self { client, http: reqwest::Client::new(), publish: true }
     }
 }
 
 #[async_trait::async_trait]
 impl AssetStore for DispatcherStore<'_> {
 
-    async fn list(&self) -> Result<BTreeMap<String, String>> {
+    async fn held(&self, hashes: &[String]) -> Result<BTreeMap<String, String>> {
         let resp = self
             .client
-            .post_json("/storage/assets/list", &serde_json::json!({ "project": self.project }))
+            .post_json(
+                "/storage/assets/held",
+                &serde_json::to_value(weft_core::storage::AssetsHeldRequest { hashes: hashes.to_vec() })?,
+            )
             .await
-            .context("list project assets")?;
-        let listing: weft_core::storage::ListFilesResponse =
-            serde_json::from_value(resp).context("parse project asset listing")?;
-        let mut out = BTreeMap::new();
-        for file in listing.files {
-            let key = &file.key;
-            // The asset key's id segment IS the content hash. Parse through
-            // the one key grammar and fail loud on anything else: a
-            // malformed entry silently registered as a "hash" would corrupt
-            // the sync's diff and re-upload real content.
+            .context("ask which contents are already stored")?;
+        let held: weft_core::storage::AssetsHeldResponse =
+            serde_json::from_value(resp).context("parse the stored-contents answer")?;
+        // Each key must be the asset its hash names. Parsed through the one
+        // key grammar and failed loud on anything else: an entry taken on
+        // faith would skip uploading content the store does not hold.
+        for (hash, key) in &held.keys {
             let parsed = weft_core::storage::key::parse_key(key)
-                .map_err(|e| anyhow::anyhow!("asset listing returned a malformed key: {e}"))?;
-            if !weft_core::storage::is_content_hash(&parsed.id) {
-                bail!("asset listing returned a non-content-hash id in key '{key}'");
+                .map_err(|e| anyhow::anyhow!("the stored-contents answer holds a malformed key: {e}"))?;
+            if parsed.scope != weft_core::storage::key::KeyScope::Asset || &parsed.id != hash {
+                bail!("the stored-contents answer names '{key}' for {hash}, which is not that content's asset");
             }
-            out.insert(parsed.id, key.to_string());
         }
-        Ok(out)
+        Ok(held.keys)
     }
 
     async fn upload(
@@ -275,7 +310,7 @@ impl AssetStore for DispatcherStore<'_> {
         size_bytes: u64,
         bytes: &mut (dyn Read + Send),
     ) -> Result<String> {
-        anyhow::ensure!(self.publish, "asset '{filename}' is not stored for this project; run `weft bake` to publish the current files and capture trigger settings");
+        anyhow::ensure!(self.publish, "asset '{filename}' is not stored in your account's assets yet; run `weft bake` to publish the current files and capture trigger settings");
         // NOT wrapped in a Ctrl-C handler, and that is deliberate.
         //
         // Cancelling the upload on an interrupt looks right and costs too
@@ -321,7 +356,11 @@ impl DispatcherStore<'_> {
         self.client
             .post_with_body(
                 "/storage/upload/part-done",
-                &serde_json::json!({ "key": key, "part_number": part.part_number, "etag": etag }),
+                &serde_json::to_value(weft_core::storage::PartDoneRequest {
+                    key: key.to_string(),
+                    part_number: part.part_number,
+                    etag,
+                })?,
             )
             .await
             .context("report asset part")?;
@@ -342,14 +381,12 @@ impl DispatcherStore<'_> {
                 .client
                 .post_json_status(
                     "/storage/upload/begin",
-                    // SYNC: begin body <-> crates/weft-dispatcher/src/api/storage.rs EditorUploadBeginRequest
-                    &serde_json::json!({
-                        "project": self.project,
-                        "mime_type": mime,
-                        "filename": filename,
-                        "declared_size": size_bytes,
-                        "content_hash": hash,
-                    }),
+                    &serde_json::to_value(weft_core::storage::AssetUploadBeginRequest {
+                        mime_type: mime.to_string(),
+                        filename: filename.to_string(),
+                        declared_size: Some(size_bytes),
+                        content_hash: hash.to_string(),
+                    })?,
                 )
                 .await
                 .context("begin asset upload")?;
@@ -373,12 +410,15 @@ impl DispatcherStore<'_> {
                     // another publish of the same asset running right now.
                     // Carrying on with it is safe either way, because a part is
                     // reserved by NUMBER and both writers put identical bytes in
-                    // it, so whichever finishes first is the answer for both.
+                    // it. The first to call complete claims the upload; from
+                    // then on the store refuses the other's changes as
+                    // "completing", and that one waits for the file to land
+                    // (see the error path below).
                     let (rstatus, rbody) = self
                         .client
                         .post_json_status(
                             "/storage/upload/resume",
-                            &serde_json::json!({ "key": begin.key }),
+                            &serde_json::to_value(weft_core::storage::UploadResumeRequest { key: begin.key.clone() })?,
                         )
                         .await
                         .context("resume the earlier upload of this content")?;
@@ -512,59 +552,84 @@ impl DispatcherStore<'_> {
                     .client
                     .post_json(
                         "/storage/upload/parts",
-                        &serde_json::json!({
-                            "key": key,
-                            "parts": [{ "part_number": part_number, "size_bytes": want }],
-                        }),
+                        &serde_json::to_value(weft_core::storage::UploadPartsRequest {
+                            key: key.clone(),
+                            parts: vec![weft_core::storage::PartAsk { part_number, size_bytes: want as u64 }],
+                        })?,
                     )
                     .await
                     .context("reserve asset part")?;
-                let part = parts
-                    .get("parts")
-                    .and_then(|v| v.as_array())
-                    .and_then(|a| a.first())
-                    .context("upload/parts returned no part")?;
-                let part: weft_core::storage::PresignedPart =
-                    serde_json::from_value(part.clone()).context("parse the reserved part")?;
+                let parts: weft_core::storage::UploadPartsResponse =
+                    serde_json::from_value(parts).context("parse the reserved part")?;
+                let part = parts.parts.into_iter().next().context("upload/parts returned no part")?;
                 self.put_part(&key, &part, &buf[..want]).await?;
                 sent += want as u64;
             }
 
             self.client
-                .post_json("/storage/upload/complete", &serde_json::json!({ "key": key }))
+                .post_json(
+                    "/storage/upload/complete",
+                    &serde_json::to_value(weft_core::storage::UploadCompleteRequest { key: key.clone() })?,
+                )
                 .await
                 .context("complete asset upload")?;
             Ok(key)
         }.await;
-        match transferred {
-            Ok(uploaded) => Ok(uploaded),
-            Err(error) => {
-                // Any transfer step can lose to another publisher finishing
-                // these same content-addressed bytes. Confirm the final state
-                // once, without retrying the upload or interpreting error text.
-                if let Some(key) = upload_key {
-                    let stored = self.client.get_json_if_found(&format!("/storage/files/meta/{key}")).await
-                        .with_context(|| format!("{error:#}; could not determine whether another publisher completed this asset"))?;
-                    if let Some(stored) = stored {
-                        let meta: weft_core::storage::StoredFileMeta = serde_json::from_value(stored)
-                            .with_context(|| format!("{error:#}; the store's answer about {key} did not parse"))?;
-                        // The key is the content hash the store was told at
-                        // begin, and the store checks only the assembled
-                        // size, so this confirms a finished upload under
-                        // this key, not the bytes themselves.
-                        anyhow::ensure!(
-                            meta.key == key && meta.size_bytes == size_bytes,
-                            "{error:#}; the store holds {} under {key} at {} bytes where {filename} is {size_bytes} bytes, \
-                             so that upload is not this content",
-                            meta.key, meta.size_bytes
-                        );
-                        return Ok(key);
-                    }
-                }
-                Err(error)
+        let error = match transferred {
+            Ok(uploaded) => return Ok(uploaded),
+            Err(error) => error,
+        };
+        // Any transfer step can lose to another publisher finishing these
+        // same content-addressed bytes. When the store said so outright (a
+        // "completing" refusal), the file is about to land: wait for it with
+        // the same bounded backoff the engine gives a completion. Otherwise
+        // look once, without retrying the upload or interpreting error text.
+        let Some(key) = upload_key else { return Err(error) };
+        let completing = error.chain().any(|cause| cause.is::<crate::client::StoreCompleting>());
+        let mut attempt = 0;
+        loop {
+            let stored = self.client.get_json_if_found(&format!("/storage/files/meta/{key}")).await
+                .with_context(|| format!("{error:#}; could not determine whether another publisher completed this asset"))?;
+            if let Some(stored) = stored {
+                let meta: weft_core::storage::StoredFileMeta = serde_json::from_value(stored)
+                    .with_context(|| format!("{error:#}; the store's answer about {key} did not parse"))?;
+                // The key is the content hash the store was told at begin,
+                // and the store checks only the assembled size, so this
+                // confirms a finished upload under this key, not the bytes
+                // themselves.
+                anyhow::ensure!(
+                    meta.key == key && meta.size_bytes == size_bytes,
+                    "{error:#}; the store holds {} under {key} at {} bytes where {filename} is {size_bytes} bytes, \
+                     so that upload is not this content",
+                    meta.key, meta.size_bytes
+                );
+                return Ok(key);
             }
+            if !completing {
+                return Err(error);
+            }
+            let Some(delay) = completing_wait(attempt) else {
+                bail!(
+                    "{error:#}; another publish of {filename} was completing it as {key}, and the file \
+                     had not landed after waiting. The store finishes or ends that upload on its own; \
+                     run the command again"
+                );
+            };
+            tokio::time::sleep(delay).await;
+            attempt += 1;
         }
     }
+}
+
+/// How long to wait before looking again for a file another caller is
+/// completing, after `attempt` looks found nothing; `None` once the wait is
+/// over. 1s doubling, capped at 30s, twelve times: about four minutes, near
+/// the store's completion lease, after which its sweep finishes or ends the
+/// upload itself.
+// SYNC: completion backoff <-> crates/weft-engine/src/storage.rs COMPLETE_ATTEMPTS / complete_until_landed
+fn completing_wait(attempt: u32) -> Option<std::time::Duration> {
+    const ATTEMPTS: u32 = 12;
+    (attempt < ATTEMPTS).then(|| std::time::Duration::from_secs(1u64 << attempt.min(5)).min(std::time::Duration::from_secs(30)))
 }
 
 #[cfg(test)]
@@ -588,6 +653,54 @@ mod tests {
         assert_eq!(weft_assets::hash_reader(reader).unwrap().1, 8);
     }
 
+    /// The wait for a file another caller is completing has the engine's
+    /// shape: 1s doubling, capped at 30s, then over.
+    #[test]
+    fn the_completing_wait_doubles_caps_and_ends() {
+        let waits: Vec<u64> = (0..).map_while(completing_wait).map(|d| d.as_secs()).collect();
+        assert_eq!(waits, [1, 2, 4, 8, 16, 30, 30, 30, 30, 30, 30, 30]);
+    }
+
+    /// Two publishes of the same new content: the other one claimed the
+    /// completion, so this one's complete is refused as "completing" and the
+    /// file is not there yet on the first look. It waits and gets the file.
+    #[tokio::test]
+    async fn a_completing_refusal_waits_for_the_other_publish_to_land() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let part_url = format!("{base}/part");
+        let looks = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let app = Router::new().fallback(move |uri: Uri| {
+            let part_url = part_url.clone();
+            let looks = looks.clone();
+            async move {
+                let value = match uri.path() {
+                    "/storage/upload/begin" => serde_json::json!({"key":"asset/hash", "part_size":4, "resume":false}),
+                    "/storage/upload/parts" => serde_json::json!({"parts":[{"part_number":1,"size_bytes":4,"offset_bytes":0,"url":part_url}]}),
+                    "/part" => return (StatusCode::OK, [("etag", "part-1")], "").into_response(),
+                    "/storage/upload/part-done" => serde_json::json!({}),
+                    "/storage/upload/complete" => {
+                        return (StatusCode::CONFLICT, [(weft_core::storage::COMPLETING_HEADER, "retry")], "completing").into_response();
+                    }
+                    "/storage/files/meta/asset/hash" => {
+                        if looks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                            return (StatusCode::NOT_FOUND, [("x-weft-not-found", "file")], "missing file").into_response();
+                        }
+                        serde_json::json!({"key":"asset/hash","mimeType":"text/plain","sizeBytes":4,"filename":"test","keep":false,"createdAtUnix":0,"version":1})
+                    }
+                    _ => return (StatusCode::NOT_FOUND, "unexpected request").into_response(),
+                };
+                Json(value).into_response()
+            }
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let client = DispatcherClient::new(base, None);
+        let store = DispatcherStore::new(&client);
+        let result = store.transfer("hash", "text/plain", "test", 4, &mut &b"data"[..]).await;
+        server.abort();
+        assert_eq!(result.unwrap(), "asset/hash");
+    }
+
     #[tokio::test]
     async fn another_publisher_can_finish_at_any_upload_step() {
       for completed_elsewhere in [true, false] {
@@ -599,27 +712,27 @@ mod tests {
                 let part_url = part_url.clone();
                 async move {
                     if uri.path() == failed_path { return (StatusCode::CONFLICT, "upload no longer pending").into_response(); }
-                    if uri.path() == "/storage/files/meta/asset/p/hash" && !completed_elsewhere {
+                    if uri.path() == "/storage/files/meta/asset/hash" && !completed_elsewhere {
                         return (StatusCode::NOT_FOUND, [("x-weft-not-found", "file")], "missing file").into_response();
                     }
                     let value = match uri.path() {
-                        "/storage/upload/begin" => serde_json::json!({"key":"asset/p/hash", "part_size":4, "resume":failed_path.ends_with("resume")}),
+                        "/storage/upload/begin" => serde_json::json!({"key":"asset/hash", "part_size":4, "resume":failed_path.ends_with("resume")}),
                         "/storage/upload/parts" => serde_json::json!({"parts":[{"part_number":1,"size_bytes":4,"offset_bytes":0,"url":part_url}]}),
                         "/part" => return (StatusCode::OK, [("etag", "part-1")], "").into_response(),
                         "/storage/upload/part-done" => serde_json::json!({}),
-                        "/storage/files/meta/asset/p/hash" => serde_json::json!({"key":"asset/p/hash","mimeType":"text/plain","sizeBytes":4,"filename":"test","keep":false,"createdAtUnix":0}),
+                        "/storage/files/meta/asset/hash" => serde_json::json!({"key":"asset/hash","mimeType":"text/plain","sizeBytes":4,"filename":"test","keep":false,"createdAtUnix":0,"version":1}),
                         _ => return (StatusCode::NOT_FOUND, "unexpected request").into_response(),
                     };
                     Json(value).into_response()
                 }
             });
             let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
-            let client = DispatcherClient::new(base);
-            let store = DispatcherStore::new(&client, "p".into());
+            let client = DispatcherClient::new(base, None);
+            let store = DispatcherStore::new(&client);
             let result = store.transfer("hash", "text/plain", "test", 4, &mut &b"data"[..]).await;
             server.abort();
             if completed_elsewhere {
-                assert_eq!(result.unwrap(), "asset/p/hash", "failure at {failed_path}");
+                assert_eq!(result.unwrap(), "asset/hash", "failure at {failed_path}");
             } else {
                 assert!(result.is_err(), "failure at {failed_path} cannot succeed without stored content");
             }
@@ -635,10 +748,10 @@ mod tests {
         let make_ref = |path: String| FileRef {
             path, marker: FileMarker::Asset, ty: WeftType::parse("String").unwrap(),
         };
-        let own = format!("asset/{}/{}", project.id, "a".repeat(64));
+        let own = format!("asset/{}", "a".repeat(64));
         let refs = [
             make_ref(own.clone()),
-            make_ref(format!("asset/other-project/{}", "b".repeat(64))),
+            make_ref("asset/logo.png".into()),
             make_ref("exec/c/generated".into()),
         ];
         assert_eq!(asset_references(&project, refs.iter()).unwrap().keys, vec![own]);

@@ -6,13 +6,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::frames::LoopFrames;
-use crate::Color;
+use crate::project::ProjectDefinition;
+use crate::ExecutionId;
 
 /// A unit of data flowing between nodes in an execution. Pulses carry
-/// their own execution identity (color) and a frame stack (`frames`)
+/// their own execution identity (execution) and a frame stack (`frames`)
 /// identifying which iteration of which (nested) loop the pulse belongs
 /// to. Nodes fire when all required inputs have a pulse with matching
-/// `(color, frames)` at the exact same frame stack.
+/// `(execution_id, frames)` at the exact same frame stack.
 ///
 /// Pulses do NOT carry execution metadata; that lives in
 /// `NodeExecution` records. This split is load-bearing: the scheduler
@@ -38,7 +39,7 @@ use crate::Color;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pulse {
     pub id: uuid::Uuid,
-    pub color: Color,
+    pub execution_id: ExecutionId,
     pub frames: LoopFrames,
     /// The destination node id.
     pub target_node: String,
@@ -54,11 +55,13 @@ pub struct Pulse {
     /// `value` is always `Null` when `closed`; the field is for
     /// serialisation symmetry only.
     pub closed: bool,
-    /// The producer failed or its output was refused. Stream consumers
-    /// receive this error at the end; scalar consumers retain ordinary
-    /// closure behavior. Neither may replace this error with a backup.
+    /// The producer failed or its output was refused: which node broke
+    /// and why, carried unchanged however many skips sit between that
+    /// node and this wire. Stream consumers receive it at the end;
+    /// scalar consumers retain ordinary closure behavior. Neither may
+    /// replace it with a backup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub close_error: Option<String>,
+    pub failure: Option<Failure>,
     /// A supplied output or a used input backup, including its stream end.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub provided: bool,
@@ -68,7 +71,35 @@ pub struct Pulse {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub backup: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inherited_from: Option<Color>,
+    pub inherited_from: Option<ExecutionId>,
+}
+
+/// A node that broke, as the closures it leaves behind carry it: the
+/// node, spelled the way the program reads it (through its call sites),
+/// and its error. Set once, where the node fails, and passed on
+/// unchanged by every skip it causes, so a message three nodes further
+/// down still names the node that actually failed.
+// SYNC: Failure <-> packages/weft-graph/src/protocol.ts Failure
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Failure {
+    pub node: String,
+    pub error: String,
+}
+
+impl Failure {
+    /// The failure of the node `node_id` firing at `frames`, spelled
+    /// through the call sites on those frames.
+    pub fn at(project: &ProjectDefinition, node_id: &str, frames: &LoopFrames, error: impl Into<String>) -> Self {
+        let call_path: Vec<String> = crate::frames::call_path(frames).into_iter().map(str::to_string).collect();
+        Self { node: crate::project::address_of(project, node_id, &call_path), error: error.into() }
+    }
+}
+
+// SYNC: Display for Failure <-> packages/weft-graph/src/webview/lib/utils/status.ts failureText
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "'{}' failed: {}", self.node, self.error)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,8 +112,9 @@ pub enum PulseStatus {
     /// readiness (the consumer is already running; a re-dispatch would
     /// double-run it) yet still in flight for completion accounting.
     /// In-RAM only: the journal fold never produces it (a crash before
-    /// the take refolds the pulse as Pending and re-delivers, the
-    /// documented at-least-once crash semantics).
+    /// the take refolds the pulse as Pending; the consumer that was
+    /// taking it went down with the worker and is failed, never run
+    /// again).
     Routed,
     /// Consumed by a dispatch, a take, or cancellation and never read
     /// again.
@@ -108,7 +140,7 @@ impl Pulse {
     /// wire the same emission reached.
     pub fn new(
         id: uuid::Uuid,
-        color: Color,
+        execution_id: ExecutionId,
         frames: LoopFrames,
         target_node: impl Into<String>,
         target_port: impl Into<String>,
@@ -116,14 +148,14 @@ impl Pulse {
     ) -> Self {
         Self {
             id,
-            color,
+            execution_id,
             frames,
             target_node: target_node.into(),
             target_port: target_port.into(),
             value,
             status: PulseStatus::Pending,
             closed: false,
-            close_error: None,
+            failure: None,
             provided: false,
             backup: false,
             inherited_from: None,
@@ -137,35 +169,35 @@ impl Pulse {
     /// closure -> consumer fires with the port missing.
     pub fn closure(
         id: uuid::Uuid,
-        color: Color,
+        execution_id: ExecutionId,
         frames: LoopFrames,
         target_node: impl Into<String>,
         target_port: impl Into<String>,
     ) -> Self {
-        Self::closure_with_error(id, color, frames, target_node, target_port, None)
+        Self::closure_with_failure(id, execution_id, frames, target_node, target_port, None)
     }
 
-    /// Closure carrying WHY the upstream ended, for generator ports:
-    /// `Some(error)` marks a failed stream end (the consumer's pull
-    /// gets the error), `None` a clean finish.
-    pub fn closure_with_error(
+    /// Closure carrying WHY the upstream ended: `Some(failure)` marks a
+    /// producer that broke (a generator consumer's pull gets the error),
+    /// `None` a clean finish or a decline.
+    pub fn closure_with_failure(
         id: uuid::Uuid,
-        color: Color,
+        execution_id: ExecutionId,
         frames: LoopFrames,
         target_node: impl Into<String>,
         target_port: impl Into<String>,
-        close_error: Option<String>,
+        failure: Option<Failure>,
     ) -> Self {
         Self {
             id,
-            color,
+            execution_id,
             frames,
             target_node: target_node.into(),
             target_port: target_port.into(),
             value: Arc::new(Value::Null),
             status: PulseStatus::Pending,
             closed: true,
-            close_error,
+            failure,
             provided: false,
             backup: false,
             inherited_from: None,
@@ -183,14 +215,14 @@ impl Pulse {
 #[derive(Debug, Clone, Default)]
 pub struct PulseTable {
     buckets: BTreeMap<String, Vec<Pulse>>,
-    consumed_streams: HashSet<(Color, crate::frames::FiringLocation, String)>,
+    consumed_streams: HashSet<(ExecutionId, crate::frames::FiringLocation, String)>,
 }
 
 impl PulseTable {
     pub fn new() -> Self { Self::default() }
 
-    pub fn stream_was_consumed(&self, color: Color, node: &str, port: &str, frames: &LoopFrames) -> bool {
-        self.consumed_streams.contains(&(color, crate::frames::FiringLocation::new(node, frames.clone()), port.into()))
+    pub fn stream_was_consumed(&self, execution_id: ExecutionId, node: &str, port: &str, frames: &LoopFrames) -> bool {
+        self.consumed_streams.contains(&(execution_id, crate::frames::FiringLocation::new(node, frames.clone()), port.into()))
     }
 
     /// Call only after validating that every id belongs to this bucket.
@@ -198,7 +230,7 @@ impl PulseTable {
     pub fn remove_consumed(&mut self, node: &str, ids: &[uuid::Uuid]) {
         let bucket = self.buckets.get_mut(node).expect("consumed pulse bucket exists");
         for pulse in bucket.iter().filter(|p| ids.contains(&p.id)) {
-            self.consumed_streams.insert((pulse.color,
+            self.consumed_streams.insert((pulse.execution_id,
                 crate::frames::FiringLocation::new(node, pulse.frames.clone()), pulse.target_port.clone()));
         }
         bucket.retain(|p| !ids.contains(&p.id));
@@ -217,5 +249,28 @@ impl DerefMut for PulseTable {
 impl<const N: usize> From<[(String, Vec<Pulse>); N]> for PulseTable {
     fn from(values: [(String, Vec<Pulse>); N]) -> Self {
         Self { buckets: BTreeMap::from(values), consumed_streams: HashSet::new() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A closure crosses processes (the engine's in-RAM table, a seeded
+    /// run's history, the inspector) as JSON: the failure travels as the
+    /// node that broke plus its error, and comes back the same.
+    #[test]
+    fn a_failed_closure_round_trips_with_the_node_that_broke() {
+        let failure = Failure { node: "auth.query".into(), error: "the database is down".into() };
+        let pulse = Pulse::closure_with_failure(uuid::Uuid::nil(), uuid::Uuid::nil(), vec![], "sink", "in", Some(failure.clone()));
+        let wire = serde_json::to_value(&pulse).unwrap();
+        assert_eq!(wire["failure"], json!({ "node": "auth.query", "error": "the database is down" }));
+        let back: Pulse = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.failure, Some(failure.clone()));
+        assert_eq!(failure.to_string(), "'auth.query' failed: the database is down");
+
+        let plain = serde_json::to_value(Pulse::closure(uuid::Uuid::nil(), uuid::Uuid::nil(), vec![], "sink", "in")).unwrap();
+        assert!(plain.get("failure").is_none(), "a plain closure carries no failure field");
     }
 }

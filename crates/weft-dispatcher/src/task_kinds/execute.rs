@@ -1,224 +1,173 @@
 //! Producer helpers for `execute`, `resume`, and `cancel_execution`
-//! tasks. These all target the per-project worker pool, NOT the
-//! dispatcher: the worker's run_pod claim loop in weft-engine
-//! consumes them. The handlers (`ExecuteKind`, `CancelExecutionKind`)
-//! live in weft-engine.
+//! tasks. The first two are the work a worker is called for (the
+//! dispatcher's `delivery` hands each to the project's workers); a cancel
+//! is taken by the worker driving its execution, through its cancel wait. The
+//! handlers live in `weft_engine::worker`.
 
 use anyhow::Result;
 
 use weft_task_store::tasks::{enqueue_or_rearm, NewTask, TaskTarget};
 use weft_task_store::{CancelExecutionPayload, ExecutionPayload, TaskKind};
 
-/// Enqueue a `resume` task for `color`. Dedup key is `{color}:resume`
-/// so multiple fires arriving while a worker is already running
-/// coalesce: the in-flight worker is expected to observe the fresh
-/// SuspensionResolved rows during its pre-Stalled re-fetch loop
-/// (see `run_one_execution`). Once that worker completes, a fire
-/// arriving afterwards spawns a fresh resume task because the prior
-/// dedup row has transitioned to `complete`.
+/// Enqueue a `resume` task for `execution_id`. Dedup key is `{execution_id}:resume` so
+/// multiple fires arriving while a worker is already running coalesce:
+/// the in-flight worker observes the fresh `SuspensionResolved` rows
+/// during its pre-Stalled re-fetch loop (see `run_one_execution`). Once
+/// that worker completes, a fire arriving afterwards gets a fresh resume
+/// task because the prior dedup row has transitioned to `complete`.
 ///
-/// At most one worker ever runs per color at a time. With ONE worker
-/// per project that held for free (only one pod could claim the
-/// unpinned task). Now that a project can run MULTIPLE workers, an
-/// unpinned resume could be claimed by a FRESH worker while the
-/// original owner is still driving the color (e.g. held warm by a live
-/// bus, resolving the suspension in place): the fresh worker would
-/// claim, the broker would stamp it as the new owner (latest-claim-
-/// wins), and the original's journal writes would then be rejected.
-///
-/// So we PIN the resume to the color's current owner when that owner is
-/// still alive: the `target_pod_name` claim filter then guarantees only
-/// the owner reclaims it, keeping "one active pod per color" true. When
-/// the owner is gone (crashed / idle-exited / never assigned), the
-/// resume stays unpinned: cold_start spawns a fresh pod, it claims, and
-/// it legitimately takes over ownership. That handoff is the only time
-/// ownership moves.
+/// At most one worker drives an execution at a time: a resume is neither
+/// delivered nor claimable while another task of its execution is being
+/// driven (`tasks::EXECUTION_ID_PICK`), so it waits for that drive to end
+/// instead of folding the journal a second time beside it.
 ///
 /// A resume already claimed is asked to run once more rather than
 /// collapsed onto (`enqueue_or_rearm`): its worker may have read the
 /// journal for the last time before this wake was written, and would
 /// otherwise finish without driving it.
+///
+/// The resume runs on the image and under the run class the execution
+/// was born with, both read off its `ExecutionStarted`.
 pub async fn enqueue_resume(
     pool: &sqlx::PgPool,
     project_id: uuid::Uuid,
-    color: weft_core::Color,
+    execution_id: weft_core::ExecutionId,
     definition_hash: &str,
     tenant_id: &str,
-) -> Result<()> {
-    // Pin to the color's owner IFF it is still alive; a dead/absent owner
-    // leaves the resume unpinned so a fresh pod takes over.
-    let alive_owner = alive_color_owner(pool, color).await?;
-    enqueue_execution(
-        pool,
-        project_id,
-        color,
-        definition_hash,
-        tenant_id,
-        alive_owner,
-    )
-    .await
-}
-
-/// The pod that currently OWNS a color, but only if that pod is still
-/// alive (`spawning`/`alive`). `None` when the color has no owner or the
-/// owner is gone. The single source of truth for "which pod is driving
-/// this color right now," used to route any task that must reach the
-/// driver: a resume (pin so the owner reclaims, keeping one-active-pod-
-/// per-color) and a cancel (the cancel flag lives in the owner's
-/// in-RAM registry, so the cancel must land on the owner or it no-ops).
-/// Routing either to any other pod would also restamp ownership via the
-/// claim trigger and fence the real owner, which is exactly why both go
-/// through this one owner lookup rather than picking an arbitrary alive
-/// pod for the project.
-async fn alive_color_owner<'e>(
-    executor: impl sqlx::PgExecutor<'e>,
-    color: weft_core::Color,
-) -> Result<Option<String>> {
-    let row: Option<(String,)> = sqlx::query_as(
-        r#"SELECT ec.owner_pod_name
-           FROM execution_color ec
-           JOIN worker_pod wp ON wp.pod_name = ec.owner_pod_name
-           WHERE ec.color = $1
-             AND ec.owner_pod_name IS NOT NULL
-             AND wp.status IN ('spawning', 'alive')"#,
-    )
-    .bind(color.to_string())
-    .fetch_optional(executor)
-    .await?;
-    Ok(row.map(|(p,)| p))
-}
-
-/// Build the `NewTask` for an execution-family task (`execute` / `resume`),
-/// UNQUEUED: the caller decides how it is inserted (a plain dedup'd enqueue,
-/// or committed atomically with the execution's journal birth via
-/// `Journal::start_execution` / `start_live_execution`).
-///
-/// `live_connection`: `Some(spec)` for a live-caller execution (the worker
-/// expects a caller to attach), `None` otherwise.
-pub fn execution_task_spec(
-    kind: TaskKind,
-    project_id: uuid::Uuid,
-    color: weft_core::Color,
-    definition_hash: &str,
-    binary_hash: &str,
-    tenant_id: &str,
-    // The pod to pin the task to, or None to let any alive worker for
-    // the project claim it. New executions pass None (a fresh color has
-    // no owner; whichever worker claims first becomes owner, and the
-    // atomic claim guarantees exactly one). Resume passes the alive
-    // owner so a sibling worker can't steal a live color.
-    target_pod_name: Option<String>,
-    live_connection: Option<weft_task_store::kinds::LiveConnectionStart>,
-    // An unrecorded run's birth rows (`ExecutionPayload::unrecorded_birth`),
-    // `None` for every recorded run.
-    unrecorded_birth: Option<&[weft_journal::ExecEvent]>,
-) -> Result<NewTask> {
-    let color_str = color.to_string();
-    let payload = ExecutionPayload {
-        project_id,
-        color: color_str.clone(),
-        definition_hash: definition_hash.to_string(),
-        live_connection,
-        unrecorded_birth: unrecorded_birth
-            .map(|rows| rows.iter().map(serde_json::to_value).collect::<Result<Vec<_>, _>>())
-            .transpose()?,
-    };
-    let dedup = format!("{color_str}:{}", kind.as_str());
-    Ok(NewTask {
-        kind: kind.into(),
-        target: TaskTarget::Worker,
-        project_id: Some(project_id),
-        dedup_key: Some(dedup),
-        color: Some(color_str),
-        tenant_id: tenant_id.to_string(),
-        target_pod_name,
-        binary_hash: Some(binary_hash.to_string()),
-        payload: serde_json::to_value(&payload)?,
-    })
-}
-
-async fn enqueue_execution(
-    pool: &sqlx::PgPool,
-    project_id: uuid::Uuid,
-    color: weft_core::Color,
-    definition_hash: &str,
-    tenant_id: &str,
-    target_pod_name: Option<String>,
 ) -> Result<()> {
     let payload: String = sqlx::query_scalar(
-        "SELECT payload_json FROM exec_event WHERE color = $1 AND kind = 'execution_started' ORDER BY id LIMIT 1"
-    ).bind(color.to_string()).fetch_one(pool).await?;
+        "SELECT payload_json FROM exec_event WHERE execution_id = $1 AND kind = 'execution_started' ORDER BY id LIMIT 1",
+    )
+    .bind(execution_id.to_string())
+    .fetch_one(pool)
+    .await?;
     let birth: weft_journal::ExecEvent = serde_json::from_str(&payload)?;
-    let weft_journal::ExecEvent::ExecutionStarted { program: Some(program), project_id: recorded_project, .. } = birth else {
-        anyhow::bail!("execution {color} has no recorded production code identity");
+    let weft_journal::ExecEvent::ExecutionStarted { program: Some(program), project_id: recorded_project, run_class, .. } = birth
+    else {
+        anyhow::bail!("execution {execution_id} has no recorded production code identity");
     };
-    anyhow::ensure!(recorded_project == project_id && program.definition_hash == definition_hash,
-        "execution {color} does not match the requested project and graph");
-    let task = execution_task_spec(
-        TaskKind::Resume,
+    anyhow::ensure!(
+        recorded_project == project_id && program.definition_hash == definition_hash,
+        "execution {execution_id} does not match the requested project and graph"
+    );
+    let task = execution_task_spec(ExecutionTask {
+        kind: TaskKind::Resume,
         project_id,
-        color,
+        execution_id,
         definition_hash,
-        &program.binary_hash,
+        binary_hash: &program.binary_hash,
         tenant_id,
-        target_pod_name,
-        None,
-        None,
-    )?;
+        run_class,
+        pinned_to: None,
+        live_connection: None,
+        unrecorded_birth: None,
+    })?;
     enqueue_or_rearm(pool, task).await?;
     Ok(())
 }
 
-/// Enqueue a `cancel_execution` task addressed to the Pod that OWNS
-/// this color right now (the pod driving the execution), looked up via
-/// `alive_color_owner`. The cancel flag lives in that pod's in-RAM
-/// `cancel_registry`, so the cancel must reach the owner to have any
-/// effect; routing it to the oldest alive pod (the previous behavior)
-/// landed it on a sibling in a multi-pod pool, where it silently
-/// no-opped AND, via the claim trigger, restamped color ownership to
-/// the sibling and fenced the real owner mid-run. The
-/// `task.target_pod_name` claim filter ensures only the owner claims it.
+/// What an execution-family task (`execute` / `resume`) is built from.
+pub struct ExecutionTask<'a> {
+    pub kind: TaskKind,
+    pub project_id: uuid::Uuid,
+    pub execution_id: weft_core::ExecutionId,
+    pub definition_hash: &'a str,
+    /// The worker image the task runs on.
+    pub binary_hash: &'a str,
+    pub tenant_id: &'a str,
+    pub run_class: weft_core::run_class::RunClass,
+    /// The worker replica a live run is pinned to (the one its caller's
+    /// connection reached); `None` for everything else, which is
+    /// delivered to whichever worker the platform gives.
+    pub pinned_to: Option<String>,
+    /// `Some(start)` for a live-caller execution (the worker expects a
+    /// caller to attach).
+    pub live_connection: Option<weft_task_store::kinds::LiveConnectionStart>,
+    /// An unrecorded run's birth rows (`ExecutionPayload::unrecorded_birth`),
+    /// `None` for every recorded run.
+    pub unrecorded_birth: Option<&'a [weft_journal::ExecEvent]>,
+}
+
+/// Build the `NewTask` for an execution-family task, UNQUEUED: the caller
+/// decides how it is inserted (a plain dedup'd enqueue, or committed
+/// atomically with the execution's journal birth via
+/// `Journal::start_execution` / `start_live_execution`).
+pub fn execution_task_spec(task: ExecutionTask<'_>) -> Result<NewTask> {
+    let execution_id_str = task.execution_id.to_string();
+    let payload = ExecutionPayload {
+        project_id: task.project_id,
+        execution_id: execution_id_str.clone(),
+        definition_hash: task.definition_hash.to_string(),
+        live_connection: task.live_connection,
+        unrecorded_birth: task
+            .unrecorded_birth
+            .map(|rows| rows.iter().map(serde_json::to_value).collect::<Result<Vec<_>, _>>())
+            .transpose()?,
+        run_class: task.run_class,
+    };
+    let dedup = format!("{execution_id_str}:{}", task.kind.as_str());
+    Ok(NewTask {
+        kind: task.kind.into(),
+        target: TaskTarget::Worker,
+        project_id: Some(task.project_id),
+        dedup_key: Some(dedup),
+        execution_id: Some(execution_id_str),
+        tenant_id: task.tenant_id.to_string(),
+        target_replica: task.pinned_to,
+        binary_hash: Some(task.binary_hash.to_string()),
+        payload: serde_json::to_value(&payload)?,
+    })
+}
+
+/// Enqueue a `cancel_execution` task for `execution_id` when a worker is driving
+/// it right now (its execute or resume task holds a claim that is being
+/// renewed). The cancel flag lives in that worker's memory; the worker
+/// takes the task through its cancel wait and fires the flag.
 ///
-/// `cause` rides in the payload so the owning worker flips the color's
-/// flag WITH it: when the worker's terminal write beats the
-/// dispatcher's, the journal still names the same cause.
+/// `cause` rides in the payload so the worker flips the execution's flag WITH
+/// it: when the worker's terminal write beats the dispatcher's, the
+/// journal still names the same cause.
 ///
-/// Returns `Ok(false)` if the color has no live owner (the execution is
-/// already terminal or its worker is gone; nothing to cancel).
+/// Returns `Ok(false)` if nothing drives the execution (it is waiting, is
+/// terminal, or its worker is gone): the caller's own terminal write is
+/// then the whole cancel.
 ///
 /// Runs on the caller's connection so the journal's cancel write can
 /// commit it in the same transaction as the terminal rows and the
-/// wake-signal strip (`Journal::cancel_execution`): a cancel either
-/// lands whole or not at all.
+/// wake-signal strip (`Journal::cancel_execution`): a cancel either lands
+/// whole or not at all.
 pub async fn enqueue_cancel_in(
     conn: &mut sqlx::PgConnection,
     project_id: uuid::Uuid,
-    color: weft_core::Color,
+    execution_id: weft_core::ExecutionId,
     tenant_id: &str,
     cause: &weft_core::exec::CancelCause,
 ) -> Result<bool> {
-    let Some(pod_name) = alive_color_owner(&mut *conn, color).await? else {
+    let execution_id_str = execution_id.to_string();
+    let driven: bool = sqlx::query_scalar(
+        r#"SELECT EXISTS (
+               SELECT 1 FROM task
+               WHERE execution_id = $1 AND kind IN ('execute', 'resume')
+                 AND status = 'claimed'
+                 AND claimed_until_unix >= EXTRACT(EPOCH FROM NOW())::BIGINT)"#,
+    )
+    .bind(&execution_id_str)
+    .fetch_one(&mut *conn)
+    .await?;
+    if !driven {
         return Ok(false);
-    };
-    let color_str = color.to_string();
-    let payload = CancelExecutionPayload {
-        project_id,
-        color: color_str.clone(),
-        cause: cause.clone(),
-    };
-    let dedup = format!("{color_str}:cancel");
+    }
+    let payload = CancelExecutionPayload { project_id, execution_id: execution_id_str.clone(), cause: cause.clone() };
     weft_task_store::tasks::enqueue_dedup_in(
         conn,
         NewTask {
             kind: TaskKind::CancelExecution.into(),
             target: TaskTarget::Worker,
             project_id: Some(project_id),
-            dedup_key: Some(dedup),
-            color: Some(color_str),
+            dedup_key: Some(format!("{execution_id_str}:cancel")),
+            execution_id: Some(execution_id_str),
             tenant_id: tenant_id.to_string(),
-            target_pod_name: Some(pod_name),
-            // Pinned to the color's owner: must reach THAT pod whatever
-            // image it runs (the claim filter bypasses on pinned tasks).
+            target_replica: None,
             binary_hash: None,
             payload: serde_json::to_value(&payload)?,
         },

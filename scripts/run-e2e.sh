@@ -10,7 +10,7 @@
 #   scripts/run-e2e.sh --keep-going           # keep starting tests after a failure
 #   scripts/run-e2e.sh --clean                # only remove what failed runs kept
 #
-# What a run does, once: brings the cluster to current code (setup.sh),
+# What a run does, once: brings the install to current code (setup.sh),
 # removes whatever earlier failed runs kept, builds every test binary, then
 # runs the tests one by one, as many at once as -j says, longest first (by
 # how long each took last time) so a slow one never starts last and holds
@@ -20,8 +20,14 @@
 # When a test passes it removes everything it made. When one fails, it keeps
 # it (its projects, its cell if it had one) so you can look, and the runner
 # stops starting new tests, lets the running ones finish, and writes what
-# the cluster looked like next to that test's log. What it kept stays until
+# the install looked like next to that test's log. What it kept stays until
 # the next run starts (or `--clean`), so look before you run again.
+#
+# No test runs longer than TEST_LIMIT (5 minutes): past it the runner stops
+# the test and everything it started, and counts it failed, saying so in
+# its log. A hang (a wait on something that never comes) otherwise holds
+# the whole run open with nothing on screen. A test that needs longer is
+# too big: split it.
 #
 # Ctrl-C (or a TERM) stops every running test, and everything each one
 # started, before the runner exits; the tests it cut short and the ones it
@@ -39,7 +45,7 @@ cd "$REPO_ROOT" || exit 1
 
 # Outside target/, which setup.sh empties when it grows past its cap, and
 # per machine rather than per checkout: every worktree drives the same
-# cluster, so one run at a time is a rule for the machine.
+# install, so one run at a time is a rule for the machine.
 # SYNC: the weft data dir <-> crates/weft-cli/src/commands/daemon.rs (data_dir)
 E2E_DIR="$HOME/.local/share/weft/e2e"
 RUN_DIR="$E2E_DIR/run"
@@ -54,7 +60,7 @@ mkdir -p "$E2E_DIR"
 
 # ---------- One run (or clean) at a time ----------
 # A clean during a run would remove what a running test is using, and two
-# runs (from any checkout: they share the cluster) would redeploy it under
+# runs (from any checkout: they share the install) would redeploy it under
 # each other. The lock is a symlink whose target is the holder's pid:
 # creating it both takes the lock and names the holder in one atomic step
 # (portable, unlike flock, which macOS lacks), so no run ever sees a lock
@@ -133,14 +139,14 @@ if ! [[ "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
-# ---------- The cluster, on current code ----------
-# setup.sh is idempotent: on unchanged code it rebuilds nothing and rolls
-# nothing. Once per run, never per test. --clean skips it: on changed code
-# it would roll the dispatcher a failure kept for inspection, and removing
-# what was kept only needs the install as it is (the clean fails loudly if
-# no dispatcher answers).
+# ---------- The install, on current code ----------
+# setup.sh is idempotent: on unchanged code it rebuilds nothing and
+# restarts nothing. Once per run, never per test. --clean skips it: on
+# changed code it would restart the runtime a failure kept for inspection,
+# and removing what was kept only needs the install as it is (the clean
+# fails loudly if no runtime answers).
 if [ "$CLEAN" -eq 0 ]; then
-  echo "bringing the cluster to current code (setup.sh --cli --daemon)"
+  echo "bringing the install to current code (setup.sh --cli --daemon)"
   if ! ./setup.sh --cli --daemon >"$E2E_DIR/setup.log" 2>&1; then
     echo "setup.sh failed; its output is in $E2E_DIR/setup.log" >&2
     exit 1
@@ -165,88 +171,59 @@ if [ "$CLEAN" -eq 1 ]; then
 fi
 
 # ---------- Auto-provisioned dependencies ----------
-# Everything a test needs that a local machine can serve is provisioned
-# HERE, and torn down when the run ends. Only genuinely external services
+# Everything a test needs that a local machine can serve comes from the
+# install already running here: its Postgres, and a `weft-e2e` bucket in
+# its object store (made the first time, then reused by every run, so
+# nothing here needs tearing down). Only genuinely external services
 # (Slack, GitHub, Google, Telegram, a real mailbox, an OpenRouter key) come
 # from the operator's env / repo-root .env. Any WEFT_E2E_* var already set
 # wins.
 
-# The default install's Postgres, for the tests that seed rows directly: a
-# port-forward on a port the system picks.
+# The default install's Postgres, for the tests that seed rows directly:
+# the address its runtime uses, from the secrets its start wrote.
+# SYNC: secrets.env <-> crates/weft-cli/src/commands/daemon.rs (secrets),
+#       crates/weft-e2e/src/platform.rs (secret)
 if [ -z "${WEFT_E2E_DATABASE_URL:-}" ]; then
-  PF_OUT="$E2E_DIR/postgres-forward.out"
-  # SYNC: weft-db <-> crates/weft-core/src/infra/instance.rs (the default install's db_namespace)
-  kubectl -n weft-db port-forward svc/weft-postgres :5432 >"$PF_OUT" 2>&1 &
-  PF_PID=$!
-  CLEANUP+=("kill $PF_PID 2>/dev/null || true")
-  PG_PORT=""
-  for _ in $(seq 1 60); do
-    PG_PORT="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) .*/\1/p' "$PF_OUT" | head -1)"
-    [ -n "$PG_PORT" ] && break
-    kill -0 "$PF_PID" 2>/dev/null || break
-    sleep 0.5
-  done
-  if [ -z "$PG_PORT" ]; then
-    echo "the Postgres port-forward never listened:" >&2
-    cat "$PF_OUT" >&2
+  SECRETS="$HOME/.local/share/weft/secrets.env"
+  WEFT_E2E_DATABASE_URL="$(sed -n 's/^WEFT_DATABASE_URL=//p' "$SECRETS" 2>/dev/null | head -1)"
+  if [ -z "$WEFT_E2E_DATABASE_URL" ]; then
+    echo "$SECRETS names no WEFT_DATABASE_URL; is the install up?" >&2
     exit 1
   fi
-  # SYNC: local-dev PG credentials <-> deploy/k8s/postgres.yaml (WEFT_DATABASE_URL secret),
-  #       crates/weft-e2e/src/platform.rs (PG_USER/PG_PASSWORD/PG_DBNAME),
-  #       setup.sh (WEFT_LIVE_DATABASE_URL)
-  export WEFT_E2E_DATABASE_URL="postgres://weft:weft-local-dev@127.0.0.1:$PG_PORT/weft"
-  echo "provisioned: WEFT_E2E_DATABASE_URL via port-forward (port $PG_PORT)"
+  export WEFT_E2E_DATABASE_URL
 fi
 
-# An S3 store: the daemon ALREADY runs SeaweedFS as a host docker
-# container ('weft-object-store', S3 gateway on WEFT_SEAWEED_PORT,
-# local-dev identities); reuse it with a dedicated e2e bucket rather
-# than spawning a second store. The endpoint below is dialled by the
-# WORKER POD running the node under test, so it names this machine as
-# pods see it: on Docker Desktop the address `host.docker.internal`
-# resolves to inside the node, on Linux the kind docker network's
-# gateway. The broker's egress denies private ranges, and the daemon
-# derives that address's /32 opening from its own object-store
-# endpoint, so nothing is exported here for it.
-# SYNC: the machine address pods dial <->
-#       crates/weft-cli/src/commands/daemon.rs (machine_address_for_pods)
-if [ -z "${WEFT_E2E_S3_ENDPOINT:-}" ] && command -v docker >/dev/null 2>&1; then
-  MACHINE_IP="$(docker exec weft-local-control-plane getent hosts host.docker.internal 2>/dev/null \
-    | awk '{print $1}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)"
-  if [ -z "$MACHINE_IP" ]; then
-    MACHINE_IP="$(docker network inspect kind \
-      --format '{{range .IPAM.Config}}{{.Gateway}}{{"\n"}}{{end}}' 2>/dev/null \
-      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)"
+# An S3 store: the install already runs one ('weft-object-store', on the
+# install's Docker network, local-dev identities); a dedicated e2e bucket
+# in it serves the S3 tests. The endpoint is dialled by the WORKER running
+# the node under test, a container on that same network, so it names the
+# store by its address there: a private IP, which a stored connection base
+# may reach over plain http (a container name is not one).
+# SYNC: the store's address on the network <-> crates/weft-cli/src/commands/daemon.rs
+#       (OBJECT_STORE_CONTAINER, worker_endpoint)
+if [ -z "${WEFT_E2E_S3_ENDPOINT:-}" ]; then
+  if [ -z "$(docker ps -q -f name='^weft-object-store$')" ]; then
+    echo "no running weft-object-store container; is the install up?" >&2
+    exit 1
   fi
-  if [ -n "$MACHINE_IP" ] && [ -n "$(docker ps -q -f name='^weft-object-store$')" ]; then
-    # The bucket stays across runs (it is the store the daemon owns,
-    # not ours to tear down), so "already exists" is as good as
-    # created. Any OTHER failure must not export the S3 vars: the test
-    # would then fail deep inside the run instead of skipping loudly.
-    # weed shell's exit code and chatter are both unreliable (it prints
-    # "created" even for an existing bucket and exits 0 on errors), so
-    # the create is fire-and-forget and the LIST afterwards is the one
-    # source of truth: the bucket exists or the S3 e2e skips.
-    docker exec weft-object-store sh -c \
-      'echo "s3.bucket.create -name weft-e2e" | weed shell' >/dev/null 2>&1
-    BUCKET_OUT="$(docker exec weft-object-store sh -c \
-      'echo "s3.bucket.list" | weed shell' 2>&1)"
-    BUCKET_STATUS=$?
-    if [ "$BUCKET_STATUS" -eq 0 ] && printf '%s\n' "$BUCKET_OUT" | grep -q 'weft-e2e'; then
-      export WEFT_E2E_S3_ENDPOINT="http://$MACHINE_IP:${WEFT_SEAWEED_PORT:-9096}"
-      export WEFT_E2E_S3_REGION="us-east-1"
-      export WEFT_E2E_S3_ACCESS_KEY_ID="weft-local"
-      export WEFT_E2E_S3_SECRET_ACCESS_KEY="weft-local-dev-secret"
-      export WEFT_E2E_S3_BUCKET="weft-e2e"
-      echo "provisioned: S3 vars pointed at the daemon's SeaweedFS ($WEFT_E2E_S3_ENDPOINT, bucket weft-e2e)"
-    else
-      echo "SKIP: the weft-e2e bucket does not exist in the daemon's SeaweedFS (list exit $BUCKET_STATUS);" >&2
-      echo "      not exporting WEFT_E2E_S3_* so the S3 e2e skips instead of failing deep. weed shell said:" >&2
-      printf '%s\n' "$BUCKET_OUT" >&2
-    fi
-  else
-    echo "warning: no running weft-object-store container (or no kind network); the S3 e2e will skip" >&2
+  # weed shell's exit code and chatter are both unreliable (it prints
+  # "created" even for an existing bucket and exits 0 on errors), so the
+  # create is fire-and-forget and the LIST afterwards is the one source of
+  # truth.
+  docker exec weft-object-store sh -c \
+    'echo "s3.bucket.create -name weft-e2e" | weed shell' >/dev/null 2>&1
+  BUCKET_OUT="$(docker exec weft-object-store sh -c 'echo "s3.bucket.list" | weed shell' 2>&1)"
+  if ! printf '%s\n' "$BUCKET_OUT" | grep -q 'weft-e2e'; then
+    echo "could not create the weft-e2e bucket in the install's object store. weed shell said:" >&2
+    printf '%s\n' "$BUCKET_OUT" >&2
+    exit 1
   fi
+  STORE_IP="$(docker inspect weft-object-store --format '{{(index .NetworkSettings.Networks "weft").IPAddress}}')"
+  export WEFT_E2E_S3_ENDPOINT="http://$STORE_IP:8333"
+  export WEFT_E2E_S3_REGION="us-east-1"
+  export WEFT_E2E_S3_ACCESS_KEY_ID="weft-local"
+  export WEFT_E2E_S3_SECRET_ACCESS_KEY="weft-local-dev-secret"
+  export WEFT_E2E_S3_BUCKET="weft-e2e"
 fi
 
 # ---------- Build every test binary once ----------
@@ -318,36 +295,31 @@ mkdir -p "$RUN_DIR"
 : > "$FAILED_LIST"
 export WEFT_E2E_RUN_DIR="$RUN_DIR"
 
-# What the cluster looked like when a test failed, next to its log: every
-# pod, the recent events, and the dispatcher logs of the default install and
-# of any cell the failed test kept.
+# What the install looked like when a test failed, next to its log: every
+# container, the runtime's log of the default install and of any cell the
+# failed test kept, and the logs of the kept projects' containers.
+# SYNC: labels weft-install, weft.project <-> crates/weft-platform-local/src/docker.rs
 post_mortem() {
-  local t="$1" dir="$RUN_DIR/$1.post-mortem"
+  local t="$1" dir="$RUN_DIR/$1.post-mortem" root="$HOME/.local/share/weft"
   mkdir -p "$dir"
-  kubectl get pods -A -o wide >"$dir/pods.txt" 2>&1
-  kubectl get events -A --sort-by=.lastTimestamp >"$dir/events.txt" 2>&1
-  # SYNC: weft-system <-> crates/weft-core/src/infra/instance.rs (the default install's system_namespace)
-  kubectl -n weft-system logs statefulset/weft-dispatcher --tail=2000 >"$dir/dispatcher.log" 2>&1
-  # The pooled tiers the test's signals and infra went through.
-  local pod
-  for pod in $(kubectl -n weft-system get pods -o name 2>/dev/null | grep -E 'pod/(listener|weft-infra-supervisor)-'); do
-    kubectl -n weft-system logs "$pod" --tail=2000 >"$dir/${pod#pod/}.log" 2>&1
-  done
+  docker ps -a --filter label=weft-install \
+    --format '{{.Names}}\t{{.Status}}\t{{.Label "weft.role"}}\t{{.Label "weft.project"}}' >"$dir/containers.txt" 2>&1
+  tail -n 5000 "$root/runtime.log" >"$dir/runtime.log" 2>&1
   local cell
-  for cell in $(sed -n "s/.*cell '\(e2e[a-z0-9]*\)' NOT finished.*/\1/p" "$RUN_DIR/$t.log" | sort -u); do
-    kubectl -n "weft-$cell-system" logs statefulset/weft-dispatcher --tail=2000 \
-      >"$dir/dispatcher-$cell.log" 2>&1
-    kubectl -n "weft-$cell-system" get pods -o wide >"$dir/pods-$cell.txt" 2>&1
+  # Every cell and project the test made, as it says the moment it makes
+  # one: a test stopped for running too long never reaches the lines its
+  # guards print when they drop.
+  # SYNC: the "made" lines <-> crates/weft-e2e/src/cell.rs, crates/weft-e2e/src/teardown.rs
+  for cell in $(sed -n "s/^weft-e2e: made cell '\(e2e[a-z0-9]*\)'.*/\1/p" "$RUN_DIR/$t.log" | sort -u); do
+    tail -n 5000 "$root/installs/$cell/runtime.log" >"$dir/runtime-$cell.log" 2>&1
   done
-  # The worker pods of every project the test kept, while they still run
-  # (an idle worker exits, taking its log with it).
-  local project
-  for project in $(sed -n "s/.*project '[^']*' (\([0-9a-f-]*\)) NOT finished.*/\1/p" "$RUN_DIR/$t.log" | sort -u); do
-    kubectl get pods -A -l "weft.dev/project=$project" \
-      -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' 2>/dev/null \
-      | while IFS=/ read -r ns pod; do
-          kubectl -n "$ns" logs "$pod" --all-containers --tail=5000 >"$dir/worker-$pod.log" 2>&1
-        done
+  # The containers of every project the test kept, while they still run
+  # (an idle worker is removed, taking its log with it).
+  local project name
+  for project in $(sed -n "s/^weft-e2e: made project '[^']*' (\([0-9a-f-]*\)).*/\1/p" "$RUN_DIR/$t.log" | sort -u); do
+    for name in $(docker ps -a --filter "label=weft.project=$project" --format '{{.Names}}' 2>/dev/null); do
+      docker logs --tail 5000 "$name" >"$dir/$name.log" 2>&1
+    done
   done
 }
 
@@ -362,6 +334,37 @@ STOPPING=0
 SETSID=()
 command -v setsid >/dev/null 2>&1 && SETSID=(setsid)
 
+# The most one test may take, in seconds (see the header).
+# SYNC: TEST_LIMIT <-> crates/weft-e2e/src/client.rs TEST_LIMIT
+TEST_LIMIT=300
+# test pid -> the watchdog that stops it at TEST_LIMIT.
+declare -A WATCHDOG=()
+
+# Call off the watchdog of the test at `pid` (it and its sleep).
+stop_watchdog() {
+  local dog="${WATCHDOG[$1]:-}"
+  unset "WATCHDOG[$1]"
+  [ -n "$dog" ] || return 0
+  # The watchdog first, its sleep after: a subshell outliving its sleep
+  # reports the kill ("Terminated") in the run's output.
+  local sleeper
+  sleeper=$(pgrep -P "$dog")
+  kill "$dog" 2>/dev/null
+  wait "$dog" 2>/dev/null
+  [ -z "$sleeper" ] || kill $sleeper 2>/dev/null
+}
+
+# Stop the test at `pid` and everything it started.
+stop_test() {
+  local pid="$1"
+  if [ ${#SETSID[@]} -gt 0 ]; then
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+  else
+    pkill -TERM -P "$pid" 2>/dev/null
+    kill -TERM "$pid" 2>/dev/null
+  fi
+}
+
 # Every test this run has not seen pass (failed, cut short, never started)
 # goes on the --failed list.
 record_unfinished() {
@@ -372,7 +375,7 @@ record_unfinished() {
 }
 
 # Ctrl-C or TERM: stop every running test and what it started, wait for
-# them, so nothing outlives the lock and the Postgres port-forward; then
+# them, so nothing outlives the lock; then
 # leave the list --failed needs.
 on_interrupt() {
   local code="$1" pid
@@ -380,12 +383,8 @@ on_interrupt() {
   echo ""
   echo "interrupted: stopping ${#RUNNING[@]} running test(s)"
   for pid in "${!RUNNING[@]}"; do
-    if [ ${#SETSID[@]} -gt 0 ]; then
-      kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
-    else
-      pkill -TERM -P "$pid" 2>/dev/null
-      kill -TERM "$pid" 2>/dev/null
-    fi
+    stop_watchdog "$pid"
+    stop_test "$pid"
   done
   for pid in "${!RUNNING[@]}"; do wait "$pid" 2>/dev/null; done
   record_unfinished
@@ -396,12 +395,13 @@ trap 'on_interrupt 130' INT
 trap 'on_interrupt 143' TERM
 # Each test runs in its own session (setsid), so a closed terminal's
 # hangup reaches only this runner: it passes the stop on, or the tests
-# would keep deploying against the cluster after the runner is gone.
+# would keep deploying against the install after the runner is gone.
 trap 'on_interrupt 129' HUP
 
 finish_one() {
   local pid="$1" status="$2" t="${RUNNING[$1]}"
   unset "RUNNING[$pid]"
+  stop_watchdog "$pid"
   local secs=$(( $(date +%s) - STARTED[$t] ))
   if [ "$status" -eq 0 ]; then
     PASSED+=("$t")
@@ -410,7 +410,9 @@ finish_one() {
   else
     FAILED+=("$t")
     echo "$t" >> "$FAILED_LIST"
-    printf '  FAIL  %-70s %4ss   log: %s\n' "$t" "$secs" "$RUN_DIR/$t.log"
+    local why="FAIL"
+    [ -e "$RUN_DIR/$t.timed-out" ] && why="SLOW"
+    printf '  %-4s  %-70s %4ss   log: %s\n' "$why" "$t" "$secs" "$RUN_DIR/$t.log"
     post_mortem "$t"
     if [ "$STOPPING" -eq 0 ] && [ "$KEEP_GOING" -eq 0 ]; then
       STOPPING=1
@@ -419,11 +421,30 @@ finish_one() {
   fi
 }
 
+# Reap one finished test. Bash moves a finished job out of its job table
+# whenever a `wait` for one pid runs (the watchdog's), and `wait -n` then
+# no longer knows it ("no such job"), though `wait <pid>` still has its
+# status. So a test already gone is reaped by pid first, and `wait -n`
+# only ever waits on tests still running.
 wait_one() {
-  local done_pid status
-  wait -n -p done_pid "${!RUNNING[@]}"
-  status=$?
-  finish_one "$done_pid" "$status"
+  local done_pid status pid
+  while true; do
+    for pid in "${!RUNNING[@]}"; do
+      if ! kill -0 "$pid" 2>/dev/null; then
+        wait "$pid"
+        status=$?
+        finish_one "$pid" "$status"
+        return
+      fi
+    done
+    done_pid=""
+    wait -n -p done_pid "${!RUNNING[@]}" 2>/dev/null
+    status=$?
+    if [ -n "$done_pid" ]; then
+      finish_one "$done_pid" "$status"
+      return
+    fi
+  done
 }
 
 echo "running ${#TESTS[@]} test(s), $JOBS at a time; logs in $RUN_DIR"
@@ -435,10 +456,18 @@ for t in "${TESTS[@]}"; do
   bin="${BINARY[${t%%::*}]}"
   STARTED["$t"]=$(date +%s)
   # In its own process group (setsid), so an interrupt can stop the test
-  # and everything it started (weft, kubectl, docker) in one kill.
+  # and everything it started (weft, docker) in one kill.
   ( cd "$REPO_ROOT/crates/weft-e2e" && exec "${SETSID[@]}" "$bin" --exact "${t#*::}" --test-threads=1 --nocapture ) \
     >"$RUN_DIR/$t.log" 2>&1 &
   RUNNING[$!]="$t"
+  pid=$!
+  (
+    sleep "$TEST_LIMIT"
+    touch "$RUN_DIR/$t.timed-out"
+    echo "[run-e2e] stopped: over the ${TEST_LIMIT}s every test must finish in" >>"$RUN_DIR/$t.log"
+    stop_test "$pid"
+  ) &
+  WATCHDOG[$pid]=$!
 done
 while [ ${#RUNNING[@]} -gt 0 ]; do wait_one; done
 

@@ -9,7 +9,7 @@ in-process state too expensive to rebuild: a browser session with thousands of
 cookies, a loaded local model, a warm connection pool. The plan is an opt-in
 primitive, `ctx.hold_signal`, where the await happens in place and the worker
 stays alive. Die-and-resume stays the default, and the language makes the cost
-visible, because holding pins a pod for the whole wait.
+visible, because holding keeps a worker up for the whole wait.
 
 **Suspendable live channels.** A bus is pinned to one worker, both ends have to
 stay alive, and `await_signal` is forbidden while it is open. The plan is to
@@ -45,20 +45,9 @@ safety-critical programs required to build out of those. Read
 
 ## Running it for real
 
-**Cloud deployment, and routes that reach the internet.** Everything today runs
-on one machine: a kind cluster, a local Postgres, and a quick tunnel whose door
-allowlists only the provider-events receiver, the per-signal fire door, the file
-relay and the OAuth callback. A `Route` or `Socket` is reached through
-`/connect/<tenant>/<path>`, and the dispatcher answers with a redirect to the
-worker's own address on the gateway, which only resolves locally; the tunnel does
-not forward `/connect/` at all. Routes stay local until this changes. The open
-work is the whole deployment story: where the control plane runs and who owns it,
-how workers are reached from outside, secrets and identity, images and a
-registry, upgrades against a database that is not disposable, and cost and
-isolation. A guide to deploying on your own cloud provider lands with it.
-
-**Running outside Kubernetes.** A local LLM, or an AWS, GCP or Azure service,
-connected to the rest of the runtime.
+**Other clouds.** Weft installs on GCP today ([deploying to your
+cloud](../running/cloud.md)). AWS and Azure come next, installed on your
+own account the same way.
 
 ## The builders
 

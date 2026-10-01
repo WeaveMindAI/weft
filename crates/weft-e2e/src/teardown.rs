@@ -46,9 +46,15 @@ impl Teardown {
     /// `recovery_hint` (the by-hand cleanup commands the `Drop` warning prints
     /// when a test ends early).
     pub fn new(id: Uuid, label: impl Into<String>, recovery_hint: impl Into<String>) -> Self {
+        let label = label.into();
+        // Said the moment the project exists, not only when the guard
+        // drops: a test the runner stops for running too long dies without
+        // dropping anything, and the post-mortem finds its projects here.
+        // SYNC: this line <-> scripts/run-e2e.sh (post_mortem)
+        eprintln!("weft-e2e: made project '{label}' ({id})");
         Self {
             id,
-            label: label.into(),
+            label,
             finished: false,
             recovery_hint: recovery_hint.into(),
         }

@@ -1,7 +1,7 @@
 // The connection vocabulary: a service's recipe as the connect surfaces
 // read it, a stored connection as the store lists it, and whose credential
 // a connection is. Shared by the editor's connection picker (through the
-// graph protocol, which re-exports it) and a member's connect page.
+// graph protocol, which re-exports it) and an instance's connect page.
 
 /** The credentials of a service's OAuth app: a mandatory display
  *  label (the connection list's middle column), client id, secret
@@ -142,9 +142,9 @@ export interface GrantSummary {
   permissions_verified: boolean;
   /** Whose credential the row resolves to; 'platform' rows spend credits. */
   owner: CredentialOwner;
-  /** The member of `project_id` whose connection this is; absent for
+  /** The instance of `project_id` whose connection this is; absent for
    *  the author's. */
-  member?: string;
+  instance?: string;
   /** Which door created it; drives the shared-door one-time warning. */
   door: Door;
   expires_at?: string | null;
@@ -158,16 +158,16 @@ export interface GrantSummary {
 }
 
 /// Whose credential a measured call spent: the runtime's own key, the
-/// author's own connection, or a member's own connection.
+/// author's own connection, or an instance's own connection.
 // SYNC: CredentialOwner <-> crates/weft-core/src/access/mod.rs CredentialOwner
-export type CredentialOwner = 'platform' | 'author' | { member: string };
+export type CredentialOwner = 'platform' | 'author' | { instance: string };
 
-/// The kind of a `CredentialOwner`, member id dropped: what a firing's
-/// cost row says ("own key", "platform key", "member's key").
-export type CredentialOwnerKind = 'platform' | 'author' | 'member';
+/// The kind of a `CredentialOwner`, instance id dropped: what a firing's
+/// cost row says ("own key", "platform key", "instance's key").
+export type CredentialOwnerKind = 'platform' | 'author' | 'instance';
 
 export function credentialOwnerKind(owner: CredentialOwner): CredentialOwnerKind {
-  return typeof owner === 'string' ? owner : 'member';
+  return typeof owner === 'string' ? owner : 'instance';
 }
 
 /** One registered app the shared door offers: its label and the FIXED
@@ -207,7 +207,7 @@ export interface StartedConsent {
 
 /** A consent's outcome once it landed (`null` while still pending; the
  *  poll answers 410 once nothing is live under the state). */
-// SYNC: ConsentOutcome <-> crates/weft-access-store/src/flows.rs complete_oauth (the parked result_json)
+// SYNC: ConsentOutcome <-> crates/weft-access-store/src/flows.rs complete_oauth, take_connect_result (the parked result_json), crates/weft-cli/src/commands/connect.rs ConnectOutcome
 export type ConsentOutcome = { grant?: GrantSummary; error?: string } | null;
 
 // The ways a `remote_select` field can be filled, in preference order.
@@ -273,60 +273,60 @@ export type PickerOutcome = { picked?: LookupItem; cancelled?: boolean; error?: 
  *  server-side, so any connection signs it; a `picker` or `granted`
  *  source hands the connection to the person's own browser, so it only
  *  runs on their OWN connection. */
-// SYNC: FieldConnection <-> crates/weft-core/src/member_door.rs FieldConnection
+// SYNC: FieldConnection <-> crates/weft-core/src/instance_door.rs FieldConnection
 export type FieldConnection = 'none' | 'own' | 'shared';
 
-/** One field a member fills, at one place of the program, as the member
- *  door lists it. */
-// SYNC: MemberField <-> crates/weft-core/src/member_door.rs MemberField
-export interface MemberField {
+/** One field that takes a value of each instance's own, at one place of
+ *  the program, as the instance door lists it. */
+// SYNC: InstanceField <-> crates/weft-core/src/instance_door.rs InstanceField
+export interface InstanceField {
   /** The step, spelled the way the program writes it; with `field`, the
-   *  key the member's value is stored under. */
+   *  key the instance's value is stored under. */
   step: string;
   field: string;
   nodeType: string;
   label?: string;
   /** The input as its node declares it. */
   input: InputDefinition;
-  /** What a member who gives nothing gets. */
+  /** What an instance given nothing gets. */
   fallback?: unknown;
-  /** Whether a run needs the member's value here. */
+  /** Whether a run needs the instance's value here. */
   needed: boolean;
   /** For a connection field, the service's recipe. */
   spec?: AccessSpecWire;
   /** For a `remote_select` field, the connection wired to it for this
-   *  member and whose it is; `none` for any other field. */
+   *  instance and whose it is; `none` for any other field. */
   connection: FieldConnection;
-  /** What the member gave (a connection reads as its handle). */
+  /** What the instance was given (a connection reads as its handle). */
   value?: unknown;
 }
 
 /** A value to give one field. */
-// SYNC: MemberValueInput <-> crates/weft-core/src/run_spec.rs MemberValueInput
-export interface MemberValueInput {
+// SYNC: InstanceValueInput <-> crates/weft-core/src/run_spec.rs InstanceValueInput
+export interface InstanceValueInput {
   step: string;
   field: string;
   value: unknown;
 }
 
-/** One member-filled field, named: `field` of the step at `step`. */
-// SYNC: MemberFieldRef <-> crates/weft-core/src/run_spec.rs MemberFieldRef
-export interface MemberFieldRef {
+/** One instance-filled field, named: `field` of the step at `step`. */
+// SYNC: InstanceFieldRef <-> crates/weft-core/src/run_spec.rs InstanceFieldRef
+export interface InstanceFieldRef {
   step: string;
   field: string;
 }
 
-/** `PUT /member/values`: values to give, and fields to clear, at once. */
-// SYNC: ValuesRequest <-> crates/weft-dispatcher/src/api/member_door.rs ValuesRequest
+/** `PUT /instance/values`: values to give, and fields to clear, at once. */
+// SYNC: ValuesRequest <-> crates/weft-core/src/instance_door.rs ValuesRequest
 export interface ValuesRequest {
-  set: MemberValueInput[];
-  clear: MemberFieldRef[];
+  set: InstanceValueInput[];
+  clear: InstanceFieldRef[];
 }
 
-/** `POST /member/lookup`: which list of which field, by the position of
+/** `POST /instance/lookup`: which list of which field, by the position of
  *  its source in the field's `sources`. */
-// SYNC: MemberLookupRequest <-> crates/weft-dispatcher/src/api/member_door.rs LookupRequest
-export interface MemberLookupRequest {
+// SYNC: InstanceLookupRequest <-> crates/weft-dispatcher/src/api/instance_door.rs LookupRequest
+export interface InstanceLookupRequest {
   step: string;
   field: string;
   source: number;
@@ -335,18 +335,18 @@ export interface MemberLookupRequest {
   cursor?: string | null;
 }
 
-/** `POST /member/picker`: which field's chooser to open, by the position
+/** `POST /instance/picker`: which field's chooser to open, by the position
  *  of its `picker` source. */
-// SYNC: MemberPickerRequest <-> crates/weft-dispatcher/src/api/member_door.rs PickerRequest
-export interface MemberPickerRequest {
+// SYNC: InstancePickerRequest <-> crates/weft-dispatcher/src/api/instance_door.rs PickerRequest
+export interface InstancePickerRequest {
   step: string;
   field: string;
   source: number;
 }
 
-/** What a change of a member's values did beyond storing: the member's
- *  triggers set up again because they read a changed value. */
-// SYNC: ValuesChanged <-> crates/weft-core/src/member_door.rs ValuesChanged
+/** What a change of an instance's values did beyond storing: the
+ *  instance's triggers set up again because they read a changed value. */
+// SYNC: ValuesChanged <-> crates/weft-core/src/instance_door.rs ValuesChanged
 export interface ValuesChanged {
   rearmed: string[];
 }
@@ -445,8 +445,10 @@ export type Widget =
   /// A calendar-and-clock picker; the stored String is ISO-8601 with
   /// the picker's own zone offset.
   | { kind: 'datetime' }
-  | { kind: 'select'; options: string[] }
-  | { kind: 'multiselect'; options: string[] }
+  /// `free_text`: the options are suggestions (model ids, voices), so
+  /// the user may type a value outside them and nothing refuses it.
+  | { kind: 'select'; options: string[]; free_text?: boolean }
+  | { kind: 'multiselect'; options: string[]; free_text?: boolean }
   | { kind: 'password' }
   /// The connection picker; `service` and `optional` are
   /// compiler-stamped from the node metadata's recipe

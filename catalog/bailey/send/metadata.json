@@ -34,5 +34,8 @@
       "type": "String"
     }
   ],
+  "features": {
+    "catchErrors": true
+  },
   "requires_infra": false
 }

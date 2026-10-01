@@ -28,6 +28,8 @@ impl Node for SlackFindUserNode {
         let email: Option<String> = ctx.inputs.opt("email")?;
         let id: Option<String> = ctx.inputs.opt("id")?;
 
+        // Which key to look up by is the program's choice, so a wrong
+        // pair is an input mistake, never a caught failure.
         let user: Value = match (email, id) {
             (Some(e), None) => {
                 let answer =
@@ -39,9 +41,15 @@ impl Node for SlackFindUserNode {
                 answer["user"].clone()
             }
             (Some(_), Some(_)) => {
-                weft::node_bail!("pick ONE lookup key: an email or a user id, not both")
+                return Err(weft::WeftError::Input(
+                    "pick ONE lookup key: an email or a user id, not both".to_string(),
+                ));
             }
-            (None, None) => weft::node_bail!("pick a lookup key: an email or a user id"),
+            (None, None) => {
+                return Err(weft::WeftError::Input(
+                    "pick a lookup key: an email or a user id".to_string(),
+                ));
+            }
         };
         if user.is_null() {
             weft::node_bail!("slack returned no user object for the lookup");

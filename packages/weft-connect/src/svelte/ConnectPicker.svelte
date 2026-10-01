@@ -13,7 +13,7 @@
 	// deliberately no mode switch and no second tab.
 	//
 	// The host decides where it talks (`transport`): the weft editor
-	// through its host bridge, a member's page through the member door.
+	// through its host bridge, an instance's page through the instance door.
 	// The look is set with CSS custom properties (`--wc-accent`,
 	// `--wc-font-size`, ...) on any ancestor.
 	import type { AppRegistration, AccessSpecWire, Door, GrantSummary, SharedAppChoice } from '../core/wire';
@@ -51,7 +51,7 @@
 		projectApp?: AppRegistration | undefined;
 		/// The access node's type, named in the permission picker's
 		/// add-your-own hint (a missing permission is added to this
-		/// node's metadata). Absent on a member's page.
+		/// node's metadata). Absent on an instance's page.
 		nodeType?: string | null;
 		/// The handle of the picked connection, if any.
 		value: { id: string; identity?: string } | undefined;

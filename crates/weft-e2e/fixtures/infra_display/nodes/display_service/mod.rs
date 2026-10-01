@@ -6,8 +6,7 @@
 use async_trait::async_trait;
 
 use weft::infra::{
-    Container, ContainerPort, Endpoint, Expose, Image, InfraSpec, Probe, Protocol, Resources, Unit,
-    UnitKind,
+    Container, ContainerPort, Endpoint, EndpointTarget, Expose, Image, InfraSpec, Limits, Probe, Protocol, Unit,
 };
 use weft::node::NodeOutput;
 use weft::{ExecutionContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
@@ -27,7 +26,6 @@ impl Node for DisplayServiceNode {
         Ok(InfraSpec {
             units: vec![Unit {
                 name: "svc".into(),
-                kind: UnitKind::Deployment,
                 containers: vec![Container::new("app", Image::Local {
                     name: "display_service".into(),
                 })
@@ -36,24 +34,16 @@ impl Node for DisplayServiceNode {
                     port: PORT,
                     protocol: Protocol::Tcp,
                 }])
-                .with_resources(Resources {
-                    cpu_request: Some("50m".into()),
-                    memory_request: Some("32Mi".into()),
-                    cpu_limit: Some("250m".into()),
-                    memory_limit: Some("128Mi".into()),
-                    ..Default::default()
-                })
+                .with_limits(Limits { cpu: Some("0.25".into()), memory: Some("128Mi".into()) })
                 .with_readiness(Probe::http("/health", PORT).with_initial_delay(2))],
                 ..Default::default()
             }],
             // `api` is the endpoint metadata.json names as the one serving
-            // `/live`; the display doors reach it inside the cluster.
+            // `/live`; the display doors reach it at its install address.
             endpoints: vec![Endpoint {
                 name: "api".into(),
-                unit: "svc".into(),
-                container: "app".into(),
-                port: "http".into(),
-                expose: Expose::ClusterInternal,
+                target: EndpointTarget::Unit { unit: "svc".into(), container: "app".into(), port: "http".into() },
+                expose: Expose::Project,
             }],
             ..Default::default()
         })

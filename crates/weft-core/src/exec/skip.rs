@@ -31,7 +31,7 @@
 use std::collections::HashSet;
 
 use crate::project::NodeDefinition;
-use crate::pulse::Pulse;
+use crate::pulse::{Failure, Pulse};
 
 /// Why a firing did not run. Carried on the Skipped lifecycle event so
 /// the inspector can tell a DECISION (the author's `_should_flow` said
@@ -44,10 +44,10 @@ pub enum SkipReason {
     DidNotFlow,
     /// `_should_flow` closed: whatever decides whether this node runs
     /// never said yes. `failure` when it never said yes because it
-    /// broke (the closure carried the producer's error).
+    /// broke (the closure carried the node that failed and its error).
     FlowClosed {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        failure: Option<String>,
+        failure: Option<Failure>,
     },
     /// `_should_not_flow` got a value: this node runs when the thing it
     /// watches did NOT happen, and it did.
@@ -56,29 +56,29 @@ pub enum SkipReason {
     /// FINISH (it failed, or the run was cancelled under it), not
     /// because the thing did not happen. A database that errored is not
     /// an empty table, so the branch written for "nothing there" stays
-    /// off and the failure is what the run reports. `error` is the
-    /// closure's own reason: the failure text, or the cancel reason.
-    WatchedNodeFailed { error: String },
+    /// off and the failure is what the run reports. `failure` is the
+    /// closure's own: the node that broke (or was cancelled) and why.
+    WatchedNodeFailed { failure: Failure },
     /// A required input arrived closed, so nothing can drive the body.
     /// `failure` when it closed because its producer broke.
     RequiredInputClosed {
         port: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        failure: Option<String>,
+        failure: Option<Failure>,
     },
     /// Every input this node could act on arrived closed (or could
     /// never arrive at all). `failure` when one of them closed because
     /// its producer broke.
     EveryInputClosed {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        failure: Option<String>,
+        failure: Option<Failure>,
     },
     /// Every port of a `@require_one_of` group arrived closed.
     /// `failure` when one of them closed because its producer broke.
     OneOfGroupClosed {
         ports: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        failure: Option<String>,
+        failure: Option<Failure>,
     },
     /// The scope this node lives in (a group or a loop) did not run:
     /// its `_should_flow` said no, or a loop's list never came. Every
@@ -96,23 +96,23 @@ impl SkipReason {
     /// nothing on. A scope member's `ScopeSkipped` emits no closures of
     /// its own (the scope's teardown closed its exits, with the scope's
     /// failure), so it carries none.
-    pub fn inherited_failure(&self) -> Option<&str> {
+    pub fn inherited_failure(&self) -> Option<&Failure> {
         match self {
             Self::DidNotFlow | Self::DidFlow | Self::ScopeSkipped { .. } => None,
-            Self::WatchedNodeFailed { error } => Some(error),
+            Self::WatchedNodeFailed { failure } => Some(failure),
             Self::FlowClosed { failure }
             | Self::RequiredInputClosed { failure, .. }
             | Self::EveryInputClosed { failure }
-            | Self::OneOfGroupClosed { failure, .. } => failure.as_deref(),
+            | Self::OneOfGroupClosed { failure, .. } => failure.as_ref(),
         }
     }
 }
 
 /// The tail a reason's text grows when the closure it names carried a
 /// failure. One spelling for every reason.
-fn after_failure(failure: &Option<String>) -> String {
+fn after_failure(failure: &Option<Failure>) -> String {
     match failure {
-        Some(error) => format!(": a node before it failed ({error})"),
+        Some(failure) => format!(" because {failure}"),
         None => String::new(),
     }
 }
@@ -125,9 +125,9 @@ impl std::fmt::Display for SkipReason {
                 write!(f, "nothing ever answered its `_should_flow`{}", after_failure(failure))
             }
             Self::DidFlow => write!(f, "its `_should_not_flow` saw a value"),
-            Self::WatchedNodeFailed { error } => write!(
+            Self::WatchedNodeFailed { failure } => write!(
                 f,
-                "the node its `_should_not_flow` watches did not finish ({error}), which is \
+                "what its `_should_not_flow` watches did not finish ({failure}), which is \
                  not the absence this node runs on"
             ),
             Self::RequiredInputClosed { port, failure } => {
@@ -199,7 +199,7 @@ pub fn check_flow_permission(node: &NodeDefinition, group_pulses: &[&Pulse]) -> 
     // (the compiler refuses that), so whichever one speaks decides.
     let plain = match super::ready::resolve_port_value(group_pulses, SHOULD_FLOW_PORT) {
         Some(pulse) if pulse.closed => {
-            Some(Some(SkipReason::FlowClosed { failure: pulse.close_error.clone() }))
+            Some(Some(SkipReason::FlowClosed { failure: pulse.failure.clone() }))
         }
         Some(pulse) if *pulse.value == serde_json::Value::Bool(false) => {
             Some(Some(SkipReason::DidNotFlow))
@@ -226,12 +226,12 @@ pub fn check_flow_permission(node: &NodeDefinition, group_pulses: &[&Pulse]) -> 
     // decline to emit; it broke, and "broke" is not "nothing there". A
     // query that errored would otherwise render as an empty result (an
     // API route answering 404 over a database that is down). The wire
-    // already tells the two apart (`close_error`), so the gate does.
+    // already tells the two apart (`failure`), so the gate does.
     match super::ready::resolve_port_value(group_pulses, SHOULD_NOT_FLOW_PORT) {
         Some(pulse) if pulse.closed => pulse
-            .close_error
+            .failure
             .as_ref()
-            .map(|error| SkipReason::WatchedNodeFailed { error: error.clone() }),
+            .map(|failure| SkipReason::WatchedNodeFailed { failure: failure.clone() }),
         Some(pulse) if *pulse.value == serde_json::Value::Bool(false) => None,
         // Something real arrived, so the absence this node waits for did
         // not happen.
@@ -376,16 +376,16 @@ fn port_arrived_closed(group_pulses: &[&Pulse], port_name: &str) -> bool {
 
 /// `Some` when the port arrived closed, holding the error the closure
 /// carried when its producer failed rather than declined.
-fn port_closure<'a>(group_pulses: &[&'a Pulse], port_name: &str) -> Option<Option<&'a String>> {
+fn port_closure<'a>(group_pulses: &[&'a Pulse], port_name: &str) -> Option<Option<&'a Failure>> {
     super::ready::resolve_port_value(group_pulses, port_name)
         .filter(|p| p.closed)
-        .map(|p| p.close_error.as_ref())
+        .map(|p| p.failure.as_ref())
 }
 
-/// Among `ports` (in the node's own order), the error of the first
-/// one whose closure carried a failure. The one failure a skip over
-/// several closed ports passes on.
-fn first_failure<'a>(group_pulses: &[&Pulse], ports: impl Iterator<Item = &'a str>) -> Option<String> {
+/// Among `ports` (in the node's own order), the failure of the first
+/// one whose closure carried one. The one failure a skip over several
+/// closed ports passes on.
+fn first_failure<'a>(group_pulses: &[&Pulse], ports: impl Iterator<Item = &'a str>) -> Option<Failure> {
     ports
         .filter_map(|port| port_closure(group_pulses, port).flatten())
         .next()

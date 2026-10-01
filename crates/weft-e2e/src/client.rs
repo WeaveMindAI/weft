@@ -2,7 +2,7 @@
 //! real user / outside party would:
 //!
 //!   - [`Dispatcher`]: a thin HTTP client over the dispatcher's public API
-//!     (port 9999 by default). Used for reads (execution status / replay,
+//!     (`weft_core::ports::PUBLIC` by default). Used for reads (execution status / replay,
 //!     storage, infra status) and outside-world pokes (firing signals, the
 //!     live-caller handshake). This is the same contract the CLI and the
 //!     VS Code extension speak.
@@ -24,10 +24,10 @@ use anyhow::{bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-/// Default dispatcher API base. The kind node maps the dispatcher to
-/// `127.0.0.1:9999`; override with `WEFT_DISPATCHER_URL` to match a
-/// non-default `WEFT_DISPATCHER_PORT`.
-pub const DEFAULT_DISPATCHER_URL: &str = "http://127.0.0.1:9999";
+/// Default dispatcher API base: where the default install answers. Override
+/// with `WEFT_DISPATCHER_URL` to match an install on another
+/// `WEFT_PUBLIC_PORT`.
+pub const DEFAULT_DISPATCHER_URL: &str = weft_core::ports::LOCAL_PUBLIC_URL;
 
 /// Mints the bearer a request authenticates with. With no auth, the default is
 /// `None` (no `Authorization` header). A harness that needs a token injects a
@@ -50,11 +50,11 @@ pub struct Dispatcher {
     /// Mints the per-request bearer. `None` => unauthenticated; `Some` => a
     /// harness signs a token per call.
     auth: Option<std::sync::Arc<dyn AuthProvider>>,
-    /// Which install on the cluster this dispatcher belongs to: the default
-    /// one, or a test cell ([`crate::cell::Cell`]). What reaches behind the
-    /// API (the platform layer, the `weft` CLI) follows it to the right
-    /// namespaces and database.
-    instance: weft_core::infra::Instance,
+    /// Which install on this machine this dispatcher belongs to: the
+    /// default one, or a test cell ([`crate::cell::Cell`]). What reaches
+    /// behind the API (the platform layer, the `weft` CLI) follows it to
+    /// the right files and database.
+    install: weft_core::infra::Install,
 }
 
 impl Dispatcher {
@@ -66,12 +66,12 @@ impl Dispatcher {
     pub fn from_env() -> Result<Self> {
         let base = std::env::var("WEFT_DISPATCHER_URL")
             .unwrap_or_else(|_| DEFAULT_DISPATCHER_URL.to_string());
-        Self::for_install(&base, weft_core::infra::Instance::default_install())
+        Self::for_install(&base, weft_core::infra::Install::default_install())
     }
 
-    /// An UNAUTHENTICATED client for the dispatcher of `instance`, answering
+    /// An UNAUTHENTICATED client for the dispatcher of `install`, answering
     /// at `base`.
-    pub fn for_install(base: &str, instance: weft_core::infra::Instance) -> Result<Self> {
+    pub fn for_install(base: &str, install: weft_core::infra::Install) -> Result<Self> {
         let http = reqwest::Client::builder()
             .build()
             .context("build reqwest client")?;
@@ -79,13 +79,13 @@ impl Dispatcher {
             base: base.trim_end_matches('/').to_string(),
             http,
             auth: None,
-            instance,
+            install,
         })
     }
 
     /// The install this dispatcher belongs to.
-    pub fn instance(&self) -> &weft_core::infra::Instance {
-        &self.instance
+    pub fn install(&self) -> &weft_core::infra::Install {
+        &self.install
     }
 
     /// A clone of this client that authenticates every request via `auth`. A
@@ -273,9 +273,8 @@ impl Dispatcher {
     }
 
     /// GET an ABSOLUTE url (not under the dispatcher base) and return raw
-    /// status + body. Used for the live-caller per-pod gateway URL and for
-    /// storage capability URLs, which point at the gateway / storage box, not
-    /// the dispatcher.
+    /// status + body. Used for the live-caller URL and for storage
+    /// capability URLs, which the dispatcher hands out whole.
     pub async fn get_abs_raw(&self, url: &str) -> Result<(reqwest::StatusCode, Vec<u8>)> {
         let resp = self
             .http
@@ -313,9 +312,9 @@ pub async fn cli(disp: &Dispatcher, dir: &Path, args: &[&str]) -> Result<CliOutp
     cmd.current_dir(dir);
     cmd.args(args);
     cmd.env("WEFT_DISPATCHER_URL", disp.base());
-    match disp.instance().name() {
-        Some(name) => cmd.env(weft_core::infra::INSTANCE_ENV, name),
-        None => cmd.env_remove(weft_core::infra::INSTANCE_ENV),
+    match disp.install().name() {
+        Some(name) => cmd.env(weft_core::infra::INSTALL_ENV, name),
+        None => cmd.env_remove(weft_core::infra::INSTALL_ENV),
     };
     // The rig is non-interactive by construction: a verb that wants a
     // prompt must receive its answer via flags. With an inherited stdin
@@ -378,13 +377,27 @@ pub fn tail(s: &str, n: usize) -> &str {
     &s[start..]
 }
 
+/// The most one test may take: past it the runner stops the test and
+/// counts it failed, saying only that it ran out of time.
+// SYNC: TEST_LIMIT <-> scripts/run-e2e.sh TEST_LIMIT
+pub const TEST_LIMIT: Duration = Duration::from_secs(300);
+
+/// How long a wait may take in a test that began at `started` and still
+/// needs `after` for what follows the wait, so a slow wait fails with its
+/// own named [`poll_until`] timeout before the runner cuts the test with
+/// nothing to say. Zero once the time is already spent (the poll then
+/// checks once and fails naming the wait).
+pub fn time_left(started: std::time::Instant, after: Duration) -> Duration {
+    TEST_LIMIT.saturating_sub(started.elapsed()).saturating_sub(after)
+}
+
 /// Poll `f` until it returns `Ok(Some(v))`, yielding `v`; retry on `Ok(None)`;
 /// propagate `Err` immediately. Times out after `deadline` with a message that
 /// names `what`. This is the rig's single wait primitive: every "wait until the
 /// system reaches state X" loop goes through here so the timeout / poll cadence
 /// is consistent and a hang always surfaces as a clear error rather than a hung
 /// test the harness has to kill. The deadline is for INTERNAL transitions the
-/// rig controls (build done, pod running, run terminal), which legitimately
+/// rig controls (build done, unit running, run terminal), which legitimately
 /// bound; it is not imposed on user-controlled long operations.
 pub async fn poll_until<T, F, Fut>(
     what: &str,

@@ -22,7 +22,7 @@ use crate::socket_engine::PrepareError;
 use crate::stream_engine::{self, PlanReply, PlanStep, StreamPlan};
 
 use super::socket_listen::interpolate_frame;
-use super::{KindHandler, LiveCtx, SpawnCtx};
+use super::{BetweenFires, KindHandler, LiveCtx, SpawnCtx};
 use weft_core::live::{LiveFeed, LiveItem};
 
 pub struct StreamListenHandler;
@@ -31,6 +31,10 @@ pub struct StreamListenHandler;
 impl KindHandler for StreamListenHandler {
     fn tag(&self) -> &'static str {
         StreamListen::TAG
+    }
+
+    fn between_fires(&self) -> BetweenFires {
+        BetweenFires::Holds
     }
 
     fn compute_routing(&self, _spec: &SignalSpec) -> Result<SignalRouting> {
@@ -121,6 +125,7 @@ async fn prepare_cycle(
 
     let address = interpolate_frame(&cfg.address, &values)
         .map_err(|e| PrepareError::Fatal(anyhow::anyhow!(e)))?;
+    let address = crate::infra_address::for_listener(&address, ctx).await.map_err(PrepareError::Transient)?;
     let script = cfg
         .script
         .iter()

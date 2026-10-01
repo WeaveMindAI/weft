@@ -30,14 +30,14 @@
 //       read by crate::infra_event_bridge. Each has `writer_xid` and an index on
 //       (writer_xid, id).
 //
-// exec_event is also read in order PER COLOR: the bridge must apply one
-// color's rows in write order, or a terminal lands before the event it
+// exec_event is also read in order PER EXECUTION_ID: the bridge must apply one
+// execution's rows in write order, or a terminal lands before the event it
 // closes and the run reopens. `(writer_xid, id)` order gives that only
-// if a transaction holds the color's lock before it gets its xid (at its
+// if a transaction holds the execution's lock before it gets its xid (at its
 // first write), which is the invariant on `weft_journal::write`. Every
 // transaction that writes something else before its exec_event rows
-// takes `weft_journal::lock_colors` first:
-// SYNC: color lock before first write <-> crate::journal::postgres
+// takes `weft_journal::lock_execution_ids` first:
+// SYNC: execution lock before first write <-> crate::journal::postgres
 //       (record_with_seed, start_execution, start_live_execution,
 //       cancel_execution). Transactions whose first write is the
 //       exec_event insert are covered by the lock that insert takes:
@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 use sqlx::postgres::PgRow;
 use sqlx::Row;
 
-use crate::pg_wake::{self, DrainStep};
+use weft_task_store::drain::{self as pg_wake, DrainStep};
 
 /// How soon to look again the first time a row is held back: its writer
 /// is usually a short transaction, nothing announces its end, and waiting
@@ -78,7 +78,7 @@ impl Position {
 
 /// One cursor's settled reads, and what it remembers between them: the
 /// horizon it is held back on, to back off while that transaction stays
-/// open and to say so in the log. RAM only; a pod that starts fresh just
+/// open and to say so in the log. RAM only; a process that starts fresh just
 /// starts at the shortest retry.
 pub struct SettledReader {
     /// The tracing target the stall warning is logged under.
@@ -319,32 +319,32 @@ mod db_tests {
             .unwrap()
     }
 
-    /// Two writers of one color, the second of which writes something
+    /// Two writers of one execution, the second of which writes something
     /// else first (as `cancel_execution` strips signals before its
     /// terminals). Locked before that first write, the second writer's
     /// xid follows the first writer's, so the settled read applies the
-    /// color's rows in write order. Locked after it, the second writer
+    /// execution's rows in write order. Locked after it, the second writer
     /// already holds the older xid and its later row reads first: the
-    /// reopened-run bug `weft_journal::lock_colors` exists for.
+    /// reopened-run bug `weft_journal::lock_execution_ids` exists for.
     #[sqlx::test]
-    async fn locking_the_color_before_any_write_keeps_its_rows_in_xid_order(pool: PgPool) {
+    async fn locking_the_execution_id_before_any_write_keeps_its_rows_in_xid_order(pool: PgPool) {
         table(&pool).await;
         for lock_first in [true, false] {
-            let color = uuid::Uuid::new_v4();
+            let execution_id = uuid::Uuid::new_v4();
             let (first, second) = (format!("first-{lock_first}"), format!("second-{lock_first}"));
             let mut t1 = pool.begin().await.unwrap();
-            weft_journal::lock_colors(&mut t1, &[color]).await.unwrap();
+            weft_journal::lock_execution_ids(&mut t1, &[execution_id]).await.unwrap();
 
             let (pool2, second2) = (pool.clone(), second.clone());
             let other = format!("other-{lock_first}");
             let t2 = tokio::spawn(async move {
                 let mut t2 = pool2.begin().await.unwrap();
                 if lock_first {
-                    weft_journal::lock_colors(&mut t2, &[color]).await.unwrap();
+                    weft_journal::lock_execution_ids(&mut t2, &[execution_id]).await.unwrap();
                     insert(&mut *t2, &other).await;
                 } else {
                     insert(&mut *t2, &other).await;
-                    weft_journal::lock_colors(&mut t2, &[color]).await.unwrap();
+                    weft_journal::lock_execution_ids(&mut t2, &[execution_id]).await.unwrap();
                 }
                 insert(&mut *t2, &second2).await;
                 t2.commit().await.unwrap();

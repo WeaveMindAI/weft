@@ -69,7 +69,7 @@ impl Rig {
         project.activate().await?;
         feed.wait_for_subscribers(subscribers, Duration::from_secs(60)).await?;
         let pid = project.id();
-        let known = run::execution_colors(&disp, &pid).await?;
+        let known = run::executions(&disp, &pid).await?;
         Ok(Self {
             disp,
             project,
@@ -91,11 +91,11 @@ impl Rig {
     /// Push one event and return the run it started.
     async fn fire(&mut self, event: &str, value: &str) -> anyhow::Result<Uuid> {
         self.feed.push_event(event, &Self::event_data(value));
-        let color =
+        let execution_id =
             run::wait_for_triggered_execution(&self.disp, &self.pid, &self.known, Duration::from_secs(60))
                 .await?;
-        self.known.insert(color);
-        Ok(color)
+        self.known.insert(execution_id);
+        Ok(execution_id)
     }
 
     /// Push `values` as a burst of "go" events with no wait between them
@@ -104,7 +104,7 @@ impl Rig {
         for value in values {
             self.feed.push_event("go", &Self::event_data(value));
         }
-        let colors = run::wait_for_triggered_executions(
+        let execution_ids = run::wait_for_triggered_executions(
             &self.disp,
             &self.pid,
             &self.known,
@@ -112,29 +112,29 @@ impl Rig {
             Duration::from_secs(60),
         )
         .await?;
-        self.known.extend(colors.iter().copied());
-        Ok(colors)
+        self.known.extend(execution_ids.iter().copied());
+        Ok(execution_ids)
     }
 
-    async fn summary(&self, color: Uuid) -> anyhow::Result<Value> {
-        self.disp.get_json(&format!("/executions/{color}")).await
+    async fn summary(&self, execution_id: Uuid) -> anyhow::Result<Value> {
+        self.disp.get_json(&format!("/executions/{execution_id}")).await
     }
 
-    async fn parked(&self, color: Uuid) -> anyhow::Result<()> {
-        run::wait_for_status(&self.disp, color, "waiting_for_input").await
+    async fn parked(&self, execution_id: Uuid) -> anyhow::Result<()> {
+        run::wait_for_status(&self.disp, execution_id, "waiting_for_input").await
     }
 
-    /// Wait until `color` carries `tag`. A run reads as running before
+    /// Wait until `execution_id` carries `tag`. A run reads as running before
     /// its tag node has run, and the stop order is the order runs TAGGED
     /// themselves, so a test that means "a later run stops this one"
     /// waits for the tag, not for the status.
-    async fn tagged(&self, color: Uuid, tag: &str) -> anyhow::Result<()> {
+    async fn tagged(&self, execution_id: Uuid, tag: &str) -> anyhow::Result<()> {
         weft_e2e::client::poll_until(
-            &format!("execution {color} to carry the tag '{tag}'"),
+            &format!("execution {execution_id} to carry the tag '{tag}'"),
             Duration::from_secs(60),
             Duration::from_millis(100),
             || async move {
-                let summary = self.summary(color).await?;
+                let summary = self.summary(execution_id).await?;
                 let carries = summary["tags"]
                     .as_array()
                     .is_some_and(|tags| tags.iter().any(|t| t == tag));
@@ -206,7 +206,7 @@ async fn later_run_stops_earlier_runs_for_the_same_sender() -> anyhow::Result<()
         .await?;
     let row = listing["executions"]
         .as_array()
-        .and_then(|rows| rows.iter().find(|r| r["color"] == json!(third)))
+        .and_then(|rows| rows.iter().find(|r| r["execution_id"] == json!(third)))
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("run 3 missing from the listing: {listing}"))?;
     assert_eq!(row["tags"], json!(["user_7", "everyone"]), "{row}");
@@ -476,7 +476,7 @@ async fn a_stop_never_crosses_a_project() -> anyhow::Result<()> {
 /// sits in `running` on a node in flight instead of parked on a person.
 fn graph_in_flight(sse_url: &str, release_url: &str) -> String {
     format!(
-        "start = TestSseTrigger {{\n\
+        "start = TestSseTrigger -> (value: String) {{\n\
          \x20 url: \"{sse_url}\"\n\
          \x20 event_name: \"go\"\n\
          }}\n\
@@ -503,24 +503,24 @@ fn assert_stopped_by(settled: &SettledRun, by: Uuid, tag: &str) -> anyhow::Resul
     anyhow::ensure!(
         settled.status == "cancelled",
         "run {} must be cancelled, is {}",
-        settled.color,
+        settled.execution_id,
         settled.status
     );
     let terminal = settled
         .replay()
         .first_kind("execution_cancelled")
-        .ok_or_else(|| anyhow::anyhow!("no execution_cancelled for {}", settled.color))?;
+        .ok_or_else(|| anyhow::anyhow!("no execution_cancelled for {}", settled.execution_id))?;
     let cause = terminal.0["cause"].clone();
     anyhow::ensure!(
         cause == json!({ "kind": "execution", "by": by, "tag": tag }),
         "cause on {}: {cause}",
-        settled.color
+        settled.execution_id
     );
     let reason = settled.cancel_reason().unwrap_or_default();
     anyhow::ensure!(
         reason.contains(&by.to_string()) && reason.contains(tag),
         "reason on {}: {reason}",
-        settled.color
+        settled.execution_id
     );
     // A node is cancelled only if one was live when the stop landed: a
     // run stopped between two nodes (one finished, the next not yet
@@ -529,7 +529,7 @@ fn assert_stopped_by(settled: &SettledRun, by: Uuid, tag: &str) -> anyhow::Resul
         let node_cancel = settled
             .replay()
             .first_kind("node_cancelled")
-            .ok_or_else(|| anyhow::anyhow!("no node_cancelled for the live node on {}", settled.color))?;
+            .ok_or_else(|| anyhow::anyhow!("no node_cancelled for the live node on {}", settled.execution_id))?;
         anyhow::ensure!(
             node_cancel.str_field("reason").unwrap_or_default() == reason,
             "the live node's cancel row names the same cause: {:?}",
@@ -565,11 +565,11 @@ fn assert_tagged_event(settled: &SettledRun, tags: &[&str]) -> anyhow::Result<()
     let tagged = settled
         .replay()
         .first_kind("execution_tagged")
-        .ok_or_else(|| anyhow::anyhow!("no execution_tagged on {}", settled.color))?;
+        .ok_or_else(|| anyhow::anyhow!("no execution_tagged on {}", settled.execution_id))?;
     anyhow::ensure!(
         tagged.0["tags"] == json!(tags),
         "tags on {}: {:?}",
-        settled.color,
+        settled.execution_id,
         tagged.0
     );
     Ok(())

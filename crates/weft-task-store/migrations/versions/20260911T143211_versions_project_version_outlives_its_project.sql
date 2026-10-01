@@ -1,1 +1,0 @@
-ALTER TABLE project_version DROP CONSTRAINT project_version_project_id_fkey;

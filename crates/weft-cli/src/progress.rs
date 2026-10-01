@@ -42,8 +42,8 @@ pub enum ActionVerb {
     /// Inactive.
     CancelActivate,
     /// Cancel an in-flight build (transition=building).
-    /// Flips the transition to cancelling_build; the pod driving the
-    /// build interrupts the builder job.
+    /// Flips the transition to cancelling_build; the dispatcher driving
+    /// the build sees it and stops the build.
     CancelBuild,
     Deactivate,
     /// Force-cancel running executions while a deactivate-with-wait
@@ -73,23 +73,16 @@ pub enum ActionVerb {
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
-    /// Worker / infra image build started.
+    /// The install started building the project. Detail carries
+    /// `{ "project": <name> }`.
     BuildStart,
-    /// Build skipped because the hash matched an existing image.
-    BuildSkip,
-    /// Build finished (image is local).
+    /// The install finished building the project. Detail carries
+    /// `{ "project": <name> }`.
     BuildDone,
-    /// Loading image into kind cluster (or pushing it to a registry).
-    ImagePushStart,
-    ImagePushDone,
-    /// The stale-image sweep after an ensure dropped something. Detail
-    /// carries `{ "images": [<ref>, ...] }`, the host refs untagged.
-    /// Never emitted when the sweep dropped nothing.
-    ImagesReclaimed,
     /// HTTP request to the dispatcher started.
     DispatcherCallStart,
     /// HTTP request to the dispatcher finished. Body in `detail`
-    /// (e.g. `{ "color": "..." }` for run, `{ "signal_count": N }`
+    /// (e.g. `{ "execution_id": "..." }` for run, `{ "signal_count": N }`
     /// for activate).
     DispatcherCallDone,
     /// Infra provision started (one event covers every infra node
@@ -287,64 +280,26 @@ impl Progress {
         }
     }
 
-    pub fn build_start(&self, image: &str) {
-        self.emit(
-            Phase::BuildStart,
-            Some(serde_json::json!({ "image": image })),
-        );
+    // SYNC: the details' "project" and "built" keys <-> packages/weft-graph/src/protocol.ts CliPhase
+    pub fn build_start(&self, project: &str) {
+        self.emit(Phase::BuildStart, Some(serde_json::json!({ "project": project })));
     }
 
-    pub fn build_skip(&self, image: &str, reason: &str) {
-        self.emit(
-            Phase::BuildSkip,
-            Some(serde_json::json!({ "image": image, "reason": reason })),
-        );
-    }
-
-    pub fn build_done(&self, image: &str) {
-        self.emit(
-            Phase::BuildDone,
-            Some(serde_json::json!({ "image": image })),
-        );
-    }
-
-    pub fn image_push_start(&self, image: &str) {
-        self.emit(
-            Phase::ImagePushStart,
-            Some(serde_json::json!({ "image": image })),
-        );
-    }
-
-    pub fn image_push_done(&self, image: &str) {
-        self.emit(
-            Phase::ImagePushDone,
-            Some(serde_json::json!({ "image": image })),
-        );
-    }
-
-    /// Report the stale images an ensure's sweep untagged; silent when
-    /// there were none, so a no-change build prints nothing about it.
-    pub fn images_reclaimed(&self, images: &[String]) {
-        if images.is_empty() {
-            return;
-        }
-        self.emit(
-            Phase::ImagesReclaimed,
-            Some(serde_json::json!({ "images": images })),
-        );
+    /// `built`: the image refs the install had to build (empty when every
+    /// image was already there).
+    pub fn build_done(&self, project: &str, built: &[String]) {
+        self.emit(Phase::BuildDone, Some(serde_json::json!({ "project": project, "built": built })));
     }
 
     /// Say what the call about to be made will wait for, and for how
-    /// long. `deactivation` is the wire object the verb is about to
-    /// send.
+    /// long: the running policy and cap the verb is about to send.
     ///
     /// The POLICY decides whether there is a wait, and the mode has no
     /// say: it is the same rule as `DeactivateSpec::drains`, so park and
     /// hibernate both wait when the person asked to wait. (Wipe cannot
     /// reach here with `wait`; the spec's validator refuses that pair.)
-    pub fn drain_wait(&self, deactivation: &Value, cap_seconds: Option<u64>) {
-        let field = |name: &str| deactivation.get(name).and_then(|v| v.as_str());
-        if field("runningPolicy") != Some("wait") {
+    pub fn drain_wait(&self, policy: weft_core::RunningPolicy, cap_seconds: Option<u64>) {
+        if policy != weft_core::RunningPolicy::Wait {
             return;
         }
         self.emit(
@@ -457,30 +412,10 @@ fn human_line(ev: &Event<'_>) -> Option<String> {
         Phase::BuildStart => format!(
             "building {}",
             ev.detail
-                .and_then(|d| d.get("image"))
+                .and_then(|d| d.get("project"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("?")
+                .expect("build_start always names the project")
         ),
-        // The image is what is cached: node code and the engine. The
-        // definition (config, `@file` contents) always registers fresh,
-        // so a SQL or prompt edit runs without a rebuild and this line
-        // must not read as "your change was skipped".
-        Phase::BuildSkip => format!(
-            "{} unchanged since the last build, reusing the image (config and @file contents still update)",
-            ev.detail
-                .and_then(|d| d.get("image"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("?")
-        ),
-        Phase::ImagePushStart => "loading image".to_string(),
-        Phase::ImagesReclaimed => {
-            let n = ev
-                .detail
-                .and_then(|d| d.get("images"))
-                .and_then(|v| v.as_array())
-                .map_or(0, |a| a.len());
-            format!("dropped {n} stale image tag{}", if n == 1 { "" } else { "s" })
-        }
         Phase::InfraProvisionStart => "provisioning infra".to_string(),
         Phase::DrainWait => {
             let cap = match ev.detail.and_then(|d| d.get("capSeconds")).and_then(|v| v.as_u64()) {

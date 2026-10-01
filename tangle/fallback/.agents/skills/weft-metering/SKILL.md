@@ -5,7 +5,7 @@ description: "Read when the user asks what a run costs, or when a node is wired 
 
 # What a call costs
 
-A node never computes what its API call cost. Every cost figure in weft comes from a [meter]: separate code that watches the request go out and the answer come back, and works out the real number. The number lands on [the trail], the durable record of what an execution spent, read with `weft events <color> --kind cost_reported`.
+A node never computes what its API call cost. Every cost figure in weft comes from a [meter]: separate code that watches the request go out and the answer come back, and works out the real number. The number lands on [the trail], the durable record of what an execution spent, read with `weft events <execution-id> --kind cost_reported`.
 
 ## Two kinds of meter, and only one of them is yours
 
@@ -328,7 +328,7 @@ async fn priceable(&self, path: &str, follow_up: FollowUp<'_>) -> anyhow::Result
 You run the program, then read [the trail]:
 
 ```text
-weft events <color> --kind cost_reported
+weft events <execution-id> --kind cost_reported
 ```
 
 Each measured call prints a `cost_reported` line carrying `service=` and `amount_usd=`, plus whatever metadata your `resolve` returned. No line at all means the route classified `Unknown`, or `register_meter!` never ran.

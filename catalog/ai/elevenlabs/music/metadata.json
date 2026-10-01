@@ -41,6 +41,7 @@
       "default": "music_v1",
       "widget": {
         "kind": "select",
+        "free_text": true,
         "options": [
           "music_v1",
           "music_v2"
@@ -78,6 +79,9 @@
       "type": "Number"
     }
   ],
+  "features": {
+    "catchErrors": true
+  },
   "display": {
     "kind": "media",
     "output": "file"

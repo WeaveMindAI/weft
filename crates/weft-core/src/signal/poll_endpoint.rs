@@ -50,7 +50,7 @@ pub struct PollEndpoint {
     pub interval_secs: u64,
     /// Delta mode: instead of firing the whole response every poll,
     /// fire once per NEW item since the last poll. The cursor is
-    /// durable (it survives listener restarts and pod moves), and the
+    /// durable (it survives listener restarts and process moves), and the
     /// FIRST poll primes it silently: activating a trigger means
     /// "from now on", never "replay all history".
     #[serde(default, skip_serializing_if = "Option::is_none")]

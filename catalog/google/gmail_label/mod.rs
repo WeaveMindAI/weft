@@ -32,7 +32,9 @@ impl Node for GmailLabelNode {
         let add = non_blank_list(&ctx.inputs, "add")?;
         let remove = non_blank_list(&ctx.inputs, "remove")?;
         if add.is_empty() && remove.is_empty() {
-            weft::node_bail!("nothing to do: provide labels to add, remove, or both");
+            return Err(weft::WeftError::Input(
+                "nothing to do: provide labels to add, remove, or both".to_string(),
+            ));
         }
 
         let http = ctx.client(&account).await?;

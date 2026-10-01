@@ -8,7 +8,7 @@
 //     the project's at-rest facts. Available verbs, drift bits,
 //     trigger/infra rollups, per-node infra status.
 //
-//   - Live executions: the currently-running colors on the project,
+//   - Live executions: the currently-running executions on the project,
 //     each with its phase (a run, or an infra / trigger setup).
 //     REPLACED by every status fetch's `running` (the
 //     reconciliation), mutated between fetches by SSE
@@ -16,15 +16,15 @@
 //     A terminal event lost to a dropped stream is caught by the next
 //     fetch, so a Stop button never outlives its run.
 //
-//   - Follow state: which color the user is watching, and in what
+//   - Follow state: which execution the user is watching, and in what
 //     mode (latest tracks the newest live exec; pinned holds on a
-//     specific color the user picked from the right sidebar).
+//     specific execution the user picked from the right sidebar).
 //
 // CLI in-flight + error overlay sit on top of all three.
 //
-// The reducer computes "watched-live color" by intersecting follow
-// state with running colors. When that intersection is non-empty,
-// the bar shows Stop and cancels that color; otherwise the bar
+// The reducer computes "watched-live execution" by intersecting follow
+// state with running executions. When that intersection is non-empty,
+// the bar shows Stop and cancels that execution; otherwise the bar
 // shows Run/Activate. Only runs of the graph count there: a setup is
 // never a run to stop. The trigger section reads the backend status
 // alone; the infra section also reads whether an infra setup is
@@ -56,12 +56,12 @@ import type { RunningExecution } from '../../packages/weft-graph/src/status';
 
 interface FollowState {
   mode: FollowMode;
-  color: string | undefined;
+  executionId: string | undefined;
 }
 
 interface Slot {
   backend: ActionAvailability | undefined;
-  /// Running colors in start order (a Map iterates in insertion
+  /// Running executions in start order (a Map iterates in insertion
   /// order), each with what it is for. Only `fire` ones are runs the
   /// bar can stop; the setups drive the infra and trigger slots.
   running: Map<string, ExecutionPhase>;
@@ -74,14 +74,14 @@ interface Slot {
   /// HTTP-driven verb awaiting confirmation. Currently only used
   /// for Stop on a running execution: set when the user clicks
   /// Stop, cleared when an SSE terminal event arrives for the
-  /// targeted color (or when a status fetch reveals the color is
+  /// targeted execution (or when a status fetch reveals the execution is
   /// no longer running).
   pendingAction: {
     verb: ActionVerb;
     message: string;
-    /// Color the verb targets. The pending state clears as soon
-    /// as `markExecutionFinished(color)` matches.
-    color: string;
+    /// Execution id the verb targets. The pending state clears as soon
+    /// as `markExecutionFinished(executionId)` matches.
+    executionId: string;
   } | undefined;
   error: ActionBarError | undefined;
   /// Terminal output of the verb in `cli`, or of the verb that just
@@ -95,7 +95,7 @@ function emptySlot(): Slot {
   return {
     backend: undefined,
     running: new Map(),
-    follow: { mode: 'following', color: undefined },
+    follow: { mode: 'following', executionId: undefined },
     cli: undefined,
     pendingAction: undefined,
     error: undefined,
@@ -127,15 +127,15 @@ export class ActionBarStore {
     return this.derive();
   }
 
-  /// A color that is running right now on this project, or undefined
+  /// An execution that is running right now on this project, or undefined
   /// if the user is looking at a finished execution or nothing runs.
-  /// Stop button uses this; cancel POSTs against this color.
-  watchedRunningColor(projectId?: string): string | undefined {
+  /// Stop button uses this; cancel POSTs against this execution.
+  watchedRunningExecutionId(projectId?: string): string | undefined {
     const id = projectId ?? this.pinnedProjectId;
     if (!id) return undefined;
     const slot = this.slots.get(id);
     if (!slot) return undefined;
-    return computeWatchedRunningColor(slot);
+    return computeWatchedRunningExecutionId(slot);
   }
 
   pushStatus(
@@ -145,9 +145,9 @@ export class ActionBarStore {
   ): void {
     const slot = this.ensureSlot(projectId);
     slot.backend = snapshot;
-    // The fetch is the truth about what runs: colors it does not name
+    // The fetch is the truth about what runs: executions it does not name
     // are gone (their terminal event may have been lost to a dropped
-    // stream), colors it names and the set lacks are live.
+    // stream), executions it names and the set lacks are live.
     //
     // The fetch's ORDER is the truth too, and it replaces what was
     // here rather than being merged into it. The dispatcher sends them
@@ -155,11 +155,11 @@ export class ActionBarStore {
     // taking the last is taking the newest. Keeping the old positions
     // and appending, which is what this used to do, mixed one ordering
     // into another and left "latest" following an arbitrary run.
-    slot.running = new Map(running.map((r) => [r.color, r.phase]));
+    slot.running = new Map(running.map((r) => [r.execution_id, r.phase]));
     const next = slot.running;
     // A Stop waiting on a run the fetch no longer lists is over: the
     // run ended, whether or not its terminal event ever arrived.
-    if (slot.pendingAction && !next.has(slot.pendingAction.color)) {
+    if (slot.pendingAction && !next.has(slot.pendingAction.executionId)) {
       slot.pendingAction = undefined;
     }
     this.notifyIfPinned(projectId);
@@ -178,23 +178,23 @@ export class ActionBarStore {
     this.notifyIfPinned(projectId);
   }
 
-  /// SSE `execution_started` arrived: that color is now live.
-  markExecutionStarted(projectId: string, color: string, phase: ExecutionPhase): void {
+  /// SSE `execution_started` arrived: that execution is now live.
+  markExecutionStarted(projectId: string, executionId: string, phase: ExecutionPhase): void {
     const slot = this.ensureSlot(projectId);
-    slot.running.set(color, phase);
+    slot.running.set(executionId, phase);
     this.notifyIfPinned(projectId);
   }
 
   /// SSE `execution_completed` / `execution_failed` arrived: that
-  /// color is no longer live.
-  markExecutionFinished(projectId: string, color: string): void {
+  /// execution is no longer live.
+  markExecutionFinished(projectId: string, executionId: string): void {
     const slot = this.slots.get(projectId);
     if (!slot) return;
-    slot.running.delete(color);
-    // If a pending action was targeting this color, the backend
+    slot.running.delete(executionId);
+    // If a pending action was targeting this execution, the backend
     // has confirmed it: clear the pending state. The bar exits
     // "Cancelling..." into whatever the next derived state is.
-    if (slot.pendingAction?.color === color) {
+    if (slot.pendingAction?.executionId === executionId) {
       slot.pendingAction = undefined;
     }
     this.notifyIfPinned(projectId);
@@ -203,15 +203,15 @@ export class ActionBarStore {
   /// User clicked Stop (or another HTTP-driven action). Lock the
   /// bar into a transient "waiting for backend" state until SSE
   /// confirms the action took effect.
-  setPending(projectId: string, verb: ActionVerb, message: string, color: string): void {
+  setPending(projectId: string, verb: ActionVerb, message: string, executionId: string): void {
     const slot = this.ensureSlot(projectId);
-    slot.pendingAction = { verb, message, color };
+    slot.pendingAction = { verb, message, executionId };
     this.notifyIfPinned(projectId);
   }
 
   /// Clear pending action (e.g. POST failed and we want to revert
   /// to the previous derived state). On success, prefer letting
-  /// `markExecutionFinished` clear it via the color match.
+  /// `markExecutionFinished` clear it via the execution match.
   clearPending(projectId: string): void {
     const slot = this.slots.get(projectId);
     if (!slot || !slot.pendingAction) return;
@@ -248,11 +248,11 @@ export class ActionBarStore {
   }
 
   /// AutoFollow emitted a follow-state change for projectId.
-  /// Mirrors mode + color into the slot so the reducer can compute
-  /// the watched-live color.
-  setFollow(projectId: string, mode: FollowMode, color: string | undefined): void {
+  /// Mirrors mode + execution into the slot so the reducer can compute
+  /// the watched-live execution.
+  setFollow(projectId: string, mode: FollowMode, executionId: string | undefined): void {
     const slot = this.ensureSlot(projectId);
-    slot.follow = { mode, color };
+    slot.follow = { mode, executionId };
     this.notifyIfPinned(projectId);
   }
 
@@ -409,7 +409,7 @@ export class ActionBarStore {
   /// Overlay precedence (top wins):
   ///   1. cli set            -> cli_running    (CLI verb in flight)
   ///   2. pendingAction set  -> pending        (HTTP verb awaiting SSE)
-  ///   3. watched-live color -> execution_running (live exec)
+  ///   3. watched-live execution -> execution_running (live exec)
   ///   4. otherwise          -> idle
   ///
   /// Backend stays present in every overlay so the section that
@@ -453,18 +453,18 @@ function overlayFromSlot(slot: Slot | undefined): ActionBarOverlay {
       message: slot.pendingAction.message,
     };
   }
-  const watchedLive = computeWatchedRunningColor(slot);
+  const watchedLive = computeWatchedRunningExecutionId(slot);
   if (watchedLive && slot.backend) {
-    return { kind: 'execution_running', color: watchedLive };
+    return { kind: 'execution_running', executionId: watchedLive };
   }
   return { kind: 'idle' };
 }
 
-/// Pure function: which running color does the bar act on for this slot?
+/// Pure function: which running execution does the bar act on for this slot?
 ///
-///   locked: the locked color, only if it's currently running.
+///   locked: the locked execution, only if it's currently running.
 ///   off:    undefined; no run is on screen to stop.
-///   following: the most recently started of the running colors.
+///   following: the most recently started of the running executions.
 ///              Returns undefined when nothing runs.
 ///
 /// "Most recently started" is the last element of an insertion-ordered set, and that
@@ -475,14 +475,14 @@ function overlayFromSlot(slot: Slot | undefined): ActionBarOverlay {
 /// Returns undefined when the user is looking at a finished
 /// execution (so the bar shows Run, not Stop), even if a different
 /// execution is running on the same project.
-function computeWatchedRunningColor(slot: Slot): string | undefined {
+function computeWatchedRunningExecutionId(slot: Slot): string | undefined {
   // Only runs: a setup is its verb working, shown in its own slot.
-  const runs = [...slot.running].filter(([, phase]) => phase === 'fire').map(([color]) => color);
+  const runs = [...slot.running].filter(([, phase]) => phase === 'fire').map(([executionId]) => executionId);
   if (runs.length === 0) return undefined;
   if (slot.follow.mode === 'off') return undefined;
   if (slot.follow.mode === 'locked') {
-    return slot.follow.color && runs.includes(slot.follow.color)
-      ? slot.follow.color
+    return slot.follow.executionId && runs.includes(slot.follow.executionId)
+      ? slot.follow.executionId
       : undefined;
   }
   // Following: the newest running run. Map iteration is

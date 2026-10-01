@@ -5,7 +5,8 @@
 //! status payload as a single JSON line for consumption by the
 //! VS Code extension's action bar.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use weft_core::projects::{ProjectDrift, ProjectStatusResponse, ProjectTransition};
 
 use super::Ctx;
 
@@ -36,21 +37,20 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     // project with an asset in it, and the drift banner would never
     // clear. Asset resolution also publishes the current references,
     // including an empty set when the last asset was removed.
-    let (desired_binary, desired_full_binary, desired_definition, desired_infra) =
+    let (desired_binary_hash, desired_full_binary_hash, desired_definition_hash, desired_infra_hash) =
         match weft_compiler::hash::load_enriched_project(project) {
             Ok((mut def, catalog)) => {
                 let resolved = crate::commands::assets::resolve_project_assets(
-                    &ctx.client(),
+                    &ctx.client()?,
                     &project.root,
                     &mut def,
-                    None,
                     true,
                 )
                 .await;
                 // Both node sets: a worker built with the full catalog is as
                 // current as one built from the referenced set, and the
                 // dispatcher accepts either as "not drifted".
-                use weft_compiler::codegen::NodeSet;
+                use weft_core::builds::NodeSet;
                 match resolved {
                     Ok(_) => (
                         weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Referenced).ok(),
@@ -68,39 +68,19 @@ pub async fn run(ctx: Ctx) -> Result<()> {
             Err(_) => (None, None, None, None),
         };
 
-    let mut path = format!("/projects/{project_id}/status");
-    let mut sep = '?';
-    // camelCase to match the rest of the wire (body fields are
-    // camelCase via serde rename; query params follow the same).
-    if let Some(h) = desired_binary.as_deref() {
-        path.push(sep);
-        sep = '&';
-        path.push_str("desiredBinaryHash=");
-        path.push_str(h);
-    }
-    if let Some(h) = desired_full_binary.as_deref() {
-        path.push(sep);
-        sep = '&';
-        path.push_str("desiredFullBinaryHash=");
-        path.push_str(h);
-    }
-    if let Some(h) = desired_definition.as_deref() {
-        path.push(sep);
-        sep = '&';
-        path.push_str("desiredDefinitionHash=");
-        path.push_str(h);
-    }
-    if let Some(h) = desired_infra.as_deref() {
-        path.push(sep);
-        path.push_str("desiredInfraHash=");
-        path.push_str(h);
-    }
+    let query = weft_core::projects::StatusQuery {
+        desired_binary_hash,
+        desired_full_binary_hash,
+        desired_definition_hash,
+        desired_infra_hash,
+    };
+    let path = format!("/projects/{project_id}/status{}", query.to_query_string());
 
     // A project that exists on disk but was never registered is not an error:
     // it is the state every project starts in, and the answer is the
     // command that leaves it. The marked 404 is how the dispatcher says
     // "no project I know under this id" (as opposed to a missing route).
-    let Some(data) = ctx.client().get_json_if_found(&path).await? else {
+    let Some(data) = ctx.client()?.get_json_if_found(&path).await? else {
         if !ctx.json_out(&serde_json::json!({ "registered": false, "project_id": project_id }))? {
             println!(
                 "project: {} ({project_id})\n  not registered with the dispatcher yet: \
@@ -111,29 +91,23 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         return Ok(());
     };
 
+    let data: ProjectStatusResponse = serde_json::from_value(data)
+        .context("read the project's status (the dispatcher and this CLI disagree on its shape; upgrade one of them)")?;
+
     // One JSON object on stdout; the extension reads it.
     if ctx.json_out(&data)? {
         return Ok(());
     }
 
-    let name = data.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-    let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-    let listener = data
-        .get("listener_running")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    println!("project: {name} ({project_id})");
-    println!("  registration: {status}");
+    println!("project: {} ({project_id})", data.name);
+    println!("  registration: {}", data.status);
     // The build-transition axis: only worth a line while in flight.
-    if let Some(t) = data.get("transition").and_then(|v| v.as_str()) {
-        if t != "none" {
-            println!("  build: {t} (cancel with `weft cancel-build`)");
-        }
+    if data.transition != ProjectTransition::None {
+        println!("  build: {} (cancel with `weft cancel-build`)", data.transition);
     }
-    println!("  listener: {}", if listener { "running" } else { "stopped" });
+    println!("  listener: {}", if data.listener_running { "running" } else { "stopped" });
     // Orphaned live infra: never silent (the never-lose-track rule).
-    if data.get("orphaned_infra").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if data.orphaned_infra {
         println!(
             "  WARNING: live infra exists whose node was removed from the source; \
              it keeps running (and consuming resources) until stopped/terminated via the infra verbs"
@@ -142,94 +116,79 @@ pub async fn run(ctx: Ctx) -> Result<()> {
 
     // One entry per infra node the program declares, started or not, so
     // an empty list really means no node declares `requires_infra`.
-    if let Some(infra) = data.get("infra").and_then(|v| v.as_array()) {
-        if infra.is_empty() {
-            println!("  infra: (no nodes declare requires_infra)");
-        } else {
-            println!("  infra:");
-            for entry in infra {
-                // `node` is the instance's place, spelled the way the
-                // source reads it (`one.db`): the key and the label are one.
-                let node = entry.get("node").and_then(|v| v.as_str()).unwrap_or("?");
-                let st = entry.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-                // SYNC: the two statuses a place with no shared copy reads <-> crates/weft-dispatcher/src/api/project.rs INFRA_NOT_STARTED, INFRA_PER_MEMBER
-                match st {
-                    "not_started" => println!("    {node}: not started (`weft infra start` brings it up)"),
-                    "per_member" => {
-                        let copies = entry.get("member_copies").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let counted = if copies == 1 { "1 member has a copy".to_string() } else { format!("{copies} members have a copy") };
-                        println!("    {node}: one copy per member ({counted}, listed under member copies)");
-                    }
-                    _ => {
-                        let url = entry.get("endpoint_url").and_then(|v| v.as_str()).unwrap_or("-");
-                        println!("    {node}: {st} ({url})");
-                    }
+    if data.infra.is_empty() {
+        println!("  infra: (no nodes declare requires_infra)");
+    } else {
+        println!("  infra:");
+        for entry in &data.infra {
+            // `node` is the node's place, spelled the way the source
+            // reads it (`one.db`): the key and the label are one.
+            let node = &entry.node;
+            match entry.status.as_str() {
+                weft_core::infra::wire::INFRA_NOT_STARTED => {
+                    println!("    {node}: not started (`weft infra start` brings it up)")
                 }
+                weft_core::infra::wire::INFRA_PER_INSTANCE => {
+                    let copies = entry.instance_copy_count.unwrap_or(0);
+                    let counted = if copies == 1 { "1 instance has a copy".to_string() } else { format!("{copies} instances have a copy") };
+                    println!("    {node}: one copy per instance ({counted}, listed under instance infra)");
+                }
+                st => println!("    {node}: {st} ({})", entry.endpoint_url.as_deref().unwrap_or("-")),
             }
         }
     }
 
     // Each trigger's own activation: the shared ones make up the
-    // registration line above, and a member's appear only here.
-    if let Some(activations) = data.get("activations").and_then(|v| v.as_array()) {
-        if !activations.is_empty() {
-            println!("  triggers:");
-            for entry in activations {
-                let trigger = entry.get("trigger").and_then(|v| v.as_str()).unwrap_or("?");
-                let mode = entry.get("mode").and_then(|v| v.as_str()).unwrap_or("?");
-                match entry.get("member").and_then(|v| v.as_str()) {
-                    Some(member) => println!("    {trigger} (member {member}): {mode}"),
-                    None => println!("    {trigger}: {mode}"),
-                }
-                // Fires parked until the member gives a value they need:
-                // the member's next change of values routes them again.
-                if let Some(waiting) = entry.get("waiting") {
-                    let fires = waiting.get("fires").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let reason = waiting.get("reason").and_then(|v| v.as_str()).unwrap_or("?");
-                    let counted = if fires == 1 { "1 fire waits".to_string() } else { format!("{fires} fires wait") };
-                    println!("      {counted} until the member changes their values: {reason}");
-                }
+    // registration line above, and an instance's appear only here.
+    if !data.activations.is_empty() {
+        println!("  triggers:");
+        for entry in &data.activations {
+            let (trigger, mode) = (&entry.trigger, entry.mode.as_str());
+            match &entry.instance {
+                Some(instance) => println!("    {trigger} (instance {instance}): {mode}"),
+                None => println!("    {trigger}: {mode}"),
+            }
+            // Fires parked until the instance is given a value they
+            // need: its next change of values routes them again.
+            if let Some(waiting) = &entry.waiting {
+                let counted = if waiting.fires == 1 { "1 fire waits".to_string() } else { format!("{} fires wait", waiting.fires) };
+                println!("      {counted} until the instance's values change: {}", waiting.reason);
             }
         }
     }
-    // Members' own copies of the `@per_member` infra nodes.
-    if let Some(copies) = data.get("member_copies").and_then(|v| v.as_array()) {
-        if !copies.is_empty() {
-            println!("  member copies:");
-            for entry in copies {
-                let node = entry.get("node").and_then(|v| v.as_str()).unwrap_or("?");
-                let member = entry.get("member").and_then(|v| v.as_str()).unwrap_or("?");
-                let st = entry.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-                println!("    {node} (member {member}): {st}");
-            }
+    // Instances' own copies of the `@per_instance` infra nodes.
+    if !data.instance_infra.is_empty() {
+        println!("  instance infra:");
+        for entry in &data.instance_infra {
+            println!("    {} (instance {}): {}", entry.node, entry.instance, entry.status);
         }
     }
 
-    if let Some(execs) = data.get("executions") {
-        let total = execs.get("total").and_then(|v| v.as_u64()).unwrap_or(0);
-        println!("  executions: {total} total");
-        if let (Some(color), Some(status)) = (
-            execs.get("last_color").and_then(|v| v.as_str()),
-            execs.get("last_status").and_then(|v| v.as_str()),
-        ) {
-            match execs.get("last_completed_at").and_then(|v| v.as_u64()) {
-                Some(ts) => {
-                    let age = unix_now().saturating_sub(ts);
-                    println!("    last: {color} ({status}, completed {age}s ago)");
-                }
-                None => println!("    last: {color} ({status}, in flight)"),
+    let execs = &data.executions;
+    println!("  executions: {} total", execs.total);
+    if let (Some(execution_id), Some(status)) = (&execs.last_execution_id, &execs.last_status) {
+        match execs.last_completed_at {
+            Some(ts) => {
+                let age = unix_now().saturating_sub(ts);
+                println!("    last: {execution_id} ({status}, completed {age}s ago)");
             }
+            None => println!("    last: {execution_id} ({status}, in flight)"),
         }
     }
-    print_drift(&data);
+    print_drift(&data.drift);
+    // A public entry turning callers away, so the author knows a limit
+    // is acting and which one (each is a setting on the trigger).
+    if !data.limited.is_empty() {
+        println!("  refused calls (last two minutes):");
+        for entry in &data.limited {
+            println!("    {}: {} by {}", entry.node, entry.refused, entry.limit);
+        }
+    }
     // The same verb list the editor's action bar offers, so a terminal
     // reader sees what the project accepts right now (and that `resync`
     // is on the table when the listeners lag behind the code).
-    if let Some(actions) = data.get("available_actions").and_then(|v| v.as_array()) {
-        let verbs: Vec<&str> = actions.iter().filter_map(|v| v.as_str()).collect();
-        if !verbs.is_empty() {
-            println!("  actions: {}", verbs.join(", "));
-        }
+    if !data.available_actions.is_empty() {
+        println!("  actions: {}", data.available_actions.join(", "));
     }
 
     Ok(())
@@ -237,14 +196,12 @@ pub async fn run(ctx: Ctx) -> Result<()> {
 
 /// Every drift bit the dispatcher set, each with the verb that clears
 /// it. Silent when nothing drifted.
-fn print_drift(data: &serde_json::Value) {
-    let Some(drift) = data.get("drift") else { return };
-    let bit = |name: &str| drift.get(name).and_then(|v| v.as_bool()).unwrap_or(false);
+fn print_drift(drift: &ProjectDrift) {
     let lines = [
-        (bit("infra_drift"), "infra: source has changed; `weft infra upgrade` rebuilds it"),
-        (bit("binary_drift"), "binary: worker code has changed; the next run or `weft build` rebuilds the image"),
-        (bit("definition_drift"), "definition: project shape has changed; the next run picks it up"),
-        (bit("activation_drift"), "activation: the listeners fire an older program; `weft resync` re-registers them against this one"),
+        (drift.infra_drift, "infra: source has changed; `weft infra upgrade` rebuilds it"),
+        (drift.binary_drift, "binary: worker code has changed; the next run or `weft build` rebuilds the image"),
+        (drift.definition_drift, "definition: project shape has changed; the next run picks it up"),
+        (drift.activation_drift, "activation: the listeners fire an older program; `weft resync` re-registers them against this one"),
     ];
     if lines.iter().all(|(set, _)| !set) {
         return;

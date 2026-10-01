@@ -85,6 +85,9 @@
       "description": "The call recording (when Download the recording is on)."
     }
   ],
+  "features": {
+    "catchErrors": true
+  },
   "display": {
     "kind": "media",
     "output": "audio"

@@ -1,7 +1,7 @@
 //! Layer-3 contract tests for the raw-pipe serving side: the real
 //! listener code (registration, the stream engine, framing, the
 //! connect dialogue, the fire pattern) wired against hand-rolled
-//! fakes of its I/O: a fake broker (the listener-resolve route
+//! fakes of its I/O: a fake broker (the listener-resolve and infra-address routes
 //! answering the connection's values), a fake peer (a real
 //! in-process TCP server speaking a line dialogue), and a fake task
 //! store recording the fires the sink enqueued.
@@ -13,8 +13,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use weft_core::signal::{to_spec, Framing, SocketFrame, StreamListen};
 use weft_core::Access;
-use weft_listener::kinds::{register_in_registry, RoutingSource, SignalIdentity};
-use weft_listener::registry::Registry;
+use weft_listener::kinds::bring_up;
+use weft_listener::ListenerState;
 use weft_listener::ListenerConfig;
 
 // ---------- Fakes ----------
@@ -26,6 +26,15 @@ struct FakeTasks {
 
 #[async_trait::async_trait]
 impl weft_task_store::TaskStoreClient for FakeTasks {
+    async fn wait_cancels(
+        &self,
+        _project_id: uuid::Uuid,
+        _execution_ids: Vec<String>,
+        _wait: std::time::Duration,
+    ) -> anyhow::Result<Vec<weft_task_store::tasks::CancelAsked>> {
+        Ok(Vec::new())
+    }
+
     async fn enqueue_dedup(
         &self,
         spec: weft_task_store::tasks::NewTask,
@@ -139,8 +148,9 @@ async fn spawn_peer() -> FakePeer {
     FakePeer { received, address: addr.to_string(), downlink: tx }
 }
 
-/// The fake broker: only the listener-resolve route, answering the
-/// mailbox connection's values.
+/// The fake broker: the listener-resolve route, answering the mailbox
+/// connection's values, and the infra-address route, which knows no
+/// infra and hands every address back unchanged.
 async fn spawn_broker() -> String {
     use axum::routing::post;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -156,6 +166,10 @@ async fn spawn_broker() -> String {
                 "recipe_values": {}
             }))
         }),
+    )
+    .route(
+        "/v1/infra/listener-address",
+        post(|axum::Json(req): axum::Json<Value>| async move { axum::Json(json!({ "authority": req["authority"] })) }),
     );
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     format!("http://{addr}")
@@ -196,17 +210,20 @@ async fn run_scenario() {
     let broker_base = spawn_broker().await;
 
     let tasks = Arc::new(FakeTasks { enqueued: Mutex::new(Vec::new()) });
-    let registry = Arc::new(Registry::new());
-    let config = Arc::new(ListenerConfig {
-        pod_name: format!("test-pod-{run_id}"),
-        http_port: 0,
-        broker_url: broker_base.clone(),
-    });
-    let token_path = std::env::temp_dir().join(format!("weft-test-token-{}", uuid::Uuid::new_v4()));
-    std::fs::write(&token_path, "test-token").unwrap();
-    let events_broker = weft_broker_client::BrokerEventsClient::new(
-        broker_base,
-        weft_broker_client::TokenSource::new(token_path),
+    let state = ListenerState::new(
+        ListenerConfig {
+            replica: format!("test-listener-{run_id}"),
+            broker_url: broker_base,
+            placement: weft_platform_traits::Placement::Machine,
+        },
+        tasks.clone(),
+        // The fake broker ignores the bearer.
+        weft_broker_client::TokenSource::role(
+            Arc::new(weft_platform_traits::FixedToken("test-token".into())),
+            format!("test-listener-{run_id}"),
+            weft_platform_traits::CoreRole::Listener,
+        ),
+        Arc::new(weft_platform_traits::FakeAlarm::new()),
     );
 
     let access = Access::new(uuid::Uuid::new_v4().to_string(), "email", None);
@@ -224,33 +241,16 @@ async fn run_scenario() {
     // The peer is plaintext: an in-process pipe has no certificate.
     kind.tls = false;
 
-    register_in_registry(
-        SignalIdentity {
-            token: sig_token.clone(),
-            tenant_id: "tenant-a".into(),
-            for_member: None,
-            node_id: "node-1".into(),
-            is_resume: false,
-            color: None,
-            placement_generation: 7,
-            spec: to_spec(kind),
-        },
-        RoutingSource::Restore {
-            routing: weft_core::primitive::SignalRouting {
-                surface: weft_core::primitive::SignalSurface::Internal,
-                auth: weft_core::primitive::SignalAuth::None,
-                auth_config: Value::Null,
-            },
-            kind_state: json!({}),
-            seq: 0,
-        },
-        registry.clone(),
-        weft_listener::fire_sink::FireSignalSink::new(tasks.clone()),
-        config,
-        events_broker,
-    )
-    .await
-    .expect("registration succeeds");
+    // Brought up from its row, the way a restarted listener does.
+    let row = json!({
+        "token": sig_token, "tenant_id": "tenant-a", "for_instance": null, "node_id": "node-1",
+        "spec_json": serde_json::to_string(&to_spec(kind)).unwrap(), "is_resume": false, "execution_id": null,
+        "surface_kind": "internal", "mount_path": null, "mount_methods": [], "auth_kind": "none",
+        "auth_config": null, "kind_state": {}, "kind_state_seq": 1
+    });
+    bring_up(&state, serde_json::from_value(row).unwrap(), weft_core::signal::listener_protocol::StartMode::Restore)
+        .await
+        .expect("registration succeeds");
 
     // The dialogue ran with the connection's values interpolated.
     wait_until(|| peer.received.lock().unwrap().len() >= 2, "the dialogue").await;
@@ -274,7 +274,6 @@ async fn run_scenario() {
         assert_eq!(fires[0].payload["payload"], Value::String("* 4 EXISTS".into()));
         assert_eq!(fires[0].tenant_id, "tenant-a");
         assert_eq!(fires[0].payload["token"], Value::String(sig_token.clone()));
-        assert_eq!(fires[0].payload["placement_generation"], 7);
     }
 
     // A steady-state line that does not match stays quiet.

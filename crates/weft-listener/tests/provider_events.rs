@@ -13,8 +13,8 @@ use serde_json::{json, Value};
 
 use weft_core::signal::{to_spec, Predicate, PredicateOp, ProviderEvents};
 use weft_core::Access;
-use weft_listener::kinds::{register_in_registry, RoutingSource, SignalIdentity};
-use weft_listener::registry::Registry;
+use weft_listener::kinds::bring_up;
+use weft_listener::ListenerState;
 use weft_listener::ListenerConfig;
 
 // ---------- Fakes ----------
@@ -26,6 +26,15 @@ struct FakeTasks {
 
 #[async_trait::async_trait]
 impl weft_task_store::TaskStoreClient for FakeTasks {
+    async fn wait_cancels(
+        &self,
+        _project_id: uuid::Uuid,
+        _execution_ids: Vec<String>,
+        _wait: std::time::Duration,
+    ) -> anyhow::Result<Vec<weft_task_store::tasks::CancelAsked>> {
+        Ok(Vec::new())
+    }
+
     async fn enqueue_dedup(
         &self,
         spec: weft_task_store::tasks::NewTask,
@@ -217,7 +226,7 @@ async fn wait_until(mut check: impl FnMut() -> bool, what: &str) {
 //
 // Stress-looped by construction (spawned tasks + channels + a
 // multi-thread runtime): each iteration runs a fully isolated
-// scenario (its own pod name, token, servers), so concurrent runs
+// scenario (its own process name, token, servers), so concurrent runs
 // contend on the scheduler, never on each other's state.
 weft_core::stress_test!(
     name: a_socket_subscription_serves_end_to_end,
@@ -228,28 +237,33 @@ weft_core::stress_test!(
     }
 );
 
-/// One scenario's shared listener-side rig: the fake task store, the
-/// registry, and the config every registration in the scenario uses.
+/// One scenario's shared listener-side rig: the fake task store and the
+/// listener every registration in the scenario goes through.
 struct Rig {
     tasks: Arc<FakeTasks>,
-    registry: Arc<Registry>,
-    config: Arc<ListenerConfig>,
-    broker_base: String,
+    state: ListenerState,
 }
 
 fn rig(run_id: &str, broker_base: String) -> Rig {
-    Rig {
-        tasks: Arc::new(FakeTasks { enqueued: Mutex::new(Vec::new()) }),
-        registry: Arc::new(Registry::new()),
-        config: Arc::new(ListenerConfig {
-            // Per-run pod name: the shared-socket registry keys on
-            // it, so parallel iterations never share a socket.
-            pod_name: format!("test-pod-{run_id}"),
-            http_port: 0,
-            broker_url: broker_base.clone(),
-        }),
-        broker_base,
-    }
+    let tasks = Arc::new(FakeTasks { enqueued: Mutex::new(Vec::new()) });
+    let state = ListenerState::new(
+        ListenerConfig {
+            // Per-run instance: the shared-socket registry keys on it,
+            // so parallel iterations never share a socket.
+            replica: format!("test-listener-{run_id}"),
+            broker_url: broker_base,
+            placement: weft_platform_traits::Placement::Machine,
+        },
+        tasks.clone(),
+        // The fake broker ignores the bearer.
+        weft_broker_client::TokenSource::role(
+            Arc::new(weft_platform_traits::FixedToken("test-token".into())),
+            format!("test-listener-{run_id}"),
+            weft_platform_traits::CoreRole::Listener,
+        ),
+        Arc::new(weft_platform_traits::FakeAlarm::new()),
+    );
+    Rig { tasks, state }
 }
 
 /// Register one subscription through the real registration path.
@@ -258,42 +272,16 @@ async fn register_subscription(
     token: &str,
     spec: weft_core::primitive::SignalSpec,
 ) {
-    // The events client reads a bearer token from a file; hand it a
-    // real one (the fake broker ignores it).
-    let token_path =
-        std::env::temp_dir().join(format!("weft-test-token-{}", uuid::Uuid::new_v4()));
-    std::fs::write(&token_path, "test-token").unwrap();
-    let events_broker = weft_broker_client::BrokerEventsClient::new(
-        rig.broker_base.clone(),
-        weft_broker_client::TokenSource::new(token_path),
-    );
-    register_in_registry(
-        SignalIdentity {
-            token: token.to_string(),
-            tenant_id: "tenant-a".into(),
-            for_member: None,
-            node_id: "node-1".into(),
-            is_resume: false,
-            color: None,
-            placement_generation: 7,
-            spec,
-        },
-        RoutingSource::Restore {
-            routing: weft_core::primitive::SignalRouting {
-                surface: weft_core::primitive::SignalSurface::Internal,
-                auth: weft_core::primitive::SignalAuth::None,
-                auth_config: Value::Null,
-            },
-            kind_state: json!({}),
-            seq: 0,
-        },
-        rig.registry.clone(),
-        weft_listener::fire_sink::FireSignalSink::new(rig.tasks.clone()),
-        rig.config.clone(),
-        events_broker,
-    )
-    .await
-    .expect("registration succeeds");
+    // Brought up from its row, the way a restarted listener does.
+    let row = json!({
+        "token": token, "tenant_id": "tenant-a", "for_instance": null, "node_id": "node-1",
+        "spec_json": serde_json::to_string(&spec).unwrap(), "is_resume": false, "execution_id": null,
+        "surface_kind": "internal", "mount_path": null, "mount_methods": [], "auth_kind": "none",
+        "auth_config": null, "kind_state": {}, "kind_state_seq": 1
+    });
+    bring_up(&rig.state, serde_json::from_value(row).unwrap(), weft_core::signal::listener_protocol::StartMode::Restore)
+        .await
+        .expect("registration succeeds");
 }
 
 async fn run_scenario() {
@@ -303,7 +291,7 @@ async fn run_scenario() {
     let (broker_base, broker) = spawn_broker(gateway.url.clone(), false).await;
     let rig = rig(&run_id, broker_base);
     let tasks = rig.tasks.clone();
-    let registry = rig.registry.clone();
+    let registry = rig.state.registry.clone();
 
     let access = Access::new(uuid::Uuid::new_v4().to_string(), "fakechat", None);
     let spec = to_spec(ProviderEvents::new(
@@ -355,7 +343,6 @@ async fn run_scenario() {
         );
         assert_eq!(fires[0].tenant_id, "tenant-a");
         assert_eq!(fires[0].payload["token"], Value::String(sig_token.clone()));
-        assert_eq!(fires[0].payload["placement_generation"], 7);
     }
 
     // The envelope was acked on the socket, per the recipe's reply

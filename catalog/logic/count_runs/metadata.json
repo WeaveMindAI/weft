@@ -1,0 +1,72 @@
+{
+  "type": "CountRuns",
+  "label": "Count runs",
+  "description": "Count this project's runs, narrowed by instance, status, the node that started them, a tag, or age. To see the runs themselves, use `ListRuns`.",
+  "tags": [
+    "flow",
+    "runs",
+    "executions",
+    "tag",
+    "count"
+  ],
+  "icon": "Hash",
+  "color": "#6366f1",
+  "inputs": [
+    {
+      "name": "instance",
+      "type": "String",
+      "description": "Only the runs for this instance, by the id your program gives it (`user-42`)."
+    },
+    {
+      "name": "status",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": ["running", "waiting_for_input", "completed", "failed", "cancelled"]
+      },
+      "description": "Only the runs that ended this way (`completed`, `failed`, `cancelled`), `running` for the ones still going (a run parked on a wait included), or `waiting_for_input` for only the ones parked on a wait. Any other word is refused."
+    },
+    {
+      "name": "node",
+      "type": "String",
+      "description": "Only the runs this node started (the trigger that fired, or the node a run was started from), named the way the program writes it."
+    },
+    {
+      "name": "tag",
+      "type": "String",
+      "description": "Only the runs carrying this tag, given the way `TagRun` was given it: the same value finds the same runs."
+    },
+    {
+      "name": "olderThanSecs",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "step": 1
+      },
+      "description": "Only the runs started at least this many seconds ago, a whole number."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "count",
+      "type": "Number",
+      "description": "How many runs match. This run counts too when it matches."
+    }
+  ],
+  "requires_infra": false,
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": { "kind": "input_names", "port": "node", "names": { "node": {} } }
+      },
+      "then": {
+        "message": "CountRuns '{id}' names {names} in `node`, which is no node of this program. Name it the way the program writes it (`inbox`, or `one.inbox` inside an included file).",
+        "level": "structural",
+        "severity": "error",
+        "port": "node"
+      }
+    }
+  ]
+}

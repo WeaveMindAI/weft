@@ -38,6 +38,7 @@
       "default": "scribe_v1",
       "widget": {
         "kind": "select",
+        "free_text": true,
         "options": [
           "scribe_v1",
           "scribe_v1_experimental"
@@ -58,5 +59,8 @@
       "description": "The language the model heard (ISO code)."
     }
   ],
+  "features": {
+    "catchErrors": true
+  },
   "requires_infra": false
 }

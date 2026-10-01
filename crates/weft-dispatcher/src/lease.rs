@@ -1,54 +1,11 @@
-//! Lease + coordination primitives shared across the dispatcher.
+//! Coordination primitives shared across the dispatcher; it owns no table
+//! of its own.
 //!
-//! This is the generic toolkit the pooled placement machinery is built
-//! on; it owns no table of its own. Two things live here:
-//!
-//! - **Row-ownership lease helpers** (`lease_duration_secs`,
-//!   `lease_renew_interval`, `is_lease_live`, `now_unix`). A
-//!   registry row (e.g. a `listener_pod` or `supervisor_pod` entry)
-//!   carries a `leased_until_unix`; its owning dispatcher Pod renews it
-//!   every `lease_renew_interval`, and on hard death the lease
-//!   expires after `lease_duration_secs` so a sibling Pod can adopt it.
+//! - **`now_unix`**, the wall clock every lease and timestamp column is
+//!   written in.
 //! - **Advisory-lock key derivation** (`advisory_key` + the per-regime
-//!   domain constants). Serializes cross-Pod state transitions (listener
-//!   + supervisor pick-or-spawn) without a dedicated lock table.
-
-/// How long a row-ownership lease is valid before it must be renewed,
-/// at this install's pace (`weft_core::time_scale`): 30 seconds in real
-/// time.
-pub fn lease_duration_secs() -> i64 {
-    weft_core::time_scale::scaled_secs(30)
-}
-
-/// Soft renewal interval. Owners renew this often to stay ahead of
-/// expiry: a third of [`lease_duration_secs`], 10 seconds in real time.
-pub fn lease_renew_interval() -> std::time::Duration {
-    weft_core::time_scale::scaled(std::time::Duration::from_secs(10))
-}
-
-/// Spawn grace for a freshly-placed pool pod (listener / supervisor).
-///
-/// A new pod has a window between "spawned + registry row inserted" and
-/// "its first work is recorded in the DB" (a listener's
-/// `signal.listener_pod`, a supervisor's `infra_owner` row). During that
-/// window the idle reaper would see ZERO work on the pod and tear it
-/// down mid-setup (the "object has been deleted" race). The pod's
-/// registry row carries a `grace_until_unix`; the idle reaper skips any
-/// pod still inside its grace. Sized to comfortably cover spawn ->
-/// health-wait -> register -> first work-row write under cluster load,
-/// while still letting a pod whose placement genuinely failed get reaped
-/// shortly after. Distinct from the ownership lease: the lease says
-/// "which dispatcher drives this pod," the grace says "this pod is too
-/// young to be judged idle yet."
-///
-/// Never scaled by `weft_core::time_scale`: what it waits for is real work
-/// (a pod starting, a first write under cluster load), which takes as long
-/// in a fast install as in any other.
-pub const SPAWN_GRACE_SECS: i64 = 30;
-
-pub fn is_lease_live(leased_until_unix: i64) -> bool {
-    leased_until_unix >= now_unix()
-}
+//!   domain constants). Serializes cross-process state transitions
+//!   without a dedicated lock table.
 
 pub fn now_unix() -> i64 {
     // System clock past UNIX_EPOCH is a hard invariant; the fallback
@@ -63,8 +20,7 @@ pub fn now_unix() -> i64 {
 
 /// Derive a stable i64 advisory-lock key from a `(domain, scope)`
 /// pair. The domain string namespaces unrelated coordination
-/// regimes (supervisor-vs-sync, listener-op-vs-row, future
-/// additions) so a collision in one doesn't bleed into another.
+/// regimes so a collision in one doesn't bleed into another.
 ///
 /// Uses FNV-1a, which is spec-stable: the same `(domain, scope)`
 /// pair always derives to the same i64, regardless of rustc
@@ -107,56 +63,33 @@ pub fn advisory_key(domain: &str, scope: &str) -> i64 {
     hash as i64
 }
 
-/// Domain strings for advisory-key derivation. Use
-/// `advisory_key(domain, scope)` at the call site.
-pub const SUPERVISOR_COORD_DOMAIN: &str = "weft_supervisor_coord";
-/// Serializes listener pick-or-spawn so a cold-start burst of
-/// concurrent placements funnels to ONE new listener instead of each
-/// spawning its own (the thundering-herd race). One scope value
-/// (`"placement"`): the pool is global.
-pub const LISTENER_POOL_DOMAIN: &str = "weft_listener_pool";
-/// Serializes pool scale-DOWN (drain + reap) cluster-wide so two
-/// dispatcher replicas never consolidate the same pool at once (which
-/// would drain one pod twice, or drain two pods onto each other). One
-/// scope value per pool (`"listener"` / `"supervisor"`). A dispatcher
-/// that fails the try-lock simply skips this cycle; the next sweep
-/// retries. Mirrors the pick-or-spawn lock shape.
-pub const POOL_SCALEDOWN_DOMAIN: &str = "weft_pool_scaledown";
-/// Serializes the RE-PLACEMENT of a single signal (reserve generation ->
-/// register on the new pod -> write the holder) cluster-wide, keyed by
-/// signal token. Without it, two concurrent re-placements of one token
-/// (a drain racing a fire-path re-place, or two idle-signal fires on two
-/// dispatchers) can leave the holder column pointing at a pod registered
-/// under a LOWER generation than another still-live pod, defeating the
-/// broker's stale-fire fence (which assumes the row's generation is the
-/// highest any live holder carries). Holding this across the whole
-/// sequence makes "the highest reserved generation is the final holder"
-/// an invariant instead of a race outcome. The scope is the token.
-pub const SIGNAL_PLACEMENT_DOMAIN: &str = "weft_signal_placement";
+// Domain strings for advisory-key derivation. Use
+// `advisory_key(domain, scope)` at the call site.
+
 /// Serializes the read-state-then-flip entry into a PROJECT lifecycle
 /// transition (activate, deactivate, the build marker, the has-infra
 /// worker relocation), keyed by project id. Held only for the
-/// microseconds of the read-and-CAS (or the short kubectl-bounded
+/// microseconds of the read-and-CAS (or the short platform-call-bounded
 /// worker relocation): the TRANSITIONAL STATE written into the project
 /// row is the durable mutual exclusion that makes competing verbs
 /// REJECT instantly; this lock only stops two verbs from both winning
 /// the flip. Never held across a build, a drain, or user code.
 pub const PROJECT_TRANSITION_DOMAIN: &str = "weft_project_transition";
 /// Serializes a tenant's signal registrations from the route overlap
-/// check to the signal row's insert, cluster-wide, keyed by tenant id.
+/// check to the signal row's insert, install-wide, keyed by tenant id.
 /// The check reads the tenant's mounted routes and the insert writes
 /// one; two routes of one activation register concurrently, and
 /// without this each checked before the other had written, so two
 /// routes that claim the same call both armed (the e2e `api_overlap`
 /// shape). Held on the lock pool, so a waiter pins no work connection.
 pub const SIGNAL_MOUNT_DOMAIN: &str = "weft_signal_mount";
-/// Serializes each background reaper cluster-wide, keyed by the
+/// Serializes each background reaper install-wide, keyed by the
 /// reaper's name, so one dispatcher replica runs a given sweep at a
 /// time and the others skip that turn (see `reaper`).
 pub const REAPER_DOMAIN: &str = "weft_reaper";
 /// Serializes issuing an upgrade of one owner's copies, keyed by
-/// `<project>/<member>` (empty member: the shared copies), so the
-/// in-flight check and the insert are one step cluster-wide.
+/// `<project>/<instance>` (empty instance: the shared copies), so the
+/// in-flight check and the insert are one step install-wide.
 pub const UPGRADE_ISSUE_DOMAIN: &str = "weft_upgrade_issue";
 
 /// Run `body` while holding the TRANSACTION-SCOPED advisory lock for
@@ -234,40 +167,25 @@ where
     result
 }
 
-/// Convenience wrapper: hold the cluster-wide scale-down lock for
-/// `pool_scope` (`"listener"` / `"supervisor"`). `Ok(None)` means a
-/// sibling is consolidating this pool right now; skip this cycle.
-pub async fn with_scaledown_lock<T, F, Fut>(
-    pg_pool: &sqlx::postgres::PgPool,
-    pool_scope: &str,
-    body: F,
-) -> anyhow::Result<Option<T>>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<T>>,
-{
-    with_advisory_lock(pg_pool, advisory_key(POOL_SCALEDOWN_DOMAIN, pool_scope), body).await
-}
-
 /// How often a caller waiting for a project's transition lock says so.
 ///
-/// There is NO deadline on the wait. Most holders are short (a few
-/// writes and an enqueue), but `teardown_project_namespace_if_no_infra`
-/// holds this lock around a namespace teardown against the cluster, and
-/// a teardown behind finalizers routinely runs past a minute. A deadline
-/// there fails a `weft run` or a `weft checkpoint` that was never
-/// wedged, only behind real infrastructure work, which is the one thing
-/// the project's rules say never gets a deadline. What a long wait gets
-/// instead is a breadcrumb at this interval, so a genuinely stuck
-/// project is visible rather than silent.
+/// There is NO deadline on the wait. Every holder does a few database
+/// writes and returns (the version tree's writes in `api::versions`,
+/// the start of an infra sync in `api::infra`, which awaits the sync
+/// itself outside the lock), and a holder whose process dies drops the
+/// lock with its connection. So a wait ends on its own, and the only
+/// thing a deadline could catch is a slow database, where it would fail
+/// a `weft run` or `weft checkpoint` that was merely queued. What a long
+/// wait gets instead is a breadcrumb at this interval, so a slow one is
+/// visible rather than silent.
 const PROJECT_LOCK_BREADCRUMB: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Turn a failure of [`with_project_transition_lock`] into the answer an
 /// HTTP caller should get.
 ///
-/// Every caller of that lock goes through here so the three of them
-/// cannot disagree about the same failure. One kind is left: the lock's
-/// own database work failed, which is a server error. WAITING is not a
+/// Every caller of that lock goes through here so they cannot disagree
+/// about the same failure. One kind is left: the lock's own database
+/// work failed, which is a server error. WAITING is not a
 /// failure and never arrives here, because the wait has no deadline (see
 /// [`PROJECT_LOCK_BREADCRUMB`]).
 pub fn lock_answer(what: &str, e: anyhow::Error) -> (axum::http::StatusCode, String) {
@@ -292,7 +210,7 @@ pub fn lock_answer(what: &str, e: anyhow::Error) -> (axum::http::StatusCode, Str
 /// blocking `pg_advisory_xact_lock` waits in the server, so every waiter
 /// would pin a connection of the lock pool for as long as it waits, and
 /// a burst on one project would exhaust the lock pool for every project
-/// on the Pod. A waiter holds nothing between attempts.
+/// on the process. A waiter holds nothing between attempts.
 pub async fn with_project_transition_lock<T, F, Fut>(
     lock_pool: &sqlx::postgres::PgPool,
     project_id: uuid::Uuid,
@@ -320,10 +238,8 @@ where
         // Rolled back BEFORE the sleep, so the connection goes back to
         // the pool while this caller waits.
         let _ = tx.rollback().await;
-        // A breadcrumb instead of a deadline. An infra sync holds this
-        // lock across a cluster teardown, so a long wait is ordinary and
-        // failing it would fail work that was never wedged; what a long
-        // wait must not be is silent.
+        // A breadcrumb instead of a deadline (see
+        // `PROJECT_LOCK_BREADCRUMB`): a long wait must not be silent.
         let waited = waiting_since.elapsed();
         if waited.saturating_sub(said_at) >= PROJECT_LOCK_BREADCRUMB {
             said_at = waited;
@@ -331,9 +247,8 @@ where
                 target: "weft_dispatcher::lease",
                 %project_id,
                 waited_secs = waited.as_secs(),
-                "still waiting for this project's transition lock; another lifecycle or \
-                 version-tree operation holds it. `weft status` shows what the project is \
-                 doing, and an infra sync is the one that routinely holds it this long"
+                "still waiting for this project's transition lock; a version-tree write or \
+                 the start of an infra sync holds it"
             );
         }
         // Jittered, because a try-lock loop has no queue: without it a
@@ -362,12 +277,12 @@ mod tests {
     /// targets. If any of these assertions fail, the
     /// implementation of `advisory_key` has been changed in a
     /// way that breaks lock-space compatibility with deployed
-    /// pods. Roll forward only after confirming no two pods
+    /// processes. Roll forward only after confirming no two processes
     /// running different implementations coexist.
     #[test]
     fn advisory_key_pinned_values() {
         assert_eq!(
-            advisory_key(SUPERVISOR_COORD_DOMAIN, "tenant-a"),
+            advisory_key("weft_supervisor_coord", "tenant-a"),
             5099131965359238650,
         );
         assert_eq!(
@@ -382,7 +297,7 @@ mod tests {
     /// Domain separation: same scope, different domain, different key.
     #[test]
     fn advisory_key_domains_separate() {
-        let a = advisory_key(SUPERVISOR_COORD_DOMAIN, "tenant-a");
+        let a = advisory_key(REAPER_DOMAIN, "tenant-a");
         let b = advisory_key("some_other_domain", "tenant-a");
         assert_ne!(a, b);
     }

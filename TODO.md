@@ -53,7 +53,7 @@ to compare against exists; the desired side is what's project-wide.
 rest of the per-unit model). The CLI computes a desired hash per
 infra node (it already compiles each node's spec); the dispatcher
 compares each node's desired hash against its row's `applied_spec_hash`
-and classifies: unchanged / changed / orphaned (in cluster, not in
+and classifies: unchanged / changed / orphaned (running, not in
 source). Status carries per-node drift; the UI shows precisely which
 nodes changed and a correct per-node affordance.
 
@@ -69,37 +69,37 @@ version when this lands.
 `running_infra_hash` / `desired_infra_hash` or `ProjectInfraEntry`,
 revisit this entry.
 
-## Infra namespace-escape hardening
+## Infra isolation between projects
 
-A node author ships arbitrary container specs + raw `extras` k8s
-manifests that get applied into the project namespace. Node packages are
-untrusted third-party code, so verify a node CANNOT escape its namespace.
-Audit: `extras` namespace forced + cluster-scoped kinds rejected;
-`PodOptions.service_account` constrained; Pod Security admission rejects
-privileged / hostPath / host-namespaces; NetworkPolicy blocks
-cross-tenant traffic; supervisor RBAC not turnable into a cross-namespace
-write. Goal: compiler rejects escaping specs loudly + namespace admission
-enforces, not "we assume they can't".
+A node author ships container specs, and node packages are untrusted
+third-party code. The neutral infra spec (`weft_core::infra::types`) has
+no field for a privileged container, a host path or a host namespace, so
+a node cannot ask for one. What is not audited yet: on a local install,
+which other containers a unit's network reaches (another project's
+units, the install's own), and on GCP, what a unit's machine can do with
+the project account it runs as beyond pulling its images and reading the
+ticket secret. Goal: each answer checked, and the refusals at the
+compiler or the host, not "we assume they can't".
 
-[Update Notice Warning] If we touch `compile.rs` extras/namespace
-stamping, `PodOptions`, `project_namespace.rs` policies/RBAC, or the
-supervisor apply path, revisit.
+[Update Notice Warning] If we touch `crates/weft-platform-local/src/infra_host.rs`
+(the unit's network), `crates/weft-platform-gcp/src/accounts.rs` (the
+project account's grants), or the infra spec's fields, revisit.
 
 ## Held suspensions (warm-worker model)
 
-**Problem.** The durable-replay model dies-and-resumes the worker pod
+**Problem.** The durable-replay model dies-and-resumes the worker
 on every suspension: a worker dies whenever all lanes park on
-`await_signal`, and a fresh pod folds the journal to resume. That's the
+`await_signal`, and a fresh worker folds the journal to resume. That's the
 right trade for thousands of cheap parked flows (a HumanQuery waiting
 days costs only journal rows). But it works against a node that holds
 in-process state too expensive to rebuild on replay: a browser session
 with thousands of cookies, a long-lived local model load, a warm
 connection pool. Replaying the journal doesn't reconstruct that state;
-it's gone with the pod.
+it's gone with the worker.
 
 **Direction.** A `ctx.hold_signal` primitive that opts a node into a
 warm-worker model: the future actually awaits in place and the worker
-pod stays alive across the suspension, instead of unwinding and dying.
+stays alive across the suspension, instead of unwinding and dying.
 The node keeps its in-process state; the await is a real await, not a
 replay boundary.
 
@@ -111,7 +111,7 @@ replay boundary.
 - Crosses the node/language boundary cleanly (the "nodes do no
   plumbing" rule): the node awaits a future, it does not reach into the
   worker lifecycle or the dispatcher.
-- Honest about the cost: a held suspension pins a worker pod for its
+- Honest about the cost: a held suspension pins a worker for its
   whole duration, so the language should make that trade visible (this
   is no longer free parking).
 - Composes with the existing wake-signal contract: a held await resolves
@@ -186,9 +186,6 @@ string, `Wait` a number of seconds: three spellings of "a moment" with
 no type behind them. Worth deciding whether time (and a repeating time)
 should be a WeftType of its own, or whether three string-ish inputs on
 three nodes is fine.
-
-## Rename color to exec
-Color was a concept I was experimenting with for mutliple execution in the same runtime but I changed my mind and never ended up changing the name back.
 
 ## Native branching and retries: should `if` / `else` / retry become language constructs?
 
@@ -340,7 +337,7 @@ rest.
 did, across firings of the SAME execution, which weft gives a node no
 way to do. Something like a scratchpad on the ctx, scoped to this node
 in this execution, and the question of whether it lives in the worker's
-memory (lost the moment the execution suspends or the pod dies) or in
+memory (lost the moment the execution suspends or the worker dies) or in
 the journal (durable, replayable, another thing on the write path).
 
 **The questions to answer before anything is built.**
@@ -360,7 +357,7 @@ the journal (durable, replayable, another thing on the write path).
 - Does a CLOSED arrival count as a fill? For the fork it must not (the
   branch that lost has nothing to say), but "the first two that arrive"
   needs the same answer stated deliberately rather than falling out.
-- Loops. A firing is per (color, frames), so this is per iteration; is
+- Loops. A firing is per (execution, frames), so this is per iteration; is
   there any case where it should be otherwise?
 - Cost. A node that fired four times bills as what.
 
@@ -390,79 +387,49 @@ sits beside it (a run is reachable through both today); how much of a
 long history to load before the view goes lazy; and whether a version's
 diff should open the file diff in the editor rather than a tooltip.
 
-## Cloud deployment, and a route's URL that reaches the internet
+## Cloud installs: what is still open
 
-Deployment beyond one machine is undesigned. What exists: a kind
-cluster per machine, set up by `./setup.sh`, and an opt-in Cloudflare
-quick tunnel (`--public-url`) whose door allowlists exactly the
-provider-events receiver, the per-signal fire door, the file relay and
-the OAuth callback. A `k8s` backend exists in `weft daemon start` and
-demands `WEFT_GATEWAY_HOST`, `WEFT_GATEWAY_BASE_URL` and
-`WEFT_CALLER_TOKEN_SECRET`, and nothing has ever been deployed with it.
+Weft installs on GCP (`deploy/terraform/gcp/`, `.github/workflows/install-gcp.yml`):
+one machine running `weft-runtime` and Postgres, project workers on Cloud
+Run, builds on Cloud Build, wakes on Cloud Tasks, infra nodes on Compute
+Engine, and a front door on the machine's own address with Let's
+Encrypt certificates. What is left:
 
-**The concrete gap that surfaced it.** `Route` and `Socket` are reached
-through `/connect/<tenant>/<path>`, and the dispatcher answers by
-redirecting the caller to the worker's own address on the live gateway:
-`<pod>.<namespace>.<gateway host>`. Locally that host is
-`127-0-0-1.nip.io`, so the redirect only resolves on the same machine,
-and the public proxy does not forward `/connect/` at all. `weft activate`
-prints no URL, so nothing points this out: anyone who takes the tunnel
-address and appends `/connect/<tenant>/<path>`, the way every other
-minted link is built, gets a 404 from the proxy's catch-all. Decision for now: routes stay local-only; do not
-special-case the tunnel.
+- **Nobody has run it on a real GCP project yet.** The Terraform, the
+  machine's boot, the Cloud Run, Cloud Build, Cloud Tasks and Compute
+  Engine clients, and the certificate issuance are covered by unit tests
+  on their request bodies only.
+- **The machine's memory.** An e2-micro has 1 GB for Postgres and every
+  role; nobody has measured weft's resident size there. If it does not
+  fit, the default machine becomes e2-small, which is not free.
+- **A connection whose provider refuses a bare IP as its callback**
+  (Google) needs the install to have a domain; nothing yet checks with a
+  real Slack app whether Slack's request URL verification accepts one.
+- **AWS and Azure**, on the same shape: Terraform per cloud and a
+  platform crate each.
+- **A frontend's database address in CI, on its own.** The deploy workflow
+  hands the frontend whatever the `WEFT_FRONT_ENV` secret holds, so the
+  program's database door reaches it once someone writes it there
+  (`weft infra env --on <target> --into <file>`, then `weft target export
+  --front-env <file>`). Nothing fills it in automatically when the program's
+  infrastructure comes up.
 
-**Rate limiting a public route belongs here.** A `Route` on the open
-internet has nothing in front of it: no per-caller ceiling, no burst
-cap, nothing that says one address is asking too often. Today the only
-way is counters in the author's own Postgres, which is exactly the
-plumbing the language is supposed to own, so a program that goes public
-either ships without a limit or hand-rolls one. It sits with the
-deployment questions rather than beside them: where the limit is
-enforced (the gateway, the dispatcher's entry, the worker), and what one
-caller even means, both fall out of how workers are reached from outside.
+## To consider: `@install_filled`, a value filled once per install
 
-**What has to be decided, together, before any of it is built.**
-- Where the control plane runs (dispatcher, broker, Postgres, the
-  object store) and who owns it: one shared multi-tenant install, or
-  one per customer.
-- Rate limiting: where a per-caller ceiling is enforced, and what
-  identifies a caller once a request has been through a tunnel or an
-  ingress and its source address is the proxy's.
-- How workers are reached from outside. The per-pod subdomain scheme
-  needs a wildcard DNS record and a wildcard certificate; a quick
-  tunnel offers one random hostname and no subdomains. The alternative
-  is the pod in the path (`/live/<pod>/<namespace>/<rest>`) so a single
-  hostname serves every worker, which changes the Envoy rewrite rule,
-  the redirect the dispatcher mints, the proxy allowlist and the
-  daemon's gateway variables.
-- What a URL handed to a third party is built from once there are
-  several public addresses (MEMORY.md has the rule for the local case:
-  the request's own host when the requester fetches, the configured
-  external base otherwise).
-- Secrets and identity: the caller-token HMAC, the broker's sealing
-  key, the tunnel token, the database credentials, all fixed dev values
-  today.
-- Images: workers, listeners and infra nodes are built on the machine
-  and loaded into kind; a cloud cluster needs a registry and a build
-  that publishes to it.
-- Upgrades and migrations against a database that is not disposable
-  (the `setup.sh cross-version upgrade path` entry above is the local
-  half of this).
-- Cost and isolation: what one tenant can consume, and what of another
-  tenant's a worker can reach (today: one project per pod, egress
-  denies private ranges).
-- Who may come through a door. A `SameNetwork` endpoint compiles to a
-  NodePort plus a NetworkPolicy rule admitting `0.0.0.0/0` on that one
-  port (`compile_network_policy` in `crates/weft-core/src/infra/compile.rs`),
-  which in-cluster means every pod in every other tenant's namespace.
-  It has to be an address rule locally: traffic from the machine
-  arrives SNATed to the node's address, so no pod selector can match
-  it, and that path is how a person's own frontend reaches their
-  database. What holds the line today is the loopback binding on every
-  mapped node port, which a real cluster does not have. The shape to
-  design: the door carries who may use it, defaulting to the project's
-  own namespace, with the machine admitted by address only where the
-  node ports are bound to loopback.
+A connection a program's own node uses is picked per install, in the
+install's store, never in the source. A plain value can differ between
+installs too (a channel id, a sheet id, an API base address), and today it
+can only be written in the source, the same on every install. A marker
+like `@install_filled`, the sibling of `@instance_filled` ("filled once per
+install, for everybody"), would put such a value in the same store. Not
+decided: whether it is needed at all, and whether it would be opt-in per
+field.
+
+It might just be environment variables instead: variables set per project
+on each install (never install-wide), which a node field reads. Most such
+values are the same in dev and prod anyway, are computed by a wired node,
+or are an instance's (`@instance_filled`); what is left (a test deployment
+beside a real one) is the case env vars already answer everywhere else.
 
 ## `[T]` instead of `List[T]`
 
@@ -507,10 +474,10 @@ holding a `--display` token reads from anywhere).
 **The one that is not about scale.** The dispatcher reads a container's
 `/live` answer with `resp.json::<Value>()` and no byte cap
 (`api/infra.rs`, `read_live`). The only bound is a 3 second deadline on
-the whole exchange, and three seconds of pod-to-pod bandwidth is a lot
-of megabytes landing in the dispatcher's memory. A dispatcher Pod is
+the whole exchange, and three seconds of container-to-runtime bandwidth is a lot
+of megabytes landing in the dispatcher's memory. The dispatcher is
 shared across tenants, so one tenant's buggy or hostile container can
-spike the RSS of the Pod serving everybody. This one bites at a single
+spike the RSS of the process serving everybody. This one bites at a single
 user, not at a thousand.
 
 **The knobs, and what they are today.**
@@ -527,7 +494,7 @@ user, not at a thousand.
 default that suits a local install, set where the rest of the
 dispatcher's deployment knobs are set, not a literal in a handler. The
 defaults are what a person running `./setup.sh` gets and never thinks
-about; a cluster operator moves them.
+about; whoever runs a cloud install moves them.
 
 **The token door still reads on demand.** A client on
 `/signal-token/displays/...` gets the whole payload on every request and

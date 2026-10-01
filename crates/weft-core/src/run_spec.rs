@@ -12,8 +12,22 @@ use serde_json::Value;
 use crate::frames::{Located, LoopFrames};
 use crate::project::selection::{source_place, RunSelection, SelectionBounds};
 use crate::project::ProjectDefinition;
+use crate::pulse::Failure;
 use crate::weft_type::WeftType;
-use crate::Color;
+use crate::ExecutionId;
+
+/// The chosen origin of each reused result, independent of which nodes
+/// execute in the child. Readers reconstruct each origin under its own
+/// birth context and import history without replaying its scheduling.
+// SYNC: Seed <-> packages/weft-graph/src/protocol.ts Seed
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Seed {
+    pub parent: ExecutionId,
+    /// Per place (a node under the calls that reach it): the run whose
+    /// result it keeps.
+    pub origins: BTreeMap<Located, ExecutionId>,
+}
 
 pub type PortValues = BTreeMap<String, BTreeMap<String, Value>>;
 /// A group's simulated outputs: the group id and one value per output port.
@@ -25,7 +39,7 @@ pub type GroupOutputs = (String, BTreeMap<String, Value>);
 pub struct BakeSummary {
     pub program: crate::project::hash::ProgramIdentity,
     pub captured: Vec<String>,
-    pub color: Color,
+    pub execution_id: ExecutionId,
     pub at_unix: u64,
 }
 
@@ -76,11 +90,14 @@ pub struct RunSpec {
     pub frozen_from: Option<FrozenFrom>,
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_unique")]
     pub expected: Option<Expected>,
-    /// Who the run is for: one member of the program. Required when the
-    /// run reaches a node that exists once per member
-    /// ([`refuse_memberless`]), unused otherwise.
+    /// Which instance the run is for: one separate running copy of part of
+    /// the program. Required when the run reaches a node that exists once
+    /// per instance ([`refuse_instanceless`]), unused otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub member: Option<crate::member::MemberId>,
+    pub instance: Option<crate::instance::InstanceId>,
+    /// How long the run may run (`weft run --long`; `crate::run_class`).
+    #[serde(default, skip_serializing_if = "crate::run_class::RunClass::is_default")]
+    pub run_class: crate::run_class::RunClass,
 }
 
 fn deserialize_unique<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned>(deserializer: D) -> Result<T, D::Error> {
@@ -191,7 +208,7 @@ pub struct Answer {
 #[serde(deny_unknown_fields)]
 pub struct FrozenFrom {
     pub version: String,
-    pub color: Color,
+    pub execution_id: ExecutionId,
     pub definition_hash: String,
 }
 
@@ -225,8 +242,9 @@ pub struct ExpectedWire {
     pub ordinal: u64,
     #[serde(default)]
     pub closed: bool,
+    /// A closure left by a node that broke: which node and why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
+    pub failure: Option<Failure>,
     pub value: Value,
 }
 
@@ -241,7 +259,8 @@ pub struct OutputWire {
     pub port: String,
     pub ordinal: u64,
     pub closed: bool,
-    pub error: Option<String>,
+    /// A closure left by a node that broke: which node and why.
+    pub failure: Option<Failure>,
     pub value: Value,
 }
 
@@ -264,7 +283,7 @@ impl ExpectedWire {
             frames: wire.frames.iter().filter(|frame| frame.loop_index().is_some()).cloned().collect(),
             ordinal: wire.ordinal,
             closed: wire.closed,
-            error: wire.error.clone(),
+            failure: wire.failure.clone(),
             value: wire.value.clone(),
         }
     }
@@ -691,8 +710,8 @@ pub fn refuse_unfed(project: &ProjectDefinition, selection: &RunSelection, spec:
 /// skipped.
 pub fn refuse_unrunnable(project: &ProjectDefinition, selection: &RunSelection, spec: &RunSpec) -> Result<(), Refusal> {
     let mut refusal = refuse_unfed(project, selection, spec).err().unwrap_or_default();
-    if let Err(memberless) = refuse_memberless(project, selection, spec.member.as_ref()) {
-        refusal.errors.extend(memberless.errors);
+    if let Err(instanceless) = refuse_instanceless(project, selection, spec.instance.as_ref()) {
+        refusal.errors.extend(instanceless.errors);
     }
     let fired = spec.fire.as_ref().map(|(spelled, _)| {
         let (id, path) = crate::project::resolve_address(project, spelled);
@@ -732,95 +751,96 @@ pub fn refuse_unrunnable(project: &ProjectDefinition, selection: &RunSelection, 
     if refusal.is_empty() { Ok(()) } else { Err(refusal) }
 }
 
-/// The places of the run that exist once per member (marked or reached
+/// The places of the run that exist once per instance (marked or reached
 /// from a mark), spelled the way the program reads them, sorted.
-pub fn per_member_places(project: &ProjectDefinition, selection: &RunSelection) -> Vec<String> {
+pub fn per_instance_places(project: &ProjectDefinition, selection: &RunSelection) -> Vec<String> {
     selection.nodes.iter()
-        .filter(|place| crate::project::is_per_member(project, &place.id))
+        .filter(|place| crate::project::is_per_instance(project, &place.id))
         .map(|place| crate::project::address_of(project, &place.id, &place.path))
         .collect::<BTreeSet<_>>().into_iter().collect()
 }
 
-/// Refuse a run that reaches something per member without saying which
-/// member it is for: nothing could pick that member's connection, copy or
-/// storage. A member given to a run that reaches nothing per member is
-/// fine (the id is simply unused), and so is a run with no member that
-/// reaches nothing per member: a cron on the shared database beside a
-/// per-member bridge runs for nobody.
-pub fn refuse_memberless(project: &ProjectDefinition, selection: &RunSelection, member: Option<&crate::member::MemberId>) -> Result<(), Refusal> {
-    if member.is_some() {
+/// Refuse a run that reaches something per instance without saying which
+/// instance it is for: nothing could pick that instance's connection, copy
+/// or storage. An instance given to a run that reaches nothing per instance
+/// is fine (the id is simply unused), and so is a run with no instance that
+/// reaches nothing per instance: a cron on the shared database beside a
+/// per-instance bridge runs for no instance.
+pub fn refuse_instanceless(project: &ProjectDefinition, selection: &RunSelection, instance: Option<&crate::instance::InstanceId>) -> Result<(), Refusal> {
+    if instance.is_some() {
         return Ok(());
     }
-    let places = per_member_places(project, selection);
+    let places = per_instance_places(project, selection);
     if places.is_empty() {
         return Ok(());
     }
     Err(Refusal::error(format!(
-        "{} {} once per member, so this run needs to know which member it is for. Name one with \
-         --member <id>; a trigger firing through a member's copy, a member token, or the Weft-Member \
+        "{} {} once per instance, so this run needs to know which instance it is for. Name one with \
+         --instance <id>; a trigger firing through an instance's copy, an instance token, or the Weft-Instance \
          header on a gated route name it for you",
         spell_list(&places),
         if places.len() == 1 { "exists" } else { "exist" },
     )))
 }
 
-/// What a run for `member` over `selection` starts with: the member's
-/// `stored` values for the places of the run that are `@member_filled`,
-/// each held to its field ([`crate::member::check_member_value`]), or the
-/// refusal naming every gap ([`crate::member::unfilled_gaps`],
-/// [`crate::member::rule_gaps`]): a field the
-/// run needs and the member never filled, a value the node's rules refuse
+/// What a run for `instance` over `selection` starts with: the instance's
+/// `stored` values for the places of the run that are `@instance_filled`,
+/// each held to its field ([`crate::instance::check_instance_value`]), or the
+/// refusal naming every gap ([`crate::instance::unfilled_gaps`],
+/// [`crate::instance::rule_gaps`]): a field the
+/// run needs and the instance never filled, a value the node's rules refuse
 /// with it swapped in. The answer is what the run carries and every
 /// firing reads, so a value changed after the run is born reaches the
 /// next run, never this one.
-pub fn member_run_values(
+pub fn instance_run_values(
     project: &ProjectDefinition,
     selection: &RunSelection,
-    member: &crate::member::MemberId,
-    stored: &crate::member::MemberValues,
-) -> Result<crate::member::MemberValues, Refusal> {
-    let mut values = crate::member::MemberValues::new();
+    instance: &crate::instance::InstanceId,
+    stored: &crate::instance::InstanceValues,
+) -> Result<crate::instance::InstanceValues, Refusal> {
+    let mut values = crate::instance::InstanceValues::new();
     let mut refusal = Refusal { errors: Vec::new() };
     let mut seen = BTreeSet::new();
+    let rules = crate::rules::RuleContext::new(project);
     for place in &selection.nodes {
         let Some(node) = project.nodes.iter().find(|n| n.id == place.id) else { continue };
-        if crate::member::member_filled_fields(node).next().is_none() {
+        if crate::instance::instance_filled_fields(node).next().is_none() {
             continue;
         }
         let spelled = crate::project::address_of(project, &place.id, &place.path);
         if !seen.insert(spelled.clone()) {
             continue;
         }
-        let mut kept = crate::member::PlaceValues::new();
+        let mut kept = crate::instance::PlaceValues::new();
         let mut mistyped = Vec::new();
         for (field, value) in stored.get(&spelled).into_iter().flatten() {
             // A value for a field the program no longer fills (the marker
             // was removed, the node changed) stays stored and unused.
-            if !crate::member::member_filled_fields(node).any(|(filled, _)| filled == field) {
+            if !crate::instance::instance_filled_fields(node).any(|(filled, _)| filled == field) {
                 continue;
             }
-            match crate::member::check_member_value(node, field, value) {
+            match crate::instance::check_instance_value(node, field, value) {
                 Ok(typed) => {
                     kept.insert(field.clone(), typed);
                 }
                 Err(why) => {
-                    refusal.errors.push(format!("member '{member}' at '{spelled}': {why}"));
+                    refusal.errors.push(format!("instance '{instance}' at '{spelled}': {why}"));
                     mistyped.push(field.clone());
                 }
             }
         }
-        let mut filled = crate::member::filled_node(node, Some(&kept));
+        let mut filled = crate::instance::filled_node(node, Some(&kept));
         // A field whose stored value failed its check was already refused
-        // above: it stays `@member_filled` (there, value not known yet),
+        // above: it stays `@instance_filled` (there, value not known yet),
         // so it is never also said as unfilled or tripping a rule.
         for field in mistyped {
             filled.port_literals.insert(field.clone(), node.port_literals[&field].clone());
         }
         // A required field left empty can also trip a rule about it; the
-        // member hears it once.
-        for gap in crate::member::unfilled_gaps(node, &filled, &spelled, member)
+        // refusal says it once.
+        for gap in crate::instance::unfilled_gaps(node, &filled, &spelled, instance)
             .into_iter()
-            .chain(crate::member::rule_gaps(project, node, &filled, &spelled, member))
+            .chain(crate::instance::rule_gaps(&rules, node, &filled, &spelled, instance))
         {
             if !refusal.errors.contains(&gap) {
                 refusal.errors.push(gap);
@@ -833,60 +853,61 @@ pub fn member_run_values(
     if refusal.is_empty() { Ok(values) } else { Err(refusal) }
 }
 
-/// One value a member (or the program, for them) asks to store: `value`
+/// One value asked to be stored for an instance (by its token or by the
+/// program): `value`
 /// for `field` of the step at `step` (its place, spelled).
-// SYNC: MemberValueInput <-> packages/weft-connect/src/core/wire.ts MemberValueInput
+// SYNC: InstanceValueInput <-> packages/weft-connect/src/core/wire.ts InstanceValueInput
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MemberValueInput {
+pub struct InstanceValueInput {
     pub step: String,
     pub field: String,
     pub value: serde_json::Value,
 }
 
-/// One member-filled field, named: `field` of the step at `step`.
-// SYNC: MemberFieldRef <-> packages/weft-connect/src/core/wire.ts MemberFieldRef
+/// One instance-filled field, named: `field` of the step at `step`.
+// SYNC: InstanceFieldRef <-> packages/weft-connect/src/core/wire.ts InstanceFieldRef
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct MemberFieldRef {
+pub struct InstanceFieldRef {
     pub step: String,
     pub field: String,
 }
 
-/// A [`MemberValueInput`] the program accepts, as it is kept: the value
+/// A [`InstanceValueInput`] the program accepts, as it is kept: the value
 /// cast to its field, and for a connection field the connection it names
 /// with the service the field connects to.
 #[derive(Debug, Clone, PartialEq)]
-pub struct CheckedMemberValue {
+pub struct CheckedInstanceValue {
     pub step: String,
     pub field: String,
     pub value: serde_json::Value,
     pub connection: Option<(uuid::Uuid, String)>,
 }
 
-/// Hold values a member asks to store to the program, before anything is
-/// stored: each must be for a `@member_filled` field at one of the
+/// Hold values asked to be stored for an instance, before anything is
+/// stored: each must be for an `@instance_filled` field at one of the
 /// program's places, of the field's type, and the node's rules must not
-/// refuse it with the member's values (`stored`, then these) swapped in. A
-/// field the member has not reached yet reads as not known yet, so a form
+/// refuse it with the instance's values (`stored`, then these) swapped in. A
+/// field the instance has not reached yet reads as not known yet, so a form
 /// filled one field at a time is never refused for the fields after it;
-/// a run is refused for those (`member_run_values`). All or nothing: the
+/// a run is refused for those (`instance_run_values`). All or nothing: the
 /// refusal names every value refused.
-pub fn check_member_values(
+pub fn check_instance_values(
     project: &ProjectDefinition,
-    member: &crate::member::MemberId,
-    stored: &crate::member::MemberValues,
-    inputs: &[MemberValueInput],
-) -> Result<Vec<CheckedMemberValue>, Refusal> {
+    instance: &crate::instance::InstanceId,
+    stored: &crate::instance::InstanceValues,
+    inputs: &[InstanceValueInput],
+) -> Result<Vec<CheckedInstanceValue>, Refusal> {
     let places: BTreeMap<String, &crate::project::NodeDefinition> =
-        crate::project::member_filled_places(project).into_iter().collect();
+        crate::project::instance_filled_places(project).into_iter().collect();
     let mut refusal = Refusal { errors: Vec::new() };
     let mut checked = Vec::new();
     let mut after = stored.clone();
     for input in inputs {
         let Some(node) = places.get(&input.step) else {
-            refusal.errors.push(format!("'{}' is no step with a field each member fills", input.step));
+            refusal.errors.push(format!("'{}' is no step with a field each instance fills", input.step));
             continue;
         };
-        let value = match crate::member::check_member_value(node, &input.field, &input.value) {
+        let value = match crate::instance::check_instance_value(node, &input.field, &input.value) {
             Ok(value) => value,
             Err(why) => {
                 refusal.errors.push(format!("'{}.{}': {why}", input.step, input.field));
@@ -898,7 +919,7 @@ pub fn check_member_values(
             .iter()
             .any(|i| i.name == input.field && matches!(i.widget, Some(crate::node::Widget::Access { .. })));
         let connection = if is_connection {
-            let Some(service) = node.member_service.as_ref().map(|spec| spec.service.clone()) else {
+            let Some(service) = node.instance_service.as_ref().map(|spec| spec.service.clone()) else {
                 refusal.errors.push(format!("'{}.{}' is a connection field with no service recipe", input.step, input.field));
                 continue;
             };
@@ -906,7 +927,7 @@ pub fn check_member_values(
                 Some(id) => Some((id, service)),
                 None => {
                     refusal.errors.push(format!(
-                        "'{}.{}' takes one of the member's connections, as {{\"id\": \"<connection id>\"}}",
+                        "'{}.{}' takes one of the instance's connections, as {{\"id\": \"<connection id>\"}}",
                         input.step, input.field
                     ));
                     continue;
@@ -916,13 +937,14 @@ pub fn check_member_values(
             None
         };
         after.entry(input.step.clone()).or_default().insert(input.field.clone(), value.clone());
-        checked.push(CheckedMemberValue { step: input.step.clone(), field: input.field.clone(), value, connection });
+        checked.push(CheckedInstanceValue { step: input.step.clone(), field: input.field.clone(), value, connection });
     }
     let touched: BTreeSet<&str> = checked.iter().map(|c| c.step.as_str()).collect();
+    let rules = crate::rules::RuleContext::new(project);
     for step in touched {
         let node = places[step];
-        let partly = crate::member::partly_filled_node(node, &after[step]);
-        refusal.errors.extend(crate::member::rule_gaps(project, node, &partly, step, member));
+        let partly = crate::instance::partly_filled_node(node, &after[step]);
+        refusal.errors.extend(crate::instance::rule_gaps(&rules, node, &partly, step, instance));
     }
     if refusal.is_empty() { Ok(checked) } else { Err(refusal) }
 }
@@ -971,7 +993,7 @@ mod tests {
             definition_hash: "graph".into(), binary_hash: "binary".into(),
             implementations: BTreeMap::from([("T".into(), "implementation".into())]),
         };
-        let mut bake = BakeSummary { program: program.clone(), captured: vec!["trigger".into()], color: Color::nil(), at_unix: 1 };
+        let mut bake = BakeSummary { program: program.clone(), captured: vec!["trigger".into()], execution_id: ExecutionId::nil(), at_unix: 1 };
         assert!(validate_fire_bake("trigger", &program, &[bake.clone()]).is_ok());
         assert!(validate_fire_bake("trigger", &program, &[]).unwrap_err().to_string().contains("weft bake"));
         bake.captured.clear();
@@ -1389,14 +1411,14 @@ mod tests {
         assert!(resolve_spec(&spec, &program()).unwrap().warnings.iter().all(|w| !w.contains("continues to the end")));
     }
 
-    /// `b` fills `in` from each member (no fallback, required), and its
+    /// `b` fills `in` from each instance (no fallback, required), and its
     /// rules refuse the value "bad".
     fn filled_program() -> ProjectDefinition {
         let mut project = program();
         project.edges.retain(|e| e.target != "b");
         let b = project.nodes.iter_mut().find(|n| n.id == "b").unwrap();
-        b.port_literals.insert("in".into(), crate::member::member_filled_literal(None));
-        b.member_rules = Some(serde_json::from_value(json!({ "rules": [{
+        b.port_literals.insert("in".into(), crate::instance::instance_filled_literal(None));
+        b.instance_rules = Some(serde_json::from_value(json!({ "rules": [{
             "when": { "kind": "config_equals", "field": "in", "equals": "bad" },
             "then": { "message": "'{id}' refuses {field}", "field": "in" }
         }]})).unwrap());
@@ -1404,83 +1426,83 @@ mod tests {
     }
 
     #[test]
-    fn a_members_run_carries_their_checked_values() {
+    fn an_instances_run_carries_its_checked_values() {
         let project = filled_program();
-        let ada = crate::member::MemberId::new("ada").unwrap();
+        let ada = crate::instance::InstanceId::new("ada").unwrap();
         let whole = RunSelection::whole(&project);
-        let stored = |value: serde_json::Value| crate::member::MemberValues::from([("b".into(), [("in".to_string(), value)].into())]);
+        let stored = |value: serde_json::Value| crate::instance::InstanceValues::from([("b".into(), [("in".to_string(), value)].into())]);
 
-        let values = member_run_values(&project, &whole, &ada, &stored(json!("hello"))).unwrap();
+        let values = instance_run_values(&project, &whole, &ada, &stored(json!("hello"))).unwrap();
         assert_eq!(values["b"]["in"], json!("hello"));
 
-        let unfilled = member_run_values(&project, &whole, &ada, &Default::default()).unwrap_err().to_string();
-        assert!(unfilled.contains("member 'ada' has not filled 'b.in'"), "{unfilled}");
+        let unfilled = instance_run_values(&project, &whole, &ada, &Default::default()).unwrap_err().to_string();
+        assert!(unfilled.contains("instance 'ada' has not filled 'b.in'"), "{unfilled}");
 
-        let refused = member_run_values(&project, &whole, &ada, &stored(json!("bad"))).unwrap_err().to_string();
-        assert!(refused.contains("member 'ada' at 'b': 'b' refuses in"), "{refused}");
+        let refused = instance_run_values(&project, &whole, &ada, &stored(json!("bad"))).unwrap_err().to_string();
+        assert!(refused.contains("instance 'ada' at 'b': 'b' refuses in"), "{refused}");
 
-        let mistyped = member_run_values(&project, &whole, &ada, &stored(json!({ "x": 1 }))).unwrap_err();
+        let mistyped = instance_run_values(&project, &whole, &ada, &stored(json!({ "x": 1 }))).unwrap_err();
         // Refused once, for its type, never also as "has not filled".
         assert_eq!(
             mistyped.errors,
-            vec!["member 'ada' at 'b': 'in' takes String: no cast from Dict[String, Number] into String".to_string()]
+            vec!["instance 'ada' at 'b': 'in' takes String: no cast from Dict[String, Number] into String".to_string()]
         );
 
-        // A run that does not reach the filled step needs nothing from the member.
+        // A run that does not reach the filled step needs nothing from the instance.
         let just_a = RunSelection::setup(&project, &[Located::top("a")]).unwrap();
-        assert!(member_run_values(&project, &just_a, &ada, &Default::default()).unwrap().is_empty());
+        assert!(instance_run_values(&project, &just_a, &ada, &Default::default()).unwrap().is_empty());
     }
 
-    /// A rule about a field the member left empty (a connection's "pick
-    /// one on the node", say) is said as the member's gap, once, even
+    /// A rule about a field the instance left empty (a connection's "pick
+    /// one on the node", say) is said as the instance's gap, once, even
     /// when the field is required too.
     #[test]
-    fn a_rule_on_an_empty_member_field_names_what_the_member_did_not_fill() {
+    fn a_rule_on_an_empty_instance_field_names_what_the_instance_did_not_fill() {
         let mut project = filled_program();
         let b = project.nodes.iter_mut().find(|n| n.id == "b").unwrap();
-        b.member_rules = Some(serde_json::from_value(json!({ "rules": [{
+        b.instance_rules = Some(serde_json::from_value(json!({ "rules": [{
             "when": { "kind": "not", "of": { "kind": "config_nonempty", "field": "in" } },
             "then": { "message": "'{id}' has nothing picked; pick one on the node", "field": "in" }
         }]})).unwrap());
-        let ada = crate::member::MemberId::new("ada").unwrap();
-        let refusal = member_run_values(&project, &RunSelection::whole(&project), &ada, &Default::default()).unwrap_err();
-        assert_eq!(refusal.errors, vec!["member 'ada' has not filled 'b.in'".to_string()]);
+        let ada = crate::instance::InstanceId::new("ada").unwrap();
+        let refusal = instance_run_values(&project, &RunSelection::whole(&project), &ada, &Default::default()).unwrap_err();
+        assert_eq!(refusal.errors, vec!["instance 'ada' has not filled 'b.in'".to_string()]);
         project.nodes[1].inputs[0].required = false;
-        let refusal = member_run_values(&project, &RunSelection::whole(&project), &ada, &Default::default()).unwrap_err();
-        assert_eq!(refusal.errors, vec!["member 'ada' has not filled 'b.in'".to_string()]);
-        // The member's page marks the field as needed for the same reason.
-        assert!(crate::member::member_field_needed(&project, &project.nodes[1], "in"));
-        project.nodes[1].port_literals.insert("in".into(), crate::member::member_filled_literal(Some(json!("x"))));
-        assert!(!crate::member::member_field_needed(&project, &project.nodes[1], "in"));
+        let refusal = instance_run_values(&project, &RunSelection::whole(&project), &ada, &Default::default()).unwrap_err();
+        assert_eq!(refusal.errors, vec!["instance 'ada' has not filled 'b.in'".to_string()]);
+        // The instance's settings page marks the field as needed for the same reason.
+        assert!(crate::instance::instance_field_needed(&crate::rules::RuleContext::new(&project), &project.nodes[1], "in"));
+        project.nodes[1].port_literals.insert("in".into(), crate::instance::instance_filled_literal(Some(json!("x"))));
+        assert!(!crate::instance::instance_field_needed(&crate::rules::RuleContext::new(&project), &project.nodes[1], "in"));
     }
 
     #[test]
-    fn a_fallback_or_a_default_stands_in_for_a_member_who_gave_nothing() {
-        let ada = crate::member::MemberId::new("ada").unwrap();
+    fn a_fallback_or_a_default_stands_in_for_an_instance_that_gave_nothing() {
+        let ada = crate::instance::InstanceId::new("ada").unwrap();
         let mut with_fallback = filled_program();
-        with_fallback.nodes[1].port_literals.insert("in".into(), crate::member::member_filled_literal(Some(json!("dflt"))));
-        assert!(member_run_values(&with_fallback, &RunSelection::whole(&with_fallback), &ada, &Default::default()).is_ok());
+        with_fallback.nodes[1].port_literals.insert("in".into(), crate::instance::instance_filled_literal(Some(json!("dflt"))));
+        assert!(instance_run_values(&with_fallback, &RunSelection::whole(&with_fallback), &ada, &Default::default()).is_ok());
         let mut bad_fallback = filled_program();
-        bad_fallback.nodes[1].port_literals.insert("in".into(), crate::member::member_filled_literal(Some(json!("bad"))));
-        assert!(member_run_values(&bad_fallback, &RunSelection::whole(&bad_fallback), &ada, &Default::default()).is_err());
+        bad_fallback.nodes[1].port_literals.insert("in".into(), crate::instance::instance_filled_literal(Some(json!("bad"))));
+        assert!(instance_run_values(&bad_fallback, &RunSelection::whole(&bad_fallback), &ada, &Default::default()).is_err());
         let mut defaulted = filled_program();
         defaulted.nodes[1].inputs[0].default = Some(json!("x"));
-        assert!(member_run_values(&defaulted, &RunSelection::whole(&defaulted), &ada, &Default::default()).is_ok());
+        assert!(instance_run_values(&defaulted, &RunSelection::whole(&defaulted), &ada, &Default::default()).is_ok());
     }
 
     #[test]
     fn values_are_held_to_the_program_before_they_are_stored() {
         let project = filled_program();
-        let ada = crate::member::MemberId::new("ada").unwrap();
-        let ask = |step: &str, value: serde_json::Value| MemberValueInput { step: step.into(), field: "in".into(), value };
-        let ok = check_member_values(&project, &ada, &Default::default(), &[ask("b", json!("hello"))]).unwrap();
-        assert_eq!(ok, vec![CheckedMemberValue { step: "b".into(), field: "in".into(), value: json!("hello"), connection: None }]);
-        let refused = check_member_values(&project, &ada, &Default::default(), &[ask("b", json!("bad")), ask("a", json!("x"))])
+        let ada = crate::instance::InstanceId::new("ada").unwrap();
+        let ask = |step: &str, value: serde_json::Value| InstanceValueInput { step: step.into(), field: "in".into(), value };
+        let ok = check_instance_values(&project, &ada, &Default::default(), &[ask("b", json!("hello"))]).unwrap();
+        assert_eq!(ok, vec![CheckedInstanceValue { step: "b".into(), field: "in".into(), value: json!("hello"), connection: None }]);
+        let refused = check_instance_values(&project, &ada, &Default::default(), &[ask("b", json!("bad")), ask("a", json!("x"))])
             .unwrap_err()
             .to_string();
         assert!(refused.contains("'b' refuses in"), "{refused}");
-        assert!(refused.contains("'a' is no step with a field each member fills"), "{refused}");
-        let unknown_field = MemberValueInput { step: "b".into(), field: "other".into(), value: json!(1) };
-        assert!(check_member_values(&project, &ada, &Default::default(), &[unknown_field]).is_err());
+        assert!(refused.contains("'a' is no step with a field each instance fills"), "{refused}");
+        let unknown_field = InstanceValueInput { step: "b".into(), field: "other".into(), value: json!(1) };
+        assert!(check_instance_values(&project, &ada, &Default::default(), &[unknown_field]).is_err());
     }
 }

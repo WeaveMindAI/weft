@@ -1,52 +1,25 @@
 use std::sync::Arc;
 
 use crate::authenticator::Authenticator;
-use crate::backend::{ProjectBuilder, WorkerBackend};
 use crate::events::EventBus;
 use crate::journal::Journal;
-use crate::listener::{ListenerBackend, ListenerPool};
+use crate::listener::ListenerClient;
 use crate::project_store::ProjectStore;
-use crate::supervisor_pool::{SupervisorBackend, SupervisorPool};
 use crate::tenant::TenantRouter;
-
-/// Stable identifier for this dispatcher Pod. Derived from
-/// `WEFT_POD_ID` (set explicitly), or from `HOSTNAME` (StatefulSet
-/// auto-sets it), or a random uuid for local-process dev.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PodId(pub String);
-
-impl PodId {
-    pub fn from_env() -> Self {
-        if let Ok(v) = std::env::var("WEFT_POD_ID") {
-            return Self(v);
-        }
-        if let Ok(v) = std::env::var("HOSTNAME") {
-            return Self(v);
-        }
-        Self(format!("local-{}", uuid::Uuid::new_v4().simple()))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for PodId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
 
 /// Top-level dispatcher state. Shared across HTTP handlers via
 /// `axum::extract::State`. All fields are `Arc`-friendly.
 #[derive(Clone)]
 pub struct DispatcherState {
-    pub pod_id: PodId,
+    /// This process's replica id: the holder of the leases, claims and
+    /// builds it takes. Minted at boot; a sibling replica (another copy
+    /// of the dispatcher) has its own.
+    pub replica: String,
     pub journal: Arc<dyn Journal>,
-    /// Direct Postgres pool handle. Owned here (not threaded
-    /// through Journal) so lease management, EventBus pub/sub, and
-    /// other DB-backed primitives can share connections without
-    /// extending the Journal trait into a kitchen sink.
+    /// Direct Postgres pool handle. Owned here (not threaded through
+    /// Journal) so lease management, EventBus pub/sub, and other
+    /// DB-backed primitives can share connections without extending the
+    /// Journal trait into a kitchen sink.
     pub pg_pool: sqlx::PgPool,
     /// Connections used ONLY to hold a project's transition lock.
     ///
@@ -60,23 +33,28 @@ pub struct DispatcherState {
     /// would release until it got one. A pool of its own makes holding a
     /// lock cost nothing that doing the work needs.
     pub lock_pool: sqlx::PgPool,
-    /// The pod's one Postgres `LISTEN` connection, on every channel in
-    /// [`crate::app::DISPATCHER_CHANNELS`]. Every loop and request that
-    /// waits on a row sleeps on it (`pg_wake`, the picker, command
-    /// waits) instead of polling.
+    /// The process's one Postgres `LISTEN` connection, on (at least)
+    /// every channel in [`crate::app::DISPATCHER_CHANNELS`]. Every loop
+    /// and request that waits on a row sleeps on it
+    /// (`weft_task_store::drain`, the picker, command waits) instead of
+    /// polling.
     pub signals: Arc<weft_task_store::pg_signal::PgSignalWatch>,
-    /// What the nodes on the graphs open against this pod are showing,
-    /// looked at only while an editor watches (see `display_feeds`).
+    /// What the nodes on the graphs open against this dispatcher are
+    /// showing, looked at only while an editor watches (see
+    /// `display_feeds`).
     pub displays: Arc<crate::display_feeds::DisplayFeeds>,
-    pub workers: Arc<dyn WorkerBackend>,
-    /// Builds a project's latest saved source on demand so a verb (`run` /
-    /// `activate` / infra start) can just be clicked on a not-yet-built (or
-    /// edited-since-built) project and it builds first. `None` when a runnable
-    /// definition is already registered before the verb (nothing to build): the
-    /// generic seam a source-tree build path fills. Whatever that impl needs to do
-    /// its work (a builder, a bucket, a registry) it carries itself; the dispatcher
-    /// does not hold those.
-    pub ensure_built: Option<Arc<dyn ProjectBuilder>>,
+    /// Where the project's workers run and how to reach them.
+    pub runner: Arc<dyn weft_platform_traits::Runner>,
+    /// Where the projects' infrastructure runs: read here for its logs
+    /// (the supervisor is what changes it).
+    pub host: Arc<dyn weft_platform_traits::InfraHost>,
+    /// The worker settings every project starts from.
+    pub worker_defaults: weft_platform_traits::WorkerSettings,
+    /// Builds a project version inside the install (`crate::build`): the
+    /// one way a project's program and images come to exist.
+    pub builder: Arc<crate::build::VersionBuilder>,
+    /// What the install tells about itself (`GET /install`).
+    pub install_info: weft_core::install::InstallInfo,
     pub projects: ProjectStore,
     /// Which triggers listen, per trigger per owner
     /// (`crate::activation_store`).
@@ -85,100 +63,50 @@ pub struct DispatcherState {
     /// been, every run under one, and head.
     pub versions: crate::versions::VersionStore,
     pub events: EventBus,
-    /// Spawns pooled listener pods.
-    pub listener_backend: Arc<dyn ListenerBackend>,
-    /// Pooled listener placement. Each listener pod holds signals across
-    /// many tenants; placement is per-signal, load-based, with scale-up
-    /// and scale-down.
-    pub listeners: ListenerPool,
-    /// Spawns pooled infra-supervisor pods.
-    pub supervisor_backend: Arc<dyn SupervisorBackend>,
-    /// Pooled infra-supervisor placement. Each supervisor pod owns the
-    /// infra of many projects (exclusive `infra_owner` lease); the pool
-    /// scales the pod count up and down by load.
-    pub supervisors: SupervisorPool,
-    /// Authenticates a user-facing request to the tenant making it. The default
-    /// returns `local` for every request (no token); a token-verifying impl reads
-    /// the caller's signed token.
+    /// The listener role: registers signals, processes fires.
+    pub listener: ListenerClient,
+    /// Authenticates a user-facing request to the tenant making it. The
+    /// default returns `local` for every request (no token); a
+    /// token-verifying impl reads the caller's signed token.
     pub authenticator: Arc<dyn Authenticator>,
     /// Resolves the owning tenant for a given project. The default returns
     /// `local`.
     pub tenant_router: Arc<dyn TenantRouter>,
-    /// Decides the worker namespace for a project. The default is the structural
-    /// has-infra rule. The 3 worker-placement sites route through this so there is
-    /// one answer to "where does this worker live."
-    pub placement: Arc<dyn crate::placement::PlacementPolicy>,
-    /// Decides the sandbox runtime (`runtimeClassName`) for a pod, or none. The
-    /// default runs on the host runtime. Held here so any pod spawner shares the
-    /// same decision the worker backend uses.
-    pub sandbox: Arc<dyn crate::placement::SandboxPolicy>,
-    /// Frees a deleted project's stored data, run as the project is removed
-    /// (before the project row is dropped). The default (`WipeProjectFiles`)
-    /// frees the project's `project/`-scoped runtime files from the object
-    /// store. Canonical doc on the `ProjectReclaimer` trait in `placement.rs`.
-    pub project_reclaimer: Arc<dyn crate::placement::ProjectReclaimer>,
-    /// The STABLE base URL users hit for this dispatcher (the host's
-    /// loopback port in local dev, the ingress host on a real
-    /// cluster). Architecture-4: the dispatcher hosts every external
-    /// URL; the listener has no public surface.
+    /// Frees a deleted project's stored data, run as the project is
+    /// removed (before the project row is dropped). Canonical doc on the
+    /// `ProjectReclaimer` trait in `reclaim.rs`.
+    pub project_reclaimer: Arc<dyn crate::reclaim::ProjectReclaimer>,
+    /// The STABLE base URL people and editors reach this install at.
     pub public_base_url: String,
-    /// An ADDITIONAL address the open internet reaches this
-    /// dispatcher at (a public tunnel's minted URL), when one exists.
-    /// Never a replacement for the base: local surfaces (the OAuth
-    /// callback shown to the operator, storage links) stay on the
-    /// stable base, and only internet-facing surfaces (activation
-    /// URLs, event pushes) prefer this one via
+    /// An ADDITIONAL address the open internet reaches this install at (a
+    /// tunnel's), when one exists. Never a replacement for the base:
+    /// local surfaces (the OAuth callback shown to the operator, storage
+    /// links) stay on the stable base, and only internet-facing surfaces
+    /// (activation URLs, event pushes) prefer this one via
     /// [`DispatcherState::external_base_url`].
     pub internet_url: Option<String>,
-    /// Cluster Pod / Service CIDRs. Threaded into rendered tenant
-    /// namespace NetworkPolicies so `ipBlock except <cluster-cidrs>`
-    /// expresses "internet but not other Pods." Must be the cluster
-    /// operator's actual CIDRs; defaults are Kind's.
-    pub cluster_pod_cidr: String,
-    pub cluster_service_cidr: String,
-    /// Which install this dispatcher belongs to, and so every namespace
-    /// it names: its own system namespace (where the pooled listener
-    /// and supervisor pods run), its db namespace (the broker), the
-    /// shared worker namespace, and the per-project namespace prefix.
-    pub instance: weft_core::infra::Instance,
-    /// The in-cluster broker URL the dispatcher proxies the CLI `weft files`
-    /// verbs to (the broker owns the runtime-file bucket + metadata; the
-    /// dispatcher never touches bytes, it just fronts the CLI as the control
-    /// plane). Same URL the worker pods use for the journal.
-    pub broker_url: String,
-    /// The dispatcher's own projected SA token path, signed onto the broker
-    /// storage-admin requests so the broker resolves it to the control plane.
-    pub broker_token_path: std::path::PathBuf,
-    /// Shared HTTP client for the broker storage-admin proxy.
-    /// The process's one HTTP client for the broker's admin surface and
-    /// for an infra container's `/live` and `/action`. Follows no
-    /// redirect (see `app.rs`): every peer answers in place.
+    /// What the install allows at its public edge (trusted proxy hops,
+    /// the token-guessing bound); see `entry_limits`.
+    pub edge: crate::entry_limits::EdgeConfig,
+    /// The broker's admin surface, which the dispatcher fronts for the
+    /// CLI's `weft files` verbs (the broker owns the runtime-file bucket
+    /// and its metadata; the dispatcher never touches bytes).
+    pub broker: crate::role_client::RoleClient,
+    /// The process's one HTTP client: the role clients above, an infra
+    /// unit's `/live` and `/action`, and a worker's `/_weft/...`. Follows
+    /// no redirect (see `app.rs`): every peer answers in place.
     pub http: reqwest::Client,
-    /// kube client used by the reaper (supervisor scale-down). The
-    /// listener and worker backends hold their own clones of the
-    /// same `Arc<dyn KubeClient>` (constructed once in main). The
-    /// trait lives in `weft-platform-traits`, shared with the
-    /// supervisor crate.
-    pub kube: Arc<dyn weft_platform_traits::KubeClient>,
-    /// HMAC secret the dispatcher signs live-connection routing tokens
-    /// with (the worker verifies with the same secret). Empty when live
-    /// connections aren't provisioned (`WEFT_CALLER_TOKEN_SECRET` unset);
-    /// the handshake then fails loud rather than minting unverifiable
-    /// tokens.
+    /// HMAC secret the dispatcher signs live-caller routing tickets with
+    /// (the worker verifies with the same secret).
     pub caller_token_secret: Arc<Vec<u8>>,
-    /// Public origin of the live-connection gateway (e.g.
-    /// `https://live.example.com`, or a nip.io-based origin). The
-    /// handshake builds the per-pod caller URL by prefixing
-    /// the pod subdomain onto this host. Empty disables live connections.
-    pub gateway_base_url: String,
+    /// Wakes a role that may be scaled to zero when work waits for it.
+    pub kick: Arc<dyn weft_platform_traits::Kick>,
 }
 
 impl DispatcherState {
     /// The base for URLs handed to OUTSIDE callers (webhook activation
     /// URLs, addresses a provider posts events to): the additional
-    /// internet address when one exists, the stable base otherwise
-    /// (which on a real cluster is already the internet-reachable
-    /// ingress host).
+    /// internet address when one exists, the stable base otherwise.
     pub fn external_base_url(&self) -> &str {
         self.internet_url.as_deref().unwrap_or(&self.public_base_url)
     }

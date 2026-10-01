@@ -76,7 +76,7 @@ pub fn object_url(bucket: &str, key: &str) -> weft::WeftResult<String> {
     let mut encoded_key: Vec<String> = Vec::new();
     for segment in key.split('/') {
         if segment == "." || segment == ".." {
-            return Err(weft::node_error(format!(
+            return Err(weft::WeftError::Input(format!(
                 "the object key '{key}' contains a '{segment}' path segment, which URL \
                  normalization would collapse into a different key; rename the object"
             )));

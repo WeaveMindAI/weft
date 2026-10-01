@@ -1,0 +1,58 @@
+{
+  "type": "WipeInstance",
+  "label": "Wipe instance",
+  "description": "Remove everything an instance has in this program: its triggers (wiped, its runs cancelled), its copies of the infra nodes listed in `infra` (terminated with every disk, the ones listed in `keepOnTerminate` too), the values it was given for the `@instance_filled` fields, its connections, its tokens, its files (`StorageScope::Instance`), and its runs. The instance id then has nothing attached; run it again to finish a wipe that stopped part way.",
+  "tags": [
+    "instances",
+    "wipe",
+    "delete",
+    "cleanup"
+  ],
+  "icon": "UserX",
+  "color": "#0ea5e9",
+  "inputs": [
+    {
+      "name": "instance",
+      "type": "String",
+      "required": true,
+      "description": "The instance, by the id your program gives it (`user-42`)."
+    },
+    {
+      "name": "infra",
+      "type": "List[String]",
+      "description": "The `@per_instance` infra nodes whose copy for this instance to terminate, named the way the program writes them."
+    },
+    {
+      "name": "includeSelf",
+      "type": "Boolean",
+      "widget": {
+        "kind": "checkbox"
+      },
+      "default": false,
+      "label": "Stop this run too",
+      "description": "Off: this run keeps going even when it is one of the runs reached. On: this run ends with them, cancelled."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "done",
+      "type": "Boolean",
+      "description": "True once everything the instance had is removed, except the deletion of its infra copies, which is handed to the supervisor and finishes on its own time. Wire it into the `_should_flow` of what must happen after."
+    }
+  ],
+  "requires_infra": false,
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": { "kind": "input_names", "port": "infra", "names": { "node": { "role": "infra", "per_instance": true } } }
+      },
+      "then": {
+        "message": "WipeInstance '{id}' names {names} in `infra`, which is no infra node of this program marked `@per_instance`. Name each the way the program writes it (`bridge`, or `one.bridge` inside an included file).",
+        "level": "structural",
+        "severity": "error",
+        "port": "infra"
+      }
+    }
+  ]
+}

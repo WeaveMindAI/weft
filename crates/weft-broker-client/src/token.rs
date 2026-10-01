@@ -1,63 +1,55 @@
-//! Bearer token source. Reads the projected SA token from a
-//! filesystem path on every call so the kubelet's automatic token
-//! rotation propagates without any in-process refresh logic. The
-//! OS page cache covers the per-call cost.
+//! What a call to the broker authenticates with: the caller's platform
+//! identity for the broker's address, and the process replica it comes
+//! from.
 //!
-//! The path is the same conventional path k8s uses for projected
-//! tokens (`/var/run/secrets/...`), but configurable via env so a
-//! dev binary can point at any token file.
+//! The token comes from the platform (`IdentityTokens`): a token the
+//! install signed and handed to the process at start on a local install, a
+//! token the cloud mints for the process's own service account on a cloud.
+//! It is asked for on every call, so a platform that rotates tokens needs
+//! no refresh logic here. The replica id names this running copy of the
+//! caller (`weft_platform_traits::identity::REPLICA_HEADER`).
 
-use std::path::PathBuf;
+use std::sync::Arc;
+
+use weft_platform_traits::identity::{IdentityTokens, REPLICA_HEADER, ROLE_HEADER};
+use weft_platform_traits::CoreRole;
 
 #[derive(Clone)]
 pub struct TokenSource {
-    path: PathBuf,
+    tokens: Arc<dyn IdentityTokens>,
+    replica: String,
+    /// The role a weft role calls as; `None` for a worker.
+    role: Option<CoreRole>,
 }
 
 impl TokenSource {
-    pub fn new(path: PathBuf) -> Self {
-        Self { path }
+    /// A worker's source: its platform identity names its project.
+    pub fn worker(tokens: Arc<dyn IdentityTokens>, replica: impl Into<String>) -> Self {
+        Self { tokens, replica: replica.into(), role: None }
     }
 
-    /// Default path for in-cluster pods; the dispatcher mounts the
-    /// projected SA token at this location for listener / worker /
-    /// infra pods.
-    pub fn default_path() -> PathBuf {
-        PathBuf::from("/var/run/weft/sa/token")
+    /// One of weft's own roles calling the broker.
+    pub fn role(tokens: Arc<dyn IdentityTokens>, replica: impl Into<String>, role: CoreRole) -> Self {
+        Self { tokens, replica: replica.into(), role: Some(role) }
     }
 
-    /// Read the token. Reads the file every call; the kubelet
-    /// rewrites the file in place during rotation, so a fresh read
-    /// is the simplest way to stay current. Atomic-rename rotation
-    /// in k8s makes the read race-free; if a transient `NotFound`
-    /// shows up (kubelet mid-rotation, volume remount), retry once
-    /// after a short sleep before propagating.
-    pub async fn read(&self) -> anyhow::Result<String> {
-        match self.read_once().await {
-            Ok(t) => Ok(t),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound
-                || e.kind() == std::io::ErrorKind::Interrupted =>
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                self.read_once()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("read token at {}: {e}", self.path.display()))
-            }
-            Err(e) => Err(anyhow::anyhow!(
-                "read token at {}: {e}",
-                self.path.display()
-            )),
+    /// The bearer token for a call to `audience` (the broker's base URL).
+    pub async fn read(&self, audience: &str) -> anyhow::Result<String> {
+        self.tokens.token_for(audience).await
+    }
+
+    /// This process replica's id, sent on every call.
+    pub fn replica(&self) -> &str {
+        &self.replica
+    }
+
+    /// The headers every call carries besides the bearer: the replica
+    /// id, and for a weft role, which role it calls as.
+    pub fn headers(&self) -> Vec<(&'static str, String)> {
+        let mut headers = vec![(REPLICA_HEADER, self.replica.clone())];
+        if let Some(role) = self.role {
+            headers.push((ROLE_HEADER, role.as_str().to_string()));
         }
-    }
-
-    async fn read_once(&self) -> std::io::Result<String> {
-        let bytes = tokio::fs::read(&self.path).await?;
-        let text = String::from_utf8(bytes).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "token file is not utf8",
-            )
-        })?;
-        Ok(text.trim().to_string())
+        headers
     }
 }

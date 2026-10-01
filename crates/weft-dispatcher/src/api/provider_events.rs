@@ -215,39 +215,21 @@ async fn match_signals(
         return Ok(Vec::new());
     }
 
-    // Ask the pods holding them. A push can feed subscriptions spread
-    // over several listener pods, so the candidates are grouped by
-    // holder and each pod asked once. A signal with no live holder is
-    // re-placed first: a parked webhook trigger's holder may have been
-    // reaped while the subscription stayed alive at the provider, and
-    // dropping the push because nothing happened to be running is the
-    // silent loss the fire path already refuses to take.
-    let mut by_pod: BTreeMap<String, (crate::listener::ListenerHandle, Vec<String>)> =
-        BTreeMap::new();
-    for token in candidates {
-        let handle = state
-            .listeners
-            .ensure_placed_handle(&token, state.listener_backend.as_ref(), &state.pg_pool, state.pod_id.as_str())
-            .await?;
-        by_pod
-            .entry(handle.admin_url.clone())
-            .or_insert_with(|| (handle, Vec::new()))
-            .1
-            .push(token);
-    }
-
+    // Ask the listener, once for all of them: one account-routed push can
+    // feed many subscriptions, and a call per candidate would make the
+    // provider wait on a round trip each.
     let push = weft_core::signal::listener_protocol::PushEvent {
         service: service.to_string(),
         topic: topic.to_string(),
         event: named_event.clone(),
     };
-    let mut matched = Vec::new();
-    for (handle, tokens) in by_pod.into_values() {
-        for m in crate::listener::match_push(&handle, &push, &tokens).await? {
-            matched.push(MatchedSignal { token: m.token, payload: m.payload });
-        }
-    }
-    Ok(matched)
+    Ok(state
+        .listener
+        .match_push(&push, &candidates)
+        .await?
+        .into_iter()
+        .map(|m| MatchedSignal { token: m.token, payload: m.payload })
+        .collect())
 }
 
 /// Push one fire through the shared lifecycle gate (park / refuse /

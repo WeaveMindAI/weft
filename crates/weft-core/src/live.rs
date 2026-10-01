@@ -238,7 +238,7 @@ impl LiveItem {
 /// the name the container answers to on its own `/action`; nothing
 /// between the two reads it. A listener kind never puts one on a
 /// trigger's display (see the module doc).
-// SYNC: LiveAction <-> packages/weft-graph/src/protocol.ts LiveDataItem.action, crates/weft-dispatcher/src/api/infra.rs InfraActionBody
+// SYNC: LiveAction <-> packages/weft-graph/src/protocol.ts LiveDataItem.action
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LiveAction {
     pub label: String,
@@ -273,6 +273,23 @@ impl LiveAction {
         self.payload = Some(payload);
         self
     }
+
+    /// What pressing this button sends.
+    pub fn press(&self) -> LivePress {
+        LivePress { kind: self.action_kind.clone(), payload: self.payload.clone().unwrap_or(Value::Null) }
+    }
+}
+
+/// A [`LiveAction`] pressed: the body of `/infra/nodes/{node}/action` and
+/// of the token door's `/signal-token/displays/.../action`, so a node's
+/// author writes one `/action` handler and both reach it.
+// SYNC: LivePress <-> extension-vscode/src/graphView.ts (the press it posts to `.../action`)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LivePress {
+    /// The button's `actionKind`.
+    pub kind: String,
+    #[serde(default)]
+    pub payload: Value,
 }
 
 #[cfg(test)]

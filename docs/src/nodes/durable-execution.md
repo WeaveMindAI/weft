@@ -74,38 +74,49 @@ logic in ctx.run.
 If your body can take a different path on a replay, whatever decides that path
 goes inside a `ctx.run` so the decision is remembered rather than remade.
 
-## The guarantee, exactly
+## When the worker dies mid-step
 
-**At least once.** A thing can happen twice, and here is precisely when.
+If the worker goes away while a body is running (a crash, a lost machine),
+nobody can tell how much of the body's work already happened, so the next
+worker fails the step and says why:
 
-`ctx.run` writes its result down after the closure finishes. If the worker dies
-in between, the action happened and nothing recorded it, so the replay does it
-again. weft cannot close that window from the inside, and it says so rather
-than pretending:
+```text
+the worker running 'billing' went away while it was running; it was not run
+again, because it may have partly happened. Re-run from here once you have
+checked what it did.
+```
+
+If the node sets `catchErrors` and you wired its `error` output, this failure
+goes there like any other, and that branch carries on.
+
+If the body was waiting on `ctx.await_signal` when the worker went away, it is
+not failed: when its answer comes, it replays from the top. This is the only way a body runs
+twice, and its `ctx.run` calls give back their saved results instead of doing
+the work again.
+
+If a step emitted a value before the crash and the step reading it had not
+started yet, that value is still delivered and the reading step runs.
+
+## When ctx.run cannot save its result
+
+`ctx.run` writes its result down after the closure finishes. If that write
+fails, the action has happened but nothing recorded it, and the step fails
+with:
 
 ```text
 could not save result of 'charge the card' for node 'billing': <error>. The
 action may already have happened; inspect this run before repeating it.
 ```
 
-The same applies one level up. A crash between a node emitting and its consumer
-starting re-delivers the value, so the consumer runs again.
-
-What this means for you: if the thing you are doing matters and the service on
-the other end has an idempotency key, use it. That is what it is for.
-
 Two things are deliberately **not** wrapped, because they are already safe to
-repeat: `ctx.tag_execution` keeps its place in the order, and `ctx.stop_tagged`
-finds its targets already gone.
+repeat on a replay: `ctx.tag_execution` keeps its place in the order, and
+`ctx.stop_tagged` finds its targets already gone.
 
 ## What a resume actually does
 
-The new worker fetches your program by hash, folds the journal back into a
-picture of where the run had got to, and re-dispatches every node that is
-ready. Each body starts from the top with its answered awaits and finished
-`ctx.run`s loaded, so they replay in order and everything else runs.
-
-A step whose completion was safely written down does not run again at all.
+The new worker fetches your program by hash, reads the journal to see where the
+run had got to, and carries on from there: a step that was running is failed,
+a step that was waiting replays, and every step whose inputs are ready starts.
 
 ## When the worker stays
 

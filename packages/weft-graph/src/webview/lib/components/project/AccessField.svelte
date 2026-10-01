@@ -1,7 +1,7 @@
 <script lang="ts">
 	// The `access` widget: the CONNECTION PICKER on an ACCESS NODE. The
 	// picker itself is the connect library's (one set of components for
-	// the editor and a member's connect page); here it talks through the
+	// the editor and an instance's connect page); here it talks through the
 	// host bridge, and what it picks is the small `{id, identity}` handle
 	// the node's config holds. Pasted values go editor -> store directly
 	// and are never written into node config.

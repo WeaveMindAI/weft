@@ -1,0 +1,5 @@
+ALTER TABLE infra_owner RENAME COLUMN supervisor_instance TO supervisor_replica;
+
+ALTER TABLE infra_owner RENAME CONSTRAINT infra_owner_supervisor_instance_not_null TO infra_owner_supervisor_replica_not_null;
+
+ALTER INDEX idx_infra_owner_instance RENAME TO idx_infra_owner_replica;

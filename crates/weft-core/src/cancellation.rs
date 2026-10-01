@@ -19,7 +19,7 @@
 //!
 //! The flag also remembers WHY, when the canceller says: an execution's
 //! flag is flipped by the worker acting on a `cancel_execution` task, by
-//! the pod shutting down, or by a live caller dropping, and the terminal
+//! the process shutting down, or by a live caller dropping, and the terminal
 //! event the driver writes afterwards has to name that cause. The first
 //! cause to land is the one kept: a run cancelled twice for two reasons
 //! was cancelled for the first.

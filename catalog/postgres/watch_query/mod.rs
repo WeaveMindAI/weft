@@ -29,7 +29,7 @@ use weft::bus::BusOptions;
 use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::postgres::{
-    connect, connect_listening, plan, query_json, refuse_shadowed_columns,
+    connect, connect_listening, mistake, plan, query_json, refuse_shadowed_columns,
     refuse_unanswered_ports, ListenEvent, Plan,
 };
 
@@ -44,7 +44,7 @@ mod tests;
 pub fn watched(query: &str) -> WeftResult<(String, Vec<String>)> {
     match plan(query)? {
         Plan::Query { sql, names } => Ok((sql, names)),
-        Plan::Script { .. } | Plan::Steps(_) => weft::node_bail!(
+        Plan::Script { .. } | Plan::Steps(_) => mistake!(
             "a watched query is one statement (its result is what is kept live); this SQL \
              holds several. Keep the SELECT here and run the rest with Postgres: Query"
         ),
@@ -54,7 +54,7 @@ pub fn watched(query: &str) -> WeftResult<(String, Vec<String>)> {
 /// The cadence as a duration, refusing what would hammer the database.
 pub fn cadence(interval_secs: f64) -> WeftResult<std::time::Duration> {
     if !interval_secs.is_finite() || interval_secs < 1.0 {
-        weft::node_bail!("intervalSecs must be at least 1, got {interval_secs}");
+        mistake!("intervalSecs must be at least 1, got {interval_secs}");
     }
     Ok(std::time::Duration::from_secs_f64(interval_secs))
 }

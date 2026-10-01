@@ -40,8 +40,13 @@ use thiserror::Error;
 use weft_core::is_rust_identifier;
 use weft_core::node::{MetadataCatalog, NodeMetadata};
 
-/// Directory names that are never part of a node's source tree:
-/// build outputs and VCS/dependency caches. The single policy shared
+/// Entry names that are never part of a node's source tree: build
+/// outputs, VCS/dependency caches, local secrets and databases. The
+/// runtime image carries weft's `catalog/` and `crates/` minus exactly
+/// these (`.dockerignore`), and a dispatcher hashes the standard
+/// library from that copy while the CLI hashes it from the checkout,
+/// so every walk leaving out the same entries is what makes the two
+/// agree on one worker hash. The single policy shared
 /// by every traversal of a node directory tree (discovery's descent,
 /// the build's staging copy, and the source-hash walk) so they agree
 /// on exactly which bytes constitute a node. Diverging here is how a
@@ -52,13 +57,20 @@ use weft_core::node::{MetadataCatalog, NodeMetadata};
 /// a symlink into a weft checkout's `catalog/`, e.g. this repo's own
 /// `examples/`); the recursive walks refuse symlink cycles through
 /// `guard_node_tree_cycle` (a descent-chain check) and fail loudly.
-pub const NODE_TREE_EXCLUDE: &[&str] = &["target", "node_modules", ".git", ".weft"];
+// SYNC: NODE_TREE_EXCLUDE + NODE_TREE_EXCLUDE_SUFFIXES <-> .dockerignore
+//       (the "Even inside the allowlisted dirs" block)
+// Only names that are never a real node directory: `pkg` (wasm-pack
+// output) stays out because a package may well be called that.
+pub const NODE_TREE_EXCLUDE: &[&str] = &["target", "node_modules", ".git", ".weft", ".svelte-kit", ".env"];
 
-/// True if `name` is an excluded node-tree directory. Convenience over
-/// `NODE_TREE_EXCLUDE.contains(&name)` for callers matching an
-/// `OsStr`/`Cow<str>` entry name.
+/// Name endings excluded the same way (a local SQLite database and its
+/// side files).
+pub const NODE_TREE_EXCLUDE_SUFFIXES: &[&str] = &[".db", ".db-journal", ".db-shm", ".db-wal"];
+
+/// True if an entry of this name, file or directory, is never part of
+/// a node tree. THE check every node-tree walk makes.
 pub fn is_node_tree_excluded(name: &str) -> bool {
-    NODE_TREE_EXCLUDE.contains(&name)
+    NODE_TREE_EXCLUDE.contains(&name) || NODE_TREE_EXCLUDE_SUFFIXES.iter().any(|s| name.ends_with(s))
 }
 
 /// What one node-tree entry is, symlinks resolved: a symlinked
@@ -147,22 +159,17 @@ pub struct Package {
     pub package_deps: Option<toml::Table>,
 }
 
-/// How discovery reacts to malformed nodes and duplicate node types.
-///
-/// The traversal (what counts as a unit, how packages and nesting
-/// work) is identical for both; only the error reaction differs, so
-/// the editor-live path and the build path never disagree about the
-/// shape of the catalog.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DiscoverPolicy {
-    /// Build path: a malformed `metadata.json` or a duplicate node
-    /// type is a hard error. The catalog must be sound to compile.
-    Strict,
-    /// Editor-live path: malformed nodes and duplicates are skipped
-    /// with a warning, never an error. A node mid-rename has a
-    /// transient parse error the editor should surface but not crash
-    /// on. Collected in `FsCatalog::warnings`.
-    Lenient,
+/// Something discovery could not load: a node, or a whole package. It
+/// is left out of the catalog and nothing else is: one bad folder never
+/// costs a project the rest of its nodes. `node_types` are the types
+/// the broken folder claims (read from its `metadata.json` files as far
+/// as they can be read), so a program that names one of them is told
+/// this error instead of "unknown node type". Empty when not even a
+/// type name could be read; the problem is then only listed.
+#[derive(Debug)]
+pub struct CatalogProblem {
+    pub node_types: Vec<String>,
+    pub error: CatalogError,
 }
 
 #[derive(Debug)]
@@ -171,9 +178,10 @@ pub struct FsCatalog {
     /// All discovered packages, keyed by package root. Each
     /// `CatalogEntry` has a `package_key` pointing back in here.
     packages: HashMap<PathBuf, Package>,
-    /// Soft errors collected under `DiscoverPolicy::Lenient` (`Strict`
-    /// errors on those instead), plus, under either policy, one line
-    /// per node left out because it is not ready (see `pending`).
+    /// Every node or package that failed to load, with its error.
+    problems: Vec<CatalogProblem>,
+    /// One line per thing left out: each problem, each node not ready
+    /// yet (see `pending`), each package with no node in it yet.
     warnings: Vec<String>,
     /// Nodes seen but left out: a folder with a `metadata.json` and no
     /// `mod.rs` yet (a specialist writes the description before the
@@ -190,25 +198,9 @@ pub struct FsCatalog {
 }
 
 impl FsCatalog {
-    /// Walk the project's `nodes/` root strictly: every node must be
-    /// well-formed and every `node_type` unique. There is one source:
-    /// the project owns all its nodes (the stdlib is cloned in at
-    /// `weft new`). A duplicate `node_type` is an ambiguous collision,
-    /// not a shadow, and fails loudly. This is the build path.
+    /// Walk one node tree. See `discover_roots`.
     pub fn discover(root: &Path) -> Result<Self, CatalogError> {
-        Self::discover_with_policy(root, DiscoverPolicy::Strict)
-    }
-
-    /// Walk the project's `nodes/` root under an explicit policy. Both
-    /// policies share one traversal; see `DiscoverPolicy`. `Lenient`
-    /// never returns `Err` from a malformed node or a collision (those
-    /// land in `warnings`); it can still fail on an unreadable
-    /// directory.
-    pub fn discover_with_policy(
-        root: &Path,
-        policy: DiscoverPolicy,
-    ) -> Result<Self, CatalogError> {
-        Self::discover_roots_with_policy(&[root], policy)
+        Self::discover_roots(&[root])
     }
 
     /// One catalog over several trees. A project's nodes live in two
@@ -217,35 +209,40 @@ impl FsCatalog {
     /// into one catalog with one namespace: a type name declared in both
     /// is the same collision it would be inside one tree. A root that
     /// does not exist contributes nothing.
-    pub fn discover_roots_with_policy(
-        roots: &[&Path],
-        policy: DiscoverPolicy,
-    ) -> Result<Self, CatalogError> {
-        let mut cat = Self {
-            entries: HashMap::new(),
-            packages: HashMap::new(),
-            warnings: Vec::new(),
-            pending: BTreeMap::new(),
-            type_registry: std::sync::Arc::new(weft_core::weft_type::TypeRegistry::builtin()),
-        };
+    ///
+    /// A node or package that cannot load is recorded in `problems` and
+    /// left out; everything else loads. Two folders claiming one name
+    /// (a node type, a package name, a service) are BOTH left out, each
+    /// told about the other: no folder outranks another, so neither can
+    /// silently win. The only `Err` is a root that exists and cannot be
+    /// read at all.
+    pub fn discover_roots(roots: &[&Path]) -> Result<Self, CatalogError> {
+        let mut cat = Self::empty();
         let roots: Vec<&Path> = roots.iter().copied().filter(|r| r.exists()).collect();
-        if !roots.is_empty() {
-            // Type declarations first: port type strings in any
-            // metadata.json may use the declared names, so the registry
-            // must exist before a single NodeMetadata is deserialized.
-            match build_type_registry(&roots, policy, &mut cat.warnings)? {
-                Some(registry) => cat.type_registry = std::sync::Arc::new(registry),
-                None => { /* Lenient fallback: builtin only, warned. */ }
-            }
-            let registry = cat.type_registry.clone();
-            let mut ctx = DiscoverCtx {
-                policy,
-                cat: &mut cat,
-                chain: Default::default(),
-                done: Default::default(),
-            };
-            registry.scoped(|| roots.iter().try_for_each(|root| visit_dir(root, &mut ctx)))?;
+        for root in &roots {
+            fs::read_dir(root).map_err(|error| CatalogError::Io { path: root.to_path_buf(), error })?;
         }
+        if roots.is_empty() {
+            return Ok(cat);
+        }
+        // Type declarations first: port type strings in any
+        // metadata.json may use the declared names, so the registry
+        // must exist before a single NodeMetadata is deserialized.
+        let mut ctx = DiscoverCtx {
+            cat: &mut cat,
+            units: Vec::new(),
+            broken_files: HashMap::new(),
+            chain: Default::default(),
+            done: Default::default(),
+        };
+        let registry = std::sync::Arc::new(build_type_registry(&roots, &mut ctx));
+        ctx.cat.type_registry = registry.clone();
+        registry.scoped(|| {
+            for root in &roots {
+                visit_dir(root, &mut ctx);
+            }
+        });
+        ctx.settle();
         Ok(cat)
     }
 
@@ -265,17 +262,24 @@ impl FsCatalog {
         Self {
             entries: HashMap::new(),
             packages: HashMap::new(),
+            problems: Vec::new(),
             warnings: Vec::new(),
             pending: BTreeMap::new(),
             type_registry: std::sync::Arc::new(weft_core::weft_type::TypeRegistry::builtin()),
         }
     }
 
-    /// Soft errors collected during a `Lenient` discover (malformed
-    /// `metadata.json`, duplicate node types), and under either policy
-    /// one line per node left out for not being ready yet.
+    /// One line per thing left out of the catalog: every problem, every
+    /// node not ready yet, every package with no node in it yet.
     pub fn warnings(&self) -> &[String] {
         &self.warnings
+    }
+
+    /// The nodes and packages that failed to load, with their errors.
+    /// Empty means every folder in the tree loaded (or is only waiting
+    /// for its code, see `pending`).
+    pub fn problems(&self) -> &[CatalogProblem] {
+        &self.problems
     }
 
     /// The nodes left out for not being ready yet: type name to the
@@ -364,8 +368,19 @@ impl MetadataCatalog for FsCatalog {
     fn type_registry(&self) -> std::sync::Arc<weft_core::weft_type::TypeRegistry> {
         self.type_registry.clone()
     }
-    fn not_ready(&self, node_type: &str) -> Option<String> {
-        self.pending.get(node_type).map(|dir| pending_reason(node_type, dir))
+    fn unavailable(&self, node_type: &str) -> Option<String> {
+        let reasons: Vec<String> = self
+            .problems
+            .iter()
+            .filter(|p| p.node_types.iter().any(|t| t == node_type))
+            .map(|p| p.error.to_string())
+            .collect();
+        if !reasons.is_empty() {
+            return Some(format!("node '{node_type}' failed to load: {}", reasons.join("; ")));
+        }
+        self.pending
+            .get(node_type)
+            .map(|dir| format!("node type '{node_type}' is not ready yet: {}", pending_reason(node_type, dir)))
     }
 }
 
@@ -721,13 +736,29 @@ struct PackageSection {
     name: String,
 }
 
-/// Discovery state threaded through the traversal: the policy plus the
-/// catalog being built. Both `Strict` and `Lenient` share this exact
-/// traversal; the policy only changes how a malformed node or a
-/// collision is handled (`soft_fail`).
+/// A unit the walk loaded: a package root or a bare node, with every
+/// member that loaded. Nothing registers until the whole tree is walked
+/// (`DiscoverCtx::settle`), because a clash between two units can only
+/// be judged once both are known, and neither may win by being first.
+struct Unit {
+    root: PathBuf,
+    name: String,
+    entries: Vec<CatalogEntry>,
+    shared_rs: Vec<PathBuf>,
+    package_deps: Option<toml::Table>,
+}
+
+/// Discovery state threaded through the traversal: the catalog being
+/// built, the units loaded so far, and the files the type pass already
+/// found broken.
 struct DiscoverCtx<'a> {
-    policy: DiscoverPolicy,
     cat: &'a mut FsCatalog,
+    units: Vec<Unit>,
+    /// `metadata.json` files whose `types` declarations could not be
+    /// taken into the registry, with why. Loading such a file fails with
+    /// that reason, so the error lands on the node or package that
+    /// declared the type, never on the whole catalog.
+    broken_files: HashMap<PathBuf, String>,
     /// Canonical dirs of the CURRENT descent chain; re-entering one is
     /// a symlink cycle and fails loudly (see `guard_node_tree_cycle`).
     chain: Vec<PathBuf>,
@@ -740,85 +771,135 @@ struct DiscoverCtx<'a> {
 }
 
 impl DiscoverCtx<'_> {
-    /// A node seen but not ready: left out under EITHER policy (a
-    /// half-written node is not an error in anyone's build), recorded
-    /// so the compiler can name it when a program asks for it.
+    /// A node seen but not ready: left out (a half-written node is not
+    /// an error in anyone's build), recorded so the compiler can name it
+    /// when a program asks for it.
     fn leave_pending(&mut self, node_type: String, dir: PathBuf) {
         self.cat.warnings.push(pending_reason(&node_type, &dir));
         self.cat.pending.insert(node_type, dir);
     }
 
-    /// Resolve a soft failure (malformed node, duplicate type) per the
-    /// policy: `Strict` propagates the error, `Lenient` records a
-    /// warning and returns `Ok(())` so the walk continues.
-    fn soft_fail(&mut self, err: CatalogError) -> Result<(), CatalogError> {
-        match self.policy {
-            DiscoverPolicy::Strict => Err(err),
-            DiscoverPolicy::Lenient => {
-                self.cat.warnings.push(err.to_string());
-                Ok(())
-            }
-        }
+    /// A node or package that failed to load: left out, with its error,
+    /// under the types it claims.
+    fn record(&mut self, node_types: Vec<String>, error: CatalogError) {
+        self.cat.warnings.push(error.to_string());
+        self.cat.problems.push(CatalogProblem { node_types, error });
     }
 
-    /// Insert an entry. A `node_type` collision is a soft failure
-    /// (there is no shadowing with a single root, so a duplicate is
-    /// ambiguous): `Strict` errors, `Lenient` warns and keeps the
-    /// first. Returns whether the entry was actually inserted, so the
-    /// caller's `Package.node_types` lists only the types `entries`
-    /// attributes to it (the two views can't disagree under Lenient).
-    fn insert_entry(&mut self, entry: CatalogEntry) -> Result<bool, CatalogError> {
-        if let Some(existing) = self.cat.entries.get(&entry.node_type) {
-            self.soft_fail(CatalogError::Collision {
-                node_type: entry.node_type.clone(),
-                first: existing.source_dir.clone(),
-                second: entry.source_dir.clone(),
-            })?;
-            return Ok(false);
+    /// Register every loaded unit, after leaving out each one that
+    /// shares a claim with another. Three names must each lead to one
+    /// place: a package name (the test-crate emit picks its package by
+    /// name), a node type, and a service (the store that keeps
+    /// connections and the compiler resolving what a node publishes
+    /// both find a service by name alone). Every claimant of a shared
+    /// name is left out, told about all the others, because the walk's
+    /// order is no reason for one folder to win.
+    fn settle(mut self) {
+        let mut units = std::mem::take(&mut self.units);
+
+        // Package names: a clash takes the whole unit out.
+        let mut by_name: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+        for unit in &units {
+            by_name.entry(unit.name.clone()).or_default().push(unit.root.clone());
         }
-        // A service is found BY NAME, by the store that keeps its
-        // connections and by the compiler resolving what a node
-        // publishes. Two nodes claiming one name make that lookup a
-        // coin toss, so it is refused here, where the other identity
-        // collisions are.
-        if let Some(service) = entry.metadata.service.as_ref().map(|s| s.service.clone()) {
-            if let Some(existing) = self
-                .cat
-                .entries
-                .values()
-                .find(|e| e.metadata.service.as_ref().is_some_and(|s| s.service == service))
-            {
-                self.soft_fail(CatalogError::ServiceCollision {
-                    service,
-                    first: existing.node_type.clone(),
-                    second: entry.node_type.clone(),
-                })?;
-                return Ok(false);
+        let (clashing, mut units_ok): (Vec<Unit>, Vec<Unit>) =
+            units.drain(..).partition(|u| by_name[&u.name].len() > 1);
+        // Node types are judged over EVERY loaded entry, the clashing
+        // units' included: a type claimed twice is ambiguous whatever
+        // else is wrong with one of its claimants.
+        let mut by_type: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+        for entry in clashing.iter().chain(units_ok.iter()).flat_map(|u| &u.entries) {
+            by_type.entry(entry.node_type.clone()).or_default().push(entry.source_dir.clone());
+        }
+        for unit in clashing {
+            let node_types = unit.entries.iter().map(|e| e.node_type.clone()).collect();
+            let roots = by_name[&unit.name].clone();
+            self.record(node_types, CatalogError::PackageNameCollision { name: unit.name, roots });
+        }
+        for (node_type, dirs) in &by_type {
+            if dirs.len() > 1 {
+                self.record(
+                    vec![node_type.clone()],
+                    CatalogError::Collision { node_type: node_type.clone(), dirs: dirs.clone() },
+                );
             }
         }
-        self.cat.entries.insert(entry.node_type.clone(), entry);
-        Ok(true)
-    }
-
-    /// Claim a package NAME for a unit about to register, refusing a
-    /// duplicate the same way a duplicate node type is refused: every
-    /// by-name package lookup (the test-crate emit picks its package
-    /// by name) must resolve to exactly one root, so a second root
-    /// with the same name is ambiguous. `Strict` errors, `Lenient`
-    /// warns and keeps the first (the whole second unit is skipped,
-    /// entries included, so no entry ever points at an unregistered
-    /// package). Returns whether the unit may register.
-    fn claim_package_name(&mut self, name: &str, root: &Path) -> Result<bool, CatalogError> {
-        if let Some(existing) = self.cat.packages.values().find(|p| p.name == name) {
-            self.soft_fail(CatalogError::PackageNameCollision {
-                name: name.to_string(),
-                first: existing.root.clone(),
-                second: root.to_path_buf(),
-            })?;
-            return Ok(false);
+        for unit in &mut units_ok {
+            unit.entries.retain(|e| by_type[&e.node_type].len() == 1);
         }
-        Ok(true)
+
+        // Services, over what is left.
+        let mut by_service: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for entry in units_ok.iter().flat_map(|u| &u.entries) {
+            if let Some(service) = &entry.metadata.service {
+                by_service.entry(service.service.clone()).or_default().push(entry.node_type.clone());
+            }
+        }
+        for (service, node_types) in &by_service {
+            if node_types.len() > 1 {
+                self.record(
+                    node_types.clone(),
+                    CatalogError::ServiceCollision { service: service.clone(), node_types: node_types.clone() },
+                );
+            }
+        }
+        for unit in &mut units_ok {
+            unit.entries.retain(|e| {
+                e.metadata.service.as_ref().is_none_or(|s| by_service[&s.service].len() == 1)
+            });
+        }
+
+        // A unit whose every entry was taken out has nothing to serve;
+        // its types are already recorded.
+        for unit in units_ok.into_iter().filter(|u| !u.entries.is_empty()) {
+            let mut node_types: Vec<String> = unit.entries.iter().map(|e| e.node_type.clone()).collect();
+            node_types.sort();
+            for entry in unit.entries {
+                self.cat.entries.insert(entry.node_type.clone(), entry);
+            }
+            self.cat.packages.insert(
+                unit.root.clone(),
+                Package {
+                    root: unit.root,
+                    name: unit.name,
+                    node_types,
+                    shared_rs: unit.shared_rs,
+                    package_deps: unit.package_deps,
+                },
+            );
+        }
     }
+}
+
+/// The node type a folder's `metadata.json` claims, read as plainly as
+/// possible: used only to name a folder that failed to load, so a
+/// program naming that type is told why.
+fn declared_type(node_dir: &Path) -> Option<String> {
+    let raw = fs::read_to_string(node_dir.join("metadata.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    value.get("type")?.as_str().map(str::to_string)
+}
+
+/// The node types claimed by a package's member folders (every
+/// immediate subdir with a `metadata.json`), for naming a package that
+/// failed to load as a whole.
+fn declared_member_types(entries: &[NodeDirEntry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter_map(|e| match e {
+            NodeDirEntry::Dir(path) => declared_type(path),
+            NodeDirEntry::File(_) => None,
+        })
+        .collect()
+}
+
+/// Read a `metadata.json`, failing with the type pass's reason when that
+/// pass already found the file's `types` declarations unusable.
+fn read_metadata_file(path: &Path, broken_files: &HashMap<PathBuf, String>) -> Result<String, CatalogError> {
+    if let Some(error) = broken_files.get(path) {
+        return Err(CatalogError::Parse { path: path.to_path_buf(), error: error.clone() });
+    }
+    fs::read_to_string(path).map_err(|error| CatalogError::Io { path: path.to_path_buf(), error })
 }
 
 /// Harvest every `types` declaration under `root` and build the
@@ -828,111 +909,148 @@ impl DiscoverCtx<'_> {
 /// tree (member and package-root alike, same symlink-following and
 /// exclusion policy via `read_node_dir`) with no unit semantics. Malformed JSON is left
 /// for the main discovery pass to report (it owns metadata errors);
-/// only the declarations themselves fail here. Under `Lenient` a
-/// registry build failure becomes a warning and `None` (builtin-only),
-/// so the editor keeps rendering while the author fixes the clash.
-fn build_type_registry(
-    roots: &[&Path],
-    policy: DiscoverPolicy,
-    warnings: &mut Vec<String>,
-) -> Result<Option<weft_core::weft_type::TypeRegistry>, CatalogError> {
+/// only the declarations themselves fail here.
+///
+/// A file whose declarations cannot be taken in (a bad shape, a cycle,
+/// a name declared twice with different bodies) goes into
+/// `broken_files` with the reason, and the registry is built from the
+/// rest, so the failure lands on the node or package that declared the
+/// type. Two files clashing on one name are BOTH left out: neither
+/// outranks the other.
+fn build_type_registry(roots: &[&Path], ctx: &mut DiscoverCtx<'_>) -> weft_core::weft_type::TypeRegistry {
+    use weft_core::weft_type::{Redeclaration, TypeRegistry};
     let mut declarations: Vec<(String, String, String)> = Vec::new();
     for root in roots {
-        harvest_type_declarations(root, &mut declarations)?;
+        harvest_type_declarations(root, &mut declarations, &mut ctx.broken_files);
     }
     // Lexical order by origin path: `fs::read_dir` order is
-    // filesystem-dependent, and a clash error names the SECOND origin,
-    // so an unsorted harvest would blame a different file per machine.
+    // filesystem-dependent, and the messages name origins in the order
+    // they are met.
     declarations.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
-    match weft_core::weft_type::TypeRegistry::build(&declarations) {
-        Ok(registry) => Ok(Some(registry)),
-        Err(error) => match policy {
-            DiscoverPolicy::Strict => Err(CatalogError::Parse {
-                // The clash names both origins itself; the first root is
-                // the tree the reader will look in first.
-                path: roots.first().map(|r| r.to_path_buf()).unwrap_or_default(),
-                error: format!("type declarations: {error}"),
-            }),
-            DiscoverPolicy::Lenient => {
-                warnings.push(format!("type declarations: {error}"));
-                Ok(None)
+    if let Ok(registry) = TypeRegistry::build(&declarations) {
+        return registry;
+    }
+
+    // Something is wrong in some file. Take the files in one by one
+    // until none more can be taken, and leave out the ones that never
+    // fit; when one of those restates a name an accepted file declares
+    // differently, that accepted file is just as much at fault, so it
+    // is left out too and the round runs again without it.
+    let mut by_origin: BTreeMap<String, Vec<(String, String, String)>> = BTreeMap::new();
+    for decl in declarations {
+        by_origin.entry(decl.2.clone()).or_default().push(decl);
+    }
+    let mut excluded: BTreeMap<String, String> = BTreeMap::new();
+    loop {
+        let mut registry = TypeRegistry::builtin();
+        let mut accepted: Vec<&String> = Vec::new();
+        let mut waiting: Vec<&String> = by_origin.keys().filter(|o| !excluded.contains_key(*o)).collect();
+        let mut last_error: BTreeMap<&String, String> = BTreeMap::new();
+        loop {
+            let before = waiting.len();
+            waiting.retain(|origin| match registry.extended(&by_origin[*origin], Redeclaration::AbsorbIdentical) {
+                Ok(next) => {
+                    registry = next;
+                    accepted.push(*origin);
+                    false
+                }
+                Err(error) => {
+                    last_error.insert(origin, error);
+                    true
+                }
+            });
+            if waiting.is_empty() || waiting.len() == before {
+                break;
             }
-        },
+        }
+        let mut again = false;
+        for origin in &waiting {
+            let error = last_error.remove(origin).expect("a file still waiting failed its last try");
+            for other in &accepted {
+                let restated = by_origin[*origin].iter().any(|(name, body, _)| {
+                    by_origin[*other].iter().any(|(n, b, _)| n == name && b.trim() != body.trim())
+                });
+                if restated {
+                    excluded.insert((*other).clone(), error.clone());
+                    again = true;
+                }
+            }
+            excluded.insert((*origin).clone(), error);
+        }
+        if !again {
+            for (origin, error) in excluded {
+                ctx.broken_files.insert(PathBuf::from(origin), format!("type declarations: {error}"));
+            }
+            return registry;
+        }
     }
 }
 
+/// Collect every `types` declaration under `dir` as `(name, type string,
+/// origin file)`. A `types` key of the wrong shape puts its file in
+/// `broken_files`; anything the walk itself cannot read is left for the
+/// main pass, which reports it on the folder it belongs to.
 fn harvest_type_declarations(
     dir: &Path,
     out: &mut Vec<(String, String, String)>,
-) -> Result<(), CatalogError> {
+    broken_files: &mut HashMap<PathBuf, String>,
+) {
     let mut chain = Vec::new();
     let mut done = std::collections::HashSet::new();
-    harvest_type_declarations_inner(dir, out, &mut chain, &mut done)
+    harvest_type_declarations_inner(dir, out, broken_files, &mut chain, &mut done)
 }
 
 fn harvest_type_declarations_inner(
     dir: &Path,
     out: &mut Vec<(String, String, String)>,
+    broken_files: &mut HashMap<PathBuf, String>,
     chain: &mut Vec<PathBuf>,
     done: &mut std::collections::HashSet<PathBuf>,
-) -> Result<(), CatalogError> {
-    let canon = guard_node_tree_cycle(dir, chain)
-        .map_err(|error| CatalogError::Io { path: dir.to_path_buf(), error })?;
+) {
+    let Ok(canon) = guard_node_tree_cycle(dir, chain) else { return };
     // Same dedupe as discovery: a folder reachable by two symlink paths
     // yields its declarations once.
     if !done.insert(canon.clone()) {
-        return Ok(());
+        return;
     }
+    let Ok(entries) = read_node_dir(dir) else { return };
     chain.push(canon);
-    let result = harvest_type_declarations_entries(dir, out, chain, done);
-    chain.pop();
-    result
-}
-
-fn harvest_type_declarations_entries(
-    dir: &Path,
-    out: &mut Vec<(String, String, String)>,
-    chain: &mut Vec<PathBuf>,
-    done: &mut std::collections::HashSet<PathBuf>,
-) -> Result<(), CatalogError> {
-    for entry in read_node_dir(dir)? {
+    for entry in entries {
         match entry {
-            NodeDirEntry::Dir(path) => harvest_type_declarations_inner(&path, out, chain, done)?,
+            NodeDirEntry::Dir(path) => harvest_type_declarations_inner(&path, out, broken_files, chain, done),
             NodeDirEntry::File(path) => {
                 if path.file_name().and_then(|n| n.to_str()) != Some("metadata.json") {
                     continue;
                 }
                 // Raw read: the typed NodeMetadata parse needs the
-                // registry we are building. Malformed JSON is the main
-                // pass's error to report (it owns metadata errors), so
-                // it is skipped here; an UNREADABLE file is not (the
-                // main pass treats a package root's partial as defaults
-                // to merge and may never report it, and a vanished
-                // declaration would surface much later as an unresolved
-                // port type on an innocent node).
-                let raw = fs::read_to_string(&path)
-                    .map_err(|error| CatalogError::Io { path: path.clone(), error })?;
+                // registry we are building. An unreadable or malformed
+                // file is the main pass's error to report (it reads
+                // every metadata.json it loads, package roots included).
+                let Ok(raw) = fs::read_to_string(&path) else { continue };
                 let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
                 let Some(types) = value.get("types") else { continue };
                 let Some(map) = types.as_object() else {
-                    return Err(CatalogError::Parse {
-                        path,
-                        error: "`types` must be an object of name -> type string".into(),
-                    });
+                    broken_files.insert(path, "`types` must be an object of name -> type string".into());
+                    continue;
                 };
-                for (name, body) in map {
-                    let Some(body) = body.as_str() else {
-                        return Err(CatalogError::Parse {
-                            path,
-                            error: format!("`types.{name}` must be a type string"),
-                        });
-                    };
-                    out.push((name.clone(), body.to_string(), path.display().to_string()));
+                let bodies = map
+                    .iter()
+                    .map(|(name, body)| body.as_str().map(|body| (name, body)).ok_or(name))
+                    .collect::<Result<Vec<_>, _>>();
+                match bodies {
+                    Ok(bodies) => {
+                        for (name, body) in bodies {
+                            out.push((name.clone(), body.to_string(), path.display().to_string()));
+                        }
+                    }
+                    Err(name) => {
+                        broken_files.insert(path, format!("`types.{name}` must be a type string"));
+                    }
                 }
             }
         }
     }
-    Ok(())
+    chain.pop();
 }
 
 /// Recursive directory visitor under `nodes/`. For each directory:
@@ -1011,113 +1129,78 @@ fn has_node_file(entries: &[NodeDirEntry], name: &str) -> bool {
     })
 }
 
-fn visit_dir(dir: &Path, ctx: &mut DiscoverCtx<'_>) -> Result<(), CatalogError> {
-    let canon = guard_node_tree_cycle(dir, &ctx.chain)
-        .map_err(|error| CatalogError::Io { path: dir.to_path_buf(), error })?;
+/// Walk one directory. Nothing here fails the catalog: a folder that
+/// cannot be read or that loops back on itself is recorded as a problem
+/// and the walk goes on with its siblings.
+fn visit_dir(dir: &Path, ctx: &mut DiscoverCtx<'_>) {
+    let canon = match guard_node_tree_cycle(dir, &ctx.chain) {
+        Ok(canon) => canon,
+        Err(error) => return ctx.record(Vec::new(), CatalogError::Io { path: dir.to_path_buf(), error }),
+    };
     // A folder already fully processed (reached again through a second
     // symlink path) registers nothing twice and is not re-walked.
     if !ctx.done.insert(canon.clone()) {
-        return Ok(());
+        return;
     }
-    let entries = read_node_dir(dir)?;
+    let entries = match read_node_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => return ctx.record(Vec::new(), error),
+    };
     if has_node_file(&entries, "package.toml") {
-        return register_package(dir, &dir.join("package.toml"), entries, ctx);
+        return register_package(dir, entries, ctx);
     }
     if has_node_file(&entries, "metadata.json") {
         return register_bare_node(dir, ctx);
     }
     ctx.chain.push(canon);
-    let result = visit_dir_children(entries, ctx);
-    ctx.chain.pop();
-    result
-}
-
-fn visit_dir_children(
-    entries: Vec<NodeDirEntry>,
-    ctx: &mut DiscoverCtx<'_>,
-) -> Result<(), CatalogError> {
     for entry in entries {
         if let NodeDirEntry::Dir(path) = entry {
-            visit_dir(&path, ctx)?;
+            visit_dir(&path, ctx);
         }
     }
-    Ok(())
+    ctx.chain.pop();
 }
 
 /// A bare node: the directory IS the node. It is its own degenerate
 /// package (one member, no shared code, deps from its `deps.toml`, no
 /// package-level metadata defaults: its own `metadata.json` is already
 /// the whole story).
-fn register_bare_node(dir: &Path, ctx: &mut DiscoverCtx<'_>) -> Result<(), CatalogError> {
-    let entry = match load_node_entry(dir, dir, None) {
+fn register_bare_node(dir: &Path, ctx: &mut DiscoverCtx<'_>) {
+    let entry = match load_node_entry(dir, dir, None, &ctx.broken_files) {
         Ok(Loaded::Ready(e)) => *e,
-        Ok(Loaded::Pending { node_type }) => {
-            ctx.leave_pending(node_type, dir.to_path_buf());
-            return Ok(());
-        }
-        Err(e) => return ctx.soft_fail(e),
+        Ok(Loaded::Pending { node_type }) => return ctx.leave_pending(node_type, dir.to_path_buf()),
+        Err(e) => return ctx.record(declared_type(dir).into_iter().collect(), e),
     };
     // The package name is the directory name. A non-UTF-8 name is a
-    // node weft can't compile (it becomes a Rust module ident), so fail
-    // loudly instead of substituting a placeholder that would collide
-    // with any other unnameable node.
-    let package_name = match dir.file_name().and_then(|n| n.to_str()) {
-        Some(n) => n.to_string(),
-        None => {
-            return ctx.soft_fail(CatalogError::Parse {
-                path: dir.to_path_buf(),
-                error: "node directory name is not valid UTF-8".into(),
-            })
-        }
-    };
-    if !ctx.claim_package_name(&package_name, dir)? {
-        return Ok(());
-    }
-    let node_type = entry.node_type.clone();
-    // Only register the package if the node's type actually landed in
-    // `entries` (Lenient may drop a collision with a warning); otherwise
-    // the package would claim a type owned by another package.
-    if ctx.insert_entry(entry)? {
-        ctx.cat.packages.insert(
-            dir.to_path_buf(),
-            Package {
-                root: dir.to_path_buf(),
-                name: package_name,
-                node_types: vec![node_type],
-                shared_rs: Vec::new(),
-                package_deps: None,
-            },
+    // node weft can't compile (it becomes a Rust module ident), so it
+    // is refused instead of given a placeholder that would collide with
+    // any other unnameable node.
+    let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
+        return ctx.record(
+            vec![entry.node_type],
+            CatalogError::Parse { path: dir.to_path_buf(), error: "node directory name is not valid UTF-8".into() },
         );
-    }
-    Ok(())
+    };
+    ctx.units.push(Unit {
+        root: dir.to_path_buf(),
+        name: name.to_string(),
+        entries: vec![entry],
+        shared_rs: Vec::new(),
+        package_deps: None,
+    });
 }
 
 /// A package root: `package.toml` names the package and carries shared
 /// cargo deps. Members are auto-detected (any immediate subdir with a
 /// `metadata.json`), so the author never maintains a node list. Shared
 /// `.rs` files at the root are bundled into the package module.
-fn register_package(
-    dir: &Path,
-    toml_path: &Path,
-    entries: Vec<NodeDirEntry>,
-    ctx: &mut DiscoverCtx<'_>,
-) -> Result<(), CatalogError> {
-    let raw = fs::read_to_string(toml_path).map_err(|e| CatalogError::Io {
-        path: toml_path.to_path_buf(),
-        error: e,
-    })?;
-    let parsed: PackageToml = match toml::from_str(&raw) {
-        Ok(p) => p,
-        Err(e) => {
-            return ctx.soft_fail(CatalogError::Parse {
-                path: toml_path.to_path_buf(),
-                error: e.to_string(),
-            })
-        }
+fn register_package(dir: &Path, entries: Vec<NodeDirEntry>, ctx: &mut DiscoverCtx<'_>) {
+    // Whatever makes the package itself unloadable takes out every
+    // member with it, named by the types they claim.
+    let parsed = match load_package_toml(&dir.join("package.toml")) {
+        Ok(parsed) => parsed,
+        Err(e) => return ctx.record(declared_member_types(&entries), e),
     };
-    if !ctx.claim_package_name(&parsed.package.name, dir)? {
-        return Ok(());
-    }
 
     // Package-level metadata defaults: an OPTIONAL, PARTIAL `metadata.json`
     // at the package root. Every member inherits its top-level keys unless
@@ -1130,9 +1213,9 @@ fn register_package(
     // staging, and hash use (`has_node_file`), so the catalog's view and
     // the compiled node's (whose derive reads the staged tree) agree.
     let package_defaults = if has_node_file(&entries, "metadata.json") {
-        match load_package_defaults(dir) {
-            Ok(d) => d,
-            Err(e) => return ctx.soft_fail(e),
+        match load_package_defaults(dir, &ctx.broken_files) {
+            Ok(d) => Some(d),
+            Err(e) => return ctx.record(declared_member_types(&entries), e),
         }
     } else {
         None
@@ -1143,33 +1226,27 @@ fn register_package(
     // package root. All of this is the `read_node_dir` view (the
     // package's `entries` plus each member's), so a package's tree is
     // seen identically by discovery, staging, and hashing.
-    let mut node_types: Vec<String> = Vec::new();
+    let mut loaded: Vec<CatalogEntry> = Vec::new();
     let mut shared_rs: Vec<PathBuf> = Vec::new();
-    let mut pending_members = 0usize;
+    let mut members_seen = 0usize;
     for entry in entries {
         match entry {
             NodeDirEntry::Dir(path) => {
-                let member_entries = read_node_dir(&path)?;
+                let member_entries = match read_node_dir(&path) {
+                    Ok(member_entries) => member_entries,
+                    Err(e) => {
+                        ctx.record(declared_type(&path).into_iter().collect(), e);
+                        continue;
+                    }
+                };
                 if !has_node_file(&member_entries, "metadata.json") {
                     continue;
                 }
-                match load_node_entry(&path, dir, package_defaults.as_ref()) {
-                    Ok(Loaded::Ready(entry)) => {
-                        let entry = *entry;
-                        let node_type = entry.node_type.clone();
-                        // Only list the type if it was actually inserted.
-                        // Under Lenient a collision is dropped-with-warning;
-                        // listing it anyway would make this package claim a
-                        // type whose entry points at a different package.
-                        if ctx.insert_entry(entry)? {
-                            node_types.push(node_type);
-                        }
-                    }
-                    Ok(Loaded::Pending { node_type }) => {
-                        pending_members += 1;
-                        ctx.leave_pending(node_type, path);
-                    }
-                    Err(e) => ctx.soft_fail(e)?,
+                members_seen += 1;
+                match load_node_entry(&path, dir, package_defaults.as_ref(), &ctx.broken_files) {
+                    Ok(Loaded::Ready(entry)) => loaded.push(*entry),
+                    Ok(Loaded::Pending { node_type }) => ctx.leave_pending(node_type, path),
+                    Err(e) => ctx.record(declared_type(&path).into_iter().collect(), e),
                 }
             }
             NodeDirEntry::File(path)
@@ -1180,37 +1257,36 @@ fn register_package(
             _ => {}
         }
     }
-    node_types.sort();
     shared_rs.sort();
 
-    // A package whose members are all still being written is not a
-    // package with no members: the pending lines already say what is
-    // missing, and it registers once one member is ready.
-    if node_types.is_empty() && pending_members > 0 {
-        return Ok(());
+    // A package with no node folder at all is one being started (its
+    // `package.toml` written first): not ready, and no error for anyone.
+    // One whose members are all pending or broken already has a line
+    // for each of them, and still enters `settle` with no entries: its
+    // name is claimed all the same, so a healthy package elsewhere under
+    // that name is a collision rather than the quiet winner.
+    if members_seen == 0 {
+        ctx.cat.warnings.push(format!(
+            "package '{}' at {} has no node in it yet (no subfolder with a metadata.json); it is \
+             left out until it does",
+            parsed.package.name,
+            dir.display()
+        ));
+        return;
     }
-    if node_types.is_empty() {
-        return ctx.soft_fail(CatalogError::Parse {
-            path: toml_path.to_path_buf(),
-            error: format!(
-                "package '{}' has no member nodes (no subdir with metadata.json under {})",
-                parsed.package.name,
-                dir.display()
-            ),
-        });
-    }
+    ctx.units.push(Unit {
+        root: dir.to_path_buf(),
+        name: parsed.package.name,
+        entries: loaded,
+        shared_rs,
+        package_deps: Some(parsed.dependencies),
+    });
+}
 
-    ctx.cat.packages.insert(
-        dir.to_path_buf(),
-        Package {
-            root: dir.to_path_buf(),
-            name: parsed.package.name,
-            node_types,
-            shared_rs,
-            package_deps: Some(parsed.dependencies),
-        },
-    );
-    Ok(())
+/// Read and parse a `package.toml`.
+fn load_package_toml(path: &Path) -> Result<PackageToml, CatalogError> {
+    let raw = fs::read_to_string(path).map_err(|error| CatalogError::Io { path: path.to_path_buf(), error })?;
+    toml::from_str(&raw).map_err(|e| CatalogError::Parse { path: path.to_path_buf(), error: e.to_string() })
 }
 
 /// Load a package root's partial `metadata.json` (the defaults its members
@@ -1221,12 +1297,10 @@ fn register_package(
 /// quietly miss its inherited keys.
 fn load_package_defaults(
     package_root: &Path,
-) -> Result<Option<serde_json::Map<String, serde_json::Value>>, CatalogError> {
+    broken_files: &HashMap<PathBuf, String>,
+) -> Result<serde_json::Map<String, serde_json::Value>, CatalogError> {
     let path = package_root.join("metadata.json");
-    let raw = fs::read_to_string(&path).map_err(|e| CatalogError::Io {
-        path: path.clone(),
-        error: e,
-    })?;
+    let raw = read_metadata_file(&path, broken_files)?;
     let value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| CatalogError::Parse {
             path: path.clone(),
@@ -1253,7 +1327,7 @@ fn load_package_defaults(
             });
         }
     }
-    Ok(Some(obj))
+    Ok(obj)
 }
 
 /// What loading a node folder found: a node ready to catalog, or one
@@ -1275,12 +1349,10 @@ fn load_node_entry(
     node_dir: &Path,
     package_key: &Path,
     package_defaults: Option<&serde_json::Map<String, serde_json::Value>>,
+    broken_files: &HashMap<PathBuf, String>,
 ) -> Result<Loaded, CatalogError> {
     let meta_path = node_dir.join("metadata.json");
-    let raw = fs::read_to_string(&meta_path).map_err(|e| CatalogError::Io {
-        path: meta_path.clone(),
-        error: e,
-    })?;
+    let raw = read_metadata_file(&meta_path, broken_files)?;
     let mut value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| CatalogError::Parse {
             path: meta_path.clone(),
@@ -1302,17 +1374,22 @@ fn load_node_entry(
     }
     weft_core::node::refuse_removed_metadata_keys(&value)
         .map_err(|error| CatalogError::Parse { path: meta_path.clone(), error })?;
-    let metadata: NodeMetadata =
-        serde_json::from_value(value).map_err(|e| CatalogError::Parse {
-            path: meta_path.clone(),
-            // A stale stdlib COPY is the common way to hold metadata this
-            // weft no longer accepts; name the one-command re-sync.
-            error: if meta_path.components().any(|c| c.as_os_str() == "base_catalog") {
-                format!("{e} (a stale base_catalog copy? run `weft catalog update` in the project to re-sync it)")
-            } else {
-                e.to_string()
-            },
-        })?;
+    // A stale stdlib COPY is the common way to hold metadata this weft
+    // no longer accepts (a shape serde refuses, or a setting the
+    // language now owns); name the one-command re-sync.
+    let parse_error = |error: String| CatalogError::Parse {
+        path: meta_path.clone(),
+        error: if meta_path.components().any(|c| c.as_os_str() == "base_catalog") {
+            format!("{error} (a stale base_catalog copy? run `weft catalog update` in the project to re-sync it)")
+        } else {
+            error
+        },
+    };
+    let mut metadata: NodeMetadata =
+        serde_json::from_value(value).map_err(|e| parse_error(e.to_string()))?;
+    // The settings the language owns (long runs, entry limits), added
+    // before the semantic check so they are checked like any input.
+    metadata.add_language_ports().map_err(parse_error)?;
     // Semantic rules serde can't express (field/port name collisions).
     metadata.validate_semantics().map_err(|error| CatalogError::Parse {
         path: meta_path.clone(),
@@ -1359,28 +1436,29 @@ pub enum CatalogError {
     },
     #[error("parse: {path}: {error}")]
     Parse { path: PathBuf, error: String },
-    #[error("node type '{node_type}' declared twice: {first} and {second}")]
-    Collision {
-        node_type: String,
-        first: PathBuf,
-        second: PathBuf,
-    },
     #[error(
-        "the '{service}' service is declared by two nodes ({first} and {second}); a service \
-         names one sign-in, and everything that stores or publishes a connection finds it \
-         by that name alone"
+        "node type '{node_type}' is declared by more than one folder ({}); none of them is \
+         loaded until only one declares it",
+        list_paths(dirs)
     )]
-    ServiceCollision {
-        service: String,
-        first: String,
-        second: String,
-    },
-    #[error("package name '{name}' declared twice: {first} and {second}")]
-    PackageNameCollision {
-        name: String,
-        first: PathBuf,
-        second: PathBuf,
-    },
+    Collision { node_type: String, dirs: Vec<PathBuf> },
+    #[error(
+        "the '{service}' service is declared by more than one node ({}); a service names one \
+         sign-in, and everything that stores or publishes a connection finds it by that name \
+         alone, so none of them is loaded until only one declares it",
+        node_types.join(", ")
+    )]
+    ServiceCollision { service: String, node_types: Vec<String> },
+    #[error(
+        "package name '{name}' is used by more than one folder ({}); a bare node is named by its \
+         folder, a package by its package.toml. None of them is loaded until the names differ",
+        list_paths(roots)
+    )]
+    PackageNameCollision { name: String, roots: Vec<PathBuf> },
+}
+
+fn list_paths(paths: &[PathBuf]) -> String {
+    paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
 }
 
 #[cfg(test)]
@@ -1525,42 +1603,68 @@ mod package_tests {
         }
     }
 
-    /// Two roots declaring the same package NAME are ambiguous the
-    /// same way two roots declaring the same node type are: Strict
-    /// errors naming both roots, Lenient warns and keeps the first.
+    /// Two folders using one package NAME are both left out, each
+    /// problem naming both folders; nothing else in the tree is lost.
     #[test]
-    fn duplicate_package_name_is_refused() {
+    fn duplicate_package_name_leaves_both_out() {
         let root = tempfile::tempdir().expect("temp root");
-        // Same package.toml name under two different directory roots.
-        // (The node-type collision inside would also fire, but the
-        // name is claimed BEFORE any entry inserts, so the error must
-        // be the package-name collision.)
-        copy_dir(&stdlib_root().expect("stdlib root").join("slack"), &root.path().join("a"));
-        copy_dir(&stdlib_root().expect("stdlib root").join("slack"), &root.path().join("b"));
+        let stdlib = stdlib_root().expect("stdlib root");
+        copy_dir(&stdlib.join("slack"), &root.path().join("a"));
+        copy_dir(&stdlib.join("slack"), &root.path().join("b"));
+        copy_dir(&stdlib.join("logic"), &root.path().join("logic"));
 
-        let err = FsCatalog::discover(root.path()).expect_err("duplicate name refused");
-        assert!(
-            matches!(&err, CatalogError::PackageNameCollision { name, .. } if name == "slack"),
-            "expected a package-name collision, got: {err}"
-        );
+        let cat = FsCatalog::discover(root.path()).expect("a clash never fails the catalog");
+        assert!(!cat.packages().any(|p| p.name == "slack"), "neither claimant wins");
+        assert!(cat.packages().any(|p| p.name == "logic"), "the rest loads");
+        let clashes: Vec<_> = cat
+            .problems()
+            .iter()
+            .filter(|p| matches!(&p.error, CatalogError::PackageNameCollision { name, .. } if name == "slack"))
+            .collect();
+        assert_eq!(clashes.len(), 2, "one per claimant: {:?}", cat.problems());
+        for clash in clashes {
+            let message = clash.error.to_string();
+            assert!(message.contains(&root.path().join("a").display().to_string()), "{message}");
+            assert!(message.contains(&root.path().join("b").display().to_string()), "{message}");
+        }
+        let slack_type = cat.problems()[0].node_types.first().expect("the clash names its types").clone();
+        assert!(cat.lookup(&slack_type).is_none());
+        let told = cat.unavailable(&slack_type).expect("named");
+        assert!(told.contains("failed to load") && told.contains("package name 'slack'"), "{told}");
+    }
 
-        let cat = FsCatalog::discover_with_policy(root.path(), DiscoverPolicy::Lenient)
-            .expect("lenient never errors on a collision");
-        assert_eq!(
-            cat.packages().count(),
-            1,
-            "lenient keeps exactly the first root"
-        );
-        assert!(
-            cat.warnings().iter().any(|w| w.contains("declared twice")),
-            "the drop is warned, not silent: {:?}",
-            cat.warnings()
-        );
+    /// A package named like a bare node's folder (the real case: a
+    /// `feed` package beside a bare `rss/feed` node) is the same clash:
+    /// both out, both named, neither folder outranks the other.
+    #[test]
+    fn a_package_named_like_a_bare_node_folder_leaves_both_out() {
+        let root = tempfile::tempdir().expect("temp root");
+        let bare = root.path().join("rss/feed");
+        fs::create_dir_all(&bare).expect("mkdir");
+        fs::write(bare.join("metadata.json"), r#"{"type": "Feed", "label": "Feed", "description": "d", "inputs": [], "outputs": []}"#).expect("write");
+        fs::write(bare.join("mod.rs"), "// impl\n").expect("write");
+        let pkg = root.path().join("mine/feeds");
+        fs::create_dir_all(pkg.join("poll")).expect("mkdir");
+        fs::write(pkg.join("package.toml"), "[package]\nname = \"feed\"\n").expect("write");
+        fs::write(pkg.join("poll/metadata.json"), r#"{"type": "Poll", "label": "Poll", "description": "d", "inputs": [], "outputs": []}"#).expect("write");
+        fs::write(pkg.join("poll/mod.rs"), "// impl\n").expect("write");
+        copy_dir(&stdlib_root().expect("stdlib root").join("logic"), &root.path().join("logic"));
+
+        let cat = FsCatalog::discover(root.path()).expect("a clash never fails the catalog");
+        assert!(cat.lookup("Feed").is_none() && cat.lookup("Poll").is_none());
+        assert!(cat.lookup("FirstInOrder").is_some(), "the rest loads");
+        for node_type in ["Feed", "Poll"] {
+            let told = cat.unavailable(node_type).expect("named");
+            assert!(
+                told.contains(&bare.display().to_string()) && told.contains(&pkg.display().to_string()),
+                "{told}"
+            );
+        }
     }
 
     /// A folder with a `metadata.json` and no `mod.rs` is a node still
-    /// being written: left out under either policy, one warning naming
-    /// the folder, and answered by `not_ready`. A package whose only
+    /// being written: left out, one warning naming the folder, and
+    /// answered by `unavailable`. A package whose only
     /// members are pending is left out too, without the "no members"
     /// complaint; a ready sibling registers as usual.
     #[test]
@@ -1582,17 +1686,138 @@ mod package_tests {
         fs::write(alone.join("package.toml"), "[package]\nname = \"alone\"\n").expect("write");
         fs::write(alone.join("only/metadata.json"), r#"{"type": "Only", "label": "Only", "description": "Not yet.", "inputs": [], "outputs": []}"#).expect("write");
 
-        for policy in [DiscoverPolicy::Strict, DiscoverPolicy::Lenient] {
-            let cat = FsCatalog::discover_with_policy(&root.path().join("nodes"), policy).expect("a pending node is no error");
-            assert!(cat.lookup("Resizer").is_none() && cat.lookup("Later").is_none() && cat.lookup("Only").is_none());
-            assert!(cat.lookup("FirstInOrder").is_some(), "the ready sibling registers");
-            assert!(cat.packages().any(|p| p.name == "logic") && !cat.packages().any(|p| p.name == "alone"));
-            assert_eq!(cat.pending().keys().collect::<Vec<_>>(), ["Later", "Only", "Resizer"]);
-            let reason = cat.not_ready("Resizer").expect("named");
-            assert!(reason.contains("no mod.rs yet") && reason.contains(&bare.display().to_string()), "{reason}");
-            assert!(cat.not_ready("Nowhere").is_none());
-            assert_eq!(cat.warnings().iter().filter(|w| w.contains("no mod.rs yet")).count(), 3, "{:?}", cat.warnings());
-            assert_eq!(cat.warnings().len(), 3, "nothing else complained: {:?}", cat.warnings());
+        let cat = FsCatalog::discover(&root.path().join("nodes")).expect("a pending node is no error");
+        assert!(cat.lookup("Resizer").is_none() && cat.lookup("Later").is_none() && cat.lookup("Only").is_none());
+        assert!(cat.lookup("FirstInOrder").is_some(), "the ready sibling registers");
+        assert!(cat.packages().any(|p| p.name == "logic") && !cat.packages().any(|p| p.name == "alone"));
+        assert_eq!(cat.pending().keys().collect::<Vec<_>>(), ["Later", "Only", "Resizer"]);
+        let reason = cat.unavailable("Resizer").expect("named");
+        assert!(reason.contains("is not ready yet") && reason.contains("no mod.rs yet") && reason.contains(&bare.display().to_string()), "{reason}");
+        assert!(cat.unavailable("Nowhere").is_none());
+        assert!(cat.problems().is_empty(), "not ready is no problem: {:?}", cat.problems());
+        assert_eq!(cat.warnings().iter().filter(|w| w.contains("no mod.rs yet")).count(), 3, "{:?}", cat.warnings());
+        assert_eq!(cat.warnings().len(), 3, "nothing else complained: {:?}", cat.warnings());
+    }
+
+    /// A `package.toml` written before any node folder (the real case
+    /// that once broke every node) is a package being started: left
+    /// out with one line, no problem, and every other node loads.
+    #[test]
+    fn a_package_with_no_node_yet_is_not_ready_not_broken() {
+        let root = tempfile::tempdir().expect("temp root");
+        let fresh = root.path().join("fresh");
+        fs::create_dir_all(&fresh).expect("mkdir");
+        fs::write(fresh.join("package.toml"), "[package]\nname = \"fresh\"\n").expect("write");
+        copy_dir(&stdlib_root().expect("stdlib root").join("logic"), &root.path().join("logic"));
+
+        let cat = FsCatalog::discover(root.path()).expect("an empty package is no error");
+        assert!(cat.problems().is_empty(), "{:?}", cat.problems());
+        assert!(cat.lookup("FirstInOrder").is_some());
+        assert!(!cat.packages().any(|p| p.name == "fresh"));
+        assert_eq!(cat.warnings().len(), 1, "{:?}", cat.warnings());
+        assert!(cat.warnings()[0].contains("has no node in it yet"), "{:?}", cat.warnings());
+    }
+
+    /// A node whose metadata does not load is left out with its error,
+    /// named by the type it claims; its package siblings and every other
+    /// node load. A folder whose type cannot even be read is listed only.
+    #[test]
+    fn a_broken_node_is_recorded_and_its_siblings_load() {
+        let root = tempfile::tempdir().expect("temp root");
+        let stdlib = stdlib_root().expect("stdlib root");
+        copy_dir(&stdlib.join("logic"), &root.path().join("logic"));
+        let bad = root.path().join("logic/bad");
+        fs::create_dir_all(&bad).expect("mkdir");
+        fs::write(bad.join("metadata.json"), r#"{"type": "Bad", "label": "Bad", "description": "d", "inputs": [], "outputs": [], "nonsense": 1}"#).expect("write");
+        fs::write(bad.join("mod.rs"), "// impl\n").expect("write");
+        let garbled = root.path().join("garbled");
+        fs::create_dir_all(&garbled).expect("mkdir");
+        fs::write(garbled.join("metadata.json"), "{ not json").expect("write");
+
+        let cat = FsCatalog::discover(root.path()).expect("a broken node never fails the catalog");
+        assert!(cat.lookup("FirstInOrder").is_some(), "the siblings load");
+        assert!(cat.package_of("FirstInOrder").is_some_and(|p| !p.node_types.iter().any(|t| t == "Bad")));
+        assert!(cat.lookup("Bad").is_none());
+        let told = cat.unavailable("Bad").expect("named");
+        assert!(told.starts_with("node 'Bad' failed to load:") && told.contains("nonsense"), "{told}");
+        assert_eq!(cat.problems().len(), 2, "{:?}", cat.problems());
+        assert!(cat.problems().iter().any(|p| p.node_types.is_empty()
+            && p.error.to_string().contains(&garbled.display().to_string())));
+    }
+
+    /// A package whose `package.toml` does not parse takes its members
+    /// out, each named by the type it claims, and the error quotes that
+    /// package's own file.
+    #[test]
+    fn a_broken_package_names_its_members_and_its_own_file() {
+        let root = tempfile::tempdir().expect("temp root");
+        let stdlib = stdlib_root().expect("stdlib root");
+        copy_dir(&stdlib.join("logic"), &root.path().join("logic"));
+        let pkg = root.path().join("half");
+        fs::create_dir_all(pkg.join("one")).expect("mkdir");
+        fs::write(pkg.join("package.toml"), "name = \"half\"\n").expect("write");
+        fs::write(pkg.join("one/metadata.json"), r#"{"type": "One", "label": "One", "description": "d", "inputs": [], "outputs": []}"#).expect("write");
+        fs::write(pkg.join("one/mod.rs"), "// impl\n").expect("write");
+
+        let cat = FsCatalog::discover(root.path()).expect("never fails the catalog");
+        assert!(cat.lookup("FirstInOrder").is_some());
+        let told = cat.unavailable("One").expect("named");
+        assert!(told.contains(&pkg.join("package.toml").display().to_string()) && told.contains("name = \"half\""), "{told}");
+    }
+
+    /// A package whose every member failed still claims its name: a
+    /// healthy package of the same name elsewhere is a collision, never
+    /// the quiet winner.
+    #[test]
+    fn an_all_broken_package_still_claims_its_name() {
+        let root = tempfile::tempdir().expect("temp root");
+        for (dir, node_type, extra) in [("a", "Broken", r#", "nonsense": 1"#), ("b", "Healthy", "")] {
+            let pkg = root.path().join(dir);
+            fs::create_dir_all(pkg.join("one")).expect("mkdir");
+            fs::write(pkg.join("package.toml"), "[package]\nname = \"slack\"\n").expect("write");
+            fs::write(
+                pkg.join("one/metadata.json"),
+                format!(r#"{{"type": "{node_type}", "label": "L", "description": "d", "inputs": [], "outputs": []{extra}}}"#),
+            )
+            .expect("write");
+            fs::write(pkg.join("one/mod.rs"), "// impl\n").expect("write");
+        }
+
+        let cat = FsCatalog::discover(root.path()).expect("never fails the catalog");
+        assert!(cat.lookup("Healthy").is_none(), "the healthy claimant is taken out too");
+        assert!(
+            cat.problems().iter().any(|p| matches!(&p.error, CatalogError::PackageNameCollision { name, roots } if name == "slack" && roots.len() == 2)),
+            "{:?}",
+            cat.problems()
+        );
+        assert!(cat.unavailable("Healthy").expect("named").contains("slack"));
+    }
+
+    /// Two files declaring one type name with different bodies: both
+    /// declaring nodes are left out, each told about the clash, and a
+    /// node that declares nothing still loads.
+    #[test]
+    fn a_type_declaration_clash_leaves_both_declarers_out() {
+        let root = tempfile::tempdir().expect("temp root");
+        for (dir, node_type, body) in [("a", "Alpha", "{ x: String }"), ("b", "Beta", "{ x: Number }")] {
+            let d = root.path().join(dir);
+            fs::create_dir_all(&d).expect("mkdir");
+            fs::write(
+                d.join("metadata.json"),
+                serde_json::json!({ "type": node_type, "label": node_type, "description": "d",
+                                    "inputs": [], "outputs": [], "types": { "Shared": body } })
+                    .to_string(),
+            )
+            .expect("write");
+            fs::write(d.join("mod.rs"), "// impl\n").expect("write");
+        }
+        copy_dir(&stdlib_root().expect("stdlib root").join("logic"), &root.path().join("logic"));
+
+        let cat = FsCatalog::discover(root.path()).expect("never fails the catalog");
+        assert!(cat.lookup("FirstInOrder").is_some());
+        for node_type in ["Alpha", "Beta"] {
+            let told = cat.unavailable(node_type).expect("named");
+            assert!(told.contains("declared twice"), "{told}");
         }
     }
 
@@ -1607,17 +1832,21 @@ mod package_tests {
         copy_dir(&stdlib.join("logic"), &root.path().join("src/billing/logic"));
         let roots = [root.path().join("nodes"), root.path().join("src")];
         let roots: Vec<&Path> = roots.iter().map(|r| r.as_path()).collect();
-        let cat = FsCatalog::discover_roots_with_policy(&roots, DiscoverPolicy::Strict).expect("both trees");
+        let cat = FsCatalog::discover_roots(&roots).expect("both trees");
         assert!(cat.packages().any(|p| p.name == "slack"), "the shared tree");
         assert!(cat.packages().any(|p| p.name == "logic"), "beside the code");
         // A root that is not there contributes nothing and is no error.
         let missing = root.path().join("nowhere");
-        FsCatalog::discover_roots_with_policy(&[roots[0], &missing], DiscoverPolicy::Strict).expect("a missing root is empty");
+        FsCatalog::discover_roots(&[roots[0], &missing]).expect("a missing root is empty");
 
         copy_dir(&stdlib.join("slack"), &root.path().join("src/slack_again"));
-        let err = FsCatalog::discover_roots_with_policy(&roots, DiscoverPolicy::Strict)
-            .expect_err("one name in both trees is a collision");
-        assert!(matches!(&err, CatalogError::PackageNameCollision { name, .. } if name == "slack"), "{err}");
+        let cat = FsCatalog::discover_roots(&roots).expect("a clash never fails the catalog");
+        assert!(
+            cat.problems().iter().any(|p| matches!(&p.error, CatalogError::PackageNameCollision { name, .. } if name == "slack")),
+            "one name in both trees is a collision: {:?}",
+            cat.problems()
+        );
+        assert!(cat.packages().any(|p| p.name == "logic"));
     }
 
     /// Every shipped stdlib `metadata.json` parses under the strict schema
@@ -1627,8 +1856,8 @@ mod package_tests {
     /// red suite the moment a catalog file drifts from the metadata types.
     #[test]
     fn every_stdlib_node_loads_strict() {
-        let cat = FsCatalog::discover(&stdlib_root().expect("stdlib root"))
-            .expect("all stdlib metadata.json must load under strict parse");
+        let cat = FsCatalog::discover(&stdlib_root().expect("stdlib root")).expect("stdlib root reads");
+        assert!(cat.problems().is_empty(), "every stdlib node must load: {:#?}", cat.problems());
         assert!(!cat.all().is_empty(), "catalog discovered no nodes");
     }
 

@@ -1,10 +1,10 @@
 //! Execution tags: the selectable copy of `ctx.tag_execution`.
 //!
 //! A tag is journaled as an `ExecutionTagged` event (the record of the
-//! act) AND written to `execution_tag`, one row per (color, tag), in the
+//! act) AND written to `execution_tag`, one row per (execution, tag), in the
 //! same transaction. The table exists because `ctx.stop_tagged` has to
 //! answer "which live executions of this project carry tag T" on every
-//! inbound message, and folding every open color's journal to find out
+//! inbound message, and folding every open execution's journal to find out
 //! would be O(all history). Every piece of SQL that touches the table
 //! lives here (write, read-back, live selector, delete) so the
 //! dispatcher and the broker, which both act on it, can never disagree
@@ -18,7 +18,7 @@
 //! the later one survives. Unix seconds could not do this (a tie inside
 //! one second would let both live, or both die).
 
-use weft_core::Color;
+use weft_core::ExecutionId;
 
 use crate::events::ExecEvent;
 use crate::write::{record_event_in, RecordError};
@@ -27,33 +27,33 @@ use crate::write::{record_event_in, RecordError};
 /// run, and the sequence its tag row got.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaggedExecution {
-    pub color: Color,
+    pub execution_id: ExecutionId,
     pub seq: i64,
 }
 
 /// Journal `ExecutionTagged` and insert the tag rows, on the caller's
-/// transaction. Re-tagging an existing (color, tag) keeps the original
-/// row (and its `seq`): a body re-run after a crash lands on the same
-/// state, and a tag's position in the order is the FIRST time the run
-/// claimed it. `pod_name` stamps the event for the fencing trigger,
+/// transaction. Re-tagging an existing (execution, tag) keeps the original
+/// row (and its `seq`): a body replayed after a durable wait lands on
+/// the same state, and a tag's position in the order is the FIRST time the run
+/// claimed it. `replica` stamps the event with the writing replica,
 /// exactly like every other worker-originated write. The journal row
 /// is this function's first write; a caller that writes before it takes
-/// [`crate::lock_colors`] first (the ordering invariant on `write`).
+/// [`crate::lock_execution_ids`] first (the ordering invariant on `write`).
 pub async fn tag_execution_in(
     tx: &mut sqlx::PgConnection,
-    color: Color,
+    execution_id: ExecutionId,
     tags: &[String],
     at_unix: u64,
-    pod_name: Option<&str>,
+    replica: Option<&str>,
 ) -> Result<(), RecordError> {
-    let event = ExecEvent::ExecutionTagged { color, tags: tags.to_vec(), at_unix };
-    record_event_in(&mut *tx, &event, pod_name, None).await?;
+    let event = ExecEvent::ExecutionTagged { execution_id, tags: tags.to_vec(), at_unix };
+    record_event_in(&mut *tx, &event, replica, None).await?;
     for tag in tags {
         sqlx::query(
-            "INSERT INTO execution_tag (color, tag, tagged_at_unix) VALUES ($1, $2, $3) \
-             ON CONFLICT (color, tag) DO NOTHING",
+            "INSERT INTO execution_tag (execution_id, tag, tagged_at_unix) VALUES ($1, $2, $3) \
+             ON CONFLICT (execution_id, tag) DO NOTHING",
         )
-        .bind(color.to_string())
+        .bind(execution_id.to_string())
         .bind(tag)
         .bind(at_unix as i64)
         .execute(&mut *tx)
@@ -65,32 +65,32 @@ pub async fn tag_execution_in(
 /// The tag column every execution-summary read selects: the run's tags
 /// in the order it claimed them, `{}` for an untagged run, so
 /// `Vec<String>` decodes straight off the row. Spliced into queries
-/// that already have the color in scope as `execution_color ec`.
+/// that already have the execution in scope as `execution ec`.
 pub const TAGS_LATERAL: &str =
-    "(SELECT COALESCE(array_agg(tag ORDER BY seq), '{}') FROM execution_tag WHERE color = ec.color)";
+    "(SELECT COALESCE(array_agg(tag ORDER BY seq), '{}') FROM execution_tag WHERE execution_id = ec.execution_id)";
 
-/// Delete `color`'s tag rows. Runs on the caller's transaction, inside
-/// `delete_execution`'s one-shot clean of the color's whole footprint:
+/// Delete `execution_id`'s tag rows. Runs on the caller's transaction, inside
+/// `delete_execution`'s one-shot clean of the execution's whole footprint:
 /// tag rows must never outlive the journal they select on, or a
 /// half-applied clean leaves exactly the row set `live_tagged_executions`
 /// matches for a run whose history is gone.
-pub async fn delete_for_color(tx: &mut sqlx::PgConnection, color: Color) -> Result<u64, sqlx::Error> {
-    let res = sqlx::query("DELETE FROM execution_tag WHERE color = $1")
-        .bind(color.to_string())
+pub async fn delete_for_execution_id(tx: &mut sqlx::PgConnection, execution_id: ExecutionId) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM execution_tag WHERE execution_id = $1")
+        .bind(execution_id.to_string())
         .execute(&mut *tx)
         .await?;
     Ok(res.rows_affected())
 }
 
-/// The `seq` of `color`'s `tag` row, if the run carries that tag.
+/// The `seq` of `execution_id`'s `tag` row, if the run carries that tag.
 pub async fn tag_seq<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
-    color: Color,
+    execution_id: ExecutionId,
     tag: &str,
 ) -> Result<Option<i64>, sqlx::Error> {
     let row: Option<(i64,)> =
-        sqlx::query_as("SELECT seq FROM execution_tag WHERE color = $1 AND tag = $2")
-            .bind(color.to_string())
+        sqlx::query_as("SELECT seq FROM execution_tag WHERE execution_id = $1 AND tag = $2")
+            .bind(execution_id.to_string())
             .bind(tag)
             .fetch_optional(executor)
             .await?;
@@ -121,9 +121,9 @@ pub async fn live_tagged_executions<'e, E: sqlx::PgExecutor<'e>>(
     // Live is the one rule every sweep shares
     // (`crate::unrecorded::LIVE_RUN_SQL`, which holds the terminal list).
     let query = format!(
-        "SELECT et.color, et.seq \
+        "SELECT et.execution_id, et.seq \
          FROM execution_tag et \
-         JOIN execution_color ec ON ec.color = et.color \
+         JOIN execution ec ON ec.execution_id = et.execution_id \
          WHERE ec.project_id = $1 \
            AND et.tag = $2 \
            AND {} \
@@ -136,13 +136,13 @@ pub async fn live_tagged_executions<'e, E: sqlx::PgExecutor<'e>>(
     .fetch_all(executor)
     .await?;
     rows.into_iter()
-        .map(|(color, seq)| {
-            let color: Color = color.parse().map_err(|e: uuid::Error| {
+        .map(|(execution_id, seq)| {
+            let execution_id: ExecutionId = execution_id.parse().map_err(|e: uuid::Error| {
                 sqlx::Error::Decode(
-                    format!("execution_tag row holds a non-uuid color '{color}': {e}").into(),
+                    format!("execution_tag row holds a non-uuid execution '{execution_id}': {e}").into(),
                 )
             })?;
-            Ok(TaggedExecution { color, seq })
+            Ok(TaggedExecution { execution_id, seq })
         })
         .collect()
 }
@@ -159,15 +159,15 @@ pub async fn live_tagged_executions<'e, E: sqlx::PgExecutor<'e>>(
 /// - `StopSelf::Keep` never returns `by` itself, whatever the seqs say.
 pub fn select_stop_targets(
     candidates: &[TaggedExecution],
-    by: Color,
+    by: ExecutionId,
     before_seq: Option<i64>,
     stop_self: weft_core::StopSelf,
-) -> Vec<Color> {
+) -> Vec<ExecutionId> {
     candidates
         .iter()
         .filter(|c| before_seq.is_none_or(|n| c.seq < n))
-        .filter(|c| stop_self == weft_core::StopSelf::Include || c.color != by)
-        .map(|c| c.color)
+        .filter(|c| stop_self == weft_core::StopSelf::Include || c.execution_id != by)
+        .map(|c| c.execution_id)
         .collect()
 }
 
@@ -177,7 +177,7 @@ mod tests {
     use weft_core::StopSelf;
 
     fn tagged(seq: i64) -> TaggedExecution {
-        TaggedExecution { color: Color::new_v4(), seq }
+        TaggedExecution { execution_id: ExecutionId::new_v4(), seq }
     }
 
     /// Two messages a few milliseconds apart, both "stop the others,
@@ -190,12 +190,12 @@ mod tests {
         let second = tagged(2);
         let live = vec![first.clone(), second.clone()];
         assert_eq!(
-            select_stop_targets(&live, first.color, Some(first.seq), StopSelf::Keep),
-            Vec::<Color>::new()
+            select_stop_targets(&live, first.execution_id, Some(first.seq), StopSelf::Keep),
+            Vec::<ExecutionId>::new()
         );
         assert_eq!(
-            select_stop_targets(&live, second.color, Some(second.seq), StopSelf::Keep),
-            vec![first.color]
+            select_stop_targets(&live, second.execution_id, Some(second.seq), StopSelf::Keep),
+            vec![first.execution_id]
         );
     }
 
@@ -206,10 +206,10 @@ mod tests {
     fn keep_stop_without_own_tag_reaches_every_current_row() {
         let a = tagged(1);
         let b = tagged(2);
-        let by = Color::new_v4();
+        let by = ExecutionId::new_v4();
         assert_eq!(
             select_stop_targets(&[a.clone(), b.clone()], by, Some(3), StopSelf::Keep),
-            vec![a.color, b.color]
+            vec![a.execution_id, b.execution_id]
         );
     }
 
@@ -220,8 +220,8 @@ mod tests {
         let me = tagged(2);
         let c = tagged(3);
         assert_eq!(
-            select_stop_targets(&[a.clone(), me.clone(), c.clone()], me.color, None, StopSelf::Include),
-            vec![a.color, me.color, c.color]
+            select_stop_targets(&[a.clone(), me.clone(), c.clone()], me.execution_id, None, StopSelf::Include),
+            vec![a.execution_id, me.execution_id, c.execution_id]
         );
     }
 
@@ -230,8 +230,8 @@ mod tests {
     fn keep_never_returns_the_asker() {
         let me = tagged(5);
         assert_eq!(
-            select_stop_targets(std::slice::from_ref(&me), me.color, Some(10), StopSelf::Keep),
-            Vec::<Color>::new()
+            select_stop_targets(std::slice::from_ref(&me), me.execution_id, Some(10), StopSelf::Keep),
+            Vec::<ExecutionId>::new()
         );
     }
 }

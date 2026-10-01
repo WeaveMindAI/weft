@@ -22,7 +22,7 @@ async fn sse_event_fires_execution_with_payload() -> anyhow::Result<()> {
 
     // Snapshot existing executions (activation creates a TriggerSetup run) so we
     // can tell the genuine Fire execution apart from it.
-    let before = run::execution_colors(&disp, &pid).await?;
+    let before = run::executions(&disp, &pid).await?;
 
     // Give the listener a moment to establish the subscription, then push one
     // matching event. (The subscription is live once activate returns, but the
@@ -32,9 +32,9 @@ async fn sse_event_fires_execution_with_payload() -> anyhow::Result<()> {
     feed.push_event("tick", &json!({ "value": 99 }).to_string());
 
     // A fresh execution fires; assert it carried value=99 to Debug.
-    let color =
+    let execution_id =
         run::wait_for_triggered_execution(&disp, &pid, &before, Duration::from_secs(60)).await?;
-    let settled = SettledRun::observe(&disp, color).await?;
+    let settled = SettledRun::observe(&disp, execution_id).await?;
     settled.completed()?;
     // The SSE payload `{"value":99}` carries through as a JSON integer (the
     // event JSON is passed verbatim; no f64 coercion on this path).

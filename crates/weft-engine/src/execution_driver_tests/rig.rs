@@ -66,19 +66,19 @@
     /// the log, and a held read wakes on the next write, as the real
     /// journal's does.
     #[derive(Default)]
-    pub(super) struct MemJournal {
+    pub(crate) struct MemJournal {
         pub(super) events: StdMutex<Vec<ExecEvent>>,
         written: tokio::sync::Notify,
     }
     impl MemJournal {
-        fn rows_after_now(&self, color: Color, after_id: i64) -> Vec<weft_journal::RawJournalRow> {
+        fn rows_after_now(&self, execution_id: ExecutionId, after_id: i64) -> Vec<weft_journal::RawJournalRow> {
             self.events
                 .lock()
                 .unwrap()
                 .iter()
                 .enumerate()
                 .map(|(i, e)| (i as i64 + 1, e))
-                .filter(|(id, e)| *id > after_id && e.color() == color)
+                .filter(|(id, e)| *id > after_id && e.execution_id() == execution_id)
                 .map(|(id, e)| weft_journal::RawJournalRow {
                     id,
                     payload: serde_json::to_string(e).expect("serialize ExecEvent"),
@@ -88,14 +88,14 @@
     }
     #[async_trait]
     impl JournalClient for MemJournal {
-        async fn record_event(&self, event: &ExecEvent, _pod: Option<&str>) -> anyhow::Result<()> {
+        async fn record_event(&self, event: &ExecEvent, _instance: Option<&str>) -> anyhow::Result<()> {
             self.events.lock().unwrap().push(event.clone());
             self.written.notify_waiters();
             Ok(())
         }
         async fn raw_rows_after(
             &self,
-            color: Color,
+            execution_id: ExecutionId,
             after_id: i64,
             wait: std::time::Duration,
         ) -> anyhow::Result<Vec<weft_journal::RawJournalRow>> {
@@ -104,18 +104,18 @@
                 let written = self.written.notified();
                 tokio::pin!(written);
                 written.as_mut().enable();
-                let rows = self.rows_after_now(color, after_id);
+                let rows = self.rows_after_now(execution_id, after_id);
                 if !rows.is_empty() || tokio::time::timeout_at(deadline, written).await.is_err() {
                     return Ok(rows);
                 }
             }
         }
-        async fn has_terminal_event(&self, color: Color) -> anyhow::Result<bool> {
+        async fn has_terminal_event(&self, execution_id: ExecutionId) -> anyhow::Result<bool> {
             Ok(self.events.lock().unwrap().iter().any(|e| matches!(
                 e,
-                ExecEvent::ExecutionCompleted { color: c, .. }
-                    | ExecEvent::ExecutionFailed { color: c, .. }
-                    | ExecEvent::ExecutionCancelled { color: c, .. } if *c == color
+                ExecEvent::ExecutionCompleted { execution_id: c, .. }
+                    | ExecEvent::ExecutionFailed { execution_id: c, .. }
+                    | ExecEvent::ExecutionCancelled { execution_id: c, .. } if *c == execution_id
             )))
         }
     }
@@ -123,6 +123,15 @@
     pub(super) struct NoopTasks;
     #[async_trait]
     impl weft_task_store::TaskStoreClient for NoopTasks {
+        async fn wait_cancels(
+            &self,
+            _project_id: uuid::Uuid,
+            _execution_ids: Vec<String>,
+            _wait: std::time::Duration,
+        ) -> anyhow::Result<Vec<weft_task_store::tasks::CancelAsked>> {
+            Ok(Vec::new())
+        }
+
         async fn enqueue_dedup(&self, _s: weft_task_store::tasks::NewTask) -> anyhow::Result<weft_task_store::tasks::DedupOutcome> {
             unreachable!("rig tests enqueue no tasks")
         }
@@ -138,22 +147,22 @@
     pub(super) struct NoopSteering;
     #[async_trait]
     impl crate::context::ExecutionSteeringClient for NoopSteering {
-        async fn tag_execution(&self, _c: Color, _t: Vec<String>, _p: &str) -> anyhow::Result<()> {
+        async fn tag_execution(&self, _c: ExecutionId, _t: Vec<String>, _p: &str) -> anyhow::Result<()> {
             unreachable!("rig tests steer no executions")
         }
-        async fn stop_tagged(&self, _c: Color, _t: String, _s: weft_core::StopSelf, _p: &str) -> anyhow::Result<bool> {
+        async fn stop_tagged(&self, _c: ExecutionId, _t: String, _s: weft_core::StopSelf, _p: &str) -> anyhow::Result<bool> {
             unreachable!("rig tests steer no executions")
         }
     }
     pub(super) struct NoopInfra;
     #[async_trait]
     impl InfraReader for NoopInfra {
-        async fn endpoint_address(&self, _c: weft_core::Color, _n: &str, _p: bool, _e: &str) -> anyhow::Result<Option<weft_core::infra::EndpointAddress>> { Ok(None) }
+        async fn endpoint_address(&self, _c: weft_core::ExecutionId, _n: &str, _p: bool, _e: &str) -> anyhow::Result<Option<weft_core::infra::EndpointAddress>> { Ok(None) }
     }
     pub(super) struct NoopInfraState;
     #[async_trait]
     impl InfraStateClient for NoopInfraState {
-        async fn enqueue_apply(&self, _p: uuid::Uuid, _n: &str, _m: Option<&weft_core::member::MemberId>, _s: serde_json::Value) -> anyhow::Result<i64> { Ok(0) }
+        async fn enqueue_apply(&self, _p: uuid::Uuid, _n: &str, _m: Option<&weft_core::instance::InstanceId>, _s: serde_json::Value) -> anyhow::Result<i64> { Ok(0) }
         async fn wait_apply(&self, _p: uuid::Uuid, _c: i64, _w: std::time::Duration) -> anyhow::Result<weft_broker_client::protocol::InfraWaitApplyResponse> {
             Ok(weft_broker_client::protocol::InfraWaitApplyResponse {
                 completed: true,
@@ -238,10 +247,10 @@
         drive_kicked(project, catalog, kicks, Some(firing), subgraph, CancellationFlag::new_arc()).await
     }
 
-    /// `drive` for a color whose journal ALREADY holds a terminal
+    /// `drive` for an execution whose journal ALREADY holds a terminal
     /// (cancelled before the worker claimed it): the shape of a cancel
     /// landing in the dispatcher's route window, or a late second
-    /// execute task for a finished color.
+    /// execute task for a finished execution.
     pub(super) async fn drive_settled(
         project: ProjectDefinition,
         catalog: Arc<dyn NodeCatalog>,
@@ -270,9 +279,9 @@
         cancellation: Arc<CancellationFlag>,
         already_cancelled: bool,
     ) -> (ExecutionOutcome, Vec<ExecEvent>) {
-        let color = uuid::Uuid::new_v4();
+        let execution_id = uuid::Uuid::new_v4();
         let mut rows = vec![ExecEvent::ExecutionStarted {
-            color,
+            execution_id,
             project_id: project.id,
             entry_node: kicks[0].to_string(),
             phase: weft_core::context::Phase::Fire,
@@ -281,11 +290,12 @@
             subgraph: subgraph.map(|s| weft_core::project::selection::RunSelection::restricted(
                 &project, s.iter().map(|n| weft_core::frames::Located::top(*n)).collect()).expect("valid test selection")),
             seed: None,
-            member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
+            instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+            run_class: weft_core::run_class::RunClass::Short,
         }];
         for kick in kicks {
             rows.push(ExecEvent::NodeKicked {
-                color,
+                execution_id,
                 node_id: kick.to_string(), frames: vec![],
                 firing: firing == Some(*kick),
                 payload: None,
@@ -295,22 +305,22 @@
         }
         if already_cancelled {
             rows.push(ExecEvent::ExecutionCancelled {
-                color,
+                execution_id,
                 reason: "cancelled in the route window".into(),
                 cause: Some(weft_core::exec::CancelCause::User),
                 at_unix: 0,
             });
         }
-        let (drove, events) = drive_journal_observed(project, catalog, color, rows, cancellation).await;
+        let (drove, events) = drive_journal_observed(project, catalog, execution_id, rows, cancellation).await;
         let drove = drove.expect("run_one_execution ok");
-        // A color already settled before the worker claimed it drove
+        // An execution already settled before the worker claimed it drove
         // nothing: its tables are asserted empty (the fold of the same
         // rows holds the kicks, so the two are not compared).
         if already_cancelled {
             assert!(matches!(drove.outcome, ExecutionOutcome::AlreadySettled), "{:?}", drove.outcome);
             assert!(
                 drove.pulses.is_empty() && drove.executions.is_empty() && drove.loop_runtime.iter().next().is_none(),
-                "a settled color drives nothing"
+                "a settled execution drives nothing"
             );
         }
         (drove.outcome, events)
@@ -338,7 +348,7 @@
         /// One pulse as compared: node, id, status, closed, close
         /// error, frames, port, value (as its JSON text, so the row
         /// orders totally).
-        type PulseRow = (String, uuid::Uuid, String, bool, Option<String>, Vec<u32>, String, String, bool, bool, Option<uuid::Uuid>);
+        type PulseRow = (String, uuid::Uuid, String, bool, Option<weft_core::pulse::Failure>, Vec<u32>, String, String, bool, bool, Option<uuid::Uuid>);
         /// One record as compared: node, frames, ordinal, status,
         /// error, suspension token, absorbed pulses.
         type RecordRow =
@@ -367,8 +377,8 @@
         /// payload, port snapshot, the scope that skipped it.
         type KickRow = (String, Vec<u32>, bool, bool, Option<String>, Option<String>, Option<String>);
         let birth = events.first().expect("journal has rows");
-        let color = birth.color();
-        let snap = weft_journal::fold_seeded(color, Arc::new(project.clone()), chain, events).expect("journal folds");
+        let execution_id = birth.execution_id();
+        let snap = weft_journal::fold_seeded(execution_id, Arc::new(project.clone()), chain, events).expect("journal folds");
         assert!(snap.corruptions.is_empty(), "the fold rejected a row the run wrote: {:?}", snap.corruptions);
         let json_pairs = |m: &HashMap<String, Arc<serde_json::Value>>| -> Vec<(String, String)> {
             let mut v: Vec<_> = m.iter().map(|(k, v)| (k.clone(), v.to_string())).collect();
@@ -385,7 +395,7 @@
                             p.id,
                             format!("{:?}", p.status),
                             p.closed,
-                            p.close_error.clone(),
+                            p.failure.clone(),
                             p.frames.iter().map(|f| f.loop_index().expect("loop frame")).collect::<Vec<_>>(),
                             p.target_port.clone(),
                             p.value.to_string(),
@@ -495,18 +505,18 @@
         assert_eq!(kicks(&live.kicked), kicks(&snap.kicked), "the kicks differ between the run and the fold");
     }
 
-    /// Drive a color over a journal that already holds `rows` (the
+    /// Drive an execution over a journal that already holds `rows` (the
     /// birth row included), the shape of a resume: returns the run's
     /// `Result` untouched, so a test can assert on a run that refuses
     /// to go on, plus every journaled event.
     pub(super) async fn drive_journal(
         project: ProjectDefinition,
         catalog: Arc<dyn NodeCatalog>,
-        color: Color,
+        execution_id: ExecutionId,
         rows: Vec<ExecEvent>,
         cancellation: Arc<CancellationFlag>,
     ) -> (anyhow::Result<ExecutionOutcome>, Vec<ExecEvent>) {
-        let (drove, events) = drive_journal_observed(project, catalog, color, rows, cancellation).await;
+        let (drove, events) = drive_journal_observed(project, catalog, execution_id, rows, cancellation).await;
         (drove.map(|d| d.outcome), events)
     }
 
@@ -514,7 +524,7 @@
     pub(super) async fn drive_journal_observed(
         project: ProjectDefinition,
         catalog: Arc<dyn NodeCatalog>,
-        color: Color,
+        execution_id: ExecutionId,
         rows: Vec<ExecEvent>,
         cancellation: Arc<CancellationFlag>,
     ) -> (anyhow::Result<Drove>, Vec<ExecEvent>) {
@@ -523,18 +533,18 @@
             journal.record_event(row, None).await.unwrap();
         }
         let project = Arc::new(project);
-        let drove = drive_on(project, catalog, color, journal.clone(), clients(journal.clone()), cancellation, None).await;
+        let drove = drive_on(project, catalog, execution_id, journal.clone(), clients(journal.clone()), cancellation, None).await;
         let events = journal.events.lock().unwrap().clone();
         (drove, events)
     }
 
     /// Drive a SEEDED run: the journal already holds `ancestor_rows`
-    /// (the seed runs, under their own colors) and the child's birth
+    /// (the seed runs, under their own executions) and the child's birth
     /// rows are `rows`. Answers the outcome and the child's own rows.
     pub(super) async fn drive_seeded(
         project: ProjectDefinition,
         catalog: Arc<dyn NodeCatalog>,
-        color: Color,
+        execution_id: ExecutionId,
         ancestor_rows: Vec<ExecEvent>,
         definitions: Vec<ProjectDefinition>,
         rows: Vec<ExecEvent>,
@@ -549,15 +559,15 @@
             let key = (definition.id.to_string(), weft_core::project::hash::compute_definition_hash(&definition).unwrap());
             (key, definition)
         }).collect()));
-        let drove = drive_on(project, catalog, color, journal.clone(), clients, CancellationFlag::new_arc(), None)
+        let drove = drive_on(project, catalog, execution_id, journal.clone(), clients, CancellationFlag::new_arc(), None)
             .await
             .expect("run_one_execution ok");
-        let events = journal.events_for_color(color).await.expect("mem journal");
+        let events = journal.events_for_execution_id(execution_id).await.expect("mem journal");
         (drove.outcome, events)
     }
 
     /// The rig's fake clients over `journal`.
-    pub(super) fn clients(journal: Arc<MemJournal>) -> EngineClients {
+    pub(crate) fn clients(journal: Arc<MemJournal>) -> EngineClients {
         EngineClients {
             journal,
             tasks: Arc::new(NoopTasks),
@@ -573,17 +583,17 @@
         }
     }
 
-    /// Drive `color` over what `journal` already holds (`clients` is
+    /// Drive `execution_id` over what `journal` already holds (`clients` is
     /// built over that same journal, by `clients` or by hand when a
     /// test swaps one fake), and check the rows the run wrote fold
     /// back into the tables it held (`assert_fold_matches_live`).
     /// Every engine test drives through here, so no run escapes that
-    /// check. A run that found its color already settled drove
+    /// check. A run that found its execution already settled drove
     /// nothing and holds nothing to compare.
     pub(super) async fn drive_on(
         project: Arc<ProjectDefinition>,
         catalog: Arc<dyn NodeCatalog>,
-        color: Color,
+        execution_id: ExecutionId,
         journal: Arc<MemJournal>,
         clients: EngineClients,
         cancellation: Arc<CancellationFlag>,
@@ -595,11 +605,10 @@
             run_one_execution_observed(
                 project.clone(),
                 catalog,
-                color,
+                execution_id,
                 clients,
-                "pod-test".into(),
+                "instance-test".into(),
                 "tenant-test".into(),
-                "ns-test".into(),
                 cancellation,
                 caller,
             ),
@@ -608,9 +617,9 @@
         .expect("the drive hung: a loud-failure contract regressed into a hang")?;
         if !matches!(drove.outcome, ExecutionOutcome::AlreadySettled) {
             // The run's own rows, folded over what it inherits (the
-            // journal may hold the seed's rows under another color).
-            let events = journal.events_for_color(color).await.expect("mem journal");
-            let chain = weft_journal::seed_chain(&events, |c| journal.events_for_color(c), |id, hash| {
+            // journal may hold the seed's rows under another execution).
+            let events = journal.events_for_execution_id(execution_id).await.expect("mem journal");
+            let chain = weft_journal::seed_chain(&events, |c| journal.events_for_execution_id(c), |id, hash| {
                 let projects = projects.clone();
                 async move {
                     projects.fetch_definition(id, &hash).await?.map(Arc::new)
@@ -628,11 +637,11 @@
     pub(super) async fn run_checked(
         project: Arc<ProjectDefinition>,
         catalog: Arc<dyn NodeCatalog>,
-        color: Color,
+        execution_id: ExecutionId,
         journal: Arc<MemJournal>,
         clients: EngineClients,
         cancellation: Arc<CancellationFlag>,
         caller: Option<Arc<dyn weft_core::caller::CallerConnection>>,
     ) -> anyhow::Result<ExecutionOutcome> {
-        drive_on(project, catalog, color, journal, clients, cancellation, caller).await.map(|d| d.outcome)
+        drive_on(project, catalog, execution_id, journal, clients, cancellation, caller).await.map(|d| d.outcome)
     }

@@ -1,18 +1,18 @@
 <script lang="ts">
-  // A member's settings page: for every member token saved in the
-  // extension, the fields that program asks the member to fill (their
-  // connections among them), each with its own control (the connect
+  // The settings page of each instance: for every instance token saved in
+  // the extension, the fields that take a value of that instance's own
+  // (connections among them), each with its own control (the connect
   // library's, the same ones the weft editor uses). Everything goes
-  // through the member door with that token, so it reaches that member's
-  // values and connections and nothing else. A token that is not a member
-  // token is left out: it acts as nobody, so it has nothing to fill. A member token whose
-  // door fails (its runtime unreachable, the token expired) stays, with
-  // what went wrong.
-  import { MemberDoor, MemberDoorError } from '@weft/connect';
-  import { MemberSettings } from '@weft/connect/svelte';
+  // through the instance door with that token, so it reaches that
+  // instance's values and connections and nothing else. A token that is
+  // not an instance token is left out: it acts inside no instance, so it
+  // has nothing to fill. An instance token whose door fails (its runtime
+  // unreachable, the token expired) stays, with what went wrong.
+  import { InstanceDoor, InstanceDoorError } from '@weft/connect';
+  import { InstanceSettings } from '@weft/connect/svelte';
   import { getTokens, type ApiToken } from '../../lib/api';
 
-  type Entry = { token: ApiToken; door: MemberDoor; failed: string | null };
+  type Entry = { token: ApiToken; door: InstanceDoor; failed: string | null };
 
   let entries = $state<Entry[]>([]);
   let loading = $state(true);
@@ -24,19 +24,19 @@
     try {
       const found: Entry[] = [];
       for (const token of await getTokens()) {
-        const door = new MemberDoor(token.token, {
+        const door = new InstanceDoor(token.token, {
           base: token.dispatcherUrl,
           opener: (url) => {
             void browser.tabs.create({ url });
           },
         });
-        // A member token answers its fields; any other token is refused
-        // at the member door as not a member token, and is not listed.
+        // An instance token answers its fields; any other token is refused
+        // at the instance door as not an instance token, and is not listed.
         try {
           await door.fields();
           found.push({ token, door, failed: null });
         } catch (e) {
-          if (e instanceof MemberDoorError && e.notAMemberToken) continue;
+          if (e instanceof InstanceDoorError && e.notAnInstanceToken) continue;
           found.push({ token, door, failed: e instanceof Error ? e.message : String(e) });
         }
       }
@@ -61,8 +61,8 @@
     <p class="error">{error}</p>
   {:else if entries.length === 0}
     <p class="muted">
-      None of the tokens saved here is a member token. A program you use gives you one (it acts as you, in that
-      program); add it from the extension's settings to fill in what that program asks you for here.
+      None of the tokens saved here is an instance token. A program you use can give you one (it acts inside one
+      instance of that program); add it from the extension's settings to fill in that instance's values here.
     </p>
   {:else}
     {#each entries as entry (entry.token.token)}
@@ -71,7 +71,7 @@
         {#if entry.failed}
           <p class="error">{entry.failed}</p>
         {:else}
-          <MemberSettings door={entry.door} />
+          <InstanceSettings door={entry.door} />
         {/if}
       </section>
     {/each}

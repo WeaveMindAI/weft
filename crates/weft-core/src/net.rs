@@ -42,7 +42,7 @@ pub fn is_loopback_url(url: &str) -> bool {
 }
 
 /// Install ring as the process-level rustls crypto provider, once.
-/// Called at every binary's startup (and the worker's pod entry): the
+/// Called at every binary's startup (and the worker's process entry): the
 /// dependency graph carries TWO providers (ring everywhere, aws-lc-rs
 /// via the S3 stack), and rustls refuses to guess between them, so any
 /// library that builds TLS from the process default (a WebSocket
@@ -191,6 +191,23 @@ pub fn request_base_url(headers: &http::HeaderMap) -> Option<String> {
     Some(format!("{}{prefix}", parsed.origin().ascii_serialization()))
 }
 
+/// [`request_base_url`] over a request's headers carried as name/value
+/// pairs (how a request that already crossed a process boundary holds
+/// them, `crate::caller::LiveRequest::headers`). A pair that is not a
+/// valid header is skipped, as the HTTP stack would have refused it.
+pub fn request_base_url_of(headers: &[(String, String)]) -> Option<String> {
+    let map: http::HeaderMap = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            Some((
+                http::HeaderName::from_bytes(name.as_bytes()).ok()?,
+                http::HeaderValue::from_str(value).ok()?,
+            ))
+        })
+        .collect();
+    request_base_url(&map)
+}
+
 /// The first value of a header a chain of proxies may list comma-separated.
 fn first_hop(value: &http::HeaderValue) -> Option<&str> {
     let text = value.to_str().ok()?;
@@ -244,13 +261,42 @@ mod request_base_url_tests {
         h
     }
 
+    /// A request carried as pairs (a live caller's, on its way to the
+    /// run) yields the same base the live request would: the door's
+    /// forwarded host and scheme, not the worker's own address.
+    #[test]
+    fn a_carried_request_yields_the_door_it_came_through() {
+        let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+            list.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+        assert_eq!(
+            super::request_base_url_of(&pairs(&[
+                ("host", "10.10.0.2:14113"),
+                ("x-forwarded-host", "127.0.0.1:14111"),
+                ("x-forwarded-proto", "http"),
+            ]))
+            .as_deref(),
+            Some("http://127.0.0.1:14111")
+        );
+        assert_eq!(
+            super::request_base_url_of(&pairs(&[
+                ("host", "10.10.0.2:14113"),
+                ("x-forwarded-host", "weft.example.com"),
+                ("x-forwarded-proto", "https"),
+            ]))
+            .as_deref(),
+            Some("https://weft.example.com")
+        );
+        assert_eq!(super::request_base_url_of(&pairs(&[("bad header", "x")])), None);
+    }
+
     /// The caller's own host is the base, and a fronting proxy's
     /// scheme wins over the listener's plain http.
     #[test]
     fn the_base_is_the_host_the_caller_used() {
         assert_eq!(
-            request_base_url(&headers(&[("host", "127.0.0.1:9998")])).as_deref(),
-            Some("http://127.0.0.1:9998")
+            request_base_url(&headers(&[("host", "127.0.0.1:14112")])).as_deref(),
+            Some("http://127.0.0.1:14112")
         );
         assert_eq!(
             request_base_url(&headers(&[
@@ -324,7 +370,7 @@ mod request_base_url_tests {
     fn a_forwarding_proxy_names_the_host_scheme_and_mount() {
         assert_eq!(
             request_base_url(&headers(&[
-                ("host", "10.0.0.7:9999"),
+                ("host", "10.0.0.7:14111"),
                 ("x-forwarded-host", "app.example.com, 10.0.0.2"),
                 ("x-forwarded-proto", "https"),
                 ("x-forwarded-prefix", "/weft/"),
@@ -374,7 +420,7 @@ mod tests {
         for local in [
             "http://localhost:8080",
             "http://LOCALHOST/x",
-            "http://127.0.0.1:9999",
+            "http://127.0.0.1:14111",
             "https://[::1]/events",
             "not a url",
             "",

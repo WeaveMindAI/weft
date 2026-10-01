@@ -14,15 +14,15 @@ mod common;
 
 use std::time::Duration;
 
-use common::color_of;
+use common::execution_id_of;
 
 use serde_json::{json, Value};
 use weft_e2e::client::poll_until;
 use weft_e2e::{display, ensure, run, project::Project};
 
 /// The `waiting` list of a run, each entry's node spelling.
-async fn waiting_on(disp: &weft_e2e::Dispatcher, color: uuid::Uuid) -> anyhow::Result<Vec<String>> {
-    let detail: Value = disp.get_json(&format!("/executions/{color}")).await?;
+async fn waiting_on(disp: &weft_e2e::Dispatcher, execution_id: uuid::Uuid) -> anyhow::Result<Vec<String>> {
+    let detail: Value = disp.get_json(&format!("/executions/{execution_id}")).await?;
     anyhow::ensure!(
         !detail.to_string().contains("@src:"),
         "the file's own path never reaches a reader: {detail}"
@@ -46,7 +46,7 @@ async fn each_call_holds_its_own_wait_and_is_woken_on_its_own() -> anyhow::Resul
     let project = Project::prepare("include_twice", disp.clone()).await?;
 
     let stdout = project.weft(&["run", "--json", "--target", "first", "--target", "second"]).await?;
-    let held = color_of(&stdout)?;
+    let held = execution_id_of(&stdout)?;
     // `waiting_for_input` means ONE wait is registered, not both: each
     // call registers its own, and the second can land a moment after the
     // first. So the run is watched until both are in.

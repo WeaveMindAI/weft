@@ -15,7 +15,7 @@
 //! real wall clock (the stream is deliberately REALTIME, so a run
 //! takes about the audio's length). Skips without
 //! `WEFT_E2E_ELEVENLABS_API_KEY` (the shared-door run also needs an
-//! `elevenlabs` api_key entry in the cluster's credentials file).
+//! `elevenlabs` api_key entry in the install's credentials file).
 #![cfg(feature = "e2e")]
 
 use anyhow::Result;
@@ -35,7 +35,7 @@ async fn assert_transcribed(
     origin: &str,
 ) -> Result<()> {
     let mut project = Project::prepare("audio_transcribe", disp).await?;
-    set_account(&project, "ears", "account", conn.handle())?;
+    set_account(&project, "ears", conn.handle()).await?;
     project.set_node_config("src", "audio", "@asset(\"assets/speech.wav\", Audio)")?;
 
     let mut settled = run::run_and_settle(&mut project).await?;
@@ -81,7 +81,7 @@ async fn a_wav_asset_streams_through_realtime_transcription_to_text() -> Result<
 }
 
 /// The RUNTIME's key: a one-click shared-door connection resolving to
-/// the `elevenlabs` api_key entry in the cluster's credentials file,
+/// the `elevenlabs` api_key entry in the install's credentials file,
 /// then the same pipeline, measured as `platform`.
 #[tokio::test]
 async fn the_runtime_key_door_measures_the_session_as_ours() -> Result<()> {

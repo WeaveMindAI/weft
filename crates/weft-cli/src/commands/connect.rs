@@ -7,17 +7,18 @@
 //!
 //! Every choice has a flag (see [`ConnectOpts`]) so scripts and AI runs
 //! never hang on a prompt; interactively the command walks the same
-//! decisions as menus. The picked handle is written into the node's own
-//! source file (main.weft, or the `@include`d file the node lives in)
-//! through the compiler's structural `SetConfig` edit, exactly as a
-//! click in the editor writes it; pasted secrets go terminal -> store
-//! and never touch the source.
+//! decisions as menus. The pick is kept by the install, per place of the
+//! node (`weft_core::picks`), never written in the source: a connection's
+//! id means nothing on another install, so `--on <target>` picks for that
+//! one. Pasted secrets go terminal -> store and never touch the source.
 
 use std::collections::BTreeMap;
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use uuid::Uuid;
+use weft_core::picks::{ChangePicks, PickInput};
+use weft_core::run_spec::InstanceFieldRef;
 use weft_core::access::spec::{
     percent_encode, AccessSpec, AppRegistration, CredentialField, Door, GrantCoexistence,
 };
@@ -51,6 +52,14 @@ pub struct ConnectOpts {
     /// project's node fails loudly at run with a reconnect message.
     #[arg(long, group = "action", conflicts_with = "node")]
     pub forget: Option<Uuid>,
+    /// Carry every connection and value the install keeps for the node at
+    /// one address over to another, when a node moved in the source (a file
+    /// moved into a folder changes every address inside it): `--move
+    /// chat.send.agent studio.chat.send.agent`. Takes the program's picks
+    /// and every instance's values at once; refused when the new address
+    /// already has some, or its node takes different connections.
+    #[arg(long = "move", group = "action", num_args = 2, value_names = ["OLD", "NEW"], conflicts_with_all = ["node", "instance"])]
+    pub move_picks: Option<Vec<String>>,
     /// Skip the are-you-sure prompt on --forget.
     #[arg(long, requires = "forget")]
     pub yes: bool,
@@ -94,11 +103,12 @@ pub struct ConnectOpts {
     /// its permissions (services with one grant per account).
     #[arg(long, group = "action")]
     pub upgrade: Option<Uuid>,
-    /// Act as this member of the program, on a node marked `@per_member`:
-    /// list, connect and pick THEIR connections, exactly as their connect
-    /// page would. For trying a program's member path from the terminal.
+    /// Act inside this instance of the program, on a field marked
+    /// `@instance_filled`: list, connect and pick ITS connections, exactly
+    /// as its connect page would. For trying a program's per-instance
+    /// path from the terminal.
     #[arg(long, conflicts_with_all = ["forget", "upgrade", "mint"])]
-    pub member: Option<weft_core::member::MemberId>,
+    pub instance: Option<weft_core::instance::InstanceId>,
 }
 
 impl ConnectOpts {
@@ -120,21 +130,17 @@ impl ConnectOpts {
 
 /// One access node of the project: where a connection can be picked.
 /// Discovery walks main.weft AND every `@include`d file (recursively),
-/// each file visited ONCE: a subgraph included in two places is still
-/// one source file, so one pick serves every inclusion.
+/// each file visited ONCE: a subgraph included in two places is one
+/// node with two places, and the install keeps a pick per place
+/// (`weft_core::picks`), so the one this target answers for is the place
+/// it is named by ([`AccessTarget::spelling`]).
 pub(crate) struct AccessTarget {
-    /// The project root the file sits under.
-    root: std::path::PathBuf,
-    /// The file the node is written in; the pick is written HERE (the
-    /// same per-file edit the editor makes when navigated into it).
-    file: std::path::PathBuf,
-    /// The same file relative to the project root, the name `--node
-    /// file:id` qualification and every message use.
+    /// The file the node is written in, relative to the project root, the
+    /// name `--node file:id` qualification and every message use.
     rel_file: String,
     /// The node's id, as the compiler keys it: for a node inside an
     /// included file that carries the file's path (`@src:sweep.key`).
-    /// It is the id the structural edit needs to write the pick, and
-    /// nothing else: what a person reads and types is `spellings`.
+    /// What a person reads and types is `spellings`.
     pub(crate) node: String,
     node_type: String,
     input: String,
@@ -142,7 +148,8 @@ pub(crate) struct AccessTarget {
     /// The project's declared public app for this service, the own
     /// door's fallback when the user pastes no app.
     project_app: Option<AppRegistration>,
-    /// What the node's picker field currently holds.
+    /// What the node's connection is at the place it is named by: this
+    /// install's pick, or what the source says instead.
     pub(crate) picked: Pick,
     /// Every way a person names this node: one per place it is at in
     /// the program (see [`spellings_of`]). A node of the entry file has
@@ -150,7 +157,30 @@ pub(crate) struct AccessTarget {
     spellings: Vec<String>,
 }
 
-/// The `{id, identity}` handle a node's picker config holds.
+/// `weft connect --move OLD NEW`: the install carries what it keeps at
+/// `from` to `to`, and says what moved.
+async fn move_picks(ctx: &Ctx, client: &DispatcherClient, from: &str, to: &str, json: bool) -> Result<()> {
+    super::ensure::ensure_project_known(ctx).await?;
+    let project_id = ctx.project()?.id();
+    let body = weft_core::picks::MovePicks { from: from.to_string(), to: to.to_string() };
+    let answer = client.post_json(&format!("/projects/{project_id}/picks/move"), &serde_json::to_value(&body)?).await?;
+    let moved: weft_core::picks::PicksMoved = serde_json::from_value(answer)
+        .context("read the install's answer to the move; upgrade the dispatcher or this CLI so the versions match")?;
+    if json {
+        println!("{}", serde_json::to_value(&moved)?);
+        return Ok(());
+    }
+    println!(
+        "moved {} pick(s) and {} instance value(s) from '{from}' to '{to}'.",
+        moved.picks, moved.instance_values
+    );
+    if !moved.rearmed.is_empty() {
+        println!("The trigger(s) reading it were set up again: {}.", moved.rearmed.join(", "));
+    }
+    Ok(())
+}
+
+/// The `{id, identity}` handle a pick is kept as.
 pub(crate) struct PickedHandle {
     pub(crate) id: Uuid,
     identity: Option<String>,
@@ -163,18 +193,19 @@ impl PickedHandle {
     }
 }
 
-/// What a node's picker field holds. `Malformed` carries the parse
-/// error so listings can SAY the field is unreadable; discovery must
-/// not die on it, because the write paths (pick, disconnect) overwrite
-/// the value, and bailing would brick the very commands that fix it
-/// (a `--disconnect` on another node would die on this one's value).
+/// What a node's connection is. The install keeps the pick
+/// (`weft_core::picks`); the source only says when it is not the
+/// install's to keep.
 pub(crate) enum Pick {
+    /// Nothing picked on this install yet.
     None,
     Handle(PickedHandle),
-    /// `@member_filled`: each member of the program picks their own
-    /// (`--member`), and the source holds no pick.
-    MemberFilled,
-    Malformed(String),
+    /// `@instance_filled`: each instance of the program picks its own
+    /// (`--instance`).
+    InstanceFilled,
+    /// A connection written in the source, the old way, which the
+    /// compiler refuses: it has to be erased and picked again.
+    WrittenInSource,
 }
 
 impl Pick {
@@ -188,17 +219,22 @@ impl Pick {
 }
 
 pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
-    let client = ctx.client();
+    let client = ctx.client()?;
     let interactive = is_interactive();
     let json = ctx.json();
     // --json promises one JSON object per line on stdout, which the
     // menu and the connect walkthroughs cannot keep; only the fully
     // flag-driven actions honor it.
-    if json && !(opts.list || opts.grant.is_some() || opts.disconnect || opts.forget.is_some()) {
+    if json && !(opts.list || opts.grant.is_some() || opts.disconnect || opts.forget.is_some() || opts.move_picks.is_some()) {
         bail!(
             "--json works with the flag-driven actions (--list, --grant, --disconnect, \
-             --forget); the connect walkthrough prints for a person"
+             --forget, --move); the connect walkthrough prints for a person"
         );
+    }
+
+    if let Some(addresses) = &opts.move_picks {
+        let [from, to] = addresses.as_slice() else { unreachable!("clap takes exactly two values for --move") };
+        return move_picks(&ctx, &client, from, to, json).await;
     }
 
     // Forgetting a stored connection is store-wide: it needs no node
@@ -224,16 +260,18 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
             }
             return Ok(());
         }
+        // The install's picks pointing at it go with it; the ones of the
+        // project here are named, so nobody is surprised by a node that
+        // no longer has a connection.
+        let cleared = picks_pointing_at(&ctx, *id).await?;
         forget_grant(&client, *id).await?;
-        if !json {
-            println!("forgot connection {id}.");
-        }
-        let cleared = clear_picks_pointing_at(&ctx, *id, json);
         if json {
-            // `cleared` names the nodes whose source files were just
-            // rewritten (their pick pointed at the deleted row); a JSON
-            // consumer must hear about disk it did not ask to touch.
             println!("{}", serde_json::json!({ "forgot": id, "cleared": cleared }));
+        } else {
+            println!("forgot connection {id}.");
+            if !cleared.is_empty() {
+                println!("These nodes no longer have a connection picked: {}.", cleared.join(", "));
+            }
         }
         return Ok(());
     }
@@ -253,7 +291,13 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
     let catalog = weft_compiler::build::build_project_catalog(&root)
         .map_err(|e| anyhow::anyhow!("catalog: {e}"))?;
     let mut others: Vec<OtherNode> = Vec::new();
-    let (targets, program) = discover(project, &catalog, &mut others)?;
+    let (mut targets, program) = discover(project, &catalog, &mut others)?;
+    // The picks are the install's: the project has to be known there
+    // before one can be read or kept.
+    super::ensure::ensure_project_known(&ctx).await?;
+    let project_id = project.id();
+    let stored = install_picks(&client, project_id).await?;
+    with_install_picks(&mut targets, &stored)?;
     if targets.is_empty() {
         if opts.list {
             // Nothing to scope the listing to; list the whole store.
@@ -285,35 +329,41 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
         }
         return Ok(());
     }
-    let target = choose_target(project, &program, targets, &others, opts.node.as_deref(), json)?;
+    let mut target = choose_target(project, &program, targets, &others, opts.node.as_deref(), json)?;
+    // Named by one of its places: the pick shown is that place's.
+    with_install_picks(std::slice::from_mut(&mut target), &stored)?;
     let service = target.spec.service.clone();
     let label = target.spec.display_label().to_string();
-    let registry = catalog.type_registry();
-    if let Some(member) = &opts.member {
-        return as_member(&ctx, &client, member, &opts, &target, &label, &registry).await;
+    if let Some(instance) = &opts.instance {
+        return as_instance(&ctx, &client, instance, &opts, &target, &label).await;
     }
-    // A pick here would overwrite the marker that hands the connection to
-    // each member: say what the field is instead.
-    if matches!(target.picked, Pick::MemberFilled) && !opts.list {
+    // A connection written in the source is the old way, refused by the
+    // compiler; the line has to go before anything is picked.
+    if matches!(target.picked, Pick::WrittenInSource) {
+        bail!("{}", written_in_source(&target));
+    }
+    // A pick here would sit beside the marker that hands the connection to
+    // each instance, and never be read: say what the field is instead.
+    if matches!(target.picked, Pick::InstanceFilled) && !opts.list {
         bail!(
-            "'{}' is connected by each member of the program (`{}: @member_filled`); manage one \
-             member's with --member <id>, or remove the marker to pick one connection for everyone",
+            "'{}' is connected separately in each instance of the program (`{}: @instance_filled`); \
+             manage one instance's with --instance <id>, or remove the marker to pick one connection for everyone",
             target.spelling(),
             target.input
         );
     }
     let cx = Connecting {
         client: &client,
+        project_id,
         target: &target,
         service_label: &label,
-        registry: &registry,
         interactive,
         json,
         doorway: Doorway::Owner,
     };
 
     if opts.disconnect {
-        cx.clear_pick()?;
+        cx.clear_pick().await?;
         if json {
             println!(
                 "{}",
@@ -352,11 +402,11 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
             .iter()
             .find(|g| g.id == *id)
             .with_context(|| format!("no stored {label} connection with id {id} (see --list)"))?;
-        cx.pick_grant(g)?;
+        let rearmed = cx.pick_grant(g).await?;
         if json {
             println!(
                 "{}",
-                serde_json::json!({ "node": target.spelling(), "file": target.rel_file, "picked": g.id })
+                serde_json::json!({ "node": target.spelling(), "file": target.rel_file, "picked": g.id, "rearmed": rearmed })
             );
         }
         return Ok(());
@@ -407,7 +457,7 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
         let grant = cx
             .consent_flow(g.door, ticked, shared_app, Some(*id), None)
             .await?;
-        cx.pick_grant(&grant)?;
+        cx.pick_grant(&grant).await?;
         return Ok(());
     }
 
@@ -433,7 +483,7 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
         match words.as_slice() {
             [] | ["q"] => return Ok(()),
             ["d"] => {
-                cx.clear_pick()?;
+                cx.clear_pick().await?;
                 return Ok(());
             }
             ["c"] => { /* falls through to the connect flow below */ }
@@ -447,15 +497,12 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
                     ),
                     "--forget <id> --yes",
                 )? {
+                    let cleared = picks_pointing_at(&ctx, g.id).await?;
                     forget_grant(&client, g.id).await?;
                     println!("forgot it.");
-                    // The SAME sweep the --forget flag runs: every node
-                    // in the project whose pick pointed at the deleted
-                    // row is cleared (not just the one being managed),
-                    // or a run would fail with a reconnect error the
-                    // user did not expect. The catalog in hand is
-                    // reused rather than rebuilt from disk.
-                    sweep_picks(&ctx, g.id, json, project, &catalog, &registry);
+                    if !cleared.is_empty() {
+                        println!("These nodes no longer have a connection picked: {}.", cleared.join(", "));
+                    }
                 } else {
                     println!("kept.");
                 }
@@ -463,7 +510,7 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
             }
             [n] if !grants.is_empty() && n.parse::<usize>().is_ok() => {
                 let g = grant_by_number(&grants, n)?;
-                cx.pick_grant(g)?;
+                cx.pick_grant(g).await?;
                 return Ok(());
             }
             _ if grants.is_empty() => {
@@ -477,71 +524,72 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
     }
 
     let grant = cx.connect_new(&opts).await?;
-    cx.pick_grant(&grant)?;
+    cx.pick_grant(&grant).await?;
     Ok(())
 }
 
-/// `weft connect --member <id>`: the member's side of one member-filled
-/// connection field, through the member door (see
-/// `member_values::as_member`).
-async fn as_member(
+/// `weft connect --instance <id>`: the instance's side of one
+/// instance-filled connection field, through the instance door (see
+/// `instance_values::as_instance`).
+async fn as_instance(
     ctx: &Ctx,
     client: &DispatcherClient,
-    member: &weft_core::member::MemberId,
+    instance: &weft_core::instance::InstanceId,
     opts: &ConnectOpts,
     target: &AccessTarget,
     label: &str,
-    registry: &std::sync::Arc<weft_core::weft_type::TypeRegistry>,
 ) -> Result<()> {
     let json = ctx.json();
-    super::member_values::as_member(ctx, client, member, |door| async move {
-        member_connect(&door, member, opts, target, label, registry, json).await
+    let project_id = ctx.project()?.id();
+    super::instance_values::as_instance(ctx, client, instance, |door| async move {
+        instance_connect(&door, project_id, instance, opts, target, label, json).await
     })
     .await
 }
 
-async fn member_connect(
+async fn instance_connect(
     door: &DispatcherClient,
-    member: &weft_core::member::MemberId,
+    project_id: Uuid,
+    instance: &weft_core::instance::InstanceId,
     opts: &ConnectOpts,
     target: &AccessTarget,
     label: &str,
-    registry: &std::sync::Arc<weft_core::weft_type::TypeRegistry>,
     json: bool,
 ) -> Result<()> {
     let step = target.spelling();
     let cx = Connecting {
         client: door,
+        project_id,
         target,
         service_label: label,
-        registry,
         interactive: is_interactive(),
         json,
-        doorway: Doorway::Member,
+        doorway: Doorway::Instance,
     };
-    if !matches!(target.picked, Pick::MemberFilled) {
+    if !matches!(target.picked, Pick::InstanceFilled) {
         bail!(
-            "'{step}' takes the author's connection, not each member's; write `{}: @member_filled` on it \
-             to have each member connect their own",
+            "'{step}' takes the author's connection, not each instance's; write `{}: @instance_filled` on it \
+             to have each instance connect its own",
             target.input
         );
     }
     if opts.disconnect {
-        door.put_json("/member/values", &serde_json::json!({ "clear": [{ "step": step, "field": target.input }] }))
-            .await?;
+        let clear = weft_core::run_spec::InstanceFieldRef { step: step.clone(), field: target.input.clone() };
+        let body = weft_core::instance_door::ValuesRequest { set: Vec::new(), clear: vec![clear] };
+        door.put_json("/instance/values", &serde_json::to_value(body)?).await?;
         if json {
-            println!("{}", serde_json::json!({ "node": step, "member": member, "picked": Value::Null }));
+            println!("{}", serde_json::json!({ "node": step, "instance": instance, "picked": Value::Null }));
         } else {
-            println!("'{step}' now has no connection picked for member '{member}'.");
+            println!("'{step}' now has no connection picked for instance '{instance}'.");
         }
         return Ok(());
     }
-    let grants = list_grants(door, Doorway::Member, Some(&target.spec.service)).await?;
+    let grants = list_grants(door, Doorway::Instance, Some(&target.spec.service)).await?;
     if opts.list {
         if json {
-            println!("{}", serde_json::json!({ "node": step, "member": member, "connections": grants }));
+            println!("{}", serde_json::json!({ "node": step, "instance": instance, "connections": grants }));
         } else if grants.is_empty() {
-            println!("member '{member}' has no {label} connection yet; connect one with --door own (or shared).");
+            println!("instance '{instance}' has no {label} connection yet; connect one with --door own (or shared).");
         } else {
             for g in &grants {
                 println!("  {}  {}", g.id, g.identity.clone().unwrap_or_default());
@@ -553,33 +601,40 @@ async fn member_connect(
         Some(id) => grants
             .into_iter()
             .find(|g| g.id == *id)
-            .with_context(|| format!("member '{member}' has no {label} connection with id {id} (see --list)"))?,
+            .with_context(|| format!("instance '{instance}' has no {label} connection with id {id} (see --list)"))?,
         None => cx.connect_new(opts).await?,
     };
     let changed = door
         .put_json(
-            "/member/values",
-            &serde_json::json!({ "set": [{ "step": step, "field": target.input, "value": { "id": grant.id } }] }),
+            "/instance/values",
+            &serde_json::to_value(weft_core::instance_door::ValuesRequest {
+                set: vec![weft_core::run_spec::InstanceValueInput {
+                    step: step.clone(),
+                    field: target.input.clone(),
+                    value: serde_json::json!({ "id": grant.id }),
+                }],
+                clear: Vec::new(),
+            })?,
         )
         .await
         .with_context(|| {
             format!(
-                "the connection is stored as {}; pick it with `weft connect --member {member} --node {step} --grant {}`",
+                "the connection is stored as {}; pick it with `weft connect --instance {instance} --node {step} --grant {}`",
                 grant.id, grant.id
             )
         })?;
-    let rearmed = serde_json::from_value::<weft_core::member_door::ValuesChanged>(changed)
+    let rearmed = serde_json::from_value::<weft_core::instance_door::ValuesChanged>(changed)
         .context("read the dispatcher's answer to the change; upgrade the dispatcher or this CLI so the versions match")?
         .rearmed;
     if json {
-        println!("{}", serde_json::json!({ "node": step, "member": member, "picked": grant.id, "rearmed": rearmed }));
+        println!("{}", serde_json::json!({ "node": step, "instance": instance, "picked": grant.id, "rearmed": rearmed }));
     } else {
         println!(
-            "'{step}' now uses {} for member '{member}'.",
+            "'{step}' now uses {} for instance '{instance}'.",
             grant.identity.clone().unwrap_or_else(|| grant.id.to_string())
         );
         if !rearmed.is_empty() {
-            println!("Their trigger(s) reading it were set up again: {}.", rearmed.join(", "));
+            println!("Its trigger(s) reading it were set up again: {}.", rearmed.join(", "));
         }
     }
     Ok(())
@@ -589,27 +644,29 @@ async fn member_connect(
 /// instead of five parameters through every flow.
 struct Connecting<'a> {
     client: &'a DispatcherClient,
+    /// The project the pick is kept for.
+    project_id: Uuid,
     target: &'a AccessTarget,
     /// The SERVICE's display label ("Slack"), never a connection's name.
     service_label: &'a str,
-    registry: &'a std::sync::Arc<weft_core::weft_type::TypeRegistry>,
     interactive: bool,
     /// Under --json prose stays off stdout (one JSON object per line).
     json: bool,
-    /// Whose connection this is: the author's (picked in the source)
-    /// or one member's (`--member`, picked at the member door).
+    /// Whose connection this is: the author's (picked on the install)
+    /// or one instance's (`--instance`, picked at the instance door).
     doorway: Doorway,
 }
 
 /// Whose connections `weft connect` manages. The author's go through
-/// the store's own routes and the pick is written into the source; a
-/// member's go through the member door, exactly as the member's connect
-/// page would, with a member token the command mints for the purpose,
-/// and the pick is the member's own, stored beside their connections.
+/// the store's own routes and the pick is kept by the install; a
+/// instance's go through the instance door, exactly as the instance's
+/// connect page would, with an instance token the command mints for the
+/// purpose, and the pick is the instance's own, stored beside its
+/// connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Doorway {
     Owner,
-    Member,
+    Instance,
 }
 
 /// The connect routes both doorways offer, one name each.
@@ -630,11 +687,11 @@ impl Doorway {
             (Doorway::Owner, Route::Direct) => "/access/connect/direct",
             (Doorway::Owner, Route::Begin) => "/access/connect/begin",
             (Doorway::Owner, Route::Status) => "/access/connect/status",
-            (Doorway::Member, Route::Grants) => "/member/connections",
-            (Doorway::Member, Route::Doors) => "/member/doors",
-            (Doorway::Member, Route::Direct) => "/member/connections/direct",
-            (Doorway::Member, Route::Begin) => "/member/connections/begin",
-            (Doorway::Member, Route::Status) => "/member/connections/status",
+            (Doorway::Instance, Route::Grants) => "/instance/connections",
+            (Doorway::Instance, Route::Doors) => "/instance/doors",
+            (Doorway::Instance, Route::Direct) => "/instance/connections/direct",
+            (Doorway::Instance, Route::Begin) => "/instance/connections/begin",
+            (Doorway::Instance, Route::Status) => "/instance/connections/status",
         }
     }
 }
@@ -645,84 +702,92 @@ pub(crate) async fn forget_grant(client: &DispatcherClient, id: Uuid) -> Result<
     client.delete(&format!("/access/grants/{id}")).await
 }
 
-/// After a store-wide forget: clear every pick in the current project
-/// that pointed at the deleted row, so no node is left failing every
-/// run with a reconnect error the user did not expect. Returns the
-/// node ids whose picks were cleared. Outside a project there is
-/// nothing to sweep (and nothing to say); a project that is here but
-/// broken cannot fail the forget (the grant is already gone), so the
-/// dangling picks and their recovery are named on stderr instead of
-/// silently skipped.
-fn clear_picks_pointing_at(ctx: &Ctx, id: Uuid, json: bool) -> Vec<String> {
-    let project = match ctx.project_here() {
-        Ok(Some(p)) => p,
-        Ok(None) => return Vec::new(),
-        Err(e) => {
-            sweep_failed(&e);
-            return Vec::new();
-        }
-    };
-    match weft_compiler::build::build_project_catalog(&project.root)
-        .map_err(|e| anyhow::anyhow!("catalog: {e}"))
-    {
-        Ok(catalog) => {
-            let registry = catalog.type_registry();
-            sweep_picks(ctx, id, json, project, &catalog, &registry)
-        }
-        Err(e) => {
-            sweep_failed(&e);
-            Vec::new()
-        }
-    }
-}
-
-/// The sweep itself, for a caller that already holds the project and
-/// catalog (the interactive menu). Failures print the recovery on
-/// stderr and never fail the forget; the cleared node ids come back.
-fn sweep_picks(
-    ctx: &Ctx,
-    id: Uuid,
-    json: bool,
-    project: &weft_compiler::project::Project,
-    catalog: &weft_catalog::FsCatalog,
-    registry: &std::sync::Arc<weft_core::weft_type::TypeRegistry>,
-) -> Vec<String> {
-    let mut cleared = Vec::new();
-    let client = ctx.client();
-    let swept = (|| -> Result<()> {
-        // The sweep only reads picks, so the non-connectable nodes it
-        // walks past are nobody's business here.
-        let targets = access_targets(project, catalog, &mut Vec::new())?;
-        for target in &targets {
-            if target.picked.handle().is_some_and(|p| p.id == id) {
-                Connecting {
-                    client: &client,
-                    target,
-                    service_label: target.spec.display_label(),
-                    registry,
-                    // The sweep only writes; nothing in clear_pick
-                    // prompts, so interactivity is moot here.
-                    interactive: false,
-                    json,
-                    doorway: Doorway::Owner,
-                }
-                .clear_pick()?;
-                cleared.push(target.spelling());
+/// The places of the project here whose pick on this install is the
+/// connection `id`, spelled: what a forget of it takes away with it.
+/// Outside a project, nobody's. A project here that cannot be read, or
+/// an install whose picks cannot be read, is an error: the forget would
+/// otherwise report that nothing lost its connection without knowing.
+async fn picks_pointing_at(ctx: &Ctx, id: Uuid) -> Result<Vec<String>> {
+    let unknowable = "cannot tell which nodes use this connection, so nothing was forgotten";
+    let Some(project) = ctx.project_here().context(unknowable)? else { return Ok(Vec::new()) };
+    let stored = install_picks(&ctx.client()?,project.id()).await.context(unknowable)?;
+    let mut pointing = Vec::new();
+    for (step, fields) in stored {
+        for (field, handle) in &fields {
+            if picked_handle(&step, field, handle)?.id == id {
+                pointing.push(step.clone());
+                break;
             }
         }
-        Ok(())
-    })();
-    if let Err(e) = swept {
-        sweep_failed(&e);
     }
-    cleared
+    Ok(pointing)
 }
 
-fn sweep_failed(e: &anyhow::Error) {
-    eprintln!(
-        "could not sweep this project's picks: {e}; a node still pointing at the \
-         deleted connection can be cleared with `weft connect --node <id> --disconnect`"
-    );
+/// The connection an install's pick at `step.field` names. One the CLI
+/// cannot read is an error naming the place, never "not connected".
+fn picked_handle(step: &str, field: &str, handle: &Value) -> Result<PickedHandle> {
+    parse_picked(handle).with_context(|| {
+        format!(
+            "the install's pick for '{step}.{field}' is not a connection this CLI can read ({handle}); \
+             upgrade the CLI or the install so the versions match, or connect '{step}' again"
+        )
+    })
+}
+
+/// Every pick this install keeps for `project_id`, by place and field.
+/// A project the install has never heard of has none.
+pub(crate) async fn install_picks(client: &DispatcherClient, project_id: Uuid) -> Result<weft_core::picks::Picks> {
+    let answer = client.get_json(&format!("/projects/{project_id}/picks")).await?;
+    serde_json::from_value(answer).context("read the install's picks")
+}
+
+/// Set each target's pick from `stored`, at the place it is named by. A
+/// field the source marks for each instance, or holds a connection
+/// written in the old way, keeps what the source says.
+fn with_install_picks(targets: &mut [AccessTarget], stored: &weft_core::picks::Picks) -> Result<()> {
+    for target in targets {
+        if matches!(target.picked, Pick::InstanceFilled | Pick::WrittenInSource) {
+            continue;
+        }
+        let step = target.spelling();
+        target.picked = match stored.get(&step).and_then(|fields| fields.get(&target.input)) {
+            Some(handle) => Pick::Handle(picked_handle(&step, &target.input, handle)?),
+            None => Pick::None,
+        };
+    }
+    Ok(())
+}
+
+/// What the source says about a node's connection, off the value its
+/// parse holds there: nothing (the install keeps the pick, read after),
+/// each instance's, or one written the old way. The parse is enriched,
+/// so "nothing written" arrives as the compiler's install-picked marker;
+/// an instance's fallback connection is written in the source like any
+/// other.
+fn source_pick(written: Option<&Value>) -> Pick {
+    match written {
+        None | Some(Value::Null) => Pick::None,
+        Some(v) if weft_core::picks::is_install_picked(v) => Pick::None,
+        Some(v) => match weft_core::instance::as_instance_filled(v) {
+            Some(filled) if filled.fallback.is_none() => Pick::InstanceFilled,
+            _ => Pick::WrittenInSource,
+        },
+    }
+}
+
+/// What to do about a connection written in the source, the old way:
+/// the same words the compiler refuses it with.
+pub(crate) fn written_in_source(target: &AccessTarget) -> String {
+    format!(
+        "'{node}.{field}' holds a connection written in the source ({file}). That was the old way of \
+         connecting a node: a connection lives in one install, so its id means nothing on any other. \
+         Erase that line, then run `weft connect --node {node}` again; the pick is kept by the \
+         install. See {doc}",
+        node = target.spelling(),
+        field = target.input,
+        file = target.rel_file,
+        doc = weft_core::picks::PICKS_DOC,
+    )
 }
 
 // ── Target discovery ────────────────────────────────────────────────────────
@@ -736,13 +801,14 @@ struct OtherNode {
 }
 
 /// Walk main.weft and every `@include`d file (recursively) and pair
-/// each access node with its service recipe and its currently picked
-/// handle. Each FILE is parsed standalone and visited once: a subgraph
-/// included from two places is one source file, so its access node is
-/// one target and one pick serves every inclusion. What a person calls
-/// that node comes from the WHOLE program, flattened once here: a node
-/// has one name per place it is at, and the file walk knows nothing
-/// about places (a file reached through a nested include is two sites
+/// each access node with its service recipe and what its source says of
+/// its connection (the install's pick is read after, `with_install_picks`),
+/// plus the leniently flattened program the names came from. Each FILE is
+/// parsed standalone and visited once: a subgraph included from two places
+/// is one source file, so its access node is one target with two places.
+/// What a person calls that node comes from the WHOLE program, flattened
+/// once here: a node has one name per place it is at, and the file walk
+/// knows nothing about places (a file reached through a nested include is two sites
 /// deep, and the alias it was reached by is only the innermost).
 ///
 /// The flattening is the LENIENT one (lex, parse, includes inlined, no
@@ -751,17 +817,6 @@ struct OtherNode {
 /// mis-typed literal leaves the node list whole, and the places come
 /// from the node list alone. A parse error is refused the way the file
 /// walk refuses one, naming the file and the line.
-fn access_targets(
-    project: &weft_compiler::project::Project,
-    catalog: &weft_catalog::FsCatalog,
-    others: &mut Vec<OtherNode>,
-) -> Result<Vec<AccessTarget>> {
-    Ok(discover(project, catalog, others)?.0)
-}
-
-/// [`access_targets`], plus the leniently flattened program the names
-/// came from (the one view that holds every node, edge and written
-/// value across includes).
 fn discover(
     project: &weft_compiler::project::Project,
     catalog: &weft_catalog::FsCatalog,
@@ -787,8 +842,8 @@ fn discover(
     );
     if let Some(first) = parse_errors.first() {
         bail!(
-            "{} does not parse (line {}: {}); fix it before connecting, or the \
-             pick would be written into a file the compiler cannot read",
+            "{} does not parse (line {}: {}); fix it before connecting, so the \
+             nodes to connect can be read from it",
             first.file.clone().unwrap_or_else(|| project.main_weft().display().to_string()),
             first.span.start_line,
             first.message
@@ -851,8 +906,8 @@ fn collect_targets(
         matches!(d.severity, weft_core::node::Severity::Error) && d.code.as_deref() == Some("parse")
     }) {
         bail!(
-            "{} does not parse (line {}: {}); fix it before connecting, or the \
-             pick would be written into a file the compiler cannot read",
+            "{} does not parse (line {}: {}); fix it before connecting, so the \
+             nodes to connect can be read from it",
             canonical.display(),
             first.line,
             first.message
@@ -891,26 +946,11 @@ fn collect_targets(
                     node.node_type, spec.service
                 )
             })?;
-        // The stored pick is an `{id, identity}` handle; anything else
-        // in the field is unreadable and carried as such (listings say
-        // so; picking or disconnecting overwrites it).
-        //
-        // Through `written_value`, never `config`: a constant written
-        // for an INPUT PORT has two homes in source and enrich moves it
-        // from one to the other (`normalize_port_literals`), so reading
-        // `config` alone answers None for every pick a project actually
-        // holds, and every node reads as unconnected.
-        let picked = match node.written_value(&input) {
-            None | Some(Value::Null) => Pick::None,
-            Some(v) if weft_core::member::as_member_filled(v).is_some() => Pick::MemberFilled,
-            Some(v) => match parse_picked(v) {
-                Ok(h) => Pick::Handle(h),
-                Err(e) => Pick::Malformed(format!("{e:#}")),
-            },
-        };
+        // Through `written_value`, never `config`: a constant written for
+        // an INPUT PORT has two homes in source and enrich moves it from
+        // one to the other (`normalize_port_literals`).
+        let picked = source_pick(node.written_value(&input));
         out.push(AccessTarget {
-            root: root.to_path_buf(),
-            file: canonical.clone(),
             rel_file: rel_file.clone(),
             node: node.id.clone(),
             node_type: node.node_type.clone(),
@@ -967,8 +1007,13 @@ fn spellings_of(program: &weft_core::ProjectDefinition, id: &str) -> Result<Vec<
 
 impl AccessTarget {
     /// Every way a person may name this node (see [`spellings_of`]).
-    fn spellings(&self) -> &[String] {
+    pub(crate) fn spellings(&self) -> &[String] {
         &self.spellings
+    }
+
+    /// The connection field.
+    pub(crate) fn input(&self) -> &str {
+        &self.input
     }
 
     /// The one spelling to print when only one fits: the first, which
@@ -1080,8 +1125,8 @@ fn choose_target(
         let status = match &t.picked {
             Pick::Handle(p) => format!("connected as {}", p.who()),
             Pick::None => "NOT connected".to_string(),
-            Pick::MemberFilled => "each member connects their own (see --member)".to_string(),
-            Pick::Malformed(_) => "holds an unreadable value (pick or --disconnect to replace it)".to_string(),
+            Pick::InstanceFilled => "each instance connects its own (see --instance)".to_string(),
+            Pick::WrittenInSource => "written in the source the old way: erase that line and connect again".to_string(),
         };
         eprintln!("  [{}] {} - {}", i + 1, describe_target(t), status);
     }
@@ -1168,15 +1213,11 @@ fn print_grants(target: &AccessTarget, label: &str, grants: &[GrantSummary]) {
     match &target.picked {
         Pick::Handle(p) => println!("'{}' is connected as {}.", target.spelling(), p.who()),
         Pick::None => println!("'{}' has no connection picked.", target.spelling()),
-        Pick::MemberFilled => println!(
-            "'{}' is connected by each member of the program; see theirs with --member <id>.",
+        Pick::InstanceFilled => println!(
+            "'{}' is connected separately in each instance of the program; see one with --instance <id>.",
             target.spelling()
         ),
-        Pick::Malformed(why) => println!(
-            "'{}' holds a value `weft connect` cannot read ({why}); pick a connection \
-             or --disconnect to replace it.",
-            target.spelling()
-        ),
+        Pick::WrittenInSource => println!("{}", written_in_source(target)),
     }
     if grants.is_empty() {
         println!("No stored {label} connections yet.");
@@ -1213,15 +1254,22 @@ fn print_grants(target: &AccessTarget, label: &str, grants: &[GrantSummary]) {
 }
 
 impl Connecting<'_> {
-    /// Point the node at this stored connection and say so. When the
-    /// write fails the connection still exists, so the error names the
-    /// way to attach it without redoing the sign-in.
-    fn pick_grant(&self, g: &GrantSummary) -> Result<()> {
-        let handle = match &g.identity {
-            Some(identity) => serde_json::json!({ "id": g.id, "identity": identity }),
-            None => serde_json::json!({ "id": g.id }),
+    /// Point the node, at the place it is named by, at this stored
+    /// connection on this install, and say so. Answers the triggers the
+    /// change set up again. When the write fails the connection still
+    /// exists, so the error names the way to attach it without redoing
+    /// the sign-in.
+    async fn pick_grant(&self, g: &GrantSummary) -> Result<Vec<String>> {
+        let body = ChangePicks {
+            set: vec![PickInput {
+                step: self.target.spelling(),
+                field: self.target.input.clone(),
+                connection: g.id,
+                service: self.target.spec.service.clone(),
+            }],
+            clear: Vec::new(),
         };
-        self.write_pick(Some(&handle)).with_context(|| {
+        let rearmed = self.write_picks(&body).await.with_context(|| {
             format!(
                 "the connection is stored as {}; attach it with `weft connect --node {} \
                  --grant {}`",
@@ -1230,123 +1278,40 @@ impl Connecting<'_> {
         })?;
         if !self.json {
             println!(
-                "'{}' now uses {}.",
+                "'{}' now uses {} on this install.",
                 self.target.spelling(),
                 g.identity.clone().unwrap_or_else(|| g.id.to_string())
             );
-        }
-        Ok(())
-    }
-
-    /// Clear the node's pick (the stored connection stays) and say so.
-    fn clear_pick(&self) -> Result<()> {
-        self.write_pick(None)?;
-        if !self.json {
-            println!("'{}' now has no connection picked.", self.target.spelling());
-        }
-        Ok(())
-    }
-
-    /// Write the connection handle onto the node in its own source file
-    /// through the compiler's structural edit ops: the same operations
-    /// a click in the editor performs, never string surgery on the
-    /// source. `None` clears the pick (the editor removes the key
-    /// rather than writing null).
-    fn write_pick(&self, handle: Option<&Value>) -> Result<()> {
-        let file = &self.target.file;
-        let node = &self.target.node;
-        let input = &self.target.input;
-        let source =
-            std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
-        let op = match handle {
-            Some(h) => weft_compiler::edit::EditOp::SetConfig {
-                node: node.clone(),
-                key: input.clone(),
-                value: h.to_string(),
-                form: None,
-            },
-            None => weft_compiler::edit::EditOp::RemoveConfig {
-                node: node.clone(),
-                key: input.clone(),
-                form: None,
-            },
-        };
-        // The file's own anon-root id, the same identity the editor edits
-        // it under when navigated into it; the entry file has none.
-        let source_id = weft_compiler::source_name::file_id(Some(&self.target.root), Some(file));
-        let (edited, _inverse) = weft_compiler::edit::apply_edits(
-            &source,
-            source_id.as_deref(),
-            &[op],
-            self.registry.clone(),
-        )
-        .map_err(|e| anyhow::anyhow!("write the pick onto {node}.{input}: {e}"))?;
-        std::fs::write(file, &edited).with_context(|| format!("write {}", file.display()))?;
-        // Say what changed, the way an edit tool reports it, so a model
-        // driving this command updates its picture of the file without
-        // re-reading it.
-        if !self.json {
-            if let Some(block) = edit_diff_block(&self.target.rel_file, &source, &edited) {
-                println!("{block}");
+            if !rearmed.is_empty() {
+                println!("The trigger(s) reading it were set up again: {}.", rearmed.join(", "));
             }
         }
+        Ok(rearmed)
+    }
+
+    /// Forget the node's pick on this install (the stored connection
+    /// stays) and say so.
+    async fn clear_pick(&self) -> Result<()> {
+        let body = ChangePicks {
+            set: Vec::new(),
+            clear: vec![InstanceFieldRef { step: self.target.spelling(), field: self.target.input.clone() }],
+        };
+        self.write_picks(&body).await?;
+        if !self.json {
+            println!("'{}' now has no connection picked on this install.", self.target.spelling());
+        }
         Ok(())
     }
-}
 
-/// The lines an edit changed, as a before/after block: the file and
-/// the first changed line (`main.weft:15`), then every removed line
-/// with `- ` and every added line with `+ `. Lines the edit left
-/// alone are not shown. `None` when nothing changed.
-pub(crate) fn edit_diff_block(rel_file: &str, before: &str, after: &str) -> Option<String> {
-    let old: Vec<&str> = before.lines().collect();
-    let new: Vec<&str> = after.lines().collect();
-    let common_start = old.iter().zip(new.iter()).take_while(|(a, b)| a == b).count();
-    let mut common_end = 0;
-    while common_end < old.len() - common_start
-        && common_end < new.len() - common_start
-        && old[old.len() - 1 - common_end] == new[new.len() - 1 - common_end]
-    {
-        common_end += 1;
-    }
-    let removed = &old[common_start..old.len() - common_end];
-    let added = &new[common_start..new.len() - common_end];
-    if removed.is_empty() && added.is_empty() {
-        return None;
-    }
-    let mut block = format!("{rel_file}:{}", common_start + 1);
-    for line in removed {
-        block.push_str(&format!("\n- {line}"));
-    }
-    for line in added {
-        block.push_str(&format!("\n+ {line}"));
-    }
-    Some(block)
-}
-
-#[cfg(test)]
-mod diff_block_tests {
-    use super::edit_diff_block;
-
-    #[test]
-    fn a_changed_line_shows_as_before_and_after_at_its_number() {
-        let before = "a = Text {}\nb = Slack {\n  account: old\n}\n";
-        let after = "a = Text {}\nb = Slack {\n  account: new\n}\n";
-        assert_eq!(
-            edit_diff_block("main.weft", before, after).as_deref(),
-            Some("main.weft:3\n-   account: old\n+   account: new")
-        );
-    }
-
-    #[test]
-    fn an_inserted_line_shows_only_the_addition_and_no_change_shows_nothing() {
-        let before = "b = Slack {\n}\n";
-        let after = "b = Slack {\n  account: new\n}\n";
-        assert_eq!(
-            edit_diff_block("main.weft", before, after).as_deref(),
-            Some("main.weft:2\n+   account: new")
-        );
-        assert_eq!(edit_diff_block("main.weft", before, before), None);
+    /// Change the install's picks for the project.
+    async fn write_picks(&self, body: &ChangePicks) -> Result<Vec<String>> {
+        let answer = self
+            .client
+            .put_json(&format!("/projects/{}/picks", self.project_id), &serde_json::to_value(body)?)
+            .await?;
+        Ok(serde_json::from_value::<weft_core::instance_door::ValuesChanged>(answer)
+            .context("read the install's answer to the change; upgrade the dispatcher or this CLI so the versions match")?
+            .rearmed)
     }
 }
 
@@ -1366,7 +1331,7 @@ impl Connecting<'_> {
         )
         .context("parse the doors probe")?;
         let is_consent = spec.needs_browser_consent();
-        // A member always connects an account of their own: the shared
+        // An instance always connects an account of its own: the shared
         // key is the author's and spends the author's credits.
         let shared_backed = self.doorway == Doorway::Owner
             && (!doors.doors.shared_apps.is_empty() || doors.doors.shared_credential)
@@ -1485,7 +1450,7 @@ impl Connecting<'_> {
                     registration: None,
                     paste: false,
                     project_id: None,
-                    member: None,
+                    instance: None,
                 },
                 app.map(|a| a.label.clone()),
             )
@@ -1658,7 +1623,7 @@ impl Connecting<'_> {
                     registration: None,
                     paste: true,
                     project_id: None,
-                    member: None,
+                    instance: None,
                 },
                 None,
             )
@@ -1826,7 +1791,7 @@ impl Connecting<'_> {
                     registration,
                     paste: false,
                     project_id: None,
-                    member: None,
+                    instance: None,
                 },
                 None,
             )
@@ -1850,7 +1815,7 @@ impl Connecting<'_> {
                 registration: None,
                 paste: false,
                 project_id: None,
-                member: None,
+                instance: None,
             },
             None,
         )
@@ -1900,10 +1865,10 @@ pub(crate) async fn connect_direct(
 
 impl Connecting<'_> {
     /// The browser sign-in: begin, open the consent page, poll the parked
-    /// outcome until the callback lands (same 2s x 150 window as the
-    /// editor). Refused with no terminal: a script cannot finish a browser
-    /// consent, and blocking five minutes on a poll nobody watches is the
-    /// hang the flag rule exists to prevent.
+    /// outcome every 2s until the callback lands, for as long as the
+    /// person takes (a line a minute says it is still waiting; Ctrl+C
+    /// stops). Refused with no terminal: a script cannot finish a browser
+    /// consent, and a poll nobody watches would wait forever.
     async fn consent_flow(
         &self,
         door: Door,
@@ -1937,7 +1902,7 @@ impl Connecting<'_> {
             // The editor sends no project id on a user connect either; the
             // column means "published by a node in this project".
             project_id: None,
-            member: None,
+            instance: None,
             upgrade_grant_id,
             // Filled by the dispatcher (it knows its public host).
             redirect_uri: String::new(),
@@ -1963,8 +1928,21 @@ impl Connecting<'_> {
             "Waiting for the sign-in to land (Ctrl+C to stop waiting; if the sign-in \
          completed anyway, `weft connect` will list the connection)..."
         );
-        for _ in 0..150 {
+        // No deadline: the person may take as long as they like in the
+        // browser. The install drops a sign-in nobody finished, and the
+        // poll then fails naming it; until then a periodic line says what
+        // this is waiting on.
+        let started_at = std::time::Instant::now();
+        let mut last_said = started_at;
+        loop {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if last_said.elapsed() >= std::time::Duration::from_secs(60) {
+                last_said = std::time::Instant::now();
+                eprintln!(
+                    "still waiting for the sign-in in your browser ({} min so far; Ctrl+C to stop waiting)",
+                    started_at.elapsed().as_secs() / 60
+                );
+            }
             let outcome = client
                 .get_json(&format!(
                     "{}?state={}",
@@ -1978,19 +1956,28 @@ impl Connecting<'_> {
                     "polling the sign-in outcome failed; if the sign-in completed anyway, \
                  the connection shows in `weft connect --list`",
                 )?;
-            if outcome.is_null() {
-                continue;
+            let outcome: Option<ConnectOutcome> =
+                serde_json::from_value(outcome).context("read the sign-in outcome")?;
+            match outcome {
+                None => continue,
+                Some(ConnectOutcome::Failed { error }) => bail!("the sign-in failed: {error}"),
+                Some(ConnectOutcome::Done(done)) => return Ok(done.grant),
             }
-            if let Some(err) = outcome.get("error").and_then(Value::as_str) {
-                bail!("the sign-in failed: {err}");
-            }
-            return grant_of(outcome);
         }
-        bail!(
-            "the sign-in did not land within 5 minutes; run `weft connect` again to retry \
-         (if it completed after this gave up, the connection shows in the list)"
-        );
     }
+}
+
+/// What the sign-in status poll answers once a consent lands (`null`
+/// while it is still open): the connection made, or why it was not.
+/// The same route also answers a chooser's `{"picked": ..}`, but only
+/// under a state `begin_picker` minted; this poll's state comes from
+/// the sign-in begin, so that shape never reaches it.
+// SYNC: ConnectOutcome <-> crates/weft-access-store/src/flows.rs complete_oauth, take_connect_result (the parked result_json), packages/weft-connect/src/core/wire.ts ConsentOutcome
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum ConnectOutcome {
+    Done(CompletedConnect),
+    Failed { error: String },
 }
 
 /// The grant out of a connect answer. Pure: the caller prints.
@@ -2173,7 +2160,7 @@ mod tests {
             id: uuid::Uuid::nil(),
             service: "s".into(),
             project_id: None,
-            member: None,
+            instance: None,
             identity: None,
             label: None,
             scopes: vec![],
@@ -2224,6 +2211,50 @@ mod tests {
         let mut set = BTreeMap::new();
         let out = collect_field_values(&fields, &mut set, "--set", false, true).unwrap();
         assert!(out.is_empty());
+    }
+
+    /// What `weft connect` reads off a real project, parsed the way it
+    /// parses one. The parse is enriched, so a node with nothing written
+    /// carries the compiler's install marker, which is no connection
+    /// written in the source: reading it as one refused every
+    /// `weft connect --grant` on every access node.
+    #[test]
+    fn the_source_says_what_the_person_wrote_about_a_connection() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = weft_compiler::project::Project::init(dir.path(), "picks").unwrap();
+        let catalog = weft_compiler::build::build_project_catalog(&project.root).unwrap();
+        let read = |source: &str| {
+            std::fs::write(project.main_weft(), source).unwrap();
+            let (targets, _) = discover(&project, &catalog, &mut Vec::new()).unwrap();
+            targets.into_iter().next().expect("the access node is a target").picked
+        };
+        assert!(matches!(read("ws = SlackAccess\n"), Pick::None));
+        assert!(matches!(read("ws = SlackAccess { account: @instance_filled }\n"), Pick::InstanceFilled));
+        assert!(matches!(read("ws = SlackAccess { account: {\"id\": \"g-1\"} }\n"), Pick::WrittenInSource));
+        assert!(matches!(
+            read("ws = SlackAccess { account: @instance_filled({\"id\": \"g-1\"}) }\n"),
+            Pick::WrittenInSource
+        ));
+    }
+
+    /// A pick the install keeps that this CLI cannot read is an error
+    /// naming its place, never shown as "not connected".
+    #[test]
+    fn an_unreadable_install_pick_names_its_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = weft_compiler::project::Project::init(dir.path(), "picks").unwrap();
+        let catalog = weft_compiler::build::build_project_catalog(&project.root).unwrap();
+        std::fs::write(project.main_weft(), "ws = SlackAccess\n").unwrap();
+        let (mut targets, _) = discover(&project, &catalog, &mut Vec::new()).unwrap();
+        let field = targets[0].input.clone();
+        let stored = |handle: Value| -> weft_core::picks::Picks {
+            serde_json::from_value(serde_json::json!({ "ws": { field.clone(): handle } })).unwrap()
+        };
+        let id = Uuid::new_v4();
+        with_install_picks(&mut targets, &stored(serde_json::json!({ "id": id.to_string() }))).unwrap();
+        assert!(matches!(&targets[0].picked, Pick::Handle(h) if h.id == id));
+        let error = with_install_picks(&mut targets, &stored(serde_json::json!({ "id": "not-a-uuid" }))).unwrap_err();
+        assert!(error.to_string().contains(&format!("'ws.{field}'")), "{error:#}");
     }
 
     /// The shape an include compiles to: the file `src/sweep.weft` is

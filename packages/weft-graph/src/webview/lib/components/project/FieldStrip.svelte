@@ -230,7 +230,7 @@
 		<!-- data-field-key: a parent's right-click menu finds the field by it. -->
 		<div class="space-y-1" data-field-key={field.key}>
 			<div class="flex items-center justify-between">
-				<label for={domId(field)} class="text-[10px] text-muted-foreground font-medium block">
+				<label id={`${domId(field)}-label`} for={domId(field)} class="text-[10px] text-muted-foreground font-medium block">
 					{field.label}
 				</label>
 				<div class="flex items-center gap-1">
@@ -272,6 +272,26 @@
 					ondrop={() => readonlyPasteDrop(field.key, ro)}
 					use:observeTextareaResize={field.key}
 				></textarea>
+			{:else if field.type === 'select' && field.options && field.freeText}
+				<!-- A free_text select: the options are suggestions (model
+				     ids, voices), so the box takes any typed value and the
+				     browser's own list offers the known ones. -->
+				<input
+					id={domId(field)}
+					type="text"
+					list={`${domId(field)}-options`}
+					readonly={ro}
+					class="w-full text-xs {ro ? 'bg-rose-50 text-rose-700' : 'bg-muted'} px-2 py-1.5 rounded border-none outline-none nodrag"
+					placeholder="(unset)"
+					value={(effectiveValue(field) as string | undefined) ?? ''}
+					onchange={(e) => onUpdate(field.key, emptyToUnset(e.currentTarget.value.trim()), field.portDriven)}
+					onclick={(e) => e.stopPropagation()}
+				/>
+				<datalist id={`${domId(field)}-options`}>
+					{#each field.options as option}
+						<option value={option}></option>
+					{/each}
+				</datalist>
 			{:else if field.type === 'select' && field.options}
 				<!-- The shown value is the EFFECTIVE one (set value, else the
 				     input's declared default). With neither, an explicit
@@ -296,8 +316,14 @@
 			{:else if field.type === 'multiselect' && field.options}
 				<!-- Empty options cannot reach here: an optionless
 				     select/multiselect widget fails the node's metadata load. -->
-				<div class="flex flex-wrap gap-1 p-1.5 bg-muted rounded">
-					{#each field.options as option}
+				<!-- A free_text multiselect also shows the typed values the
+				     options never listed, and a box to add one. -->
+				{@const picked = (effectiveValue(field) as string[] | undefined) ?? []}
+				{@const shown = field.freeText ? [...field.options, ...picked.filter((v) => !field.options!.includes(v))] : field.options}
+				<!-- A group of buttons has no form control for the label's
+				     `for`, so the label names it through aria-labelledby. -->
+				<div role="group" aria-labelledby={`${domId(field)}-label`} class="flex flex-wrap gap-1 p-1.5 bg-muted rounded">
+					{#each shown as option}
 						{@const current = (effectiveValue(field) as string[] | undefined) ?? []}
 						{@const isSelected = current.includes(option)}
 						<button
@@ -316,6 +342,21 @@
 						</button>
 					{/each}
 				</div>
+				{#if field.freeText && !ro}
+					<input
+						id={`${domId(field)}-add`}
+						type="text"
+						class="w-full mt-1 text-xs bg-muted px-2 py-1.5 rounded border-none outline-none nodrag"
+						placeholder="Add another, press Enter"
+						onclick={(e) => e.stopPropagation()}
+						onkeydown={(e) => {
+							if (e.key !== 'Enter') return;
+							const typed = e.currentTarget.value.trim();
+							if (typed && !picked.includes(typed)) onUpdate(field.key, [...picked, typed], field.portDriven);
+							e.currentTarget.value = '';
+						}}
+					/>
+				{/if}
 			{:else if field.type === 'text_list'}
 				<!-- A list of short text values, added and removed one at a
 				     time: a select's options, the values a case matches.

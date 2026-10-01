@@ -1,6 +1,6 @@
 import { defineConfig } from 'vitest/config';
 
-// The connect library's own tests: the recipe readers, the member door's
+// The connect library's own tests: the recipe readers, the instance door's
 // requests, the consent wait. Nothing here needs a browser.
 //
 // Like the graph package, this one has no install of its own:

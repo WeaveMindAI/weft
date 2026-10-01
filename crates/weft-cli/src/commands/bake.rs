@@ -3,14 +3,14 @@
 //! replaced on the way, and `--running-policy` says what happens to
 //! its running executions, exactly as on `weft activate`.
 
-use super::ensure::{parse_running_choice, running_choice_fields};
+use super::ensure::{parse_running_choice, running_choice};
 use super::Ctx;
 use crate::progress::ActionVerb;
 
 pub async fn run(
     ctx: Ctx,
     project: Option<String>,
-    node_set: weft_compiler::codegen::NodeSet,
+    node_set: weft_core::builds::NodeSet,
     running_policy: Option<String>,
     drain_timeout: Option<u64>,
     scope: weft_core::activation::ActivationScope,
@@ -22,19 +22,17 @@ pub async fn run(
         let (running_policy, drain_timeout) =
             parse_running_choice(running_policy.as_deref(), drain_timeout)?;
         let (client, id) = match project {
-            Some(id) => (inner.client(), id),
+            Some(id) => (inner.client()?, id),
             None => {
                 let handle = super::ensure::ensure_registered(&inner, &progress, node_set).await?;
                 (handle.client, handle.id)
             }
         };
         let path = format!("/projects/{id}/bake");
-        let mut fields = running_choice_fields(running_policy, drain_timeout);
-        fields.insert("scope".into(), serde_json::to_value(&scope)?);
-        let body = serde_json::Value::Object(fields);
-        progress.drain_wait(&body, drain_timeout);
+        let body = weft_core::activation::BakeRequest { running: running_choice(running_policy, drain_timeout), scope };
+        progress.drain_wait(running_policy, drain_timeout);
         progress.dispatcher_call_start(&path);
-        let result: serde_json::Value = client.post_json(&path, &body).await?;
+        let result: serde_json::Value = client.post_json(&path, &serde_json::to_value(&body)?).await?;
         progress.dispatcher_call_done(serde_json::json!({"project_id": id}));
         progress.complete_with("trigger settings saved", result);
         Ok(())

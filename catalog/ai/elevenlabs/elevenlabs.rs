@@ -21,7 +21,9 @@ pub fn audio_file_type(output_format: &str) -> WeftResult<(&'static str, &'stati
         "pcm" => Ok(("pcm", "audio/pcm")),
         "ulaw" => Ok(("ulaw", "audio/basic")),
         "opus" => Ok(("ogg", "audio/ogg; codecs=opus")),
-        _ => weft::node_bail!("'{output_format}' is not an output format these nodes declare"),
+        _ => Err(weft::WeftError::Input(format!(
+            "'{output_format}' is not an output format these nodes declare"
+        ))),
     }
 }
 

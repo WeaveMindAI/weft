@@ -2,19 +2,18 @@
 //! (`Route`, `Socket`). A PASSIVE PublicEntry kind: the listener only
 //! registers the in-RAM entry and returns the routing shape (the route
 //! pattern + methods, and the auth gate: open, or a connection the caller
-//! is verified against). It owns NO background task (`spawn_task` returns
-//! `None`) and is NOT driven through `process_entry` (held connections are
-//! not the read-body-return model).
+//! is verified against). It needs nothing between fires and is NOT driven
+//! through `process_entry` (held connections are not the
+//! read-body-return model).
 //!
-//! The connection itself is held by the worker, routed there through the
-//! gateway by the dispatcher's control handshake; the listener's role is
-//! purely registration. The two kinds differ only by protocol (which the
+//! The connection itself is held by the worker, reached through the
+//! install's live door after the dispatcher's control handshake; the
+//! listener's role is purely registration. The two kinds differ only by protocol (which the
 //! dispatcher derives from the tag), so ONE handler impl serves both,
 //! registered once per tag.
 
 use anyhow::Result;
 use serde_json::Value;
-use tokio::task::JoinHandle;
 use weft_core::primitive::{SignalRouting, SignalSpec, SignalSurface};
 use weft_core::signal::{LiveConnectionConfig, Route, Signal, Socket};
 
@@ -23,7 +22,7 @@ use async_trait::async_trait;
 use weft_core::signal::listener_protocol::{ProcessOutcome, ProcessTarget};
 use crate::registry::RegisteredSignal;
 
-use super::{KindHandler, SpawnCtx};
+use super::{BetweenFires, KindHandler};
 
 /// One handler instance per live-caller tag. The behavior is identical
 /// across tags; only `tag` differs (the dispatcher recovers the protocol
@@ -38,6 +37,10 @@ impl KindHandler for LiveCallerHandler {
         self.tag
     }
 
+    fn between_fires(&self) -> BetweenFires {
+        BetweenFires::Called
+    }
+
     fn compute_routing(&self, spec: &SignalSpec) -> Result<SignalRouting> {
         let parsed = parse(spec)?;
         let surface = SignalSurface::PublicEntry { path: parsed.path, methods: parsed.methods };
@@ -46,15 +49,6 @@ impl KindHandler for LiveCallerHandler {
         Ok(SignalRouting::public_entry(surface, &parsed.auth))
     }
 
-    async fn spawn_task(
-        &self,
-        _spec: &SignalSpec,
-        _kind_state: &Value,
-        _ctx: SpawnCtx,
-    ) -> Result<Option<JoinHandle<()>>> {
-        // Passive: the worker holds the connection, not the listener.
-        Ok(None)
-    }
 
     fn process_entry(
         &self,
@@ -162,9 +156,9 @@ mod tests {
             node_id: "n".into(),
             tenant_id: "t".into(),
             is_resume: false,
-            color: None,
-            placement_generation: 0,
+            execution_id: None,
             task: None,
+            kind_state: None,
             routing: SignalRouting {
                 surface: SignalSurface::PublicEntry { path: "chat".into(), methods: Vec::new() },
                 auth: SignalAuth::None,

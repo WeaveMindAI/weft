@@ -3,7 +3,7 @@
 //! spec's test call, an OAuth token exchange, a `remote_select`
 //! lookup, an app mint). They run on the broker, whose network egress
 //! is locked to "public internet only", so a crafted URL pointing
-//! inside the cluster dies at the network layer. The dispatcher stays
+//! inside the install dies at the network layer. The dispatcher stays
 //! the editor's authenticated front door and forwards here with its SA
 //! token, exactly like the runtime-file admin verbs.
 //!
@@ -366,7 +366,7 @@ async fn lookup(
     let mut resolved = weft_access_store::resolve_for_worker(
         &state.pool,
         &req.tenant,
-        weft_access_store::GrantUser::of(inner.for_member.as_ref()),
+        weft_access_store::GrantUser::of(inner.for_instance.as_ref()),
         access_id,
         service,
         &[],
@@ -427,7 +427,7 @@ async fn granted(
     weft_access_store::granted_items(
         &state.pool,
         &req.tenant,
-        weft_access_store::GrantUser::of(req.inner.for_member.as_ref()),
+        weft_access_store::GrantUser::of(req.inner.for_instance.as_ref()),
         req.inner.access_id,
         &req.inner.service,
         &req.inner.from,
@@ -446,10 +446,10 @@ async fn granted(
 struct PickerTokenQuery {
     access_id: uuid::Uuid,
     service: String,
-    /// The member the pick is for (the session opened at their door);
+    /// The instance the pick is for (the session opened at its door);
     /// `None`: the author.
     #[serde(default)]
-    for_member: Option<weft_core::member::MemberScope>,
+    for_instance: Option<weft_core::instance::InstanceScope>,
 }
 
 #[derive(Serialize)]
@@ -476,7 +476,7 @@ async fn picker_token(
     let resolved = weft_access_store::resolve_for_worker(
         &state.pool,
         &req.tenant,
-        weft_access_store::GrantUser::of(req.inner.for_member.as_ref()),
+        weft_access_store::GrantUser::of(req.inner.for_instance.as_ref()),
         req.inner.access_id,
         &req.inner.service,
         &[],
@@ -484,8 +484,8 @@ async fn picker_token(
     )
     .await
     .map_err(crate::handlers::store_err)?;
-    // The resolve above already went through the member's own project.
-    weft_access_store::own_connection_gate(&resolved.owner, None, req.inner.for_member.as_ref())
+    // The resolve above already went through the instance's own project.
+    weft_access_store::own_connection_gate(&resolved.owner, None, req.inner.for_instance.as_ref())
         .map_err(|why| (StatusCode::FORBIDDEN, why.to_string()))?;
     // The same one-string derivation as `OpenedConnection::credential`:
     // exactly one auth step interpolating exactly one stored value.

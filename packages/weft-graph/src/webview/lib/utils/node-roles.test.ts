@@ -42,9 +42,9 @@ describe('the project-level questions count through includes', () => {
     expect(projectHasInfra(infra)).toBe(true);
   });
 
-  it('leaves out a per-member node, whose copies are each member\'s to run', () => {
-    const trigger = { nodeType: 'Route', features: { isTrigger: true }, perMember: 'marked' as const };
-    const infra = { nodeType: 'PostgresDatabase', requiresInfra: true, perMember: 'marked' as const };
+  it('leaves out a per-instance node, whose copies are each instance\'s to run', () => {
+    const trigger = { nodeType: 'Route', features: { isTrigger: true }, perInstance: 'marked' as const };
+    const infra = { nodeType: 'PostgresDatabase', requiresInfra: true, perInstance: 'marked' as const };
     expect(projectHasTriggers([trigger])).toBe(false);
     expect(projectHasInfra([infra])).toBe(false);
   });

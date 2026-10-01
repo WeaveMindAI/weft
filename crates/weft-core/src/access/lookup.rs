@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::member::MemberScope;
+use crate::instance::InstanceScope;
 use crate::node::Lookup;
 
 /// One page of lookup options, as the editor renders them.
@@ -35,10 +35,10 @@ pub struct LookupRequest {
     /// connection is involved at all, and no `service` either).
     #[serde(default)]
     pub access_id: Option<uuid::Uuid>,
-    /// The member this lookup is for (their own door); `None`: the
+    /// The instance this lookup is for (its own door); `None`: the
     /// author. Set by the dispatcher alone, never taken from the caller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub for_member: Option<MemberScope>,
+    pub for_instance: Option<InstanceScope>,
     /// The service `access_id` is a connection of; `None` with no
     /// connection.
     #[serde(default)]
@@ -62,10 +62,10 @@ pub struct LookupRequest {
 pub struct GrantedQuery {
     pub access_id: uuid::Uuid,
     pub service: String,
-    /// The member this read is for (their own door); `None`: the author.
+    /// The instance this read is for (its own door); `None`: the author.
     /// Set by the dispatcher alone, never taken from the caller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub for_member: Option<MemberScope>,
+    pub for_instance: Option<InstanceScope>,
     /// The stored value (captured at connect) holding the JSON array.
     pub from: String,
     /// Dotted path to one item's label (same vocabulary as [`Lookup`]).

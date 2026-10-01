@@ -14,6 +14,9 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("puts_the_content_and_emits_the_etag", puts),
         NodeTest::fake("a_dot_segment_key_is_refused", dot_segment),
+        NodeTest::fake("a_refused_upload_fails_the_run_when_error_is_unwired", refused_unwired),
+        NodeTest::fake("a_refused_upload_comes_out_on_error_when_it_is_wired", refused_wired),
+        NodeTest::fake("a_dot_segment_key_still_fails_the_run_when_error_is_wired", dot_segment_wired),
         NodeTest::live("one_real_put_list_get_delete_round_trip", "s3", live_round_trip)
             .with_fixture(fixture_spec(
                 "S3_BUCKET",
@@ -111,6 +114,41 @@ async fn dot_segment(rig: FakeRig) -> WeftResult<()> {
         .await;
     let err = outcome.result.expect_err("a dot segment must refuse").to_string();
     assert!(err.contains("path segment"), "{err}");
+    assert!(rig.requests().is_empty(), "nothing was sent");
+    Ok(())
+}
+
+/// The store refuses the PUT with a 403.
+fn refuse_the_upload(rig: &FakeRig) {
+    rig.respond_raw("PUT", "/pics/a.txt", 403, "application/xml", "<Error>AccessDenied</Error>");
+}
+
+fn put_inputs(rig: &FakeRig, key: &str) -> serde_json::Value {
+    json!({ "account": rig.access("s3"), "bucket": "pics", "key": key, "content": "x" })
+}
+
+async fn refused_unwired(rig: FakeRig) -> WeftResult<()> {
+    refuse_the_upload(&rig);
+    let err = rig.run(&S3PutObjectNode, put_inputs(&rig, "a.txt")).await.failure()?;
+    assert!(err.contains("AccessDenied"), "{err}");
+    Ok(())
+}
+
+async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
+    refuse_the_upload(&rig);
+    rig.wire_output("error");
+    let outcome = rig.run(&S3PutObjectNode, put_inputs(&rig, "a.txt")).await.ok()?;
+    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    assert!(error.contains("AccessDenied"), "{error}");
+    assert!(!outcome.outputs.contains_key("etag"), "a caught failure emits no etag");
+    Ok(())
+}
+
+/// A `..` key is a mistake in the program, never a value for `error`.
+async fn dot_segment_wired(rig: FakeRig) -> WeftResult<()> {
+    rig.wire_output("error");
+    let err = rig.run(&S3PutObjectNode, put_inputs(&rig, "a/../b.txt")).await.failure()?;
+    assert!(err.starts_with("input error"), "{err}");
     assert!(rig.requests().is_empty(), "nothing was sent");
     Ok(())
 }

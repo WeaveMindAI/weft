@@ -4,6 +4,8 @@ Serves the two routes the platform needs:
   - GET /health  -> 200, the readiness probe target.
   - GET /outputs -> a flat JSON object whose keys become the node's output ports
                     (here: `status`). The key set matches metadata.json outputs.
+  - GET /crash   -> the process dies on the spot, the way a service crashes,
+                    so the rig can watch the unit come back.
 
 No dependencies (stdlib http.server), so the image builds with no build step.
 """
@@ -27,6 +29,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             self._send(200, {"status": "ok"})
+        elif self.path == "/crash":
+            os._exit(1)
         elif self.path == "/outputs":
             # Keys here become the node's output ports (see metadata.json).
             self._send(200, {"status": "ready"})
@@ -34,7 +38,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
     def log_message(self, *args):
-        # Quiet: the rig reads behavior through the dispatcher, not pod logs.
+        # Quiet: the rig reads behavior through the dispatcher, not container logs.
         pass
 
 

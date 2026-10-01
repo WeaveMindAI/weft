@@ -1,6 +1,6 @@
 //! `program_call` task: one call a program makes on its own project
 //! (`weft_core::program::ProgramCall`). The broker enqueued it for the
-//! asking run, pinned to that run's project; a dispatcher pod carries it
+//! asking run, pinned to that run's project; a dispatcher carries it
 //! out here, through the same functions the CLI and the editor reach, and
 //! the worker reads the answer off the task.
 //!
@@ -24,16 +24,17 @@ use axum::http::StatusCode;
 use serde_json::Value;
 
 use weft_core::activation::ActivationScope;
-use weft_core::member::{Copies, MemberId};
+use weft_core::instance::{Copies, InstanceId};
 use weft_core::program::{
-    ConnectionsForgotten, CostFilter, CostRecord, InfraCopy, InfraStartAnswer, MemberHoldings, MemberTrigger, ProgramCall,
-    ProgramCallOutcome, ProgramCallPayload, TokensRevoked,
+    ConnectionsForgotten, CostFilter, CostRecord, InfraCopy, InfraStartAnswer, InstanceHoldings, InstanceTrigger, ProgramCall,
+    ProgramCallOutcome, ProgramCallPayload, RunsCounted, TokensRevoked,
 };
 use weft_core::running_policy::DeactivateSpec;
-use weft_core::{Color, StopSelf};
+use weft_core::{ExecutionId, StopSelf};
 use weft_task_store::executor::TaskExecutor;
 use weft_task_store::tasks::Task;
 
+use crate::infra_lifecycle_command::TakeDown;
 use crate::state::DispatcherState;
 
 pub struct ProgramCallExecutor;
@@ -61,29 +62,31 @@ pub(crate) async fn run_call(
     payload: &ProgramCallPayload,
 ) -> Result<ProgramCallOutcome, CallError> {
     let asker = payload.by;
-    // What members' values, connections and tokens, and the project's
+    // What instances' values, connections and tokens, and the project's
     // runs, are keyed by: the project's owning tenant, read only by the
     // calls that reach them.
     let owner = || async {
-        crate::member_values::owning_tenant(state, project_id).await.map(crate::tenant::TenantId)
+        crate::instance_values::owning_tenant(state, project_id).await.map(crate::tenant::TenantId)
     };
     let answered = |value: Value| Ok(ProgramCallOutcome { value, stops_asker: false });
     match &payload.call {
-        ProgramCall::InfraStart { node, member } => {
-            let started = infra_start(state, project_id, node, member.as_ref()).await?;
+        ProgramCall::InfraStart { node, instance } => {
+            let started = infra_start(state, project_id, node, instance.as_ref()).await?;
             answered(serde_json::to_value(started).map_err(internal("answer"))?)
         }
-        ProgramCall::InfraStop { node, member, spec } => {
-            infra_down(state, project_id, node, member.as_ref(), InfraVerb::Stop, spec, asker, payload.stop_self).await
+        ProgramCall::InfraStop { node, instance, spec } => {
+            let stop = TakeDown::Stop { force: false };
+            infra_down(state, project_id, node, instance.as_ref(), stop, spec, asker, payload.stop_self).await
         }
-        ProgramCall::InfraTerminate { node, member, spec } => {
-            infra_down(state, project_id, node, member.as_ref(), InfraVerb::Terminate, spec, asker, payload.stop_self).await
+        ProgramCall::InfraTerminate { node, instance, spec, disks } => {
+            let terminate = TakeDown::Terminate { disks: *disks };
+            infra_down(state, project_id, node, instance.as_ref(), terminate, spec, asker, payload.stop_self).await
         }
-        ProgramCall::InfraStatus { node, member } => {
+        ProgramCall::InfraStatus { node, instance } => {
             let copy = observed_copies(state, project_id)
                 .await?
                 .into_iter()
-                .find(|copy| &copy.node == node && copy.member.as_ref() == member.as_ref());
+                .find(|copy| &copy.node == node && copy.instance.as_ref() == instance.as_ref());
             answered(serde_json::to_value(copy).map_err(internal("answer"))?)
         }
         ProgramCall::InfraCopies { node } => {
@@ -91,47 +94,47 @@ pub(crate) async fn run_call(
                 observed_copies(state, project_id).await?.into_iter().filter(|copy| &copy.node == node).collect();
             answered(serde_json::to_value(copies).map_err(internal("answer"))?)
         }
-        ProgramCall::MembersList => {
+        ProgramCall::InstancesList => {
             let tenant = owner().await?;
-            answered(serde_json::to_value(members(state, &tenant, project_id).await?).map_err(internal("answer"))?)
+            answered(serde_json::to_value(instances(state, &tenant, project_id).await?).map_err(internal("answer"))?)
         }
         ProgramCall::TriggerActivate { scope } => answered(triggers_activate(state, project_id, scope).await?),
         ProgramCall::TriggerDeactivate { scope, spec } => {
             triggers_deactivate(state, project_id, scope, spec, asker, payload.stop_self).await
         }
-        ProgramCall::ConnectionsList { member } => {
+        ProgramCall::ConnectionsList { instance } => {
             let tenant = owner().await?;
             let grants = weft_access_store::list_grants(
                 &state.pg_pool,
                 tenant.as_str(),
                 None,
-                weft_access_store::GrantOwnerScope::Member { project_id, member },
+                weft_access_store::GrantOwnerScope::Instance { project_id, instance },
             )
             .await
             .map_err(access_error)?;
             answered(serde_json::to_value(grants).map_err(internal("answer"))?)
         }
-        ProgramCall::ConnectionsForget { member } => {
+        ProgramCall::ConnectionsForget { instance } => {
             let tenant = owner().await?;
-            let forgotten = weft_access_store::forget_member_grants(&state.pg_pool, tenant.as_str(), project_id, member)
+            let forgotten = weft_access_store::forget_instance_grants(&state.pg_pool, tenant.as_str(), project_id, instance)
                 .await
                 .map_err(access_error)?;
             answered(serde_json::to_value(ConnectionsForgotten { forgotten }).map_err(internal("answer"))?)
         }
-        ProgramCall::ValuesGet { member } => {
+        ProgramCall::ValuesGet { instance } => {
             let tenant = owner().await?;
-            let values = weft_access_store::member_values(&state.pg_pool, tenant.as_str(), project_id, member)
+            let values = weft_access_store::instance_values(&state.pg_pool, tenant.as_str(), project_id, instance)
                 .await
                 .map_err(access_error)?;
             answered(serde_json::to_value(values).map_err(internal("answer"))?)
         }
-        ProgramCall::ValuesChange { member, set, clear } => {
+        ProgramCall::ValuesChange { instance, set, clear } => {
             let clear: Vec<(String, String)> = clear.iter().map(|f| (f.step.clone(), f.field.clone())).collect();
-            let changed = crate::member_values::change(state, owner().await?.as_str(), project_id, member, set, &clear).await?;
+            let changed = crate::instance_values::change(state, owner().await?.as_str(), project_id, instance, set, &clear).await?;
             answered(serde_json::to_value(changed).map_err(internal("answer"))?)
         }
-        ProgramCall::ValuesForget { member } => {
-            let changed = crate::member_values::forget(state, owner().await?.as_str(), project_id, member).await?;
+        ProgramCall::ValuesForget { instance } => {
+            let changed = crate::instance_values::forget(state, owner().await?.as_str(), project_id, instance).await?;
             answered(serde_json::to_value(changed).map_err(internal("answer"))?)
         }
         ProgramCall::CostsList { filter } => {
@@ -146,27 +149,22 @@ pub(crate) async fn run_call(
             stop_asker(state, asker, stops_asker).await?;
             Ok(ProgramCallOutcome { value: serde_json::to_value(outcome).map_err(internal("answer"))?, stops_asker })
         }
-        ProgramCall::TokensRevoke { member, id } => {
+        ProgramCall::RunsList { filter, limit } => {
             let tenant = owner().await?;
-            let revoked = crate::journal::postgres::revoke_member_tokens(&state.pg_pool, tenant.as_str(), project_id, member, *id)
+            let page = crate::api::execution::list_runs(state, &tenant, project_id, filter, *limit).await?;
+            answered(serde_json::to_value(page).map_err(internal("answer"))?)
+        }
+        ProgramCall::RunsCount { filter } => {
+            let tenant = owner().await?;
+            let total = crate::api::execution::count_runs(state, &tenant, project_id, filter).await?;
+            answered(serde_json::to_value(RunsCounted { total }).map_err(internal("answer"))?)
+        }
+        ProgramCall::TokensRevoke { instance, id } => {
+            let tenant = owner().await?;
+            let revoked = crate::journal::postgres::revoke_instance_tokens(&state.pg_pool, tenant.as_str(), project_id, instance, *id)
                 .await
                 .map_err(internal("revoke tokens"))?;
             answered(serde_json::to_value(TokensRevoked { revoked }).map_err(internal("answer"))?)
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum InfraVerb {
-    Stop,
-    Terminate,
-}
-
-impl InfraVerb {
-    fn lifecycle(self) -> weft_broker_client::protocol::InfraLifecycleVerb {
-        match self {
-            InfraVerb::Stop => weft_broker_client::protocol::InfraLifecycleVerb::Stop,
-            InfraVerb::Terminate => weft_broker_client::protocol::InfraLifecycleVerb::Terminate,
         }
     }
 }
@@ -183,14 +181,14 @@ async fn infra_start(
     state: &DispatcherState,
     project_id: uuid::Uuid,
     node: &str,
-    member: Option<&MemberId>,
+    instance: Option<&InstanceId>,
 ) -> Result<InfraStartAnswer, CallError> {
-    // The node must be one this member has a copy of: refused now, to
+    // The node must be one this instance has a copy of: refused now, to
     // the program, naming the fix.
     let project = load_project(state, project_id).await?;
-    crate::api::infra::resolve_infra_nodes(&project, &[node.to_string()], member)?;
+    crate::api::infra::resolve_infra_nodes(&project, &[node.to_string()], instance)?;
     let copies = crate::infra_node::observe(&state.pg_pool, project_id, &project).await.map_err(internal("infra copies"))?;
-    match copies.status_of(node, member) {
+    match copies.status_of(node, instance) {
         Some(crate::infra_node::InfraNodeStatus::Running) => {
             return Ok(InfraStartAnswer::AlreadyRunning);
         }
@@ -205,8 +203,8 @@ async fn infra_start(
     // waiting here for that move would wait on the asker itself. A start
     // never takes a run down, so the old workers drain instead of
     // cancelling.
-    let body = crate::api::infra::SyncRequest {
-        member: member.cloned(),
+    let body = weft_core::infra::wire::SyncRequest {
+        instance: instance.cloned(),
         nodes: vec![node.to_string()],
         running: weft_core::running_policy::RunningChoice {
             running_policy: Some(weft_core::running_policy::RunningPolicy::Wait),
@@ -245,10 +243,10 @@ async fn infra_down(
     state: &DispatcherState,
     project_id: uuid::Uuid,
     node: &str,
-    member: Option<&MemberId>,
-    verb: InfraVerb,
+    instance: Option<&InstanceId>,
+    take_down: TakeDown,
     spec: &DeactivateSpec,
-    asker: Color,
+    asker: ExecutionId,
     stop_self: StopSelf,
 ) -> Result<ProgramCallOutcome, CallError> {
     spec.validate().map_err(|m| (StatusCode::BAD_REQUEST, m.to_string()))?;
@@ -258,18 +256,23 @@ async fn infra_down(
     // A start of this copy still in its setup run would issue its apply
     // after the command below and bring the copy back up: the take-down
     // is the later intent, so the start ends here.
-    let cancelled_start = !pending.setups_starting(node, member).is_empty();
-    for setup in pending.setups_starting(node, member) {
-        crate::api::execution::cancel_color(state, setup, &weft_core::exec::CancelCause::User)
+    let cancelled_start = !pending.setups_starting(node, instance).is_empty();
+    for setup in pending.setups_starting(node, instance) {
+        crate::api::execution::cancel_execution_id(state, setup, &weft_core::exec::CancelCause::User)
             .await
             .map_err(internal("cancel the copy's start"))?;
     }
     use crate::infra_node::InfraNodeStatus;
-    let row = copies_now.rows.iter().find(|r| r.node_id == node && r.member.as_ref() == member).map(|r| r.status);
-    let already_down = match (row, verb) {
+    let row = copies_now.rows.iter().find(|r| r.node_id == node && r.instance.as_ref() == instance).map(|r| r.status);
+    // A terminate deleting every disk is never already done: a copy with
+    // no row, or one mid-terminate, may still hold the disks an earlier
+    // terminate kept, and only the supervisor's pass over the host can
+    // tell.
+    let already_down = match (row, take_down) {
+        (_, TakeDown::Terminate { disks: weft_core::infra::TerminateDisks::DeleteAll }) => false,
         (None, _) => true,
-        (Some(InfraNodeStatus::Stopped | InfraNodeStatus::Stopping), InfraVerb::Stop) => true,
-        (Some(InfraNodeStatus::Terminating), InfraVerb::Terminate) => true,
+        (Some(InfraNodeStatus::Stopped | InfraNodeStatus::Stopping), TakeDown::Stop { .. }) => true,
+        (Some(InfraNodeStatus::Terminating), TakeDown::Terminate { .. }) => true,
         (Some(_), _) => false,
     };
     if already_down {
@@ -278,7 +281,7 @@ async fn infra_down(
             stops_asker: false,
         });
     }
-    let copies = Copies::of(member.cloned());
+    let copies = Copies::of(instance.cloned());
     let nodes = std::collections::BTreeSet::from([node.to_string()]);
     let live_readers: Vec<weft_core::activation::ActivationKey> =
         crate::api::infra::activations_reading(state, project_id, &project, &nodes, &copies)
@@ -300,7 +303,7 @@ async fn infra_down(
         .await?;
     }
     let runs = crate::take_down::live_runs(state, project_id).await.map_err(internal("live runs"))?;
-    let asker_uses_it = crate::take_down::runs_using_copies(&copies, &runs, None).iter().any(|r| r.color == asker);
+    let asker_uses_it = crate::take_down::runs_using_copies(&copies, &runs, None).iter().any(|r| r.execution_id == asker);
     crate::api::infra::settle_running_before_infra_op(
         state,
         project_id,
@@ -311,14 +314,13 @@ async fn infra_down(
     )
     .await?;
     let drain = spec.drain_timeout_secs.unwrap_or(weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS);
-    let command_id = crate::api::infra::issue_lifecycle_ensuring_supervisor(
+    let command_id = crate::api::infra::issue_lifecycle_kicking_supervisor(
         state,
         project_id,
         Some(node),
         &copies,
-        verb.lifecycle(),
+        take_down,
         spec.running_policy,
-        false,
         drain,
     )
     .await?;
@@ -345,7 +347,7 @@ async fn triggers_activate(state: &DispatcherState, project_id: uuid::Uuid, scop
     if keys.iter().all(active) {
         return Ok(serde_json::json!({ "activated": false, "already": "active" }));
     }
-    let request = crate::api::project::ActivateRequest { scope: scope.clone(), ..Default::default() };
+    let request = weft_core::activation::ActivateRequest { scope: scope.clone(), ..Default::default() };
     let answer =
         crate::api::project::activate_with(state, project_id, request, crate::api::project::ActivateAsker::Run)
             .await
@@ -361,7 +363,7 @@ async fn triggers_deactivate(
     project_id: uuid::Uuid,
     scope: &ActivationScope,
     spec: &DeactivateSpec,
-    asker: Color,
+    asker: ExecutionId,
     stop_self: StopSelf,
 ) -> Result<ProgramCallOutcome, CallError> {
     let project = state
@@ -373,7 +375,7 @@ async fn triggers_deactivate(
     let keys = scope.resolve(&project).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let target = crate::take_down::TakeDownTarget::Activations(keys);
     let runs = crate::take_down::live_runs(state, project_id).await.map_err(internal("live runs"))?;
-    let asker_fired = crate::take_down::affected_runs(&target, &runs, None).iter().any(|r| r.color == asker);
+    let asker_fired = crate::take_down::affected_runs(&target, &runs, None).iter().any(|r| r.execution_id == asker);
     crate::take_down::take_down(state, project_id, &target, spec, false, Some(asker)).await?;
     let stops_asker = stop_self == StopSelf::Include && asker_fired;
     stop_asker(state, asker, stops_asker).await?;
@@ -382,9 +384,9 @@ async fn triggers_deactivate(
 
 /// Cancel the asking run when its own call reaches it and it asked to be
 /// stopped with the rest. Its worker is waiting for exactly this.
-async fn stop_asker(state: &DispatcherState, asker: Color, stops: bool) -> Result<(), CallError> {
+async fn stop_asker(state: &DispatcherState, asker: ExecutionId, stops: bool) -> Result<(), CallError> {
     if stops {
-        crate::api::execution::cancel_color(state, asker, &weft_core::exec::CancelCause::User)
+        crate::api::execution::cancel_execution_id(state, asker, &weft_core::exec::CancelCause::User)
             .await
             .map_err(internal("cancel the asking run"))?;
     }
@@ -397,7 +399,7 @@ async fn asker_matches_filter(
     state: &DispatcherState,
     project_id: uuid::Uuid,
     filter: &weft_core::program::RunFilter,
-    asker: Color,
+    asker: ExecutionId,
 ) -> Result<bool, CallError> {
     let Some(run) = state.journal.execution_summary(asker).await.map_err(internal("the asking run"))? else {
         return Ok(false);
@@ -408,27 +410,27 @@ async fn asker_matches_filter(
         None => true,
     };
     Ok(run.project_id == project_id
-        && filter.member.as_ref().is_none_or(|m| run.member.as_ref() == Some(m))
-        && filter.status.as_deref().is_none_or(|s| s == "running")
+        && filter.instance.as_ref().is_none_or(|m| run.instance.as_ref() == Some(m))
+        && filter.status.is_none_or(|s| s.reaches(weft_core::program::RunStatus::Running.into()))
         && filter.node.as_deref().is_none_or(|n| n == run.entry_node)
         && filter.older_than_secs.is_none_or(|secs| run.started_at <= now.saturating_sub(secs))
         && tagged)
 }
 
-/// Cost records of the project's runs, filtered. The run's member is its
-/// `execution_color` row's, born with the run and never changed.
+/// Cost records of the project's runs, filtered. The run's instance is its
+/// `execution` row's, born with the run and never changed.
 async fn costs(state: &DispatcherState, project_id: uuid::Uuid, filter: &CostFilter) -> Result<Vec<CostRecord>, CallError> {
     let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT e.color, e.payload_json, ec.member_id \
-         FROM exec_event e JOIN execution_color ec ON ec.color = e.color \
+        "SELECT e.execution_id, e.payload_json, ec.instance_id \
+         FROM exec_event e JOIN execution ec ON ec.execution_id = e.execution_id \
          WHERE ec.project_id = $1 AND e.kind = 'cost_reported' \
-           AND ($2::text IS NULL OR ec.member_id = $2) \
-           AND ($3::text IS NULL OR e.color = $3) \
+           AND ($2::text IS NULL OR ec.instance_id = $2) \
+           AND ($3::text IS NULL OR e.execution_id = $3) \
            AND ($4::bigint IS NULL OR e.created_at >= $4) \
          ORDER BY e.id",
     )
     .bind(project_id)
-    .bind(filter.member.as_ref().map(|m| m.as_str()))
+    .bind(filter.instance.as_ref().map(|m| m.as_str()))
     .bind(filter.run.map(|r| r.to_string()))
     .bind(filter.since_unix.map(|s| s as i64))
     .fetch_all(&state.pg_pool)
@@ -436,9 +438,9 @@ async fn costs(state: &DispatcherState, project_id: uuid::Uuid, filter: &CostFil
     .map_err(internal("costs"))?;
     let project = state.projects.project(project_id).await.map_err(internal("project"))?;
     let mut out = Vec::new();
-    for (color, payload, member) in rows {
-        let color: Color = color.parse().map_err(internal("cost row color"))?;
-        let event = weft_journal::decode_event(color, &payload).map_err(internal("cost row"))?;
+    for (execution_id, payload, instance) in rows {
+        let execution_id: ExecutionId = execution_id.parse().map_err(internal("cost row execution"))?;
+        let event = weft_journal::decode_event(execution_id, &payload).map_err(internal("cost row"))?;
         let weft_journal::ExecEvent::CostReported { node_id, frames, service, model, amount_usd, origin, at_unix, .. } = event else {
             continue;
         };
@@ -456,8 +458,8 @@ async fn costs(state: &DispatcherState, project_id: uuid::Uuid, filter: &CostFil
             continue;
         }
         out.push(CostRecord {
-            run: color,
-            member: member.map(MemberId::new).transpose().map_err(internal("cost row member"))?,
+            run: execution_id,
+            instance: instance.map(InstanceId::new).transpose().map_err(internal("cost row instance"))?,
             node,
             service,
             model,
@@ -491,53 +493,53 @@ async fn observed_copies(state: &DispatcherState, project_id: uuid::Uuid) -> Res
         .into_iter()
         .map(|row| InfraCopy {
             node: row.node_id,
-            member: row.member,
+            instance: row.instance,
             status: row.status,
             failure: row.failure_message,
         })
-        .chain(copies.starting.into_iter().map(|(node, member)| InfraCopy {
+        .chain(copies.starting.into_iter().map(|(node, instance)| InfraCopy {
             node,
-            member,
+            instance,
             status: crate::infra_node::InfraNodeStatus::Provisioning,
             failure: None,
         }))
         .collect())
 }
 
-/// Every member weft holds anything for in the project, with what it
-/// holds (`MemberHoldings::merge` over each store's counts).
-async fn members(
+/// Every instance weft holds anything for in the project, with what it
+/// holds (`InstanceHoldings::merge` over each store's counts).
+async fn instances(
     state: &DispatcherState,
     tenant: &crate::tenant::TenantId,
     project_id: uuid::Uuid,
-) -> Result<Vec<MemberHoldings>, CallError> {
-    let values = weft_access_store::member_value_counts(&state.pg_pool, tenant.as_str(), project_id)
+) -> Result<Vec<InstanceHoldings>, CallError> {
+    let values = weft_access_store::instance_value_counts(&state.pg_pool, tenant.as_str(), project_id)
         .await
-        .map_err(internal("member values"))?;
-    let connections = weft_access_store::member_connection_counts(&state.pg_pool, tenant.as_str(), project_id)
+        .map_err(internal("instance values"))?;
+    let connections = weft_access_store::instance_connection_counts(&state.pg_pool, tenant.as_str(), project_id)
         .await
-        .map_err(internal("member connections"))?;
-    let tokens = crate::journal::postgres::member_token_counts(
+        .map_err(internal("instance connections"))?;
+    let tokens = crate::journal::postgres::instance_token_counts(
         &state.pg_pool,
         tenant.as_str(),
         project_id,
         crate::lease::now_unix(),
     )
     .await
-    .map_err(internal("member tokens"))?;
+    .map_err(internal("instance tokens"))?;
     let copies = observed_copies(state, project_id).await?;
-    let waiting = crate::api::signal::member_waits(&state.pg_pool, project_id).await.map_err(internal("waiting fires"))?;
-    let triggers: Vec<(MemberId, MemberTrigger)> = state
+    let waiting = crate::api::signal::instance_waits(&state.pg_pool, project_id).await.map_err(internal("waiting fires"))?;
+    let triggers: Vec<(InstanceId, InstanceTrigger)> = state
         .activations
         .list(project_id)
         .await
         .map_err(internal("activations"))?
         .into_iter()
         .filter_map(|a| {
-            let member = a.key.member()?.clone();
+            let instance = a.key.instance()?.clone();
             Some((
-                member,
-                MemberTrigger {
+                instance,
+                InstanceTrigger {
                     waiting: waiting.get(&a.key).cloned(),
                     trigger: a.key.trigger,
                     mode: a.lifecycle.mode(),
@@ -545,7 +547,7 @@ async fn members(
             ))
         })
         .collect();
-    Ok(MemberHoldings::merge(values, connections, tokens, copies, triggers))
+    Ok(InstanceHoldings::merge(values, connections, tokens, copies, triggers))
 }
 
 fn internal<E: std::fmt::Display>(what: &'static str) -> impl Fn(E) -> CallError {

@@ -90,5 +90,8 @@
       "type": "String",
       "description": "The posted message's timestamp id."
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

@@ -15,23 +15,22 @@
 //! hold no cost bookkeeping at all.
 
 use minillmlib::{
-    ChatNode, CompletionParameters, GeneratorInfo, Message, NodeCompletionParameters,
+    ChatNode, CompletionParameters, GeneratorInfo, Message, MiniLLMError, NodeCompletionParameters,
     ProviderSettings, ReasoningConfig, ToolChoice, ToolDefinition,
 };
 use serde_json::Value;
 
 use weft::node::NodeOutput;
 use weft::storage::media::{ExternalizePolicy, MediaForm};
-use weft::storage::StorageScope;
-use weft::{ExecutionContext, NodeErrExt, WeftResult};
+use weft::storage::{FileHandle, StorageScope};
+use weft::{ExecutionContext, NodeErrExt, WeftError, WeftResult};
 
 use super::chat;
 
 /// One assembled call: the generator (riding the opened connection's
 /// client), the per-call parameters, the conversation in stored form
-/// including this call's user message, and the `history` output's
-/// declared type (resolved up front so a missing declaration fails
-/// before the paid call, and both storage round-trips read one
+/// including this call's user message, and the package's `ChatHistory`
+/// type (resolved up front so both storage round-trips read one
 /// resolution). The connection itself is not held: its lease is the
 /// runtime's, released when the firing's body finishes, and the
 /// generator owns the signed client.
@@ -39,6 +38,13 @@ pub struct LlmCall {
     pub generator: GeneratorInfo,
     pub params: NodeCompletionParameters,
     pub stored: Vec<Value>,
+    /// The conversation file (`historyFile`) this call's turn is added
+    /// to, in place; `None` when no conversation came in.
+    history_file: Option<FileHandle>,
+    /// The system prompt the params configured: a conversation that
+    /// does not open with a system message gets it first, both in what
+    /// is sent and in the file the turn is written to.
+    system_prompt: String,
     /// Automatic cache placement is request-only. Saved history contains
     /// the author's marks, so the next call can choose fresh automatic ones.
     auto_cache: bool,
@@ -57,23 +63,42 @@ pub struct LlmCall {
 }
 
 impl LlmCall {
-    /// The error a failed call surfaces. A provider refusing a call
-    /// with reasoning off is told in the author's terms: the model
-    /// always reasons, so the switch has to go on; every other failure
-    /// passes through as it came.
-    pub fn call_error(&self, err: impl std::fmt::Display) -> weft::error::WeftError {
-        let text = err.to_string();
-        if self.reasoning_off && text.to_ascii_lowercase().contains("reason") {
-            return weft::node_error(format!(
-                "llm: {text}. This model always reasons; set `reasoning: true` on its params \
+    /// The error a failed call surfaces. With reasoning off, a provider
+    /// REFUSING the request (a client error: 4xx other than 408 and 429,
+    /// which are transient) whose message is about reasoning is told in
+    /// the author's terms: the model always reasons, so the switch has to
+    /// go on. That is a settings mistake (`Config`), which fails the run
+    /// even with `error` wired: retrying cannot help, the params must
+    /// change. Every other failure (a timeout, an overload, a 5xx whose
+    /// text happens to say "reason") stays a catchable node failure.
+    pub fn call_error(&self, err: MiniLLMError) -> WeftError {
+        if self.reasoning_off && refuses_reasoning_off(&err) {
+            return WeftError::Config(format!(
+                "llm: {err}. This model always reasons; set `reasoning: true` on its params \
                  (low effort unless you pick one)"
             ));
         }
-        weft::node_error(format!("llm: {text}"))
+        weft::node_error(format!("llm: {err}"))
     }
 }
 
-/// Read the node's shared inputs (`provider`, `params`, `history`,
+/// Whether `err` is the provider refusing the request over reasoning:
+/// an API error carrying a client status (the lib unwraps to the last
+/// attempt when it retried) whose provider message names reasoning.
+fn refuses_reasoning_off(err: &MiniLLMError) -> bool {
+    match err {
+        MiniLLMError::MaxRetriesExceeded(last) => refuses_reasoning_off(last),
+        MiniLLMError::Api { status, message } => {
+            (400..500).contains(status)
+                && *status != 408
+                && *status != 429
+                && message.to_ascii_lowercase().contains("reasoning")
+        }
+        _ => false,
+    }
+}
+
+/// Read the node's shared inputs (`provider`, `params`, `historyFile`,
 /// `prompt`, `media`, `tools`, `toolChoice`) into one ready-to-send
 /// call. Fails loudly on a provider object no provider node built.
 pub async fn assemble(ctx: &ExecutionContext) -> WeftResult<LlmCall> {
@@ -94,7 +119,9 @@ pub async fn assemble(ctx: &ExecutionContext) -> WeftResult<LlmCall> {
             let name: String = provider.get_or("name", "Custom".to_string())?;
             GeneratorInfo::custom(name, base_url, &model)
         }
-        other => weft::node_bail!("unknown LLM provider kind '{other}'"),
+        other => {
+            return Err(WeftError::Input(format!("unknown LLM provider kind '{other}'")))
+        }
     };
 
     // The lib's constructors read an ambient env key when one is set;
@@ -128,9 +155,12 @@ pub async fn assemble(ctx: &ExecutionContext) -> WeftResult<LlmCall> {
         None if kind == "custom" => {
             generator = generator.with_http_client(ctx.http().clone());
         }
-        None => weft::node_bail!(
-            "the wired LlmProvider object carries no connection; pick one on the provider node"
-        ),
+        None => {
+            return Err(WeftError::Input(
+                "the wired LlmProvider object carries no connection; pick one on the provider node"
+                    .to_string(),
+            ))
+        }
     };
 
     // The `params` input carries ONE plain object (the wired LlmParams
@@ -145,7 +175,8 @@ pub async fn assemble(ctx: &ExecutionContext) -> WeftResult<LlmCall> {
     fields.remove("reasoning");
     let wrote_max_tokens = fields.contains_key("maxTokens");
     let mut cp: CompletionParameters =
-        serde_json::from_value(Value::Object(fields)).node_err("completion parameters")?;
+        serde_json::from_value(Value::Object(fields))
+            .map_err(|e| WeftError::Input(format!("completion parameters: {e}")))?;
     // The lib fills a `maxTokens` of its own for an absent key; weft
     // sends one only when the author wrote it, so the provider's own
     // default applies otherwise (a wire that requires the field, the
@@ -177,8 +208,8 @@ pub async fn assemble(ctx: &ExecutionContext) -> WeftResult<LlmCall> {
     let tools: Vec<Value> = ctx.inputs.list("tools")?;
     let has_tools = !tools.is_empty();
     for tool in tools {
-        let def: ToolDefinition =
-            serde_json::from_value(tool).node_err("a wired tool is not a tool definition")?;
+        let def: ToolDefinition = serde_json::from_value(tool)
+            .map_err(|e| WeftError::Input(format!("a wired tool is not a tool definition: {e}")))?;
         cp = cp.with_tool(def);
     }
     // `toolChoice` declares a default ("auto"), so the bag always holds
@@ -199,27 +230,18 @@ pub async fn assemble(ctx: &ExecutionContext) -> WeftResult<LlmCall> {
         ncp = ncp.with_force_prepend(prepend);
     }
 
-    // The conversation in STORED form: the wired history (or a fresh
-    // one) plus this call's user message (prompt + media, media slots
-    // holding the stored-file values verbatim). No prompt (a tool-loop
-    // re-entry after appending tool results) appends nothing.
-    let mut stored: Vec<Value> = ctx.inputs.opt("history")?.unwrap_or_default();
-    // The system prompt SEEDS the conversation as its first message
-    // and rides the emitted history from then on (the lib treats a
-    // role-system message in the list as first-class). A history
-    // already opening with a system message is the truth and the
-    // params never re-insert (silently overriding it would make the
-    // sent conversation disagree with the emitted one); switching
-    // instructions mid-chain is an explicit act (append a system
-    // message via ChatHistoryAppend). A wired history built WITHOUT
-    // one still gets the seed, so a configured prompt is never
-    // silently dropped.
+    // Resolved here, before the paid call, so a conversation file is
+    // checked against it before anything is sent.
+    let history_ty = chat::history_type()?;
+
+    // The conversation in STORED form: the one the history file holds
+    // (none without one), put in shape for the provider, plus this
+    // call's user message (prompt + media, media slots holding the
+    // stored-file values verbatim). No prompt (a tool-loop re-entry
+    // after appending tool results) appends nothing.
+    let (mut stored, history_file) = chat::incoming_history(ctx, &history_ty).await?;
     let system_prompt: String = params.get_or("systemPrompt", String::new())?;
-    let opens_with_system =
-        stored.first().and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("system");
-    if !opens_with_system && !system_prompt.is_empty() {
-        stored.insert(0, chat::stored_message("system", &system_prompt, &[], None)?);
-    }
+    prepare_conversation(&mut stored, &system_prompt)?;
     let prompt: Option<String> = ctx.inputs.opt("prompt")?;
     let media: Vec<Value> = ctx.inputs.list("media")?;
     let mut new_turn = 0;
@@ -228,24 +250,41 @@ pub async fn assemble(ctx: &ExecutionContext) -> WeftResult<LlmCall> {
         new_turn = 1;
     }
     if stored.is_empty() {
-        weft::node_bail!("nothing to send: no prompt, no media, and no wired history");
+        return Err(WeftError::Input(
+            "nothing to send: no prompt, no media, and no conversation on historyFile".to_string(),
+        ));
     }
-    // Resolved here, before the paid call: a node type without a
-    // declared `history` output must fail before money is spent.
-    let history_ty = ctx
-        .output_type("history")
-        .ok_or_else(|| weft::node_error("the history output declares no type"))?;
-
     Ok(LlmCall {
         generator,
         params: ncp,
         stored,
+        history_file,
+        system_prompt,
         auto_cache: ctx.inputs.get_or("autoCache", true)?,
         new_turn,
         history_ty,
         announces_finish: kind != "custom",
         reasoning_off,
     })
+}
+
+/// Put a conversation in the shape this call sends and keeps, the same
+/// way whether it is the conversation just read or the file's content
+/// when the turn is written (another turn may have landed in between).
+/// The system prompt SEEDS a conversation that does not
+/// open with a system message (the lib treats a role-system message in
+/// the list as first-class); one already opening with a system message
+/// is the truth and the params never re-insert, since silently
+/// overriding it would make what is sent disagree with what is kept.
+/// Switching instructions mid-conversation is an explicit act (append a
+/// system message via ChatHistoryAppend).
+fn prepare_conversation(conversation: &mut Vec<Value>, system_prompt: &str) -> WeftResult<()> {
+    let opens_with_system =
+        conversation.first().and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("system");
+    if !opens_with_system && !system_prompt.is_empty() {
+        conversation.insert(0, chat::stored_message("system", system_prompt, &[], None)?);
+    }
+    Ok(())
 }
 
 /// The WIRE form of the stored conversation: media slots become
@@ -256,6 +295,12 @@ pub async fn assemble(ctx: &ExecutionContext) -> WeftResult<LlmCall> {
 /// leaf the completion runs on.
 pub async fn to_wire(ctx: &ExecutionContext, llm: &LlmCall) -> WeftResult<ChatNode> {
     let mut request = llm.stored.clone();
+    // A tool call left without its answer (a run stopped between the
+    // call and its result, or another run sharing the file still mid
+    // tool call) is answered as cancelled in what is SENT only, so the
+    // provider takes the conversation; the file never holds a synthetic
+    // answer, which would give that call two once its real result lands.
+    chat::answer_unanswered_tool_calls(&mut request);
     if llm.auto_cache {
         chat::auto_cache_marks(&mut request, llm.new_turn);
     }
@@ -296,10 +341,18 @@ pub async fn to_wire(ctx: &ExecutionContext, llm: &LlmCall) -> WeftResult<ChatNo
 /// assistant message and internalize the conversation back into stored
 /// form (any raw reply media becomes storage references; everything
 /// already stored passes through untouched), and set the shared
-/// output ports (`history`, and `toolCalls` only when the model
+/// output ports (the conversation, and `toolCalls` only when the model
 /// actually called tools, so a downstream tool branch stays
 /// structurally dead on a plain reply). The caller sets its own
 /// `response` port on the returned output.
+///
+/// The conversation is kept in a file, never on a wire: this call's
+/// turn (its user message and the reply) is added to the end of the
+/// `historyFile` that came in, in place, and that same file goes out on
+/// `historyFile`, so a conversation grows turn after turn whatever its
+/// size. With no file in, a wired `historyFile` output starts a new
+/// conversation file holding this turn, kept past the run; unwired, the call
+/// is a one-shot and keeps nothing.
 pub async fn finish(
     ctx: &ExecutionContext,
     llm: LlmCall,
@@ -307,15 +360,26 @@ pub async fn finish(
     output: NodeOutput,
 ) -> WeftResult<NodeOutput> {
     ensure_reply_substance(response, llm.announces_finish)?;
-    let mut stored = llm.stored;
     let assistant = serde_json::to_value(response.to_assistant_message())
         .node_err("serializing the assistant message")?;
-    stored.push(assistant);
-    let stored_history = ctx
-        .storage(StorageScope::Project)
-        .internalize(&Value::Array(stored), &llm.history_ty, None)
+    let mut output = output;
+    if llm.history_file.is_some() || ctx.is_output_wired("historyFile") {
+        let mut turn = llm.stored[llm.stored.len() - llm.new_turn..].to_vec();
+        turn.push(assistant);
+        // Raw media in the reply becomes storage references; what is
+        // already stored passes through untouched.
+        let turn = ctx
+            .storage(StorageScope::Project)
+            .internalize(&Value::Array(turn), &llm.history_ty, None)
+            .await?;
+        let turn = turn.as_array().cloned().node_err("the internalized turn is not a list")?;
+        let system_prompt = llm.system_prompt.clone();
+        let file = chat::append_turn(ctx, llm.history_file.as_ref(), &llm.history_ty, &turn, |conversation| {
+            prepare_conversation(conversation, &system_prompt)
+        })
         .await?;
-    let mut output = output.set("history", stored_history);
+        output = output.set("historyFile", file);
+    }
     if let Some(calls) = &response.tool_calls {
         if !calls.is_empty() {
             let calls = serde_json::to_value(calls).node_err("serializing tool calls")?;

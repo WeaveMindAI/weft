@@ -146,7 +146,7 @@
         });
 
         let project = bus_project();
-        let color = uuid::Uuid::new_v4();
+        let execution_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
 
         // Seed: ExecutionStarted(Fire) + a NodeKicked on the producer
@@ -154,7 +154,7 @@
         journal
             .record_event(
                 &ExecEvent::ExecutionStarted {
-                    color,
+                    execution_id,
                     project_id: project.id,
                     entry_node: "producer".into(),
                     phase: weft_core::context::Phase::Fire,
@@ -162,7 +162,8 @@
                     program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
                     subgraph: None,
                     seed: None,
-                    member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
+                    instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+                    run_class: weft_core::run_class::RunClass::Short,
                 },
                 None,
             )
@@ -171,7 +172,7 @@
         journal
             .record_event(
                 &ExecEvent::NodeKicked {
-                    color,
+                    execution_id,
                     node_id: "producer".into(), frames: vec![],
                     firing: false,
                     payload: None,
@@ -185,7 +186,7 @@
 
         let clients = clients(journal.clone());
 
-        let outcome = run_checked(Arc::new(project), catalog, color, journal.clone(), clients, CancellationFlag::new_arc(), None)
+        let outcome = run_checked(Arc::new(project), catalog, execution_id, journal.clone(), clients, CancellationFlag::new_arc(), None)
             .await
             .expect("run_one_execution ok");
 
@@ -299,22 +300,23 @@
             "edges": [], "groups": []
         }))
         .expect("waiter project");
-        let color = uuid::Uuid::new_v4();
+        let execution_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
         journal.record_event(&ExecEvent::ExecutionStarted {
-            color, project_id: project.id, entry_node: "waiter".into(),
+            execution_id, project_id: project.id, entry_node: "waiter".into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
-            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
+            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+            run_class: weft_core::run_class::RunClass::Short,
         }, None).await.unwrap();
         journal.record_event(&ExecEvent::NodeKicked {
-            color, node_id: "waiter".into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
+            execution_id, node_id: "waiter".into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
         }, None).await.unwrap();
 
         let clients = clients(journal.clone());
         let cancel = CancellationFlag::new_arc();
 
         let run = tokio::spawn(run_checked(
-            Arc::new(project), catalog, color, journal, clients, cancel.clone(), None,
+            Arc::new(project), catalog, execution_id, journal, clients, cancel.clone(), None,
         ));
         // Let the waiter reach its cursor wait, then cancel.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -551,21 +553,22 @@
     /// creator, run the execution with a bounded timeout (so a hang fails
     /// the test instead of the whole suite).
     async fn run_test(project: ProjectDefinition, creator: &str) -> ExecutionOutcome {
-        let color = uuid::Uuid::new_v4();
+        let execution_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
         journal.record_event(&ExecEvent::ExecutionStarted {
-            color, project_id: project.id, entry_node: creator.into(),
+            execution_id, project_id: project.id, entry_node: creator.into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
-            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
+            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+            run_class: weft_core::run_class::RunClass::Short,
         }, None).await.unwrap();
         journal.record_event(&ExecEvent::NodeKicked {
-            color, node_id: creator.into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
+            execution_id, node_id: creator.into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
         }, None).await.unwrap();
         let clients = clients(journal.clone());
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
             run_checked(
-                Arc::new(project), configurable_catalog(), color, journal, clients,
+                Arc::new(project), configurable_catalog(), execution_id, journal, clients,
                 CancellationFlag::new_arc(), None,
             ),
         )
@@ -574,15 +577,11 @@
         .expect("run_one_execution ok")
     }
 
-    /// A node body that PANICS must NOT re-run forever. The panicked
-    /// task never sends a NodeTaskResult, so before the task-id fix its
-    /// exec record stayed Running, the crashed-Running refold path
-    /// re-dispatched it on every respawn, and the node panicked in a
-    /// tight loop until the refetch wall-clock deadline (the execution
-    /// effectively hung). Now the loop maps the JoinError's task id back
-    /// to (node, frames) and journals a terminal NodeFailed, so the
-    /// execution unwinds promptly. The 10s timeout in `run_test` is the
-    /// hang tripwire.
+    /// A node body that PANICS fails its firing. The panicked task
+    /// never sends a NodeTaskResult; the loop maps the JoinError's task
+    /// id back to (node, frames) and journals a terminal NodeFailed, so
+    /// the execution unwinds promptly instead of leaving the record
+    /// Running. The 10s timeout in `run_test` is the hang tripwire.
     #[tokio::test]
     async fn panicking_node_body_fails_instead_of_re_running_forever() {
         let project = bus_topology("a", &[], "ch");
@@ -1039,15 +1038,16 @@
                 })
             }));
 
-            let color = uuid::Uuid::new_v4();
+            let execution_id = uuid::Uuid::new_v4();
             let journal = Arc::new(MemJournal::default());
             journal.record_event(&ExecEvent::ExecutionStarted {
-                color, project_id: pid, entry_node: "payer".into(),
+                execution_id, project_id: pid, entry_node: "payer".into(),
                 phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
-            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
+            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+            run_class: weft_core::run_class::RunClass::Short,
             }, None).await.unwrap();
             journal.record_event(&ExecEvent::NodeKicked {
-                color, node_id: "payer".into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
+                execution_id, node_id: "payer".into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
             }, None).await.unwrap();
             let fake_access_broker = crate::context::FakeAccessBroker::new();
             // Runtime-owned on purpose: only an `Ours` credential is
@@ -1062,7 +1062,7 @@
             let clients = EngineClients { access_broker: fake_access_broker.clone(), ..clients(journal.clone()) };
             let cancel = CancellationFlag::new_arc();
             let run = tokio::spawn(run_checked(
-                Arc::new(project), configurable_catalog(), color, journal, clients, cancel.clone(), None,
+                Arc::new(project), configurable_catalog(), execution_id, journal, clients, cancel.clone(), None,
             ));
             ready_rx.await.expect("payer must reach its opened-access state");
             cancel.cancel_because(weft_core::exec::CancelCause::User);
@@ -1210,6 +1210,15 @@
     }
     #[async_trait]
     impl weft_task_store::TaskStoreClient for AwaitTasks {
+        async fn wait_cancels(
+            &self,
+            _project_id: uuid::Uuid,
+            _execution_ids: Vec<String>,
+            _wait: std::time::Duration,
+        ) -> anyhow::Result<Vec<weft_task_store::tasks::CancelAsked>> {
+            Ok(Vec::new())
+        }
+
         async fn enqueue_dedup(
             &self,
             t: weft_task_store::tasks::NewTask,
@@ -1270,14 +1279,14 @@
     /// test can inject a `SuspensionResolved` into the journal while the
     /// worker runs. Every node in `kicked` is seeded as an entry root
     /// (so a bus-holder and an independent await-node can both start).
-    /// Returns the join handle and the color.
+    /// Returns the join handle and the execution.
     fn spawn_run(
         project: ProjectDefinition,
         kicked: &[&str],
         journal: Arc<MemJournal>,
         tasks: Arc<dyn weft_task_store::TaskStoreClient>,
-    ) -> (tokio::task::JoinHandle<anyhow::Result<ExecutionOutcome>>, Color) {
-        let color = uuid::Uuid::new_v4();
+    ) -> (tokio::task::JoinHandle<anyhow::Result<ExecutionOutcome>>, ExecutionId) {
+        let execution_id = uuid::Uuid::new_v4();
         let entry = kicked[0].to_string();
         let kicked: Vec<String> = kicked.iter().map(|s| s.to_string()).collect();
         let pid = project.id;
@@ -1285,7 +1294,7 @@
         let handle = tokio::spawn(async move {
             j.record_event(
                 &ExecEvent::ExecutionStarted {
-                    color,
+                    execution_id,
                     project_id: pid,
                     entry_node: entry,
                     phase: weft_core::context::Phase::Fire,
@@ -1293,7 +1302,8 @@
                     program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
                     subgraph: None,
                     seed: None,
-                    member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
+                    instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+                    run_class: weft_core::run_class::RunClass::Short,
                 },
                 None,
             )
@@ -1302,7 +1312,7 @@
             for node_id in kicked {
                 j.record_event(
                     &ExecEvent::NodeKicked {
-                        color,
+                        execution_id,
                         node_id, frames: vec![],
                         firing: false,
                         payload: None,
@@ -1315,10 +1325,10 @@
                 .unwrap();
             }
             let clients = EngineClients { tasks, ..clients(j.clone()) };
-            run_checked(Arc::new(project), configurable_catalog(), color, j, clients, CancellationFlag::new_arc(), None)
+            run_checked(Arc::new(project), configurable_catalog(), execution_id, j, clients, CancellationFlag::new_arc(), None)
                 .await
         });
-        (handle, color)
+        (handle, execution_id)
     }
 
     /// BASELINE (no bus): a lone node awaits. With no bus holding it, the
@@ -1342,7 +1352,7 @@
         );
         let journal = Arc::new(MemJournal::default());
         let tasks = AwaitTasks::new();
-        let (handle, _color) =
+        let (handle, _execution_id) =
             spawn_run(project, &["waiter"], journal.clone(), tasks.clone());
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
             .await
@@ -1426,7 +1436,7 @@
 
         let journal = Arc::new(MemJournal::default());
         let tasks = AwaitTasks::new();
-        let (handle, color) =
+        let (handle, execution_id) =
             spawn_run(project, &["creator", "waiter"], journal.clone(), tasks.clone());
 
         // Wait until the waiter's await registered (token minted), give it
@@ -1441,7 +1451,7 @@
         journal
             .record_event(
                 &ExecEvent::SuspensionRegistered {
-                    color,
+                    execution_id,
                     node_id: "waiter".into(),
                     frames: vec![],
                     token: token.clone(),
@@ -1456,7 +1466,7 @@
         journal
             .record_event(
                 &ExecEvent::SuspensionResolved {
-                    color,
+                    execution_id,
                     token,
                     value: serde_json::json!({ "answer": 42 }),
                     at_unix: 0,
@@ -1552,7 +1562,7 @@
 
         let journal = Arc::new(MemJournal::default());
         let tasks = AwaitTasks::new();
-        let (handle, color) =
+        let (handle, execution_id) =
             spawn_run(project, &["creator", "waiter"], journal.clone(), tasks.clone());
 
         // Resolve the FIRST await (call_index 0).
@@ -1561,7 +1571,7 @@
         journal
             .record_event(
                 &ExecEvent::SuspensionRegistered {
-                    color, node_id: "waiter".into(), frames: vec![],
+                    execution_id, node_id: "waiter".into(), frames: vec![],
                     token: token0.clone(), spec: weft_core::signal::to_spec(human_form()),
                     call_index: 0, at_unix: 0,
                 },
@@ -1572,7 +1582,7 @@
         journal
             .record_event(
                 &ExecEvent::SuspensionResolved {
-                    color, token: token0.clone(),
+                    execution_id, token: token0.clone(),
                     value: serde_json::json!({ "answer": 1 }), at_unix: 0,
                 },
                 None,
@@ -1593,7 +1603,7 @@
         journal
             .record_event(
                 &ExecEvent::SuspensionRegistered {
-                    color, node_id: "waiter".into(), frames: vec![],
+                    execution_id, node_id: "waiter".into(), frames: vec![],
                     token: token1.clone(), spec: weft_core::signal::to_spec(human_form()),
                     call_index: 1, at_unix: 0,
                 },
@@ -1604,7 +1614,7 @@
         journal
             .record_event(
                 &ExecEvent::SuspensionResolved {
-                    color, token: token1,
+                    execution_id, token: token1,
                     value: serde_json::json!({ "answer": 2 }), at_unix: 0,
                 },
                 None,
@@ -1757,7 +1767,7 @@
         let tasks = AwaitTasks::new();
         // The waiter is pulse-fed, so it is NOT kicked: the feeders are the
         // kicked roots that produce its input pulses.
-        let (handle, color) = spawn_run(
+        let (handle, execution_id) = spawn_run(
             project,
             &["creator", "feeder1", "feeder2", "feeder3"],
             journal.clone(),
@@ -1770,7 +1780,7 @@
         journal
             .record_event(
                 &ExecEvent::SuspensionRegistered {
-                    color, node_id: "waiter".into(), frames: vec![],
+                    execution_id, node_id: "waiter".into(), frames: vec![],
                     token: token0.clone(), spec: weft_core::signal::to_spec(human_form()),
                     call_index: 0, at_unix: 0,
                 },
@@ -1781,7 +1791,7 @@
         journal
             .record_event(
                 &ExecEvent::SuspensionResolved {
-                    color, token: token0.clone(),
+                    execution_id, token: token0.clone(),
                     value: serde_json::json!({ "answer": 1 }), at_unix: 0,
                 },
                 None,
@@ -1802,7 +1812,7 @@
         // resume wakes the moment its row lands, so resolving earlier
         // would re-fire the waiter before b2 exists.
         loop {
-            let events = journal.events_for_color(color).await.unwrap();
+            let events = journal.events_for_execution_id(execution_id).await.unwrap();
             if events.iter().any(|e| matches!(e, ExecEvent::PortEmitted { node_id, .. } if node_id == "feeder3")) {
                 break;
             }
@@ -1811,7 +1821,7 @@
         journal
             .record_event(
                 &ExecEvent::SuspensionRegistered {
-                    color, node_id: "waiter".into(), frames: vec![],
+                    execution_id, node_id: "waiter".into(), frames: vec![],
                     token: token1.clone(), spec: weft_core::signal::to_spec(human_form()),
                     call_index: 1, at_unix: 0,
                 },
@@ -1822,7 +1832,7 @@
         journal
             .record_event(
                 &ExecEvent::SuspensionResolved {
-                    color, token: token1,
+                    execution_id, token: token1,
                     value: serde_json::json!({ "answer": 2 }), at_unix: 0,
                 },
                 None,
@@ -1903,7 +1913,7 @@
 
         let journal = Arc::new(MemJournal::default());
         let tasks = AwaitTasks::new();
-        let (handle, _color) =
+        let (handle, _execution_id) =
             spawn_run(project, &["creator", "waiter"], journal.clone(), tasks.clone());
 
         // No SuspensionResolved is injected. The worker must exit Stalled
@@ -1985,14 +1995,14 @@
 
             let journal = Arc::new(MemJournal::default());
             let tasks = AwaitTasks::new();
-            let (handle, color) = spawn_run(project, &["producer"], journal.clone(), tasks);
+            let (handle, execution_id) = spawn_run(project, &["producer"], journal.clone(), tasks);
             tokio::time::timeout(std::time::Duration::from_secs(10), handle)
                 .await
                 .expect("must not hang")
                 .expect("join")
                 .expect("run ok");
 
-            let events = journal.events_for_color(color).await.unwrap();
+            let events = journal.events_for_execution_id(execution_id).await.unwrap();
             // The consumer must NEVER be skipped: its required `in` arrived
             // as a real value, not a closure.
             let consumer_skipped = events.iter().any(|e| {
@@ -2002,7 +2012,7 @@
             // And the consumer's firing must have seen the value on `in`:
             // what it received is the pulses it absorbed, read back
             // through the fold.
-            let mut fold = weft_journal::Fold::new(color, Arc::new(producer_consumer_project()));
+            let mut fold = weft_journal::Fold::new(execution_id, Arc::new(producer_consumer_project()));
             for e in &events {
                 fold.apply(e);
             }
@@ -2050,11 +2060,11 @@
 
     /// Seed a journal with ExecutionStarted(Fire) + a NodeKicked on
     /// `entry`, the minimal state to make a no-input node ready.
-    async fn seed(journal: &MemJournal, color: Color, project: &ProjectDefinition, entry: &str) {
+    async fn seed(journal: &MemJournal, execution_id: ExecutionId, project: &ProjectDefinition, entry: &str) {
         journal
             .record_event(
                 &ExecEvent::ExecutionStarted {
-                    color,
+                    execution_id,
                     project_id: project.id,
                     entry_node: entry.into(),
                     phase: weft_core::context::Phase::Fire,
@@ -2062,7 +2072,8 @@
                     program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
                     subgraph: None,
                     seed: None,
-                    member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
+                    instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+                    run_class: weft_core::run_class::RunClass::Short,
                 },
                 None,
             )
@@ -2070,7 +2081,7 @@
             .unwrap();
         journal
             .record_event(
-                &ExecEvent::NodeKicked { color, node_id: entry.into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0 },
+                &ExecEvent::NodeKicked { execution_id, node_id: entry.into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0 },
                 None,
             )
             .await
@@ -2084,10 +2095,10 @@
         project: ProjectDefinition,
         catalog: Arc<dyn NodeCatalog>,
         journal: Arc<MemJournal>,
-        color: Color,
+        execution_id: ExecutionId,
         caller: Option<Arc<dyn CallerConnection>>,
     ) -> ExecutionOutcome {
-        run_with_caller_tasks(project, catalog, journal, color, caller, Arc::new(NoopTasks)).await
+        run_with_caller_tasks(project, catalog, journal, execution_id, caller, Arc::new(NoopTasks)).await
     }
 
     /// As `run_with_caller` but with an explicit tasks client (await_signal
@@ -2097,12 +2108,12 @@
         project: ProjectDefinition,
         catalog: Arc<dyn NodeCatalog>,
         journal: Arc<MemJournal>,
-        color: Color,
+        execution_id: ExecutionId,
         caller: Option<Arc<dyn CallerConnection>>,
         tasks: Arc<dyn weft_task_store::TaskStoreClient>,
     ) -> ExecutionOutcome {
         let clients = EngineClients { tasks, ..clients(journal.clone()) };
-        run_checked(Arc::new(project), catalog, color, journal, clients, CancellationFlag::new_arc(), caller)
+        run_checked(Arc::new(project), catalog, execution_id, journal, clients, CancellationFlag::new_arc(), caller)
             .await
             .expect("run_one_execution ok")
     }
@@ -2313,14 +2324,14 @@
             b: Box::leak(Box::new(Drainer)),
         });
 
-        let color = uuid::Uuid::new_v4();
+        let execution_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
-        seed(&journal, color, &project, "producer").await;
+        seed(&journal, execution_id, &project, "producer").await;
         let fake = FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, false));
         for i in 0..3 { fake.push_inbound(InboundMessage::Json(json!({ "i": i }))); }
 
         let outcome = run_with_caller(
-            project, catalog, journal.clone(), color,
+            project, catalog, journal.clone(), execution_id,
             Some(fake.clone() as Arc<dyn CallerConnection>),
         ).await;
         assert!(matches!(outcome, ExecutionOutcome::Completed), "got {outcome:?}");
@@ -2340,7 +2351,7 @@
 
     /// Broadcast: two reader nodes on ONE caller both see every inbound
     /// message (per-reader cursor), neither steals from the other. This is
-    /// the in-process version of the cluster broadcast check.
+    /// the in-process version of the install broadcast check.
     #[tokio::test]
     async fn inbound_broadcasts_to_two_nodes() {
         let seen = Arc::new(StdMutex::new(Vec::new()));
@@ -2385,24 +2396,25 @@
             "edges": [], "groups": []
         })).expect("broadcast project");
 
-        let color = uuid::Uuid::new_v4();
+        let execution_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
         // Kick both reader nodes.
         journal.record_event(&ExecEvent::ExecutionStarted {
-            color, project_id: project.id, entry_node: "ra".into(),
+            execution_id, project_id: project.id, entry_node: "ra".into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("h".into()),
-            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, member: None, fired_trigger: None, member_values: Default::default(), at_unix: 0,
+            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+            run_class: weft_core::run_class::RunClass::Short,
         }, None).await.unwrap();
         for n in ["ra", "rb"] {
             journal.record_event(&ExecEvent::NodeKicked {
-                color, node_id: n.into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
+                execution_id, node_id: n.into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
             }, None).await.unwrap();
         }
         let fake = FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, false));
         for i in 0..2 { fake.push_inbound(InboundMessage::Json(json!({ "i": i }))); }
 
         let outcome = run_with_caller(
-            project, catalog, journal, color,
+            project, catalog, journal, execution_id,
             Some(fake.clone() as Arc<dyn CallerConnection>),
         ).await;
         assert!(matches!(outcome, ExecutionOutcome::Completed), "got {outcome:?}");
@@ -2421,13 +2433,13 @@
         let catalog: Arc<dyn NodeCatalog> =
             Arc::new(OneNodeCatalog { node: Box::leak(Box::new(HttpResponder)) });
         let project = single_node_project("HttpResponder");
-        let color = uuid::Uuid::new_v4();
+        let execution_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
-        seed(&journal, color, &project, "entry").await;
+        seed(&journal, execution_id, &project, "entry").await;
         let fake = FakeCallerConnection::connected(caller_cfg(Protocol::Http, false));
 
         let outcome = run_with_caller(
-            project, catalog, journal, color,
+            project, catalog, journal, execution_id,
             Some(fake.clone() as Arc<dyn CallerConnection>),
         ).await;
         assert!(matches!(outcome, ExecutionOutcome::Completed), "got {outcome:?}");
@@ -2446,14 +2458,14 @@
         let catalog: Arc<dyn NodeCatalog> =
             Arc::new(OneNodeCatalog { node: Box::leak(Box::new(CallerSender)) });
         let project = single_node_project("CallerSender");
-        let color = uuid::Uuid::new_v4();
+        let execution_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
-        seed(&journal, color, &project, "entry").await;
+        seed(&journal, execution_id, &project, "entry").await;
         // Caller-tied AND already disconnected: the send must error -> cancel.
         let fake = FakeCallerConnection::disconnected(caller_cfg(Protocol::Websocket, false));
 
         let outcome = run_with_caller(
-            project, catalog, journal, color,
+            project, catalog, journal, execution_id,
             Some(fake.clone() as Arc<dyn CallerConnection>),
         ).await;
         assert!(
@@ -2469,13 +2481,13 @@
         let catalog: Arc<dyn NodeCatalog> =
             Arc::new(OneNodeCatalog { node: Box::leak(Box::new(CallerSender)) });
         let project = single_node_project("CallerSender");
-        let color = uuid::Uuid::new_v4();
+        let execution_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
-        seed(&journal, color, &project, "entry").await;
+        seed(&journal, execution_id, &project, "entry").await;
         let fake = FakeCallerConnection::disconnected(caller_cfg(Protocol::Websocket, true));
 
         let outcome = run_with_caller(
-            project, catalog, journal, color,
+            project, catalog, journal, execution_id,
             Some(fake.clone() as Arc<dyn CallerConnection>),
         ).await;
         assert!(
@@ -2491,12 +2503,12 @@
         let catalog: Arc<dyn NodeCatalog> =
             Arc::new(OneNodeCatalog { node: Box::leak(Box::new(NeedsCaller)) });
         let project = single_node_project("NeedsCaller");
-        let color = uuid::Uuid::new_v4();
+        let execution_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
-        seed(&journal, color, &project, "entry").await;
+        seed(&journal, execution_id, &project, "entry").await;
 
         // No caller wired (None): the durable-run case.
-        let outcome = run_with_caller(project, catalog, journal, color, None).await;
+        let outcome = run_with_caller(project, catalog, journal, execution_id, None).await;
         assert!(
             matches!(outcome, ExecutionOutcome::Failed { .. }),
             "a node requiring a caller must fail loud on a caller-less run; got {outcome:?}"
@@ -2537,15 +2549,15 @@
         let catalog: Arc<dyn NodeCatalog> =
             Arc::new(OneNodeCatalog { node: Box::leak(Box::new(AwaiterNode)) });
         let project = single_node_project("Awaiter");
-        let color = uuid::Uuid::new_v4();
+        let execution_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
-        seed(&journal, color, &project, "entry").await;
+        seed(&journal, execution_id, &project, "entry").await;
         // Tied + connected + a 1s hold: no fire ever arrives, so it must
         // cancel after the hold (not Stall, not Complete).
         let fake = FakeCallerConnection::connected(caller_cfg_hold(false, 1));
 
         let outcome = run_with_caller_tasks(
-            project, catalog, journal.clone(), color,
+            project, catalog, journal.clone(), execution_id,
             Some(fake.clone() as Arc<dyn CallerConnection>), AwaitTasks::new(),
         ).await;
         assert!(
@@ -2555,7 +2567,7 @@
         // Non-durability: the terminal journal event is a cancellation, NOT
         // a clean suspension that a later fire could resume.
         let has_cancel = journal.events.lock().unwrap().iter().any(|e| matches!(
-            e, ExecEvent::ExecutionCancelled { color: c, .. } if *c == color));
+            e, ExecEvent::ExecutionCancelled { execution_id: c, .. } if *c == execution_id));
         assert!(has_cancel, "tied live run must journal a cancellation (non-durable)");
     }
 
@@ -2567,9 +2579,9 @@
         let catalog: Arc<dyn NodeCatalog> =
             Arc::new(OneNodeCatalog { node: Box::leak(Box::new(AwaiterNode)) });
         let project = single_node_project("Awaiter");
-        let color = uuid::Uuid::new_v4();
+        let execution_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
-        seed(&journal, color, &project, "entry").await;
+        seed(&journal, execution_id, &project, "entry").await;
         let fake = FakeCallerConnection::connected(caller_cfg_hold(false, 600));
         let hang_up = fake.clone();
         tokio::spawn(async move {
@@ -2580,7 +2592,7 @@
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             run_with_caller_tasks(
-                project, catalog, journal, color,
+                project, catalog, journal, execution_id,
                 Some(fake.clone() as Arc<dyn CallerConnection>), AwaitTasks::new(),
             ),
         )
@@ -2601,13 +2613,13 @@
         let catalog: Arc<dyn NodeCatalog> =
             Arc::new(OneNodeCatalog { node: Box::leak(Box::new(AwaiterNode)) });
         let project = single_node_project("Awaiter");
-        let color = uuid::Uuid::new_v4();
+        let execution_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
-        seed(&journal, color, &project, "entry").await;
+        seed(&journal, execution_id, &project, "entry").await;
         let fake = FakeCallerConnection::connected(caller_cfg_hold(true, 1));
 
         let outcome = run_with_caller_tasks(
-            project, catalog, journal, color,
+            project, catalog, journal, execution_id,
             Some(fake.clone() as Arc<dyn CallerConnection>), AwaitTasks::new(),
         ).await;
         assert!(
@@ -2645,13 +2657,13 @@
         let catalog: Arc<dyn NodeCatalog> =
             Arc::new(OneNodeCatalog { node: Box::leak(Box::new(CallerPlusEndpoint)) });
         let project = single_node_project("CallerPlusEndpoint");
-        let color = uuid::Uuid::new_v4();
+        let execution_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
-        seed(&journal, color, &project, "entry").await;
+        seed(&journal, execution_id, &project, "entry").await;
         let fake = FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, false));
 
         let outcome = run_with_caller(
-            project, catalog, journal, color,
+            project, catalog, journal, execution_id,
             Some(fake.clone() as Arc<dyn CallerConnection>),
         ).await;
         assert!(matches!(outcome, ExecutionOutcome::Completed), "got {outcome:?}");
@@ -2783,17 +2795,17 @@
             "groups": []
         })).expect("loop-caller project");
 
-        let color = uuid::Uuid::new_v4();
+        let execution_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
         // Kick the entry ListSource; it pulses the two-item list onto LoopIn.
-        seed(&journal, color, &project, "src").await;
+        seed(&journal, execution_id, &project, "src").await;
 
         let fake = FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, false));
         fake.push_inbound(InboundMessage::Json(json!("from-iter-0")));
         fake.push_inbound(InboundMessage::Json(json!("from-iter-1")));
 
         let outcome = run_with_caller(
-            project, catalog, journal, color,
+            project, catalog, journal, execution_id,
             Some(fake.clone() as Arc<dyn CallerConnection>),
         ).await;
         assert!(matches!(outcome, ExecutionOutcome::Completed), "got {outcome:?}");

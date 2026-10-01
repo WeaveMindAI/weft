@@ -33,17 +33,17 @@
     }
     #[async_trait]
     impl JournalClient for CapturingJournal {
-        async fn record_event(&self, event: &ExecEvent, _pod: Option<&str>) -> anyhow::Result<()> {
+        async fn record_event(&self, event: &ExecEvent, _instance: Option<&str>) -> anyhow::Result<()> {
             self.events.lock().unwrap().push(event.clone());
             Ok(())
         }
-        /// Every captured row (whatever its color), each numbered by its
+        /// Every captured row (whatever its execution), each numbered by its
         /// place, serialized the way the real journal stores them so a
         /// ferry-shaped consumer sees the same bytes. Never holds: the
         /// rig drives no waits.
         async fn raw_rows_after(
             &self,
-            _color: Color,
+            _execution_id: ExecutionId,
             after_id: i64,
             _wait: std::time::Duration,
         ) -> anyhow::Result<Vec<weft_journal::RawJournalRow>> {
@@ -60,7 +60,7 @@
                 .filter(|row| row.id > after_id)
                 .collect())
         }
-        async fn has_terminal_event(&self, _color: Color) -> anyhow::Result<bool> {
+        async fn has_terminal_event(&self, _execution_id: ExecutionId) -> anyhow::Result<bool> {
             Ok(false)
         }
     }
@@ -83,13 +83,13 @@
     /// LoopIn's own start: what a real run holds before the loop rows,
     /// and what the fold rebuilds the instance from.
     fn rows_before_loop_in(lp: &LoopProject, bag_json: &serde_json::Value) -> Vec<ExecEvent> {
-        let color = uuid::Uuid::nil();
+        let execution_id = uuid::Uuid::nil();
         let mut rows = vec![ExecEvent::NodeStarted {
-            color, node_id: "producer".into(), frames: vec![], at_unix: 0,
+            execution_id, node_id: "producer".into(), frames: vec![], at_unix: 0,
         }];
         for (port, value) in bag_json.as_object().expect("bag fixture is an object") {
             rows.push(ExecEvent::PortEmitted {
-                color,
+                execution_id,
                 emission_id: uuid::Uuid::new_v4(),
                 node_id: "producer".into(),
                 frames: vec![],
@@ -99,8 +99,8 @@
                 at_unix: 0,
             });
         }
-        rows.push(ExecEvent::NodeCompleted { color, node_id: "producer".into(), frames: vec![], at_unix: 0 });
-        rows.push(ExecEvent::NodeStarted { color, node_id: lp.loop_in_id.clone(), frames: vec![], at_unix: 0 });
+        rows.push(ExecEvent::NodeCompleted { execution_id, node_id: "producer".into(), frames: vec![], at_unix: 0 });
+        rows.push(ExecEvent::NodeStarted { execution_id, node_id: lp.loop_in_id.clone(), frames: vec![], at_unix: 0 });
         rows
     }
 
@@ -190,12 +190,12 @@
                 },
             ],
             features: Default::default(),
-            requires_infra: false, per_member: None,
+            requires_infra: false, per_instance: None,
             fires_with: Default::default(),
             images: vec![],
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -248,12 +248,12 @@
                 declared_type: None,
             }],
             features: Default::default(),
-            requires_infra: false, per_member: None,
+            requires_infra: false, per_instance: None,
             fires_with: Default::default(),
             images: vec![],
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -293,12 +293,12 @@
                 declared_type: None,
             }],
             features: Default::default(),
-            requires_infra: false, per_member: None,
+            requires_infra: false, per_instance: None,
             fires_with: Default::default(),
             images: vec![],
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -329,12 +329,12 @@
             }]),
             outputs: vec![],
             features: Default::default(),
-            requires_infra: false, per_member: None,
+            requires_infra: false, per_instance: None,
             fires_with: Default::default(),
             images: vec![],
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -413,7 +413,7 @@
         let loop_in = lp.project.nodes.iter().find(|n| n.id == lp.loop_in_id).unwrap();
         let group = ReadyGroup {
             frames: Vec::new(),
-            color: uuid::Uuid::nil(),
+            execution_id: uuid::Uuid::nil(),
             received: weft_core::exec::ready::FiringInput { input: bag(outer_input), ..Default::default() },
             skip: None,
             pulse_ids: Vec::new(),
@@ -427,7 +427,7 @@
             crate::stream_runtime::StreamRuntime::new(crate::wait_tracker::WaitTracker::new());
         handle_loop_boundary_firing(
             loop_in, &group, &lp.project, &edge_idx, pulses, journal,
-            "test-pod", rt, &mut stream_rt, &mut std::collections::HashMap::new(),
+            "test-instance", rt, &mut stream_rt, &mut std::collections::HashMap::new(),
         )
         .await
         .expect("LoopIn firing");
@@ -448,7 +448,7 @@
         pulses: &mut PulseTable,
         journal: &CapturingJournal,
     ) {
-        let color = uuid::Uuid::nil();
+        let execution_id = uuid::Uuid::nil();
         let frames = vec![Frame::Loop { index: iter }];
         let edge_idx = weft_core::project::EdgeIndex::build(&lp.project);
         let loop_out = lp.project.nodes.iter().find(|n| n.id == lp.loop_out_id).unwrap();
@@ -474,13 +474,13 @@
                 .push((edge.source_handle.clone().expect("edge names its source port"), value.clone()));
         }
         for (source, emitted) in by_source {
-            journal.record_event(&ExecEvent::NodeStarted { color, node_id: source.clone(), frames: frames.clone(), at_unix: 0 }, None).await.unwrap();
+            journal.record_event(&ExecEvent::NodeStarted { execution_id, node_id: source.clone(), frames: frames.clone(), at_unix: 0 }, None).await.unwrap();
             let emission = uuid::Uuid::new_v4();
             for (port, value) in emitted {
                 journal
                     .record_event(
                         &ExecEvent::PortEmitted {
-                            color,
+                            execution_id,
                             emission_id: emission,
                             node_id: source.clone(),
                             frames: frames.clone(),
@@ -494,12 +494,12 @@
                     .await
                     .unwrap();
             }
-            journal.record_event(&ExecEvent::NodeCompleted { color, node_id: source, frames: frames.clone(), at_unix: 0 }, None).await.unwrap();
+            journal.record_event(&ExecEvent::NodeCompleted { execution_id, node_id: source, frames: frames.clone(), at_unix: 0 }, None).await.unwrap();
         }
-        journal.record_event(&ExecEvent::NodeStarted { color, node_id: lp.loop_out_id.clone(), frames: frames.clone(), at_unix: 0 }, None).await.unwrap();
+        journal.record_event(&ExecEvent::NodeStarted { execution_id, node_id: lp.loop_out_id.clone(), frames: frames.clone(), at_unix: 0 }, None).await.unwrap();
         let group = ReadyGroup {
             frames,
-            color,
+            execution_id,
             received: weft_core::exec::ready::FiringInput { input: bag(writes), closed_ports, ..Default::default() },
             skip: None,
             pulse_ids: Vec::new(),
@@ -510,12 +510,12 @@
             crate::stream_runtime::StreamRuntime::new(crate::wait_tracker::WaitTracker::new());
         handle_loop_boundary_firing(
             loop_out, &group, &lp.project, &edge_idx, pulses, journal,
-            "test-pod", rt, &mut stream_rt, &mut std::collections::HashMap::new(),
+            "test-instance", rt, &mut stream_rt, &mut std::collections::HashMap::new(),
         )
         .await
         .expect("LoopOut firing");
         journal
-            .record_event(&ExecEvent::NodeCompleted { color, node_id: lp.loop_out_id.clone(), frames: vec![Frame::Loop { index: iter }], at_unix: 0 }, None)
+            .record_event(&ExecEvent::NodeCompleted { execution_id, node_id: lp.loop_out_id.clone(), frames: vec![Frame::Loop { index: iter }], at_unix: 0 }, None)
             .await
             .unwrap();
     }
@@ -817,7 +817,7 @@
     }
 
     /// Layer-3 rig 6: cancellation marks every live LoopInstance for the
-    /// color as cancelled AND emits closures on the LoopOut's outward
+    /// execution as cancelled AND emits closures on the LoopOut's outward
     /// output ports at parent_frames.
     #[tokio::test]
     async fn cancel_loop_instances_emits_outward_closures() {
@@ -843,14 +843,14 @@
             &edge_idx,
             &mut pulses,
             &journal,
-            "test-pod",
+            "test-instance",
         )
         .await;
         // Instance is now terminated::Cancelled.
         let key = LoopInstanceKey {
             group_id: lp.group_id.clone(),
             parent_frames: Vec::new(),
-            color: uuid::Uuid::nil(),
+            execution_id: uuid::Uuid::nil(),
         };
         let inst = rt.get(&key).expect("instance");
         assert_eq!(inst.terminated, Some(LoopTerminationReason::Cancelled));
@@ -1016,22 +1016,22 @@
         .await;
         // Now imagine an inner loop instance keyed at parent_frames=[{0}]
         // (one inner instance per outer iteration). The runtime keys by
-        // (group_id, parent_frames, color); two distinct parent_frames
+        // (group_id, parent_frames, execution); two distinct parent_frames
         // mean two distinct instances even for the same group_id.
         let key_outer = LoopInstanceKey {
             group_id: lp.group_id.clone(),
             parent_frames: Vec::new(),
-            color: uuid::Uuid::nil(),
+            execution_id: uuid::Uuid::nil(),
         };
         let key_inner_iter0 = LoopInstanceKey {
             group_id: "inner".into(),
             parent_frames: vec![Frame::Loop { index: 0 }],
-            color: uuid::Uuid::nil(),
+            execution_id: uuid::Uuid::nil(),
         };
         let key_inner_iter1 = LoopInstanceKey {
             group_id: "inner".into(),
             parent_frames: vec![Frame::Loop { index: 1 }],
-            color: uuid::Uuid::nil(),
+            execution_id: uuid::Uuid::nil(),
         };
         rt.ensure(key_inner_iter0.clone(), LoopConfig {
             parallel: false, over: vec![], carry: vec![], max_iters: Some(1), trim_on_mismatch: true,
@@ -1083,12 +1083,12 @@
                 })
                 .collect(),
             features: Default::default(),
-            requires_infra: false, per_member: None,
+            requires_infra: false, per_instance: None,
             fires_with: Default::default(),
             images: vec![],
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -1141,10 +1141,10 @@
                 PortDefinition { name: "acc".into(),   port_type: primitive(WeftPrimitive::String), required: false, description: None, synthesized_from_carry: false, declared_type: None },
                 PortDefinition { name: "index".into(), port_type: primitive(WeftPrimitive::Number), required: false, description: None, synthesized_from_carry: false, declared_type: None },
             ],
-            features: Default::default(), requires_infra: false, per_member: None, images: vec![], fires_with: Default::default(),
+            features: Default::default(), requires_infra: false, per_instance: None, images: vec![], fires_with: Default::default(),
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None, header_span: None, config_spans: Default::default(),
             optional_ports: Default::default(),
             port_literals: Default::default(), port_literal_spans: Default::default(),
@@ -1166,10 +1166,10 @@
                 PortDefinition { name: "results".into(), port_type: list_of_nullable(primitive(WeftPrimitive::String)), required: false, description: None, synthesized_from_carry: false, declared_type: None },
                 PortDefinition { name: "acc".into(),     port_type: primitive(WeftPrimitive::String),                   required: false, description: None, synthesized_from_carry: false, declared_type: None },
             ],
-            features: Default::default(), requires_infra: false, per_member: None, images: vec![], fires_with: Default::default(),
+            features: Default::default(), requires_infra: false, per_instance: None, images: vec![], fires_with: Default::default(),
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None, header_span: None, config_spans: Default::default(),
             optional_ports: Default::default(),
             port_literals: Default::default(), port_literal_spans: Default::default(),
@@ -1192,10 +1192,10 @@
                 PortDefinition { name: "acc".into(), port_type: primitive(WeftPrimitive::String), required: false, description: None, synthesized_from_carry: false, declared_type: None },
                 PortDefinition { name: "done".into(), port_type: primitive(WeftPrimitive::Boolean), required: false, description: None, synthesized_from_carry: false, declared_type: None },
             ],
-            features: Default::default(), requires_infra: false, per_member: None, images: vec![], fires_with: Default::default(),
+            features: Default::default(), requires_infra: false, per_instance: None, images: vec![], fires_with: Default::default(),
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None, header_span: None, config_spans: Default::default(),
             optional_ports: Default::default(),
             port_literals: Default::default(), port_literal_spans: Default::default(),
@@ -1209,10 +1209,10 @@
                 PortDefinition { name: "data".into(),  port_type: list_of_nullable(primitive(WeftPrimitive::String)), required: true, description: None, synthesized_from_carry: false, declared_type: None },
                 PortDefinition { name: "final".into(), port_type: primitive(WeftPrimitive::String),                    required: true, description: None, synthesized_from_carry: false, declared_type: None },
             ]),
-            outputs: vec![], features: Default::default(), requires_infra: false, per_member: None, images: vec![], fires_with: Default::default(),
+            outputs: vec![], features: Default::default(), requires_infra: false, per_instance: None, images: vec![], fires_with: Default::default(),
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None, header_span: None, config_spans: Default::default(),
             optional_ports: Default::default(),
             port_literals: Default::default(), port_literal_spans: Default::default(),
@@ -1315,7 +1315,7 @@
         // The instance is gone in the runtime perspective: terminated.
         use weft_core::primitive::LoopTerminationReason;
         let key = LoopInstanceKey {
-            group_id: lp.group_id.clone(), parent_frames: Vec::new(), color: uuid::Uuid::nil(),
+            group_id: lp.group_id.clone(), parent_frames: Vec::new(), execution_id: uuid::Uuid::nil(),
         };
         let inst = rt.get(&key).expect("instance");
         assert_eq!(inst.terminated, Some(LoopTerminationReason::OverExhausted));
@@ -1358,7 +1358,7 @@
 
         // And the instance's carry_values reflect the seeded zero.
         let key = LoopInstanceKey {
-            group_id: lp.group_id.clone(), parent_frames: Vec::new(), color: uuid::Uuid::nil(),
+            group_id: lp.group_id.clone(), parent_frames: Vec::new(), execution_id: uuid::Uuid::nil(),
         };
         assert_eq!(
             rt.get(&key).expect("instance").carry_values.get("acc").map(|v| &**v),
@@ -1386,7 +1386,7 @@
         let events: Vec<ExecEvent> = journal.events.lock().unwrap().clone();
         // The worker died here: two iterations gathered, the third
         // launched and not yet fired.
-        let key = LoopInstanceKey { group_id: lp.group_id.clone(), parent_frames: Vec::new(), color: uuid::Uuid::nil() };
+        let key = LoopInstanceKey { group_id: lp.group_id.clone(), parent_frames: Vec::new(), execution_id: uuid::Uuid::nil() };
         let rt2 = rehydrate(&lp, &bag, &events);
         let inst = rt2.get(&key).expect("the instance is rebuilt");
         assert_eq!(inst.out_fired, vec![0, 1]);
@@ -1434,8 +1434,90 @@
             "gather list capped at iter 2's done vote: {:?}", data[0].value);
 
         let key = LoopInstanceKey {
-            group_id: lp.group_id.clone(), parent_frames: Vec::new(), color: uuid::Uuid::nil(),
+            group_id: lp.group_id.clone(), parent_frames: Vec::new(), execution_id: uuid::Uuid::nil(),
         };
         use weft_core::primitive::LoopTerminationReason;
         assert_eq!(rt.get(&key).unwrap().terminated, Some(LoopTerminationReason::DoneVoted));
+    }
+
+    /// Fire LoopOut for iteration `iter` with `acc` closed (with
+    /// `failure` as the closure's error when set) and a gathered value,
+    /// returning the handler's outcome.
+    async fn fire_loop_out_with_closed_carry(
+        lp: &LoopProject,
+        iter: u32,
+        failure: Option<&str>,
+        rt: &mut LoopRuntime,
+        pulses: &mut PulseTable,
+        journal: &CapturingJournal,
+    ) -> Result<(), String> {
+        let edge_idx = weft_core::project::EdgeIndex::build(&lp.project);
+        let loop_out = lp.project.nodes.iter().find(|n| n.id == lp.loop_out_id).unwrap();
+        let mut received = weft_core::exec::ready::FiringInput {
+            input: bag(serde_json::json!({"results": "r"})),
+            closed_ports: vec!["acc".to_string()],
+            ..Default::default()
+        };
+        if let Some(error) = failure {
+            received.closed_failures.insert(
+                "acc".to_string(),
+                weft_core::pulse::Failure { node: "ask".into(), error: error.to_string() },
+            );
+        }
+        let group = ReadyGroup {
+            frames: vec![Frame::Loop { index: iter }],
+            execution_id: uuid::Uuid::nil(),
+            received,
+            skip: None,
+            pulse_ids: Vec::new(),
+            error: None,
+            out_of_scope: false,
+        };
+        let mut stream_rt =
+            crate::stream_runtime::StreamRuntime::new(crate::wait_tracker::WaitTracker::new());
+        handle_loop_boundary_firing(
+            loop_out, &group, &lp.project, &edge_idx, pulses, journal,
+            "test-instance", rt, &mut stream_rt, &mut std::collections::HashMap::new(),
+        )
+        .await
+    }
+
+    /// A carried value closed because a node inside the loop failed
+    /// stops the loop: the LoopOut firing fails (the driver then tears
+    /// the loop down as Failed) with the iteration, the port and the
+    /// error, and no next iteration launches from the stale carry.
+    #[tokio::test]
+    async fn carry_closed_by_a_failure_fails_the_loop() {
+        let lp = build_sequential_fold_project();
+        let mut rt = LoopRuntime::new();
+        let mut pulses = PulseTable::default();
+        let journal = CapturingJournal::default();
+        fire_loop_in(&lp, serde_json::json!({"items": ["a", "b", "c"], "acc": ""}), &mut rt, &mut pulses, &journal).await;
+        fire_loop_out(&lp, 0, serde_json::json!({"results": "a", "acc": "a"}), Vec::new(), &mut rt, &mut pulses, &journal).await;
+        let err = fire_loop_out_with_closed_carry(&lp, 1, Some("the model answered 500"), &mut rt, &mut pulses, &journal)
+            .await
+            .expect_err("a failed carry fails the loop");
+        assert!(err.contains("iteration 1") && err.contains("'acc'"), "{err}");
+        assert!(err.contains("because 'ask' failed: the model answered 500"), "names the node that broke: {err}");
+        let key = LoopInstanceKey { group_id: lp.group_id.clone(), parent_frames: Vec::new(), execution_id: uuid::Uuid::nil() };
+        assert_eq!(rt.get(&key).unwrap().launched, vec![0, 1], "iteration 2 never launches");
+    }
+
+    /// A carried value closed with no failure (a branch not taken, a
+    /// gate) keeps its previous value and the loop goes on.
+    #[tokio::test]
+    async fn carry_closed_by_a_gate_keeps_its_value() {
+        let lp = build_sequential_fold_project();
+        let mut rt = LoopRuntime::new();
+        let mut pulses = PulseTable::default();
+        let journal = CapturingJournal::default();
+        fire_loop_in(&lp, serde_json::json!({"items": ["a", "b", "c"], "acc": ""}), &mut rt, &mut pulses, &journal).await;
+        fire_loop_out(&lp, 0, serde_json::json!({"results": "a", "acc": "a"}), Vec::new(), &mut rt, &mut pulses, &journal).await;
+        fire_loop_out_with_closed_carry(&lp, 1, None, &mut rt, &mut pulses, &journal).await.expect("a plain closure is fine");
+        let carry_at_2: Vec<_> = pulses[&lp.body_id]
+            .iter()
+            .filter(|p| p.frames == vec![Frame::Loop { index: 2 }] && p.target_port == "left" && !p.closed)
+            .map(|p| (*p.value).clone())
+            .collect();
+        assert_eq!(carry_at_2, vec![serde_json::json!("a")], "iteration 2 starts from the kept carry");
     }

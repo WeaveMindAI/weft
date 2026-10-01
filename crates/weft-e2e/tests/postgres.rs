@@ -15,7 +15,7 @@
 //!     also proves the data is really in a database;
 //!   - terminating takes the connection away with the database.
 //!
-//! Needs a cluster, no external service and no credentials.
+//! Needs an install, no external service and no credentials.
 #![cfg(feature = "e2e")]
 
 use anyhow::Result;
@@ -168,6 +168,60 @@ async fn the_password_goes_into_an_env_file_and_a_reset_gets_a_new_one() -> Resu
     anyhow::ensure!(password_in(&after)? != first, "the reset wrote the old password back");
 
     // The program's own next run picks the new password up by itself.
+    round_trip(&mut project).await?;
+    infra::terminate_and_wait_gone(&project, "db").await?;
+    project.finish().await
+}
+
+/// The way a frontend reaches the program's database: turn the node's
+/// `reachable` input on, find the door with `weft infra list-doors`, write
+/// the user, the database and a fresh password into an env file with
+/// `weft infra env`, and open Postgres from outside weft with nothing
+/// else. The program's own run keeps working beside it.
+#[tokio::test]
+async fn a_client_outside_weft_opens_the_database_through_its_door() -> Result<()> {
+    let disp = ensure::up().await?;
+    let mut project = Project::prepare("postgres_db", disp).await?;
+    project.substitute_in_main("__E2E_BODY__", BODY)?;
+    project.set_node_config("db", "reachable", "true")?;
+    infra::start_and_wait_running(&mut project, "db").await?;
+
+    let listed: weft_core::infra::wire::DoorsResponse = serde_json::from_str(project.weft(&["infra", "list-doors", "--json"]).await?.trim())?;
+    let door = listed
+        .doors
+        .iter()
+        .find(|d| d.copy.node == "db" && d.endpoint == "sql")
+        .ok_or_else(|| anyhow::anyhow!("the database's sql endpoint has a door: {listed:?}"))?;
+    let (host, port) = door.address.rsplit_once(':').ok_or_else(|| anyhow::anyhow!("the door is host:port: {door:?}"))?;
+    let (host, port): (String, u16) = (host.to_string(), port.parse()?);
+
+    // Starting the database took its password, so a fresh one is minted
+    // for the outside client first.
+    project.weft(&["infra", "press", "db", "reset_password"]).await?;
+    let env = project.dir().join("front.env");
+    let into = env.to_string_lossy().to_string();
+    project
+        .weft(&["infra", "env", "db", "--into", &into, "--set", "PG_PASSWORD=Password", "--set", "PG_USER=User", "--set", "PG_DB=Database"])
+        .await?;
+    let text = std::fs::read_to_string(&env)?;
+    let value = |name: &str| -> Result<String> {
+        text.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name}=")))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("the env file does not set {name}"))
+    };
+    let options = sqlx::postgres::PgConnectOptions::new()
+        .host(&host)
+        .port(port)
+        .username(&value("PG_USER")?)
+        .password(&value("PG_PASSWORD")?)
+        .database(&value("PG_DB")?);
+    let pool = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect_with(options).await?;
+    let one: i32 = sqlx::query_scalar("SELECT 1").fetch_one(&pool).await?;
+    anyhow::ensure!(one == 1, "the database answered through its door");
+    pool.close().await;
+
     round_trip(&mut project).await?;
     infra::terminate_and_wait_gone(&project, "db").await?;
     project.finish().await

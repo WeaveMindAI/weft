@@ -1,0 +1,131 @@
+# Install (or upgrade) weft on your own GCP project. Run it by hand from
+# the Actions tab of your fork of weft. Upgrading weft is merging
+# upstream into the fork and running it again.
+#
+# It needs, once, before the first run (the cloud chapter of the docs has
+# the commands):
+#   repository variables  GCP_PROJECT_ID, GCP_REGION, GCP_ZONE,
+#                         TF_STATE_BUCKET, GCP_WORKLOAD_IDENTITY_PROVIDER,
+#                         GCP_INSTALL_SERVICE_ACCOUNT, and optionally
+#                         WEFT_FRONTEND_REPOS (a JSON list of owner/name),
+#                         WEFT_MACHINE_TYPE, WEFT_SERVERLESS_ROLES (a JSON
+#                         list of roles), WEFT_LISTENER_MACHINE (true to
+#                         give the listener a machine of its own)
+#   repository secret     WEFT_ACCESS_APPS (optional: the access-apps.json
+#                         holding OAuth clients and the runtime's own keys)
+#
+# SYNC: the TF_VAR_* names <-> deploy/terraform/gcp/variables.tf
+name: install on GCP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: install-gcp
+  cancel-in-progress: false
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    # No deadline: a first install builds weft's images, and a run cut
+    # mid-apply leaves the Terraform state locked. GitHub's own 6-hour job
+    # limit is the only cap.
+    env:
+      TF_IN_AUTOMATION: "1"
+      TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID }}
+      TF_VAR_region: ${{ vars.GCP_REGION }}
+      TF_VAR_zone: ${{ vars.GCP_ZONE }}
+      TF_VAR_frontend_repos: ${{ vars.WEFT_FRONTEND_REPOS || '[]' }}
+      TF_VAR_weft_repository: ${{ github.repository }}
+      TF_VAR_weft_commit: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_INSTALL_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: machine size
+        if: vars.WEFT_MACHINE_TYPE != ''
+        run: echo "TF_VAR_machine_type=${{ vars.WEFT_MACHINE_TYPE }}" >> "$GITHUB_ENV"
+
+      # Unset, Terraform's defaults apply: every role on Cloud Run but the
+      # listener, which shares the machine with Postgres.
+      - name: where the roles run
+        run: |
+          if [ -n '${{ vars.WEFT_SERVERLESS_ROLES }}' ]; then
+            echo 'TF_VAR_serverless_roles=${{ vars.WEFT_SERVERLESS_ROLES }}' >> "$GITHUB_ENV"
+          fi
+          if [ -n '${{ vars.WEFT_LISTENER_MACHINE }}' ]; then
+            echo 'TF_VAR_listener_machine=${{ vars.WEFT_LISTENER_MACHINE }}' >> "$GITHUB_ENV"
+          fi
+
+      # The registry first: the images this checkout names are pushed there
+      # before the machine that runs them exists.
+      - name: create the registry
+        working-directory: deploy/terraform/gcp
+        env:
+          TF_VAR_runtime_image: unset
+          TF_VAR_builder_base_image: unset
+        run: |
+          terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
+          terraform apply -input=false -auto-approve \
+            -target=google_project_service.apis -target=google_artifact_registry_repository.images
+
+      - run: rustup toolchain install
+
+      - name: build the weft CLI from this checkout
+        run: cargo build --release --locked -p weft-cli
+
+      # The runtime image and the worker builder base this checkout names,
+      # built here and pushed to the install's registry (an image already
+      # there is not built again). A fork carrying its own changes gets
+      # exactly its own runtime.
+      - name: build the runtime's images
+        run: |
+          registry=$(terraform -chdir=deploy/terraform/gcp output -raw registry)
+          gcloud auth configure-docker "${{ vars.GCP_REGION }}-docker.pkg.dev" --quiet
+          WEFT_IMAGE_REGISTRY="$registry" ./target/release/weft build-images --push > "$RUNNER_TEMP/refs.txt"
+          # SYNC: the order of the printed refs <-> crates/weft-cli/src/images.rs (SharedImages::bare_refs)
+          echo "TF_VAR_runtime_image=$(sed -n 1p "$RUNNER_TEMP/refs.txt")" >> "$GITHUB_ENV"
+          echo "TF_VAR_builder_base_image=$(sed -n 2p "$RUNNER_TEMP/refs.txt")" >> "$GITHUB_ENV"
+
+      - name: create the cloud
+        working-directory: deploy/terraform/gcp
+        env:
+          TF_VAR_access_apps_json: ${{ secrets.WEFT_ACCESS_APPS }}
+        run: terraform apply -input=false -auto-approve
+
+      - name: what to do next
+        working-directory: deploy/terraform/gcp
+        run: |
+          address=$(terraform output -raw address)
+          machine=$(terraform output -raw machine)
+          key_secret=$(terraform output -raw bootstrap_operator_key_secret)
+          {
+            echo "## weft is installed"
+            echo
+            echo "It answers at \`https://$address\` once the machine has booted and got its certificate (a minute or two)."
+            echo
+            echo "1. On your machine, read the first operator key (it never appears in these logs):"
+            echo
+            echo '```'
+            echo "gcloud secrets versions access latest --secret $key_secret --project ${{ vars.GCP_PROJECT_ID }}"
+            echo '```'
+            echo
+            echo "2. In a project: \`weft target add prod https://$address\`, then \`weft login prod\` and paste the key."
+            echo "3. For your own domain: \`weft domain add weft.example.com --on prod\` prints the DNS record to set."
+            echo
+            echo "The machine's logs: \`gcloud compute ssh $machine --zone ${{ vars.GCP_ZONE }} --tunnel-through-iap -- sudo journalctl -u weft-runtime -f\`"
+          } >> "$GITHUB_STEP_SUMMARY"

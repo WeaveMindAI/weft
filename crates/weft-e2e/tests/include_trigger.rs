@@ -15,7 +15,7 @@ async fn a_route_inside_an_included_file_registers_and_answers() -> anyhow::Resu
     let mut project = Project::prepare("include_trigger", disp.clone()).await?;
     let base = project.unique_live_path()?;
     project.activate().await?;
-    let before = run::execution_colors(&disp, &project.id()).await?;
+    let before = run::executions(&disp, &project.id()).await?;
 
     // The included route's display is reached by its PLACE, the way the
     // editor spells it after walking into the include (`one.door`): its
@@ -43,10 +43,10 @@ async fn a_route_inside_an_included_file_registers_and_answers() -> anyhow::Resu
 
     // Both fires are their own runs; the included one ran under the
     // site's call frame and is addressed through it.
-    let colors = run::wait_for_triggered_executions(&disp, &project.id(), &before, 2, std::time::Duration::from_secs(60)).await?;
+    let execution_ids = run::wait_for_triggered_executions(&disp, &project.id(), &before, 2, std::time::Duration::from_secs(60)).await?;
     let mut inside = 0;
-    for color in colors {
-        let settled = project.settled(color).await?;
+    for execution_id in execution_ids {
+        let settled = project.settled(execution_id).await?;
         settled.completed()?;
         let frames: Vec<Value> = settled.events_of("one.door").map(|e| e.frames().clone()).collect();
         if !frames.is_empty() {

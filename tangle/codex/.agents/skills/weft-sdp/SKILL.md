@@ -9,7 +9,7 @@ You build one stage against a real input, run it, and read the result
 before growing the next stage. You judge a result by what the program is meant to do:
 completion alone says nothing. If you catch yourself calling a run good
 because it completed, stop and write: "Wait. Read the result." Then
-inspect `weft events <color> --node <id>` and `weft logs <color>`.
+inspect `weft events <execution-id> --node <id>` and `weft logs <execution-id>`.
 
 The terms below:
 
@@ -31,7 +31,7 @@ The terms below:
 
 `weft run` builds the current code and starts one execution. You pass
 `--detach`, then read `weft executions --json`,
-`weft events <color> --node <id>` and `weft logs <color>`: failures and
+`weft events <execution-id> --node <id>` and `weft logs <execution-id>`: failures and
 waiting states as well as outputs. You keep the user's graph intact while
 trying a stage:
 
@@ -139,6 +139,11 @@ the node. A bake does not refuse; it brings the infrastructure up itself,
 which is right but takes as long as starting it would, so a bake that seems
 to hang on a program with infrastructure is usually provisioning.
 
+This is also how you test an infra node: live tests do not cover infra
+nodes for now, so you prove one inside a real program. Start its infra, then
+`--target` the node that reads it, with `--from` or `--emit` supplying the
+values upstream of it, so each run exercises the container and nothing else.
+
 A fire names exactly one trigger; its payload wakes that trigger, which
 runs and decides what to emit. An emit supplies the trigger's declared
 outputs directly. You choose one per trigger. Trigger ports receive their
@@ -162,7 +167,7 @@ when the work in flight has to survive, and say it deliberately.
 `weft run --seed --detach` takes eligible results from [head]'s run. If
 [head] is a version without a run, it finds a finished run on that
 version or its nearest ancestor. To choose an older run, you run
-`weft branch <color>` first; that also restores its code, so you
+`weft branch <execution-id>` first; that also restores its code, so you
 checkpoint edits you want to keep.
 
 - `--seed --seed-before classify` reuses earlier compatible work and runs
@@ -170,7 +175,10 @@ checkpoint edits you want to keep.
 - `--seed --seed-until classify` also permits reusing `classify`.
 
 These flags limit reuse within the requested run; the [cut] limits
-execution itself. Changed implementations, inputs, dependencies, failed
+execution itself. A step whose saved output names a stored file that has
+been edited since, or is gone, cannot be reused: the run is refused before
+it starts, naming the step, the port and the file, and you either hand the
+file in with `--emit` or run the step again with `--seed-before` it. Changed implementations, inputs, dependencies, failed
 work, and live handles can prevent reuse. A loop is reused whole. An
 entirely reused run is valid and does no new node work. This applies
 inside a saved or carved run too: `--from` chooses its boundary, not a
@@ -198,13 +206,13 @@ omit it when reviewing how the current program answers the saved use case.
 
 ```bash
 weft run invoice --detach
-weft events <color> --full
-weft freeze invoice <color> --expect reply
+weft events <execution-id> --full
+weft freeze invoice <execution-id> --expect reply
 # After editing the program:
 weft run invoice --detach
-weft diff example:invoice <new-color>
+weft diff example:invoice <new-execution-id>
 # After inspecting and accepting the new result:
-weft freeze invoice <new-color> --expect reply
+weft freeze invoice <new-execution-id> --expect reply
 ```
 
 `freeze` preserves that completed run's starting parameters and accepted
@@ -214,7 +222,9 @@ it. Replaying the [frozen example] recomputes the selected work on current
 code; interior reused results do not become hidden fixed inputs.
 
 `expected` holds the output evidence `diff` uses, including finite streams
-and closures. You repeat `--expect node` to focus review on particular
+and closures. A closure a failure left reads `"closed": true` with
+`"failure": {"node": "query", "error": "..."}`, the node that broke and its
+message. You repeat `--expect node` to focus review on particular
 node outputs; focus changes comparison, not execution, and a focused
 output that disappeared remains visible as a difference. Stored media
 compares by its content hash.
@@ -258,7 +268,7 @@ authority, and keep inspecting that same run. For live connections, you
 send the recorded messages through a new connection and review the new
 responses.
 
-`weft wake <color> <node>` resolves a pure time wait. A wait requiring a
+`weft wake <execution-id> <node>` resolves a pure time wait. A wait requiring a
 value must receive that value instead. Logs and inherited markers identify
 which earlier run supplied reused history; historical costs are not new
 charges.
@@ -266,7 +276,7 @@ charges.
 ## Keep a reviewable trail
 
 `weft checkpoint [label]` saves a source version without executing.
-`weft tree` shows versions and runs; `weft branch <version|label|color>`
+`weft tree` shows versions and runs; `weft branch <version|label|execution-id>`
 restores a point in that tree. [head] is shared per project. A dirty
 branch refusal names the files: you checkpoint them before switching.
 Discarding edits and pruning history require the user's authority.
@@ -279,4 +289,4 @@ pruned versions go too.
 
 After an edit, you run the relevant saved use cases, inspect their diffs,
 and report what actually ran, what changed, why a result is acceptable or
-still wrong, and the run colors.
+still wrong, and the execution ids.

@@ -31,6 +31,11 @@ If you already know what should come next, drag out of a dot and let go over
 empty canvas. The list opens, and the step you pick arrives with the arrow
 already drawn. One **Ctrl+Z** takes away both.
 
+If the text of the file changes outside the graph (you type in the code tab,
+or an AI writes the file), the graph forgets its undo history, because what it
+remembered no longer matches the text. Undo those earlier graph edits in the
+text editor instead. The graph never writes over a change made to the text.
+
 ## Connect two steps
 
 Drag from a dot on one box's right edge to a dot on another box's left edge.
@@ -70,24 +75,25 @@ puts a catalog port back the way it was.
 Double-click a box's name to rename it. Right-click a box for **Duplicate**,
 **Delete**, **Tags…**, **Set as target** and **Run from here…**.
 
-On an infra node, the same menu has **One per member**: each member of your
-program then gets their own copy of it, and it shows a **per member** badge.
-**Share across members** takes the mark off.
+On an infra node, the same menu has **One per instance**: each instance of
+your program then gets its own copy of it, and it shows a **per instance**
+badge. **Share across instances** takes the mark off.
 
-If you want each member to give their own value for a field (their account,
-their spreadsheet, their schedule), click the 👤 button beside the field's
-name, or right-click the field and pick **Let each member fill this** (the same
-entry is on the right-click menu of the field's input port). The field then
-shows **Filled by each member** instead of a control, and the node a **filled
-per member** badge. If you had already written a value, a member who gives none
-gets that one. Click 👤 again, or pick **Stop letting each member fill this**,
+If you want each instance to get its own value for a field (an account, a
+spreadsheet, a schedule), click the ⧉ button beside the field's name, or
+right-click the field and pick **Let each instance fill this** (the same entry
+is on the right-click menu of the field's input port). The field then shows
+**Filled by each instance** instead of a control, and the node a **filled per
+instance** badge. If you had already written a value, an instance that gets
+none gets that one. Click ⧉ again, or pick **Stop letting each instance fill this**,
 and that value becomes the one value for everyone again, or the field goes back
 to empty if there was none. A field with a wire into it offers neither, because
 its value comes from the wire.
 
-A box that reads from a per-member node or a member-filled field runs once for
-each member too, and shows a dashed **per member (follows)** badge. For what all
-of this means, go and read [programs with members](../running/members.md).
+A box that reads from a per-instance node or an instance-filled field runs once
+for each instance too, and shows a dashed **per instance (follows)** badge. For
+what all of this means, go and read
+[programs with instances](../running/instances.md).
 
 ## Run one branch instead of everything
 
@@ -142,7 +148,10 @@ Click the magnifying glass in a box's header, **Inspect execution**, for what
 went in, what came out, how long it took and what it cost. A failed box shows
 its error there. A skipped box says why in words, such as
 `its _should_flow said no` or `the required input 'x' closed`, and you follow
-the arrows backwards from there to find the step that decided.
+the arrows backwards from there to find the step that decided. If a step
+changed a stored file in place (added a turn to a conversation, say), its panel
+lists each change under **Files edited**: the file, the versions it moved
+between, and the lines added and removed.
 ![The inspector showing what went in and what came out](../img/graph-inspector.png)
 
 
@@ -170,6 +179,10 @@ For a run from yesterday, click the **Weft** icon in the side strip.
 and each row has **View in Graph**, which puts that run back on the canvas with
 its values in place and locks the toggle onto it. A replayed run looks exactly
 like a live one.
+
+If your project deploys to a cloud install, the switch at the top right shows
+the graph as that install runs it. For how it works, go and read
+[Look at prod from the editor](../running/cloud.md#look-at-prod-from-the-editor).
 
 ## Fold a big program down
 

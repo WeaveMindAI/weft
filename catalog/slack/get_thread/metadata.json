@@ -45,5 +45,8 @@
       "type": "Number",
       "description": "How many messages the thread holds (parent included)."
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

@@ -473,15 +473,15 @@ function applyOp(project: ProjectDefinition, op: EditOp, catalog: ProjectionCata
       }
       return;
     }
-    case 'setPerMember': {
+    case 'setPerInstance': {
       const node = resolveDecl(project, op.node);
       if (isContainerNodeType(node.nodeType)) {
-        throw new Error(`SetPerMember called on '${op.node}' which is a container; only a node exists once per member`);
+        throw new Error(`SetPerInstance called on '${op.node}' which is a container; only a node exists once per instance`);
       }
       // What the source says flips at once; which nodes it reaches
       // (`derived`) is the compiler's to say, on the host's next parse.
-      if (op.perMember) node.perMember = 'marked';
-      else delete node.perMember;
+      if (op.perInstance) node.perInstance = 'marked';
+      else delete node.perInstance;
       return;
     }
     case 'setLabel': {

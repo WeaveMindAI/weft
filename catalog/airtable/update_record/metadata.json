@@ -113,5 +113,8 @@
       "type": "JsonDict",
       "description": "The updated record."
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

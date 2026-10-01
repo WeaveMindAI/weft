@@ -12,13 +12,13 @@ src_a = Text { value: "__E2E_FAKE_URL_A__" }
 src_b = Text { value: "__E2E_FAKE_URL_B__" }
 src_c = Text { value: "__E2E_FAKE_URL_C__" }
 
-fetch_a = FetchToStorage { keep: true }
+fetch_a = FetchToStorage { ttl_days: 1 }
 fetch_a.url = src_a.value
 
-fetch_b = FetchToStorage { keep: true }
+fetch_b = FetchToStorage { ttl_days: 1 }
 fetch_b.url = src_b.value
 
-fetch_c = FetchToStorage { keep: true }
+fetch_c = FetchToStorage { ttl_days: 1 }
 fetch_c.url = src_c.value
 
 out_a = Debug

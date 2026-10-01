@@ -19,14 +19,14 @@ scripts/run-e2e.sh --keep-going             # keep going after a failure, to see
 scripts/run-e2e.sh --clean                  # only remove what failed runs kept
 ```
 
-The runner brings the cluster to current code once (`setup.sh --cli --daemon`),
+The runner brings the install to current code once (`setup.sh --cli --daemon`),
 builds every test binary once, then runs every TEST on its own, side by side,
 longest first (by how long each took last time). Each test's output lands in
 `~/.local/share/weft/e2e/run/<file>::<test>.log`, and the summary prints one
 line per test with how long it took.
 
-How many run at once is `-j`. The whole cluster is one kind node on your
-machine, so past a point more at once only makes each test slower: watch the
+If you want more tests at once, raise `-j`. Everything runs on your machine,
+so past a point that only makes each test slower: watch the
 per-test times in the summary grow when you raise it. On a 24-core machine the
 whole suite takes under three minutes at the default of 16.
 
@@ -38,23 +38,23 @@ reach a terminal status`).
 If you want to know what happens when something fails: the test keeps what it
 made (its projects, its cell if it had one), the runner stops starting new
 tests and lets the running ones finish, and it writes a post-mortem next to the
-log (`<file>::<test>.post-mortem/`: every pod, the recent events, the logs of
-the dispatcher, the listeners and the infra supervisors, and of the worker pods
-of every project the test kept). The cluster is left as it was, so you can poke at it. What
+log (`<file>::<test>.post-mortem/`: every container of the install, the runtime's
+log, and the logs of the containers of every project the test kept). The
+install is left as it was, so you can poke at it. What
 the failure kept stays until the next run starts: every run begins by removing
 what earlier failed runs kept (cells, projects and connections the suite
 made, marked as e2e), then runs `weft clean --images --all`. That last step is
 machine-wide and reaches past the suite: it removes every worker image no
 project on the default install references (yours too, once nothing runs them),
-infra images no project references, the kind node's cached copies of both,
-every builder base but the current one, the worker compile cache this checkout
+infra images no project references, every builder base and runtime image
+but the current one, the worker compile cache this checkout
 moved off (every lane, at once), and compile caches of another retired key that
-sat unused. `--clean` does only this, without bringing the cluster to
-current code first, so a failure's dispatcher is still the one that failed.
+sat unused. `--clean` does only this, without bringing the install to
+current code first, so a failure's runtime is still the one that failed.
 `--failed` re-runs just the tests that did not pass: the ones that failed, the
 ones the stop kept from starting, and, if you pressed Ctrl-C, the ones it cut
 short. Ctrl-C stops every running test (and what each one started) before the
-runner lets go of the cluster, so nothing keeps running into the next run.
+runner lets go of the install, so nothing keeps running into the next run.
 
 The runner needs bash 5.1 or newer, and only one run (or `--clean`) at a time
 on a machine, from any checkout: a second one is refused while the first is
@@ -68,9 +68,9 @@ keeps every image a project still points at) and the rest goes.
 ## Credentials, and what the runner provides for you
 
 Everything a local machine can serve, the runner provisions itself: the store's
-Postgres (a port-forward of the cluster's own, which it closes when the run
-ends), and an S3 endpoint (the daemon's SeaweedFS container, whose bucket stays
-across runs because it belongs to the daemon rather than to the suite). You set
+Postgres (the install's own, at the address in its `secrets.env`), and an S3
+endpoint (the install's object store container, whose bucket stays across runs
+because it belongs to the install rather than to the suite). You set
 nothing for those.
 
 What is left is the external services, which come from the
@@ -87,6 +87,7 @@ They are named `WEFT_E2E_<SERVICE>_<FIELD>`:
 | Email | `WEFT_E2E_EMAIL_USER`, `_PASSWORD`, `_IMAP_HOST`, `_IMAP_PORT`, `_SMTP_HOST`, `_SMTP_PORT` |
 | ElevenLabs | `WEFT_E2E_ELEVENLABS_API_KEY` |
 | JWT issuer (Auth0 or any OAuth issuer with a client-credentials grant) | `WEFT_E2E_JWT_ISSUER` (with its trailing slash, as the `iss` claim spells it), `_AUDIENCE`, `_CLIENT_ID`, `_CLIENT_SECRET`; the test mints its own token on every run, so nothing expires |
+| A GCP install (`gcp_install`, spends money on your cloud) | `WEFT_E2E_GCP_URL`, `_OPERATOR_KEY`, `_PROJECT`, `_REGION`; and, on this machine, a project whose `weft.toml` has a target at that address, with `weft login <that target>` done, because the CLI the test drives finds its key there |
 
 A test whose variables are absent **skips** rather than fails, through
 `env_or_skip` / `env_group_or_skip`, so a partial `.env` still gets you a
@@ -97,10 +98,10 @@ This is a different mechanism from the node self-tests, which read
 `WEFT_NODE_TEST_*` and can also use a connection you signed into in the editor.
 Theirs is documented in [Testing a node](https://weavemindai.github.io/weft/nodes/testing.html#giving-the-live-tier-what-it-needs).
 
-## When the cluster looks wrong, fix the source (HARD REQUIREMENT)
+## When the install looks wrong, fix the source
 
 The rule and its whole list of never-dos live in
-[CONTRIBUTING](../../CONTRIBUTING.md#working-on-the-cluster), because it holds
+[CONTRIBUTING](../../CONTRIBUTING.md#working-on-your-install), because it holds
 for every part of this repo, not just this suite.
 
 The one thing worth repeating here: time is never a reason to deviate. A
@@ -109,7 +110,7 @@ expected. Take the slow reproducible path, so a fresh
 machine and CI end up with the same working system you have.
 
 ```bash
-./setup.sh                       # bring the cluster to the current code
+./setup.sh                       # bring the install to the current code
 ```
 
 `--uninstall --purge` exists for a genuine clean slate and takes every project,
@@ -139,7 +140,10 @@ async fn my_scenario() -> anyhow::Result<()> {
 ```
 
 A **fixture** is `fixtures/<name>/` with a `weft.toml` + a `src/main.weft`; a
-custom node goes under `fixtures/<name>/nodes/<node>/`. Its `[package]` name
+custom node goes under `fixtures/<name>/nodes/<node>/`. If several fixtures
+need the same node, commit it once under `fixtures/_nodes/<node>/` and symlink
+it into each fixture's `nodes/` (as `test_sse_trigger` is): the catalog and the
+rig's copy both follow the link. The fixture's `[package]` name
 must start with `e2e_`: that is how `--clean` tells test projects from yours,
 and `Project::prepare` refuses a fixture without it. The id does not matter,
 the rig gives every copy a fresh one. For a runtime value baked into the graph,
@@ -152,23 +156,32 @@ right there; a malformed `src/main.weft` fails at build, not as a test assertion
 
 **If a test needs something the toolkit doesn't have, extend the toolkit
 (`src/`), not the test.** Keep test bodies about WHAT they assert; the HOW (HTTP,
-SQL, kubectl) lives in the toolkit so it stays DRY and reviewable.
+SQL, Docker) lives in the toolkit so it stays DRY and reviewable.
+
+### Five minutes, at most
+
+No test may run longer than 5 minutes. The runner stops one that does,
+with everything it started, and reports it as `SLOW` rather than `FAIL`,
+with a line at the end of its log saying so (`TEST_LIMIT` in
+`scripts/run-e2e.sh`). If you are writing a test that needs longer, it is
+doing too much: split it. And if one of your waits could hang (an infra
+start, a trigger that never fires), keep its own deadline well under the
+cap, so it fails naming what it waited on instead of being cut off.
 
 ### Your test runs beside the others
 
-Every test runs at the same time as a few others, on the same cluster, so a
+Every test runs at the same time as a few others, on the same install, so a
 test may only touch and count what it made itself. In practice:
 
-- Assert on your own project, your own run, your own pods. A query over a whole
-  table ("how many links exist", "how many pods are alive") counts your
-  neighbours too; scope it to your color or your project, the way
+- Assert on your own project, your own run, your own workers. A query over a whole
+  table ("how many links exist", "how many workers run") counts your
+  neighbours too; scope it to your execution id or your project, the way
   `Platform::public_file_link_count_for` does.
 - Never delete anything you did not create, and never clean up at the start of
   a test. A failed test's leftovers are evidence, and the next run removes them.
 - End a passing test with `project.finish()` (and `cell.finish()` if it made a
   cell). A failing test skips that on purpose.
-- Fakes bind a port the system picks, and the platform layer's port-forwards do
-  too. Never pick a fixed port.
+- Fakes bind a port the system picks. Never pick a fixed port.
 - Make connections through `access::connect_direct` / `connect_paste` (and wrap
   a grant you seed by hand in `access::SeededGrant`): a connection carries no
   name that says it is a test's, so those record it in a ledger, and the next
@@ -176,22 +189,21 @@ test may only touch and count what it made itself. In practice:
 
 ### When your test needs its own install: a cell
 
-Some things are shared by every project on an install, and a test that watches
-them change cannot share them. The listener and supervisor POOLS are the case
-today: a scale-down test waits for the whole pool to fold to one pod, and
-another test's trigger on the same pool keeps a second pod busy.
+A few things belong to the whole install, and a test that changes one of
+them needs an install to itself. Today that means restarting the runtime
+(`runtime_restart`), or running the runtime's own clock faster (`api_ticket`).
 
-If your test watches something install-wide, start a cell: a whole install of
-its own (dispatcher, Postgres, broker, pools) in the same cluster, in
-namespaces of its own. It starts from the images already built, and everything
-else in the toolkit follows its dispatcher there:
+If your test needs that, start a cell: a whole install of its own (its own
+runtime process, Postgres and ports) on the same machine. It starts from the
+images already built, and everything else in the toolkit follows its
+dispatcher there:
 
 ```rust
 use weft_e2e::{platform::Platform, project::Project, Cell};
 
-let cell = Cell::start(Cell::FAST).await?;              // an install of this test's own
+let cell = Cell::start(1.0).await?;                     // an install of this test's own
 let disp = cell.dispatcher();
-let platform = Platform::connect(&disp).await?;          // this cell's Postgres and namespaces
+let platform = Platform::connect(&disp).await?;          // this cell's Postgres and containers
 let mut project = Project::prepare("reach_out_feed", disp.clone()).await?;
 // ... drive, assert ...
 project.finish().await?;
@@ -199,22 +211,21 @@ cell.finish().await                                      // removes the cell (pa
 ```
 
 The number you hand `Cell::start` is how fast the cell's own timers run: `1.0`
-is real time, and `Cell::FAST` (`0.1`) runs them ten times faster. That is
-every heartbeat, lease, reaper tick and silence window the runtime keeps for
-itself, all together, so the protocol behaves the same, only sooner: the
-scale-down sweep that comes round every 60 seconds at real time comes round
-every 6. What a person configured (a wait's timeout, a trigger's poll interval)
-and budgets for real work (a new pod's spawn grace) keep their real length. If
+is real time, and `0.1` runs them ten times faster. That is
+every lease, reaper tick, ticket and silence window the runtime keeps for
+itself, all together, so the protocol behaves the same, only sooner: a lease
+that runs out after 60 seconds at real time runs out after 6. What a person
+configured (a wait's timeout, a trigger's poll interval) and budgets for real
+work (a worker's start) keep their real length. If
 your test waits on one of the runtime's own timers, `cell.scaled(...)` turns a
 real-time duration into the cell's.
 
 Use real time when a faster clock would end the thing you are observing before
-you observe it: `listener_move` holds a two-pod overlap open, and a fast
-scale-down would fold it early.
+you observe it.
 
 Pick something between the two when one of those timers also has to cover real
-work, which no clock compresses. A live caller's ticket starts counting before
-the worker it names is ready, and at a tenth of its two minutes a busy cluster
+work, which no clock compresses. A late live caller may have to wait for a
+worker to start, and at a tenth of the ticket's two minutes a busy machine
 starting that worker used up most of what was left, so `api_ticket` runs at
 `0.25`.
 
@@ -233,7 +244,7 @@ install-wide stays on the default install.
 | `signal` | Discover + fire signals: `SignalScope`, `fire_token`. |
 | `live` | Live caller: `open_ws`, `http_post`, `http_request`, `browser_post_json`. |
 | `human` | Human-in-the-loop: `wait_for_form_by_node`, `answer_form`. |
-| `fakes` | Servers the system dials OUT to: `SseFake`, `PollFake`, `SocketFake`, `BytesFake`. |
+| `fakes` | Servers the system dials OUT to: `SseFake`, `PollFake`, `BytesFake`, `HangingBytesFake`, `QueueFake`. |
 | `infra` | Infra lifecycle: `start_and_wait_running`, `call_endpoint`, `terminate_and_wait_gone`. |
 | `storage` | `list`, `download`, `assert_file_contents`. |
 | `platform::Platform` | Reaches BEHIND the API on purpose (below). |
@@ -241,7 +252,7 @@ install-wide stays on the default install.
 Driving each trigger kind: **plain** `run::run_and_settle`; **HTTP**
 `activate` + `live::http_post`; **WebSocket** `activate` + `live::open_ws`;
 **human form** `human::wait_for_form_by_node` + `answer_form`; **dial-out
-(SSE/poll/socket)** a `fakes::*` + `substitute_in_main` +
+(SSE/poll)** a `fakes::*` + `substitute_in_main` +
 `wait_for_triggered_execution`; **infra** `infra::start_and_wait_running` +
 `terminate_and_wait_gone`.
 
@@ -249,13 +260,11 @@ Driving each trigger kind: **plain** `run::run_and_settle`; **HTTP**
 
 The toolkit above tests the PROGRAM (what a `.weft` does, via the public API).
 `platform` tests the SYSTEM underneath (which worker served an execution, crash
-recovery, idle-reap) by reaching behind the API the way an operator would: reads
-the cluster Postgres, drives pods with `kubectl` (`kill_workers`,
-`restart_dispatcher`), and fakes "time passed" by BACKDATING the timestamp the
-reaper reads (never a clock hook; helpers import the reaper's own constants so
-they can't rot). **None of it ships**: `platform` + its `sqlx` dep compile only
+recovery) by reaching behind the API the way an operator would: it reads the
+install's Postgres, removes worker containers with Docker (`kill_workers`), and
+reads the runtime's log (`wait_for_runtime_log`). **None of it ships**: `platform` + its `sqlx` dep compile only
 under `e2e`, and this crate is never built into an image. Scope is LOCAL
-reliability only (crash/restart/reap on one machine). The API-driving toolkit is
+reliability only (crash and restart on one machine). The API-driving toolkit is
 auth-agnostic (via the `AuthProvider` seam), so a harness that needs tokens can
 reuse it.
 

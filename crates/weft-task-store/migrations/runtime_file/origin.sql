@@ -53,8 +53,19 @@
             -- Progress clock for the abandoned-pending reap: bumped whenever a
             -- part is reserved, so a long multi-part upload that is still
             -- moving is never reaped mid-flight.
-            progressed_at_unix BIGINT NOT NULL DEFAULT 0
+            progressed_at_unix BIGINT NOT NULL DEFAULT 0,
+            -- What the file is a copy OF, when the writer said (a message
+            -- id, a document id at a provider): a begin naming an identity
+            -- the scope already holds answers that file instead of minting
+            -- another. NULL for a file that is its own thing.
+            identity           TEXT
         );
+        -- One file per identity per scope (the key minus its id): the
+        -- lookup begin makes, and the guarantee that two runs fetching the
+        -- same thing at once cannot both land.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_file_identity
+            ON runtime_file((regexp_replace(key, '/[^/]+$', '')), identity)
+            WHERE identity IS NOT NULL;
         -- One row per RESERVED part of a pending upload: the exact size signed
         -- into its URL, and the etag once the caller reports it landed (NULL =
         -- reserved but not yet landed, i.e. what resume re-presigns). Rows are

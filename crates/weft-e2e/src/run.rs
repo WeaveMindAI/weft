@@ -1,15 +1,15 @@
 //! Start a run, wait for it to settle, fetch its replay.
 //!
-//! A "run" here is one execution identified by its `color` (a UUID). The rig
+//! A "run" here is one execution identified by its `execution_id` (a UUID). The rig
 //! fires it through the real CLI (`weft run`, which builds + registers + fires,
-//! exactly as a user does) and reads the color back from the CLI's `--json`
+//! exactly as a user does) and reads the execution back from the CLI's `--json`
 //! progress stream. From then on, the run is observed purely through the
-//! dispatcher's public API: poll `/executions/{color}` until a terminal status,
-//! then fetch `/executions/{color}/replay` for the full event log the
+//! dispatcher's public API: poll `/executions/{execution_id}` until a terminal status,
+//! then fetch `/executions/{execution_id}/replay` for the full event log the
 //! assertions read.
 //!
 //! For runs that DON'T start with a plain `weft run` (a trigger fire, a live
-//! caller, a form submission), the test obtains the color from that path and
+//! caller, a form submission), the test obtains the execution from that path and
 //! calls [`SettledRun::observe`] directly.
 
 use std::collections::HashSet;
@@ -20,7 +20,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::client::{poll_until, poll_until_describing, Dispatcher};
-use crate::event::{Replay, TERMINAL_KINDS};
+use crate::event::Replay;
 use crate::project::Project;
 
 /// How long the rig waits for an execution to reach a terminal status. This is
@@ -31,20 +31,32 @@ pub const RUN_SETTLE_DEADLINE: Duration = Duration::from_secs(120);
 const RUN_SETTLE_POLL: Duration = Duration::from_millis(300);
 
 /// Fire a plain (non-triggered) run of `project` via `weft run` and return its
-/// color. Builds + registers as a side effect. Does NOT wait for the run to
+/// execution. Builds + registers as a side effect. Does NOT wait for the run to
 /// finish; pair with [`SettledRun::observe`].
 pub async fn start(project: &mut Project) -> Result<Uuid> {
+    start_with(project, &[]).await
+}
+
+/// [`start`], as a LONG run (`weft run --long`): the run gets a worker of
+/// its own that lives until the run ends.
+pub async fn start_long(project: &mut Project) -> Result<Uuid> {
+    start_with(project, &["--long"]).await
+}
+
+async fn start_with(project: &mut Project, flags: &[&str]) -> Result<Uuid> {
     // `--json` makes the CLI emit one progress event per line and detach (it
-    // does not stream logs), so we get the color without holding the run open.
-    let stdout = project.weft(&["run", "--json"]).await?;
-    parse_color(&stdout).context("parse color from `weft run --json` output")
+    // does not stream logs), so we get the execution without holding the run open.
+    let mut args = vec!["run", "--json"];
+    args.extend_from_slice(flags);
+    let stdout = project.weft(&args).await?;
+    parse_execution_id(&stdout).context("parse execution from `weft run --json` output")
 }
 
 /// Convenience: start a plain run and wait for it to settle, returning the
 /// observed run ready for assertions.
 pub async fn run_and_settle(project: &mut Project) -> Result<SettledRun> {
-    let color = start(project).await?;
-    SettledRun::observe(project.dispatcher(), color).await
+    let execution_id = start(project).await?;
+    SettledRun::observe(project.dispatcher(), execution_id).await
 }
 
 /// Fire an AIMED run (`weft run --target <node>` per target) and wait
@@ -60,16 +72,16 @@ pub async fn run_targeted_and_settle(
         args.push(t);
     }
     let stdout = project.weft(&args).await?;
-    let color =
-        parse_color(&stdout).context("parse color from `weft run --target --json` output")?;
-    SettledRun::observe(project.dispatcher(), color).await
+    let execution_id =
+        parse_execution_id(&stdout).context("parse execution from `weft run --target --json` output")?;
+    SettledRun::observe(project.dispatcher(), execution_id).await
 }
 
-/// Extract the execution color from `weft run --json` NDJSON. The CLI emits a
-/// `dispatcher_call_done` event whose `detail` carries `{ color, project_id }`
+/// Extract the execution from `weft run --json` NDJSON. The CLI emits a
+/// `dispatcher_call_done` event whose `detail` carries `{ execution_id, project_id }`
 /// (see crates/weft-cli/src/commands/run.rs). We scan for the first event that
-/// carries a `color`, which is unambiguous across the build/register noise.
-fn parse_color(stdout: &str) -> Result<Uuid> {
+/// carries a `execution_id`, which is unambiguous across the build/register noise.
+fn parse_execution_id(stdout: &str) -> Result<Uuid> {
     for line in stdout.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -80,58 +92,49 @@ fn parse_color(stdout: &str) -> Result<Uuid> {
             // rather than fail the whole parse).
             continue;
         };
-        // The color rides in the event's `detail` object.
-        if let Some(color) = ev
+        // The execution rides in the event's `detail` object.
+        if let Some(execution_id) = ev
             .get("detail")
-            .and_then(|d| d.get("color"))
+            .and_then(|d| d.get("execution_id"))
             .and_then(Value::as_str)
         {
-            return Uuid::parse_str(color)
-                .with_context(|| format!("invalid color uuid '{color}'"));
+            return Uuid::parse_str(execution_id)
+                .with_context(|| format!("invalid execution uuid '{execution_id}'"));
         }
     }
-    bail!("no color found in `weft run --json` output:\n{stdout}")
+    bail!("no execution found in `weft run --json` output:\n{stdout}")
 }
 
-/// Snapshot the set of execution colors that currently exist for `project_id`.
+/// Snapshot the set of executions that currently exist for `project_id`.
 /// Take this BEFORE firing an external trigger, then pass it to
 /// [`wait_for_triggered_execution`] so the rig waits for a genuinely NEW
 /// execution (the Fire), not a pre-existing one (e.g. the TriggerSetup run that
 /// activation created). Returns an empty set if the project has no executions.
-pub async fn execution_colors(disp: &Dispatcher, project_id: &Uuid) -> Result<HashSet<Uuid>> {
+pub async fn executions(disp: &Dispatcher, project_id: &Uuid) -> Result<HashSet<Uuid>> {
     // `/executions` is paginated (`{ executions, total }`) with a dispatcher-side
     // project filter; walk the pages so the snapshot is complete.
-    let mut colors = HashSet::new();
+    let mut execution_ids = HashSet::new();
     let mut offset = 0u32;
     loop {
-        let page: Value = disp
+        let page: weft_core::program::ExecutionPage = disp
             .get_json(&format!(
                 "/executions?project_id={project_id}&limit=200&offset={offset}"
             ))
             .await?;
-        let batch = page
-            .get("executions")
-            .and_then(Value::as_array)
-            .ok_or_else(|| anyhow::anyhow!("/executions returned no `executions` array: {page}"))?;
-        let n = batch.len() as u32;
-        colors.extend(batch.iter().filter_map(|e| {
-            e.get("color")
-                .and_then(Value::as_str)
-                .and_then(|c| Uuid::parse_str(c).ok())
-        }));
+        let n = page.executions.len() as u32;
+        execution_ids.extend(page.executions.iter().map(|e| e.execution_id));
         offset += n;
-        let total = page.get("total").and_then(Value::as_u64).unwrap_or(0) as u32;
-        if n == 0 || offset >= total {
-            return Ok(colors);
+        if n == 0 || offset as u64 >= page.total {
+            return Ok(execution_ids);
         }
     }
 }
 
 /// Wait for a NEW execution to appear for `project_id` that is not in `known`
-/// (the snapshot taken before firing the trigger), and return its color. Used
+/// (the snapshot taken before firing the trigger), and return its execution. Used
 /// where the run is started by an external event (a reach-out feed, a timer)
 /// rather than by `weft run`: a trigger's activation creates a TriggerSetup
-/// execution, so "latest" alone is ambiguous; excluding the pre-existing colors
+/// execution, so "latest" alone is ambiguous; excluding the pre-existing executions
 /// pins the result to the actual Fire execution.
 pub async fn wait_for_triggered_execution(
     disp: &Dispatcher,
@@ -139,12 +142,12 @@ pub async fn wait_for_triggered_execution(
     known: &HashSet<Uuid>,
     deadline: Duration,
 ) -> Result<Uuid> {
-    let mut colors = wait_for_triggered_executions(disp, project_id, known, 1, deadline).await?;
-    Ok(colors.pop().expect("exactly one color"))
+    let mut execution_ids = wait_for_triggered_executions(disp, project_id, known, 1, deadline).await?;
+    Ok(execution_ids.pop().expect("exactly one execution"))
 }
 
 /// Wait for exactly `n` NEW executions (not in `known`) to exist for
-/// `project_id`, and return their colors in no particular order. This is
+/// `project_id`, and return their executions in no particular order. This is
 /// [`wait_for_triggered_execution`] for a burst: `n` events pushed back to
 /// back, each starting its own run. Fewer than `n` = not yet (retry). More
 /// than `n` = the snapshot/fire contract is violated (a stray extra
@@ -168,10 +171,10 @@ pub async fn wait_for_triggered_executions(
             let known = known.clone();
             let seen = &seen;
             async move {
-                let current = execution_colors(&disp, project_id).await?;
-                // Collect ALL colors not in the snapshot rather than pick
+                let current = executions(&disp, project_id).await?;
+                // Collect ALL executions not in the snapshot rather than pick
                 // (a HashSet has no order, so `find` would return a random
-                // new color and the test would assert against the wrong run).
+                // new execution and the test would assert against the wrong run).
                 let new: Vec<Uuid> = current.difference(&known).copied().collect();
                 seen.store(new.len(), std::sync::atomic::Ordering::Relaxed);
                 match new.len().cmp(&n) {
@@ -190,40 +193,40 @@ pub async fn wait_for_triggered_executions(
     .await
 }
 
-/// The current status string of `color` from `/executions/{color}`
+/// The current status string of `execution_id` from `/executions/{execution_id}`
 /// (`running`, `waiting_for_input`, `completed`, `failed`, `cancelled`).
-pub async fn status_of(disp: &Dispatcher, color: Uuid) -> Result<String> {
-    let v: Value = disp.get_json(&format!("/executions/{color}")).await?;
+pub async fn status_of(disp: &Dispatcher, execution_id: Uuid) -> Result<String> {
+    let v: Value = disp.get_json(&format!("/executions/{execution_id}")).await?;
     v.get("status")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| anyhow::anyhow!("/executions/{color} returned no status: {v}"))
+        .ok_or_else(|| anyhow::anyhow!("/executions/{execution_id} returned no status: {v}"))
 }
 
-/// Poll until `color` reports `status`. For the NON-terminal states a test
+/// Poll until `execution_id` reports `status`. For the NON-terminal states a test
 /// wants to observe a run sitting in (`running` on a held node,
 /// `waiting_for_input` on a form) before acting on it; a terminal state is
 /// what [`SettledRun::observe`] waits for. Bails as soon as the run reaches
 /// a terminal state other than `status`, since it can never come back.
-pub async fn wait_for_status(disp: &Dispatcher, color: Uuid, status: &str) -> Result<()> {
+pub async fn wait_for_status(disp: &Dispatcher, execution_id: Uuid, status: &str) -> Result<()> {
     // The timeout names the status last observed (parked too early,
     // still processing, never started).
     let last = std::sync::Mutex::new(String::new());
     poll_until_describing(
-        &format!("execution {color} to reach status '{status}'"),
+        &format!("execution {execution_id} to reach status '{status}'"),
         RUN_SETTLE_DEADLINE,
         RUN_SETTLE_POLL,
         || {
             let disp = disp.clone();
             let last = &last;
             async move {
-                let now = status_of(&disp, color).await?;
+                let now = status_of(&disp, execution_id).await?;
                 *last.lock().unwrap() = now.clone();
                 if now == status {
                     return Ok(Some(()));
                 }
                 if matches!(now.as_str(), "completed" | "failed" | "cancelled") {
-                    bail!("execution {color} settled as '{now}' while waiting for '{status}'");
+                    bail!("execution {execution_id} settled as '{now}' while waiting for '{status}'");
                 }
                 Ok(None)
             }
@@ -233,14 +236,43 @@ pub async fn wait_for_status(disp: &Dispatcher, color: Uuid, status: &str) -> Re
     .await
 }
 
+/// Poll until every one of `nodes` has started in `execution_id`: the
+/// moment a test that acts on a step mid-body (killing its worker, say)
+/// waits for. Bails as soon as the run settles first, since then the
+/// steps can no longer be caught running.
+pub async fn wait_for_nodes_started(disp: &Dispatcher, execution_id: Uuid, nodes: &[&str]) -> Result<()> {
+    let path = format!("/executions/{execution_id}/replay");
+    poll_until(
+        &format!("{nodes:?} of execution {execution_id} to start"),
+        RUN_SETTLE_DEADLINE,
+        RUN_SETTLE_POLL,
+        || {
+            let disp = disp.clone();
+            let path = path.clone();
+            async move {
+                let replay = Replay::from_array(disp.get_json(&path).await?);
+                let started = |node: &&str| replay.events.iter().any(|e| e.kind() == "node_started" && e.is_node(node));
+                if nodes.iter().all(started) {
+                    return Ok(Some(()));
+                }
+                if replay.has_terminal()? {
+                    bail!("execution {execution_id} settled before {nodes:?} all started");
+                }
+                Ok(None)
+            }
+        },
+    )
+    .await
+}
+
 /// A settled execution: its terminal status is known and its full replay is
 /// fetched. All [`crate::assert`] helpers operate on this.
 pub struct SettledRun {
-    pub color: Uuid,
-    /// The terminal status string from `/executions/{color}` (`completed` /
+    pub execution_id: Uuid,
+    /// The terminal status string from `/executions/{execution_id}` (`completed` /
     /// `failed` / `cancelled`).
     pub status: String,
-    /// The event log from `/executions/{color}/replay`, snapshotted at
+    /// The event log from `/executions/{execution_id}/replay`, snapshotted at
     /// terminal. The journal is APPEND-ONLY and a run's trailing bookkeeping
     /// (a metered call's cost record, a late log line) lands AFTER the
     /// terminal event by design; an assertion about those events refreshes
@@ -258,14 +290,14 @@ pub struct SettledRun {
 }
 
 impl SettledRun {
-    /// Poll `/executions/{color}` until a terminal status, then fetch the
+    /// Poll `/executions/{execution_id}` until a terminal status, then fetch the
     /// replay. Errors loudly on timeout (the run never settled) so a hung
     /// execution surfaces as a clear failure, never a silently-passing test.
-    pub async fn observe(disp: &Dispatcher, color: Uuid) -> Result<Self> {
-        let status = wait_for_terminal(disp, color).await?;
-        let replay = fetch_replay(disp, color).await?;
+    pub async fn observe(disp: &Dispatcher, execution_id: Uuid) -> Result<Self> {
+        let status = wait_for_terminal(disp, execution_id).await?;
+        let replay = fetch_replay(disp, execution_id).await?;
         Ok(Self {
-            color,
+            execution_id,
             status,
             replay,
             disp: disp.clone(),
@@ -277,13 +309,13 @@ impl SettledRun {
     /// only settles after the test closes the connection).
     pub async fn observe_within(
         disp: &Dispatcher,
-        color: Uuid,
+        execution_id: Uuid,
         deadline: Duration,
     ) -> Result<Self> {
-        let status = wait_for_terminal_within(disp, color, deadline).await?;
-        let replay = fetch_replay(disp, color).await?;
+        let status = wait_for_terminal_within(disp, execution_id, deadline).await?;
+        let replay = fetch_replay(disp, execution_id).await?;
         Ok(Self {
-            color,
+            execution_id,
             status,
             replay,
             disp: disp.clone(),
@@ -333,12 +365,12 @@ impl SettledRun {
             return Ok(());
         }
         let disp = self.disp.clone();
-        let color = self.color;
+        let execution_id = self.execution_id;
         let present = &present;
         self.replay = poll_until(what, deadline, RUN_SETTLE_POLL, || {
             let disp = disp.clone();
             async move {
-                let replay = fetch_replay(&disp, color).await?;
+                let replay = fetch_replay(&disp, execution_id).await?;
                 Ok(present(&replay).then_some(replay))
             }
         })
@@ -349,18 +381,18 @@ impl SettledRun {
 
 /// Poll the execution status until it is terminal, returning the terminal
 /// status string. Uses the default settle deadline.
-async fn wait_for_terminal(disp: &Dispatcher, color: Uuid) -> Result<String> {
-    wait_for_terminal_within(disp, color, RUN_SETTLE_DEADLINE).await
+async fn wait_for_terminal(disp: &Dispatcher, execution_id: Uuid) -> Result<String> {
+    wait_for_terminal_within(disp, execution_id, RUN_SETTLE_DEADLINE).await
 }
 
 async fn wait_for_terminal_within(
     disp: &Dispatcher,
-    color: Uuid,
+    execution_id: Uuid,
     deadline: Duration,
 ) -> Result<String> {
-    let path = format!("/executions/{color}");
+    let path = format!("/executions/{execution_id}");
     poll_until(
-        &format!("execution {color} to reach a terminal status"),
+        &format!("execution {execution_id} to reach a terminal status"),
         deadline,
         RUN_SETTLE_POLL,
         || {
@@ -383,24 +415,30 @@ async fn wait_for_terminal_within(
     .await
 }
 
-/// Whether a `/executions/{color}` status string is terminal. SYNC with the
+/// Whether a `/executions/{execution_id}` status string is terminal. SYNC with the
 /// dispatcher's status derivation (ExecutionSummary.status), which is one of
 /// running / completed / failed / cancelled.
 fn is_terminal_status(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "cancelled")
 }
 
-/// Fetch + parse the replay event array for `color`.
-async fn fetch_replay(disp: &Dispatcher, color: Uuid) -> Result<Replay> {
-    let path = format!("/executions/{color}/replay");
+/// Fetch + parse the replay event array for `execution_id`.
+async fn fetch_replay(disp: &Dispatcher, execution_id: Uuid) -> Result<Replay> {
+    let path = format!("/executions/{execution_id}/replay");
     let arr: Vec<Value> = disp.get_json(&path).await?;
+    // Every row decodes as the real event type first, so a shape the
+    // dispatcher and weft-core disagree on fails here, naming the row.
+    for row in &arr {
+        serde_json::from_value::<weft_core::live_event::LiveEvent>(row.clone())
+            .map_err(|e| anyhow::anyhow!("execution {execution_id}: a replay row does not decode as a LiveEvent ({e}): {row}"))?;
+    }
     let replay = Replay::from_array(arr);
     // Sanity: a settled run must carry exactly one terminal event. If the
     // status says terminal but the replay has none, the two read paths
     // disagree, which is a real bug we want loud, not a silent pass.
-    if !replay.has_any_kind(&TERMINAL_KINDS) {
+    if !replay.has_terminal()? {
         bail!(
-            "execution {color} reported a terminal status but its replay has no terminal event; \
+            "execution {execution_id} reported a terminal status but its replay has no terminal event; \
              status/replay disagree"
         );
     }

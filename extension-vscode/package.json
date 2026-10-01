@@ -2,7 +2,7 @@
   "name": "weft-vscode",
   "displayName": "Weft",
   "description": "Write Weft programs and watch them run: a live, editable graph of every .weft file, with diagnostics, runs and executions in the editor.",
-  "version": "0.2.253",
+  "version": "0.2.254",
   "publisher": "weavemind",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
@@ -58,6 +58,19 @@
         "icon": {
           "light": "./media/weft-file-icon.png",
           "dark": "./media/weft-file-icon.png"
+        }
+      },
+      {
+        "id": "weft-layout",
+        "aliases": [
+          "Weft layout"
+        ],
+        "extensions": [
+          ".layout"
+        ],
+        "icon": {
+          "light": "./media/layout-file-icon.svg",
+          "dark": "./media/layout-file-icon.svg"
         }
       }
     ],
@@ -338,8 +351,7 @@
       "properties": {
         "weft.dispatcherUrl": {
           "type": "string",
-          "default": "http://localhost:9999",
-          "description": "URL of the weft dispatcher daemon the extension talks to."
+          "description": "URL of the local weft install the extension talks to. Leave it empty to use the port the install saved in ~/.local/share/weft/ports.json (http://127.0.0.1:14111 until it has started). A named install (WEFT_INSTALL) is followed only when VS Code itself runs with that variable set; otherwise set this to its address."
         },
         "weft.parse.debounceMs": {
           "type": "number",

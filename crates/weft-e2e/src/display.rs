@@ -22,6 +22,8 @@
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
+use weft_core::signal_token::{MintTokenRequest, MintedToken};
+
 use crate::client::Dispatcher;
 
 /// One node's display, as either door returns it. Thin typed accessor
@@ -105,18 +107,14 @@ pub async fn mint_display_token(
         .iter()
         .map(|node| weft_core::live::display_grant(project_id, node))
         .collect();
-    let body = json!({
-        "name": name,
-        "allowedProjects": [project_id.to_string()],
-        "allowedTags": [],
-        "allowedDisplays": grants,
-        "allDisplays": all,
-    });
-    let resp: Value = disp.post_json("/signal-tokens", &body).await?;
-    resp.get("token")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .context("mint token response missing `token`")
+    let body = MintTokenRequest {
+        allowed_projects: vec![*project_id],
+        allowed_displays: grants,
+        all_displays: all,
+        ..MintTokenRequest::caller(name)
+    };
+    let minted: MintedToken = disp.post_json("/signal-tokens", &serde_json::to_value(&body)?).await?;
+    Ok(minted.token)
 }
 
 /// The node displays this token may watch, each spelled the way a

@@ -6,15 +6,17 @@
 //! through here too.
 //!
 //! A snapshot covers the files that make the program: every `*.weft`
-//! (an `@include`d file is program text), `weft.toml`, `nodes/**` except
-//! the seeded `base_catalog/` (that one is the installed weft's, and is
-//! covered by one pseudo-entry naming the weft version and the
-//! catalog's content hash), `prompts/**`, `scripts/**`, `sql/**`,
+//! (an `@include`d file is program text), `weft.toml`, `src/**` (the
+//! compiler's second node root: a node beside the code is source like
+//! any other), `nodes/**` (the standard library under
+//! `nodes/base_catalog/` included: it is the project's own, edited or
+//! left out as the project chose), `prompts/**`, `scripts/**`, `sql/**`,
 //! `assets/**`, and `examples/**` (a branch back restores the examples
 //! that existed then). NOT `layouts/`: a canvas drag is not a version,
 //! for the same reason the definition hash ignores it. The blobs go
-//! through `weft_assets::publish_files` into the project's asset plane,
-//! so a file identical to one any earlier version held costs nothing.
+//! through `weft_assets::publish_files` into the tenant's assets, so a
+//! file identical to one any version of any of the tenant's projects held
+//! (or the standard library the install preloads) costs nothing.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -22,11 +24,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use weft_compiler::project::Project;
+use weft_core::versions::{RunSummary, VersionSummary, VersionTree};
+use weft_core::live_event::{DispatcherEvent, LiveEvent};
 use weft_core::run_spec::{Expected, ExpectedWire, PortValues, RunSpec};
 
 use crate::client::DispatcherClient;
 
-pub use weft_core::project::hash::{Manifest, WEFT_ENTRY_PREFIX};
+pub use weft_core::project::hash::Manifest;
 
 /// Whether a project-relative path (forward slashes) is part of a
 /// version. The one rule; the walk and the dirty check both read it.
@@ -66,13 +70,10 @@ pub fn covers(rel: &str) -> bool {
     if rel.split('/').any(|seg| seg == "node_modules") {
         return false;
     }
-    if rel.starts_with("nodes/base_catalog/") {
-        return false;
-    }
     if rel.ends_with(".weft") || rel == "weft.toml" {
         return true;
     }
-    matches!(first, "nodes" | "prompts" | "scripts" | "sql" | "assets" | "examples")
+    matches!(first, "src" | "nodes" | "prompts" | "scripts" | "sql" | "assets" | "examples")
 }
 
 /// Every covered file under `root`, project-relative with forward
@@ -182,77 +183,6 @@ fn prunes_whole_tree(rel: &str) -> bool {
     !covers(&format!("{rel}/x.weft")) && !covers(&format!("{rel}/x"))
 }
 
-/// The content hash of the seeded base catalog: every file under
-/// `nodes/base_catalog/`, path and bytes, sorted.
-fn base_catalog_hash(root: &Path) -> Result<String> {
-    use sha2::Digest;
-    let dir = root.join("nodes").join("base_catalog");
-    let mut files: Vec<PathBuf> = Vec::new();
-    if dir.is_dir() {
-        collect_files(&dir, &mut files)?;
-    }
-    files.sort();
-    let mut hasher = sha2::Sha256::new();
-    for f in files {
-        let rel = f.strip_prefix(&dir).expect("under the catalog").to_string_lossy().replace('\\', "/");
-        hasher.update(rel.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(std::fs::read(&f).with_context(|| format!("read {}", f.display()))?);
-        hasher.update(b"\n");
-    }
-    Ok(weft_core::project::hash::hex(&hasher.finalize()))
-}
-
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
-        let entry = entry?;
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        // Installed dependencies and build output are NOT part of what
-        // weft is: they differ per machine and per install, and this hash
-        // ends up inside the manifest, which IS the version id. The
-        // catalog ships a pnpm package, so one `pnpm install` in there
-        // folded thousands of local files into the id and two machines
-        // then disagreed about the name of identical code, with the dirty
-        // check reporting drift nobody had caused.
-        //
-        // The SAME list the seed copies through
-        // (`weft_catalog::NODE_TREE_EXCLUDE`), because this hash has to
-        // describe what the catalog actually is: a name excluded here and
-        // copied there, or the other way round, means the hash answers
-        // for files the build never staged. Installed dependencies and
-        // build output differ per machine and per install, and this hash
-        // ends up inside the manifest, which IS the version id, so one
-        // `pnpm install` in the catalog once folded thousands of local
-        // files into it and two machines disagreed about the name of
-        // identical code.
-        if weft_catalog::is_node_tree_excluded(&name) {
-            continue;
-        }
-        // A symlink is refused rather than skipped. Skipping left the
-        // file out of the hash in silence, so a catalog differing only by
-        // a link hashed the same as one without it; and following it
-        // would read something that is not a file of the catalog. The
-        // catalog is generated by `weft catalog update` from weft's own
-        // installed copy, so a link in here is weft's to fix, not the
-        // project's.
-        if entry.file_type()?.is_symlink() {
-            bail!(
-                "{} is a symlink, and the catalog's hash is taken over real files only, so \
-                 this project cannot be hashed. The catalog comes from the installed weft: \
-                 report this, and `weft catalog update` once it ships without the link",
-                path.display()
-            );
-        }
-        if path.is_dir() {
-            collect_files(&path, out)?;
-        } else {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
 /// The manifest of the project as it is on disk, without publishing
 /// anything: what `branch` compares against head to see a dirty tree.
 pub fn local_manifest(project: &Project) -> Result<Manifest> {
@@ -262,90 +192,22 @@ pub fn local_manifest(project: &Project) -> Result<Manifest> {
     for hashed in weft_assets::hash_files(&paths, &source)? {
         manifest.insert(hashed.path, hashed.hash);
     }
-    manifest.insert(weft_entry(project)?, String::new());
     Ok(manifest)
 }
 
-fn weft_entry(project: &Project) -> Result<String> {
-    Ok(format!("{WEFT_ENTRY_PREFIX}{}:{}", env!("CARGO_PKG_VERSION"), base_catalog_hash(&project.root)?))
-}
-
-/// Snapshot the project: publish every covered file into the asset
-/// plane and answer the manifest a version records.
+/// Snapshot the project: publish every covered file into the tenant's
+/// assets and answer the manifest a version records.
 pub async fn snapshot(client: &DispatcherClient, project: &Project) -> Result<Manifest> {
     let paths = covered_paths(&project.root)?;
     let source = crate::commands::assets::DiskSource::new(project.root.clone());
-    let store = crate::commands::assets::DispatcherStore::new(client, project.id().to_string());
+    let store = crate::commands::assets::DispatcherStore::new(client);
     let published = weft_assets::publish_files(&paths, &source, &store).await.context("publish the version's files")?;
-    let mut manifest: Manifest = published.into_iter().map(|(path, p)| (path, p.hash)).collect();
-    manifest.insert(weft_entry(project)?, String::new());
-    Ok(manifest)
-}
-
-/// The files of `manifest` that are not the pseudo-entry.
-pub fn manifest_files(manifest: &Manifest) -> impl Iterator<Item = (&String, &String)> {
-    manifest.iter().filter(|(path, _)| !path.starts_with(WEFT_ENTRY_PREFIX))
+    Ok(published.into_iter().map(|(path, p)| (path, p.hash)).collect())
 }
 
 // ----- the tree as the dispatcher answers it -----------------------------
 
-// SYNC: Tree, Head, VersionSummary, RunSummary, ManifestDiff <-> crates/weft-dispatcher/src/api/versions.rs TreeResponse, VersionSummary, RunSummary and crates/weft-dispatcher/src/versions.rs Head, ManifestDiff, extension-vscode/src/sidebar/version-tree.ts TreeJson, VersionSummary, RunSummary
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct Tree {
-    pub head: Head,
-    pub versions: Vec<VersionSummary>,
-    pub runs: Vec<RunSummary>,
-}
-
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-pub struct Head {
-    pub head_version: Option<String>,
-    pub head_run: Option<String>,
-    #[serde(default)]
-    pub activated_versions: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct VersionSummary {
-    pub id: String,
-    pub parent_id: Option<String>,
-    pub label: Option<String>,
-    pub created_at: u64,
-    pub diff: ManifestDiff,
-    pub manifest: Manifest,
-}
-
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-pub struct ManifestDiff {
-    pub added: Vec<String>,
-    pub removed: Vec<String>,
-    pub changed: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct RunSummary {
-    pub color: String,
-    pub version_id: String,
-    pub definition_hash: String,
-    pub seed_color: Option<String>,
-    pub stale: Vec<String>,
-    pub spec: Option<RunSpec>,
-    pub example: Option<String>,
-    pub status: String,
-    pub started_at: u64,
-    pub completed_at: Option<u64>,
-    /// Why a cancelled run was cancelled. Defaulted so the CLI still
-    /// reads a tree from a dispatcher that predates the field.
-    #[serde(default)]
-    pub cancel_cause: Option<weft_core::exec::CancelCause>,
-    /// How many nodes never ran because something upstream closed. The
-    /// number a person wants when a run says it completed and the thing
-    /// they were waiting for never happened.
-    #[serde(default)]
-    pub skipped_nodes: u64,
-}
-
-pub async fn fetch_tree(client: &DispatcherClient, project_id: &str) -> Result<Tree> {
+pub async fn fetch_tree(client: &DispatcherClient, project_id: &str) -> Result<VersionTree> {
     Ok(fetch_tree_raw(client, project_id).await?.0)
 }
 
@@ -355,31 +217,31 @@ pub async fn fetch_tree(client: &DispatcherClient, project_id: &str) -> Result<T
 /// added, so it needs both. Fetching twice (once parsed, once raw) meant
 /// two round trips whose answers could disagree: the emitted document
 /// could list a version the added field was computed without.
-pub async fn fetch_tree_raw(client: &DispatcherClient, project_id: &str) -> Result<(Tree, Value)> {
+pub async fn fetch_tree_raw(client: &DispatcherClient, project_id: &str) -> Result<(VersionTree, Value)> {
     let value = client
         .get_json(&format!("/projects/{project_id}/versions/tree"))
         .await
         .context("read the version tree")?;
-    let tree: Tree = serde_json::from_value(value.clone()).context("parse the version tree")?;
+    let tree: VersionTree = serde_json::from_value(value.clone()).context("parse the version tree")?;
     Ok((tree, value))
 }
 
-/// The first characters of a version id or a color, for a line.
+/// The first characters of a version id or an execution, for a line.
 pub fn short(id: &str) -> &str {
     &id[..id.len().min(8)]
 }
 
-/// The run `ref` names: a whole color, or the start of one among the
+/// The run `ref` names: a whole execution, or the start of one among the
 /// tree's runs.
-pub fn resolve_run<'a>(tree: &'a Tree, reference: &str) -> Result<&'a RunSummary> {
-    let matches: Vec<&RunSummary> = tree.runs.iter().filter(|r| r.color.starts_with(reference)).collect();
+pub fn resolve_run<'a>(tree: &'a VersionTree, reference: &str) -> Result<&'a RunSummary> {
+    let matches: Vec<&RunSummary> = tree.runs.iter().filter(|r| r.execution_id.to_string().starts_with(reference)).collect();
     match matches.as_slice() {
         [one] => Ok(one),
         [] => bail!("no run starts with {reference} in this project's tree; `weft tree` lists them"),
         many => bail!(
             "{reference} names {} runs ({}); give more characters",
             many.len(),
-            some_ids(many.iter().map(|r| r.color.as_str()))
+            some_ids(many.iter().map(|r| r.execution_id.to_string()))
         ),
     }
 }
@@ -392,8 +254,8 @@ const AMBIGUOUS_SHOWN: usize = 5;
 /// The first few ids, shortened, with an ellipsis when there are more.
 /// One definition, because all three resolvers below report the same
 /// way and a list that is short in one of them is short in all.
-fn some_ids<'a>(ids: impl Iterator<Item = &'a str>) -> String {
-    let mut shown: Vec<&str> = Vec::new();
+fn some_ids<S: AsRef<str>>(ids: impl Iterator<Item = S>) -> String {
+    let mut shown: Vec<S> = Vec::new();
     let mut total = 0usize;
     for id in ids {
         total += 1;
@@ -401,14 +263,14 @@ fn some_ids<'a>(ids: impl Iterator<Item = &'a str>) -> String {
             shown.push(id);
         }
     }
-    let list = shown.into_iter().map(short).collect::<Vec<_>>().join(", ");
+    let list = shown.iter().map(|id| short(id.as_ref())).collect::<Vec<_>>().join(", ");
     if total > AMBIGUOUS_SHOWN { format!("{list}, ...") } else { list }
 }
 
 /// The version `ref` names: a checkpoint label, a whole id, or the
 /// start of one. A label wins over an id prefix, since a label is a
 /// word somebody chose and an id is hex.
-pub fn resolve_version<'a>(tree: &'a Tree, reference: &str) -> Result<&'a VersionSummary> {
+pub fn resolve_version<'a>(tree: &'a VersionTree, reference: &str) -> Result<&'a VersionSummary> {
     let labelled: Vec<&VersionSummary> = tree.versions.iter().filter(|v| v.label.as_deref() == Some(reference)).collect();
     match labelled.as_slice() {
         [one] => return Ok(one),
@@ -458,25 +320,25 @@ pub fn read_spec(project: &Project, name: &str) -> Result<RunSpec> {
 /// their own copy of the first half.
 pub async fn replay_rows(
     client: &crate::client::DispatcherClient,
-    color: &str,
-) -> Result<Vec<Value>> {
+    execution_id: &str,
+) -> Result<Vec<LiveEvent>> {
     let rows = client
-        .get_json(&format!("/executions/{color}/replay"))
+        .get_json(&format!("/executions/{execution_id}/replay"))
         .await
         .context("read the run")?;
-    serde_json::from_value(rows).context("execution replay must be an array of events")
+    serde_json::from_value(rows)
+        .context("read the run's events (the dispatcher and this CLI disagree on their shape; upgrade one of them)")
 }
 
 /// What every wire of a run carried, with stored media resolved to its
 /// bytes so two runs' values compare as values.
 pub async fn output_wires(
     client: &crate::client::DispatcherClient,
-    project_id: &str,
-    color: &str,
+    execution_id: &str,
 ) -> Result<Expected> {
-    let mut expected: Expected = serde_json::from_value(client.get_json(&format!("/executions/{color}/outputs")).await?)
+    let mut expected: Expected = serde_json::from_value(client.get_json(&format!("/executions/{execution_id}/outputs")).await?)
         .context("decode complete output history")?;
-    normalize_media(client, project_id, &mut expected.wires).await?;
+    normalize_media(client, &mut expected.wires).await?;
     Ok(expected)
 }
 
@@ -602,9 +464,11 @@ pub struct RunFlags {
     pub feed: Vec<String>,
     pub fire: Vec<String>,
     pub emit: Vec<String>,
-    /// Who the run is for (`--member`).
-    pub member: Option<weft_core::member::MemberId>,
+    /// Which instance the run is in (`--instance`).
+    pub instance: Option<weft_core::instance::InstanceId>,
     pub clear: Vec<String>,
+    /// Run as a job of its own (`--long`).
+    pub long: bool,
 }
 
 impl RunFlags {
@@ -616,8 +480,9 @@ impl RunFlags {
             && self.feed.is_empty()
             && self.fire.is_empty()
             && self.emit.is_empty()
-            && self.member.is_none()
+            && self.instance.is_none()
             && self.clear.is_empty()
+            && !self.long
     }
 }
 
@@ -671,8 +536,9 @@ pub fn apply_run_flags(base: &RunSpec, flags: &RunFlags) -> Result<RunSpec> {
             "group" => spec.group = None,
             "feed" => spec.feed.clear(),
             "fire" => spec.fire = None,
-            "member" => spec.member = None,
-            _ => bail!("--clear: unknown setting '{field}'; use from, emit, target, before, group, feed, fire, or member"),
+            "instance" => spec.instance = None,
+            "long" => spec.run_class = weft_core::run_class::RunClass::Short,
+            _ => bail!("--clear: unknown setting '{field}'; use from, emit, target, before, group, feed, fire, instance, or long"),
         }
     }
     if !flags.from.is_empty() { spec.from = parse_port_flags(&flags.from, "--from", true)?; }
@@ -683,8 +549,11 @@ pub fn apply_run_flags(base: &RunSpec, flags: &RunFlags) -> Result<RunSpec> {
         spec.group = parse_port_flags(std::slice::from_ref(group), "group", true)?.into_iter().next();
     }
     if let Some(fire) = flags.fire.first() { spec.fire = Some(parse_node_flag(fire, "--fire")?); }
-    if let Some(member) = &flags.member {
-        spec.member = Some(member.clone());
+    if let Some(instance) = &flags.instance {
+        spec.instance = Some(instance.clone());
+    }
+    if flags.long {
+        spec.run_class = weft_core::run_class::RunClass::Long;
     }
     for (node, ports) in parse_port_flags(&flags.emit, "--emit", false)? {
         spec.emit.entry(node).or_default().extend(ports);
@@ -693,13 +562,6 @@ pub fn apply_run_flags(base: &RunSpec, flags: &RunFlags) -> Result<RunSpec> {
 }
 
 // ----- wires: what a run put on every output port ------------------------
-
-/// The frames of a replay row.
-fn frames_of(row: &Value) -> weft_core::frames::LoopFrames {
-    row.get("frames")
-        .and_then(|f| serde_json::from_value(f.clone()).ok())
-        .unwrap_or_default()
-}
 
 pub fn frames_key(frames: &weft_core::frames::LoopFrames) -> String {
     weft_core::frames::frames_text(frames)
@@ -714,28 +576,23 @@ pub struct OutsideFacts {
     pub caller: Vec<Value>,
 }
 
-pub fn outside_facts(rows: &[Value]) -> OutsideFacts {
+pub fn outside_facts(rows: &[LiveEvent]) -> Result<OutsideFacts> {
     let mut facts = OutsideFacts::default();
     // node -> frames key -> the firing input the person saw.
     let mut inputs: BTreeMap<(String, String), Value> = BTreeMap::new();
     for row in rows {
-        match row.get("kind").and_then(|k| k.as_str()) {
-            Some("node_started") => {
-                if let Some(node) = row.get("node").and_then(|n| n.as_str()) {
-                    inputs.insert((node.to_string(), frames_key(&frames_of(row))), row.get("input").cloned().unwrap_or(Value::Null));
-                }
+        match &row.event {
+            DispatcherEvent::NodeStarted { node, frames, input, .. } => {
+                inputs.insert((node.clone(), frames_key(frames)), input.clone());
             }
-            Some("node_resumed") => {
-                let Some(node) = row.get("node").and_then(|n| n.as_str()) else { continue };
-                if row.get("token").is_some_and(|t| !t.is_null()) {
-                    let frames = frames_of(row);
-                    facts.answers.push(weft_core::run_spec::Answer {
-                        node: node.to_string(),
-                        payload: row.get("value").cloned().unwrap_or(Value::Null),
-                        question: inputs.get(&(node.to_string(), frames_key(&frames))).cloned(),
-                        frames,
-                    });
-                }
+            // A resume with no token is a boundary re-fire, not an answer.
+            DispatcherEvent::NodeResumed { node, frames, token: Some(_), value, .. } => {
+                facts.answers.push(weft_core::run_spec::Answer {
+                    node: node.clone(),
+                    payload: value.clone().unwrap_or(Value::Null),
+                    question: inputs.get(&(node.clone(), frames_key(frames))).cloned(),
+                    frames: frames.clone(),
+                });
             }
             // BOTH directions of the exchange, one entry per message.
             // The journal folds a window of the conversation into a
@@ -745,15 +602,15 @@ pub fn outside_facts(rows: &[Value]) -> OutsideFacts {
             // readable beside the request. Recording the window rows
             // whole instead would put the journal's batching into a
             // file a person reads.
-            Some("caller_window") => {
-                if let Some(messages) = row.get("messages").and_then(|m| m.as_array()) {
-                    facts.caller.extend(messages.iter().cloned());
+            DispatcherEvent::CallerWindow { messages, .. } => {
+                for message in messages {
+                    facts.caller.push(serde_json::to_value(message).context("write down a caller message")?);
                 }
             }
             _ => {}
         }
     }
-    facts
+    Ok(facts)
 }
 
 /// One wire's difference between two runs.
@@ -829,20 +686,19 @@ pub fn diff_wires(left: &[ExpectedWire], right: &[ExpectedWire]) -> WiresDiff {
 /// runs that wrote the same picture under two keys compare equal and
 /// two different pictures under look-alike keys do not. A key whose id
 /// segment already is a content hash (an asset) needs no download.
-pub async fn normalize_media(client: &DispatcherClient, project_id: &str, wires: &mut [ExpectedWire]) -> Result<()> {
+pub async fn normalize_media(client: &DispatcherClient, wires: &mut [ExpectedWire]) -> Result<()> {
     // One cache across the whole slice: a file that flows through ten
     // nodes used to be downloaded once per wire, ten times. The key IS
     // the content's address, so two wires naming it name the same bytes.
     let mut hashes: BTreeMap<String, String> = BTreeMap::new();
     for w in wires.iter_mut() {
-        w.value = normalize_value(client, project_id, std::mem::take(&mut w.value), &mut hashes).await?;
+        w.value = normalize_value(client, std::mem::take(&mut w.value), &mut hashes).await?;
     }
     Ok(())
 }
 
 async fn normalize_value(
     client: &DispatcherClient,
-    project_id: &str,
     value: Value,
     hashes: &mut BTreeMap<String, String>,
 ) -> Result<Value> {
@@ -854,7 +710,7 @@ async fn normalize_value(
         if hashes.contains_key(&key) {
             continue;
         }
-        let hash = media_hash(client, project_id, &key).await?;
+        let hash = media_hash(client, &key).await?;
         hashes.insert(key, hash);
     }
     Ok(replace_stored(value, hashes))
@@ -896,13 +752,13 @@ fn stored_key(value: &Value) -> Option<String> {
     None
 }
 
-async fn media_hash(client: &DispatcherClient, project_id: &str, key: &str) -> Result<String> {
+async fn media_hash(client: &DispatcherClient, key: &str) -> Result<String> {
     if let Ok(parsed) = weft_core::storage::key::parse_key(key) {
         if weft_core::storage::is_content_hash(&parsed.id) {
             return Ok(parsed.id);
         }
     }
-    let bytes = crate::commands::files::download_bytes(client, key, &Some(project_id.to_string()))
+    let bytes = crate::commands::files::download_bytes(client, key)
         .await
         .with_context(|| format!("download {key} to compare it"))?;
     Ok(weft_core::project::hash::sha256_hex(&bytes))
@@ -912,6 +768,7 @@ async fn media_hash(client: &DispatcherClient, project_id: &str, key: &str) -> R
 mod tests {
     use super::*;
     use serde_json::json;
+    use weft_core::versions::{Head, ManifestDiff};
 
     #[test]
     fn a_renamed_example_is_run_and_listed_by_its_filename() {
@@ -941,7 +798,7 @@ mod tests {
 
     #[test]
     fn a_version_is_found_by_label_before_id_prefix() {
-        let tree = Tree { head: Head::default(), versions: vec![version("aaaa", Some("try-x")), version("bbbb", Some("dup")), version("cccc", Some("dup"))], runs: vec![] };
+        let tree = VersionTree { head: Head::default(), versions: vec![version("aaaa", Some("try-x")), version("bbbb", Some("dup")), version("cccc", Some("dup"))], runs: vec![] };
         assert_eq!(resolve_version(&tree, "try-x").unwrap().id, "aaaa00000000");
         assert_eq!(resolve_version(&tree, "aaa").unwrap().id, "aaaa00000000");
         assert!(resolve_version(&tree, "dup").unwrap_err().to_string().contains("labels 2 versions"));
@@ -1016,12 +873,22 @@ mod tests {
             // walk checks and this pure rule cannot.
             "nodes/target/mod.rs",
             "prompts/target/tone.txt",
+            // A node may live beside the code under `src/` (the
+            // compiler's second node root), with its Rust, metadata and
+            // deps: all source, and a build on the install from the version
+            // needs every one of them.
+            "src/greeter/mod.rs",
+            "src/greeter/metadata.json",
+            "src/greeter/deps.toml",
+            "src/notes.md",
+            // The standard library is a folder of the project's nodes
+            // like any other.
+            "nodes/base_catalog/x/mod.rs",
         ] {
             assert!(covers(yes), "{yes} is part of a version");
         }
         for no in [
             "layouts/main.json",
-            "nodes/base_catalog/x/mod.rs",
             ".weft/target/x",
             ".git/HEAD",
             // Every hidden top-level folder, not just those two: a
@@ -1035,6 +902,10 @@ mod tests {
             "notes.txt",
             // Build output inside a node is build output too.
             "nodes/bridge/node_modules/left-pad/index.js",
+            "src/bridge/node_modules/left-pad/index.js",
+            // The frontend ships through the project's CI from the
+            // repository, never through a version.
+            "front/src/routes/+page.svelte",
         ] {
             assert!(!covers(no), "{no} is not part of a version");
         }
@@ -1073,10 +944,10 @@ mod tests {
     #[test]
     fn the_walk_prunes_what_the_rule_excludes_and_nothing_else() {
         // Every hidden top-level folder is tooling, not a version's files.
-        for rel in [".weft", ".git", ".github", ".vscode", ".weft-notes", "layouts", "nodes/base_catalog", "target", "nodes/a/node_modules"] {
+        for rel in [".weft", ".git", ".github", ".vscode", ".weft-notes", "layouts", "target", "nodes/a/node_modules"] {
             assert!(prunes_whole_tree(rel), "{rel} holds nothing a version covers");
         }
-        for rel in ["nodes", "prompts", "scripts", "sql", "assets", "examples"] {
+        for rel in ["nodes", "nodes/base_catalog", "prompts", "scripts", "sql", "assets", "examples"] {
             assert!(!prunes_whole_tree(rel), "{rel} can hold covered files");
         }
     }
@@ -1186,6 +1057,16 @@ mod tests {
     }
 
     #[test]
+    fn long_is_saved_with_the_spec_and_cleared_on_request() {
+        let spec = spec_from_flags("case", &RunFlags { long: true, ..Default::default() }).unwrap();
+        assert_eq!(spec.run_class, weft_core::run_class::RunClass::Long);
+        let saved: RunSpec = serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(saved.run_class, spec.run_class, "a saved example keeps it");
+        let cleared = apply_run_flags(&saved, &RunFlags { clear: vec!["long".into()], ..Default::default() }).unwrap();
+        assert_eq!(cleared.run_class, weft_core::run_class::RunClass::Short);
+    }
+
+    #[test]
     fn emitted_port_edits_merge_with_saved_values_but_duplicate_new_ports_are_errors() {
         let saved: RunSpec = serde_json::from_value(json!({"name":"case","emit":{"a":{"x":1,"y":2},"b":{"z":3}}})).unwrap();
         let edited = apply_run_flags(&saved, &RunFlags { emit:vec![r#"a={"x":9}"#.into()], ..Default::default() }).unwrap();
@@ -1212,21 +1093,31 @@ mod tests {
 
     #[test]
     fn outside_facts_pair_each_answer_with_the_question_the_node_showed() {
+        // Each row as the replay answers it: the run's own fields around
+        // the kind's.
+        let row = |mut fields: Value| -> LiveEvent {
+            let fields_of = fields.as_object_mut().unwrap();
+            fields_of.insert("event_id".into(), json!("journal:1:0"));
+            fields_of.insert("execution_id".into(), json!(uuid::Uuid::nil()));
+            fields_of.insert("project_id".into(), json!(uuid::Uuid::nil()));
+            fields_of.insert("at_unix".into(), json!(1));
+            serde_json::from_value(fields).unwrap()
+        };
         let rows = vec![
-            json!({ "kind": "node_started", "node": "review", "frames": [], "input": { "prompt": "ok?" } }),
-            json!({ "kind": "node_suspended", "node": "review", "frames": [], "token": "t" }),
-            json!({ "kind": "node_resumed", "node": "review", "frames": [], "token": "t", "value": { "answer": "yes" } }),
-            json!({ "kind": "node_resumed", "node": "crashed", "frames": [], "token": null, "value": null }),
+            row(json!({ "kind": "node_started", "node": "review", "frames": [], "input": { "prompt": "ok?" }, "closed_ports": [] })),
+            row(json!({ "kind": "node_suspended", "node": "review", "frames": [], "token": "t" })),
+            row(json!({ "kind": "node_resumed", "node": "review", "frames": [], "token": "t", "value": { "answer": "yes" } })),
+            row(json!({ "kind": "node_resumed", "node": "crashed", "frames": [], "token": null, "value": null })),
             // One window row carrying the whole short conversation,
             // which is how the journal writes it: the messages come out
             // of the row, not one row each.
-            json!({ "kind": "caller_window", "first_offset": 0, "last_offset": 1, "messages": [
+            row(json!({ "kind": "caller_window", "first_offset": 0, "last_offset": 1, "messages": [
                 { "offset": 0, "direction": "inbound", "payload": { "kind": "json", "data": "hi" }, "payload_byte_size": 4, "at_unix": 1 },
                 { "offset": 1, "direction": "outbound", "payload": { "kind": "json", "data": "bye" }, "payload_byte_size": 5, "terminal": true, "at_unix": 1 },
-            ], "totals": [], "at_unix": 1 }),
+            ], "totals": [] })),
         ];
-        let facts = outside_facts(&rows);
-        assert_eq!(facts.answers.len(), 1, "a crash re-dispatch is not an answer");
+        let facts = outside_facts(&rows).unwrap();
+        assert_eq!(facts.answers.len(), 1, "a boundary re-fire is not an answer");
         assert_eq!(facts.answers[0].payload, json!({ "answer": "yes" }));
         assert_eq!(facts.answers[0].question, Some(json!({ "prompt": "ok?" })));
         assert_eq!(facts.caller.len(), 2, "both halves of the exchange, request AND answer");

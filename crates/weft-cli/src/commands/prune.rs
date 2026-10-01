@@ -5,13 +5,14 @@
 //! terminal. Prints what it removes before asking; `--yes` for scripts.
 
 use anyhow::Context;
+use weft_core::versions::{PrunePlan, PruneResponse};
 
 use super::versions::{fetch_tree, list_specs, resolve_version, short};
 use super::Ctx;
 
 pub async fn run(ctx: Ctx, reference: String, yes: bool) -> anyhow::Result<()> {
     let project = ctx.project()?;
-    let client = ctx.client();
+    let client = ctx.client()?;
     let project_id = project.id().to_string();
     let tree = fetch_tree(&client, &project_id).await?;
     let version = resolve_version(&tree, &reference)?.id.clone();
@@ -28,10 +29,10 @@ pub async fn run(ctx: Ctx, reference: String, yes: bool) -> anyhow::Result<()> {
     let frozen: Vec<String> =
         specs.into_iter().filter_map(|s| s.frozen_from.map(|f| f.version)).collect();
     let base = format!("/projects/{project_id}/versions/{version}?frozen={}", frozen.join(","));
-    let plan = client.delete_json(&format!("{base}&plan=true")).await.context("plan the prune")?;
-    let versions = plan.pointer("/plan/versions").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-    let runs = plan.pointer("/plan/runs").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-    let blobs = plan.pointer("/plan/blobs").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    let planned: PruneResponse = serde_json::from_value(client.delete_json(&format!("{base}&plan=true")).await.context("plan the prune")?)
+        .context("read the prune plan")?;
+    let PrunePlan { versions, runs, blobs } = &planned.plan;
+    let (versions, runs, blobs) = (versions.len(), runs.len(), blobs.len());
     if !yes {
         if ctx.json() {
             anyhow::bail!("prune deletes {versions} versions and {runs} runs; pass --yes");
@@ -45,8 +46,8 @@ pub async fn run(ctx: Ctx, reference: String, yes: bool) -> anyhow::Result<()> {
     let done = client.delete_json(&base).await.context("prune")?;
     // What was actually removed, not what the plan predicted: the two
     // are separate round trips and the subtree can move in between.
-    let count = |field: &str| done.pointer(&format!("/plan/{field}")).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-    let (versions, runs, blobs) = (count("versions"), count("runs"), count("blobs"));
+    let removed: PruneResponse = serde_json::from_value(done.clone()).context("read the prune answer")?;
+    let (versions, runs, blobs) = (removed.plan.versions.len(), removed.plan.runs.len(), removed.plan.blobs.len());
     // The freed blobs expire once the referenced set no longer names
     // them: publish it now, from the code on disk, so they start
     // expiring today instead of at the next build.
@@ -55,7 +56,7 @@ pub async fn run(ctx: Ctx, reference: String, yes: bool) -> anyhow::Result<()> {
     // and that promise is false.
     let (mut definition, _) = weft_compiler::hash::load_enriched_project(project)
         .context("the versions were pruned, but the project does not load, so the freed blobs were not released; fix the project and run `weft build`")?;
-    for warning in super::assets::resolve_project_assets(&client, &project.root, &mut definition, None, true).await? {
+    for warning in super::assets::resolve_project_assets(&client, &project.root, &mut definition, true).await? {
         eprintln!("warning: {warning}");
     }
     if ctx.json_out(&done)? {

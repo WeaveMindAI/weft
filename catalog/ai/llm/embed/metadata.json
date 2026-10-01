@@ -37,5 +37,8 @@
       "name": "dimensions",
       "type": "Number"
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

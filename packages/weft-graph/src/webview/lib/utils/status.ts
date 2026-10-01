@@ -5,7 +5,7 @@
 // to handle those values.
 
 import type { NodeExecutionStatus } from '../types';
-import type { SkipReason } from '../../../protocol';
+import type { Failure, SkipReason } from '../../../protocol';
 
 export function getStatusIcon(status: NodeExecutionStatus): string {
 	switch (status) {
@@ -43,8 +43,13 @@ export function getStatusBadgeColor(status: NodeExecutionStatus): string | undef
 /// know rather than a guessed one.
 /// The tail a reason's text grows when the closure it names carried a
 /// failure: the same words as the Rust `Display`.
-function afterFailure(failure: string | undefined): string {
-	return failure === undefined ? '' : `: a node before it failed (${failure})`;
+function afterFailure(failure: Failure | undefined): string {
+	return failure === undefined ? '' : ` because ${failureText(failure)}`;
+}
+
+/// SYNC: failureText <-> crates/weft-core/src/pulse.rs `Display for Failure`
+function failureText(failure: Failure): string {
+	return `'${failure.node}' failed: ${failure.error}`;
 }
 
 export function skipReasonText(reason: SkipReason | undefined): string {
@@ -54,7 +59,7 @@ export function skipReasonText(reason: SkipReason | undefined): string {
 		case 'flow_closed': return `nothing ever answered its \`_should_flow\`${afterFailure(reason.failure)}`;
 		case 'did_flow': return 'its `_should_not_flow` saw a value';
 		case 'watched_node_failed':
-			return `the node its \`_should_not_flow\` watches did not finish (${reason.error}), which is not the absence this node runs on`;
+			return `what its \`_should_not_flow\` watches did not finish (${failureText(reason.failure)}), which is not the absence this node runs on`;
 		case 'required_input_closed':
 			return `the required input '${reason.port}' closed${afterFailure(reason.failure)}`;
 		case 'every_input_closed': return `every input closed${afterFailure(reason.failure)}`;

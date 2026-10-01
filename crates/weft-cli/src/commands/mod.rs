@@ -30,22 +30,26 @@ pub mod status;
 pub mod test_node;
 pub mod tangle;
 pub mod connect_lib;
-pub mod member_values;
+pub mod instance_values;
 pub mod token;
 pub mod connect;
 pub mod options;
-pub mod listener;
 pub mod files;
 // The version tree and its verbs.
 pub mod versions;
 pub mod checkpoint;
 pub mod branch;
+pub mod running_source;
 pub mod tree;
 pub mod diff;
 pub mod freeze;
 pub mod examples;
 pub mod prune;
 pub mod wake;
+pub mod workers;
+pub mod domain;
+pub mod target;
+pub mod ci;
 
 use std::sync::Arc;
 
@@ -56,17 +60,69 @@ use weft_compiler::project::Project;
 /// anywhere up the tree).
 type DiscoveredProject = anyhow::Result<(std::path::PathBuf, Option<Project>)>;
 
+/// The install a command acts on: its address and this person's key for
+/// it (`crate::credentials`), sent on every request.
+struct Install {
+    url: String,
+    operator_key: Option<String>,
+}
+
+/// A raw install address and where it came from. The two are kept apart
+/// because they mean different things: the `--dispatcher` flag is a
+/// request to act on that install (refused beside `--on`, and by a verb
+/// bound to this machine), while `WEFT_DISPATCHER_URL` is ambient tooling
+/// setup (setup.sh exports it), so an explicit `--on` wins over it and a
+/// verb bound to this machine does not consult it.
+#[derive(Clone, Debug)]
+pub enum Dispatcher {
+    Flag(String),
+    Env(String),
+}
+
+impl Dispatcher {
+    /// The env var that stands in for `--dispatcher`.
+    pub const ENV: &'static str = "WEFT_DISPATCHER_URL";
+
+    /// The flag when given, else a non-empty `WEFT_DISPATCHER_URL`.
+    pub fn from_flag_or_env(flag: Option<String>) -> Option<Self> {
+        match flag {
+            Some(url) => Some(Self::Flag(url)),
+            None => std::env::var(Self::ENV).ok().filter(|v| !v.is_empty()).map(Self::Env),
+        }
+    }
+
+    pub fn url(&self) -> &str {
+        match self {
+            Self::Flag(url) | Self::Env(url) => url,
+        }
+    }
+
+    /// The address to act on beside `on`: the flag always (the pair is
+    /// refused later), the env var only when no `--on` names a target.
+    fn beside(&self, on: Option<&str>) -> Option<&str> {
+        match (self, on) {
+            (Self::Env(_), Some(_)) => None,
+            _ => Some(self.url()),
+        }
+    }
+}
+
 /// Per-invocation CLI context. Built once in `main.rs`:
-///   - `dispatcher_url` is resolved from the `--dispatcher` flag, the
-///     cwd-discovered `weft.toml`, then the localhost default. ONE
-///     resolution at startup; verbs read the result, never re-resolve.
+///   - `install` is the install this command acts on, resolved on FIRST
+///     USE by [`resolve_dispatcher_url`] (through [`Ctx::client`] or
+///     [`Ctx::install_access`]) and cached, error included. Lazy on
+///     purpose: a command that never talks to an install (`weft daemon
+///     start` on a named install that has no ports yet, `weft new`)
+///     must not be refused because that install has no address yet.
 ///   - `project` holds the cwd-discovered Project. Verbs that need
 ///     project metadata (id, name) call `Ctx::project()`. Verbs that
 ///     only talk to the dispatcher (`ps`, `describe-nodes`, `daemon`)
 ///     don't touch it.
 #[derive(Clone)]
 pub struct Ctx {
-    dispatcher_url: String,
+    dispatcher: Option<Dispatcher>,
+    on: Option<String>,
+    install: Arc<std::sync::OnceLock<anyhow::Result<Install>>>,
     json: bool,
     /// One cwd discovery per invocation. Carries the START PATH the
     /// search walked alongside its answer, so the "no project" error
@@ -74,33 +130,111 @@ pub struct Ctx {
     project: Arc<std::sync::OnceLock<DiscoveredProject>>,
 }
 
-impl Ctx {
-    /// Build a Ctx from CLI flags. Resolving the dispatcher URL from
-    /// the cwd weft.toml (absent `--dispatcher`) needs the project
-    /// walk anyway, so that ONE walk primes the project cache too;
-    /// with `--dispatcher` given, discovery stays deferred so verbs
-    /// that never need a project (ps, describe-nodes) never pay it.
-    pub fn new(dispatcher_override: Option<String>, json: bool) -> Self {
-        let lock = std::sync::OnceLock::new();
-        let dispatcher_url = match dispatcher_override {
-            Some(u) => u,
-            None => {
-                let discovered = Self::discover_here();
-                let url = discovered
-                    .as_ref()
-                    .ok()
-                    .and_then(|(_, p)| p.as_ref())
-                    .map(|p| p.dispatcher_url())
-                    .unwrap_or_else(|| "http://localhost:9999".to_string());
-                let _ = lock.set(discovered);
-                url
+/// Which install a command acts on. `--dispatcher` (or
+/// `WEFT_DISPATCHER_URL`) is a raw address for tooling; `--on <name>`
+/// names a target of the cwd project; neither means the local install
+/// (the project's `[targets.local]` when it has one). Both at once is
+/// refused: which one was meant cannot be guessed, and guessing wrong
+/// can mean acting on a shared install.
+pub fn resolve_dispatcher_url(
+    dispatcher: Option<String>,
+    on: Option<&str>,
+    project: impl FnOnce() -> anyhow::Result<Option<Project>>,
+) -> anyhow::Result<String> {
+    use weft_compiler::project::LOCAL_TARGET;
+    refuse_two_installs(dispatcher.as_deref(), on)?;
+    match dispatcher {
+        Some(url) => crate::credentials::url_key(&url),
+        None => {
+            let name = on.unwrap_or(LOCAL_TARGET);
+            match project()? {
+                Some(project) => project.target_url(name).map_err(|e| anyhow::anyhow!("{e}")),
+                None if name == LOCAL_TARGET => weft_core::ports::local_public_url().map_err(anyhow::Error::msg),
+                None => anyhow::bail!(
+                    "--on {name} names a target of a project, and there is no weft.toml here \
+                     or above; run it from the project, or pass --dispatcher <url>"
+                ),
             }
-        };
-        Self {
-            dispatcher_url,
-            json,
-            project: Arc::new(lock),
         }
+    }
+}
+
+/// `--dispatcher` and `--on` together: refused, see [`resolve_dispatcher_url`].
+/// (An exported `WEFT_DISPATCHER_URL` never reaches here beside `--on`:
+/// `--on` wins over it, see [`Dispatcher`].)
+fn refuse_two_installs(dispatcher: Option<&str>, on: Option<&str>) -> anyhow::Result<()> {
+    if let (Some(_), Some(on)) = (dispatcher, on) {
+        anyhow::bail!("both --on {on} and --dispatcher name an install; pass one of them");
+    }
+    Ok(())
+}
+
+impl Ctx {
+    /// Build a Ctx from CLI flags. Nothing is resolved yet (see
+    /// [`Ctx::install`]); only flags that contradict each other are
+    /// refused here, since that needs no install and no project.
+    pub fn new(dispatcher: Option<Dispatcher>, on: Option<String>, json: bool) -> anyhow::Result<Self> {
+        refuse_two_installs(dispatcher.as_ref().and_then(|d| d.beside(on.as_deref())), on.as_deref())?;
+        Ok(Self {
+            dispatcher,
+            on,
+            install: Arc::new(std::sync::OnceLock::new()),
+            json,
+            project: Arc::new(std::sync::OnceLock::new()),
+        })
+    }
+
+    /// The install this command acts on, resolved once on first use.
+    /// Resolving a target reads the SAME cached project walk the verbs
+    /// use, so a command never walks the tree twice; with `--dispatcher`
+    /// given, the walk never happens.
+    fn install(&self) -> anyhow::Result<&Install> {
+        self.install
+            .get_or_init(|| self.resolve_install(|| Ok(self.project_here()?.cloned())))
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("{e:#}"))
+    }
+
+    /// Resolve the install from the flags, the given project lookup and
+    /// the disk, uncached. A one-shot command goes through
+    /// [`Ctx::install`] (the cwd project); a long-lived one goes through
+    /// [`Ctx::fresh_client`] (the project of the request at hand).
+    fn resolve_install(&self, project: impl FnOnce() -> anyhow::Result<Option<Project>>) -> anyhow::Result<Install> {
+        let on = self.on.as_deref();
+        let url = resolve_dispatcher_url(self.dispatcher.as_ref().and_then(|d| d.beside(on)).map(str::to_owned), on, || {
+            // A broken weft.toml only matters when the project's
+            // targets are read: outside the default target it is
+            // the answer's error; for the local default the verb
+            // that needs the project reports it.
+            match project() {
+                Ok(found) => Ok(found),
+                Err(e) if on.is_some() => Err(e),
+                Err(_) => Ok(None),
+            }
+        })?;
+        let operator_key = crate::credentials::operator_key_for(&url, on)?;
+        Ok(Install { url, operator_key })
+    }
+
+    /// Refuse `--on` and `--dispatcher` for a verb that only ever acts on
+    /// this machine's install, so the flag is never silently ignored.
+    /// `WEFT_DISPATCHER_URL` is not refused: it is ambient setup, not a
+    /// request made to this verb (see [`Dispatcher`]).
+    pub fn refuse_other_install(&self, verb: &str) -> anyhow::Result<()> {
+        if let Some(on) = &self.on {
+            anyhow::bail!("{verb} reports on this machine's install; --on {on} names another one (drop it, or use WEFT_INSTALL=<name> for a named local install)");
+        }
+        if let Some(Dispatcher::Flag(_)) = &self.dispatcher {
+            anyhow::bail!("{verb} reports on this machine's install; --dispatcher names another one (drop it, or use WEFT_INSTALL=<name> for a named local install)");
+        }
+        Ok(())
+    }
+
+    /// The address and operator key a request from this command carries
+    /// (`weft target key` prints them for the editor).
+    pub fn install_access(&self) -> anyhow::Result<(&str, Option<&str>)> {
+        let install = self.install()?;
+        Ok((&install.url, install.operator_key.as_deref()))
     }
 
     /// The one cwd project walk (see [`DiscoveredProject`]).
@@ -126,12 +260,24 @@ impl Ctx {
         Ok(true)
     }
 
-    pub fn dispatcher_url(&self) -> &str {
-        &self.dispatcher_url
+    /// A client for the install this command acts on; the first call
+    /// resolves it, so an install with no address yet errors here.
+    pub fn client(&self) -> anyhow::Result<crate::client::DispatcherClient> {
+        let install = self.install()?;
+        Ok(crate::client::DispatcherClient::new(install.url.clone(), install.operator_key.clone()))
     }
 
-    pub fn client(&self) -> crate::client::DispatcherClient {
-        crate::client::DispatcherClient::new(self.dispatcher_url.clone())
+    /// A client resolved afresh on every call, never cached: a long-lived
+    /// process (the editor's parse server) outlives any one state of the
+    /// install, so an install that starts, or credentials that get fixed,
+    /// after it launched are picked up by the next request, and a failure
+    /// is that request's error rather than the process's. The project is
+    /// the REQUEST's (a parse server serves files from many projects, and
+    /// its own cwd names none of them), re-read each time so a weft.toml
+    /// edit is seen.
+    pub fn fresh_client(&self, project: Option<&Project>) -> anyhow::Result<crate::client::DispatcherClient> {
+        let install = self.resolve_install(|| Ok(project.cloned()))?;
+        Ok(crate::client::DispatcherClient::new(install.url, install.operator_key))
     }
 
     /// The cwd-discovered project, lazy-loaded and cached, keeping
@@ -204,29 +350,23 @@ impl Ctx {
     }
 }
 
-/// Resolve a project id: explicit CLI argument wins; otherwise read
-/// it from the cwd-discovered project on `Ctx`. Pass-through for
-/// name-vs-uuid: the dispatcher's endpoints accept uuids, so name
-/// lookups would need a `/projects/by-name` round-trip; today we
-/// pass the raw arg through and the dispatcher rejects non-uuids.
-/// The full color an execution argument names. A whole uuid is taken
+/// The full execution an execution argument names. A whole uuid is taken
 /// as it is; anything shorter is the start of one, and the dispatcher
 /// answers the single execution of yours it starts (or says it starts
-/// none, or several). Every command that takes a color goes through
+/// none, or several). Every command that takes an execution goes through
 /// here, so `weft events 3f2a` works the way `weft stop 3f2a` does.
-pub async fn resolve_color(ctx: &Ctx, input: &str) -> anyhow::Result<String> {
+pub async fn resolve_execution_id(ctx: &Ctx, input: &str) -> anyhow::Result<String> {
     if uuid::Uuid::parse_str(input).is_ok() {
         return Ok(input.to_string());
     }
-    let resp: serde_json::Value = ctx
-        .client()
+    let resp = ctx
+        .client()?
         .get_json(&format!("/executions/resolve/{input}"))
         .await
         .map_err(|e| anyhow::anyhow!("'{input}' names no execution: {e}"))?;
-    resp.get("color")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| anyhow::anyhow!("dispatcher response missing color: {resp}"))
+    let resolved: weft_core::program::ResolvedExecution =
+        serde_json::from_value(resp).map_err(|e| anyhow::anyhow!("read the resolved execution: {e}"))?;
+    Ok(resolved.execution_id.to_string())
 }
 
 /// One node of the program, from the way a person spells it:
@@ -239,7 +379,7 @@ pub async fn resolve_color(ctx: &Ctx, input: &str) -> anyhow::Result<String> {
 /// What comes back is the PLACE, spelled the one way the daemon keys a
 /// place by (`setup.store`, the person's own spelling written back
 /// canonical): a wait parked on a node inside an included file, and the
-/// infra instance of one, belong to one call of it, and the daemon
+/// infra of one, belong to one call of it, and the daemon
 /// holds both under that spelling.
 pub fn node_address_for(ctx: &Ctx, spelled: &str) -> anyhow::Result<String> {
     // Outside a project there is no program to check against, and the
@@ -366,13 +506,13 @@ pub fn resolve_project_id(ctx: &Ctx, explicit: Option<String>) -> anyhow::Result
 
 /// Build (client, id, name) for verbs that talk about THIS project.
 /// All three come from the Ctx-cached Project; the client uses the
-/// already-resolved dispatcher URL.
+/// Ctx's install.
 pub fn resolve_project(
     ctx: &Ctx,
 ) -> anyhow::Result<(crate::client::DispatcherClient, String, String)> {
     let project = ctx.project()?;
     Ok((
-        ctx.client(),
+        ctx.client()?,
         project.id().to_string(),
         project.manifest.package.name.clone(),
     ))
@@ -396,8 +536,8 @@ pub fn local_time(unix_secs: u64) -> String {
 }
 
 #[cfg(test)]
-mod local_time_tests {
-    use super::local_time;
+mod tests {
+    use super::{local_time, resolve_dispatcher_url, Project};
 
     /// The stamp renders as a date and a time, and the two sentinels
     /// (zero, out of range) never render as a bogus date.
@@ -409,5 +549,100 @@ mod local_time_tests {
         assert_eq!(&text[10..11], " ");
         assert_eq!(local_time(0), "-");
         assert_eq!(local_time(u64::MAX), u64::MAX.to_string());
+    }
+
+    fn project_with_prod() -> (tempfile::TempDir, Project) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.weft"), "").unwrap();
+        std::fs::write(
+            dir.path().join("weft.toml"),
+            "[package]\nname = \"p\"\nid = \"00000000-0000-0000-0000-000000000000\"\n\
+             [targets.prod]\nurl = \"https://weft.example.com\"\n",
+        )
+        .unwrap();
+        let project = Project::load(dir.path()).unwrap();
+        (dir, project)
+    }
+
+    #[test]
+    fn no_flag_means_the_local_install_even_inside_a_project_with_a_remote_target() {
+        let (_d, project) = project_with_prod();
+        let url = resolve_dispatcher_url(None, None, || Ok(Some(project))).unwrap();
+        assert_eq!(url, weft_core::ports::local_public_url().unwrap());
+        let url = resolve_dispatcher_url(None, None, || Ok(None)).unwrap();
+        assert_eq!(url, weft_core::ports::local_public_url().unwrap());
+    }
+
+    #[test]
+    fn on_names_a_target_of_the_project() {
+        let (_d, project) = project_with_prod();
+        let url = resolve_dispatcher_url(None, Some("prod"), || Ok(Some(project.clone()))).unwrap();
+        assert_eq!(url, "https://weft.example.com");
+        let error = resolve_dispatcher_url(None, Some("staging"), || Ok(Some(project))).unwrap_err();
+        assert!(error.to_string().contains("local, prod"), "{error}");
+        let error = resolve_dispatcher_url(None, Some("prod"), || Ok(None)).unwrap_err();
+        assert!(error.to_string().contains("no weft.toml"), "{error}");
+    }
+
+    /// A named install that has never started has no address; building
+    /// the context must still succeed (so `weft daemon start` can run),
+    /// and only a command that talks to the install hears why. Sets the
+    /// process's install env var: nextest runs each test in its own
+    /// process, so no other test sees it.
+    #[test]
+    fn a_named_install_without_ports_fails_only_when_its_address_is_needed() {
+        let name = format!("ctx{}", std::process::id());
+        std::env::set_var(weft_core::infra::INSTALL_ENV, &name);
+        let ctx = super::Ctx::new(None, None, false).expect("a Ctx needs no install address");
+        let Err(error) = ctx.client() else { panic!("a named install with no ports has no address") };
+        let error = error.to_string();
+        assert!(error.contains(&format!("install '{name}' has no ports yet")), "{error}");
+        assert!(ctx.install_access().is_err(), "the cached error answers every later use");
+        // The install starts after this process did: a fresh resolution
+        // sees it, the cached one keeps its answer.
+        let dir = weft_core::infra::Install::from_env().unwrap().dir();
+        weft_core::ports::InstallPorts::DEFAULT.save(&dir).expect("save ports");
+        assert!(ctx.fresh_client(None).is_ok(), "a fresh resolution picks up the started install");
+        assert!(ctx.client().is_err(), "the cached error is kept for a one-shot command");
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::env::remove_var(weft_core::infra::INSTALL_ENV);
+    }
+
+    /// A verb bound to this machine refuses the `--dispatcher` flag but
+    /// not `WEFT_DISPATCHER_URL`, which setup.sh exports for tooling.
+    #[test]
+    fn a_machine_bound_verb_refuses_the_flag_but_not_the_env_var() {
+        let url = || "http://127.0.0.1:1".to_string();
+        let flag = super::Ctx::new(Some(super::Dispatcher::Flag(url())), None, false).unwrap();
+        assert!(flag.refuse_other_install("weft daemon status").is_err());
+        let env = super::Ctx::new(Some(super::Dispatcher::Env(url())), None, false).unwrap();
+        env.refuse_other_install("weft daemon status").expect("the env var is ambient, not a request");
+    }
+
+    /// `--on` beside the flag is two answers; beside the exported env var
+    /// it simply wins, so a person with the var set can still say `--on`.
+    #[test]
+    fn on_wins_over_the_env_var_but_not_over_the_flag() {
+        let url = || "http://127.0.0.1:1".to_string();
+        assert!(super::Ctx::new(Some(super::Dispatcher::Flag(url())), Some("prod".into()), false).is_err());
+        let env = super::Dispatcher::Env(url());
+        assert_eq!(env.beside(Some("prod")), None, "--on wins");
+        assert_eq!(env.beside(None), Some("http://127.0.0.1:1"));
+        super::Ctx::new(Some(env), Some("prod".into()), false).expect("the env var yields to --on");
+    }
+
+    #[test]
+    fn on_and_a_raw_address_together_are_refused() {
+        let error = resolve_dispatcher_url(Some("http://x".into()), Some("prod"), || {
+            panic!("the project is never read when the flags conflict")
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("pass one of them"), "{error}");
+        let url = resolve_dispatcher_url(Some("http://x/".into()), None, || {
+            panic!("a raw address needs no project")
+        })
+        .unwrap();
+        assert_eq!(url, "http://x");
     }
 }

@@ -24,7 +24,7 @@ async fn provisions(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(container.ports[0].port, 8090);
     assert!(
         container.env.iter().any(|e| matches!(e,
-            weft::infra::EnvEntry::Literal { name, value } if name == "PORT" && value == "8090")),
+            weft::infra::EnvEntry { name, value } if name == "PORT" && value == "8090")),
         "the env PORT matches the container port"
     );
     assert_eq!(spec.volumes.len(), 1, "the session auth volume persists");

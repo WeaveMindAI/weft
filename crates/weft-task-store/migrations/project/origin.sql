@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS project (
                 running_binary_hash TEXT,
                 running_definition_hash TEXT,
                 running_infra_hash TEXT,
+                running_source JSONB,
                 accepting_fires BOOLEAN NOT NULL DEFAULT TRUE,
                 fires_visible_to_consumers BOOLEAN NOT NULL DEFAULT TRUE,
                 fires_deadline_unix BIGINT,
@@ -20,38 +21,27 @@ CREATE TABLE IF NOT EXISTS project (
                 -- user-initiated stop/deactivate. Cleared by every
                 -- non-health lifecycle write.
                 deactivated_by_health BOOLEAN NOT NULL DEFAULT FALSE,
-                tenant_id TEXT NOT NULL DEFAULT 'local',
+                -- The TriggerSetup execution the CURRENT activation started,
+                -- recorded before the run starts; NULL outside Activating.
+                -- Cancel-activate and the reaper cancel exactly this run
+                -- with the true cause, and treat any other non-terminal
+                -- setup run as a leftover of an older, dead activation.
+                activating_ts_execution_id UUID,
+                tenant_id TEXT NOT NULL,
                 -- Whether this project DECLARES infrastructure (any node
                 -- with requires_infra). Derived from the definition and
                 -- refreshed on every register/sync, so it tracks edits
-                -- that add or remove infra. Decides WORKER placement: an
-                -- infra project's worker runs in the project's own k8s
-                -- namespace (next to its infra pods), a no-infra
-                -- project's worker runs in the shared worker namespace.
-                -- The worker namespace is computed from this on demand
-                -- (project_namespace::worker_namespace), never stored, so
-                -- there is no stale worker-namespace value to reconcile.
-                -- Set true the instant infra is declared, which is BEFORE
-                -- the per-project namespace below is provisioned, so it
-                -- cannot be replaced by `project_namespace <> ''`.
+                -- that add or remove infra.
                 has_infra BOOLEAN NOT NULL DEFAULT FALSE,
-                -- The project's OWN k8s namespace
-                -- (wft-project-<tenant>--<project>), where its INFRA pods
-                -- and its worker live. Distinct concept from has_infra:
-                -- this is the namespace string the supervisor runs
-                -- kubectl against, EMPTY until the namespace is actually
-                -- provisioned (first infra apply) and re-emptied when
-                -- infra is torn down. The broker's supervisor-claim
-                -- filters `project_namespace <> ''` to manage only
-                -- projects whose namespace exists. A no-infra project
-                -- keeps this empty forever (its worker lives in the
-                -- shared namespace, which is not project-owned).
-                project_namespace TEXT NOT NULL DEFAULT '',
                 -- Per-(project, node) image hash maps for Image::Local
                 -- references in InfraSpecs. CLI ships these in /sync;
                 -- supervisor reads them.
                 -- Shape: { "<node_id>": { "<image_name>": "<tag>" } }
                 infra_image_tags_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                -- The project's own worker levers, each one it sets
+                -- replacing the install's (`WorkerOverrides`); empty
+                -- runs on the install's.
+                worker_settings_json JSONB NOT NULL DEFAULT '{}'::jsonb,
                 -- Per-project health protocols overriding the weft
                 -- default. NULL = use default. Schema per
                 -- weft_infra_supervisor::protocol::HealthProtocols.
@@ -70,21 +60,45 @@ CREATE TABLE IF NOT EXISTS project (
                 drain_deadline_unix BIGINT,
                 -- Heartbeat for driver-backed transitional states
                 -- (status='activating', transition='building'/
-                -- 'cancelling_build'): the pod driving the transition
+                -- 'cancelling_build'): the instance driving the transition
                 -- bumps this on an interval; the stuck-transition
                 -- reaper repairs rows whose heartbeat went stale
                 -- (the driver died mid-transition). Per-project and
                 -- status-guarded: this replaces the old boot-time
                 -- blind bulk downgrade, which wiped live status for
-                -- every tenant's projects on any Pod restart.
-                transition_heartbeat_unix BIGINT NOT NULL DEFAULT 0
+                -- every tenant's projects on any Instance restart.
+                transition_heartbeat_unix BIGINT NOT NULL DEFAULT 0,
+                -- The version tree's HEAD (`crate::versions`): the version
+                -- the next checkpoint or run parents on, the run the next
+                -- `--seed` inherits from (NULL when head is a bare
+                -- version), and the version the triggers were activated
+                -- on (NULL while inactive). Moved by checkpoint, run,
+                -- branch and activate; nothing lives on disk.
+                head_version TEXT,
+                head_run UUID,
+                activation_version TEXT,
+                activation_program JSONB
             );
 CREATE INDEX IF NOT EXISTS idx_project_tenant ON project(tenant_id);
+CREATE TABLE IF NOT EXISTS project_code (
+            project_id UUID NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+            binary_hash TEXT NOT NULL,
+            implementations JSONB NOT NULL,
+            PRIMARY KEY (project_id, binary_hash)
+        );
 CREATE TABLE IF NOT EXISTS project_definition (
             project_id UUID NOT NULL,
             definition_hash TEXT NOT NULL,
             project_json TEXT NOT NULL,
             recorded_at_unix BIGINT NOT NULL,
-            PRIMARY KEY (project_id, definition_hash),
-            FOREIGN KEY (project_id) REFERENCES project(id) ON DELETE CASCADE
+            PRIMARY KEY (project_id, definition_hash)
+            -- Deliberately NO foreign key to `project`. An execution's
+            -- journal outlives the project it ran (that is the point of
+            -- a journal), and a run without the program it ran against
+            -- cannot be read back: the rows are there and every input
+            -- and output is underivable, so the graph paints an empty
+            -- run and the reader goes hunting for a bug in the viewer.
+            -- The history is therefore kept as long as anything points
+            -- at it, and `retire_unused_definitions` drops the versions
+            -- no surviving run needs once the project itself is gone.
         );

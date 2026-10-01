@@ -9,6 +9,8 @@ repository.workspace = true
 weft-core = { workspace = true }
 weft-journal = { workspace = true }
 weft-task-store = { workspace = true }
+# The platform identity every call presents (`token::TokenSource`).
+weft-platform-traits = { workspace = true }
 
 reqwest = { workspace = true }
 serde = { workspace = true }

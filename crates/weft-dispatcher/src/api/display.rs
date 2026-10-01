@@ -16,7 +16,7 @@
 //!   - an INFRA node, from its own container's `/live`, which the
 //!     node's author writes (`features.live_endpoint` names the
 //!     endpoint serving it). It may carry buttons;
-//!   - a TRIGGER node, from the listener Pod holding its signal. Read
+//!   - a TRIGGER node, from the listener process holding its signal. Read
 //!     only: nothing about a registration is a reader's to change.
 //!
 //! The editor has had both since the beginning, through the
@@ -84,9 +84,10 @@ pub struct NodeDisplayEntry {
     pub label: Option<String>,
     /// For an `infra` display, where the copy behind it stands:
     /// `provisioning` while it starts, `running`, `stopping`, `stopped`,
-    /// `failed`, `flaky`, `terminating`, or `absent` when it was never
-    /// started. A client shows "starting" from this instead of reading
-    /// the feed's 404 as "not started". Absent on a `trigger` display.
+    /// `failed`, `flaky`, `terminating`, or `none` when it was never
+    /// started (the word `InstanceInfraStatus` answers too). A client
+    /// shows "starting" from this instead of reading the feed's 404 as
+    /// "not started". Absent on a `trigger` display.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<&'static str>,
 }
@@ -140,17 +141,20 @@ pub async fn list_displays(
             if !token_reaches_display(&token, &summary.id, address) {
                 continue;
             }
-            // A member token lists its member's own copies alone.
-            if token.member.is_some() && node.per_member.is_none() {
+            // An instance token lists its instance's own copies alone.
+            if token.instance.is_some() && node.per_instance.is_none() {
                 continue;
             }
             let status = match kind {
                 DisplayKind::Infra => {
-                    let copy = weft_core::member::copy_owner(node.per_member, token.member.as_ref());
+                    let copy = weft_core::instance::copy_owner(node.per_instance, token.instance.as_ref());
                     let row = crate::infra_node::get(&state.pg_pool, summary.id, address, copy)
                         .await
                         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node lookup: {e}")))?;
-                    Some(row.map_or("absent", |row| row.status.as_str()))
+                    // SYNC: never-started copy word <-> catalog/instances/instance_infra_status/mod.rs run,
+                    // tangle/*/.*/skills/weft-consumers/SKILL.md (displays row, status list),
+                    // tangle/*/.*/skills/weft-frontend/SKILL.md (start button)
+                    Some(row.map_or("none", |row| row.status.as_str()))
                 }
                 DisplayKind::Trigger => None,
             };
@@ -210,7 +214,7 @@ pub async fn press_display(
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let (id, kind, copy) = resolve(&state, &headers, &project_id, &address).await?;
-    let body: crate::api::infra::InfraActionBody = serde_json::from_slice(&body).map_err(|e| {
+    let body: weft_core::live::LivePress = serde_json::from_slice(&body).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             format!("a press is {{ \"kind\": \"<actionKind>\", \"payload\": ... }}: {e}"),
@@ -519,7 +523,7 @@ async fn resolve(
     headers: &HeaderMap,
     project_id: &str,
     address: &str,
-) -> Result<(uuid::Uuid, DisplayKind, Option<weft_core::member::MemberId>), (StatusCode, String)> {
+) -> Result<(uuid::Uuid, DisplayKind, Option<weft_core::instance::InstanceId>), (StatusCode, String)> {
     let token = display_token(state, headers).await?;
     let id = project_id
         .parse::<uuid::Uuid>()
@@ -545,17 +549,17 @@ async fn resolve(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
         .ok_or_else(not_found)?;
     let kind = display_for_token(&token, &id, &project, address).ok_or_else(not_found)?;
-    // Whose copy the token reads: a member token reads its member's copy
-    // of a node that exists once per member, and the shared one of any
+    // Whose copy the token reads: an instance token reads its instance's copy
+    // of a node that exists once per instance, and the shared one of any
     // other node; any other token reads the shared copies.
     let (node_id, _) = weft_core::project::resolve_address(&project, address);
-    let per_member = project.nodes.iter().find(|n| n.id == node_id).and_then(|n| n.per_member);
-    // A member token reaches its member's own copies alone: a shared
+    let per_instance = project.nodes.iter().find(|n| n.id == node_id).and_then(|n| n.per_instance);
+    // An instance token reaches its instance's own copies alone: a shared
     // node's display (the shared bridge's pairing code) is the author's.
-    if token.member.is_some() && per_member.is_none() {
+    if token.instance.is_some() && per_instance.is_none() {
         return Err(not_found());
     }
-    let copy = weft_core::member::copy_owner(per_member, token.member.as_ref()).cloned();
+    let copy = weft_core::instance::copy_owner(per_instance, token.instance.as_ref()).cloned();
     Ok((id, kind, copy))
 }
 
@@ -644,6 +648,7 @@ mod scope_tests {
     fn scoped_token(displays: &[String], all: bool, projects: Vec<uuid::Uuid>) -> SignalToken {
         SignalToken {
             id: uuid::Uuid::nil(),
+            kind: weft_core::signal_token::TokenKind::Caller,
             token_hash: "hash".into(),
             recognizer: "wft-test-…".into(),
             tenant_id: "t".into(),
@@ -653,7 +658,7 @@ mod scope_tests {
             allowed_displays: displays.to_vec(),
             all_displays: all,
             created_at: 0,
-            member: None,
+            instance: None,
             expires_at: None,
         }
     }

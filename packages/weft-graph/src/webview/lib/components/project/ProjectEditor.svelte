@@ -82,6 +82,8 @@
 		callPath = [],
 		interactive = true,
 		fileContents = {},
+		installView,
+		onSwitchInstall,
 	}: {
 		project: ProjectDefinition;
 		onSave: (data: { fileRef?: { path: string; content: string } }) => void;
@@ -93,6 +95,8 @@
 		callPath?: string[];
 		interactive?: boolean;
 		fileContents?: Record<string, import('../../../../protocol').FileContent>;
+		installView?: import('../../../../protocol').InstallView;
+		onSwitchInstall?: (install: string) => void;
 		onRun?: (targets: string[]) => void;
 		specs?: import('../../../../run-spec').RunSpec[];
 		resolveSpec?: (spec: import('../../../../run-spec').RunSpec, seeded: boolean) => Promise<import('../../../../run-spec').ResolveSpecResponse>;
@@ -124,7 +128,7 @@
 		onUpgradeInfra?: () => void;
 		actionBarState: import('../../../../protocol').ActionBarState;
 		drift: import('../../../../protocol').ActionAvailability | undefined;
-		infraNodes?: import('../../../../protocol').InfraInstanceStatus[];
+		infraNodes?: import('../../../../protocol').InfraPlacementStatus[];
 		hasInfraInGraph?: boolean;
 		hasTriggersInGraph?: boolean;
 		executionState?: import('../../types').ExecutionState;
@@ -183,5 +187,7 @@
 		{callPath}
 		{interactive}
 		{fileContents}
+		{installView}
+		{onSwitchInstall}
 	/>
 </SvelteFlowProvider>

@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use weft::node::NodeOutput;
-use weft::storage::{KeepTtl, StorageScope};
+use weft::storage::StorageScope;
 use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::api;
@@ -29,7 +29,6 @@ impl Node for SlackDownloadFileNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let file_id: String = ctx.inputs.get("fileId")?;
-        let keep: bool = ctx.inputs.get("keep")?;
 
         let info = api::get(&ctx, &access, "files.info", &[("file", file_id.clone())]).await?;
         let url = info
@@ -60,7 +59,8 @@ impl Node for SlackDownloadFileNode {
                 "slack: download the file",
                 Some(&mime),
                 &name,
-                keep.then_some(KeepTtl::Default),
+                // Swept with the run like every node's file; KeepFile keeps it.
+                None,
             )
             .await?;
         ctx.pulse_downstream(NodeOutput::stored_file(stored)).await

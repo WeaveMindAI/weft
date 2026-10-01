@@ -23,7 +23,7 @@ use weft_core::signal::listener_protocol::{ProcessOutcome, ProcessTarget};
 use crate::registry::RegisteredSignal;
 use crate::socket_engine::{self, CyclePlan, PrepareError};
 
-use super::{KindHandler, LiveCtx, SpawnCtx};
+use super::{BetweenFires, KindHandler, LiveCtx, SpawnCtx};
 use weft_core::live::{LiveFeed, LiveItem};
 
 pub struct SocketListenHandler;
@@ -32,6 +32,10 @@ pub struct SocketListenHandler;
 impl KindHandler for SocketListenHandler {
     fn tag(&self) -> &'static str {
         SocketListen::TAG
+    }
+
+    fn between_fires(&self) -> BetweenFires {
+        BetweenFires::Holds
     }
 
     fn compute_routing(&self, _spec: &SignalSpec) -> Result<SignalRouting> {
@@ -128,7 +132,7 @@ async fn prepare_cycle(
     };
 
     let url = match &cfg.minted.connect {
-        None => cfg.url.clone(),
+        None => crate::infra_address::for_listener(&cfg.url, ctx).await.map_err(PrepareError::Transient)?,
         Some(_) => socket_engine::mint_socket_url(&cfg.minted, &values).await?,
     };
 

@@ -4,8 +4,8 @@ The connect page for one service: the list of connections somebody may pick
 from, the doors a service offers (the shared one, or your own), a paste or a
 browser sign-in, and forgetting a connection. Beside it, the control that
 fills a list field (a spreadsheet, a channel, a model) from the service. The
-weft editor's connection picker and list fields are built on them, and so is a
-member's own settings page.
+weft editor's connection picker and list fields are built on them, and so is
+an instance's own settings page.
 
 It is two halves. `src/core` is plain TypeScript: the recipe readers (what a
 service's recipe says about its fields, its guide and its permissions), the
@@ -21,10 +21,10 @@ forget, how a sign-in went), so a host plugs in by answering them:
 
 - the editor answers through its host bridge, as the program's author
   (`packages/weft-graph/.../editor-connect.ts`);
-- a member's page answers with `MemberDoor`, which calls the dispatcher's
-  member door with the member's token.
+- an instance's page answers with `InstanceDoor`, which calls the
+  dispatcher's instance door with that instance's token.
 
-On a website, the member's browser never calls the dispatcher itself: it
+On a website, the visitor's browser never calls the dispatcher itself: it
 calls its own site at `/weft/...`, and the site's server passes the call on.
 The dispatcher's address is often one the browser cannot reach (a loopback
 port on another machine, as with a Windows browser in front of a WSL
@@ -38,7 +38,7 @@ it from `$lib/weft-connect`, `$lib/weft-connect/svelte` and
 
 If you are mounting it in SvelteKit, the pass-through is one route, and the
 dispatcher's address lives only in the server's environment
-(`WEFT_DISPATCHER_URL=http://127.0.0.1:9999` for a local install):
+(`WEFT_DISPATCHER_URL=http://127.0.0.1:14111` for a local install):
 
 ```ts
 // front/src/routes/weft/[...path]/+server.ts
@@ -51,12 +51,13 @@ const pass = weftPassThrough({ dispatcher: () => env.WEFT_DISPATCHER_URL });
 export const fallback: RequestHandler = ({ request, params }) => pass(request, params.path);
 ```
 
-It passes on the member door (`/member/...`), the signal doors
+It passes on the instance door (`/instance/...`), the signal doors
 (`/signal/...`), the token's listings, displays and files
 (`/signal-token/...`), the program's own routes
-(`/connect/<tenant>/<path>`) and a field's file chooser
+(`/connect/<tenant>/<path>`), the picture links in their answers
+(`/public/files/<token>`) and a field's file chooser
 (`/access/picker/<state>` and the result it posts back), and answers 404 for
-anything else. It carries the caller's `Authorization`, `Weft-Member-Token`,
+anything else. It carries the caller's `Authorization`, `Weft-Instance-Token`,
 body and content type, and hands back the dispatcher's status. It also tells
 the dispatcher which address the browser used (your site's host and the
 `/weft` mount), so a link the dispatcher hands back, like a chooser page,
@@ -69,48 +70,48 @@ a route call's body is read whole before it goes on. Every other door streams
 its body through as it arrives, and hands a redirect back to the browser as
 it is.
 
-The site's cookies stay on the site, and so does `Weft-Member`, which only
+The site's cookies stay on the site, and so does `Weft-Instance`, which only
 the site's server may send. If `WEFT_DISPATCHER_URL` is unset it answers 500
 naming it; if the dispatcher does not answer, 502 naming the address it tried.
 
 If your site sends everyone who is not signed in to its login page (a check
 in `hooks.server.ts`, say), let `/weft/...` past that check. Each of those
-calls carries the member's own weft token, and weft checks it. Behind a login check, a call from
+calls carries an instance's own weft token, and weft checks it. Behind a login check, a call from
 a page without a site session would get the login page back instead of
 its answer.
 
-A page then builds its door with the member's token alone, and it calls
-`/weft/member/...` on its own site:
+A page then builds its door with the instance's token alone, and it calls
+`/weft/instance/...` on its own site:
 
 ```ts
-import { MemberDoor } from '@weft/connect';
-import { MemberSettings } from '@weft/connect/svelte';
+import { InstanceDoor } from '@weft/connect';
+import { InstanceSettings } from '@weft/connect/svelte';
 
-const door = new MemberDoor(memberToken);
-// <MemberSettings {door} />
+const door = new InstanceDoor(instanceToken);
+// <InstanceSettings {door} />
 ```
 
 If the page reaches the dispatcher some other way (the browser extension
 does, with the address the token was minted at), pass it as
-`new MemberDoor(token, { base: dispatcherUrl })`.
+`new InstanceDoor(token, { base: dispatcherUrl })`.
 
-`MemberSettings` lists every field the program asks the member to fill (the
-ones it writes `@member_filled`), grouped by step, each with its own control:
-the connection picker for a connection, the searchable list and the
-provider's chooser for a list field, a plain input for anything else. It
-stores what the member gives, and when a value it changed is one a live
-trigger of theirs reads, the trigger is set up again before the save answers
-and the page says so. A member never sees the shared key: it spends the
-program author's credit.
+`InstanceSettings` lists every field the program gives each instance its own
+value for (the ones it writes `@instance_filled`), grouped by step, each with
+its own control: the connection picker for a connection, the searchable list
+and the provider's chooser for a list field, a plain input for anything else.
+It stores what is given for that instance, and when a value it changed is one
+a live trigger of that instance reads, the trigger is set up again before the
+save answers and the page says so. An instance's page never sees the shared
+key: it spends the program author's credit.
 
 Each step is titled with the program's own label and each field with the
 node's own name for it (a text step's field reads "Value"), both written for
-the program's author. Name what a member reads in your own words with
+the program's author. Name what your visitors read in your own words with
 `labels`, keyed by a step's id for its title and by `step.field` for a field;
 anything you leave out keeps the program's label:
 
 ```svelte
-<MemberSettings {door} labels={{ greet: 'Your greeting', 'greet.value': 'How the bot greets you' }} />
+<InstanceSettings {door} labels={{ greet: 'Your greeting', 'greet.value': 'How the bot greets you' }} />
 ```
 
 If you build your own page instead, `door.fields()` lists the fields,

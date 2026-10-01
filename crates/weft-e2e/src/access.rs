@@ -139,10 +139,13 @@ async fn connect_direct_inner(
     })
 }
 
-/// Stamp the connect handle onto the fixture's access node, exactly as
-/// the editor writes it.
-pub fn set_account(project: &Project, node: &str, input: &str, handle: &Value) -> Result<()> {
-    project.set_node_config(node, input, &handle.to_string())
+/// Pick the connection `handle` names for the fixture's access node on
+/// the install, the way a person does (`weft connect --node <node>
+/// --grant <id>`): the install keeps the pick, never the source.
+pub async fn set_account(project: &Project, node: &str, handle: &Value) -> Result<()> {
+    let id = handle.get("id").and_then(Value::as_str).context("the handle names no connection id")?;
+    project.weft(&["connect", "--node", node, "--grant", id, "--json"]).await?;
+    Ok(())
 }
 
 /// A grant row a test seeded DIRECTLY in the store's Postgres (the

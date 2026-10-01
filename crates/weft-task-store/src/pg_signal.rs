@@ -29,7 +29,7 @@ use tokio::sync::broadcast;
 
 /// The longest any request is held open waiting on a signal. A client
 /// that wants to wait longer asks again; a hold this short never meets
-/// an idle timeout between a pod and the broker, and a lost signal
+/// an idle timeout between a process and the broker, and a lost signal
 /// costs a waiter at most this long.
 pub const MAX_HOLD: Duration = Duration::from_secs(25);
 

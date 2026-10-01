@@ -9,7 +9,7 @@ for other assistants.
 ## What is different here
 
 The persona is `.junie/AGENTS.md`. Skills sit in `.junie/skills/`, the five
-specialists are subagents in `.junie/agents/`, and the six commands are
+specialists are subagents in `.junie/agents/`, and the seven commands are
 `.junie/commands/`.
 
 Two things about this one are genuinely different.
@@ -36,7 +36,7 @@ until every template argument has a value.
 
 ## What is here
 
-Tangle is one persona plus sixteen skills, five specialists and six commands.
+Tangle is one persona plus seventeen skills, six specialists and seven commands.
 The persona holds the program: the graph shape, the typed contracts, the weft
 source. The skills are the big knowledge, loaded only when the work calls for
 them. The specialists take the heavy scoped jobs. The commands are the loop's

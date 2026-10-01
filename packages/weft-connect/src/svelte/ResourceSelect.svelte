@@ -16,7 +16,7 @@
 	//
 	// ONE control for every page that fills such a field: the weft editor
 	// plugs in a transport that signs with the author's connection, a
-	// member's page one that goes through the member door.
+	// an instance's page one that goes through the instance door.
 	import type { ResourceTransport } from '../core/transport';
 	import type { FieldConnection, LookupItem, ResourceSource } from '../core/wire';
 	import { onDestroy } from 'svelte';
@@ -60,7 +60,7 @@
 	const connected = $derived(connection !== 'none');
 
 	/// The usable sources, with their position in the declared list (the
-	/// member door names a source by it).
+	/// instance door names a source by it).
 	const usable = $derived.by(() =>
 		sources
 			.map((source, index) => ({ source, index }))

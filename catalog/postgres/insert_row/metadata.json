@@ -1,7 +1,7 @@
 {
   "type": "PostgresInsertRow",
   "label": "Postgres: Insert Row",
-  "description": "Insert one row into a table, columns from a JSON object, and get the inserted row back (defaults and generated ids filled in).",
+  "description": "Insert one row into a table, columns from a JSON object, and get the inserted row back (defaults and generated ids filled in). A database that cannot be reached or refuses the row (a broken constraint, a duplicate key) is a failure `error` catches when wired; a mistake in the program (a table or column that does not exist, `values` that is not an object) always fails the run.",
   "tags": [
     "postgres",
     "database",
@@ -41,5 +41,8 @@
       "type": "JsonDict",
       "description": "The inserted row as the database stored it. The node fails rather than emitting nothing: if the table has a rule or trigger that discards the insert, no row was stored and there is nothing to pass on."
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

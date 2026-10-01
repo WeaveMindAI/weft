@@ -15,19 +15,20 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 use weft_core::run_spec::{resolve_spec, Refusal, Resolved, RunSpec};
 use weft_core::frames::Located;
 use weft_core::seeding::{inheritable_nodes, seed_plan, SeedOutcome};
-use weft_core::Color;
+use weft_core::ExecutionId;
 
 use crate::api::project::{coherent_definition, require_action, Kick};
 use crate::authenticator::{authorize_project, CallerTenant};
 use crate::state::DispatcherState;
-use crate::versions::{
-    manifest_diff, plan_prune, resolve_seed, version_id, Head, Manifest, ManifestDiff,
-    PrunePlan, RunRow, SeedChoice, VersionRow,
+use crate::versions::{plan_prune, resolve_seed, version_id, Manifest, RunRow, SeedChoice, VersionRow};
+use weft_core::versions::{
+    manifest_diff, CheckpointRequest, Head, HeadRequest, HeadResponse, PruneResponse, RunStarted, RunSummary, RunUpdate,
+    RunningSource, SweepResponse, VersionRunRequest, VersionSummary, VersionTree, VersionUpsert,
 };
 
 type ApiError = (StatusCode, String);
@@ -84,31 +85,12 @@ where
         Ok(body().await)
     })
     .await
-    // Shared with every other holder of this lock, so the three of them
-    // cannot answer the same failure differently.
+    // Shared with every other holder of this lock, so they cannot answer
+    // the same failure differently.
     .map_err(|e| crate::lease::lock_answer("tree lock", e))?
 }
 
 // ----- checkpoint --------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-pub struct CheckpointRequest {
-    pub manifest: Manifest,
-    #[serde(default)]
-    pub label: Option<String>,
-    /// Start a new tree: the version parents on nothing.
-    #[serde(default)]
-    pub root: bool,
-}
-
-// SYNC: VersionUpsert <-> crates/weft-cli/src/commands/checkpoint.rs (response fields)
-#[derive(Debug, Serialize)]
-pub struct VersionUpsert {
-    pub version: String,
-    /// `false` when the project already had this exact code.
-    pub created: bool,
-    pub parent: Option<String>,
-}
 
 /// Record the files as a version under head (no run, no build) and
 /// move head there. Identical code answers the existing version.
@@ -171,12 +153,12 @@ pub(crate) async fn record_program_source_locked(
 
 /// The durable journal bridge records real fires from their immutable birth.
 /// A storage failure retries without firing the trigger again.
-pub(crate) async fn record_trigger_run(state: &DispatcherState, color: Color) -> anyhow::Result<()> {
-    if state.versions.run(color).await?.is_some() { return Ok(()); }
-    let rows = state.journal.events_log(color).await?;
-    if let Some(run) = trigger_run_from_birth(color, &rows)? {
+pub(crate) async fn record_trigger_run(state: &DispatcherState, execution_id: ExecutionId) -> anyhow::Result<()> {
+    if state.versions.run(execution_id).await?.is_some() { return Ok(()); }
+    let rows = state.journal.events_log(execution_id).await?;
+    if let Some(run) = trigger_run_from_birth(execution_id, &rows)? {
         if let Err(error) = state.versions.insert_run(&run).await {
-            return orphaned_run_is_recorded_nowhere(color, error);
+            return orphaned_run_is_recorded_nowhere(execution_id, error);
         }
     }
     Ok(())
@@ -190,12 +172,12 @@ pub(crate) async fn record_trigger_run(state: &DispatcherState, color: Color) ->
 /// good, with every event of every project behind it, and every
 /// activation waiting on those events with it. Any other failure (the
 /// database) stays an error, so the bridge retries it as designed.
-fn orphaned_run_is_recorded_nowhere(color: Color, error: anyhow::Error) -> anyhow::Result<()> {
+fn orphaned_run_is_recorded_nowhere(execution_id: ExecutionId, error: anyhow::Error) -> anyhow::Result<()> {
     match error.downcast_ref::<crate::versions::VersionMissing>() {
         Some(missing) => {
             tracing::info!(
                 target: "weft_dispatcher::journal_bridge",
-                %color,
+                %execution_id,
                 project = %missing.project,
                 version = %missing.version,
                 "a fire's tree row has nowhere to go (its project or version is gone); its journal stays, nothing to record"
@@ -206,22 +188,22 @@ fn orphaned_run_is_recorded_nowhere(color: Color, error: anyhow::Error) -> anyho
     }
 }
 
-fn trigger_run_from_birth(color: Color, rows: &[weft_journal::ExecEvent]) -> anyhow::Result<Option<RunRow>> {
+fn trigger_run_from_birth(execution_id: ExecutionId, rows: &[weft_journal::ExecEvent]) -> anyhow::Result<Option<RunRow>> {
     let Some(weft_journal::ExecEvent::ExecutionStarted { project_id, source_version, definition_hash, at_unix, .. }) = rows.first() else {
-        anyhow::bail!("run {color} has no birth");
+        anyhow::bail!("run {execution_id} has no birth");
     };
     let mut fires = rows.iter().filter_map(|row| match row {
         weft_journal::ExecEvent::NodeKicked { node_id, firing: true, payload, .. } => Some((node_id.clone(), payload.clone().unwrap_or(Value::Null))),
         _ => None,
     });
     let Some(fire) = fires.next() else { return Ok(None); };
-    anyhow::ensure!(fires.next().is_none(), "trigger run {color} started from more than one trigger");
-    let version = source_version.clone().ok_or_else(|| anyhow::anyhow!("trigger run {color} has no original source version"))?;
-    let definition_hash = definition_hash.clone().ok_or_else(|| anyhow::anyhow!("trigger run {color} has no original definition"))?;
+    anyhow::ensure!(fires.next().is_none(), "trigger run {execution_id} started from more than one trigger");
+    let version = source_version.clone().ok_or_else(|| anyhow::anyhow!("trigger run {execution_id} has no original source version"))?;
+    let definition_hash = definition_hash.clone().ok_or_else(|| anyhow::anyhow!("trigger run {execution_id} has no original definition"))?;
     let mut spec = weft_core::run_spec::RunSpec::whole("");
     spec.fire = Some(fire);
     Ok(Some(RunRow {
-        color, project_id: *project_id, version_id: version, seed_color: None,
+        execution_id, project_id: *project_id, version_id: version, seed_execution_id: None,
         stale: Vec::new(), spec: Some(spec), definition_hash, example: None, created_at: *at_unix,
     }))
 }
@@ -296,25 +278,8 @@ fn root_conflict(id: &str, parent: &str) -> ApiError {
 /// reference publish spans EVERY version of the project, one such row
 /// would break that project's publish from then on, durably. The gate
 /// belongs here because this is where a manifest becomes a version.
-fn validate_manifest(manifest: &Manifest) -> Result<(), ApiError> {
+pub(crate) fn validate_manifest(manifest: &Manifest) -> Result<(), ApiError> {
     for (path, hash) in manifest {
-        if path.starts_with(weft_core::project::hash::WEFT_ENTRY_PREFIX) {
-            // The pseudo-entry naming the installed weft. It addresses
-            // no blob, so its value must be empty: checked, not
-            // assumed, because `blob_keys` decides what is a blob by
-            // the empty value and would otherwise try to build a key
-            // out of whatever a caller put here.
-            if !hash.is_empty() {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    format!(
-                        "'{}' names the installed weft, which addresses no file, so it carries no hash",
-                        weft_core::truncate_user_string(path, 256)
-                    ),
-                ));
-            }
-            continue;
-        }
         if path.is_empty()
             || path.starts_with('/')
             || path.contains('\\')
@@ -345,7 +310,7 @@ fn validate_manifest(manifest: &Manifest) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Move head from where the caller read it, or refuse: a sibling Pod
+/// Move head from where the caller read it, or refuse: a sibling process
 /// moved head in between, and every decision here (which version to
 /// parent on, which run to seed from) was made against the old one.
 async fn move_head_or_conflict(
@@ -353,7 +318,7 @@ async fn move_head_or_conflict(
     project: uuid::Uuid,
     expected: &Head,
     version: Option<&str>,
-    run: Option<Color>,
+    run: Option<ExecutionId>,
 ) -> Result<(), ApiError> {
     let moved = state
         .versions
@@ -380,45 +345,6 @@ async fn move_head_or_conflict(
 
 // ----- run ---------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct VersionRunRequest {
-    pub manifest: Manifest,
-    /// The definition the CLI just registered; the run refuses if the
-    /// project's running definition moved since.
-    #[serde(rename = "definitionHash")]
-    pub definition_hash: String,
-    #[serde(rename = "binaryHash")]
-    pub binary_hash: String,
-    #[serde(default)]
-    pub seed: bool,
-    #[serde(default, rename = "seedUntil")]
-    pub seed_until: Vec<String>,
-    #[serde(default, rename = "seedBefore")]
-    pub seed_before: Vec<String>,
-    #[serde(default)]
-    pub root: bool,
-    /// `None` is a plain whole-graph run.
-    #[serde(default)]
-    pub spec: Option<RunSpec>,
-    /// The saved example whose starting parameters this run uses, if any.
-    #[serde(default)]
-    pub example: Option<String>,
-}
-
-// SYNC: VersionRunResponse <-> crates/weft-cli/src/commands/run.rs (response fields)
-#[derive(Debug, Serialize)]
-pub struct VersionRunResponse {
-    pub color: Color,
-    pub version: String,
-    pub seed: Option<Color>,
-    /// Nodes taken from the seed, sorted.
-    pub inherited: Vec<String>,
-    /// Nodes this run executes, sorted.
-    pub ran: Vec<String>,
-    pub warnings: Vec<String>,
-}
-
 /// What the resolver refused, as the 422 body: JSON, so the CLI prints
 /// every line and the editor makes a field per missing input.
 fn refused(refusal: &Refusal) -> ApiError {
@@ -427,28 +353,28 @@ fn refused(refusal: &Refusal) -> ApiError {
 
 /// The runs of a project that are genuinely still going.
 ///
-/// NOT simply "not settled": a color the journal does not know at all
+/// NOT simply "not settled": an execution the journal does not know at all
 /// (a tree row whose execution never started, which is what a failure
 /// between recording the run and journaling it leaves) has no terminal
 /// event, and calling that "in flight" made prune refuse the whole
 /// subtree for ever, with `weft stop` unable to reach it either. The
-/// journal's own non-terminal list only contains colors it knows, so a
+/// journal's own non-terminal list only contains executions it knows, so a
 /// row it has never heard of is not in flight; it is nothing.
-async fn in_flight_colors(
+async fn in_flight_execution_ids(
     state: &DispatcherState,
     project: uuid::Uuid,
-) -> Result<std::collections::HashSet<Color>, ApiError> {
-    let mut live: std::collections::HashSet<Color> = state
+) -> Result<std::collections::HashSet<ExecutionId>, ApiError> {
+    let mut live: std::collections::HashSet<ExecutionId> = state
         .journal
-        .list_non_terminal_colors_for_project(project)
+        .list_non_terminal_execution_ids_for_project(project)
         .await
-        .map_err(|e| internal("non-terminal colors", e))?
+        .map_err(|e| internal("non-terminal executions", e))?
         .into_iter()
-        .map(|(color, _)| color)
+        .map(|(execution_id, _)| execution_id)
         .collect();
     // Parked on a person is not "still going": it is waiting, and
     // prune's refusal is about work that could still write rows.
-    for parked in crate::api::project::suspended_color_set(state, project)
+    for parked in crate::api::project::suspended_execution_id_set(state, project)
         .await
         .map_err(|e| internal("suspended", e))?
     {
@@ -457,7 +383,7 @@ async fn in_flight_colors(
     Ok(live)
 }
 
-/// Every settled color of a project: terminal, or parked on a suspension.
+/// Every settled execution of a project: terminal, or parked on a suspension.
 ///
 /// Both halves are project-wide questions, so they are asked once. Asked
 /// per run instead, a project with a thousand recorded runs did two
@@ -465,17 +391,17 @@ async fn in_flight_colors(
 /// prune`, re-fetching the same project-wide suspended set each time. The
 /// terminal half goes through the `Journal` trait rather than the raw
 /// pool, so the in-memory journal can answer it too.
-async fn settled_colors(
+async fn settled_execution_ids(
     state: &DispatcherState,
     project: uuid::Uuid,
-) -> Result<std::collections::HashSet<Color>, ApiError> {
+) -> Result<std::collections::HashSet<ExecutionId>, ApiError> {
     let mut settled = state
         .journal
-        .list_terminal_colors_for_project(project)
+        .list_terminal_execution_ids_for_project(project)
         .await
-        .map_err(|e| internal("terminal colors", e))?;
+        .map_err(|e| internal("terminal executions", e))?;
     settled.extend(
-        crate::api::project::suspended_color_set(state, project)
+        crate::api::project::suspended_execution_id_set(state, project)
             .await
             .map_err(|e| internal("suspended", e))?,
     );
@@ -484,24 +410,24 @@ async fn settled_colors(
 
 /// The seed run folded, with its program: what the stale set reads.
 struct SeededFrom {
-    color: Color,
+    execution_id: ExecutionId,
     outcomes: BTreeMap<Located, SeedOutcome>,
     outputs: Vec<weft_core::run_spec::OutputWire>,
 }
 
 async fn fold_seed(state: &DispatcherState, project: uuid::Uuid, run: &RunRow) -> Result<SeededFrom, ApiError> {
     if run.project_id != project { return Err((StatusCode::NOT_FOUND, "seed is outside this project".into())); }
-    let sources = crate::projection::reconstruct_execution(state, run.color).await.map_err(|e| internal("seed sources", e))?;
-    let definition = sources[&run.color].project().as_ref();
-    let snapshot = sources[&run.color].snapshot();
-    let outputs = sources[&run.color].output_wires().map_err(|e| internal("seed outputs", e))?;
+    let sources = crate::projection::reconstruct_execution(state, run.execution_id).await.map_err(|e| internal("seed sources", e))?;
+    let definition = sources[&run.execution_id].project().as_ref();
+    let snapshot = sources[&run.execution_id].snapshot();
+    let outputs = sources[&run.execution_id].output_wires().map_err(|e| internal("seed outputs", e))?;
     let live_nodes: BTreeSet<Located> = outputs.iter().filter(|wire| weft_core::weft_type::WeftType::contains_bus_handle(&wire.value))
         .map(|wire| wire.place()).collect();
     let mut identities = BTreeMap::new();
     let mut outcomes = BTreeMap::new();
     for place in inheritable_nodes(definition, snapshot) {
-        let origin = snapshot.inherited_origins.get(&place).copied().unwrap_or(run.color);
-        let (original, graph) = if origin == run.color { (snapshot, definition) } else {
+        let origin = snapshot.inherited_origins.get(&place).copied().unwrap_or(run.execution_id);
+        let (original, graph) = if origin == run.execution_id { (snapshot, definition) } else {
             let source = sources.get(&origin).ok_or_else(|| internal("seed origin", format!("missing run {origin}")))?;
             (source.snapshot(), source.project().as_ref())
         };
@@ -532,7 +458,39 @@ async fn fold_seed(state: &DispatcherState, project: uuid::Uuid, run: &RunRow) -
                 .map(|(_, kick)| kick.payload.clone().unwrap_or(Value::Null)),
         });
     }
-    Ok(SeededFrom { color: run.color, outcomes, outputs })
+    Ok(SeededFrom { execution_id: run.execution_id, outcomes, outputs })
+}
+
+/// Refuse a seed that would reuse an output naming a stored file the
+/// file has moved on from: a reused step's saved result says what the
+/// step made, and a file edited since (by a later step, by another run)
+/// or gone no longer holds it. Every such output is named at once, so
+/// one refusal says everything to hand in or re-run.
+async fn refuse_moved_files(
+    state: &DispatcherState,
+    project: &weft_core::ProjectDefinition,
+    reused: &BTreeMap<Located, ExecutionId>,
+    outputs: &[weft_core::run_spec::OutputWire],
+) -> Result<(), ApiError> {
+    let mut refusals = Vec::new();
+    for wire in outputs.iter().filter(|wire| !wire.closed && reused.contains_key(&wire.place())) {
+        for file in weft_core::storage::stored_files_within(&wire.value) {
+            let now = match crate::storage::file_meta(state, &file.key).await {
+                Ok(meta) => weft_core::seeding::FileNow::At(meta.version),
+                Err(e) if e.downcast_ref::<crate::storage::StorageNotFound>().is_some() => {
+                    weft_core::seeding::FileNow::Gone
+                }
+                Err(e) => return Err(internal("read a reused output's file", e)),
+            };
+            let place = wire.place();
+            let step = weft_core::project::address_of(project, &place.id, &place.path);
+            refusals.extend(weft_core::seeding::moved_file_refusal(&step, &wire.port, &file, now));
+        }
+    }
+    if refusals.is_empty() {
+        return Ok(());
+    }
+    Err((StatusCode::CONFLICT, refusals.join("\n")))
 }
 
 /// Start a run that records itself in the tree. See the module doc.
@@ -541,7 +499,7 @@ pub async fn run(
     caller: CallerTenant,
     Path(id): Path<uuid::Uuid>,
     Json(body): Json<VersionRunRequest>,
-) -> Result<Json<VersionRunResponse>, ApiError> {
+) -> Result<Json<RunStarted>, ApiError> {
     authorize_project(&state, &caller.0, id).await?;
     require_action(&state, id, None, &["run"]).await?;
     if (!body.seed_until.is_empty() || !body.seed_before.is_empty()) && !body.seed {
@@ -593,14 +551,14 @@ pub async fn run(
     let seed_run: Option<RunRow> = if body.seed && !body.root {
         let versions = state.versions.versions(id).await.map_err(|e| internal("versions", e))?;
         let runs = state.versions.runs(id).await.map_err(|e| internal("runs", e))?;
-        let settled = settled_colors(&state, id).await?;
+        let settled = settled_execution_ids(&state, id).await?;
         match resolve_seed(&head, &versions, &runs, |c| settled.contains(&c)) {
-            SeedChoice::Run(color) => runs.into_iter().find(|r| r.color == color),
+            SeedChoice::Run(execution_id) => runs.into_iter().find(|r| r.execution_id == execution_id),
             SeedChoice::Nothing => None,
-            SeedChoice::HeadRunning(color) => {
+            SeedChoice::HeadRunning(execution_id) => {
                 return Err((
                     StatusCode::CONFLICT,
-                    format!("head {color} is still running; `weft stop {color}` or wait, then run again"),
+                    format!("head {execution_id} is still running; `weft stop {execution_id}` or wait, then run again"),
                 ));
             }
         }
@@ -611,9 +569,9 @@ pub async fn run(
     let spec = body.spec.clone().unwrap_or_else(|| RunSpec::whole("run"));
     let mut resolved = resolve_spec(&spec, &project).map_err(|r| refused(&r))?;
     let bakes = if spec.fire.is_some() {
-        // A member's trigger was baked with that member's values: the
-        // fire replays the member's bake.
-        state.journal.trigger_bakes(id, spec.member.as_ref()).await.map_err(|error| internal("read trigger bakes", error))?
+        // An instance's trigger was baked with that instance's values: the
+        // fire replays the instance's bake.
+        state.journal.trigger_bakes(id, spec.instance.as_ref()).await.map_err(|error| internal("read trigger bakes", error))?
     } else { Vec::new() };
     // A fired CALLER trigger (a Route) gets a stand-in caller: there is
     // no socket coming, so the run serves the body the author typed and
@@ -624,8 +582,8 @@ pub async fn run(
     // The trigger's signal spec comes from its BAKE, the same capture
     // the port snapshot below comes from, so the dispatcher needs no
     // knowledge of what a Route is: whether this trigger speaks to a
-    // caller at all is `protocol_for_tag` on the signal kind, which is
-    // the language's own vocabulary.
+    // caller at all is the signal kind's own declaration
+    // (`weft_core::signal::caller_protocol`).
     let mut fired_caller: Option<weft_task_store::kinds::LiveConnectionStart> = None;
     // The trigger `--fire` names, spelled: the run is that trigger's.
     let mut fired_trigger: Option<String> = None;
@@ -641,7 +599,7 @@ pub async fn run(
             .and_then(|bake| bake.captured.get(&address))
             .expect("validated bake contains this trigger for this program");
         kick.port_snapshot = Some(capture.ports.clone());
-        if weft_core::signal::protocol_for_tag(&capture.spec.kind).is_some() {
+        if weft_core::signal::caller_protocol(&capture.spec.kind).is_some() {
             let payload = spec
                 .fire
                 .as_ref()
@@ -660,7 +618,7 @@ pub async fn run(
     // was wired to. `require_action` above deliberately does not enforce
     // the whole-graph fact (it reports it, for the bar's unaimed button),
     // the way it leaves the trigger facts to `require_trigger_infra`.
-    crate::api::project::require_run_infra(&state, id, &project, &resolved.selection, spec.member.as_ref()).await?;
+    crate::api::project::require_run_infra(&state, id, &project, &resolved.selection, spec.instance.as_ref()).await?;
 
     // What the run inherits and what it kicks.
     let mut starting_parameters = spec.clone();
@@ -670,13 +628,14 @@ pub async fn run(
             let planned = seed_plan(&project, &program, &resolved.selection, &spec, &from.outcomes,
                 &body.seed_until, &body.seed_before)
                 .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+            refuse_moved_files(&state, &project, &planned.origins, &from.outputs).await?;
             starting_parameters = weft_core::seeding::starting_parameters(&project, &spec, &resolved.selection, &planned, &from.outcomes, &from.outputs)
                 .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
             resolved.warnings.extend(planned.warnings);
             resolved.selection = planned.selection;
             let stale = resolved.selection.nodes.clone();
             let kicks = seeded_kicks(&resolved, &stale);
-            let seed = weft_journal::Seed { parent: from.color, origins: planned.origins };
+            let seed = weft_journal::Seed { parent: from.execution_id, origins: planned.origins };
             (Some(seed), stale, kicks)
         }
         None => (None, resolved.selection.nodes.clone(), resolved.kicks.clone()),
@@ -696,23 +655,26 @@ pub async fn run(
         }
         refused(&refusal)
     })?;
-    // A member's run reaching a `@member_filled` field runs on what that
-    // member provides there: read and checked now, refused naming every
+    // An instance's run reaching a `@instance_filled` field runs on what that
+    // instance provides there: read and checked now, refused naming every
     // field left unfilled or filled wrong, rather than failing at the
     // step mid-run. The run carries what was read.
-    let member_values = match &spec.member {
-        Some(member) => {
-            crate::api::project::member_values_for_run(&state, id, &project, &resolved.selection, member, None).await?
+    let instance_values = match &spec.instance {
+        Some(instance) => {
+            crate::api::project::instance_values_for_run(&state, id, &project, &resolved.selection, instance, None).await?
         }
         None => Default::default(),
     };
+    // The program's own connections, as this install picked them: a
+    // required one nobody picked is refused now, naming the command.
+    let picks = crate::api::project::picks_for_run(&state, id, &project, &resolved.selection).await?;
     // A stale node with no kick still runs: its inputs are inherited
     // pulses the worker folds in, and it fires the moment they settle
     // after the selected reuse boundary. Only a run with
     // nothing stale, nothing kicked and nothing provided has no work.
-    let color = uuid::Uuid::new_v4();
+    let execution_id = uuid::Uuid::new_v4();
     let now = crate::lease::now_unix() as u64;
-    let birth_rows = supplied_output_events(&project, &spec, &resolved, color, now);
+    let birth_rows = supplied_output_events(&project, &spec, &resolved, execution_id, now);
     // An empty `entry_node` is the journal's marker for a row that no
     // longer decodes, and `weft executions` prints `?` for it. A
     // seeded re-run of a mid-graph node has no kick and no provided
@@ -744,7 +706,7 @@ pub async fn run(
     //
     // The tree row goes first: once `start_queued_execution_with`
     // returns, a real run is queued and burning worker capacity, so a
-    // failure after that point would hand the caller no color at all
+    // failure after that point would hand the caller no execution at all
     // while the run proceeded, unreachable from `weft tree` and with
     // nothing to hand `weft clean`.
     //
@@ -773,10 +735,10 @@ pub async fn run(
         state
             .versions
             .insert_run(&RunRow {
-                color,
+                execution_id,
                 project_id: id,
                 version_id: version.version.clone(),
-                seed_color: seed.as_ref().map(|s| s.parent),
+                seed_execution_id: seed.as_ref().map(|s| s.parent),
                 stale: stale_vec.clone(),
                 spec: Some(starting_parameters.clone()),
                 definition_hash: definition_hash.clone(),
@@ -787,26 +749,32 @@ pub async fn run(
             .map_err(|e| internal("record run", e))?;
         crate::api::project::start_queued_execution_with(
             &state,
-            color,
-            id,
-            weft_core::context::Phase::Fire,
-            &entry_node,
-            &kicks,
+            crate::api::project::Birth {
+                execution_id,
+                project_id: id,
+                phase: weft_core::context::Phase::Fire,
+                entry_node: &entry_node,
+                kicks: &kicks,
+                program: &program,
+                subgraph: Some(&resolved.selection),
+                seed: seed.clone(),
+                source_version: Some(&version.version),
+                instance: spec.instance.as_ref().map(|instance| crate::api::project::RunFor { instance, values: &instance_values }),
+                picks: &picks,
+                fired_trigger: fired_trigger.as_deref(),
+                run_kind: weft_core::exec::RunKind::Execution,
+                run_class: spec.run_class,
+                at_unix: now,
+            },
             &birth_rows,
-            &program,
-            Some(&resolved.selection),
-            seed.clone(),
             None,
-            Some(&version.version),
             fired_caller.clone(),
-            spec.member.as_ref().map(|member| crate::api::project::RunFor { member, values: &member_values }),
-            fired_trigger.as_deref(),
         )
         .await?;
         // Head moves LAST, and a lost race is reported, never refused.
         let moved = state
             .versions
-            .move_head(id, &head, Some(&version.version), Some(color))
+            .move_head(id, &head, Some(&version.version), Some(execution_id))
             .await
             .map_err(|e| internal("set head", e))?;
         Ok((version, moved))
@@ -818,7 +786,7 @@ pub async fn run(
     // By this point the execution is journaled, queued and recorded
     // under its version: it is running. Answering 409 would tell the
     // person nothing started while a real run burned worker capacity
-    // under a color they were never given, with no way to stop it. So
+    // under an execution they were never given, with no way to stop it. So
     // the run stands and the answer says what happened.
     //
     // Another session checkpointing is NOT the cause any more: every tree
@@ -840,15 +808,15 @@ pub async fn run(
              this version, which is what they already are unless you have edited them since \
              reading this.",
             version.version,
-            &color.to_string()[..8],
-            &color.to_string()[..8],
+            &execution_id.to_string()[..8],
+            &execution_id.to_string()[..8],
         ));
     }
 
     let ran: Vec<String> = resolved.selection.nodes.iter().map(spell).collect::<BTreeSet<_>>().into_iter().collect();
     let inherited: Vec<String> = seed.as_ref().map(|seed| seed.origins.keys().map(spell).collect::<BTreeSet<_>>().into_iter().collect()).unwrap_or_default();
-    Ok(Json(VersionRunResponse {
-        color,
+    Ok(Json(RunStarted {
+        execution_id,
         version: version.version,
         seed: seed.map(|s| s.parent),
         inherited,
@@ -880,9 +848,7 @@ fn stand_in_caller(
     // would serve it: the engine keeps its own floor, but by then the
     // person has already waited for an execution to start just to be
     // told the thing they asked for cannot happen.
-    if weft_core::signal::live_connection::protocol_for_tag(&spec.kind)
-        == Some(weft_core::signal::Protocol::Websocket)
-    {
+    if weft_core::signal::caller_protocol(&spec.kind) == Some(weft_core::signal::Protocol::Websocket) {
         return Err(format!(
             "--fire {address}: a Socket cannot be fired. Its shape is a conversation over \
              time, and there is nothing honest to invent for the caller's next message. \
@@ -910,7 +876,7 @@ fn stand_in_caller(
     })
 }
 
-fn supplied_output_events(project: &weft_core::ProjectDefinition, spec: &RunSpec, resolved: &Resolved, color: Color, at_unix: u64) -> Vec<weft_journal::ExecEvent> {
+fn supplied_output_events(project: &weft_core::ProjectDefinition, spec: &RunSpec, resolved: &Resolved, execution_id: ExecutionId, at_unix: u64) -> Vec<weft_journal::ExecEvent> {
     let mut events = Vec::new();
     // Seed suppliers carry their original events. Only authored emits create
     // new supplied facts, including closures for an explicit empty port map,
@@ -943,14 +909,14 @@ fn supplied_output_events(project: &weft_core::ProjectDefinition, spec: &RunSpec
             };
             for (index, value) in values.into_iter().enumerate() {
                 events.push(weft_journal::ExecEvent::PortEmitted {
-                    color, emission_id: uuid::Uuid::new_v5(&color, format!("supplied\0{source}\0{}\0{index}", port.name).as_bytes()),
+                    execution_id, emission_id: uuid::Uuid::new_v5(&execution_id, format!("supplied\0{source}\0{}\0{index}", port.name).as_bytes()),
                     node_id: source.to_string(), frames: frames.clone(), port: port.name.clone(), value: Arc::new(value.clone()),
                     provided: true, at_unix,
                 });
             }
             if generator || supplied.is_none() {
                 events.push(weft_journal::ExecEvent::PortClosed {
-                    color, emission_id: uuid::Uuid::new_v5(&color, format!("supplied-end\0{source}\0{}", port.name).as_bytes()),
+                    execution_id, emission_id: uuid::Uuid::new_v5(&execution_id, format!("supplied-end\0{source}\0{}", port.name).as_bytes()),
                     node_id: source.to_string(), frames: frames.clone(), port: port.name.clone(), provided: true, at_unix,
                 });
             }
@@ -963,7 +929,7 @@ fn supplied_output_events(project: &weft_core::ProjectDefinition, spec: &RunSpec
 #[derive(Debug, Default, Deserialize)]
 pub struct BakesQuery {
     #[serde(default)]
-    pub member: Option<weft_core::member::MemberId>,
+    pub instance: Option<weft_core::instance::InstanceId>,
 }
 
 /// Code identities and captured trigger names for preview validation.
@@ -974,7 +940,7 @@ pub async fn trigger_bakes(
     axum::extract::Query(query): axum::extract::Query<BakesQuery>,
 ) -> Result<Json<Vec<weft_core::run_spec::BakeSummary>>, ApiError> {
     authorize_project(&state, &caller.0, id).await?;
-    let bakes = state.journal.trigger_bakes(id, query.member.as_ref()).await.map_err(|error| internal("read trigger bakes", error))?;
+    let bakes = state.journal.trigger_bakes(id, query.instance.as_ref()).await.map_err(|error| internal("read trigger bakes", error))?;
     Ok(Json(bakes.iter().map(|bake| bake.summary()).collect()))
 }
 
@@ -993,55 +959,33 @@ fn seeded_kicks(
 
 // ----- tree --------------------------------------------------------------
 
-// SYNC: VersionSummary <-> crates/weft-cli/src/commands/versions.rs VersionSummary, extension-vscode/src/sidebar/version-tree.ts VersionSummary
-#[derive(Debug, Serialize)]
-pub struct VersionSummary {
-    pub id: String,
-    pub parent_id: Option<String>,
-    pub label: Option<String>,
-    pub created_at: u64,
-    /// What changed against the parent (empty on a root).
-    pub diff: ManifestDiff,
-    pub manifest: Manifest,
-}
-
-// SYNC: RunSummary <-> crates/weft-cli/src/commands/versions.rs RunSummary, extension-vscode/src/sidebar/version-tree.ts RunSummary
-#[derive(Debug, Serialize)]
-pub struct RunSummary {
-    pub color: Color,
-    pub version_id: String,
-    /// The program this run executed. `weft freeze` records it on the
-    /// example so a later reader can tell which definition the frozen
-    /// wires came from.
-    pub definition_hash: String,
-    pub seed_color: Option<Color>,
-    pub stale: Vec<String>,
-    pub spec: Option<RunSpec>,
-    pub example: Option<String>,
-    /// The execution's status as the executions list reports it, or
-    /// `unknown` when its journal is gone.
-    pub status: String,
-    pub started_at: u64,
-    pub completed_at: Option<u64>,
-    /// For a cancelled run, who or what stopped it (see
-    /// `ExecutionSummary::cancel_cause`).
-    pub cancel_cause: Option<weft_core::exec::CancelCause>,
-    /// Node firings the run skipped (see `ExecutionSummary::skipped_nodes`).
-    pub skipped_nodes: u64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct TreeResponse {
-    pub head: Head,
-    pub versions: Vec<VersionSummary>,
-    pub runs: Vec<RunSummary>,
+/// `GET /projects/{id}/versions/running`: the files of the program the
+/// install last built (what its triggers and runs use), as a manifest the
+/// caller downloads through the storage plane like any version's. What
+/// `weft running-source` and the editor's install switch read, so a person
+/// looking at another install sees the program it holds rather than the
+/// files on their disk.
+pub async fn running(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<Json<RunningSource>, ApiError> {
+    authorize_project(&state, &caller.0, id).await?;
+    let identity = state
+        .projects
+        .running_program_identity(id)
+        .await
+        .map_err(|e| internal("running program", e))?
+        .ok_or((StatusCode::NOT_FOUND, "this install holds no build of the project yet; `weft activate` puts one there".to_string()))?;
+    let manifest = state.projects.program_source(id, &identity).await.map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+    Ok(Json(RunningSource { version: version_id(&manifest), manifest }))
 }
 
 pub async fn tree(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(id): Path<uuid::Uuid>,
-) -> Result<Json<TreeResponse>, ApiError> {
+) -> Result<Json<VersionTree>, ApiError> {
     authorize_project(&state, &caller.0, id).await?;
     let head = state.versions.head(id).await.map_err(|e| internal("head", e))?;
     let versions = state.versions.versions(id).await.map_err(|e| internal("versions", e))?;
@@ -1063,7 +1007,7 @@ pub async fn tree(
             manifest: v.manifest.clone(),
         })
         .collect();
-    let suspended = crate::api::project::suspended_color_set(&state, id)
+    let suspended = crate::api::project::suspended_execution_id_set(&state, id)
         .await
         .map_err(|e| internal("suspended", e))?;
     // ONE read for every run's status. Asked per run, a project with a
@@ -1076,18 +1020,15 @@ pub async fn tree(
         .map_err(|e| internal("execution summaries", e))?;
     let mut run_summaries = Vec::with_capacity(runs.len());
     for r in runs {
-        let (mut status, started_at, completed_at, cancel_cause, skipped_nodes) = match summaries.get(&r.color) {
-            Some(s) => (s.status.clone(), s.started_at, s.completed_at, s.cancel_cause.clone(), s.skipped_nodes),
-            None => ("unknown".to_string(), r.created_at, None, None, 0),
+        let (status, started_at, completed_at, cancel_cause, skipped_nodes) = match summaries.get(&r.execution_id) {
+            Some(s) => (Some(s.status.parked(suspended.contains(&r.execution_id))), s.started_at, s.completed_at, s.cancel_cause.clone(), s.skipped_nodes),
+            None => (None, r.created_at, None, None, 0),
         };
-        if status == "running" && suspended.contains(&r.color) {
-            status = "waiting_for_input".to_string();
-        }
         run_summaries.push(RunSummary {
-            color: r.color,
+            execution_id: r.execution_id,
             version_id: r.version_id,
             definition_hash: r.definition_hash,
-            seed_color: r.seed_color,
+            seed_execution_id: r.seed_execution_id,
             stale: r.stale,
             spec: r.spec,
             example: r.example,
@@ -1098,25 +1039,10 @@ pub async fn tree(
             skipped_nodes,
         });
     }
-    Ok(Json(TreeResponse { head, versions: version_summaries, runs: run_summaries }))
+    Ok(Json(VersionTree { head, versions: version_summaries, runs: run_summaries }))
 }
 
 // ----- head, activation, run bookkeeping ---------------------------------
-
-#[derive(Debug, Deserialize)]
-pub struct HeadRequest {
-    #[serde(default)]
-    pub version: Option<String>,
-    #[serde(default)]
-    pub run: Option<Color>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct HeadResponse {
-    pub version: String,
-    pub run: Option<Color>,
-    pub manifest: Manifest,
-}
 
 /// Move head: to a run (its version, with the run as the next seed) or
 /// to a bare version. Answers the manifest so `weft branch` restores
@@ -1132,15 +1058,15 @@ pub async fn set_head(
         // Resolve the destination under the same lock as prune and the head move.
         // Otherwise a valid destination can disappear between its read and use.
         let (version_id, run) = match (body.run, body.version) {
-            (Some(color), _) => {
+            (Some(execution_id), _) => {
                 let run = state
                     .versions
-                    .run(color)
+                    .run(execution_id)
                     .await
                     .map_err(|e| internal("run", e))?
                     .filter(|r| r.project_id == id)
-                    .ok_or((StatusCode::NOT_FOUND, format!("run {color} is not recorded in this project's tree")))?;
-                (run.version_id, Some(color))
+                    .ok_or((StatusCode::NOT_FOUND, format!("run {execution_id} is not recorded in this project's tree")))?;
+                (run.version_id, Some(execution_id))
             }
             (None, Some(version)) => (version, None),
             (None, None) => return Err((StatusCode::BAD_REQUEST, "name a version or a run".into())),
@@ -1161,49 +1087,30 @@ pub async fn set_head(
     .await
 }
 
-/// A field the caller may leave alone, set, or clear.
-///
-/// `None` is "the key was absent, keep what is recorded"; `Some(None)`
-/// is an explicit `null`, "clear it".
-fn present<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
-where
-    T: Deserialize<'de>,
-    D: serde::Deserializer<'de>,
-{
-    Ok(Some(T::deserialize(d)?))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RunUpdate {
-    #[serde(default, deserialize_with = "present")]
-    pub example: Option<Option<String>>,
-}
-
 /// Associate a recorded run with a saved example.
 pub async fn update_run(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path((id, color)): Path<(uuid::Uuid, String)>,
+    Path((id, execution_id)): Path<(uuid::Uuid, String)>,
     Json(body): Json<RunUpdate>,
 ) -> Result<StatusCode, ApiError> {
     authorize_project(&state, &caller.0, id).await?;
-    let color: Color = color.parse().map_err(|_| (StatusCode::BAD_REQUEST, "bad color".into()))?;
-    // Read only to authorize the color to this project. What gets written
+    let execution_id: ExecutionId = execution_id.parse().map_err(|_| (StatusCode::BAD_REQUEST, "bad execution".into()))?;
+    // Read only to authorize the execution to this project. What gets written
     // is exactly what the caller named: the store leaves an unmentioned
     // column alone, so two sessions writing different fields of one run
     // cannot put back each other's stale value.
     state
         .versions
-        .run(color)
+        .run(execution_id)
         .await
         .map_err(|e| internal("run", e))?
         .filter(|r| r.project_id == id)
-        .ok_or((StatusCode::NOT_FOUND, format!("run {color} is not recorded in this project's tree")))?;
+        .ok_or((StatusCode::NOT_FOUND, format!("run {execution_id} is not recorded in this project's tree")))?;
     if let Some(example) = body.example {
         state
             .versions
-            .set_run_example(color, example.as_deref())
+            .set_run_example(execution_id, example.as_deref())
             .await
             .map_err(|e| internal("update run", e))?;
     }
@@ -1222,12 +1129,6 @@ pub struct PruneQuery {
     /// to prune under one.
     #[serde(default)]
     pub frozen: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct PruneResponse {
-    pub plan: PrunePlan,
-    pub deleted: bool,
 }
 
 /// Delete a version subtree and every run under it, or (with
@@ -1253,7 +1154,7 @@ pub async fn prune(
         let head = state.versions.head(id).await.map_err(|e| internal("head", e))?;
         let versions = state.versions.versions(id).await.map_err(|e| internal("versions", e))?;
         let runs = state.versions.runs(id).await.map_err(|e| internal("runs", e))?;
-        let in_flight = in_flight_colors(&state, id).await?;
+        let in_flight = in_flight_execution_ids(&state, id).await?;
         let frozen: Vec<String> = query
             .frozen
             .as_deref()
@@ -1283,7 +1184,7 @@ pub async fn prune(
         // "run X is still running", for a run that could never finish
         // and that `weft stop` could no longer reach. Dropping the tree
         // rows first means a failure here leaves journals nobody's tree
-        // names, which `weft clean` still reaches by color.
+        // names, which `weft clean` still reaches by execution.
         state
             .versions
             .delete_versions(id, &plan.versions)
@@ -1306,17 +1207,17 @@ pub async fn prune(
     // and every run start on that project queued behind it while
     // holding a connection of its own.
     let mut failed: Vec<String> = Vec::new();
-    for color in &plan.runs {
-        match crate::api::execution::clean_execution(&state, &caller.0, *color).await {
+    for execution_id in &plan.runs {
+        match crate::api::execution::clean_execution(&state, &caller.0, *execution_id).await {
             Ok(_) => {}
             // A journal that is already gone is already clean: the
             // residue an older ordering left behind (a tree row
             // outliving its journal). Its row has just been cascaded
             // away, so there is nothing to do and nothing to report;
             // calling it a failure told the person to run a command
-            // that answers 404 for ever on that color.
+            // that answers 404 for ever on that execution.
             Err(StatusCode::NOT_FOUND) => {}
-            Err(status) => failed.push(format!("{color} ({status})")),
+            Err(status) => failed.push(format!("{execution_id} ({status})")),
         }
     }
     if !failed.is_empty() {
@@ -1324,17 +1225,12 @@ pub async fn prune(
             "prune",
             format!(
                 "the versions were pruned, but these runs' journals could not be cleaned: {}. \
-                 They are no longer in the tree; `weft clean <color>` removes each one.",
+                 They are no longer in the tree; `weft clean <execution_id>` removes each one.",
                 failed.join(", ")
             ),
         ));
     }
     Ok(Json(PruneResponse { plan, deleted }))
-}
-
-#[derive(Debug, Serialize)]
-pub struct SweepResponse {
-    pub swept: Vec<String>,
 }
 
 /// Drop the versions a bulk clean left bare: no runs, no descendants,
@@ -1386,28 +1282,15 @@ pub(crate) async fn sweep_bare_versions(
     .await
 }
 
-/// Every blob the project's surviving versions name, as storage keys,
-/// for the reference publish (`api::storage::asset_references`) to keep
-/// alive alongside the build's own assets.
-pub async fn version_blob_keys(state: &DispatcherState, project: uuid::Uuid) -> anyhow::Result<Vec<String>> {
-    let versions = state.versions.versions(project).await?;
-    let source = state.versions.registered_source(project).await?;
-    blob_keys(project, versions.iter().map(|v| (v.id.as_str(), &v.manifest))
-        .chain(source.as_ref().map(|source| ("registered sources", source))))
-}
-
-/// The distinct blob keys the given manifests name. A manifest entry
-/// with an empty hash names no blob (the CLI's `weft:<version>:<catalog
-/// hash>` pseudo-entry, which is part of the version id and nothing in
-/// storage) and is skipped rather than turned into a malformed key.
+/// The distinct blob keys the given manifests name: every entry is a
+/// file, so every entry names one.
 pub fn blob_keys<'a>(
-    project: uuid::Uuid,
     manifests: impl Iterator<Item = (&'a str, &'a BTreeMap<String, String>)>,
 ) -> anyhow::Result<Vec<String>> {
     let mut keys: BTreeSet<String> = BTreeSet::new();
-    let scope = weft_core::storage::key::KeyScope::Asset { project_id: project.to_string() };
+    let scope = weft_core::storage::key::KeyScope::Asset;
     for (version, manifest) in manifests {
-        for (path, hash) in manifest.iter().filter(|(_, h)| !h.is_empty()) {
+        for (path, hash) in manifest {
             keys.insert(weft_core::storage::key::scope_key(&scope, hash).map_err(|e| {
                 // Every stored manifest passed `validate_manifest`, so
                 // this cannot happen for a row written since that gate
@@ -1434,21 +1317,26 @@ pub fn blob_keys<'a>(
 mod blob_key_tests {
     use super::*;
 
-    /// The `weft:` pseudo-entry carries no blob, so it makes no key; a
-    /// hash two versions share makes one key.
+    /// A hash two versions share makes one key.
     #[test]
-    fn blob_keys_skip_empty_hashes_and_dedupe() {
-        let project = uuid::Uuid::nil();
-        let a: BTreeMap<String, String> =
-            [("main.weft".to_string(), "aaa".to_string()), ("weft:0.5.0:cat".to_string(), String::new())].into_iter().collect();
+    fn blob_keys_dedupe() {
+        let (aaa, bbb) = ("a".repeat(64), "b".repeat(64));
+        let a: BTreeMap<String, String> = [("main.weft".to_string(), aaa.clone())].into_iter().collect();
         let b: BTreeMap<String, String> =
-            [("main.weft".to_string(), "aaa".to_string()), ("weft.toml".to_string(), "bbb".to_string())].into_iter().collect();
-        let keys = blob_keys(project, [("v1", &a), ("v2", &b)].into_iter()).expect("both are addressable");
-        assert_eq!(
-            keys,
-            vec![format!("asset/{project}/aaa"), format!("asset/{project}/bbb")],
-            "no key for the empty hash, one for the shared one"
-        );
+            [("main.weft".to_string(), aaa.clone()), ("weft.toml".to_string(), bbb.clone())].into_iter().collect();
+        let keys = blob_keys([("v1", &a), ("v2", &b)].into_iter()).expect("both are addressable");
+        assert_eq!(keys, vec![format!("asset/{aaa}"), format!("asset/{bbb}")], "one key for the shared hash");
+    }
+
+    /// A version stored while a manifest still named the installed weft
+    /// by a `weft:<version>:<catalog hash>` entry with no hash: that entry
+    /// is no file, so the publish fails naming it rather than skipping it.
+    #[test]
+    fn a_stored_entry_with_no_hash_fails_by_name() {
+        let old: BTreeMap<String, String> =
+            [("main.weft".to_string(), "a".repeat(64)), ("weft:0.5.0:cat".to_string(), String::new())].into_iter().collect();
+        let err = blob_keys([("v1", &old)].into_iter()).unwrap_err().to_string();
+        assert!(err.contains("version v1") && err.contains("weft:0.5.0:cat"), "{err}");
     }
 
     /// A manifest is client-supplied, and its values become storage
@@ -1458,7 +1346,7 @@ mod blob_key_tests {
     #[test]
     fn a_manifest_that_cannot_be_addressed_is_refused() {
         let good = "a".repeat(64);
-        let ok: Manifest = [("main.weft".to_string(), good.clone()), ("weft:0.5.0:cat".to_string(), String::new())]
+        let ok: Manifest = [("main.weft".to_string(), good.clone()), ("nodes/base_catalog/a/mod.rs".to_string(), good.clone())]
             .into_iter()
             .collect();
         validate_manifest(&ok).expect("an ordinary manifest passes");
@@ -1469,6 +1357,7 @@ mod blob_key_tests {
             [("../escape.weft".to_string(), good.clone())],
             [("/absolute.weft".to_string(), good.clone())],
             [("main.weft".to_string(), String::new())],
+            [("weft:0.5.0:cat".to_string(), String::new())],
         ] {
             let m: Manifest = bad.into_iter().collect();
             assert!(validate_manifest(&m).is_err(), "{m:?} must be refused");
@@ -1490,43 +1379,59 @@ mod fire_snapshot_tests {
                 "outputs": [{"name": "value", "portType": "String", "required": true}]
             }], "edges": []
         })).unwrap();
-        let color = Color::new_v4();
+        let execution_id = ExecutionId::new_v4();
         let mut spec = RunSpec::whole("reuse");
         let resolved = |spec: &RunSpec| resolve_spec(spec, &project).expect("one node resolves");
-        assert!(supplied_output_events(&project, &spec, &resolved(&spec), color, 0).is_empty());
+        assert!(supplied_output_events(&project, &spec, &resolved(&spec), execution_id, 0).is_empty());
         spec.emit.insert("source".into(), BTreeMap::new());
-        let events = supplied_output_events(&project, &spec, &resolved(&spec), color, 0);
+        let events = supplied_output_events(&project, &spec, &resolved(&spec), execution_id, 0);
         assert!(matches!(&events[..], [weft_journal::ExecEvent::PortClosed { node_id, port, provided: true, .. }]
             if node_id == "source" && port == "value"));
         spec.emit.get_mut("source").unwrap().insert("value".into(), serde_json::json!("manual"));
-        let events = supplied_output_events(&project, &spec, &resolved(&spec), color, 0);
+        let events = supplied_output_events(&project, &spec, &resolved(&spec), execution_id, 0);
         assert!(matches!(&events[..], [weft_journal::ExecEvent::PortEmitted { value, provided: true, .. }]
             if **value == serde_json::json!("manual")));
     }
 
     #[test]
     fn real_trigger_run_preserves_its_birth_version_and_single_wake() {
-        let color = Color::new_v4();
+        let execution_id = ExecutionId::new_v4();
         let project = uuid::Uuid::new_v4();
         let wake = serde_json::json!({"message": "original"});
-        let (birth, mut kicks) = crate::api::project::execution_birth_events(
-            color, project, weft_core::context::Phase::Fire, "trigger",
-            &[Kick { node: "trigger".into(), frames: Vec::new(), firing: true, payload: Some(wake.clone()), port_snapshot: None }],
-            "original-graph", None, None, None, Some("original-source"), None, Some("trigger"),
-            weft_core::exec::RunKind::Execution, 42,
-        );
+        let program = weft_core::project::hash::ProgramIdentity {
+            definition_hash: "original-graph".into(),
+            binary_hash: "original-binary".into(),
+            implementations: Default::default(),
+        };
+        let (birth, mut kicks) = crate::api::project::execution_birth_events(crate::api::project::Birth {
+            execution_id,
+            project_id: project,
+            phase: weft_core::context::Phase::Fire,
+            entry_node: "trigger",
+            kicks: &[Kick { node: "trigger".into(), frames: Vec::new(), firing: true, payload: Some(wake.clone()), port_snapshot: None }],
+            program: &program,
+            subgraph: None,
+            seed: None,
+            source_version: Some("original-source"),
+            instance: None,
+            picks: &Default::default(),
+            fired_trigger: Some("trigger"),
+            run_kind: weft_core::exec::RunKind::Execution,
+            run_class: weft_core::run_class::RunClass::Short,
+            at_unix: 42,
+        });
         let mut rows = vec![birth];
         rows.append(&mut kicks);
-        let run = trigger_run_from_birth(color, &rows).unwrap().unwrap();
+        let run = trigger_run_from_birth(execution_id, &rows).unwrap().unwrap();
         assert_eq!(run.version_id, "original-source");
         assert_eq!(run.definition_hash, "original-graph");
         assert_eq!(run.created_at, 42);
         assert_eq!(run.spec.unwrap().fire, Some(("trigger".into(), wake)));
         rows.push(weft_journal::ExecEvent::NodeKicked {
-            color, node_id: "other-trigger".into(), frames: vec![], firing: true,
+            execution_id, node_id: "other-trigger".into(), frames: vec![], firing: true,
             payload: None, port_snapshot: None, at_unix: 42,
         });
-        assert!(trigger_run_from_birth(color, &rows).unwrap_err().to_string().contains("more than one trigger"));
+        assert!(trigger_run_from_birth(execution_id, &rows).unwrap_err().to_string().contains("more than one trigger"));
     }
 
     fn plan(node: &str, firing: bool) -> Kick {
@@ -1614,11 +1519,11 @@ mod orphaned_run_tests {
     /// any other failure keeps the bridge retrying the row.
     #[test]
     fn only_a_missing_version_is_forgiven() {
-        let color = uuid::Uuid::new_v4();
+        let execution_id = uuid::Uuid::new_v4();
         let missing = VersionMissing { project: uuid::Uuid::new_v4(), version: "v7".into() };
-        orphaned_run_is_recorded_nowhere(color, missing.into()).expect("nothing to record in is not a failure");
+        orphaned_run_is_recorded_nowhere(execution_id, missing.into()).expect("nothing to record in is not a failure");
         let storage = anyhow::anyhow!("connection reset by peer");
-        let err = orphaned_run_is_recorded_nowhere(color, storage).expect_err("a storage failure retries");
+        let err = orphaned_run_is_recorded_nowhere(execution_id, storage).expect_err("a storage failure retries");
         assert!(err.to_string().contains("connection reset"));
     }
 }

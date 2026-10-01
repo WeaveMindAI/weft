@@ -64,7 +64,8 @@
 - [Versions, seeds and frozen examples](running/versions.md)
 - [Files at run time](running/files.md)
 - [The browser extension](running/browser-extension.md)
-- [Programs with members](running/members.md)
+- [Programs with instances](running/instances.md)
+- [Deploying to your cloud](running/cloud.md)
 - [How the runtime is built](running/architecture.md)
 
 # Why it is shaped this way

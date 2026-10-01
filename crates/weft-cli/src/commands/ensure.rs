@@ -1,29 +1,29 @@
-//! Shared helper: discover the cwd project, compile it, register
-//! it (or re-register if it already exists). Every mutating
-//! project-scoped command (`run`, `activate`, `deactivate`,
-//! `infra up`, `infra down`) calls this first so users don't
-//! have to remember `weft run` as a prerequisite.
+//! Shared helper: discover the cwd project, compile it, and have the
+//! install build it. Every mutating project-scoped command (`run`,
+//! `activate`, `bake`, `resync`, the infra verbs, `build`) calls this first
+//! so users don't have to remember `weft build` as a prerequisite.
 //!
 //! Semantics:
-//!   - Compile via `weft-compiler::build`: this stages the
-//!     docker build context and emits the multi-stage Dockerfile
-//!     but does NOT run cargo (cargo runs inside the builder
-//!     image).
-//!   - Registration is UNCONDITIONAL even while executions run on
-//!     the previous image: every worker task is stamped with the
-//!     image it was enqueued for and only claimable by a pod baked
-//!     from it, so in-flight work finishes on the old pods while
-//!     new work flows to fresh, current-image pods. No park, no
-//!     drain, no wait-or-cancel dialog at register time. (An
-//!     earlier shape parked triggers and drained here; the
-//!     image-stamped claim gate made that whole gate obsolete.)
-//!   - Build the per-project worker image and load it into the
-//!     local kind cluster so spawned worker Pods can pull it.
-//!   - Post to `POST /projects`; the dispatcher is idempotent on
-//!     the `id` field (existing row gets its source updated).
+//!   - Compile here first: a mistake in the program is reported at once,
+//!     with every diagnostic, before anything is uploaded.
+//!   - Snapshot: every covered file the tenant's assets lack is uploaded
+//!     straight to the bucket; the manifest names the version.
+//!   - Resolve the `@asset` refs only this machine can read (a file outside
+//!     the project, a URL) and send them with the version.
+//!   - `POST /projects/{id}/builds`: the install fetches the version back,
+//!     compiles it, builds every stale image with its own BuildKit, and
+//!     registers the result. Nothing is built or loaded on this machine,
+//!     and nothing this machine computed is believed.
+//!   - Registering a build is UNCONDITIONAL even while executions run on
+//!     the previous image: every worker task is stamped with the image it
+//!     was enqueued for and only claimable by a process baked from it, so
+//!     in-flight work finishes on the old processes while new work flows to
+//!     fresh, current-image processes.
 
 
 use anyhow::{Context, Result};
+
+use weft_core::builds::BuiltProgram;
 
 use super::Ctx;
 use crate::client::DispatcherClient;
@@ -72,15 +72,10 @@ pub fn parse_running_choice(
     Ok((policy, drain_timeout))
 }
 
-/// The running-work answer as the request fields every verb sends:
-/// `runningPolicy` always (so the wire never guesses), `drainTimeoutSecs`
-/// when a cap was given. One spelling, the wire type's own.
-pub fn running_choice_fields(policy: RunningPolicy, drain_timeout: Option<u64>) -> serde_json::Map<String, serde_json::Value> {
-    let choice = RunningChoice { running_policy: Some(policy), drain_timeout_secs: drain_timeout };
-    match serde_json::to_value(choice).expect("a wire struct serializes") {
-        serde_json::Value::Object(fields) => fields,
-        other => unreachable!("a struct serializes to an object, got {other}"),
-    }
+/// The running-work answer as every verb sends it: the policy always
+/// (so the wire never guesses), the cap when one was given.
+pub fn running_choice(policy: RunningPolicy, drain_timeout: Option<u64>) -> RunningChoice {
+    RunningChoice { running_policy: Some(policy), drain_timeout_secs: drain_timeout }
 }
 
 pub struct ProjectHandle {
@@ -89,119 +84,76 @@ pub struct ProjectHandle {
     pub client: DispatcherClient,
     /// Published sources verified against the files used to compile this build.
     pub manifest: super::versions::Manifest,
-    /// The full build plan `ensure_registered` produced: the three authoritative
-    /// hashes (binary = worker image identity, definition = runtime shape /
-    /// resync drift, infra = infra-closure / upgrade drift) PLUS every image the
-    /// version needs (worker + infra), each with its content-addressed ref and
-    /// build context. Downstream verbs consume the plan instead of re-compiling
-    /// or re-deriving tags: the plan is the single source of truth for what this
-    /// project version builds.
-    pub plan: weft_compiler::build_plan::BuildPlan,
+    /// What the install built and registered: the compiled program and its
+    /// three authoritative hashes (binary = worker image identity,
+    /// definition = runtime shape / resync drift, infra = infra closure /
+    /// upgrade drift). Downstream verbs name the build by these.
+    pub built: BuiltProgram,
+}
+
+/// What a person is told when a build moved infra places onto a new
+/// image: only a copy started from now on gets it.
+fn replaced_infra_images_note(places: &[String]) -> Option<String> {
+    if places.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "this build changed the image of infra {}: a copy started from now on gets the new image, \
+         and a copy already running keeps its own until you run `weft infra upgrade` \
+         (with `--instance <id>` for one instance's copy)",
+        places.join(", ")
+    ))
 }
 
 impl ProjectHandle {
     pub fn binary_hash(&self) -> &str {
-        &self.plan.binary_hash
+        &self.built.binary_hash
     }
     pub fn definition_hash(&self) -> &str {
-        &self.plan.definition_hash
-    }
-    pub fn infra_hash(&self) -> &str {
-        &self.plan.infra_hash
+        &self.built.definition_hash
     }
 
-    /// Inject the three hash fields into a JSON body map using the
-    /// canonical camelCase keys. Single source of truth for the wire
-    /// contract.
-    pub fn inject_hash_fields(&self, body: &mut serde_json::Map<String, serde_json::Value>) {
-        inject_hash_fields_opt(
-            body,
-            Some(self.binary_hash()),
-            Some(self.definition_hash()),
-            Some(self.infra_hash()),
-        );
+    /// This build as an activate or a resync names it (no reactivate
+    /// choice: the caller sets one when it has one).
+    pub fn activation_target(&self) -> weft_core::activation::ActivationTarget {
+        weft_core::activation::ActivationTarget { build: self.built.named(), reactivate_choice: None }
     }
 }
 
-/// Inject hashes when each is independently optional (`activate.rs`'s
-/// "activate-by-id" path forwards none of them). Skipping a None
-/// field is the correct behavior: posting null would overwrite the
-/// dispatcher's stored running hash and silently flip drift state.
-pub fn inject_hash_fields_opt(
-    body: &mut serde_json::Map<String, serde_json::Value>,
-    binary: Option<&str>,
-    definition: Option<&str>,
-    infra: Option<&str>,
-) {
-    if let Some(h) = binary {
-        body.insert("binaryHash".into(), serde_json::Value::String(h.into()));
-    }
-    if let Some(h) = definition {
-        body.insert("definitionHash".into(), serde_json::Value::String(h.into()));
-    }
-    if let Some(h) = infra {
-        body.insert("infraHash".into(), serde_json::Value::String(h.into()));
-    }
-}
-
-/// Make sure the dispatcher knows this project, WITHOUT building
-/// anything. Cheap and a no-op when it already does.
+/// Make sure the install knows this project, WITHOUT building anything.
+/// Cheap and a no-op when it already does.
 ///
-/// The version tree lives on the dispatcher, under the project's id, so
-/// a verb that records a version needs the project to exist there.
+/// The version tree lives on the install, under the project's id, so a
+/// verb that records a version needs the project to exist there.
 /// `weft checkpoint` is the one such verb a person can reasonably reach
 /// for before they have ever run (save a point, then start changing
 /// things), and making them run first would build a worker image for
 /// nothing.
-///
-/// What this registers is the source: the compiled definition, and none
-/// of the three hashes, so the dispatcher's running pointers stay
-/// untouched and the project is registered-but-not-built until a real
-/// `weft run` builds it. `@asset` references are left unresolved for
-/// the same reason: resolving them belongs to the register that makes
-/// the project runnable, and that one re-sends the whole definition.
 pub async fn ensure_project_known(ctx: &Ctx) -> Result<()> {
     let project = ctx.project()?;
-    let client = ctx.client();
-    let id = project.id().to_string();
-    if client.get_json_if_found(&format!("/projects/{id}")).await?.is_some() {
-        return Ok(());
-    }
-    let definition = weft_compiler::hash::load_enriched_project(project)
-        .map_err(|e| anyhow::anyhow!("compile project: {e}"))?
-        .0;
+    let client = ctx.client()?;
+    let body = weft_core::projects::DeclareRequest { id: project.id(), name: project.manifest.package.name.clone() };
     client
-        .post_json(
-            "/projects/register",
-            &serde_json::json!({
-                "id": id,
-                "name": project.manifest.package.name,
-                "definition": definition,
-            }),
-        )
+        .post_json("/projects", &serde_json::to_value(&body)?)
         .await
-        .context("register the project with the dispatcher")?;
+        .context("declare the project to the install")?;
     Ok(())
 }
 
-/// Discover + compile + register the cwd project. Registration is
-/// UNCONDITIONAL with respect to running executions: in-flight work
-/// finishes on the pods baked from the image it was enqueued for (the
-/// task rows carry that image and the claim gate enforces it), while
-/// everything enqueued after this register lands on fresh
-/// current-image pods. Nothing here parks, drains, or prompts.
+/// Discover + compile the cwd project and have the install build and
+/// register it (see the module doc). Nothing here parks, drains, or
+/// prompts.
 pub async fn ensure_registered(
     ctx: &Ctx,
     progress: &Progress,
-    node_set: weft_compiler::codegen::NodeSet,
+    node_set: weft_core::builds::NodeSet,
 ) -> Result<ProjectHandle> {
     let compiled = compile_project(ctx, progress)?;
-    register_compiled(ctx, progress, node_set, compiled).await
+    build_compiled(ctx, progress, node_set, compiled).await
 }
 
 pub struct CompiledProject {
     pub definition: weft_core::ProjectDefinition,
-    catalog: weft_catalog::FsCatalog,
     sources: super::versions::Manifest,
 }
 
@@ -240,7 +192,7 @@ pub fn compile_project(ctx: &Ctx, progress: &Progress) -> Result<CompiledProject
     if diags.iter().any(|d| matches!(d.severity, weft_compiler::Severity::Error)) {
         return Err(compile_failure(project, progress, &diags));
     }
-    Ok(CompiledProject { definition, catalog, sources })
+    Ok(CompiledProject { definition, sources })
 }
 
 /// Report compile diagnostics both ways at once and hand back the error
@@ -300,129 +252,70 @@ fn compile_failure(
     anyhow::anyhow!("compile failed:\n{}", weft_compiler::render_diagnostics(diags))
 }
 
-pub async fn register_compiled(
+/// Upload the version the compile read, and have the install build it.
+pub async fn build_compiled(
     ctx: &Ctx,
     progress: &Progress,
-    node_set: weft_compiler::codegen::NodeSet,
+    node_set: weft_core::builds::NodeSet,
     compiled: CompiledProject,
 ) -> Result<ProjectHandle> {
-    let CompiledProject { mut definition, catalog, sources } = compiled;
+    let CompiledProject { definition, sources } = compiled;
     let project = ctx.project()?;
-    let client = ctx.client();
+    let client = ctx.client()?;
     let manifest = super::versions::snapshot(&client, project).await?;
     anyhow::ensure!(manifest == sources,
         "project files changed after compilation; rerun the command to build and record the same sources");
 
-    // Resolve `@asset` refs BEFORE the plan hashes the definition: the
-    // asset sync publishes referenced files to the project's asset plane and
-    // substitutes their stored-file values, so the hashes cover the resolved
-    // content (a changed asset re-hashes exactly like a config change).
-    for warning in crate::commands::assets::resolve_project_assets(&client, &project.root, &mut definition, Some(&manifest), true)
-        .await?
-    {
-        progress.warn(&warning);
+    // The `@asset` refs only this machine can read, resolved here and sent
+    // with the version (a referenced file the tenant's assets lack is
+    // uploaded on the way).
+    let resolutions =
+        crate::commands::assets::asset_resolutions(&client, &project.root, &definition, true).await?;
+
+    let id = project.id().to_string();
+    let path = format!("/projects/{id}/builds");
+    let body = weft_core::builds::VersionBuildRequest {
+        name: project.manifest.package.name.clone(),
+        manifest: manifest.clone(),
+        node_set,
+        assets: resolutions.map.clone(),
+    };
+    progress.build_start(&project.manifest.package.name);
+    progress.dispatcher_call_start(&path);
+    let (status, text) = client.post_json_status(&path, &serde_json::to_value(&body)?).await.context("ask the install to build")?;
+    if !(200..300).contains(&status) {
+        anyhow::bail!(
+            "the build failed:\n{}",
+            if text.trim().is_empty() { format!("the install answered {status}") } else { text.trim().to_string() }
+        );
+    }
+    let built: BuiltProgram = serde_json::from_str(&text).context("read the build's answer")?;
+    progress.dispatcher_call_done(serde_json::json!({ "project_id": id }));
+    progress.build_done(&project.manifest.package.name, &built.built_images);
+    if let Some(note) = replaced_infra_images_note(&built.replaced_infra_images) {
+        progress.warn(&note);
     }
 
-    // Plan the build from the already-compiled definition + catalog (no second
-    // compile): the three hashes + the staged worker context + the infra image set,
-    // via the SHARED build brain. The base is ensured first so the staged Dockerfile
-    // FROMs it.
-    let builder_base_ref = crate::images::builder_base_ref()?;
-    let plan = weft_compiler::build_plan::plan_build_from(
-        project,
-        &definition,
-        &catalog,
-        &builder_base_ref,
-        &crate::commands::build::CliTagPolicy,
-        node_set,
-    )
-    .map_err(|e| anyhow::anyhow!("plan build: {e}"))?;
-
-    // The FULL hashes are sent on the wire and used to tag the worker image, so
-    // the dispatcher's `running_binary_hash` matches the content-addressed image
-    // tag (`weft-worker:<binary_hash>`) it spawns. The hashes are compared by
-    // equality, so any consistent length works; full is the canonical form the
-    // image tag uses.
-
-    let dispatcher = ctx.dispatcher_url().to_string();
-
-    // Worker image: hash-skip + build (from the already-staged plan context) +
-    // kind-load. The dispatcher gets the binary_hash on every spawn-relevant call so
-    // the project row's `running_binary_hash` stays current regardless of whether we
-    // rebuilt or hit the cache.
-    let worker = crate::commands::build::worker_planned_image(&plan)?;
-    // What must survive the post-ensure GC beyond the fresh tag (idle
-    // projects' current images, draining pods): the keep-set via
-    // `referenced_set_for_gc` (None + a warning when the answer is
-    // unlearnable -> the GC is skipped, never guessed).
-    let referenced = crate::images::referenced_set_for_gc(&client).await;
-    crate::commands::build::ensure_worker_image_with_progress(
-        progress,
-        &project.id().to_string(),
-        &worker.image_ref,
-        &worker.context_dir,
-        referenced.as_ref(),
-    )
-    .await
-    .context("worker image")?;
-    // The build used the files as they were when it started; recording
-    // that version now would put the project one edit behind its own
-    // disk, and the next edit would look already live. So it stops
-    // here and asks for a second run, which is short (the image is
-    // content-addressed and the parts that did not move are cached).
+    // The version's blobs and the assets the built program uses are the
+    // project's current references; everything else starts expiring.
+    for warning in crate::commands::assets::publish_references(&client, &built.definition, &resolutions, Some(&manifest)).await? {
+        progress.warn(&warning);
+    }
+    // The install built the files as they were when this command read
+    // them; if the disk moved meanwhile, the build registered is already
+    // behind it, and the next edit would look already live.
     anyhow::ensure!(
         super::versions::local_manifest(project)? == manifest,
-        "project files changed while building, so the version this would record is already \
-         behind your disk; nothing was deployed. Run the command again (it rebuilds only what \
-         moved). If several people or agents edit at once, wait for them to finish first"
+        "project files changed while building, so the version this built is already \
+         behind your disk. Run the command again (it rebuilds only what moved). If several \
+         people or agents edit at once, wait for them to finish first"
     );
-    // Send the already compiled + enriched definition (built above for
-    // the infra hash). The dispatcher can't compile it: the nodes live
-    // here, not in the dispatcher pod. It stores the artifact as-is.
-    let register_body = serde_json::json!({
-        "id": project.id().to_string(),
-        "name": project.manifest.package.name,
-        "definition": definition,
-        "binaryHash": plan.binary_hash,
-        "implementations": plan.implementations,
-        "source": manifest,
-        "definitionHash": plan.definition_hash,
-        "infraHash": plan.infra_hash,
-    });
-    let register_resp: serde_json::Value = client
-        .post_json("/projects/register", &register_body)
-        .await
-        .with_context(|| format!("register against {dispatcher}"))?;
-
-    let id = register_resp
-        .get("id")
-        .and_then(|v| v.as_str())
-        .context("dispatcher response missing id")?
-        .to_string();
-
-    // Image GC moved to an explicit `weft clean --images` operation.
-    // The earlier shape ran here after register landed, but it
-    // wiped both docker AND kind containerd tags; a running worker
-    // pod restarted by the kubelet (eviction, node restart) with
-    // `imagePullPolicy: IfNotPresent` then went into ImagePullBackOff
-    // because the image bytes were gone from the node and there is
-    // no registry to pull from in the kind workflow. Disk-pressure
-    // cleanup is a developer concern, not a side-effect of every
-    // register.
 
     Ok(ProjectHandle {
         id,
         name: project.manifest.package.name.clone(),
         client,
         manifest,
-        plan,
+        built,
     })
 }
-
-// (The register-time "stale-binary gate" that used to live here: prompt for
-// wait-or-cancel, park the triggers, drain before registering; was deleted
-// when worker tasks became image-stamped. In-flight work finishes on the pods
-// baked from its own image while new work flows to fresh current-image pods,
-// so registering during running executions disturbs nothing and there is no
-// policy to ask for. Disturbing verbs (deactivate, infra stop/terminate/
-// upgrade, resync, worker replacement) keep their explicit wait/cancel picker.)

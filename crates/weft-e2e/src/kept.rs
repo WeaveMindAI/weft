@@ -24,7 +24,7 @@ pub const KEPT_DIR_ENV: &str = "WEFT_E2E_KEPT_DIR";
 
 /// A grant `disp`'s install now holds for this test.
 pub(crate) fn grant_made(disp: &Dispatcher, grant_id: &str) -> Result<()> {
-    if disp.instance().name().is_some() {
+    if disp.install().name().is_some() {
         return Ok(());
     }
     default_install_grant_made(grant_id)
@@ -49,7 +49,7 @@ pub(crate) fn grant_gone(grant_id: &str) -> Result<()> {
 }
 
 /// Every grant the ledger still holds: what failed tests kept. Read
-/// only by the sweep, which reaches the cluster, so `e2e` only.
+/// only by the sweep, which reaches the install, so `e2e` only.
 #[cfg(feature = "e2e")]
 pub(crate) fn kept_grants() -> Result<Vec<String>> {
     let dir = grants_dir()?;

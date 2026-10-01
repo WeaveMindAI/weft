@@ -17,7 +17,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::frames::Located;
-use super::{boundary_in_id, boundary_out_id, Edge, GroupBoundaryRole, GroupKind, NodeDefinition, ProjectDefinition};
+use super::graph::{GraphView, ProjectGraph};
+use super::{boundary_in_id, Edge, GroupBoundaryRole, GroupKind, NodeDefinition, ProjectDefinition};
 
 // SYNC: RunSelection <-> packages/weft-graph/src/run-spec.ts RunSelection
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,7 +39,7 @@ pub struct RunSelection {
     /// Authored backups for selected receiving ports, recorded at birth.
     pub input: BTreeMap<Located, BTreeMap<String, serde_json::Value>>,
     /// Origins only for inherited backups. Authored backups belong to this run.
-    pub input_origins: BTreeMap<Located, BTreeMap<String, crate::Color>>,
+    pub input_origins: BTreeMap<Located, BTreeMap<String, crate::ExecutionId>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -71,13 +72,13 @@ enum Crossing<'a> {
     None,
 }
 
-fn crossing<'a>(project: &'a ProjectDefinition, edge: &Edge) -> Crossing<'a> {
-    let boundary = |id: &str| project.nodes.iter().find(|n| n.id == id).and_then(|n| n.group_boundary.as_ref());
+fn crossing<'a>(g: &'a impl GraphView, edge: &Edge) -> Crossing<'a> {
+    let boundary = |id: &str| g.node(id).and_then(|n| n.group_boundary.as_ref());
     let (Some(source), Some(target)) = (boundary(&edge.source), boundary(&edge.target)) else { return Crossing::None };
     match (&source.role, &target.role) {
-        (GroupBoundaryRole::In, GroupBoundaryRole::In) if body_of(project, &source.group_id) == Some(target.group_id.as_str()) =>
+        (GroupBoundaryRole::In, GroupBoundaryRole::In) if g.body_of(&source.group_id) == Some(target.group_id.as_str()) =>
             Crossing::Into(&source.group_id),
-        (GroupBoundaryRole::Out, GroupBoundaryRole::Out) if body_of(project, &target.group_id) == Some(source.group_id.as_str()) =>
+        (GroupBoundaryRole::Out, GroupBoundaryRole::Out) if g.body_of(&target.group_id) == Some(source.group_id.as_str()) =>
             Crossing::OutOf(&target.group_id),
         _ => Crossing::None,
     }
@@ -87,13 +88,13 @@ fn crossing<'a>(project: &'a ProjectDefinition, edge: &Edge) -> Crossing<'a> {
 /// entering a body pushes the site, leaving one pops it. A wire out of
 /// a body belongs to the site the walk is under; another site's wire
 /// on the same boundary is not on this path, and is `None`.
-fn step(project: &ProjectDefinition, from: &Located, edge: &Edge, direction: Direction) -> Option<Located> {
+fn step(g: &impl GraphView, from: &Located, edge: &Edge, direction: Direction) -> Option<Located> {
     let other = match direction {
         Direction::Upstream => &edge.source,
         Direction::Downstream => &edge.target,
     };
     let at = Located::new(other.clone(), from.path.clone());
-    Some(match (crossing(project, edge), direction) {
+    Some(match (crossing(g, edge), direction) {
         (Crossing::Into(site), Direction::Downstream) | (Crossing::OutOf(site), Direction::Upstream) => at.into_call(site),
         (Crossing::OutOf(site), Direction::Downstream) | (Crossing::Into(site), Direction::Upstream) => {
             if from.site() != Some(site) { return None; }
@@ -113,7 +114,7 @@ pub fn source_place(project: &ProjectDefinition, at: &Located, edge: &Edge) -> O
 /// own place (the deeper end's): the shallower end of a wire into or
 /// out of a body is one site up. `None` for an unknown wire.
 pub fn wire_ends(project: &ProjectDefinition, wire: &Located) -> Option<(Located, Located)> {
-    let edge = project.edges.iter().find(|edge| edge.id == wire.id)?;
+    let edge = project.edge(&wire.id)?;
     let deep = |id: &str| Located::new(id, wire.path.clone());
     Some(match crossing(project, edge) {
         Crossing::Into(_) => (deep(&edge.source).out_of_call()?, deep(&edge.target)),
@@ -130,11 +131,11 @@ fn edge_place(edge: &Edge, a: &Located, b: &Located) -> Located {
 
 /// The wires into `at` that are on its path, each with the place of its
 /// source and the wire's own place.
-fn incoming<'a>(project: &'a ProjectDefinition, at: &Located) -> impl Iterator<Item = (&'a Edge, Located, Located)> + 'a {
+fn incoming<'a>(g: &'a impl GraphView, at: &Located) -> impl Iterator<Item = (&'a Edge, Located, Located)> + 'a {
+    let edges: Vec<&Edge> = g.edges_into(&at.id).collect();
     let at = at.clone();
-    project.edges.iter().filter_map(move |edge| {
-        if edge.target != at.id { return None; }
-        let source = step(project, &at, edge, Direction::Upstream)?;
+    edges.into_iter().filter_map(move |edge| {
+        let source = step(g, &at, edge, Direction::Upstream)?;
         let place = edge_place(edge, &source, &at);
         Some((edge, source, place))
     })
@@ -150,14 +151,14 @@ fn incoming<'a>(project: &'a ProjectDefinition, at: &Located) -> impl Iterator<I
 /// door, no gate feeding it, no loop taken whole), which is what tells
 /// this walk apart from [`RunSelection::dependencies`]: that one is the
 /// run's shape, this one is what a value's path runs through.
-pub fn upstream_by_wires(project: &ProjectDefinition, seeds: &[Located]) -> BTreeSet<Located> {
+pub fn upstream_by_wires(g: &ProjectGraph, seeds: &[Located]) -> BTreeSet<Located> {
     let mut reached = BTreeSet::new();
     let mut visited = BTreeSet::new();
     let mut pending: Vec<(Located, Option<String>)> = seeds.iter().map(|place| (place.clone(), None)).collect();
     while let Some((place, port)) = pending.pop() {
         if !visited.insert((place.clone(), port.clone())) { continue; }
         reached.insert(place.clone());
-        pending.extend(upstream_of(project, &place, port.as_deref()));
+        pending.extend(upstream_of(g, &place, port.as_deref()));
     }
     reached
 }
@@ -168,11 +169,11 @@ pub fn upstream_by_wires(project: &ProjectDefinition, seeds: &[Located]) -> BTre
 /// wires into `port`: its ports are walked one at a time, so what feeds
 /// a group's `y` never reaches a member reading its `x`, and what feeds
 /// its gate reaches no member at all.
-fn upstream_of(project: &ProjectDefinition, place: &Located, port: Option<&str>) -> Vec<(Located, Option<String>)> {
-    let ordinary = is_ordinary_boundary(project, &place.id);
-    incoming(project, place)
+fn upstream_of(g: &ProjectGraph, place: &Located, port: Option<&str>) -> Vec<(Located, Option<String>)> {
+    let ordinary = g.is_ordinary_boundary(&place.id);
+    incoming(g, place)
         .filter(|(edge, _, _)| !ordinary || port.is_none_or(|p| edge.target_handle.as_deref().unwrap_or("default") == p))
-        .map(|(edge, source, _)| (source, port_of(project, &edge.source, edge.source_handle.as_deref())))
+        .map(|(edge, source, _)| (source, port_of(g, &edge.source, edge.source_handle.as_deref())))
         .collect()
 }
 
@@ -183,37 +184,37 @@ fn upstream_of(project: &ProjectDefinition, place: &Located, port: Option<&str>)
 /// group's output door). Only that node; what feeds IT stays outside
 /// unless the cut already reaches it.
 fn feeders_of(
-    project: &ProjectDefinition,
+    g: &ProjectGraph,
     feed: &[(String, BTreeSet<String>)],
     entries: &BTreeSet<Located>,
     group: Option<&str>,
 ) -> Result<BTreeSet<Located>, String> {
     let mut feeders = BTreeSet::new();
     for (spelled, handed) in feed {
-        let start = start_node_at(project, spelled)?;
-        let group_start = group.is_some_and(|g| start_node_at(project, g).is_ok_and(|place| place == start));
+        let start = start_node_in(g, spelled)?;
+        let group_start = group.is_some_and(|group| start_node_in(g, group).is_ok_and(|place| place == start));
         if !entries.contains(&start) && !group_start {
             return Err(format!("--feed {spelled}: only a start can be fed; name it with --from or --group too"));
         }
-        let node = project.nodes.iter().find(|n| n.id == start.id).ok_or_else(|| format!("unknown node '{spelled}'"))?;
+        let node = g.node(&start.id).ok_or_else(|| format!("unknown node '{spelled}'"))?;
         let mut pending: Vec<(Located, String)> = node.inputs.iter()
             .filter(|input| !crate::exec::skip::is_gate_port(&input.name) && !handed.contains(&input.name))
             .map(|input| (start.clone(), input.name.clone())).collect();
         let mut visited = BTreeSet::new();
         while let Some((place, port)) = pending.pop() {
             if !visited.insert((place.clone(), port.clone())) { continue; }
-            for (edge, source, _) in incoming(project, &place) {
+            for (edge, source, _) in incoming(g, &place) {
                 if edge.target_handle.as_deref().unwrap_or("default") != port { continue; }
-                if is_ordinary_boundary(project, &source.id) {
+                if g.is_ordinary_boundary(&source.id) {
                     // A door on the way runs too: the value crosses it. A
                     // group's output door is how a feeder inside that group
                     // hands its value out, and nothing else would bring it.
                     feeders.insert(source.clone());
                     pending.push((source, edge.source_handle.as_deref().unwrap_or("default").to_string()));
-                } else if let Some(each) = loop_of(project, &source) {
+                } else if let Some(each) = loop_of(g, &source) {
                     // A loop's result comes out of the loop as a whole: it
                     // runs whole, and never cut inside.
-                    feeders.extend(members_with_paths(project, &each, &source.path));
+                    feeders.extend(members_in(g, &each, &source.path));
                 } else {
                     feeders.insert(source);
                 }
@@ -224,11 +225,9 @@ fn feeders_of(
 }
 
 /// The loop whose boundary `place` is, if it is one.
-fn loop_of(project: &ProjectDefinition, place: &Located) -> Option<String> {
-    let boundary = project.nodes.iter().find(|n| n.id == place.id)?.group_boundary.as_ref()?;
-    project.groups.iter()
-        .any(|g| g.id == boundary.group_id && matches!(g.kind, GroupKind::Loop { .. }))
-        .then(|| boundary.group_id.clone())
+fn loop_of(g: &ProjectGraph, place: &Located) -> Option<String> {
+    let boundary = g.node(&place.id)?.group_boundary.as_ref()?;
+    g.is_loop(&boundary.group_id).then(|| boundary.group_id.clone())
 }
 
 /// Where a value that arrives at a port ends up needed: the input that
@@ -287,7 +286,7 @@ pub fn required_consumer(
     while let Some((place, port, start)) = pending.pop() {
         if !visited.insert((place.clone(), port.clone())) { continue; }
         if crate::exec::skip::is_gate_port(&port) || !counts(&place, &port) { continue; }
-        let Some(node) = project.nodes.iter().find(|n| n.id == place.id) else { continue };
+        let Some(node) = project.node(&place.id) else { continue };
         let start = start.or_else(|| is_start(&place).then(|| (place.clone(), port.clone())));
         let input = node.inputs.iter().find(|p| p.name == port);
         if input.is_some_and(|input| input.required && input.default.is_none()) {
@@ -309,11 +308,11 @@ pub fn required_consumer(
 
 /// The wires out of `at` that are on its path, each with the place of
 /// its target and the wire's own place.
-fn outgoing<'a>(project: &'a ProjectDefinition, at: &Located) -> impl Iterator<Item = (&'a Edge, Located, Located)> + 'a {
+fn outgoing<'a>(g: &'a impl GraphView, at: &Located) -> impl Iterator<Item = (&'a Edge, Located, Located)> + 'a {
+    let edges: Vec<&Edge> = g.edges_out_of(&at.id).collect();
     let at = at.clone();
-    project.edges.iter().filter_map(move |edge| {
-        if edge.source != at.id { return None; }
-        let target = step(project, &at, edge, Direction::Downstream)?;
+    edges.into_iter().filter_map(move |edge| {
+        let target = step(g, &at, edge, Direction::Downstream)?;
         let place = edge_place(edge, &at, &target);
         Some((edge, target, place))
     })
@@ -336,7 +335,11 @@ impl RunSelection {
     /// in this run: the wire is in it and so is what is at its source
     /// (a node of the run, or a supplier standing in for one).
     pub fn fed_by(&self, project: &ProjectDefinition, at: &Located, edge: &Edge) -> bool {
-        step(project, at, edge, Direction::Upstream).is_some_and(|source| self.edges.contains(&edge_place(edge, &source, at))
+        self.fed(project, at, edge)
+    }
+
+    fn fed(&self, g: &impl GraphView, at: &Located, edge: &Edge) -> bool {
+        step(g, at, edge, Direction::Upstream).is_some_and(|source| self.edges.contains(&edge_place(edge, &source, at))
             && (self.nodes.contains(&source) || self.suppliers.contains(&source)))
     }
 
@@ -346,57 +349,61 @@ impl RunSelection {
 
     /// Every place downstream of `starts`, the starts included.
     pub fn downstream(project: &ProjectDefinition, starts: &[Located]) -> BTreeSet<Located> {
-        walk(project, starts, Direction::Downstream, &|_| false)
+        walk(&ProjectGraph::new(project), starts, Direction::Downstream, &|_| false)
     }
 
     /// Rebuild a selected node set's data paths and controls, preserving loops.
     pub fn restricted(project: &ProjectDefinition, nodes: BTreeSet<Located>) -> Result<Self, String> {
+        let g = ProjectGraph::new(project);
         for place in &nodes {
-            if !project.nodes.iter().any(|node| node.id == place.id) {
+            if g.node(&place.id).is_none() {
                 return Err(format!("unknown node '{}'", place.id));
             }
         }
-        let selection = Self::from_nodes(project, nodes, BTreeSet::new());
-        selection.validate_loops(project)?;
+        let selection = Self::from_nodes(&g, nodes, BTreeSet::new());
+        selection.validate_loops_in(&g)?;
         Ok(selection)
     }
 
     /// The whole program: every node at every place it can run.
     pub fn whole(project: &ProjectDefinition) -> Self {
-        Self::from_nodes(project, every_place(project), BTreeSet::new())
+        let g = ProjectGraph::new(project);
+        Self::from_nodes(&g, every_place_in(&g), BTreeSet::new())
     }
 
     /// History relevant to this cut, including ancestors before its starts.
     /// An unrelated branch is not inherited merely because the seed retained it.
     pub fn history_nodes(&self, project: &ProjectDefinition) -> BTreeSet<Located> {
+        let g = ProjectGraph::new(project);
         let starts = self.nodes.iter().chain(&self.suppliers).flat_map(|place| {
-            if is_ordinary_boundary(project, &place.id) {
+            if g.is_ordinary_boundary(&place.id) {
                 self.boundary_ports.get(place).into_iter().flatten()
                     .map(|port| (place.clone(), Some(port.clone()))).collect::<Vec<_>>()
             } else { vec![(place.clone(), None)] }
         }).collect();
-        walk_ports(project, starts, Direction::Upstream, &|_| false)
+        walk_ports(&g, starts, Direction::Upstream, &|_| false)
     }
 
     /// Keep the authored cut while replacing reusable results with their
     /// frontier supply. History that feeds no new work adds no control work.
     pub fn with_reused(&self, project: &ProjectDefinition, reused: &BTreeSet<Located>) -> Self {
+        let g = ProjectGraph::new(project);
         let nodes: BTreeSet<_> = self.nodes.difference(reused).cloned().collect();
         let mut suppliers = self.suppliers.clone();
         for place in &nodes {
-            suppliers.extend(incoming(project, place)
+            suppliers.extend(incoming(&g, place)
                 .filter(|(_, source, wire)| self.edges.contains(wire) && reused.contains(source))
                 .map(|(_, source, _)| source));
         }
         for place in nodes.iter().chain(&self.suppliers) {
-            suppliers.extend(gates_of(project, place).into_iter()
+            suppliers.extend(gates_of(&g, place).into_iter()
                 .map(|gate| Located::new(boundary_in_id(&gate.id), gate.path))
                 .filter(|gate| reused.contains(gate)));
         }
-        let mut selected = Self::from_nodes(project, nodes, suppliers);
+        let mut selected = Self::from_nodes(&g, nodes, suppliers);
         selected.nodes.retain(|place| self.nodes.contains(place) && !reused.contains(place));
         let targets: BTreeSet<Located> = selected.nodes.iter()
-            .flat_map(|place| incoming(project, place).map(|(_, _, wire)| wire)).collect();
+            .flat_map(|place| incoming(&g, place).map(|(_, _, wire)| wire)).collect();
         selected.edges.retain(|wire| self.edges.contains(wire) && targets.contains(wire));
         selected.input = self.input.clone();
         selected.input_origins = self.input_origins.clone();
@@ -405,28 +412,35 @@ impl RunSelection {
 
     /// Manual carving and trigger fire use identical walks and bounds.
     pub fn carve(project: &ProjectDefinition, bounds: &SelectionBounds) -> Result<Self, String> {
+        Self::carve_in(&ProjectGraph::new(project), bounds)
+    }
+
+    /// [`Self::carve`] over a program already indexed, for a caller that
+    /// carves many runs from one program.
+    pub fn carve_in(g: &ProjectGraph, bounds: &SelectionBounds) -> Result<Self, String> {
+        let project = g.project();
         // Every bound is spelled from the top of the program, through
         // the call sites (`triage.up`), and resolves to one place.
         let mut entries = BTreeSet::new();
         for id in &bounds.from {
-            if !entries.insert(start_node_at(project, id)?) {
+            if !entries.insert(start_node_in(g, id)?) {
                 return Err(format!("starting entry '{id}' is supplied more than once"));
             }
         }
         let mut target = Vec::new();
         let mut before = Vec::new();
-        let emits: Vec<Located> = bounds.emit.iter().map(|id| locate(project, id)).collect::<Result<_, _>>()?;
-        let fire: Option<Located> = bounds.fire.as_ref().map(|id| locate(project, id)).transpose()?;
+        let emits: Vec<Located> = bounds.emit.iter().map(|id| locate(g, id)).collect::<Result<_, _>>()?;
+        let fire: Option<Located> = bounds.fire.as_ref().map(|id| locate(g, id)).transpose()?;
         let mut excluded: BTreeSet<Located> = emits.iter().cloned().collect();
-        let feeders = feeders_of(project, &bounds.feed, &entries, bounds.group.as_deref())?;
+        let feeders = feeders_of(g, &bounds.feed, &entries, bounds.group.as_deref())?;
         for (inclusive, ends) in [(true, &bounds.target), (false, &bounds.before)] {
             for spelled in ends {
-                let place = locate(project, spelled)?;
-                let endpoints: Vec<Located> = if project.groups.iter().any(|group| group.id == place.id) {
-                    validate_group_place(project, &place, spelled)?;
-                    members_with_paths(project, &place.id, &place.path)
+                let place = locate(g, spelled)?;
+                let endpoints: Vec<Located> = if g.group(&place.id).is_some() {
+                    validate_group_place(g, &place, spelled)?;
+                    members_in(g, &place.id, &place.path)
                 } else {
-                    validate_endpoint(project, spelled)?;
+                    validate_endpoint_in(g, spelled)?;
                     vec![place]
                 };
                 if inclusive { target.extend(endpoints); } else {
@@ -436,7 +450,7 @@ impl RunSelection {
             }
         }
         for spelled in bounds.emit.iter().chain(bounds.fire.iter()) {
-            validate_endpoint(project, spelled)?;
+            validate_endpoint_in(g, spelled)?;
         }
         for place in &emits {
             if let Some(group) = project.groups.iter().find(|group| boundary_in_id(&group.id) == place.id) {
@@ -447,7 +461,7 @@ impl RunSelection {
             return Err(format!("'{}' cannot both run and have its outputs supplied", place.id));
         }
         if let Some(fire) = &fire {
-            if !project.nodes.iter().any(|n| n.id == fire.id && n.features.is_trigger) {
+            if !g.is_trigger(&fire.id) {
                 return Err(format!("'{}' is not a trigger", fire.id));
             }
         }
@@ -457,27 +471,27 @@ impl RunSelection {
             {
                 return Err("group cannot be combined with from, emit, target, or before".into());
             }
-            let place = locate(project, group)?;
-            if !project.groups.iter().any(|g| g.id == place.id) {
+            let place = locate(g, group)?;
+            if g.group(&place.id).is_none() {
                 return Err(format!("unknown group '{}'", place.id));
             }
-            validate_group_place(project, &place, group)?;
-            let mut nodes: BTreeSet<Located> = members_with_paths(project, &place.id, &place.path).into_iter().collect();
+            validate_group_place(g, &place, group)?;
+            let mut nodes: BTreeSet<Located> = members_in(g, &place.id, &place.path).into_iter().collect();
             if fire.as_ref().is_some_and(|fire| !nodes.contains(fire)) {
                 return Err("the fired trigger is outside the selected group".into());
             }
             nodes.extend(feeders);
-            Self::from_nodes(project, nodes, BTreeSet::new())
+            Self::from_nodes(g, nodes, BTreeSet::new())
         } else {
-            let is_trigger = |place: &Located| project.nodes.iter().any(|n| n.id == place.id && n.features.is_trigger);
+            let is_trigger = |place: &Located| g.is_trigger(&place.id);
             let stops = |place: &Located| is_trigger(place) || entries.contains(place) || emits.contains(place);
             let starts: Vec<Located> = entries.iter().cloned().chain(emits.iter().cloned()).chain(fire.iter().cloned()).collect();
             let mut nodes = if starts.is_empty() {
-                every_place(project)
+                every_place_in(g)
             } else {
-                let downstream = Self::downstream(project, &starts);
-                let consumers: Vec<Located> = downstream.iter().filter(|place| !is_ordinary_boundary(project, &place.id)).cloned().collect();
-                let mut nodes = walk(project, &consumers, Direction::Upstream, &stops);
+                let downstream = walk(g, &starts, Direction::Downstream, &|_| false);
+                let consumers: Vec<Located> = downstream.iter().filter(|place| !g.is_ordinary_boundary(&place.id)).cloned().collect();
+                let mut nodes = walk(g, &consumers, Direction::Upstream, &stops);
                 nodes.extend(downstream);
                 nodes
             };
@@ -490,14 +504,14 @@ impl RunSelection {
             // start's feeders are kept as well, one level and no further.
             let others_reach = |start: &Located| entries.iter().chain(&emits)
                 .filter(|other| *other != start)
-                .any(|other| Self::downstream(project, std::slice::from_ref(other)).contains(start));
+                .any(|other| walk(g, std::slice::from_ref(other), Direction::Downstream, &|_| false).contains(start));
             let inner: BTreeSet<Located> = entries.iter().filter(|start| others_reach(start)).cloned().collect();
             let bounded = |place: &Located| is_trigger(place)
                 || emits.contains(place)
                 || (entries.contains(place) && !inner.contains(place));
             for ends in [&target, &before] {
                 if !ends.is_empty() {
-                    let mut allowed = walk(project, ends, Direction::Upstream, &bounded);
+                    let mut allowed = walk(g, ends, Direction::Upstream, &bounded);
                     allowed.extend(feeders.iter().cloned());
                     nodes.retain(|place| allowed.contains(place));
                     suppliers.retain(|place| allowed.contains(place));
@@ -505,7 +519,7 @@ impl RunSelection {
             }
             suppliers.retain(|place| !before.contains(place));
             nodes.retain(|place| !excluded.contains(place));
-            let selection = Self::from_nodes(project, nodes, suppliers);
+            let selection = Self::from_nodes(g, nodes, suppliers);
             // Structural completion cannot restore an explicitly excluded endpoint.
             if selection.nodes.iter().any(|place| excluded.contains(place)) {
                 return Err("the requested cut removes group control machinery needed by the run".into());
@@ -516,27 +530,33 @@ impl RunSelection {
             // A fired trigger reads its baked inputs. A shared setup producer
             // may run for another consumer without feeding the trigger again.
             // Unfired triggers close their outputs without reading setup inputs.
-            let into_trigger: BTreeSet<&str> = project.edges.iter().filter(|edge| project.nodes.iter()
-                .any(|node| node.id == edge.target && node.features.is_trigger)).map(|edge| edge.id.as_str()).collect();
+            let into_trigger: BTreeSet<&str> = project.edges.iter().filter(|edge| g.is_trigger(&edge.target))
+                .map(|edge| edge.id.as_str()).collect();
             selection.edges.retain(|wire| !into_trigger.contains(wire.id.as_str()));
         }
-        selection.validate_loops(project)?;
+        selection.validate_loops_in(g)?;
         Ok(selection)
     }
 
     /// Data dependencies and enclosing controls, with whole-loop expansion.
     pub fn dependencies(project: &ProjectDefinition, targets: &[Located]) -> Self {
-        let walked = walk(project, targets, Direction::Upstream, &|_| false);
-        Self::from_nodes(project, walked, BTreeSet::new())
+        Self::dependencies_in(&ProjectGraph::new(project), targets)
+    }
+
+    /// [`Self::dependencies`] over a program already indexed.
+    pub fn dependencies_in(g: &ProjectGraph, targets: &[Located]) -> Self {
+        let walked = walk(g, targets, Direction::Upstream, &|_| false);
+        Self::from_nodes(g, walked, BTreeSet::new())
     }
 
     /// Both setup phases stop inclusively at their targets.
     pub fn setup(project: &ProjectDefinition, targets: &[Located]) -> Result<Self, String> {
+        let g = ProjectGraph::new(project);
         for target in targets {
-            validate_place(project, target, &super::address_of(project, &target.id, &target.path))?;
+            validate_place(&g, target, &super::address_of(project, &target.id, &target.path))?;
         }
-        let selection = Self::dependencies(project, targets);
-        selection.validate_loops(project)?;
+        let selection = Self::dependencies_in(&g, targets);
+        selection.validate_loops_in(&g)?;
         Ok(selection)
     }
 
@@ -556,15 +576,16 @@ impl RunSelection {
     /// opens it: the start's own, or the enclosing group's In, which only
     /// a start AT that group can be handed.
     pub fn shut_gates(&self, project: &ProjectDefinition, start: &Located, fired: Option<&Located>) -> Vec<ShutGate> {
-        let mut doors: BTreeSet<Located> = gates_of(project, start).into_iter()
+        let g = ProjectGraph::new(project);
+        let mut doors: BTreeSet<Located> = gates_of(&g, start).into_iter()
             .map(|gate| Located::new(boundary_in_id(&gate.id), gate.path)).collect();
         doors.insert(start.clone());
         let gate = crate::exec::skip::SHOULD_FLOW_PORT;
         doors.into_iter().filter_map(|door| {
             if self.input.get(&door).is_some_and(|ports| ports.contains_key(gate)) { return None; }
-            if !project.edges.iter().any(|edge| edge.target == door.id && edge.target_handle.as_deref() == Some(gate)) { return None; }
+            if !g.edges_into(&door.id).any(|edge| edge.target_handle.as_deref() == Some(gate)) { return None; }
             let mut triggers = BTreeSet::new();
-            (!self.could_carry(project, &door, gate, fired, &mut BTreeSet::new(), &mut triggers))
+            (!self.could_carry(&g, &door, gate, fired, &mut BTreeSet::new(), &mut triggers))
                 .then(|| ShutGate { door, triggers: triggers.into_iter().collect() })
         }).collect()
     }
@@ -577,7 +598,7 @@ impl RunSelection {
     /// every wire is like that is a root that fires on its own.
     fn could_carry(
         &self,
-        project: &ProjectDefinition,
+        g: &ProjectGraph,
         at: &Located,
         port: &str,
         fired: Option<&Located>,
@@ -586,33 +607,33 @@ impl RunSelection {
     ) -> bool {
         if !seen.insert((at.clone(), port.to_string())) { return false; }
         if self.input.get(at).is_some_and(|ports| ports.contains_key(port)) { return true; }
-        let wires: Vec<(Edge, Located)> = incoming(project, at)
-            .filter(|(edge, _, _)| edge.target_handle.as_deref().unwrap_or("default") == port && self.fed_by(project, at, edge))
+        let wires: Vec<(Edge, Located)> = incoming(g, at)
+            .filter(|(edge, _, _)| edge.target_handle.as_deref().unwrap_or("default") == port && self.fed(g, at, edge))
             .map(|(edge, source, _)| (edge.clone(), source)).collect();
         wires.into_iter().any(|(edge, source)| {
             if self.suppliers.contains(&source) { return true; }
-            let Some(node) = project.nodes.iter().find(|n| n.id == source.id) else { return false };
+            let Some(node) = g.node(&source.id) else { return false };
             if node.features.is_trigger && fired != Some(&source) {
                 triggers.insert(source);
                 return false;
             }
-            if is_ordinary_boundary(project, &source.id) {
+            if g.is_ordinary_boundary(&source.id) {
                 let through = edge.source_handle.as_deref().unwrap_or("default");
-                return self.could_carry(project, &source, through, fired, seen, triggers);
+                return self.could_carry(g, &source, through, fired, seen, triggers);
             }
             // A node: open when nothing it reads comes over a wire of the
             // run, or when any wired input could carry.
-            let ports: BTreeSet<String> = incoming(project, &source)
-                .filter(|(edge, _, _)| self.fed_by(project, &source, edge))
+            let ports: BTreeSet<String> = incoming(g, &source)
+                .filter(|(edge, _, _)| self.fed(g, &source, edge))
                 .map(|(edge, _, _)| edge.target_handle.as_deref().unwrap_or("default").to_string()).collect();
-            ports.is_empty() || ports.iter().any(|port| self.could_carry(project, &source, port, fired, seen, triggers))
+            ports.is_empty() || ports.iter().any(|port| self.could_carry(g, &source, port, fired, seen, triggers))
         })
     }
 
     /// Whether something in the run feeds `port` of the node at `at`.
     pub fn has_supplier(&self, project: &ProjectDefinition, at: &Located, port: &str) -> bool {
-        project.edges.iter().any(|edge| edge.target == at.id
-            && edge.target_handle.as_deref().unwrap_or("default") == port && self.fed_by(project, at, edge))
+        project.edges_into(&at.id).any(|edge| edge.target_handle.as_deref().unwrap_or("default") == port
+            && self.fed_by(project, at, edge))
     }
 
     /// Roots are relative to selected wires. Enclosing gates still control
@@ -627,16 +648,25 @@ impl RunSelection {
     /// merge (same node, same frames): the group launcher stamps its
     /// verdict onto the kick that is already there.
     pub fn roots(&self, project: &ProjectDefinition) -> Vec<Located> {
+        let g = ProjectGraph::new(project);
         self.nodes.iter()
-            .filter(|place| !in_a_loop_body(project, place))
-            .filter(|place| !project.edges.iter().any(|edge| edge.target == place.id && self.fed_by(project, place, edge)))
+            .filter(|place| !in_loop_body(&g, place))
+            .filter(|place| !g.edges_into(&place.id).any(|edge| self.fed(&g, place, edge)))
             .cloned().collect()
     }
 
     pub fn validate_loops(&self, project: &ProjectDefinition) -> Result<(), String> {
+        self.validate_loops_in(&ProjectGraph::new(project))
+    }
+
+    fn validate_loops_in(&self, g: &ProjectGraph) -> Result<(), String> {
+        // Each loop at each place is checked once, however many of its
+        // members the run holds.
+        let mut checked = BTreeSet::new();
         for place in &self.nodes {
-            for group in enclosing_loops(project, place) {
-                let members = members_with_paths(project, &group.id, &group.path);
+            for group in loops_around(g, place) {
+                if !checked.insert(group.clone()) { continue; }
+                let members = members_in(g, &group.id, &group.path);
                 if members.iter().any(|member| !self.nodes.contains(member)) {
                     return Err(format!("cannot cut inside loop '{}'; select the whole loop", group.id));
                 }
@@ -645,23 +675,23 @@ impl RunSelection {
         Ok(())
     }
 
-    fn from_nodes(project: &ProjectDefinition, mut nodes: BTreeSet<Located>, suppliers: BTreeSet<Located>) -> Self {
+    fn from_nodes(g: &ProjectGraph, mut nodes: BTreeSet<Located>, suppliers: BTreeSet<Located>) -> Self {
         let mut gates = BTreeSet::new();
-        let is_trigger = |place: &Located| project.nodes.iter().any(|n| n.id == place.id && n.features.is_trigger);
+        let is_trigger = |place: &Located| g.is_trigger(&place.id);
         loop {
             let before = nodes.len();
             for place in nodes.iter().chain(&suppliers) {
-                gates.extend(gates_of(project, place));
+                gates.extend(gates_of(g, place));
             }
             for gate in &gates {
                 let boundary = Located::new(boundary_in_id(&gate.id), gate.path.clone());
                 if suppliers.contains(&boundary) { continue; }
                 nodes.insert(boundary.clone());
-                let sources: Vec<_> = incoming(project, &boundary)
+                let sources: Vec<_> = incoming(g, &boundary)
                     .filter(|(edge, _, _)| edge.target_handle.as_deref() == Some("_should_flow"))
                     .map(|(edge, source, _)| (source, Some(edge.source_handle.as_deref().unwrap_or("default").to_string())))
                     .collect();
-                nodes.extend(walk_ports(project, sources, Direction::Upstream, &is_trigger));
+                nodes.extend(walk_ports(g, sources, Direction::Upstream, &is_trigger));
             }
             if nodes.len() == before { break; }
         }
@@ -678,17 +708,17 @@ impl RunSelection {
         // at the start of a run its members completed, and re-run by
         // every seeded run after (a skip is not reused).
         let mut pending: Vec<(&Edge, Located, Located)> = nodes.iter()
-            .filter(|place| !is_ordinary_boundary(project, &place.id))
-            .flat_map(|place| incoming(project, place)).collect();
-        for place in nodes.iter().filter(|place| is_ordinary_boundary(project, &place.id)) {
-            let node = project.nodes.iter().find(|n| n.id == place.id).expect("selected node exists");
-            for (edge, source, wire) in incoming(project, place)
+            .filter(|place| !g.is_ordinary_boundary(&place.id))
+            .flat_map(|place| incoming(g, place)).collect();
+        for place in nodes.iter().filter(|place| g.is_ordinary_boundary(&place.id)) {
+            let node = g.node(&place.id).expect("selected node exists");
+            for (edge, source, wire) in incoming(g, place)
                 .filter(|(_, source, _)| nodes.contains(source) || suppliers.contains(source))
             {
                 boundary_ports.entry(place.clone()).or_default().insert(edge.target_handle.as_deref().unwrap_or("default").into());
                 pending.push((edge, source, wire));
             }
-            let terminal = !outgoing(project, place).any(|(_, target, _)| nodes.contains(&target));
+            let terminal = !outgoing(g, place).any(|(_, target, _)| nodes.contains(&target));
             if terminal {
                 boundary_ports.entry(place.clone()).or_default().extend(node.port_literals.keys().cloned());
             }
@@ -696,15 +726,15 @@ impl RunSelection {
         for gate in &gates {
             let boundary = Located::new(boundary_in_id(&gate.id), gate.path.clone());
             boundary_ports.entry(boundary.clone()).or_default().insert("_should_flow".into());
-            pending.extend(incoming(project, &boundary)
+            pending.extend(incoming(g, &boundary)
                 .filter(|(edge, _, _)| edge.target_handle.as_deref() == Some("_should_flow")));
         }
         while let Some((edge, source, wire)) = pending.pop() {
             if !edges.insert(wire) { continue; }
-            if is_ordinary_boundary(project, &source.id) && nodes.contains(&source) {
+            if g.is_ordinary_boundary(&source.id) && nodes.contains(&source) {
                 let port = edge.source_handle.as_deref().unwrap_or("default");
                 boundary_ports.entry(source.clone()).or_default().insert(port.into());
-                pending.extend(incoming(project, &source)
+                pending.extend(incoming(g, &source)
                     .filter(|(edge, _, _)| edge.target_handle.as_deref().unwrap_or("default") == port));
             }
         }
@@ -715,13 +745,19 @@ impl RunSelection {
 /// Every place in the program: the top-level nodes, and each included
 /// file's nodes once per site that reaches it, however deep.
 pub fn every_place(project: &ProjectDefinition) -> BTreeSet<Located> {
-    let in_a_body = |node: &NodeDefinition| enclosing_body(project, node).is_some();
+    every_place_in(&ProjectGraph::new(project))
+}
+
+/// [`every_place`] over a program already indexed.
+pub fn every_place_in(g: &ProjectGraph) -> BTreeSet<Located> {
+    let project = g.project();
+    let in_a_body = |node: &NodeDefinition| body_around(g, node).is_some();
     let mut places: BTreeSet<Located> = project.nodes.iter().filter(|node| !in_a_body(node))
         .map(|node| Located::top(node.id.clone())).collect();
     for group in project.groups.iter().filter(|group| matches!(group.kind, GroupKind::Call { .. })) {
-        let entry = project.nodes.iter().find(|node| node.id == boundary_in_id(&group.id));
+        let entry = g.node(&boundary_in_id(&group.id));
         if entry.is_some_and(|entry| !in_a_body(entry)) {
-            places.extend(members_with_paths(project, &group.id, &[]));
+            places.extend(members_in(g, &group.id, &[]));
         }
     }
     places
@@ -730,12 +766,12 @@ pub fn every_place(project: &ProjectDefinition) -> BTreeSet<Located> {
 /// The groups that gate `place`, each at the place its In runs: the
 /// node's own scopes (a boundary's own container among them) at the
 /// node's path, and every site on the path at the path above it.
-fn gates_of(project: &ProjectDefinition, place: &Located) -> Vec<Located> {
+fn gates_of(g: &ProjectGraph, place: &Located) -> Vec<Located> {
     let mut gates: Vec<Located> = place.path.iter().enumerate()
         .map(|(depth, site)| Located::new(site.clone(), place.path[..depth].to_vec())).collect();
-    if let Some(node) = project.nodes.iter().find(|n| n.id == place.id) {
+    if let Some(node) = g.node(&place.id) {
         gates.extend(node.scope.iter().map(|group| Located::new(group.clone(), place.path.clone())));
-        if is_ordinary_boundary(project, &node.id) {
+        if g.is_ordinary_boundary(&node.id) {
             gates.extend(node.group_boundary.iter().map(|boundary| Located::new(boundary.group_id.clone(), place.path.clone())));
         }
     }
@@ -747,9 +783,8 @@ fn gates_of(project: &ProjectDefinition, place: &Located) -> Vec<Located> {
 /// not inside it (they run at the loop's frames), so `enclosing_loops`,
 /// which counts them, is the wrong question for what the loop launcher
 /// owns.
-pub fn in_a_loop_body(project: &ProjectDefinition, place: &Located) -> bool {
-    let is_loop = |group: &str| project.groups.iter().any(|g| g.id == group && matches!(g.kind, GroupKind::Loop { .. }));
-    let scope_has_loop = |id: &str| project.nodes.iter().find(|n| n.id == id).is_some_and(|n| n.scope.iter().any(|g| is_loop(g)));
+fn in_loop_body(project: &impl GraphView, place: &Located) -> bool {
+    let scope_has_loop = |id: &str| project.node(id).is_some_and(|n| n.scope.iter().any(|g| project.is_loop(g)));
     scope_has_loop(&place.id) || place.path.iter().any(|site| scope_has_loop(&boundary_in_id(site)))
 }
 
@@ -757,18 +792,20 @@ pub fn in_a_loop_body(project: &ProjectDefinition, place: &Located) -> bool {
 /// loop runs: a loop in the node's own scope, and a loop around any
 /// site on its path (a call inside a loop runs whole with the loop).
 pub fn enclosing_loops(project: &ProjectDefinition, place: &Located) -> Vec<Located> {
-    let is_loop = |group: &str| project.groups.iter().any(|g| g.id == group && matches!(g.kind, GroupKind::Loop { .. }));
-    let node = |id: &str| project.nodes.iter().find(|n| n.id == id);
+    loops_around(project, place)
+}
+
+fn loops_around(project: &impl GraphView, place: &Located) -> Vec<Located> {
     let mut loops = Vec::new();
     for (depth, site) in place.path.iter().enumerate() {
-        if let Some(entry) = node(&boundary_in_id(site)) {
-            loops.extend(entry.scope.iter().filter(|group| is_loop(group))
+        if let Some(entry) = project.node(&boundary_in_id(site)) {
+            loops.extend(entry.scope.iter().filter(|group| project.is_loop(group))
                 .map(|group| Located::new(group.clone(), place.path[..depth].to_vec())));
         }
     }
-    if let Some(node) = node(&place.id) {
+    if let Some(node) = project.node(&place.id) {
         loops.extend(node.scope.iter().chain(node.group_boundary.iter().map(|b| &b.group_id))
-            .filter(|group| is_loop(group)).map(|group| Located::new(group.clone(), place.path.clone())));
+            .filter(|group| project.is_loop(group)).map(|group| Located::new(group.clone(), place.path.clone())));
     }
     loops.dedup();
     loops
@@ -777,27 +814,24 @@ pub fn enclosing_loops(project: &ProjectDefinition, place: &Located) -> Vec<Loca
 /// A group's members, each at the place it runs when the group is at
 /// `path`: its nodes and boundaries at `path`, and behind every call
 /// site among them (the group itself, when it is one) the whole body
-/// one site deeper.
-pub fn members_with_paths(project: &ProjectDefinition, group: &str, path: &[String]) -> Vec<Located> {
-    let mut out: Vec<Located> = project.nodes.iter().filter(|n| n.scope.iter().any(|g| g == group)
-        || n.id == boundary_in_id(group) || n.id == boundary_out_id(group))
-        .map(|n| Located::new(n.id.clone(), path.to_vec())).collect();
-    let sites = project.groups.iter().filter(|site| matches!(site.kind, GroupKind::Call { .. }))
-        .filter(|site| site.id == group || project.nodes.iter().any(|n| n.id == boundary_in_id(&site.id) && n.scope.iter().any(|g| g == group)));
-    for site in sites {
-        let body = body_of(project, &site.id).expect("a call site names its body");
+/// one site deeper. Takes the graph so a caller walking many groups
+/// indexes the program once.
+pub fn members_in(g: &ProjectGraph, group: &str, path: &[String]) -> Vec<Located> {
+    let mut out: Vec<Located> = g.members(group).map(|n| Located::new(n.id.clone(), path.to_vec())).collect();
+    for site in g.sites(group) {
+        let body = g.body_of(&site.id).expect("a call site names its body");
         let mut deeper = path.to_vec();
         deeper.push(site.id.clone());
-        out.extend(members_with_paths(project, body, &deeper));
+        out.extend(members_in(g, body, &deeper));
     }
     out
 }
 
 /// A bound as a person wrote it, resolved: the node or group id and the
 /// call path it names. An unknown spelling is reported as written.
-fn locate(project: &ProjectDefinition, spelled: &str) -> Result<Located, String> {
-    let (id, path) = super::resolve_address(project, spelled);
-    if project.nodes.iter().any(|n| n.id == id) || project.groups.iter().any(|g| g.id == id) {
+fn locate(g: &ProjectGraph, spelled: &str) -> Result<Located, String> {
+    let (id, path) = super::resolve_address(g.project(), spelled);
+    if g.node(&id).is_some() || g.group(&id).is_some() {
         Ok(Located::new(id, path))
     } else {
         Err(format!("unknown node '{spelled}'"))
@@ -808,13 +842,13 @@ fn locate(project: &ProjectDefinition, spelled: &str) -> Result<Located, String>
 /// included) starts at its In boundary; a node starts at itself. Never
 /// inside a loop, and never a bare body: a body is started through a
 /// site that calls it.
-pub fn start_node_at(project: &ProjectDefinition, spelled: &str) -> Result<Located, String> {
-    let place = locate(project, spelled)?;
-    if project.groups.iter().any(|group| group.id == place.id) {
-        validate_group_place(project, &place, spelled)?;
+pub fn start_node_in(g: &ProjectGraph, spelled: &str) -> Result<Located, String> {
+    let place = locate(g, spelled)?;
+    if g.group(&place.id).is_some() {
+        validate_group_place(g, &place, spelled)?;
         return Ok(Located::new(boundary_in_id(&place.id), place.path));
     }
-    validate_place(project, &place, spelled)?;
+    validate_place(g, &place, spelled)?;
     Ok(place)
 }
 
@@ -824,22 +858,20 @@ pub fn start_node_at(project: &ProjectDefinition, spelled: &str) -> Result<Locat
 /// none around a site on its path; and a group inside an included file
 /// is named through a site, never through the file's own id. A body is
 /// never an endpoint: it runs through the site that calls it.
-fn validate_group_place(project: &ProjectDefinition, place: &Located, spelled: &str) -> Result<(), String> {
-    let group = project.groups.iter().find(|group| group.id == place.id)
-        .ok_or_else(|| format!("unknown group '{spelled}'"))?;
+fn validate_group_place(g: &ProjectGraph, place: &Located, spelled: &str) -> Result<(), String> {
+    let group = g.group(&place.id).ok_or_else(|| format!("unknown group '{spelled}'"))?;
     if matches!(group.kind, GroupKind::Body) {
         return Err(format!("cannot cut at '{spelled}': it is an included file, which runs through the site that includes it; name the site"));
     }
     let entry = Located::new(boundary_in_id(&group.id), place.path.clone());
-    let node = project.nodes.iter().find(|node| node.id == entry.id)
-        .ok_or_else(|| format!("group '{}' has no entry", group.id))?;
+    let node = g.node(&entry.id).ok_or_else(|| format!("group '{}' has no entry", group.id))?;
     // The group's own container is not "around" it: a loop is cut whole.
-    if let Some(container) = enclosing_loops(project, &entry).into_iter().find(|l| l.id != group.id) {
+    if let Some(container) = loops_around(g, &entry).into_iter().find(|l| l.id != group.id) {
         return Err(format!("cannot cut at '{spelled}' inside loop '{}'; select the whole loop", container.id));
     }
     if place.path.is_empty() {
-        if let Some(body) = enclosing_body(project, node) {
-            return Err(inside_a_file(project, spelled, &group.id, &body));
+        if let Some(body) = body_around(g, node) {
+            return Err(inside_a_file(g.project(), spelled, &group.id, &body));
         }
     }
     Ok(())
@@ -862,25 +894,23 @@ fn inside_a_file(project: &ProjectDefinition, spelled: &str, id: &str, body: &st
 /// site, spelled `site.node`; naming the body's own id (`Triage.up`)
 /// says nothing about which call, so it is refused with the spelling
 /// that does.
-pub fn validate_endpoint(project: &ProjectDefinition, spelled: &str) -> Result<(), String> {
-    validate_place(project, &locate(project, spelled)?, spelled)
+fn validate_endpoint_in(g: &ProjectGraph, spelled: &str) -> Result<(), String> {
+    validate_place(g, &locate(g, spelled)?, spelled)
 }
 
-fn validate_place(project: &ProjectDefinition, place: &Located, spelled: &str) -> Result<(), String> {
-    let node = project.nodes.iter().find(|node| node.id == place.id)
-        .ok_or_else(|| format!("unknown node '{spelled}'"))?;
-    if let Some(container) = enclosing_loop(project, node) {
+fn validate_place(g: &ProjectGraph, place: &Located, spelled: &str) -> Result<(), String> {
+    let node = g.node(&place.id).ok_or_else(|| format!("unknown node '{spelled}'"))?;
+    if let Some(container) = enclosing_loop(g, node) {
         return Err(format!("cannot cut at '{spelled}' inside loop '{container}'; select the whole loop"));
     }
     if place.path.is_empty() {
-        if let Some(body) = enclosing_body(project, node) {
-            return Err(inside_a_file(project, spelled, &place.id, &body));
+        if let Some(body) = body_around(g, node) {
+            return Err(inside_a_file(g.project(), spelled, &place.id, &body));
         }
     }
     for site in &place.path {
-        let site_in = project.nodes.iter().find(|n| n.id == boundary_in_id(site))
-            .ok_or_else(|| format!("call site '{site}' has no entry"))?;
-        if let Some(container) = enclosing_loop(project, site_in) {
+        let site_in = g.node(&boundary_in_id(site)).ok_or_else(|| format!("call site '{site}' has no entry"))?;
+        if let Some(container) = enclosing_loop(g, site_in) {
             return Err(format!("cannot cut at '{spelled}': the site '{site}' sits inside loop '{container}'; select the whole loop"));
         }
     }
@@ -888,39 +918,45 @@ fn validate_place(project: &ProjectDefinition, place: &Located, spelled: &str) -
 }
 
 pub(crate) fn is_ordinary_boundary(project: &ProjectDefinition, id: &str) -> bool {
-    project.nodes.iter().find(|n| n.id == id).and_then(|n| n.group_boundary.as_ref())
-        .is_some_and(|b| project.groups.iter().any(|g| g.id == b.group_id && matches!(g.kind, GroupKind::Group | GroupKind::Call { .. } | GroupKind::Body)))
+    project.is_ordinary_boundary(id)
 }
 
 /// Whether `group` is an included file's body.
 pub fn is_body(project: &ProjectDefinition, group: &str) -> bool {
-    project.groups.iter().any(|g| g.id == group && matches!(g.kind, GroupKind::Body))
-}
-
-/// The shared body a call site's group stands for, when `group` is one.
-fn body_of<'a>(project: &'a ProjectDefinition, group: &str) -> Option<&'a str> {
-    project.groups.iter().find(|g| g.id == group).and_then(|g| match &g.kind {
-        GroupKind::Call { body } => Some(body.as_str()),
-        _ => None,
-    })
+    project.group(group).is_some_and(|g| matches!(g.kind, GroupKind::Body))
 }
 
 /// The loop around `node`, if any: a loop's body runs whole, once per
-/// iteration, so a run is never cut inside one.
-fn enclosing_loop(project: &ProjectDefinition, node: &NodeDefinition) -> Option<String> {
-    project.groups.iter().find(|g| matches!(g.kind, GroupKind::Loop { .. }) && (node.scope.contains(&g.id)
-        || node.group_boundary.as_ref().is_some_and(|b| b.group_id == g.id))).map(|g| g.id.clone())
+/// iteration, so a run is never cut inside one. The first in the
+/// program's group order, when the node is in several.
+fn enclosing_loop(g: &ProjectGraph, node: &NodeDefinition) -> Option<String> {
+    first_group_around(g, node, |kind| matches!(kind, GroupKind::Loop { .. }))
 }
 
 /// The included file's body `node` sits in (as a member or as one of
 /// its boundaries), if any.
 pub fn enclosing_body(project: &ProjectDefinition, node: &NodeDefinition) -> Option<String> {
-    project.groups.iter().find(|g| matches!(g.kind, GroupKind::Body) && (node.scope.contains(&g.id)
-        || node.group_boundary.as_ref().is_some_and(|b| b.group_id == g.id))).map(|g| g.id.clone())
+    body_around(project, node)
 }
 
-fn walk(project: &ProjectDefinition, starts: &[Located], direction: Direction, stops: &dyn Fn(&Located) -> bool) -> BTreeSet<Located> {
-    walk_ports(project, starts.iter().map(|place| (place.clone(), None)).collect(), direction, stops)
+fn body_around(project: &impl GraphView, node: &NodeDefinition) -> Option<String> {
+    first_group_around(project, node, |kind| matches!(kind, GroupKind::Body))
+}
+
+/// The first group, in the program's group order, of a kind `wanted`
+/// takes, that `node` is a member or a boundary of.
+fn first_group_around(g: &impl GraphView, node: &NodeDefinition, wanted: impl Fn(&GroupKind) -> bool) -> Option<String> {
+    let project = g.project();
+    let order = |id: &str| project.groups.iter().position(|group| group.id == id);
+    node.scope.iter().chain(node.group_boundary.iter().map(|b| &b.group_id))
+        .filter(|id| g.group(id).is_some_and(|group| wanted(&group.kind)))
+        .filter_map(|id| order(id).map(|at| (at, id)))
+        .min()
+        .map(|(_, id)| id.clone())
+}
+
+fn walk(g: &ProjectGraph, starts: &[Located], direction: Direction, stops: &dyn Fn(&Located) -> bool) -> BTreeSet<Located> {
+    walk_ports(g, starts.iter().map(|place| (place.clone(), None)).collect(), direction, stops)
 }
 
 /// The walk is over places: entering a body through a site pushes the
@@ -928,26 +964,31 @@ fn walk(project: &ProjectDefinition, starts: &[Located], direction: Direction, s
 /// caller's wire on the same body boundary is never taken (see `step`).
 /// A body reached through two sites is walked once per site. A stop is
 /// reached and not walked through.
-fn walk_ports(project: &ProjectDefinition, mut pending: Vec<(Located, Option<String>)>, direction: Direction, stops: &dyn Fn(&Located) -> bool) -> BTreeSet<Located> {
+fn walk_ports(g: &ProjectGraph, mut pending: Vec<(Located, Option<String>)>, direction: Direction, stops: &dyn Fn(&Located) -> bool) -> BTreeSet<Located> {
     let mut nodes = BTreeSet::new();
     let mut visited = BTreeSet::new();
+    // A loop's members are pushed once per loop place, not once per
+    // member reached.
+    let mut loops_taken = BTreeSet::new();
     while let Some((place, port)) = pending.pop() {
         if !visited.insert((place.clone(), port.clone())) { continue; }
         nodes.insert(place.clone());
         if stops(&place) { continue; }
         // A loop goes in whole: reaching any part of one pulls in every
         // member and both boundaries, at the loop's place.
-        if let Some(group) = enclosing_loops(project, &place).into_iter().next() {
-            for member in members_with_paths(project, &group.id, &group.path) {
-                if !visited.contains(&(member.clone(), None)) { pending.push((member, None)); }
+        if let Some(group) = loops_around(g, &place).into_iter().next() {
+            if loops_taken.insert(group.clone()) {
+                for member in members_in(g, &group.id, &group.path) {
+                    if !visited.contains(&(member.clone(), None)) { pending.push((member, None)); }
+                }
             }
         }
-        let ordinary = is_ordinary_boundary(project, &place.id);
+        let ordinary = g.is_ordinary_boundary(&place.id);
         let next: Vec<(Located, Option<String>)> = match direction {
-            Direction::Upstream => upstream_of(project, &place, port.as_deref()),
-            Direction::Downstream => outgoing(project, &place)
+            Direction::Upstream => upstream_of(g, &place, port.as_deref()),
+            Direction::Downstream => outgoing(g, &place)
                 .filter(|(edge, _, _)| !ordinary || port.as_ref().is_none_or(|p| edge.source_handle.as_deref().unwrap_or("default") == p))
-                .map(|(edge, target, _)| (target, port_of(project, &edge.target, edge.target_handle.as_deref()))).collect(),
+                .map(|(edge, target, _)| (target, port_of(g, &edge.target, edge.target_handle.as_deref()))).collect(),
         };
         pending.extend(next);
         // A `_should_flow` wire into a group's door says "run what is in
@@ -956,8 +997,8 @@ fn walk_ports(project: &ProjectDefinition, mut pending: Vec<(Located, Option<Str
         // its body behind a call site included. A data port on the door
         // keeps the port-by-port walk, so a cut stays precise.
         if direction == Direction::Downstream && port.as_deref().is_some_and(crate::exec::skip::is_gate_port) {
-            if let Some(group) = gated_group(project, &place) {
-                for member in members_with_paths(project, &group, &place.path) {
+            if let Some(group) = gated_group(g, &place) {
+                for member in members_in(g, &group, &place.path) {
                     if !visited.contains(&(member.clone(), None)) { pending.push((member, None)); }
                 }
             }
@@ -968,16 +1009,16 @@ fn walk_ports(project: &ProjectDefinition, mut pending: Vec<(Located, Option<Str
 
 /// The group whose door `place` is: an ordinary In boundary's group,
 /// `None` for anything else.
-fn gated_group(project: &ProjectDefinition, place: &Located) -> Option<String> {
-    let node = project.nodes.iter().find(|n| n.id == place.id)?;
+fn gated_group(g: &ProjectGraph, place: &Located) -> Option<String> {
+    let node = g.node(&place.id)?;
     let boundary = node.group_boundary.as_ref()?;
-    (is_ordinary_boundary(project, &place.id) && boundary.role == GroupBoundaryRole::In).then(|| boundary.group_id.clone())
+    (g.is_ordinary_boundary(&place.id) && boundary.role == GroupBoundaryRole::In).then(|| boundary.group_id.clone())
 }
 
 /// The port a walk arrives on at an ordinary boundary (whose ports are
 /// walked one at a time); `None` for any other node.
-fn port_of(project: &ProjectDefinition, node: &str, handle: Option<&str>) -> Option<String> {
-    is_ordinary_boundary(project, node).then(|| handle.unwrap_or("default").to_string())
+fn port_of(g: &ProjectGraph, node: &str, handle: Option<&str>) -> Option<String> {
+    g.is_ordinary_boundary(node).then(|| handle.unwrap_or("default").to_string())
 }
 
 #[cfg(test)]
@@ -1040,7 +1081,7 @@ mod tests {
     }
 
     fn top_members(project: &ProjectDefinition, group: &str) -> BTreeSet<Located> {
-        members_with_paths(project, group, &[]).into_iter().collect()
+        members_in(&ProjectGraph::new(project), group, &[]).into_iter().collect()
     }
 
     #[test]
@@ -1096,8 +1137,8 @@ mod tests {
             let roots: BTreeSet<Located> = RunSelection::whole(&project).roots(&project).into_iter().collect();
             let expected = if looping { tops(&["a", "unrelated", "gate"]) } else { tops(&["a", "unrelated", "gate", "trigger", "lonely"]) };
             assert_eq!(roots, expected, "looping={looping}");
-            assert_eq!(in_a_loop_body(&project, &top("lonely")), looping);
-            assert!(!in_a_loop_body(&project, &top("g__in")), "a door is not inside its own loop");
+            assert_eq!(in_loop_body(&project, &top("lonely")), looping);
+            assert!(!in_loop_body(&project, &top("g__in")), "a door is not inside its own loop");
         }
     }
 
@@ -1250,7 +1291,7 @@ mod tests {
         let mut project = program();
         project.groups[0].kind = GroupKind::Loop { loop_config: json!({}) };
         for id in ["b", "c", "g__in", "g__out"] {
-            assert!(validate_endpoint(&project, id).unwrap_err().contains("inside loop"));
+            assert!(validate_endpoint_in(&ProjectGraph::new(&project), id).unwrap_err().contains("inside loop"));
             assert!(RunSelection::setup(&project, &[top(id)]).is_err());
         }
         let selection = RunSelection::carve(&project, &SelectionBounds {
@@ -1386,10 +1427,10 @@ mod tests {
         // A node inside the body is named through a site. The body's own
         // id says nothing about which call, so it is refused with the
         // spelling that does.
-        let err = validate_endpoint(&project, "B.n").unwrap_err();
+        let err = validate_endpoint_in(&ProjectGraph::new(&project), "B.n").unwrap_err();
         assert!(err.contains("inside an included file") && err.contains("like `a.n`"), "{err}");
-        validate_endpoint(&project, "a.n").unwrap();
-        validate_endpoint(&project, "b.n").unwrap();
+        validate_endpoint_in(&ProjectGraph::new(&project), "a.n").unwrap();
+        validate_endpoint_in(&ProjectGraph::new(&project), "b.n").unwrap();
         // The body's own id is no endpoint, however it is asked for.
         for bounds in [SelectionBounds { group: Some("B".into()), ..Default::default() }, SelectionBounds { target: vec!["B".into()], ..Default::default() }, SelectionBounds { from: vec!["B".into()], ..Default::default() }] {
             let err = RunSelection::carve(&project, &bounds).unwrap_err();
@@ -1507,7 +1548,7 @@ mod tests {
             assert!(cut.nodes.contains(&at("B.g.x", &["a"])) && cut.nodes.contains(&at("B.g__in", &["a"])), "{:?}", cut.nodes);
             assert!(!cut.nodes.iter().any(|p| p.path == vec!["b".to_string()]));
         }
-        assert_eq!(start_node_at(&project, "a.g").unwrap(), at("B.g__in", &["a"]));
+        assert_eq!(start_node_in(&ProjectGraph::new(&project), "a.g").unwrap(), at("B.g__in", &["a"]));
         let err = RunSelection::carve(&project, &SelectionBounds { target: vec!["B.g".into()], ..Default::default() }).unwrap_err();
         assert!(err.contains("like `a.g`"), "{err}");
     }
@@ -1544,9 +1585,44 @@ mod tests {
             let err = RunSelection::carve(&project, &SelectionBounds { target: vec![spelled.into()], ..Default::default() }).unwrap_err();
             assert!(err.contains("inside loop 'l'"), "{spelled}: {err}");
         }
-        let members: BTreeSet<Located> = members_with_paths(&project, "l", &[]).into_iter().collect();
+        let members: BTreeSet<Located> = members_in(&ProjectGraph::new(&project), "l", &[]).into_iter().collect();
         assert!(members.contains(&at("B.n", &["l.c"])) && members.contains(&top("l.c__in")) && members.contains(&top("l__out")));
         assert_eq!(ids(&members), names(&["l__in", "l__out", "l.c__in", "l.c__out", "B__in", "B.n", "B.free", "B__out"]));
+    }
+
+    /// The index answers every lookup a walk makes exactly as scanning
+    /// the program does, on programs with groups, gates, and included
+    /// files called from several sites.
+    #[test]
+    fn the_index_answers_like_a_scan() {
+        use crate::project::graph::{GraphView, ProjectGraph};
+        for project in [program(), called_program(), gated_program()] {
+            let g = ProjectGraph::new(&project);
+            let ids = |nodes: Vec<&NodeDefinition>| nodes.into_iter().map(|n| n.id.clone()).collect::<Vec<_>>();
+            let edge_ids = |edges: Vec<&Edge>| edges.into_iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+            let group_ids = project.groups.iter().map(|g| g.id.clone()).chain(["missing".to_string()]);
+            for id in project.nodes.iter().map(|n| n.id.clone()).chain(group_ids.clone()) {
+                assert_eq!(g.node(&id).map(|n| &n.id), project.node(&id).map(|n| &n.id), "{id}");
+                assert_eq!(edge_ids(g.edges_into(&id).collect()), edge_ids(project.edges_into(&id).collect()), "{id}");
+                assert_eq!(edge_ids(g.edges_out_of(&id).collect()), edge_ids(project.edges_out_of(&id).collect()), "{id}");
+                assert_eq!(g.is_ordinary_boundary(&id), project.is_ordinary_boundary(&id), "{id}");
+                assert_eq!(g.is_trigger(&id), project.is_trigger(&id), "{id}");
+            }
+            for id in group_ids {
+                assert_eq!(g.group(&id).map(|g| &g.id), project.group(&id).map(|g| &g.id), "{id}");
+                assert_eq!(ids(g.members(&id).collect()), ids(project.members(&id).collect()), "{id}");
+                let sites = |it: Vec<&super::super::GroupDefinition>| it.into_iter().map(|g| g.id.clone()).collect::<Vec<_>>();
+                assert_eq!(sites(g.sites(&id).collect()), sites(project.sites(&id).collect()), "{id}");
+                assert_eq!(g.body_of(&id), project.body_of(&id), "{id}");
+                assert_eq!(g.is_loop(&id), project.is_loop(&id), "{id}");
+            }
+            for edge in &project.edges {
+                assert_eq!(g.edge(&edge.id).map(|e| &e.id), Some(&edge.id));
+            }
+            for node in &project.nodes {
+                assert_eq!(body_around(&g, node), body_around(&project, node), "{}", node.id);
+            }
+        }
     }
 
     #[test]

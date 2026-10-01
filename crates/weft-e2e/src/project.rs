@@ -120,8 +120,8 @@ impl Project {
 
     /// Observe a run to its end and read it through this program, so
     /// every node in an assertion is spelled the way the source reads.
-    pub async fn settled(&self, color: Uuid) -> Result<crate::run::SettledRun> {
-        Ok(crate::run::SettledRun::observe(&self.disp, color).await?.reading(self.definition()?))
+    pub async fn settled(&self, execution_id: Uuid) -> Result<crate::run::SettledRun> {
+        Ok(crate::run::SettledRun::observe(&self.disp, execution_id).await?.reading(self.definition()?))
     }
 
     /// The temp working directory (where `weft` runs).
@@ -221,7 +221,7 @@ impl Project {
     /// `main.weft`. Used for reach-out fixtures whose trigger URL must point at
     /// a fake server the rig stood up at a port only known at runtime: the
     /// fixture commits a placeholder token (e.g. `__E2E_FAKE_URL__`) and the
-    /// test rewrites it to the cluster-reachable fake URL before building. Call
+    /// test rewrites it to the reachable fake URL before building. Call
     /// BEFORE [`Project::activate`] / a run so the compiled graph carries the
     /// real URL. Errors if the placeholder is absent (a fixture/test mismatch we
     /// want loud, never a silent no-op that ships a placeholder to the compiler).
@@ -437,9 +437,9 @@ impl Project {
 
     /// Whether the dispatcher holds this project.
     async fn registered_on_dispatcher(&self) -> Result<bool> {
-        let projects: Vec<serde_json::Value> = self.disp.get_json("/projects").await?;
+        let projects: Vec<weft_core::projects::ProjectSummary> = self.disp.get_json("/projects").await?;
         let id = self.id.to_string();
-        Ok(projects.iter().any(|p| p.get("id").and_then(|v| v.as_str()) == Some(id.as_str())))
+        Ok(projects.iter().any(|p| p.id == id))
     }
 }
 
@@ -460,14 +460,21 @@ fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
         let entry = entry?;
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        // Never copy generated / cache trees: base_catalog is regenerated, and
-        // .weft / target hold build output that must be fresh per isolated copy.
-        if matches!(name_str.as_ref(), ".weft" | "target" | "node_modules" | ".git") {
+        // Never copy what no node tree holds (build output, caches, local
+        // databases): the one exclusion list every node-tree walk shares.
+        if weft_catalog::is_node_tree_excluded(&name_str) {
             continue;
         }
         let from = entry.path();
         let to = dst.join(&name);
-        if entry.file_type()?.is_dir() {
+        // Symlinks resolved: a node several fixtures share is committed once
+        // under `fixtures/_nodes/` and symlinked into each fixture's `nodes/`,
+        // and the copy has to carry its contents, since a relative link
+        // means nothing from the temp dir.
+        let is_dir = std::fs::metadata(&from)
+            .with_context(|| format!("read {} (a dangling symlink?)", from.display()))?
+            .is_dir();
+        if is_dir {
             // Skip a committed base_catalog if one slipped in; catalog update
             // owns it.
             if from.ends_with("nodes/base_catalog") {

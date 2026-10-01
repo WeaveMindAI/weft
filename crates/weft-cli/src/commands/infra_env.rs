@@ -25,7 +25,7 @@ pub struct EnvArgs {
     pub set: Vec<String>,
     /// The name for the card's only secret.
     pub secret_as: Option<String>,
-    pub member: Option<weft_core::member::MemberId>,
+    pub instance: Option<weft_core::instance::InstanceId>,
 }
 
 /// Which item a name takes its value from.
@@ -244,7 +244,7 @@ fn write_env(path: &Path, pairs: &[(String, String)]) -> Result<()> {
 pub async fn run(ctx: Ctx, args: EnvArgs) -> Result<()> {
     let wanted = wanted(&args.set, args.secret_as.as_deref())?;
     let path = target(&args.into)?;
-    let card = Card::open(&ctx, &args.node, args.member.as_ref()).await?;
+    let card = Card::open(&ctx, &args.node, args.instance.as_ref()).await?;
     let feed = card.read().await?;
     let mut pairs = Vec::new();
     let mut written = Vec::new();

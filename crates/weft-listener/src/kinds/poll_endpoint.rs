@@ -1,14 +1,12 @@
-//! Periodic HTTP poll handler. Hits the configured URL every
-//! `interval_secs` and fires a fresh execution carrying the response body
-//! (JSON if it parses, else a JSON string). Shares the entry routing,
-//! fire path, and reconnect-backoff ladder with the other event-source
-//! kinds; the only thing specific here is the timer-driven GET.
+//! Periodic HTTP poll handler. Hits the configured URL once per wake,
+//! every `interval_secs`, and fires a fresh execution carrying the
+//! response body (JSON if it parses, else a JSON string), or, in delta
+//! mode, one per new item past the cursor kept on the signal row. Nothing
+//! runs between polls: each wake polls once and sets the next.
 
 
 use anyhow::Result;
 use serde_json::Value;
-use tokio::task::JoinHandle;
-use tokio::time::{interval, Duration, MissedTickBehavior};
 use tracing::warn;
 use weft_core::primitive::{SignalAuth, SignalRouting, SignalSpec, SignalSurface};
 use weft_core::signal::{PollEndpoint, Signal};
@@ -18,7 +16,7 @@ use crate::registry::RegisteredSignal;
 
 use async_trait::async_trait;
 
-use super::{KindHandler, LiveCtx, SpawnCtx};
+use super::{BetweenFires, KindHandler, LiveCtx, SpawnCtx, WakeFrom, Woken};
 use weft_core::live::{LiveFeed, LiveItem};
 
 pub struct PollEndpointHandler;
@@ -27,6 +25,10 @@ pub struct PollEndpointHandler;
 impl KindHandler for PollEndpointHandler {
     fn tag(&self) -> &'static str {
         PollEndpoint::TAG
+    }
+
+    fn between_fires(&self) -> BetweenFires {
+        BetweenFires::Wakes
     }
 
     fn compute_routing(&self, _spec: &SignalSpec) -> Result<SignalRouting> {
@@ -47,26 +49,33 @@ impl KindHandler for PollEndpointHandler {
         Ok(prior.cloned().unwrap_or_else(|| Value::Object(serde_json::Map::new())))
     }
 
-    async fn spawn_task(
-        &self,
-        spec: &SignalSpec,
-        kind_state: &Value,
-        ctx: SpawnCtx,
-    ) -> Result<Option<JoinHandle<()>>> {
+    /// The next point on the poll's grid: every `interval_secs` counted
+    /// from the epoch, so everyone asking within one interval (a
+    /// registration and the rehydrate after it, two copies of the
+    /// listener) names the same moment and sets one wake. A slow poll
+    /// or a late wake skips the points it missed rather than polling in
+    /// a burst to catch up.
+    fn next_wake(&self, spec: &SignalSpec, _state: &Value, _from: WakeFrom, now_ms: i64) -> Result<Option<i64>> {
         let poll: PollEndpoint = serde_json::from_value(spec.config.clone())
             .map_err(|e| anyhow::anyhow!("malformed poll_endpoint spec: {e}"))?;
-        Ok(Some(spawn_loop(poll, spec.access.clone(), kind_state.clone(), ctx)))
+        Ok(Some(next_grid_point(now_ms, poll.interval_secs)))
+    }
+
+    async fn on_wake(&self, spec: &SignalSpec, woken: Woken, ctx: SpawnCtx) -> Result<Value> {
+        let poll: PollEndpoint = serde_json::from_value(spec.config.clone())
+            .map_err(|e| anyhow::anyhow!("malformed poll_endpoint spec: {e}"))?;
+        poll_once(&poll, &spec.access, woken.state, woken.seq, &ctx).await
     }
 
     fn process_entry(&self, _sig: &RegisteredSignal, payload: Value) -> ProcessOutcome {
-        // A poll result (raised internally by spawn_loop via `sink.fire`)
-        // routes to the entry trigger.
+        // A poll result (raised by a wake via `ctx.fire`) routes to the
+        // entry trigger.
         ProcessOutcome { value: payload, target: ProcessTarget::Entry }
     }
 
     /// A poll has no address either: what somebody wants to see is
-    /// what it is reading and how often, plus whether the loop is
-    /// currently healthy.
+    /// what it is reading and how often, plus whether its last polls
+    /// went through.
     fn live(&self, ctx: &LiveCtx<'_>) -> LiveFeed {
         let sig = ctx.sig;
         let poll = match super::config_for_display::<PollEndpoint>(sig, "Polling") {
@@ -76,7 +85,13 @@ impl KindHandler for PollEndpointHandler {
         let mut items: Vec<LiveItem> =
             super::configured_url_item("Polling", &poll.url).into_iter().collect();
         items.push(LiveItem::text("Every", format!("{}s", poll.interval_secs)));
-        items.extend(super::serving_item(sig));
+        // The status is read off the row (`sig.kind_state`), since each
+        // poll may have run on another copy of the listener.
+        match sig.kind_state.as_ref().map(PollState::read) {
+            Some(Ok(state)) => items.push(LiveItem::text("State", state.status_line())),
+            Some(Err(e)) => items.push(LiveItem::text("State", format!("{e:#}"))),
+            None => {}
+        }
         LiveFeed::new(items)
     }
 
@@ -85,186 +100,208 @@ impl KindHandler for PollEndpointHandler {
     }
 }
 
-fn spawn_loop(
-    poll: PollEndpoint,
-    access: Option<weft_core::primitive::AccessRef>,
-    kind_state: Value,
-    ctx: SpawnCtx,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let url = poll.url;
-        let mut ticker = interval(Duration::from_secs(poll.interval_secs));
-        // A slow poll (response took longer than the interval) must not
-        // cause a burst of catch-up polls; skip missed ticks instead.
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        // The state blob is purely the kind's own state (the write
-        // fence's seq travels beside it, never inside). UNPRIMED is a
-        // fact of the fence, not a shape guess: a row that has never
-        // been written sits at seq 0, and any persisted state (even
-        // an empty one from a quiet first poll) means primed, so a
-        // restart can never re-prime and (on a queue-draining feed)
-        // discard everything that arrived in between.
-        let mut seq = ctx.state_seq;
-        let mut state = (seq > 0).then_some(kind_state);
-        // Consecutive-failure counter: a transient miss warns, a poll
-        // that keeps failing (wrong items path, an endpoint answering
-        // HTML) escalates to an error so a misconfigured trigger is
-        // never indistinguishable from a quiet feed.
-        let mut consecutive_failures: u32 = 0;
-        // Every miss is written where the node's display reads it, so a
-        // person looking at a trigger that stopped firing sees why.
-        let serving = ctx.serving.clone();
-        let fail = move |streak: &mut u32, url: &str, what: &str, detail: String| {
-            *streak += 1;
-            serving.lock().status = format!("{what}: {detail} (failed {streak} in a row)");
-            if *streak >= POLL_FAILURE_ESCALATION {
-                tracing::error!(
-                    target: "weft_listener::poll_endpoint",
-                    %url, consecutive_failures = *streak, error = %detail,
-                    "{what}; this trigger has not produced a successful poll in \
-                     {streak} attempts, check its endpoint and recipe",
-                    streak = *streak,
-                );
-            } else {
-                warn!(target: "weft_listener::poll_endpoint", %url, error = %detail, "{what}; will retry next tick");
-            }
-        };
-        super::set_serving_status(&ctx, "polling");
-        loop {
-            ticker.tick().await;
-            // Signed-in polls resolve the connection PER CYCLE: the
-            // credential is refreshed store-side and never frozen
-            // into this loop. No connection = a plain client.
-            let client = match crate::listener_access::client_for(&access, &ctx).await {
-                Ok(c) => c,
-                Err(e) => {
-                    fail(&mut consecutive_failures, &url, "connection resolve failed", format!("{e:#}"));
-                    continue;
-                }
-            };
-            let tick_url = match poll_url(&url, poll.delta.as_ref(), state.as_ref()) {
-                Ok(u) => u,
-                Err(e) => {
-                    // A primed-but-unreadable cursor must NEVER fall
-                    // back to the prime value: on a queue-draining
-                    // feed the prime means "discard everything".
-                    fail(&mut consecutive_failures, &url, "cursor unusable", format!("{e:#}"));
-                    continue;
-                }
-            };
-            // The verb and body are part of the registered recipe: a
-            // POST feed (a query endpoint) sends its declared body
-            // every tick, a GET feed sends the bare URL.
-            let request = match poll.method {
-                weft_core::signal::PollMethod::Get => client.get(&tick_url),
-                weft_core::signal::PollMethod::Post => {
-                    let req = client.post(&tick_url);
-                    match &poll.body {
-                        Some(b) => req.json(b),
-                        None => req,
-                    }
-                }
-            };
-            let resp = match request.send().await {
-                Ok(r) if r.status().is_success() => r,
-                Ok(r) => {
-                    fail(&mut consecutive_failures, &url, "non-success poll", r.status().to_string());
-                    continue;
-                }
-                Err(e) => {
-                    fail(&mut consecutive_failures, &url, "poll request failed", e.to_string());
-                    continue;
-                }
-            };
-            let body = match resp.text().await {
-                Ok(b) => b,
-                Err(e) => {
-                    fail(&mut consecutive_failures, &url, "poll body read failed", e.to_string());
-                    continue;
-                }
-            };
-            let Some(delta) = &poll.delta else {
-                // Plain mode: every poll fires the whole response.
-                consecutive_failures = 0;
-                super::set_serving_status(&ctx, "polling");
-                let payload = super::event_source::coerce_text_payload(body);
-                // Plain mode has no replay cursor; the delivery
-                // outcome is already logged by the fire path.
-                let _ = ctx.fire.fire(payload, "poll_endpoint").await;
-                continue;
-            };
-
-            // Delta mode: fire once per NEW item, then persist the
-            // advanced cursor. The declared format decides how the
-            // body becomes the item-bearing JSON.
-            let parsed: Value = match poll.format {
-                weft_core::signal::PollFormat::Json => match serde_json::from_str(&body) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        fail(&mut consecutive_failures, &url, "delta poll needs a JSON response", e.to_string());
-                        continue;
-                    }
-                },
-                weft_core::signal::PollFormat::Feed => match feed_items(&body) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        fail(&mut consecutive_failures, &url, "delta poll needs an RSS/Atom feed", e);
-                        continue;
-                    }
-                },
-            };
-            let (fires, idle_state) = match delta_advance(delta, &parsed, state.as_ref()) {
-                Ok(x) => x,
-                Err(e) => {
-                    fail(&mut consecutive_failures, &url, "delta poll skipped", e.to_string());
-                    continue;
-                }
-            };
-            consecutive_failures = 0;
-            super::set_serving_status(&ctx, "polling");
-            // The first successful poll PRIMES the cursor silently
-            // (activation means "from now on"); `delta_advance`
-            // returns no fires for it by construction. Each fire
-            // carries the state that acknowledges EXACTLY it, and the
-            // cursor advances to the last item that actually
-            // delivered: a dropped enqueue stops the batch, so its
-            // item (and everything after it) is re-offered next poll,
-            // while already-delivered items are never re-offered (a
-            // re-offer past a completed task would EXECUTE again; the
-            // enqueue dedup only collapses onto live task rows).
-            let next_state = if fires.is_empty() {
-                idle_state
-            } else {
-                let mut advanced = state.clone();
-                for (payload, state_after) in fires {
-                    match ctx.fire.fire(payload, "poll_endpoint").await {
-                        // Not delivered (transient failure, a token the
-                        // broker does not know, or this pod was drained
-                        // and the fire fenced): hold the cursor so the
-                        // item is re-offered.
-                        crate::event_context::FireOutcome::EnqueueFailed
-                        | crate::event_context::FireOutcome::Fenced
-                        | crate::event_context::FireOutcome::UnknownSignal => break,
-                        crate::event_context::FireOutcome::Fired
-                        | crate::event_context::FireOutcome::Filtered => {
-                            advanced = Some(state_after);
-                        }
-                    }
-                }
-                advanced
-            };
-            if let Some(next) = next_state {
-                if state.as_ref() != Some(&next) {
-                    seq += 1;
-                    ctx.fire.update_kind_state(next.clone(), seq, "poll_endpoint").await;
-                    state = Some(next);
-                }
-            }
-        }
-    })
+/// The first multiple of `interval_secs` (from the epoch) strictly after
+/// `now_ms`.
+fn next_grid_point(now_ms: i64, interval_secs: u64) -> i64 {
+    let step = (interval_secs.max(1) as i64).saturating_mul(1000);
+    (now_ms.div_euclid(step) + 1).saturating_mul(step)
 }
 
-/// Consecutive failed polls before the per-tick warning escalates to
+/// A poll's durable state, all of it on the signal row: each wake may
+/// land on a different copy of the listener, so nothing about the poll
+/// lives in a process between wakes.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PollState {
+    /// The delta cursor (what was already delivered). PRIMED iff present:
+    /// a priming poll that pinned nothing (an empty first page) leaves it
+    /// absent, and a primed cursor never falls back to the prime value,
+    /// which on a queue-draining feed means "discard everything queued".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    delta: Option<Value>,
+    /// Polls in a row that failed, across every copy that ran one.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    consecutive_failures: u32,
+    /// Why the last of them failed. Absent once a poll went through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_failure: Option<String>,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+impl PollState {
+    fn read(state: &Value) -> Result<Self> {
+        serde_json::from_value(state.clone()).map_err(|e| anyhow::anyhow!("malformed poll_endpoint state {state}: {e}"))
+    }
+
+    fn to_value(&self) -> Value {
+        serde_json::to_value(self).expect("a poll state always serializes")
+    }
+
+    /// What the node's display says about the polls.
+    fn status_line(&self) -> String {
+        match (&self.last_failure, self.consecutive_failures) {
+            (Some(why), n) if n > 0 => format!("{why} (failed {n} in a row)"),
+            _ => "polling".to_string(),
+        }
+    }
+}
+
+/// Move the poll's state from `seq` to `next`, as a claim: of two copies
+/// that polled at the same state, one write lands and the other's is
+/// dropped (they read the same feed, so either answer stands). A write
+/// that could not be made is logged: the next poll starts from the older
+/// state, which only re-offers items, never loses them.
+async fn store(ctx: &SpawnCtx, seq: i64, next: &PollState) {
+    match ctx.fire.claim_kind_state(next.to_value(), seq).await {
+        Ok(true) => {}
+        Ok(false) => tracing::debug!(
+            target: "weft_listener::poll_endpoint",
+            token = %ctx.fire.token(),
+            "another copy moved this poll's state first; its write stands"
+        ),
+        Err(e) => warn!(
+            target: "weft_listener::poll_endpoint",
+            token = %ctx.fire.token(), error = %format!("{e:#}"),
+            "poll state write failed"
+        ),
+    }
+}
+
+/// One poll: fetch, fire what is new, persist the advanced cursor.
+/// Answers the state the signal now stands at. A failed poll fires
+/// nothing and moves no cursor; it counts the streak on the row, where
+/// the node's display reads it, and a streak that keeps growing
+/// escalates to an error so a misconfigured trigger is never
+/// indistinguishable from a quiet feed.
+async fn poll_once(
+    poll: &PollEndpoint,
+    access: &Option<weft_core::primitive::AccessRef>,
+    kind_state: Value,
+    seq: i64,
+    ctx: &SpawnCtx,
+) -> Result<Value> {
+    let url = poll.url.as_str();
+    let before = PollState::read(&kind_state)?;
+    let state = before.delta.clone();
+    let failed = |what: &str, detail: String| {
+        let streak = before.consecutive_failures + 1;
+        if streak >= POLL_FAILURE_ESCALATION {
+            tracing::error!(
+                target: "weft_listener::poll_endpoint",
+                %url, consecutive_failures = streak, error = %detail,
+                "{what}; this trigger has not produced a successful poll in {streak} attempts, \
+                 check its endpoint and recipe",
+            );
+        } else {
+            warn!(target: "weft_listener::poll_endpoint", %url, error = %detail, "{what}; will retry next poll");
+        }
+        PollState { delta: before.delta.clone(), consecutive_failures: streak, last_failure: Some(format!("{what}: {detail}")) }
+    };
+    let next = 'poll: {
+        // Signed-in polls resolve the connection PER POLL: the credential
+        // is refreshed store-side and never frozen. No connection = a
+        // plain client.
+        let client = match crate::listener_access::client_for(access, ctx).await {
+            Ok(c) => c,
+            Err(e) => break 'poll failed("connection resolve failed", format!("{e:#}")),
+        };
+        let url = match crate::infra_address::for_listener(url, ctx).await {
+            Ok(u) => u,
+            Err(e) => break 'poll failed("address resolve failed", format!("{e:#}")),
+        };
+        let poll_url = match poll_url(&url, poll.delta.as_ref(), state.as_ref()) {
+            Ok(u) => u,
+            // A primed-but-unreadable cursor must NEVER fall back to the
+            // prime value: on a queue-draining feed the prime means
+            // "discard everything".
+            Err(e) => break 'poll failed("cursor unusable", format!("{e:#}")),
+        };
+        // The verb and body are part of the registered recipe: a POST
+        // feed (a query endpoint) sends its declared body every poll, a
+        // GET feed sends the bare URL.
+        let request = match poll.method {
+            weft_core::signal::PollMethod::Get => client.get(&poll_url),
+            weft_core::signal::PollMethod::Post => {
+                let req = client.post(&poll_url);
+                match &poll.body {
+                    Some(b) => req.json(b),
+                    None => req,
+                }
+            }
+        };
+        let resp = match request.send().await {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => break 'poll failed("non-success poll", r.status().to_string()),
+            Err(e) => break 'poll failed("poll request failed", e.to_string()),
+        };
+        let body = match resp.text().await {
+            Ok(b) => b,
+            Err(e) => break 'poll failed("poll body read failed", e.to_string()),
+        };
+        let Some(delta) = &poll.delta else {
+            // Plain mode: every poll fires the whole response. It has no
+            // replay cursor; the delivery outcome is already logged by
+            // the fire path.
+            let _ = ctx.fire.fire(super::event_source::coerce_text_payload(body), "poll_endpoint").await;
+            break 'poll PollState { delta: None, consecutive_failures: 0, last_failure: None };
+        };
+
+        // Delta mode: fire once per NEW item, then persist the advanced
+        // cursor. The declared format decides how the body becomes the
+        // item-bearing JSON.
+        let parsed: Value = match poll.format {
+            weft_core::signal::PollFormat::Json => match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(e) => break 'poll failed("delta poll needs a JSON response", e.to_string()),
+            },
+            weft_core::signal::PollFormat::Feed => match feed_items(&body) {
+                Ok(v) => v,
+                Err(e) => break 'poll failed("delta poll needs an RSS/Atom feed", e),
+            },
+        };
+        let (fires, idle_state) = match delta_advance(delta, &parsed, state.as_ref()) {
+            Ok(x) => x,
+            Err(e) => break 'poll failed("delta poll skipped", e.to_string()),
+        };
+        // The first successful poll PRIMES the cursor silently
+        // (activation means "from now on"); `delta_advance` returns no
+        // fires for it by construction. Each fire carries the state that
+        // acknowledges EXACTLY it, and the cursor advances to the last
+        // item that actually delivered: a dropped enqueue stops the
+        // batch, so its item (and everything after it) is re-offered next
+        // poll, while already-delivered items are never re-offered (a
+        // re-offer past a completed task would EXECUTE again; the enqueue
+        // dedup only collapses onto live task rows).
+        let advanced = if fires.is_empty() {
+            idle_state.or(state.clone())
+        } else {
+            let mut advanced = state.clone();
+            for (payload, state_after) in fires {
+                match ctx.fire.fire(payload, "poll_endpoint").await {
+                    // Not delivered (a transient failure, or a token the
+                    // broker does not know): hold the cursor so the item
+                    // is re-offered.
+                    crate::event_context::FireOutcome::EnqueueFailed
+                    | crate::event_context::FireOutcome::UnknownSignal => break,
+                    crate::event_context::FireOutcome::Fired | crate::event_context::FireOutcome::Filtered => {
+                        advanced = Some(state_after);
+                    }
+                }
+            }
+            advanced
+        };
+        PollState { delta: advanced, consecutive_failures: 0, last_failure: None }
+    };
+    if next != before {
+        store(ctx, seq, &next).await;
+    }
+    Ok(next.to_value())
+}
+
+/// Consecutive failed polls before the per-poll warning escalates to
 /// an error naming the streak.
 const POLL_FAILURE_ESCALATION: u32 = 3;
 
@@ -841,5 +878,18 @@ mod tests {
             "the synthesized id is stable across polls"
         );
         assert!(feed_items("not a feed").is_err());
+    }
+
+    /// Everyone asking within one interval names the same moment, so a
+    /// registration and the rehydrate after it set one wake; the next
+    /// point is always strictly ahead, so a late wake skips what it
+    /// missed.
+    #[test]
+    fn the_poll_grid_names_one_moment_per_interval() {
+        assert_eq!(next_grid_point(0, 30), 30_000);
+        assert_eq!(next_grid_point(29_999, 30), 30_000);
+        assert_eq!(next_grid_point(30_000, 30), 60_000, "a point already reached is behind");
+        assert_eq!(next_grid_point(1_000, 30), next_grid_point(12_345, 30));
+        assert_eq!(next_grid_point(95_000, 30), 120_000, "late by two points: skip to the next");
     }
 }

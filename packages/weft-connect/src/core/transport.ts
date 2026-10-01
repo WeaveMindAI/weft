@@ -1,8 +1,8 @@
 // How a connect page talks to weft. The page only ever asks these few
 // questions (which connections, which doors, connect, forget, poll a
 // consent), so a host plugs in by answering them: the weft editor answers
-// through its host bridge, a member's page answers with a member token
-// against the dispatcher's member door.
+// through its host bridge, an instance's page answers with an instance
+// token against the dispatcher's instance door.
 
 import { trimTrailingSlashes } from './url';
 import type {
@@ -15,11 +15,11 @@ import type {
 	GrantSummary,
 	LookupItem,
 	LookupPage,
-	MemberField,
-	MemberFieldRef,
-	MemberLookupRequest,
-	MemberPickerRequest,
-	MemberValueInput,
+	InstanceField,
+	InstanceFieldRef,
+	InstanceLookupRequest,
+	InstancePickerRequest,
+	InstanceValueInput,
 	PickerOutcome,
 	ResourceSource,
 	StartedConsent,
@@ -27,15 +27,15 @@ import type {
 	ValuesRequest,
 } from './wire';
 
-// The header a trusted backend names a member with, on a route gated by a
-// connection (a member's own browser never uses it: it holds a token).
-// SYNC: MEMBER_HEADER <-> crates/weft-core/src/member.rs MEMBER_HEADER
-export const MEMBER_HEADER = 'Weft-Member';
+// The header a trusted backend names an instance with, on a route gated by
+// a connection (a browser never uses it: it holds an instance token).
+// SYNC: INSTANCE_HEADER <-> crates/weft-core/src/instance.rs INSTANCE_HEADER
+export const INSTANCE_HEADER = 'Weft-Instance';
 
-// The header a member's browser presents its member token in, on a live
-// route call: the run it starts is that member's.
-// SYNC: MEMBER_TOKEN_HEADER <-> crates/weft-core/src/member.rs MEMBER_TOKEN_HEADER
-export const MEMBER_TOKEN_HEADER = 'Weft-Member-Token';
+// The header a browser presents its instance token in, on a live route
+// call: the run it starts is that instance's.
+// SYNC: INSTANCE_TOKEN_HEADER <-> crates/weft-core/src/instance.rs INSTANCE_TOKEN_HEADER
+export const INSTANCE_TOKEN_HEADER = 'Weft-Instance-Token';
 
 /** A paste / shared-key connect, completed in one request. */
 // SYNC: DirectConnect <-> crates/weft-core/src/access/wire.rs ConnectDirect
@@ -78,10 +78,10 @@ export interface ConnectTransport {
 	 *  the wait. */
 	consentOutcome(state: string): Promise<ConsentOutcome>;
 	/** "Create it for me": mint an app from the recipe. Absent where the
-	 *  page may not mint (a member makes no apps for the program). */
+	 *  page may not mint (an instance makes no apps for the program). */
 	mintApp?(spec: AccessSpecWire, permissions: string[]): Promise<{ values: Record<string, string> }>;
 	/** The shared door of a paste-less service (the runtime's own key).
-	 *  Absent where it is not offered: a member connects their own
+	 *  Absent where it is not offered: an instance connects its own
 	 *  account, never the program author's key. */
 	allowsSharedKey: boolean;
 	/** Open a page in the person's real browser (the consent page). */
@@ -91,9 +91,9 @@ export interface ConnectTransport {
 /** Everything a `remote_select` field asks of weft to fill its list and
  *  open its chooser. Each source is named by its position in the field's
  *  `sources` too: the editor sends the source itself (it signs with the
- *  author's connection it traced), a member's page sends only the
- *  position (the member door reads the source off the program, so a
- *  member token asks for nothing the program does not declare). */
+ *  author's connection it traced), an instance's page sends only the
+ *  position (the instance door reads the source off the program, so an
+ *  instance token asks for nothing the program does not declare). */
 export interface ResourceTransport {
 	granted(index: number, source: Extract<ResourceSource, { kind: 'granted' }>): Promise<LookupItem[]>;
 	list(
@@ -118,29 +118,29 @@ export interface ResourceTransport {
  *  SYNC: WEFT_PASS_THROUGH_PATH <-> src/server/passthrough.ts, the route the READMEs mount */
 export const WEFT_PASS_THROUGH_PATH = '/weft';
 
-/** What the member door refused, with the HTTP status it answered: 401
+/** What the instance door refused, with the HTTP status it answered: 401
  *  for a token it does not know (or one that expired), 403 for a token
- *  that is not a member token. */
-export class MemberDoorError extends Error {
+ *  that is not an instance token. */
+export class InstanceDoorError extends Error {
 	constructor(
 		message: string,
 		readonly status: number,
 	) {
 		super(message);
-		this.name = 'MemberDoorError';
+		this.name = 'InstanceDoorError';
 	}
 
-	/** The token acts as nobody in particular: it is not a member token. */
-	get notAMemberToken(): boolean {
+	/** The token acts inside no instance: it is not an instance token. */
+	get notAnInstanceToken(): boolean {
 		return this.status === 403;
 	}
 }
 
-/** A member of a program, at the dispatcher's member door, with their
- *  member token: everything a connect page needs, plus the fields the
- *  program asks the member to fill, their values, and the lists and
+/** One instance of a program, at the dispatcher's instance door, with its
+ *  instance token: everything a connect page needs, plus the fields that
+ *  take a value of the instance's own, its values, and the lists and
  *  choosers those fields fill from. */
-export class MemberDoor implements ConnectTransport {
+export class InstanceDoor implements ConnectTransport {
 	readonly allowsSharedKey = false;
 	private readonly base: string;
 	private readonly fetcher: typeof fetch;
@@ -165,7 +165,7 @@ export class MemberDoor implements ConnectTransport {
 	}
 
 	private async call<T>(method: 'GET' | 'POST' | 'PUT' | 'DELETE', path: string, body?: unknown): Promise<T> {
-		const resp = await this.fetcher(`${this.base}/member/${path}`, {
+		const resp = await this.fetcher(`${this.base}/instance/${path}`, {
 			method,
 			headers: {
 				Authorization: `Bearer ${this.token}`,
@@ -175,7 +175,7 @@ export class MemberDoor implements ConnectTransport {
 		});
 		if (!resp.ok) {
 			const text = await resp.text().catch(() => '');
-			throw new MemberDoorError(text || `${method} /member/${path}: ${resp.status}`, resp.status);
+			throw new InstanceDoorError(text || `${method} /instance/${path}: ${resp.status}`, resp.status);
 		}
 		if (resp.status === 204) return undefined as T;
 		const text = await resp.text();
@@ -210,24 +210,24 @@ export class MemberDoor implements ConnectTransport {
 		this.opener(url);
 	}
 
-	/** Every field the program asks the member to fill, with what they
-	 *  gave. */
-	fields(): Promise<MemberField[]> {
+	/** Every field that takes a value of the instance's own, with what
+	 *  was given. */
+	fields(): Promise<InstanceField[]> {
 		return this.call('GET', 'fields');
 	}
 
 	/** Give values and clear others, all at once. A live trigger of the
-	 *  member that reads a changed value is set up again before this
+	 *  instance that reads a changed value is set up again before this
 	 *  answers, and the answer names it. */
-	setValues(set: MemberValueInput[], clear: MemberFieldRef[] = []): Promise<ValuesChanged> {
+	setValues(set: InstanceValueInput[], clear: InstanceFieldRef[] = []): Promise<ValuesChanged> {
 		const body: ValuesRequest = { set, clear };
 		return this.call('PUT', 'values', body);
 	}
 
-	/** The lists and chooser of one field the member fills. */
+	/** The lists and chooser of one field the instance fills. */
 	resources(step: string, field: string): ResourceTransport {
-		const lookup = <T,>(body: MemberLookupRequest) => this.call<T>('POST', 'lookup', body);
-		const picker = (body: MemberPickerRequest) => this.call<{ state: string; url: string }>('POST', 'picker', body);
+		const lookup = <T,>(body: InstanceLookupRequest) => this.call<T>('POST', 'lookup', body);
+		const picker = (body: InstancePickerRequest) => this.call<{ state: string; url: string }>('POST', 'picker', body);
 		return {
 			granted: (index) => lookup<LookupItem[]>({ step, field, source: index }),
 			list: (index, _source, query, parents, cursor) => lookup<LookupPage>({ step, field, source: index, query, parents, cursor }),

@@ -72,7 +72,7 @@ Two more, for a [consumer] that manages [signal]s:
 `DELETE /signal/{signal token}` cancels the run behind a [signal] (answers
 204), and
 `DELETE /signal-token/signals` cancels every run the [api token] sees and
-drops its triggers (answers `{ colors_cancelled, entry_signals_dropped }`).
+drops its triggers (answers `{ execution_ids_cancelled, entry_signals_dropped }`).
 Both need an [api token] with **no tag scope** and full project view; a
 narrowed token gets 403, because a cancel reaches sibling questions of the
 same run that the token may not see. `GET /signal-token/health` answers
@@ -85,7 +85,7 @@ A [display] is what one node shows about itself while it runs. Three more
 
 | [door] | What it does |
 |---|---|
-| `GET /signal-token/displays` | the displays this token may watch: `{ project_id, project_name, node, node_type, kind, label?, status? }` each, `kind` being `infra` or `trigger`. An `infra` entry's `status` is where the copy behind it stands: `absent` (never started), `provisioning` (starting), `running`, `flaky`, `stopping`, `stopped`, `terminating` or `failed`. `node` is spelled the way a person writes it, and it is what `{node}` takes in the two doors below |
+| `GET /signal-token/displays` | the displays this token may watch: `{ project_id, project_name, node, node_type, kind, label?, status? }` each, `kind` being `infra` or `trigger`. An `infra` entry's `status` is where the copy behind it stands: `none` (never started), `provisioning` (starting), `running`, `flaky`, `stopping`, `stopped`, `terminating` or `failed`. `node` is spelled the way a person writes it, and it is what `{node}` takes in the two doors below |
 | `GET /signal-token/displays/{project}/{node}` | what that node is showing right now |
 | `POST /signal-token/displays/{project}/{node}/action` | press a button one of its items carried: `{ "kind": "<actionKind>", "payload": ... }`. Only an `infra` node has buttons; a `trigger`'s [display] is read-only and answers 400 |
 
@@ -157,7 +157,7 @@ would have given it one, so ask the operator to mint a token with `--display
 is nothing behind the display yet the door answers 404 as well, so read the
 listing's `status` to say which: `provisioning` is "starting" (a copy can take
 minutes, so show that it is on its way, and read the feed again once it says
-`running`), `absent` or `stopped` is "not started" with the button that starts
+`running`), `none` or `stopped` is "not started" with the button that starts
 it, and `failed` is the error. A trigger's display 404s until the project is
 activated.
 

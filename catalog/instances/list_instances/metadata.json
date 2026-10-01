@@ -1,0 +1,30 @@
+{
+  "type": "ListInstances",
+  "label": "List instances",
+  "description": "List every instance weft holds anything for in this project: saved values, connections, infra copies, instance tokens, trigger activations. One entry per instance with what it has (counts and states, never a value or a secret), including fires of its triggers that wait because a field is not filled yet, with the reason. For an admin overview, or a website that shows what is still missing.",
+  "tags": [
+    "instances",
+    "status"
+  ],
+  "icon": "Users",
+  "color": "#0ea5e9",
+  "inputs": [],
+  "outputs": [
+    {
+      "name": "instances",
+      "type": "List[JsonDict]",
+      "description": "One entry per instance: `{ instance, values, connections, tokens, copies, triggers }`. `values`, `connections` and `tokens` are counts (tokens that still work); `copies` is its infra copies, each `{ node, instance, status, failure? }`; `triggers` is its trigger activations, each `{ trigger, mode, waiting? }`, where `waiting` is `{ fires, reason }` when fires wait on a value not given yet (`reason` names the field)."
+    },
+    {
+      "name": "ids",
+      "type": "List[String]",
+      "description": "Every instance's id, in the same order."
+    },
+    {
+      "name": "waiting",
+      "type": "List[String]",
+      "description": "The instances with fires waiting on a value not given yet."
+    }
+  ],
+  "requires_infra": false
+}

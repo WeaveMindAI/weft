@@ -26,7 +26,7 @@
 #
 # __E2E_FAKE_URL__ is substituted by the test with the fake SSE feed's URL.
 
-start = TestSseTrigger {
+start = TestSseTrigger -> (value: String) {
   url: "__E2E_FAKE_URL__"
   event_name: "go"
 }
@@ -57,7 +57,7 @@ review.sender = start.value
 out = Debug
 out.data = review.decision_approved
 
-purge = TestSseTrigger {
+purge = TestSseTrigger -> (value: String) {
   url: "__E2E_FAKE_URL__"
   event_name: "purge"
 }
@@ -79,7 +79,7 @@ purge_confirm = HumanQuery {
 purge_out = Debug
 purge_out.data = purge_confirm.ack_approved
 
-abort = TestSseTrigger {
+abort = TestSseTrigger -> (value: String) {
   url: "__E2E_FAKE_URL__"
   event_name: "abort"
 }

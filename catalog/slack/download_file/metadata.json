@@ -1,7 +1,7 @@
 {
   "type": "SlackDownloadFile",
   "label": "Slack: Download File",
-  "description": "Pull a Slack-hosted file (an F... id, e.g. from the file-shared trigger) into storage and emit the stored-file reference for downstream nodes.",
+  "description": "Pull a Slack-hosted file (an F... id, e.g. from the file-shared trigger) into storage and emit the stored-file reference for downstream nodes. The file belongs to this run and is swept when it ends; wire it through KeepFile to keep it longer or share it with later runs.",
   "tags": [
     "slack",
     "file"
@@ -24,16 +24,6 @@
       "required": true,
       "label": "File id",
       "placeholder": "F0123456789"
-    },
-    {
-      "name": "keep",
-      "type": "Boolean",
-      "default": false,
-      "widget": {
-        "kind": "checkbox"
-      },
-      "label": "Keep after the run",
-      "description": "Keep the downloaded file in storage after the execution finishes."
     }
   ],
   "outputs": [
@@ -54,5 +44,8 @@
       "name": "sizeBytes",
       "type": "Number"
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

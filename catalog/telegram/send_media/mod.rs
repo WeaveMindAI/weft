@@ -43,10 +43,12 @@ impl Node for TelegramSendMediaNode {
         let kind: String = ctx.inputs.get("kind")?;
         let caption: Option<String> = ctx.inputs.opt("caption")?;
 
+        // The kind is the program's setting: an unknown one is an input
+        // mistake, never a caught failure.
         let Some((method, field)) = method_of(&kind) else {
-            weft::node_bail!(
+            return Err(weft::WeftError::Input(format!(
                 "unknown media kind '{kind}' (photo, document, voice, video, audio)"
-            );
+            )));
         };
         let (meta, bytes) = ctx.storage(StorageScope::Execution).get_bytes(&file).await?;
 

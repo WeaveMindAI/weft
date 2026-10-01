@@ -40,7 +40,7 @@ pub(super) fn apply_op(view: &FileView, op: &super::EditOp) -> Result<(), EditEr
         SetConfig { node, key, value, form } => set_config(view, node, key, Some(value), *form),
         RemoveConfig { node, key, form } => set_config(view, node, key, None, *form),
         SetLabel { node, label } => set_label(view, node, label.as_deref()),
-        SetPerMember { node, per_member } => set_per_member(view, node, *per_member),
+        SetPerInstance { node, per_instance } => set_per_instance(view, node, *per_instance),
         AddNode { id, node_type, parent_group } => {
             // The type is written into the source too, so it is validated at the
             // door: a single identifier, and not one of the type names the
@@ -1265,12 +1265,12 @@ fn set_label(view: &FileView, node_id: &str, label: Option<&str>) -> Result<(), 
     }
 }
 
-/// Add or remove a node's `@per_member` line. Whether the node may carry
+/// Add or remove a node's `@per_instance` line. Whether the node may carry
 /// it is the compiler's call (it reads the node's metadata, which this
 /// layer has no catalog for); the editor only offers the toggle where the
 /// compiler would accept it. Idempotent both ways, and removing takes
 /// every copy, so a hand-written duplicate goes too.
-fn set_per_member(view: &FileView, node_id: &str, on: bool) -> Result<(), EditError> {
+fn set_per_instance(view: &FileView, node_id: &str, on: bool) -> Result<(), EditError> {
     let decl = resolve(view, node_id)?;
     match &decl {
         Decl::Node(_) => {}
@@ -1279,10 +1279,10 @@ fn set_per_member(view: &FileView, node_id: &str, on: bool) -> Result<(), EditEr
         Decl::InlineNode(_) => {
             return Err(EditError::InvalidArgument(format!(
                 "'{node_id}' is written inside another node's value; give it its own line \
-                 first, then mark it per member"
+                 first, then mark it per instance"
             )));
         }
-        other => return Err(kind_mismatch("setPerMember", node_id, "Node", other)),
+        other => return Err(kind_mismatch("setPerInstance", node_id, "Node", other)),
     }
     let existing: Vec<SyntaxNode> = decl
         .body()
@@ -1295,7 +1295,7 @@ fn set_per_member(view: &FileView, node_id: &str, on: bool) -> Result<(), EditEr
                         .filter_map(|e| e.into_token())
                         .find(|t| t.kind() == SyntaxKind::MARKER)
                         .is_some_and(|t| {
-                            crate::cst::marker::directive(t.text()) == weft_core::member::PER_MEMBER_DIRECTIVE
+                            crate::cst::marker::directive(t.text()) == weft_core::instance::PER_INSTANCE_DIRECTIVE
                         })
                 })
                 .collect()
@@ -1303,7 +1303,7 @@ fn set_per_member(view: &FileView, node_id: &str, on: bool) -> Result<(), EditEr
         .unwrap_or_default();
     if on {
         if existing.is_empty() {
-            insert_body_line(&decl, &format!("@{}", weft_core::member::PER_MEMBER_DIRECTIVE), BodyLine::Directive)?;
+            insert_body_line(&decl, &format!("@{}", weft_core::instance::PER_INSTANCE_DIRECTIVE), BodyLine::Directive)?;
         }
     } else {
         for directive in existing {

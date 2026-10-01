@@ -2,7 +2,8 @@
 //! opens a Bus on its `stream` output and sends each text delta the
 //! moment the model produces it; the bus close is the end-of-stream
 //! signal, and the whole reply then pulses on the normal ports
-//! (`response`, `history`, `toolCalls`) exactly like LlmInference. A
+//! (`response`, `historyFile`, `toolCalls`) exactly like LlmInference,
+//! the turn added in place to the conversation file on `historyFile`. A
 //! consumer that wants the live text joins the bus; one that only
 //! wants the final reply ignores it.
 //!
@@ -55,7 +56,7 @@ impl Node for LlmStreamNode {
                 err = cancelled.cancelled_err() => return Err(err),
             };
             let Some(chunk) = chunk else { break };
-            let chunk = chunk.node_err("llm stream")?;
+            let chunk = chunk.map_err(|e| llm.call_error(e))?;
             if !chunk.delta.is_empty() {
                 bus.send("delta", json!(chunk.delta)).node_err("sending a delta on the bus")?;
             }

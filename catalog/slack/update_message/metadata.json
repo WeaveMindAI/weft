@@ -52,5 +52,8 @@
       "type": "String",
       "description": "The updated message's timestamp id."
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

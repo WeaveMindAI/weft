@@ -45,5 +45,8 @@
       "type": "List[JsonDict]",
       "description": "Each entry: the original index and its relevance score, best first."
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

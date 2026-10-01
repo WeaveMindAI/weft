@@ -3,12 +3,12 @@
 //! platform-traits, not in the dispatcher alongside the other policy
 //! seams, on purpose: the runtime `ctx.storage` plane runs INSIDE the
 //! worker, and weft-engine does not (and must not) depend on
-//! weft-dispatcher. A cross-cutting capability both pods need is exactly
-//! what this crate is for (same as `KubeClient` and `Clock`).
+//! weft-dispatcher. A cross-cutting capability both processes need is exactly
+//! what this crate is for (same as `Clock`).
 //!
 //! The store is deliberately dumb: keyed put / get / head / delete /
 //! list / presign over opaque bytes. It is the deploy-time SLOT the
-//! cluster is handed (S3-compatible endpoint + bucket + creds), mirroring
+//! install is handed (S3-compatible endpoint + bucket + creds), mirroring
 //! how the image registry is a slot: the bundled default points it at a
 //! SeaweedFS service, and it can be pointed at any S3-compatible bucket
 //! (e.g. GCS) instead. Everything above it (content-defined chunking,
@@ -16,8 +16,8 @@
 //! higher crates and is backing-agnostic.
 //!
 //! There is no "local default that fails loud" here: object storage is a
-//! hard dependency of a running cluster (the source plane AND the runtime
-//! plane both need it), so a cluster without a configured store is a
+//! hard dependency of a running install (the source plane AND the runtime
+//! plane both need it), so an install without a configured store is a
 //! startup error, surfaced where the slot is constructed, not a silent
 //! no-op impl that defers the failure to first use.
 //!
@@ -35,19 +35,24 @@ use bytes::Bytes;
 /// Which network the presigned URL will be used FROM. An S3 signature is bound to
 /// the host in the URL, so the store must sign for the host the caller can reach.
 /// The two audiences differ only when the bucket sits behind a split-horizon setup
-/// (a browser reaches it at a public host; an in-cluster worker reaches it at the
+/// (a browser reaches it at a public host; an internal worker reaches it at the
 /// internal host); the local-dev SeaweedFS port-forward is exactly that case. A
-/// bucket whose endpoint is already publicly reachable in-cluster collapses both
+/// bucket whose endpoint is already publicly reachable internal collapses both
 /// to the same URL, so this stays a no-op there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresignAudience {
-    /// A caller OUTSIDE the cluster (the browser; the open internet when the
+    /// A caller OUTSIDE the install (the browser; the open internet when the
     /// operator declared the endpoint internet-reachable): sign for the
     /// public endpoint (`WEFT_OBJECT_STORE_PUBLIC_ENDPOINT`).
     External,
-    /// A caller INSIDE the cluster (a worker running node code): sign for the
-    /// I/O endpoint the broker itself uses (`WEFT_OBJECT_STORE_ENDPOINT`).
+    /// A project's worker running node code: sign for the endpoint workers
+    /// reach the store at (`objectStore.workerEndpoint`), or the runtime's
+    /// own I/O endpoint when they reach it at the same address.
     Internal,
+    /// weft's own runtime fetching for itself (the broker relaying a
+    /// file link's bytes): sign for the endpoint the runtime does its
+    /// own I/O on.
+    Runtime,
 }
 
 /// One entry returned by `list`: the object's full key and its size. The
@@ -188,6 +193,16 @@ pub trait ObjectStore: Send + Sync {
     /// in flight while the abort runs can still land afterwards, so a
     /// caller that must guarantee zero residue re-aborts on its sweep.
     async fn abort_multipart(&self, key: &str, upload_id: &str) -> Result<()>;
+
+    /// Whether the multipart upload is still open: true while it can take
+    /// parts and be completed, false once it is gone (completed, aborted,
+    /// or never existed). Read through ListParts, which answers 404
+    /// `NoSuchUpload` for a gone upload on S3, the GCS XML API and
+    /// SeaweedFS alike (SeaweedFS removes the upload's folder when it
+    /// completes). It cannot say WHICH way the upload went; a caller that
+    /// never aborts an upload it is completing reads "gone" as "completed"
+    /// and checks the object.
+    async fn multipart_exists(&self, key: &str, upload_id: &str) -> Result<bool>;
 }
 
 /// The deploy-time slot config: where the bucket lives and how to reach it.
@@ -203,7 +218,7 @@ pub trait ObjectStore: Send + Sync {
 /// defaults on.
 #[derive(Debug, Clone)]
 pub struct ObjectStoreConfig {
-    /// The S3-compatible endpoint URL (e.g. the in-cluster SeaweedFS service,
+    /// The S3-compatible endpoint URL (e.g. the internal SeaweedFS service,
     /// or the GCS/AWS regional endpoint).
     pub endpoint_url: String,
     /// The single bucket every object lives in (prefixes namespace the
@@ -222,69 +237,50 @@ pub struct ObjectStoreConfig {
     pub force_path_style: bool,
     /// The BROWSER/host-reachable endpoint presigned URLs are signed for, when it
     /// differs from `endpoint_url`. The broker reaches the bucket over the
-    /// in-cluster `endpoint_url` for its own I/O, but a presigned download URL is
+    /// internal `endpoint_url` for its own I/O, but a presigned download URL is
     /// handed to an external caller (a browser, an external API, the e2e on the
-    /// host) that cannot resolve an in-cluster DNS name, so it must be signed for
+    /// host) that cannot resolve an internal DNS name, so it must be signed for
     /// a reachable host. `None` (an `endpoint_url` that is already public) means
     /// presign against `endpoint_url` directly. For local dev / e2e this is the
     /// host-forwarded SeaweedFS address.
     pub public_endpoint_url: Option<String>,
+    /// The endpoint a project's worker reaches the store at, when it
+    /// differs from `endpoint_url` (a local worker is a container, and the
+    /// runtime a process on the machine: `127.0.0.1` means a different
+    /// place to each).
+    pub worker_endpoint_url: Option<String>,
 }
 
 impl ObjectStoreConfig {
-    /// Read the slot from env, or `Ok(None)` if unconfigured. A cluster
-    /// without a storage slot is a deploy error surfaced at the composition
-    /// root (object storage is a hard dependency), NOT a silent default.
-    ///
-    /// `WEFT_OBJECT_STORE_ENDPOINT` is the presence switch: if unset, no
-    /// slot. If set, bucket + creds are required (fail loud if missing).
-    pub fn from_env() -> Result<Option<Self>> {
-        let Some(endpoint_url) =
-            std::env::var("WEFT_OBJECT_STORE_ENDPOINT").ok().filter(|s| !s.is_empty())
-        else {
-            return Ok(None);
-        };
-        let req = |name: &str| -> Result<String> {
+    /// The store the install config names, with its credentials read from
+    /// `WEFT_OBJECT_STORE_ACCESS_KEY` and `WEFT_OBJECT_STORE_SECRET_KEY`
+    /// (secrets reach the process through its environment). Missing
+    /// credentials are an error naming them: object storage is a hard
+    /// dependency, never a silent default.
+    pub fn from_settings(settings: &crate::config::ObjectStoreSettings) -> Result<Self> {
+        let secret = |name: &str| -> Result<String> {
             std::env::var(name)
                 .ok()
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| anyhow!("{name} must be set when WEFT_OBJECT_STORE_ENDPOINT is set"))
+                .ok_or_else(|| anyhow!("{name} must be set: the object store's credentials reach the runtime through its environment"))
         };
-        let region = std::env::var("WEFT_OBJECT_STORE_REGION")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "us-east-1".to_string());
-        // Path-style defaults ON (SeaweedFS + most non-AWS need it); only an
-        // explicit "false" turns it off.
-        let force_path_style = std::env::var("WEFT_OBJECT_STORE_FORCE_PATH_STYLE")
-            .ok()
-            .map(|s| s != "false" && s != "0")
-            .unwrap_or(true);
-        let public_endpoint_url = std::env::var("WEFT_OBJECT_STORE_PUBLIC_ENDPOINT")
-            .ok()
-            .filter(|s| !s.is_empty());
-        Ok(Some(Self {
-            endpoint_url,
-            bucket: req("WEFT_OBJECT_STORE_BUCKET")?,
-            region,
-            access_key_id: req("WEFT_OBJECT_STORE_ACCESS_KEY")?,
-            secret_access_key: req("WEFT_OBJECT_STORE_SECRET_KEY")?,
-            force_path_style,
-            public_endpoint_url,
-        }))
+        Ok(Self {
+            endpoint_url: settings.endpoint.clone(),
+            bucket: settings.bucket.clone(),
+            region: settings.region.clone(),
+            access_key_id: secret("WEFT_OBJECT_STORE_ACCESS_KEY")?,
+            secret_access_key: secret("WEFT_OBJECT_STORE_SECRET_KEY")?,
+            force_path_style: settings.force_path_style,
+            public_endpoint_url: settings.public_endpoint.clone(),
+            worker_endpoint_url: settings.worker_endpoint.clone(),
+        })
     }
 }
 
-/// Build the `ObjectStore` slot from env, the one place every binary that needs
-/// the store (the dispatcher and the broker) constructs it, so they read the SAME env and
-/// fail loud identically. `Ok(None)` iff no slot is configured (open weft with
-/// no object store); `Ok(Some(store))` when the slot is set; `Err` iff the slot
-/// is half-configured (endpoint set but bucket/creds missing).
-pub async fn object_store_from_env() -> Result<Option<SharedObjectStore>> {
-    match ObjectStoreConfig::from_env()? {
-        Some(cfg) => Ok(Some(Arc::new(S3ObjectStore::new(&cfg).await?))),
-        None => Ok(None),
-    }
+/// Build the store the install config names: the one place every role that
+/// needs it (the dispatcher and the broker) constructs it.
+pub async fn object_store_for(settings: &crate::config::ObjectStoreSettings) -> Result<SharedObjectStore> {
+    Ok(Arc::new(S3ObjectStore::new(&ObjectStoreConfig::from_settings(settings)?).await?))
 }
 
 /// Production `ObjectStore` over the AWS Rust SDK's S3 client. The SDK is used
@@ -299,6 +295,10 @@ pub struct S3ObjectStore {
     /// endpoint (the endpoint is already public): presign against the main
     /// `client`.
     presign_client: Option<aws_sdk_s3::Client>,
+    /// A client whose endpoint is the one workers reach the store at, used
+    /// ONLY to presign for them. `None` when workers reach it at the I/O
+    /// endpoint.
+    worker_client: Option<aws_sdk_s3::Client>,
     bucket: String,
 }
 
@@ -310,6 +310,13 @@ impl S3ObjectStore {
     /// static credentials + an endpoint override + path-style addressing, the
     /// standard recipe for talking to a non-AWS S3 server.
     pub async fn new(cfg: &ObjectStoreConfig) -> anyhow::Result<Self> {
+        let store = Self::clients(cfg).await;
+        store.ensure_bucket().await?;
+        Ok(store)
+    }
+
+    /// The clients, without touching the store.
+    async fn clients(cfg: &ObjectStoreConfig) -> Self {
         let creds = aws_credential_types::Credentials::from_keys(
             &cfg.access_key_id,
             &cfg.secret_access_key,
@@ -347,7 +354,7 @@ impl S3ObjectStore {
                 .build();
             aws_sdk_s3::Client::from_conf(s3_config)
         };
-        let store = Self {
+        Self {
             client: client_for(&cfg.endpoint_url),
             // Only build a separate presign client when the public endpoint
             // genuinely differs from the I/O endpoint.
@@ -356,10 +363,13 @@ impl S3ObjectStore {
                 .as_ref()
                 .filter(|p| p.as_str() != cfg.endpoint_url)
                 .map(|p| client_for(p)),
+            worker_client: cfg
+                .worker_endpoint_url
+                .as_ref()
+                .filter(|p| p.as_str() != cfg.endpoint_url)
+                .map(|p| client_for(p)),
             bucket: cfg.bucket.clone(),
-        };
-        store.ensure_bucket().await?;
-        Ok(store)
+        }
     }
 
     /// Ensure the slot's bucket exists and is reachable (idempotent). SeaweedFS
@@ -382,7 +392,7 @@ impl S3ObjectStore {
             Ok(_) => Ok(()),
             Err(e) => {
                 // A create that conflicts with an existing/owned bucket is a
-                // benign race (another pod created it between our head and
+                // benign race (another process created it between our head and
                 // create). Detect it by the HTTP 409 status, not by string-
                 // matching the Debug output: the substring form breaks on an
                 // SDK version bump or a non-AWS store (SeaweedFS / GCS) that
@@ -409,12 +419,13 @@ impl S3ObjectStore {
     ///   - External (browser / external API): the public-endpoint client when
     ///     one is configured, else the I/O client (a bucket whose endpoint is
     ///     already publicly reachable).
-    ///   - Internal (in-cluster worker): always the I/O client, the same
-    ///     endpoint the broker uses for its own bucket access.
+    ///   - Internal (a project's worker): the worker-endpoint client when
+    ///     one is configured, else the I/O client.
     fn signing_client(&self, audience: PresignAudience) -> &aws_sdk_s3::Client {
         match audience {
             PresignAudience::External => self.presign_client.as_ref().unwrap_or(&self.client),
-            PresignAudience::Internal => &self.client,
+            PresignAudience::Internal => self.worker_client.as_ref().unwrap_or(&self.client),
+            PresignAudience::Runtime => &self.client,
         }
     }
 
@@ -729,6 +740,23 @@ impl ObjectStore for S3ObjectStore {
             Err(e) => Err(e).with_context(|| format!("object-store abort-multipart {key}")),
         }
     }
+
+    async fn multipart_exists(&self, key: &str, upload_id: &str) -> Result<bool> {
+        match self
+            .client
+            .list_parts()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .max_parts(1)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) if Self::is_not_found(&e) => Ok(false),
+            Err(e) => Err(e).with_context(|| format!("object-store list-parts {key}")),
+        }
+    }
 }
 
 /// In-memory `ObjectStore` for tests: a map plus an append-only call log.
@@ -781,6 +809,13 @@ pub mod fake {
         /// Keys whose NEXT `delete` fails (one-shot, then cleared), for
         /// exercising callers' reap-retry paths. Dumb injection, no logic.
         fail_delete_once: Mutex<std::collections::BTreeSet<String>>,
+        /// Make the next `complete_multipart` fail with the upload left
+        /// open (one-shot), like a bucket that was briefly unreachable.
+        fail_complete_once: Mutex<bool>,
+        /// One-shot pause for the next completion, after the bytes are
+        /// swapped in and before it answers: (tell the test it got there,
+        /// wait for the test to let it go). Dumb injection, no logic.
+        hold_complete: Mutex<Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>>,
     }
 
     impl FakeObjectStore {
@@ -791,6 +826,66 @@ pub mod fake {
         /// Make the next `delete(key)` fail once (subsequent deletes succeed).
         pub fn fail_next_delete(&self, key: &str) {
             self.fail_delete_once.lock().insert(key.to_string());
+        }
+
+        /// Pause the next `complete_multipart` once its object holds the new
+        /// bytes. Returns (resolves when it got there, send to let it answer).
+        pub fn hold_next_complete(&self) -> (tokio::sync::oneshot::Receiver<()>, tokio::sync::oneshot::Sender<()>) {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            *self.hold_complete.lock() = Some((entered_tx, release_rx));
+            (entered_rx, release_tx)
+        }
+
+        /// Assemble an in-progress upload's parts into its object, the way
+        /// the bucket's completion does. The upload is gone afterwards, so
+        /// a second completion of it fails like the real backends'
+        /// `NoSuchUpload`.
+        fn assemble(&self, key: &str, upload_id: &str, parts: &[(i32, String)]) -> Result<u64> {
+            let mut uploads = self.uploads.lock();
+            let upload = uploads
+                .get(upload_id)
+                .ok_or_else(|| anyhow!("no such upload {upload_id}"))?;
+            if upload.key != key {
+                anyhow::bail!("upload {upload_id} is for key {}, not {key}", upload.key);
+            }
+            // Real S3/SeaweedFS reject a completion with no parts (there is no
+            // multipart way to make a zero-byte object) with InvalidPart /
+            // MalformedXML. Model that so the empty-object path is never
+            // (re)routed through multipart by mistake.
+            if parts.is_empty() {
+                anyhow::bail!("InvalidPart: multipart completion needs at least one part");
+            }
+            let mut assembled = Vec::new();
+            let mut last = 0;
+            for (n, etag) in parts {
+                if *n <= last {
+                    anyhow::bail!("parts not ascending at #{n}");
+                }
+                last = *n;
+                let (landed_etag, bytes) = upload
+                    .parts
+                    .get(n)
+                    .ok_or_else(|| anyhow!("InvalidPart: part #{n} never landed"))?;
+                if landed_etag != etag {
+                    anyhow::bail!("InvalidPart: part #{n} etag mismatch");
+                }
+                // Real S3 also rejects a zero-byte part; the store must never
+                // reserve one (an empty object uploads zero parts instead).
+                if bytes.is_empty() {
+                    anyhow::bail!("InvalidPart: part #{n} is empty (parts must be non-empty)");
+                }
+                assembled.extend_from_slice(bytes);
+            }
+            uploads.remove(upload_id);
+            let size = assembled.len() as u64;
+            self.objects.lock().insert(key.to_string(), Bytes::from(assembled));
+            Ok(size)
+        }
+
+        /// Make the next `complete_multipart` fail, leaving the upload open.
+        pub fn fail_next_complete(&self) {
+            *self.fail_complete_once.lock() = true;
         }
 
         /// Snapshot of every recorded call, in order.
@@ -1040,44 +1135,15 @@ pub mod fake {
                 upload_id: upload_id.to_string(),
                 parts: parts.len(),
             });
-            let mut uploads = self.uploads.lock();
-            let upload = uploads
-                .get(upload_id)
-                .ok_or_else(|| anyhow!("no such upload {upload_id}"))?;
-            if upload.key != key {
-                anyhow::bail!("upload {upload_id} is for key {}, not {key}", upload.key);
+            if std::mem::take(&mut *self.fail_complete_once.lock()) {
+                bail!("injected: the bucket is unreachable");
             }
-            // Real S3/SeaweedFS reject a completion with no parts (there is no
-            // multipart way to make a zero-byte object) with InvalidPart /
-            // MalformedXML. Model that so the empty-object path is never
-            // (re)routed through multipart by mistake.
-            if parts.is_empty() {
-                anyhow::bail!("InvalidPart: multipart completion needs at least one part");
+            let size = self.assemble(key, upload_id, parts)?;
+            let hold = self.hold_complete.lock().take();
+            if let Some((entered, release)) = hold {
+                let _ = entered.send(());
+                let _ = release.await;
             }
-            let mut assembled = Vec::new();
-            let mut last = 0;
-            for (n, etag) in parts {
-                if *n <= last {
-                    anyhow::bail!("parts not ascending at #{n}");
-                }
-                last = *n;
-                let (landed_etag, bytes) = upload
-                    .parts
-                    .get(n)
-                    .ok_or_else(|| anyhow!("InvalidPart: part #{n} never landed"))?;
-                if landed_etag != etag {
-                    anyhow::bail!("InvalidPart: part #{n} etag mismatch");
-                }
-                // Real S3 also rejects a zero-byte part; the store must never
-                // reserve one (an empty object uploads zero parts instead).
-                if bytes.is_empty() {
-                    anyhow::bail!("InvalidPart: part #{n} is empty (parts must be non-empty)");
-                }
-                assembled.extend_from_slice(bytes);
-            }
-            uploads.remove(upload_id);
-            let size = assembled.len() as u64;
-            self.objects.lock().insert(key.to_string(), Bytes::from(assembled));
             Ok(size)
         }
 
@@ -1089,6 +1155,10 @@ pub mod fake {
             // Removing an absent upload is the idempotent success case.
             self.uploads.lock().remove(upload_id);
             Ok(())
+        }
+
+        async fn multipart_exists(&self, _key: &str, upload_id: &str) -> Result<bool> {
+            Ok(self.uploads.lock().contains_key(upload_id))
         }
     }
 }
@@ -1102,6 +1172,31 @@ pub type SharedObjectStore = Arc<dyn ObjectStore>;
 mod tests {
     use super::fake::{FakeCall, FakeObjectStore};
     use super::*;
+
+    /// Each audience is signed for the endpoint that caller reaches the
+    /// store at: a browser the public one, a worker the one on its
+    /// network, and the runtime relaying a file link its own.
+    #[tokio::test]
+    async fn each_audience_is_signed_for_its_own_endpoint() {
+        let store = S3ObjectStore::clients(&ObjectStoreConfig {
+            endpoint_url: "http://127.0.0.1:14115".into(),
+            bucket: "weft".into(),
+            region: "us-east-1".into(),
+            access_key_id: "k".into(),
+            secret_access_key: "s".into(),
+            force_path_style: true,
+            public_endpoint_url: Some("https://files.example.com".into()),
+            worker_endpoint_url: Some("http://weft-object-store:8333".into()),
+        })
+        .await;
+        let url = |audience| {
+            let store = &store;
+            async move { store.presign_get("a/b", audience, 60).await.unwrap() }
+        };
+        assert!(url(PresignAudience::External).await.starts_with("https://files.example.com/weft/a/b?"));
+        assert!(url(PresignAudience::Internal).await.starts_with("http://weft-object-store:8333/weft/a/b?"));
+        assert!(url(PresignAudience::Runtime).await.starts_with("http://127.0.0.1:14115/weft/a/b?"));
+    }
 
     #[tokio::test]
     async fn put_then_get_round_trips() {
@@ -1190,10 +1285,16 @@ mod tests {
         // Land them out of order; completion order comes from the part list.
         let e2 = store.put_part(&u2, Bytes::from_static(b"de")).unwrap();
         let e1 = store.put_part(&u1, Bytes::from_static(b"abc")).unwrap();
-        let size = store.complete_multipart("k", &id, &[(1, e1), (2, e2)]).await.unwrap();
+        assert!(store.multipart_exists("k", &id).await.unwrap(), "open until completed");
+        let parts = [(1, e1), (2, e2)];
+        let size = store.complete_multipart("k", &id, &parts).await.unwrap();
         assert_eq!(size, 5);
         assert_eq!(store.get("k").await.unwrap().as_deref(), Some(&b"abcde"[..]));
         assert!(store.in_progress_uploads().is_empty());
+        // Like S3, GCS and SeaweedFS: a completed upload is gone, so it no
+        // longer lists and a second completion is refused.
+        assert!(!store.multipart_exists("k", &id).await.unwrap());
+        assert!(store.complete_multipart("k", &id, &parts).await.is_err());
     }
 
     #[tokio::test]

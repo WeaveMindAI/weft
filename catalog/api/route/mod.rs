@@ -16,9 +16,9 @@
 //!     riding a wire as bytes), a text or byte body whole on the one
 //!     declared port. A
 //!     declared port named like a path capture (`-> (id: String)` on
-//!     `cards/{id}`) reads the capture, over a body key of that name.
-//!     On a text or bytes route that one port IS the whole body, so
-//!     the same collision is refused instead of eating the payload. A
+//!     `cards/{id}`) reads the capture, over a body key of that name,
+//!     and is never where a text or bytes body lands: that is the one
+//!     declared port left once the captures are set aside. A
 //!     picture on a file-kind port is stored on the way in
 //!     (`wire::inline_files`). Nothing here answers the caller; Reply,
 //!     Stream and Close do, or a custom node through `ctx.http_caller()`.
@@ -46,7 +46,8 @@ impl Node for RouteNode {
     }
 
     async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let common = LiveConnectionConfig::from_node_fields(ctx.inputs.object()?).map_err(weft::node_error)?;
+        let fields = ctx.inputs.object()?;
+        let common = LiveConnectionConfig::from_node_fields(fields).map_err(weft::node_error)?;
         ctx.register_signal(Route { common }).await
     }
 
@@ -72,7 +73,7 @@ impl Node for RouteNode {
             other => other.clone(),
         };
         let data_type = ctx.caller_data_type().unwrap_or_default();
-        let body_ports = declared_body_ports(&ctx);
+        let body_ports = declared_body_ports(&ctx, &request.params);
         let output = match (data_type, body) {
             (DataType::Json, InboundMessage::Json(body)) => {
                 // A json route fans the body's top-level KEYS onto ports of
@@ -127,24 +128,7 @@ impl Node for RouteNode {
                 .await?;
                 match body_ports.as_slice() {
                     [] => NodeOutput::new(),
-                    [port] => {
-                        // The capture fold below writes over a body port
-                        // of the same name, which is what a json route
-                        // wants (a capture beats a body key). Here that
-                        // one port is the caller's WHOLE body, so the
-                        // same rule would drop the payload without a
-                        // word.
-                        if request.params.contains_key(port) {
-                            weft::node_bail!(
-                                "the port '{port}' is both where a {} route's whole body lands \
-                                 and the path capture `{{{port}}}`, and one would quietly \
-                                 overwrite the other; rename the port, or name the capture in \
-                                 `path` something else",
-                                data_type.as_wire_str()
-                            );
-                        }
-                        NodeOutput::new().set(port.clone(), value)
-                    }
+                    [port] => NodeOutput::new().set(port.clone(), value),
                     many => weft::node_bail!(
                         "a {} route delivers its whole body on one declared port, but {} are \
                          declared ({}); keep one",
@@ -158,10 +142,11 @@ impl Node for RouteNode {
         // A capture read through a declared port of its name: part of
         // the fixed request, so it wins over a body key, and the fixed
         // ports still win over it.
+        let declared = ctx.declared_outputs();
         let output = request
             .params
             .iter()
-            .filter(|(name, _)| body_ports.contains(name))
+            .filter(|(name, _)| declared.contains_key(*name))
             .fold(output, |out, (name, value)| out.set(name.clone(), Value::String(value.clone())));
         let output = wire::inline_files(&ctx, output).await?;
         let output = wire::request_ports(&request)
@@ -171,13 +156,15 @@ impl Node for RouteNode {
     }
 }
 
-/// The ports the author declared beyond the fixed request ports: where
-/// the body lands.
-fn declared_body_ports(ctx: &ExecutionContext) -> Vec<String> {
+/// The ports the author declared beyond the fixed request ports and the
+/// path's captures: where the body lands. A port named like a capture
+/// reads the capture, so a `GET preview/{view}` on a bytes route can
+/// read `view` and still answer bytes.
+fn declared_body_ports(ctx: &ExecutionContext, captures: &std::collections::BTreeMap<String, String>) -> Vec<String> {
     let mut ports: Vec<String> = ctx
         .declared_outputs()
         .keys()
-        .filter(|name| !REQUEST_PORTS.contains(&name.as_str()))
+        .filter(|name| !REQUEST_PORTS.contains(&name.as_str()) && !captures.contains_key(*name))
         .cloned()
         .collect();
     ports.sort();

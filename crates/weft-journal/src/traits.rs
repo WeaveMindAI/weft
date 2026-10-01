@@ -4,7 +4,7 @@
 //!   - `BrokerJournalClient` (in `weft-broker-client`): HTTP through
 //!     the broker. Used by workers and listeners.
 //!
-//! The trait carries only the operations user-namespace pods need.
+//! The trait carries only the operations user-namespace processes need.
 //! It deliberately omits any signal/admin surface (the dispatcher's
 //! `Journal` trait in `weft-dispatcher/src/journal/mod.rs` is a
 //! superset for dispatcher-internal use).
@@ -34,10 +34,10 @@ pub struct JournalRow {
 }
 
 /// Read + write surface used by the worker (engine) and the listener
-/// for journal operations. `pod_name` is the worker's k8s Pod name,
-/// stamped on every write so the fencing trigger can reject events
-/// from a Pod whose `worker_pod` row is no longer alive. Listener-side
-/// callers pass `None`.
+/// for journal operations. `replica` is the worker's replica id,
+/// stamped on every write; the broker takes a write only from the
+/// replica that owns the execution's claim. Listener-side callers pass
+/// `None`.
 #[async_trait]
 pub trait JournalClient: Send + Sync {
     /// Insert one event. Errors propagate; the engine's wrapper
@@ -45,12 +45,12 @@ pub trait JournalClient: Send + Sync {
     async fn record_event(
         &self,
         event: &ExecEvent,
-        pod_name: Option<&str>,
+        replica: Option<&str>,
     ) -> anyhow::Result<()>;
 
-    /// The rows of `color` after `after_id`, in order, as RAW payload
+    /// The rows of `execution_id` after `after_id`, in order, as RAW payload
     /// strings, holding up to `wait` for at least one to exist (a zero
-    /// `wait` answers at once; empty when none came). A color's rows
+    /// `wait` answers at once; empty when none came). An execution's rows
     /// are numbered and committed in one order (see `write`), so a
     /// reader that resumes from the last id it applied never passes a
     /// row. Raw for a FERRY (the broker's handler): a hop that decoded
@@ -59,7 +59,7 @@ pub trait JournalClient: Send + Sync {
     /// pass through byte-faithful.
     async fn raw_rows_after(
         &self,
-        color: weft_core::Color,
+        execution_id: weft_core::ExecutionId,
         after_id: i64,
         wait: Duration,
     ) -> anyhow::Result<Vec<RawJournalRow>>;
@@ -72,15 +72,15 @@ pub trait JournalClient: Send + Sync {
     /// resuming wrong.
     async fn rows_after(
         &self,
-        color: weft_core::Color,
+        execution_id: weft_core::ExecutionId,
         after_id: i64,
         wait: Duration,
     ) -> anyhow::Result<Vec<JournalRow>> {
-        self.raw_rows_after(color, after_id, wait)
+        self.raw_rows_after(execution_id, after_id, wait)
             .await?
             .into_iter()
             .map(|row| {
-                let event = crate::decode_event(color, &row.payload).map_err(anyhow::Error::msg)?;
+                let event = crate::decode_event(execution_id, &row.payload).map_err(anyhow::Error::msg)?;
                 Ok(JournalRow { id: row.id, event })
             })
             .collect()
@@ -88,32 +88,32 @@ pub trait JournalClient: Send + Sync {
 
     /// Every event of one execution, in order, as it stands now. For a
     /// log that no longer changes (a seed ancestor, which is terminal).
-    async fn events_for_color(&self, color: weft_core::Color) -> anyhow::Result<Vec<ExecEvent>> {
-        Ok(self.rows_after(color, 0, Duration::ZERO).await?.into_iter().map(|row| row.event).collect())
+    async fn events_for_execution_id(&self, execution_id: weft_core::ExecutionId) -> anyhow::Result<Vec<ExecEvent>> {
+        Ok(self.rows_after(execution_id, 0, Duration::ZERO).await?.into_iter().map(|row| row.event).collect())
     }
 
-    /// True iff a terminal event already exists for `color`. Used
+    /// True iff a terminal event already exists for `execution_id`. Used
     /// by the worker before writing its own terminal so the
     /// dispatcher's cancel path doesn't bridge double.
-    async fn has_terminal_event(&self, color: weft_core::Color) -> anyhow::Result<bool>;
+    async fn has_terminal_event(&self, execution_id: weft_core::ExecutionId) -> anyhow::Result<bool>;
 
     /// An unrecorded run that failed: write its whole record (every
     /// event, in order, terminal included) and make it an ordinary
     /// recorded run, in one transaction, so it lists and inspects like
-    /// any other. Refused unless the color is still unrecorded. Only a
+    /// any other. Refused unless the execution is still unrecorded. Only a
     /// journal that reaches the database takes it; every other one
     /// refuses loudly.
-    async fn record_retroactively(&self, events: &[ExecEvent], pod_name: Option<&str>) -> anyhow::Result<()> {
-        let _ = (events, pod_name);
+    async fn record_retroactively(&self, events: &[ExecEvent], replica: Option<&str>) -> anyhow::Result<()> {
+        let _ = (events, replica);
         anyhow::bail!("this journal cannot record an unrecorded run afterwards")
     }
 
-    /// An unrecorded run that ended without failing: drop its color row
+    /// An unrecorded run that ended without failing: drop its execution row
     /// when nothing of it reached the journal (the costs it reported
-    /// keep it, since they are addressed by color), and release its run
+    /// keep it, since they are addressed by execution), and release its run
     /// files. Only a journal that reaches the database takes it.
-    async fn forget_unrecorded(&self, color: weft_core::Color, pod_name: Option<&str>) -> anyhow::Result<()> {
-        let _ = (color, pod_name);
+    async fn forget_unrecorded(&self, execution_id: weft_core::ExecutionId, replica: Option<&str>) -> anyhow::Result<()> {
+        let _ = (execution_id, replica);
         anyhow::bail!("this journal cannot forget an unrecorded run")
     }
 }
@@ -130,7 +130,7 @@ impl JournalClient for NoopJournal {
     async fn record_event(
         &self,
         _event: &ExecEvent,
-        _pod_name: Option<&str>,
+        _replica: Option<&str>,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -138,7 +138,7 @@ impl JournalClient for NoopJournal {
     /// Nothing is ever written, so nothing ever comes: the hold runs out.
     async fn raw_rows_after(
         &self,
-        _color: weft_core::Color,
+        _execution_id: weft_core::ExecutionId,
         _after_id: i64,
         wait: Duration,
     ) -> anyhow::Result<Vec<RawJournalRow>> {
@@ -146,7 +146,7 @@ impl JournalClient for NoopJournal {
         Ok(Vec::new())
     }
 
-    async fn has_terminal_event(&self, _color: weft_core::Color) -> anyhow::Result<bool> {
+    async fn has_terminal_event(&self, _execution_id: weft_core::ExecutionId) -> anyhow::Result<bool> {
         Ok(false)
     }
 }
@@ -171,59 +171,60 @@ impl JournalClient for PostgresJournalClient {
     async fn record_event(
         &self,
         event: &ExecEvent,
-        pod_name: Option<&str>,
+        replica: Option<&str>,
     ) -> anyhow::Result<()> {
-        crate::write::record_event_from_pod(&self.pool, event, pod_name)
+        crate::write::record_event_from_replica(&self.pool, event, replica)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
-    async fn record_retroactively(&self, events: &[ExecEvent], pod_name: Option<&str>) -> anyhow::Result<()> {
-        crate::unrecorded::record_retroactively(&self.pool, events, pod_name).await
+    async fn record_retroactively(&self, events: &[ExecEvent], replica: Option<&str>) -> anyhow::Result<()> {
+        crate::unrecorded::record_retroactively(&self.pool, events, replica).await
     }
 
-    async fn forget_unrecorded(&self, color: weft_core::Color, _pod_name: Option<&str>) -> anyhow::Result<()> {
+    async fn forget_unrecorded(&self, execution_id: weft_core::ExecutionId, _replica: Option<&str>) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
-        crate::unrecorded::forget_in(&mut tx, color).await?;
+        crate::unrecorded::forget_in(&mut tx, execution_id).await?;
         tx.commit().await?;
         Ok(())
     }
 
     async fn raw_rows_after(
         &self,
-        color: weft_core::Color,
+        execution_id: weft_core::ExecutionId,
         after_id: i64,
         wait: Duration,
     ) -> anyhow::Result<Vec<RawJournalRow>> {
         let deadline = tokio::time::Instant::now() + wait;
-        let color = color.to_string();
+        let execution_id = execution_id.to_string();
         // Subscribed before the first read, so a row committed between
         // an empty read and the wait still ends the wait.
         let mut heard = self.signals.subscribe();
         loop {
             let rows: Vec<(i64, String)> = sqlx::query_as(
-                "SELECT id, payload_json FROM exec_event WHERE color = $1 AND id > $2 ORDER BY id ASC",
+                "SELECT id, payload_json FROM exec_event WHERE execution_id = $1 AND id > $2 ORDER BY id ASC",
             )
-            .bind(&color)
+            .bind(&execution_id)
             .bind(after_id)
             .fetch_all(&self.pool)
             .await?;
             if !rows.is_empty()
-                || !heard.woken_before(deadline, |c, p| c == crate::EXEC_EVENT_CHANNEL && p == color).await?
+                || !heard.woken_before(deadline, |c, p| c == crate::EXEC_EVENT_CHANNEL && p == execution_id).await?
             {
                 return Ok(rows.into_iter().map(|(id, payload)| RawJournalRow { id, payload }).collect());
             }
         }
     }
 
-    async fn has_terminal_event(&self, color: weft_core::Color) -> anyhow::Result<bool> {
-        let row: Option<(String,)> = sqlx::query_as(
+    async fn has_terminal_event(&self, execution_id: weft_core::ExecutionId) -> anyhow::Result<bool> {
+        let row: Option<(String,)> = sqlx::query_as(concat!(
             "SELECT kind FROM exec_event \
-             WHERE color = $1 \
-               AND kind IN ('execution_completed', 'execution_failed', 'execution_cancelled') \
-             LIMIT 1",
-        )
-        .bind(color.to_string())
+             WHERE execution_id = $1 \
+               AND kind IN ",
+            crate::execution_terminal_kinds_sql!(),
+            " LIMIT 1",
+        ))
+        .bind(execution_id.to_string())
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.is_some())

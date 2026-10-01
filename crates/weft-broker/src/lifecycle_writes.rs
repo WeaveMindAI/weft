@@ -12,183 +12,117 @@ use anyhow::Context as _;
 use sqlx::PgPool;
 
 use weft_broker_client::lifecycle_command::{
-    claimable_project, command_reaches_copy, live_lease_exists, owns_project_predicate,
+    command_reaches_copy, live_lease_exists, ownable_project, owns_project_predicate,
     pending_supervisor_command,
 };
 use weft_broker_client::protocol::{
     InfraLifecycleVerb, LifecycleOutcome, ProjectStatus, RunningPolicy,
     SupervisorCommandCompleteRequest, SupervisorCommandRow, SupervisorProject,
-    SupervisorSetScaledRequest, SupervisorSetStatusRequest, SupervisorSyncOwnershipResponse,
+    SupervisorSetStatusRequest, SupervisorSyncOwnershipResponse,
 };
 
 /// One supervisor ownership tick, atomically, so two supervisors never
 /// end up owning one project. Steps in one transaction:
-///   0. Record this pod's reported memory pressure on its registry row
-///      (the dispatcher's placement + scale-down read it).
-///   1. Renew this pod's existing leases (it is alive and working).
-///   2. Claim a BATCH of MORE projects, but only while the pod is
-///      below the shared memory saturation threshold (a saturated pod
-///      keeps what it owns and takes on no more; the dispatcher then
-///      spawns another supervisor). Claiming is memory-gated, not
-///      count-gated, so load is the SAME metric as the listener.
-///      `FOR UPDATE SKIP LOCKED` + `ON CONFLICT` make concurrent
-///      supervisors partition the free projects without double-claiming.
-///   3. Return the full owned set (the work loops act only on these),
-///      and which of them this tick took on: freshly claimed, or its
-///      own lease revived after it lapsed. A command issued on such a
-///      project while nobody held it woke no claim of this pod's, so
-///      the pod asks again at once.
-/// A project is eligible only if it is `claimable_project` (only
-/// namespaced/paid-tier projects have infra). All time comes from the DB clock
-/// (`EXTRACT(EPOCH FROM NOW())`), never the app clock, so a skewed
-/// dispatcher/broker host can't mis-judge lease expiry.
+///   1. Renew this supervisor's existing leases (it is alive and working)
+///      over the projects it may own.
+///   2. Claim a BATCH of MORE projects it may own with no live owner. `FOR UPDATE
+///      SKIP LOCKED` + `ON CONFLICT` make concurrent supervisors partition
+///      the free projects without double-claiming.
+///   3. Return the full owned set (the work loops act only on these), and
+///      which of them this tick took on: freshly claimed, or its own lease
+///      revived after it lapsed. A command issued on such a project while
+///      nobody held it woke no claim of this supervisor's, so it asks
+///      again at once.
+/// Claiming and renewing both go through ONE condition,
+/// `ownable_project` (infra to manage, copies on this host, or a
+/// supervisor command waiting), and the owned set is every live lease
+/// this supervisor holds. So a lease over a project with nothing left
+/// to own is not renewed and lapses, and the supervisor reports a
+/// project lost exactly when its lease is gone, never while a command
+/// it runs still keeps the project ownable. All time comes from the DB
+/// clock, never the app clock, so a skewed host can't mis-judge lease
+/// expiry.
 pub async fn sync_ownership(
     pool: &PgPool,
-    pod_name: &str,
-    mem_pressure: f64,
+    replica: &str,
+    held_projects: &[uuid::Uuid],
 ) -> anyhow::Result<SupervisorSyncOwnershipResponse> {
     let lease_secs = weft_broker_client::lifecycle_command::infra_owner_lease_secs();
     let mut tx = pool.begin().await?;
-
-    // 0. Record reported memory pressure and read back whether this pod
-    //    is a working member of the pool: it has a registry row, and the
-    //    dispatcher has not marked it draining (scaled down). Anything
-    //    else renews and claims nothing. A draining pod's leases were
-    //    released for re-adoption, and re-grabbing them would defeat
-    //    consolidation. A pod with no row was reaped and is on its way
-    //    out (its pod lives on until the cluster stops it, and in that
-    //    time it would otherwise take back the very projects its drain
-    //    handed over), or its spawn has not committed the row yet, in
-    //    which case it owns nothing and the next tick finds its row.
-    let member: Option<bool> = sqlx::query_scalar(
-        "UPDATE supervisor_pod SET mem_pressure = $1 WHERE pod_name = $2 RETURNING NOT draining",
-    )
-    .bind(mem_pressure)
-    .bind(pod_name)
-    .fetch_optional(&mut *tx)
+    // 1. Renew owned leases. A lease that had lapsed comes back as taken
+    //    on this tick (the self-join reads the row as it was before this
+    //    statement).
+    let mut claimed: Vec<uuid::Uuid> = sqlx::query_scalar::<_, Option<uuid::Uuid>>(&format!(
+        "UPDATE infra_owner io \
+         SET leased_until_unix = EXTRACT(EPOCH FROM NOW())::BIGINT + $1 \
+         FROM infra_owner prior \
+         WHERE io.supervisor_replica = $2 AND prior.project_id = io.project_id \
+           AND EXISTS (SELECT 1 FROM project p WHERE p.id = io.project_id AND {ownable}) \
+         RETURNING CASE WHEN prior.leased_until_unix < EXTRACT(EPOCH FROM NOW())::BIGINT \
+                        THEN io.project_id END",
+        ownable = ownable_project("p", "$3"),
+    ))
+    .bind(lease_secs)
+    .bind(replica)
+    .bind(held_projects)
+    .fetch_all(&mut *tx)
     .await
-        .context("record supervisor mem_pressure")?;
-    let working = member == Some(true);
-    let mut claimed: Vec<uuid::Uuid> = Vec::new();
+    .context("renew infra_owner leases")?
+    .into_iter()
+    .flatten()
+    .collect();
 
-    // 1. Renew owned leases, only while working (a leaving pod's leases
-    //    lapse or stay released so survivors adopt them; the drain
-    //    already deleted them, this guards against a renew racing that
-    //    delete).
-    //    A lease that had lapsed comes back as taken on this tick (the
-    //    self-join reads the row as it was before this statement).
-    if working {
-        let revived: Vec<uuid::Uuid> = sqlx::query_scalar::<_, Option<uuid::Uuid>>(
-            "UPDATE infra_owner io \
-             SET leased_until_unix = EXTRACT(EPOCH FROM NOW())::BIGINT + $1 \
-             FROM infra_owner prior \
-             WHERE io.supervisor_pod = $2 AND prior.project_id = io.project_id \
-             RETURNING CASE WHEN prior.leased_until_unix < EXTRACT(EPOCH FROM NOW())::BIGINT \
-                            THEN io.project_id END",
-        )
+    // 2. Claim a batch. `free` selects projects with no live owner and
+    //    LOCKS them `FOR UPDATE OF p SKIP LOCKED`, so a sibling
+    //    supervisor's concurrent claim takes a DISJOINT set. ON CONFLICT
+    //    overwrites a stale (expired-lease) row still present ONLY if its
+    //    lease is actually expired, so a live owner is never stolen.
+    let sql = format!(
+        "WITH free AS ( \
+             SELECT p.id AS project_id, p.tenant_id \
+             FROM project p \
+             WHERE {ownable} \
+               AND NOT {leased} \
+             ORDER BY p.id \
+             LIMIT $2 \
+             FOR UPDATE OF p SKIP LOCKED \
+         ) \
+         INSERT INTO infra_owner \
+             (project_id, supervisor_replica, tenant_id, leased_until_unix) \
+         SELECT project_id, $1, tenant_id, EXTRACT(EPOCH FROM NOW())::BIGINT + $3 \
+         FROM free \
+         ON CONFLICT (project_id) DO UPDATE \
+           SET supervisor_replica = EXCLUDED.supervisor_replica, \
+               tenant_id = EXCLUDED.tenant_id, \
+               leased_until_unix = EXCLUDED.leased_until_unix \
+           WHERE infra_owner.leased_until_unix < EXTRACT(EPOCH FROM NOW())::BIGINT \
+         RETURNING project_id",
+        ownable = ownable_project("p", "$4"),
+        leased = live_lease_exists(None, "p.id"),
+    );
+    let taken: Vec<uuid::Uuid> = sqlx::query_scalar(&sql)
+        .bind(replica)
+        .bind(weft_broker_client::lifecycle_command::SUPERVISOR_CLAIM_BATCH)
         .bind(lease_secs)
-        .bind(pod_name)
+        .bind(held_projects)
         .fetch_all(&mut *tx)
         .await
-        .context("renew infra_owner leases")?
-        .into_iter()
-        .flatten()
-        .collect();
-        claimed.extend(revived);
-    }
-
-    // 2. Claim a batch, but only while under the memory saturation
-    //    threshold AND working. At/above saturation claim nothing (a
-    //    saturated pod keeps what it owns); a pod on its way out, or not
-    //    registered yet, takes on nothing.
-    let headroom = if takes_on_projects(working, mem_pressure) {
-        weft_broker_client::lifecycle_command::SUPERVISOR_CLAIM_BATCH
-    } else {
-        0
-    };
-    if headroom > 0 {
-        // Atomic claim via a CTE: `free` selects projects with no live
-        // owner and LOCKS them `FOR UPDATE OF p SKIP LOCKED`, so a
-        // sibling supervisor's concurrent claim takes a DISJOINT set
-        // (never the same row). The INSERT then takes the EXCLUSIVE
-        // `infra_owner` lease for each. ON CONFLICT covers a stale
-        // (expired-lease) row still physically present: we overwrite it
-        // ONLY if its lease is actually expired, so a live owner is
-        // never stolen. Rows we lock are guaranteed free at insert time
-        // because the lock is held to the end of the tx.
-        let sql = format!(
-            "WITH free AS ( \
-                 SELECT p.id AS project_id, p.project_namespace, p.tenant_id \
-                 FROM project p \
-                 WHERE {claimable} \
-                   AND NOT {leased} \
-                 ORDER BY p.id \
-                 LIMIT $2 \
-                 FOR UPDATE OF p SKIP LOCKED \
-             ) \
-             INSERT INTO infra_owner \
-                 (project_id, supervisor_pod, namespace, tenant_id, leased_until_unix) \
-             SELECT project_id, $1, project_namespace, tenant_id, \
-                    EXTRACT(EPOCH FROM NOW())::BIGINT + $3 \
-             FROM free \
-             ON CONFLICT (project_id) DO UPDATE \
-               SET supervisor_pod = EXCLUDED.supervisor_pod, \
-                   namespace = EXCLUDED.namespace, \
-                   tenant_id = EXCLUDED.tenant_id, \
-                   leased_until_unix = EXCLUDED.leased_until_unix \
-               WHERE infra_owner.leased_until_unix < EXTRACT(EPOCH FROM NOW())::BIGINT \
-             RETURNING project_id",
-            claimable = claimable_project("p"),
-            leased = live_lease_exists(None, "p.id"),
-        );
-        let taken: Vec<uuid::Uuid> = sqlx::query_scalar(&sql)
-            .bind(pod_name)
-            .bind(headroom)
-            .bind(lease_secs)
-            .fetch_all(&mut *tx)
-            .await
-            .context("claim infra_owner rows")?;
-        claimed.extend(taken);
-    }
+        .context("claim infra_owner rows")?;
+    claimed.extend(taken);
 
     // 3. Return the full owned set (joined to current project state).
-    let owned = owned_projects(&mut *tx, pod_name).await?;
+    let owned = owned_projects(&mut *tx, replica).await?;
     tx.commit().await.context("commit sync_ownership tx")?;
+    claimed.retain(|id| owned.iter().any(|p| p.project_id == *id));
     claimed.sort_unstable();
     claimed.dedup();
     Ok(SupervisorSyncOwnershipResponse { owned, claimed })
 }
 
-/// Whether a supervisor pod takes on more projects: it is a working
-/// member of the pool (registered, not draining) and below the shared
-/// memory saturation threshold. The ownership tick claims only for such
-/// a pod, and only such a pod is told a command waits on a project
-/// nobody owns.
-pub fn takes_on_projects(working: bool, mem_pressure: f64) -> bool {
-    working
-        && !weft_platform_traits::is_saturated(
-            mem_pressure,
-            weft_platform_traits::SATURATION_MEM_FRACTION,
-        )
-}
-
-/// Whether `pod_name` takes on more projects right now, read off its
-/// registry row (see [`takes_on_projects`]): no row, draining, or
-/// saturated all answer false.
-pub async fn pod_takes_on_projects(pool: &PgPool, pod_name: &str) -> anyhow::Result<bool> {
-    let row: Option<(bool, f64)> = sqlx::query_as(
-        "SELECT draining, mem_pressure FROM supervisor_pod WHERE pod_name = $1",
-    )
-    .bind(pod_name)
-    .fetch_optional(pool)
-    .await
-    .context("read supervisor_pod membership")?;
-    Ok(row.is_some_and(|(draining, pressure)| takes_on_projects(!draining, pressure)))
-}
-
-/// The projects a supervisor pod owns, joined to live project state,
+/// The projects a supervisor owns (every live `infra_owner` lease it
+/// holds, whatever made the project ownable), joined to live project state,
 /// against any executor (a pool or the ownership tick's transaction).
-pub async fn owned_projects<'e, E>(executor: E, pod_name: &str) -> anyhow::Result<Vec<SupervisorProject>>
+pub async fn owned_projects<'e, E>(executor: E, replica: &str) -> anyhow::Result<Vec<SupervisorProject>>
 where
     E: sqlx::PgExecutor<'e>,
 {
@@ -199,28 +133,27 @@ where
     // activations, every owner's, and whether any activation it took down
     // itself is still down.
     let sql = format!(
-        "SELECT p.id AS project_id, p.tenant_id, p.project_namespace, \
+        "SELECT p.id AS project_id, p.tenant_id, \
                 a.status, a.accepting_fires, a.fires_visible_to_consumers, a.fires_deadline_unix, \
-                a.drain_deadline_unix, a.deactivated_by_health, a.activating_color \
+                a.drain_deadline_unix, a.deactivated_by_health, a.activating_execution_id \
          FROM infra_owner io \
          JOIN project p ON p.id = io.project_id \
          LEFT JOIN trigger_activation a ON a.project_id = p.id \
-         WHERE io.supervisor_pod = $1 AND {claimable} \
+         WHERE {owns} \
          ORDER BY p.id",
-        claimable = claimable_project("p"),
+        owns = owns_project_predicate("$1", "p.id"),
     );
     let rows = sqlx::query(&sql)
-        .bind(pod_name)
+        .bind(replica)
         .fetch_all(executor)
         .await?;
-    let mut projects: Vec<(uuid::Uuid, String, String, Vec<weft_broker_client::activation::ActivationLifecycle>)> = Vec::new();
+    let mut projects: Vec<(uuid::Uuid, String, Vec<weft_broker_client::activation::ActivationLifecycle>)> = Vec::new();
     for r in &rows {
         let project_id: uuid::Uuid = r.try_get("project_id").context("decode project_id")?;
         if projects.last().map(|p| p.0) != Some(project_id) {
             projects.push((
                 project_id,
                 r.try_get("tenant_id").context("decode tenant_id")?,
-                r.try_get("project_namespace").context("decode project_namespace")?,
                 Vec::new(),
             ));
         }
@@ -234,18 +167,17 @@ where
             fires_deadline_unix: r.try_get("fires_deadline_unix").context("decode deadline")?,
             drain_deadline_unix: r.try_get("drain_deadline_unix").context("decode drain deadline")?,
             deactivated_by_health: r.try_get("deactivated_by_health").context("decode deactivated_by_health")?,
-            activating_color: r.try_get("activating_color").context("decode activating_color")?,
+            activating_execution_id: r.try_get("activating_execution_id").context("decode activating_execution_id")?,
         };
-        projects.last_mut().expect("pushed above").3.push(lifecycle);
+        projects.last_mut().expect("pushed above").2.push(lifecycle);
     }
     Ok(projects
         .into_iter()
-        .map(|(project_id, tenant_id, project_namespace, lifecycles)| {
+        .map(|(project_id, tenant_id, lifecycles)| {
             let aggregate = weft_broker_client::activation::aggregate(&lifecycles);
             SupervisorProject {
                 project_id,
                 tenant_id,
-                project_namespace,
                 status: aggregate.status,
                 health_parked: lifecycles
                     .iter()
@@ -255,14 +187,14 @@ where
         .collect())
 }
 
-/// The command `claimer_pod` runs next: the oldest uncompleted one of a
+/// The command `claimer_replica` runs next: the oldest uncompleted one of a
 /// project it owns (the `infra_owner` exclusive lease) and is not
 /// already running a command for (`busy_projects`), or `None`.
 ///
 /// Ownership is the supervisor's one single-actor authority: exclusive
-/// (one pod per project) and renewed on every ownership tick, so two
-/// supervisors never run kubectl for one project. Inside the owner, one
-/// project's commands run in order, because the pod names the projects
+/// (one process per project) and renewed on every ownership tick, so two
+/// supervisors never change one project's infrastructure. Inside the owner, one
+/// project's commands run in order, because the process names the projects
 /// it is busy with and gets none of theirs back; different projects'
 /// commands run side by side.
 ///
@@ -273,19 +205,19 @@ where
 /// if ownership moves mid-command, every write from the old owner is
 /// refused (`owns_project_predicate` on the fenced writes below) and
 /// the new owner runs it again, which is safe because the supervisor's
-/// kubectl work is declarative.
+/// infrastructure work is declarative.
 ///
 /// Only the supervisor's verbs: `deactivate` and `reactivate` are the
-/// dispatcher's, claimed by dispatcher pods under their own
-/// `claimed_by_pod` lease.
+/// dispatcher's, claimed by dispatchers under their own
+/// `claimed_by_replica` lease.
 pub async fn next_command(
     pool: &PgPool,
-    claimer_pod: &str,
+    claimer_replica: &str,
     busy_projects: &[uuid::Uuid],
 ) -> anyhow::Result<Option<SupervisorCommandRow>> {
     let sql = format!(
         "SELECT c.id, c.project_id, c.node_id, c.verb, c.running_policy, c.spec_json, c.force, \
-                c.drain_timeout_secs, c.member_id, c.every_copy \
+                c.drain_timeout_secs, c.instance_id, c.every_copy \
          FROM infra_lifecycle_command c \
          WHERE {pending} \
            AND NOT (c.project_id = ANY($2)) \
@@ -296,7 +228,7 @@ pub async fn next_command(
         owns = owns_project_predicate("$1", "c.project_id"),
     );
     let row = sqlx::query(&sql)
-        .bind(claimer_pod)
+        .bind(claimer_replica)
         .bind(busy_projects)
         .fetch_optional(pool)
         .await?;
@@ -324,11 +256,11 @@ pub struct IssuedCommand<'a> {
     pub project_id: uuid::Uuid,
     pub node_id: Option<&'a str>,
     /// Which copies of the node it acts on.
-    pub copies: &'a weft_core::member::Copies,
+    pub copies: &'a weft_core::instance::Copies,
     pub verb: InfraLifecycleVerb,
     pub running_policy: Option<RunningPolicy>,
     pub spec_json: Option<&'a serde_json::Value>,
-    pub issued_by_pod: &'a str,
+    pub issued_by_replica: &'a str,
 }
 
 /// Issue a lifecycle command; its id, or `None` when the project row is
@@ -343,21 +275,21 @@ pub struct IssuedCommand<'a> {
 /// An apply is deduplicated against an in-flight apply for the same
 /// copy, so a worker restart retrying the call never issues it twice:
 /// the partial unique index `uq_lifecycle_cmd_pending_apply` allows one
-/// pending apply per (project_id, node_id, member_id), and on a clash
+/// pending apply per (project_id, node_id, instance_id), and on a clash
 /// the no-op `DO UPDATE` hands back the existing row's id in the same
 /// statement (a `DO NOTHING` would return no row and need a second read
 /// that races the row's completion). Other verbs never match that
 /// index's predicate.
 pub async fn issue_command(pool: &PgPool, cmd: &IssuedCommand<'_>) -> anyhow::Result<Option<i64>> {
-    let (member_id, every_copy) = cmd.copies.columns();
+    let (instance_id, every_copy) = cmd.copies.columns();
     sqlx::query_scalar(
         "INSERT INTO infra_lifecycle_command \
          (tenant_id, project_id, node_id, verb, running_policy, \
-          spec_json, issued_by_pod, issued_at_unix, member_id, every_copy) \
+          spec_json, issued_by_replica, issued_at_unix, instance_id, every_copy) \
          SELECT $1, p.id, $3, $4, $5, $6, $7, EXTRACT(EPOCH FROM NOW())::BIGINT, $8, $9 \
          FROM project p WHERE p.id = $2 \
          FOR KEY SHARE OF p \
-         ON CONFLICT (project_id, node_id, member_id) \
+         ON CONFLICT (project_id, node_id, instance_id) \
            WHERE completed_at_unix IS NULL AND verb = 'apply' \
            DO UPDATE SET issued_at_unix = infra_lifecycle_command.issued_at_unix \
          RETURNING id",
@@ -368,8 +300,8 @@ pub async fn issue_command(pool: &PgPool, cmd: &IssuedCommand<'_>) -> anyhow::Re
     .bind(cmd.verb.as_str())
     .bind(cmd.running_policy.map(|p| p.as_str()))
     .bind(cmd.spec_json)
-    .bind(cmd.issued_by_pod)
-    .bind(member_id)
+    .bind(cmd.issued_by_replica)
+    .bind(instance_id)
     .bind(every_copy)
     .fetch_optional(pool)
     .await
@@ -383,13 +315,13 @@ pub async fn record_event(
     tenant_id: &str,
     project_id: uuid::Uuid,
     node_id: Option<&str>,
-    member: Option<&weft_core::member::MemberId>,
+    instance: Option<&weft_core::instance::InstanceId>,
     kind: &str,
     payload: &serde_json::Value,
 ) -> anyhow::Result<Option<i64>> {
     sqlx::query_scalar(
         "INSERT INTO infra_event \
-         (tenant_id, project_id, node_id, kind, payload, at_unix, member_id) \
+         (tenant_id, project_id, node_id, kind, payload, at_unix, instance_id) \
          SELECT $1, p.id, $3, $4, $5, EXTRACT(EPOCH FROM NOW())::BIGINT, $6 \
          FROM project p WHERE p.id = $2 \
          FOR KEY SHARE OF p \
@@ -400,7 +332,7 @@ pub async fn record_event(
     .bind(node_id)
     .bind(kind)
     .bind(payload)
-    .bind(member.map(|m| m.as_str()))
+    .bind(instance.map(|i| i.as_str()))
     .fetch_optional(pool)
     .await
     .context("record infra_event")
@@ -431,9 +363,9 @@ fn decode_command(r: &sqlx::postgres::PgRow) -> anyhow::Result<SupervisorCommand
     let spec_json: Option<serde_json::Value> =
         r.try_get::<Option<serde_json::Value>, _>("spec_json")?;
     let force: bool = r.try_get("force")?;
-    let member_id: Option<String> = r.try_get("member_id")?;
+    let instance_id: Option<String> = r.try_get("instance_id")?;
     let every_copy: bool = r.try_get("every_copy")?;
-    let copies = weft_core::member::Copies::from_columns(member_id, every_copy)
+    let copies = weft_core::instance::Copies::from_columns(instance_id, every_copy)
         .map_err(|e| anyhow::anyhow!("infra_lifecycle_command.id={id}: {e}"))?;
     let drain_timeout_secs: i64 = r.try_get("drain_timeout_secs")?;
     Ok(SupervisorCommandRow {
@@ -452,10 +384,10 @@ fn decode_command(r: &sqlx::postgres::PgRow) -> anyhow::Result<SupervisorCommand
 /// What a fenced lifecycle write did. The two stale answers are
 /// deliberately distinct because the supervisor must do different
 /// things with them (see `WriteOutcome` in the client crate, the wire
-/// twin of this): `Displaced`, the pod no longer owns the project, it
-/// leaves the command for the new owner; `Gone`, the pod still owns
+/// twin of this): `Displaced`, the process no longer owns the project, it
+/// leaves the command for the new owner; `Gone`, the process still owns
 /// the project and the target itself is not there (row removed, unit
-/// not in the roster, command already completed), the pod's work for
+/// not in the roster, command already completed), the process's work for
 /// that target is moot and the command proceeds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FencedWrite {
@@ -466,14 +398,14 @@ pub enum FencedWrite {
 
 /// The answer to a fenced write that matched no row: one ownership
 /// SELECT settles which predicate failed (the WHERE that just failed
-/// cannot say). Displaced when `pod_name` no longer holds the
+/// cannot say). Displaced when `replica` no longer holds the
 /// project's `infra_owner` lease, Gone otherwise.
-pub async fn stale_answer(pool: &PgPool, pod_name: &str, project_id: uuid::Uuid) -> anyhow::Result<FencedWrite> {
+pub async fn stale_answer(pool: &PgPool, replica: &str, project_id: uuid::Uuid) -> anyhow::Result<FencedWrite> {
     let owns: bool = sqlx::query_scalar(&format!(
         "SELECT {owns}",
         owns = owns_project_predicate("$1", "$2"),
     ))
-    .bind(pod_name)
+    .bind(replica)
     .bind(project_id)
     .fetch_one(pool)
     .await?;
@@ -528,7 +460,7 @@ fn rollup_sql(units_expr: &str) -> String {
 /// repair), and a plain `(units_json->$1) || ...` would NULL the column
 /// and fail the UPDATE as an error instead of a stale answer.
 ///
-/// The fence itself: `pod_name` must still hold the project's
+/// The fence itself: `replica` must still hold the project's
 /// `infra_owner` lease, on both branches, evaluated inside the UPDATE's
 /// WHERE so check and write share one row snapshot (no TOCTOU window);
 /// the instant ownership moves, the write is rejected (Displaced). With
@@ -573,7 +505,7 @@ pub async fn set_status(pool: &PgPool, req: &SupervisorSetStatusRequest) -> anyh
         sqlx::query(&format!(
             "UPDATE infra_node SET {set_clause} \
              WHERE project_id = $5 AND node_id = $6 \
-               AND member_id IS NOT DISTINCT FROM $9{unit_fence} AND EXISTS ( \
+               AND instance_id IS NOT DISTINCT FROM $9{unit_fence} AND EXISTS ( \
                SELECT 1 FROM infra_lifecycle_command c \
                WHERE c.id = $7 \
                  AND c.project_id = $5 \
@@ -590,15 +522,15 @@ pub async fn set_status(pool: &PgPool, req: &SupervisorSetStatusRequest) -> anyh
         .bind(req.project_id)
         .bind(&req.node_id)
         .bind(cid)
-        .bind(&req.pod_name)
-        .bind(req.member.as_ref().map(|m| m.as_str()))
+        .bind(&req.replica)
+        .bind(req.instance.as_ref().map(|m| m.as_str()))
         .execute(pool)
         .await?
     } else {
         sqlx::query(&format!(
             "UPDATE infra_node SET {set_clause} \
              WHERE project_id = $5 AND node_id = $6 \
-               AND member_id IS NOT DISTINCT FROM $8{unit_fence} AND NOT EXISTS ( \
+               AND instance_id IS NOT DISTINCT FROM $8{unit_fence} AND NOT EXISTS ( \
                SELECT 1 FROM infra_lifecycle_command c \
                WHERE c.project_id = $5 \
                  AND {reaches} \
@@ -613,58 +545,22 @@ pub async fn set_status(pool: &PgPool, req: &SupervisorSetStatusRequest) -> anyh
         .bind(req.failure_message.as_deref())
         .bind(req.project_id)
         .bind(&req.node_id)
-        .bind(&req.pod_name)
-        .bind(req.member.as_ref().map(|m| m.as_str()))
+        .bind(&req.replica)
+        .bind(req.instance.as_ref().map(|m| m.as_str()))
         .execute(pool)
         .await?
     };
     if res.rows_affected() > 0 {
         return Ok(FencedWrite::Applied);
     }
-    stale_answer(pool, &req.pod_name, req.project_id).await
-}
-
-/// Record the replicas a health protocol's `Scale` just set, in
-/// the unit's `scaled_to` inside `units_json`. Fenced exactly like the
-/// autonomous branch of [`set_status`]: the unit must be in the roster
-/// (`units_json ? $1`, so no stub entry is ever written), no uncompleted
-/// command may reach the copy, and `pod_name` must still own the
-/// project, all in the UPDATE's WHERE so check and write share one
-/// snapshot.
-pub async fn set_scaled(pool: &PgPool, req: &SupervisorSetScaledRequest) -> anyhow::Result<FencedWrite> {
-    let res = sqlx::query(&format!(
-        "UPDATE infra_node \
-         SET units_json = jsonb_set(units_json, ARRAY[$1], \
-             (units_json->$1) || jsonb_build_object('scaled_to', $2::bigint)) \
-         WHERE project_id = $3 AND node_id = $4 \
-           AND member_id IS NOT DISTINCT FROM $6 AND units_json ? $1 AND NOT EXISTS ( \
-           SELECT 1 FROM infra_lifecycle_command c \
-           WHERE c.project_id = $3 \
-             AND {reaches} \
-             AND c.completed_at_unix IS NULL \
-         ) AND {owns}",
-        reaches = command_reaches_copy("c", "$4", "$6"),
-        owns = owns_project_predicate("$5", "$3"),
-    ))
-    .bind(&req.unit)
-    .bind(i64::from(req.replicas))
-    .bind(req.project_id)
-    .bind(&req.node_id)
-    .bind(&req.pod_name)
-    .bind(req.member.as_ref().map(|m| m.as_str()))
-    .execute(pool)
-    .await?;
-    if res.rows_affected() > 0 {
-        return Ok(FencedWrite::Applied);
-    }
-    stale_answer(pool, &req.pod_name, req.project_id).await
+    stale_answer(pool, &req.replica, req.project_id).await
 }
 
 /// Stamp a lifecycle command terminal: success (`error = None`),
 /// failure (`error = Some`), or a user-requested cancellation the
 /// supervisor honored mid-command (`cancelled`; `error` then carries
 /// the halt point as the outcome message, never counted as a failure).
-/// Only the pod that currently OWNS the project may complete it: a
+/// Only the process that currently OWNS the project may complete it: a
 /// supervisor that lost ownership mid-command must NOT, because leaving
 /// the command uncompleted is exactly what lets the new owner re-run
 /// and finish it. Combined with `completed_at_unix IS NULL` this is
@@ -695,7 +591,7 @@ pub async fn complete_command(
     .bind(outcome.as_str())
     .bind(req.error.as_deref())
     .bind(req.command_id)
-    .bind(&req.pod_name)
+    .bind(&req.replica)
     .execute(pool)
     .await?;
     if res.rows_affected() > 0 {
@@ -709,7 +605,38 @@ pub async fn complete_command(
             .fetch_optional(pool)
             .await?;
     match project {
-        Some(project_id) => stale_answer(pool, &req.pod_name, project_id).await,
+        Some(project_id) => stale_answer(pool, &req.replica, project_id).await,
         None => Ok(FencedWrite::Gone),
     }
+}
+
+/// How many of `project`'s runs the copies `copies` serve are live:
+/// started, not terminal, and not parked on a resume. A parked run (a
+/// form waiting for input, a timer waiting to fire) holds no worker and
+/// does nothing until it resumes; counting it would deadlock
+/// `running_policy=wait` against any project with a long-lived parked
+/// trigger fire. An instance's copy serves only that instance's runs; the
+/// shared copy (and every copy together) serves every run of the project.
+pub async fn live_run_count(pool: &PgPool, project: uuid::Uuid, copies: &weft_core::instance::Copies) -> anyhow::Result<i64> {
+    let live = |instance_clause: &str| {
+        format!(
+            "SELECT COUNT(*)::bigint \
+             FROM execution ec \
+             WHERE ec.project_id = $1 \
+               {instance_clause} \
+               AND {} \
+               AND NOT {}",
+            weft_journal::unrecorded::LIVE_RUN_SQL,
+            weft_journal::RUN_PARKED_SQL
+        )
+    };
+    let count = match copies {
+        weft_core::instance::Copies::Instance(instance) => {
+            sqlx::query_scalar(&live("AND ec.instance_id = $2")).bind(project).bind(instance.as_str()).fetch_one(pool).await?
+        }
+        weft_core::instance::Copies::Shared | weft_core::instance::Copies::Every => {
+            sqlx::query_scalar(&live("")).bind(project).fetch_one(pool).await?
+        }
+    };
+    Ok(count)
 }

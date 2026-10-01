@@ -7,25 +7,28 @@
 //!
 //! ```text
 //! .weft/target/build/
-//!   Cargo.toml          # base deps + per-package deps (package.toml)
-//!                       # + per-node deps (deps.toml) for nodes
-//!                       # actually referenced by this project.
+//!   Cargo.toml          # base deps + a path dep on each package crate.
+//!   rust-toolchain.toml # the weft workspace's pinned toolchain.
+//!   weft-cache-gc.sh    # run by the Dockerfile after `cargo build`.
+//!   pkg_<name>-<slot>/  # one cargo crate per referenced package,
+//!     Cargo.toml        # carrying its package.toml + deps.toml deps.
+//!     src/lib.rs        # #[path]-includes the package's shared .rs
+//!                       # files at the top level, then each referenced
+//!                       # node's mod.rs as a submodule. Nodes reach
+//!                       # shared code via `use super::<shared_mod>;`.
 //!   src/
 //!     main.rs           # spawns weft-engine; fetches the
 //!                       # ProjectDefinition per execution from the
 //!                       # broker. NO project.json baked in.
-//!     registry.rs       # NodeCatalog impl: pulls in one shim
-//!                       # `pkg_<name>.rs` per referenced package,
-//!                       # dispatches node_type -> struct.
-//!     pkg_<name>.rs     # one per referenced package. #[path]-includes
-//!                       # the package's shared .rs files at the top
-//!                       # level, then each referenced node's mod.rs
-//!                       # as a submodule. Nodes reach shared code via
-//!                       # `use super::<shared_mod>;`.
+//!     registry.rs       # NodeCatalog impl: dispatches node_type to
+//!                       # the struct in its `pkg_<name>` crate.
 //! ```
 //!
-//! Pruning: each package's shim is emitted only if at least one of
-//! its nodes is referenced. Within a shim, only referenced node
+//! `<slot>` is a hash over the package's files and its generated
+//! manifest and shim, so editing one node recompiles only its package.
+//!
+//! Pruning: each package's crate is emitted only if at least one of
+//! its nodes is referenced. Within a crate, only referenced node
 //! subdirs are `#[path]`-included. Package-level shared .rs files
 //! are always included in an emitted shim (they may be load-bearing
 //! for the referenced nodes; dead-code analysis in the Rust compiler
@@ -45,12 +48,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use weft_catalog::FsCatalog;
+use weft_core::builds::NodeSet;
 use weft_core::ProjectDefinition;
 
 use crate::error::{CompileError, CompileResult};
 
 /// Emit the full cargo crate. Writes every file listed in the module
-/// docstring. Returns the crate root (`build::build_project` compiles it).
+/// docstring. Returns the crate root (`build::build_project` stages it
+/// into the docker build context, whose `cargo build` compiles it).
 pub fn emit(
     project: &ProjectDefinition,
     project_root: &Path,
@@ -221,33 +226,6 @@ fn sanitize_pkg_ident(raw: &str) -> String {
     // so a package's module ident, crate name, and staging paths can
     // never disagree or collide.
     format!("pkg_{}", crate::build::sanitize_crate_name(raw))
-}
-
-/// Which catalog node types a worker binary compiles in.
-///
-/// `Referenced` is the ordinary build: the types the program names, so
-/// the binary is as small as the program. `Full` compiles every node
-/// in the catalog, so a program edit that starts using a node the
-/// previous program did not never rebuilds the image: the build is
-/// content-addressed either way (`compute_binary_hash` folds the same
-/// set plus this choice), so a full image rebuilds only when a node
-/// source was added, removed, or edited. CLI builds default to `Full`;
-/// `--referenced` selects only the graph's types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeSet {
-    Referenced,
-    Full,
-}
-
-impl NodeSet {
-    /// The line the binary hash folds so a full image and a referenced
-    /// image of one program never share a tag.
-    pub fn hash_marker(self) -> &'static str {
-        match self {
-            NodeSet::Referenced => "referenced",
-            NodeSet::Full => "full",
-        }
-    }
 }
 
 /// The catalog node types a build under `node_set` compiles in, sorted:
@@ -1144,77 +1122,57 @@ fn baked_type_decls(catalog: &FsCatalog) -> String {
 fn write_main_rs(src_dir: &Path, catalog: &FsCatalog) -> CompileResult<()> {
     let type_decls = baked_type_decls(catalog);
     let contents = format!(
-        r#"//! Project worker binary. Spawned by the dispatcher as part of
-//! a per-project pool. Claims `target=worker` tasks for its own
-//! `project_id` and runs each as a tokio task in-process. Idle-shuts
-//! itself down after a grace window with no pending work.
+        r#"//! Project worker binary. Weft calls it once per execution
+//! (`weft_engine::worker`): it serves HTTP, or with `--run <execution_id>` runs
+//! one execution as a job of its own and exits.
 
 use std::sync::Arc;
 
 use clap::Parser;
 
-use weft_broker_client::{{BrokerWorkerPodClient, TokenSource}};
+use weft_broker_client::TokenSource;
 use weft_core::NodeCatalog;
 use weft_engine::EngineClients;
 
 mod registry;
 
+// SYNC: the worker's environment <-> crates/weft-platform-local/src/runner.rs,
+//       crates/weft-platform-gcp/src/runner.rs (what each sets)
 #[derive(Debug, Parser)]
 #[command(name = "weft-project-worker", version)]
 struct Args {{
-    /// Project id this Pod serves. Worker only claims tasks scoped to
-    /// this project.
+    /// The project this worker serves.
     #[arg(long, env = "WEFT_PROJECT_ID")]
     project_id: uuid::Uuid,
 
-    /// Broker base URL. The worker never touches Postgres directly;
-    /// every journal write, task enqueue/claim, worker_pod heartbeat,
-    /// and infra read flows through the broker, which validates the
-    /// projected SA token at WEFT_BROKER_TOKEN_PATH and runs a
-    /// per-tenant scope check.
-    #[arg(long, env = "WEFT_BROKER_URL")]
-    broker_url: String,
-
-    /// Filesystem path to the kubelet-projected SA token. The broker
-    /// validates this token via TokenReview on every call.
-    #[arg(long, env = "WEFT_BROKER_TOKEN_PATH", default_value = "/var/run/weft/sa/token")]
-    broker_token_path: String,
-
-    /// k8s Pod name (injected via downward API). Stamped on every
-    /// journal write; the fencing trigger uses it to detect zombies.
-    #[arg(long, env = "WEFT_POD_NAME")]
-    pod_name: String,
-
-    /// k8s namespace this Pod runs in. Recorded on the worker_pod
-    /// row so the dispatcher's reaper can `kubectl delete` against
-    /// the right namespace.
-    #[arg(long, env = "WEFT_NAMESPACE")]
-    namespace: String,
-
-    /// Identifier of the dispatcher Pod that spawned us. Recorded on
-    /// the worker_pod row for ops traceability.
-    #[arg(long, env = "WEFT_OWNER_DISPATCHER", default_value = "unknown")]
-    owner_dispatcher: String,
-
-    /// Tenant this worker belongs to. Stamped on every task this
-    /// worker enqueues so the dispatcher's listener reaper can tell
-    /// "this tenant has work mid-flight" from "this listener is
-    /// genuinely idle." Without it, the reaper races register flows.
+    /// The tenant the project belongs to, stamped on every task this
+    /// worker enqueues.
     #[arg(long, env = "WEFT_TENANT_ID")]
     tenant_id: String,
 
-    /// TCP port the worker's live caller connection server listens on
-    /// (plain HTTP/WS; TLS terminates at the gateway). The gateway
-    /// forwards caller connections here. Default matches the worker pod
-    /// manifest's exposed port.
-    #[arg(long, env = "WEFT_CONNECTION_PORT", default_value = "9091")]
-    connection_port: u16,
+    /// The broker's address. The worker never touches Postgres; every
+    /// journal write, task claim and infra read goes through the broker,
+    /// which checks the worker's identity and scopes it to its project.
+    #[arg(long, env = "WEFT_BROKER_URL")]
+    broker_url: String,
 
-    /// HMAC secret the worker verifies dispatcher-signed live-connection
-    /// routing tokens with (hex-encoded). Same cluster secret the
-    /// dispatcher signs with; provisioned via the worker pod env.
+    /// The port the worker serves HTTP on.
+    #[arg(long, env = "PORT", default_value = "8080")]
+    port: u16,
+
+    /// The secret live-caller routing tickets are signed with (hex).
+    /// Empty: this worker takes no live callers.
     #[arg(long, env = "WEFT_CALLER_TOKEN_SECRET", default_value = "")]
     caller_token_secret: String,
+
+    /// The platform's hard cap on one short run, in seconds, when it
+    /// has one.
+    #[arg(long, env = "WEFT_SHORT_RUN_CAP_SECS")]
+    short_run_cap_secs: Option<u64>,
+
+    /// Run this one execution as a job of its own (a long run) and exit.
+    #[arg(long)]
+    run: Option<uuid::Uuid>,
 }}
 
 #[tokio::main]
@@ -1238,23 +1196,16 @@ async fn main() -> anyhow::Result<()> {{
     )
     .expect("first registry install in this process");
 
-    let token = TokenSource::new(std::path::PathBuf::from(&args.broker_token_path));
-    let worker_pods = BrokerWorkerPodClient::new(args.broker_url.clone(), token.clone());
-
-    // The engine composes its own client bundle from the broker address + the
-    // pod's token, so this generated binary never names the bundle's fields.
-    let clients = EngineClients::from_broker(
-        &args.broker_url,
-        std::path::Path::new(&args.broker_token_path),
-    );
-
+    let replica = weft_engine::mint_replica_id("worker");
+    let token = TokenSource::worker(weft_engine::identity_from_env()?, replica.clone());
+    // The engine composes its own client bundle from the broker address and
+    // the worker's identity, so this generated binary never names the
+    // bundle's fields.
+    let clients = EngineClients::from_broker(&args.broker_url, token);
     let catalog = Arc::new(CatalogRef) as Arc<dyn NodeCatalog>;
 
-    // Live-connection routing-token secret: hex from env. Empty means no
-    // secret provisioned (local dev without the gateway), surfaced as `None`
-    // so `run_pod` does not start the connection server at all. An empty
-    // HMAC key would validate forgeable tokens (fail-open), so we never feed
-    // one in: "empty" structurally means "no live-caller capability".
+    // An empty HMAC key would validate forgeable tickets (fail-open), so
+    // "empty" structurally means "no live callers", never an empty key.
     let caller_token_secret = if args.caller_token_secret.is_empty() {{
         None
     }} else {{
@@ -1263,21 +1214,20 @@ async fn main() -> anyhow::Result<()> {{
                 .map_err(|e| anyhow::anyhow!("WEFT_CALLER_TOKEN_SECRET is not valid hex: {{e}}"))?,
         )
     }};
-
-    weft_engine::run_pod(
-        catalog,
-        clients,
-        worker_pods,
-        args.pod_name,
-        args.project_id,
-        args.tenant_id,
-        args.namespace,
-        args.connection_port,
+    let config = weft_engine::WorkerConfig {{
+        project_id: args.project_id,
+        tenant_id: args.tenant_id,
+        replica,
+        door: weft_engine::WorkerDoor::from_env()?,
         caller_token_secret,
-    )
-    .await?;
-
-    tracing::info!(target: "weft_project_worker", "pod exit");
+        port: args.port,
+        short_run_cap: args.short_run_cap_secs.map(std::time::Duration::from_secs),
+    }};
+    match args.run {{
+        Some(execution) => weft_engine::run_long(catalog, clients, config, execution).await?,
+        None => weft_engine::serve(catalog, clients, config).await?,
+    }}
+    tracing::info!(target: "weft_project_worker", "worker exit");
     Ok(())
 }}
 
@@ -1426,7 +1376,7 @@ pub fn emit_test_crate(
         let mut known: Vec<&str> = catalog.packages().map(|p| p.name.as_str()).collect();
         known.sort();
         return Err(CompileError::Build(format!(
-            "no package named '{package_name}' in this project's nodes/ (known: {})",
+            "no package named '{package_name}' in this project (nodes/ or src/) (known: {})",
             known.join(", ")
         )));
     };
@@ -1572,6 +1522,10 @@ mod tests {
                 "weft-engine".to_string(),
                 "weft-journal".to_string(),
                 "weft-node-derive".to_string(),
+                // A worker on Cloud Run mints its own identity tokens
+                // (`weft_platform_gcp::MetadataTokens`, never the control
+                // side, which stays behind the crate's `control` feature).
+                "weft-platform-gcp".to_string(),
                 "weft-platform-traits".to_string(),
                 "weft-providers".to_string(),
                 "weft-task-store".to_string(),
@@ -1615,12 +1569,12 @@ mod tests {
             features: NodeFeatures::default(),
             scope: Vec::new(),
             group_boundary: None,
-            requires_infra: false, per_member: None,
+            requires_infra: false, per_instance: None,
             images: Vec::new(),
             fires_with: Default::default(),
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None,
             header_span: None,
             config_spans: Default::default(),

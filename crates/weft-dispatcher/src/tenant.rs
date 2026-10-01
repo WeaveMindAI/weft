@@ -1,16 +1,8 @@
-//! Tenant identity and namespace resolution.
+//! Tenant identity.
 //!
 //! A tenant is a single billing / isolation unit. The built-in default uses one
 //! tenant called `local`. Every dispatcher operation that touches a listener, a
 //! worker, or a signal threads a `TenantId` through.
-//!
-//! There is deliberately NO tenant->namespace mapper anymore: storage
-//! moved to a shared pooled pod in the control-plane namespace (keyed by
-//! the tenant prefix inside the key, not a per-tenant namespace), and
-//! workers/infra live in PROJECT namespaces (`project_namespace.rs`,
-//! keyed by tenant+project). Nothing maps a bare tenant to a k8s
-//! namespace, so the lossy-sanitize / namespace-ceiling problems are
-//! gone with it.
 //!
 //! The `TenantRouter` trait resolves a project's owning tenant; the default
 //! answers `local`.
@@ -45,7 +37,7 @@ impl std::fmt::Display for TenantId {
 /// every project (no I/O); resolving a project's real owner is a lookup, so the
 /// method is async. Every project row already carries its owning `tenant_id`.
 ///
-/// The result is fallible: the tenant a project is keyed by drives worker-pod
+/// The result is fallible: the tenant a project is keyed by drives worker-process
 /// namespacing, storage keying, and signal mounting, so an unresolvable tenant
 /// (the project row is gone, or the store errored) must fail LOUD at the caller,
 /// not resolve to a sentinel that would silently mis-key or strand state. Every

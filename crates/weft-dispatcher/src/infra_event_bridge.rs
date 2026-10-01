@@ -9,16 +9,16 @@
 //! publish is cosmetic (clients reconnect and re-poll), losing a
 //! control-plane action is not, and that path has its own queue.
 //!
-//! Multi-pod concurrency: a drain holds a session advisory lock on its
+//! Multi-process concurrency: a drain holds a session advisory lock on its
 //! own connection, taken with `pg_try_advisory_lock`, so only one
-//! dispatcher Pod drains at a time and the others skip rather than wait
+//! dispatcher drains at a time and the others skip rather than wait
 //! (the holder's own wake covers whatever they heard). No transaction
 //! stays open across the publishes: an open one would hold back the
 //! settled horizon every cursor reads against (`crate::settled`).
 
 use crate::events::DispatcherEvent;
 use crate::infra_event::{self, InfraEvent};
-use crate::pg_wake::{self, DrainStep, WakeOn};
+use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn, SAFETY_POLL_INTERVAL};
 use crate::settled::{Position, SettledReader};
 use crate::state::DispatcherState;
 
@@ -52,20 +52,17 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 
 const ON_INFRA_EVENT: &[WakeOn] = &[WakeOn::any(INFRA_EVENT_CHANNEL)];
 
-/// The advisory lock key only one Pod's drain holds at a time.
+/// The advisory lock key only one process's drain holds at a time.
 // SYNC: 'infra_event_bridge' <-> CURSOR_KEY (the lock is keyed like the cursor row)
 const DRAIN_LOCK_SQL: &str = "hashtextextended('infra_event_bridge', 0)";
 
-pub async fn run(state: DispatcherState) {
-    let reader = tokio::sync::Mutex::new(SettledReader::new("infra_event_bridge"));
-    pg_wake::run(
-        state.signals.subscribe(),
-        ON_INFRA_EVENT,
-        pg_wake::SAFETY_POLL_INTERVAL,
-        "weft_dispatcher::infra_event_bridge",
-        || async { drain(&state, &mut *reader.lock().await).await },
-    )
-    .await;
+pub fn drain_loop(state: DispatcherState) -> DrainLoop {
+    let reader = std::sync::Arc::new(tokio::sync::Mutex::new(SettledReader::new("infra_event_bridge")));
+    DrainLoop::new("infra_event_bridge", ON_INFRA_EVENT, SAFETY_POLL_INTERVAL, move || {
+        let state = state.clone();
+        let reader = reader.clone();
+        async move { drain(&state, &mut *reader.lock().await).await }
+    })
 }
 
 async fn drain(state: &DispatcherState, reader: &mut SettledReader) -> anyhow::Result<DrainStep> {
@@ -111,7 +108,7 @@ async fn drain_locked(
     let rows = infra_event::parse_rows(batch.rows)?;
 
     // Publish BEFORE the cursor advances. SSE consumers are idempotent
-    // (they de-dupe by (project_id, color, step) on the client), so a
+    // (they de-dupe by (project_id, execution, step) on the client), so a
     // crash after publish and before the advance just re-publishes the
     // same events on the next drain, while a crash after an advance and
     // before publish would drop them for good. The lock is a session
@@ -144,12 +141,7 @@ pub(crate) fn to_dispatcher_event(
             project_id: pid,
             node_id: require_node_id(ev)?,
             // User-string field: cap at 4 KB before NOTIFY fan-out.
-            reason: weft_core::truncate_user_string(
-                &p.reason
-                    .clone()
-                    .unwrap_or_else(|| format!("desired={} ready={}", p.desired, p.ready)),
-                4096,
-            ),
+            reason: weft_core::truncate_user_string(&p.reason, 4096),
         }),
         InfraEvent::Recovered => Some(DispatcherEvent::InfraRecovered {
             project_id: pid,
@@ -195,7 +187,7 @@ fn require_node_id(ev: &crate::infra_event::InfraEventRow) -> Option<String> {
         // unbounded; bound it here, the single choke point feeding every
         // node-scoped infra DispatcherEvent, so a long id can't push a
         // publish-path NOTIFY payload over the 8000-byte cap and make
-        // sibling pods silently miss the event.
+        // sibling processes silently miss the event.
         Some(s) if !s.is_empty() => Some(weft_core::truncate_user_string(&s, 4096)),
         _ => {
             tracing::warn!(
@@ -231,11 +223,7 @@ mod tests {
     #[test]
     fn flaky_maps_with_reason_from_payload() {
         let r = row(
-            InfraEvent::Flaky(FlakyPayload {
-                desired: 3,
-                ready: 1,
-                reason: Some("crashloop".into()),
-            }),
+            InfraEvent::Flaky(FlakyPayload { reason: "crashloop".into() }),
             Some("n1"),
         );
         let de = to_dispatcher_event(&r).expect("event");
@@ -246,24 +234,6 @@ mod tests {
                 assert_eq!(reason, "crashloop");
             }
             other => panic!("wrong variant: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn flaky_without_reason_uses_desired_ready_summary() {
-        let r = row(
-            InfraEvent::Flaky(FlakyPayload {
-                desired: 2,
-                ready: 0,
-                reason: None,
-            }),
-            Some("n1"),
-        );
-        match to_dispatcher_event(&r).unwrap() {
-            DispatcherEvent::InfraFlaky { reason, .. } => {
-                assert_eq!(reason, "desired=2 ready=0");
-            }
-            _ => panic!("wrong variant"),
         }
     }
 
@@ -280,7 +250,7 @@ mod tests {
     fn started_maps_to_status_running() {
         let r = row(
             InfraEvent::Started(StartedPayload {
-                instance_id: "inst1".into(),
+                copy_id: "inst1".into(),
                 mode: weft_broker_client::protocol::StartMode::Fresh,
             }),
             Some("n1"),
@@ -305,7 +275,7 @@ mod tests {
         let r = row(
             InfraEvent::Failed(FailedPayload {
                 stage: weft_broker_client::protocol::FailureStage::Apply,
-                message: "kubectl rejected".into(),
+                message: "apply rejected".into(),
             }),
             Some("n1"),
         );

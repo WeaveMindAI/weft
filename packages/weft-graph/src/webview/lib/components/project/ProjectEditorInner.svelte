@@ -17,14 +17,16 @@
 	import { boundaryInId, boundaryOutId } from "../../../host-bridge";
 	import { NODE_TYPE_CONFIG, type NodeType } from "../../nodes";
 	import { hasUnpickedAccess, inputsOf, outputsOf } from "../../utils/input-field";
+	import { effectiveAccessValue, installPicksVersion, loadInstallPicks } from "./install-picks.svelte";
 	import type { ProjectDefinition, PortDefinition, NodeFeatures, NodeDataUpdates } from "../../types";
 	import { locatedKey, type Frame } from "../../../../protocol";
 	import { isContainerNodeType, isLoopNodeType, isIncludeNodeType, isBoundaryBoxNodeType, INCLUDE_NODE_TYPE, containerKindOf, acceptsWire, ownValue, parseWeftType, isWeftTypeCompatible, portValueFirstForm } from "../../types";
 	import { rowsByCallPath, type RowsByCallPath } from "../../utils/call-path-rows";
 	import RunSpecDialog from './RunSpecDialog.svelte';
+	import InstallSwitch from './InstallSwitch.svelte';
 	import { addressOf, groupOfCallPath, orderSpecsForMenu, specForAction, type ResolveSpecResponse, type RunSpec } from '../../../../run-spec';
 	import type { CredentialOwnerKind, EditOp, SourceLocation, TextEdit } from "../../../../protocol";
-	import { SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT } from "../../../../protocol";
+	import { LOCAL_INSTALL, SHOULD_FLOW_PORT, SHOULD_NOT_FLOW_PORT } from "../../../../protocol";
 	import { PORT_TYPE_COLORS } from "../../constants/colors";
 	import { autoOrganize } from "../../auto-organize";
 	import { updateLayoutEntry, removeLayoutEntryEveryView, parseLayoutCode, renameLayoutSubtree, computeContainmentFloors, parseViewMode, setViewMode, LAYOUT_VERB, SIMPLIFIED_LAYOUT_VERB, type ViewMode, type LayoutVerb } from "../../layout";
@@ -41,7 +43,7 @@
 	import { provideFieldEditorRegistry } from "./field-editor-registry";
 	import { extractInfraSubgraph } from "../../utils/infra-subgraph";
 	import { extractTriggerSubgraph } from "../../utils/trigger-subgraph";
-	import { canBePerMember, nodeHasDisplay, nodeIsTrigger, nodeRequiresInfra } from "../../utils/node-roles";
+	import { canBePerInstance, nodeHasDisplay, nodeIsTrigger, nodeRequiresInfra } from "../../utils/node-roles";
 	import { toast } from "svelte-sonner";
 
 	let {
@@ -89,6 +91,8 @@
 		callPath = [],
 		interactive = true,
 		fileContents = {},
+		installView,
+		onSwitchInstall = () => {},
 	}: {
 		project: ProjectDefinition;
 		onSave: (data: { fileRef?: { path: string; content: string } }) => void;
@@ -126,6 +130,10 @@
 		// path. The display value for file-backed fields (config holds only
 		// the `@file(...)` marker, never the resolved content).
 		fileContents?: Record<string, import('../../../../protocol').FileContent>;
+		// The installs the project can be shown on, and which one it is
+		// (the switch, top right). Absent when the project names no target.
+		installView?: import('../../../../protocol').InstallView;
+		onSwitchInstall?: (install: string) => void;
 		// Action-bar verb callbacks. The webview emits these; the
 		// host translates each into a CLI shell-out.
 		/// Targets are the nodes the user aimed the run at, empty for the
@@ -155,7 +163,7 @@
 		onTerminateInfra?: () => void;
 		/// Per-node infra lifecycle. The graph's node context-menu
 		/// emits these when the user right-clicks an infra node, with
-		/// the instance's PLACE (`addressOf(callPath, id)`, so `one.db`
+		/// the node's PLACEMENT (`addressOf(callPath, id)`, so `one.db`
 		/// for the `db` of the call this view walked into). Routed
 		/// through the host's CLI verb path so the action bar's
 		/// `cli_running` overlay covers them.
@@ -173,7 +181,7 @@
 		// instance of the call it walked into. Used by the graph node
 		// decorations (badge under each infra node); independent of the
 		// action bar's infra rollup.
-		infraNodes?: import('../../../../protocol').InfraInstanceStatus[];
+		infraNodes?: import('../../../../protocol').InfraPlacementStatus[];
 		// Source-derived flags from the parsed project: does this
 		// graph DECLARE infra / trigger nodes. Drives bar-section
 		// visibility (don't show Infra section on a project with
@@ -1187,6 +1195,28 @@
 	// the `let nodes = $state.raw(buildNodes(...))` initializer, where reading
 	// `nodes` would hit its temporal dead zone (the "Loading graph..." crash). At
 	// init there is nothing measured yet, so the caller passes `[]`.
+	/// A node's place as this view shows it: what the install keys a node's
+	/// connection pick by.
+	function placeOf(nodeId: string): string {
+		return addressOf(callPath, nodeId);
+	}
+
+	// Another install's program is a copy: nothing but its connections
+	// changes (they are that install's, picked through its own store).
+	const remoteInstall = $derived(
+		installView && installView.active !== LOCAL_INSTALL ? installView.active : undefined,
+	);
+	$effect(() => {
+		engine.setInstallReadOnly(remoteInstall);
+	});
+
+	// The install keeps the picks of the program's own connections; read
+	// them once the view is a place (a file opened on its own is none, so
+	// its nodes' picks cannot be told apart and none is shown).
+	$effect(() => {
+		if (interactive) void loadInstallPicks();
+	});
+
 	function buildNodes(projectNodes: typeof project.nodes, projectEdges: typeof project.edges, layoutMap?: Record<string, { x: number; y: number; w?: number; h?: number; expanded?: boolean; configOpen?: boolean }>, liveNodes: Node[] = []): Node[] {
 		// Pure merge step: overlay each node's layout entry (width/height/expanded)
 		// onto its config UP FRONT, so the structural parse (which carries none of
@@ -1236,6 +1266,8 @@
 					inputsOf(n.inputs),
 					n.portLiterals as Record<string, unknown> | undefined,
 					wiredByNode.get(n.id) ?? noWires,
+					// A connection the install keeps is read at the node's place.
+					(field, literal) => effectiveAccessValue(literal, placeOf(n.id), field),
 				);
 				if (pinned) pinnedIds.add(n.id);
 			}
@@ -1485,12 +1517,13 @@
 					// predicates read the instance before the catalog, the
 					// way the host does before it starts a poller.
 					requiresInfra: n.requiresInfra,
-					// Whether the node exists once per member (marked in the
+					// Whether the node exists once per instance (marked in the
 					// source, or reached from a marked one): drawn on the node.
-					perMember: n.perMember,
+					perInstance: n.perInstance,
 					// The unconnected-access pin (view state, never config):
 					// ProjectNode draws the body open and disables collapse.
 					pinnedOpen: pinnedIds.has(n.id),
+					placeOf,
 					includePath: (n as typeof n & { includePath?: string }).includePath,
 					sourceLine: (n as typeof n & { sourceLine?: number }).sourceLine,
 					onUpdate: createNodeUpdateHandler(n.id),
@@ -1986,7 +2019,7 @@
 								costUnknown: allRelated.some((e) => e.costUnknown),
 								credentialOwner: groupCredentialOwner(allRelated),
 								logs: [],
-								color: inExec.color,
+								executionId: inExec.executionId,
 								frames: inExec.frames,
 								framesKey: inExec.framesKey,
 							};
@@ -2087,7 +2120,7 @@
 							fileContents: ctx.fileContents,
 							bodyFeed,
 							infraNodeStatus: backendNode?.status,
-							infraMemberCopies: backendNode?.memberCopies,
+							infraInstanceCopies: backendNode?.instanceCopyCount,
 							infraFailureStage: backendNode?.failureStage,
 							infraFailureMessage: backendNode?.failureMessage,
 						},
@@ -2136,6 +2169,7 @@
 	$effect(() => {
 		const f = fold;
 		void layoutCode; // tracked: layout-only changes re-render too
+		void installPicksVersion(); // tracked: a pick changes the unpicked pin
 		untrack(() => {
 			if (f.dropped.length > 0) {
 				// An op stopped applying (it should have been pruned at truth-advance
@@ -2290,9 +2324,9 @@
 		runTargetFactsLive.infraIds.every((id) => infraStatusOf(id)?.status === 'running'),
 	);
 
-	/// The infra instance behind a node on screen: the one at THIS view's
+	/// The infra placement behind a node on screen: the one at THIS view's
 	/// place (`addressOf(callPath, id)`), never another call's. A view
-	/// that is no place names no instance, whatever the status holds.
+	/// that is no place names no placement, whatever the status holds.
 	function infraStatusOf(nodeId: string) {
 		if (!interactive) return undefined;
 		const place = addressOf(callPath, nodeId);
@@ -3771,9 +3805,9 @@
 	 *  whether to open the menu in simplified view and to render the infra section. */
 	function nodeInfraActions(nodeId: string | null): { stop: boolean; terminate: boolean; has: boolean } {
 		const infra = nodeId ? infraStatusOf(nodeId) : undefined;
-		// A place with no shared copy (never started, or one per member)
+		// A place with no shared copy (never started, or one per instance)
 		// has nothing to stop or terminate here.
-		const hasCopy = !!infra && infra.status !== 'not_started' && infra.status !== 'per_member';
+		const hasCopy = !!infra && infra.status !== 'not_started' && infra.status !== 'per_instance';
 		const stop = hasCopy && (infra.status === 'running' || infra.status === 'flaky');
 		const terminate = hasCopy && infra.status !== 'terminating';
 		return { stop, terminate, has: stop || terminate };
@@ -4122,7 +4156,10 @@
 			<!-- View-mode toggle (top-right). An explicit labelled on/off switch so
 			     it always reads as "Simplified view: off/on", never an opaque icon.
 			     Per-project, persisted. -->
-			<div class="absolute top-3 right-3 z-30 pointer-events-auto">
+			<div class="absolute top-3 right-3 z-30 pointer-events-auto flex items-start gap-2">
+				{#if installView && installView.installs.length > 0}
+					<InstallSwitch view={installView} onSwitch={onSwitchInstall} />
+				{/if}
 				<button
 					type="button"
 					role="switch"
@@ -4204,7 +4241,21 @@
 		<!-- Graph-logic lock banner (explicit lock only; the sliding auto-lock
 		     surfaces through gesture-rejection toasts instead, since it lives
 		     sub-second). The release button clears the lock locally. -->
-		{#if engine.lockGraphLogic}
+		<!-- Another install's program: which one, which version, and whether
+		     the files on disk are that version. No release: switching back
+		     to local is the way out. -->
+		{#if remoteInstall && installView}
+			<div class="absolute top-3 left-1/2 -translate-x-1/2 z-10 max-w-[60%]">
+				<div class="flex items-center gap-2 px-4 py-2 bg-sky-700/90 text-white rounded-lg shadow-lg text-xs font-medium backdrop-blur-sm">
+					<span>
+						What {remoteInstall} runs{installView.version ? ` (version ${installView.version.slice(0, 8)})` : ''}. Read-only; its connections can still be changed.
+						{#if installView.version && installView.diskVersion && installView.version !== installView.diskVersion}
+							Your files are another version ({installView.diskVersion.slice(0, 8)}).
+						{/if}
+					</span>
+				</div>
+			</div>
+		{:else if engine.lockGraphLogic}
 			<div class="absolute top-3 left-1/2 -translate-x-1/2 z-10">
 				<div class="flex items-center gap-3 px-4 py-2 bg-indigo-600/90 text-white rounded-lg shadow-lg text-xs font-medium backdrop-blur-sm">
 					<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
@@ -4405,21 +4456,21 @@
 								<span class="text-muted-foreground text-xs">#</span>
 								<span>Tags…</span>
 							</button>
-							<!-- `@per_member`: only on a node that owns something per
-							     account (an infra container, a connection). A node the
+							<!-- `@per_instance`: only on a node that owns something per
+							     instance (an infra container, a connection). A node the
 							     compiler reached from a marked one follows it and has
 							     nothing of its own to toggle. -->
-							{#if canBePerMember({ nodeType: nodeToEdit.data.nodeType as string, requiresInfra: nodeToEdit.data.requiresInfra as boolean | undefined })}
-								{@const marked = nodeToEdit.data.perMember === 'marked'}
+							{#if canBePerInstance({ nodeType: nodeToEdit.data.nodeType as string, requiresInfra: nodeToEdit.data.requiresInfra as boolean | undefined })}
+								{@const marked = nodeToEdit.data.perInstance === 'marked'}
 								<button
 									class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
 									title={marked
-										? 'Make this node one shared node again: every member uses the same one.'
-										: 'Give every member of the program their own copy of this node (its container, or the connection it uses).'}
-									onclick={() => { const id = contextMenu!.nodeId!; contextMenu = null; recordEdit([{ op: 'setPerMember', node: id, perMember: !marked }]); }}
+										? 'Make this node one shared node again: every instance uses the same one.'
+										: 'Give every instance of the program its own copy of this node (its container, or the connection it uses).'}
+									onclick={() => { const id = contextMenu!.nodeId!; contextMenu = null; recordEdit([{ op: 'setPerInstance', node: id, perInstance: !marked }]); }}
 								>
 									<span class="text-muted-foreground text-xs">@</span>
-									<span>{marked ? 'Share across members' : 'One per member'}</span>
+									<span>{marked ? 'Share across instances' : 'One per instance'}</span>
 								</button>
 							{/if}
 						{/if}

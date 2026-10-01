@@ -13,9 +13,9 @@ use weft_core::reqwest_middleware;
 use crate::kinds::SpawnCtx;
 
 /// Resolve the signal's connection freshly through the broker. The
-/// tenant and the member are the signal's (both traveled with the
+/// tenant and the instance are the signal's (both traveled with the
 /// registration, the same trust the listener's fires already ride on).
-/// A member's signal resolves through that member's connection alone.
+/// An instance's signal resolves through that instance's connection alone.
 pub async fn resolve(
     access: &AccessRef,
     ctx: &SpawnCtx,
@@ -23,7 +23,7 @@ pub async fn resolve(
     ctx.events_broker
         .listener_resolve(&ListenerResolveRequest {
             tenant: ctx.fire.tenant_id().to_string(),
-            for_member: ctx.fire.for_member().cloned(),
+            for_instance: ctx.fire.for_instance().cloned(),
             access_id: access.id.clone(),
             service: access.service.clone(),
             required_values: access.required_values.clone(),

@@ -5,7 +5,7 @@
 //! print JSON to stdout. This is where the editor's live graph and
 //! Problems-panel feedback comes from. It runs locally, on the CLI,
 //! because the catalog lives in the project's `nodes/` folder: the
-//! dispatcher (a remote pod) has no access to it.
+//! dispatcher (a remote process) has no access to it.
 //!
 //! `parse` is lenient (unknown node types become placeholders so the
 //! graph keeps rendering mid-edit); `validate` is the full strict
@@ -41,6 +41,13 @@ struct ParseResponse {
 #[derive(Debug, Serialize)]
 struct ValidateResponse {
     diagnostics: Vec<Diagnostic>,
+    /// One line per catalog folder left out and why (a broken
+    /// `metadata.json`, a node with no code yet, an empty package), the
+    /// same lines `weft describe-nodes` warns with. Never a failure on
+    /// their own: a program naming a left-out node gets its own
+    /// diagnostic.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 fn read_stdin() -> Result<String> {
@@ -215,13 +222,17 @@ pub async fn serve(ctx: Ctx) -> Result<()> {
     // signals via `reload_catalog`.
     let mut catalogs: HashMap<PathBuf, FsCatalog> = HashMap::new();
 
+    // No client here: the server runs for the whole editor session, most
+    // requests never reach an install, and the one that does resolves its
+    // own (see `Ctx::fresh_client`), so an install that is down, unnamed
+    // or starts later never costs the editor its parsing.
     for line in stdin.lock().lines() {
         let line = line.context("read request line")?;
         if line.trim().is_empty() {
             continue;
         }
         let resp = match serde_json::from_str::<ServerRequest>(&line) {
-            Ok(req) => handle_request(req, &mut catalogs, &ctx.client()).await,
+            Ok(req) => handle_request(req, &mut catalogs, &ctx).await,
             // A request we can't parse into the typed shape may still be
             // valid JSON carrying an `id` (a stale editor talking to a
             // newer server): recover it so the host matches the reply to
@@ -248,7 +259,7 @@ pub async fn serve(ctx: Ctx) -> Result<()> {
 /// pipeline. Project discovery walks up from the file's directory (the server
 /// has no fixed cwd project, unlike the one-shot commands). Parse is lenient
 /// and works without a project (nil id, empty catalog); validate requires one.
-async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCatalog>, client: &crate::client::DispatcherClient) -> ServerResponse {
+async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCatalog>, ctx: &Ctx) -> ServerResponse {
     let id = req.id;
     // Three-way: no project (lenient), a project, or a BROKEN manifest. A broken
     // `weft.toml` must surface loudly on every kind, not silently degrade to the
@@ -280,7 +291,11 @@ async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCa
                 Ok(mut definition) => {
                     if spec.fire.is_some() {
                         let root = &project.as_ref().expect("resolution requires a project").root;
-                        if let Err(error) = super::assets::resolve_project_assets(client, root, &mut definition, None, false).await {
+                        let verified = match ctx.fresh_client(project.as_ref()) {
+                            Ok(client) => super::assets::resolve_project_assets(&client, root, &mut definition, false).await,
+                            Err(error) => Err(error),
+                        };
+                        if let Err(error) = verified {
                             return envelope(id, &ResolveSpecResponse {
                                 resolved: None, refusal: Some(weft_core::run_spec::Refusal::error(format!("cannot verify trigger assets: {error:#}"))),
                             });
@@ -450,8 +465,8 @@ fn preview_program(
         let root = weft_compiler::build::resolve_weft_root()?;
         Ok(weft_core::project::hash::ProgramIdentity {
             definition_hash: weft_compiler::hash::compute_definition_hash(definition)?,
-            binary_hash: weft_compiler::hash::compute_binary_hash(definition, project, &root, catalog, weft_compiler::codegen::NodeSet::Full)?,
-            implementations: weft_compiler::hash::implementation_hashes(definition, project, &root, catalog, weft_compiler::codegen::NodeSet::Full)?,
+            binary_hash: weft_compiler::hash::compute_binary_hash(definition, project, &root, catalog, weft_core::builds::NodeSet::Full)?,
+            implementations: weft_compiler::hash::implementation_hashes(definition, project, &root, catalog, weft_core::builds::NodeSet::Full)?,
         })
     };
     facts().map_err(|error| format!("cannot verify the buffer's trigger bake: {error:#}"))
@@ -575,6 +590,11 @@ pub async fn validate(ctx: Ctx, file: Option<std::path::PathBuf>) -> Result<()> 
     // shape plus runtime rules like missing credentials); callers that want
     // the structural tier go through the parse-server's mode field.
     let resp = do_validate(&source, project.id(), &anchor, &catalog, file.as_deref(), ValidationMode::Runtime);
+    // The catalog's left-out folders go to stderr either way, as
+    // `weft describe-nodes` does; the JSON on stdout carries them too.
+    for warning in &resp.warnings {
+        eprintln!("warning: {warning}");
+    }
     println!("{}", serde_json::to_string(&resp).context("serialize validate response")?);
     Ok(())
 }
@@ -603,7 +623,7 @@ fn do_validate(
         mode,
         source_id.as_deref(),
     );
-    ValidateResponse { diagnostics }
+    ValidateResponse { diagnostics, warnings: catalog.warnings().to_vec() }
 }
 
 /// For each node type in the project, pull its catalog entry. Hidden
@@ -635,6 +655,29 @@ fn collect_catalog(
 mod tests {
     use super::{file_dir, handle_request, ServerRequest, ServerRequestKind};
     use std::path::Path;
+
+    /// A broken catalog folder is a warning on the answer, never a
+    /// failure of a program that does not name it.
+    #[test]
+    fn validate_lists_the_catalog_folders_left_out_without_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("nodes/broken")).unwrap();
+        std::fs::write(dir.path().join("nodes/broken/metadata.json"), "{ not json").unwrap();
+        let catalog = weft_compiler::build::build_project_catalog(dir.path()).unwrap();
+        let anchor = super::anchor_for(None, Some(dir.path()));
+        let resp = super::do_validate(
+            "",
+            uuid::Uuid::nil(),
+            &anchor,
+            &catalog,
+            None,
+            weft_compiler::validate::ValidationMode::Runtime,
+        );
+        assert!(resp.diagnostics.is_empty(), "{:?}", resp.diagnostics);
+        assert!(resp.warnings.iter().any(|w| w.contains("broken")), "{:?}", resp.warnings);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["warnings"].as_array().map(|w| w.len()), Some(resp.warnings.len()));
+    }
 
     #[test]
     fn runtime_preview_expands_includes_using_the_unsaved_file() {
@@ -681,7 +724,7 @@ mod tests {
             serde_json::from_str(r#"{"id":2,"kind":"validate","source":""}"#).unwrap();
         assert_eq!(req.mode, None);
         // And the handler refuses it before touching any project state.
-        let resp = handle_request(req, &mut Default::default(), &crate::client::DispatcherClient::new("http://unused")).await;
+        let resp = handle_request(req, &mut Default::default(), &crate::commands::Ctx::new(None, None, false).unwrap()).await;
         assert_eq!(
             resp.error.as_deref(),
             Some("validate requires a mode (\"structural\" or \"runtime\")")

@@ -5,22 +5,25 @@
 // a dispatcher on a private address, or on a loopback port another machine
 // cannot see (a Windows browser in front of a WSL install), still works.
 //
-// It forwards only the doors a member's browser uses, and only what that
+// It forwards only the doors a visitor's browser uses, and only what that
 // browser may say there: its own token (`Authorization`, or
-// `Weft-Member-Token` on a live call), the body and its type. The site's
-// cookies stay behind, and so does `Weft-Member`, the header only the
-// site's server may send on the member's behalf.
+// `Weft-Instance-Token` on a live call), the body and its type. The site's
+// cookies stay behind, and so does `Weft-Instance`, the header only the
+// site's server may send to name an instance.
 
 import { trimTrailingSlashes } from '../core/url';
 
 /** The first path segment of each door a page may reach through here: the
- *  member door, a signal's fire / skip / cancel door, the member or api
- *  token's listings (signals, displays, files), the program's own live
- *  routes (`connect/<tenant>/<path>`), which a member calls with their
- *  token, and a field's provider chooser (`access/picker/<state>` and the
- *  `/result` it posts; nothing else under `access` passes).
- *  SYNC: PASSED_DOORS <-> crates/weft-dispatcher/src/api/mod.rs outside_caller_routes, crates/weft-dispatcher/src/api/member_door.rs */
-export const PASSED_DOORS = ['member', 'signal', 'signal-token', 'connect', 'access'] as const;
+ *  instance door, a signal's fire / skip / cancel door, the instance or
+ *  api token's listings (signals, displays, files), the program's own live
+ *  routes (`connect/<tenant>/<path>`), which a browser calls with its
+ *  instance token, a field's provider chooser (`access/picker/<state>` and the
+ *  `/result` it posts; nothing else under `access` passes), and a stored
+ *  file's link (`public/files/<token>`: a route's answer names a picture by
+ *  a link built on the site's address, so the picture comes back through
+ *  here; nothing else under `public` passes).
+ *  SYNC: PASSED_DOORS <-> crates/weft-dispatcher/src/api/mod.rs outside_caller_routes, crates/weft-dispatcher/src/api/instance_door.rs */
+export const PASSED_DOORS = ['instance', 'signal', 'signal-token', 'connect', 'access', 'public'] as const;
 
 /** The door of the program's live routes. The dispatcher answers a call
  *  there with a redirect to the worker serving the run, an address the
@@ -29,9 +32,9 @@ export const PASSED_DOORS = ['member', 'signal', 'signal-token', 'connect', 'acc
 const ROUTE_DOOR = 'connect';
 
 // The request headers that travel on. Anything else (the site's cookies,
-// its own auth, `Weft-Member`) stays on the site.
-// SYNC: 'weft-member-token' <-> src/core/transport.ts MEMBER_TOKEN_HEADER
-const PASSED_REQUEST_HEADERS = ['authorization', 'content-type', 'accept', 'weft-member-token'];
+// its own auth, `Weft-Instance`) stays on the site.
+// SYNC: 'weft-instance-token' <-> src/core/transport.ts INSTANCE_TOKEN_HEADER
+const PASSED_REQUEST_HEADERS = ['authorization', 'content-type', 'accept', 'weft-instance-token'];
 
 // The response headers that travel back: what the body is, how long it may
 // be kept, and where a redirect points (the dispatcher builds that address
@@ -39,7 +42,7 @@ const PASSED_REQUEST_HEADERS = ['authorization', 'content-type', 'accept', 'weft
 const PASSED_RESPONSE_HEADERS = ['content-type', 'content-length', 'cache-control', 'content-disposition', 'location'];
 
 // The headers that tell the dispatcher which address the BROWSER used, so a
-// link it hands back (a member's file chooser page) points at the site, not
+// link it hands back (an instance's file chooser page) points at the site, not
 // at the site server's own view of the dispatcher.
 // SYNC: the forwarded headers <-> crates/weft-core/src/net.rs request_base_url
 const FORWARDED_HOST = 'x-forwarded-host';
@@ -48,7 +51,7 @@ const FORWARDED_PREFIX = 'x-forwarded-prefix';
 
 export interface PassThroughOptions {
 	/** The dispatcher's address as the site's SERVER reaches it (for a local
-	 *  install `http://127.0.0.1:9999`), read on every call, so a function
+	 *  install `http://127.0.0.1:14111`), read on every call, so a function
 	 *  reading the environment is fine. */
 	dispatcher: string | (() => string | undefined);
 	/** Defaults to the global `fetch`. */
@@ -56,7 +59,7 @@ export interface PassThroughOptions {
 }
 
 /** Pass one call on to the dispatcher. `path` is what follows the mount
- *  point (`member/fields` for `/weft/member/fields`), the query string is
+ *  point (`instance/fields` for `/weft/instance/fields`), the query string is
  *  read off `request`. A path outside the weft doors answers 404 without
  *  reaching the dispatcher; a dispatcher that cannot be reached answers
  *  502 naming the address tried. */
@@ -134,6 +137,9 @@ function refusal(segments: string[]): string | null {
 	}
 	if (segments[0] === 'access' && !isPickerDoor(segments)) {
 		return `under /access/ only a chooser page (/access/picker/<state>) and its /result pass, not /${segments.join('/')}`;
+	}
+	if (segments[0] === 'public' && !(segments.length === 3 && segments[1] === 'files')) {
+		return `under /public/ only a file link (/public/files/<token>) passes, not /${segments.join('/')}`;
 	}
 	return null;
 }

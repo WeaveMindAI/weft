@@ -1,22 +1,14 @@
 //! The execution event stream, as the rig reads it.
 //!
-//! `GET /executions/{color}/replay` returns a JSON array of the dispatcher's
-//! `DispatcherEvent` (a `{ "kind": "...", ... }` tagged union; see
-//! `crates/weft-dispatcher/src/events.rs`). The rig does NOT re-declare that
-//! 35-variant enum: doing so would fork the concept and create a large SYNC
-//! surface that rots every time a variant changes. Instead an [`Event`] is a
-//! thin typed accessor over the raw tagged JSON: it exposes `kind()` and reads
-//! the handful of fields the assertions need BY NAME. A field the server
-//! renames surfaces as a loud assertion failure carrying the real JSON, which
-//! is the honest Layer-4 contract (the rig tests the wire shape, it does not
-//! get to assume it).
-//!
-//! SYNC (loose, by string tag + field name, not by type):
-//! `kind` values and field names here mirror
-//! `crates/weft-dispatcher/src/events.rs::DispatcherEvent`
-//! (`#[serde(tag = "kind", rename_all = "snake_case")]`). The node identifier
-//! field is `node` there (NOT `node_id`); execution outputs are on
-//! `execution_completed.outputs`; per-node values on `node_completed.output`.
+//! `GET /executions/{execution_id}/replay` returns a JSON array of
+//! `weft_core::live_event::LiveEvent` (a `{ "kind": "...", ... }` tagged
+//! union). The fetch decodes every row as that type first, so a shape the
+//! dispatcher and weft-core disagree on fails there. An [`Event`] is then a
+//! thin accessor over the row's JSON: it exposes `kind()` and reads the
+//! handful of fields the assertions need by name (the node is `node`, NOT
+//! `node_id`; execution outputs are on `execution_completed.outputs`;
+//! per-node values on `node_completed.output`), and a failed read carries
+//! the real JSON.
 
 use serde_json::Value;
 
@@ -42,7 +34,7 @@ impl Event {
         self.0.get(name)
     }
 
-    /// The `node` field (DispatcherEvent's node identifier on node_* events).
+    /// The `node` field (LiveEvent's node identifier on node_* events).
     pub fn node(&self) -> Option<&str> {
         self.str_field("node")
     }
@@ -83,7 +75,7 @@ pub struct Replay {
 }
 
 impl Replay {
-    /// Parse the JSON array returned by `/executions/{color}/replay`.
+    /// Parse the JSON array returned by `/executions/{execution_id}/replay`.
     pub fn from_array(raw: Vec<Value>) -> Self {
         Self {
             events: raw.into_iter().map(Event).collect(),
@@ -106,17 +98,24 @@ impl Replay {
         self.events.iter().filter(move |e| e.is_node(node))
     }
 
+    /// True once the run has ended: some event is an execution's ending,
+    /// by the one rule weft-core keeps (`DispatcherEvent::is_execution_terminal`).
+    /// A row that does not decode as a `LiveEvent` is an error, never "not
+    /// ended": a changed replay shape must fail by name, not time out.
+    pub fn has_terminal(&self) -> anyhow::Result<bool> {
+        for e in &self.events {
+            let live: weft_core::live_event::LiveEvent = serde_json::from_value(e.0.clone())
+                .map_err(|err| anyhow::anyhow!("a replay row does not decode as a LiveEvent ({err}): {}", e.0))?;
+            if live.event.is_execution_terminal() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// True if any event has a kind in `kinds`.
     pub fn has_any_kind(&self, kinds: &[&str]) -> bool {
         self.events.iter().any(|e| kinds.contains(&e.kind()))
     }
 }
 
-/// The terminal-event kinds. An execution is settled once exactly one of these
-/// appears (the journal writes exactly one, guarded). SYNC with the
-/// `execution_*` variants of DispatcherEvent.
-pub const TERMINAL_KINDS: [&str; 3] = [
-    "execution_completed",
-    "execution_failed",
-    "execution_cancelled",
-];

@@ -66,7 +66,11 @@ which is what downstream reads.
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `isTrigger` | Boolean | `false` | This node starts executions from outside instead of running inside one |
+| `isTrigger` | Boolean | `false` | This node starts executions from outside instead of running inside one. Weft gives it `callsPerMinute` and `callsAtOnce`, and unless it is a `liveConnection` trigger a `longRuns` input, so do not declare those |
+| `liveConnection` | `"http"` or `"websocket"` | none | On a trigger whose run answers a caller holding the connection open: `"http"` for a request waiting on its response (a route), `"websocket"` for a socket. It also gets `callsPerMinutePerCaller`, and does not get `longRuns` |
+| `answersCaller` | `"whole"`, `"stream"` or `"end"` | none | This node answers its run's live caller. `"whole"`: the response in one go (a Reply). `"stream"`: the response head, then the body piece by piece (a Stream). `"end"`: the end of the exchange (a Close). Set it on your own node too if it answers through the ctx, so a route's "never answers its caller" warning counts it |
+| `calledFromOutside` | Boolean | `false` | On a trigger somebody outside calls whose call ends there (a form somebody submits). It also gets `callsPerMinutePerCaller`. A `liveConnection` trigger is called from outside already, so it never sets this; a trigger that picks its events up itself (a schedule, a feed, a provider's push) has no caller and does not either |
+| `catchErrors` | Boolean | `false` | Set it when the node reaches outside and a program may want to handle its failures. Weft gives it an `error` output, and when that output is wired the failure's message goes there; unwired, the failure stops the run. The node needs no error handling of its own. Declaring its own `error` output is refused when the node loads. For the details, go and read [letting the program handle a failure](values-and-emission.md#letting-the-program-handle-a-failure) |
 | `oneOfRequired` | List[List[String]] | `[]` | Each inner list is a group where at least one port must arrive, or the node skips |
 | `canAddInputPorts` | Boolean | `false` | Source may declare extra inputs on it |
 | `canAddOutputPorts` | Boolean | `false` | Source may declare extra outputs |
@@ -99,8 +103,8 @@ Every widget, by its `kind`:
 | `number` | `min`, `max`, `step` | A number box. `min` and `max` are real rules the runtime enforces, and a whole-number `step` means the input takes whole numbers |
 | `checkbox` | | A tick box. The default for `Boolean` |
 | `datetime` | | A date and time picker, stored as ISO 8601 |
-| `select` | `options` | A dropdown. `options` cannot be empty |
-| `multiselect` | `options` | Multiple choice over a `List[String]` |
+| `select` | `options`, `free_text` | A dropdown. `options` cannot be empty, and they are a real rule: a written, wired or instance-provided value outside them is refused, and so is a default. If the list is only suggestions (model ids, voices, anything the provider adds to), set `"free_text": true`: the editor still offers the list, lets the user type anything else, and nothing is refused |
+| `multiselect` | `options`, `free_text` | Multiple choice over a `List[String]`, each item held to `options` the same way, unless `free_text` is set |
 | `text_list` | | Short strings added one at a time. The default for `List[String]` |
 | `password` | | A masked box |
 | `file_drop` | `accept`, `type`, `multiple` | A file picker that writes an `@asset(...)` reference |
@@ -130,7 +134,7 @@ the array), `label`, `value`, optional `page` (`cursor_param` and
 Each rule is `{ "when": <condition>, "then": <diagnostic> }`.
 
 The diagnostic takes `message` (with `{id}`, `{port}`, `{field}` and
-`{custom_outputs}` filled in), `level` (`structural`, the default, or
+`{custom_outputs}` filled in, plus the three the conditions below name), `level` (`structural`, the default, or
 `runtime`), `severity` (`error` by default, or `warning`, `info`, `hint`), and
 optionally `port` or `field` to say what the finding is about.
 
@@ -152,9 +156,39 @@ The conditions are a closed list:
 | `config_in_set` | `field`, `values` | Is its string one of these |
 | `config_matches` | `field`, `regex` | Does its string match. False if absent, not a string, or the regex is broken |
 | `custom_outputs_declared` | | Did the source add outputs beyond the metadata's own |
-| `run_reaches` | `direction`, `types` | Does this node's run contain one of these types, upstream or downstream |
+| `run_reaches` | `direction`, `with` | Does this node's run hold a node `with` a feature. `downstream`: every run this node starts holds one. `upstream`: this node is in the run of one |
+| `downstream_of` | `with` | Is a node `with` a feature wired upstream of this one, so it runs first. `{with}` in the message names those nodes |
+| `per_instance` | | Does this node exist once per instance: marked `@per_instance`, with an `@instance_filled` field, or reading one of those (a group that receives a per-instance value on any port counts for everything reading its ports). `{per_instance_reason}` in the message says why, path included: "it reads 'blender'", or "it sits inside group 'work', which receives 'blender'" |
+| `input_names` | `port`, `names` | Is every name written on this input something of this program. The names are the String, each String of a list, or each key of an object. `names` says what they name: `{"node": {}}` is a node spelled the way the program writes it (`bridge`, `one.bridge`), narrowed with `role` (`infra` or `trigger`) and `per_instance` (`true` or `false`); `{"field": {}}` is a node's field written `node.field` (`send.model`), narrowed with `instance_filled` (`true` or `false`). Nothing written is fine; a wired name is only known at run time, so it is not checked. `{names}` in the message lists the ones that fail |
 | `all` / `any` | `of` | Every one, or at least one |
 | `not` | `of` | The opposite |
+
+`with` picks nodes by one feature they declare, never by type, so your own
+node counts the same as a catalog one: `{"answersCaller": true}` is any node
+that answers its caller, `{"answersCaller": ["stream"]}` only a Stream-like
+one, `{"liveConnection": ["http"]}` a trigger with an HTTP caller.
+
+Two examples from the catalog. A route warns when nothing in its run answers
+its caller, and refuses to become per instance, since its public address is
+one for everybody:
+
+```json
+{ "when": { "kind": "not", "of": { "kind": "run_reaches", "direction": "downstream", "with": { "answersCaller": true } } },
+  "then": { "message": "Route '{id}' starts a run that never answers its caller...", "severity": "warning" } }
+{ "when": { "kind": "per_instance" },
+  "then": { "message": "Route '{id}' would exist once per instance, because {per_instance_reason}..." } }
+```
+
+A node that starts an instance's copy of an infra node refuses a name that is
+no such node, and `SetInstanceValues` refuses a key that is no field an
+instance fills:
+
+```json
+{ "when": { "kind": "not", "of": { "kind": "input_names", "port": "node", "names": { "node": { "role": "infra", "per_instance": true } } } },
+  "then": { "message": "StartInstanceInfra '{id}' names {names} in `node`...", "port": "node" } }
+{ "when": { "kind": "not", "of": { "kind": "input_names", "port": "values", "names": { "field": { "instance_filled": true } } } },
+  "then": { "message": "SetInstanceValues '{id}' gives {names} in `values`...", "port": "values" } }
+```
 
 ## portsFromConfig
 
@@ -206,7 +240,7 @@ level and nested.
 
 `pathField` names the config field holding the route pattern, and the optional
 `methodField` names the one holding the HTTP method. Leave the method out, or
-leave it empty on the instance, and the node claims every method.
+leave it empty on the node in your program, and the node claims every method.
 
 ## accessApps
 

@@ -6,7 +6,7 @@ Run the live tier of a node's self-tests, with the user's informed consent. The 
 
 Walk it in this order:
 
-1. **Say what it costs.** One live test is one short-lived pod in the cluster making a real call on the named service, on the user's own credential or their credits. Get a plain "yes" before anything else.
+1. **Say what it costs.** One live test is one short-lived test server on the user's install making a real call on the named service, on the user's own credential or their credits. Get a plain "yes" before anything else.
 2. **Find what the tests need.** Read the node's `tests.rs` (`nodes/<snake_name>/tests.rs`, the folder whose `metadata.json` declares that type, or the package's members) for the `NodeTest::live` entries: the service each names, the credential fields, and any fixtures the test cannot self-provision (a chat id to message, a file to touch).
 3. **Check the ground.** `weft daemon status`; start it with the user if it is down. The live tier also needs the project registered with the dispatcher: if the run refuses with an unknown-project error, register with an ordinary `weft run` (registration is part of it) or follow the error's own hint.
 4. **Set up the credential, never through the chat.** Two ways, the user picks:

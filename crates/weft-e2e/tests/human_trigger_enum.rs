@@ -18,7 +18,7 @@ async fn human_trigger_entry_form_enumerates_and_fires() -> anyhow::Result<()> {
 
     // Activate: the HumanTrigger registers its entry form signal.
     project.activate().await?;
-    let before = run::execution_colors(&disp, &pid).await?;
+    let before = run::executions(&disp, &pid).await?;
 
     // The entry form appears in the signal-token enumeration, tagged as a
     // trigger (isResume=false), NOT a resume task.
@@ -39,8 +39,8 @@ async fn human_trigger_entry_form_enumerates_and_fires() -> anyhow::Result<()> {
 
     // Firing the entry form (POST /signal/{token}) starts a fresh execution.
     human::answer_form(&disp, &form, &json!({ "go": "approve" })).await?;
-    let color = run::wait_for_triggered_execution(&disp, &pid, &before, Duration::from_secs(60)).await?;
-    let settled = SettledRun::observe(&disp, color).await?;
+    let execution_id = run::wait_for_triggered_execution(&disp, &pid, &before, Duration::from_secs(60)).await?;
+    let settled = SettledRun::observe(&disp, execution_id).await?;
     settled.completed()?;
     // approve_reject 'go' -> go_approved = true reaches Debug.
     settled.assert_input("out", "data", &json!(true))?;

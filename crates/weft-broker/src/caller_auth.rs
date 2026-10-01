@@ -93,7 +93,7 @@ pub async fn verify_caller(
         .parse()
         .map_err(|_| CallerRefusal::Failed(anyhow::anyhow!("malformed connection id '{}'", req.access_id)))?;
     let verifier =
-        weft_access_store::caller_verifier(pool, &req.tenant, weft_access_store::GrantUser::of(req.for_member.as_ref()), access_id, &req.service)
+        weft_access_store::caller_verifier(pool, &req.tenant, weft_access_store::GrantUser::of(req.for_instance.as_ref()), access_id, &req.service)
             .await
             .map_err(|e| match e.downcast_ref::<weft_access_store::AccessError>() {
                 // A connection that is not there (or another tenant's,

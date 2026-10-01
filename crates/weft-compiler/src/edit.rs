@@ -40,11 +40,11 @@ pub enum EditOp {
     RemoveConfig { node: String, key: String, #[serde(default, skip_serializing_if = "Option::is_none")] form: Option<ValueForm> },
     /// Set or clear a node's label.
     SetLabel { node: String, label: Option<String> },
-    /// Add (`per_member: true`) or remove the node's `@per_member` line:
-    /// the node then exists once per member of the program. The editor
+    /// Add (`per_instance: true`) or remove the node's `@per_instance` line:
+    /// the node then exists once per instance of the program. The editor
     /// offers it only on a node that may carry it (an infra node); the
     /// compiler refuses it anywhere else.
-    SetPerMember { node: String, per_member: bool },
+    SetPerInstance { node: String, per_instance: bool },
     /// Add a bare node `id = Type {}` at the end of the scope (top level when
     /// `parent_group` is None).
     AddNode { id: String, node_type: String, parent_group: Option<String> },
@@ -181,6 +181,12 @@ pub enum EditError {
     InvalidArgument(String),
     #[error("source does not parse: {0}")]
     Unparseable(String),
+    /// A replayed `TextEdit` (graph undo/redo) found different bytes at its
+    /// range than the graph wrote there: the text changed since that graph
+    /// edit, so replaying it would overwrite somebody's text edit.
+    // SYNC: stale-text-edit message <-> packages/weft-graph/src/webview/lib/projection/engine.svelte.ts TEXT_CHANGED_UNDO_MESSAGE
+    #[error("the text changed after these graph edits, so undo and redo from the graph can no longer replay them; use the text editor's undo instead")]
+    StaleTextEdit,
 }
 
 /// A minimal text edit: replace the byte range `[start, end)` of the source
@@ -193,12 +199,18 @@ pub enum EditError {
 /// Byte offsets (not line/col) so empty-replacement and trailing-newline
 /// boundaries are unambiguous. Offsets land on char boundaries (the diff trims
 /// on `char_indices`).
+///
+/// `expected` is the exact text currently at `[start, end)` in the source the
+/// edit was computed against. Applying refuses when the bytes there differ, so
+/// a stale edit (the text changed since) can never overwrite a text edit.
+// SYNC: TextEdit <-> packages/weft-graph/src/protocol.ts TextEdit
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TextEdit {
     pub start: usize,
     pub end: usize,
     pub text: String,
+    pub expected: String,
 }
 
 /// Apply an ordered batch of edits atomically, returning the new source AND the
@@ -279,6 +291,7 @@ pub fn invert_text_edit(old: &str, new: &str) -> TextEdit {
         start: prefix,
         end: new.len() - suffix,
         text: old[prefix..old.len() - suffix].to_string(),
+        expected: new[prefix..new.len() - suffix].to_string(),
     }
 }
 
@@ -286,7 +299,9 @@ pub fn invert_text_edit(old: &str, new: &str) -> TextEdit {
 /// replacing the byte range `[start, end)` with `text`. Total: host-supplied
 /// offsets are untrusted (a buffer may have drifted), so it validates them and
 /// fails LOUDLY rather than slicing blind (a bad offset would panic `&str`
-/// indexing and take the parse-server down).
+/// indexing and take the parse-server down). It also refuses when the bytes at
+/// the range are not `edit.expected`: the text changed since the edit was
+/// computed, and weft never overwrites a text edit.
 pub fn apply_text_edit(source: &str, edit: &TextEdit) -> Result<String, EditError> {
     let bad = |why: &str| EditError::InvalidArgument(format!("text edit {}..{} {}", edit.start, edit.end, why));
     if edit.start > edit.end {
@@ -297,6 +312,9 @@ pub fn apply_text_edit(source: &str, edit: &TextEdit) -> Result<String, EditErro
     }
     if !source.is_char_boundary(edit.start) || !source.is_char_boundary(edit.end) {
         return Err(bad("does not land on a char boundary"));
+    }
+    if source[edit.start..edit.end] != edit.expected {
+        return Err(EditError::StaleTextEdit);
     }
     Ok(format!("{}{}{}", &source[..edit.start], edit.text, &source[edit.end..]))
 }

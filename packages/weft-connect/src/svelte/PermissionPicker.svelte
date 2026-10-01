@@ -18,7 +18,7 @@
 		/// is a curated subset; renders the add-your-own hint below.
 		allPermissionsUrl?: string | null;
 		/// The access node type whose metadata a missing permission is
-		/// added to (named in the hint). Absent on a member's page, where
+		/// added to (named in the hint). Absent on an instance's page, where
 		/// nobody edits the program.
 		nodeType?: string | null;
 		openExternal: (url: string) => void;

@@ -1,0 +1,30 @@
+{
+  "type": "FileToText",
+  "label": "File to Text",
+  "description": "Read a stored text file and emit its content as a String. For a file whose content a node needs as text (a document someone uploaded, a file TextToFile made). A file that is not text (an image, audio, video, or bytes that are not UTF-8) is refused, naming what it is. The text travels on a wire, so a file over 100 KB of text fails there: keep large text in the file and hand the file on instead.",
+  "tags": [
+    "storage",
+    "text",
+    "file",
+    "convert",
+    "read"
+  ],
+  "icon": "FileText",
+  "color": "#8b5cf6",
+  "inputs": [
+    {
+      "name": "file",
+      "type": "File",
+      "required": true,
+      "description": "The stored text file to read."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "text",
+      "type": "String",
+      "description": "The file's content."
+    }
+  ],
+  "requires_infra": false
+}

@@ -6,7 +6,7 @@
 use base64::Engine as _;
 use serde_json::Value;
 
-use weft::{node_bail, WeftResult};
+use weft::WeftResult;
 
 pub const API: &str = "https://gmail.googleapis.com/gmail/v1/users/me";
 
@@ -58,7 +58,9 @@ pub fn build_mime(
         v.replace(['\r', '\n'], " ")
     }
     if text.is_none() && html.is_none() {
-        node_bail!("nothing to send: provide text, html, or both");
+        return Err(weft::WeftError::Input(
+            "nothing to send: provide text, html, or both".to_string(),
+        ));
     }
     let mut head = String::new();
     if !to.is_empty() {

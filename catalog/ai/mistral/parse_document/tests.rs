@@ -15,7 +15,8 @@ const TINY_PDF: &[u8] = include_bytes!("fixture.pdf");
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("uploads_signs_and_emits_the_pages_markdown", ocr_dance),
-        NodeTest::fake("a_refused_upload_fails_loud", refused_upload),
+        NodeTest::fake("a_refused_upload_fails_the_run_when_error_is_unwired", refused_upload),
+        NodeTest::fake("a_refused_upload_comes_out_on_error_when_it_is_wired", refused_upload_wired),
         NodeTest::live("one_real_page_ocr", "mistral", live_ocr),
     ]
 }
@@ -67,6 +68,25 @@ async fn refused_upload(rig: FakeRig) -> WeftResult<()> {
         .await;
     let err = outcome.result.expect_err("a 401 must refuse").to_string();
     assert!(err.contains("bad key"), "{err}");
+    Ok(())
+}
+
+async fn refused_upload_wired(rig: FakeRig) -> WeftResult<()> {
+    rig.respond_status("POST", "/v1/files", 401, json!({ "detail": "bad key" }));
+    rig.wire_output("error");
+    let file = rig.store_file("doc.pdf", "application/pdf", TINY_PDF.to_vec());
+    let outcome = rig
+        .run(
+            &MistralParseDocumentNode,
+            json!({ "account": rig.access("mistral"), "file": file }),
+        )
+        .await
+        .ok()?;
+    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    assert!(error.contains("bad key"), "{error}");
+    for port in ["markdown", "pages", "pageCount"] {
+        assert!(!outcome.outputs.contains_key(port), "a caught failure emits nothing on {port}");
+    }
     Ok(())
 }
 

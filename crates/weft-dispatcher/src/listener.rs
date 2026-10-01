@@ -1,1561 +1,175 @@
-//! Pooled listener placement. A listener is a long-lived, TRUSTED,
-//! tenant-agnostic processor: each pod holds signals belonging to MANY
-//! tenants (placement is per-signal, not per-tenant). The dispatcher
-//! places each signal on a non-saturated listener pod (or spawns one),
-//! records the holder in `signal.listener_pod`, and resolves a fire by
-//! looking that holder up.
+//! The dispatcher's client for the listener role.
 //!
-//! ## State (all in Postgres; pod-local RAM is only optimization)
+//! The listener is one logical service: a module of the machine's process,
+//! or a service of its own that scales to zero. It holds signals and runs
+//! the kind-specific logic of every fire. The durable `signal` table is the
+//! truth about which signals exist; the listener rebuilds what it needs
+//! from it (every held signal at boot, a single one on first use), so the
+//! dispatcher never tracks WHERE a signal is held: it registers a signal
+//! when one is born, tells the listener to forget one when it goes, and
+//! asks it to process a fire, all at the one address.
 //!
-//! - `listener_pod(pod_name PK, admin_url, namespace, owner_pod_id,
-//!   leased_until_unix)`: the registry of live listener pods, keyed
-//!   by POD. `owner_pod_id` + `leased_until_unix` say which dispatcher
-//!   pod is authoritative for this listener's lifecycle; a sibling
-//!   dispatcher adopts an expired lease.
-//! - `signal.listener_pod`: which listener holds each signal's live
-//!   registry entry. NULL = not placed yet, or the holder died and it
-//!   awaits re-placement.
-//!
-//! ## Placement (load-based, Branch 2)
-//!
-//! `place_signal` reads each live pod's `GET /load`, picks the
-//! least-loaded NON-saturated pod, and registers the signal there
-//! (setting `signal.listener_pod`). If every pod is saturated (or none
-//! exist), it spawns a fresh pod and places there. A pod that reports
-//! `saturated` also 503s `/register`, so a placement race against a
-//! stale load read fails loudly instead of overloading the pod, and
-//! the caller retries placement.
-//!
-//! ## Resolution + reap
-//!
-//! Fire / display / action resolve `token -> signal.listener_pod ->
-//! admin_url`. The reaper reaps a listener pod that holds ZERO signals.
-//! A pod holding live held-connection loops is never reaped under load;
-//! its signals are re-placed elsewhere first on an intentional
-//! scale-down.
+//! Every call carries the dispatcher's platform identity: the listener's
+//! endpoints answer weft's own roles only.
 
-use std::path::PathBuf;
-use std::process::Stdio;
-use std::sync::Arc;
-
-use anyhow::{Context, Result};
-use async_trait::async_trait;
-use dashmap::DashMap;
+use anyhow::Result;
 use serde_json::Value;
-use sqlx::postgres::PgPool;
-use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
-use uuid::Uuid;
-use weft_core::primitive::SignalSpec;
 
-/// Handle to a running listener. Just the URL: there is no bearer
-/// auth between dispatcher and listener. The trust boundary is the
-/// network (NetworkPolicy in k8s, loopback-only listen address in
-/// subprocess dev), not a shared secret.
-#[derive(Debug, Clone)]
-pub struct ListenerHandle {
-    pub admin_url: String,
-}
+use crate::role_client::RoleClient;
 
-/// A live listener pod: its name (placement key) + admin URL.
-#[derive(Debug, Clone)]
-pub struct ListenerPod {
-    pub pod_name: String,
-    pub admin_url: String,
-}
-
-impl ListenerPod {
-    fn handle(&self) -> ListenerHandle {
-        ListenerHandle {
-            admin_url: self.admin_url.clone(),
-        }
-    }
-}
-
-#[async_trait]
-pub trait ListenerBackend: Send + Sync {
-    /// Spawn a fresh listener pod named `pod_name` in `namespace`.
-    /// The pod is tenant-agnostic; its identity is its own name.
-    async fn spawn(&self, pod_name: &str, namespace: &str) -> Result<ListenerHandle>;
-    async fn stop(&self, pod_name: &str, namespace: &str) -> Result<()>;
-}
-
-// =============================================================
-// Backends
-// =============================================================
-
-/// Local-development backend: forks the `weft-listener` binary as a
-/// child process. Pre-allocates an ephemeral port so the dispatcher
-/// knows the URL before exec.
-pub struct SubprocessListenerBackend {
-    binary_path: PathBuf,
-    children: Arc<DashMap<String, Arc<Mutex<Child>>>>,
-}
-
-impl SubprocessListenerBackend {
-    pub fn new(binary_path: PathBuf) -> Self {
-        Self {
-            binary_path,
-            children: Arc::new(DashMap::new()),
-        }
-    }
-}
-
-#[async_trait]
-impl ListenerBackend for SubprocessListenerBackend {
-    async fn spawn(&self, pod_name: &str, _namespace: &str) -> Result<ListenerHandle> {
-        let port = pick_free_port()?;
-        // Listener binds to `127.0.0.1` only: that's the auth boundary
-        // in subprocess dev. Anyone with shell on the dev machine
-        // already has dispatcher-equivalent access.
-        let admin_url = format!("http://127.0.0.1:{port}");
-        let broker_url = std::env::var("WEFT_BROKER_URL")
-            .context("WEFT_BROKER_URL must be set for subprocess listener")?;
-        let token_path = std::env::var("WEFT_BROKER_TOKEN_PATH")
-            .context("WEFT_BROKER_TOKEN_PATH must be set for subprocess listener (point at a file with a valid SA token)")?;
-
-        let mut cmd = Command::new(&self.binary_path);
-        cmd.env("WEFT_POD_NAME", pod_name)
-            .env("WEFT_LISTENER_PORT", port.to_string())
-            .env("WEFT_BROKER_URL", broker_url)
-            .env("WEFT_BROKER_TOKEN_PATH", token_path)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
-        let child = cmd
-            .spawn()
-            .with_context(|| format!("spawn listener pod {pod_name}"))?;
-        self.children
-            .insert(pod_name.to_string(), Arc::new(Mutex::new(child)));
-
-        wait_for_health(&admin_url).await?;
-        Ok(ListenerHandle { admin_url })
-    }
-
-    async fn stop(&self, pod_name: &str, _namespace: &str) -> Result<()> {
-        if let Some((_, child)) = self.children.remove(pod_name) {
-            let mut c = child.lock().await;
-            // `kill` failing means the child is already dead or the
-            // OS refused; either way the subprocess is no longer
-            // ours to manage. Log so a stuck process doesn't go
-            // silent.
-            if let Err(e) = c.kill().await {
-                tracing::warn!(
-                    target: "weft_dispatcher::listener",
-                    pod = pod_name,
-                    error = %e,
-                    "child kill failed (likely already exited)"
-                );
-            }
-        }
-        Ok(())
-    }
-}
-
-/// k8s backend: applies a Deployment + Service in the pooled-tier
-/// namespace and resolves the admin URL via cluster DNS. Listener has
-/// no public surface; only the dispatcher reaches it.
-pub struct K8sListenerBackend {
-    listener_image: String,
-    broker_url: String,
-    kube: Arc<dyn weft_platform_traits::KubeClient>,
-}
-
-impl K8sListenerBackend {
-    pub fn new(
-        listener_image: String,
-        broker_url: String,
-        kube: Arc<dyn weft_platform_traits::KubeClient>,
-    ) -> Self {
-        Self {
-            listener_image,
-            broker_url,
-            kube,
-        }
-    }
-}
-
-#[async_trait]
-impl ListenerBackend for K8sListenerBackend {
-    async fn spawn(&self, pod_name: &str, namespace: &str) -> Result<ListenerHandle> {
-        let admin_url = format!("http://{pod_name}.{namespace}.svc.cluster.local:8080");
-        let manifest =
-            render_listener_manifest(pod_name, namespace, &self.listener_image, &self.broker_url);
-        self.kube.apply_yaml(&manifest).await?;
-        self.kube
-            .wait_rollout_status(namespace, pod_name, 120)
-            .await?;
-        wait_for_health(&admin_url).await?;
-        Ok(ListenerHandle { admin_url })
-    }
-
-    async fn stop(&self, pod_name: &str, namespace: &str) -> Result<()> {
-        // Service first (instant delete), then Deployment with
-        // foreground cascade so ReplicaSet + Pods finish terminating
-        // before we return; eliminates the "old Pod still holds the
-        // Service Endpoint" race when a fresh spawn lands milliseconds
-        // later. Routes through the shared `KubeClient` trait so the
-        // reaper's `backend.stop failed during reap` branch can
-        // actually observe failures (and tests can fake them).
-        self.kube
-            .delete_named(
-                namespace,
-                weft_platform_traits::kube::NamedKind::Service,
-                pod_name,
-                weft_platform_traits::DeleteOpts::wait(),
-            )
-            .await?;
-        self.kube
-            .delete_named(
-                namespace,
-                weft_platform_traits::kube::NamedKind::Deployment,
-                pod_name,
-                weft_platform_traits::DeleteOpts::wait_cascade(),
-            )
-            .await?;
-        Ok(())
-    }
-}
-
-/// Mint a fresh listener pod name. Pooled listeners are not tied to a
-/// tenant, so the name is just a unique k8s-safe id.
-fn mint_pod_name() -> String {
-    format!("listener-{}", Uuid::new_v4().simple())
-}
-
-fn render_listener_manifest(name: &str, namespace: &str, image: &str, broker_url: &str) -> String {
-    // The pod-level isolation comes from the `pooled-listener`
-    // NetworkPolicy in the control-plane namespace (in
-    // deploy/k8s/system-namespace.yaml; selects `weft.dev/role=listener`
-    // there). Here we only render the Deployment + Service.
-    // SYNC: the weft.dev/role value <->
-    //       crates/weft-cli/src/commands/daemon.rs (POOLED_TIERS, which
-    //       re-points these Deployments at a new image by this label),
-    //       crates/weft-dispatcher/src/supervisor_pool.rs (the sibling
-    //       pooled manifest's weft.dev/role),
-    //       deploy/k8s/system-namespace.yaml (the pooled-listener
-    //       NetworkPolicy podSelector)
-    //
-    // Auth: the broker validates the projected SA token mounted at
-    // /var/run/weft/sa/token. The audience claim is `weft-broker`.
-    // The pod runs as `weft-listener-sa`, which the broker maps to the
-    // Listener role (a TRUSTED control-plane role: a pooled listener
-    // may fire held events for any tenant, validated per-fire against
-    // the signal's real tenant). `WEFT_POD_NAME` (the literal Deployment
-    // name, injected as a plain env value below, NOT a downward-API
-    // fieldRef, see the env block) is the placement key: the pod
-    // rehydrates `signal WHERE listener_pod = this name` on restart.
-    format!(
-        r#"apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: {name}
-  namespace: {namespace}
-  labels:
-    app: {name}
-    weft.dev/role: listener
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: {name}
-  template:
-    metadata:
-      labels:
-        app: {name}
-        weft.dev/role: listener
-    spec:
-      serviceAccountName: weft-listener-sa
-      automountServiceAccountToken: false
-      {dns_config}
-      containers:
-        - name: listener
-          image: {image}
-          imagePullPolicy: IfNotPresent
-          ports:
-            - containerPort: 8080
-          env:
-            # The listener's placement identity. This MUST be the
-            # Deployment name (`{name}`), the same string the dispatcher
-            # mints, writes to `signal.listener_pod`, and uses as the
-            # Service DNS host. We deliberately do NOT use
-            # `fieldRef: metadata.name` here: that resolves to the
-            # auto-generated POD name (`{name}-<rs-hash>-<rand>`), which
-            # placement never writes, so a restarted listener would
-            # rehydrate `WHERE listener_pod = <pod-name>` and find ZERO
-            # signals, silently dropping every Timer/SSE it held. The
-            # literal Deployment name keeps placement, resolution, and
-            # rehydrate on one consistent key.
-            - name: WEFT_POD_NAME
-              value: "{name}"
-            - name: WEFT_LISTENER_PORT
-              value: "8080"
-            - name: WEFT_BROKER_URL
-              value: "{broker_url}"
-            - name: WEFT_BROKER_TOKEN_PATH
-              value: "/var/run/weft/sa/token"
-            # This install's pace, shared by every process in it.
-            - name: {time_scale_env}
-              value: "{time_scale}"
-          volumeMounts:
-            - name: weft-sa-token
-              mountPath: /var/run/weft/sa
-              readOnly: true
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: 8080
-            initialDelaySeconds: 1
-            periodSeconds: 2
-      volumes:
-        - name: weft-sa-token
-          projected:
-            sources:
-              - serviceAccountToken:
-                  audience: weft-broker
-                  expirationSeconds: 3600
-                  path: token
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: {name}
-  namespace: {namespace}
-spec:
-  selector:
-    app: {name}
-  ports:
-    - port: 8080
-      targetPort: 8080
-"#,
-        time_scale_env = weft_core::time_scale::TIME_SCALE_ENV,
-        dns_config = weft_core::pod_dns::pod_dns_config_yaml(),
-        time_scale = weft_core::time_scale::factor(),
-    )
-}
-
-fn pick_free_port() -> Result<u16> {
-    let s = std::net::TcpListener::bind("127.0.0.1:0").context("bind ephemeral port")?;
-    let port = s.local_addr()?.port();
-    drop(s);
-    Ok(port)
-}
-
-/// The one HTTP client this module talks to listener Pods with: one
-/// connection pool for the process, so a door that is polled (a
-/// trigger's display, every few seconds per open graph) reuses its
-/// connections rather than opening a fresh pool per call. Admin URLs
-/// are inside the cluster and answer in place, so no redirect is
-/// followed, the same policy as the dispatcher's client for containers.
-fn admin_http() -> &'static reqwest::Client {
-    static CLIENT: std::sync::LazyLock<reqwest::Client> = std::sync::LazyLock::new(|| {
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("a default reqwest client builds")
-    });
-    &CLIENT
-}
-
-async fn wait_for_health(admin_url: &str) -> Result<()> {
-    let health = format!("{}/health", admin_url.trim_end_matches('/'));
-    for _ in 0..50 {
-        if admin_http().get(&health).send().await.is_ok() {
-            return Ok(());
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    anyhow::bail!("listener at {admin_url} did not become healthy in time")
-}
-
-// =============================================================
-// Listener admin client (HTTP helpers)
-// =============================================================
-
-/// Bail with `<route> returned <status>: <body>` if the response
-/// wasn't 2xx; otherwise pass it through. The body decode in the
-/// error path surfaces decode failures via
-/// `unwrap_or_else(|e| format!("<body read failed: {e}>"))` so a
-/// truncated TLS / network reset mid-response shows up in the
-/// error message instead of an empty body.
-async fn bail_unless_ok(resp: reqwest::Response, route: &str) -> Result<reqwest::Response> {
-    if resp.status().is_success() {
-        return Ok(resp);
-    }
-    let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .unwrap_or_else(|e| format!("<body read failed: {e}>"));
-    anyhow::bail!("listener {route} returned {status}: {body}")
-}
-
-pub async fn register_signal(
-    handle: &ListenerHandle,
-    token: &str,
-    tenant_id: &str,
-    for_member: Option<&weft_core::member::MemberScope>,
-    spec: &SignalSpec,
-    node_id: &str,
-    is_resume: bool,
-    color: Option<&str>,
-    placement_generation: i64,
-    source: weft_core::signal::listener_protocol::RegisterSource,
-) -> Result<(weft_core::primitive::SignalRouting, Value)> {
-    let client = admin_http();
-    let url = format!("{}/register", handle.admin_url.trim_end_matches('/'));
-    // Use the typed wire struct so a new required field (e.g. tenant_id)
-    // is a compile error here, not a runtime deserialize failure on the
-    // listener.
-    let req = weft_core::signal::listener_protocol::RegisterRequest {
-        token: token.to_string(),
-        tenant_id: tenant_id.to_string(),
-        for_member: for_member.cloned(),
-        spec: spec.clone(),
-        node_id: node_id.to_string(),
-        is_resume,
-        color: color.map(str::to_string),
-        placement_generation,
-        source,
-    };
-    let resp = client.post(&url).json(&req).send().await?;
-    let resp = bail_unless_ok(resp, "/register").await?;
-    let body: weft_core::signal::listener_protocol::RegisterResponse = resp.json().await?;
-    Ok((body.routing, body.kind_state))
-}
-
-/// What the trigger's kind is showing, off the Pod holding its signal,
-/// or `None` when the pod answers that it does not hold this token
-/// (its registry lost the entry; the durable row still names the pod).
-/// To the person looking at the trigger that is the same as no holder
-/// at all: nothing is listening until the project is activated again.
-///
-/// `address` is where an outside caller reaches this signal, which the
-/// listener cannot work out on its own (see `LiveRequest::address`).
-pub async fn live_signal(
-    handle: &ListenerHandle,
-    token: &str,
-    address: Option<&str>,
-) -> Result<Option<weft_core::live::LiveFeed>> {
-    let url = format!("{}/live", handle.admin_url.trim_end_matches('/'));
-    // The listener's own request type, so a renamed field fails to
-    // compile here rather than arriving as a silently absent address.
-    let resp = admin_http()
-        .post(&url)
-        .json(&weft_core::signal::listener_protocol::LiveRequest {
-            token: token.to_string(),
-            address: address.map(str::to_string),
-        })
-        .send()
-        .await?;
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-    let resp = bail_unless_ok(resp, "/live").await?;
-    let body: weft_core::signal::listener_protocol::LiveResponse = resp.json().await?;
-    Ok(Some(body.live))
-}
-
-
-pub async fn process_signal(
-    handle: &ListenerHandle,
-    token: &str,
-    payload: &Value,
-) -> Result<weft_core::signal::listener_protocol::ProcessOutcome> {
-    let client = admin_http();
-    let url = format!("{}/process", handle.admin_url.trim_end_matches('/'));
-    let resp = client
-        .post(&url)
-        .json(&serde_json::json!({ "token": token, "payload": payload }))
-        .send()
-        .await?;
-    let resp = bail_unless_ok(resp, "/process").await?;
-    Ok(resp.json::<weft_core::signal::listener_protocol::ProcessOutcome>().await?)
-}
-
-/// Ask one listener pod which of `tokens` a verified provider push
-/// feeds, and with what payload.
-///
-/// The dispatcher never answers this itself. It knows a push arrived,
-/// that the broker called it genuine, and which connections it names;
-/// which SIGNALS that comes to depends on a kind's own settings, and the
-/// kinds live in the listener. Batched per pod: one account-routed push
-/// can feed many subscriptions, and a call per candidate would make the
-/// provider wait on a round trip each.
-pub async fn match_push(
-    handle: &ListenerHandle,
-    push: &weft_core::signal::listener_protocol::PushEvent,
-    tokens: &[String],
-) -> Result<Vec<weft_core::signal::listener_protocol::MatchedPush>> {
-    let client = admin_http();
-    let url = format!("{}/match_push", handle.admin_url.trim_end_matches('/'));
-    let resp = client
-        .post(&url)
-        .json(&weft_core::signal::listener_protocol::MatchPushRequest {
-            push: push.clone(),
-            tokens: tokens.to_vec(),
-        })
-        .send()
-        .await?;
-    let resp = bail_unless_ok(resp, "/match_push").await?;
-    Ok(resp
-        .json::<weft_core::signal::listener_protocol::MatchPushResponse>()
-        .await?
-        .matched)
-}
-
-/// What one signal wakes with when a person wakes it by hand, or `None`
-/// when its kind cannot be woken that way.
-///
-/// The dispatcher owns whether a wake is allowed to happen (the project
-/// is live, the node really is waiting, the caller may touch it) and
-/// what to do with the answer. It does not own the answer: a wake
-/// payload is a kind's own shape, and minting one here would put a
-/// second tier in the business of knowing what a timer says.
-pub async fn wake_by_hand(handle: &ListenerHandle, token: &str) -> Result<Option<Value>> {
-    let client = admin_http();
-    let url = format!("{}/wake_by_hand", handle.admin_url.trim_end_matches('/'));
-    let resp = client
-        .post(&url)
-        .json(&weft_core::signal::listener_protocol::WakeByHandRequest { token: token.to_string() })
-        .send()
-        .await?;
-    let resp = bail_unless_ok(resp, "/wake_by_hand").await?;
-    Ok(resp
-        .json::<weft_core::signal::listener_protocol::WakeByHandResponse>()
-        .await?
-        .payload)
-}
-
-pub async fn render_signal(handle: &ListenerHandle, token: &str) -> Result<Value> {
-    let client = admin_http();
-    let url = format!("{}/render", handle.admin_url.trim_end_matches('/'));
-    let resp = client
-        .post(&url)
-        .json(&serde_json::json!({ "token": token }))
-        .send()
-        .await?;
-    let resp = bail_unless_ok(resp, "/render").await?;
-    Ok(resp.json::<Value>().await?)
-}
-
-/// Tell a listener pod to reconcile its in-memory registry with the
-/// durable signal table (the signals placed on it). Idempotent.
-pub async fn rehydrate(handle: &ListenerHandle) -> Result<()> {
-    let url = format!("{}/rehydrate", handle.admin_url.trim_end_matches('/'));
-    let resp = admin_http().post(&url).send().await?;
-    bail_unless_ok(resp, "/rehydrate").await?;
-    Ok(())
-}
-
-pub async fn unregister_signal(handle: &ListenerHandle, token: &str) -> Result<()> {
-    let url = format!("{}/unregister", handle.admin_url.trim_end_matches('/'));
-    let resp = admin_http()
-        .post(&url)
-        .json(&serde_json::json!({ "token": token }))
-        .send()
-        .await?;
-    bail_unless_ok(resp, "/unregister").await?;
-    Ok(())
-}
-
-async fn load_report(handle: &ListenerHandle) -> Result<weft_core::signal::listener_protocol::LoadReport> {
-    let url = format!("{}/load", handle.admin_url.trim_end_matches('/'));
-    let resp = admin_http().get(&url).send().await?;
-    let resp = bail_unless_ok(resp, "/load").await?;
-    Ok(resp.json::<weft_core::signal::listener_protocol::LoadReport>().await?)
-}
-
-// =============================================================
-// Pod registry schema
-// =============================================================
-
-// The registry of live listener pods. Keyed by pod (the placement
-// target), NOT tenant: a pooled listener holds many tenants'
-// signals. `owner_pod_id` + `leased_until_unix` say which
-// dispatcher pod is authoritative for this listener's lifecycle.
-// `grace_until_unix` is the spawn grace: until it passes, the idle
-// reaper leaves the pod alone even with zero signals placed, so a
-// freshly-spawned pod is not torn down in the window before its
-// first placement row is written.
-pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
-    name: "listener_pod",
-    tables: &["listener_pod"],
-    ddl: &[r#"CREATE TABLE IF NOT EXISTS listener_pod (
-            pod_name          TEXT PRIMARY KEY,
-            admin_url         TEXT NOT NULL,
-            namespace         TEXT NOT NULL,
-            owner_pod_id      TEXT NOT NULL,
-            leased_until_unix BIGINT NOT NULL,
-            grace_until_unix  BIGINT NOT NULL
-        )"#],
-    seed: &[],
-};
-
-// =============================================================
-// ListenerPool: load-based placement
-// =============================================================
-
-/// Where pooled listener pods run + how to spawn them. The placement
-/// namespace is the pooled tier's shared namespace (the dispatcher's
-/// own namespace by default); a listener serves many tenants so it does
-/// not live in any one tenant's namespace.
 #[derive(Clone)]
-pub struct ListenerPool {
-    /// Namespace the pooled listeners run in.
-    namespace: String,
+pub struct ListenerClient {
+    role: RoleClient,
 }
 
-impl ListenerPool {
-    pub fn new(namespace: String) -> Self {
-        Self { namespace }
+impl ListenerClient {
+    /// `role` addresses the listener role (`CoreRole::Listener`).
+    pub fn new(role: RoleClient) -> Self {
+        Self { role }
     }
 
-    /// Resolve the listener pod currently holding `token`'s signal, if
-    /// any. Reads `signal.listener_pod -> listener_pod.admin_url`.
-    /// Returns `None` when the signal is unplaced or its holder is gone.
-    pub async fn resolve_signal(
-        &self,
-        token: &str,
-        pg_pool: &PgPool,
-    ) -> Result<Option<ListenerHandle>> {
-        let row: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT listener_pod FROM signal WHERE token = $1")
-                .bind(token)
-                .fetch_optional(pg_pool)
-                .await?;
-        let Some((Some(pod_name),)) = row else {
-            return Ok(None);
-        };
-        self.pod_handle(&pod_name, pg_pool).await
-    }
-
-    /// The admin handle for a named live pod, or None if its registry
-    /// row is gone (the pod was reaped). Public alias for callers that
-    /// hold a pod name directly (e.g. register rollback).
-    pub async fn resolve_pod(
-        &self,
-        pod_name: &str,
-        pg_pool: &PgPool,
-    ) -> Result<Option<ListenerHandle>> {
-        self.pod_handle(pod_name, pg_pool).await
-    }
-
-    /// The admin handle for a named live pod, or None if its registry
-    /// row is gone (the pod was reaped).
-    async fn pod_handle(&self, pod_name: &str, pg_pool: &PgPool) -> Result<Option<ListenerHandle>> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT admin_url FROM listener_pod WHERE pod_name = $1")
-                .bind(pod_name)
-                .fetch_optional(pg_pool)
-                .await?;
-        Ok(row.map(|(admin_url,)| ListenerHandle { admin_url }))
-    }
-
-    /// Resolve the live holder of `token`, RE-PLACING the signal from
-    /// its durable row if no holder is live (the prior holder was
-    /// reaped while the signal sat idle, e.g. a parked webhook trigger).
-    /// This is the fire-path equivalent of the old respawn-on-fire: a
-    /// fire must always find a listener, never silently drop. Fails loud
-    /// if the signal row is gone (a fire for a token with no durable
-    /// signal is a real inconsistency, not something to swallow).
-    pub async fn ensure_placed_handle(
-        &self,
-        token: &str,
-        backend: &dyn ListenerBackend,
-        pg_pool: &PgPool,
-        pod_id: &str,
-    ) -> Result<ListenerHandle> {
-        if let Some(handle) = self.resolve_signal(token, pg_pool).await? {
-            return Ok(handle);
-        }
-        // No live holder: re-place under the per-token lock. The lock
-        // serializes this against a concurrent drain / fire re-place of
-        // the same token, and we DOUBLE-CHECK resolve under it: a sibling
-        // re-placement that finished while we waited for the lock means
-        // the signal is already live and we just reuse its holder (no
-        // second placement, no generation churn).
-        let key = crate::lease::advisory_key(crate::lease::SIGNAL_PLACEMENT_DOMAIN, token);
-        let placed = crate::lease::with_advisory_lock_blocking(pg_pool, key, || async {
-            if let Some(handle) = self.resolve_signal(token, pg_pool).await? {
-                return Ok(handle);
-            }
-            let (_pod_name, _generation, handle) = self
-                .replace_onto_new_pod(token, backend, pg_pool, pod_id, None)
-                .await
-                .with_context(|| {
-                    format!(
-                        "fire for token '{token}' could not place a listener \
-                         (re-registering from its durable signal row)"
-                    )
-                })?;
-            Ok(handle)
-        })
-        .await?;
-        Ok(placed)
-    }
-
-    /// Re-place `token`'s signal (read from its durable `signal` row) onto
-    /// a freshly-picked pod (optionally excluding `exclude`, the pod being
-    /// drained): reserve the next generation, register on the new pod,
-    /// AND write the holder (`set_placement`) as one unit, returning the
-    /// chosen pod name + generation + handle.
-    ///
-    /// MUST be called while holding the per-token placement lock
-    /// (`SIGNAL_PLACEMENT_DOMAIN`, scope = token). That lock is what makes
-    /// the sequence safe: it serializes concurrent re-placements of the
-    /// same token so the holder column always ends up pointing at the pod
-    /// registered under the HIGHEST reserved generation. Without it, two
-    /// re-placements could interleave reserve / register / set_placement
-    /// and leave the holder under a LOWER generation than a still-live
-    /// pod, which the broker's stale-fire fence (row gen == max live
-    /// holder gen) depends on never happening. The single re-place path
-    /// shared by the fire re-placement (`ensure_placed_handle`) and the
-    /// scale-down drain.
-    async fn replace_onto_new_pod(
-        &self,
-        token: &str,
-        backend: &dyn ListenerBackend,
-        pg_pool: &PgPool,
-        pod_id: &str,
-        exclude: Option<&str>,
-    ) -> Result<(String, i64, ListenerHandle)> {
-        // The full identity + routing + state columns: a pod move
-        // RESTORES the signal verbatim (routing and kind_state from
-        // the row). Recomputing routing would mint a fresh API key and
-        // silently invalidate the user's existing one; recomputing
-        // kind_state would reset a timer's clock or a poll cursor
-        // mid-flight. A move is not a user action; nothing may change.
-        #[allow(clippy::type_complexity)]
-        let row: Option<(
-            String,
-            String,
-            String,
-            bool,
-            Option<String>,
-            String,
-            Option<String>,
-            Vec<String>,
-            String,
-            Option<Value>,
-            Value,
-            i64,
-            uuid::Uuid,
-            Option<String>,
-        )> = sqlx::query_as(
-            "SELECT tenant_id, node_id, spec_json, is_resume, color, \
-                    surface_kind, mount_path, mount_methods, auth_kind, auth_config, kind_state, \
-                    kind_state_seq, project_id, member_id \
-             FROM signal WHERE token = $1",
-        )
-        .bind(token)
-        .fetch_optional(pg_pool)
-        .await?;
-        let Some((
-            tenant_id,
-            node_id,
-            spec_json,
-            is_resume,
-            color,
-            surface_kind,
-            mount_path,
-            mount_methods,
-            auth_kind,
-            auth_config,
-            kind_state,
-            kind_state_seq,
-            project_id,
-            member_id,
-        )) = row
-        else {
-            anyhow::bail!(
-                "token '{token}' has no durable signal row; \
-                 cannot place a listener for a signal that does not exist"
-            );
-        };
-        let spec: SignalSpec = serde_json::from_str(&spec_json)
-            .with_context(|| format!("parse spec_json for re-placing signal {token}"))?;
-        let for_member = weft_core::member::MemberScope::from_columns(project_id, member_id)
-            .map_err(|e| anyhow::anyhow!("corrupt member_id on signal {token}: {e}"))?;
-        let routing = {
-            let surface: weft_broker_client::protocol::SignalSurfaceKind =
-                serde_json::from_value(Value::String(surface_kind))
-                    .with_context(|| format!("parse surface_kind for signal {token}"))?;
-            let auth: weft_broker_client::protocol::SignalAuthKind =
-                serde_json::from_value(Value::String(auth_kind))
-                    .with_context(|| format!("parse auth_kind for signal {token}"))?;
-            weft_broker_client::protocol::routing_from_columns(
-                surface,
-                mount_path.as_deref(),
-                &mount_methods,
-                auth,
-                auth_config,
-            )
-            .map_err(|e| anyhow::anyhow!("reassemble routing for signal {token}: {e}"))?
-        };
-        // The next generation (current + 1), a PURE READ. It is committed
-        // only by `set_placement` at the end of this method; if register
-        // fails before then, the row's generation is untouched so the
-        // still-live old holder keeps firing correctly. Safe to read-then-
-        // write because we hold the per-token placement lock.
-        let generation = next_generation(pg_pool, token).await?;
-        let token_owned = token.to_string();
-        let (pod_name, handle) = self
-            .place_signal_excluding(backend, pg_pool, pod_id, exclude, move |handle| {
-                let spec = spec.clone();
-                let node_id = node_id.clone();
-                let tenant_id = tenant_id.clone();
-                let for_member = for_member.clone();
-                let color = color.clone();
-                let routing = routing.clone();
-                let kind_state = kind_state.clone();
-                async move {
-                    register_signal(
-                        &handle,
-                        &token_owned,
-                        &tenant_id,
-                        for_member.as_ref(),
-                        &spec,
-                        &node_id,
-                        is_resume,
-                        color.as_deref(),
-                        generation,
-                        weft_core::signal::listener_protocol::RegisterSource::Restore {
-                            routing,
-                            kind_state,
-                            seq: kind_state_seq,
-                        },
-                    )
-                    .await?;
-                    Ok(handle)
-                }
-            })
-            .await?;
-        // Write the holder + generation together, under the lock, so the
-        // row reflects this (highest) generation's pod.
-        set_placement(pg_pool, token, &pod_name, generation).await?;
-        Ok((pod_name, generation, handle))
-    }
-
-    /// Place a signal on a listener: pick the least-loaded non-saturated
-    /// pod (or spawn a fresh one), run `register` against it, and on
-    /// success record `signal.listener_pod = pod`. The placement write
-    /// is the caller's responsibility AFTER its own `signal_insert`
-    /// (the signal row must exist before we point a holder at it); this
-    /// returns the chosen pod so the caller stamps it.
-    ///
-    /// `register` runs the actual `/register` POST (and any follow-up
-    /// the caller needs) against the chosen pod's handle. If it fails,
-    /// the spawn (if we spawned) is left for the reaper (an empty pod is
-    /// reaped on the next idle sweep); we do not leak a placement row
-    /// because we never wrote one.
-    pub async fn place_signal<R, F, Fut>(
-        &self,
-        backend: &dyn ListenerBackend,
-        pg_pool: &PgPool,
-        pod_id: &str,
-        register: F,
-    ) -> Result<(String, R)>
-    where
-        F: FnOnce(ListenerHandle) -> Fut,
-        Fut: std::future::Future<Output = Result<R>>,
-    {
-        self.place_signal_excluding(backend, pg_pool, pod_id, None, register)
+    async fn post(&self, route: &str, body: &impl serde::Serialize) -> Result<reqwest::Response> {
+        let resp = self
+            .role
+            .request(reqwest::Method::POST, route)
+            .await?
+            .json(body)
+            .send()
             .await
+            .map_err(|e| anyhow::anyhow!("listener {route}: {e}"))?;
+        Ok(resp)
     }
 
-    /// Like `place_signal`, but never places onto `exclude` (a pod being
-    /// drained on scale-down). `exclude = None` is the normal path. The
-    /// exclusion keeps a draining pod's own signals from being re-picked
-    /// back onto it; it is a placement filter, not a separate code path.
-    pub async fn place_signal_excluding<R, F, Fut>(
+    /// Bail with `<route> returned <status>: <body>` unless 2xx.
+    async fn ok(resp: reqwest::Response, route: &str) -> Result<reqwest::Response> {
+        if resp.status().is_success() {
+            return Ok(resp);
+        }
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_else(|e| format!("<body read failed: {e}>"));
+        anyhow::bail!("listener {route} returned {status}: {body}")
+    }
+
+    /// What the row of a new signal holds, as its kind computes it
+    /// (routing, starting kind state, consumer payload). Starts nothing:
+    /// [`Self::start`] brings the signal up once the row is committed.
+    pub async fn prepare(
         &self,
-        backend: &dyn ListenerBackend,
-        pg_pool: &PgPool,
-        pod_id: &str,
-        exclude: Option<&str>,
-        register: F,
-    ) -> Result<(String, R)>
-    where
-        F: FnOnce(ListenerHandle) -> Fut,
-        Fut: std::future::Future<Output = Result<R>>,
-    {
-        // Pick a pod AND re-arm its spawn grace in one atomic claim. The
-        // grace is the idle reaper's "work is about to arrive, hands off"
-        // signal, and it must cover THIS placement's whole window (pick,
-        // the listener HTTP round-trip below, the signal_insert stamp),
-        // not just a fresh pod's boot: an ESTABLISHED zero-signal pod is
-        // otherwise reapable the instant after pick, and the register
-        // call then dials a torn-down pod (a live incident: DNS failure
-        // on /register three seconds after the reaper deleted the pod).
-        // Zero rows back from the re-arm means the reaper's gated DELETE
-        // won the row race first; the pod is gone, pick again. The
-        // reaper's own DELETE re-checks grace, so whichever statement
-        // lands second sees the other's write: exactly one winner per
-        // pod, no window.
-        let pod = loop {
-            let candidate = self.pick_or_spawn(backend, pg_pool, pod_id, exclude).await?;
-            let armed = sqlx::query(
-                "UPDATE listener_pod SET grace_until_unix = $1 WHERE pod_name = $2",
+        req: &weft_core::signal::listener_protocol::PrepareRequest,
+    ) -> Result<weft_core::signal::listener_protocol::PrepareResponse> {
+        Ok(Self::ok(self.post("/prepare", req).await?, "/prepare").await?.json().await?)
+    }
+
+    /// What the trigger's kind is showing, or `None` when the listener
+    /// holds no such signal. `address` is where an outside caller
+    /// reaches this signal, which the listener cannot work out on its own
+    /// (see `LiveRequest::address`).
+    pub async fn live(&self, token: &str, address: Option<&str>) -> Result<Option<weft_core::live::LiveFeed>> {
+        let resp = self
+            .post(
+                "/live",
+                &weft_core::signal::listener_protocol::LiveRequest {
+                    token: token.to_string(),
+                    address: address.map(str::to_string),
+                },
             )
-            .bind(crate::lease::now_unix() + crate::lease::SPAWN_GRACE_SECS)
-            .bind(&candidate.pod_name)
-            .execute(pg_pool)
             .await?;
-            if armed.rows_affected() > 0 {
-                break candidate;
-            }
-        };
-        // The chosen pod 503s `/register` if it saturated between our
-        // load read and now; that surfaces as an error here and the
-        // task framework retries placement (a fresh pick, possibly a
-        // spawn). No silent overload.
-        let r = register(pod.handle()).await?;
-        Ok((pod.pod_name, r))
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let body: weft_core::signal::listener_protocol::LiveResponse = Self::ok(resp, "/live").await?.json().await?;
+        Ok(Some(body.live))
     }
 
-    /// Pick the least-loaded non-saturated live pod, or spawn a fresh
-    /// one when all are saturated / none exist. Serialized cluster-wide
-    /// against a cold-start thundering herd (a burst of concurrent
-    /// placements each spawning its own listener) by a TRANSACTION-scoped
-    /// Postgres advisory lock, TRY-locked so a loser never blocks:
-    ///   - The winner takes the lock, picks-or-spawns (spawn waits for
-    ///     the new pod's health THEN inserts its registry row, so the
-    ///     pod is live before the lock releases), then the lock drops
-    ///     with the transaction.
-    ///   - A loser fails the try-lock (`with_advisory_lock` returns
-    ///     `None`), waits briefly, and retries `pick_or_spawn` from the
-    ///     top, by which point the winner's pod is live and gets reused.
-    /// At most one spawn is ever in flight. The lock lives in Postgres,
-    /// so this holds across N dispatcher replicas; being transaction-
-    /// scoped it is released the instant the transaction ends, INCLUDING
-    /// a panic unwind (sqlx's `Transaction::drop` rolls back), so a panic
-    /// mid-spawn cannot orphan the lock on a recycled pooled connection.
-    async fn pick_or_spawn(
+    pub async fn process(&self, token: &str, payload: &Value) -> Result<weft_core::signal::listener_protocol::ProcessOutcome> {
+        let resp = self.post("/process", &serde_json::json!({ "token": token, "payload": payload })).await?;
+        Ok(Self::ok(resp, "/process").await?.json().await?)
+    }
+
+    /// Which of `tokens` a verified provider push feeds, and with what
+    /// payload. The dispatcher knows a push arrived, that the broker called
+    /// it genuine, and which connections it names; which SIGNALS that comes
+    /// to depends on a kind's own settings, and the kinds live in the
+    /// listener.
+    pub async fn match_push(
         &self,
-        backend: &dyn ListenerBackend,
-        pg_pool: &PgPool,
-        pod_id: &str,
-        exclude: Option<&str>,
-    ) -> Result<ListenerPod> {
-        let key = crate::lease::advisory_key(crate::lease::LISTENER_POOL_DOMAIN, "placement");
-        loop {
-            // Fast path: an existing live non-saturated pod needs no
-            // lock at all (the common steady-state case).
-            if let Some(pod) = self.pick_live(pg_pool, exclude).await? {
-                return Ok(pod);
-            }
-            // No live pod: contend for the right to spawn one. Under the
-            // lock, re-check (another winner may have spawned between our
-            // pick and our lock), then pick-or-spawn.
-            let outcome = crate::lease::with_advisory_lock(pg_pool, key, || async {
-                if let Some(pod) = self.pick_live(pg_pool, exclude).await? {
-                    return Ok(pod);
-                }
-                self.spawn_pod(backend, pg_pool, pod_id).await
-            })
+        push: &weft_core::signal::listener_protocol::PushEvent,
+        tokens: &[String],
+    ) -> Result<Vec<weft_core::signal::listener_protocol::MatchedPush>> {
+        let resp = self
+            .post(
+                "/match_push",
+                &weft_core::signal::listener_protocol::MatchPushRequest { push: push.clone(), tokens: tokens.to_vec() },
+            )
             .await?;
-            match outcome {
-                Some(pod) => return Ok(pod),
-                // A sibling holds the spawn lock; back off and retry the
-                // pick, by which point its pod should be live.
-                None => {
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                    continue;
-                }
-            }
-        }
+        Ok(Self::ok(resp, "/match_push").await?.json::<weft_core::signal::listener_protocol::MatchPushResponse>().await?.matched)
     }
 
-    /// Pick the least-loaded non-saturated live pod, or `None` if there
-    /// is none (so the caller spawns one under the placement lock).
-    /// `exclude` (a pod being drained) is never chosen.
-    async fn pick_live(
-        &self,
-        pg_pool: &PgPool,
-        exclude: Option<&str>,
-    ) -> Result<Option<ListenerPod>> {
-        let pods = self.live_pods(pg_pool).await?;
-        // Read each pod's load; keep the non-saturated ones, pick the
-        // least loaded. A pod that fails to answer /load is treated as
-        // unavailable for placement (it may be mid-restart); it is not
-        // chosen, and the reaper / lease expiry handles a truly dead
-        // pod. We never place onto a pod we cannot confirm has room.
-        let mut best: Option<(u32, ListenerPod)> = None;
-        for pod in pods {
-            if Some(pod.pod_name.as_str()) == exclude {
-                continue;
-            }
-            match load_report(&pod.handle()).await {
-                Ok(load) if !load.saturated => {
-                    let signals = load.signals;
-                    if best.as_ref().is_none_or(|(b, _)| signals < *b) {
-                        best = Some((signals, pod));
-                    }
-                }
-                Ok(_) => {} // saturated: skip
-                Err(e) => {
-                    tracing::warn!(
-                        target: "weft_dispatcher::listener",
-                        pod = %pod.pod_name,
-                        error = %e,
-                        "listener /load failed; not a placement candidate this round"
-                    );
-                }
-            }
-        }
-        Ok(best.map(|(_, pod)| pod))
+    /// What one signal wakes with when a person wakes it by hand, or
+    /// `None` when its kind cannot be woken that way. The wake payload is a
+    /// kind's own shape, so the listener answers it.
+    pub async fn wake_by_hand(&self, token: &str) -> Result<Option<Value>> {
+        let resp = self
+            .post("/wake_by_hand", &weft_core::signal::listener_protocol::WakeByHandRequest { token: token.to_string() })
+            .await?;
+        Ok(Self::ok(resp, "/wake_by_hand")
+            .await?
+            .json::<weft_core::signal::listener_protocol::WakeByHandResponse>()
+            .await?
+            .payload)
     }
 
-    /// Spawn a fresh listener pod and register it. The lease is armed
-    /// at insert so a sibling dispatcher does not adopt it immediately.
-    async fn spawn_pod(
-        &self,
-        backend: &dyn ListenerBackend,
-        pg_pool: &PgPool,
-        pod_id: &str,
-    ) -> Result<ListenerPod> {
-        let pod_name = mint_pod_name();
-        let handle = backend.spawn(&pod_name, &self.namespace).await?;
-        let now = crate::lease::now_unix();
-        sqlx::query(
-            "INSERT INTO listener_pod \
-             (pod_name, admin_url, namespace, owner_pod_id, leased_until_unix, grace_until_unix) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(&pod_name)
-        .bind(&handle.admin_url)
-        .bind(&self.namespace)
-        .bind(pod_id)
-        .bind(now + crate::lease::lease_duration_secs())
-        .bind(now + crate::lease::SPAWN_GRACE_SECS)
-        .execute(pg_pool)
-        .await
-        .context("insert listener_pod row")?;
-        Ok(ListenerPod {
-            pod_name,
-            admin_url: handle.admin_url,
-        })
-    }
-
-    /// All listener pods whose lease is live.
-    async fn live_pods(&self, pg_pool: &PgPool) -> Result<Vec<ListenerPod>> {
-        let now = crate::lease::now_unix();
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT pod_name, admin_url FROM listener_pod WHERE leased_until_unix >= $1",
-        )
-        .bind(now)
-        .fetch_all(pg_pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(pod_name, admin_url)| ListenerPod { pod_name, admin_url })
-            .collect())
-    }
-
-    /// Live pods that are also PAST their spawn grace (established pool
-    /// members). The scale-down planner reads these so a freshly-spawned
-    /// pod is never a consolidation candidate while still warming up.
-    async fn established_pods(&self, pg_pool: &PgPool) -> Result<Vec<ListenerPod>> {
-        let now = crate::lease::now_unix();
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT pod_name, admin_url FROM listener_pod \
-             WHERE leased_until_unix >= $1 AND grace_until_unix < $1",
-        )
-        .bind(now)
-        .fetch_all(pg_pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(pod_name, admin_url)| ListenerPod { pod_name, admin_url })
-            .collect())
-    }
-
-    /// Tell every pod holding any of `project_id`'s signals to
-    /// reconcile its registry (used by activate, after TriggerSetup, so
-    /// resume signals that survived a deactivate-park come back). A
-    /// signal whose holder is gone (NULL `listener_pod`) is re-placed by
-    /// the next register/fire; here we only nudge live holders.
-    pub async fn rehydrate_project(
-        &self,
-        project_id: uuid::Uuid,
-        pg_pool: &PgPool,
-    ) -> Result<()> {
-        let pods: Vec<(String,)> = sqlx::query_as(
-            "SELECT DISTINCT listener_pod FROM signal \
-             WHERE project_id = $1 AND listener_pod IS NOT NULL",
-        )
-        .bind(project_id)
-        .fetch_all(pg_pool)
-        .await?;
-        for (pod_name,) in pods {
-            if let Some(handle) = self.pod_handle(&pod_name, pg_pool).await? {
-                rehydrate(&handle).await?;
-            }
-        }
+    /// Bring up the signal whose row was just committed under `token`
+    /// (its first wake, its held connection), as a new registration or a
+    /// row put back (see `StartMode`). A kind refusing to come up answers
+    /// its reason.
+    pub async fn start(&self, token: &str, mode: weft_core::signal::listener_protocol::StartMode) -> Result<()> {
+        let req = weft_core::signal::listener_protocol::StartRequest { token: token.to_string(), mode };
+        Self::ok(self.post("/start", &req).await?, "/start").await?;
         Ok(())
     }
 
-    /// Best-effort bulk unregister: POST `/unregister` to the pod each
-    /// signal names as its holder (drop the in-RAM registry entry only).
-    /// The holder comes off the registration, never off a fresh row
-    /// lookup: most callers hand in rows a DELETE ... RETURNING just
-    /// removed, so there is no row left to look up. Does NOT touch
-    /// `signal.listener_pod` or delete the `signal` row; what the caller
-    /// does with the durable rows is the caller's choice:
-    ///   - delete/cancel/consume callers (delete_signals, project-delete,
-    ///     cancel, a resume fire) delete the `signal` rows themselves,
-    ///     which removes the placement with them;
-    ///   - the hibernate/park caller deliberately KEEPS the rows (the DB
-    ///     is canonical; reactivate re-rehydrates them), clearing only the
-    ///     in-RAM registry.
-    /// Either way this function's job is solely the in-RAM unregister.
-    /// Unplaced signals and holders already reaped are skipped (their
-    /// registry is gone; the durable signal row is the source of truth).
-    pub async fn unregister_many(
-        &self,
-        pg_pool: &PgPool,
-        signals: &[crate::journal::SignalRegistration],
-    ) {
+    /// Tell the listener to reconcile what it holds of `project` with
+    /// the durable signal table, leaving the signals in `skip` down.
+    /// Idempotent. Fails naming each of the project's rows that could not
+    /// come up.
+    pub async fn rehydrate(&self, project: uuid::Uuid, skip: &[String]) -> Result<()> {
+        let req = weft_core::signal::listener_protocol::RehydrateRequest { project, skip: skip.to_vec() };
+        Self::ok(self.post("/rehydrate", &req).await?, "/rehydrate").await?;
+        Ok(())
+    }
+
+    pub async fn unregister(&self, token: &str) -> Result<()> {
+        Self::ok(self.post("/unregister", &serde_json::json!({ "token": token })).await?, "/unregister").await?;
+        Ok(())
+    }
+
+    /// Tell the listener to forget each of `signals`, best effort. Does
+    /// NOT touch the durable rows: what the caller does with them is its
+    /// choice (a delete, cancel or consume deletes them; a hibernate keeps
+    /// them so reactivate brings them back). A failure is logged: the
+    /// durable row is the truth, and a listener that kept a stale entry
+    /// finds the row gone the next time it is asked about the token.
+    pub async fn unregister_many(&self, signals: &[crate::journal::SignalRegistration]) {
         for sig in signals {
-            let Some(pod_name) = sig.listener_pod.as_deref() else {
-                tracing::debug!(
-                    target: "weft_dispatcher::listener",
-                    token = %sig.token,
-                    "unregister sweep: signal has no holder (waiting to be re-placed); nothing to tell"
-                );
-                continue;
-            };
-            let handle = match self.pod_handle(pod_name, pg_pool).await {
-                Ok(Some(h)) => h,
-                Ok(None) => {
-                    tracing::debug!(
-                        target: "weft_dispatcher::listener",
-                        token = %sig.token,
-                        pod = pod_name,
-                        "unregister sweep: holder already reaped; its registry is gone with it"
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "weft_dispatcher::listener",
-                        token = %sig.token,
-                        pod = pod_name,
-                        error = %e,
-                        "pod lookup failed during unregister sweep; token may remain registered"
-                    );
-                    continue;
-                }
-            };
-            if let Err(e) = unregister_signal(&handle, &sig.token).await {
+            if let Err(e) = self.unregister(&sig.token).await {
                 tracing::warn!(
                     target: "weft_dispatcher::listener",
                     token = %sig.token,
-                    pod = pod_name,
                     error = %e,
-                    "unregister_signal failed (sweep); listener pod may carry stale state"
+                    "unregister failed; the listener may keep a stale entry until it next reads the row"
                 );
             }
         }
     }
-
-    /// True iff `project_id` has at least one signal with a live holder.
-    /// Status endpoints use it to render "listener: running" for a
-    /// project.
-    pub async fn project_has_live_listener(
-        &self,
-        project_id: uuid::Uuid,
-        pg_pool: &PgPool,
-    ) -> Result<bool> {
-        let row: Option<(i64,)> = sqlx::query_as(
-            "SELECT COUNT(*) FROM signal s \
-             JOIN listener_pod lp ON lp.pod_name = s.listener_pod \
-             WHERE s.project_id = $1",
-        )
-        .bind(project_id)
-        .fetch_optional(pg_pool)
-        .await?;
-        Ok(row.is_some_and(|(n,)| n > 0))
-    }
-
-    /// Renew the lease on every listener pod this dispatcher owns. The
-    /// main loop calls this on a heartbeat so a live pod is not adopted
-    /// by a sibling dispatcher.
-    pub async fn renew_owned(&self, pg_pool: &PgPool, pod_id: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE listener_pod SET leased_until_unix = $1 WHERE owner_pod_id = $2",
-        )
-        .bind(crate::lease::now_unix() + crate::lease::lease_duration_secs())
-        .bind(pod_id)
-        .execute(pg_pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Reaper hook: reap every listener pod that holds ZERO signals. A
-    /// pod holding even one signal is kept (something still needs it).
-    /// Adopt-on-expiry: a pod whose owning dispatcher died (lease
-    /// lapsed) is adopted before being reaped, so a sibling cleans it.
-    pub async fn reap_idle(
-        &self,
-        backend: &dyn ListenerBackend,
-        pg_pool: &PgPool,
-        pod_id: &str,
-    ) -> Result<()> {
-        // Candidate pods: those with no signals placed on them, AND
-        // past their spawn grace (a freshly-spawned pod inside its grace
-        // has zero placements only because its first placement has not
-        // landed yet; reaping it there is the mid-setup race). The LEFT
-        // JOIN + IS NULL finds pods absent from the signal placement set.
-        // Restrict to pods we own OR whose lease lapsed (adopt then
-        // reap), so two dispatchers do not both reap one.
-        let now = crate::lease::now_unix();
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT lp.pod_name, lp.namespace \
-             FROM listener_pod lp \
-             LEFT JOIN signal s ON s.listener_pod = lp.pod_name \
-             WHERE s.token IS NULL \
-               AND lp.grace_until_unix < $2 \
-               AND (lp.owner_pod_id = $1 OR lp.leased_until_unix < $2)",
-        )
-        .bind(pod_id)
-        .bind(now)
-        .fetch_all(pg_pool)
-        .await?;
-        for (pod_name, namespace) in rows {
-            // Delete the registry row FIRST, atomically re-checking the
-            // idle + grace conditions, under the per-pod advisory lock
-            // that every placement STAMP also takes (`signal_insert` /
-            // `set_placement`). The lock is what makes this race-free:
-            // a placement that picked this pod either stamps its signal
-            // row before we get the lock (the NOT EXISTS re-check then
-            // aborts the reap) or is forced to wait, finds the pod row
-            // gone, and re-places onto a live pod. Without the lock the
-            // two single statements can write-skew (both read the
-            // other's table before either write commits) and a signal
-            // ends up stamped onto a deleted pod. Row-first ordering:
-            // once the row is gone the pod is invisible to pick_live and
-            // to the stamps; a backend.stop failure then leaves only an
-            // orphan k8s object for the later k8s sweep, never a
-            // registry row pointing at a half-dead pod (which would
-            // mis-route placement).
-            let key = pod_lock_key(&pod_name);
-            let deleted = crate::lease::with_advisory_lock(pg_pool, key, || async {
-                let gone: Option<(String,)> = sqlx::query_as(
-                    "DELETE FROM listener_pod \
-                     WHERE pod_name = $1 \
-                       AND grace_until_unix < $2 \
-                       AND (owner_pod_id = $3 OR leased_until_unix < $2) \
-                       AND NOT EXISTS (SELECT 1 FROM signal WHERE listener_pod = $1) \
-                     RETURNING namespace",
-                )
-                .bind(&pod_name)
-                .bind(now)
-                .bind(pod_id)
-                .fetch_optional(pg_pool)
-                .await?;
-                Ok(gone)
-            })
-            .await?;
-            match deleted {
-                // Lock contended (a placement is stamping onto it right
-                // now) or the re-check failed (a signal landed / grace
-                // re-armed / a sibling reaped first). Leave it.
-                None | Some(None) => continue,
-                Some(Some(_)) => {
-                    if let Err(e) = backend.stop(&pod_name, &namespace).await {
-                        tracing::warn!(
-                            target: "weft_dispatcher::listener",
-                            pod = %pod_name,
-                            namespace = %namespace,
-                            error = %e,
-                            "backend.stop failed during listener reap; registry row already \
-                             deleted, the k8s object is left for the later k8s sweep"
-                        );
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Read every ESTABLISHED live pod's memory pressure via `GET /load`,
-    /// for the scale-down planner. Pods still in their spawn grace are
-    /// excluded: a fresh pod is not yet a stable pool member and must not
-    /// be a consolidation candidate (draining it would re-place nothing
-    /// useful and it could not be reaped until its grace passed). A pod
-    /// that fails to answer is omitted (mid-restart / unreachable; the
-    /// lease reaper handles a truly dead one).
-    async fn pod_loads(&self, pg_pool: &PgPool) -> Result<Vec<weft_platform_traits::PoolPodLoad>> {
-        let mut out = Vec::new();
-        for pod in self.established_pods(pg_pool).await? {
-            match load_report(&pod.handle()).await {
-                Ok(load) => out.push(weft_platform_traits::PoolPodLoad {
-                    pod_name: pod.pod_name,
-                    mem_pressure: load.mem_pressure,
-                }),
-                Err(e) => tracing::warn!(
-                    target: "weft_dispatcher::listener",
-                    pod = %pod.pod_name,
-                    error = %e,
-                    "listener /load failed; excluded from scale-down planning this cycle"
-                ),
-            }
-        }
-        Ok(out)
-    }
-
-    /// Scale-down: drain AT MOST ONE pod per call (one per cycle so we
-    /// never thrash). Reads each live pod's memory pressure, asks the
-    /// shared `plan_memory_scaledown` whether the pool has excess
-    /// capacity, and if so re-places the chosen pod's signals onto the
-    /// OTHER pods (never back onto the drain target), then lets the empty
-    /// pod be reaped. A held connection is never dropped: each signal is
-    /// re-registered on its new holder BEFORE its
-    /// old registration is removed.
-    ///
-    /// Re-placement reuses the normal placement path (`place_signal_
-    /// excluding`), so a survivor that saturated mid-drain 503s and the
-    /// signal lands elsewhere or spawns a pod, exactly like a first
-    /// placement. If re-placement of any signal fails, we STOP draining
-    /// this pod (leave it live, holding its remaining signals) rather
-    /// than half-drain it: a partially-drained pod still serves its
-    /// signals, and the next cycle retries from a clean read.
-    pub async fn drain_one(
-        &self,
-        backend: &dyn ListenerBackend,
-        pg_pool: &PgPool,
-        pod_id: &str,
-    ) -> Result<()> {
-        // Serialize consolidation cluster-wide: two dispatchers planning
-        // off near-identical loads would otherwise pick the same target
-        // (or two targets that drain onto each other). Skip this cycle if
-        // a sibling already holds the lock; the next sweep retries.
-        crate::lease::with_scaledown_lock(pg_pool, "listener", || {
-            self.drain_one_locked(backend, pg_pool, pod_id)
-        })
-        .await
-        .map(|_| ())
-    }
-
-    /// The body of `drain_one`, run under the scale-down lock.
-    async fn drain_one_locked(
-        &self,
-        backend: &dyn ListenerBackend,
-        pg_pool: &PgPool,
-        pod_id: &str,
-    ) -> Result<()> {
-        let loads = self.pod_loads(pg_pool).await?;
-        let Some(target) = weft_platform_traits::plan_memory_scaledown(
-            &loads,
-            weft_platform_traits::SATURATION_MEM_FRACTION,
-        ) else {
-            return Ok(());
-        };
-        let target = target.as_str();
-        // The signals currently placed on the drain target. Re-place each
-        // onto another pod, then unregister it from the target.
-        let signals: Vec<(String,)> =
-            sqlx::query_as("SELECT token FROM signal WHERE listener_pod = $1")
-                .bind(target)
-                .fetch_all(pg_pool)
-                .await?;
-        let old_handle = self.pod_handle(target, pg_pool).await?;
-        for (token,) in &signals {
-            // Re-place onto a fresh pod (excluding the drain target),
-            // UNDER the per-token lock so a concurrent fire-path re-place
-            // of the same token cannot interleave and leave the holder
-            // under a lower generation than a still-live pod. The lock
-            // covers reserve -> register -> set_placement as one unit
-            // (inside `replace_onto_new_pod`). The bumped generation
-            // fences the OLD pod's lingering fire (old generation), so it
-            // is rejected by the broker even before we unregister it.
-            let key = crate::lease::advisory_key(
-                crate::lease::SIGNAL_PLACEMENT_DOMAIN,
-                token,
-            );
-            let placed = crate::lease::with_advisory_lock_blocking(pg_pool, key, || async {
-                self.replace_onto_new_pod(token, backend, pg_pool, pod_id, Some(target))
-                    .await
-            })
-            .await;
-            if let Err(e) = placed {
-                tracing::warn!(
-                    target: "weft_dispatcher::listener",
-                    token = %token,
-                    drain_target = %target,
-                    error = %e,
-                    "re-place during drain failed; leaving pod live with remaining signals, retry next cycle"
-                );
-                return Ok(());
-            }
-            // The signal is live on its new holder (set_placement ran
-            // under the lock). Remove the old registration. A failure here
-            // only leaves a stale in-RAM entry on a pod we are about to
-            // tear down, so it is logged, not fatal.
-            if let Some(handle) = &old_handle {
-                if let Err(e) = unregister_signal(handle, token).await {
-                    tracing::warn!(
-                        target: "weft_dispatcher::listener",
-                        token = %token,
-                        drain_target = %target,
-                        error = %e,
-                        "unregister from drain target failed; pod is being torn down anyway"
-                    );
-                }
-            }
-        }
-        // The target now holds zero signals (all re-placed). Reap it via
-        // the shared idle path so the claim-then-teardown logic is not
-        // duplicated.
-        self.reap_idle(backend, pg_pool, pod_id).await
-    }
 }
 
-/// Generation for the first-ever placement of a token that has no
-/// signal row yet (a brand-new entry token, or a per-suspension resume
-/// token: both insert fresh). Used as the reserve result when the row
-/// does not exist; `set_placement` then stamps it onto the row the
-/// caller is about to insert.
-const FIRST_PLACEMENT_GENERATION: i64 = 1;
-
-/// The generation the NEXT placement of `token` will hold the signal
-/// under: the row's current generation + 1, or `FIRST_PLACEMENT_GENERATION`
-/// if no row exists yet (a brand-new token whose `signal_insert` runs
-/// after this). A PURE READ: it does NOT mutate the row.
-///
-/// Mutating eagerly would be a bug. The generation is committed ONLY by
-/// the final holder write (`set_placement`, or `signal_insert` on the
-/// fresh path), so a re-placement that FAILS before that write leaves the
-/// row's generation untouched and the still-live old holder keeps firing
-/// under a generation the row still matches (no spurious fence, no lost
-/// fire). Safe as a read-then-write because both re-placement callers
-/// hold the per-token placement lock (`SIGNAL_PLACEMENT_DOMAIN`) across
-/// read -> register -> write, serializing concurrent re-placements of one
-/// token; and the fresh-register path has a unique, dedup'd token with no
-/// concurrent placer. Called BEFORE register so the register call carries
-/// the generation the pod stamps on its fires.
-pub async fn next_generation(pg_pool: &PgPool, token: &str) -> Result<i64> {
-    let row: Option<(i64,)> =
-        sqlx::query_as("SELECT placement_generation FROM signal WHERE token = $1")
-            .bind(token)
-            .fetch_optional(pg_pool)
-            .await?;
-    Ok(row.map(|(g,)| g + 1).unwrap_or(FIRST_PLACEMENT_GENERATION))
-}
-
-/// Record the chosen holder + its generation for a re-placed signal in
-/// ONE write, so the row's `listener_pod` and `placement_generation` are
-/// never observed out of step (the fire path reads both together; the
-/// broker's stale-fire fence depends on them agreeing). This is the FIRST
-/// and ONLY mutation of the generation for a re-placement (the read in
-/// `next_generation` does not write), so if the re-placement fails before
-/// this call the row is untouched. Called under the per-token lock, so
-/// the `generation` passed (computed by `next_generation` under the same
-/// lock) is still the current+1 at write time.
-pub async fn set_placement(
-    pg_pool: &PgPool,
-    token: &str,
-    pod_name: &str,
-    generation: i64,
-) -> Result<()> {
-    // Stamp under the per-pod advisory lock, guarded on the pod's
-    // registry row still existing: the idle reaper deletes that row (and
-    // then the pod) under the SAME lock with a none-placed re-check, so
-    // exactly one of {this stamp, that reap} wins. Without the lock the
-    // two writes can skew past each other and a signal ends up placed on
-    // a pod that no longer exists, which nothing would ever fire.
-    let mut tx = pg_pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock($1)")
-        .bind(pod_lock_key(pod_name))
-        .execute(&mut *tx)
-        .await?;
-    let res = sqlx::query(
-        "UPDATE signal SET listener_pod = $1, placement_generation = $2 \
-         WHERE token = $3 \
-           AND EXISTS (SELECT 1 FROM listener_pod WHERE pod_name = $1)",
-    )
-    .bind(pod_name)
-    .bind(generation)
-    .bind(token)
-    .execute(&mut *tx)
-    .await?;
-    tx.commit().await?;
-    if res.rows_affected() == 0 {
-        anyhow::bail!(
-            "placement stamp for token '{token}' onto pod '{pod_name}' did not apply: the pod \
-             was reaped mid-placement (or the signal row is gone); retry places onto a live pod"
-        );
-    }
-    Ok(())
-}
-
-/// The per-listener-pod advisory-lock key. Taken (blocking) by every
-/// placement STAMP (`signal_insert`, `set_placement`) and (try) by the
-/// idle reaper's claim-and-delete, so "a signal points at this pod" and
-/// "this pod's registry row is deleted" are strictly serialized; the
-/// reap-vs-place race cannot strand a signal on a reaped pod.
-pub fn pod_lock_key(pod_name: &str) -> i64 {
-    crate::lease::advisory_key(crate::lease::LISTENER_POOL_DOMAIN, pod_name)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The listener's placement identity (`WEFT_POD_NAME`) MUST be the
-    /// literal Deployment name the dispatcher minted, the same string it
-    /// writes to `signal.listener_pod` and uses as the Service DNS host.
-    /// It must NOT be `fieldRef: metadata.name`, which resolves to the
-    /// auto-generated POD name and would make a restarted listener
-    /// rehydrate zero signals (placement is keyed by Deployment name).
-    /// This invariant is invisible to fakes (k8s is faked at layers
-    /// 1-3), so pin it here.
-    #[test]
-    fn listener_manifest_pod_name_is_deployment_name_not_fieldref() {
-        let yaml = render_listener_manifest(
-            "listener-abc123",
-            "weft-system",
-            "weft-listener:local",
-            "http://broker:9090",
-        );
-        // The env var carries the literal Deployment name.
-        assert!(
-            yaml.contains("name: WEFT_POD_NAME"),
-            "WEFT_POD_NAME env missing:\n{yaml}"
-        );
-        assert!(
-            yaml.contains("value: \"listener-abc123\""),
-            "WEFT_POD_NAME must be the literal Deployment name:\n{yaml}"
-        );
-        // The Deployment/Service name, the DNS host, and the placement
-        // key are all this one string; a fieldRef pod-name would break
-        // rehydrate. Guard against a regression re-introducing it.
-        assert!(
-            !yaml.contains("fieldPath: metadata.name"),
-            "WEFT_POD_NAME must not be a fieldRef pod-name:\n{yaml}"
-        );
-    }
-
-    // Scale-down headroom math is the shared, memory-based
-    // `weft_platform_traits::plan_memory_scaledown`, tested next to its
-    // definition (mem_pressure.rs). The listener's drain_one just feeds
-    // it per-pod memory pressure read from each pod's /load.
-
-    /// The Service selector must match the pod template's `app` label so
-    /// the admin URL (Service DNS) actually routes to the pod. A
-    /// mismatch makes every listener unreachable, an e2e-only failure.
-    #[test]
-    fn listener_manifest_service_selector_matches_pod() {
-        let yaml = render_listener_manifest("listener-x", "weft-system", "img", "url");
-        // Both the Deployment selector and the Service selector key on
-        // `app: <name>`, which the pod template carries.
-        assert!(yaml.contains("app: listener-x"));
-        assert!(yaml.contains("weft.dev/role: listener"));
-        assert!(
-            yaml.contains(&format!("\n      {}\n      containers:", weft_core::pod_dns::pod_dns_config_yaml())),
-            "ndots:1 at the pod spec level"
-        );
-    }
+/// Whether the listener is listening for `project`: it holds every signal
+/// the durable table has, so that is whether the project has an armed
+/// trigger.
+pub async fn project_is_listening(pool: &sqlx::PgPool, project: uuid::Uuid) -> Result<bool> {
+    Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM signal WHERE project_id = $1 AND is_resume = FALSE)")
+        .bind(project)
+        .fetch_one(pool)
+        .await?)
 }

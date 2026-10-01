@@ -38,7 +38,6 @@ pub struct RoutePattern {
 
 /// The HTTP methods a route may name. Anything else is refused at
 /// validation so a typo (`GTE`) is not a route nobody can call.
-// SYNC: HTTP_METHODS <-> deploy/k8s/gateway.yaml (SecurityPolicy weft-live-cors allowMethods)
 pub const HTTP_METHODS: &[&str] =
     &["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
 
@@ -55,12 +54,27 @@ pub fn normalize_method(raw: &str) -> Result<String, String> {
     }
 }
 
+/// The first path segment a worker keeps for its own endpoints
+/// (`/_weft/run/...`): no route may start with it, and the install's
+/// relay never forwards a caller's path that does.
+// SYNC: RESERVED_SEGMENT <-> crates/weft-engine/src/worker.rs (its routes)
+pub const RESERVED_SEGMENT: &str = "_weft";
+
+/// Whether a caller's path (no leading slash) reaches into the worker's
+/// own endpoints.
+pub fn is_reserved_path(path: &str) -> bool {
+    path.trim_start_matches('/').split('/').next() == Some(RESERVED_SEGMENT)
+}
+
 impl RoutePattern {
     /// Parse `chat/{room}` into segments. The empty string is the root
     /// pattern (zero segments), which matches only the empty path.
     pub fn parse(raw: &str) -> Result<Self, String> {
         if raw.starts_with('/') {
             return Err(format!("route '{raw}' must not start with '/'"));
+        }
+        if is_reserved_path(raw) {
+            return Err(format!("route '{raw}' starts with '{RESERVED_SEGMENT}', which the worker keeps for itself"));
         }
         if raw.is_empty() {
             return Ok(Self { segments: Vec::new() });
@@ -309,8 +323,16 @@ mod tests {
     }
 
     #[test]
+    fn the_workers_own_prefix_is_reserved() {
+        assert!(is_reserved_path("_weft/run/x"));
+        assert!(is_reserved_path("/_weft"));
+        assert!(!is_reserved_path("weft/run"));
+        assert!(!is_reserved_path("chat/_weft"));
+    }
+
+    #[test]
     fn refuses_malformed_patterns() {
-        for bad in ["/chat", "chat//x", "chat/{", "chat/{}", "chat/{a}/{a}", "chat/x{y}", "a/{b-c}"] {
+        for bad in ["/chat", "chat//x", "chat/{", "chat/{}", "chat/{a}/{a}", "chat/x{y}", "a/{b-c}", "_weft", "_weft/run"] {
             assert!(RoutePattern::parse(bad).is_err(), "'{bad}' must be refused");
         }
     }

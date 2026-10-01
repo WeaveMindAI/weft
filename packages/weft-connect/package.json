@@ -1,7 +1,7 @@
 {
   "name": "@weft/connect",
   "version": "0.1.0",
-  "description": "The weft connect library: a service's connect page (connections, doors, sign-in), framework-free at its core with Svelte components on top. Used by the weft editor's connection picker and by a member's connect page (a website or the browser extension) through the member door.",
+  "description": "The weft connect library: a service's connect page (connections, doors, sign-in), framework-free at its core with Svelte components on top. Used by the weft editor's connection picker and by an instance's connect page (a website or the browser extension) through the instance door.",
   "type": "module",
   "private": true,
   "scripts": {

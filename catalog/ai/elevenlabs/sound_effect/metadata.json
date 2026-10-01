@@ -76,6 +76,9 @@
       "type": "Number"
     }
   ],
+  "features": {
+    "catchErrors": true
+  },
   "display": {
     "kind": "media",
     "output": "file"

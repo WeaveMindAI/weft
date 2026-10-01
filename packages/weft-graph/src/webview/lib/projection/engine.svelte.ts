@@ -50,6 +50,9 @@ export interface EngineHost {
 }
 
 const MAX_HISTORY = 100;
+// SYNC: stale-text-edit message <-> crates/weft-compiler/src/edit.rs EditError::StaleTextEdit
+const TEXT_CHANGED_UNDO_MESSAGE =
+	"the text changed after these graph edits, so undo and redo from the graph can no longer replay them; use the text editor's undo instead";
 const TYPING_FLUSH_MS = 250;
 
 /** A gesture's layout half: a PURE transform of the current layout text to the
@@ -96,6 +99,8 @@ export class ProjectionEngine {
 	codeEditLockUntil = $state<number | null>(null);
 	lockGraphLogic = $state(false);
 	lockReason = $state<string | undefined>(undefined);
+	// Gate 3: the graph shows another install's program (see LockState).
+	installReadOnly = $state<string | undefined>(undefined);
 
 	// ── Internals ────────────────────────────────────────────────────────
 	private readonly host: EngineHost;
@@ -280,11 +285,20 @@ export class ProjectionEngine {
 	}
 
 	private lock(): LockState {
-		return { codeEditLockUntil: this.codeEditLockUntil, lockGraphLogic: this.lockGraphLogic, lockReason: this.lockReason };
+		return {
+			codeEditLockUntil: this.codeEditLockUntil,
+			lockGraphLogic: this.lockGraphLogic,
+			lockReason: this.lockReason,
+			installReadOnly: this.installReadOnly,
+		};
 	}
 
 	setCodeEditTouched(): void {
 		this.codeEditLockUntil = this.host.now() + 1000;
+	}
+
+	setInstallReadOnly(install: string | undefined): void {
+		this.installReadOnly = install;
 	}
 
 	setGraphLogicLock(locked: boolean, reason?: string): void {
@@ -409,6 +423,7 @@ export class ProjectionEngine {
 	}
 
 	private pushHistory(entry: HistoryEntry): void {
+		this.textHistoryDropped = false;
 		this.undoStack = [...this.undoStack, entry].slice(-MAX_HISTORY);
 		// Clear redo SYNCHRONOUSLY (a redo pressed before the async
 		// confirmation must already see it gone) and bump the epoch so an
@@ -598,7 +613,36 @@ export class ProjectionEngine {
 				this.layoutBase = newLayoutCode;
 			}
 		}
+		// Any text change the graph did not make (typing, an AI writing the
+		// file) makes every recorded inverse TextEdit meaningless: its byte
+		// offsets point into a source that no longer exists. Drop them so undo
+		// can never write over that text edit (the edit-server's expected-bytes
+		// check is the floor if this is ever missed).
+		if (newWeftCode !== this.truth.weftCode) this.dropTextHistory();
 		this.adoptTruth(newProject, newWeftCode);
+	}
+
+	/** Why the last undo/redo found nothing, when the answer is "the text
+	 *  changed under the graph" (set by dropTextHistory, cleared by the next
+	 *  forward gesture). Lets an empty press say why instead of doing nothing. */
+	private textHistoryDropped = false;
+
+	/** Remove every history entry holding a source TextEdit (confirmed
+	 *  entries), on both stacks. Pending entries (semantic ops, sent against
+	 *  whatever text is current) and reapply entries (semantic ops, preflighted
+	 *  again at redo) stay valid. */
+	private dropTextHistory(): void {
+		const keep = (e: HistoryEntry) => !(e.kind === 'confirmed' && e.source);
+		const undo = this.undoStack.filter(keep);
+		const redo = this.redoStack.filter(keep);
+		if (undo.length === this.undoStack.length && redo.length === this.redoStack.length) return;
+		this.undoStack = undo;
+		this.redoStack = redo;
+		this.textHistoryDropped = true;
+	}
+
+	private notifyTextHistoryDropped(title: string): void {
+		this.host.notify(title, TEXT_CHANGED_UNDO_MESSAGE);
 	}
 
 	// ── Sending ──────────────────────────────────────────────────────────
@@ -811,7 +855,10 @@ export class ProjectionEngine {
 	undo(): void {
 		const press = ++this.pressSeq;
 		const target = this.undoStack[this.undoStack.length - 1 - this.queuedUndoPresses];
-		if (!target) return;
+		if (!target) {
+			if (this.textHistoryDropped) this.notifyTextHistoryDropped('Nothing to undo in the graph');
+			return;
+		}
 		// An UNCONFIRMED op undoes AT PRESS TIME, not after its round-trip:
 		// the projection drops it instantly, so a long optimistic chain
 		// (edit, undo, edit, undo, redo...) reads coherently even while the
@@ -901,7 +948,10 @@ export class ProjectionEngine {
 		this.enqueue(async () => {
 			this.queuedRedoPresses--;
 			const entry = this.redoStack[this.redoStack.length - 1];
-			if (!entry) return;
+			if (!entry) {
+				if (this.textHistoryDropped) this.notifyTextHistoryDropped('Nothing to redo in the graph');
+				return;
+			}
 			if (entry.pressStamp! > press) return;
 			this.redoStack = this.redoStack.slice(0, -1);
 			try {

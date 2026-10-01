@@ -10,13 +10,13 @@ use crate::frames::LoopFrames;
 use crate::primitive::SignalSpec;
 use crate::tag::StopSelf;
 use crate::weft_type::WeftType;
-use crate::Color;
+use crate::ExecutionId;
 
 pub use crate::primitive::Phase;
 
 mod program_calls;
 pub use program_calls::{
-    ConnectionCalls, CostQuery, InfraCalls, MemberConnections, MemberTokens, MemberValueCalls, RunQuery, TokenCalls,
+    ConnectionCalls, CostQuery, InfraCalls, InstanceConnections, InstanceTokens, InstanceValueCalls, RunQuery, TokenCalls,
     TriggerCalls, ValueCalls,
 };
 
@@ -48,12 +48,12 @@ pub struct ExecutionContext {
     /// the node; runtime callers decide whether to fall back to
     /// node_id or omit the label entirely.
     pub node_label: Option<String>,
-    pub color: Color,
+    pub execution_id: ExecutionId,
     pub frames: LoopFrames,
-    /// Who this run is for: the member whatever started it named, or
-    /// `None` for a run for nobody in particular. Read it through
-    /// [`Self::member`].
-    member: Option<crate::member::MemberId>,
+    /// Which instance this run is for: the one whatever started it
+    /// named, or `None` for a run for no instance in particular. Read it
+    /// through [`Self::instance`].
+    instance: Option<crate::instance::InstanceId>,
     /// The node's INPUTS this firing, one bag: wired pulse values,
     /// braces/assignment literals from the `.weft` body, and declared
     /// defaults for anything still absent. However an input got its
@@ -76,6 +76,83 @@ pub struct ExecutionContext {
 /// link never leaves the firing (every exit strips it), so a short
 /// life costs nothing and bounds what a leaked URL is worth.
 pub const NODE_LINK_TTL_SECS: u64 = 60 * 60;
+
+pub use crate::node::ERROR_PORT;
+
+/// The message a failed body hands to [`ERROR_PORT`] if it is caught,
+/// or `None` for a failure that is never caught. An outcome of the
+/// step (a [`WeftError::NodeExecution`] or [`WeftError::Runtime`]) may
+/// be caught; a bad config, input or type, a suspension and a cancel
+/// never are: those are the program's own shape or the runtime's
+/// control flow, never an outcome to route around. A failure that
+/// never came from a body (a panic, an infra apply that failed) is not
+/// a `WeftError` and never passes through here: the engine decides its
+/// catchable message itself where it builds the failed outcome
+/// (`weft-engine` `execution_driver.rs`, `note_task_joined` and the
+/// infra apply), and `handle_node_failure` routes it like any other.
+pub fn catchable_message(error: &WeftError) -> Option<String> {
+    match error {
+        WeftError::NodeExecution(message) => Some(message.clone()),
+        WeftError::Runtime(error) => Some(format!("{error:#}")),
+        WeftError::Config(_)
+        | WeftError::Input(_)
+        | WeftError::Type(_)
+        | WeftError::Suspended { .. }
+        | WeftError::Suspension(_)
+        | WeftError::Cancelled => None,
+    }
+}
+
+/// Whether a failure goes to [`ERROR_PORT`] instead of stopping the
+/// run, and with what message: only when the node declares
+/// `features.catchErrors`, its `error` output is wired (a caught
+/// failure nobody reads would be silent), and the failure is catchable
+/// ([`catchable_message`]). The one decision, read by the engine's
+/// failure path and by the node-test rigs alike.
+pub fn caught_failure(catch_errors: bool, catchable: Option<String>, error_wired: bool) -> Option<String> {
+    catchable.filter(|_| catch_errors && error_wired)
+}
+
+/// Waiting out another write of the same file: short and growing
+/// pauses, and a line in the node's log every minute so a wait that
+/// does not end reads as one. It ends when that write does; one whose
+/// worker went away is cleared by the storage sweep within the hour.
+struct BusyWait<'k> {
+    key: &'k str,
+    started: std::time::Instant,
+    pause: std::time::Duration,
+    told_at: std::time::Duration,
+}
+
+impl<'k> BusyWait<'k> {
+    const FIRST_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
+    const LONGEST_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+    const TELL_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+    fn new(key: &'k str) -> Self {
+        Self { key, started: std::time::Instant::now(), pause: Self::FIRST_PAUSE, told_at: std::time::Duration::ZERO }
+    }
+
+    async fn wait(&mut self, handle: &Arc<dyn ContextHandle>) -> WeftResult<()> {
+        tokio::time::sleep(self.pause).await;
+        self.pause = (self.pause * 2).min(Self::LONGEST_PAUSE);
+        let waited = self.started.elapsed();
+        if waited >= self.told_at + Self::TELL_EVERY {
+            self.told_at = waited;
+            handle
+                .log(
+                    LogLevel::Warn,
+                    format!(
+                        "still waiting for another write of '{}' to finish ({}s so far)",
+                        self.key,
+                        waited.as_secs()
+                    ),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+}
 
 /// An emission with every firing-scoped file link taken off: what
 /// leaves a node is the stored form, never a link that expires.
@@ -141,28 +218,28 @@ impl ExecutionContext {
         node_id: String,
         node_type: String,
         node_label: Option<String>,
-        color: Color,
+        execution_id: ExecutionId,
         frames: LoopFrames,
-        member: Option<crate::member::MemberId>,
+        instance: Option<crate::instance::InstanceId>,
         inputs: ValueBag,
         handle: Arc<dyn ContextHandle>,
     ) -> Self {
         let wake = ValueBag::wake(handle.wake_payload());
         Self {
-            project_id, node_id, node_type, node_label, color, frames, member,
+            project_id, node_id, node_type, node_label, execution_id, frames, instance,
             inputs, wake, handle,
         }
     }
 
-    /// Who this run is for: the member whatever started it named (a
-    /// firing through a member's own copy, a member token, the
-    /// `Weft-Member` header on a gated route, `weft run --member`), or
-    /// `None` for a run for nobody in particular (a cron, an admin
-    /// route). A node that needs one says so with its own error; the
-    /// runtime has already refused a run that reaches a per-member node
-    /// without one.
-    pub fn member(&self) -> Option<&crate::member::MemberId> {
-        self.member.as_ref()
+    /// Which instance this run is for: the one whatever started it named
+    /// (a firing through an instance's own infra, an instance token, the
+    /// `Weft-Instance` header on a gated route, `weft run --instance`),
+    /// or `None` for a run for no instance in particular (a cron, an
+    /// admin route). A node that needs one says so with its own error;
+    /// the runtime has already refused a run that reaches a per-instance
+    /// node without one.
+    pub fn instance(&self) -> Option<&crate::instance::InstanceId> {
+        self.instance.as_ref()
     }
 
     // ----- Wait-and-resume primitive ---------------------------------
@@ -206,6 +283,14 @@ impl ExecutionContext {
     /// Every public URL is derived from the signal's mount_path on
     /// the dispatcher; nodes don't need the URL handed back. Returns
     /// `()` once the dispatcher has acknowledged the registration.
+    ///
+    /// The settings the language gives the trigger
+    /// (`NodeMetadata::add_language_ports`) are read here from the
+    /// node's inputs, never by the node: the run class (`longRuns`)
+    /// and the trigger's entry limits (`callsPerMinutePerCaller` on a
+    /// trigger called from outside, `callsPerMinute`, `callsAtOnce`),
+    /// which the dispatcher enforces. A trigger without one of them
+    /// gets its default.
     pub async fn register_signal<K: crate::signal::Signal>(
         &self,
         kind: K,
@@ -218,6 +303,8 @@ impl ExecutionContext {
             crate::storage::media::strip_links(&Value::Object(self.inputs.values.clone()));
         let mut spec = crate::signal::to_spec(kind);
         spec.config = crate::storage::media::strip_links(&spec.config);
+        spec.limits = crate::signal::EntryLimits::from_node_fields(&self.inputs.values).map_err(crate::node_error)?;
+        spec.run_class = crate::run_class::RunClass::from_node_fields(&self.inputs.values).map_err(crate::node_error)?;
         self.handle.register_signal(spec, port_snapshot).await
     }
 
@@ -275,7 +362,24 @@ impl ExecutionContext {
     /// mentions, neither here nor via `close_port`, get a CLOSURE marker
     /// at termination so downstream consumers learn nothing's coming.
     pub async fn pulse_downstream(&self, output: crate::node::NodeOutput) -> WeftResult<()> {
+        self.refuse_error_port(output.outputs.keys())?;
         self.handle.pulse_downstream(without_links(output), false).await
+    }
+
+    /// A node with `features.catchErrors` never touches [`ERROR_PORT`]
+    /// itself: the runtime fills it with the node's failure. Writing
+    /// or closing it from the body is the node's own mistake, a
+    /// [`WeftError::Type`] that is never caught.
+    fn refuse_error_port<'a>(&self, mut ports: impl Iterator<Item = &'a String>) -> WeftResult<()> {
+        if self.handle.catches_errors() && ports.any(|p| p == ERROR_PORT) {
+            return Err(WeftError::Type(format!(
+                "node '{}' ({}) touches its '{ERROR_PORT}' output, which the runtime fills \
+                 with the node's failure (features.catchErrors); return the error from the \
+                 body instead",
+                self.node_id, self.node_type
+            )));
+        }
+        Ok(())
     }
 
     /// [`Self::pulse_downstream`] that DOES NOT RETURN until the
@@ -302,6 +406,7 @@ impl ExecutionContext {
         &self,
         output: crate::node::NodeOutput,
     ) -> WeftResult<()> {
+        self.refuse_error_port(output.outputs.keys())?;
         self.handle.pulse_downstream(without_links(output), true).await
     }
 
@@ -326,17 +431,42 @@ impl ExecutionContext {
     /// `.set(..)` after it for ports the node computes itself; the later
     /// set wins, so a payload key can't shadow the node's own truth.
     pub fn fan_declared(&self, source: &serde_json::Value) -> crate::node::NodeOutput {
-        crate::node::NodeOutput::new()
-            .extend_from_declared(source, self.handle.declared_output_ports())
+        crate::node::NodeOutput::new().extend_from_declared(source, &self.data_outputs())
+    }
+
+    /// The declared outputs a node fills from data (a row's columns, a
+    /// response's fields): every declared output but, on a node with
+    /// `features.catchErrors`, [`ERROR_PORT`], which only the runtime
+    /// fills. A field that happens to be called `error` in a model's
+    /// answer or a query's row is then data, never the node's failure.
+    pub fn data_outputs(&self) -> std::collections::HashMap<String, WeftType> {
+        let catches = self.handle.catches_errors();
+        self.handle
+            .declared_output_ports()
+            .iter()
+            .filter(|(name, _)| !(catches && name.as_str() == ERROR_PORT))
+            .map(|(name, ty)| (name.clone(), ty.clone()))
+            .collect()
     }
 
     /// The declared type of one of THIS instance's output ports, as the
     /// compiled project resolved it (a metadata `MustOverride` output
     /// reads as the concrete type the weft source declared on it).
-    /// `None` for a port this node does not declare. For nodes whose
-    /// behavior follows their resolved type (Cast).
-    pub fn output_type(&self, port: &str) -> Option<WeftType> {
-        self.handle.declared_output_ports().get(port).cloned()
+    /// For nodes whose behavior follows their resolved type (Cast, a
+    /// node storing a file on a typed port). A port this node does not
+    /// declare is the node's own mistake, never an outcome of the run:
+    /// the error is a [`WeftError::Type`], which is never caught
+    /// ([`catchable_message`]), so it fails the run even with `error`
+    /// wired. A node that only probes whether a
+    /// port exists reads [`Self::declared_outputs`].
+    pub fn output_type(&self, port: &str) -> WeftResult<WeftType> {
+        self.handle.declared_output_ports().get(port).cloned().ok_or_else(|| {
+            WeftError::Type(format!(
+                "node '{}' ({}) reads the type of its output '{port}', which it does not \
+                 declare; add '{port}' to its metadata outputs",
+                self.node_id, self.node_type
+            ))
+        })
     }
 
     /// Every output port THIS instance declares, with its resolved
@@ -355,6 +485,13 @@ impl ExecutionContext {
         self.handle.declared_input_ports()
     }
 
+    /// Whether anything downstream reads `port` in this run: at least
+    /// one wire leaves it in the compiled graph. For a node whose
+    /// behavior depends on whether a result is consumed.
+    pub fn is_output_wired(&self, port: &str) -> bool {
+        self.handle.wired_output_ports().contains(port)
+    }
+
     /// Close an output port mid-firing. The downstream subgraph attached
     /// to `port` receives a CLOSURE pulse (structural "nothing's coming")
     /// at the firing's own frame stack, same shape as the
@@ -365,6 +502,7 @@ impl ExecutionContext {
     /// mention of `port`: any later `pulse_downstream` or `close_port`
     /// on the same port errors loud.
     pub async fn close_port(&self, port: &str) -> WeftResult<()> {
+        self.refuse_error_port(std::iter::once(&port.to_string()))?;
         self.handle.close_port(port).await
     }
 
@@ -461,7 +599,7 @@ impl ExecutionContext {
     /// lookups.
     ///
     /// The address is handed over only once something ANSWERS on it. A
-    /// workload is marked ready a moment before the cluster routes to
+    /// workload is marked ready a moment before the install routes to
     /// it, so anything dialling straight away would be refused; this
     /// waits that gap out, whatever the node speaks next.
     ///
@@ -472,7 +610,7 @@ impl ExecutionContext {
     ///
     /// Returns an error if the endpoint doesn't exist or the infra
     /// isn't applied. The dispatcher resolves the URL from the
-    /// `infra_node` row so node code never touches k8s.
+    /// `infra_node` row so node code never touches the platform.
     pub async fn endpoint(&self, name: &str) -> WeftResult<EndpointHandle> {
         let address = self.handle.endpoint_address(name).await?;
         Ok(EndpointHandle {
@@ -495,7 +633,7 @@ impl ExecutionContext {
     /// (`get`/`delete`/`keep`/`presign`) act on the key's OWN scope
     /// (the key encodes its prefix), so a downstream node can `get` a
     /// stored-file value without knowing which scope produced it; the box
-    /// still enforces the wall (own color, own project, granted
+    /// still enforces the wall (own execution, own project, granted
     /// shared names). `copy` is both: it reads the key's own scope and
     /// writes the handle's, which is how a file crosses from one scope
     /// to another.
@@ -613,7 +751,8 @@ impl ExecutionContext {
 
     /// Tag THIS execution. Additive: the tags join whatever the run
     /// already carries, and tagging twice with the same tag is a
-    /// no-op, so a body re-run after a crash lands on the same state.
+    /// no-op, so a body replayed after a durable wait (which runs it
+    /// again from the top) lands on the same state.
     /// Any node can call it, at any point. The tags are what a sibling
     /// run's [`Self::stop_tagged`] selects on, and they show on the
     /// run in the inspector.
@@ -1408,7 +1547,7 @@ pub enum EndpointMethod {
 /// Obtained via `ctx.endpoint(name)`: one broker round-trip
 /// resolves the URL, the handle caches it. After that:
 ///
-///   - `.url()` is a sync getter for the bare cluster-internal URL
+///   - `.url()` is a sync getter for the bare install-internal URL
 ///     (e.g. to forward as a NodeOutput port value);
 ///   - `.call(method, path, body)` issues an HTTP request to the
 ///     cached URL + `path` and returns the JSON response.
@@ -1482,17 +1621,17 @@ impl EndpointHandle {
         endpoint_host_and_port(&self.url)
     }
 
-    /// Cluster-internal URL of this endpoint. No broker call; the
-    /// URL was resolved by `ctx.endpoint(name)`.
+    /// The address the project's own workers reach this endpoint at. No
+    /// broker call; the URL was resolved by `ctx.endpoint(name)`.
     pub fn url(&self) -> &str {
         &self.url
     }
 
-    /// The address a caller outside the cluster reaches this endpoint
+    /// The address a caller outside the install reaches this endpoint
     /// at, to hand to whoever calls in (a provider's webhook target, a
-    /// browser). `Some` only for an `Expose::TenantPublic` endpoint, on
-    /// an install that has a front-door address. The node declares
-    /// `/hooks`; this is `<front door>/infra/<namespace>/<instance>/hooks`,
+    /// browser). `Some` only for an `Expose::Public` endpoint, on an
+    /// install that has a front-door address. The node declares
+    /// `/hooks`; this is `<front door>/infra/<project>/<instance>/hooks`,
     /// which the door rewrites back to `/hooks` on the way in.
     pub fn public_url(&self) -> Option<&str> {
         self.public_url.as_deref()
@@ -1567,14 +1706,19 @@ impl StorageHandle {
 
     /// Store `bytes` under this handle's scope. Returns the
     /// self-describing stored-file value (`key` + `mimeType` +
-    /// `sizeBytes` + `filename`, NO url) to emit downstream. `keep` flags an
-    /// execution-scoped file to survive the terminate sweep (with the
-    /// given access-bumped TTL); it is meaningless for project/shared
-    /// scopes (those persist without a flag) and rejected there.
-    /// `None` leaves the file run-scoped (swept shortly after the run
+    /// `sizeBytes` + `filename`, NO url) to emit downstream. Every put
+    /// is a NEW file under a fresh key; to change a file's content in
+    /// place, use [`Self::replace`].
+    ///
+    /// `keep` is how long the file lives, renewed by every access. On an
+    /// execution file it also makes the file survive the end of its run;
+    /// `None` there leaves it run-scoped (swept shortly after the run
     /// ends): right for scratch bytes, wrong for a node's user-facing
     /// media output, which should pass a keep TTL so the artifact
-    /// outlives the run.
+    /// outlives the run. On a project, shared or instance file (which
+    /// outlive runs anyway) `None` and `KeepTtl::Never` mean it lives
+    /// until deleted, and any other TTL makes it expire once nobody has
+    /// touched it for that long.
     pub async fn put(
         &self,
         bytes: impl Into<bytes::Bytes>,
@@ -1609,6 +1753,110 @@ impl StorageHandle {
     ) -> WeftResult<Value> {
         self.handle
             .storage_put(&self.scope, self.identity.as_deref(), stream, mime_type, filename, keep, None)
+            .await
+    }
+
+    /// Overwrite a stored file's content with `bytes`, whatever it holds
+    /// now, in place: the file keeps its key (so every reference already
+    /// handed out now reads the new content), its scope, name, type and
+    /// lifetime, and a reader sees either the old bytes or the new ones,
+    /// never a mix. Returns the file's value with its new `sizeBytes` and
+    /// `version`. Explicit only: a put never overwrites anything. To
+    /// CHANGE what is there (append a line, update a field), use
+    /// [`Self::edit`], which never loses another write's change. The
+    /// handle's scope plays no part (the key carries its own); a
+    /// url-backed file has nothing in storage to overwrite and errors
+    /// loud, as does an asset.
+    pub async fn replace(
+        &self,
+        file: &crate::storage::FileHandle,
+        bytes: impl Into<bytes::Bytes>,
+    ) -> WeftResult<Value> {
+        let key = Self::bucket_key(file, "replace")?;
+        let bytes = bytes.into();
+        let mut waited = BusyWait::new(key);
+        let stored = loop {
+            match self.write_once(key, None, &bytes).await? {
+                crate::storage::ReplaceOutcome::Replaced(stored) => break stored,
+                crate::storage::ReplaceOutcome::Busy => waited.wait(&self.handle).await?,
+                crate::storage::ReplaceOutcome::Stale => {
+                    return Err(WeftError::NodeExecution(format!(
+                        "storage replace of '{key}' was refused as stale without naming a version; \
+                         the storage service broke its contract"
+                    )))
+                }
+            }
+        };
+        self.handle
+            .record_file_edit(crate::storage::FileEdit {
+                key: stored.key.clone(),
+                filename: stored.filename.clone(),
+                from_version: None,
+                to_version: stored.version,
+                diff: crate::storage::diff::overwrite_note(stored.size_bytes),
+            })
+            .await?;
+        Ok(stored.to_value())
+    }
+
+    /// Change a stored file's content in place: read it, hand its bytes
+    /// to `change`, write what it returns. Another write of the same
+    /// file (a parallel loop iteration, another run on a project file)
+    /// can never be lost: the write only lands on the content `change`
+    /// read, and if the file moved on in between, it is read again and
+    /// `change` runs again on the new content. So `change` must be a
+    /// pure function of the bytes it is given (no counter it bumps, no
+    /// call it makes). Returning the bytes unchanged writes nothing.
+    ///
+    /// Every change is recorded for the run's inspector as a readable
+    /// diff of the file (cut to a readable size; a file that is not text
+    /// shows its old and new size). Returns the file's value at its new
+    /// version, the same key as before.
+    pub async fn edit<F>(&self, file: &crate::storage::FileHandle, change: F) -> WeftResult<Value>
+    where
+        F: Fn(&[u8]) -> WeftResult<Vec<u8>>,
+    {
+        let key = Self::bucket_key(file, "edit")?;
+        let mut waited = BusyWait::new(key);
+        loop {
+            let (meta, old) = self.get_bytes(file).await?;
+            let new = bytes::Bytes::from(change(&old)?);
+            if new == old {
+                return Ok(crate::storage::StoredFile::from(&meta).to_value());
+            }
+            match self.write_once(key, Some(meta.version), &new).await? {
+                crate::storage::ReplaceOutcome::Replaced(stored) => {
+                    self.handle
+                        .record_file_edit(crate::storage::FileEdit {
+                            key: stored.key.clone(),
+                            filename: stored.filename.clone(),
+                            from_version: Some(meta.version),
+                            to_version: stored.version,
+                            diff: crate::storage::diff::edit_diff(&meta.mime_type, &old, &new),
+                        })
+                        .await?;
+                    return Ok(stored.to_value());
+                }
+                crate::storage::ReplaceOutcome::Stale => continue,
+                crate::storage::ReplaceOutcome::Busy => waited.wait(&self.handle).await?,
+            }
+        }
+    }
+
+    /// One attempt at writing `bytes` over the file at `key`.
+    async fn write_once(
+        &self,
+        key: &str,
+        expected_version: Option<u64>,
+        bytes: &bytes::Bytes,
+    ) -> WeftResult<crate::storage::ReplaceOutcome> {
+        self.handle
+            .storage_replace(
+                key,
+                expected_version,
+                crate::storage::bytes_stream(bytes.clone()),
+                Some(bytes.len() as u64),
+            )
             .await
     }
 
@@ -1774,11 +2022,13 @@ impl StorageHandle {
         self.handle.storage_list(&self.scope).await
     }
 
-    /// Mark an existing execution-scoped file to survive the
-    /// terminate sweep (the after-the-fact twin of `put(.., keep)`).
-    /// Keep is purely ADDITIVE: there is no un-keep / keep-only verb.
-    /// Bucket-only: a url-backed file is not subject to the terminate
-    /// sweep (the bytes were never in storage) and errors loud.
+    /// Set how long an existing file lives from now on (the
+    /// after-the-fact twin of `put(.., keep)`), renewed by every access.
+    /// On an execution file it also marks the file to survive the
+    /// terminate sweep, and that mark is ADDITIVE: there is no un-keep.
+    /// On a project, shared or instance file it is only the lifetime,
+    /// and `KeepTtl::Never` clears one. Bucket-only: a url-backed file
+    /// has nothing in storage to keep and errors loud.
     pub async fn keep(
         &self,
         file: &crate::storage::FileHandle,
@@ -1791,7 +2041,7 @@ impl StorageHandle {
     /// Mint a TEMPORARY link to this file: the internet-reachable one
     /// when the install serves one (a tunnel, a real ingress, a bucket
     /// declared public), which an external URL-accepting API streams
-    /// from directly, else one signed for the cluster's own address,
+    /// from directly, else one signed for the install's own address,
     /// which your body can fetch and nothing outside can. When the
     /// consumer is outside and inline bytes are an option, use
     /// [`Self::public_link`], which says which case you are in.
@@ -1830,18 +2080,20 @@ impl StorageHandle {
         self.link_for(file, ttl_secs, crate::storage::LinkReach::Internet).await
     }
 
-    /// Mint a temporary URL a CALLER of this install can fetch this
-    /// file from: the internet address when the install has one, else
-    /// its own stable base (a local install's loopback, which is where
-    /// the browser that called a route reached it). What a route's
-    /// answer carries in place of a stored file. `None` only when the
-    /// install has no base at all.
+    /// Mint a temporary URL the CALLER of this run can fetch this file
+    /// from, on the very address its request came in on (a browser on a
+    /// local install's loopback port gets a loopback link, one on the
+    /// tunnel a tunnel link). What a route's answer carries in place of a
+    /// stored file. A run no request started falls back to the install's
+    /// configured address (the internet one when there is one, else its
+    /// own stable base). `None` only when the install has no base at all.
     pub async fn caller_link(
         &self,
         file: &crate::storage::FileHandle,
         ttl_secs: Option<u64>,
     ) -> WeftResult<Option<String>> {
-        self.link_for(file, ttl_secs, crate::storage::LinkReach::Caller).await
+        let base = self.handle.caller_connection().and_then(|conn| conn.handshake().base_url.clone());
+        self.link_for(file, ttl_secs, crate::storage::LinkReach::Caller { base }).await
     }
 
     async fn link_for(
@@ -1953,7 +2205,7 @@ impl StorageHandle {
         match file {
             crate::storage::FileHandle::Key(key) => Ok(key),
             crate::storage::FileHandle::Url { url, .. } => Err(WeftError::Input(format!(
-                "storage {verb}: this file value points at an external URL ({url}), not a stored file; only bucket-stored files can be {verb}ed"
+                "storage {verb}: this file value points at an external URL ({url}), not a stored file; only a stored file supports `{verb}`"
             ))),
         }
     }
@@ -2081,18 +2333,18 @@ pub trait ContextHandle: Send + Sync {
     /// same call on a replayed run has the same index, so the runtime
     /// keys the call on it and a call carried twice is one call.
     async fn program_call(&self, call: crate::program::ProgramCall, stop_self: StopSelf, call_index: u32) -> WeftResult<Value>;
-    /// Backs `ctx.tokens().mint_for_member`: a member token for `member`
-    /// of this run's project, working for `expires_in_secs`, reading the
-    /// member's own copies' displays when `displays`. `id` is the token's
-    /// id, chosen by the run: minting under an id that already names this
-    /// member's token replaces that token.
-    async fn mint_member_token(
+    /// Backs `ctx.tokens().mint_for_instance`: an instance token for
+    /// `instance` of this run's project, working for `expires_in_secs`,
+    /// reading the instance's own infra's displays when `displays`. `id`
+    /// is the token's id, chosen by the run: minting under an id that
+    /// already names this instance's token replaces that token.
+    async fn mint_instance_token(
         &self,
-        member: &crate::member::MemberId,
+        instance: &crate::instance::InstanceId,
         expires_in_secs: u64,
         displays: bool,
         id: uuid::Uuid,
-    ) -> WeftResult<crate::program::MintedMemberToken>;
+    ) -> WeftResult<crate::program::MintedInstanceToken>;
     fn cancellation(&self) -> Arc<CancellationFlag>;
 
     /// The output port names this node declares in its metadata.
@@ -2113,6 +2365,16 @@ pub trait ContextHandle: Send + Sync {
     /// that binds every port by name (a script) can tell an input
     /// that received nothing from one that was never declared.
     fn declared_input_ports(&self) -> &HashMap<String, WeftType>;
+
+    /// The output ports of this node that have at least one wire out
+    /// of them in this run, read off the compiled graph (a port with
+    /// no consumer in a run of part of the program counts as unwired).
+    /// Backs [`ExecutionContext::is_output_wired`].
+    fn wired_output_ports(&self) -> &std::collections::HashSet<String>;
+
+    /// Whether this node declares `features.catchErrors`, so its
+    /// [`ERROR_PORT`] belongs to the runtime ([`caught_failure`]).
+    fn catches_errors(&self) -> bool;
 
     /// Fire downstream with `output`. The engine turns each mentioned
     /// output port into pulses on its outgoing edges, at the firing's
@@ -2172,8 +2434,9 @@ pub trait ContextHandle: Send + Sync {
     /// value (see [`crate::storage::StoredFile`]). Implementations
     /// resolve the tenant's box endpoint, attach the caller's
     /// identity, and stream the body; they never buffer the whole
-    /// file. `keep` only applies to `StorageScope::Execution`.
-    /// `declared_size` is the total byte size when the caller knows it
+    /// file. `keep` is the file's access-renewed lifetime, in any scope
+    /// but the asset one (on an execution file it also survives the
+    /// run). `declared_size` is the total byte size when the caller knows it
     /// up front (a buffered payload, a sized HTTP body); `None` for a
     /// genuinely unknown-length stream.
     async fn storage_put(
@@ -2241,7 +2504,27 @@ pub trait ContextHandle: Send + Sync {
         scope: &crate::storage::StorageScope,
     ) -> WeftResult<Vec<crate::storage::StoredFileMeta>>;
 
-    /// Flag an execution-scoped file to survive the terminate sweep.
+    /// One attempt at overwriting the stored file at `key` with `data`:
+    /// same key, scope, name, type and lifetime; the content, its size
+    /// and its version change. With `expected_version`, a file that is
+    /// at another version is left alone ([`crate::storage::ReplaceOutcome::Stale`]);
+    /// a file another write is changing right now is left alone too
+    /// ([`crate::storage::ReplaceOutcome::Busy`]). `declared_size` as in
+    /// [`Self::storage_put`]. The retrying lives in [`StorageHandle`].
+    async fn storage_replace(
+        &self,
+        key: &str,
+        expected_version: Option<u64>,
+        data: crate::storage::ByteStream,
+        declared_size: Option<u64>,
+    ) -> WeftResult<crate::storage::ReplaceOutcome>;
+
+    /// Record a change to a stored file this firing made, for the
+    /// run's inspector. A run that keeps no journal records nothing.
+    async fn record_file_edit(&self, edit: crate::storage::FileEdit) -> WeftResult<()>;
+
+    /// Set a stored file's access-renewed lifetime from now on; on an
+    /// execution file this also makes it survive the terminate sweep.
     async fn storage_keep(&self, key: &str, ttl: crate::storage::KeepTtl) -> WeftResult<()>;
 
     /// Mint a temporary signed URL for an external service to fetch
@@ -2276,6 +2559,40 @@ pub trait ContextHandle: Send + Sync {
 
 /// Splitting an endpoint address: the one place that knows a default
 /// port still counts as a port.
+#[cfg(test)]
+mod caught_failure_tests {
+    use super::{catchable_message, caught_failure};
+    use crate::error::WeftError;
+
+    fn every_kind() -> Vec<(WeftError, bool)> {
+        vec![
+            (WeftError::NodeExecution("x".into()), true),
+            (WeftError::Runtime(anyhow::anyhow!("x")), true),
+            (WeftError::Config("x".into()), false),
+            (WeftError::Input("x".into()), false),
+            (WeftError::Type("x".into()), false),
+            (WeftError::Cancelled, false),
+        ]
+    }
+
+    /// Caught only with the flag on, `error` wired, and an outcome of
+    /// the step; every other combination stays a failure of the run.
+    #[test]
+    fn only_an_outcome_on_a_wired_catching_node_is_caught() {
+        for (error, outcome) in every_kind() {
+            for flag in [false, true] {
+                for wired in [false, true] {
+                    let caught = caught_failure(flag, catchable_message(&error), wired);
+                    assert_eq!(caught.is_some(), outcome && flag && wired, "{error:?} flag={flag} wired={wired}");
+                    if let Some(message) = caught {
+                        assert_eq!(message, "x");
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod endpoint_address_tests {
     use super::{endpoint_host_and_port, endpoint_socket_address};
@@ -2446,10 +2763,12 @@ mod value_bag_tests {
         async fn tag_execution(&self, _: Vec<String>) -> WeftResult<()> { unreachable!() }
         async fn stop_tagged(&self, _: String, _: StopSelf) -> WeftResult<()> { unreachable!() }
         async fn program_call(&self, _: crate::program::ProgramCall, _: StopSelf, _: u32) -> WeftResult<Value> { unreachable!() }
-        async fn mint_member_token(&self, _: &crate::member::MemberId, _: u64, _: bool, _: uuid::Uuid) -> WeftResult<crate::program::MintedMemberToken> { unreachable!() }
+        async fn mint_instance_token(&self, _: &crate::instance::InstanceId, _: u64, _: bool, _: uuid::Uuid) -> WeftResult<crate::program::MintedInstanceToken> { unreachable!() }
         fn cancellation(&self) -> Arc<CancellationFlag> { unreachable!() }
         fn declared_output_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
         fn declared_input_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
+        fn wired_output_ports(&self) -> &std::collections::HashSet<String> { unreachable!() }
+        fn catches_errors(&self) -> bool { false }
         async fn pulse_downstream(&self, _: crate::node::NodeOutput, _: bool) -> WeftResult<()> { unreachable!() }
         fn set_max_buffered_items(&self, _: &str, _: usize) -> WeftResult<()> { unreachable!() }
         async fn close_port(&self, _: &str) -> WeftResult<()> { unreachable!() }
@@ -2461,6 +2780,8 @@ mod value_bag_tests {
         async fn storage_get_url(&self, _: &str, _: &str, _: &str, _: u64, _: Option<crate::storage::ByteRange>) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)> { unreachable!() }
         async fn storage_delete(&self, _: &str) -> WeftResult<()> { unreachable!() }
         async fn storage_list(&self, _: &crate::storage::StorageScope) -> WeftResult<Vec<crate::storage::StoredFileMeta>> { unreachable!() }
+        async fn storage_replace(&self, _: &str, _: Option<u64>, _: crate::storage::ByteStream, _: Option<u64>) -> WeftResult<crate::storage::ReplaceOutcome> { unreachable!() }
+        async fn record_file_edit(&self, _: crate::storage::FileEdit) -> WeftResult<()> { unreachable!() }
         async fn storage_keep(&self, _: &str, _: crate::storage::KeepTtl) -> WeftResult<()> { unreachable!() }
         async fn storage_presign(&self, _: &str, _: Option<u64>) -> WeftResult<String> { unreachable!() }
         async fn storage_public_link(&self, _: &str, _: Option<u64>, _: crate::storage::LinkReach) -> WeftResult<Option<String>> { unreachable!() }
@@ -2504,10 +2825,12 @@ mod value_bag_tests {
         async fn tag_execution(&self, _: Vec<String>) -> WeftResult<()> { unreachable!() }
         async fn stop_tagged(&self, _: String, _: StopSelf) -> WeftResult<()> { unreachable!() }
         async fn program_call(&self, _: crate::program::ProgramCall, _: StopSelf, _: u32) -> WeftResult<Value> { unreachable!() }
-        async fn mint_member_token(&self, _: &crate::member::MemberId, _: u64, _: bool, _: uuid::Uuid) -> WeftResult<crate::program::MintedMemberToken> { unreachable!() }
+        async fn mint_instance_token(&self, _: &crate::instance::InstanceId, _: u64, _: bool, _: uuid::Uuid) -> WeftResult<crate::program::MintedInstanceToken> { unreachable!() }
         fn cancellation(&self) -> Arc<CancellationFlag> { unreachable!() }
         fn declared_output_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
         fn declared_input_ports(&self) -> &HashMap<String, WeftType> { unreachable!() }
+        fn wired_output_ports(&self) -> &std::collections::HashSet<String> { unreachable!() }
+        fn catches_errors(&self) -> bool { false }
         async fn pulse_downstream(&self, _: crate::node::NodeOutput, _: bool) -> WeftResult<()> { unreachable!() }
         fn set_max_buffered_items(&self, _: &str, _: usize) -> WeftResult<()> { unreachable!() }
         async fn close_port(&self, _: &str) -> WeftResult<()> { unreachable!() }
@@ -2527,6 +2850,7 @@ mod value_bag_tests {
                 mime_type: mime.into(),
                 size_bytes: bytes.len() as u64,
                 filename: filename.into(),
+                version: crate::storage::FIRST_FILE_VERSION,
             }
             .to_value())
         }
@@ -2541,12 +2865,15 @@ mod value_bag_tests {
                 expires_at_unix: None,
                 keep_ttl_secs: None,
                 created_at_unix: 0,
+                version: crate::storage::FIRST_FILE_VERSION,
             };
             Ok((meta, crate::storage::bytes_stream(bytes::Bytes::from_static(b"png"))))
         }
         async fn storage_get_url(&self, _: &str, _: &str, _: &str, _: u64, _: Option<crate::storage::ByteRange>) -> WeftResult<(crate::storage::StoredFileMeta, crate::storage::ByteStream)> { unreachable!() }
         async fn storage_delete(&self, _: &str) -> WeftResult<()> { unreachable!() }
         async fn storage_list(&self, _: &crate::storage::StorageScope) -> WeftResult<Vec<crate::storage::StoredFileMeta>> { unreachable!() }
+        async fn storage_replace(&self, _: &str, _: Option<u64>, _: crate::storage::ByteStream, _: Option<u64>) -> WeftResult<crate::storage::ReplaceOutcome> { unreachable!() }
+        async fn record_file_edit(&self, _: crate::storage::FileEdit) -> WeftResult<()> { unreachable!() }
         async fn storage_keep(&self, _: &str, _: crate::storage::KeepTtl) -> WeftResult<()> { unreachable!() }
         async fn storage_presign(&self, key: &str, ttl_secs: Option<u64>) -> WeftResult<String> {
             if self.presign_fails {
@@ -2573,13 +2900,14 @@ mod value_bag_tests {
             mime_type: "image/png".into(),
             size_bytes: 3,
             filename: "p.png".into(),
+            version: crate::storage::FIRST_FILE_VERSION,
         };
         let mut ctx = ExecutionContext::new(
             uuid::Uuid::nil(),
             "node-1".into(),
             "TestNode".into(),
             None,
-            crate::Color::nil(),
+            crate::ExecutionId::nil(),
             LoopFrames::default(),
             None,
             inputs_bag(json!({ "photo": file.to_value(), "note": "text" })),
@@ -2611,7 +2939,7 @@ mod value_bag_tests {
             "node-1".into(),
             "TestNode".into(),
             None,
-            crate::Color::nil(),
+            crate::ExecutionId::nil(),
             LoopFrames::default(),
             None,
             inputs_bag(json!({})),
@@ -2643,13 +2971,14 @@ mod value_bag_tests {
             mime_type: "image/png".into(),
             size_bytes: 3,
             filename: "p.png".into(),
+            version: crate::storage::FIRST_FILE_VERSION,
         };
         let mut ctx = ExecutionContext::new(
             uuid::Uuid::nil(),
             "node-1".into(),
             "TestNode".into(),
             None,
-            crate::Color::nil(),
+            crate::ExecutionId::nil(),
             LoopFrames::default(),
             None,
             inputs_bag(json!({ "photo": file.to_value(), "note": "text" })),
@@ -2682,6 +3011,7 @@ mod value_bag_tests {
             mime_type: "image/png".into(),
             size_bytes: 3,
             filename: "p.png".into(),
+            version: crate::storage::FIRST_FILE_VERSION,
         };
         let ty = WeftType::parse("Image").unwrap();
         let with_link = |link: Option<&str>| {
@@ -2690,7 +3020,7 @@ mod value_bag_tests {
                 "node-1".into(),
                 "TestNode".into(),
                 None,
-                crate::Color::nil(),
+                crate::ExecutionId::nil(),
                 LoopFrames::default(),
                 None,
                 inputs_bag(json!({})),
@@ -2724,7 +3054,7 @@ mod value_bag_tests {
             "node-1".into(),
             "TestNode".into(),
             None,
-            crate::Color::nil(),
+            crate::ExecutionId::nil(),
             LoopFrames::default(),
             None,
             inputs_bag(inputs_json),

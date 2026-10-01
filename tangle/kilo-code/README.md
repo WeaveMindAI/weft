@@ -20,7 +20,7 @@ and writes the weft code. A missing capability is a dispatch: Tangle designs the
 contract and sends a `node-smith` specialist (several in parallel when
 several nodes are missing), which researches the real API documentation on
 the web, writes the node and extensive tests (live-tier tests included),
-and proves the local tiers (`weft test-node`, basic and fake: no cluster,
+and proves the local tiers (`weft test-node`, basic and fake: no weft install,
 no credentials, no money), iterating until green before reporting with
 evidence. The live tier spends real money, so the specialist writes its
 tests but never runs them; the user does, with informed consent, through
@@ -75,13 +75,16 @@ commands are the expert's hand on the same loop.
 | `.kilo/skills/weft-api/` | on demand, when the program is an HTTP API or a WebSocket service | the `Route` and `Socket` triggers, `Reply`, `Stream` and `Close`, gating a route with an auth connection, the shapes that need a custom node, trying it with curl and a socket client |
 | `.kilo/skills/weft-onboarding/` | on demand, when asked to teach | the guided tour: plain-word vocabulary and the itinerary |
 | `.kilo/skills/weft-updating/` | on demand, when weft itself updates | the git pull plus setup.sh walk, what an update touches and preserves, and fixing a failed one |
-| `.kilo/command/` | `/weft-check`, `/weft-run`, `/weft-grow`, `/weft-debug`, `/weft-new-node`, `/weft-live-test` | the expert's hand: the loop's steps on demand, live tests with informed consent |
+| `.kilo/skills/weft-deploying/` | on demand, when the program goes to a cloud install | targets and `--on`, logging in, the deploy workflow `weft ci add` writes, `weft target export`, a cloud build and how it fails, rolling back, connections per install |
+| `.kilo/skills/weft-cloud-install/` | on demand, when weft itself goes onto the user's Google Cloud, or is upgraded or resized there | the fork, the one-time gcloud block, the fork's variables, the install workflow, the first operator key, upgrading, growing the machine |
+| `.kilo/command/` | `/weft-check`, `/weft-run`, `/weft-grow`, `/weft-debug`, `/weft-new-node`, `/weft-live-test`, `/weft-deploy` | the expert's hand: the loop's steps on demand, live tests with informed consent, a deploy handed to the deployer |
 | `.kilo/plugin/weft-validation.ts` | after every edit | the compiler answers every edit: fast validate on the touched source, structural errors and the level warning fed back to the model automatically |
 | `.kilo/agent/prompt-engineer.md` | when dispatched | writes and overhauls the program's LLM prompts, running the WeaveMind prompt-building playbook verbatim as its mind; its brief carries the job, the model, the data, the output shape |
 | `.kilo/agent/run-digger.md` | when dispatched | post-mortem only: walks journals, logs, source, and stored files, compares good runs against bad ones, reports the finding with quoted evidence; read-only, never fixes |
 | `.kilo/agent/red-teamer.md` | when dispatched, before handover on a high-stakes program | attack only: reads the program, prompts, and outside edges as an attacker (lying outsiders, hallucination hazards, rogue steps, unguarded stakes, forgeries, stored lies, over-powered deputies, leaks, spend loops), walks every hole from input to consequence, names the layer that closes each; never fixes, never runs |
 | `.kilo/agent/node-smith.md` | when dispatched | builds and proves exactly one node, unsupervised, web access for service docs, local test tiers green, live tests written but not run |
 | `.kilo/agent/frontend-builder.md` | when dispatched | builds and proves the project's frontend under `front/`, unsupervised: the pages, the server-held api token, the client that calls the program's own routes and signals, on the default stack unless the user named their own |
+| `.kilo/agent/deployer.md` | when dispatched | the only agent that acts on a cloud install: names the target with `--on` on every command, deploys, rolls back, sets up the deploy workflow, reports what is live or the exact failure; never changes the program |
 | `kilo.json` | every session | `default_agent: tangle`, plus permissions: an allow list for every `weft` verb Tangle runs, and no ask list; whether a call is put in front of you is your mode's decision (automatic: Tangle activates, resyncs, deactivates and runs infra on its own; manual: it asks in prose). The daemon's lifecycle stays off the list: a reinstall of weft is never Tangle's move. Unlike Claude Code there is no exclude switch for the user's global config: a project-level `default_agent` wins, so Tangle is what loads as the agent, but instructions from the user's own Kilo setup (AGENTS.md and global config) still load alongside. |
 
 The design rests on two disciplines. Ground truth: the catalog is on disk
@@ -105,9 +108,10 @@ weft new <project> --assistant kilo-code     # shorthand: --assistant kc
 
 That copies `kilo.json` and `.kilo/` out of the local weft checkout's
 `tangle/kilo-code/` into the project. The flag's value names the assistant
-(repeatable for several), and the choice is remembered: later `weft new`
-runs install it with no flag, until `--assistant <name>` changes it or
-`--assistant none` stops it. The files are the project's own from then
+(repeatable for several), for this project only. Add `--remember` and
+later `weft new` runs install it with no flag, until another
+`--assistant <name> --remember` changes it or `--assistant none --remember`
+clears it. The files are the project's own from then
 on, so they are committed with it and a teammate cloning the project gets
 Tangle with no weft checkout to point at.
 
@@ -130,7 +134,7 @@ Prerequisites sit on the machine, not in the template: the `weft` CLI on the
 PATH, Docker, and the local daemon from `setup.sh` in the weft checkout (the
 `weft-running` skill knows how to check and start all of it). The
 specialist's local test tiers build with plain cargo, no docker and no
-cluster, so they additionally need a Rust toolchain on the host; without one
+weft install, so they additionally need a Rust toolchain on the host; without one
 the specialist reports that blocker instead of pretending. The plugin needs
 a JavaScript runtime for plugins, which Kilo Code brings with it.
 

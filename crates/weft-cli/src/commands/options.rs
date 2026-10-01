@@ -2,8 +2,8 @@
 //! field offers, the same list the graph editor's dropdown shows when a
 //! person searches that field (`ResourceSelect.svelte` over
 //! `editor-connect.ts`'s `editorResources`). The connection signing the
-//! call is the one the editor traces: a pick on the step's own access
-//! field, or the pick on the access node wired into its Access input.
+//! call is the one the editor traces: the install's pick on the step's
+//! own access field, or on the access node wired into its Access input.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -13,7 +13,7 @@ use uuid::Uuid;
 use weft_core::access::lookup::{GrantedQuery, LookupItem, LookupPage, LookupRequest};
 use weft_core::node::{Lookup, MetadataCatalog, ResourceSource, Widget};
 
-use crate::commands::connect::{list_grants, resolve_step, AccessTarget, Doorway, Pick, Step};
+use crate::commands::connect::{install_picks, list_grants, resolve_step, AccessTarget, Doorway, Pick, Step};
 use crate::commands::Ctx;
 
 /// The connection a field's sources are signed with.
@@ -52,8 +52,10 @@ pub async fn run(ctx: Ctx, step_name: &str, field: &str, search: Option<&str>) -
         .inputs
         .iter()
         .any(|i| i.name == access && matches!(i.effective_widget(), Widget::Access { .. }));
-    let client = ctx.client();
-    let signing = match traced_access(&step, &access, own_widget)? {
+    let client = ctx.client()?;
+    crate::commands::ensure::ensure_project_known(&ctx).await?;
+    let picks = install_picks(&client, project.id()).await?;
+    let signing = match traced_access(&step, &access, own_widget, &picks)? {
         Some((target, id)) => {
             let grants = list_grants(&client, Doorway::Owner, Some(&target.spec.service)).await?;
             let grant = grants.into_iter().find(|g| g.id == id).with_context(|| {
@@ -88,7 +90,7 @@ pub async fn run(ctx: Ctx, step_name: &str, field: &str, search: Option<&str>) -
             let body = GrantedQuery {
                 access_id: s.access_id,
                 service: s.service.clone(),
-                for_member: None,
+                for_instance: None,
                 from: from.clone(),
                 label: label.clone(),
                 value: value.clone(),
@@ -152,8 +154,14 @@ pub async fn run(ctx: Ctx, step_name: &str, field: &str, search: Option<&str>) -
 /// editor's structural trace: the step's own access field, or the
 /// access node wired into its Access input (followed through group
 /// boundaries, whose passthroughs share one port name on both sides).
-/// `None` when nothing is picked.
-fn traced_access<'a>(step: &'a Step, access: &str, own_widget: bool) -> Result<Option<(&'a AccessTarget, Uuid)>> {
+/// `None` when nothing is picked. The pick read is the install's at the
+/// access node's place in the same call as the step.
+fn traced_access<'a>(
+    step: &'a Step,
+    access: &str,
+    own_widget: bool,
+    picks: &weft_core::picks::Picks,
+) -> Result<Option<(&'a AccessTarget, Uuid)>> {
     let source = if own_widget {
         step.node.clone()
     } else {
@@ -182,19 +190,30 @@ fn traced_access<'a>(step: &'a Step, access: &str, own_widget: bool) -> Result<O
         return Ok(None);
     };
     match &target.picked {
-        Pick::Handle(h) => Ok(Some((target, h.id))),
-        Pick::None => Ok(None),
-        Pick::MemberFilled => bail!(
-            "'{}' is connected by each member of the program, so there is no one \
+        Pick::InstanceFilled => bail!(
+            "'{}' is connected separately in each instance of the program, so there is no one \
              connection to list choices through",
             target.spelling()
         ),
-        Pick::Malformed(e) => bail!(
-            "'{}' holds an unreadable connection pick ({e}); pick one with \
-             `weft connect --node {} --list`, then `--grant <id>`",
-            target.spelling(),
-            target.spelling()
-        ),
+        Pick::WrittenInSource => bail!("{}", crate::commands::connect::written_in_source(target)),
+        Pick::None | Pick::Handle(_) => {
+            // The access node's place in the step's call: the step's
+            // spelling up to its own name, then the node's.
+            let prefix = step.spelling.rsplit_once('.').map(|(call, _)| format!("{call}.")).unwrap_or_default();
+            let place = target
+                .spellings()
+                .iter()
+                .find(|s| s.strip_prefix(&prefix).is_some_and(|rest| !rest.contains('.')))
+                .cloned()
+                .unwrap_or_else(|| target.spelling());
+            let id = picks
+                .get(&place)
+                .and_then(|fields| fields.get(target.input()))
+                .and_then(|handle| handle.get("id"))
+                .and_then(Value::as_str)
+                .and_then(|id| id.parse::<Uuid>().ok());
+            Ok(id.map(|id| (target, id)))
+        }
     }
 }
 
@@ -238,7 +257,7 @@ fn lookup_request(
 ) -> LookupRequest {
     LookupRequest {
         access_id: signing.map(|(id, _)| id),
-        for_member: None,
+        for_instance: None,
         service: signing.map(|(_, s)| s.to_string()),
         lookup: lookup.clone(),
         query: if server_filtered(lookup) { query.to_string() } else { String::new() },

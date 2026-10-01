@@ -1,5 +1,5 @@
 //! Every fixture's catalog parses AND its graph compiles, checked
-//! without a cluster.
+//! without an install.
 //!
 //! A fixture's `metadata.json` is only read once the rig has built and
 //! deployed, so a typo in it (a widget kind that does not exist, a field
@@ -8,7 +8,7 @@
 //! That is expensive and it reads like a bug in the feature rather than
 //! a bug in the fixture.
 //!
-//! This runs in an ordinary `cargo test`: no cluster, no docker, no
+//! This runs in an ordinary `cargo test`: no install, no docker, no
 //! feature flag. It is deliberately NOT behind `e2e`, because its whole
 //! value is catching the mistake before the slow suite runs.
 
@@ -35,11 +35,14 @@ fn fixtures() -> anyhow::Result<Vec<PathBuf>> {
 fn every_fixture_catalog_parses() -> anyhow::Result<()> {
     let mut broken: Vec<String> = Vec::new();
     for fixture in fixtures()? {
-        if let Err(e) = weft_compiler::build::build_project_catalog(&fixture) {
-            broken.push(format!(
-                "{}: {e}",
-                fixture.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
-            ));
+        let name = fixture.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        match weft_compiler::build::build_project_catalog(&fixture) {
+            Err(e) => broken.push(format!("{name}: {e}")),
+            Ok(catalog) => {
+                for problem in catalog.problems() {
+                    broken.push(format!("{name}: {}", problem.error));
+                }
+            }
         }
     }
     anyhow::ensure!(broken.is_empty(), "fixture catalogs that do not parse:\n{}", broken.join("\n"));
@@ -53,7 +56,7 @@ fn every_fixture_catalog_parses() -> anyhow::Result<()> {
 /// The catalog check above catches a bad `metadata.json`; this catches
 /// a bad `.weft`, which is the other half and the one an author writing
 /// a fixture gets wrong more often. A mistake here used to surface
-/// minutes into a cluster run as a failure of whatever feature the
+/// minutes into an install run as a failure of whatever feature the
 /// fixture was written to prove, which reads like a bug in the feature
 /// rather than a typo in its fixture.
 ///
@@ -62,7 +65,7 @@ fn every_fixture_catalog_parses() -> anyhow::Result<()> {
 /// chat id, a bucket), so "this required input has no driver" is the
 /// fixture working as intended, not a mistake. The structural tier is
 /// exactly the one that does not depend on the rig having run, which is
-/// what makes this test honest without a cluster.
+/// what makes this test honest without an install.
 /// The fixtures that are INCOMPLETE on disk on purpose: their test
 /// writes the missing value in before running (a chat id read from the
 /// environment, a file the rig uploads first), so the graph only stands
@@ -101,17 +104,14 @@ fn every_fixture_graph_compiles() -> anyhow::Result<()> {
         // may sit beside the file that includes it) plus the stdlib. The
         // rig copies the stdlib into each project at deploy time; here
         // every root is read where it already is, so this stays a plain
-        // cargo test with no copying and no cluster.
+        // cargo test with no copying and no install.
         let mut roots = weft_compiler::project::node_roots(fixture).to_vec();
         roots.push(stdlib.clone());
-        let catalog = match weft_catalog::FsCatalog::discover_roots_with_policy(
-            &roots.iter().map(|r| r.as_path()).collect::<Vec<_>>(),
-            weft_catalog::DiscoverPolicy::Strict,
-        ) {
-            Ok(c) => c,
+        let catalog = match weft_catalog::FsCatalog::discover_roots(&roots.iter().map(|r| r.as_path()).collect::<Vec<_>>()) {
+            Ok(c) if c.problems().is_empty() => c,
             // The catalog's own failure is the other test's finding; not
             // repeating it here keeps one mistake to one report.
-            Err(_) => return Ok(None),
+            _ => return Ok(None),
         };
         // The two anchors the CLI gives a program, and they differ:
         // `@file("assets/...")` resolves from the PROJECT ROOT, while

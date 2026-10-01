@@ -15,14 +15,11 @@ pub mod record_log;
 pub mod register_signal;
 pub mod route_entry;
 pub mod run_node_test;
-pub mod spawn_pod;
 pub mod stop_tagged;
-pub mod update_kind_state;
 
 // Only the executor unit structs are re-exported because main.rs
 // instantiates them when wiring the registry. Concrete payload /
-// result types are imported directly by their producers (e.g.
-// `cold_start.rs` imports `SpawnPodPayload` from the submodule).
+// result types are imported directly by their producers.
 pub use fire_signal::FireSignalExecutor;
 pub use live_arrival::LiveArrivalExecutor;
 pub use program_call::ProgramCallExecutor;
@@ -31,6 +28,4 @@ pub use record_log::RecordLogExecutor;
 pub use register_signal::RegisterSignalExecutor;
 pub use route_entry::RouteEntryExecutor;
 pub use run_node_test::RunNodeTestExecutor;
-pub use spawn_pod::SpawnPodExecutor;
 pub use stop_tagged::StopTaggedExecutor;
-pub use update_kind_state::UpdateSignalKindStateExecutor;

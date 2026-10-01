@@ -226,10 +226,7 @@
 		switch (phase) {
 			case 'preflight': return 'Checking...';
 			case 'build_start': return 'Building...';
-			case 'build_skip': return 'Cached, loading...';
 			case 'build_done': return 'Loading...';
-			case 'image_push_start':
-			case 'image_push_done': return 'Loading image...';
 			case 'infra_provision_start':
 			case 'infra_provision_done': return 'Provisioning infra...';
 			case 'trigger_register_start':

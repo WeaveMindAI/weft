@@ -47,42 +47,62 @@ fn access_err(e: anyhow::Error) -> ApiError {
 /// The callback URL a tenant registers at the provider. Shown by the
 /// editor during app registration and used verbatim in the code
 /// exchange. The consent rides the operator's browser, so the STABLE
-/// base works and never rots; only a provider that refuses plain-http
-/// callbacks (`callback_https` on the spec) forces an https address,
-/// loudly when this weft has none.
-pub(crate) fn redirect_uri(state: &DispatcherState, spec: &weft_core::AccessSpec) -> Result<String, ApiError> {
-    let base = callback_base(
-        &state.public_base_url,
-        state.internet_url.as_deref(),
-        spec.callback_https,
-    )
-    .ok_or_else(|| {
-        (
-            StatusCode::PRECONDITION_FAILED,
-            format!(
-                "the '{}' provider only accepts https callback URLs and this weft \
-                 has no https public address; start the daemon with --public-url \
-                 (or set an https WEFT_DISPATCHER_PUBLIC_BASE_URL)",
-                spec.service
-            ),
-        )
-    })?;
+/// base works and never rots; only a provider that restricts its
+/// callbacks (`callback` on the spec) moves it to an address that
+/// qualifies, loudly when this weft has none.
+pub(crate) async fn redirect_uri(state: &DispatcherState, spec: &weft_core::AccessSpec) -> Result<String, ApiError> {
+    use weft_core::access::spec::CallbackAddress;
+    let install_domain = match spec.callback {
+        CallbackAddress::Domain => crate::domains::list(&state.pg_pool)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read the install's domains: {e:#}")))?
+            .into_iter()
+            .find(|d| d.serves == weft_core::install::DomainServes::Install)
+            .map(|d| format!("https://{}", d.name)),
+        _ => None,
+    };
+    let base = callback_base(&state.public_base_url, state.internet_url.as_deref(), install_domain.as_deref(), spec.callback)
+        .ok_or_else(|| {
+            let why = match spec.callback {
+                CallbackAddress::Domain => format!(
+                    "the '{}' provider only accepts callback addresses on a domain name, and this weft \
+                     answers at none; give the install one with `weft domain add <name>` (\"Your own \
+                     domain\" in the cloud guide walks through it)",
+                    spec.service
+                ),
+                _ => format!(
+                    "the '{}' provider only accepts https callback URLs and this weft has no https \
+                     public address; start the daemon with --public-url",
+                    spec.service
+                ),
+            };
+            (StatusCode::PRECONDITION_FAILED, why)
+        })?;
     Ok(format!("{}/access/oauth/callback", base.trim_end_matches('/')))
 }
 
-/// Which base the OAuth callback rides: the STABLE base, unless the
-/// provider demands https and the base is not, in which case the
-/// additional internet address serves iff it is https. `None` = no
-/// https address exists for a provider that requires one. Pure so the
-/// branching is unit-tested below.
-fn callback_base<'a>(base: &'a str,
+/// Which base the OAuth callback rides, for a provider accepting
+/// `needs`: the STABLE base when it qualifies, else the install's
+/// domain, else the additional internet address. `None` = no address
+/// qualifies. Pure so the branching is unit-tested below.
+fn callback_base<'a>(
+    base: &'a str,
     internet: Option<&'a str>,
-    https_only: bool,
+    install_domain: Option<&'a str>,
+    needs: weft_core::access::spec::CallbackAddress,
 ) -> Option<&'a str> {
-    if !https_only || base.starts_with("https://") {
-        return Some(base);
-    }
-    internet.filter(|u| u.starts_with("https://"))
+    use weft_core::access::spec::CallbackAddress;
+    let qualifies = |url: &str| match needs {
+        CallbackAddress::Any => true,
+        CallbackAddress::Https => url.starts_with("https://"),
+        CallbackAddress::Domain => {
+            url.starts_with("https://")
+                && reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_string)).is_some_and(|host| {
+                    host.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>().is_err()
+                })
+        }
+    };
+    [Some(base), install_domain, internet].into_iter().flatten().find(|url| qualifies(url))
 }
 
 // ---------- Doors (which connect doors are actually open) ----------
@@ -102,14 +122,14 @@ pub async fn doors(
 
 /// Which doors a connect page offers for `req`'s service, and where its
 /// consent comes back: what `/access/doors` answers the editor and
-/// `/member/doors` a member.
+/// `/instance/doors` an instance.
 pub(crate) async fn doors_status(state: &DispatcherState, req: &DoorsRequest) -> Result<DoorsStatus, ApiError> {
     let doors: DoorsAnswer =
         crate::broker_admin::forward_json(state, "/v1/access/admin/doors", req).await?;
     // A provider demanding https on a weft with no https address
     // blocks every CONSENT, not the panel: paste connects need no
     // callback, so the probe reports the block instead of failing.
-    let (redirect_uri, consent_blocked) = match redirect_uri(state, &req.spec) {
+    let (redirect_uri, consent_blocked) = match redirect_uri(state, &req.spec).await {
         Ok(uri) => (Some(uri), None),
         Err((_, msg)) => (None, Some(msg)),
     };
@@ -138,8 +158,8 @@ pub struct ListQuery {
 }
 
 /// GET /access/grants?service=: the author's connected accounts
-/// (summaries only). A member's own connections are theirs, listed
-/// through the member door, never here.
+/// (summaries only). An instance's own connections belong to it, listed
+/// through the instance door, never here.
 pub async fn list_grants(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
@@ -213,9 +233,9 @@ pub async fn connect_direct(
     caller: CallerTenant,
     Json(mut req): Json<SharedDoorPick<ConnectDirect>>,
 ) -> Result<Json<CompletedConnect>, ApiError> {
-    // The author's door makes the author's connections; a member's are
-    // made at the member door, as that member.
-    req.inner.member = None;
+    // The author's door makes the author's connections; an instance's are
+    // made at the instance door, as that instance.
+    req.inner.instance = None;
     crate::broker_admin::forward_json(
         &state,
         "/v1/access/admin/connect/direct",
@@ -234,8 +254,8 @@ pub async fn connect_begin(
     caller: CallerTenant,
     Json(mut req): Json<SharedDoorPick<BeginOAuth>>,
 ) -> Result<Json<StartedOAuth>, ApiError> {
-    req.inner.member = None;
-    req.inner.redirect_uri = redirect_uri(&state, &req.inner.spec)?;
+    req.inner.instance = None;
+    req.inner.redirect_uri = redirect_uri(&state, &req.inner.spec).await?;
     crate::broker_admin::forward_json(
         &state,
         "/v1/access/admin/oauth/begin",
@@ -345,9 +365,9 @@ pub async fn lookup(
     caller: CallerTenant,
     Json(mut req): Json<weft_access_store::LookupRequest>,
 ) -> Result<Json<weft_access_store::LookupPage>, ApiError> {
-    // The author's door: a member's connection is never theirs to read
+    // The author's door: an instance's connection is never the author's to read
     // through, whatever the body claims.
-    req.for_member = None;
+    req.for_instance = None;
     crate::broker_admin::forward_json(
         &state,
         "/v1/access/admin/lookup",
@@ -371,7 +391,7 @@ pub async fn picker_begin(
     Json(mut req): Json<weft_access_store::BeginPicker>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // The author's door (see `lookup`).
-    req.for_member = None;
+    req.for_instance = None;
     let base = crate::storage::LinkBase::for_request(&headers).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     let picker_state = weft_access_store::begin_picker(&state.pg_pool, &caller.0 .0, req)
         .await
@@ -411,7 +431,7 @@ pub async fn picker_page(
     struct TokenQuery {
         access_id: uuid::Uuid,
         service: String,
-        for_member: Option<weft_core::member::MemberScope>,
+        for_instance: Option<weft_core::instance::InstanceScope>,
     }
     #[derive(Deserialize)]
     struct Token {
@@ -426,7 +446,7 @@ pub async fn picker_page(
             inner: TokenQuery {
                 access_id: session.access_id,
                 service: session.service.clone(),
-                for_member: session.for_member.clone(),
+                for_instance: session.for_instance.clone(),
             },
         },
     )
@@ -560,7 +580,7 @@ pub async fn granted(
     Json(mut req): Json<weft_access_store::GrantedQuery>,
 ) -> Result<Json<Vec<weft_access_store::LookupItem>>, ApiError> {
     // The author's door (see `lookup`).
-    req.for_member = None;
+    req.for_instance = None;
     crate::broker_admin::forward_json(
         &state,
         "/v1/access/admin/granted",
@@ -582,7 +602,7 @@ mod credential_stamp_tests {
             id: uuid::Uuid::new_v4(),
             service: service.into(),
             project_id: None,
-            member: None,
+            instance: None,
             identity: None,
             label: None,
             scopes: vec![],
@@ -615,16 +635,17 @@ mod credential_stamp_tests {
 #[cfg(test)]
 mod callback_base_tests {
     use super::callback_base;
+    use weft_core::access::spec::CallbackAddress::{Any, Domain, Https};
 
-    /// The stable base serves every provider without an https demand,
-    /// tunnel or not: a tunnel must never rotate the registered
-    /// callback of a provider that accepts the stable address.
+    /// The stable base serves every provider without a demand, tunnel
+    /// or not: a tunnel must never rotate the registered callback of a
+    /// provider that accepts the stable address.
     #[test]
-    fn stable_base_wins_without_an_https_demand() {
-        assert_eq!(callback_base("http://127.0.0.1:9998", None, false), Some("http://127.0.0.1:9998"));
+    fn stable_base_wins_without_a_demand() {
+        assert_eq!(callback_base("http://127.0.0.1:14112", None, None, Any), Some("http://127.0.0.1:14112"));
         assert_eq!(
-            callback_base("http://127.0.0.1:9998", Some("https://x.trycloudflare.com"), false),
-            Some("http://127.0.0.1:9998")
+            callback_base("http://127.0.0.1:14112", Some("https://x.trycloudflare.com"), None, Any),
+            Some("http://127.0.0.1:14112")
         );
     }
 
@@ -632,9 +653,10 @@ mod callback_base_tests {
     #[test]
     fn https_stable_base_meets_the_demand_itself() {
         assert_eq!(
-            callback_base("https://weft.example.com", Some("https://x.trycloudflare.com"), true),
+            callback_base("https://weft.example.com", Some("https://x.trycloudflare.com"), None, Https),
             Some("https://weft.example.com")
         );
+        assert_eq!(callback_base("https://34.1.2.3", None, None, Https), Some("https://34.1.2.3"));
     }
 
     /// An https demand on an http base uses the internet address iff
@@ -642,10 +664,25 @@ mod callback_base_tests {
     #[test]
     fn https_demand_on_http_base_needs_an_https_internet_address() {
         assert_eq!(
-            callback_base("http://127.0.0.1:9998", Some("https://x.trycloudflare.com"), true),
+            callback_base("http://127.0.0.1:14112", Some("https://x.trycloudflare.com"), None, Https),
             Some("https://x.trycloudflare.com")
         );
-        assert_eq!(callback_base("http://127.0.0.1:9998", None, true), None);
-        assert_eq!(callback_base("http://127.0.0.1:9998", Some("http://tunnel.local"), true), None);
+        assert_eq!(callback_base("http://127.0.0.1:14112", None, None, Https), None);
+        assert_eq!(callback_base("http://127.0.0.1:14112", Some("http://tunnel.local"), None, Https), None);
+    }
+
+    /// A domain demand passes over an address that is an IP, and takes
+    /// the install's domain, or a tunnel's name, instead.
+    #[test]
+    fn a_domain_demand_never_takes_an_ip() {
+        assert_eq!(callback_base("https://34.1.2.3", None, None, Domain), None);
+        assert_eq!(
+            callback_base("https://34.1.2.3", None, Some("https://weft.example.com"), Domain),
+            Some("https://weft.example.com")
+        );
+        assert_eq!(
+            callback_base("http://127.0.0.1:14112", Some("https://x.trycloudflare.com"), None, Domain),
+            Some("https://x.trycloudflare.com")
+        );
     }
 }

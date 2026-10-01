@@ -21,16 +21,16 @@ storage, the only way bytes travel a wire.
 
 ## The URL is known before anything runs
 
-A [route] answers at `<dispatcher base>/connect/<tenant>/<path>`, and every
-piece is fixed by the install, not minted at activation: on a local install
-the base is `http://127.0.0.1:9999` and the tenant is `local`, so
-`hello = Route { path: "hello" }` answers at
-`http://127.0.0.1:9999/connect/local/hello`, and a socket at the same
-address with `ws://`. You write those URLs into the frontend-builder's
+A [route] answers at `<install>/connect/local/<path>`, and every piece is
+fixed by the install, not minted at activation. On this machine the install
+is `http://127.0.0.1:14111`, so `hello = Route { path: "hello" }` answers at
+`http://127.0.0.1:14111/connect/local/hello`, and a socket at the same
+address with `ws://`. On a cloud install it is the target's `url` in
+`weft.toml` (`https://weft.example.com/connect/local/hello`, and `wss://`). You write those URLs into the frontend-builder's
 [the brief] the moment the routes are shaped, while the graph is still being
 built; `weft activate` prints the same URLs afterwards and only turns them on.
 
-`127.0.0.1:9999` answers only on this machine. When the install has a public
+`127.0.0.1:14111` answers only on this machine. When the install has a public
 address (a tunnel), `weft activate` and `weft token mint` print URLs on that
 address instead, and both reach the same dispatcher. A frontend that runs
 anywhere else (a hosted site, a phone, a browser on another machine) uses the
@@ -44,8 +44,7 @@ port.
 
 ```weft
 hello = Route -> (name: String) { path: "hello", method: "POST" }
-answer = Reply { status: 201 }
-answer.body = hello.name
+answer = Reply { status: 201, body: hello.name }
 ```
 
 A [route]'s fixed output ports carry the request as the gateway saw it: the
@@ -67,16 +66,24 @@ source, "Body shape" in the editor):
 
 Names can collide, and the order is fixed: a fixed port beats a body key of
 the same name, and a declared port named like a path capture reads the
-capture rather than the body.
+capture on every body shape. It never counts as the text or binary body's one
+port either, so a bytes or text route still reads its captures: on
+`session/preview/{view}`, `-> (view: String)` is the capture, and the body
+lands on whatever else you declare.
 
 ```weft
 card = Route -> (id: String) { path: "cards/{id}", method: "POST" }
 ```
 
 The first thing the program sends commits the status line. A `Reply` on a
-branch with `status: 404` works. A `Reply` after a `Stream` fails loud. A
-program that never sends anything holds the caller while it runs, then the
-caller gets `500` with the body `the run ended without answering`. If you
+branch with `status: 404` works. A `Reply` or a second `Stream` after a
+`Stream` is a compile error, because the head already went out: end a
+streamed answer with a `Close`. A
+program that never sends anything holds the caller while it runs. When that
+run ends, it is recorded as failed, and the caller gets `500` with the body
+`execution failed: the run ended without answering: every path to its Reply
+(or Stream, or Close) was skipped, usually because a value it waited on never
+arrived`. If you
 catch yourself wiring a branch that reaches no [answer], stop and write:
 "Wait. Every branch answers." Then end that branch on a `Reply` or `Close`.
 
@@ -96,18 +103,24 @@ returns the body and the status together:
 ```weft
 user = Route { path: "users/{id}", method: "GET" }
 lookup = ExecPython(params: Dict[String, String], query: Dict[String, String]) -> (body: JsonDict, status: Number) {
+  params: user.params
+  query: user.query
   code: "uid = params['id']\nif uid == '42':\n    return {'body': {'id': uid, 'verbose': query.get('verbose')}, 'status': 200}\nreturn {'body': {'error': 'no user ' + uid}, 'status': 404}"
 }
-lookup.params = user.params
-lookup.query = user.query
-found = Reply
-found.body = lookup.body
-found.status = lookup.status
+found = Reply { body: lookup.body, status: lookup.status }
 ```
 
 A `GET` route has no body: declare nothing on the arrow and read the fixed
 ports. A `text` route: `say = Route -> (line: String) { path: "say", dataType:
 "text" }`, and the `Reply` body must be a `String`.
+
+If the answer has a different shape from what came in, the [answer] node says
+which with `answerAs`: `json`, `text` or `bytes`, and empty follows the
+route's `dataType`. A `GET` that answers a picture is the usual case: it takes
+no body in, so the route keeps its default, and the [answer] node (a `Reply`,
+say) sets `answerAs: "bytes"` with a [stored-file value] as the body. Sent that way over HTTP, the file goes out
+with its own content type and an inline `content-disposition` carrying its
+filename, unless `headers` sets them.
 
 A run that stops without a body ends through the closing [answer] node,
 which takes no data from upstream: its `_should_flow` gate is the whole
@@ -118,9 +131,9 @@ and status already written on it, the passing case gating the rest.
 ```weft
 sweep = Route { path: "sweep/{what}", method: "DELETE" }
 clear = ExecPython(params: Dict[String, String]) -> (removed: Number) {
+  params: sweep.params
   code: "return {'removed': 3 if params['what'] == 'cards' else 0}"
 }
-clear.params = sweep.params
 outcome = Switch {
   value: clear.removed
   cases: [
@@ -128,11 +141,8 @@ outcome = Switch {
     { "kind": "otherwise", "port": "none" }
   ]
 }
-report = Reply
-report.body = clear.removed
-report._should_flow = outcome.some
-nothing = Close { status: 404, reason: "nothing to sweep" }
-nothing._should_flow = outcome.none
+report = Reply { body: clear.removed, _should_flow: outcome.some }
+nothing = Close { status: 404, reason: "nothing to sweep", _should_flow: outcome.none }
 ```
 
 The gate takes any port of any type; the value is never read, only a
@@ -148,9 +158,14 @@ If you want a webhook receiver that says `200` at once and does the slow
 part after, wire the `Reply` early in the graph, then the rest, and set
 `outlivesCaller: true` so the caller hanging up does not cancel the run.
 
-If you want a long job polled later, one route answers `202` with an id and
-writes the job's state to the project's Postgres, and a second route reads
-it back. Two routes and a table, no new node.
+A slow job (anything that takes minutes: a render, a build, a batch of model
+calls) never sits in one call the caller waits on. Answer early (a `202`
+with an id), run the work after the answer with `outlivesCaller: true`, and
+show progress: on the infra node's display when the work runs in a container
+(the `weft-node-authoring` skill has the display), or as a status the caller
+polls. For the polled status, the route that answered writes the job's state
+to the project's Postgres, the work updates it as it goes, and a second route
+reads it back. Two routes and a table, no new node.
 
 If a page asks a route for a status every few seconds, set `recorded: false`
 on the `Route` so each call does not leave a run behind. A run that succeeds or
@@ -179,7 +194,9 @@ file lands at execution scope, walled to that run and swept when it ends: a
 later request cannot read it even if it was kept. If you want to serve a picture from a
 later request, wire it through `KeepFile { scope: "project" }`, which copies
 it into the project's storage, then write the whole [stored-file value] it
-emits into a jsonb column, exactly as it arrived.
+emits into a jsonb column, exactly as it arrived. If it should not live for
+ever, give `KeepFile` a `ttl_days` too: the copy then expires that many days
+after anybody last read it.
 
 Two columns, and only one of them is right:
 
@@ -196,10 +213,39 @@ key instead of a picture.
 Sending that picture back needs nothing else. An [answer] node walks the
 whole body and turns every stored file it finds, however deep (in an object,
 in a list of rows), into `{ url, mimeType, filename, sizeBytes }`, so a list
-route serving rows with pictures is three nodes and no loop. The `url` is an
-address this install answers on, and a frontend puts it straight in an
-`<img>`. `Cast` the value to `Image` or `File` only when you want the file
+route serving rows with pictures is three nodes and no loop. The `url` is
+built on the address the caller used: a call to `127.0.0.1:14111` gets a
+loopback link, a call through the tunnel gets a tunnel link. A run no request
+started (`weft run --fire`) gets the install's internet address when it has
+one, loopback otherwise. A frontend puts the `url` straight in an `<img>`. `Cast` the value to `Image` or `File` only when you want the file
 as a typed value on a wire, to hand it to a node that takes a picture.
+
+If you want to serve a picture that is redrawn often (a live preview), the
+shape is one place that always names the latest copy, which every render
+overwrites and the serving route reads and answers as bytes. A render's own
+file is at execution scope and swept when its run ends, so a link to it dies
+with that run: each render is kept in the project scope first. One way to
+build it, with a table: each render goes through
+`KeepFile { scope: "project", ttl_days: 1 }`, and its whole value goes over
+one row per preview (`INSERT INTO preview (view, picture) VALUES ($view, $picture)
+ON CONFLICT (view) DO UPDATE SET picture = EXCLUDED.picture`). No storage node
+rewrites a picture in place, so the row is what stays put: the old copies
+expire a day after their last read, and the one on screen is read on every
+call, which resets its clock. The route that serves it, with `db` the
+program's `PostgresDatabase`:
+
+```weft
+preview = Route -> (view: String) { path: "session/preview/{view}", method: "GET" }
+latest = PostgresExecuteQuery(view: String) -> (picture: JsonDict) {
+  account: db.access
+  view: preview.view
+  query: "SELECT picture FROM preview WHERE view = $view"
+}
+show = Reply { answerAs: "bytes", body: latest.picture }
+```
+
+An `<img>` can point straight at that route. A json answer works for a
+project-scope file too, through the `url` the [answer] builds.
 
 If you catch yourself putting base64 on a wire or reading a multipart body,
 stop and write: "Wait. Files are links." Then declare the port `Image` or
@@ -215,11 +261,8 @@ one you will reach for most:
 ```weft
 ask = Route -> (prompt: String) { path: "chat", method: "POST" }
 prov = OpenRouterProvider { model: "openai/gpt-4.1-nano" }
-live = LlmStream
-live.provider = prov.provider
-live.prompt = ask.prompt
-out = Stream { format: "sse" }
-out.bus = live.stream
+live = LlmStream { provider: prov.provider, prompt: ask.prompt }
+out = Stream { format: "sse", bus: live.stream }
 ```
 
 `format` has two good answers and one for the rare case. Pick between the
@@ -245,6 +288,12 @@ first two on what the reader is, and neither is a fallback for the other:
 behind it: the id, the row just created, the session token, then the feed.
 `status` and `headers` ride the first chunk. The response ends when the bus
 closes; a bus that closed before the `Stream` node ran still streams whole.
+
+The status line went out with the first chunk, so a failure after that
+cannot change it. It arrives in the body's own framing, as the last thing the
+reader gets: a final `{"error":"..."}` line on `ndjson`, an `event: error` on
+`sse`, a `[error] ...` line on anything else. Tell the frontend's reader to
+look for it.
 
 A run behind a `Route` lives as long as its caller: when they hang up, the
 run is cancelled and whatever it was still doing stops. That is
@@ -293,11 +342,12 @@ kill the work you promised to do.
 
 ```weft
 door = Route -> (text: String) { path: "ingest", method: "POST", outlivesCaller: true }
-ack = Reply { status: 202 }
-ack.body = door.text
-slow = ExecPython(text: String) -> (done: Boolean) { code: "return {'done': True}" }
-slow.text = door.text
-slow._should_flow = ack.done
+ack = Reply { status: 202, body: door.text }
+slow = ExecPython(text: String) -> (done: Boolean) {
+  text: door.text
+  _should_flow: ack.done
+  code: "return {'done': True}"
+}
 ```
 
 **Turning that on is you taking the ending into your own hands.** With it
@@ -398,8 +448,7 @@ turn = Loop(msg: Generator[Said]) -> (results: List[Boolean | Null]) {
   parallel: false
   over: ["msg"]
   echo = JsonObject { echo: self.msg.text }
-  say = Reply
-  say.body = echo.object
+  say = Reply { body: echo.object }
   self.results = say.done
 }
 turn.msg = sock.inbound
@@ -454,6 +503,24 @@ authenticate.
 Finer rules (this key may only read, this user owns that room) are never the
 [gate]'s job: they are a branch in the graph on `caller`.
 
+Every [route] and socket counts calls per caller: by default one caller gets
+60 calls a minute, and the next one is answered `429` with a `Retry-After`
+before any run starts. A caller is who the [gate] let in, or the address on
+an open route. `callsPerMinutePerCaller` on the trigger changes it, and `0`
+means no limit. A page that polls a route every second from one server is
+one caller at 60 a minute, so on a polled route raise it, next to
+`recorded: false`. `callsPerMinute` (everybody together) and `callsAtOnce`
+are the other two limits.
+
+In a program with instances (separate copies of part of it, the
+`weft-instances` skill), a [route] is always shared: one that reads a
+per-instance container or value, or sits inside or reads from a group that
+receives one, is a compile error. Keep the [route] outside that group and
+send its work in through the group's inputs. The caller picks the
+instance per call, with `Weft-Instance: <id>` on a gated [route] (only a
+server that already checked the caller may send it; an open route refuses
+the header), or with an instance token in `Weft-Instance-Token`.
+
 ## When you need a custom node
 
 Two readers of one socket (inbound is broadcast to `ctx` readers), a reply
@@ -465,7 +532,7 @@ You reach for `ctx` only when the graph cannot say it.
 ## Trying it
 
 ```bash
-weft activate                      # prints the live URL (/connect/<tenant>/<path>)
+weft activate                      # prints the live URL (/connect/local/<path>)
 curl -L -X POST "<url>/hello" -H 'content-type: application/json' -d '{"name":"ada"}'
 curl -L -i "<url>/users/42?verbose=1"
 curl -L -N "<url>/feed"            # a Stream route: -N shows each frame as it lands
@@ -474,7 +541,7 @@ weft follow <project>              # one execution per request, live
 ```
 
 Always `curl -L`. The live URL answers a `307` that points the caller at the
-pod serving the run, so a first call without `-L` comes back a redirect and
+live door serving the run, so a first call without `-L` comes back a redirect and
 looks like total failure. The body says so, and `-L` follows it.
 
 A connection held open is the one thing `--fire` below cannot show you:
@@ -516,6 +583,7 @@ Firing one fails saying so; use `weft activate` for a real client.
 node's own body, still exists for supplying values without running code,
 but firing is now the faster way to watch a route work end to end.
 
-A request answered `500 the run ended without answering` shows in `weft
-follow` as a run that reached no [answer]. The fix is in the graph, never in
-a retry.
+A request answered `500 execution failed: the run ended without answering`
+is a failed run that reached no [answer], with that error, in `weft follow`
+and in `weft executions`, even on a `recorded: false` route (a failed run is
+always written down whole). The fix is in the graph, never in a retry.

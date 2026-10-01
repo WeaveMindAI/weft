@@ -11,7 +11,7 @@
 use serde_json::{json, Map, Value};
 
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, WeftResult};
+use weft::{Access, ExecutionContext, WeftError, WeftResult};
 
 /// Emit the `LlmProvider` object: `kind` + `model` + the picked
 /// connection + every OTHER declared input that holds a value,
@@ -66,14 +66,19 @@ pub fn read_for(
             "anthropic" => ("Anthropic", "AnthropicProvider"),
             other => (other, other),
         };
-        weft::node_bail!("{what} speaks the {api} API; wire an {node} (got '{kind}')");
+        return Err(WeftError::Input(format!(
+            "{what} speaks the {api} API; wire an {node} (got '{kind}')"
+        )));
     }
     let model: String = provider.get("model")?;
     let account: Access = match provider.opt("account")? {
         Some(a) => a,
-        None => weft::node_bail!(
-            "the wired LlmProvider object carries no connection; pick one on the provider node"
-        ),
+        None => {
+            return Err(WeftError::Input(
+                "the wired LlmProvider object carries no connection; pick one on the provider node"
+                    .to_string(),
+            ))
+        }
     };
     Ok((model, account))
 }

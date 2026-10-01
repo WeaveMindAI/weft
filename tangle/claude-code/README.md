@@ -20,7 +20,7 @@ writes the weft code. A missing capability is a dispatch: Tangle designs the nod
 contract and sends a `node-smith` specialist (several in parallel when
 several nodes are missing), which researches the real API documentation on
 the web, writes the node and extensive tests (live-tier tests included),
-and proves the local tiers (`weft test-node`, basic and fake: no cluster,
+and proves the local tiers (`weft test-node`, basic and fake: no weft install,
 no credentials, no money), iterating until green before reporting with
 evidence. The live tier spends real money, so the specialist writes its
 tests but never runs them; the user does, with informed consent, through
@@ -70,13 +70,16 @@ commands are the expert's hand on the same loop.
 | `.claude/skills/weft-api/` | on demand, when the program is an HTTP API or a WebSocket service | the `Route` and `Socket` triggers, `Reply`, `Stream` and `Close`, gating a route with an auth connection, the shapes that need a custom node, trying it with curl and a socket client |
 | `.claude/skills/weft-onboarding/` | on demand, when asked to teach | the guided tour: plain-word vocabulary and the itinerary |
 | `.claude/skills/weft-updating/` | on demand, when weft itself updates | the git pull plus setup.sh walk, what an update touches and preserves, and fixing a failed one |
-| `.claude/commands/` | `/weft-check`, `/weft-run`, `/weft-debug`, `/weft-new-node`, `/weft-live-test` | the expert's hand: the loop's steps on demand, live tests with informed consent |
+| `.claude/skills/weft-deploying/` | on demand, when the program goes to a cloud install | targets and `--on`, logging in, the deploy workflow `weft ci add` writes, `weft target export`, a cloud build and how it fails, rolling back, connections per install |
+| `.claude/skills/weft-cloud-install/` | on demand, when weft itself goes onto the user's Google Cloud, or is upgraded or resized there | the fork, the one-time gcloud block, the fork's variables, the install workflow, the first operator key, upgrading, growing the machine |
+| `.claude/commands/` | `/weft-check`, `/weft-run`, `/weft-debug`, `/weft-new-node`, `/weft-live-test`, `/weft-deploy` | the expert's hand: the loop's steps on demand, live tests with informed consent, a deploy handed to the deployer |
 | `.claude/hooks/validate_weft.py` | after every Edit/Write | the compiler answers every edit: fast validate on the touched source, structural errors fed back to the model automatically |
 | `.claude/agents/prompt-engineer.md` | when dispatched | writes and overhauls the program's LLM prompts, running the WeaveMind prompt-building playbook verbatim as its mind; its brief carries the job, the model, the data, the output shape |
 | `.claude/agents/run-digger.md` | when dispatched | post-mortem only: walks journals, logs, source, and stored files, compares good runs against bad ones, reports the finding with quoted evidence; read-only, never fixes |
 | `.claude/agents/red-teamer.md` | when dispatched, before handover on a high-stakes program | attack only: reads the program, prompts, and outside edges as an attacker (lying outsiders, hallucination hazards, rogue steps, unguarded stakes, forgeries, stored lies, over-powered deputies, leaks, spend loops), walks every hole from input to consequence, names the layer that closes each; never fixes, never runs |
 | `.claude/agents/node-smith.md` | when dispatched | builds and proves exactly one node, unsupervised, web access for service docs, local test tiers green, live tests written but not run |
 | `.claude/agents/frontend-builder.md` | when dispatched | builds and proves the project's frontend under `front/`, unsupervised: the pages, the server-held api token, the client that calls the program's own routes and signals, on the default stack unless the user named their own |
+| `.claude/agents/deployer.md` | when dispatched | the only agent that acts on a cloud install: names the target with `--on` on every command, deploys, rolls back, sets up the deploy workflow, reports what is live or the exact failure; never changes the program |
 | `.claude/settings.json` | every session | permissions: an allow list for every `weft` verb Tangle runs, and no ask list. Whether a call is put in front of you is your permission mode's decision: automatic means Tangle activates, resyncs, deactivates and starts or stops infra on its own, manual means it asks in prose. The daemon's lifecycle (`weft daemon start`, `stop`, `restart`) is left off the list: that is a reinstall of weft, never Tangle's move. Also `claudeMdExcludes`: the user's personal `~/.claude/CLAUDE.md` and `~/.claude/rules/` are excluded, so Tangle is the only persona that loads and the project is isolated from the user's other assistant setup. Commands and agents are `weft-`-named or project-scoped, so personal same-named ones are unlikely; agents resolve project-over-user, so Tangle's specialists always win. |
 
 The design rests on two disciplines. Ground truth: the catalog is on disk
@@ -100,9 +103,10 @@ weft new <project> --assistant claude-code     # shorthand: --assistant cc
 
 That copies `CLAUDE.md` and `.claude/` out of the local weft checkout's
 `tangle/claude-code/` into the project. The flag's value names the assistant
-(repeatable for several), and the choice is remembered: later `weft new`
-runs install it with no flag, until `--assistant <name>` changes it or
-`--assistant none` stops it. The files are the project's own from then
+(repeatable for several), for this project only. Add `--remember` and
+later `weft new` runs install it with no flag, until another
+`--assistant <name> --remember` changes it or `--assistant none --remember`
+clears it. The files are the project's own from then
 on, so they are committed with it and a teammate cloning the project gets
 Tangle with no weft checkout to point at.
 
@@ -125,7 +129,7 @@ Prerequisites sit on the machine, not in the template: the `weft` CLI on the
 PATH, Docker, and the local daemon from `setup.sh` in the weft checkout (the
 `weft-running` skill knows how to check and start all of it). The
 specialist's local test tiers build with plain cargo, no docker and no
-cluster, so they additionally need a Rust toolchain on the host; without one
+weft install, so they additionally need a Rust toolchain on the host; without one
 the specialist reports that blocker instead of pretending.
 
 ## Maintenance

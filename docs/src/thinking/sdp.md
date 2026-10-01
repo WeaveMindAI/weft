@@ -61,7 +61,7 @@ going until you reach the step where a good input became a bad output.
 
 When a run comes out right, `weft freeze <name>` keeps its starting parameters
 and its accepted outputs. After a change, `weft run <name>` runs the current code
-with those parameters, and `weft diff <color> example:<name>` shows you what
+with those parameters, and `weft diff <execution-id> example:<name>` shows you what
 moved, for you or Tangle to judge. Freezing the new run replaces the accepted
 example.
 

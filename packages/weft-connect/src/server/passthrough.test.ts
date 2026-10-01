@@ -15,23 +15,23 @@ function fakeDispatcher(answer: (req: Request) => Response | Promise<Response> =
 const site = 'https://site.example/weft';
 
 describe('the pass-through', () => {
-	it("forwards a member door call with the member's token and the query", async () => {
+	it("forwards an instance door call with the instance's token and the query", async () => {
 		const { fetcher, seen } = fakeDispatcher(() => new Response('[]', { headers: { 'content-type': 'application/json' } }));
-		const pass = weftPassThrough({ dispatcher: 'http://127.0.0.1:9999/', fetcher });
+		const pass = weftPassThrough({ dispatcher: 'http://127.0.0.1:14111/', fetcher });
 		const res = await pass(
-			new Request(`${site}/member/connections?service=slack`, {
-				headers: { Authorization: 'Bearer wft-m', Cookie: 'session=secret', 'Weft-Member': 'someone-else' },
+			new Request(`${site}/instance/connections?service=slack`, {
+				headers: { Authorization: 'Bearer wft-m', Cookie: 'session=secret', 'Weft-Instance': 'someone-else' },
 			}),
-			'member/connections',
+			'instance/connections',
 		);
 		expect(res.status).toBe(200);
 		expect(res.headers.get('content-type')).toBe('application/json');
 		expect(await res.text()).toBe('[]');
-		expect(seen[0].url).toBe('http://127.0.0.1:9999/member/connections?service=slack');
+		expect(seen[0].url).toBe('http://127.0.0.1:14111/instance/connections?service=slack');
 		expect(seen[0].headers.get('authorization')).toBe('Bearer wft-m');
-		// The site's cookies and the server-only member header stay behind.
+		// The site's cookies and the server-only instance header stay behind.
 		expect(seen[0].headers.get('cookie')).toBeNull();
-		expect(seen[0].headers.get('weft-member')).toBeNull();
+		expect(seen[0].headers.get('weft-instance')).toBeNull();
 		// The dispatcher learns the address the browser used, mount included.
 		expect(seen[0].headers.get('x-forwarded-host')).toBe('site.example');
 		expect(seen[0].headers.get('x-forwarded-proto')).toBe('https');
@@ -42,10 +42,10 @@ describe('the pass-through', () => {
 		const { fetcher, seen } = fakeDispatcher();
 		const pass = weftPassThrough({ dispatcher: 'http://d', fetcher });
 		await pass(
-			new Request('http://127.0.0.1:5173/member/fields', {
+			new Request('http://127.0.0.1:5173/instance/fields', {
 				headers: { 'X-Forwarded-Host': 'evil.example', 'X-Forwarded-Prefix': '/elsewhere' },
 			}),
-			'member/fields',
+			'instance/fields',
 		);
 		expect(seen[0].headers.get('x-forwarded-host')).toBe('127.0.0.1:5173');
 		expect(seen[0].headers.get('x-forwarded-proto')).toBe('http');
@@ -92,7 +92,7 @@ describe('the pass-through', () => {
 		expect(seen[0].headers.get('content-type')).toBe('application/json');
 	});
 
-	it("calls a program's live route with the member's token, following the dispatcher to the worker", async () => {
+	it("calls a program's live route with the instance's token, following the dispatcher to the worker", async () => {
 		let init: RequestInit | undefined;
 		const fetcher = (async (url: string, given: RequestInit) => {
 			init = given;
@@ -103,7 +103,7 @@ describe('the pass-through', () => {
 			new Request(`${site}/connect/local/bot/ask`, {
 				method: 'POST',
 				body: '{"text":"hello"}',
-				headers: { 'Weft-Member-Token': 'wft-m', 'content-type': 'application/json' },
+				headers: { 'Weft-Instance-Token': 'wft-m', 'content-type': 'application/json' },
 			}),
 			'connect/local/bot/ask',
 		);
@@ -112,7 +112,7 @@ describe('the pass-through', () => {
 		// browser, and the body is whole so it can be sent again.
 		expect(init?.redirect).toBe('follow');
 		expect(new TextDecoder().decode(init?.body as ArrayBuffer)).toBe('{"text":"hello"}');
-		expect(new Headers(init?.headers).get('weft-member-token')).toBe('wft-m');
+		expect(new Headers(init?.headers).get('weft-instance-token')).toBe('wft-m');
 	});
 
 	it('reaches the display doors, keeping each segment one segment', async () => {
@@ -122,10 +122,17 @@ describe('the pass-through', () => {
 		expect(seen[0].url).toBe('http://d/signal-token/displays/p/test.whatsapp');
 	});
 
+	it("passes a stored file's link, so a picture a route answered with loads through the site", async () => {
+		const { fetcher, seen } = fakeDispatcher();
+		const pass = weftPassThrough({ dispatcher: 'http://d', fetcher });
+		await pass(new Request(`${site}/public/files/tok123`), 'public/files/tok123');
+		expect(seen[0].url).toBe('http://d/public/files/tok123');
+	});
+
 	it('refuses anything outside the weft doors without calling the dispatcher', async () => {
 		const { fetcher, seen } = fakeDispatcher();
 		const pass = weftPassThrough({ dispatcher: 'http://d', fetcher });
-		for (const path of ['projects/1/activate', '', 'member/../projects', 'signal/./x']) {
+		for (const path of ['projects/1/activate', '', 'instance/../projects', 'signal/./x', 'public', 'public/logo.png', 'public/files']) {
 			expect((await pass(new Request(`${site}/${path}`), path)).status).toBe(404);
 		}
 		expect(seen).toHaveLength(0);
@@ -133,7 +140,7 @@ describe('the pass-through', () => {
 
 	it('says which setting is missing when the address is not set', async () => {
 		const pass = weftPassThrough({ dispatcher: () => undefined, fetcher: fakeDispatcher().fetcher });
-		const res = await pass(new Request(`${site}/member/fields`), 'member/fields');
+		const res = await pass(new Request(`${site}/instance/fields`), 'instance/fields');
 		expect(res.status).toBe(500);
 		expect(await res.text()).toContain('WEFT_DISPATCHER_URL');
 	});
@@ -142,11 +149,11 @@ describe('the pass-through', () => {
 		const fetcher = (async () => {
 			throw new TypeError('fetch failed');
 		}) as unknown as typeof fetch;
-		const res = await weftPassThrough({ dispatcher: 'http://127.0.0.1:9999', fetcher })(
-			new Request(`${site}/member/fields`),
-			'member/fields',
+		const res = await weftPassThrough({ dispatcher: 'http://127.0.0.1:14111', fetcher })(
+			new Request(`${site}/instance/fields`),
+			'instance/fields',
 		);
 		expect(res.status).toBe(502);
-		expect(await res.text()).toContain('http://127.0.0.1:9999');
+		expect(await res.text()).toContain('http://127.0.0.1:14111');
 	});
 });

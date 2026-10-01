@@ -1,18 +1,20 @@
 # Allowlist model: ignore EVERYTHING, then un-ignore only what the
-# repo-root-context builds (the system images via
-# deploy/docker/system-images.Dockerfile) actually COPY. This keeps the build
+# repo-root-context build (the runtime image via
+# deploy/docker/runtime.Dockerfile) actually COPIES. This keeps the build
 # context to a few MB of source instead of the whole tree (target/ alone is many
 # GB), and it stays correct when new heavy dirs appear (they are ignored by
 # default, never dragged in). The builder base does NOT build from the repo
 # root: it uses the staged `.weft-base-context/` dir as its own context.
 #
-# The system-images Dockerfile COPYs: rust-toolchain.toml, Cargo.toml,
-# Cargo.lock, crates/. deploy/ is kept so the Dockerfile referenced
-# with `-f` is inside the context too.
+# The runtime Dockerfile COPIES: rust-toolchain.toml, Cargo.toml,
+# Cargo.lock, crates/, catalog/ and the builder base's recipe under
+# deploy/docker/. deploy/ is kept so the Dockerfile referenced with `-f`
+# is inside the context too.
 #
-# SYNC: what the repo-root build context ships <-> the system-image hash
+# SYNC: what the repo-root build context ships <-> the runtime image hash
 #       inputs in crates/weft-cli/src/images.rs (NOT_IN_THE_BINARY +
-#       hash_path_skipping's skip set): a path that changes what a
+#       weft_catalog::is_node_tree_excluded, which every hash walk
+#       applies): a path that changes what a
 #       binary compiles TO must be covered by both, or two trees with
 #       one hash build different images.
 *
@@ -22,13 +24,20 @@
 !Cargo.lock
 !crates/
 !deploy/
+# The runtime image carries the standard library a version compiles
+# against (deploy/docker/runtime.Dockerfile).
+!catalog/
 
 # Even inside the allowlisted dirs, never ship build artifacts or VCS/dev junk.
+# SYNC: this block <-> crates/weft-catalog/src/lib.rs (NODE_TREE_EXCLUDE +
+#       NODE_TREE_EXCLUDE_SUFFIXES). Every hash walk and staging copy
+#       leaves out exactly those names, so the CLI hashing the checkout
+#       and a dispatcher hashing the runtime image's copy agree.
 **/target/
 **/node_modules/
 **/.svelte-kit/
-**/pkg/
-.git/
+**/.git/
+**/.weft/
 **/.env
 **/*.db
 **/*.db-journal

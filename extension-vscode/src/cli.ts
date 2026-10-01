@@ -2,7 +2,7 @@
 //
 // Parse, validate, and describe-nodes are node-aware: they need the
 // project's `nodes/` catalog, which lives on the user's machine. The
-// dispatcher (a remote pod) has no access to it, so these run locally
+// dispatcher (possibly on a cloud install) has no access to it, so these run locally
 // through the CLI, which reads `nodes/` directly. This mirrors how the
 // extension already shells out for lifecycle verbs.
 

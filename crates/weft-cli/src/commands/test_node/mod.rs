@@ -3,16 +3,16 @@
 //! Basic/fake tiers run RIGHT HERE: every targeted package's test
 //! crate is emitted against the real weft checkout
 //! (`EmitPaths::Local`) as a member of one cargo workspace, built with
-//! plain cargo (no docker, no cluster, no broker), and executed.
+//! plain cargo (no docker, no install, no broker), and executed.
 //! A broken `main.weft` never blocks this, and neither does a broken
 //! package nobody targeted: only what you asked to test joins the
 //! build. Target a package and it is the only one that has to compile.
 //!
 //! The live tier runs the PRODUCTION credential path (connection
 //! resolution, relaying, metering, billing), which only exists next to
-//! the broker, so live tests always run as a short-lived test pod in
-//! the cluster: the CLI builds + loads the per-package test image,
-//! asks the dispatcher to run one test per pod
+//! the broker, so live tests always run on a local install: the CLI
+//! builds the per-package test image into this machine's Docker, which
+//! the install runs it from, asks the install to run one test per call
 //! (`/projects/{id}/node-tests/run`), and polls the outcome. Live
 //! needs the project registered with the dispatcher (cost has to
 //! attribute to something) and a grant for each test's declared
@@ -22,7 +22,6 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use serde_json::{json, Value};
 
 use weft_catalog::FsCatalog;
 use weft_core::access::spec::{AccessSpec, Acquisition, CredentialField, Door};
@@ -31,6 +30,7 @@ use weft_core::node::MetadataCatalog;
 use weft_core::node_test::{
     concurrency_limit, report_line, NodeTestsListing, RunAllReport, TestListing, TestReport,
 };
+use weft_core::task::TaskStatus;
 use weft_core::TestTier;
 
 use super::Ctx;
@@ -59,7 +59,7 @@ pub struct TestNodeArgs {
     /// Concurrency: `None` = one test at a time, `Some(0)` = all at
     /// once (bare `--parallel`), `Some(n)` = at most n in flight.
     /// Applies to the local tiers (forwarded to the package binary)
-    /// and to live pod runs alike.
+    /// and to live runs alike.
     pub parallel: Option<usize>,
 }
 
@@ -97,7 +97,7 @@ pub async fn run(ctx: Ctx, args: TestNodeArgs) -> Result<()> {
     let targets = resolve_targets(&catalog, args.target.as_deref())?;
     if targets.is_empty() {
         eprintln!(
-            "no package under nodes/ declares tests (a node declares tests in a \
+            "no package in this project (nodes/ or src/) declares tests (a node declares tests in a \
              tests.rs next to its code)"
         );
         return Ok(());
@@ -360,7 +360,7 @@ fn resolve_targets(catalog: &FsCatalog, target: Option<&str>) -> Result<Vec<Targ
             let mut known: Vec<&str> = catalog.packages().map(|p| p.name.as_str()).collect();
             known.sort();
             bail!(
-                "'{t}' is neither a package nor a node type in this project's nodes/ \
+                "'{t}' is neither a package nor a node type in this project (nodes/ or src/) \
                  (packages: {})",
                 known.join(", ")
             );
@@ -550,10 +550,10 @@ fn render(ctx: &Ctx, reports: &[TestReport]) -> Result<()> {
                 r.tier.as_str(),
                 r.error.as_deref().unwrap_or("no error message").replace('\n', "\n  ")
             );
-            if !r.colors.is_empty() {
+            if !r.execution_ids.is_empty() {
                 println!(
-                    "  live run cost is recorded under execution color(s): {}",
-                    r.colors.join(", ")
+                    "  live run cost is recorded under execution(s): {}",
+                    r.execution_ids.join(", ")
                 );
             }
         }
@@ -592,7 +592,7 @@ async fn run_live(
     let mut runs: Vec<LiveRun> = Vec::new();
     // Declared fixtures each selected test needs, validated up front
     // against the environment: every miss is collected and reported at
-    // once, BEFORE any consent prompt, grant, or pod. (The pod-side
+    // once, BEFORE any consent prompt, grant, or run. (The test server's
     // `rig.fixture` read stays the runtime backstop.)
     let mut missing_fixtures: Vec<String> = Vec::new();
     let listings = cached_listings(project, catalog, targets, build_dirs, workspace)?;
@@ -649,7 +649,7 @@ async fn run_live(
     }
     ensure_live_consent(args)?;
 
-    let client = ctx.client();
+    let client = ctx.client()?;
     let project_id = super::resolve_project_id(ctx, None)?;
 
     // Resolve every service's connection in TWO phases: first a pure
@@ -702,7 +702,7 @@ async fn run_live(
             );
         }
         // Typed HERE, where the flag is read: everything downstream
-        // (the plan, the pod requests) carries a real Uuid.
+        // (the plan, the run requests) carries a real Uuid.
         let id: uuid::Uuid = id
             .parse()
             .with_context(|| format!("--connection {id} is not a connection id (a UUID)"))?;
@@ -717,7 +717,7 @@ async fn run_live(
         } else if let Some(conn) = pinned.get(service) {
             // Validate NOW, in the plan phase: a typo'd or
             // wrong-service grant id must fail before any side effect
-            // (and before a pod spends money discovering it).
+            // (and before a run spends money discovering it).
             require_grant_for_service(ctx, service, *conn).await?;
             Planned::Existing(*conn)
         } else {
@@ -738,10 +738,10 @@ async fn run_live(
         plan.insert(service.clone(), planned);
     }
 
-    // Every WEFT_NODE_TEST_* variable rides into the test pod's env as
+    // Every WEFT_NODE_TEST_* variable rides to the test as
     // a live fixture (`LiveRig::fixture`): values a test cannot
     // self-provision, like the chat id a bot may message. EXCEPT the
-    // key variables: a credential field reaches the pod through the
+    // key variables: a credential field reaches the test through the
     // grant via the broker, never as env, so every catalog service's
     // key variables are excluded (not just this run's; a scripted
     // sweep exports the whole .env).
@@ -791,7 +791,7 @@ async fn run_live(
     // message says to check it.)
     let mut ephemeral_grants: Vec<uuid::Uuid> = Vec::new();
     let result = if prepared.is_empty() {
-        run_live_pods(ctx, catalog, &project_id, &runs, &connections, &fixtures, args.parallel, reports).await
+        run_live_tests(ctx, catalog, &project_id, &runs, &connections, &fixtures, args.parallel, reports).await
     } else {
         let create_and_run = async {
             for (service, key) in prepared {
@@ -799,12 +799,12 @@ async fn run_live(
                 ephemeral_grants.push(id);
                 connections.insert(service, id);
             }
-            run_live_pods(ctx, catalog, &project_id, &runs, &connections, &fixtures, args.parallel, reports).await
+            run_live_tests(ctx, catalog, &project_id, &runs, &connections, &fixtures, args.parallel, reports).await
         };
         tokio::select! {
             r = create_and_run => r,
             _ = tokio::signal::ctrl_c() => Err(anyhow::anyhow!(
-                "interrupted (Ctrl+C); any started test pod keeps running, and a \
+                "interrupted (Ctrl+C); any test already started keeps running, and a \
                  connection being stored at that moment may have survived: check \
                  `weft connect --list`"
             )),
@@ -878,10 +878,10 @@ fn env_component(name: &str) -> String {
 
 /// Plan-phase check that `grant_id` exists AND answers `service`:
 /// the run request would accept any string and fail deep inside the
-/// pod otherwise. Uses the service-scoped list (the API's read
+/// process otherwise. Uses the service-scoped list (the API's read
 /// surface for grants), so a wrong-service id fails naming both.
 async fn require_grant_for_service(ctx: &Ctx, service: &str, grant_id: uuid::Uuid) -> Result<()> {
-    let grants = super::connect::list_grants(&ctx.client(), super::connect::Doorway::Owner, Some(service)).await?;
+    let grants = super::connect::list_grants(&ctx.client()?, super::connect::Doorway::Owner, Some(service)).await?;
     if !grants.iter().any(|g| g.id == grant_id) {
         bail!(
             "--connection {grant_id} is not a grant for service '{service}'; list the \
@@ -929,7 +929,7 @@ fn ensure_live_consent(args: &TestNodeArgs) -> Result<()> {
 /// unambiguous; zero is `None` (the caller knows the other ways in);
 /// several name the fix.
 async fn sole_grant_for_service(ctx: &Ctx, service: &str) -> Result<Option<uuid::Uuid>> {
-    let grants = super::connect::list_grants(&ctx.client(), super::connect::Doorway::Owner, Some(service)).await?;
+    let grants = super::connect::list_grants(&ctx.client()?, super::connect::Doorway::Owner, Some(service)).await?;
     match grants.as_slice() {
         [] => Ok(None),
         [only] => Ok(Some(only.id)),
@@ -1040,7 +1040,7 @@ fn prepare_ephemeral_key(catalog: &FsCatalog, service: &str) -> Result<PreparedK
 /// Ctrl+C select.
 async fn create_ephemeral_grant(ctx: &Ctx, key: PreparedKey) -> Result<uuid::Uuid> {
     let grant = super::connect::connect_direct(
-        &ctx.client(),
+        &ctx.client()?,
         super::connect::Doorway::Owner,
         ConnectDirect {
             spec: key.spec,
@@ -1051,7 +1051,7 @@ async fn create_ephemeral_grant(ctx: &Ctx, key: PreparedKey) -> Result<uuid::Uui
             registration: None,
             paste: key.paste,
             project_id: None,
-            member: None,
+            instance: None,
         },
         None,
     )
@@ -1060,7 +1060,7 @@ async fn create_ephemeral_grant(ctx: &Ctx, key: PreparedKey) -> Result<uuid::Uui
     Ok(grant.id)
 }
 
-async fn run_live_pods(
+async fn run_live_tests(
     ctx: &Ctx,
     catalog: &FsCatalog,
     project_id: &str,
@@ -1070,8 +1070,19 @@ async fn run_live_pods(
     parallel: Option<usize>,
     reports: &mut Vec<TestReport>,
 ) -> Result<()> {
-    let client = ctx.client();
+    let client = ctx.client()?;
     let project = ctx.project()?;
+    // The test image is built into THIS machine's Docker, which only a
+    // local install runs images from.
+    let install: weft_core::install::InstallInfo =
+        serde_json::from_value(client.get_json("/install").await?).context("read the install's description")?;
+    if install.cloud.is_some() {
+        bail!(
+            "live node tests run on a local install: the test image is built into this machine's Docker, which {} \
+             cannot reach. Target a local install and run them there.",
+            client.base()
+        );
+    }
 
     // One image per involved package, content-addressed and skipped
     // when already present.
@@ -1085,7 +1096,7 @@ async fn run_live_pods(
         );
     }
 
-    // Each run is its own pod with its own execution identity, so runs
+    // Each run is its own call with its own execution identity, so runs
     // interleave freely; the index restores declaration order in the
     // report. A run that itself breaks (not a failing test) surfaces
     // after the in-flight batch settles.
@@ -1143,7 +1154,7 @@ async fn run_live_pods(
                 async move {
                     let outcome = match (image, connection) {
                         (Ok(image), Ok(connection)) => {
-                            run_one_live_pod(
+                            run_one_live_test(
                                 client, project_id, run, &image, connection, fixtures, progress,
                             )
                             .await
@@ -1171,12 +1182,12 @@ async fn run_live_pods(
     Ok(())
 }
 
-/// Start one live test's pod and poll it to terminal. No deadline: a
+/// Start one live test and poll it to terminal. No deadline: a
 /// live test may take as long as the provider takes; Ctrl+C is the way
 /// out, and a periodic breadcrumb keeps a long wait legible. A status
 /// this CLI does not know is a loud contract break, never an endless
 /// silent wait.
-async fn run_one_live_pod(
+async fn run_one_live_test(
     client: &crate::client::DispatcherClient,
     project_id: &str,
     run: &LiveRun,
@@ -1189,43 +1200,42 @@ async fn run_one_live_pod(
     let resp = client
         .post_json(
             &format!("/projects/{project_id}/node-tests/run"),
-            &json!({
-                "imageRef": image,
-                "node": run.node,
-                "test": run.test,
-                "liveConnection": connection,
-                "fixtures": fixtures,
-            }),
+            &serde_json::to_value(weft_core::node_test::RunNodeTestRequest {
+                image_ref: image.to_string(),
+                node: run.node.clone(),
+                test: run.test.clone(),
+                live_connection: Some(connection.to_string()),
+                fixtures: fixtures.clone(),
+            })?,
         )
         .await
         .context("start the node-test run")?;
-    let task_id = resp
-        .get("taskId")
-        .and_then(Value::as_str)
-        .context("run answered without a task id")?
-        .to_string();
+    let task_id = serde_json::from_value::<weft_core::node_test::RunNodeTestResponse>(resp)
+        .context("read the started node-test run")?
+        .task_id;
 
     let started = std::time::Instant::now();
     let mut last_breadcrumb = std::time::Instant::now();
     let report = loop {
         // Held by the dispatcher until the run finishes or the hold runs
         // out, so the loop asks again at once either way.
-        let status = client
-            .get_json(&format!(
-                "/projects/{project_id}/node-tests/runs/{task_id}?wait_ms={}",
-                RUN_HOLD.as_millis()
-            ))
-            .await
-            .context("wait on the node-test run")?;
-        match status.get("status").and_then(Value::as_str) {
-            Some("complete") => {
-                break status.get("report").cloned().context("completed without a report")?
-            }
-            Some("failed") => bail!(
+        let status: weft_core::node_test::NodeTestRunStatus = serde_json::from_value(
+            client
+                .get_json(&format!(
+                    "/projects/{project_id}/node-tests/runs/{task_id}?wait_ms={}",
+                    RUN_HOLD.as_millis()
+                ))
+                .await
+                .context("wait on the node-test run")?,
+        )
+        .context("read the node-test run's status")?;
+        match status.status {
+            TaskStatus::Complete => break status.report.context("completed without a report")?,
+            TaskStatus::Failed => bail!(
                 "the node-test run itself failed (not the test): {}",
-                status.get("error").and_then(Value::as_str).unwrap_or("unknown")
+                status.error.as_deref().unwrap_or("unknown")
             ),
-            Some(in_progress @ ("pending" | "claimed")) => {
+            in_progress @ (TaskStatus::Pending | TaskStatus::Claimed) => {
                 if last_breadcrumb.elapsed() >= std::time::Duration::from_secs(15) {
                     last_breadcrumb = std::time::Instant::now();
                     progress.note(&format!(
@@ -1237,13 +1247,8 @@ async fn run_one_live_pod(
                     ));
                 }
             }
-            other => bail!(
-                "unexpected node-test run status {other:?} for task {task_id}; \
-                 the dispatcher and this CLI disagree on the task states"
-            ),
         }
     };
-    let report: TestReport = serde_json::from_value(report).context("parse live test report")?;
     progress.finished(&run.package, &run.test, report.passed, report.error.as_deref());
     Ok(report)
 }
@@ -1253,8 +1258,8 @@ async fn run_one_live_pod(
 /// its breadcrumb checked.
 const RUN_HOLD: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Build + load the package's content-addressed test image, skipping
-/// on a tag hit (the same skip rule worker images use).
+/// Build the package's content-addressed test image into this machine's
+/// Docker, skipping on a tag hit (the same skip rule worker images use).
 async fn ensure_test_image(
     project: &weft_compiler::project::Project,
     catalog: &FsCatalog,
@@ -1262,7 +1267,15 @@ async fn ensure_test_image(
 ) -> Result<String> {
     let builder_base = crate::images::ensure_worker_builder_base().await?;
     let artifact = tokio::task::block_in_place(|| {
-        weft_compiler::build::build_test_artifact(project, catalog, package, &builder_base)
+        weft_compiler::build::build_test_artifact(
+            project,
+            catalog,
+            package,
+            &weft_compiler::worker_image::BaseImages {
+                builder: builder_base.clone(),
+                runtime: weft_compiler::worker_image::DEFAULT_BASE_IMAGE.to_string(),
+            },
+        )
     })
     .map_err(|e| anyhow::anyhow!("stage test image for '{package}': {e}"))?;
     let tag = weft_compiler::build::node_test_image_tag(&artifact.content_hash);
@@ -1276,6 +1289,7 @@ async fn ensure_test_image(
             &tag,
             &artifact.build_context.join("Dockerfile"),
             &artifact.build_context,
+            // SYNC: weft.dev/project <-> crates/weft-cli/src/commands/executions.rs (dangling_prune)
             &[
                 format!("weft.dev/project={}", project.id()),
                 format!("weft.dev/node-test-package={package}"),
@@ -1283,45 +1297,67 @@ async fn ensure_test_image(
         )
         .await?;
     }
-    // Load onto the local cluster so the pod's IfNotPresent pull hits.
-    let cfg = crate::commands::daemon::cluster_config();
-    match cfg.backend {
-        crate::commands::daemon::ClusterBackend::Kind => {
-            if crate::commands::build::kind_available(&cfg.cluster_name).await {
-                crate::images::kind_load(&cfg.cluster_name, &tag, false).await?;
-            } else {
-                bail!(
-                    "no running kind cluster '{}' to load {tag} onto; start it with \
-                     `weft daemon start`",
-                    cfg.cluster_name
-                );
-            }
-        }
-        // The SAME failure worker images surface on this backend: the
-        // image ref the pod spawns is what the user pushed, so a
-        // local-only tag must stop here with the push recipe rather
-        // than ImagePullBackOff in the cluster.
-        crate::commands::daemon::ClusterBackend::K8s => {
-            return Err(crate::commands::build::bail_k8s_push_needed(&tag));
-        }
-    }
     // Test images are content-addressed per package-source version and
     // pile up fast across a suite run; drop this PACKAGE's stale ones
     // now that its fresh tag is ensured (package-scoped: every package
-    // shares the one scratch project id). Test pods are short-lived
+    // shares the one scratch project id). Test servers are short-lived
     // and never restart from an old tag, so beyond the fresh tag
-    // nothing is referenced by design: a tag a still-running test pod
-    // uses refuses its node-side remove and survives.
-    crate::commands::build::gc_stale_images(
-        std::slice::from_ref(&tag),
+    // nothing is referenced by design: a tag a still-running server
+    // uses refuses its remove and survives.
+    gc_stale_test_images(
+        &tag,
         &[
             format!("weft.dev/project={}", project.id()),
             format!("weft.dev/node-test-package={package}"),
         ],
-        Some(&crate::images::ReferencedImages::default()),
     )
-    .await;
+    .await?;
     Ok(tag)
+}
+
+/// Drop a package's STALE test images once its fresh `tag` is ensured:
+/// every tag of `tag`'s repo carrying ALL the given `weft.dev/*` labels
+/// except `tag` itself, then the matching dangling leftovers. Test images are
+/// content-addressed, one per package-source version, and nothing ever
+/// untags the old ones, so without this the pile grows with every edit.
+///
+/// Nothing beyond `tag` is kept: a test server is short-lived and never
+/// restarts from an old tag, and one a still-running server uses refuses
+/// its remove and survives.
+///
+/// Best effort once the tag is understood (a docker hiccup never fails
+/// a test run), silent on stdout (docker's `Untagged:` chatter would
+/// land in the middle of a `--json` event stream), and the shared
+/// BuildKit layer cache is untouched, so rebuilding a dropped tag stays
+/// warm.
+async fn gc_stale_test_images(tag: &str, labels: &[String]) -> Result<()> {
+    let condemn = crate::images::outside_current(tag)?;
+    let filters: Vec<String> = labels.iter().map(|l| format!("label={l}")).collect();
+    let mut list = crate::images::docker();
+    list.arg("images");
+    for f in &filters {
+        list.args(["--filter", f]);
+    }
+    list.args(["--format", "{{.Repository}}:{{.Tag}}"]);
+    let Ok(out) = list.output().await else { return Ok(()) };
+    if !out.status.success() {
+        return Ok(());
+    }
+    let stale = crate::images::host_images_matching(&String::from_utf8_lossy(&out.stdout), &condemn);
+    if stale.is_empty() {
+        return Ok(());
+    }
+    // No `-f`: a tag docker refuses to drop (an image a host container
+    // still runs) keeps it, where force would untag it anyway and
+    // strand the container's restart.
+    let _ = crate::images::docker().args(["rmi"]).args(&stale).output().await;
+    let mut prune = crate::images::docker();
+    prune.args(["image", "prune", "--force", "--filter", "dangling=true"]);
+    for f in &filters {
+        prune.args(["--filter", f]);
+    }
+    let _ = prune.output().await;
+    Ok(())
 }
 
 #[cfg(test)]

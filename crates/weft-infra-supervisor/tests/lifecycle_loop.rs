@@ -4,94 +4,104 @@
 //! in-memory fakes. Covers stop / terminate / apply verbs and the
 //! `running_policy` drain wait.
 
-use std::collections::HashMap;
-
 use weft_broker_client::protocol::{
     InfraLifecycleVerb as Verb, InfraNodeStatus as Status, RunningPolicy as Policy,
     SupervisorCommandRow,
 };
 use weft_infra_supervisor::testing::SupervisorTestRig;
-use weft_platform_traits::kube::{WorkloadKind, WorkloadReplicaState};
+use weft_platform_traits::HostCall;
 
 const TENANT: &str = "tenant-test";
 const PROJECT: uuid::Uuid = uuid::Uuid::from_u128(1);
-const NAMESPACE: &str = "wft-project-test-proj1";
 const NODE: &str = "bridge";
+
+/// The id every apply gives the shared copy of NODE (derived, never minted),
+/// for fixtures an apply works on in place.
+fn shared_id() -> String {
+    weft_core::infra::NodeRef::copy_id(PROJECT, NODE, None)
+}
 
 fn rig() -> SupervisorTestRig {
     let rig = SupervisorTestRig::with_tenant(TENANT);
-    rig.broker.add_project(PROJECT, NAMESPACE);
+    rig.broker.add_project(PROJECT);
     rig
 }
 
-/// The hash an apply of `spec` for `instance_id` stamps: the compiled
-/// manifests under this rig's context.
-fn applied_hash(spec: &serde_json::Value, instance_id: &str) -> String {
+/// The copy `copy_id` of this file's node, as the host knows it.
+fn copy(copy_id: &str) -> weft_core::infra::NodeRef {
+    weft_core::infra::NodeRef { tenant: TENANT.into(), project: PROJECT, node: NODE.into(), copy_id: copy_id.into() }
+}
+
+/// The hash an apply of `spec` for `copy_id` stamps.
+fn applied_hash(spec: &serde_json::Value, copy_id: &str) -> String {
     let parsed: weft_core::infra::InfraSpec = serde_json::from_value(spec.clone()).unwrap();
-    let tags = std::collections::BTreeMap::new();
-    let install = weft_core::infra::Instance::default_install();
-    let ctx = weft_core::infra::CompileContext {
-        tenant_id: TENANT,
-        project_id: PROJECT,
-        node_id: NODE,
-        instance_id,
-        namespace: NAMESPACE,
-        local_image_tags: &tags,
-        install: &install,
-    };
-    weft_core::infra::hash_manifests(&weft_core::infra::compile(&parsed, &ctx).unwrap())
+    weft_core::infra::resolve(&parsed, &copy(copy_id), &Default::default()).unwrap().hash()
 }
 
-/// Workload with an explicit `weft.dev/unit` label.
-fn workload_with_unit(
-    instance: &str,
-    name: &str,
-    unit: &str,
-    desired: i64,
-    ready: i64,
-) -> WorkloadReplicaState {
-    let mut labels = HashMap::new();
-    labels.insert("weft.dev/instance".into(), instance.into());
-    labels.insert("weft.dev/role".into(), "infra".into());
-    labels.insert("weft.dev/unit".into(), unit.into());
-    WorkloadReplicaState {
-        kind: WorkloadKind::Deployment,
-        name: name.into(),
-        namespace: NAMESPACE.into(),
-        desired,
-        ready,
-        labels,
+fn unit(status: Status, on_stop: weft_core::StopBehavior) -> weft_broker_client::protocol::UnitRuntime {
+    weft_broker_client::protocol::UnitRuntime {
+        status,
+        stop_behavior: on_stop,
+        flaky_after_seconds: 30,
+        recovery_after_seconds: 30,
+        image_refs: Default::default(),
     }
 }
 
-fn workload_for(instance: &str, name: &str, desired: i64, ready: i64) -> WorkloadReplicaState {
-    let mut labels = HashMap::new();
-    labels.insert("weft.dev/instance".into(), instance.into());
-    labels.insert("weft.dev/role".into(), "infra".into());
-    // Single-unit fixture: unit name = node id (matches add_infra_node).
-    labels.insert("weft.dev/unit".into(), NODE.into());
-    WorkloadReplicaState {
-        kind: WorkloadKind::Deployment,
-        name: name.into(),
-        namespace: NAMESPACE.into(),
-        desired,
-        ready,
-        labels,
-    }
+/// The units the host was asked to stop, as `copy_id/unit`.
+fn stops(rig: &SupervisorTestRig) -> Vec<String> {
+    rig.host
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            HostCall::Stop { copy_id, unit } => Some(format!("{copy_id}/{unit}")),
+            _ => None,
+        })
+        .collect()
 }
 
+/// The copies the host was asked to terminate, with the disks it kept.
+fn terminates(rig: &SupervisorTestRig) -> Vec<(String, Vec<String>)> {
+    rig.host
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            HostCall::Terminate { copy_id, keep } => Some((copy_id, keep)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The units the host was asked to apply, as `copy_id/unit`.
+fn applies(rig: &SupervisorTestRig) -> Vec<String> {
+    rig.host
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            HostCall::Apply { copy_id, unit, .. } => Some(format!("{copy_id}/{unit}")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A person's command: a terminate keeps the disks its node lists.
 fn cmd(id: i64, verb: Verb, node: Option<&str>) -> SupervisorCommandRow {
+    let spec_json = (verb == Verb::Terminate).then(|| terminate_work(weft_core::infra::TerminateDisks::KeepListed));
     SupervisorCommandRow {
         id,
         project_id: PROJECT,
         node_id: node.map(|s| s.to_string()),
         verb,
         running_policy: Some(Policy::Cancel),
-        spec_json: None,
+        spec_json,
         force: false,
         drain_timeout_secs: weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
-        copies: weft_core::member::Copies::Shared,
+        copies: weft_core::instance::Copies::Shared,
     }
+}
+
+fn terminate_work(disks: weft_core::infra::TerminateDisks) -> serde_json::Value {
+    serde_json::to_value(weft_broker_client::protocol::TerminateWork { disks }).unwrap()
 }
 
 // ---------- empty queue ----------
@@ -106,13 +116,9 @@ async fn tick_with_no_pending_returns_false() {
 // ---------- stop verb ----------
 
 #[tokio::test]
-async fn stop_flips_status_then_scales_then_emits_stopped() {
+async fn stop_flips_status_then_stops_then_emits_stopped() {
     let rig = rig();
     rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
-    rig.kube.set_workloads(
-        NAMESPACE,
-        vec![workload_for("inst1", "inst1-bridge", 1, 1)],
-    );
     rig.broker.enqueue_command(cmd(1, Verb::Stop, Some(NODE)));
 
     let did_work = rig.tick_lifecycle().await.unwrap();
@@ -129,17 +135,8 @@ async fn stop_flips_status_then_scales_then_emits_stopped() {
         vec![Status::Stopping, Status::Stopped]
     );
 
-    // The workload was scaled to 0 via the typed `scale_workload`.
-    let scales = rig.kube.scale_calls();
-    assert_eq!(
-        scales,
-        vec![(
-            NAMESPACE.into(),
-            WorkloadKind::Deployment,
-            "inst1-bridge".into(),
-            0
-        )]
-    );
+    // The unit was stopped on the host.
+    assert_eq!(stops(&rig), vec!["inst1/bridge".to_string()]);
 
     // A `stopped` event was emitted.
     let events = rig.broker.events();
@@ -154,181 +151,108 @@ async fn stop_flips_status_then_scales_then_emits_stopped() {
 #[tokio::test]
 async fn cancel_requested_halts_stop_and_records_cancelled_outcome() {
     // The user's `/infra/cancel` flagged the command before the
-    // supervisor got to the per-node work: the tick halts (no scale
-    // calls) and completes the command with the CANCELLED outcome,
+    // supervisor got to the per-node work: the tick halts (no stop) and
+    // completes the command with the CANCELLED outcome,
     // never as a failure.
     let rig = rig();
     rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
-    rig.kube.set_workloads(
-        NAMESPACE,
-        vec![workload_for("inst1", "inst1-bridge", 1, 1)],
-    );
     rig.broker.enqueue_command(cmd(1, Verb::Stop, Some(NODE)));
     rig.broker.set_cancel_requested(1);
 
     let did_work = rig.tick_lifecycle().await.unwrap();
     assert!(did_work);
 
-    assert!(rig.kube.scale_calls().is_empty(), "halted before any kubectl scale");
+    assert!(stops(&rig).is_empty(), "halted before any stop");
     assert_eq!(rig.broker.cancelled_commands(), vec![1]);
     assert!(rig.broker.failed_commands().is_empty(), "a cancel is not a failure");
 }
 
 #[tokio::test]
-async fn stop_skips_noop_units_and_scales_only_scale_to_zero() {
-    use weft_broker_client::protocol::UnitRuntime;
+async fn stop_leaves_keep_running_units_and_stops_the_rest() {
     let rig = rig();
-    // Two-unit node: `web` scales to zero on stop, `license` is NoOp
+    // Two-unit node: `web` stops on stop, `license` keeps running
     // (survives stop, only terminate removes it).
-    let mut units = std::collections::BTreeMap::new();
-    units.insert(
-        "web".to_string(),
-        UnitRuntime {
-            status: Status::Running,
-            stop_behavior: weft_core::StopBehavior::ScaleToZero,
-            flaky_after_seconds: 30,
-            recovery_after_seconds: 30,
-            image_refs: Default::default(),
-            watched: true,
-            scaled_to: None,
-        },
-    );
-    units.insert(
-        "license".to_string(),
-        UnitRuntime {
-            status: Status::Running,
-            stop_behavior: weft_core::StopBehavior::NoOp,
-            flaky_after_seconds: 30,
-            recovery_after_seconds: 30,
-            image_refs: Default::default(),
-            watched: true,
-            scaled_to: None,
-        },
-    );
-    rig.broker.add_infra_node_with(
-        PROJECT,
-        NODE,
-        "inst1",
-        Status::Running,
-        None,
-        std::collections::BTreeMap::new(),
-        units,
-    );
-    rig.kube.set_workloads(
-        NAMESPACE,
-        vec![
-            workload_with_unit("inst1", "inst1-web", "web", 1, 1),
-            workload_with_unit("inst1", "inst1-license", "license", 1, 1),
-        ],
-    );
+    let units = std::collections::BTreeMap::from([
+        ("web".to_string(), unit(Status::Running, weft_core::StopBehavior::Stop)),
+        ("license".to_string(), unit(Status::Running, weft_core::StopBehavior::KeepRunning)),
+    ]);
+    rig.broker.add_infra_node_with(PROJECT, NODE, "inst1", Status::Running, None, Default::default(), units);
     rig.broker.enqueue_command(cmd(1, Verb::Stop, Some(NODE)));
 
     rig.tick_lifecycle().await.unwrap();
 
-    // ONLY the web workload was scaled to 0; license is untouched.
-    let scales = rig.kube.scale_calls();
-    assert_eq!(
-        scales,
-        vec![(NAMESPACE.into(), WorkloadKind::Deployment, "inst1-web".into(), 0)],
-        "only the ScaleToZero unit is scaled; the NoOp unit survives"
-    );
-
-    // Per-unit status: web stopped, license still running. Node rolls
-    // up to flaky? No: rollup of {stopped, running} = running (running
-    // outranks stopped), so the node still looks running because a unit
-    // is up. The web unit is individually Stopped.
+    assert_eq!(stops(&rig), vec!["inst1/web".to_string()], "only the Stop unit; KeepRunning survives");
+    // Per-unit status: web stopped, license still running (a running unit
+    // keeps the node rollup running).
     let row = rig.broker.infra_node(PROJECT, NODE).unwrap();
     assert_eq!(row.units.get("web").unwrap().status, Status::Stopped);
     assert_eq!(row.units.get("license").unwrap().status, Status::Running);
 }
 
 #[tokio::test]
-async fn force_stop_takes_down_noop_units_too() {
-    use weft_broker_client::protocol::UnitRuntime;
+async fn force_stop_takes_down_keep_running_units_too() {
     let rig = rig();
-    // Same two-unit node, but force=true must scale BOTH down,
-    // ignoring the license unit's NoOp.
-    let mut units = std::collections::BTreeMap::new();
-    for (name, sb) in [
-        ("web", weft_core::StopBehavior::ScaleToZero),
-        ("license", weft_core::StopBehavior::NoOp),
-    ] {
-        units.insert(
-            name.to_string(),
-            UnitRuntime {
-                status: Status::Running,
-                stop_behavior: sb,
-                flaky_after_seconds: 30,
-                recovery_after_seconds: 30,
-                image_refs: Default::default(),
-                watched: true,
-                scaled_to: None,
-            },
-        );
-    }
-    rig.broker.add_infra_node_with(
-        PROJECT,
-        NODE,
-        "inst1",
-        Status::Running,
-        None,
-        std::collections::BTreeMap::new(),
-        units,
-    );
-    rig.kube.set_workloads(
-        NAMESPACE,
-        vec![
-            workload_with_unit("inst1", "inst1-web", "web", 1, 1),
-            workload_with_unit("inst1", "inst1-license", "license", 1, 1),
-        ],
-    );
-    // force = true on the Stop command.
+    let units = std::collections::BTreeMap::from([
+        ("web".to_string(), unit(Status::Running, weft_core::StopBehavior::Stop)),
+        ("license".to_string(), unit(Status::Running, weft_core::StopBehavior::KeepRunning)),
+    ]);
+    rig.broker.add_infra_node_with(PROJECT, NODE, "inst1", Status::Running, None, Default::default(), units);
     let mut command = cmd(1, Verb::Stop, Some(NODE));
     command.force = true;
     rig.broker.enqueue_command(command);
 
     rig.tick_lifecycle().await.unwrap();
 
-    // BOTH workloads scaled to 0 (force overrode the NoOp).
-    let mut scaled: Vec<String> = rig
-        .kube
-        .scale_calls()
-        .into_iter()
-        .map(|(_, _, name, _)| name)
-        .collect();
-    scaled.sort();
-    assert_eq!(scaled, vec!["inst1-license".to_string(), "inst1-web".to_string()]);
-
-    // Both units Stopped; the node rolls up to Stopped (all down).
+    let mut stopped = stops(&rig);
+    stopped.sort();
+    assert_eq!(stopped, vec!["inst1/license".to_string(), "inst1/web".to_string()]);
     let row = rig.broker.infra_node(PROJECT, NODE).unwrap();
     assert_eq!(row.units.get("web").unwrap().status, Status::Stopped);
     assert_eq!(row.units.get("license").unwrap().status, Status::Stopped);
     assert_eq!(row.status, Status::Stopped);
 }
 
+/// A unit the host runs for the copy that the roster does not carry (a
+/// unit dropped from the spec whose removal never landed) is stopped
+/// too, and never stamped.
+#[tokio::test]
+async fn stop_also_stops_an_orphan_unit_without_stamping_it() {
+    let rig = rig();
+    rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
+    rig.host.set_state(&copy("inst1"), "leftover", weft_platform_traits::UnitRunState::Ready);
+    rig.broker.enqueue_command(cmd(1, Verb::Stop, Some(NODE)));
+
+    rig.tick_lifecycle().await.unwrap();
+
+    let mut stopped = stops(&rig);
+    stopped.sort();
+    assert_eq!(stopped, vec!["inst1/bridge".to_string(), "inst1/leftover".to_string()]);
+    assert!(
+        !rig.broker.calls().iter().any(|c| matches!(
+            c,
+            weft_infra_supervisor::broker_ops::BrokerCall::SetStatus { unit: Some(u), .. } if u == "leftover"
+        )),
+        "an orphan is never stamped"
+    );
+    assert_eq!(rig.broker.completed_commands(), vec![(1, None, false)]);
+}
+
 // ---------- terminate verb ----------
 
 #[tokio::test]
-async fn terminate_flips_status_deletes_then_removes_row() {
+async fn terminate_flips_status_removes_the_copy_then_the_row() {
     let rig = rig();
     rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
-    rig.kube.set_workloads(
-        NAMESPACE,
-        vec![workload_for("inst1", "inst1-bridge", 1, 1)],
-    );
     rig.broker.enqueue_command(cmd(2, Verb::Terminate, Some(NODE)));
 
     rig.tick_lifecycle().await.unwrap();
 
-    // Status flipped to terminating before delete.
+    // Status flipped to terminating before the removal.
     let writes = rig.broker.status_writes();
     assert!(writes.iter().any(|(_, n, _, s)| n == NODE && *s == Status::Terminating));
 
-    // Delete-by-label call issued for this instance.
-    let deletes = rig.kube.delete_calls();
-    assert!(deletes
-        .iter()
-        .any(|(_, sel, _)| sel == "weft.dev/instance=inst1"));
+    // The copy was terminated on the host.
+    assert_eq!(terminates(&rig), vec![("inst1".to_string(), Vec::new())]);
 
     // Row was removed.
     assert!(rig.broker.infra_node(PROJECT, NODE).is_none());
@@ -350,8 +274,8 @@ async fn stop_with_no_matching_infra_node_completes_cleanly() {
     let did_work = rig.tick_lifecycle().await.unwrap();
     assert!(did_work);
     assert_eq!(rig.broker.completed_commands(), vec![(3, None, false)]);
-    // No scale issued.
-    assert!(rig.kube.scale_calls().is_empty());
+    // Nothing stopped.
+    assert!(stops(&rig).is_empty());
 }
 
 // ---------- dispatcher-owned verb landed on supervisor ----------
@@ -383,8 +307,6 @@ async fn running_policy_wait_drains_then_proceeds() {
     // instantly, so no real wall-time elapses).
     let rig = rig();
     rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
-    rig.kube
-        .set_workloads(NAMESPACE, vec![workload_for("inst1", "inst1-bridge", 1, 1)]);
 
     let mut command = cmd(5, Verb::Stop, Some(NODE));
     command.running_policy = Some(Policy::Wait);
@@ -392,7 +314,7 @@ async fn running_policy_wait_drains_then_proceeds() {
 
     // Pretend there are 0 running executions from the start (the
     // simplest path). Drain returns immediately.
-    rig.broker.set_running_count(PROJECT, &weft_core::member::Copies::Shared, 0);
+    rig.broker.set_running_count(PROJECT, &weft_core::instance::Copies::Shared, 0);
 
     let did_work = rig.tick_lifecycle().await.unwrap();
     assert!(did_work);
@@ -408,9 +330,7 @@ async fn running_policy_wait_times_out_after_deadline() {
     // microseconds.
     let rig = rig();
     rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
-    rig.kube
-        .set_workloads(NAMESPACE, vec![workload_for("inst1", "inst1-bridge", 1, 1)]);
-    rig.broker.set_running_count(PROJECT, &weft_core::member::Copies::Shared, 5);
+    rig.broker.set_running_count(PROJECT, &weft_core::instance::Copies::Shared, 5);
 
     let mut command = cmd(6, Verb::Stop, Some(NODE));
     command.running_policy = Some(Policy::Wait);
@@ -426,15 +346,13 @@ async fn running_policy_wait_times_out_after_deadline() {
 
 // ---------- apply verb ----------
 
-/// Minimal one-unit spec_json the supervisor can deserialize +
-/// compile. One Unit with one upstream-image container; no
-/// endpoints/volumes so readiness sees zero workloads in the fake
-/// (empty == ready).
+/// Minimal one-unit spec_json the supervisor can deserialize and
+/// resolve: one unit with one upstream-image container, no endpoints or
+/// volumes. The fake host lands an applied unit ready.
 fn apply_cmd(id: i64) -> SupervisorCommandRow {
     let spec = serde_json::json!({
         "units": [{
             "name": "bridge",
-            "kind": "deployment",
             "containers": [{
                 "name": "c",
                 "image": { "kind": "upstream", "reference": "nginx:1" }
@@ -450,7 +368,7 @@ fn apply_cmd(id: i64) -> SupervisorCommandRow {
         spec_json: Some(spec),
         force: false,
         drain_timeout_secs: weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
-        copies: weft_core::member::Copies::Shared,
+        copies: weft_core::instance::Copies::Shared,
     }
 }
 
@@ -470,7 +388,7 @@ fn call_names(rig: &SupervisorTestRig) -> Vec<&'static str> {
 }
 
 #[tokio::test]
-async fn apply_writes_provisioning_before_kube_apply_then_applied() {
+async fn apply_writes_provisioning_before_the_host_applies_then_applied() {
     let rig = rig();
     // Fresh apply: no prior infra_node row.
     rig.broker.enqueue_command(apply_cmd(1));
@@ -479,8 +397,7 @@ async fn apply_writes_provisioning_before_kube_apply_then_applied() {
     assert!(did_work);
 
     // set_provisioning must precede set_applied in the broker call
-    // log (the whole point of B5: a row exists at Provisioning
-    // before any kube mutation).
+    // log: a row exists at Provisioning before anything runs.
     let names = call_names(&rig);
     let prov = names.iter().position(|n| *n == "set_provisioning");
     let applied = names.iter().position(|n| *n == "set_applied");
@@ -488,23 +405,40 @@ async fn apply_writes_provisioning_before_kube_apply_then_applied() {
     assert!(applied.is_some(), "set_applied must be called; calls={names:?}");
     assert!(prov < applied, "provisioning before applied; calls={names:?}");
 
-    // And the kube apply happened (recorded in the FakeKube log).
-    use weft_platform_traits::kube::KubeCall;
-    assert!(
-        rig.kube.calls().iter().any(|c| matches!(c, KubeCall::ApplyYaml { .. } | KubeCall::Apply { .. })),
-        "expected a kube apply call"
-    );
+    // And the host applied the unit.
+    assert_eq!(applies(&rig).len(), 1, "expected one unit applied");
 
     // Command completed with no error.
     assert_eq!(rig.broker.completed_commands(), vec![(1, None, false)]);
 }
 
+/// What the host says it runs differently from what was asked lands on
+/// the applied row, where every status read tells the person.
+#[tokio::test]
+async fn apply_stamps_the_host_notes_on_the_row() {
+    use weft_infra_supervisor::broker_ops::BrokerCall;
+    let rig = rig();
+    rig.host.note(&["the container gets every GPU on this machine"]);
+    rig.broker.enqueue_command(apply_cmd(1));
+    assert!(rig.tick_lifecycle().await.unwrap());
+    let notes: Vec<Vec<String>> = rig
+        .broker
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            BrokerCall::SetApplied { notes, .. } => Some(notes),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notes, vec![vec!["the container gets every GPU on this machine".to_string()]]);
+}
+
 #[tokio::test]
 async fn apply_failure_flips_to_failed_and_bubbles() {
     let rig = rig();
-    // Make the kube apply fail so execute_apply hits the
-    // Failed-status branch.
-    rig.kube.fail_next_apply();
+    // Make the host's apply fail so execute_apply hits the Failed-status
+    // branch.
+    rig.host.fail_applies_with(Some("no room on the host"));
     rig.broker.enqueue_command(apply_cmd(2));
 
     let did_work = rig.tick_lifecycle().await.unwrap();
@@ -527,22 +461,21 @@ async fn apply_failure_flips_to_failed_and_bubbles() {
 async fn apply_skip_path_no_provisioning() {
     let rig = rig();
     // Prior row at Running with a matching applied_spec_hash means
-    // the Skip path: no set_provisioning, no kube apply.
+    // the Skip path: no set_provisioning, no host apply.
     let spec = serde_json::json!({
         "units": [{
             "name": "bridge",
-            "kind": "deployment",
             "containers": [{
                 "name": "c",
                 "image": { "kind": "upstream", "reference": "nginx:1" }
             }]
         }]
     });
-    let hash = applied_hash(&spec, "inst1");
+    let hash = applied_hash(&spec, &shared_id());
     rig.broker.add_infra_node_with(
         PROJECT,
         NODE,
-        "inst1",
+        &shared_id(),
         Status::Running,
         Some(hash),
         std::collections::BTreeMap::new(),
@@ -550,15 +483,7 @@ async fn apply_skip_path_no_provisioning() {
             let mut m = std::collections::BTreeMap::new();
             m.insert(
                 NODE.to_string(),
-                weft_broker_client::protocol::UnitRuntime {
-                    status: Status::Running,
-                    stop_behavior: weft_core::StopBehavior::ScaleToZero,
-                    flaky_after_seconds: 30,
-                    recovery_after_seconds: 30,
-                    image_refs: Default::default(),
-                    watched: true,
-                    scaled_to: None,
-                },
+                unit(Status::Running, weft_core::StopBehavior::Stop),
             );
             m
         },
@@ -576,135 +501,67 @@ async fn apply_skip_path_no_provisioning() {
         !names.contains(&"set_provisioning"),
         "skip path must not provision; calls={names:?}"
     );
-    use weft_platform_traits::kube::KubeCall;
-    assert!(
-        !rig.kube.calls().iter().any(|c| matches!(c, KubeCall::ApplyYaml { .. } | KubeCall::Apply { .. })),
-        "skip path must not kube-apply"
-    );
+    assert!(applies(&rig).is_empty(), "skip path must not apply anything");
 }
 
-/// A row stamped before its public paths were recorded (every unit up,
-/// the hash matching) is applied again rather than skipped: skipping
-/// would leave it without its public address for as long as it runs.
+/// Where each endpoint answers is stamped with the apply: the address
+/// the workers use, the front-door path of a public one, and the install
+/// network address of one open to it.
 #[tokio::test]
-async fn apply_does_not_skip_a_row_missing_its_public_paths() {
+async fn apply_stamps_every_endpoints_address() {
     let rig = rig();
     let spec = serde_json::json!({
         "units": [{
             "name": "bridge",
-            "kind": "deployment",
             "containers": [{
                 "name": "c",
                 "image": { "kind": "upstream", "reference": "nginx:1" },
                 "ports": [{ "name": "http", "port": 8080 }]
             }]
         }],
-        "endpoints": [{
-            "name": "api", "unit": "bridge", "container": "c", "port": "http",
-            "expose": { "kind": "tenant_public", "path": "/hooks" }
-        }]
+        "endpoints": [
+            { "name": "api", "target": { "kind": "unit", "unit": "bridge", "container": "c", "port": "http" },
+              "expose": { "kind": "public", "path": "/hooks" } },
+            { "name": "sql", "target": { "kind": "unit", "unit": "bridge", "container": "c", "port": "http" },
+              "expose": { "kind": "same_network" } }
+        ]
     });
-    let applied = |rig: &SupervisorTestRig| -> Vec<(String, weft_broker_client::protocol::AppliedEndpoints)> {
-        rig.broker
-            .calls()
-            .into_iter()
-            .filter_map(|c| match c {
-                weft_infra_supervisor::broker_ops::BrokerCall::SetApplied { instance_id, addresses, .. } => {
-                    Some((instance_id, addresses))
-                }
-                _ => None,
-            })
-            .collect()
-    };
-
-    // A first apply records where the endpoint answers.
-    let mut first = apply_cmd(1);
-    first.spec_json = Some(spec.clone());
-    rig.broker.enqueue_command(first);
-    rig.tick_lifecycle().await.unwrap();
-    let (instance_id, stamped) = applied(&rig).pop().expect("the first apply stamps its addresses");
-    let public_path = stamped.public_paths.get("api").expect("a public endpoint has a path").clone();
-    assert!(public_path.starts_with("/infra/") && public_path.ends_with("/hooks"), "{public_path}");
-
-    // The same row as an older build left it: up, same hash, same URL,
-    // no public path.
-    rig.broker.add_infra_node_with(
-        PROJECT,
-        NODE,
-        &instance_id,
-        Status::Running,
-        Some(applied_hash(&spec, &instance_id)),
-        stamped.urls.clone(),
-        {
-            let mut m = std::collections::BTreeMap::new();
-            m.insert(
-                "bridge".to_string(),
-                weft_broker_client::protocol::UnitRuntime {
-                    status: Status::Running,
-                    stop_behavior: weft_core::StopBehavior::ScaleToZero,
-                    flaky_after_seconds: 30,
-                    recovery_after_seconds: 30,
-                    image_refs: Default::default(),
-                    watched: true,
-                    scaled_to: None,
-                },
-            );
-            m
-        },
-    );
-    let mut again = apply_cmd(2);
-    again.spec_json = Some(spec);
-    rig.broker.enqueue_command(again);
+    let mut command = apply_cmd(1);
+    command.spec_json = Some(spec);
+    rig.broker.enqueue_command(command);
     rig.tick_lifecycle().await.unwrap();
 
-    let stamps = applied(&rig);
-    assert_eq!(stamps.len(), 2, "the second apply is not skipped");
-    assert_eq!(stamps[1].1.public_paths.get("api"), Some(&public_path));
+    let row = rig.broker.infra_node(PROJECT, NODE).unwrap();
+    let path = row.addresses.public_paths.get("api").expect("a public endpoint has a path");
+    assert_eq!(path, &format!("/infra/{PROJECT}/{}/hooks", row.copy_id));
+    assert!(row.addresses.urls.contains_key("api") && row.addresses.urls.contains_key("sql"));
+    assert!(row.addresses.doors.contains_key("sql"), "an endpoint open to the network has its door");
+    assert!(!row.addresses.doors.contains_key("api"));
 }
 
 #[tokio::test]
 async fn apply_reconciles_down_unit_and_skips_up_unit() {
-    use weft_broker_client::protocol::UnitRuntime;
     let rig = rig();
     // Two-unit spec: `web` + `license`.
     let spec = serde_json::json!({
         "units": [
-            { "name": "web", "kind": "deployment",
-              "containers": [{ "name": "c", "image": { "kind": "upstream", "reference": "nginx:1" } }] },
-            { "name": "license", "kind": "deployment",
-              "containers": [{ "name": "c", "image": { "kind": "upstream", "reference": "nginx:1" } }] }
+            { "name": "web", "containers": [{ "name": "c", "image": { "kind": "upstream", "reference": "nginx:1" } }] },
+            { "name": "license", "containers": [{ "name": "c", "image": { "kind": "upstream", "reference": "nginx:1" } }] }
         ]
     });
     // Prior row: `license` is UP (Running, frozen), `web` is DOWN
     // (Stopped). Apply must reconcile only `web`.
-    let mut prior_units = std::collections::BTreeMap::new();
-    prior_units.insert("web".to_string(), UnitRuntime {
-        status: Status::Stopped,
-        stop_behavior: weft_core::StopBehavior::ScaleToZero,
-        flaky_after_seconds: 30,
-        recovery_after_seconds: 30,
-        image_refs: Default::default(),
-        watched: true,
-        scaled_to: None,
-    });
-    prior_units.insert("license".to_string(), UnitRuntime {
-        status: Status::Running,
-        stop_behavior: weft_core::StopBehavior::NoOp,
-        flaky_after_seconds: 30,
-        recovery_after_seconds: 30,
-        image_refs: Default::default(),
-        watched: true,
-        scaled_to: None,
-    });
+    let prior_units = std::collections::BTreeMap::from([
+        ("web".to_string(), unit(Status::Stopped, weft_core::StopBehavior::Stop)),
+        ("license".to_string(), unit(Status::Running, weft_core::StopBehavior::KeepRunning)),
+    ]);
     rig.broker.add_infra_node_with(
-        PROJECT, NODE, "inst1", Status::Running, Some("oldhash".into()),
+        PROJECT, NODE, &shared_id(), Status::Running, Some("oldhash".into()),
         std::collections::BTreeMap::new(), prior_units,
     );
-    // license is up in the cluster; web is gone (scaled to 0).
-    rig.kube.set_workloads(
-        NAMESPACE,
-        vec![workload_with_unit("inst1", "inst1-license", "license", 1, 1)],
-    );
+    // license is up on the host; web is stopped.
+    rig.host.set_state(&copy(&shared_id()), "license", weft_platform_traits::UnitRunState::Ready);
+    rig.host.set_state(&copy(&shared_id()), "web", weft_platform_traits::UnitRunState::Stopped);
 
     let mut command = apply_cmd(4);
     command.spec_json = Some(spec);
@@ -716,31 +573,8 @@ async fn apply_reconciles_down_unit_and_skips_up_unit() {
     let names = call_names(&rig);
     assert!(names.contains(&"set_provisioning"), "calls={names:?}");
 
-    // The kube apply touched ONLY web's workload manifest, never
-    // license's (license is up and frozen).
-    use weft_platform_traits::kube::KubeCall;
-    let applied_manifests: Vec<String> = rig
-        .kube
-        .calls()
-        .into_iter()
-        .filter_map(|c| match c {
-            KubeCall::Apply { manifest } => manifest
-                .get("metadata")
-                .and_then(|m| m.get("labels"))
-                .and_then(|l| l.get("weft.dev/unit"))
-                .and_then(|u| u.as_str())
-                .map(|s| s.to_string()),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        applied_manifests.iter().all(|u| u != "license"),
-        "license (up, frozen) must NOT be re-applied; applied units={applied_manifests:?}"
-    );
-    assert!(
-        applied_manifests.iter().any(|u| u == "web"),
-        "web (down) must be reconciled; applied units={applied_manifests:?}"
-    );
+    // The host applied ONLY web, never license (up and frozen).
+    assert_eq!(applies(&rig), vec![format!("{}/web", shared_id())]);
 
     // Final per-unit status: web back to Running, license still Running.
     let row = rig.broker.infra_node(PROJECT, NODE).unwrap();
@@ -749,75 +583,57 @@ async fn apply_reconciles_down_unit_and_skips_up_unit() {
 }
 
 /// A Fresh apply over a `Terminating` row (a terminate that stamped
-/// the row and then failed or died before its delete landed) must
-/// first delete the PRIOR instance by its own label, honoring the PVC
-/// list its row recorded: every other sweep selects by the NEW
-/// instance id, so without this the old pods would stay up while the
-/// post-readiness stamp drops their image refs from the keep-set.
+/// the row and then failed or died before its removal landed) must first
+/// terminate the PRIOR copy, keeping the disks its row recorded, and then
+/// apply the copy under the SAME copy id, which is how the disks kept
+/// through the terminate are found again. Without the terminate first the
+/// old units would keep running while the post-readiness stamp drops their
+/// image refs from the keep-set.
 #[tokio::test]
-async fn fresh_apply_over_terminating_row_deletes_the_prior_instance_first() {
-    use weft_broker_client::protocol::UnitRuntime;
+async fn fresh_apply_over_terminating_row_terminates_the_prior_copy_first() {
     let rig = rig();
-    let mut prior_units = std::collections::BTreeMap::new();
-    prior_units.insert("bridge".to_string(), UnitRuntime {
-        status: Status::Terminating,
-        stop_behavior: weft_core::StopBehavior::ScaleToZero,
-        flaky_after_seconds: 30,
-        recovery_after_seconds: 30,
-        image_refs: ["weft-infra-bridge:old".to_string()].into_iter().collect(),
-        watched: true,
-        scaled_to: None,
-    });
+    let mut prior = unit(Status::Terminating, weft_core::StopBehavior::Stop);
+    prior.image_refs = ["weft-infra-bridge:old".to_string()].into_iter().collect();
+    let prior_units = std::collections::BTreeMap::from([("bridge".to_string(), prior)]);
     rig.broker.add_infra_node_with(
-        PROJECT, NODE, "inst-old", Status::Terminating, Some("oldhash".into()),
+        PROJECT, NODE, &shared_id(), Status::Terminating, Some("oldhash".into()),
         std::collections::BTreeMap::new(), prior_units,
     );
-    rig.broker.set_preserve_pvcs(PROJECT, NODE, None, vec!["data".to_string()]);
-    rig.kube.set_workloads(
-        NAMESPACE,
-        vec![workload_with_unit("inst-old", "inst-old-bridge", "bridge", 1, 1)],
-    );
+    rig.broker.set_keep_disks(PROJECT, NODE, None, vec!["data".to_string()]);
     rig.broker.enqueue_command(apply_cmd(9));
 
     rig.tick_lifecycle().await.unwrap();
 
     let row = rig.broker.infra_node(PROJECT, NODE).unwrap();
-    assert_ne!(row.instance_id, "inst-old", "a Terminating row never reuses its instance id");
-    // The first kube delete is the whole prior instance, with the PVC
-    // list the prior row recorded; it precedes every new-instance sweep.
-    let deletes = rig.kube.delete_calls();
-    assert_eq!(
-        deletes.first().map(|(_, sel, pvcs)| (sel.as_str(), pvcs.as_slice())),
-        Some(("weft.dev/instance=inst-old", ["data".to_string()].as_slice())),
-        "deletes={deletes:?}"
-    );
-    assert!(
-        deletes.iter().skip(1).all(|(_, sel, _)| sel.contains(&row.instance_id)),
-        "every later sweep targets the new instance; deletes={deletes:?}"
-    );
+    assert_eq!(row.copy_id, shared_id(), "the copy keeps its id, so its kept disks are adopted");
+    // The prior copy is terminated, keeping the disks its row recorded,
+    // before the new copy's unit is applied.
+    assert_eq!(terminates(&rig), vec![(shared_id(), vec!["data".to_string()])]);
+    let calls = rig.host.calls();
+    let terminated = calls.iter().position(|c| matches!(c, HostCall::Terminate { .. })).unwrap();
+    let applied = calls.iter().position(|c| matches!(c, HostCall::Apply { .. })).unwrap();
+    assert!(terminated < applied, "calls={calls:?}");
     assert_eq!(row.status, Status::Running);
 }
 
 // ---------- ownership fence: a displaced owner must not finish its command ----------
 //
 // The supervisor's single-actor authority is the exclusive `infra_owner`
-// lease. If ownership moves to another pod mid-command (a scale-down
-// drain, or a lease takeover after this pod looked dead), every state
-// write from the old pod is rejected by the broker, so the old pod must
+// lease. If ownership moves to another supervisor mid-command (a lease
+// takeover after this one looked dead), every state write from the old
+// one is rejected by the broker, so the old one must
 // NOT complete the command: it stays uncompleted for the new owner to
 // re-run (the user never re-acts). The fake models the move with
 // `set_project_owned(false)`, which returns `Displaced` from every
 // ownership-gated write exactly as the broker's `owns_project_predicate`
 // would. These tests pin "a displaced owner leaves the command for the
-// new owner" for each verb that mutates cluster state.
+// new owner" for each verb that changes what the host runs.
 
 #[tokio::test]
 async fn stop_aborts_without_completing_when_ownership_moves_mid_command() {
     let rig = rig();
     rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
-    rig.kube
-        .set_workloads(NAMESPACE, vec![workload_for("inst1", "inst1-bridge", 1, 1)]);
-    // Ownership moves to another pod right after the claim, so the
+    // Ownership moves to another supervisor right after the claim, so the
     // per-unit `set_status` write lands displaced (the broker rejects it).
     rig.broker.displace_on_claim(PROJECT);
     rig.broker.enqueue_command(cmd(1, Verb::Stop, Some(NODE)));
@@ -834,24 +650,18 @@ async fn stop_aborts_without_completing_when_ownership_moves_mid_command() {
 }
 
 #[tokio::test]
-async fn terminate_aborts_before_kubectl_when_ownership_moves_mid_command() {
+async fn terminate_aborts_before_touching_the_host_when_ownership_moves_mid_command() {
     let rig = rig();
     rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
-    rig.kube
-        .set_workloads(NAMESPACE, vec![workload_for("inst1", "inst1-bridge", 1, 1)]);
     rig.broker.displace_on_claim(PROJECT);
     rig.broker.enqueue_command(cmd(2, Verb::Terminate, Some(NODE)));
 
     rig.tick_lifecycle().await.unwrap();
 
     // The Terminating stamp (the first ownership-gated write) was
-    // displaced, so no kubectl ran, the node row survives for the new
-    // owner to terminate, and the command is left uncompleted.
-    assert!(
-        rig.kube.delete_calls().is_empty(),
-        "a displaced owner must not delete anything; deletes={:?}",
-        rig.kube.delete_calls()
-    );
+    // displaced, so nothing touched the host, the node row survives for
+    // the new owner to terminate, and the command is left uncompleted.
+    assert!(terminates(&rig).is_empty(), "a displaced owner must not remove anything");
     assert!(
         rig.broker.infra_node(PROJECT, NODE).is_some(),
         "the row must survive for the new owner"
@@ -876,7 +686,7 @@ async fn apply_does_not_complete_when_ownership_moves_mid_command() {
 
     rig.tick_lifecycle().await.unwrap();
 
-    // set_provisioning is rejected (Displaced) before any kube apply, and the
+    // set_provisioning is rejected (Displaced) before any host apply, and the
     // command is left uncompleted for the new owner.
     assert!(
         rig.broker.completed_commands().is_empty(),
@@ -898,8 +708,6 @@ async fn command_left_by_displaced_owner_completes_once_new_owner_runs_it() {
     // completes exactly once.
     let rig = rig();
     rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
-    rig.kube
-        .set_workloads(NAMESPACE, vec![workload_for("inst1", "inst1-bridge", 1, 1)]);
 
     // First owner: loses ownership mid-stop, leaves the command.
     rig.broker.displace_on_claim(PROJECT);
@@ -951,7 +759,7 @@ fn stop_of(id: i64, project: uuid::Uuid, policy: Policy) -> SupervisorCommandRow
         spec_json: None,
         force: false,
         drain_timeout_secs: weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
-        copies: weft_core::member::Copies::Shared,
+        copies: weft_core::instance::Copies::Shared,
     }
 }
 
@@ -985,7 +793,7 @@ weft_core::stress_test!(
     async fn body() {
         use weft_infra_supervisor::broker_ops::BrokerCall;
         let rig = rig();
-        rig.broker.add_project(P2, "wft-project-test-proj2");
+        rig.broker.add_project(P2);
         rig.broker.gate_running_count(PROJECT);
         rig.broker.enqueue_command(stop_of(1, PROJECT, Policy::Wait));
         rig.broker.enqueue_command(stop_of(2, PROJECT, Policy::Cancel));
@@ -1015,7 +823,7 @@ weft_core::stress_test!(
     async fn body() {
         let rig = rig();
         // The command was issued while nobody owned its project, so no
-        // held claim of this pod's woke for it.
+        // held claim of this supervisor's woke for it.
         rig.broker.set_project_unowned(PROJECT);
         rig.broker.enqueue_command(stop_of(1, PROJECT, Policy::Cancel));
         let (lifecycle, changes) = rig.spawn_lifecycle_loop();
@@ -1100,29 +908,102 @@ weft_core::stress_test!(
     }
 );
 
-// ---------- per-member copies ----------
+// ---------- per-instance copies ----------
 
-fn ada() -> weft_core::member::MemberId {
-    weft_core::member::MemberId::new("ada").unwrap()
+fn ada() -> weft_core::instance::InstanceId {
+    weft_core::instance::InstanceId::new("ada").unwrap()
 }
 
 #[tokio::test]
-async fn terminating_one_members_copy_leaves_the_shared_copy_and_the_others() {
+async fn terminating_one_instances_copy_leaves_the_shared_copy_and_the_others() {
     let rig = rig();
-    let bob = weft_core::member::MemberId::new("bob").unwrap();
+    let bob = weft_core::instance::InstanceId::new("bob").unwrap();
     rig.broker.add_infra_node(PROJECT, NODE, "inst-shared", Status::Running);
-    rig.broker.add_member_infra_node(PROJECT, NODE, &ada(), "inst-ada", Status::Running);
-    rig.broker.add_member_infra_node(PROJECT, NODE, &bob, "inst-bob", Status::Running);
+    rig.broker.add_instance_infra_node(PROJECT, NODE, &ada(), "inst-ada", Status::Running);
+    rig.broker.add_instance_infra_node(PROJECT, NODE, &bob, "inst-bob", Status::Running);
     let mut terminate = cmd(2, Verb::Terminate, Some(NODE));
-    terminate.copies = weft_core::member::Copies::Member(ada());
+    terminate.copies = weft_core::instance::Copies::Instance(ada());
     rig.broker.enqueue_command(terminate);
 
     rig.tick_lifecycle().await.unwrap();
 
-    let deletes: Vec<String> = rig.kube.delete_calls().into_iter().map(|(_, sel, _)| sel).collect();
-    assert_eq!(deletes, vec!["weft.dev/instance=inst-ada".to_string()]);
+    assert_eq!(terminates(&rig), vec![("inst-ada".to_string(), Vec::new())]);
     assert!(rig.broker.infra_copy(PROJECT, NODE, Some(&ada())).is_none());
     assert!(rig.broker.infra_copy(PROJECT, NODE, Some(&bob)).is_some());
+    assert!(rig.broker.infra_node(PROJECT, NODE).is_some());
+}
+
+/// An instance's wipe terminates its copy deleting every disk, the ones
+/// the node keeps too, while a person's terminate of another instance's
+/// copy keeps them.
+#[tokio::test]
+async fn a_wipe_deletes_the_kept_disks_a_persons_terminate_keeps() {
+    let rig = rig();
+    let bob = weft_core::instance::InstanceId::new("bob").unwrap();
+    rig.broker.add_instance_infra_node(PROJECT, NODE, &ada(), "inst-ada", Status::Running);
+    rig.broker.add_instance_infra_node(PROJECT, NODE, &bob, "inst-bob", Status::Running);
+    rig.broker.set_keep_disks(PROJECT, NODE, Some(&ada()), vec!["data".to_string()]);
+    rig.broker.set_keep_disks(PROJECT, NODE, Some(&bob), vec!["data".to_string()]);
+    let mut wipe = cmd(2, Verb::Terminate, Some(NODE));
+    wipe.copies = weft_core::instance::Copies::Instance(ada());
+    wipe.spec_json = Some(terminate_work(weft_core::infra::TerminateDisks::DeleteAll));
+    let mut terminate = cmd(3, Verb::Terminate, Some(NODE));
+    terminate.copies = weft_core::instance::Copies::Instance(bob);
+    rig.broker.enqueue_command(wipe);
+    rig.broker.enqueue_command(terminate);
+
+    rig.tick_lifecycle().await.unwrap();
+    rig.tick_lifecycle().await.unwrap();
+
+    assert_eq!(
+        terminates(&rig),
+        vec![("inst-ada".to_string(), Vec::new()), ("inst-bob".to_string(), vec!["data".to_string()])]
+    );
+}
+
+/// An instance's copy an earlier terminate took down still holds the
+/// disks it kept, with no row left. The instance's wipe reaches it
+/// through the host and deletes them; another instance's kept copy is
+/// left alone.
+#[tokio::test]
+async fn a_wipe_deletes_the_disks_a_copy_with_no_row_still_holds() {
+    let rig = rig();
+    let bob = weft_core::instance::InstanceId::new("bob").unwrap();
+    for instance in [ada(), bob.clone()] {
+        let copy = copy(&weft_core::infra::NodeRef::copy_id(PROJECT, NODE, Some(&instance)));
+        rig.host.set_state(&copy, "main", weft_platform_traits::UnitRunState::Ready);
+        weft_platform_traits::InfraHost::terminate(rig.host.as_ref(), &copy, &["data".to_string()]).await.unwrap();
+    }
+    let ada_copy = weft_core::infra::NodeRef::copy_id(PROJECT, NODE, Some(&ada()));
+    let bob_copy = weft_core::infra::NodeRef::copy_id(PROJECT, NODE, Some(&bob));
+    let before = rig.host.calls().len();
+    let mut wipe = cmd(2, Verb::Terminate, Some(NODE));
+    wipe.copies = weft_core::instance::Copies::Instance(ada());
+    wipe.spec_json = Some(terminate_work(weft_core::infra::TerminateDisks::DeleteAll));
+    rig.broker.enqueue_command(wipe);
+
+    rig.tick_lifecycle().await.unwrap();
+
+    let after: Vec<HostCall> = rig.host.calls().into_iter().skip(before).collect();
+    assert_eq!(after, vec![HostCall::Terminate { copy_id: ada_copy.clone(), keep: vec![] }]);
+    assert!(rig.host.kept_disks(&ada_copy).is_empty());
+    assert_eq!(rig.host.kept_disks(&bob_copy), vec!["data".to_string()]);
+    assert_eq!(rig.broker.completed_commands(), vec![(2, None, false)]);
+}
+
+/// A terminate row issued without its work is a writer bug: the command
+/// fails before the host is touched.
+#[tokio::test]
+async fn a_terminate_without_its_work_fails_before_touching_the_host() {
+    let rig = rig();
+    rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
+    let mut terminate = cmd(2, Verb::Terminate, Some(NODE));
+    terminate.spec_json = None;
+    rig.broker.enqueue_command(terminate);
+
+    rig.tick_lifecycle().await.unwrap();
+
+    assert!(terminates(&rig).is_empty());
     assert!(rig.broker.infra_node(PROJECT, NODE).is_some());
 }
 
@@ -1130,9 +1011,9 @@ async fn terminating_one_members_copy_leaves_the_shared_copy_and_the_others() {
 async fn a_project_wide_terminate_for_every_copy_takes_them_all() {
     let rig = rig();
     rig.broker.add_infra_node(PROJECT, NODE, "inst-shared", Status::Running);
-    rig.broker.add_member_infra_node(PROJECT, NODE, &ada(), "inst-ada", Status::Running);
+    rig.broker.add_instance_infra_node(PROJECT, NODE, &ada(), "inst-ada", Status::Running);
     let mut terminate = cmd(2, Verb::Terminate, None);
-    terminate.copies = weft_core::member::Copies::Every;
+    terminate.copies = weft_core::instance::Copies::Every;
     rig.broker.enqueue_command(terminate);
 
     rig.tick_lifecycle().await.unwrap();
@@ -1142,17 +1023,10 @@ async fn a_project_wide_terminate_for_every_copy_takes_them_all() {
 }
 
 #[tokio::test]
-async fn a_shared_stop_never_touches_a_members_copy() {
+async fn a_shared_stop_never_touches_an_instances_copy() {
     let rig = rig();
     rig.broker.add_infra_node(PROJECT, NODE, "inst-shared", Status::Running);
-    rig.broker.add_member_infra_node(PROJECT, NODE, &ada(), "inst-ada", Status::Running);
-    rig.kube.set_workloads(
-        NAMESPACE,
-        vec![
-            workload_for("inst-shared", "inst-shared-bridge", 1, 1),
-            workload_for("inst-ada", "inst-ada-bridge", 1, 1),
-        ],
-    );
+    rig.broker.add_instance_infra_node(PROJECT, NODE, &ada(), "inst-ada", Status::Running);
     rig.broker.enqueue_command(cmd(3, Verb::Stop, Some(NODE)));
 
     rig.tick_lifecycle().await.unwrap();
@@ -1162,33 +1036,31 @@ async fn a_shared_stop_never_touches_a_members_copy() {
         rig.broker.infra_copy(PROJECT, NODE, Some(&ada())).unwrap().status,
         Status::Running
     );
-    let scaled: Vec<String> = rig.kube.scale_calls().into_iter().map(|(_, _, name, _)| name).collect();
-    assert!(!scaled.is_empty(), "the shared copy was scaled down");
-    assert!(scaled.iter().all(|name| name == "inst-shared-bridge"), "only the shared instance: {scaled:?}");
+    assert_eq!(stops(&rig), vec!["inst-shared/bridge".to_string()], "only the shared copy");
 }
 
 #[tokio::test]
-async fn a_members_apply_builds_their_own_copy_under_a_fresh_instance() {
+async fn an_instances_apply_builds_its_own_copy_under_a_fresh_host_instance() {
     let rig = rig();
     rig.broker.add_infra_node(PROJECT, NODE, "inst-shared", Status::Running);
     let mut apply = apply_cmd(4);
-    apply.copies = weft_core::member::Copies::Member(ada());
+    apply.copies = weft_core::instance::Copies::Instance(ada());
     rig.broker.enqueue_command(apply);
 
     rig.tick_lifecycle().await.unwrap();
 
     assert_eq!(rig.broker.completed_commands(), vec![(4, None, false)]);
-    let copy = rig.broker.infra_copy(PROJECT, NODE, Some(&ada())).expect("the member's copy");
-    assert_eq!(copy.member, Some(ada()));
-    assert_ne!(copy.instance_id, "inst-shared");
-    assert_eq!(rig.broker.infra_node(PROJECT, NODE).unwrap().instance_id, "inst-shared");
+    let copy = rig.broker.infra_copy(PROJECT, NODE, Some(&ada())).expect("the instance's copy");
+    assert_eq!(copy.instance, Some(ada()));
+    assert_ne!(copy.copy_id, "inst-shared");
+    assert_eq!(rig.broker.infra_node(PROJECT, NODE).unwrap().copy_id, "inst-shared");
 }
 
 #[tokio::test]
 async fn an_apply_for_every_copy_is_refused() {
     let rig = rig();
     let mut apply = apply_cmd(5);
-    apply.copies = weft_core::member::Copies::Every;
+    apply.copies = weft_core::instance::Copies::Every;
     rig.broker.enqueue_command(apply);
 
     rig.tick_lifecycle().await.unwrap();
@@ -1199,38 +1071,37 @@ async fn an_apply_for_every_copy_is_refused() {
 }
 
 #[tokio::test]
-async fn a_members_wait_drains_on_that_members_runs() {
+async fn an_instances_wait_drains_on_that_instances_runs() {
     use weft_infra_supervisor::broker_ops::BrokerCall;
     let rig = rig();
-    rig.broker.add_member_infra_node(PROJECT, NODE, &ada(), "inst-ada", Status::Running);
-    rig.kube.set_workloads(NAMESPACE, vec![workload_for("inst-ada", "inst-ada-bridge", 1, 1)]);
+    rig.broker.add_instance_infra_node(PROJECT, NODE, &ada(), "inst-ada", Status::Running);
     let mut stop = cmd(6, Verb::Stop, Some(NODE));
     stop.running_policy = Some(Policy::Wait);
-    stop.copies = weft_core::member::Copies::Member(ada());
+    stop.copies = weft_core::instance::Copies::Instance(ada());
     rig.broker.enqueue_command(stop);
 
     // The shared copies' runs are busy; ada has none. Her wait drains
     // on her own runs only, so the stop goes through at once.
-    rig.broker.set_running_count(PROJECT, &weft_core::member::Copies::Shared, 3);
-    rig.broker.set_running_count(PROJECT, &weft_core::member::Copies::Member(ada()), 0);
+    rig.broker.set_running_count(PROJECT, &weft_core::instance::Copies::Shared, 3);
+    rig.broker.set_running_count(PROJECT, &weft_core::instance::Copies::Instance(ada()), 0);
 
     rig.tick_lifecycle().await.unwrap();
 
     assert!(rig.broker.calls().iter().any(|c| matches!(
         c,
-        BrokerCall::RunningCount { copies: weft_core::member::Copies::Member(m), .. } if *m == ada()
+        BrokerCall::RunningCount { copies: weft_core::instance::Copies::Instance(m), .. } if *m == ada()
     )));
     assert!(
         !rig.broker.calls().iter().any(|c| matches!(
             c,
-            BrokerCall::RunningCount { copies: weft_core::member::Copies::Shared | weft_core::member::Copies::Every, .. }
+            BrokerCall::RunningCount { copies: weft_core::instance::Copies::Shared | weft_core::instance::Copies::Every, .. }
         )),
         "the shared runs are never waited on"
     );
     assert_eq!(rig.broker.completed_commands(), vec![(6, None, false)]);
     assert_eq!(rig.broker.infra_copy(PROJECT, NODE, Some(&ada())).unwrap().status, Status::Stopped);
     assert!(
-        rig.broker.status_writes().iter().all(|(_, _, member, _)| member.as_ref() == Some(&ada())),
+        rig.broker.status_writes().iter().all(|(_, _, instance, _)| instance.as_ref() == Some(&ada())),
         "every status write is ada's copy's"
     );
 }

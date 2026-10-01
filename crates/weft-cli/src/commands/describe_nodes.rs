@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use weft_catalog::{stdlib_root, DiscoverPolicy, FsCatalog};
+use weft_catalog::{stdlib_root, FsCatalog};
 
 use super::Ctx;
 
@@ -77,20 +77,17 @@ pub async fn run(
     list: bool,
 ) -> Result<()> {
     // `--stdlib`: describe the bundled stdlib catalog directly (no project on
-    // disk). Otherwise describe the project's own `nodes/`. Lenient discovery
-    // either way: the editor's palette must survive a node mid-edit. Same
-    // traversal as the build, only the error reaction differs (warn vs abort),
-    // so the palette and the build never disagree about what a node is.
+    // disk). Otherwise describe the project's own `nodes/`. The same
+    // discovery as the build: a node that fails to load is left out and
+    // listed in the warnings, so the palette survives a node mid-edit and
+    // never disagrees with the build about what a node is.
     let roots: Vec<std::path::PathBuf> = if stdlib {
         vec![stdlib_root().map_err(|e| anyhow::anyhow!(e))?]
     } else {
         weft_compiler::project::node_roots(&ctx.project()?.root).to_vec()
     };
-    let cat = FsCatalog::discover_roots_with_policy(
-        &roots.iter().map(|r| r.as_path()).collect::<Vec<_>>(),
-        DiscoverPolicy::Lenient,
-    )
-    .map_err(|e| anyhow::anyhow!("describe: {e}"))?;
+    let cat = FsCatalog::discover_roots(&roots.iter().map(|r| r.as_path()).collect::<Vec<_>>())
+        .map_err(|e| anyhow::anyhow!("describe: {e}"))?;
 
     let mut catalog = BTreeMap::new();
     for entry in cat.iter() {
@@ -189,7 +186,7 @@ fn language_construct(name: &str) -> Option<String> {
         "Group" => ("a group, written `name = Group(...) { ... }`", "docs/src/language/groups.md"),
         "Loop" => ("a loop, written `name = Loop(...) { ... }`", "docs/src/language/loops.md"),
         "Include" => ("an include, written `name = @include(\"file.weft\")`", "docs/src/language/files-and-reuse.md"),
-        "Passthrough" | "LoopIn" | "LoopOut" => (
+        weft_core::project::boundary_types::PASSTHROUGH | weft_core::project::boundary_types::LOOP_IN | weft_core::project::boundary_types::LOOP_OUT => (
             "a step the compiler makes out of a group or a loop; you never write it",
             "docs/src/language/how-a-program-runs.md",
         ),
