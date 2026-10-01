@@ -31,7 +31,7 @@ pub enum UnitRunState {
 /// One unit the host runs for a project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnitObservation {
-    pub instance: String,
+    pub copy_id: String,
     pub unit: String,
     /// The hash of the resolved unit it runs (`ResolvedUnit::hash`).
     pub hash: String,
@@ -44,6 +44,15 @@ pub trait InfraHost: Send + Sync {
     /// GPU on a machine that has none, a machine shape the platform
     /// cannot give), naming what to change.
     fn check(&self, node: &ResolvedNode) -> Result<(), String>;
+
+    /// What this host gives `node` other than what its spec asks, one
+    /// plain sentence each (a GPU kind it cannot choose); empty when it
+    /// runs the node as asked. Told to the person starting the node, never
+    /// a refusal: what this host cannot run at all, [`InfraHost::check`]
+    /// refuses.
+    fn notes(&self, _node: &ResolvedNode) -> Vec<String> {
+        Vec::new()
+    }
 
     /// Bring `unit` of `node` up as resolved: its disks created if
     /// missing, the running copy replaced when its hash differs, started
@@ -112,11 +121,11 @@ pub mod fake {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum HostCall {
-        Apply { instance: String, unit: String, hash: String },
-        Stop { instance: String, unit: String },
-        Restart { instance: String, unit: String },
-        Remove { instance: String, unit: String },
-        Terminate { instance: String, keep: Vec<String> },
+        Apply { copy_id: String, unit: String, hash: String },
+        Stop { copy_id: String, unit: String },
+        Restart { copy_id: String, unit: String },
+        Remove { copy_id: String, unit: String },
+        Terminate { copy_id: String, keep: Vec<String> },
     }
 
     /// Records every call and keeps a plain map of what "runs". An apply
@@ -126,13 +135,15 @@ pub mod fake {
     pub struct FakeInfraHost {
         calls: Mutex<Vec<HostCall>>,
         units: Mutex<BTreeMap<(uuid::Uuid, String, String), UnitObservation>>,
-        /// The copy each applied instance belongs to, kept after a
+        /// The copy each applied copy id belongs to, kept after a
         /// terminate that kept disks (the copy still holds them).
         copies: Mutex<BTreeMap<String, NodeRef>>,
         /// The disks each terminated copy still holds.
         kept: Mutex<BTreeMap<String, Vec<String>>>,
         refuse: Mutex<Option<String>>,
         fail_apply: Mutex<Option<String>>,
+        /// What `notes` says of every node.
+        notes: Mutex<Vec<String>>,
         /// Copies whose terminate fails (recorded, nothing removed).
         fail_terminate: Mutex<std::collections::BTreeSet<String>>,
         hang_restarts: Mutex<bool>,
@@ -149,10 +160,10 @@ pub mod fake {
         /// when absent: a unit the supervisor applied before this fake
         /// existed, from a seeded row).
         pub fn set_state(&self, node: &NodeRef, unit: &str, state: UnitRunState) {
-            self.copies.lock().insert(node.instance.clone(), node.clone());
+            self.copies.lock().insert(node.copy_id.clone(), node.clone());
             let mut units = self.units.lock();
-            let o = units.entry((node.project, node.instance.clone(), unit.to_string())).or_insert_with(|| {
-                UnitObservation { instance: node.instance.clone(), unit: unit.into(), hash: String::new(), state: UnitRunState::Ready }
+            let o = units.entry((node.project, node.copy_id.clone(), unit.to_string())).or_insert_with(|| {
+                UnitObservation { copy_id:node.copy_id.clone(), unit: unit.into(), hash: String::new(), state: UnitRunState::Ready }
             });
             o.state = state;
         }
@@ -162,9 +173,9 @@ pub mod fake {
             self.units.lock().retain(|(p, _, _), _| *p != project);
             self.copies.lock().retain(|_, c| c.project != project);
         }
-        /// The disks a terminate left `instance` holding.
-        pub fn kept_disks(&self, instance: &str) -> Vec<String> {
-            self.kept.lock().get(instance).cloned().unwrap_or_default()
+        /// The disks a terminate left the copy `copy_id` holding.
+        pub fn kept_disks(&self, copy_id: &str) -> Vec<String> {
+            self.kept.lock().get(copy_id).cloned().unwrap_or_default()
         }
         /// Make every restart record its call and then never return.
         pub fn hang_restarts(&self) {
@@ -174,9 +185,14 @@ pub mod fake {
         pub fn fail_applies_with(&self, why: Option<&str>) {
             *self.fail_apply.lock() = why.map(str::to_string);
         }
-        /// Make every terminate of `instance` fail.
-        pub fn fail_terminates_of(&self, instance: &str) {
-            self.fail_terminate.lock().insert(instance.to_string());
+        /// Make every terminate of the copy `copy_id` fail.
+        pub fn fail_terminates_of(&self, copy_id: &str) {
+            self.fail_terminate.lock().insert(copy_id.to_string());
+        }
+        /// Make `notes` say `notes` of every node, as a host running
+        /// nodes differently from what they ask.
+        pub fn note(&self, notes: &[&str]) {
+            *self.notes.lock() = notes.iter().map(|n| n.to_string()).collect();
         }
     }
 
@@ -188,52 +204,55 @@ pub mod fake {
                 None => Ok(()),
             }
         }
+        fn notes(&self, _node: &ResolvedNode) -> Vec<String> {
+            self.notes.lock().clone()
+        }
         async fn apply_unit(&self, node: &ResolvedNode, unit: &str) -> anyhow::Result<()> {
             let hash = node.unit(unit).map(|u| u.hash.clone()).unwrap_or_default();
-            self.calls.lock().push(HostCall::Apply { instance: node.node.instance.clone(), unit: unit.into(), hash: hash.clone() });
+            self.calls.lock().push(HostCall::Apply { copy_id:node.node.copy_id.clone(), unit: unit.into(), hash: hash.clone() });
             if let Some(why) = self.fail_apply.lock().clone() {
                 anyhow::bail!(why);
             }
-            self.copies.lock().insert(node.node.instance.clone(), node.node.clone());
+            self.copies.lock().insert(node.node.copy_id.clone(), node.node.clone());
             self.units.lock().insert(
-                (node.node.project, node.node.instance.clone(), unit.to_string()),
-                UnitObservation { instance: node.node.instance.clone(), unit: unit.into(), hash, state: UnitRunState::Ready },
+                (node.node.project, node.node.copy_id.clone(), unit.to_string()),
+                UnitObservation { copy_id:node.node.copy_id.clone(), unit: unit.into(), hash, state: UnitRunState::Ready },
             );
             Ok(())
         }
         async fn stop_unit(&self, node: &NodeRef, unit: &str) -> anyhow::Result<()> {
-            self.calls.lock().push(HostCall::Stop { instance: node.instance.clone(), unit: unit.into() });
-            if let Some(o) = self.units.lock().get_mut(&(node.project, node.instance.clone(), unit.to_string())) {
+            self.calls.lock().push(HostCall::Stop { copy_id:node.copy_id.clone(), unit: unit.into() });
+            if let Some(o) = self.units.lock().get_mut(&(node.project, node.copy_id.clone(), unit.to_string())) {
                 o.state = UnitRunState::Stopped;
             }
             Ok(())
         }
         async fn restart_unit(&self, node: &NodeRef, unit: &str) -> anyhow::Result<()> {
-            self.calls.lock().push(HostCall::Restart { instance: node.instance.clone(), unit: unit.into() });
+            self.calls.lock().push(HostCall::Restart { copy_id:node.copy_id.clone(), unit: unit.into() });
             if *self.hang_restarts.lock() {
                 std::future::pending::<()>().await;
             }
             Ok(())
         }
         async fn remove_unit(&self, node: &NodeRef, unit: &str) -> anyhow::Result<()> {
-            self.calls.lock().push(HostCall::Remove { instance: node.instance.clone(), unit: unit.into() });
-            self.units.lock().remove(&(node.project, node.instance.clone(), unit.to_string()));
+            self.calls.lock().push(HostCall::Remove { copy_id:node.copy_id.clone(), unit: unit.into() });
+            self.units.lock().remove(&(node.project, node.copy_id.clone(), unit.to_string()));
             Ok(())
         }
         async fn terminate(&self, node: &NodeRef, keep_disks: &[String]) -> anyhow::Result<()> {
-            self.calls.lock().push(HostCall::Terminate { instance: node.instance.clone(), keep: keep_disks.to_vec() });
-            if self.fail_terminate.lock().contains(&node.instance) {
-                anyhow::bail!("terminating {} failed", node.instance);
+            self.calls.lock().push(HostCall::Terminate { copy_id:node.copy_id.clone(), keep: keep_disks.to_vec() });
+            if self.fail_terminate.lock().contains(&node.copy_id) {
+                anyhow::bail!("terminating {} failed", node.copy_id);
             }
-            self.units.lock().retain(|(p, i, _), _| !(*p == node.project && *i == node.instance));
+            self.units.lock().retain(|(p, i, _), _| !(*p == node.project && *i == node.copy_id));
             // A copy that held something keeps the disks it is told to,
             // and with them its place in `copies`.
-            let held = self.copies.lock().contains_key(&node.instance);
+            let held = self.copies.lock().contains_key(&node.copy_id);
             if keep_disks.is_empty() || !held {
-                self.copies.lock().remove(&node.instance);
-                self.kept.lock().remove(&node.instance);
+                self.copies.lock().remove(&node.copy_id);
+                self.kept.lock().remove(&node.copy_id);
             } else {
-                self.kept.lock().insert(node.instance.clone(), keep_disks.to_vec());
+                self.kept.lock().insert(node.copy_id.clone(), keep_disks.to_vec());
             }
             Ok(())
         }
@@ -245,9 +264,9 @@ pub mod fake {
         }
         async fn endpoint(&self, node: &ResolvedNode, endpoint: &str) -> anyhow::Result<EndpointAt> {
             Ok(EndpointAt {
-                url: format!("http://{}.{endpoint}.fake", node.node.instance),
-                install_url: format!("http://{}.{endpoint}.install.fake", node.node.instance),
-                same_network: Some(format!("{}.{endpoint}.fake:1", node.node.instance)),
+                url: format!("http://{}.{endpoint}.fake", node.node.copy_id),
+                install_url: format!("http://{}.{endpoint}.install.fake", node.node.copy_id),
+                same_network: Some(format!("{}.{endpoint}.fake:1", node.node.copy_id)),
             })
         }
         async fn logs(&self, node: &NodeRef, unit: &str, _from: &LogsFrom) -> anyhow::Result<Vec<LogStream>> {
@@ -256,7 +275,7 @@ pub mod fake {
                 lines: vec![weft_core::infra::wire::LogLine {
                     at: Default::default(),
                     pipe: weft_core::infra::wire::Pipe::Stdout,
-                    text: format!("logs of {} {unit}", node.instance),
+                    text: format!("logs of {} {unit}", node.copy_id),
                 }],
                 mark: weft_core::infra::wire::LogMark { at: Default::default(), stdout_seen: 1, stderr_seen: 0 },
             }])

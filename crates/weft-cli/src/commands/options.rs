@@ -90,7 +90,7 @@ pub async fn run(ctx: Ctx, step_name: &str, field: &str, search: Option<&str>) -
             let body = GrantedQuery {
                 access_id: s.access_id,
                 service: s.service.clone(),
-                for_member: None,
+                for_instance: None,
                 from: from.clone(),
                 label: label.clone(),
                 value: value.clone(),
@@ -190,8 +190,8 @@ fn traced_access<'a>(
         return Ok(None);
     };
     match &target.picked {
-        Pick::MemberFilled => bail!(
-            "'{}' is connected by each member of the program, so there is no one \
+        Pick::InstanceFilled => bail!(
+            "'{}' is connected separately in each instance of the program, so there is no one \
              connection to list choices through",
             target.spelling()
         ),
@@ -257,7 +257,7 @@ fn lookup_request(
 ) -> LookupRequest {
     LookupRequest {
         access_id: signing.map(|(id, _)| id),
-        for_member: None,
+        for_instance: None,
         service: signing.map(|(_, s)| s.to_string()),
         lookup: lookup.clone(),
         query: if server_filtered(lookup) { query.to_string() } else { String::new() },

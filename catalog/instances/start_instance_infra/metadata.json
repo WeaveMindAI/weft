@@ -1,0 +1,48 @@
+{
+  "type": "StartInstanceInfra",
+  "label": "Start instance infra",
+  "description": "Bring up one instance's own copy of an infra node marked `@per_instance`. Fires `done` once the copy answers, so the instance's triggers that read it can be activated right after. However long the copy takes to come up, the run waits without holding a worker; a copy that fails to come up fails the node with the reason. Starting a copy that already runs does nothing.",
+  "tags": [
+    "instances",
+    "infra",
+    "start"
+  ],
+  "icon": "Play",
+  "color": "#0ea5e9",
+  "inputs": [
+    {
+      "name": "node",
+      "type": "String",
+      "required": true,
+      "description": "The infra node marked `@per_instance`, named the way the program writes it (`bridge`, or `one.bridge` inside an included file)."
+    },
+    {
+      "name": "instance",
+      "type": "String",
+      "required": true,
+      "description": "The instance, by the id your program gives it (`user-42`)."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "done",
+      "type": "Boolean",
+      "description": "True once the copy is running. Wire it into the `_should_flow` of what must happen after."
+    }
+  ],
+  "requires_infra": false,
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": { "kind": "input_names", "port": "node", "names": { "node": { "role": "infra", "per_instance": true } } }
+      },
+      "then": {
+        "message": "StartInstanceInfra '{id}' names {names} in `node`, which is no infra node of this program marked `@per_instance`. Name one the way the program writes it (`bridge`, or `one.bridge` inside an included file).",
+        "level": "structural",
+        "severity": "error",
+        "port": "node"
+      }
+    }
+  ]
+}

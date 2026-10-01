@@ -21,11 +21,12 @@ it remembers.
 | Something else | `--assistant agents`, which writes a plain `AGENTS.md` |
 | Nothing | `--assistant none` |
 
-If you use more than one, pass `--assistant` once for each. Whichever you pick
-is remembered, so your next `weft new` installs the same one with no flag.
+If you use more than one, pass `--assistant` once for each. The pick is for
+this project only. If you want your next `weft new` to install the same one
+with no flag, add `--remember`, as here:
 
 ```bash
-weft new hello --assistant claude-code
+weft new hello --assistant claude-code --remember
 cd hello
 weft run
 ```

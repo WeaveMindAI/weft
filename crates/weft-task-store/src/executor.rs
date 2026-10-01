@@ -115,23 +115,23 @@ pub fn dispatcher_picker_loop<Ctx>(
     store: Arc<dyn TaskStoreClient>,
     ctx: Ctx,
     registry: TaskRegistry<Ctx>,
-    instance: String,
+    replica: String,
 ) -> crate::drain::DrainLoop
 where
     Ctx: Send + Sync + Clone + 'static,
 {
     let slots = Arc::new(tokio::sync::Semaphore::new(DISPATCHER_PICKER_CONCURRENCY));
     crate::drain::DrainLoop::new("dispatcher_picker", DISPATCHER_READY, crate::drain::SAFETY_POLL_INTERVAL, move || {
-        let (store, ctx, registry, instance, slots) = (store.clone(), ctx.clone(), registry.clone(), instance.clone(), slots.clone());
+        let (store, ctx, registry, replica, slots) = (store.clone(), ctx.clone(), registry.clone(), replica.clone(), slots.clone());
         async move {
             // At capacity: wait for a running task to finish before claiming
             // another.
             let slot = slots.acquire_owned().await.expect("the picker's semaphore is never closed");
-            match store.claim_one(&instance, ClaimFilter::Dispatcher, Duration::ZERO).await? {
+            match store.claim_one(&replica, ClaimFilter::Dispatcher, Duration::ZERO).await? {
                 Some(task) => {
                     tokio::spawn(async move {
                         let _slot = slot;
-                        run_dispatcher_task(store, ctx, registry, instance, task).await;
+                        run_dispatcher_task(store, ctx, registry, replica, task).await;
                     });
                     Ok(crate::drain::DrainStep::More)
                 }
@@ -146,7 +146,7 @@ async fn run_dispatcher_task<Ctx>(
     store: Arc<dyn TaskStoreClient>,
     ctx: Ctx,
     registry: TaskRegistry<Ctx>,
-    instance: String,
+    replica: String,
     task: Task,
 ) where
     Ctx: Send + Sync + Clone + 'static,
@@ -158,7 +158,7 @@ async fn run_dispatcher_task<Ctx>(
             id = %task.id, kind = %task.kind, error = %err,
             "rejecting unknown task kind"
         );
-        if let Err(e) = store.fail(task.id, &instance, err).await {
+        if let Err(e) = store.fail(task.id, &replica, err).await {
             tracing::warn!(
                 target: "weft_task_store::executor",
                 id = %task.id, error = %e,
@@ -173,7 +173,7 @@ async fn run_dispatcher_task<Ctx>(
     let heartbeat = spawn_claim_heartbeat(
         store.clone(),
         task_id,
-        instance.clone(),
+        replica.clone(),
         lease.clone(),
     );
     let outcome = run_with_lease_guard(
@@ -184,7 +184,7 @@ async fn run_dispatcher_task<Ctx>(
     )
     .await;
     heartbeat.abort();
-    finalize_task(store.as_ref(), task_id, &instance, &kind, outcome).await;
+    finalize_task(store.as_ref(), task_id, &replica, &kind, outcome).await;
 }
 
 /// Why the heartbeat task told the executor to stop. Typed so the
@@ -293,7 +293,7 @@ where
 async fn finalize_task(
     store: &dyn TaskStoreClient,
     task_id: uuid::Uuid,
-    instance: &str,
+    replica: &str,
     kind: &str,
     outcome: ExecOutcome,
 ) -> TaskEnd {
@@ -308,7 +308,7 @@ async fn finalize_task(
             return TaskEnd::LeaseLost;
         }
         ExecOutcome::LeaseLost(LeaseLoss::Unrenewable) => {
-            match store.requeue(task_id, instance).await {
+            match store.requeue(task_id, replica).await {
                 Ok(true) => tracing::warn!(
                     target: "weft_task_store::executor",
                     id = %task_id, kind = %kind,
@@ -332,7 +332,7 @@ async fn finalize_task(
     };
     match outcome {
         Ok(Ok(result)) => {
-            if let Err(e) = store.complete(task_id, instance, result).await {
+            if let Err(e) = store.complete(task_id, replica, result).await {
                 tracing::warn!(
                     target: "weft_task_store::executor",
                     id = %task_id, kind = %kind, error = %e,
@@ -343,7 +343,7 @@ async fn finalize_task(
         }
         Ok(Err(e)) => {
             let msg = format!("{e:#}");
-            if let Err(e2) = store.fail(task_id, instance, msg.clone()).await {
+            if let Err(e2) = store.fail(task_id, replica, msg.clone()).await {
                 tracing::warn!(
                     target: "weft_task_store::executor",
                     id = %task_id, kind = %kind, error = %e2,
@@ -360,7 +360,7 @@ async fn finalize_task(
                 "task panicked; writing tasks::fail"
             );
             let msg = format!("panic: {panic_msg}");
-            if let Err(e) = store.fail(task_id, instance, msg.clone()).await {
+            if let Err(e) = store.fail(task_id, replica, msg.clone()).await {
                 tracing::warn!(
                     target: "weft_task_store::executor",
                     id = %task_id, kind = %kind, error = %e,
@@ -411,7 +411,7 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
 fn spawn_claim_heartbeat(
     store: Arc<dyn TaskStoreClient>,
     task_id: uuid::Uuid,
-    instance: String,
+    replica: String,
     lease: LeaseSignal,
 ) -> tokio::task::JoinHandle<()> {
     let interval = claim_heartbeat_interval();
@@ -421,7 +421,7 @@ fn spawn_claim_heartbeat(
         let mut consecutive_errors: u32 = 0;
         loop {
             tokio::time::sleep(interval).await;
-            match store.heartbeat(task_id, &instance).await {
+            match store.heartbeat(task_id, &replica).await {
                 Ok(true) => {
                     consecutive_errors = 0;
                 }
@@ -463,7 +463,7 @@ fn spawn_claim_heartbeat(
 /// it ended, for the worker to tell whoever called it.
 pub async fn run_claimed_worker_task<F>(
     store: Arc<dyn TaskStoreClient>,
-    instance: &str,
+    replica: &str,
     task: &Task,
     work: F,
 ) -> TaskEnd
@@ -471,10 +471,10 @@ where
     F: std::future::Future<Output = Result<()>>,
 {
     let lease = LeaseSignal::new();
-    let heartbeat = spawn_claim_heartbeat(store.clone(), task.id, instance.to_string(), lease.clone());
+    let heartbeat = spawn_claim_heartbeat(store.clone(), task.id, replica.to_string(), lease.clone());
     let kind = task.kind.clone();
     let result = serde_json::json!({ "kind": kind });
     let outcome = run_with_lease_guard(async { work.await.map(|()| result) }, lease, task.id, &kind).await;
     heartbeat.abort();
-    finalize_task(store.as_ref(), task.id, instance, &kind, outcome).await
+    finalize_task(store.as_ref(), task.id, replica, &kind, outcome).await
 }

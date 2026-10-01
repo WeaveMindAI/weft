@@ -68,6 +68,26 @@ not a package default
 The merge is shallow: a node's `types` replaces the package's rather than
 adding to it.
 
+## When a folder does not load
+
+If a node or a package has something wrong with it, only that folder is left
+out. Every other node still loads, and a program that never uses the broken
+one still compiles. A program that does use it fails with the reason:
+
+```text
+node 'Poll' failed to load: package name 'feed' is used by more than one
+folder (nodes/rss/feed, nodes/mine/feeds); ...
+```
+
+Names have to be unique across all your node folders: a node type, a service,
+and a package name (a package is named by its `package.toml`, a bare node by
+its folder). If two folders claim the same name, both are left out and each
+error names the other, so you pick which one to rename.
+
+If you write a `package.toml` before any of its nodes, the package just waits,
+and it loads once a node folder with a `metadata.json` and a `mod.rs` is there.
+`weft describe-nodes` lists everything that was left out, and why.
+
 ## deps.toml
 
 Per node, and every section is optional.

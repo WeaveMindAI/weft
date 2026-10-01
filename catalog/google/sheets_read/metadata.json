@@ -104,5 +104,8 @@
       "type": "List[JsonDict]",
       "description": "The sheet's rows. With a header, each row is {column: value}; without one, {c0, c1, ...}."
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

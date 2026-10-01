@@ -20,7 +20,7 @@ async fn setup(pool: &PgPool) {
     weft_dispatcher::app::apply_core_schema(pool).await.expect("core schema");
 }
 
-fn builder(pool: &PgPool, images: Arc<FakeImageBuilder>, instance: &str) -> VersionBuilder {
+fn builder(pool: &PgPool, images: Arc<FakeImageBuilder>, replica: &str) -> VersionBuilder {
     VersionBuilder {
         bases: weft_compiler::worker_image::BaseImages {
             builder: "reg:5000/base:1".into(),
@@ -28,10 +28,11 @@ fn builder(pool: &PgPool, images: Arc<FakeImageBuilder>, instance: &str) -> Vers
         },
         images,
         pool: pool.clone(),
-        instance: instance.into(),
+        replica: replica.into(),
         compile_lanes: 2,
         poll_every: std::time::Duration::from_millis(10),
         prunes: Default::default(),
+        blobs: weft_dispatcher::build::blob_cache::BlobCache::in_temp_dir(),
     }
 }
 
@@ -153,7 +154,7 @@ async fn a_cancel_stops_the_projects_own_build(pool: PgPool) {
         .unwrap_err()
         .to_string();
     assert!(e.contains("cancelled"), "{e}");
-    assert_eq!(fake.releases().len(), 1, "its instance is freed");
+    assert_eq!(fake.releases().len(), 1, "its build is freed");
     let (status,): (String,) = sqlx::query_as("SELECT status FROM image_build WHERE image_ref = $1")
         .bind("reg:5000/weft-worker:d")
         .fetch_one(&pool)
@@ -211,7 +212,7 @@ async fn every_waiter_on_one_build_gets_its_end(pool: PgPool) {
     a.unwrap();
     b.unwrap();
     assert_eq!(fake.starts().len(), 1, "one build for both");
-    assert!(!fake.releases().is_empty(), "the instance is freed once the end is recorded");
+    assert!(!fake.releases().is_empty(), "the build is freed once the end is recorded");
 }
 
 /// A build whose driver died (its hold lapsed) is taken over by the next
@@ -237,7 +238,7 @@ async fn an_orphaned_build_is_taken_over_and_built_again(pool: PgPool) {
     assert_eq!(starts.len(), 1, "built again, once");
     assert_ne!(starts[0].name, name, "under a new name");
     let (status, driver, current): (String, String, String) =
-        sqlx::query_as("SELECT status, driver_instance, build_name FROM image_build WHERE image_ref = $1")
+        sqlx::query_as("SELECT status, driver_replica, build_name FROM image_build WHERE image_ref = $1")
             .bind("reg:5000/weft-worker:f")
             .fetch_one(&pool)
             .await
@@ -281,7 +282,7 @@ async fn a_cancel_never_leaves_a_driven_build_without_a_driver(pool: PgPool) {
 /// A second verb on the same process joining a build whose process is still being
 /// created never calls it gone: only the task that started the process may.
 #[sqlx::test]
-async fn a_joiner_never_calls_a_instance_still_being_made_gone(pool: PgPool) {
+async fn a_joiner_never_calls_a_build_still_being_made_gone(pool: PgPool) {
     setup(&pool).await;
     let fake = Arc::new(FakeImageBuilder::new());
     let project = uuid::Uuid::new_v4();

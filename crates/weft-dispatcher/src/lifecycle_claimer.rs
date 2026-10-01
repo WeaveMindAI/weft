@@ -71,7 +71,7 @@ enum RunOutcome {
 /// claim. The handler returns a typed `RunOutcome` so "no longer
 /// applicable" cancellations are distinguished from real failures.
 async fn claim_and_run_one(state: &DispatcherState) -> Result<bool> {
-    let Some(row) = claim_one(&state.pg_pool, &state.instance).await? else {
+    let Some(row) = claim_one(&state.pg_pool, &state.replica).await? else {
         return Ok(false);
     };
     let state = state.clone();
@@ -84,26 +84,26 @@ async fn claim_and_run_one(state: &DispatcherState) -> Result<bool> {
 /// for a whole lease and another process took the command over), the run
 /// stops here and the new holder answers for it.
 async fn run_and_complete(state: &DispatcherState, row: ClaimedCommand) {
-    let instance = state.instance.as_str();
+    let replica = state.replica.as_str();
     let outcome = tokio::select! {
         outcome = run_claimed(state, &row) => outcome.unwrap_or_else(|e| RunOutcome::Failed(format!("{e:#}"))),
-        () = hold_claim(&state.pg_pool, row.id, instance) => {
+        () = hold_claim(&state.pg_pool, row.id, replica) => {
             tracing::warn!(
                 target: "weft_dispatcher::lifecycle_claimer",
                 command_id = row.id,
                 verb = %row.verb,
-                "the claim on this command was taken over by another instance; it answers for it now"
+                "the claim on this command was taken over by another replica; it answers for it now"
             );
             return;
         }
     };
-    if let Err(e) = complete(&state.pg_pool, row.id, instance, &outcome).await {
+    if let Err(e) = complete(&state.pg_pool, row.id, replica, &outcome).await {
         tracing::error!(
             target: "weft_dispatcher::lifecycle_claimer",
             command_id = row.id,
             verb = %row.verb,
             error = %format!("{e:#}"),
-            "the command ran but its outcome could not be recorded; the claim lapses and another instance runs it again"
+            "the command ran but its outcome could not be recorded; the claim lapses and another replica runs it again"
         );
         return;
     }
@@ -130,7 +130,7 @@ async fn run_and_complete(state: &DispatcherState, row: ClaimedCommand) {
 /// returning only once the claim is no longer this process's. A renewal that
 /// cannot reach the database is retried at the next interval: the lease
 /// outlives several of them.
-async fn hold_claim(pool: &PgPool, id: i64, instance: &str) {
+async fn hold_claim(pool: &PgPool, id: i64, replica: &str) {
     let mut every = tokio::time::interval(weft_broker_client::lifecycle_command::CLAIM_RENEW_INTERVAL);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     every.tick().await; // the first tick fires at once: the claim is fresh
@@ -138,10 +138,10 @@ async fn hold_claim(pool: &PgPool, id: i64, instance: &str) {
         every.tick().await;
         let renewed = sqlx::query(
             "UPDATE infra_lifecycle_command SET claimed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT \
-             WHERE id = $1 AND claimed_by_instance = $2 AND completed_at_unix IS NULL",
+             WHERE id = $1 AND claimed_by_replica = $2 AND completed_at_unix IS NULL",
         )
         .bind(id)
-        .bind(instance)
+        .bind(replica)
         .execute(pool)
         .await;
         match renewed {
@@ -173,7 +173,7 @@ async fn run_claimed(state: &DispatcherState, row: &ClaimedCommand) -> Result<Ru
         let work: crate::infra_lifecycle_command::UpgradeWork = serde_json::from_value(spec)
             .map_err(|e| anyhow::anyhow!("infra_lifecycle_command.id={}: upgrade spec_json malformed: {e}", row.id))?;
         return Ok(
-            match crate::api::infra::run_upgrade(state, project_id, row.id, row.member.as_ref(), &work).await {
+            match crate::api::infra::run_upgrade(state, project_id, row.id, row.instance.as_ref(), &work).await {
                 Ok(crate::api::infra::UpgradeEnd::Done) => RunOutcome::Succeeded,
                 Ok(crate::api::infra::UpgradeEnd::Cancelled(reason)) => RunOutcome::Cancelled(reason),
                 Err((_, message)) => RunOutcome::Failed(message),
@@ -197,20 +197,20 @@ pub struct ClaimedCommand {
     pub verb: InfraLifecycleVerb,
     spec_json: Option<serde_json::Value>,
     /// Whose copies an upgrade cycles (`None`: the shared ones).
-    member: Option<weft_core::member::MemberId>,
+    instance: Option<weft_core::instance::InstanceId>,
 }
 
 /// Atomic claim: UPDATE the row AND parse its typed columns in one
 /// step. A parse failure on a successfully-claimed row would
 /// otherwise leave it claimed-but-never-completed, because the
-/// `WHERE claimed_by_instance IS NULL` filter excludes it from future
+/// `WHERE claimed_by_replica IS NULL` filter excludes it from future
 /// claims.
 ///
 /// Strategy: if `try_get` / `parse` fails on a row we just claimed,
 /// write `complete(failed, msg)` BEFORE returning the error. The
 /// caller's contract ("exactly one complete per claim") stays
 /// intact.
-pub async fn claim_one(pool: &PgPool, claimer_instance: &str) -> Result<Option<ClaimedCommand>> {
+pub async fn claim_one(pool: &PgPool, claimer_replica: &str) -> Result<Option<ClaimedCommand>> {
     use sqlx::Row;
     // Claim predicate (shared with the broker's supervisor claim):
     // either no current claimer OR an expired lease. The lease lets
@@ -224,7 +224,7 @@ pub async fn claim_one(pool: &PgPool, claimer_instance: &str) -> Result<Option<C
     // upgrade is not held behind them, nor holds them.
     let sql = format!(
         "UPDATE infra_lifecycle_command \
-         SET claimed_by_instance = $1, claimed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT \
+         SET claimed_by_replica = $1, claimed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT \
          WHERE id = ( \
             SELECT c.id FROM infra_lifecycle_command c \
             WHERE c.verb IN ({verbs}) \
@@ -239,7 +239,7 @@ pub async fn claim_one(pool: &PgPool, claimer_instance: &str) -> Result<Option<C
             FOR UPDATE SKIP LOCKED \
             LIMIT 1 \
          ) \
-         RETURNING id, project_id, verb, spec_json, member_id",
+         RETURNING id, project_id, verb, spec_json, instance_id",
         verbs = weft_broker_client::lifecycle_command::DISPATCHER_VERBS_SQL,
         predicate = weft_broker_client::lifecycle_command::claimable_predicate(),
         health = format!(
@@ -249,7 +249,7 @@ pub async fn claim_one(pool: &PgPool, claimer_instance: &str) -> Result<Option<C
         ),
     );
     let row = sqlx::query(&sql)
-        .bind(claimer_instance)
+        .bind(claimer_replica)
         .fetch_optional(pool)
         .await?;
     let Some(r) = row else { return Ok(None) };
@@ -264,7 +264,7 @@ pub async fn claim_one(pool: &PgPool, claimer_instance: &str) -> Result<Option<C
             // Best-effort complete: if THIS write also fails we
             // surface both via the bubbled error; the safety poll
             // will retry through the listener loop.
-            if let Err(complete_err) = complete(pool, id, claimer_instance, &outcome).await {
+            if let Err(complete_err) = complete(pool, id, claimer_replica, &outcome).await {
                 anyhow::bail!(
                     "claim parse failed ({parse_err}); subsequent complete also failed: {complete_err}"
                 );
@@ -283,17 +283,17 @@ fn decode_row(r: &sqlx::postgres::PgRow) -> Result<ClaimedCommand> {
         .ok_or_else(|| anyhow::anyhow!("unknown verb '{verb_str}' on id={id}"))?;
     let spec_json: Option<serde_json::Value> =
         r.try_get::<Option<serde_json::Value>, _>("spec_json")?;
-    let member = r
-        .try_get::<Option<String>, _>("member_id")?
-        .map(weft_core::member::MemberId::new)
+    let instance = r
+        .try_get::<Option<String>, _>("instance_id")?
+        .map(weft_core::instance::InstanceId::new)
         .transpose()
-        .map_err(|e| anyhow::anyhow!("corrupt member_id on id={id}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("corrupt instance_id on id={id}: {e}"))?;
     Ok(ClaimedCommand {
         id,
         project_id,
         verb,
         spec_json,
-        member,
+        instance,
     })
 }
 
@@ -314,19 +314,19 @@ fn project_outcome(
 /// Record `outcome` on command `id`, only while `process` still holds its
 /// claim: a process whose claim was taken over never answers for the
 /// command, and one already cancelled keeps its cancel.
-async fn complete(pool: &PgPool, id: i64, instance: &str, outcome: &RunOutcome) -> Result<()> {
+async fn complete(pool: &PgPool, id: i64, replica: &str, outcome: &RunOutcome) -> Result<()> {
     let (lc_outcome, message) = project_outcome(outcome);
     sqlx::query(
         "UPDATE infra_lifecycle_command \
          SET completed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT, \
              outcome = $2, \
              outcome_message = $3 \
-         WHERE id = $1 AND claimed_by_instance = $4 AND completed_at_unix IS NULL",
+         WHERE id = $1 AND claimed_by_replica = $4 AND completed_at_unix IS NULL",
     )
     .bind(id)
     .bind(lc_outcome.as_str())
     .bind(message)
-    .bind(instance)
+    .bind(replica)
     .execute(pool)
     .await?;
     Ok(())
@@ -404,7 +404,7 @@ fn health_take_down_targets(
                     deps,
                     &a.key,
                     &std::collections::BTreeSet::from([copy.node_id.clone()]),
-                    &weft_core::member::Copies::of(copy.member.clone()),
+                    &weft_core::instance::Copies::of(copy.instance.clone()),
                 )
             })
         })
@@ -424,19 +424,19 @@ async fn run_reactivate(
     };
     let targets = health_restore_targets(
         &crate::api::project::compute_trigger_deps(&project),
-        |place| crate::api::infra::is_per_member_place(&project, place),
+        |place| crate::api::infra::is_per_instance_place(&project, place),
         &state.activations.list(project_id).await?,
         &restore.still_broken,
     );
     // Owner by owner (one activation per owner, since a setup run is
     // one owner's).
-    let mut parked: std::collections::BTreeMap<Option<weft_core::member::MemberId>, Vec<String>> = Default::default();
+    let mut parked: std::collections::BTreeMap<Option<weft_core::instance::InstanceId>, Vec<String>> = Default::default();
     for key in targets {
-        parked.entry(key.member().cloned()).or_default().push(key.trigger);
+        parked.entry(key.instance().cloned()).or_default().push(key.trigger);
     }
-    for (member, triggers) in parked {
-        let request = crate::api::project::ActivateRequest {
-            scope: weft_core::activation::ActivationScope { triggers, member },
+    for (instance, triggers) in parked {
+        let request = weft_core::activation::ActivateRequest {
+            scope: weft_core::activation::ActivationScope { triggers, instance },
             ..Default::default()
         };
         match crate::api::project::activate_inner(state, project_id, request).await {
@@ -454,14 +454,14 @@ async fn run_reactivate(
 /// took down (they carry its mark, and a person's deactivate clears it)
 /// that are still down, and that read none of the `still_broken`
 /// copies. A trigger reading one copy still broken stays down; one
-/// member's broken copy never holds back another's readers; a copy the
+/// instance's broken copy never holds back another's readers; a copy the
 /// loop cannot see (nothing says it is broken) holds back nobody.
 /// `deps` is the program's `(infra, trigger)` reads; a trigger reads
 /// the shared copy of a shared node and its owner's copy of a
-/// per-member one.
+/// per-instance one.
 fn health_restore_targets(
     deps: &[(String, String)],
-    per_member_of: impl Fn(&str) -> bool,
+    per_instance_of: impl Fn(&str) -> bool,
     activations: &[crate::activation_store::Activation],
     still_broken: &[weft_broker_client::protocol::InfraCopy],
 ) -> Vec<weft_core::activation::ActivationKey> {
@@ -474,7 +474,7 @@ fn health_restore_targets(
                 .filter(|(_, trigger)| *trigger == a.key.trigger)
                 .map(|(infra, _)| weft_broker_client::protocol::InfraCopy {
                     node_id: infra.clone(),
-                    member: if per_member_of(infra) { a.key.member().cloned() } else { None },
+                    instance: if per_instance_of(infra) { a.key.instance().cloned() } else { None },
                 })
                 .any(|copy| still_broken.contains(&copy))
         })
@@ -487,7 +487,7 @@ mod tests {
     use super::*;
     use weft_broker_client::protocol::{InfraCopy, LifecycleOutcome, TakeDownReach};
     use weft_core::activation::ActivationKey;
-    use weft_core::member::{MemberId, Owner};
+    use weft_core::instance::{InstanceId, Owner};
 
     fn activation(trigger: &str, owner: Owner, status: crate::activation_store::ProjectStatus) -> crate::activation_store::Activation {
         let lifecycle = match status {
@@ -510,19 +510,19 @@ mod tests {
     }
 
     fn ada() -> Owner {
-        Owner::Member(MemberId::new("ada").unwrap())
+        Owner::Instance(InstanceId::new("ada").unwrap())
     }
 
-    /// A member's broken copy takes down only that member's live
+    /// An instance's broken copy takes down only that instance's live
     /// triggers that read the node: never a trigger that reads no infra
-    /// (the program's shared `mint`), never another member's reader,
+    /// (the program's shared `mint`), never another instance's reader,
     /// never one already down. A broken shared copy takes down every
     /// owner's readers of it.
     #[test]
     fn a_health_take_down_reaches_only_the_readers_of_the_broken_copy() {
         use crate::activation_store::ProjectStatus::{Active, Inactive};
         let deps = vec![("svc".to_string(), "up".to_string()), ("db".to_string(), "look".to_string())];
-        let bob = Owner::Member(MemberId::new("bob").unwrap());
+        let bob = Owner::Instance(InstanceId::new("bob").unwrap());
         let activations = vec![
             activation("mint", Owner::Shared, Active),
             activation("up", ada(), Active),
@@ -532,12 +532,12 @@ mod tests {
             activation("look", bob.clone(), Inactive),
         ];
         let of = |copy: InfraCopy| TakeDownReach::ReadersOf { broken: vec![copy] };
-        let ada_svc = InfraCopy { node_id: "svc".into(), member: Some(MemberId::new("ada").unwrap()) };
+        let ada_svc = InfraCopy { node_id: "svc".into(), instance: Some(InstanceId::new("ada").unwrap()) };
         assert_eq!(
             health_take_down_targets(&deps, &activations, &of(ada_svc)),
             vec![ActivationKey::new("up", ada())]
         );
-        let shared_db = InfraCopy { node_id: "db".into(), member: None };
+        let shared_db = InfraCopy { node_id: "db".into(), instance: None };
         assert_eq!(
             health_take_down_targets(&deps, &activations, &of(shared_db)),
             vec![ActivationKey::new("look", ada()), ActivationKey::new("look", Owner::Shared)]
@@ -562,7 +562,7 @@ mod tests {
             ("db".to_string(), "both".to_string()),
             ("svc".to_string(), "both".to_string()),
         ];
-        let bob = Owner::Member(MemberId::new("bob").unwrap());
+        let bob = Owner::Instance(InstanceId::new("bob").unwrap());
         let activations = vec![
             by_health("up", ada()),
             by_health("up", bob.clone()),
@@ -570,7 +570,7 @@ mod tests {
             by_health("both", bob.clone()),
             activation("look", ada(), Inactive),
         ];
-        let still_broken = vec![InfraCopy { node_id: "svc".into(), member: Some(MemberId::new("bob").unwrap()) }];
+        let still_broken = vec![InfraCopy { node_id: "svc".into(), instance: Some(InstanceId::new("bob").unwrap()) }];
         assert_eq!(
             health_restore_targets(&deps, |place| place == "svc", &activations, &still_broken),
             vec![ActivationKey::new("up", ada()), ActivationKey::new("look", Owner::Shared)]

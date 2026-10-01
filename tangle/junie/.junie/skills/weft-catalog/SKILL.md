@@ -37,13 +37,15 @@ Two triggers, two different answers:
 
 The copy under `nodes/base_catalog/` does not follow the installed weft on its own, so it can lag it. When a node misbehaves in a way its metadata should not allow, or a diagnostic names the catalog (an enrichment error, an unknown field, "a stale base_catalog copy"), you run `weft catalog update` and re-check before anything else. The update wipes and recopies only `base_catalog`, never the project's own nodes. Only wrongness that survives the update is a real finding.
 
+A broken node or package never breaks the catalog: it is left out, and only a program that uses it fails, with `node 'X' failed to load: <reason>`. Package names, node types and service names are unique across every node folder; when two folders claim one, every claimant is left out and the error names all the folders, so you rename one. A folder with a `package.toml` and no node yet just waits, with a warning.
+
 ## Reading a metadata file
 
 Top-level keys: `type`, `label`, `description`, `tags`, `icon`, `color`, `inputs`, `outputs`, `types`, `requires_infra`, `images`, `publishes`, `service`, `portsFromConfig`, `features`, `display`, `validate`.
 
 An input entry: `name`, `type`, `required`, `accepts`, `widget`, `default`, `label`, `placeholder`, `description`, and for `Access`-typed inputs `requiresScopes` / `requiresValues`. An output entry: `name`, `type`, `description`.
 
-`accepts` lists the drivers the port takes: `literal` (a value written in the source, in the braces or on its own line, `@file`/`@asset` included) and `wire` (a value another node produces). Absent means both; `["wire"]` means only a real node fills it (an LLM's `provider`, `params`, `history`, `tools`; a consumer's `Access` handle). The list named in `portsFromConfig` is compiler-read: an inline typed value only, never a wire, never a marker. The access picker holds nothing in the source at all: its connection is picked on the install (`weft connect`). Exactly one driver per port.
+`accepts` lists the drivers the port takes: `literal` (a value written in the source, in the braces or on its own line, `@file`/`@asset` included) and `wire` (a value another node produces). Absent means both; `["wire"]` means only a real node fills it (an LLM's `provider`, `params`, `historyFile`, `tools`; a consumer's `Access` handle). The list named in `portsFromConfig` is compiler-read: an inline typed value only, never a wire, never a marker. The access picker holds nothing in the source at all: its connection is picked on the install (`weft connect`). Exactly one driver per port.
 
 `widget` is the editor's control, an object naming its kind:
 `"widget": { "kind": "textarea" }`. The kinds are `text`, `textarea`,

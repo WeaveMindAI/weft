@@ -43,7 +43,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             node_id     TEXT,
             -- Whose copy of the node the event is about: NULL for the
             -- shared copy, or for a project-wide event.
-            member_id   TEXT,
+            instance_id   TEXT,
             kind        TEXT NOT NULL,
             payload     JSONB NOT NULL,
             at_unix     BIGINT NOT NULL,

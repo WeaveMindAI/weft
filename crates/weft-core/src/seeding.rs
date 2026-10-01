@@ -14,7 +14,8 @@ use crate::frames::{loop_indices, Located, LoopFrames};
 use crate::primitive::ExecutionSnapshot;
 use crate::project::{boundary_in_id, GroupBoundaryRole, GroupKind, ProjectDefinition};
 use crate::project::hash::ProgramIdentity;
-use crate::project::selection::{enclosing_loops, every_place, is_body, members_with_paths, source_place, RunSelection, SelectionBounds};
+use crate::project::graph::ProjectGraph;
+use crate::project::selection::{enclosing_loops, every_place, is_body, members_in, source_place, RunSelection, SelectionBounds};
 use crate::run_spec::{OutputWire, RunSpec};
 use crate::ExecutionId;
 
@@ -34,6 +35,37 @@ pub struct SeedOutcome {
     pub fire: Option<Value>,
 }
 
+/// A stored file as the store holds it now, for a reused output that
+/// names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileNow {
+    At(u64),
+    Gone,
+}
+
+/// Why a reused step's output cannot stand in for it any more, or
+/// `None` when it still can: the output names a stored `file` the step
+/// left at one version, and the file is at another now (another run, or
+/// a later step, changed it), or is gone. `step` and `port` are spelled
+/// the way the program reads them. The reason names both ways out.
+pub fn moved_file_refusal(step: &str, port: &str, file: &crate::storage::StoredFile, now: FileNow) -> Option<String> {
+    let what = match now {
+        FileNow::At(version) if version == file.version => return None,
+        FileNow::At(version) => format!(
+            "has changed since (that run left it at version {}, it is at version {version} now)",
+            file.version
+        ),
+        FileNow::Gone => "is gone (deleted, or expired with the run that made it)".to_string(),
+    };
+    Some(format!(
+        "--seed would reuse what '{step}' produced on '{port}', but the file it names, '{}', {what}, so \
+         the saved result no longer says what that step made. Hand the file in yourself \
+         (`--emit {step}='{{\"{port}\": ...}}'`), or run '{step}' again by keeping it out of the seed \
+         (`--seed-before {step}`).",
+        file.filename
+    ))
+}
+
 #[derive(Debug)]
 pub struct SeedPlan {
     pub origins: BTreeMap<Located, ExecutionId>,
@@ -51,6 +83,7 @@ pub fn starting_parameters(
     outcomes: &BTreeMap<Located, SeedOutcome>,
     history: &[OutputWire],
 ) -> anyhow::Result<RunSpec> {
+    let graph = ProjectGraph::new(project);
     let mut saved = spec.clone();
     if saved.fire.is_none() {
         for (place, outcome) in outcomes.iter().filter(|(place, _)| authored.nodes.contains(*place)
@@ -87,7 +120,7 @@ pub fn starting_parameters(
         }
     }
     for (id, ports) in saved.from.iter_mut().chain(saved.group.iter_mut().map(|(id, ports)| (&*id, ports))) {
-        let entry = crate::project::selection::start_node_at(project, id).map_err(anyhow::Error::msg)?;
+        let entry = crate::project::selection::start_node_in(&graph, id).map_err(anyhow::Error::msg)?;
         let node = project.nodes.iter().find(|node| node.id == entry.id).expect("validated start");
         if planned.origins.contains_key(&entry) {
             if let Some(old) = outcomes.get(&entry) {
@@ -152,6 +185,7 @@ pub fn seed_plan(
     until: &[String],
     before: &[String],
 ) -> anyhow::Result<SeedPlan> {
+    let graph = ProjectGraph::new(project);
     let cap = RunSelection::carve(project, &SelectionBounds {
         target: until.to_vec(), before: before.to_vec(), ..Default::default()
     }).map_err(anyhow::Error::msg)?;
@@ -209,7 +243,7 @@ pub fn seed_plan(
         }
         for group in project.groups.iter().filter(|g| matches!(g.kind, GroupKind::Loop { .. })) {
             for entry in places.iter().filter(|place| place.id == boundary_in_id(&group.id)) {
-                let members = members_with_paths(project, &group.id, &entry.path);
+                let members = members_in(&graph, &group.id, &entry.path);
                 let origins: BTreeSet<_> = members.iter().filter_map(|member| outcomes.get(member).map(|o| o.origin)).collect();
                 if origins.len() != 1 || members.iter().any(|member| invalid.contains(member)) {
                     invalid.extend(members);
@@ -258,6 +292,7 @@ pub fn seed_plan(
 /// loop iterations must have settled in all three), and none is parked
 /// on a suspension. A place with no record never ran and is not here.
 pub fn inheritable_nodes(project: &ProjectDefinition, snapshot: &ExecutionSnapshot) -> HashSet<Located> {
+    let graph = ProjectGraph::new(project);
     let mut eligible: HashSet<Located> = HashSet::new();
     let mut unfinished: HashSet<Located> = HashSet::new();
     for (id, records) in &snapshot.executions {
@@ -283,7 +318,7 @@ pub fn inheritable_nodes(project: &ProjectDefinition, snapshot: &ExecutionSnapsh
         let Some(entry) = project.nodes.iter().find(|node| node.id == boundary_in_id(&group.id)) else { continue };
         for at in places.iter().filter(|place| place.id == entry.id) {
             if enclosing_loops(project, at).iter().any(|around| around.id != group.id) { continue; }
-            let members = members_with_paths(project, &group.id, &at.path);
+            let members = members_in(&graph, &group.id, &at.path);
             let complete = complete_loop(project, snapshot, &group.id, &at.frames())
                 && members.iter().all(|member| snapshot.executions.get(&member.id).is_none_or(|records|
                     records.iter().filter(|record| Located::at(&member.id, &record.frames) == *member)
@@ -388,6 +423,45 @@ fn scope_settled(project: &ProjectDefinition, snapshot: &ExecutionSnapshot, scop
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn chat_file(version: u64) -> crate::storage::StoredFile {
+        crate::storage::StoredFile {
+            key: "t/project/p/f".into(),
+            mime_type: "application/x-ndjson".into(),
+            size_bytes: 10,
+            filename: "chat.jsonl".into(),
+            version,
+        }
+    }
+
+    /// A reused output's file still stands in only at the version the
+    /// step left it at; a newer version or a missing file refuses,
+    /// naming the step, the port, the file and both ways out.
+    #[test]
+    fn a_reused_file_must_be_where_the_step_left_it() {
+        assert_eq!(moved_file_refusal("ask", "historyFile", &chat_file(4), FileNow::At(4)), None);
+        let moved = moved_file_refusal("ask", "historyFile", &chat_file(4), FileNow::At(6)).unwrap();
+        for part in ["'ask'", "'historyFile'", "'chat.jsonl'", "version 4", "version 6", "--emit ask=", "--seed-before ask"] {
+            assert!(moved.contains(part), "{part} in {moved}");
+        }
+        let gone = moved_file_refusal("ask", "historyFile", &chat_file(4), FileNow::Gone).unwrap();
+        assert!(gone.contains("is gone"), "{gone}");
+    }
+
+    /// The files an output names are found wherever the value holds
+    /// them; a file at a URL is not in storage.
+    #[test]
+    fn stored_files_are_found_anywhere_in_a_value() {
+        let value = json!({
+            "reply": "hi",
+            "files": [chat_file(2).to_value(), { "nested": chat_file(3).to_value() }],
+            "link": { "__weft_image__": { "url": "https://x/y.png", "mimeType": "image/png", "sizeBytes": 1, "filename": "y.png" } },
+        });
+        let mut versions: Vec<u64> = crate::storage::stored_files_within(&value).iter().map(|f| f.version).collect();
+        versions.sort_unstable();
+        assert_eq!(versions, vec![2, 3]);
+        assert_eq!(crate::storage::stored_files_within(&chat_file(1).to_value()).len(), 1);
+    }
 
     fn top(id: &str) -> Located {
         Located::top(id)
@@ -531,7 +605,7 @@ mod tests {
         assert_eq!(spelled, ["src", "s", "s.free", "s.g", "s.g.x"].into_iter().collect(), "{spelled:?}");
         assert_eq!(saved.from["s.free"]["v"], json!("kept"));
         for (key, place) in [("s.free", at("@f.free")), ("s.g", at("@f.g__in"))] {
-            assert_eq!(crate::project::selection::start_node_at(&project, key).unwrap(), place, "{key}");
+            assert_eq!(crate::project::selection::start_node_in(&crate::project::graph::ProjectGraph::new(&project), key).unwrap(), place, "{key}");
         }
     }
 

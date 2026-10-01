@@ -33,7 +33,7 @@ pub async fn clean_kept() -> Result<()> {
         println!("removing cell {cell}");
         let out = tokio::process::Command::new("weft")
             .args(["daemon", "remove"])
-            .env(weft_core::infra::INSTANCE_ENV, &cell)
+            .env(weft_core::infra::INSTALL_ENV, &cell)
             .stdin(std::process::Stdio::null())
             .output()
             .await
@@ -46,10 +46,9 @@ pub async fn clean_kept() -> Result<()> {
     }
 
     let disp = crate::ensure::up().await?;
-    let projects: Vec<serde_json::Value> = disp.get_json("/projects").await?;
+    let projects: Vec<weft_core::projects::ProjectSummary> = disp.get_json("/projects").await?;
     for p in &projects {
-        let name = p.get("name").and_then(|v| v.as_str()).unwrap_or_default();
-        let Some(id) = p.get("id").and_then(|v| v.as_str()) else { continue };
+        let (name, id) = (&p.name, &p.id);
         if name.starts_with(crate::project::E2E_PROJECT_PREFIX) {
             println!("removing project {name} ({id})");
             // Forced: a kept project may sit in any state, and the force
@@ -84,7 +83,7 @@ pub async fn clean_kept() -> Result<()> {
 /// The names of every cell on this machine, read off the named installs'
 /// directories.
 async fn kept_cells() -> Result<Vec<String>> {
-    let dir = crate::ensure::install_dir(&weft_core::infra::Instance::default_install()).join("installs");
+    let dir = crate::ensure::install_dir(&weft_core::infra::Install::default_install()).join("installs");
     let names = match std::fs::read_dir(&dir) {
         Ok(entries) => entries
             .filter_map(|e| e.ok())
@@ -102,7 +101,7 @@ fn cells_in(names: Vec<String>) -> Vec<String> {
     names
         .into_iter()
         .filter(|name| name.starts_with(crate::cell::CELL_NAME_PREFIX))
-        .filter(|name| weft_core::infra::Instance::named(name).is_ok())
+        .filter(|name| weft_core::infra::Install::named(name).is_ok())
         .collect()
 }
 

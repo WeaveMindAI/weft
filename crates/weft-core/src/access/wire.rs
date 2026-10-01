@@ -93,10 +93,10 @@ pub struct GrantSummary {
     /// `exclusive`-class shared grant (every project referencing it
     /// follows its rotations).
     pub project_id: Option<uuid::Uuid>,
-    /// The member of `project_id` whose connection this is; `None` for
+    /// The instance of `project_id` whose connection this is; `None` for
     /// the author's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub member: Option<crate::member::MemberId>,
+    pub instance: Option<crate::instance::InstanceId>,
     pub identity: Option<String>,
     /// The connection list's middle column: the app's label, or the
     /// name the user typed for a pasted credential. `None` only for
@@ -115,7 +115,7 @@ pub struct GrantSummary {
     #[serde(default)]
     pub value_names: Vec<String>,
     /// Whose credential the row resolves to: `Platform` rows are the
-    /// spends-credits connections, `Author` and `Member` rows spend
+    /// spends-credits connections, `Author` and `Instance` rows spend
     /// their owner's money.
     pub owner: CredentialOwner,
     /// Which door created it; drives the shared-door displacement
@@ -123,7 +123,7 @@ pub struct GrantSummary {
     pub door: Door,
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Whether a credential stands behind the row right now. An
-    /// `Author` or `Member` row stores its own material, so always. A
+    /// `Author` or `Instance` row stores its own material, so always. A
     /// `Platform` row resolves to the runtime's own key at run time, which lives
     /// in the broker's shared-credentials file and can be gone (the
     /// file changed, the secret was emptied) while the row stays: the
@@ -194,12 +194,12 @@ pub struct ConnectDirect {
     /// exclusive-class OAuth grant ignores it, but direct connects are
     /// per-paste anyway).
     pub project_id: Option<uuid::Uuid>,
-    /// The member of `project_id` this connection is for. Stamped by the
-    /// dispatcher from WHO is connecting (a member token, or a trusted
-    /// backend's `Weft-Member` header), never taken from a client body:
-    /// nobody connects in somebody else's name.
+    /// The instance of `project_id` this connection is for. Stamped by the
+    /// dispatcher from WHO is connecting (an instance token, or a trusted
+    /// backend's `Weft-Instance` header), never taken from a client body:
+    /// nobody connects in another instance's name.
     #[serde(default)]
-    pub member: Option<crate::member::MemberId>,
+    pub instance: Option<crate::instance::InstanceId>,
 }
 
 fn own_door() -> Door {
@@ -269,11 +269,11 @@ pub struct BeginOAuth {
     /// by the broker; nothing the client sent survives there).
     pub permissions: Vec<String>,
     pub project_id: Option<uuid::Uuid>,
-    /// The member of `project_id` this consent is for; stamped by the
+    /// The instance of `project_id` this consent is for; stamped by the
     /// dispatcher from who is connecting, exactly like
-    /// [`ConnectDirect::member`].
+    /// [`ConnectDirect::instance`].
     #[serde(default)]
-    pub member: Option<crate::member::MemberId>,
+    pub instance: Option<crate::instance::InstanceId>,
     /// Upgrade/rotate this existing exclusive-class grant in place
     /// instead of minting a new row.
     pub upgrade_grant_id: Option<uuid::Uuid>,
@@ -329,7 +329,7 @@ mod wire_tests {
             id: uuid::Uuid::nil(),
             service: "openrouter".into(),
             project_id: None,
-            member: None,
+            instance: None,
             identity: Some("Q".into()),
             label: None,
             scopes: vec!["s".into()],
@@ -371,7 +371,7 @@ mod wire_tests {
             registration: None,
             permissions: vec![],
             project_id: Some(uuid::Uuid::nil()),
-            member: None,
+            instance: None,
             upgrade_grant_id: None,
             redirect_uri: String::new(),
         };
@@ -396,7 +396,7 @@ mod wire_tests {
                 registration: None,
                 paste: false,
                 project_id: None,
-                member: None,
+                instance: None,
             },
         };
         let v = serde_json::to_value(&pick).unwrap();
@@ -436,7 +436,7 @@ mod wire_tests {
                 registration: Some(reg.clone()),
                 paste: true,
                 project_id: Some(uuid::Uuid::nil()),
-                member: None,
+                instance: None,
             },
         };
         let v = serde_json::to_value(&pick).unwrap();
@@ -461,7 +461,7 @@ mod wire_tests {
                 registration: Some(reg),
                 permissions: vec!["write".into()],
                 project_id: None,
-                member: None,
+                instance: None,
                 upgrade_grant_id: Some(uuid::Uuid::nil()),
                 redirect_uri: "http://h/cb".into(),
             },

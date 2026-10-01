@@ -5,8 +5,8 @@
 //! roles, or one project's worker). What that caller may do here is this
 //! module's: a worker acts for its own project only; a weft role acts for
 //! any tenant, and says which of its surfaces a call is for in the
-//! `ROLE_HEADER`. The process instance a call comes from travels in the
-//! `INSTANCE_HEADER`, and that is what ties a worker's claims, the execution it
+//! `ROLE_HEADER`. The process replica a call comes from travels in the
+//! `REPLICA_HEADER`, and that is what ties a worker's claims, the execution it
 //! drives and the journal rows it writes to one running copy.
 
 use std::num::NonZeroUsize;
@@ -21,7 +21,7 @@ use hmac::{Hmac, Mac};
 use lru::LruCache;
 use parking_lot::Mutex;
 use sha2::Sha256;
-use weft_platform_traits::identity::{Principal, INSTANCE_HEADER, ROLE_HEADER};
+use weft_platform_traits::identity::{Principal, REPLICA_HEADER, ROLE_HEADER};
 use weft_platform_traits::CoreRole;
 
 use crate::state::BrokerState;
@@ -89,10 +89,10 @@ impl CallerScope {
 pub struct CallerIdentity {
     pub scope: CallerScope,
     pub role: Role,
-    /// The calling process instance (`INSTANCE_HEADER`). Required from a
+    /// The calling process replica (`REPLICA_HEADER`). Required from a
     /// worker: journal writes, claims and the execution it drives are all
     /// bound to it.
-    pub instance: Option<String>,
+    pub replica: Option<String>,
 }
 
 /// Cache key: HMAC-SHA-256 of the bearer token under a per-process random
@@ -174,9 +174,9 @@ pub async fn verified_principal(state: &Arc<BrokerState>, headers: &HeaderMap) -
     Ok(principal)
 }
 
-/// The instance a call comes from, when it named one.
-fn instance_of(headers: &HeaderMap) -> Option<String> {
-    headers.get(INSTANCE_HEADER).and_then(|v| v.to_str().ok()).map(str::trim).filter(|v| !v.is_empty()).map(str::to_string)
+/// The replica a call comes from, when it named one.
+fn replica_of(headers: &HeaderMap) -> Option<String> {
+    headers.get(REPLICA_HEADER).and_then(|v| v.to_str().ok()).map(str::trim).filter(|v| !v.is_empty()).map(str::to_string)
 }
 
 /// The role a weft role calls as.
@@ -189,14 +189,14 @@ fn role_of(headers: &HeaderMap) -> Result<CoreRole, (StatusCode, String)> {
 }
 
 /// What a verified caller is to the broker's data surface.
-pub(crate) fn interpret(principal: Principal, role: Option<CoreRole>, instance: Option<String>) -> Result<CallerIdentity, (StatusCode, String)> {
+pub(crate) fn interpret(principal: Principal, role: Option<CoreRole>, replica: Option<String>) -> Result<CallerIdentity, (StatusCode, String)> {
     match principal {
         Principal::Worker { tenant, project } => {
-            let instance = instance.ok_or((
+            let replica = replica.ok_or((
                 StatusCode::BAD_REQUEST,
-                format!("a worker names its process instance in the {INSTANCE_HEADER} header"),
+                format!("a worker names its process replica in the {REPLICA_HEADER} header"),
             ))?;
-            Ok(CallerIdentity { scope: CallerScope::Tenant { tenant, project }, role: Role::Worker, instance: Some(instance) })
+            Ok(CallerIdentity { scope: CallerScope::Tenant { tenant, project }, role: Role::Worker, replica: Some(replica) })
         }
         Principal::Core => {
             let role = match role {
@@ -207,7 +207,7 @@ pub(crate) fn interpret(principal: Principal, role: Option<CoreRole>, instance: 
                 }
                 None => return Err((StatusCode::BAD_REQUEST, format!("a weft role names itself in the {ROLE_HEADER} header"))),
             };
-            Ok(CallerIdentity { scope: CallerScope::ControlPlane, role, instance })
+            Ok(CallerIdentity { scope: CallerScope::ControlPlane, role, replica })
         }
     }
 }
@@ -220,7 +220,7 @@ pub async fn extract_identity(state: &Arc<BrokerState>, headers: &HeaderMap) -> 
         Principal::Core => Some(role_of(headers)?),
         Principal::Worker { .. } => None,
     };
-    interpret(principal, role, instance_of(headers))
+    interpret(principal, role, replica_of(headers))
 }
 
 /// Resolve a runtime-storage caller into the pure key-wall identity
@@ -229,7 +229,7 @@ pub async fn extract_identity(state: &Arc<BrokerState>, headers: &HeaderMap) -> 
 ///   - the dispatcher -> ControlPlane (the CLI admin verbs).
 ///   - a worker -> Worker { tenant, project, execution }, verifying any
 ///     claimed `execution_id` the way journal writes do (the execution's owner must
-///     be the calling instance, and the execution must be the caller's
+///     be the calling replica, and the execution must be the caller's
 ///     project's).
 /// Any other weft role has no runtime-storage identity (403).
 pub async fn resolve_storage_caller(
@@ -244,18 +244,18 @@ pub async fn resolve_storage_caller(
             other => Err((StatusCode::FORBIDDEN, format!("the {other} has no runtime-storage identity"))),
         },
         Principal::Worker { tenant, project } => {
-            let instance = instance_of(headers);
-            let (execution_id, member) = match execution_id {
+            let replica = replica_of(headers);
+            let (execution_id, instance) = match execution_id {
                 None => (None, None),
                 Some(execution_id) => {
                     let row: Option<(String, uuid::Uuid, Option<String>, Option<String>)> = sqlx::query_as(
-                        "SELECT tenant_id, project_id, owner_instance, member_id FROM execution WHERE execution_id = $1",
+                        "SELECT tenant_id, project_id, owner_replica, instance_id FROM execution WHERE execution_id = $1",
                     )
                     .bind(execution_id)
                     .fetch_optional(&state.pool)
                     .await
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
-                    let Some((execution_id_tenant, execution_id_project, owner, member)) = row else {
+                    let Some((execution_id_tenant, execution_id_project, owner, instance)) = row else {
                         return Err((StatusCode::FORBIDDEN, "unknown execution".into()));
                     };
                     if execution_id_tenant != tenant || execution_id_project != project {
@@ -267,15 +267,15 @@ pub async fn resolve_storage_caller(
                         );
                         return Err((StatusCode::FORBIDDEN, "execution belongs to a different project".into()));
                     }
-                    // Same gate as journal writes: only the instance that
+                    // Same gate as journal writes: only the replica that
                     // claimed the execution drives its execution.
-                    if instance.is_none() || owner.as_deref() != instance.as_deref() {
-                        return Err((StatusCode::FORBIDDEN, "execution is not owned by the calling instance".into()));
+                    if replica.is_none() || owner.as_deref() != replica.as_deref() {
+                        return Err((StatusCode::FORBIDDEN, "execution is not owned by the calling replica".into()));
                     }
-                    (Some(execution_id.to_string()), member)
+                    (Some(execution_id.to_string()), instance)
                 }
             };
-            Ok(CallerAuth::Worker { tenant, project_id: project.to_string(), execution_id, member })
+            Ok(CallerAuth::Worker { tenant, project_id: project.to_string(), execution_id, instance })
         }
     }
 }
@@ -285,7 +285,7 @@ pub async fn resolve_storage_caller(
 pub(crate) async fn control_plane(state: &Arc<BrokerState>, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
     match resolve_storage_caller(state, headers, None).await? {
         weft_core::storage::key::CallerAuth::ControlPlane => Ok(()),
-        weft_core::storage::key::CallerAuth::Worker { .. } => {
+        weft_core::storage::key::CallerAuth::Worker { .. } | weft_core::storage::key::CallerAuth::Tenant { .. } => {
             Err((StatusCode::FORBIDDEN, "the admin surface is dispatcher-only".into()))
         }
     }
@@ -319,11 +319,11 @@ mod tests {
     }
 
     #[test]
-    fn a_worker_is_pinned_to_its_project_and_needs_its_instance() {
+    fn a_worker_is_pinned_to_its_project_and_needs_its_replica() {
         let id = interpret(worker(), None, Some("w-1".into())).unwrap();
         assert_eq!(id.role, Role::Worker);
         assert_eq!(id.scope.pinned_project(), Some(uuid::Uuid::from_u128(1)));
-        assert_eq!(id.instance.as_deref(), Some("w-1"));
+        assert_eq!(id.replica.as_deref(), Some("w-1"));
         assert_eq!(interpret(worker(), None, None).unwrap_err().0, StatusCode::BAD_REQUEST);
     }
 

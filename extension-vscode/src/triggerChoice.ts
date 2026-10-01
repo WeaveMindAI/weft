@@ -1,6 +1,6 @@
 // The editor's half of the dispatcher's "how do the triggers come down"
 // question. Only the dispatcher knows whether a trigger is on (the
-// program's or a member's), so the webview sends a verb without a choice;
+// program's or an instance's), so the webview sends a verb without a choice;
 // when the dispatcher needs one, `weft <verb> --json` fails with an error
 // event flagged `needsTriggerChoice`, and the host asks the webview to
 // open its picker for that verb instead of showing the refusal.

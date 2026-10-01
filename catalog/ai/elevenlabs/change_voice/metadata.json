@@ -49,6 +49,7 @@
       "default": "eleven_multilingual_sts_v2",
       "widget": {
         "kind": "select",
+        "free_text": true,
         "options": [
           "eleven_multilingual_sts_v2",
           "eleven_english_sts_v2"
@@ -108,6 +109,9 @@
       "type": "Number"
     }
   ],
+  "features": {
+    "catchErrors": true
+  },
   "display": {
     "kind": "media",
     "output": "file"

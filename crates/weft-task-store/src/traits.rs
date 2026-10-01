@@ -43,19 +43,19 @@ pub trait TaskStoreClient: Send + Sync {
     /// `wait` passed with nothing to claim; a zero `wait` answers at once.
     /// The dispatcher's picker holds; a worker handed one execution asks
     /// once.
-    async fn claim_one(&self, instance: &str, filter: ClaimFilter, wait: Duration) -> Result<Option<Task>>;
+    async fn claim_one(&self, replica: &str, filter: ClaimFilter, wait: Duration) -> Result<Option<Task>>;
 
-    async fn heartbeat(&self, task_id: Uuid, instance: &str) -> Result<bool>;
+    async fn heartbeat(&self, task_id: Uuid, replica: &str) -> Result<bool>;
 
     /// Surrender a claim back to `pending` (no claimant), guarded on
-    /// `claimed_by = instance` so a row already re-claimed elsewhere is
+    /// `claimed_by = replica` so a row already re-claimed elsewhere is
     /// never clobbered. Returns true when the requeue landed. See
     /// `tasks::requeue`.
-    async fn requeue(&self, task_id: Uuid, instance: &str) -> Result<bool>;
+    async fn requeue(&self, task_id: Uuid, replica: &str) -> Result<bool>;
 
-    async fn complete(&self, task_id: Uuid, instance: &str, result: Value) -> Result<()>;
+    async fn complete(&self, task_id: Uuid, replica: &str, result: Value) -> Result<()>;
 
-    async fn fail(&self, task_id: Uuid, instance: &str, error: String) -> Result<()>;
+    async fn fail(&self, task_id: Uuid, replica: &str, error: String) -> Result<()>;
 
     /// The cancels asked for any of `execution_ids` of `project_id` (the
     /// executions the asking worker drives), each taken as it is
@@ -94,14 +94,14 @@ impl TaskStoreClient for PostgresTaskStoreClient {
         crate::terminal::wait_for_terminal(&self.pool, &self.signals, task_id, timeout).await
     }
 
-    async fn claim_one(&self, instance: &str, filter: ClaimFilter, wait: Duration) -> Result<Option<Task>> {
+    async fn claim_one(&self, replica: &str, filter: ClaimFilter, wait: Duration) -> Result<Option<Task>> {
         let deadline = tokio::time::Instant::now() + wait;
         // Subscribed before the first claim, so a task that lands
         // between an empty claim and the wait still wakes it.
         let mut signals = self.signals.subscribe();
         let ready = filter.ready_payload();
         loop {
-            if let Some(task) = crate::tasks::claim_one(&self.pool, instance, &filter).await? {
+            if let Some(task) = crate::tasks::claim_one(&self.pool, replica, &filter).await? {
                 return Ok(Some(task));
             }
             if !signals.woken_before(deadline, |c, p| c == crate::tasks::TASK_READY_CHANNEL && p == ready).await? {
@@ -110,20 +110,20 @@ impl TaskStoreClient for PostgresTaskStoreClient {
         }
     }
 
-    async fn heartbeat(&self, task_id: Uuid, instance: &str) -> Result<bool> {
-        crate::tasks::heartbeat(&self.pool, task_id, instance).await
+    async fn heartbeat(&self, task_id: Uuid, replica: &str) -> Result<bool> {
+        crate::tasks::heartbeat(&self.pool, task_id, replica).await
     }
 
-    async fn requeue(&self, task_id: Uuid, instance: &str) -> Result<bool> {
-        crate::tasks::requeue(&self.pool, task_id, instance).await
+    async fn requeue(&self, task_id: Uuid, replica: &str) -> Result<bool> {
+        crate::tasks::requeue(&self.pool, task_id, replica).await
     }
 
-    async fn complete(&self, task_id: Uuid, instance: &str, result: Value) -> Result<()> {
-        crate::tasks::complete(&self.pool, task_id, instance, result).await
+    async fn complete(&self, task_id: Uuid, replica: &str, result: Value) -> Result<()> {
+        crate::tasks::complete(&self.pool, task_id, replica, result).await
     }
 
-    async fn fail(&self, task_id: Uuid, instance: &str, error: String) -> Result<()> {
-        crate::tasks::fail(&self.pool, task_id, instance, error).await
+    async fn fail(&self, task_id: Uuid, replica: &str, error: String) -> Result<()> {
+        crate::tasks::fail(&self.pool, task_id, replica, error).await
     }
 
     async fn wait_cancels(&self, project_id: Uuid, execution_ids: Vec<String>, wait: Duration) -> Result<Vec<CancelAsked>> {
@@ -153,14 +153,14 @@ pub trait InfraReader: Send + Sync {
     /// Where one declared endpoint of an infra node answers, for the
     /// run `execution_id`. `None` when the node is not Running or declares no
     /// endpoint by that name. Backs `ctx.endpoint(name)` in node code.
-    /// The run names only itself: its project, and its member when the
-    /// node exists once per member (`per_member`), are the broker's to
-    /// resolve, so a run can never reach another member's copy.
+    /// The run names only itself: its project, and its instance when the
+    /// node exists once per instance (`per_instance`), are the broker's to
+    /// resolve, so a run can never reach another instance's copy.
     async fn endpoint_address(
         &self,
         execution_id: weft_core::ExecutionId,
         node_id: &str,
-        per_member: bool,
+        per_instance: bool,
         endpoint_name: &str,
     ) -> Result<Option<weft_core::infra::EndpointAddress>>;
 }
@@ -181,22 +181,22 @@ impl PostgresInfraReader {
 
 impl PostgresInfraReader {
     /// [`InfraReader::endpoint_address`] once the broker has resolved
-    /// the run: `member` is whose copy (`None` for a shared node).
+    /// the run: `instance` is which copy (`None` for a shared node).
     pub async fn endpoint_address(
         &self,
         project_id: Uuid,
         node_id: &str,
-        member: Option<&weft_core::member::MemberId>,
+        instance: Option<&weft_core::instance::InstanceId>,
         endpoint_name: &str,
     ) -> Result<Option<weft_core::infra::EndpointAddress>> {
         let row = sqlx::query(
             "SELECT endpoints_json, public_paths_json FROM infra_node \
-             WHERE project_id = $1 AND node_id = $2 AND member_id IS NOT DISTINCT FROM $3 \
+             WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3 \
                AND status = 'running'",
         )
         .bind(project_id)
         .bind(node_id)
-        .bind(member.map(|m| m.as_str()))
+        .bind(instance.map(|m| m.as_str()))
         .fetch_optional(&self.pool)
         .await?;
         let Some(row) = row else {

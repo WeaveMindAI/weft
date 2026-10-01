@@ -380,7 +380,7 @@ fn serve_subscription(
 // ---------- Dial-out: the shared per-(connection, topic) socket ----------
 
 /// One socket per (connection, topic) in this process, fanning events
-/// to all of that pair's subscriptions. Keyed by the listener instance
+/// to all of that pair's subscriptions. Keyed by the listener replica
 /// too, so several in-process listeners (tests) never cross wires.
 static SOCKETS: LazyLock<DashMap<String, SocketShare>> = LazyLock::new(DashMap::new);
 
@@ -442,7 +442,7 @@ async fn serve_socket(
     provider_account: Option<String>,
     ctx: &SpawnCtx,
 ) {
-    let key = format!("{}|{}|{}", ctx.config.instance, access.id, cfg.topic);
+    let key = format!("{}|{}|{}", ctx.config.replica, access.id, cfg.topic);
     let _guard = SubscriberGuard { key: key.clone(), token: ctx.fire.token().to_string() };
     {
         let share = SOCKETS.entry(key.clone()).or_insert_with(|| {
@@ -624,7 +624,7 @@ async fn ensure_via_broker(
             topic: cfg.topic.clone(),
             access_id: access.id.clone(),
             signal_token: ctx.fire.token().to_string(),
-            for_member: ctx.fire.for_member().cloned(),
+            for_instance: ctx.fire.for_instance().cloned(),
             params: cfg.params.clone(),
         })
         .await

@@ -68,7 +68,7 @@ pub struct StockProject {
 impl StockProject {
     /// Every catalog node type: the set the stock worker compiles.
     pub fn node_types(&self) -> BTreeSet<String> {
-        codegen::node_types_for(&self.definition, &self.catalog, codegen::NodeSet::Full)
+        codegen::node_types_for(&self.definition, &self.catalog, weft_core::builds::NodeSet::Full)
     }
 
     /// What the builder base installs and exports to compile this
@@ -111,7 +111,7 @@ pub fn standard_worker_hash() -> CompileResult<String> {
     }
     let stock = StockProject::materialize()?;
     let root = resolve_weft_root()?;
-    let hash = crate::hash::compute_binary_hash(&stock.definition, &stock.project, &root, &stock.catalog, codegen::NodeSet::Full)
+    let hash = crate::hash::compute_binary_hash(&stock.definition, &stock.project, &root, &stock.catalog, weft_core::builds::NodeSet::Full)
         .map_err(|e| CompileError::Build(format!("compute the standard worker's hash: {e}")))?;
     Ok(HASH.get_or_init(|| hash).clone())
 }
@@ -146,7 +146,7 @@ pub fn build_project(
     definition: &weft_core::project::ProjectDefinition,
     catalog: &FsCatalog,
     bases: &worker_image::BaseImages,
-    node_set: codegen::NodeSet,
+    node_set: weft_core::builds::NodeSet,
 ) -> CompileResult<StagedImageBuild> {
     let project_root = project.root.as_path();
     crate::bail_on_errors(crate::validate::validate_with_mode(
@@ -656,7 +656,7 @@ pub fn stage_builder_base_context_at(weft_root: &Path, ctx: &Path) -> CompileRes
         &ctx.join(worker_image::WARMUP_CRATE_DIR),
         &stock.catalog,
         WORKER_CRATE_NAME,
-        codegen::NodeSet::Full,
+        weft_core::builds::NodeSet::Full,
     )?;
     stage_project_nodes(stock.project.root.as_path(), &stock.catalog, &referenced, &ctx.join("project-nodes"))?;
 
@@ -1080,14 +1080,13 @@ pub fn drop_built_binary(binary: &Path) {
 /// Build the catalog for a project: discover every node under its
 /// `nodes/` directory. That is the single source of truth (the stdlib
 /// is cloned in at `weft new`), so the project is self-contained and
-/// nothing reaches into the weft installation at build time.
+/// nothing reaches into the weft installation at build time. A node or
+/// package that fails to load is left out and recorded
+/// (`FsCatalog::problems`); a program that names it is told why.
 pub fn build_project_catalog(project_root: &Path) -> CompileResult<FsCatalog> {
     let roots = crate::project::node_roots(project_root);
-    FsCatalog::discover_roots_with_policy(
-        &roots.iter().map(|r| r.as_path()).collect::<Vec<_>>(),
-        weft_catalog::DiscoverPolicy::Strict,
-    )
-    .map_err(|e| CompileError::Enrich(format!("catalog: {e}")))
+    FsCatalog::discover_roots(&roots.iter().map(|r| r.as_path()).collect::<Vec<_>>())
+        .map_err(|e| CompileError::Enrich(format!("catalog: {e}")))
 }
 
 #[cfg(test)]

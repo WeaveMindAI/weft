@@ -729,10 +729,10 @@ mod tests {
         HealthCondition::NodeNotReady { node_id: "*".into(), unit: "*".into() }
     }
 
-    fn view(node: &str, member: Option<&str>, ready: bool, flaky: bool) -> UnitView {
+    fn view(node: &str, instance: Option<&str>, ready: bool, flaky: bool) -> UnitView {
         UnitView {
             node_id: node.into(),
-            member: member.map(|m| weft_core::member::MemberId::new(m).unwrap()),
+            instance: instance.map(|m| weft_core::instance::InstanceId::new(m).unwrap()),
             unit: node.into(),
             ready,
             flaky,
@@ -789,7 +789,7 @@ mod tests {
             ],
         };
         let inputs = inputs_with_ready("n1", false);
-        let n1 = BTreeSet::from([InfraCopy { node_id: "n1".into(), member: None }]);
+        let n1 = BTreeSet::from([InfraCopy { node_id: "n1".into(), instance: None }]);
         let m = evaluate_protocols(&p, &fired("first", n1), false, &inputs);
         assert_eq!(m.expect("match").protocol.name, "second");
     }
@@ -836,7 +836,7 @@ mod tests {
         let latched = inputs(vec![view("svc", Some("ada"), false, true), view("db", None, true, false)]);
         let m = evaluate_protocols(&p, &HashMap::new(), false, &latched).expect("park");
         assert_eq!(m.protocol.name, "park-while-infra-broken");
-        let ada_svc = InfraCopy { node_id: "svc".into(), member: Some(weft_core::member::MemberId::new("ada").unwrap()) };
+        let ada_svc = InfraCopy { node_id: "svc".into(), instance: Some(weft_core::instance::InstanceId::new("ada").unwrap()) };
         assert_eq!(m.scope, BTreeSet::from([ada_svc.clone()]));
 
         // Fired on ada's copy: the same breakage does not fire again, a
@@ -845,7 +845,7 @@ mod tests {
         assert!(evaluate_protocols(&p, &acted, false, &latched).is_none());
         let both = inputs(vec![view("svc", Some("ada"), false, true), view("db", None, false, true)]);
         let m = evaluate_protocols(&p, &acted, false, &both).expect("the new breakage parks");
-        assert_eq!(m.scope, BTreeSet::from([InfraCopy { node_id: "db".into(), member: None }]));
+        assert_eq!(m.scope, BTreeSet::from([InfraCopy { node_id: "db".into(), instance: None }]));
     }
 
     /// A restart fires once per copy: ada's broken copy is restarted, and
@@ -859,8 +859,8 @@ mod tests {
                 ProtocolAction::RestartUnit { node_id: "svc".into(), unit: "svc".into() },
             )],
         };
-        let ada = InfraCopy { node_id: "svc".into(), member: Some(weft_core::member::MemberId::new("ada").unwrap()) };
-        let bob = InfraCopy { node_id: "svc".into(), member: Some(weft_core::member::MemberId::new("bob").unwrap()) };
+        let ada = InfraCopy { node_id: "svc".into(), instance: Some(weft_core::instance::InstanceId::new("ada").unwrap()) };
+        let bob = InfraCopy { node_id: "svc".into(), instance: Some(weft_core::instance::InstanceId::new("bob").unwrap()) };
         let mut acted = HashMap::new();
         let first = inputs(vec![view("svc", Some("ada"), false, true), view("svc", Some("bob"), true, false)]);
         let m = evaluate_protocols(&p, &acted, false, &first).expect("ada's copy breaks");
@@ -886,7 +886,7 @@ mod tests {
         };
         let m = evaluate_protocols(&p, &HashMap::new(), false, &inputs(vec![view("svc", None, false, false)]))
             .expect("the shared copy is not ready");
-        assert_eq!(m.scope, BTreeSet::from([InfraCopy { node_id: "svc".into(), member: None }]));
+        assert_eq!(m.scope, BTreeSet::from([InfraCopy { node_id: "svc".into(), instance: None }]));
     }
 
     /// A protocol whose condition names no infra acts where it did
@@ -905,7 +905,7 @@ mod tests {
             )],
         };
         let m = evaluate_protocols(&restart, &HashMap::new(), false, &inputs(Vec::new())).expect("fires");
-        assert_eq!(m.scope, BTreeSet::from([InfraCopy { node_id: "svc".into(), member: None }]));
+        assert_eq!(m.scope, BTreeSet::from([InfraCopy { node_id: "svc".into(), instance: None }]));
 
         let park = HealthProtocols { protocols: vec![proto("park", active, ProtocolAction::ParkTriggers)] };
         let mut acted = HashMap::new();
@@ -926,7 +926,7 @@ mod tests {
     #[test]
     fn the_default_recover_names_the_copies_still_broken() {
         let p = crate::protocol::default_protocols();
-        let ada_svc = InfraCopy { node_id: "svc".into(), member: Some(weft_core::member::MemberId::new("ada").unwrap()) };
+        let ada_svc = InfraCopy { node_id: "svc".into(), instance: Some(weft_core::instance::InstanceId::new("ada").unwrap()) };
         let healthy_parked = ProtocolEvalInputs { health_parked: true, ..inputs(vec![view("svc", None, true, false)]) };
         let m = evaluate_protocols(&p, &HashMap::new(), false, &healthy_parked).expect("recover");
         assert_eq!(m.protocol.name, "auto-recover-when-infra-healthy");
@@ -965,8 +965,8 @@ mod tests {
     #[test]
     fn rearm_is_copy_by_copy() {
         let p = crate::protocol::default_protocols();
-        let ada = InfraCopy { node_id: "svc".into(), member: Some(weft_core::member::MemberId::new("ada").unwrap()) };
-        let bob = InfraCopy { node_id: "svc".into(), member: Some(weft_core::member::MemberId::new("bob").unwrap()) };
+        let ada = InfraCopy { node_id: "svc".into(), instance: Some(weft_core::instance::InstanceId::new("ada").unwrap()) };
+        let bob = InfraCopy { node_id: "svc".into(), instance: Some(weft_core::instance::InstanceId::new("bob").unwrap()) };
         let recover = &p.protocols[1];
         let mut acted = HashMap::from([
             ("park-while-infra-broken".to_string(), BTreeSet::from([ada.clone(), bob.clone()])),

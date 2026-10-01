@@ -8,12 +8,12 @@
 //!   run (`weft_broker::lifecycle_writes::issue_command`); the body
 //!   carries only the `InfraSpec` JSON. The supervisor reads the prior
 //!   `infra_node` row itself, compiles the new spec with the real
-//!   image-tag map + instance id, hashes, and decides skip / fresh /
+//!   image-tag map + copy id, hashes, and decides skip / fresh /
 //!   replace internally.
-//! - **Stop**: scale to zero, preserve PVCs. Issued here.
+//! - **Stop**: stop the containers, keep their disks. Issued here.
 //! - **Terminate**: delete the copies and their disks, keeping the ones
 //!   the node lists in `keepOnTerminate` unless the command's
-//!   [`TakeDown::Terminate`] says every disk goes (a member's wipe).
+//!   [`TakeDown::Terminate`] says every disk goes (an instance's wipe).
 //!   Issued here.
 //!
 //! The supervisor claims through the broker's held
@@ -58,9 +58,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- ignores it. One source of truth per verb.
             running_policy    TEXT,
             spec_json         JSONB,
-            issued_by_instance     TEXT NOT NULL,
+            issued_by_replica     TEXT NOT NULL,
             issued_at_unix    BIGINT NOT NULL,
-            claimed_by_instance    TEXT,
+            claimed_by_replica    TEXT,
             claimed_at_unix   BIGINT,
             completed_at_unix BIGINT,
             -- 'succeeded' | 'failed' | 'cancelled' | NULL.
@@ -96,11 +96,11 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- (SYNC: the two numbers move together, by migration here).
             drain_timeout_secs BIGINT NOT NULL DEFAULT 60,
             -- Which copies of the infra the command acts on
-            -- (`weft_core::member::Copies`): the shared ones (member_id
-            -- NULL, every_copy FALSE), one member's (member_id set), or
+            -- (`weft_core::instance::Copies`): the shared ones (instance_id
+            -- NULL, every_copy FALSE), one instance's (instance_id set), or
             -- every copy there is (every_copy TRUE; the project going).
             -- An apply always names exactly one copy.
-            member_id         TEXT,
+            instance_id         TEXT,
             every_copy        BOOLEAN NOT NULL DEFAULT FALSE
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_lifecycle_cmd_pending
@@ -110,7 +110,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // terminate). The supervisor `claim_command` SELECT scans
         // uncompleted rows of these verbs ordered by id and gates each
         // on a live `infra_owner` lease (its single-actor authority); it
-        // does NOT use the `claimed_by_instance` lease (that is the
+        // does NOT use the `claimed_by_replica` lease (that is the
         // dispatcher's mechanism). This partial index keyed on id covers
         // that scan and skips dispatcher-owned + completed rows.
         concat!(
@@ -128,7 +128,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             r#"CREATE INDEX IF NOT EXISTS idx_lifecycle_cmd_dispatcher_claim
               ON infra_lifecycle_command(id)
               WHERE completed_at_unix IS NULL
-                AND claimed_by_instance IS NULL
+                AND claimed_by_replica IS NULL
                 AND verb IN ("#,
             weft_broker_client::dispatcher_verbs_sql!(),
             ")",
@@ -138,7 +138,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // double-enqueueing the same apply; `infra_enqueue_apply`
         // catches the conflict and returns the existing row's id.
         r#"CREATE UNIQUE INDEX IF NOT EXISTS uq_lifecycle_cmd_pending_apply
-              ON infra_lifecycle_command(project_id, node_id, member_id) NULLS NOT DISTINCT
+              ON infra_lifecycle_command(project_id, node_id, instance_id) NULLS NOT DISTINCT
               WHERE completed_at_unix IS NULL AND verb = 'apply'"#,
         // Announce a command when it is issued (its claimers wake) and
         // when it completes (whoever waits on its outcome wakes), from
@@ -212,18 +212,18 @@ pub async fn issue_lifecycle(
     tenant_id: &str,
     project_id: uuid::Uuid,
     node_id: Option<&str>,
-    copies: &weft_core::member::Copies,
+    copies: &weft_core::instance::Copies,
     take_down: TakeDown,
     running_policy: RunningPolicy,
     drain_timeout_secs: u64,
-    issued_by_instance: &str,
+    issued_by_replica: &str,
 ) -> Result<i64> {
-    let (member_id, every_copy) = copies.columns();
+    let (instance_id, every_copy) = copies.columns();
     let (force, spec_json) = take_down.columns();
     let row: (i64,) = sqlx::query_as(
         "INSERT INTO infra_lifecycle_command \
          (tenant_id, project_id, node_id, verb, running_policy, force, spec_json, drain_timeout_secs, \
-          issued_by_instance, issued_at_unix, member_id, every_copy) \
+          issued_by_replica, issued_at_unix, instance_id, every_copy) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, EXTRACT(EPOCH FROM NOW())::BIGINT, $10, $11) \
          RETURNING id",
     )
@@ -235,8 +235,8 @@ pub async fn issue_lifecycle(
     .bind(force)
     .bind(spec_json)
     .bind(drain_timeout_secs as i64)
-    .bind(issued_by_instance)
-    .bind(member_id)
+    .bind(issued_by_replica)
+    .bind(instance_id)
     .bind(every_copy)
     .fetch_one(pool)
     .await?;
@@ -244,7 +244,7 @@ pub async fn issue_lifecycle(
 }
 
 /// An upgrade's work, carried in its command's `spec_json`; whose
-/// copies it cycles is the row's `member_id`, where a cancel of that
+/// copies it cycles is the row's `instance_id`, where a cancel of that
 /// owner's infra work finds it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UpgradeWork {
@@ -279,7 +279,7 @@ pub enum UpgradeIssued {
     AlreadyInFlight(i64),
 }
 
-/// Issue an upgrade of `member`'s copies (the shared ones for `None`),
+/// Issue an upgrade of `instance`'s copies (the shared ones for `None`),
 /// unless one of the same copies is still in flight. The check and the
 /// insert run under one advisory lock keyed by the copies, so two
 /// requests racing each other issue one upgrade.
@@ -287,28 +287,28 @@ pub async fn issue_upgrade(
     pool: &PgPool,
     tenant_id: &str,
     project_id: uuid::Uuid,
-    member: Option<&weft_core::member::MemberId>,
+    instance: Option<&weft_core::instance::InstanceId>,
     work: &UpgradeWork,
-    issued_by_instance: &str,
+    issued_by_replica: &str,
 ) -> Result<UpgradeIssued> {
-    let member = member.map(|m| m.as_str());
+    let instance = instance.map(|m| m.as_str());
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock($1)")
         .bind(crate::lease::advisory_key(
             crate::lease::UPGRADE_ISSUE_DOMAIN,
-            &format!("{project_id}/{}", member.unwrap_or("")),
+            &format!("{project_id}/{}", instance.unwrap_or("")),
         ))
         .execute(&mut *tx)
         .await?;
     let in_flight: Option<i64> = sqlx::query_scalar(
         "SELECT id FROM infra_lifecycle_command \
-         WHERE project_id = $1 AND verb = $2 AND member_id IS NOT DISTINCT FROM $3 \
+         WHERE project_id = $1 AND verb = $2 AND instance_id IS NOT DISTINCT FROM $3 \
            AND completed_at_unix IS NULL \
          ORDER BY id LIMIT 1",
     )
     .bind(project_id)
     .bind(InfraLifecycleVerb::Upgrade.as_str())
-    .bind(member)
+    .bind(instance)
     .fetch_optional(&mut *tx)
     .await?;
     if let Some(id) = in_flight {
@@ -316,7 +316,7 @@ pub async fn issue_upgrade(
     }
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO infra_lifecycle_command \
-         (tenant_id, project_id, verb, spec_json, issued_by_instance, issued_at_unix, member_id) \
+         (tenant_id, project_id, verb, spec_json, issued_by_replica, issued_at_unix, instance_id) \
          VALUES ($1, $2, $3, $4, $5, EXTRACT(EPOCH FROM NOW())::BIGINT, $6) \
          RETURNING id",
     )
@@ -324,8 +324,8 @@ pub async fn issue_upgrade(
     .bind(project_id)
     .bind(InfraLifecycleVerb::Upgrade.as_str())
     .bind(sqlx::types::Json(work))
-    .bind(issued_by_instance)
-    .bind(member)
+    .bind(issued_by_replica)
+    .bind(instance)
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -335,13 +335,13 @@ pub async fn issue_upgrade(
 /// Record that upgrade `command_id`'s stop leg landed, while `process`
 /// still holds its claim. `false` when it does not (another process took it
 /// over): the caller stops there.
-pub async fn mark_upgrade_stopped(pool: &PgPool, command_id: i64, instance: &str) -> Result<bool> {
+pub async fn mark_upgrade_stopped(pool: &PgPool, command_id: i64, replica: &str) -> Result<bool> {
     let res = sqlx::query(
         "UPDATE infra_lifecycle_command SET spec_json = jsonb_set(spec_json, '{stopped}', 'true') \
-         WHERE id = $1 AND claimed_by_instance = $2 AND completed_at_unix IS NULL",
+         WHERE id = $1 AND claimed_by_replica = $2 AND completed_at_unix IS NULL",
     )
     .bind(command_id)
-    .bind(instance)
+    .bind(replica)
     .execute(pool)
     .await?;
     Ok(res.rows_affected() > 0)
@@ -361,7 +361,7 @@ const INFRA_WORK_VERBS_SQL: &str = concat!(weft_broker_client::supervisor_verbs_
 // for Deactivate / Reactivate / Upgrade. There is no shared helper because the
 // two claim paths enforce different ownership invariants (broker
 // requires SA-authenticated supervisor process; dispatcher claims by
-// instance with a lease).
+// replica with a lease).
 
 /// Wait for a previously-issued command to reach a terminal state.
 /// Returns a typed outcome that distinguishes "the claimer hit a
@@ -578,9 +578,9 @@ pub async fn any_in_flight(pool: &PgPool, project_id: uuid::Uuid) -> Result<bool
 
 /// Cancel one owner's in-flight infra work (apply / stop / terminate,
 /// and an upgrade, whose claimer reads the flag between its stop and
-/// its start): the shared copies' (`member` `None`, which also reaches
+/// its start): the shared copies' (`instance` `None`, which also reaches
 /// a command for every copy, since that one takes the shared copies
-/// down too) or one member's. Flags CLAIMED rows (`cancel_requested =
+/// down too) or one instance's. Flags CLAIMED rows (`cancel_requested =
 /// TRUE`; the executing supervisor polls the flag between install
 /// calls and halts) and completes still-UNCLAIMED rows outright with
 /// outcome `cancelled` (nothing has touched the install for them yet).
@@ -592,19 +592,19 @@ pub async fn any_in_flight(pool: &PgPool, project_id: uuid::Uuid) -> Result<bool
 pub async fn request_cancel_owner(
     pool: &PgPool,
     project_id: uuid::Uuid,
-    member: Option<&weft_core::member::MemberId>,
+    instance: Option<&weft_core::instance::InstanceId>,
 ) -> Result<u64> {
     let owner = format!(
         "project_id = $1 AND completed_at_unix IS NULL \
-         AND member_id IS NOT DISTINCT FROM $2 \
+         AND instance_id IS NOT DISTINCT FROM $2 \
          AND verb IN ({INFRA_WORK_VERBS_SQL})",
     );
-    let member = member.map(|m| m.as_str());
+    let instance = instance.map(|m| m.as_str());
     let flagged = sqlx::query(&format!(
         "UPDATE infra_lifecycle_command SET cancel_requested = TRUE WHERE {owner}"
     ))
     .bind(project_id)
-    .bind(member)
+    .bind(instance)
     .execute(pool)
     .await?
     .rows_affected();
@@ -613,10 +613,10 @@ pub async fn request_cancel_owner(
          SET completed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT, \
              outcome = 'cancelled', \
              outcome_message = 'cancelled by user before execution' \
-         WHERE {owner} AND claimed_by_instance IS NULL"
+         WHERE {owner} AND claimed_by_replica IS NULL"
     ))
     .bind(project_id)
-    .bind(member)
+    .bind(instance)
     .execute(pool)
     .await?
     .rows_affected();
@@ -626,7 +626,7 @@ pub async fn request_cancel_owner(
     tracing::info!(
         target: "weft_dispatcher::infra_lifecycle_command",
         project_id = %project_id,
-        member = member.unwrap_or("<shared>"),
+        instance = instance.unwrap_or("<shared>"),
         flagged,
         cancelled_unclaimed = completed,
         "infra cancel requested"
@@ -688,7 +688,7 @@ mod tests {
                 id: 1,
                 project_id: uuid::Uuid::from_u128(1),
                 node_id: None,
-                copies: weft_core::member::Copies::Shared,
+                copies: weft_core::instance::Copies::Shared,
                 verb: take_down.verb(),
                 running_policy: Some(RunningPolicy::Cancel),
                 spec_json,

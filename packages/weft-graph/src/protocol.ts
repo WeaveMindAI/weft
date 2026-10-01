@@ -16,7 +16,7 @@ export interface Span {
 }
 
 // The input vocabulary (ports, their drivers, the control an input draws)
-// lives in the connect library, whose member page draws a program's inputs
+// lives in the connect library, whose instance page draws a program's inputs
 // too; the graph protocol names it from there.
 export type { AcceptedForm, Accepts, PortDefinition, InputDefinition, Widget } from '../../weft-connect/src/core/wire';
 import type { Accepts, PortDefinition, InputDefinition, Widget } from '../../weft-connect/src/core/wire';
@@ -484,9 +484,9 @@ export interface NodeDefinition {
   outputs: PortDefinition[];
   features: NodeFeaturesWire;
   requiresInfra?: boolean;
-  /// Set on a node that exists once per member of the program.
-  // SYNC: perMember <-> crates/weft-core/src/project.rs NodeDefinition.per_member
-  perMember?: PerMember;
+  /// Set on a node that exists once per instance of the program.
+  // SYNC: perInstance <-> crates/weft-core/src/project.rs NodeDefinition.per_instance
+  perInstance?: PerInstance;
   span?: Span;
   headerSpan?: Span;
   configSpans?: Record<string, ConfigFieldSpan>;
@@ -714,7 +714,7 @@ export interface CatalogEntry {
 }
 
 // The connection vocabulary (recipes, connections, doors) lives in the
-// connect library, which the editor's picker and a member's connect page
+// connect library, which the editor's picker and an instance's connect page
 // both build on; the graph protocol names it from there.
 export type {
   AppRegistration,
@@ -821,18 +821,27 @@ export interface ParseResponse {
 /// reads differently from a CONSEQUENCE (an input it needed never arrived), so
 /// the journal carries which one it was.
 // SYNC: SkipReason <-> crates/weft-core/src/exec/skip.rs SkipReason
-/// `failure` on a closure-caused reason is the error the closure carried:
+/// `failure` on a closure-caused reason is the failure the closure carried:
 /// the node skipped because something before it BROKE rather than
-/// declined, and its own closures went out with that error.
+/// declined, and its own closures went out with that same failure.
 export type SkipReason =
   | { kind: 'did_not_flow' }
-  | { kind: 'flow_closed'; failure?: string }
+  | { kind: 'flow_closed'; failure?: Failure }
   | { kind: 'did_flow' }
-  | { kind: 'watched_node_failed'; error: string }
-  | { kind: 'required_input_closed'; port: string; failure?: string }
-  | { kind: 'every_input_closed'; failure?: string }
-  | { kind: 'one_of_group_closed'; ports: string[]; failure?: string }
+  | { kind: 'watched_node_failed'; failure: Failure }
+  | { kind: 'required_input_closed'; port: string; failure?: Failure }
+  | { kind: 'every_input_closed'; failure?: Failure }
+  | { kind: 'one_of_group_closed'; ports: string[]; failure?: Failure }
   | { kind: 'scope_skipped'; scope: string };
+
+/// A node that broke, as the closures it leaves carry it: the node spelled
+/// the way the program reads it, and its error. Passed on unchanged through
+/// every skip it causes.
+// SYNC: Failure <-> crates/weft-core/src/pulse.rs Failure
+export interface Failure {
+  node: string;
+  error: string;
+}
 
 /// Why an execution was cancelled: a person, a sibling run's
 /// `ctx.stop_tagged` (naming the run and the tag), the live caller
@@ -921,31 +930,31 @@ export function locatedKey(id: string, callPath: readonly string[]): string {
 }
 
 
-/// Why a node exists once per member: `marked` for an infra node the
-/// source marks `@per_member` (a container each), `filled` for a node with
-/// a field written `@member_filled` (each member provides it), `derived`
-/// for a node reached from either.
-// SYNC: PerMember <-> crates/weft-core/src/member.rs PerMember
-export type PerMember = 'marked' | 'filled' | 'derived';
+/// Why a node exists once per instance: `marked` for an infra node the
+/// source marks `@per_instance` (a container each), `filled` for a node with
+/// a field written `@instance_filled` (each instance gets its own value),
+/// `derived` for a node reached from either.
+// SYNC: PerInstance <-> crates/weft-core/src/instance.rs PerInstance
+export type PerInstance = 'marked' | 'filled' | 'derived';
 
-/// The shape a `@member_filled` field's value takes in the compiled
-/// literals: `{ "__weft_member_filled__": {} }`, with `fallback` inside
-/// when the source gives one (`@member_filled(<value>)`).
-// SYNC: MEMBER_FILLED_KEY <-> crates/weft-core/src/member.rs MEMBER_FILLED_KEY
-export const MEMBER_FILLED_KEY = '__weft_member_filled__';
+/// The shape an `@instance_filled` field's value takes in the compiled
+/// literals: `{ "__weft_instance_filled__": {} }`, with `fallback` inside
+/// when the source gives one (`@instance_filled(<value>)`).
+// SYNC: INSTANCE_FILLED_KEY <-> crates/weft-core/src/instance.rs INSTANCE_FILLED_KEY
+export const INSTANCE_FILLED_KEY = '__weft_instance_filled__';
 
-export interface MemberFilledValue {
-  [MEMBER_FILLED_KEY]: { fallback?: unknown };
+export interface InstanceFilledValue {
+  [INSTANCE_FILLED_KEY]: { fallback?: unknown };
 }
 
-/// `value` read as a `@member_filled` literal (its fallback, when any),
+/// `value` read as an `@instance_filled` literal (its fallback, when any),
 /// `null` for any other value.
-// SYNC: memberFilled <-> crates/weft-core/src/member.rs as_member_filled
-export function memberFilled(value: unknown): { fallback?: unknown } | null {
+// SYNC: instanceFilled <-> crates/weft-core/src/instance.rs as_instance_filled
+export function instanceFilled(value: unknown): { fallback?: unknown } | null {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
   const keys = Object.keys(value);
-  if (keys.length !== 1 || keys[0] !== MEMBER_FILLED_KEY) return null;
-  const inner = (value as Record<string, unknown>)[MEMBER_FILLED_KEY];
+  if (keys.length !== 1 || keys[0] !== INSTANCE_FILLED_KEY) return null;
+  const inner = (value as Record<string, unknown>)[INSTANCE_FILLED_KEY];
   if (typeof inner !== 'object' || inner === null || Array.isArray(inner)) return null;
   return inner as { fallback?: unknown };
 }
@@ -994,22 +1003,23 @@ export interface ChangePicks {
   clear?: { step: string; field: string }[];
 }
 
-/// The literal `@member_filled` (or `@member_filled(<fallback>)`) lowers to.
-export function memberFilledValue(fallback?: unknown): MemberFilledValue {
-  return { [MEMBER_FILLED_KEY]: fallback === undefined ? {} : { fallback } };
+/// The literal `@instance_filled` (or `@instance_filled(<fallback>)`) lowers to.
+// SYNC: instanceFilledValue <-> crates/weft-core/src/instance.rs instance_filled_literal
+export function instanceFilledValue(fallback?: unknown): InstanceFilledValue {
+  return { [INSTANCE_FILLED_KEY]: fallback === undefined ? {} : { fallback } };
 }
 
 /// Which activations a lifecycle verb names: the triggers (every one of
-/// the owner's when empty), for a member (the shared ones when absent).
+/// the owner's when empty), for an instance (the shared ones when absent).
 // SYNC: ActivationScope <-> crates/weft-core/src/activation.rs ActivationScope
 export interface ActivationScope {
   triggers?: string[];
-  member?: string;
+  instance?: string;
 }
 
 /// One trigger activation, as the project status lists it.
 /// Where a project or one activation stands in its lifecycle.
-// SYNC: LifecycleStatus <-> crates/weft-broker-client/src/protocol.rs ProjectStatus
+// SYNC: LifecycleStatus <-> crates/weft-core/src/projects.rs ProjectStatus
 export type LifecycleStatus = 'registered' | 'activating' | 'active' | 'deactivating' | 'inactive';
 
 /// Where one activation stands, as a person reads it: its status, or
@@ -1017,31 +1027,31 @@ export type LifecycleStatus = 'registered' | 'activating' | 'active' | 'deactiva
 // SYNC: ActivationMode <-> crates/weft-core/src/activation.rs ActivationMode
 export type ActivationMode = 'registered' | 'activating' | 'active' | 'deactivating' | DeactivationSpec['mode'];
 
-// SYNC: ActivationEntry <-> crates/weft-dispatcher/src/api/project.rs ActivationEntry
+// SYNC: ActivationEntry <-> crates/weft-core/src/projects.rs ActivationEntry
 export interface ActivationEntry {
   trigger: string;
-  member?: string;
-  // SYNC: status <-> crates/weft-broker-client/src/protocol.rs ProjectStatus
+  instance?: string;
+  // SYNC: status <-> crates/weft-core/src/projects.rs ProjectStatus
   status: LifecycleStatus;
   // SYNC: mode <-> crates/weft-core/src/activation.rs ActivationMode
   mode: ActivationMode;
-  /// A member's fires parked until the member gives a value they need:
+  /// An instance's fires parked until the instance has a value they need:
   /// how many, and why (the refusal naming the field).
   // SYNC: waiting <-> crates/weft-core/src/program.rs WaitingFires
   waiting?: { fires: number; reason: string };
 }
 
-/// One member's copy of an infra node, as the project status lists it.
-// SYNC: MemberCopyEntry <-> crates/weft-dispatcher/src/api/project.rs MemberCopyEntry
-export interface MemberCopyEntry {
+/// One instance's copy of an infra node, as the project status lists it.
+// SYNC: InstanceInfraEntry <-> crates/weft-core/src/projects.rs InstanceInfraEntry
+export interface InstanceInfraEntry {
   node: string;
-  member: string;
+  instance: string;
   status: string;
 }
 
 /// The parent run and the original run supplying each reused result,
 /// per place (a `locatedKey`).
-// SYNC: Seed <-> crates/weft-journal/src/events.rs Seed
+// SYNC: Seed <-> crates/weft-core/src/run_spec.rs Seed
 export interface Seed {
   parent: string;
   origins: Record<string, string>;
@@ -1087,14 +1097,14 @@ export interface NodeExecEvent {
   /// (`weft run --seed`) and reused it instead of firing the node
   /// again. The graph marks the node inherited. Absent on the run's
   /// own firings.
-  // SYNC: inheritedFrom <-> crates/weft-dispatcher/src/events.rs DispatcherEvent inherited_from
+  // SYNC: inheritedFrom <-> crates/weft-core/src/live_event.rs DispatcherEvent inherited_from
   inheritedFrom?: string;
   /// Input ports whose value a person provided (a scoped run's
   /// `--from node='{"port":value}'`), on `running`. The inspector paints
   /// them as provided by hand.
-  // SYNC: providedPorts <-> crates/weft-dispatcher/src/events.rs DispatcherEvent provided_ports
+  // SYNC: providedPorts <-> crates/weft-core/src/live_event.rs DispatcherEvent provided_ports
   providedPorts?: string[];
-  // SYNC: input origins <-> crates/weft-dispatcher/src/events.rs DispatcherEvent, extension-vscode/src/execFollower.ts DispatcherEvent, packages/weft-graph/src/webview/lib/types/index.ts NodeExecution
+  // SYNC: input origins <-> crates/weft-core/src/live_event.rs DispatcherEvent, extension-vscode/src/execFollower.ts DispatcherEvent, packages/weft-graph/src/webview/lib/types/index.ts NodeExecution
   backupPorts?: string[];
   inheritedPorts?: Record<string, string>;
 }
@@ -1113,7 +1123,7 @@ export type LoopTerminationReason =
   | 'failed';
 
 export type LoopInspectorEvent =
-  // SYNC: LoopInspectorEvent 'instantiated' <-> crates/weft-dispatcher/src/events.rs LoopInstantiated, extension-vscode/src/execFollower.ts loop_instantiated
+  // SYNC: LoopInspectorEvent 'instantiated' <-> crates/weft-core/src/live_event.rs LoopInstantiated, extension-vscode/src/execFollower.ts loop_instantiated
   | {
       kind: 'instantiated';
       groupId: string;
@@ -1188,6 +1198,7 @@ export type BusInspectorEvent =
   /// from <sender>"). `offset` is the window's first offset (the
   /// dedup key the log store uses). Journaled buses never produce
   /// this: their windows unpack into per-message `message` events.
+  // SYNC: BusInspectorEvent 'window' <-> crates/weft-journal/src/events.rs BusWindow, crates/weft-core/src/live_event.rs BusWindow, extension-vscode/src/execFollower.ts DispatcherEvent 'bus_window'
   | {
       kind: 'window';
       busId: string;
@@ -1222,7 +1233,7 @@ export interface WindowedCallerMessage {
   atUnix: number;
 }
 
-// SYNC: CallerInspectorEvent 'window' <-> crates/weft-journal/src/events.rs CallerWindow, crates/weft-dispatcher/src/events.rs CallerWindow, extension-vscode/src/execFollower.ts DispatcherEvent 'caller_window'
+// SYNC: CallerInspectorEvent 'window' <-> crates/weft-journal/src/events.rs CallerWindow, crates/weft-core/src/live_event.rs CallerWindow, extension-vscode/src/execFollower.ts DispatcherEvent 'caller_window'
 export type CallerInspectorEvent =
   | { kind: 'connected'; offset: number; protocol: string; atUnix: number }
   | {
@@ -1344,7 +1355,7 @@ export type NodeFeedState =
 /// The BUILD-transition axis on the project row, orthogonal to
 /// `projectStatus`. While not 'none', the only offered action is
 /// cancel_build (the master transitional rule).
-// SYNC: ProjectTransition <-> crates/weft-dispatcher/src/project_store.rs ProjectTransition, crates/weft-dispatcher/src/api/project.rs ProjectStatusResponse.transition, packages/weft-graph/src/status.ts VALID_TRANSITIONS
+// SYNC: ProjectTransition <-> crates/weft-core/src/projects.rs ProjectTransition, packages/weft-graph/src/status.ts VALID_TRANSITIONS
 export type ProjectTransition = 'none' | 'building' | 'cancelling_build';
 
 /// Trigger-deactivation spec the shared picker produces and the verbs
@@ -1374,7 +1385,7 @@ export interface DeactivationSpec {
 // SYNC: DEFAULT_DRAIN_TIMEOUT_SECS <-> crates/weft-core/src/running_policy.rs DEFAULT_DRAIN_TIMEOUT_SECS
 export const DEFAULT_DRAIN_TIMEOUT_SECS = 60;
 
-// SYNC: ActionAvailability <-> crates/weft-dispatcher/src/api/project.rs ProjectStatusResponse
+// SYNC: ActionAvailability <-> crates/weft-core/src/projects.rs ProjectStatusResponse
 export interface ActionAvailability {
   /// Verbs the dispatcher will currently accept.
   availableActions: ActionVerb[];
@@ -1394,7 +1405,7 @@ export interface ActionAvailability {
   /// deactivating | inactive. Drives action-bar primary slot
   /// ("Activate" vs "Activating + Cancel" vs "Deactivate" vs
   /// "Cancel running / Resume" while deactivating).
-  // SYNC: projectStatus <-> crates/weft-broker-client/src/protocol.rs ProjectStatus, crates/weft-dispatcher/src/api/project.rs ProjectStatusResponse.status
+  // SYNC: projectStatus <-> crates/weft-core/src/projects.rs ProjectStatus
   projectStatus: LifecycleStatus | 'unknown';
   /// The build-transition axis. 'building'/'cancelling_build' render
   /// the unified transitional pattern (the launching button shows
@@ -1423,10 +1434,10 @@ export interface ActionAvailability {
   /// client deciding from the rollup alone would offer a button that
   /// can only fail.
   infraBusy: boolean;
-  /// Per-instance infra status. Used by graph decorations (badges
+  /// Per-placement infra status. Used by graph decorations (badges
   /// under each infra node), independent of the rollup. One entry per
   /// PLACE: a file included twice provisions its infra twice.
-  infraNodes: InfraInstanceStatus[];
+  infraNodes: InfraPlacementStatus[];
   /// Counts of preserved state, for the reactivate-time dialog.
   preservation: {
     /// Resume signals with parked_payload set (queued submissions).
@@ -1668,10 +1679,10 @@ export type BackendSnapshot = {
   firesDeadlineUnix?: number;
 };
 
-/// One infra INSTANCE's status, as `weft status` reports it.
-// SYNC: InfraInstanceStatus <-> crates/weft-dispatcher/src/api/project.rs ProjectInfraEntry, packages/weft-graph/src/status.ts RawStatusPayload.infra
-export interface InfraInstanceStatus {
-  /// The instance's place spelled the way a person writes it (`db`,
+/// One infra PLACEMENT's status, as `weft status` reports it.
+// SYNC: InfraPlacementStatus <-> crates/weft-core/src/projects.rs ProjectInfraEntry, packages/weft-graph/src/status.ts RawStatusPayload.infra
+export interface InfraPlacementStatus {
+  /// The node's placement spelled the way a person writes it (`db`,
   /// `one.db`), which is what a view matches against the node under
   /// the calls it walked into (`addressOf(callPath, id)`) and what the
   /// per-node verbs take.
@@ -1684,11 +1695,11 @@ export interface InfraInstanceStatus {
   /// stopping before the supervisor reaches the copy), and for a place
   /// with no shared copy:
   ///   "not_started" (nothing started it yet)
-  ///   | "per_member" (a `@per_member` node: only members have copies)
-  // SYNC: "not_started" / "per_member" <-> crates/weft-dispatcher/src/api/project.rs INFRA_NOT_STARTED, INFRA_PER_MEMBER
+  ///   | "per_instance" (a `@per_instance` node: only instances have copies)
+  // SYNC: "not_started" / "per_instance" <-> crates/weft-core/src/infra/wire.rs INFRA_NOT_STARTED, INFRA_PER_INSTANCE
   status: string;
-  /// For a `per_member` place: how many members have a copy.
-  memberCopies?: number;
+  /// For a `per_instance` place: how many instances have a copy.
+  instanceCopyCount?: number;
   /// Set when status=failed: which stage of the apply pipeline
   /// failed (`provision` | `apply` | `execute` | `apply_lifecycle`).
   failureStage?: string;
@@ -1718,7 +1729,7 @@ export type ActionBarOverlay =
 
 /// A verb whose trigger-deactivation choice the dispatcher may ask for.
 /// Only the dispatcher knows whether any trigger is on (the program's or
-/// a member's), so the webview sends these without a choice and opens
+/// an instance's), so the webview sends these without a choice and opens
 /// its picker when the host answers `needsTriggerChoice`.
 export type TriggerChoiceIntent = 'resync' | 'infraStop' | 'infraTerminate' | 'infraUpgrade';
 
@@ -1821,7 +1832,7 @@ export type HostMessage =
   /// (`locatedKey`s; `null` = the whole graph), so every other node
   /// paints as not in this run, and the run it was seeded from with
   /// what it re-ran.
-  // SYNC: execScope <-> crates/weft-dispatcher/src/events.rs DispatcherEvent::ExecutionStarted (subgraph, seed)
+  // SYNC: execScope <-> crates/weft-core/src/live_event.rs DispatcherEvent::ExecutionStarted (subgraph, seed)
   | { kind: 'execScope'; executionId: string; subgraph: string[] | null; seed: Seed | null }
   /// Which version the followed run ran, and which version the files on
   /// disk are (`null` when the disk matches no recorded version), so the
@@ -1858,8 +1869,15 @@ export type HostMessage =
   /// this run was seeded from that one and reused its work: the money
   /// is real but it was not spent again, so a total that adds it is
   /// counting it twice.
-  // SYNC: execCost <-> extension-vscode/src/execFollower.ts DispatcherEvent 'cost_reported', crates/weft-dispatcher/src/events.rs CostReported
+  // SYNC: execCost <-> extension-vscode/src/execFollower.ts DispatcherEvent 'cost_reported', crates/weft-core/src/live_event.rs CostReported
   | { kind: 'execCost'; nodeId: string; frames: Frame[]; costId: string; service: string; inheritedFrom: string | null; amountUsd: number | null; origin: CredentialOwner }
+  /// One change a firing made to a stored file's content in place, for
+  /// the inspector's "Files edited" card. The same change can arrive via
+  /// both the replay and the live stream; the reducer dedups on the file's
+  /// key and the version the change produced (each version is reached
+  /// once). `inheritedFrom` as on `execCost`.
+  // SYNC: execFileEdit <-> extension-vscode/src/execFollower.ts DispatcherEvent 'file_edited', crates/weft-core/src/live_event.rs FileEdited
+  | { kind: 'execFileEdit'; nodeId: string; frames: Frame[]; inheritedFrom: string | null; edit: FileEditWire }
   /// One bus event (live or replay). Carries only what the bus layer
   /// recorded: join / left / message / closed keyed by `busId`.
   /// Routing to node inspector panels is a SEPARATE signal,
@@ -2049,7 +2067,7 @@ export type WebviewMessage =
   /// Cancel the in-flight build (transition=building).
   | { kind: 'cancelBuild' }
   /// Per-node Stop (graph menu, partial-state recovery). `node` is the
-  /// instance's PLACE as a person spells it (`one.db`), the node under
+  /// node's PLACEMENT as a person spells it (`one.db`), the node under
   /// the calls the view walked into: what `weft infra node-stop` takes.
   | { kind: 'infraNodeStop'; node: string }
   /// Per-node Terminate (graph menu, partial-state recovery); see above.
@@ -2193,6 +2211,7 @@ export type WebviewMessage =
   | { kind: 'listRuntimeFiles'; requestId: number };
 
 // SYNC: FileValueWire <-> crates/weft-core/src/storage/mod.rs StoredFile
+//       (`version` is backend-only: the editor never reads it)
 /// The payload INSIDE a concrete file marker: self-describing metadata
 /// plus exactly ONE handle saying where the bytes live. A bucket-backed
 /// file carries a `key` (bytes fetched via the authenticated handshake
@@ -2205,6 +2224,20 @@ export type FileValueWire = {
   sizeBytes: number;
   filename: string;
 } & ({ key: string; url?: undefined } | { url: string; key?: undefined });
+
+// SYNC: FileEditWire <-> crates/weft-core/src/storage/mod.rs FileEdit
+/// One change a firing made to a stored file: which file, the version it
+/// was made from (`null` for an overwrite that never read the file) and
+/// the one it produced, and a readable diff already cut to a readable
+/// size (changed lines prefixed `+`/`-`, context with a space, `@@`
+/// block headers; a file that is not text reads as its old and new size).
+export type FileEditWire = {
+  key: string;
+  filename: string;
+  fromVersion: number | null;
+  toVersion: number;
+  diff: string;
+};
 
 // SYNC: STORED_FILE_MARKER_TYPES <-> crates/weft-core/src/weft_type.rs FileKind
 /// The per-kind sentinel key -> primitive type. The marker IS the
@@ -2259,10 +2292,10 @@ export type EditOp =
   | { op: 'setConfig'; node: string; key: string; value: string; form?: 'inline' | 'connection' }
   | { op: 'removeConfig'; node: string; key: string; form?: 'inline' | 'connection' }
   | { op: 'setLabel'; node: string; label: string | null }
-  // Add or remove the node's `@per_member` line: the node then exists
-  // once per member of the program. Offered only on a node that may
-  // carry it (`canBePerMember`).
-  | { op: 'setPerMember'; node: string; perMember: boolean }
+  // Add or remove the node's `@per_instance` line: the node then exists
+  // once per instance of the program. Offered only on a node that may
+  // carry it (`canBePerInstance`).
+  | { op: 'setPerInstance'; node: string; perInstance: boolean }
   | { op: 'addNode'; id: string; nodeType: string; parentGroup: string | null }
   | { op: 'removeNode'; node: string }
   | { op: 'addEdge'; source: string; sourcePort: string; target: string; targetPort: string; scopeGroup: string | null; path?: string[] }
@@ -2339,9 +2372,13 @@ export interface RevertedPortSig {
 /// range `[start, end)` with `text`. The reversible-action unit for source: an
 /// applied edit yields its inverse edit, and the webview's undo stack stores
 /// inverses (source) alongside layout-op inverses. Byte offsets so empty
-/// replacements and trailing newlines are unambiguous.
+/// replacements and trailing newlines are unambiguous. `expected` is the text
+/// the range holds when the edit was made; applying refuses when it differs,
+/// so a stale undo never writes over a text edit.
+// SYNC: TextEdit <-> crates/weft-compiler/src/edit.rs TextEdit
 export interface TextEdit {
   start: number;
   end: number;
   text: string;
+  expected: string;
 }

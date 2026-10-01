@@ -4,73 +4,51 @@
 //! itself; what it leaves unset follows the install. A change applies to
 //! the running workers at once.
 
-use super::Ctx;
+use anyhow::Context;
+use weft_platform_traits::{WorkerOverrides, WorkersResponse};
 
-/// The levers a project sets, by the names the flags and the API use.
-pub struct WorkerLevers {
-    pub min_instances: Option<u32>,
-    pub max_instances: Option<u32>,
-    pub concurrency: Option<u32>,
-    pub cpu: Option<String>,
-    pub memory: Option<String>,
-    pub startup_boost: Option<bool>,
-    pub cpu_always_allocated: Option<bool>,
-}
+use super::Ctx;
 
 pub enum WorkersAction {
     Show,
-    Set(WorkerLevers),
+    /// Set these levers, keeping the ones the project already sets.
+    Set(WorkerOverrides),
     /// Put these levers back on the install's (every lever when empty).
     Reset(Vec<String>),
 }
 
-// SYNC: lever names <-> crates/weft-platform-traits/src/runner.rs (WorkerOverrides)
-const LEVERS: [&str; 7] =
-    ["min_instances", "max_instances", "concurrency", "cpu", "memory", "startup_boost", "cpu_always_allocated"];
-
 pub async fn run(ctx: Ctx, action: WorkersAction) -> anyhow::Result<()> {
     let (client, id, _) = super::resolve_project(&ctx)?;
     let path = format!("/projects/{id}/workers");
-    let current = client.get_json(&path).await?;
-    let answer = match action {
-        WorkersAction::Show => current,
-        WorkersAction::Set(l) => {
-            let mut project = current["project"].as_object().cloned().unwrap_or_default();
-            let mut put = |k: &str, v: Option<serde_json::Value>| {
-                if let Some(v) = v {
-                    project.insert(k.to_string(), v);
-                }
-            };
-            put("min_instances", l.min_instances.map(Into::into));
-            put("max_instances", l.max_instances.map(Into::into));
-            put("concurrency", l.concurrency.map(Into::into));
-            put("cpu", l.cpu.map(Into::into));
-            put("memory", l.memory.map(Into::into));
-            put("startup_boost", l.startup_boost.map(Into::into));
-            put("cpu_always_allocated", l.cpu_always_allocated.map(Into::into));
-            client.put_json(&path, &serde_json::Value::Object(project)).await?
-        }
+    let read = |v: serde_json::Value| -> anyhow::Result<WorkersResponse> {
+        serde_json::from_value(v).context("read the project's worker levers")
+    };
+    let current = read(client.get_json(&path).await?)?;
+    let project = match action {
+        WorkersAction::Show => None,
+        WorkersAction::Set(levers) => Some(current.project.merged(&levers)),
         WorkersAction::Reset(names) => {
-            for n in &names {
-                anyhow::ensure!(LEVERS.contains(&n.as_str()), "'{n}' is not a worker lever; the levers are {}", LEVERS.join(", "));
-            }
-            let mut project = current["project"].as_object().cloned().unwrap_or_default();
+            let mut project = current.project.clone();
             if names.is_empty() {
-                project.clear();
-            } else {
-                project.retain(|k, _| !names.contains(k));
+                project = WorkerOverrides::default();
             }
-            client.put_json(&path, &serde_json::Value::Object(project)).await?
+            for name in &names {
+                project.unset(name).map_err(anyhow::Error::msg)?;
+            }
+            Some(project)
         }
+    };
+    let answer = match project {
+        None => current,
+        Some(project) => read(client.put_json(&path, &serde_json::to_value(&project)?).await?)?,
     };
     if ctx.json_out(&answer)? {
         return Ok(());
     }
-    let project = answer["project"].as_object().cloned().unwrap_or_default();
-    for lever in LEVERS {
-        let value = &answer["effective"][lever];
-        let from = if project.contains_key(lever) { "this project" } else { "the install" };
-        println!("{lever:<22} {:<8} ({from})", value.to_string().trim_matches('"'));
+    let effective = serde_json::to_value(&answer.effective)?;
+    for lever in WorkerOverrides::LEVERS {
+        let from = if answer.project.sets(lever) { "this project" } else { "the install" };
+        println!("{lever:<22} {:<8} ({from})", effective[lever].to_string().trim_matches('"'));
     }
     Ok(())
 }

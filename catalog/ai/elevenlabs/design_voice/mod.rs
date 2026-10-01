@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use weft::access::client::post_json;
 use weft::node::NodeOutput;
 use weft::storage::{KeepTtl, StorageScope};
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
 
 use super::elevenlabs::API;
 
@@ -69,9 +69,7 @@ impl Node for ElevenLabsDesignVoiceNode {
             weft::node_bail!("elevenlabs answered no previews for this description");
         }
 
-        let ty = ctx
-            .output_type("previews")
-            .node_err("the previews port declares no type")?;
+        let ty = ctx.output_type("previews")?;
         let stored = ctx
             .storage(StorageScope::Execution)
             // The preview clips are the run's product: keep them past

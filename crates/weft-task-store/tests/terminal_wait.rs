@@ -48,7 +48,7 @@ fn task(dedup: &str) -> tasks::NewTask {
         dedup_key: Some(dedup.to_string()),
         execution_id: None,
         tenant_id: "tenant-1".to_string(),
-        target_instance: None,
+        target_replica: None,
         binary_hash: None,
         payload: json!({}),
     }

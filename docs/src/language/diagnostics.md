@@ -48,6 +48,7 @@ a slug per cause.
 | `input-accepts` | The port does not take this kind of driver: a wire on a literal-only port, a written value on a wire-only port | Use the one it takes; the message lists them |
 | `gate-not-boolean` | A written `_should_flow` or `_should_not_flow` is not a Boolean | Write `true` or `false`, or wire it |
 | `literal-out-of-range` | A written number is outside the input's `min` and `max`, or off its whole-number step | Write a value inside the declared range |
+| `literal-not-an-option` | A written value is not one of the input's dropdown `options` (for a multiselect, one item is not). A dropdown marked `free_text` never raises it | Write one of the options; the message lists them |
 | `value-on-output` | You wrote a value for an output port | Remove it. Outputs are filled by the node, and you read them with `node.port` |
 | `undeclared-port-no-custom` | A key names no input, on a node that does not take added inputs | Fix the key, or use a node with `canAddInputPorts` |
 | `config-null-literal` (warning) | A key is written `key: null`, which does nothing | Leave the key out and let the default apply |
@@ -130,16 +131,16 @@ or a switch's cases.
 | `route-method-unknown` | That is not an HTTP method | Fix it |
 | `route-overlap` | Two nodes claim addresses one call could reach, and neither is more specific | Make one spell out what the other captures, or change a path or a method |
 
-## Members
+## Instances
 
 | Slug | What it found | What to do |
 |---|---|---|
-| `per-member-ineligible` | `@per_member` on a node that runs no container of its own. Only an infra node can carry it | Remove it; for a value each member gives (their connection included), write `@member_filled` on the field |
-| `member-filled-wired` | A `@member_filled` field also has a wire into it | Remove the wire, or the marker |
-| `member-filled-boundary` | `@member_filled` on a group's or included file's own port | Write it on the input of the node inside that reads the value |
-| `member-filled-not-an-input` | `@member_filled` on a key that is not one of the node's inputs | Put it on an input |
+| `per-instance-ineligible` | `@per_instance` on a node that runs no container of its own. Only an infra node can carry it | Remove it; for a value each instance gets (its connection included), write `@instance_filled` on the field |
+| `instance-filled-wired` | An `@instance_filled` field also has a wire into it | Remove the wire, or the marker |
+| `instance-filled-boundary` | `@instance_filled` on a group's or included file's own port | Write it on the input of the node inside that reads the value |
+| `instance-filled-not-an-input` | `@instance_filled` on a key that is not one of the node's inputs | Put it on an input |
 
-For what `@per_member` and `@member_filled` do, go and read [Programs with members](../running/members.md).
+For what `@per_instance` and `@instance_filled` do, go and read [Programs with instances](../running/instances.md).
 
 ## Types you named
 

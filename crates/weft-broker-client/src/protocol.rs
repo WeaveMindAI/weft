@@ -18,96 +18,9 @@ use weft_task_store::tasks::{ClaimFilter, NewTask, Task, TaskOutcome, TaskStatus
 /// again.
 pub use weft_task_store::pg_signal::MAX_HOLD;
 
-// =================================================================
-// Wire-enum helper
-// =================================================================
-//
-// Every enum that crosses a process boundary as a TEXT column or a
-// JSON string field uses this macro. Single source of truth for
-// the variant <-> string mapping: the serde `rename_all` attribute.
-// No more dual `as_str/parse` tables that drift apart.
-//
-// Generates:
-// - the enum itself with `#[derive(...Serialize, Deserialize)]` and
-//   `#[serde(rename_all = "snake_case")]`
-// - `as_str(self) -> &'static str` using the same casing rule
-// - `parse(s: &str) -> Option<Self>` driven by the same serde derive
-//   (via `serde::Deserialize::deserialize(StrDeserializer::new(s))`)
-// - `pub const VARIANTS: &[Self]` for iteration (e.g. the
-//   auto-generated round-trip tests walk it)
-//
-// Add or rename a variant in ONE place; everything follows.
-macro_rules! wire_enum {
-    (
-        $(#[$enum_meta:meta])*
-        $vis:vis enum $name:ident {
-            $(
-                $(#[$variant_meta:meta])*
-                $variant:ident = $str:literal
-            ),+ $(,)?
-        }
-    ) => {
-        $(#[$enum_meta])*
-        #[derive(
-            Debug, Clone, Copy, PartialEq, Eq, Hash,
-            ::serde::Serialize, ::serde::Deserialize,
-        )]
-        #[serde(rename_all = "snake_case")]
-        $vis enum $name {
-            $(
-                $(#[$variant_meta])*
-                #[serde(rename = $str)]
-                $variant,
-            )+
-        }
-
-        impl $name {
-            pub const fn as_str(self) -> &'static str {
-                match self {
-                    $( Self::$variant => $str, )+
-                }
-            }
-            pub fn parse(s: &str) -> ::core::option::Option<Self> {
-                match s {
-                    $( $str => ::core::option::Option::Some(Self::$variant), )+
-                    _ => ::core::option::Option::None,
-                }
-            }
-            pub const VARIANTS: &'static [Self] = &[ $( Self::$variant ),+ ];
-        }
-
-        impl ::core::fmt::Display for $name {
-            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
-                f.write_str(self.as_str())
-            }
-        }
-    };
-}
-
-/// Generate one round-trip `#[test]` per `wire_enum!`. Each test
-/// walks `T::VARIANTS` and asserts `parse(as_str) == Some(v)`, the
-/// serde wire form equals `"<as_str>"`, and decode round-trips.
-/// New variants are covered automatically (driven off `VARIANTS`);
-/// adding a new wire enum means adding one line to the invocation
-/// at the bottom of this file.
-#[cfg(test)]
-macro_rules! wire_enum_roundtrip_tests {
-    ( $( $name:ident ),+ $(,)? ) => {
-        $(
-            #[allow(non_snake_case)]
-            #[test]
-            fn $name() {
-                for v in $name::VARIANTS {
-                    assert_eq!($name::parse(v.as_str()), Some(*v), "parse(as_str) {v:?}");
-                    let json = serde_json::to_string(v).expect("serialize");
-                    assert_eq!(json, format!("\"{}\"", v.as_str()), "wire form {v:?}");
-                    let back: $name = serde_json::from_str(&json).expect("deserialize");
-                    assert_eq!(back, *v, "round-trip {v:?}");
-                }
-            }
-        )+
-    };
-}
+// The wire-enum helper is weft-core's (`weft_core::wire_enum!`), so an
+// enum can live beside the messages that carry it in any crate.
+use weft_core::wire_enum;
 
 // =================================================================
 // Typed wire enums
@@ -181,26 +94,9 @@ pub struct UnitRuntime {
     pub image_refs: std::collections::BTreeSet<String>,
 }
 
-wire_enum! {
-    /// Lifecycle status of a project row, written into
-    /// `project.status`. Both the dispatcher (writer) and the
-    /// supervisor (reader, via the broker) consume this enum.
-    /// SYNC: ProjectStatus <-> packages/weft-graph/src/protocol.ts LifecycleStatus,
-    ///       crates/weft-dispatcher/src/api/project.rs ProjectStatusResponse.status
-    pub enum ProjectStatus {
-        /// Fresh row, never activated.
-        Registered = "registered",
-        /// Transient: user clicked activate; trigger setup in flight.
-        Activating = "activating",
-        /// Live; worker pool spawns on demand and fires execute.
-        Active = "active",
-        /// Transient: user clicked deactivate with runningPolicy=wait;
-        /// running executions are draining.
-        Deactivating = "deactivating",
-        /// Idle; gate refuses / parks fires per the lifecycle axes.
-        Inactive = "inactive",
-    }
-}
+/// Lifecycle status of a project row: weft-core's, since the CLI reads it
+/// in the project status too.
+pub use weft_core::projects::ProjectStatus;
 
 wire_enum! {
     /// `infra_node.failure_stage` discriminator. Set whenever
@@ -219,11 +115,11 @@ wire_enum! {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalRecordRequest {
     pub event: ExecEvent,
-    /// The writing worker's instance id: the broker takes the write only
-    /// from the instance that owns the execution's claim. Always present: only
+    /// The writing worker's replica id: the broker takes the write only
+    /// from the replica that owns the execution's claim. Always present: only
     /// workers write through this request (every caller passes its own), and the dispatcher's own in-process writes
     /// bypass this struct entirely.
-    pub instance: String,
+    pub replica: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,7 +131,7 @@ pub struct JournalRecordResponse {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalRecordRetroactiveRequest {
     pub events: Vec<ExecEvent>,
-    pub instance: String,
+    pub replica: String,
 }
 
 /// `POST /v1/journal/forget_unrecorded`: an unrecorded run ended without
@@ -243,7 +139,7 @@ pub struct JournalRecordRetroactiveRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalForgetUnrecordedRequest {
     pub execution_id: String,
-    pub instance: String,
+    pub replica: String,
 }
 
 // ---------- Execution steering (`ctx.tag_execution` / `ctx.stop_tagged`) ----------
@@ -260,7 +156,7 @@ pub struct ExecutionTagRequest {
     /// Already validated by the ctx (`weft_core::tag`); the broker
     /// validates again, because it trusts no process.
     pub tags: Vec<String>,
-    pub instance: String,
+    pub replica: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,7 +175,7 @@ pub struct ExecutionStopTaggedRequest {
     pub execution_id: String,
     pub tag: String,
     pub stop_self: weft_core::StopSelf,
-    pub instance: String,
+    pub replica: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -375,7 +271,7 @@ impl TaskWaitTerminalResponse {
 /// claimable yet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskClaimOneRequest {
-    pub instance: String,
+    pub replica: String,
     pub filter: ClaimFilter,
     pub wait_ms: u64,
 }
@@ -388,7 +284,7 @@ pub struct TaskClaimOneResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskHeartbeatRequest {
     pub task_id: Uuid,
-    pub instance: String,
+    pub replica: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -399,7 +295,7 @@ pub struct TaskHeartbeatResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskCompleteRequest {
     pub task_id: Uuid,
-    pub instance: String,
+    pub replica: String,
     pub result: Value,
 }
 
@@ -409,7 +305,7 @@ pub struct TaskCompleteResponse {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRequeueRequest {
     pub task_id: Uuid,
-    pub instance: String,
+    pub replica: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -422,7 +318,7 @@ pub struct TaskRequeueResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskFailRequest {
     pub task_id: Uuid,
-    pub instance: String,
+    pub replica: String,
     pub error: String,
 }
 
@@ -448,16 +344,16 @@ pub struct TaskWaitCancelsResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfraEndpointUrlRequest {
-    /// The asking run. The broker resolves its project and member from
-    /// it, so a run reaches only its own member's copy.
+    /// The asking run. The broker resolves its project and instance from
+    /// it, so a run reaches only its own instance's copy.
     pub execution_id: weft_core::ExecutionId,
-    /// The instance's place spelling (see `InfraEnqueueApplyRequest`):
+    /// The node's placement spelling (see `InfraEnqueueApplyRequest`):
     /// the asking node's own place, so a node inside a file included
-    /// twice reaches the instance of its own call.
+    /// twice reaches the placement of its own call.
     pub node_id: String,
-    /// Whether the node exists once per member: then the copy is the
-    /// run's member's, else the shared one.
-    pub per_member: bool,
+    /// Whether the node exists once per instance: then the copy is the
+    /// run's instance's, else the shared one.
+    pub per_instance: bool,
     pub endpoint_name: String,
 }
 
@@ -537,11 +433,11 @@ pub struct PublishAccessRequest {
     pub values: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub label: Option<String>,
-    /// Whether the publishing node exists once per member: its
-    /// connection is then the run member's (whose, the broker reads off
+    /// Whether the publishing node exists once per instance: its
+    /// connection is then the run instance's (whose, the broker reads off
     /// the run, never from here), else the shared one.
     #[serde(default)]
-    pub per_member: bool,
+    pub per_instance: bool,
 }
 
 /// The reference the publisher gets back, to put on its output port.
@@ -556,25 +452,25 @@ pub struct PublishedAccessRequest {
     pub execution_id: String,
     pub node_id: String,
     pub service: String,
-    /// As on [`PublishAccessRequest::per_member`].
+    /// As on [`PublishAccessRequest::per_instance`].
     #[serde(default)]
-    pub per_member: bool,
+    pub per_instance: bool,
 }
 
-/// Worker: mint a member token for a member of the run's own project
-/// (`ctx.tokens().mint_for_member`). The project is the run's.
+/// Worker: mint an instance token for one instance of the run's own
+/// project (`ctx.tokens().mint_for_instance`). The project is the run's.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProgramMintMemberTokenRequest {
+pub struct ProgramMintInstanceTokenRequest {
     /// The token's id, chosen by the run and journaled before this
     /// request: a replayed run mints under the same id, which replaces
     /// that token (a new value, the old one dead) instead of leaving a
     /// second one behind.
     pub id: uuid::Uuid,
     pub execution_id: String,
-    pub member: weft_core::member::MemberId,
+    pub instance: weft_core::instance::InstanceId,
     /// How long it works, in seconds; required, a year at most.
     pub expires_in_secs: u64,
-    /// Whether it reads its member's copies' displays (a bridge's pairing
+    /// Whether it reads its instance's copies' displays (a bridge's pairing
     /// code).
     #[serde(default)]
     pub displays: bool,
@@ -695,15 +591,15 @@ pub struct ProjectFetchDefinitionResponse {
 /// authority.
 /// Claim + renew + report ownership in one atomic broker round-trip.
 /// The pooled supervisor calls this on its ownership tick: the broker
-/// renews this instance's existing project leases and claims a batch
+/// renews this replica's existing project leases and claims a batch
 /// more unowned-or-expired projects' infra for it (the EXCLUSIVE lease
 /// that keeps two supervisors off the same project), then returns the
-/// full set this instance now owns. Both work loops
+/// full set this replica now owns. Both work loops
 /// (lifecycle, health) then act ONLY on the returned set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorSyncOwnershipRequest {
-    /// The supervisor instance syncing its ownership.
-    pub instance: String,
+    /// The supervisor replica syncing its ownership.
+    pub replica: String,
     /// Every project the caller's host holds a copy of. Each is claimed
     /// and renewed like a project with infra to manage, even when it has
     /// none any more, because the gone-copy sweep judges and deletes a
@@ -740,12 +636,12 @@ pub struct SupervisorProject {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorSyncOwnershipResponse {
-    /// Every project this instance now owns (after renew + claim). The work
+    /// Every project this replica now owns (after renew + claim). The work
     /// loops act only on these.
     pub owned: Vec<SupervisorProject>,
     /// The projects among `owned` this tick took on: freshly claimed, or
-    /// this instance's own lease revived after it lapsed. A command issued
-    /// on one of them while nobody held it woke none of this instance's
+    /// this replica's own lease revived after it lapsed. A command issued
+    /// on one of them while nobody held it woke none of this replica's
     /// claims, so it asks again at once when this is not empty.
     pub claimed: Vec<Uuid>,
 }
@@ -757,7 +653,7 @@ pub struct SupervisorSyncOwnershipResponse {
 /// doing work.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorOwnedProjectsRequest {
-    pub instance: String,
+    pub replica: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -779,7 +675,7 @@ pub struct SupervisorOwnedProjectsResponse {
 /// for anyone: nothing can apply it until it is registered again.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorGoneCopiesRequest {
-    pub instance: String,
+    pub replica: String,
     pub project: Uuid,
     /// Copies of `project` only; any other is refused (HTTP 400).
     pub copies: Vec<weft_core::infra::NodeRef>,
@@ -787,7 +683,7 @@ pub struct SupervisorGoneCopiesRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorGoneCopiesResponse {
-    /// The gone copies' instance ids.
+    /// The gone copies' ids.
     pub gone: Vec<String>,
 }
 
@@ -798,11 +694,11 @@ pub struct SupervisorInfraNodesRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorInfraNode {
-    /// The instance's place spelling (see `InfraEnqueueApplyRequest`).
+    /// The node's placement spelling (see `InfraEnqueueApplyRequest`).
     pub node_id: String,
     /// Whose copy: `None` for the shared one.
-    pub member: Option<weft_core::member::MemberId>,
-    pub instance_id: String,
+    pub instance: Option<weft_core::instance::InstanceId>,
+    pub copy_id: String,
     pub status: InfraNodeStatus,
     pub applied_spec_hash: Option<String>,
     /// When the last apply of this copy finished (unix seconds), `None`
@@ -849,7 +745,7 @@ pub struct SupervisorClaimCommandRequest {
     /// command ONLY for a project whose infra it currently owns (the
     /// `infra_owner` exclusive lease), so two supervisors never change
     /// the same project's infrastructure.
-    pub claimer_instance: String,
+    pub claimer_replica: String,
     /// The projects this process is running a command for right now. Their
     /// next command waits until that one completes, so one project's
     /// commands run in order while different projects' run side by side.
@@ -879,9 +775,9 @@ pub struct SupervisorCommandRow {
     pub project_id: Uuid,
     pub node_id: Option<String>,
     /// Which copies the command acts on (an apply names exactly one:
-    /// shared, or one member's). Absent reads as the shared copies.
+    /// shared, or one instance's). Absent reads as the shared copies.
     #[serde(default)]
-    pub copies: weft_core::member::Copies,
+    pub copies: weft_core::instance::Copies,
     pub verb: InfraLifecycleVerb,
     /// Whether the supervisor should wait for the project's
     /// running-execution count to reach 0 before performing the
@@ -912,7 +808,7 @@ pub struct SupervisorCommandRow {
 /// A terminate command's work, carried in its `spec_json`: what the
 /// terminate does with the disks the node lists in `keepOnTerminate`.
 /// On the command because it is the asker's answer, never the copy's: a
-/// person's terminate keeps them, a member's wipe deletes them.
+/// person's terminate keeps them, an instance's wipe deletes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TerminateWork {
@@ -939,7 +835,7 @@ pub struct SupervisorEventRecordRequest {
     /// Whose copy the event is about: `None` for the shared one (or a
     /// project-level event).
     #[serde(default)]
-    pub member: Option<weft_core::member::MemberId>,
+    pub instance: Option<weft_core::instance::InstanceId>,
     pub kind: InfraEventKind,
     pub payload: serde_json::Value,
 }
@@ -1006,7 +902,7 @@ pub enum InfraEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartedPayload {
-    pub instance_id: String,
+    pub copy_id: String,
     pub mode: StartMode,
 }
 
@@ -1103,21 +999,21 @@ impl InfraEvent {
     }
 }
 
-/// The supervisor's claim identity on a lifecycle write: its instance
+/// The supervisor's claim identity on a lifecycle write: its replica
 /// id, the SAME string it claims commands with and that keys its
 /// `infra_owner` lease. The broker's ownership gate compares the lease
 /// against THIS, so the supervisor sends it explicitly, exactly as it
 /// does on `claim_command` / `sync_ownership`.
-// SYNC: supervisor instance (its instance id, the infra_owner lease key) <-> crates/weft-infra-supervisor/src/lib.rs (SupervisorState.instance, sent by lifecycle.rs/health.rs/ownership.rs), crates/weft-broker-client/src/lifecycle_command.rs (owns_project_predicate, gating infra_owner.supervisor_instance = req.instance in weft-broker/src/handlers.rs)
+// SYNC: supervisor replica (its replica id, the infra_owner lease key) <-> crates/weft-infra-supervisor/src/lib.rs (SupervisorState.replica, sent by lifecycle.rs/health.rs/ownership.rs), crates/weft-broker-client/src/lifecycle_command.rs (owns_project_predicate, gating infra_owner.supervisor_replica = req.replica in weft-broker/src/handlers.rs)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorSetStatusRequest {
-    /// The supervisor's claim identity (its instance id); the broker
+    /// The supervisor's claim identity (its replica id); the broker
     /// checks it holds the project's live `infra_owner` lease.
-    pub instance: String,
+    pub replica: String,
     /// `infra_lifecycle_command.id` the supervisor is executing,
     /// if this write is part of a lifecycle command (Stop /
     /// Terminate / Apply transitions). The broker checks the caller
-    /// still OWNS the project (live `infra_owner` lease for `instance`)
+    /// still OWNS the project (live `infra_owner` lease for `replica`)
     /// before applying the write; a supervisor that lost ownership
     /// (drain / lease takeover) can't stamp statuses for a project
     /// another process now owns.
@@ -1130,7 +1026,7 @@ pub struct SupervisorSetStatusRequest {
     pub project_id: Uuid,
     pub node_id: String,
     /// Whose copy: `None` for the shared one.
-    pub member: Option<weft_core::member::MemberId>,
+    pub instance: Option<weft_core::instance::InstanceId>,
     /// The unit whose status this write sets. `Some(unit)` updates that
     /// unit's entry in `units_json` and recomputes the node-level
     /// rollup; the autonomous health loop always targets a unit.
@@ -1148,14 +1044,14 @@ pub struct SupervisorSetStatusRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorSetStatusResponse {}
 
-/// Atomic post-apply state write: status, instance_id, applied spec
+/// Atomic post-apply state write: status, copy_id, applied spec
 /// hash, endpoints map. Supervisor calls this on successful apply.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorSetAppliedRequest {
-    /// The supervisor's claim identity (its instance id); the broker
+    /// The supervisor's claim identity (its replica id); the broker
     /// gates the UPSERT on it holding the project's live `infra_owner`
-    /// lease. See [`SupervisorSetStatusRequest::instance`].
-    pub instance: String,
+    /// lease. See [`SupervisorSetStatusRequest::replica`].
+    pub replica: String,
     /// `infra_lifecycle_command.id` the supervisor is executing.
     /// The broker rejects the UPSERT if the caller no longer OWNS the
     /// project; prevents a displaced supervisor from resurrecting a row
@@ -1165,8 +1061,8 @@ pub struct SupervisorSetAppliedRequest {
     pub project_id: Uuid,
     pub node_id: String,
     /// Whose copy: `None` for the shared one.
-    pub member: Option<weft_core::member::MemberId>,
-    pub instance_id: String,
+    pub instance: Option<weft_core::instance::InstanceId>,
+    pub copy_id: String,
     pub applied_spec_hash: String,
     #[serde(flatten)]
     pub addresses: AppliedEndpoints,
@@ -1176,6 +1072,11 @@ pub struct SupervisorSetAppliedRequest {
     /// access to the spec). No `serde(default)`: broker and supervisor
     /// deploy together; a missing field is schema drift.
     pub keep_disks: Vec<String>,
+    /// What the host gives this copy other than what its spec asks, one
+    /// plain sentence each (`InfraHost::notes`); empty when it runs the
+    /// copy as asked. Stamped on the row, so every status read tells the
+    /// person starting it.
+    pub notes: Vec<String>,
     /// Per-unit runtime, resolved from the spec's units at apply.
     /// Status is set to `Running` for every unit here (apply success
     /// = all units up). The health loop then maintains per-unit
@@ -1208,23 +1109,23 @@ pub struct AppliedEndpoints {
 
 /// Supervisor-callable: write or update the `infra_node` row at
 /// `Provisioning` status BEFORE the apply begins. Locks in the
-/// (instance_id, keep_disks) pair so that a partial-apply failure leaves
+/// (copy_id, keep_disks) pair so that a partial-apply failure leaves
 /// a visible row naming the half-started copy. The user's Terminate then
-/// works (the host removes the copy by its instance id, keeping
+/// works (the host removes the copy by its copy id, keeping
 /// `keep_disks`). On apply success, `set_applied` flips Provisioning ->
 /// Running and fills endpoints + applied_spec_hash.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorSetProvisioningRequest {
-    /// The supervisor's claim identity (its instance id); the broker
+    /// The supervisor's claim identity (its replica id); the broker
     /// gates the write on it holding the project's live `infra_owner`
-    /// lease. See [`SupervisorSetStatusRequest::instance`].
-    pub instance: String,
+    /// lease. See [`SupervisorSetStatusRequest::replica`].
+    pub replica: String,
     pub command_id: i64,
     pub project_id: Uuid,
     pub node_id: String,
     /// Whose copy: `None` for the shared one.
-    pub member: Option<weft_core::member::MemberId>,
-    pub instance_id: String,
+    pub instance: Option<weft_core::instance::InstanceId>,
+    pub copy_id: String,
     /// Carried forward to `set_applied`; needed at Terminate time
     /// even when the apply never reaches success.
     pub keep_disks: Vec<String>,
@@ -1297,7 +1198,7 @@ pub enum TakeDownReach {
     Project,
     /// The activations whose triggers read one of the `broken` copies,
     /// and nothing else. A shared copy is read by every owner's triggers
-    /// that read the node; a member's copy only by that member's. Never
+    /// that read the node; an instance's copy only by that instance's. Never
     /// empty: a take-down aimed at no copy is refused.
     ReadersOf { broken: Vec<InfraCopy> },
 }
@@ -1320,7 +1221,7 @@ impl TakeDownReaders {
 pub struct InfraCopy {
     pub node_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub member: Option<weft_core::member::MemberId>,
+    pub instance: Option<weft_core::instance::InstanceId>,
 }
 
 impl LifecycleSpec {
@@ -1419,15 +1320,15 @@ pub struct SupervisorEnqueueLifecycleResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfraEnqueueApplyRequest {
     pub project_id: Uuid,
-    /// The instance's PLACE, spelled the way a person writes the node
+    /// The node's PLACEMENT, spelled the way a person writes the node
     /// (`db`, or `one.db` inside the file the site `one` includes): the
     /// key its `infra_node` row and every resource are made under. A
     /// file included twice is applied twice, once per place.
     pub node_id: String,
-    /// Whose copy: the setup run's member, for a node that exists once
-    /// per member; `None` for a shared node.
+    /// Whose copy: the setup run's instance, for a node that exists once
+    /// per instance; `None` for a shared node.
     #[serde(default)]
-    pub member: Option<weft_core::member::MemberId>,
+    pub instance: Option<weft_core::instance::InstanceId>,
     pub spec_json: serde_json::Value,
 }
 
@@ -1568,14 +1469,14 @@ pub fn units_json_repair_sql(project_id: uuid::Uuid, node_id: &str) -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorRemoveNodeRequest {
-    /// The supervisor's claim identity (its instance id); the broker
+    /// The supervisor's claim identity (its replica id); the broker
     /// gates the cascade-delete on it holding the project's live
-    /// `infra_owner` lease. See [`SupervisorSetStatusRequest::instance`].
-    pub instance: String,
+    /// `infra_owner` lease. See [`SupervisorSetStatusRequest::replica`].
+    pub replica: String,
     pub project_id: Uuid,
     pub node_id: String,
     /// Whose copy: `None` for the shared one.
-    pub member: Option<weft_core::member::MemberId>,
+    pub instance: Option<weft_core::instance::InstanceId>,
     /// The terminate removing it: the one command of this copy the
     /// cascade does not cancel, since it is the one finishing.
     pub command_id: i64,
@@ -1588,11 +1489,11 @@ pub struct SupervisorRemoveNodeResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorCommandCompleteRequest {
-    /// The supervisor's claim identity (its instance id); the broker
+    /// The supervisor's claim identity (its replica id); the broker
     /// gates the terminal write on it holding the project's live
     /// `infra_owner` lease, so a displaced process can't complete a command
-    /// the new owner must re-run. See [`SupervisorSetStatusRequest::instance`].
-    pub instance: String,
+    /// the new owner must re-run. See [`SupervisorSetStatusRequest::replica`].
+    pub replica: String,
     pub command_id: i64,
     pub error: Option<String>,
     /// True when the supervisor halted the command because the user
@@ -1638,10 +1539,10 @@ pub struct SupervisorTriggerDepsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorRunningCountRequest {
     pub project_id: Uuid,
-    /// Whose runs: a member's copy going waits on that member's runs
+    /// Whose runs: an instance's copy going waits on that instance's runs
     /// only; the shared copies wait on every run.
     #[serde(default)]
-    pub copies: weft_core::member::Copies,
+    pub copies: weft_core::instance::Copies,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1672,14 +1573,14 @@ pub struct SupervisorInfraCommandInFlightResponse {
 pub struct InFlightCommand {
     /// The node it names; `None` for every node of the project.
     pub node_id: Option<String>,
-    pub copies: weft_core::member::Copies,
+    pub copies: weft_core::instance::Copies,
 }
 
 impl InFlightCommand {
-    /// Whether it acts on the copy of `node_id` owned by `member`.
+    /// Whether it acts on the copy of `node_id` owned by `instance`.
     // SYNC: InFlightCommand::reaches <-> crates/weft-broker-client/src/lifecycle_command.rs (command_reaches_copy)
-    pub fn reaches(&self, node_id: &str, member: Option<&weft_core::member::MemberId>) -> bool {
-        self.node_id.as_deref().is_none_or(|n| n == node_id) && self.copies.admits(member)
+    pub fn reaches(&self, node_id: &str, instance: Option<&weft_core::instance::InstanceId>) -> bool {
+        self.node_id.as_deref().is_none_or(|n| n == node_id) && self.copies.admits(instance)
     }
 }
 
@@ -1702,7 +1603,7 @@ pub const LISTENER_HELD_STATUSES: [&str; 2] =
 /// activation governing signal `s` as `a` (absent when none governs it).
 pub const SIGNAL_ACTIVATION_JOIN: &str = "LEFT JOIN trigger_activation a \
     ON a.project_id = s.project_id AND a.trigger = s.activation_trigger \
-    AND a.member_id IS NOT DISTINCT FROM s.member_id";
+    AND a.instance_id IS NOT DISTINCT FROM s.instance_id";
 
 /// Every signal the listener must hold: the rows whose governing
 /// activation's status is one of [`LISTENER_HELD_STATUSES`], of one
@@ -1833,9 +1734,9 @@ pub struct SignalRowWire {
     /// listener rehydrates from.
     pub tenant_id: String,
     /// Whose signal it is (`None` for a shared one), from the row's
-    /// `project_id` and `member_id`: the rehydrated signal reads through
-    /// that member's connections alone, as it did when first registered.
-    pub for_member: Option<weft_core::member::MemberScope>,
+    /// `project_id` and `instance_id`: the rehydrated signal reads through
+    /// that instance's connections alone, as it did when first registered.
+    pub for_instance: Option<weft_core::instance::InstanceScope>,
     pub node_id: String,
     pub spec_json: String,
     pub is_resume: bool,
@@ -1874,11 +1775,11 @@ pub struct SignalRowWire {
 pub struct ListenerResolveRequest {
     pub tenant: String,
     /// Whose signal the connection serves (`None` for a shared one), as
-    /// registered, the same trust as `tenant`: a member's trigger reads
-    /// through that member's connection alone. Carried rather than read
+    /// registered, the same trust as `tenant`: an instance's trigger reads
+    /// through that instance's connection alone. Carried rather than read
     /// off the signal row, because a trigger resolves while it is being
     /// registered, before its row exists.
-    pub for_member: Option<weft_core::member::MemberScope>,
+    pub for_instance: Option<weft_core::instance::InstanceScope>,
     pub access_id: String,
     pub service: String,
     /// The stored values the SIGNAL's input declared it needs (the
@@ -1932,9 +1833,9 @@ pub struct SubscriptionEnsureRequest {
     pub access_id: String,
     pub signal_token: String,
     /// Whose signal the subscription serves (`None` for a shared one),
-    /// as registered: the subscription dials through that member's
+    /// as registered: the subscription dials through that instance's
     /// connection alone.
-    pub for_member: Option<weft_core::member::MemberScope>,
+    pub for_instance: Option<weft_core::instance::InstanceScope>,
     #[serde(default)]
     pub params: std::collections::BTreeMap<String, String>,
 }
@@ -1963,10 +1864,10 @@ pub struct SubscriptionDropRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallerVerifyRequest {
     pub tenant: String,
-    /// The member whose route this is, when the gate is their own
-    /// connection (a member's trigger); `None`: a shared route.
+    /// The instance whose route this is, when the gate is its own
+    /// connection (an instance's trigger); `None`: a shared route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub for_member: Option<weft_core::member::MemberScope>,
+    pub for_instance: Option<weft_core::instance::InstanceScope>,
     pub access_id: String,
     pub service: String,
     pub method: String,
@@ -2048,13 +1949,13 @@ pub enum EventVerdict {
 #[cfg(test)]
 mod wire_enum_roundtrips {
     use super::*;
+    use weft_core::wire_enum_roundtrip_tests;
     // One generated round-trip test per wire enum. Adding a new
     // wire_enum! means adding its name here; missing one is a
     // visible omission in this single list.
     wire_enum_roundtrip_tests!(
         InfraLifecycleVerb,
         InfraNodeStatus,
-        ProjectStatus,
         FailureStage,
         InfraEventKind,
         StartMode,
@@ -2085,10 +1986,10 @@ mod supervisor_protocol_tests {
             spec,
             values: [("host".to_string(), "db.svc".to_string())].into_iter().collect(),
             label: Some("db".into()),
-            per_member: true,
+            per_instance: true,
         };
         let v = serde_json::to_value(&req).unwrap();
-        assert_eq!(v["per_member"], true, "whose copy published it rides as a flag; the member is the run's");
+        assert_eq!(v["per_instance"], true, "whose copy published it rides as a flag; the instance is the run's");
         assert_eq!(v["execution_id"], "c1");
         assert_eq!(v["node_id"], "db");
         assert_eq!(v["values"]["host"], "db.svc");
@@ -2141,9 +2042,9 @@ mod supervisor_protocol_tests {
 
     #[test]
     fn sync_ownership_round_trip() {
-        let req = SupervisorSyncOwnershipRequest { instance: "sup-1".into(), held_projects: vec![] };
+        let req = SupervisorSyncOwnershipRequest { replica: "sup-1".into(), held_projects: vec![] };
         let v = serde_json::to_value(&req).unwrap();
-        assert_eq!(v, json!({ "instance": "sup-1", "held_projects": [] }));
+        assert_eq!(v, json!({ "replica": "sup-1", "held_projects": [] }));
         let resp: SupervisorSyncOwnershipResponse = serde_json::from_value(json!({
             "owned": [
                 {
@@ -2165,14 +2066,14 @@ mod supervisor_protocol_tests {
     #[test]
     fn claim_round_trip() {
         let req = SupervisorClaimCommandRequest {
-            claimer_instance: "sup-1".into(),
+            claimer_replica: "sup-1".into(),
             busy_projects: vec![uuid::Uuid::from_u128(0xa1)],
             wait_ms: 25_000,
         };
         assert_eq!(
             serde_json::to_value(&req).unwrap(),
             json!({
-                "claimer_instance": "sup-1",
+                "claimer_replica": "sup-1",
                 "busy_projects": ["00000000-0000-0000-0000-0000000000a1"],
                 "wait_ms": 25_000,
             })
@@ -2181,7 +2082,7 @@ mod supervisor_protocol_tests {
             id: 7,
             project_id: uuid::Uuid::from_u128(0xa1),
             node_id: Some("db".into()),
-            copies: weft_core::member::Copies::Member(weft_core::member::MemberId::new("user-42").unwrap()),
+            copies: weft_core::instance::Copies::Instance(weft_core::instance::InstanceId::new("user-42").unwrap()),
             verb: InfraLifecycleVerb::Apply,
             running_policy: None,
             spec_json: None,
@@ -2199,10 +2100,10 @@ mod supervisor_protocol_tests {
     #[test]
     fn owned_projects_round_trip() {
         let req = SupervisorOwnedProjectsRequest {
-            instance: "sup-1".into(),
+            replica: "sup-1".into(),
         };
         let v = serde_json::to_value(&req).unwrap();
-        assert_eq!(v, json!({ "instance": "sup-1" }));
+        assert_eq!(v, json!({ "replica": "sup-1" }));
         let resp: SupervisorOwnedProjectsResponse = serde_json::from_value(json!({
             "owned": [
                 {
@@ -2260,7 +2161,7 @@ mod supervisor_protocol_tests {
             "nodes": [
                 {
                     "node_id": "tgi",
-                    "instance_id": "wn-abc-tgi-12",
+                    "copy_id": "wn-abc-tgi-12",
                     "status": "running",
                     "applied_spec_hash": "deadbeef",
                     "endpoints": { "api": "http://x.svc:8080" },
@@ -2297,7 +2198,7 @@ mod supervisor_protocol_tests {
             "nodes": [
                 {
                     "node_id": "tgi",
-                    "instance_id": "wn-abc-tgi-12",
+                    "copy_id": "wn-abc-tgi-12",
                     "status": "running",
                     "applied_spec_hash": "deadbeef",
                     "endpoints": {}, "public_paths": {}, "doors": {}
@@ -2311,12 +2212,12 @@ mod supervisor_protocol_tests {
     #[test]
     fn set_applied_request_round_trip() {
         let req = SupervisorSetAppliedRequest {
-            instance: "weft-infra-supervisor-abc".into(),
+            replica: "weft-infra-supervisor-abc".into(),
             command_id: 7,
             project_id: "00000000-0000-0000-0000-0000000000a1".parse().unwrap(),
             node_id: "tgi".into(),
-            member: None,
-            instance_id: "wn-abc-tgi-12".into(),
+            instance: None,
+            copy_id: "wn-abc-tgi-12".into(),
             applied_spec_hash: "deadbeef".into(),
             addresses: AppliedEndpoints {
                 urls: [("api".to_string(), "http://x".to_string())].into(),
@@ -2325,9 +2226,11 @@ mod supervisor_protocol_tests {
                 doors: [("sql".to_string(), "10.0.0.7:5432".to_string())].into(),
             },
             keep_disks: vec!["data".into()],
+            notes: vec!["unit 'main' of 'tgi' asked for 1 x l4".into()],
             units: std::collections::BTreeMap::new(),
         };
         let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["notes"][0], "unit 'main' of 'tgi' asked for 1 x l4");
         // Flattened: the maps sit on the request itself, and the
         // URLs keep the `endpoints` name the broker writes to its column.
         assert_eq!(v["endpoints"]["api"], "http://x");
@@ -2337,7 +2240,7 @@ mod supervisor_protocol_tests {
         assert_eq!(back.addresses, req.addresses);
         assert_eq!(back.command_id, 7);
         assert_eq!(back.keep_disks, vec!["data".to_string()]);
-        assert_eq!(back.instance_id, "wn-abc-tgi-12");
+        assert_eq!(back.copy_id, "wn-abc-tgi-12");
     }
 
     #[test]
@@ -2430,7 +2333,7 @@ mod supervisor_protocol_tests {
         // keep_disks, so a missing field is loud schema drift.
         let v = json!({
             "command_id": 7, "project_id": "00000000-0000-0000-0000-0000000000a1", "node_id": "tgi",
-            "instance_id": "i", "applied_spec_hash": "h",
+            "copy_id": "i", "applied_spec_hash": "h",
             "endpoints": {}, "public_paths": {}, "doors": {}, "units": {}
         });
         let res: Result<SupervisorSetAppliedRequest, _> = serde_json::from_value(v);
@@ -2440,12 +2343,12 @@ mod supervisor_protocol_tests {
     #[test]
     fn set_provisioning_request_round_trip() {
         let req = SupervisorSetProvisioningRequest {
-            instance: "weft-infra-supervisor-abc".into(),
+            replica: "weft-infra-supervisor-abc".into(),
             command_id: 9,
             project_id: "00000000-0000-0000-0000-0000000000a1".parse().unwrap(),
             node_id: "tgi".into(),
-            member: None,
-            instance_id: "wn-abc-tgi-12".into(),
+            instance: None,
+            copy_id: "wn-abc-tgi-12".into(),
             keep_disks: vec!["data".into()],
             units: std::collections::BTreeMap::new(),
         };
@@ -2459,7 +2362,7 @@ mod supervisor_protocol_tests {
     fn set_provisioning_missing_keep_disks_fails() {
         let v = json!({
             "command_id": 9, "project_id": "00000000-0000-0000-0000-0000000000a1", "node_id": "tgi",
-            "instance_id": "i"
+            "copy_id": "i"
         });
         let res: Result<SupervisorSetProvisioningRequest, _> = serde_json::from_value(v);
         assert!(res.is_err(), "missing keep_disks must fail deserialize");
@@ -2507,19 +2410,19 @@ mod supervisor_protocol_tests {
     }
 
     fn ada_svc() -> InfraCopy {
-        InfraCopy { node_id: "svc".into(), member: Some(weft_core::member::MemberId::new("ada").unwrap()) }
+        InfraCopy { node_id: "svc".into(), instance: Some(weft_core::instance::InstanceId::new("ada").unwrap()) }
     }
 
     #[test]
     fn lifecycle_spec_round_trip_deactivate_and_reactivate() {
         let d = LifecycleSpec::Deactivate(take_down(vec![
             ada_svc(),
-            InfraCopy { node_id: "db".into(), member: None },
+            InfraCopy { node_id: "db".into(), instance: None },
         ]));
         let v = serde_json::to_value(&d).unwrap();
         assert_eq!(v["verb"], "deactivate");
         assert_eq!(v["reach"]["kind"], "readers_of");
-        assert_eq!(v["reach"]["broken"], json!([{ "node_id": "svc", "member": "ada" }, { "node_id": "db" }]));
+        assert_eq!(v["reach"]["broken"], json!([{ "node_id": "svc", "instance": "ada" }, { "node_id": "db" }]));
         let back: LifecycleSpec = serde_json::from_value(v).unwrap();
         assert_eq!(d, back);
 
@@ -2531,7 +2434,7 @@ mod supervisor_protocol_tests {
         let r = LifecycleSpec::Reactivate(RestoreReaders { still_broken: vec![ada_svc()] });
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(v["verb"], "reactivate");
-        assert_eq!(v["still_broken"], json!([{ "node_id": "svc", "member": "ada" }]));
+        assert_eq!(v["still_broken"], json!([{ "node_id": "svc", "instance": "ada" }]));
         let back: LifecycleSpec = serde_json::from_value(v).unwrap();
         assert_eq!(r, back);
     }
@@ -2552,7 +2455,7 @@ mod supervisor_protocol_tests {
             InfraEvent::Stopped,
             InfraEvent::Terminated,
             InfraEvent::Started(StartedPayload {
-                instance_id: "inst1".into(),
+                copy_id: "inst1".into(),
                 mode: StartMode::Fresh,
             }),
             InfraEvent::Notify(NotifyPayload {
@@ -2577,7 +2480,7 @@ mod supervisor_protocol_tests {
             id: 42,
             project_id: "00000000-0000-0000-0000-0000000000a1".parse().unwrap(),
             node_id: Some("n".into()),
-            copies: weft_core::member::Copies::Shared,
+            copies: weft_core::instance::Copies::Shared,
             verb: InfraLifecycleVerb::Terminate,
             running_policy: Some(RunningPolicy::Cancel),
             spec_json: None,
@@ -2605,7 +2508,7 @@ mod supervisor_protocol_tests {
             id: 1,
             project_id: uuid::Uuid::from_u128(1),
             node_id: None,
-            copies: weft_core::member::Copies::Shared,
+            copies: weft_core::instance::Copies::Shared,
             verb: InfraLifecycleVerb::Terminate,
             running_policy: Some(RunningPolicy::Cancel),
             spec_json: Some(spec_json),
@@ -2664,11 +2567,11 @@ mod supervisor_protocol_tests {
     #[test]
     fn set_status_request_optional_fields_skip_when_none() {
         let r = SupervisorSetStatusRequest {
-            instance: "weft-infra-supervisor-abc".into(),
+            replica: "weft-infra-supervisor-abc".into(),
             command_id: None,
             project_id: "00000000-0000-0000-0000-0000000000a1".parse().unwrap(),
             node_id: "n".into(),
-            member: None,
+            instance: None,
             unit: None,
             status: InfraNodeStatus::Running,
             failure_stage: None,
@@ -2683,11 +2586,11 @@ mod supervisor_protocol_tests {
     #[test]
     fn set_status_request_with_command_id_round_trip() {
         let r = SupervisorSetStatusRequest {
-            instance: "weft-infra-supervisor-abc".into(),
+            replica: "weft-infra-supervisor-abc".into(),
             command_id: Some(42),
             project_id: "00000000-0000-0000-0000-0000000000a1".parse().unwrap(),
             node_id: "n".into(),
-            member: None,
+            instance: None,
             unit: None,
             status: InfraNodeStatus::Stopping,
             failure_stage: None,
@@ -2704,7 +2607,7 @@ mod supervisor_protocol_tests {
         let r = SupervisorEventRecordRequest {
             project_id: "00000000-0000-0000-0000-0000000000a1".parse().unwrap(),
             node_id: Some("n".into()),
-            member: None,
+            instance: None,
             kind: InfraEventKind::Flaky,
             payload: json!({ "desired": 3, "ready": 1 }),
         };
@@ -2742,7 +2645,7 @@ mod supervisor_protocol_tests {
         let v = json!({
             "execution_id": "00000000-0000-0000-0000-0000000000a1",
             "node_id": "n",
-            "per_member": false,
+            "per_instance": false,
             "endpoint_name": "api"
         });
         let r: InfraEndpointUrlRequest = serde_json::from_value(v).unwrap();
@@ -2758,7 +2661,7 @@ mod supervisor_protocol_tests {
         SignalRowWire {
             token: "t".into(),
             tenant_id: "tenant-a".into(),
-            for_member: None,
+            for_instance: None,
             node_id: "n".into(),
             kind_state_seq: 0,
             spec_json: "{}".into(),
@@ -2880,9 +2783,9 @@ mod supervisor_protocol_tests {
     fn listener_resolve_request_round_trip() {
         let req = ListenerResolveRequest {
             tenant: "tenant-a".into(),
-            for_member: Some(weft_core::member::MemberScope {
+            for_instance: Some(weft_core::instance::InstanceScope {
                 project_id: uuid::Uuid::from_u128(0xa1),
-                member: weft_core::member::MemberId::new("alice").unwrap(),
+                instance: weft_core::instance::InstanceId::new("alice").unwrap(),
             }),
             access_id: "11111111-2222-3333-4444-555555555555".into(),
             service: "slack".into(),
@@ -2895,9 +2798,9 @@ mod supervisor_protocol_tests {
             v,
             json!({
                 "tenant": "tenant-a",
-                "for_member": {
+                "for_instance": {
                     "project_id": "00000000-0000-0000-0000-0000000000a1",
-                    "member": "alice"
+                    "instance": "alice"
                 },
                 "access_id": "11111111-2222-3333-4444-555555555555",
                 "service": "slack",
@@ -2906,15 +2809,15 @@ mod supervisor_protocol_tests {
         );
         let back: ListenerResolveRequest = serde_json::from_value(v).unwrap();
         assert_eq!(back.service, "slack");
-        assert_eq!(back.for_member, req.for_member);
+        assert_eq!(back.for_instance, req.for_instance);
         // required_values defaults when absent; a shared signal's
-        // member is null.
+        // instance is null.
         let bare: ListenerResolveRequest = serde_json::from_value(json!({
-            "tenant": "t", "for_member": null, "access_id": "a", "service": "s"
+            "tenant": "t", "for_instance": null, "access_id": "a", "service": "s"
         }))
         .unwrap();
         assert!(bare.required_values.is_empty());
-        assert!(bare.for_member.is_none());
+        assert!(bare.for_instance.is_none());
     }
 
     #[test]
@@ -2961,7 +2864,7 @@ mod supervisor_protocol_tests {
             topic: "drive".into(),
             access_id: "a-1".into(),
             signal_token: "sig-1".into(),
-            for_member: None,
+            for_instance: None,
             params: [("target".to_string(), "file-9".to_string())].into_iter().collect(),
         };
         let v = serde_json::to_value(&req).unwrap();
@@ -2969,7 +2872,7 @@ mod supervisor_protocol_tests {
             v,
             json!({
                 "tenant": "tenant-a", "service": "google", "topic": "drive",
-                "access_id": "a-1", "signal_token": "sig-1", "for_member": null,
+                "access_id": "a-1", "signal_token": "sig-1", "for_instance": null,
                 "params": { "target": "file-9" }
             })
         );
@@ -3108,7 +3011,7 @@ mod supervisor_protocol_tests {
     fn caller_verify_wire_round_trips() {
         let req = CallerVerifyRequest {
             tenant: "alice".into(),
-            for_member: None,
+            for_instance: None,
             access_id: "acc-1".into(),
             service: "hmac_auth".into(),
             method: "POST".into(),

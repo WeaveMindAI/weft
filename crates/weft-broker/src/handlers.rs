@@ -41,10 +41,10 @@ pub async fn journal_record(
         return Err((StatusCode::FORBIDDEN, "only workers journal events".into()));
     }
     let execution_id = req.event.execution_id();
-    require_worker_owns_execution_id(&state, &caller, execution_id, &req.instance).await?;
+    require_worker_owns_execution_id(&state, &caller, execution_id, &req.replica).await?;
     state
         .journal
-        .record_event(&req.event, Some(req.instance.as_str()))
+        .record_event(&req.event, Some(req.replica.as_str()))
         .await
         .map_err(internal)?;
     Ok(Json(JournalRecordResponse {}))
@@ -64,10 +64,10 @@ pub async fn journal_record_retroactive(
     let Some(first) = req.events.first() else {
         return Err((StatusCode::BAD_REQUEST, "an unrecorded run's record has at least its birth".into()));
     };
-    require_worker_owns_execution_id(&state, &caller, first.execution_id(), &req.instance).await?;
+    require_worker_owns_execution_id(&state, &caller, first.execution_id(), &req.replica).await?;
     state
         .journal
-        .record_retroactively(&req.events, Some(req.instance.as_str()))
+        .record_retroactively(&req.events, Some(req.replica.as_str()))
         .await
         .map_err(internal)?;
     Ok(Json(JournalRecordResponse {}))
@@ -86,34 +86,34 @@ pub async fn journal_forget_unrecorded(
     }
     let execution_id: weft_core::ExecutionId =
         req.execution_id.parse().map_err(|e| (StatusCode::BAD_REQUEST, format!("bad execution: {e}")))?;
-    let scope = require_worker_owns_execution_id(&state, &caller, execution_id, &req.instance).await?;
+    let scope = require_worker_owns_execution_id(&state, &caller, execution_id, &req.replica).await?;
     // Files first: a failed sweep leaves the row, so the worker's error
     // names a run that is still there to look at.
     state.runtime_store.sweep_exec(&scope.tenant, &req.execution_id).await.map_err(internal)?;
     state
         .journal
-        .forget_unrecorded(execution_id, Some(req.instance.as_str()))
+        .forget_unrecorded(execution_id, Some(req.replica.as_str()))
         .await
         .map_err(internal)?;
     Ok(Json(JournalRecordResponse {}))
 }
 
 /// The gate every write a worker makes ABOUT an execution passes: the execution
-/// is in the caller's scope, the caller is the instance it says it is,
-/// and that instance is the execution's current owner. Returns the execution's scope
+/// is in the caller's scope, the caller is the replica it says it is,
+/// and that replica is the execution's current owner. Returns the execution's scope
 /// (tenant + project) so the handler can act inside it.
 ///
-/// Instance binding: the caller can only act under the instance its
-/// request names (`caller.instance`, from the instance header). Without
-/// it, a worker could write under a sibling's instance id and slip past
-/// the owner check or poison attribution. The instance is self-asserted;
+/// Replica binding: the caller can only act under the replica its
+/// request names (`caller.replica`, from the replica header). Without
+/// it, a worker could write under a sibling's replica id and slip past
+/// the owner check or poison attribution. The replica is self-asserted;
 /// the platform identity underneath already pins the caller to its
 /// project, so this only orders writers inside one project.
 ///
-/// Cross-execution sabotage gate: the execution's owning instance (stamped at
+/// Cross-execution sabotage gate: the execution's owning replica (stamped at
 /// first task_claim_one) must match the caller's. A compromised worker
 /// can act only on executions it legitimately owns, not
-/// arbitrary sibling executions in the same tenant. `owner_instance IS
+/// arbitrary sibling executions in the same tenant. `owner_replica IS
 /// NULL` means the execution has not been claimed yet (e.g. a
 /// dispatcher-orchestrated phase still in flight); workers shouldn't be
 /// writing in that state anyway, so we refuse.
@@ -121,35 +121,35 @@ async fn require_worker_owns_execution_id(
     state: &BrokerState,
     caller: &CallerIdentity,
     execution_id: weft_core::ExecutionId,
-    claimed_instance: &str,
+    claimed_replica: &str,
 ) -> Result<scope::ExecutionScope, (StatusCode, String)> {
     let execution_id_scope =
         scope::require_execution_id_scope(&state.scope_cache, &state.pool, caller, &execution_id.to_string())
             .await?;
-    require_instance_matches(caller, claimed_instance)?;
+    require_replica_matches(caller, claimed_replica)?;
     let owner: Option<(Option<String>,)> = sqlx::query_as(
-        "SELECT owner_instance FROM execution WHERE execution_id = $1",
+        "SELECT owner_replica FROM execution WHERE execution_id = $1",
     )
     .bind(execution_id.to_string())
     .fetch_optional(&state.pool)
     .await
     .map_err(internal)?;
-    let owner_instance = owner.and_then(|(p,)| p).ok_or((
+    let owner_replica = owner.and_then(|(p,)| p).ok_or((
         StatusCode::FORBIDDEN,
-        "execution has no owning instance yet; worker may not act on it".into(),
+        "execution has no owning replica yet; worker may not act on it".into(),
     ))?;
-    if owner_instance != claimed_instance {
+    if owner_replica != claimed_replica {
         tracing::warn!(
             target: "weft_broker::scope",
             caller_tenant = ?caller.scope.pinned_tenant(),
-            caller_instance = %claimed_instance,
+            caller_replica = %claimed_replica,
             execution_id = %execution_id,
-            owner_instance = %owner_instance,
+            owner_replica = %owner_replica,
             "broker rejected cross-execution worker write"
         );
         return Err((
             StatusCode::FORBIDDEN,
-            "execution owned by a different worker instance".into(),
+            "execution owned by a different worker replica".into(),
         ));
     }
     Ok(execution_id_scope)
@@ -180,10 +180,10 @@ pub async fn execution_tag(
     // The ctx validated already; the broker trusts no worker, so again.
     weft_core::tag::validate_tags(&req.tags)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    require_worker_owns_execution_id(&state, &caller, execution_id, &req.instance).await?;
+    require_worker_owns_execution_id(&state, &caller, execution_id, &req.replica).await?;
     let at_unix = unix_now_secs();
     let mut tx = state.pool.begin().await.map_err(internal)?;
-    weft_journal::tags::tag_execution_in(&mut tx, execution_id, &req.tags, at_unix, Some(&req.instance))
+    weft_journal::tags::tag_execution_in(&mut tx, execution_id, &req.tags, at_unix, Some(&req.replica))
         .await
         .map_err(internal)?;
     tx.commit().await.map_err(internal)?;
@@ -218,7 +218,7 @@ pub async fn execution_stop_tagged(
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad execution: {e}")))?;
     weft_core::tag::validate_tag(&req.tag)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let execution_id_scope = require_worker_owns_execution_id(&state, &caller, execution_id, &req.instance).await?;
+    let execution_id_scope = require_worker_owns_execution_id(&state, &caller, execution_id, &req.replica).await?;
     let own_seq = weft_journal::tags::tag_seq(&state.pool, execution_id, &req.tag)
         .await
         .map_err(internal)?;
@@ -262,7 +262,7 @@ pub async fn execution_stop_tagged(
         dedup_key: Some(format!("stop_tagged:{}", uuid::Uuid::new_v4())),
         execution_id: Some(execution_id.to_string()),
         tenant_id: execution_id_scope.tenant,
-        target_instance: None,
+        target_replica: None,
         binary_hash: None,
         payload: serde_json::to_value(&payload).map_err(internal)?,
     };
@@ -438,18 +438,18 @@ pub async fn task_enqueue_dedup(
     if target != TaskTarget::Dispatcher {
         return Err((
             StatusCode::FORBIDDEN,
-            "tenant-instance-enqueued tasks must target dispatcher".into(),
+            "worker-enqueued tasks must target dispatcher".into(),
         ));
     }
-    // `target_instance` is meaningful only for cancel-style tasks
-    // claimed by a specific worker instance. Workers never enqueue
+    // `target_replica` is meaningful only for cancel-style tasks
+    // claimed by a specific worker replica. Workers never enqueue
     // those (the dispatcher emits cancels itself), so any
     // wire-set value is either confused or hostile. Refuse to
     // persist a value the caller has no legitimate use for.
-    if req.spec.target_instance.is_some() {
+    if req.spec.target_replica.is_some() {
         return Err((
             StatusCode::FORBIDDEN,
-            "tenant instances may not set target_instance".into(),
+            "workers may not set target_replica".into(),
         ));
     }
 
@@ -512,12 +512,12 @@ pub async fn task_enqueue_dedup(
         }
     }
 
-    // A live arrival pins the run it asks for to the instance the caller
-    // reached, so it may only name the instance that sends it.
+    // A live arrival pins the run it asks for to the replica the caller
+    // reached, so it may only name the replica that sends it.
     if kind == TaskKind::LiveArrival.as_str() {
-        let named = req.spec.payload.get("instance").and_then(|v| v.as_str());
-        if named.is_none() || named != caller.instance.as_deref() {
-            return Err((StatusCode::FORBIDDEN, "a live arrival names the worker instance that sends it".into()));
+        let named = req.spec.payload.get("replica").and_then(|v| v.as_str());
+        if named.is_none() || named != caller.replica.as_deref() {
+            return Err((StatusCode::FORBIDDEN, "a live arrival names the worker replica that sends it".into()));
         }
     }
 
@@ -604,7 +604,7 @@ pub async fn task_claim_one(
     Json(req): Json<TaskClaimOneRequest>,
 ) -> Resp<TaskClaimOneResponse> {
     require_worker(&caller)?;
-    require_instance_matches(&caller, &req.instance)?;
+    require_replica_matches(&caller, &req.replica)?;
     let filter = req.filter;
     if let ClaimFilter::ExecutionId { project_id, .. } = &filter {
         scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, *project_id).await?;
@@ -613,13 +613,13 @@ pub async fn task_claim_one(
     }
     let task = state
         .tasks
-        .claim_one(&req.instance, filter, held(req.wait_ms))
+        .claim_one(&req.replica, filter, held(req.wait_ms))
         .await
         .map_err(internal)?;
     // Latest-claim-wins execution ownership is bound IN the claim's own
     // transaction by the `task_claim_binds_execution_id_owner` DB trigger:
     // claiming an execution-bearing task atomically stamps
-    // execution.owner_instance to the claiming instance. The broker
+    // execution.owner_replica to the claiming replica. The broker
     // does NOT stamp it here, so "claimed by X" and "owned by X" can never
     // disagree. The journal_record owner check reads what the trigger
     // wrote.
@@ -632,11 +632,11 @@ pub async fn task_heartbeat(
     Json(req): Json<TaskHeartbeatRequest>,
 ) -> Resp<TaskHeartbeatResponse> {
     require_worker(&caller)?;
-    require_instance_matches(&caller, &req.instance)?;
+    require_replica_matches(&caller, &req.replica)?;
     require_task_owned_by(&state, &caller, req.task_id).await?;
     let renewed = state
         .tasks
-        .heartbeat(req.task_id, &req.instance)
+        .heartbeat(req.task_id, &req.replica)
         .await
         .map_err(internal)?;
     Ok(Json(TaskHeartbeatResponse { renewed }))
@@ -648,11 +648,11 @@ pub async fn task_requeue(
     Json(req): Json<TaskRequeueRequest>,
 ) -> Resp<TaskRequeueResponse> {
     require_worker(&caller)?;
-    require_instance_matches(&caller, &req.instance)?;
+    require_replica_matches(&caller, &req.replica)?;
     require_task_owned_by(&state, &caller, req.task_id).await?;
     let requeued = state
         .tasks
-        .requeue(req.task_id, &req.instance)
+        .requeue(req.task_id, &req.replica)
         .await
         .map_err(internal)?;
     Ok(Json(TaskRequeueResponse { requeued }))
@@ -664,11 +664,11 @@ pub async fn task_complete(
     Json(req): Json<TaskCompleteRequest>,
 ) -> Resp<TaskCompleteResponse> {
     require_worker(&caller)?;
-    require_instance_matches(&caller, &req.instance)?;
+    require_replica_matches(&caller, &req.replica)?;
     require_task_owned_by(&state, &caller, req.task_id).await?;
     state
         .tasks
-        .complete(req.task_id, &req.instance, req.result)
+        .complete(req.task_id, &req.replica, req.result)
         .await
         .map_err(internal)?;
     Ok(Json(TaskCompleteResponse {}))
@@ -680,11 +680,11 @@ pub async fn task_fail(
     Json(req): Json<TaskFailRequest>,
 ) -> Resp<TaskFailResponse> {
     require_worker(&caller)?;
-    require_instance_matches(&caller, &req.instance)?;
+    require_replica_matches(&caller, &req.replica)?;
     require_task_owned_by(&state, &caller, req.task_id).await?;
     state
         .tasks
-        .fail(req.task_id, &req.instance, req.error)
+        .fail(req.task_id, &req.replica, req.error)
         .await
         .map_err(internal)?;
     Ok(Json(TaskFailResponse {}))
@@ -697,16 +697,16 @@ pub async fn task_wait_cancels(
 ) -> Resp<TaskWaitCancelsResponse> {
     require_worker(&caller)?;
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id).await?;
-    // Only the executions the calling instance drives: a cancel is taken as it
+    // Only the executions the calling replica drives: a cancel is taken as it
     // is answered, so a worker waiting on an execution it does not own would
     // swallow a cancel meant for the one that does.
-    let instance = caller.instance.as_deref().ok_or((StatusCode::FORBIDDEN, "a worker names its instance".into()))?;
+    let replica = caller.replica.as_deref().ok_or((StatusCode::FORBIDDEN, "a worker names its replica".into()))?;
     let owned: Vec<String> = sqlx::query_scalar(
-        "SELECT execution_id FROM execution WHERE execution_id = ANY($1) AND project_id = $2 AND owner_instance = $3",
+        "SELECT execution_id FROM execution WHERE execution_id = ANY($1) AND project_id = $2 AND owner_replica = $3",
     )
     .bind(&req.execution_ids)
     .bind(req.project_id)
-    .bind(instance)
+    .bind(replica)
     .fetch_all(&state.pool)
     .await
     .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("owned executions")))?;
@@ -719,21 +719,21 @@ pub async fn task_wait_cancels(
 
 // ---------- Infra ----------
 
-/// Whose copy a node's call reaches: the run's member when the node
-/// exists once per member, the shared copy otherwise. A per-member
-/// node asking from a run that carries no member is refused: reading
-/// the shared copy in its place would hand it someone else's thing.
-fn member_copy(
-    run_member: Option<&weft_core::member::MemberId>,
-    per_member: bool,
-) -> Result<Option<&weft_core::member::MemberId>, (StatusCode, String)> {
-    match (per_member, run_member) {
+/// Whose copy a node's call reaches: the run's instance when the node
+/// exists once per instance, the shared copy otherwise. A per-instance
+/// node asking from a run that carries no instance is refused: reading
+/// the shared copy in its place would hand it another instance's thing.
+fn instance_copy(
+    instance: Option<&weft_core::instance::InstanceId>,
+    per_instance: bool,
+) -> Result<Option<&weft_core::instance::InstanceId>, (StatusCode, String)> {
+    match (per_instance, instance) {
         (false, _) => Ok(None),
-        (true, Some(member)) => Ok(Some(member)),
+        (true, Some(instance)) => Ok(Some(instance)),
         (true, None) => Err((
             StatusCode::BAD_REQUEST,
-            "this node exists once per member, but the run asking carries no member; \
-             start it from a member's door"
+            "this node exists once per instance, but the run asking carries no instance; \
+             start it from an instance's door"
                 .into(),
         )),
     }
@@ -746,15 +746,15 @@ pub async fn infra_endpoint_url(
 ) -> Resp<InfraEndpointUrlResponse> {
     // A worker's run asks, at fire time, for an endpoint of its node's
     // infra. The copy is resolved from the run itself: its project, and
-    // its member when the node exists once per member. Nothing in the
-    // request names a member, so a run cannot reach another's copy.
+    // its instance when the node exists once per instance. Nothing in the
+    // request names an instance, so a run cannot reach another's copy.
     require_worker(&caller)?;
     let run = scope::require_execution_id_scope(&state.scope_cache, &state.pool, &caller, &req.execution_id.to_string())
         .await?;
-    let member = member_copy(run.member.as_ref(), req.per_member)?;
+    let instance = instance_copy(run.instance.as_ref(), req.per_instance)?;
     let address = state
         .infra
-        .endpoint_address(run.project, &req.node_id, member, &req.endpoint_name)
+        .endpoint_address(run.project, &req.node_id, instance, &req.endpoint_name)
         .await
         .map_err(internal)?;
     Ok(Json(InfraEndpointUrlResponse { address }))
@@ -851,15 +851,15 @@ pub async fn resolve_connection(
     let connection_id: uuid::Uuid = req.connection_id.parse().map_err(|_| {
         (StatusCode::BAD_REQUEST, format!("malformed connection id '{}'", req.connection_id))
     })?;
-    // A member's connection serves that member's runs alone.
-    let for_member = owner
-        .member
+    // An instance's connection serves that instance's runs alone.
+    let for_instance = owner
+        .instance
         .clone()
-        .map(|member| weft_core::member::MemberScope { project_id: owner.project, member });
+        .map(|instance| weft_core::instance::InstanceScope { project_id: owner.project, instance });
     let resolved = weft_access_store::resolve_for_worker(
         &state.pool,
         &tenant,
-        weft_access_store::GrantUser::of(for_member.as_ref()),
+        weft_access_store::GrantUser::of(for_instance.as_ref()),
         connection_id,
         &req.service,
         &req.required_permissions,
@@ -879,7 +879,7 @@ pub async fn resolve_connection(
     })?;
 
     let response = match resolved.owner {
-        weft_core::CredentialOwner::Author | weft_core::CredentialOwner::Member(_) => ResolveConnectionResponse {
+        weft_core::CredentialOwner::Author | weft_core::CredentialOwner::Instance(_) => ResolveConnectionResponse {
             values: resolved.values,
             auth: resolved.auth,
             identity: resolved.identity,
@@ -901,7 +901,7 @@ pub async fn resolve_connection(
                 node_type: req.node_type,
                 service: resolved.service.clone(),
                 auth: resolved.auth.clone(),
-                instance: caller.instance.clone(),
+                replica: caller.replica.clone(),
                 window: std::time::Duration::from_secs(req.expected_duration_secs),
             };
             match state.credentials.resolve(&state.pool, &key_req).await.map_err(internal)? {
@@ -988,9 +988,9 @@ pub async fn publish_access(
         weft_access_store::PublishAccess {
             spec: req.spec,
             project_id: owner.project,
-            // A member's copy of a node publishes that member's
+            // An instance's copy of a node publishes that instance's
             // connection: the run it publishes from says whose.
-            member: member_copy(owner.member.as_ref(), req.per_member)?.cloned(),
+            instance: instance_copy(owner.instance.as_ref(), req.per_instance)?.cloned(),
             node_id: req.node_id,
             values: req.values,
             label: req.label,
@@ -1020,7 +1020,7 @@ pub async fn published_access(
         &owner.tenant,
         owner.project,
         &req.node_id,
-        member_copy(owner.member.as_ref(), req.per_member)?,
+        instance_copy(owner.instance.as_ref(), req.per_instance)?,
         &req.service,
     )
     .await
@@ -1057,7 +1057,7 @@ pub async fn supervisor_sync_ownership(
     Json(req): Json<SupervisorSyncOwnershipRequest>,
 ) -> Resp<SupervisorSyncOwnershipResponse> {
     require_supervisor(&caller)?;
-    let synced = crate::lifecycle_writes::sync_ownership(&state.pool, &req.instance, &req.held_projects)
+    let synced = crate::lifecycle_writes::sync_ownership(&state.pool, &req.replica, &req.held_projects)
         .await
         .map_err(internal)?;
     Ok(Json(synced))
@@ -1072,7 +1072,7 @@ pub async fn supervisor_owned_projects(
     Json(req): Json<SupervisorOwnedProjectsRequest>,
 ) -> Resp<SupervisorOwnedProjectsResponse> {
     require_supervisor(&caller)?;
-    let owned = crate::lifecycle_writes::owned_projects(&state.pool, &req.instance)
+    let owned = crate::lifecycle_writes::owned_projects(&state.pool, &req.replica)
         .await
         .map_err(internal)?;
     Ok(Json(SupervisorOwnedProjectsResponse { owned }))
@@ -1094,7 +1094,7 @@ pub async fn supervisor_gone_copies(
     if let Some(stray) = req.copies.iter().find(|c| c.project != req.project) {
         return Err((
             StatusCode::BAD_REQUEST,
-            format!("gone_copies of project {}: copy {} belongs to project {}", req.project, stray.instance, stray.project),
+            format!("gone_copies of project {}: copy {} belongs to project {}", req.project, stray.copy_id, stray.project),
         ));
     }
     let err = |e: sqlx::Error| internal(anyhow::anyhow!("{e}"));
@@ -1103,12 +1103,12 @@ pub async fn supervisor_gone_copies(
         owns = weft_broker_client::lifecycle_command::owns_project_predicate("$2", "p.id"),
     ))
     .bind(req.project)
-    .bind(&req.instance)
+    .bind(&req.replica)
     .fetch_optional(&state.pool)
     .await
     .map_err(err)?;
     let gone = match project {
-        None => req.copies.iter().map(|c| c.instance.clone()).collect(),
+        None => req.copies.iter().map(|c| c.copy_id.clone()).collect(),
         Some((_, false)) => {
             return Err((StatusCode::GONE, format!("gone_copies of project {}: project ownership moved", req.project)));
         }
@@ -1117,7 +1117,7 @@ pub async fn supervisor_gone_copies(
                 .map_err(|e| internal(anyhow::anyhow!("project {} definition: {e}", req.project)))?;
             let declared = weft_core::project::DeclaredInfra::of(&definition);
             let rows: std::collections::HashSet<String> =
-                sqlx::query_scalar("SELECT instance_id FROM infra_node WHERE project_id = $1")
+                sqlx::query_scalar("SELECT copy_id FROM infra_node WHERE project_id = $1")
                     .bind(req.project)
                     .fetch_all(&state.pool)
                     .await
@@ -1126,8 +1126,8 @@ pub async fn supervisor_gone_copies(
                     .collect();
             req.copies
                 .iter()
-                .filter(|c| !rows.contains(&c.instance) && !declared.declares_copy(c))
-                .map(|c| c.instance.clone())
+                .filter(|c| !rows.contains(&c.copy_id) && !declared.declares_copy(c))
+                .map(|c| c.copy_id.clone())
                 .collect()
         }
     };
@@ -1144,9 +1144,9 @@ pub async fn supervisor_infra_nodes(
         .await?;
     use sqlx::Row;
     let rows = sqlx::query(
-        "SELECT node_id, member_id, instance_id, status, applied_spec_hash, applied_at_unix, \
-                endpoints_json, install_endpoints_json, public_paths_json, doors_json, preserve_pvcs_json, units_json \
-         FROM infra_node WHERE project_id = $1 ORDER BY node_id, member_id NULLS FIRST",
+        "SELECT node_id, instance_id, copy_id, status, applied_spec_hash, applied_at_unix, \
+                endpoints_json, install_endpoints_json, public_paths_json, doors_json, keep_disks_json, units_json \
+         FROM infra_node WHERE project_id = $1 ORDER BY node_id, instance_id NULLS FIRST",
     )
     .bind(req.project_id)
     .fetch_all(&state.pool)
@@ -1160,16 +1160,16 @@ pub async fn supervisor_infra_nodes(
         let node_id: String = r
             .try_get("node_id")
             .map_err(|e| internal(anyhow::anyhow!("decode node_id: {e}")))?;
-        let member: Option<String> = r
-            .try_get("member_id")
-            .map_err(|e| internal(anyhow::anyhow!("decode member_id: {e}")))?;
-        let member = member
-            .map(weft_core::member::MemberId::new)
-            .transpose()
-            .map_err(|e| internal(anyhow::anyhow!("infra_node.member_id for node='{node_id}': {e}")))?;
-        let instance_id: String = r
+        let instance: Option<String> = r
             .try_get("instance_id")
             .map_err(|e| internal(anyhow::anyhow!("decode instance_id: {e}")))?;
+        let instance = instance
+            .map(weft_core::instance::InstanceId::new)
+            .transpose()
+            .map_err(|e| internal(anyhow::anyhow!("infra_node.instance_id for node='{node_id}': {e}")))?;
+        let copy_id: String = r
+            .try_get("copy_id")
+            .map_err(|e| internal(anyhow::anyhow!("decode copy_id: {e}")))?;
         let status_str: String = r
             .try_get("status")
             .map_err(|e| internal(anyhow::anyhow!("decode status: {e}")))?;
@@ -1202,7 +1202,7 @@ pub async fn supervisor_infra_nodes(
             public_paths: column(&r, "public_paths_json", &node_id)?,
             doors: column(&r, "doors_json", &node_id)?,
         };
-        let keep_disks: Vec<String> = column(&r, "preserve_pvcs_json", &node_id)?;
+        let keep_disks: Vec<String> = column(&r, "keep_disks_json", &node_id)?;
         let units_json: serde_json::Value = r
             .try_get("units_json")
             .map_err(|e| internal(anyhow::anyhow!("decode units_json: {e}")))?;
@@ -1214,8 +1214,8 @@ pub async fn supervisor_infra_nodes(
         .map_err(internal)?;
         nodes.push(SupervisorInfraNode {
             node_id,
-            member,
-            instance_id,
+            instance,
+            copy_id,
             status,
             applied_spec_hash,
             applied_at_unix,
@@ -1277,7 +1277,7 @@ pub async fn supervisor_claim_command(
     loop {
         let next = crate::lifecycle_writes::next_command(
             &state.pool,
-            &req.claimer_instance,
+            &req.claimer_replica,
             &req.busy_projects,
         )
         .await
@@ -1320,7 +1320,7 @@ pub async fn supervisor_event_record(
         &project_tenant,
         req.project_id,
         req.node_id.as_deref(),
-        req.member.as_ref(),
+        req.instance.as_ref(),
         req.kind.as_str(),
         &req.payload,
     )
@@ -1361,7 +1361,7 @@ pub async fn supervisor_set_status(
     // The write, its fence and its stale answers live in
     // `lifecycle_writes::set_status` (pool-level, db-tested); this is
     // the scope-checked HTTP wrapper. The identity is the supervisor's
-    // instance id (`req.instance`, what keys `infra_owner`).
+    // replica id (`req.replica`, what keys `infra_owner`).
     let outcome = crate::lifecycle_writes::set_status(&state.pool, &req)
         .await
         .map_err(internal)?;
@@ -1401,6 +1401,10 @@ struct ApplyRowState {
     stamp_applied_at: bool,
     /// Where the endpoints answer; empty until the apply succeeds.
     addresses: weft_broker_client::protocol::AppliedEndpoints,
+    /// What the host runs differently from what was asked
+    /// (`SupervisorSetAppliedRequest::notes`); empty until the apply
+    /// succeeds.
+    notes: Vec<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1409,8 +1413,8 @@ async fn write_apply_row(
     op: &str,
     project_id: uuid::Uuid,
     node_id: &str,
-    member: Option<&weft_core::member::MemberId>,
-    instance_id: &str,
+    instance: Option<&weft_core::instance::InstanceId>,
+    copy_id: &str,
     keep_disks: &[String],
     units_json: serde_json::Value,
     command_id: i64,
@@ -1425,6 +1429,7 @@ async fn write_apply_row(
     let public_paths_json = json("public_paths", serde_json::to_value(&row.addresses.public_paths))?;
     let doors_json = json("doors", serde_json::to_value(&row.addresses.doors))?;
     let install_endpoints_json = json("install_endpoints", serde_json::to_value(&row.addresses.install_urls))?;
+    let notes_json = json("notes", serde_json::to_value(&row.notes))?;
     // The INSERT pulls its values FROM the caller's still-claimed
     // apply command so the ownership check and the write share one
     // row snapshot. Every variable is a bind: no SQL built by string
@@ -1433,23 +1438,23 @@ async fn write_apply_row(
     // bound `$6` flag via CASE.
     let res = sqlx::query(
         &format!("INSERT INTO infra_node \
-         (project_id, node_id, member_id, instance_id, status, \
+         (project_id, node_id, instance_id, copy_id, status, \
           failure_stage, failure_message, applied_spec_hash, \
-          applied_at_unix, endpoints_json, public_paths_json, doors_json, preserve_pvcs_json, units_json, \
-          install_endpoints_json) \
+          applied_at_unix, endpoints_json, public_paths_json, doors_json, keep_disks_json, units_json, \
+          install_endpoints_json, notes_json) \
          SELECT $1, $2, $13, $3, $4, NULL, NULL, $5, \
                 CASE WHEN $6 THEN EXTRACT(EPOCH FROM NOW())::BIGINT ELSE NULL END, \
-                $7, $12, $14, $8, $9, $15 \
+                $7, $12, $14, $8, $9, $15, $16 \
          FROM infra_lifecycle_command \
          WHERE id = $10 \
            AND project_id = $1 \
            AND node_id = $2 \
-           AND member_id IS NOT DISTINCT FROM $13 \
+           AND instance_id IS NOT DISTINCT FROM $13 \
            AND verb = 'apply' \
            AND completed_at_unix IS NULL \
            AND {owns} \
-         ON CONFLICT (project_id, node_id, member_id) DO UPDATE SET \
-            instance_id        = EXCLUDED.instance_id, \
+         ON CONFLICT (project_id, node_id, instance_id) DO UPDATE SET \
+            copy_id            = EXCLUDED.copy_id, \
             status             = EXCLUDED.status, \
             failure_stage      = NULL, \
             failure_message    = NULL, \
@@ -1459,14 +1464,15 @@ async fn write_apply_row(
             public_paths_json  = EXCLUDED.public_paths_json, \
             doors_json         = EXCLUDED.doors_json, \
             install_endpoints_json = EXCLUDED.install_endpoints_json, \
-            preserve_pvcs_json = EXCLUDED.preserve_pvcs_json, \
+            notes_json         = EXCLUDED.notes_json, \
+            keep_disks_json = EXCLUDED.keep_disks_json, \
             units_json         = EXCLUDED.units_json",
         owns = weft_broker_client::lifecycle_command::owns_project_predicate("$11", "$1"),
     ),
     )
     .bind(project_id)
     .bind(node_id)
-    .bind(instance_id)
+    .bind(copy_id)
     .bind(row.status)
     .bind(&row.applied_spec_hash)
     .bind(row.stamp_applied_at)
@@ -1476,9 +1482,10 @@ async fn write_apply_row(
     .bind(command_id)
     .bind(owner)
     .bind(public_paths_json)
-    .bind(member.map(|m| m.as_str()))
+    .bind(instance.map(|m| m.as_str()))
     .bind(doors_json)
     .bind(install_endpoints_json)
+    .bind(notes_json)
     .execute(&state.pool)
     .await
     .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
@@ -1507,12 +1514,12 @@ pub async fn supervisor_set_applied(
         "set_applied",
         req.project_id,
         &req.node_id,
-        req.member.as_ref(),
-        &req.instance_id,
+        req.instance.as_ref(),
+        &req.copy_id,
         &req.keep_disks,
         units_json,
         req.command_id,
-        &req.instance,
+        &req.replica,
         ApplyRowState {
             // Flaky if a frozen unit still is, Running otherwise: the
             // node status must agree with the roster it is written with
@@ -1525,6 +1532,7 @@ pub async fn supervisor_set_applied(
             applied_spec_hash: Some(req.applied_spec_hash.clone()),
             stamp_applied_at: true,
             addresses: req.addresses.clone(),
+            notes: req.notes.clone(),
         },
     )
     .await?;
@@ -1532,7 +1540,7 @@ pub async fn supervisor_set_applied(
 }
 
 /// Supervisor-callable: write the `infra_node` row at `Provisioning`
-/// before the apply begins. Locks in the (instance_id, keep_disks) pair
+/// before the apply begins. Locks in the (copy_id, keep_disks) pair
 /// so that a partial-apply leaves a visible row
 /// the user can Terminate. On apply success, `set_applied` flips to
 /// `Running` and fills endpoints + applied_spec_hash. Same ownership
@@ -1554,12 +1562,12 @@ pub async fn supervisor_set_provisioning(
         "set_provisioning",
         req.project_id,
         &req.node_id,
-        req.member.as_ref(),
-        &req.instance_id,
+        req.instance.as_ref(),
+        &req.copy_id,
         &req.keep_disks,
         units_json,
         req.command_id,
-        &req.instance,
+        &req.replica,
         ApplyRowState {
             // Not-yet-applied: NULL hash + applied_at, empty
             // endpoints. set_applied flips these on success.
@@ -1567,6 +1575,7 @@ pub async fn supervisor_set_provisioning(
             applied_spec_hash: None,
             stamp_applied_at: false,
             addresses: Default::default(),
+            notes: Vec::new(),
         },
     )
     .await?;
@@ -1603,10 +1612,10 @@ pub async fn supervisor_enqueue_lifecycle(
     // None for both variants (Deactivate carries it inside
     // spec_json; Reactivate has no policy). Bind NULL.
     let (verb, running_policy, spec_json) = req.spec.into_row_columns();
-    let issued_by_instance = caller.instance.as_deref().ok_or_else(|| {
+    let issued_by_replica = caller.replica.as_deref().ok_or_else(|| {
         (
             StatusCode::FORBIDDEN,
-            "supervisor token missing instance claim".to_string(),
+            "supervisor token missing replica claim".to_string(),
         )
     })?;
     let command_id = crate::lifecycle_writes::issue_command(
@@ -1617,11 +1626,11 @@ pub async fn supervisor_enqueue_lifecycle(
             node_id: None,
             // A dispatcher verb acts on activations, not on infra
             // copies; the column stays at its shared default.
-            copies: &weft_core::member::Copies::Shared,
+            copies: &weft_core::instance::Copies::Shared,
             verb,
             running_policy,
             spec_json: spec_json.as_ref(),
-            issued_by_instance,
+            issued_by_replica,
         },
     )
     .await
@@ -1700,10 +1709,10 @@ pub async fn infra_enqueue_apply(
             .await?;
     // Deduplicated against an in-flight apply for the same (project,
     // node): `lifecycle_writes::issue_command`.
-    let issued_by_instance = caller.instance.as_deref().ok_or_else(|| {
+    let issued_by_replica = caller.replica.as_deref().ok_or_else(|| {
         (
             StatusCode::FORBIDDEN,
-            "worker token missing instance claim".to_string(),
+            "worker token missing replica claim".to_string(),
         )
     })?;
     // Apply doesn't carry a running_policy (no in-flight executions
@@ -1714,11 +1723,11 @@ pub async fn infra_enqueue_apply(
             tenant_id: &project_tenant,
             project_id: req.project_id,
             node_id: Some(&req.node_id),
-            copies: &weft_core::member::Copies::of(req.member.clone()),
+            copies: &weft_core::instance::Copies::of(req.instance.clone()),
             verb: weft_broker_client::protocol::InfraLifecycleVerb::Apply,
             running_policy: None,
             spec_json: Some(&req.spec_json),
-            issued_by_instance,
+            issued_by_replica,
         },
     )
     .await
@@ -1829,14 +1838,14 @@ pub async fn supervisor_remove_node(
     let tenant =
         scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
             .await?;
-    // Ownership gate: only the instance that currently OWNS the project may
+    // Ownership gate: only the replica that currently OWNS the project may
     // cascade-delete its infra_node + cancel its pending commands. A
     // supervisor that lost ownership mid-Terminate must NOT wipe rows
     // out from under the new owner. 410 → the supervisor aborts the
     // command (leaving it uncompleted for the new owner to re-run). The
     // check runs INSIDE the cascade transaction so the ownership read
     // and the deletes share one snapshot (no TOCTOU window). The
-    // identity is the supervisor's instance id (`req.instance`, what
+    // identity is the supervisor's replica id (`req.replica`, what
     // keys `infra_owner`).
     // Cascade in one transaction so a remove-then-readd of the same
     // node_id starts clean: no stale events claiming "flaky" from
@@ -1851,7 +1860,7 @@ pub async fn supervisor_remove_node(
         "SELECT {owns}",
         owns = weft_broker_client::lifecycle_command::owns_project_predicate("$1", "$2"),
     ))
-    .bind(&req.instance)
+    .bind(&req.replica)
     .bind(req.project_id)
     .fetch_one(&mut *tx)
     .await
@@ -1865,28 +1874,28 @@ pub async fn supervisor_remove_node(
             StatusCode::GONE,
             format!(
                 "remove_node: {} no longer owns project {}",
-                req.instance, req.project_id
+                req.replica, req.project_id
             ),
         ));
     }
-    let member = req.member.as_ref().map(|m| m.as_str());
+    let instance = req.instance.as_ref().map(|m| m.as_str());
     let res = sqlx::query(
         "DELETE FROM infra_node \
-          WHERE project_id = $1 AND node_id = $2 AND member_id IS NOT DISTINCT FROM $3",
+          WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3",
     )
         .bind(req.project_id)
         .bind(&req.node_id)
-        .bind(member)
+        .bind(instance)
         .execute(&mut *tx)
         .await
         .map_err(|e| internal(anyhow::anyhow!("delete infra_node: {e}")))?;
     sqlx::query(
         "DELETE FROM infra_event \
-          WHERE project_id = $1 AND node_id = $2 AND member_id IS NOT DISTINCT FROM $3",
+          WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3",
     )
     .bind(req.project_id)
     .bind(&req.node_id)
-    .bind(member)
+    .bind(instance)
     .execute(&mut *tx)
     .await
     .map_err(|e| internal(anyhow::anyhow!("delete infra_event: {e}")))?;
@@ -1902,13 +1911,13 @@ pub async fn supervisor_remove_node(
                 outcome = $3, \
                 outcome_message = 'node removed by remove_node' \
           WHERE project_id = $1 AND node_id = $2 \
-            AND NOT every_copy AND member_id IS NOT DISTINCT FROM $4 \
+            AND NOT every_copy AND instance_id IS NOT DISTINCT FROM $4 \
             AND completed_at_unix IS NULL AND id <> $5",
     )
     .bind(req.project_id)
     .bind(&req.node_id)
     .bind(LifecycleOutcome::Cancelled.as_str())
-    .bind(member)
+    .bind(instance)
     .bind(req.command_id)
     .execute(&mut *tx)
     .await
@@ -1921,7 +1930,7 @@ pub async fn supervisor_remove_node(
         &mut *tx,
         &tenant,
         req.project_id,
-        Some((&req.node_id, req.member.as_ref())),
+        Some((&req.node_id, req.instance.as_ref())),
     )
     .await
     .map_err(|e| internal(anyhow::anyhow!("delete published connections: {e}")))?;
@@ -2004,7 +2013,7 @@ pub async fn supervisor_infra_command_in_flight(
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
         .await?;
     let rows: Vec<(Option<String>, Option<String>, bool)> = sqlx::query_as(&format!(
-        "SELECT node_id, member_id, every_copy FROM infra_lifecycle_command \
+        "SELECT node_id, instance_id, every_copy FROM infra_lifecycle_command \
          WHERE project_id = $1 AND completed_at_unix IS NULL AND verb IN ({verbs})",
         verbs = weft_broker_client::lifecycle_command::SUPERVISOR_VERBS_SQL,
     ))
@@ -2014,8 +2023,8 @@ pub async fn supervisor_infra_command_in_flight(
     .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
     let commands = rows
         .into_iter()
-        .map(|(node_id, member, every)| {
-            let copies = weft_core::member::Copies::from_columns(member, every)
+        .map(|(node_id, instance, every)| {
+            let copies = weft_core::instance::Copies::from_columns(instance, every)
                 .map_err(|e| internal(anyhow::anyhow!("infra_lifecycle_command copies: {e}")))?;
             Ok(InFlightCommand { node_id, copies })
         })
@@ -2046,8 +2055,8 @@ pub async fn supervisor_command_complete(
     scope::require_tenant_in_scope(&caller, &tenant_id)?;
     // The terminal write, its ownership fence and its stale answers
     // live in `lifecycle_writes::complete_command` (pool-level,
-    // db-tested). Ownership identity is the supervisor's instance id
-    // (`req.instance`, what keys `infra_owner`).
+    // db-tested). Ownership identity is the supervisor's replica id
+    // (`req.replica`, what keys `infra_owner`).
     // Tenant scope was already re-checked above via the token.
     let outcome = crate::lifecycle_writes::complete_command(&state.pool, &req)
         .await
@@ -2193,28 +2202,28 @@ fn require_worker(caller: &CallerIdentity) -> Result<(), (StatusCode, String)> {
     Ok(())
 }
 
-/// Reject if the request claims a `instance` other than the instance the
+/// Reject if the request claims a `replica` other than the replica the
 /// call came from.
-fn require_instance_matches(
+fn require_replica_matches(
     caller: &CallerIdentity,
     claimed: &str,
 ) -> Result<(), (StatusCode, String)> {
-    let bound = caller.instance.as_deref().ok_or((
+    let bound = caller.replica.as_deref().ok_or((
         StatusCode::FORBIDDEN,
-        "the call names no instance; refusing an instance-bound op".into(),
+        "the call names no replica; refusing a replica-bound op".into(),
     ))?;
     if bound != claimed {
         tracing::warn!(
             target: "weft_broker::scope",
             caller_tenant = ?caller.scope.pinned_tenant(),
             caller_role = ?caller.role,
-            bound_instance = %bound,
-            claimed_instance = %claimed,
-            "broker rejected instance mismatch"
+            bound_replica = %bound,
+            claimed_replica = %claimed,
+            "broker rejected replica mismatch"
         );
         return Err((
             StatusCode::FORBIDDEN,
-            "claimed instance is not the calling instance".into(),
+            "claimed replica is not the calling replica".into(),
         ));
     }
     Ok(())

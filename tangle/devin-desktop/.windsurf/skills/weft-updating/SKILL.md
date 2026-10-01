@@ -7,7 +7,7 @@ description: "Read when the user asks to update or upgrade weft, or when somethi
 
 [the checkout] is the git clone of weft on the user's machine; `./setup.sh` in it is what installed weft. An update is `git pull` in [the checkout], then `./setup.sh`, then one command per project. An update never edits a file inside the user's projects.
 
-Projects created with `weft new <name> --assistant devin-desktop` (shorthand `dd`; the choice is remembered, so plain `weft new` installs it too once picked) have their Tangle persona (`.devin/` and `.windsurf/`) COPIED into the project, so a project keeps the version that created it. After the `./setup.sh`, `weft tangle update` inside a project re-copies its Tangle from [the checkout]; run it in each project the user wants on the new version. It replaces every file Tangle owns and leaves anything the assistant wrote beside them alone, so the diff is worth reading.
+Projects created with `weft new <name> --assistant devin-desktop` (shorthand `dd`; adding `--remember` makes it the default, so plain `weft new` installs it too) have their Tangle persona (`.devin/` and `.windsurf/`) COPIED into the project, so a project keeps the version that created it. After the `./setup.sh`, `weft tangle update` inside a project re-copies its Tangle from [the checkout]; run it in each project the user wants on the new version. It replaces every file Tangle owns and leaves anything the assistant wrote beside them alone, so the diff is worth reading.
 
 ## Finding the checkout
 

@@ -7,7 +7,9 @@ the user opens the project.
 
 One folder here per assistant. `weft new <name> --assistant <one of them>`
 copies that folder's files into the new project, where they are the
-project's own files and get committed with it. To move a project onto a
+project's own files and get committed with it. The choice is for that
+project only; add `--remember` if you want later `weft new` runs to install
+the same folder with no flag. To move a project onto a
 newer Tangle, run `weft tangle update` in it.
 
 Copies rather than links, because an assistant treats a project's

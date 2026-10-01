@@ -104,6 +104,30 @@ pub enum DomainServes {
     Api { project: uuid::Uuid },
 }
 
+/// A stored domain and the DNS record that points it at the install:
+/// what `GET /install/domains` lists and `POST /install/domains` answers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomainEntry {
+    pub domain: Domain,
+    pub record: DnsRecord,
+}
+
+/// The DNS record that points a domain at the install.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DnsRecord {
+    /// `A` for an IPv4 address, `AAAA` for an IPv6 one.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub name: String,
+    pub value: String,
+}
+
+impl std::fmt::Display for DnsRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} record, name {}, value {}", self.kind, self.name, self.value)
+    }
+}
+
 impl Domain {
     /// Check a domain before it is stored, naming what is wrong.
     pub fn validate(&self) -> Result<(), String> {

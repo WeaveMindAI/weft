@@ -15,31 +15,11 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use serde::{Deserialize, Serialize};
+use weft_core::node_test::{NodeTestRunStatus, RunNodeTestRequest, RunNodeTestResponse};
 
 use crate::authenticator::{authorize_project, CallerTenant};
 use crate::state::DispatcherState;
 use crate::task_kinds::run_node_test::{RunNodeTestPayload, RUN_NODE_TEST_KIND};
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RunNodeTestRequest {
-    pub image_ref: String,
-    pub node: String,
-    pub test: String,
-    #[serde(default)]
-    pub live_connection: Option<String>,
-    /// Live-test fixture variables (`WEFT_NODE_TEST_*`), handed to the
-    /// test with the request.
-    #[serde(default)]
-    pub fixtures: std::collections::BTreeMap<String, String>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RunNodeTestResponse {
-    pub task_id: String,
-}
 
 pub async fn run(
     State(state): State<DispatcherState>,
@@ -67,7 +47,7 @@ pub async fn run(
             dedup_key: None,
             execution_id: None,
             tenant_id: caller.0 .0.clone(),
-            target_instance: None,
+            target_replica: None,
             binary_hash: None,
             payload: serde_json::to_value(&payload)
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
@@ -78,20 +58,6 @@ pub async fn run(
     state.kick.kick(weft_platform_traits::CoreRole::Dispatcher);
 
     Ok(Json(RunNodeTestResponse { task_id: task_id.to_string() }))
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NodeTestRunStatus {
-    /// `pending` / `claimed` / `complete` / `failed`.
-    pub status: weft_task_store::tasks::TaskStatus,
-    /// The runner's JSON report, present once the task completed.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub report: Option<serde_json::Value>,
-    /// The task's error, present when the RUN ITSELF failed (a failing
-    /// test is a completed task whose report says `passed: false`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 pub async fn status(
@@ -126,9 +92,12 @@ pub async fn status(
         )
     })?;
 
-    Ok(Json(NodeTestRunStatus {
-        status: outcome.status,
-        report: outcome.result,
-        error: outcome.error,
-    }))
+    // The report is the runner's `TestReport`; one that does not read as
+    // one is a runner and dispatcher out of step, said as such.
+    let report = outcome
+        .result
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("the node-test run's report does not read as a test report: {e}")))?;
+    Ok(Json(NodeTestRunStatus { status: outcome.status, report, error: outcome.error }))
 }

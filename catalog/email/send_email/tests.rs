@@ -12,6 +12,9 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("an_unparseable_address_refuses_before_sending", bad_address),
         NodeTest::fake("a_non_numeric_smtp_port_refuses_before_sending", bad_port),
+        NodeTest::fake("an_unreachable_server_fails_the_run_when_error_is_unwired", refused_unwired),
+        NodeTest::fake("an_unreachable_server_comes_out_on_error_when_it_is_wired", refused_wired),
+        NodeTest::fake("a_bad_address_still_fails_the_run_when_error_is_wired", bad_address_wired),
         NodeTest::live("one_real_send_to_self", "email", live_send).with_fixture(fixture_spec(
             "EMAIL_TO",
             "Recipient address",
@@ -63,6 +66,46 @@ async fn bad_port(rig: FakeRig) -> WeftResult<()> {
         .await;
     let err = outcome.result.expect_err("a bad port must refuse").to_string();
     assert!(err.contains("not a number"), "{err}");
+    Ok(())
+}
+
+/// A server that hangs up on every connection, so the SMTP send fails
+/// at once without leaving the machine.
+fn unreachable_server(rig: &FakeRig) {
+    rig.connection_value("email", "user", "sender@example.com");
+    rig.connection_value("email", "password", "secret");
+    rig.connection_value("email", "smtp_host", "127.0.0.1");
+    rig.connection_value("email", "smtp_port", &rig.hang_up_server().to_string());
+}
+
+fn send_inputs(rig: &FakeRig, to: &str) -> serde_json::Value {
+    json!({ "account": rig.access("email"), "to": to, "subject": "s", "body": "b" })
+}
+
+async fn refused_unwired(rig: FakeRig) -> WeftResult<()> {
+    unreachable_server(&rig);
+    let err = rig.run(&SendEmailNode, send_inputs(&rig, "someone@example.com")).await.failure()?;
+    assert!(err.contains("SMTP server"), "{err}");
+    Ok(())
+}
+
+async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
+    unreachable_server(&rig);
+    rig.wire_output("error");
+    let outcome = rig.run(&SendEmailNode, send_inputs(&rig, "someone@example.com")).await.ok()?;
+    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    assert!(error.contains("SMTP server"), "{error}");
+    assert!(!outcome.outputs.contains_key("messageId"), "a caught failure emits no messageId");
+    Ok(())
+}
+
+/// A malformed address is a mistake in the program, never a value for
+/// `error`.
+async fn bad_address_wired(rig: FakeRig) -> WeftResult<()> {
+    unreachable_server(&rig);
+    rig.wire_output("error");
+    let err = rig.run(&SendEmailNode, send_inputs(&rig, "not an address")).await.failure()?;
+    assert!(err.starts_with("input error"), "{err}");
     Ok(())
 }
 

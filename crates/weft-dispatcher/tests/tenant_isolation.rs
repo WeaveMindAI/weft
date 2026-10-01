@@ -298,7 +298,7 @@ fn started(execution_id: Uuid, project_id: uuid::Uuid) -> weft_journal::ExecEven
         program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
         subgraph: None,
         seed: None,
-        member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+        instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
         run_class: weft_core::run_class::RunClass::Short,
     }
 }
@@ -306,7 +306,7 @@ fn started(execution_id: Uuid, project_id: uuid::Uuid) -> weft_journal::ExecEven
 fn token(hash: &str, tenant: &str) -> SignalToken {
     SignalToken {
         id: uuid::Uuid::new_v4(),
-        kind: weft_dispatcher::journal::TokenKind::Caller,
+        kind: weft_core::signal_token::TokenKind::Caller,
         token_hash: hash.to_string(),
         recognizer: "wft-test-…".to_string(),
         tenant_id: tenant.to_string(),
@@ -316,7 +316,7 @@ fn token(hash: &str, tenant: &str) -> SignalToken {
         allowed_displays: vec![],
         all_displays: false,
         created_at: 0,
-        member: None,
+        instance: None,
         expires_at: None,
     }
 }

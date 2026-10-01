@@ -13,6 +13,7 @@
 
 use anyhow::{bail, Context};
 use weft_core::run_spec::{Refusal, RunSpec};
+use weft_core::versions::RunStarted;
 
 use super::versions::{spec_from_flags, RunFlags};
 use super::Ctx;
@@ -24,7 +25,7 @@ use crate::progress::ActionVerb;
 pub struct RunArgs {
     pub spec: Option<String>,
     pub detach: bool,
-    pub node_set: Option<weft_compiler::codegen::NodeSet>,
+    pub node_set: Option<weft_core::builds::NodeSet>,
     pub seed: bool,
     pub seed_until: Vec<String>,
     pub seed_before: Vec<String>,
@@ -81,32 +82,32 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
     // below judges the file, never the marker text. What was saved above
     // keeps the markers, so an example reads its file afresh every run.
     if let Some(spec) = &mut spec {
-        let (client, project_id, _) = super::resolve_project(ctx)?;
-        super::assets::resolve_run_values(&client, &ctx.project()?.root, &project_id, spec).await?;
+        let (client, _, _) = super::resolve_project(ctx)?;
+        super::assets::resolve_run_values(&client, &ctx.project()?.root, spec).await?;
     }
     validate_run(&compiled.definition, spec.as_ref(), &args)?;
-    let node_set = args.node_set.unwrap_or(weft_compiler::codegen::NodeSet::Full);
+    let node_set = args.node_set.unwrap_or(weft_core::builds::NodeSet::Full);
     let definition = compiled.definition.clone();
     let handle = super::ensure::build_compiled(ctx, progress, node_set, compiled).await?;
     if !ctx.json() {
         println!("registered {} ({})", handle.name, handle.id);
     }
-    // SYNC: body <-> crates/weft-dispatcher/src/api/versions.rs VersionRunRequest
-    let body = serde_json::json!({
-        "manifest": handle.manifest,
-        "definitionHash": handle.definition_hash(),
-        "binaryHash": handle.binary_hash(),
-        "seed": args.seed,
-        "seedUntil": args.seed_until,
-        "seedBefore": args.seed_before,
-        "root": args.root,
-        "spec": spec,
-        "example": args.save.as_ref().or(args.spec.as_ref()).and_then(|_| spec.as_ref().map(|spec| &spec.name)),
-    });
+    let example = args.save.as_ref().or(args.spec.as_ref()).and_then(|_| spec.as_ref().map(|spec| spec.name.clone()));
+    let body = weft_core::versions::VersionRunRequest {
+        manifest: handle.manifest.clone(),
+        definition_hash: handle.definition_hash().to_string(),
+        binary_hash: handle.binary_hash().to_string(),
+        seed: args.seed,
+        seed_until: args.seed_until.clone(),
+        seed_before: args.seed_before.clone(),
+        root: args.root,
+        spec: spec.clone(),
+        example,
+    };
     let path = format!("/projects/{}/versions/runs", handle.id);
     progress.dispatcher_call_start(&path);
     let started = start_run(&handle.client, &path, &body).await?;
-    let execution_id = started.execution_id.clone();
+    let execution_id = started.execution_id;
     progress.dispatcher_call_done(serde_json::json!({ "execution_id": execution_id, "project_id": handle.id }));
 
     let summary = summary_line(&started, spec.as_ref());
@@ -130,7 +131,7 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
     if args.detach || ctx.json() {
         return Ok(());
     }
-    super::follow::follow_execution_id(&handle.client, &execution_id, Some(&definition)).await?;
+    super::follow::follow_execution_id(&handle.client, &execution_id.to_string(), Some(&definition)).await?;
     Ok(())
 }
 
@@ -151,21 +152,14 @@ fn validate_run(definition: &weft_core::ProjectDefinition, spec: Option<&RunSpec
     Ok(())
 }
 
-// SYNC: Started <-> crates/weft-dispatcher/src/api/versions.rs VersionRunResponse
-#[derive(Debug, serde::Deserialize)]
-pub struct Started {
-    pub execution_id: String,
-    pub version: String,
-    pub seed: Option<String>,
-    pub inherited: Vec<String>,
-    pub ran: Vec<String>,
-    pub warnings: Vec<String>,
-}
-
 /// Start the run, turning the resolver's 422 into its lines: every
 /// missing input at once, each naming the three ways to satisfy it.
-pub async fn start_run(client: &crate::client::DispatcherClient, path: &str, body: &serde_json::Value) -> anyhow::Result<Started> {
-    let (status, text) = client.post_json_status(path, body).await.context("start run")?;
+pub async fn start_run(
+    client: &crate::client::DispatcherClient,
+    path: &str,
+    body: &weft_core::versions::VersionRunRequest,
+) -> anyhow::Result<RunStarted> {
+    let (status, text) = client.post_json_status(path, &serde_json::to_value(body)?).await.context("start run")?;
     match status {
         200..=299 => serde_json::from_str(&text).context("parse run response"),
         422 => {
@@ -178,11 +172,11 @@ pub async fn start_run(client: &crate::client::DispatcherClient, path: &str, bod
 
 /// The one line a run ends its start with: what was inherited and
 /// what runs, or what the spec covered.
-pub fn summary_line(started: &Started, spec: Option<&RunSpec>) -> String {
+pub fn summary_line(started: &RunStarted, spec: Option<&RunSpec>) -> String {
     let mut parts: Vec<String> = Vec::new();
     match &started.seed {
         Some(seed) => {
-            parts.push(format!("{} nodes inherited from {}", started.inherited.len(), super::versions::short(seed)));
+            parts.push(format!("{} nodes inherited from {}", started.inherited.len(), super::versions::short(&seed.to_string())));
             parts.push(format!("{} ran ({})", started.ran.len(), started.ran.join(", ")));
         }
         None => parts.push(format!("{} nodes", started.ran.len())),
@@ -206,11 +200,11 @@ pub fn summary_line(started: &Started, spec: Option<&RunSpec>) -> String {
 mod tests {
     use super::*;
 
-    fn started(seed: Option<&str>, inherited: &[&str], ran: &[&str]) -> Started {
-        Started {
-            execution_id: "c".into(),
+    fn started(seed: Option<&str>, inherited: &[&str], ran: &[&str]) -> RunStarted {
+        RunStarted {
+            execution_id: uuid::Uuid::nil(),
             version: "v".into(),
-            seed: seed.map(str::to_string),
+            seed: seed.map(|s| format!("{s}-0000-0000-0000-000000000000").parse().expect("a uuid")),
             inherited: inherited.iter().map(|s| s.to_string()).collect(),
             ran: ran.iter().map(|s| s.to_string()).collect(),
             warnings: vec![],

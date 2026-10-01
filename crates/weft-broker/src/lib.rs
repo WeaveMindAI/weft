@@ -151,7 +151,7 @@ pub fn router(state: Arc<BrokerState>) -> Router {
         // publishing can never reach the runtime's.
         .route("/v1/access/publish", post(handlers::publish_access))
         .route("/v1/access/published", post(handlers::published_access))
-        .route("/v1/program/mint_member_token", post(program_tokens::mint_member_token))
+        .route("/v1/program/mint_instance_token", post(program_tokens::mint_instance_token))
         // Signals (the listener's rehydrate read)
         .route("/v1/signal/list_held", post(handlers::signal_list_held))
         .route("/v1/signal/get_held", post(handlers::signal_get_held))

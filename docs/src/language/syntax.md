@@ -41,17 +41,18 @@ show = Debug { data: message.value }
 Or put it on its own line, which is the same connection:
 
 ```weft
-show = Debug
 show.data = message.value
 ```
 
 Values travel right to left, into the input on the left, and the type has to
-fit.
+fit. Write the wire in the braces whenever you can. The line of its own is for
+the ports a group, a loop or an `@include` declares, which you set from
+outside because their braces hold something else or there are none.
 
 To take one field out of a value, keep going with dots:
 
 ```weft
-speed.wpm = reader.profile.stats.wpm
+show = Debug { data: reader.profile.stats.wpm }
 ```
 
 That reads `stats.wpm` off `reader.profile`. For the type rules, go and read
@@ -106,7 +107,18 @@ calc = ExecPython(a: Number, b: Number) -> (sum: Number) {
 ```
 
 `ExecPython` hands your code `a` and `b` and expects a dictionary back, keyed
-by output name.
+by output name. A key left out sends nothing on that output, and `return {}`
+sends nothing at all. A key set to `None` sends a real null on an output whose
+type takes `Null` (`last: JsonDict | Null`), and nothing on any other output.
+
+If you want the program to carry on when the script raises (a request it
+makes fails, or it raises on purpose), wire the step's `error` output: the
+exception's type, message and traceback come out there, and the other outputs
+send nothing. Left unwired, the exception fails the run. A mistake in the
+program fails the run either way: code that does not compile, a script that
+ends without returning a dictionary, a key that is not one of its outputs, or a
+value of the wrong type for its output. `error` counts as a key it may not
+return, since weft fills it; to fail on purpose, raise.
 
 You can only declare the ports a step leaves open for you. Ports whose types
 are already fixed keep them. Declare inputs, outputs, or both:
@@ -230,32 +242,32 @@ It goes in a step's body or its inline signature. A step's author can bake the
 same requirement into its metadata as `oneOfRequired`. Groups and loops reject
 it: put it on the child that needs the value.
 
-## One copy per member, one value per member
+## One copy per instance, one value per instance
 
-`@per_member` on its own line in an infra node's body gives each member of the
-program their own copy of that node (their own container):
+`@per_instance` on its own line in an infra node's body gives each instance of
+the program its own copy of that node (its own container):
 
 ```weft
 bridge = BaileyBridge {
-  @per_member
+  @per_instance
 }
 ```
 
 It takes no arguments.
 
-`@member_filled` goes where a field's value would, and makes the value each
-member's own: `@member_filled` alone, or `@member_filled(<value>)` with the
-value a member who gave none gets. A connection is a value too:
+`@instance_filled` goes where a field's value would, and makes the value each
+instance's own: `@instance_filled` alone, or `@instance_filled(<value>)` with
+the value an instance that was given none gets. A connection is a value too:
 
 ```weft
-google = GoogleAccess { account: @member_filled }
-digest = Cron { cron: @member_filled("0 0 8 * * *") }
+google = GoogleAccess { account: @instance_filled }
+digest = Cron { cron: @instance_filled("0 0 8 * * *") }
 ```
 
 The fallback can also be a file, read the way a written one is:
-`personality: @member_filled(@file("prompts/default.md"))`.
+`personality: @instance_filled(@file("prompts/default.md"))`.
 
-For what both do, go and read [programs with members](../running/members.md).
+For what both do, go and read [programs with instances](../running/instances.md).
 
 ## Comments
 

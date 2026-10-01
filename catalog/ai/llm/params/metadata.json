@@ -110,6 +110,7 @@
       "type": "String",
       "widget": {
         "kind": "select",
+        "free_text": true,
         "options": [
           "low",
           "medium",

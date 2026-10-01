@@ -28,12 +28,12 @@ pub trait ProjectReclaimer: Send + Sync {
 
 /// The default reclaimer: free the project's per-project storage from the
 /// object store: its `project/`-scoped runtime files (persistent state a
-/// running node wrote) AND its `asset/`-scoped published assets (the sync's
-/// derived copies of source-referenced media). Both are tied to the project's
-/// lifetime by design and go away with it. `shared/`-scoped files are the
-/// owner's, not the project's, and are deliberately left untouched (they
-/// outlive the project). This runtime-files plane always exists, so it is the
-/// default.
+/// running node wrote) and every instance's files, which go away with the
+/// project. Its references to the tenant's assets are dropped, so an asset no
+/// other project of the tenant references starts its countdown; one another
+/// project still references stays. `shared/`-scoped files are the owner's,
+/// not the project's, and are deliberately left untouched (they outlive the
+/// project). This runtime-files plane always exists, so it is the default.
 pub struct WipeProjectFiles;
 
 #[async_trait]
@@ -51,15 +51,18 @@ impl ProjectReclaimer for WipeProjectFiles {
         let project_files =
             weft_core::storage::key::ParsedKey::project_prefix(tenant, &project)
                 .map_err(|e| anyhow::anyhow!("project wipe prefix: {e}"))?;
-        let assets = weft_core::storage::key::ParsedKey::asset_prefix(tenant, &project)
-            .map_err(|e| anyhow::anyhow!("asset wipe prefix: {e}"))?;
-        // Every member's files: a member id is only a name inside its
+        // Every instance's files: an instance id is only a name inside its
         // project, so they go with the project.
-        let members = weft_core::storage::key::ParsedKey::members_prefix(tenant, &project)
-            .map_err(|e| anyhow::anyhow!("member wipe prefix: {e}"))?;
+        let instances = weft_core::storage::key::ParsedKey::instances_prefix(tenant, &project)
+            .map_err(|e| anyhow::anyhow!("instance wipe prefix: {e}"))?;
         crate::storage::wipe_prefix(state, &project_files).await?;
-        crate::storage::wipe_prefix(state, &assets).await?;
-        crate::storage::wipe_prefix(state, &members).await?;
+        crate::storage::set_asset_references(
+            state,
+            tenant,
+            weft_core::storage::AssetReferencesRequest { project, keys: Vec::new(), kept: Vec::new() },
+        )
+        .await?;
+        crate::storage::wipe_prefix(state, &instances).await?;
         Ok(())
     }
 }

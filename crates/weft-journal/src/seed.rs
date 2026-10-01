@@ -245,7 +245,7 @@ mod tests {
         ExecEvent::ExecutionStarted {
             execution_id, project_id: Uuid::nil(), entry_node: from.into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some(weft_core::project::hash::compute_definition_hash(&program()).unwrap()),
-            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: Some(selection), seed, member: None, fired_trigger: None, run_class: weft_core::run_class::RunClass::Short, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: Some(selection), seed, instance: None, fired_trigger: None, run_class: weft_core::run_class::RunClass::Short, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
         }
     }
 

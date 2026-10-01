@@ -11,7 +11,7 @@ one line; everything it does is declared in its
 **Activation.** Turning a trigger on. It runs the trigger's setup, which
 registers subscriptions with providers and dials sockets, then leaves the
 listener running. Each trigger is turned on separately, and a trigger that
-exists once per member is turned on separately for each member. The command is
+exists once per instance is turned on separately for each instance. The command is
 `weft activate`.
 
 **Asset.** A file pulled into your project at build time with `@asset`. Never
@@ -69,6 +69,17 @@ inherits from.
 **Infra node.** A node that needs a container of its own. Nothing starts it for
 you.
 
+**Instance.** One separate running copy of part of a program, under an id the
+program picks. It can stand for one person, one session, or one of several
+things a person owns; which person owns which instances is kept in the
+program's own database. A node marked `@per_instance` gets one copy per
+instance, and every run is for one instance or for none. See
+[programs with instances](../running/instances.md).
+
+**Instance token.** A signal token that acts inside one instance of one
+program and can do nothing else: it starts that instance's runs, answers its
+waits, shows its displays and connects its accounts. It always expires.
+
 **Journal.** The append-only record of a run, one row per event. It is what the
 graph shows you and what rebuilds a run that was interrupted.
 
@@ -77,14 +88,6 @@ Additive, and there is no un-keep.
 
 **Listener.** The tier that holds the timers, the sockets and the
 subscriptions. The only tier that tells one kind of event source from another.
-
-**Member.** One person a program serves, named by an id the program picks. A
-node marked `@per_member` gets one copy per member, and every run is for one
-member or for nobody. See [programs with members](../running/members.md).
-
-**Member token.** A signal token that acts as one member of one program and
-can do nothing else. You give it to that member for their browser. It always
-expires.
 
 **Meter.** The code that works out what one provider's call really cost. A node
 never states a cost.
@@ -111,7 +114,7 @@ level, plus every trigger.
 **Scope (run).** Which part of the graph a run covers, set by `--from`,
 `--target`, `--before`, `--group` or `--fire`.
 
-**Scope (storage).** Which of execution, project, shared, asset or member a
+**Scope (storage).** Which of execution, project, shared, asset or instance a
 file belongs to. It decides where new files go and how long they live.
 
 **Seed.** The run a `--seed` run inherits from. By default head's run.

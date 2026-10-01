@@ -18,7 +18,7 @@ const NODE: &str = "bridge";
 /// The id every apply gives the shared copy of NODE (derived, never minted),
 /// for fixtures an apply works on in place.
 fn shared_id() -> String {
-    weft_core::infra::NodeRef::copy_instance_id(PROJECT, NODE, None)
+    weft_core::infra::NodeRef::copy_id(PROJECT, NODE, None)
 }
 
 fn rig() -> SupervisorTestRig {
@@ -27,15 +27,15 @@ fn rig() -> SupervisorTestRig {
     rig
 }
 
-/// The copy `instance` of this file's node, as the host knows it.
-fn copy(instance: &str) -> weft_core::infra::NodeRef {
-    weft_core::infra::NodeRef { tenant: TENANT.into(), project: PROJECT, node: NODE.into(), instance: instance.into() }
+/// The copy `copy_id` of this file's node, as the host knows it.
+fn copy(copy_id: &str) -> weft_core::infra::NodeRef {
+    weft_core::infra::NodeRef { tenant: TENANT.into(), project: PROJECT, node: NODE.into(), copy_id: copy_id.into() }
 }
 
-/// The hash an apply of `spec` for `instance_id` stamps.
-fn applied_hash(spec: &serde_json::Value, instance_id: &str) -> String {
+/// The hash an apply of `spec` for `copy_id` stamps.
+fn applied_hash(spec: &serde_json::Value, copy_id: &str) -> String {
     let parsed: weft_core::infra::InfraSpec = serde_json::from_value(spec.clone()).unwrap();
-    weft_core::infra::resolve(&parsed, &copy(instance_id), &Default::default()).unwrap().hash()
+    weft_core::infra::resolve(&parsed, &copy(copy_id), &Default::default()).unwrap().hash()
 }
 
 fn unit(status: Status, on_stop: weft_core::StopBehavior) -> weft_broker_client::protocol::UnitRuntime {
@@ -48,13 +48,13 @@ fn unit(status: Status, on_stop: weft_core::StopBehavior) -> weft_broker_client:
     }
 }
 
-/// The units the host was asked to stop, as `instance/unit`.
+/// The units the host was asked to stop, as `copy_id/unit`.
 fn stops(rig: &SupervisorTestRig) -> Vec<String> {
     rig.host
         .calls()
         .into_iter()
         .filter_map(|c| match c {
-            HostCall::Stop { instance, unit } => Some(format!("{instance}/{unit}")),
+            HostCall::Stop { copy_id, unit } => Some(format!("{copy_id}/{unit}")),
             _ => None,
         })
         .collect()
@@ -66,19 +66,19 @@ fn terminates(rig: &SupervisorTestRig) -> Vec<(String, Vec<String>)> {
         .calls()
         .into_iter()
         .filter_map(|c| match c {
-            HostCall::Terminate { instance, keep } => Some((instance, keep)),
+            HostCall::Terminate { copy_id, keep } => Some((copy_id, keep)),
             _ => None,
         })
         .collect()
 }
 
-/// The units the host was asked to apply, as `instance/unit`.
+/// The units the host was asked to apply, as `copy_id/unit`.
 fn applies(rig: &SupervisorTestRig) -> Vec<String> {
     rig.host
         .calls()
         .into_iter()
         .filter_map(|c| match c {
-            HostCall::Apply { instance, unit, .. } => Some(format!("{instance}/{unit}")),
+            HostCall::Apply { copy_id, unit, .. } => Some(format!("{copy_id}/{unit}")),
             _ => None,
         })
         .collect()
@@ -96,7 +96,7 @@ fn cmd(id: i64, verb: Verb, node: Option<&str>) -> SupervisorCommandRow {
         spec_json,
         force: false,
         drain_timeout_secs: weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
-        copies: weft_core::member::Copies::Shared,
+        copies: weft_core::instance::Copies::Shared,
     }
 }
 
@@ -314,7 +314,7 @@ async fn running_policy_wait_drains_then_proceeds() {
 
     // Pretend there are 0 running executions from the start (the
     // simplest path). Drain returns immediately.
-    rig.broker.set_running_count(PROJECT, &weft_core::member::Copies::Shared, 0);
+    rig.broker.set_running_count(PROJECT, &weft_core::instance::Copies::Shared, 0);
 
     let did_work = rig.tick_lifecycle().await.unwrap();
     assert!(did_work);
@@ -330,7 +330,7 @@ async fn running_policy_wait_times_out_after_deadline() {
     // microseconds.
     let rig = rig();
     rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
-    rig.broker.set_running_count(PROJECT, &weft_core::member::Copies::Shared, 5);
+    rig.broker.set_running_count(PROJECT, &weft_core::instance::Copies::Shared, 5);
 
     let mut command = cmd(6, Verb::Stop, Some(NODE));
     command.running_policy = Some(Policy::Wait);
@@ -368,7 +368,7 @@ fn apply_cmd(id: i64) -> SupervisorCommandRow {
         spec_json: Some(spec),
         force: false,
         drain_timeout_secs: weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
-        copies: weft_core::member::Copies::Shared,
+        copies: weft_core::instance::Copies::Shared,
     }
 }
 
@@ -410,6 +410,27 @@ async fn apply_writes_provisioning_before_the_host_applies_then_applied() {
 
     // Command completed with no error.
     assert_eq!(rig.broker.completed_commands(), vec![(1, None, false)]);
+}
+
+/// What the host says it runs differently from what was asked lands on
+/// the applied row, where every status read tells the person.
+#[tokio::test]
+async fn apply_stamps_the_host_notes_on_the_row() {
+    use weft_infra_supervisor::broker_ops::BrokerCall;
+    let rig = rig();
+    rig.host.note(&["the container gets every GPU on this machine"]);
+    rig.broker.enqueue_command(apply_cmd(1));
+    assert!(rig.tick_lifecycle().await.unwrap());
+    let notes: Vec<Vec<String>> = rig
+        .broker
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            BrokerCall::SetApplied { notes, .. } => Some(notes),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notes, vec![vec!["the container gets every GPU on this machine".to_string()]]);
 }
 
 #[tokio::test]
@@ -512,7 +533,7 @@ async fn apply_stamps_every_endpoints_address() {
 
     let row = rig.broker.infra_node(PROJECT, NODE).unwrap();
     let path = row.addresses.public_paths.get("api").expect("a public endpoint has a path");
-    assert_eq!(path, &format!("/infra/{PROJECT}/{}/hooks", row.instance_id));
+    assert_eq!(path, &format!("/infra/{PROJECT}/{}/hooks", row.copy_id));
     assert!(row.addresses.urls.contains_key("api") && row.addresses.urls.contains_key("sql"));
     assert!(row.addresses.doors.contains_key("sql"), "an endpoint open to the network has its door");
     assert!(!row.addresses.doors.contains_key("api"));
@@ -564,7 +585,7 @@ async fn apply_reconciles_down_unit_and_skips_up_unit() {
 /// A Fresh apply over a `Terminating` row (a terminate that stamped
 /// the row and then failed or died before its removal landed) must first
 /// terminate the PRIOR copy, keeping the disks its row recorded, and then
-/// apply the copy under the SAME instance id, which is how the disks kept
+/// apply the copy under the SAME copy id, which is how the disks kept
 /// through the terminate are found again. Without the terminate first the
 /// old units would keep running while the post-readiness stamp drops their
 /// image refs from the keep-set.
@@ -584,7 +605,7 @@ async fn fresh_apply_over_terminating_row_terminates_the_prior_copy_first() {
     rig.tick_lifecycle().await.unwrap();
 
     let row = rig.broker.infra_node(PROJECT, NODE).unwrap();
-    assert_eq!(row.instance_id, shared_id(), "the copy keeps its id, so its kept disks are adopted");
+    assert_eq!(row.copy_id, shared_id(), "the copy keeps its id, so its kept disks are adopted");
     // The prior copy is terminated, keeping the disks its row recorded,
     // before the new copy's unit is applied.
     assert_eq!(terminates(&rig), vec![(shared_id(), vec!["data".to_string()])]);
@@ -738,7 +759,7 @@ fn stop_of(id: i64, project: uuid::Uuid, policy: Policy) -> SupervisorCommandRow
         spec_json: None,
         force: false,
         drain_timeout_secs: weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
-        copies: weft_core::member::Copies::Shared,
+        copies: weft_core::instance::Copies::Shared,
     }
 }
 
@@ -887,21 +908,21 @@ weft_core::stress_test!(
     }
 );
 
-// ---------- per-member copies ----------
+// ---------- per-instance copies ----------
 
-fn ada() -> weft_core::member::MemberId {
-    weft_core::member::MemberId::new("ada").unwrap()
+fn ada() -> weft_core::instance::InstanceId {
+    weft_core::instance::InstanceId::new("ada").unwrap()
 }
 
 #[tokio::test]
-async fn terminating_one_members_copy_leaves_the_shared_copy_and_the_others() {
+async fn terminating_one_instances_copy_leaves_the_shared_copy_and_the_others() {
     let rig = rig();
-    let bob = weft_core::member::MemberId::new("bob").unwrap();
+    let bob = weft_core::instance::InstanceId::new("bob").unwrap();
     rig.broker.add_infra_node(PROJECT, NODE, "inst-shared", Status::Running);
-    rig.broker.add_member_infra_node(PROJECT, NODE, &ada(), "inst-ada", Status::Running);
-    rig.broker.add_member_infra_node(PROJECT, NODE, &bob, "inst-bob", Status::Running);
+    rig.broker.add_instance_infra_node(PROJECT, NODE, &ada(), "inst-ada", Status::Running);
+    rig.broker.add_instance_infra_node(PROJECT, NODE, &bob, "inst-bob", Status::Running);
     let mut terminate = cmd(2, Verb::Terminate, Some(NODE));
-    terminate.copies = weft_core::member::Copies::Member(ada());
+    terminate.copies = weft_core::instance::Copies::Instance(ada());
     rig.broker.enqueue_command(terminate);
 
     rig.tick_lifecycle().await.unwrap();
@@ -912,22 +933,22 @@ async fn terminating_one_members_copy_leaves_the_shared_copy_and_the_others() {
     assert!(rig.broker.infra_node(PROJECT, NODE).is_some());
 }
 
-/// A member's wipe terminates their copy deleting every disk, the ones
-/// the node keeps too, while a person's terminate of another member's
+/// An instance's wipe terminates its copy deleting every disk, the ones
+/// the node keeps too, while a person's terminate of another instance's
 /// copy keeps them.
 #[tokio::test]
 async fn a_wipe_deletes_the_kept_disks_a_persons_terminate_keeps() {
     let rig = rig();
-    let bob = weft_core::member::MemberId::new("bob").unwrap();
-    rig.broker.add_member_infra_node(PROJECT, NODE, &ada(), "inst-ada", Status::Running);
-    rig.broker.add_member_infra_node(PROJECT, NODE, &bob, "inst-bob", Status::Running);
+    let bob = weft_core::instance::InstanceId::new("bob").unwrap();
+    rig.broker.add_instance_infra_node(PROJECT, NODE, &ada(), "inst-ada", Status::Running);
+    rig.broker.add_instance_infra_node(PROJECT, NODE, &bob, "inst-bob", Status::Running);
     rig.broker.set_keep_disks(PROJECT, NODE, Some(&ada()), vec!["data".to_string()]);
     rig.broker.set_keep_disks(PROJECT, NODE, Some(&bob), vec!["data".to_string()]);
     let mut wipe = cmd(2, Verb::Terminate, Some(NODE));
-    wipe.copies = weft_core::member::Copies::Member(ada());
+    wipe.copies = weft_core::instance::Copies::Instance(ada());
     wipe.spec_json = Some(terminate_work(weft_core::infra::TerminateDisks::DeleteAll));
     let mut terminate = cmd(3, Verb::Terminate, Some(NODE));
-    terminate.copies = weft_core::member::Copies::Member(bob);
+    terminate.copies = weft_core::instance::Copies::Instance(bob);
     rig.broker.enqueue_command(wipe);
     rig.broker.enqueue_command(terminate);
 
@@ -940,30 +961,31 @@ async fn a_wipe_deletes_the_kept_disks_a_persons_terminate_keeps() {
     );
 }
 
-/// A member's copy an earlier terminate took down still holds the disks
-/// it kept, with no row left. Their wipe reaches it through the host
-/// and deletes them; another member's kept copy is left alone.
+/// An instance's copy an earlier terminate took down still holds the
+/// disks it kept, with no row left. The instance's wipe reaches it
+/// through the host and deletes them; another instance's kept copy is
+/// left alone.
 #[tokio::test]
 async fn a_wipe_deletes_the_disks_a_copy_with_no_row_still_holds() {
     let rig = rig();
-    let bob = weft_core::member::MemberId::new("bob").unwrap();
-    for member in [ada(), bob.clone()] {
-        let copy = copy(&weft_core::infra::NodeRef::copy_instance_id(PROJECT, NODE, Some(&member)));
+    let bob = weft_core::instance::InstanceId::new("bob").unwrap();
+    for instance in [ada(), bob.clone()] {
+        let copy = copy(&weft_core::infra::NodeRef::copy_id(PROJECT, NODE, Some(&instance)));
         rig.host.set_state(&copy, "main", weft_platform_traits::UnitRunState::Ready);
         weft_platform_traits::InfraHost::terminate(rig.host.as_ref(), &copy, &["data".to_string()]).await.unwrap();
     }
-    let ada_copy = weft_core::infra::NodeRef::copy_instance_id(PROJECT, NODE, Some(&ada()));
-    let bob_copy = weft_core::infra::NodeRef::copy_instance_id(PROJECT, NODE, Some(&bob));
+    let ada_copy = weft_core::infra::NodeRef::copy_id(PROJECT, NODE, Some(&ada()));
+    let bob_copy = weft_core::infra::NodeRef::copy_id(PROJECT, NODE, Some(&bob));
     let before = rig.host.calls().len();
     let mut wipe = cmd(2, Verb::Terminate, Some(NODE));
-    wipe.copies = weft_core::member::Copies::Member(ada());
+    wipe.copies = weft_core::instance::Copies::Instance(ada());
     wipe.spec_json = Some(terminate_work(weft_core::infra::TerminateDisks::DeleteAll));
     rig.broker.enqueue_command(wipe);
 
     rig.tick_lifecycle().await.unwrap();
 
     let after: Vec<HostCall> = rig.host.calls().into_iter().skip(before).collect();
-    assert_eq!(after, vec![HostCall::Terminate { instance: ada_copy.clone(), keep: vec![] }]);
+    assert_eq!(after, vec![HostCall::Terminate { copy_id: ada_copy.clone(), keep: vec![] }]);
     assert!(rig.host.kept_disks(&ada_copy).is_empty());
     assert_eq!(rig.host.kept_disks(&bob_copy), vec!["data".to_string()]);
     assert_eq!(rig.broker.completed_commands(), vec![(2, None, false)]);
@@ -989,9 +1011,9 @@ async fn a_terminate_without_its_work_fails_before_touching_the_host() {
 async fn a_project_wide_terminate_for_every_copy_takes_them_all() {
     let rig = rig();
     rig.broker.add_infra_node(PROJECT, NODE, "inst-shared", Status::Running);
-    rig.broker.add_member_infra_node(PROJECT, NODE, &ada(), "inst-ada", Status::Running);
+    rig.broker.add_instance_infra_node(PROJECT, NODE, &ada(), "inst-ada", Status::Running);
     let mut terminate = cmd(2, Verb::Terminate, None);
-    terminate.copies = weft_core::member::Copies::Every;
+    terminate.copies = weft_core::instance::Copies::Every;
     rig.broker.enqueue_command(terminate);
 
     rig.tick_lifecycle().await.unwrap();
@@ -1001,10 +1023,10 @@ async fn a_project_wide_terminate_for_every_copy_takes_them_all() {
 }
 
 #[tokio::test]
-async fn a_shared_stop_never_touches_a_members_copy() {
+async fn a_shared_stop_never_touches_an_instances_copy() {
     let rig = rig();
     rig.broker.add_infra_node(PROJECT, NODE, "inst-shared", Status::Running);
-    rig.broker.add_member_infra_node(PROJECT, NODE, &ada(), "inst-ada", Status::Running);
+    rig.broker.add_instance_infra_node(PROJECT, NODE, &ada(), "inst-ada", Status::Running);
     rig.broker.enqueue_command(cmd(3, Verb::Stop, Some(NODE)));
 
     rig.tick_lifecycle().await.unwrap();
@@ -1018,27 +1040,27 @@ async fn a_shared_stop_never_touches_a_members_copy() {
 }
 
 #[tokio::test]
-async fn a_members_apply_builds_their_own_copy_under_a_fresh_instance() {
+async fn an_instances_apply_builds_its_own_copy_under_a_fresh_host_instance() {
     let rig = rig();
     rig.broker.add_infra_node(PROJECT, NODE, "inst-shared", Status::Running);
     let mut apply = apply_cmd(4);
-    apply.copies = weft_core::member::Copies::Member(ada());
+    apply.copies = weft_core::instance::Copies::Instance(ada());
     rig.broker.enqueue_command(apply);
 
     rig.tick_lifecycle().await.unwrap();
 
     assert_eq!(rig.broker.completed_commands(), vec![(4, None, false)]);
-    let copy = rig.broker.infra_copy(PROJECT, NODE, Some(&ada())).expect("the member's copy");
-    assert_eq!(copy.member, Some(ada()));
-    assert_ne!(copy.instance_id, "inst-shared");
-    assert_eq!(rig.broker.infra_node(PROJECT, NODE).unwrap().instance_id, "inst-shared");
+    let copy = rig.broker.infra_copy(PROJECT, NODE, Some(&ada())).expect("the instance's copy");
+    assert_eq!(copy.instance, Some(ada()));
+    assert_ne!(copy.copy_id, "inst-shared");
+    assert_eq!(rig.broker.infra_node(PROJECT, NODE).unwrap().copy_id, "inst-shared");
 }
 
 #[tokio::test]
 async fn an_apply_for_every_copy_is_refused() {
     let rig = rig();
     let mut apply = apply_cmd(5);
-    apply.copies = weft_core::member::Copies::Every;
+    apply.copies = weft_core::instance::Copies::Every;
     rig.broker.enqueue_command(apply);
 
     rig.tick_lifecycle().await.unwrap();
@@ -1049,37 +1071,37 @@ async fn an_apply_for_every_copy_is_refused() {
 }
 
 #[tokio::test]
-async fn a_members_wait_drains_on_that_members_runs() {
+async fn an_instances_wait_drains_on_that_instances_runs() {
     use weft_infra_supervisor::broker_ops::BrokerCall;
     let rig = rig();
-    rig.broker.add_member_infra_node(PROJECT, NODE, &ada(), "inst-ada", Status::Running);
+    rig.broker.add_instance_infra_node(PROJECT, NODE, &ada(), "inst-ada", Status::Running);
     let mut stop = cmd(6, Verb::Stop, Some(NODE));
     stop.running_policy = Some(Policy::Wait);
-    stop.copies = weft_core::member::Copies::Member(ada());
+    stop.copies = weft_core::instance::Copies::Instance(ada());
     rig.broker.enqueue_command(stop);
 
     // The shared copies' runs are busy; ada has none. Her wait drains
     // on her own runs only, so the stop goes through at once.
-    rig.broker.set_running_count(PROJECT, &weft_core::member::Copies::Shared, 3);
-    rig.broker.set_running_count(PROJECT, &weft_core::member::Copies::Member(ada()), 0);
+    rig.broker.set_running_count(PROJECT, &weft_core::instance::Copies::Shared, 3);
+    rig.broker.set_running_count(PROJECT, &weft_core::instance::Copies::Instance(ada()), 0);
 
     rig.tick_lifecycle().await.unwrap();
 
     assert!(rig.broker.calls().iter().any(|c| matches!(
         c,
-        BrokerCall::RunningCount { copies: weft_core::member::Copies::Member(m), .. } if *m == ada()
+        BrokerCall::RunningCount { copies: weft_core::instance::Copies::Instance(m), .. } if *m == ada()
     )));
     assert!(
         !rig.broker.calls().iter().any(|c| matches!(
             c,
-            BrokerCall::RunningCount { copies: weft_core::member::Copies::Shared | weft_core::member::Copies::Every, .. }
+            BrokerCall::RunningCount { copies: weft_core::instance::Copies::Shared | weft_core::instance::Copies::Every, .. }
         )),
         "the shared runs are never waited on"
     );
     assert_eq!(rig.broker.completed_commands(), vec![(6, None, false)]);
     assert_eq!(rig.broker.infra_copy(PROJECT, NODE, Some(&ada())).unwrap().status, Status::Stopped);
     assert!(
-        rig.broker.status_writes().iter().all(|(_, _, member, _)| member.as_ref() == Some(&ada())),
+        rig.broker.status_writes().iter().all(|(_, _, instance, _)| instance.as_ref() == Some(&ada())),
         "every status write is ada's copy's"
     );
 }

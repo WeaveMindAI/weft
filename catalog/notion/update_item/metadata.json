@@ -54,5 +54,8 @@
       "name": "url",
       "type": "String"
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

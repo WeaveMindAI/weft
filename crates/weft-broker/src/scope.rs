@@ -114,15 +114,15 @@ pub struct ProjectScope {
 }
 
 /// WHOSE an execution is, and who it is for: its project scope, plus the
-/// member its run was started for (`execution.member_id`, born with
+/// instance its run was started for (`execution.instance_id`, born with
 /// the execution and never changed). What every worker call about a run
-/// resolves to, so a member's pick, copy or storage is found from the
+/// resolves to, so an instance's pick, copy or storage is found from the
 /// run itself and never from anything the worker says.
 #[derive(Debug, Clone)]
 pub struct ExecutionScope {
     pub tenant: String,
     pub project: uuid::Uuid,
-    pub member: Option<weft_core::member::MemberId>,
+    pub instance: Option<weft_core::instance::InstanceId>,
 }
 
 impl ExecutionScope {
@@ -246,17 +246,17 @@ async fn lookup_execution_id_scope(
         return Ok(scope);
     }
     let row: Option<(String, uuid::Uuid, Option<String>)> =
-        sqlx::query_as("SELECT tenant_id, project_id, member_id FROM execution WHERE execution_id = $1")
+        sqlx::query_as("SELECT tenant_id, project_id, instance_id FROM execution WHERE execution_id = $1")
             .bind(execution_id)
             .fetch_optional(pool)
             .await
             .map_err(|e| crate::handlers::unavailable_or_internal(anyhow::Error::from(e).context("execution lookup")))?;
-    let (tenant, project, member) = row.ok_or((StatusCode::NOT_FOUND, "unknown execution".into()))?;
-    let member = member
-        .map(weft_core::member::MemberId::new)
+    let (tenant, project, instance) = row.ok_or((StatusCode::NOT_FOUND, "unknown execution".into()))?;
+    let instance = instance
+        .map(weft_core::instance::InstanceId::new)
         .transpose()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("corrupt execution.member_id: {e}")))?;
-    let scope = ExecutionScope { tenant, project, member };
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("corrupt execution.instance_id: {e}")))?;
+    let scope = ExecutionScope { tenant, project, instance };
     cache_put(&cache.execution_id_to_scope, execution_id.to_string(), scope.clone()).await;
     Ok(scope)
 }
@@ -288,7 +288,7 @@ fn log_denied(caller: &CallerIdentity, kind: &str, requested: &str, owner: &str)
         target: "weft_broker::scope",
         caller_tenant = ?caller.scope.pinned_tenant(),
         caller_role = ?caller.role,
-        caller_instance = ?caller.instance,
+        caller_replica = ?caller.replica,
         scope = kind,
         requested,
         owner = owner,
@@ -308,7 +308,7 @@ mod tests {
                 project: project(&format!("{tenant}-project")),
             },
             role: Role::Worker,
-            instance: Some("instance-x".into()),
+            replica: Some("replica-x".into()),
         }
     }
 
@@ -316,7 +316,7 @@ mod tests {
         CallerIdentity {
             scope: CallerScope::ControlPlane,
             role,
-            instance: Some("instance-cp".into()),
+            replica: Some("replica-cp".into()),
         }
     }
 

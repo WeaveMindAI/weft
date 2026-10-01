@@ -63,6 +63,7 @@
                 provided: false,
                 at_unix: 0,
             },
+            ExecEvent::NodeCompleted { execution_id: execution_id(), node_id: "src".into(), frames: vec![], at_unix: 0 },
             started("n"),
             registered("t0", 0),
             suspended("t0"),
@@ -118,7 +119,11 @@
         )
     }
 
-    fn apply(events: &[ExecEvent]) -> (PulseTable, NodeExecutionTable, HashMap<FiringLocation, weft_core::primitive::KickedNode>) {
+    type Applied = (PulseTable, NodeExecutionTable, HashMap<FiringLocation, weft_core::primitive::KickedNode>, Vec<FiringLocation>);
+
+    /// The tables `apply_snapshot` leaves, and the steps it hands back
+    /// to be failed.
+    fn apply_with_crashed(events: &[ExecEvent]) -> Applied {
         let project = await_project();
         let snap = weft_journal::fold_to_snapshot(execution_id(), project.clone(), events);
         assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
@@ -127,10 +132,15 @@
         let mut kicked = HashMap::new();
         let mut awaited = HashMap::new();
         let mut loops = LoopRuntime::new();
-        let doomed = apply_snapshot(
+        let crashed = apply_snapshot(
             &project, snap, &mut pulses, &mut executions, &mut kicked, &mut awaited, &mut loops,
         );
-        assert!(doomed.is_empty(), "no stream consumers in these fixtures");
+        (pulses, executions, kicked, crashed.into_iter().map(|step| step.loc).collect())
+    }
+
+    fn apply(events: &[ExecEvent]) -> (PulseTable, NodeExecutionTable, HashMap<FiringLocation, weft_core::primitive::KickedNode>) {
+        let (pulses, executions, kicked, crashed) = apply_with_crashed(events);
+        assert!(crashed.is_empty(), "no step is left running in these fixtures: {crashed:?}");
         (pulses, executions, kicked)
     }
 
@@ -143,8 +153,8 @@
     }
 
     /// Project with a real stream edge plus a LoopIn boundary that
-    /// also declares a generator input, for the doomed-consumer
-    /// routing tests below.
+    /// also declares a generator input, for the crashed-step routing
+    /// tests below.
     fn stream_project() -> Arc<ProjectDefinition> {
         Arc::new(serde_json::from_value(json!({
             "id": uuid::Uuid::nil(),
@@ -187,7 +197,9 @@
         vec![started(node)]
     }
 
-    fn apply_stream(events: &[ExecEvent]) -> Vec<FiringLocation> {
+    /// The steps `apply_snapshot` hands back to be failed, as
+    /// (location, read a stream).
+    fn apply_stream(events: &[ExecEvent]) -> Vec<(FiringLocation, bool)> {
         let project = stream_project();
         let snap = weft_journal::fold_to_snapshot(execution_id(), project.clone(), events);
         assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
@@ -197,12 +209,11 @@
             &project, snap, &mut pulses, &mut executions,
             &mut HashMap::new(), &mut HashMap::new(), &mut LoopRuntime::new(),
         )
+        .into_iter()
+        .map(|step| (step.loc, step.consumed_a_stream))
+        .collect()
     }
 
-    /// A crashed-Running STREAM CONSUMER is doomed (its already-pulled
-    /// items were removed durably, so a re-run would silently compute
-    /// over a truncated stream), and lands in the doomed set instead
-    /// of being re-dispatched.
     /// A journal the fold rejects does not resume: the run fails, and
     /// the failure is journaled as its terminal (naming the rejected
     /// row and `weft clean`) so the run reads Failed instead of
@@ -219,7 +230,7 @@
                 program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
                 subgraph: None,
                 seed: None,
-                member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+                instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
                 run_class: weft_core::run_class::RunClass::Short,
             },
             // A resume of a firing the journal never opened.
@@ -242,32 +253,32 @@
         assert_eq!(events.iter().filter(|e| e.is_execution_terminal()).count(), 1);
     }
 
+    /// A step a dead worker left running is handed back to be failed,
+    /// never re-run; one reading a stream says so in its message.
     #[test]
-    fn crashed_stream_consumer_is_doomed_not_redispatched() {
-        let doomed = apply_stream(&crashed_running("consumer"));
+    fn a_crashed_stream_consumer_is_failed() {
         assert_eq!(
-            doomed,
-            vec![FiringLocation::new("consumer", vec![])],
-            "the crashed stream consumer must be doomed"
+            apply_stream(&crashed_running("consumer")),
+            vec![(FiringLocation::new("consumer", vec![]), true)],
         );
     }
 
-    /// A crashed-Running node WITHOUT a generator input takes the
-    /// normal re-dispatch route, never the doomed one.
+    /// A plain step is failed too: nothing says how far its body got.
     #[test]
-    fn crashed_plain_node_is_not_doomed() {
-        let doomed = apply_stream(&crashed_running("producer"));
-        assert!(doomed.is_empty(), "a plain crashed node re-dispatches, got {doomed:?}");
+    fn a_crashed_plain_step_is_failed() {
+        assert_eq!(
+            apply_stream(&crashed_running("producer")),
+            vec![(FiringLocation::new("producer", vec![]), false)],
+        );
     }
 
-    /// A crashed-Running LOOP BOUNDARY also declares a generator input
-    /// but is replay-safe by construction (journal-backed launched /
-    /// out_fired / stream_end), so dooming it would kill a fully
-    /// recoverable loop.
+    /// A LOOP BOUNDARY is runtime machinery whose re-fire is
+    /// journal-backed (launched / out_fired / stream_end), so it
+    /// carries on instead of failing a fully recoverable loop.
     #[test]
-    fn crashed_loop_boundary_is_not_doomed() {
-        let doomed = apply_stream(&crashed_running("work__in"));
-        assert!(doomed.is_empty(), "a LoopIn resumes normally, got {doomed:?}");
+    fn a_crashed_loop_boundary_carries_on() {
+        let crashed = apply_stream(&crashed_running("work__in"));
+        assert!(crashed.is_empty(), "a LoopIn resumes normally, got {crashed:?}");
     }
 
     #[test]
@@ -312,16 +323,14 @@
         ]
     }
 
-    /// Kicked entry node whose worker crashed mid-Fire (Running exec,
-    /// no terminal row): `apply_snapshot` must reset `dispatched` so
-    /// the kick synthesis re-fires it. Kicked nodes have no inbound
-    /// pulses, so the pulse un-absorb path can never cover them; the
-    /// old behavior left the exec Running forever and the execution
-    /// landed Stuck with the wake payload silently dropped.
+    /// A kicked entry node whose worker died mid-Fire (Running exec,
+    /// no terminal row) is handed back to be failed, never re-fired:
+    /// its kick stays dispatched.
     #[test]
-    fn crashed_kicked_node_redispatches() {
-        let (_, _, kicked) = apply(&kick_events());
-        assert!(!kicked.get(&FiringLocation::new("n", vec![])).expect("kick present").dispatched);
+    fn a_crashed_kicked_node_is_failed_not_refired() {
+        let (_, _, kicked, crashed) = apply_with_crashed(&kick_events());
+        assert_eq!(crashed, vec![FiringLocation::new("n", vec![])]);
+        assert!(kicked.get(&FiringLocation::new("n", vec![])).expect("kick present").dispatched);
     }
 
     #[test]

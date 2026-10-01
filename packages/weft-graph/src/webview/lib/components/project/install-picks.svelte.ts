@@ -53,7 +53,7 @@ export function pickedAt(place: string, field: string): ConnectionHandle | undef
 
 /// What a connection field's literal stands for: the install's pick when
 /// the literal is the install-picked marker or absent (a view the
-/// compiler has not marked yet), the literal otherwise (`@member_filled`).
+/// compiler has not marked yet), the literal otherwise (`@instance_filled`).
 export function effectiveAccessValue(literal: unknown, place: string, field: string): unknown {
 	return literal == null || installPicked(literal) ? pickedAt(place, field) : literal;
 }

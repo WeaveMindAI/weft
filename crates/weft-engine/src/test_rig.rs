@@ -30,7 +30,7 @@ use crate::context::{BusCoordinator, EngineClients, RunnerHandle};
 /// dropped.
 pub struct LiveTestRunner {
     clients: EngineClients,
-    instance: String,
+    replica: String,
     tenant_id: String,
     project_id: uuid::Uuid,
     /// THE run's execution identity: the pre-registered execution the
@@ -91,7 +91,7 @@ impl LiveTestRunner {
     pub fn new(
         mut clients: EngineClients,
         catalog: &'static dyn weft_core::NodeCatalog,
-        instance: String,
+        replica: String,
         tenant_id: String,
         project_id: uuid::Uuid,
         fixed_execution_id: Option<ExecutionId>,
@@ -99,7 +99,7 @@ impl LiveTestRunner {
         clients.journal = Arc::new(weft_journal::NoopJournal);
         Self {
             clients,
-            instance,
+            replica,
             tenant_id,
             project_id,
             execution_id: fixed_execution_id.unwrap_or_else(ExecutionId::new_v4),
@@ -119,7 +119,7 @@ impl LiveTestRunner {
     pub fn rig(&self, connection_id: &str, service: &str, fixtures: std::collections::BTreeMap<String, String>) -> LiveRig {
         let access = Access::new(connection_id, service, None);
         let clients = self.clients.clone();
-        let instance = self.instance.clone();
+        let replica = self.replica.clone();
         let tenant_id = self.tenant_id.clone();
         let project_id = self.project_id;
         let handles = self.handles.clone();
@@ -208,7 +208,7 @@ impl LiveTestRunner {
                 weft_core::frames::LoopFrames::default(),
                 clients.clone(),
                 published,
-                instance.clone(),
+                replica.clone(),
                 tenant_id.clone(),
                 Arc::new(CancellationFlag::new()),
                 waits.clone(),
@@ -218,6 +218,9 @@ impl LiveTestRunner {
                 // inputs (it knows the manifest); the inner handle is
                 // never asked.
                 std::collections::HashMap::new(),
+                // Likewise the wired outputs: the capturing wrapper
+                // answers them from the case (`LiveRig::wire_output`).
+                std::collections::HashSet::new(),
                 // From the node's manifest, so a stream consumer's
                 // `await_signal` is refused in a live test exactly as
                 // in an execution (the rig DOES serve stream consumers:

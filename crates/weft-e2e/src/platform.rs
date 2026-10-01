@@ -7,7 +7,7 @@
 //!
 //! The program layer (the rest of this crate) asserts through the dispatcher's
 //! public HTTP API, exactly as the outside world does. But platform facts
-//! (which worker instance owns an execution, what a run stored) are NOT on that
+//! (which worker replica owns an execution, what a run stored) are NOT on that
 //! surface, by design: exposing them would add privileged endpoints to the
 //! shipped system for a need only tests have. So the platform layer reaches
 //! BEHIND the API, the way an operator of a local install can: it reads the
@@ -50,13 +50,13 @@ impl Role {
 /// [`crate::cell::Cell`]).
 pub struct Platform {
     pool: PgPool,
-    instance: weft_core::infra::Instance,
+    install: weft_core::infra::Install,
 }
 
 
 /// One line of the install's `secrets.env`.
-fn secret(instance: &weft_core::infra::Instance, name: &str) -> Result<String> {
-    let path = crate::ensure::install_dir(instance).join("secrets.env");
+fn secret(install: &weft_core::infra::Install, name: &str) -> Result<String> {
+    let path = crate::ensure::install_dir(install).join("secrets.env");
     let raw = std::fs::read_to_string(&path).with_context(|| format!("read {} (is the install up?)", path.display()))?;
     raw.lines()
         .find_map(|l| l.strip_prefix(&format!("{name}=")))
@@ -68,20 +68,21 @@ impl Platform {
     /// Connect to `disp`'s install's Postgres, at the address its runtime
     /// uses.
     pub async fn connect(disp: &Dispatcher) -> Result<Self> {
-        let instance = disp.instance().clone();
-        let url = secret(&instance, "WEFT_DATABASE_URL")?;
+        let install = disp.install().clone();
+        let url = secret(&install, "WEFT_DATABASE_URL")?;
         let pool = PgPoolOptions::new()
             .max_connections(4)
             .acquire_timeout(Duration::from_secs(10))
             .connect(&url)
             .await
             .context("connect to the install's Postgres")?;
-        Ok(Self { pool, instance })
+        Ok(Self { pool, install })
     }
 
     /// How many live PUBLIC RELAY file links point at one run's files: its
     /// execution's own (`<tenant>/exec/<execution_id>/...`) and its project's
-    /// (`<tenant>/project/<project>/...`, `<tenant>/asset/<project>/...`).
+    /// (`<tenant>/project/<project>/...`, and the tenant's assets the project
+    /// references, `<tenant>/asset/<sha256>`).
     /// A minted relay link (a media slot externalized as
     /// `<base>/public/files/<token>`) leaves one row until it expires, so a
     /// test that just externalized media can tell which path it took: rows
@@ -91,7 +92,8 @@ impl Platform {
     pub async fn public_file_link_count_for(&self, execution_id: &Uuid, project: &Uuid) -> Result<i64> {
         sqlx::query_scalar(
             "SELECT count(*) FROM public_file_link \
-             WHERE key LIKE '%/' || $1 || '/%' OR key LIKE '%/' || $2 || '/%'",
+             WHERE key LIKE '%/' || $1 || '/%' OR key LIKE '%/' || $2 || '/%' \
+                OR key IN (SELECT key FROM asset_reference WHERE project_id = $2)",
         )
         .bind(execution_id.to_string())
         .bind(project.to_string())
@@ -100,11 +102,11 @@ impl Platform {
         .context("count public file links")
     }
 
-    /// The worker instance that currently OWNS an execution (stamped
+    /// The worker replica that currently OWNS an execution (stamped
     /// by the claim trigger), or None while unclaimed.
     pub async fn execution_owner(&self, execution_id: &Uuid) -> Result<Option<String>> {
         let row: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT owner_instance FROM execution WHERE execution_id = $1")
+            sqlx::query_as("SELECT owner_replica FROM execution WHERE execution_id = $1")
                 .bind(execution_id.to_string())
                 .fetch_optional(&self.pool)
                 .await
@@ -166,7 +168,7 @@ impl Platform {
             .args([
                 "ps",
                 "--filter",
-                &format!("label={}={}", weft_core::infra::INSTALL_LABEL, self.instance.label_value()),
+                &format!("label={}={}", weft_core::infra::INSTALL_LABEL, self.install.label_value()),
                 "--filter",
                 &format!("label={}={project_id}", labels::PROJECT),
                 "--filter",
@@ -200,7 +202,7 @@ impl Platform {
 
     /// The last lines weft's runtime wrote.
     pub fn runtime_log(&self) -> Result<String> {
-        let path = crate::ensure::install_dir(&self.instance).join("runtime.log");
+        let path = crate::ensure::install_dir(&self.install).join("runtime.log");
         let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         Ok(crate::client::tail(&raw, 200_000).to_string())
     }

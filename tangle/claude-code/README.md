@@ -103,9 +103,10 @@ weft new <project> --assistant claude-code     # shorthand: --assistant cc
 
 That copies `CLAUDE.md` and `.claude/` out of the local weft checkout's
 `tangle/claude-code/` into the project. The flag's value names the assistant
-(repeatable for several), and the choice is remembered: later `weft new`
-runs install it with no flag, until `--assistant <name>` changes it or
-`--assistant none` stops it. The files are the project's own from then
+(repeatable for several), for this project only. Add `--remember` and
+later `weft new` runs install it with no flag, until another
+`--assistant <name> --remember` changes it or `--assistant none --remember`
+clears it. The files are the project's own from then
 on, so they are committed with it and a teammate cloning the project gets
 Tangle with no weft checkout to point at.
 

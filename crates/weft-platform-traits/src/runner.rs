@@ -120,6 +120,69 @@ pub struct WorkerOverrides {
     pub cpu_always_allocated: Option<bool>,
 }
 
+impl WorkerOverrides {
+    /// Every lever's name, as the flags, the API and a `weft.toml` spell it.
+    pub const LEVERS: [&'static str; 7] =
+        ["min_instances", "max_instances", "concurrency", "cpu", "memory", "startup_boost", "cpu_always_allocated"];
+
+    /// `self` with every lever `o` sets in its place.
+    pub fn merged(&self, o: &WorkerOverrides) -> Self {
+        Self {
+            min_instances: o.min_instances.or(self.min_instances),
+            max_instances: o.max_instances.or(self.max_instances),
+            concurrency: o.concurrency.or(self.concurrency),
+            cpu: o.cpu.clone().or_else(|| self.cpu.clone()),
+            memory: o.memory.clone().or_else(|| self.memory.clone()),
+            startup_boost: o.startup_boost.or(self.startup_boost),
+            cpu_always_allocated: o.cpu_always_allocated.or(self.cpu_always_allocated),
+        }
+    }
+
+    /// Put the lever named `name` back on the install's. Refused, listing
+    /// the levers, for a name that is not one.
+    pub fn unset(&mut self, name: &str) -> Result<(), String> {
+        match name {
+            "min_instances" => self.min_instances = None,
+            "max_instances" => self.max_instances = None,
+            "concurrency" => self.concurrency = None,
+            "cpu" => self.cpu = None,
+            "memory" => self.memory = None,
+            "startup_boost" => self.startup_boost = None,
+            "cpu_always_allocated" => self.cpu_always_allocated = None,
+            other => {
+                return Err(format!("'{other}' is not a worker lever; the levers are {}", Self::LEVERS.join(", ")))
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the lever named `name` is set here.
+    pub fn sets(&self, name: &str) -> bool {
+        match name {
+            "min_instances" => self.min_instances.is_some(),
+            "max_instances" => self.max_instances.is_some(),
+            "concurrency" => self.concurrency.is_some(),
+            "cpu" => self.cpu.is_some(),
+            "memory" => self.memory.is_some(),
+            "startup_boost" => self.startup_boost.is_some(),
+            "cpu_always_allocated" => self.cpu_always_allocated.is_some(),
+            _ => false,
+        }
+    }
+}
+
+/// `GET/PUT /projects/{id}/workers`: a project's worker levers, where
+/// each one comes from, and what its workers run with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkersResponse {
+    /// What the install gives every project.
+    pub install: WorkerSettings,
+    /// What this project sets for itself.
+    pub project: WorkerOverrides,
+    /// What its workers run with.
+    pub effective: WorkerSettings,
+}
+
 impl WorkerSettings {
     /// These settings with `o`'s set levers in their place.
     pub fn with(&self, o: &WorkerOverrides) -> Self {
@@ -398,6 +461,49 @@ pub mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn every_lever_set() -> WorkerOverrides {
+        WorkerOverrides {
+            min_instances: Some(1),
+            max_instances: Some(2),
+            concurrency: Some(3),
+            cpu: Some("2".into()),
+            memory: Some("2Gi".into()),
+            startup_boost: Some(false),
+            cpu_always_allocated: Some(true),
+        }
+    }
+
+    #[test]
+    fn the_lever_names_are_the_wire_names() {
+        let wire = serde_json::to_value(every_lever_set()).unwrap();
+        let keys: Vec<&str> = wire.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut levers = WorkerOverrides::LEVERS.to_vec();
+        levers.sort_unstable();
+        let mut keys = keys;
+        keys.sort_unstable();
+        assert_eq!(keys, levers);
+        let full = every_lever_set();
+        assert!(WorkerOverrides::LEVERS.iter().all(|lever| full.sets(lever)));
+    }
+
+    #[test]
+    fn unsetting_every_lever_leaves_nothing_and_a_wrong_name_is_refused() {
+        let mut o = every_lever_set();
+        for lever in WorkerOverrides::LEVERS {
+            o.unset(lever).unwrap();
+        }
+        assert_eq!(o, WorkerOverrides::default());
+        let refused = o.unset("gpus").unwrap_err();
+        assert!(refused.contains("'gpus' is not a worker lever"), "{refused}");
+    }
+
+    #[test]
+    fn a_merge_keeps_what_the_new_levers_leave_unset() {
+        let base = WorkerOverrides { cpu: Some("1".into()), concurrency: Some(4), ..Default::default() };
+        let merged = base.merged(&WorkerOverrides { cpu: Some("2".into()), ..Default::default() });
+        assert_eq!(merged, WorkerOverrides { cpu: Some("2".into()), concurrency: Some(4), ..Default::default() });
+    }
 
     #[test]
     fn only_evidence_the_address_is_gone_forgets_it() {

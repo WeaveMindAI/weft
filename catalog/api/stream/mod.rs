@@ -41,7 +41,7 @@ impl Node for StreamNode {
         let status: u16 = ctx.inputs.get("status")?;
         let headers: Option<Value> = ctx.inputs.opt("headers")?;
         let caller = ctx.live_caller().await?;
-        let data_type = ctx.caller_data_type().unwrap_or_default();
+        let data_type = wire::answer_type(&ctx)?;
         // An observer, not a participant: it reads what is retained from
         // the start (a producer that already finished, an LLM whose
         // reply came back fast, is still fully readable) and never

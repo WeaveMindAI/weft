@@ -1,8 +1,8 @@
-//! Layer-4: an infra node inside a file included twice is two INSTANCES.
+//! Layer-4: an infra node inside a file included twice is two PLACEMENTS.
 //! The `include_twice_infra` fixture includes a file holding a
 //! MiniService at the sites `one` and `two`; starting infra provisions
 //! two sidecars with two rows, two endpoints and two status lines, each
-//! call's nodes reach their own call's instance, one instance is stopped
+//! call's nodes reach their own call's placement, one placement is stopped
 //! on its own by its place, and terminate takes both down.
 #![cfg(feature = "e2e")]
 
@@ -12,13 +12,13 @@ use serde_json::json;
 use weft_e2e::client::poll_until;
 use weft_e2e::{ensure, infra, project::Project, run};
 
-/// The status of one instance, by its place, or `None` when it has no row.
+/// The status of one placement, by its place, or `None` when it has no row.
 async fn status_of(project: &Project, place: &str) -> anyhow::Result<Option<String>> {
     let nodes = infra::status(project.dispatcher(), &project.id()).await?;
     Ok(nodes
         .iter()
-        .find(|n| n.node() == Some(place))
-        .and_then(|n| n.status().map(str::to_string)))
+        .find(|n| n.node == place)
+        .map(|n| n.status.clone()))
 }
 
 #[tokio::test]
@@ -27,14 +27,14 @@ async fn a_file_included_twice_provisions_its_infra_once_per_call() -> anyhow::R
     let mut project = Project::prepare("include_twice_infra", disp).await?;
     project.add_node_from_fixture("infra_min", "mini_service")?;
 
-    // Two instances, two endpoints.
+    // Two placements, two endpoints.
     let one = infra::start_and_wait_running(&mut project, "one.svc").await?;
     let two = infra::wait_running(&project, "two.svc").await?;
-    anyhow::ensure!(one != two, "each call's instance has its own endpoint: {one} / {two}");
+    anyhow::ensure!(one != two, "each call's placement has its own endpoint: {one} / {two}");
     let listed = infra::status(project.dispatcher(), &project.id()).await?;
-    let mut places: Vec<&str> = listed.iter().filter_map(|n| n.node()).collect();
+    let mut places: Vec<&str> = listed.iter().map(|n| n.node.as_str()).collect();
     places.sort();
-    anyhow::ensure!(places == vec!["one.svc", "two.svc"], "one status line per instance: {listed:?}");
+    anyhow::ensure!(places == vec!["one.svc", "two.svc"], "one status line per placement: {listed:?}");
     anyhow::ensure!(
         !format!("{listed:?}").contains("@src:"),
         "the file's own path never reaches a reader: {listed:?}"
@@ -54,7 +54,7 @@ async fn a_file_included_twice_provisions_its_infra_once_per_call() -> anyhow::R
         "an infra setup run is started by a place: {setups}"
     );
 
-    // A run reaches each call's own instance, and each call's rows
+    // A run reaches each call's own placement, and each call's rows
     // carry that call's frame. Observed with the program in hand, so the
     // names below are read through their sites.
     let execution_id = run::start(&mut project).await?;
@@ -88,7 +88,7 @@ async fn a_file_included_twice_provisions_its_infra_once_per_call() -> anyhow::R
     )
     .await?;
 
-    // Terminate takes both instances down, and both rows with them.
+    // Terminate takes both placements down, and both rows with them.
     infra::terminate_and_wait_gone(&project, "one.svc").await?;
     infra::wait_gone(&project, "two.svc").await?;
 

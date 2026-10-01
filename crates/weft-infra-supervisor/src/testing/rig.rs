@@ -38,7 +38,7 @@ impl SupervisorTestRig {
         let clock = FakeClock::new();
         let state = SupervisorState {
             broker: broker.clone() as Arc<dyn crate::broker_ops::BrokerSupervisorOps>,
-            instance: "test-supervisor".to_string(),
+            replica: "test-supervisor".to_string(),
             host: host.clone() as Arc<dyn weft_platform_traits::InfraHost>,
             clock: clock.clone() as Arc<dyn weft_platform_traits::clock::Clock>,
             ownership_interval: Duration::from_secs(15),

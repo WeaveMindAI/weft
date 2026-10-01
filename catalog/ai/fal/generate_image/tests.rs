@@ -11,7 +11,9 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("queues_polls_and_stores_the_images", generates),
         NodeTest::fake("a_failed_generation_surfaces_fals_words", failed_generation),
-        NodeTest::fake("a_traversal_model_id_refuses", bad_model),
+        NodeTest::fake("a_traversal_model_id_fails_the_run_even_when_error_is_wired", bad_model),
+        NodeTest::fake("a_refused_submit_fails_the_run_when_error_is_unwired", refused_unwired),
+        NodeTest::fake("a_refused_submit_comes_out_on_error_when_it_is_wired", refused_wired),
         NodeTest::live("one_real_small_generation", "fal", live_generate),
     ]
 }
@@ -117,8 +119,11 @@ async fn failed_generation(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
+/// A malformed model id is a mistake in the program, not fal's answer:
+/// a wired `error` must not swallow it.
 async fn bad_model(rig: FakeRig) -> WeftResult<()> {
-    let outcome = rig
+    rig.wire_output("error");
+    let err = rig
         .run(
             &FalGenerateImageNode,
             json!({
@@ -129,8 +134,40 @@ async fn bad_model(rig: FakeRig) -> WeftResult<()> {
                 "count": 1,
             }),
         )
-        .await;
-    let err = outcome.result.expect_err("a traversal id must refuse").to_string();
+        .await
+        .failure()?;
+    assert!(err.starts_with("input error"), "{err}");
     assert!(err.contains("not a fal model id"), "{err}");
+    Ok(())
+}
+
+/// The submit refused by fal, and the inputs of the run that sends it.
+fn refuse_the_submit(rig: &FakeRig) -> serde_json::Value {
+    rig.respond_status("POST", "/fal-ai/flux/dev", 401, json!({ "detail": "bad key" }));
+    json!({
+        "account": rig.access("fal"),
+        "prompt": "a red fox",
+        "model": "fal-ai/flux/dev",
+        "imageSize": "square",
+        "count": 1,
+    })
+}
+
+async fn refused_unwired(rig: FakeRig) -> WeftResult<()> {
+    let inputs = refuse_the_submit(&rig);
+    let err = rig.run(&FalGenerateImageNode, inputs).await.failure()?;
+    assert!(err.contains("bad key"), "{err}");
+    Ok(())
+}
+
+async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
+    let inputs = refuse_the_submit(&rig);
+    rig.wire_output("error");
+    let outcome = rig.run(&FalGenerateImageNode, inputs).await.ok()?;
+    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    assert!(error.contains("bad key"), "{error}");
+    for port in ["images", "image"] {
+        assert!(!outcome.outputs.contains_key(port), "a caught failure emits nothing on {port}");
+    }
     Ok(())
 }

@@ -46,6 +46,34 @@ terminal to ask on, run `scripts/scrub-old-install.sh` yourself, then
 `./setup.sh`. On a machine that never had the old weft, or that was already
 wiped, `./setup.sh` is a normal install or update and asks nothing.
 
+**"Member" is now "instance", everywhere.**
+
+What used to be a program's members are now its instances: separate copies of
+part of a program, each under its own id. One per person is one way to use
+them, one per session another, several per person a third; which person owns
+which instances is kept in your program's own database. Every name changed
+with it, and the old ones are gone:
+- `@per_member` is `@per_instance`, and `@member_filled` is `@instance_filled`.
+  Change them in your `.weft` files.
+- The `members` catalog package is `instances`, and its nodes follow:
+  `CurrentInstance`, `MintInstanceToken`, `WipeInstance`, `ListInstances`,
+  `ListInstanceInfra`, `InstanceInfraStatus`, `StartInstanceInfra`,
+  `StopInstanceInfra`, `TerminateInstanceInfra`, `ActivateInstanceTriggers`,
+  `DeactivateInstanceTriggers`, `GetInstanceValues`, `SetInstanceValues` and
+  `InstanceCosts`.
+- The headers are `Weft-Instance` and `Weft-Instance-Token`. If your backend or
+  frontend sends the old ones, rename them there.
+- The `--member` flag is `--instance` on every command, and
+  `--all-members` is `--all-instances`.
+- A member token is now an instance token: it acts inside one instance of the
+  program.
+
+The page is now [programs with instances](docs/src/running/instances.md).
+
+The name "instance" used to mean a named install (a second weft on the same
+machine, such as a test cell). That is now called an install: the field in
+`~/.local/share/weft/config.json` is `install`.
+
 **weft moves to new ports.**
 
 Weft now answers at `http://127.0.0.1:14111` (it was 9999). Open the dashboard
@@ -64,3 +92,39 @@ or `WEFT_POSTGRES_PORT`). Weft saves the ports it runs on in
 `~/.local/share/weft/ports.json`, so the port stays moved on later runs and
 the CLI and the VS Code extension find it there.
 `WEFT_SEAWEED_PORT` moves the object store, and is read on every run.
+
+**A step the worker was running is never run again by itself.**
+
+If a worker went away while a step was running, the next worker used to run
+that step again from the top, so an email, a post or a paid call could happen
+twice. Now it fails the step instead, saying the worker went away and the step
+was not run again. Check what the step did, then re-run from there with
+`weft run --seed`, which reuses every step that completed. A step that was
+waiting on an answer still carries on when the answer comes, as before.
+
+**Nodes that catch their failures say so with `catchErrors`.**
+
+If you wrote a node with an optional `error` output and `ctx.catch_into_error`,
+change it: remove the `error` output from its `metadata.json`, add
+`"catchErrors": true` under `features`, and let `run` return its errors as any
+node does (`ctx.catch_into_error` is gone). Weft adds the `error` output
+itself, and a failure goes there when a program wires it. A node with `catchErrors`
+that still declares `error` is refused when it loads. Programs need no change.
+
+**Conversations are kept in a file only.**
+
+The AI nodes (`LlmInference`, `LlmStream`) and `ChatHistoryAppend` no longer
+have a `history` input or output. If a program wires `history`, wire
+`historyFile` instead: each call adds its turn to that one file and passes the
+same file on. If a call gets no file and its `historyFile` output is wired, it
+starts a new one. The graph shows each change to the file under "Files
+edited" on the step that made it.
+
+**A node changes a stored file with `edit`.**
+
+`ctx.storage(scope).edit(&file, |old| ...)` changes a file in place without
+losing another write's change. `replace` still overwrites.
+`replace_stream` is gone. Every stored file value now carries a `version`. A
+seeded run that would reuse a step whose file was edited since is refused,
+naming the step, the port and the file, and offering `--emit` or
+`--seed-before`.

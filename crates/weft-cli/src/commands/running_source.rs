@@ -8,13 +8,7 @@ use anyhow::{bail, Context};
 use super::branch::{download_into, unrecordable_paths};
 use super::versions::Manifest;
 use super::Ctx;
-
-// SYNC: RunningSource <-> crates/weft-dispatcher/src/api/versions.rs RunningSource
-#[derive(Debug, serde::Deserialize)]
-struct RunningSource {
-    version: String,
-    manifest: Manifest,
-}
+use weft_core::versions::RunningSource;
 
 pub async fn run(ctx: Ctx, dir: std::path::PathBuf) -> anyhow::Result<()> {
     let project = ctx.project()?;
@@ -37,11 +31,7 @@ pub async fn run(ctx: Ctx, dir: std::path::PathBuf) -> anyhow::Result<()> {
     let parent = dir.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
     std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     let staged = tempfile::tempdir_in(parent).with_context(|| format!("stage in {}", parent.display()))?;
-    download_into(&client, &id, &running.manifest, &Manifest::new(), staged.path()).await?;
-    // A version names the standard library by the weft that built it
-    // rather than carrying it, so the folder gets this weft's, the one the
-    // install runs (a program built by another weft is refused there).
-    weft_compiler::project::seed_base_catalog(staged.path()).map_err(|e| anyhow::anyhow!("seed the standard library: {e}"))?;
+    download_into(&client, &running.manifest, &Manifest::new(), staged.path()).await?;
     // Dropping `staged` after the move deletes nothing: its path is gone.
     std::fs::rename(staged.path(), &dir).with_context(|| format!("move the files into {}", dir.display()))?;
     let answer = serde_json::json!({ "version": running.version, "dir": dir });

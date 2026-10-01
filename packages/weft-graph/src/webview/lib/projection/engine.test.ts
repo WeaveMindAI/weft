@@ -1037,3 +1037,40 @@ describe('burst with periodic rejections', () => {
 		expect(engine.undoStack).toHaveLength(45);
 	});
 });
+
+describe('a text change from outside the graph', () => {
+	it('drops the graph history: an old inverse can never write over the text edit', async () => {
+		const after = project([...baseProject().nodes, node({ id: 'text_2', nodeType: 'Text' })]);
+		host.editScript.push(ok(after, 'v1'));
+		engine.recordEdit([addNodeOp('text_2')]);
+		await engine.settled();
+		expect(engine.undoStack).toHaveLength(1);
+
+		// Somebody edits the text: the host reparses and hands the graph new code.
+		engine.applyExternalSource(after, 'v1-typed', '');
+		expect(engine.undoStack).toHaveLength(0);
+
+		// Undo now says why it does nothing, and never replays a stale edit.
+		engine.undo();
+		await engine.settled();
+		expect(host.calls.filter(c => c.kind === 'applyTextEdit')).toHaveLength(0);
+		expect(host.notifications.some(n => n.title === 'Nothing to undo in the graph' && /text editor/.test(n.description))).toBe(true);
+	});
+
+	it('drops redo too, and keeps history when the reparse brings the same code', async () => {
+		const after = project([...baseProject().nodes, node({ id: 'text_2', nodeType: 'Text' })]);
+		host.editScript.push(ok(after, 'v1'), ok(baseProject(), 'v0'));
+		engine.recordEdit([addNodeOp('text_2')]);
+		await engine.settled();
+		engine.undo();
+		await engine.settled();
+		expect(engine.redoStack).toHaveLength(1);
+
+		// A reparse of the text the graph itself wrote (focus change) keeps it.
+		engine.applyExternalSource(baseProject(), 'v0', '');
+		expect(engine.redoStack).toHaveLength(1);
+
+		engine.applyExternalSource(baseProject(), 'v0-typed', '');
+		expect(engine.redoStack).toHaveLength(0);
+	});
+});

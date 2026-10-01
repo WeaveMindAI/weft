@@ -28,18 +28,18 @@ pub trait BrokerSupervisorOps: Send + Sync {
     /// `held_projects` (every project the host holds a copy of) are
     /// claimed and renewed too, so the gone-copy sweep can judge them
     /// under their lease (see `SupervisorSyncOwnershipRequest`).
-    async fn sync_ownership(&self, instance: &str, held_projects: &[uuid::Uuid]) -> Result<SupervisorSyncOwnershipResponse>;
+    async fn sync_ownership(&self, replica: &str, held_projects: &[uuid::Uuid]) -> Result<SupervisorSyncOwnershipResponse>;
     /// Pure read of the projects this supervisor owns (no claim/renew).
     /// The work loops iterate this; ownership breadth changes only via
     /// `sync_ownership` (the ownership tick).
-    async fn owned_projects(&self, instance: &str) -> Result<Vec<SupervisorProject>>;
+    async fn owned_projects(&self, replica: &str) -> Result<Vec<SupervisorProject>>;
     /// Which of `copies` (all of `project`) are gone for good, as their
-    /// instance ids, or `None` when this supervisor does not hold the
+    /// copy ids, or `None` when this supervisor does not hold the
     /// project's lease and so may not judge them (see
     /// `SupervisorGoneCopiesRequest`).
     async fn gone_copies(
         &self,
-        instance: &str,
+        replica: &str,
         project: uuid::Uuid,
         copies: &[weft_core::infra::NodeRef],
     ) -> Result<Option<Vec<String>>>;
@@ -64,7 +64,7 @@ pub trait BrokerSupervisorOps: Send + Sync {
         &self,
         project_id: uuid::Uuid,
         node_id: Option<&str>,
-        member: Option<&weft_core::member::MemberId>,
+        instance: Option<&weft_core::instance::InstanceId>,
         event: weft_broker_client::protocol::InfraEvent,
     ) -> Result<i64>;
     /// Set the `infra_node.status` row.
@@ -79,33 +79,33 @@ pub trait BrokerSupervisorOps: Send + Sync {
     /// uniform transition).
     async fn set_status(
         &self,
-        instance: &str,
+        replica: &str,
         command_id: Option<i64>,
         project_id: uuid::Uuid,
         node_id: &str,
-        member: Option<&weft_core::member::MemberId>,
+        instance: Option<&weft_core::instance::InstanceId>,
         unit: Option<&str>,
         status: weft_broker_client::protocol::InfraNodeStatus,
         failure_stage: Option<weft_broker_client::protocol::FailureStage>,
         failure_message: Option<&str>,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetStatusResponse>>;
     /// Cascade-delete the node, gated on the caller still OWNING the
-    /// project (via `instance` = the supervisor's claim id). `Displaced`
+    /// project (via `replica` = the supervisor's claim id). `Displaced`
     /// means ownership moved mid-Terminate; the supervisor aborts and
     /// leaves the command for the new owner.
     async fn remove_node(
         &self,
-        instance: &str,
+        replica: &str,
         project_id: uuid::Uuid,
         node_id: &str,
-        member: Option<&weft_core::member::MemberId>,
+        instance: Option<&weft_core::instance::InstanceId>,
         command_id: i64,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorRemoveNodeResponse>>;
     /// `cancelled = true` records outcome `cancelled` (a user-honored
     /// cancel), never a failure; `error` then carries the halt point.
     async fn command_complete(
         &self,
-        instance: &str,
+        replica: &str,
         command_id: i64,
         error: Option<&str>,
         cancelled: bool,
@@ -113,7 +113,7 @@ pub trait BrokerSupervisorOps: Send + Sync {
     /// Whether the user requested cancellation of a claimed command.
     /// Polled between platform steps and inside readiness/drain waits.
     async fn command_cancel_requested(&self, command_id: i64) -> Result<bool>;
-    async fn running_count(&self, project_id: uuid::Uuid, copies: &weft_core::member::Copies) -> Result<i64>;
+    async fn running_count(&self, project_id: uuid::Uuid, copies: &weft_core::instance::Copies) -> Result<i64>;
     /// The project's uncompleted supervisor commands (apply / stop /
     /// terminate), each as the copies it acts on. The health loop stands
     /// down for those copies so it never races a user action.
@@ -122,36 +122,37 @@ pub trait BrokerSupervisorOps: Send + Sync {
         project_id: uuid::Uuid,
     ) -> Result<Vec<weft_broker_client::protocol::InFlightCommand>>;
     /// Pre-apply commitment. Writes the infra_node row at Provisioning
-    /// status with the locked-in (instance_id, keep_disks) pair.
+    /// status with the locked-in (copy_id, keep_disks) pair.
     /// Subsequent apply failure leaves a visible row the user can
     /// Terminate; apply success flips Provisioning -> Running via
     /// set_applied.
     async fn set_provisioning(
         &self,
-        instance: &str,
+        replica: &str,
         command_id: i64,
         project_id: uuid::Uuid,
         node_id: &str,
-        member: Option<&weft_core::member::MemberId>,
-        instance_id: &str,
+        instance: Option<&weft_core::instance::InstanceId>,
+        copy_id: &str,
         keep_disks: Vec<String>,
         units: BTreeMap<String, weft_broker_client::protocol::UnitRuntime>,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetProvisioningResponse>>;
 
     /// Post-apply state write. Gated on the caller still OWNING the
-    /// project (via `instance`): a displaced supervisor can't resurrect
+    /// project (via `replica`): a displaced supervisor can't resurrect
     /// a `remove_node`d row or stamp over the new owner's apply.
     async fn set_applied(
         &self,
-        instance: &str,
+        replica: &str,
         command_id: i64,
         project_id: uuid::Uuid,
         node_id: &str,
-        member: Option<&weft_core::member::MemberId>,
-        instance_id: &str,
+        instance: Option<&weft_core::instance::InstanceId>,
+        copy_id: &str,
         applied_spec_hash: &str,
         addresses: weft_broker_client::protocol::AppliedEndpoints,
         keep_disks: Vec<String>,
+        notes: Vec<String>,
         units: BTreeMap<String, weft_broker_client::protocol::UnitRuntime>,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetAppliedResponse>>;
     async fn project_image_tags(
@@ -173,19 +174,19 @@ pub trait BrokerSupervisorOps: Send + Sync {
 
 #[async_trait]
 impl BrokerSupervisorOps for BrokerSupervisorClient {
-    async fn sync_ownership(&self, instance: &str, held_projects: &[uuid::Uuid]) -> Result<SupervisorSyncOwnershipResponse> {
-        BrokerSupervisorClient::sync_ownership(self, instance, held_projects).await
+    async fn sync_ownership(&self, replica: &str, held_projects: &[uuid::Uuid]) -> Result<SupervisorSyncOwnershipResponse> {
+        BrokerSupervisorClient::sync_ownership(self, replica, held_projects).await
     }
-    async fn owned_projects(&self, instance: &str) -> Result<Vec<SupervisorProject>> {
-        BrokerSupervisorClient::owned_projects(self, instance).await
+    async fn owned_projects(&self, replica: &str) -> Result<Vec<SupervisorProject>> {
+        BrokerSupervisorClient::owned_projects(self, replica).await
     }
     async fn gone_copies(
         &self,
-        instance: &str,
+        replica: &str,
         project: uuid::Uuid,
         copies: &[weft_core::infra::NodeRef],
     ) -> Result<Option<Vec<String>>> {
-        BrokerSupervisorClient::gone_copies(self, instance, project, copies).await
+        BrokerSupervisorClient::gone_copies(self, replica, project, copies).await
     }
     async fn infra_nodes(&self, project_id: uuid::Uuid) -> Result<Vec<SupervisorInfraNode>> {
         BrokerSupervisorClient::infra_nodes(self, project_id).await
@@ -208,18 +209,18 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
         &self,
         project_id: uuid::Uuid,
         node_id: Option<&str>,
-        member: Option<&weft_core::member::MemberId>,
+        instance: Option<&weft_core::instance::InstanceId>,
         event: weft_broker_client::protocol::InfraEvent,
     ) -> Result<i64> {
-        BrokerSupervisorClient::event_record(self, project_id, node_id, member, event).await
+        BrokerSupervisorClient::event_record(self, project_id, node_id, instance, event).await
     }
     async fn set_status(
         &self,
-        instance: &str,
+        replica: &str,
         command_id: Option<i64>,
         project_id: uuid::Uuid,
         node_id: &str,
-        member: Option<&weft_core::member::MemberId>,
+        instance: Option<&weft_core::instance::InstanceId>,
         unit: Option<&str>,
         status: weft_broker_client::protocol::InfraNodeStatus,
         failure_stage: Option<weft_broker_client::protocol::FailureStage>,
@@ -227,11 +228,11 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetStatusResponse>> {
         BrokerSupervisorClient::set_status(
             self,
-            instance,
+            replica,
             command_id,
             project_id,
             node_id,
-            member,
+            instance,
             unit,
             status,
             failure_stage,
@@ -241,29 +242,29 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
     }
     async fn remove_node(
         &self,
-        instance: &str,
+        replica: &str,
         project_id: uuid::Uuid,
         node_id: &str,
-        member: Option<&weft_core::member::MemberId>,
+        instance: Option<&weft_core::instance::InstanceId>,
         command_id: i64,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorRemoveNodeResponse>> {
-        BrokerSupervisorClient::remove_node(self, instance, project_id, node_id, member, command_id).await
+        BrokerSupervisorClient::remove_node(self, replica, project_id, node_id, instance, command_id).await
     }
     async fn command_complete(
         &self,
-        instance: &str,
+        replica: &str,
         command_id: i64,
         error: Option<&str>,
         cancelled: bool,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorCommandCompleteResponse>> {
-        BrokerSupervisorClient::command_complete(self, instance, command_id, error, cancelled)
+        BrokerSupervisorClient::command_complete(self, replica, command_id, error, cancelled)
             .await
     }
 
     async fn command_cancel_requested(&self, command_id: i64) -> Result<bool> {
         BrokerSupervisorClient::command_cancel_requested(self, command_id).await
     }
-    async fn running_count(&self, project_id: uuid::Uuid, copies: &weft_core::member::Copies) -> Result<i64> {
+    async fn running_count(&self, project_id: uuid::Uuid, copies: &weft_core::instance::Copies) -> Result<i64> {
         BrokerSupervisorClient::running_count(self, project_id, copies).await
     }
     async fn infra_commands_in_flight(
@@ -274,23 +275,23 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
     }
     async fn set_provisioning(
         &self,
-        instance: &str,
+        replica: &str,
         command_id: i64,
         project_id: uuid::Uuid,
         node_id: &str,
-        member: Option<&weft_core::member::MemberId>,
-        instance_id: &str,
+        instance: Option<&weft_core::instance::InstanceId>,
+        copy_id: &str,
         keep_disks: Vec<String>,
         units: BTreeMap<String, weft_broker_client::protocol::UnitRuntime>,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetProvisioningResponse>> {
         BrokerSupervisorClient::set_provisioning(
             self,
-            instance,
+            replica,
             command_id,
             project_id,
             node_id,
-            member,
-            instance_id,
+            instance,
+            copy_id,
             keep_disks,
             units,
         )
@@ -298,28 +299,30 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
     }
     async fn set_applied(
         &self,
-        instance: &str,
+        replica: &str,
         command_id: i64,
         project_id: uuid::Uuid,
         node_id: &str,
-        member: Option<&weft_core::member::MemberId>,
-        instance_id: &str,
+        instance: Option<&weft_core::instance::InstanceId>,
+        copy_id: &str,
         applied_spec_hash: &str,
         addresses: weft_broker_client::protocol::AppliedEndpoints,
         keep_disks: Vec<String>,
+        notes: Vec<String>,
         units: BTreeMap<String, weft_broker_client::protocol::UnitRuntime>,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetAppliedResponse>> {
         BrokerSupervisorClient::set_applied(
             self,
-            instance,
+            replica,
             command_id,
             project_id,
             node_id,
-            member,
-            instance_id,
+            instance,
+            copy_id,
             applied_spec_hash,
             addresses,
             keep_disks,
+            notes,
             units,
         )
         .await

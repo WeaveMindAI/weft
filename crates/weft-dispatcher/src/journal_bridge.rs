@@ -288,7 +288,7 @@ async fn process_one_row(
                 if let Some(trigger) = owner.fired_by {
                     let key = weft_core::activation::ActivationKey::new(
                         trigger,
-                        weft_core::member::Owner::from_member(owner.member),
+                        weft_core::instance::Owner::from_instance(owner.instance),
                     );
                     try_finish_drain(state, project_id, &key, None).await?;
                 }
@@ -389,7 +389,7 @@ async fn open_projection<'c>(
     // The caller found no projection for the execution; a stale one here
     // would mean two folds of one run on this process, which nothing does.
     let replaced = cursor.projectors.insert(execution_id, LiveProjection { projector, last_row_at: Instant::now() });
-    assert!(replaced.is_none(), "a projection for execution {execution_id} was already open on this instance");
+    assert!(replaced.is_none(), "a projection for execution {execution_id} was already open on this replica");
     Ok(cursor.projectors.get_mut(&execution_id).expect("inserted just above"))
 }
 
@@ -514,16 +514,19 @@ pub async fn run_unrecorded_endings(state: DispatcherState) {
     }
 }
 
-/// One ending: the drain its run's activation may be waiting on.
+/// One ending: its entry slot is free, and the drain its run's
+/// activation may be waiting on is re-checked, as a recorded run's
+/// terminal does in `terminal_cleanup`.
 pub(crate) async fn on_unrecorded_ended(state: &DispatcherState, payload: &str) -> anyhow::Result<()> {
     let ended: weft_journal::unrecorded::UnrecordedEnded = serde_json::from_str(payload)
         .map_err(|e| anyhow::anyhow!("unrecorded ending '{payload}' does not decode: {e}"))?;
+    crate::entry_limits::release_slot(&state.pg_pool, &ended.execution_id.to_string()).await?;
     let Some(trigger) = ended.fired_by else {
         return Ok(());
     };
-    let member = ended.member.map(weft_core::member::MemberId::new).transpose()
-        .map_err(|e| anyhow::anyhow!("unrecorded ending names a bad member: {e}"))?;
-    let key = weft_core::activation::ActivationKey::new(trigger, weft_core::member::Owner::from_member(member));
+    let instance = ended.instance.map(weft_core::instance::InstanceId::new).transpose()
+        .map_err(|e| anyhow::anyhow!("unrecorded ending names a bad instance: {e}"))?;
+    let key = weft_core::activation::ActivationKey::new(trigger, weft_core::instance::Owner::from_instance(instance));
     try_finish_drain(state, ended.project_id, &key, None).await
 }
 
@@ -533,11 +536,11 @@ async fn terminal_cleanup(state: &DispatcherState, execution_id: weft_core::Exec
     let removed = state.journal.signal_remove_for_execution_id(execution_id).await?;
     state.listener.unregister_many(&removed).await;
     // The run's own row says which activation it belonged to (the
-    // trigger that fired it, for its member); a waiting deactivation of
+    // trigger that fired it, for its instance); a waiting deactivation of
     // that activation may have been waiting on exactly this run.
     if let Some(owner) = state.journal.execution_owner(execution_id).await? {
         if let Some(trigger) = owner.fired_by {
-            let key = weft_core::activation::ActivationKey::new(trigger, weft_core::member::Owner::from_member(owner.member));
+            let key = weft_core::activation::ActivationKey::new(trigger, weft_core::instance::Owner::from_instance(owner.instance));
             try_finish_drain(state, owner.project_id, &key, None).await?;
         }
     }

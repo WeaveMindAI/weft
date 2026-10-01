@@ -42,31 +42,9 @@ pub fn claim_heartbeat_interval() -> std::time::Duration {
 /// them. Long enough that producers polling for results see them.
 pub const TERMINAL_RETENTION_SECS: i64 = 3600;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskStatus {
-    Pending,
-    Claimed,
-    Complete,
-    Failed,
-}
-
-impl TaskStatus {
-    fn parse(s: &str) -> Option<Self> {
-        match s {
-            "pending" => Some(Self::Pending),
-            "claimed" => Some(Self::Claimed),
-            "complete" => Some(Self::Complete),
-            "failed" => Some(Self::Failed),
-            _ => None,
-        }
-    }
-
-    /// Whether the task is done, one way or the other.
-    pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Complete | Self::Failed)
-    }
-}
+/// Where a task stands: weft-core's, since a client waiting on a task
+/// reads it off the wire.
+pub use weft_core::task::TaskStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -131,12 +109,12 @@ pub struct NewTask {
     /// uniqueness is scoped by it (a NULL tenant would never dedup) and
     /// every task is somebody's.
     pub tenant_id: String,
-    /// If set, only the named process instance can claim this task. A
-    /// live execution is pinned to the worker instance its caller's
+    /// If set, only the named process replica can claim this task. A
+    /// live execution is pinned to the worker replica its caller's
     /// connection reached (`admit_live_execution_in`), since the caller
-    /// is on THAT instance's socket. NULL means whoever the task is
+    /// is on THAT replica's socket. NULL means whoever the task is
     /// delivered to may claim it.
-    pub target_instance: Option<String>,
+    pub target_replica: Option<String>,
     /// The worker IMAGE this task runs on: the project's
     /// `running_binary_hash` at enqueue time. A worker task is delivered
     /// to workers running exactly this image (`take_deliveries`), so new
@@ -227,7 +205,7 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             dedup_key TEXT,
             execution_id TEXT,
             tenant_id TEXT NOT NULL,
-            target_instance TEXT,
+            target_replica TEXT,
             binary_hash TEXT,
             payload JSONB NOT NULL,
             claimed_by TEXT,
@@ -322,7 +300,7 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
         // somehow does not the UPDATE matches zero rows and the
         // broker's journal-write owner check then refuses the process
         // loudly (no silent mis-bind).
-        // SYNC: execution.owner_instance has exactly two writers,
+        // SYNC: execution.owner_replica has exactly two writers,
         // this trigger and `bind_execution_id_owner` below (the appointed-driver
         // path for processes that never claim a task); the readers are
         // crates/weft-broker/src/handlers.rs journal_record and
@@ -331,7 +309,7 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             BEGIN
                 IF NEW.execution_id IS NOT NULL AND NEW.claimed_by IS NOT NULL THEN
                     UPDATE execution
-                    SET owner_instance = NEW.claimed_by
+                    SET owner_replica = NEW.claimed_by
                     WHERE execution_id = NEW.execution_id;
                 END IF;
                 RETURN NEW;
@@ -371,7 +349,7 @@ pub async fn enqueue(pool: &PgPool, spec: NewTask) -> Result<Uuid> {
     sqlx::query(
         r#"INSERT INTO task (
             id, kind, status, target, project_id, dedup_key, execution_id, tenant_id,
-            target_instance, binary_hash, payload, attempts, created_at_unix
+            target_replica, binary_hash, payload, attempts, created_at_unix
         ) VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9, $10, 0, $11)"#,
     )
     .bind(id)
@@ -381,7 +359,7 @@ pub async fn enqueue(pool: &PgPool, spec: NewTask) -> Result<Uuid> {
     .bind(spec.dedup_key.as_deref())
     .bind(spec.execution_id.as_deref())
     .bind(spec.tenant_id.as_str())
-    .bind(spec.target_instance.as_deref())
+    .bind(spec.target_replica.as_deref())
     .bind(spec.binary_hash.as_deref())
     .bind(&spec.payload)
     .bind(now)
@@ -453,7 +431,7 @@ pub async fn enqueue_dedup_in(
     sqlx::query(
         r#"INSERT INTO task (
             id, kind, status, target, project_id, dedup_key, execution_id, tenant_id,
-            target_instance, binary_hash, payload, attempts, created_at_unix
+            target_replica, binary_hash, payload, attempts, created_at_unix
         ) VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9, $10, 0, $11)"#,
     )
     .bind(id)
@@ -463,7 +441,7 @@ pub async fn enqueue_dedup_in(
     .bind(dedup)
     .bind(spec.execution_id.as_deref())
     .bind(spec.tenant_id.as_str())
-    .bind(spec.target_instance.as_deref())
+    .bind(spec.target_replica.as_deref())
     .bind(spec.binary_hash.as_deref())
     .bind(&spec.payload)
     .bind(now)
@@ -519,17 +497,17 @@ pub async fn enqueue_or_rearm(pool: &PgPool, spec: NewTask) -> Result<DedupOutco
 /// the pinned task (the caller's transaction now owns a fresh admission and
 /// should write whatever must commit atomically with it).
 /// `AlreadyAdmitted` = an earlier call for the same execution already inserted
-/// it, pinned to `instance` (an idempotent retry when that is the asker; a
+/// it, pinned to `replica` (an idempotent retry when that is the asker; a
 /// second copy of the caller's request on another worker otherwise).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveAdmitOutcome {
     Admitted,
-    AlreadyAdmitted { instance: String },
+    AlreadyAdmitted { replica: String },
 }
 
-/// ATOMICALLY admit a live execution onto the worker instance its caller's
+/// ATOMICALLY admit a live execution onto the worker replica its caller's
 /// connection reached: insert the execute task for the spec's execution,
-/// pinned to `spec.target_instance` (that instance), unless one is already
+/// pinned to `spec.target_replica` (that replica), unless one is already
 /// live for the execution.
 ///
 /// MUST run inside a caller-owned transaction: the caller writes the
@@ -542,10 +520,10 @@ pub async fn admit_live_execution_in(conn: &mut sqlx::PgConnection, spec: &NewTa
     let project_id = spec.project_id.ok_or_else(|| anyhow::anyhow!("live admission requires project_id"))?;
     let execution_id = spec.execution_id.as_deref().ok_or_else(|| anyhow::anyhow!("live admission requires execution"))?;
     let dedup = spec.dedup_key.as_deref().ok_or_else(|| anyhow::anyhow!("live admission requires dedup_key"))?;
-    let instance = spec
-        .target_instance
+    let replica = spec
+        .target_replica
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("live admission requires the worker instance the caller reached"))?;
+        .ok_or_else(|| anyhow::anyhow!("live admission requires the worker replica the caller reached"))?;
     // Serialize admissions of one execution, so two copies of the same
     // arrival never both insert.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
@@ -553,7 +531,7 @@ pub async fn admit_live_execution_in(conn: &mut sqlx::PgConnection, spec: &NewTa
         .execute(&mut *conn)
         .await?;
     let existing: Option<(Option<String>,)> = sqlx::query_as(
-        r#"SELECT target_instance FROM task
+        r#"SELECT target_replica FROM task
            WHERE tenant_id = $1 AND kind = 'execute' AND dedup_key = $2
              AND status IN ('pending', 'claimed')
            LIMIT 1"#,
@@ -566,14 +544,14 @@ pub async fn admit_live_execution_in(conn: &mut sqlx::PgConnection, spec: &NewTa
         let pinned = pinned.ok_or_else(|| {
             anyhow::anyhow!("live execution {execution_id} has an execute task pinned to no worker; it was not admitted as a live run")
         })?;
-        return Ok(LiveAdmitOutcome::AlreadyAdmitted { instance: pinned });
+        return Ok(LiveAdmitOutcome::AlreadyAdmitted { replica: pinned });
     }
     let id = Uuid::new_v4();
     let now = unix_now();
     sqlx::query(
         r#"INSERT INTO task (
             id, kind, status, target, project_id, dedup_key, execution_id, tenant_id,
-            target_instance, binary_hash, payload, attempts, created_at_unix
+            target_replica, binary_hash, payload, attempts, created_at_unix
         ) VALUES ($1, 'execute', 'pending', 'worker', $2, $3, $4, $5, $6, $7, $8, 0, $9)"#,
     )
     .bind(id)
@@ -581,7 +559,7 @@ pub async fn admit_live_execution_in(conn: &mut sqlx::PgConnection, spec: &NewTa
     .bind(dedup)
     .bind(execution_id)
     .bind(spec.tenant_id.as_str())
-    .bind(instance)
+    .bind(replica)
     .bind(spec.binary_hash.as_deref())
     .bind(&spec.payload)
     .bind(now)
@@ -590,8 +568,8 @@ pub async fn admit_live_execution_in(conn: &mut sqlx::PgConnection, spec: &NewTa
     Ok(LiveAdmitOutcome::Admitted)
 }
 
-/// Atomically claim one task for `instance` (the claiming process
-/// instance). Picks oldest pending first; also rescues claims whose lease
+/// Atomically claim one task for `replica` (the claiming process
+/// replica). Picks oldest pending first; also rescues claims whose lease
 /// expired (the claimant died mid-work).
 ///
 /// One statement: the pick locks its row (`FOR UPDATE SKIP LOCKED`, so
@@ -599,7 +577,7 @@ pub async fn admit_live_execution_in(conn: &mut sqlx::PgConnection, spec: &NewTa
 /// updates it, with no round trip between.
 pub async fn claim_one(
     pool: &PgPool,
-    instance: &str,
+    replica: &str,
     filter: &ClaimFilter,
 ) -> Result<Option<Task>> {
     let now = unix_now();
@@ -607,7 +585,7 @@ pub async fn claim_one(
     let row = match filter {
         ClaimFilter::Dispatcher => {
             sqlx::query(&claim_sql(DISPATCHER_PICK))
-                .bind(instance)
+                .bind(replica)
                 .bind(now)
                 .bind(claim_until)
                 .fetch_optional(pool)
@@ -615,7 +593,7 @@ pub async fn claim_one(
         }
         ClaimFilter::ExecutionId { project_id, execution_id } => {
             sqlx::query(&claim_sql(EXECUTION_ID_PICK))
-                .bind(instance)
+                .bind(replica)
                 .bind(now)
                 .bind(claim_until)
                 .bind(*project_id)
@@ -646,14 +624,14 @@ fn claim_sql(pick: &str) -> String {
 const DISPATCHER_PICK: &str = r#"SELECT id FROM task
     WHERE target = 'dispatcher'
       AND (status = 'pending' OR (status = 'claimed' AND claimed_until_unix < $2))
-      AND (target_instance IS NULL OR target_instance = $1)
+      AND (target_replica IS NULL OR target_replica = $1)
     ORDER BY created_at_unix ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1"#;
 
 /// The execute or resume task of execution `$5` of project `$4`, pending
-/// or with a lapsed claim, that instance `$1` may run: unpinned, or
-/// pinned to it (a live run is pinned to the instance its caller's
+/// or with a lapsed claim, that replica `$1` may run: unpinned, or
+/// pinned to it (a live run is pinned to the replica its caller's
 /// connection reached), and only while no OTHER task of the execution is
 /// being driven (see [`NOT_DRIVEN_ELSEWHERE`]). The order is a tie-break:
 /// the oldest first.
@@ -664,7 +642,7 @@ const EXECUTION_ID_PICK: &str = concat!(
       AND execution_id = $5
       AND kind IN ('execute', 'resume')
       AND (status = 'pending' OR (status = 'claimed' AND claimed_until_unix < $2))
-      AND (target_instance IS NULL OR target_instance = $1)
+      AND (target_replica IS NULL OR target_replica = $1)
       AND "#,
     not_driven_elsewhere!(),
     r#"
@@ -756,7 +734,7 @@ pub struct Undeliverable {
 /// or its claim lapsed (the worker that had it died), no delivery of it is
 /// outstanding, and no other task of its execution is being driven (the one
 /// execution, one claim rule of `EXECUTION_ID_PICK`; the sweep that follows the
-/// driving task's end delivers it). A task pinned to an instance is never delivered: it
+/// driving task's end delivers it). A task pinned to a replica is never delivered: it
 /// is a live run, driven inside its caller's own connection. A worker task
 /// that cannot be delivered (no image, no run class) comes back in
 /// [`Taken::undeliverable`] with its reason rather than delivered to a
@@ -769,7 +747,7 @@ pub async fn take_deliveries(pool: &PgPool, limit: i64) -> Result<Taken> {
                SELECT id FROM task
                WHERE target = 'worker'
                  AND kind IN ('execute', 'resume')
-                 AND target_instance IS NULL
+                 AND target_replica IS NULL
                  AND (status = 'pending' OR (status = 'claimed' AND claimed_until_unix < $1))
                  AND (delivered_until_unix IS NULL OR delivered_until_unix < $1)
                  AND NOT EXISTS (SELECT 1 FROM task other
@@ -904,7 +882,7 @@ pub async fn take_cancels(pool: &PgPool, project_id: Uuid, execution_ids: &[Stri
 /// Renew the claim's lease. Returns false if the row no longer
 /// belongs to us (lease lost, manually transitioned, deleted).
 /// The caller should abandon work and let the next claim recover.
-pub async fn heartbeat(pool: &PgPool, task_id: Uuid, instance: &str) -> Result<bool> {
+pub async fn heartbeat(pool: &PgPool, task_id: Uuid, replica: &str) -> Result<bool> {
     let now = unix_now();
     let claim_until = now + claim_duration_secs();
     let rows = sqlx::query(
@@ -914,7 +892,7 @@ pub async fn heartbeat(pool: &PgPool, task_id: Uuid, instance: &str) -> Result<b
     )
     .bind(claim_until)
     .bind(task_id)
-    .bind(instance)
+    .bind(replica)
     .execute(pool)
     .await?;
     Ok(rows.rows_affected() > 0)
@@ -927,16 +905,16 @@ pub async fn heartbeat(pool: &PgPool, task_id: Uuid, instance: &str) -> Result<b
 /// transient outage into a permanent failure. Guarded on
 /// `claimed_by = $process`, so a thief that already re-claimed the row is
 /// never clobbered; returns false in that case (the thief owns the
-/// task) and true when the requeue landed. Keeps `target_instance`
+/// task) and true when the requeue landed. Keeps `target_replica`
 /// (a pinned task stays addressed; surrender is not process death).
-pub async fn requeue(pool: &PgPool, task_id: Uuid, instance: &str) -> Result<bool> {
+pub async fn requeue(pool: &PgPool, task_id: Uuid, replica: &str) -> Result<bool> {
     let rows = sqlx::query(
         r#"UPDATE task
            SET status = 'pending', claimed_by = NULL, claimed_until_unix = NULL
            WHERE id = $1 AND claimed_by = $2 AND status = 'claimed'"#,
     )
     .bind(task_id)
-    .bind(instance)
+    .bind(replica)
     .execute(pool)
     .await?;
     Ok(rows.rows_affected() > 0)
@@ -952,7 +930,7 @@ pub async fn requeue(pool: &PgPool, task_id: Uuid, instance: &str) -> Result<boo
 pub async fn store_result_partial(
     pool: &PgPool,
     task_id: Uuid,
-    instance: &str,
+    replica: &str,
     result: &Value,
 ) -> Result<()> {
     let updated = sqlx::query(
@@ -962,12 +940,12 @@ pub async fn store_result_partial(
     )
     .bind(result)
     .bind(task_id)
-    .bind(instance)
+    .bind(replica)
     .execute(pool)
     .await?;
     if updated.rows_affected() == 0 {
         anyhow::bail!(
-            "store_result_partial: task {task_id} no longer claimed by {instance}; \
+            "store_result_partial: task {task_id} no longer claimed by {replica}; \
              the result was NOT recorded"
         );
     }
@@ -1020,7 +998,7 @@ fn end_claim_as(status: &str) -> String {
 pub async fn complete(
     pool: &PgPool,
     task_id: Uuid,
-    instance: &str,
+    replica: &str,
     result: Value,
 ) -> Result<()> {
     let now = unix_now();
@@ -1034,11 +1012,11 @@ pub async fn complete(
     .bind(&result)
     .bind(now)
     .bind(task_id)
-    .bind(instance)
+    .bind(replica)
     .fetch_all(pool)
     .await?;
     if updated.is_empty() {
-        anyhow::bail!("complete: task {task_id} no longer claimed by {instance}");
+        anyhow::bail!("complete: task {task_id} no longer claimed by {replica}");
     }
     Ok(())
 }
@@ -1070,7 +1048,7 @@ pub async fn fail_pending(pool: &PgPool, task_id: Uuid, error: &str) -> Result<b
 pub async fn fail(
     pool: &PgPool,
     task_id: Uuid,
-    instance: &str,
+    replica: &str,
     error: String,
 ) -> Result<()> {
     let now = unix_now();
@@ -1084,11 +1062,11 @@ pub async fn fail(
     .bind(&error)
     .bind(now)
     .bind(task_id)
-    .bind(instance)
+    .bind(replica)
     .fetch_all(pool)
     .await?;
     if updated.is_empty() {
-        anyhow::bail!("fail: task {task_id} no longer claimed by {instance}");
+        anyhow::bail!("fail: task {task_id} no longer claimed by {replica}");
     }
     Ok(())
 }
@@ -1197,8 +1175,8 @@ pub async fn drop_stale_cancels(pool: &PgPool) -> Result<u64> {
     .rows_affected())
 }
 
-/// A live execution whose worker instance went away. The caller was on
-/// THAT instance's connection, so the run cannot be re-run anywhere else
+/// A live execution whose worker replica went away. The caller was on
+/// THAT replica's connection, so the run cannot be re-run anywhere else
 /// (the caller is gone with it); the dispatcher records a terminal
 /// `ExecutionCancelled` for the execution so the journal does not keep a
 /// started-but-unrunnable execution.
@@ -1213,9 +1191,9 @@ pub struct OrphanedLiveExecution {
     pub project_id: Option<Uuid>,
 }
 
-/// Every live execution whose instance is gone: its pinned execute task's
-/// claim lapsed (the instance stopped renewing it), or it was admitted and
-/// never claimed within a claim's duration (the instance died between the
+/// Every live execution whose replica is gone: its pinned execute task's
+/// claim lapsed (the replica stopped renewing it), or it was admitted and
+/// never claimed within a claim's duration (the replica died between the
 /// birth and the claim, which it makes in the same breath).
 ///
 /// A read: the reaper cancels then deletes each, and a sweep that runs
@@ -1225,7 +1203,7 @@ pub async fn orphaned_live_executions(pool: &PgPool) -> Result<Vec<OrphanedLiveE
     let rows = sqlx::query(
         r#"SELECT id, execution_id, project_id FROM task
            WHERE kind = 'execute'
-             AND target_instance IS NOT NULL
+             AND target_replica IS NOT NULL
              AND payload -> 'live_connection' IS NOT NULL
              AND payload -> 'live_connection' != 'null'::jsonb
              AND ((status = 'claimed' AND claimed_until_unix < $1)
@@ -1295,7 +1273,7 @@ pub(crate) fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
-/// Appoint `instance` (a process instance) as the driver of `execution_id`.
+/// Appoint `replica` (one running worker process) as the driver of `execution_id`.
 /// Ownership normally follows the task claim (the
 /// `task_claim_binds_execution_id_owner` trigger), but a process that never
 /// claims a task (a node test: the dispatcher holds the task and calls the
@@ -1303,15 +1281,15 @@ pub(crate) fn unix_now() -> i64 {
 /// Idempotent: a lease-loss re-claim re-stamps the same process name. A
 /// missing execution row matches zero rows and fails loudly (the execution is
 /// always seeded at ExecutionStarted first).
-/// SYNC: writer of execution.owner_instance, see the
+/// SYNC: writer of execution.owner_replica, see the
 /// `task_claim_binds_execution_id_owner` trigger in [`GROUP`]
 /// for the full writer/reader chain.
-pub async fn bind_execution_id_owner(pool: &PgPool, execution_id: &str, instance: &str) -> Result<()> {
+pub async fn bind_execution_id_owner(pool: &PgPool, execution_id: &str, replica: &str) -> Result<()> {
     let updated = sqlx::query(
-        "UPDATE execution SET owner_instance = $2 WHERE execution_id = $1",
+        "UPDATE execution SET owner_replica = $2 WHERE execution_id = $1",
     )
     .bind(execution_id)
-    .bind(instance)
+    .bind(replica)
     .execute(pool)
     .await?
     .rows_affected();
@@ -1339,7 +1317,7 @@ mod wire_tests {
             dedup_key: Some("d1".to_string()),
             execution_id: Some("c1".to_string()),
             tenant_id: "t1".to_string(),
-            target_instance: Some("instance-0".to_string()),
+            target_replica: Some("replica-0".to_string()),
             binary_hash: Some("abc123".to_string()),
             payload: serde_json::json!({ "a": 1, "nested": [true, null] }),
         };
@@ -1351,7 +1329,7 @@ mod wire_tests {
         assert_eq!(back.dedup_key, original.dedup_key);
         assert_eq!(back.execution_id, original.execution_id);
         assert_eq!(back.tenant_id, original.tenant_id);
-        assert_eq!(back.target_instance, original.target_instance);
+        assert_eq!(back.target_replica, original.target_replica);
         assert_eq!(back.binary_hash, original.binary_hash);
         assert_eq!(back.payload, original.payload);
         // The kind travels as a raw string, not a tagged enum.
@@ -1373,7 +1351,7 @@ mod wire_tests {
             "dedup_key": null,
             "execution": null,
             "tenant_id": "t",
-            "target_instance": null,
+            "target_replica": null,
             "payload": {}
         }"#;
         let back: NewTask = serde_json::from_str(json).unwrap();
@@ -1418,7 +1396,7 @@ mod wire_tests {
             "dedup_key": null,
             "execution": null,
             "tenant_id": null,
-            "target_instance": null,
+            "target_replica": null,
             "payload": {}
         }"#;
         assert!(serde_json::from_str::<NewTask>(json).is_err());

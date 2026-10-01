@@ -519,7 +519,7 @@ impl CostSink {
                 dedup_key: Some(dedup_key.clone()),
                 execution_id: Some(self.execution_id.to_string()),
                 tenant_id: self.tenant_id.clone(),
-                target_instance: None,
+                target_replica: None,
                 binary_hash: None,
                 payload: payload_json.clone(),
             };
@@ -989,22 +989,22 @@ mod tests {
         }
         async fn claim_one(
             &self,
-            _instance: &str,
+            _replica: &str,
             _filter: weft_task_store::tasks::ClaimFilter,
             _wait: std::time::Duration,
         ) -> anyhow::Result<Option<weft_task_store::tasks::Task>> {
             Ok(None)
         }
-        async fn requeue(&self, _task_id: uuid::Uuid, _instance: &str) -> anyhow::Result<bool> {
+        async fn requeue(&self, _task_id: uuid::Uuid, _replica: &str) -> anyhow::Result<bool> {
             Ok(true)
         }
-        async fn heartbeat(&self, _task_id: uuid::Uuid, _instance: &str) -> anyhow::Result<bool> {
+        async fn heartbeat(&self, _task_id: uuid::Uuid, _replica: &str) -> anyhow::Result<bool> {
             Ok(true)
         }
         async fn complete(
             &self,
             _task_id: uuid::Uuid,
-            _instance: &str,
+            _replica: &str,
             _result: serde_json::Value,
         ) -> anyhow::Result<()> {
             Ok(())
@@ -1012,7 +1012,7 @@ mod tests {
         async fn fail(
             &self,
             _task_id: uuid::Uuid,
-            _instance: &str,
+            _replica: &str,
             _error: String,
         ) -> anyhow::Result<()> {
             Ok(())
@@ -2062,7 +2062,7 @@ mod open_charge_tests {
         let charges = sink.open_charges.clone();
         charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, sink });
 
-        charges.flush("the instance shut down");
+        charges.flush("the replica shut down");
         pending.wait_zero().await;
 
         let booked = recorded_payloads(&tasks);
@@ -2070,7 +2070,7 @@ mod open_charge_tests {
         assert_eq!(booked[0].amount_usd, None, "recorded AS unknown, never as zero");
         assert_eq!(booked[0].model.as_deref(), Some("m1"));
         assert!(
-            booked[0].metadata["resolution"].as_str().unwrap().contains("the instance shut down"),
+            booked[0].metadata["resolution"].as_str().unwrap().contains("the replica shut down"),
             "the trail says why it has no figure"
         );
     }

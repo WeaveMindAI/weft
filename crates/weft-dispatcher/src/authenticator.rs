@@ -30,7 +30,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
-use crate::journal::{Journal, TokenKind};
+use crate::journal::Journal;
+use weft_core::signal_token::TokenKind;
 use crate::state::DispatcherState;
 use crate::tenant::TenantId;
 
@@ -320,7 +321,7 @@ mod tests {
             allowed_displays: vec![],
             all_displays: false,
             created_at: 0,
-            member: None,
+            instance: None,
             expires_at: None,
         }
     }

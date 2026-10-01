@@ -300,12 +300,12 @@ fn worker_emission_declares_but_never_enables_node_tests() {
         features: weft_core::NodeFeatures::default(),
         scope: Vec::new(),
         group_boundary: None,
-        requires_infra: false, per_member: None,
+        requires_infra: false, per_instance: None,
         images: Vec::new(),
         fires_with: Default::default(),
         published_service: None,
-        member_service: None,
-        member_rules: None,
+        instance_service: None,
+        instance_rules: None,
         span: None,
         header_span: None,
         config_spans: Default::default(),
@@ -342,7 +342,7 @@ fn worker_emission_declares_but_never_enables_node_tests() {
         dir.path(),
         &catalog,
         "probe",
-        weft_compiler::codegen::NodeSet::Referenced,
+        weft_core::builds::NodeSet::Referenced,
     )
     .expect("worker emission");
 

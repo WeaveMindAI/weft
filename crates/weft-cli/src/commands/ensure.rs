@@ -6,7 +6,7 @@
 //! Semantics:
 //!   - Compile here first: a mistake in the program is reported at once,
 //!     with every diagnostic, before anything is uploaded.
-//!   - Snapshot: every covered file the asset plane lacks is uploaded
+//!   - Snapshot: every covered file the tenant's assets lack is uploaded
 //!     straight to the bucket; the manifest names the version.
 //!   - Resolve the `@asset` refs only this machine can read (a file outside
 //!     the project, a URL) and send them with the version.
@@ -22,6 +22,8 @@
 
 
 use anyhow::{Context, Result};
+
+use weft_core::builds::BuiltProgram;
 
 use super::Ctx;
 use crate::client::DispatcherClient;
@@ -70,15 +72,10 @@ pub fn parse_running_choice(
     Ok((policy, drain_timeout))
 }
 
-/// The running-work answer as the request fields every verb sends:
-/// `runningPolicy` always (so the wire never guesses), `drainTimeoutSecs`
-/// when a cap was given. One spelling, the wire type's own.
-pub fn running_choice_fields(policy: RunningPolicy, drain_timeout: Option<u64>) -> serde_json::Map<String, serde_json::Value> {
-    let choice = RunningChoice { running_policy: Some(policy), drain_timeout_secs: drain_timeout };
-    match serde_json::to_value(choice).expect("a wire struct serializes") {
-        serde_json::Value::Object(fields) => fields,
-        other => unreachable!("a struct serializes to an object, got {other}"),
-    }
+/// The running-work answer as every verb sends it: the policy always
+/// (so the wire never guesses), the cap when one was given.
+pub fn running_choice(policy: RunningPolicy, drain_timeout: Option<u64>) -> RunningChoice {
+    RunningChoice { running_policy: Some(policy), drain_timeout_secs: drain_timeout }
 }
 
 pub struct ProjectHandle {
@@ -94,24 +91,18 @@ pub struct ProjectHandle {
     pub built: BuiltProgram,
 }
 
-/// The install's answer to a build.
-// SYNC: BuiltProgram <-> crates/weft-dispatcher/src/build/mod.rs (BuiltProgram)
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct BuiltProgram {
-    pub definition: weft_core::ProjectDefinition,
-    #[serde(rename = "binaryHash")]
-    pub binary_hash: String,
-    #[serde(rename = "definitionHash")]
-    pub definition_hash: String,
-    #[serde(rename = "infraHash")]
-    pub infra_hash: String,
-    /// `place -> { image name -> image ref }`, one entry per infra place.
-    #[serde(rename = "infraImages")]
-    pub infra_images: std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
-    /// The image refs this build had to build; empty when every image
-    /// was already there.
-    #[serde(rename = "builtImages")]
-    pub built_images: Vec<String>,
+/// What a person is told when a build moved infra places onto a new
+/// image: only a copy started from now on gets it.
+fn replaced_infra_images_note(places: &[String]) -> Option<String> {
+    if places.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "this build changed the image of infra {}: a copy started from now on gets the new image, \
+         and a copy already running keeps its own until you run `weft infra upgrade` \
+         (with `--instance <id>` for one instance's copy)",
+        places.join(", ")
+    ))
 }
 
 impl ProjectHandle {
@@ -121,40 +112,11 @@ impl ProjectHandle {
     pub fn definition_hash(&self) -> &str {
         &self.built.definition_hash
     }
-    pub fn infra_hash(&self) -> &str {
-        &self.built.infra_hash
-    }
 
-    /// Inject the three hash fields into a JSON body map using the
-    /// canonical camelCase keys: how a verb names the build it acts on.
-    pub fn inject_hash_fields(&self, body: &mut serde_json::Map<String, serde_json::Value>) {
-        inject_hash_fields_opt(
-            body,
-            Some(self.binary_hash()),
-            Some(self.definition_hash()),
-            Some(self.infra_hash()),
-        );
-    }
-}
-
-/// Inject hashes when each is independently optional (`activate.rs`'s
-/// "activate-by-id" path forwards none of them). Skipping a None
-/// field is the correct behavior: posting null would overwrite the
-/// dispatcher's stored running hash and silently flip drift state.
-pub fn inject_hash_fields_opt(
-    body: &mut serde_json::Map<String, serde_json::Value>,
-    binary: Option<&str>,
-    definition: Option<&str>,
-    infra: Option<&str>,
-) {
-    if let Some(h) = binary {
-        body.insert("binaryHash".into(), serde_json::Value::String(h.into()));
-    }
-    if let Some(h) = definition {
-        body.insert("definitionHash".into(), serde_json::Value::String(h.into()));
-    }
-    if let Some(h) = infra {
-        body.insert("infraHash".into(), serde_json::Value::String(h.into()));
+    /// This build as an activate or a resync names it (no reactivate
+    /// choice: the caller sets one when it has one).
+    pub fn activation_target(&self) -> weft_core::activation::ActivationTarget {
+        weft_core::activation::ActivationTarget { build: self.built.named(), reactivate_choice: None }
     }
 }
 
@@ -170,12 +132,9 @@ pub fn inject_hash_fields_opt(
 pub async fn ensure_project_known(ctx: &Ctx) -> Result<()> {
     let project = ctx.project()?;
     let client = ctx.client()?;
-    // SYNC: body <-> crates/weft-dispatcher/src/api/project.rs DeclareRequest
+    let body = weft_core::projects::DeclareRequest { id: project.id(), name: project.manifest.package.name.clone() };
     client
-        .post_json(
-            "/projects",
-            &serde_json::json!({ "id": project.id(), "name": project.manifest.package.name }),
-        )
+        .post_json("/projects", &serde_json::to_value(&body)?)
         .await
         .context("declare the project to the install")?;
     Ok(())
@@ -187,7 +146,7 @@ pub async fn ensure_project_known(ctx: &Ctx) -> Result<()> {
 pub async fn ensure_registered(
     ctx: &Ctx,
     progress: &Progress,
-    node_set: weft_compiler::codegen::NodeSet,
+    node_set: weft_core::builds::NodeSet,
 ) -> Result<ProjectHandle> {
     let compiled = compile_project(ctx, progress)?;
     build_compiled(ctx, progress, node_set, compiled).await
@@ -297,7 +256,7 @@ fn compile_failure(
 pub async fn build_compiled(
     ctx: &Ctx,
     progress: &Progress,
-    node_set: weft_compiler::codegen::NodeSet,
+    node_set: weft_core::builds::NodeSet,
     compiled: CompiledProject,
 ) -> Result<ProjectHandle> {
     let CompiledProject { definition, sources } = compiled;
@@ -308,26 +267,22 @@ pub async fn build_compiled(
         "project files changed after compilation; rerun the command to build and record the same sources");
 
     // The `@asset` refs only this machine can read, resolved here and sent
-    // with the version (a referenced file the asset plane lacks is
+    // with the version (a referenced file the tenant's assets lack is
     // uploaded on the way).
     let resolutions =
         crate::commands::assets::asset_resolutions(&client, &project.root, &definition, true).await?;
 
     let id = project.id().to_string();
     let path = format!("/projects/{id}/builds");
-    // SYNC: body <-> crates/weft-dispatcher/src/build/mod.rs VersionBuildRequest
-    let body = serde_json::json!({
-        "name": project.manifest.package.name,
-        "manifest": manifest,
-        "nodeSet": match node_set {
-            weft_compiler::codegen::NodeSet::Full => "full",
-            weft_compiler::codegen::NodeSet::Referenced => "referenced",
-        },
-        "assets": resolutions.map,
-    });
+    let body = weft_core::builds::VersionBuildRequest {
+        name: project.manifest.package.name.clone(),
+        manifest: manifest.clone(),
+        node_set,
+        assets: resolutions.map.clone(),
+    };
     progress.build_start(&project.manifest.package.name);
     progress.dispatcher_call_start(&path);
-    let (status, text) = client.post_json_status(&path, &body).await.context("ask the install to build")?;
+    let (status, text) = client.post_json_status(&path, &serde_json::to_value(&body)?).await.context("ask the install to build")?;
     if !(200..300).contains(&status) {
         anyhow::bail!(
             "the build failed:\n{}",
@@ -337,6 +292,9 @@ pub async fn build_compiled(
     let built: BuiltProgram = serde_json::from_str(&text).context("read the build's answer")?;
     progress.dispatcher_call_done(serde_json::json!({ "project_id": id }));
     progress.build_done(&project.manifest.package.name, &built.built_images);
+    if let Some(note) = replaced_infra_images_note(&built.replaced_infra_images) {
+        progress.warn(&note);
+    }
 
     // The version's blobs and the assets the built program uses are the
     // project's current references; everything else starts expiring.

@@ -55,7 +55,7 @@ pub struct LocalRunnerConfig {
     /// it takes to start it (the secrets stay off the command line).
     pub scratch_dir: std::path::PathBuf,
     /// The install these workers belong to.
-    pub install: weft_core::infra::Instance,
+    pub install: weft_core::infra::Install,
     /// The install's clock factor (`weft_core::time_scale`). Its workers
     /// run at it too: a worker's claim heartbeat and the broker's claim
     /// length are one protocol, and must agree.
@@ -379,7 +379,7 @@ fn worker_env(target: &WorkerTarget, cfg: &LocalRunnerConfig, door: &str, token:
 }
 
 /// `docker run` for a worker container.
-fn run_args(install: &weft_core::infra::Instance, target: &WorkerTarget, name: &str, run: WorkerRun, env_file: &std::path::Path) -> Vec<String> {
+fn run_args(install: &weft_core::infra::Install, target: &WorkerTarget, name: &str, run: WorkerRun, env_file: &std::path::Path) -> Vec<String> {
     let mut l = BTreeMap::new();
     l.insert(labels::INSTALL, install.label_value().to_string());
     l.insert(labels::PROJECT, target.project.to_string());
@@ -492,7 +492,7 @@ mod tests {
                 caller_token_secret: Some("cd".repeat(32)),
                 idle_stop: Duration::from_secs(300),
                 scratch_dir: dir.to_path_buf(),
-                install: weft_core::infra::Instance::default_install(),
+                install: weft_core::infra::Install::default_install(),
                 time_scale: 1.0,
             },
         )
@@ -583,7 +583,7 @@ mod tests {
 
     #[test]
     fn a_long_run_names_its_execution_id_and_removes_itself() {
-        let args = run_args(&weft_core::infra::Instance::default_install(), &target(0), "weft-long-x", WorkerRun::Long(uuid::Uuid::from_u128(9)), std::path::Path::new("/e"));
+        let args = run_args(&weft_core::infra::Install::default_install(), &target(0), "weft-long-x", WorkerRun::Long(uuid::Uuid::from_u128(9)), std::path::Path::new("/e"));
         assert!(args.contains(&"--rm".to_string()));
         assert!(!args.contains(&"--publish".to_string()));
         assert_eq!(args[args.len() - 2..], ["--run".to_string(), uuid::Uuid::from_u128(9).to_string()]);

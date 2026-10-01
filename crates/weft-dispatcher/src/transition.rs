@@ -128,7 +128,7 @@ pub(crate) async fn publish_transition_changed(state: &DispatcherState, id: uuid
         Ok(activations) => crate::activation_store::aggregate(
             activations
                 .iter()
-                .filter(|a| a.key.owner == weft_core::member::Owner::Shared)
+                .filter(|a| a.key.owner == weft_core::instance::Owner::Shared)
                 .map(|a| &a.lifecycle),
         )
         .status
@@ -278,9 +278,9 @@ pub(crate) async fn build_version_gated(
     state: &DispatcherState,
     id: uuid::Uuid,
     tenant: &crate::tenant::TenantId,
-    request: &crate::build::VersionBuildRequest,
+    request: &weft_core::builds::VersionBuildRequest,
     hold: &crate::build::prune::ImageHold,
-) -> Result<crate::build::BuiltProgram, (StatusCode, String)> {
+) -> Result<crate::build::Build, (StatusCode, String)> {
     let gate = ProjectBuildGate::new(state.clone(), id);
     let storage = crate::storage::BrokerStorage(state);
     let result = state.builder.build(&storage, id, tenant.as_str(), request, &gate, hold).await;

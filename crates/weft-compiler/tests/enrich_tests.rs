@@ -108,6 +108,28 @@ t = Text() -> (bogus: String) { value: "hi" }
     );
 }
 
+/// A node that catches its failures (`features.catchErrors`) already
+/// has the `error` output the runtime fills: a source port of that name
+/// is refused, naming the fix, even on a node that accepts custom
+/// outputs. It is the ONE error that port earns: a type that disagrees
+/// with the language's own `error` port adds no mismatch on top.
+#[test]
+fn enrich_rejects_an_error_port_on_a_catching_node() {
+    for declared in ["String", "Number"] {
+        let source = format!(
+            "\nq = PostgresExecuteQuery() -> (error: {declared}) {{ query: \"SELECT 1 AS one\" }}\n"
+        );
+        let mut project = compile(&source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+        let errors = weft_compiler::enrich::enrich_collecting(&mut project, &catalog(), weft_compiler::enrich::EnrichPolicy::Strict);
+        assert_eq!(errors.len(), 1, "{declared}: {:?}", errors.iter().map(|e| &e.message).collect::<Vec<_>>());
+        assert!(
+            errors[0].message.contains("'error' is the output this node type already has for its failures"),
+            "{declared}: expected the error-port refusal, got: {}",
+            errors[0].message
+        );
+    }
+}
+
 /// An output takes no value: a firing emits on it. On a node that
 /// accepts custom inputs, a braces key, a statement, or a wire aimed at
 /// one of its outputs is refused instead of quietly creating an input
@@ -750,7 +772,7 @@ fn a_program_naming_a_node_without_its_code_is_told_it_is_not_ready() {
     )
     .expect("write");
     let stdlib = stdlib_root().expect("stdlib root");
-    let cat = FsCatalog::discover_roots_with_policy(&[stdlib.as_path(), &root.path().join("nodes")], weft_catalog::DiscoverPolicy::Strict)
+    let cat = FsCatalog::discover_roots(&[stdlib.as_path(), &root.path().join("nodes")])
         .expect("a pending node is no error");
 
     let mut clean = compile("greeting = Text { value: \"hi\" }\nout = Debug\nout.data = greeting.value\n", uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");

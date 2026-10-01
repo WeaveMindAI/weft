@@ -47,16 +47,16 @@ export interface RunSpec {
   caller?: JsonValue[];
   frozen_from?: FrozenFrom;
   expected?: Expected;
-  /// Who the run is for: one member of the program. Needed only when the
-  /// run reaches something that exists once per member.
-  member?: string;
+  /// Which instance of the program the run is for. Needed only when the
+  /// run reaches something that exists once per instance.
+  instance?: string;
   /// How long the run may run (`weft run --long`); absent means `short`.
   run_class?: 'short' | 'long';
 }
 
-/// A member id: the grammar of one storage key segment.
-// SYNC: MEMBER_ID_PATTERN <-> crates/weft-core/src/storage/key.rs valid_segment
-export const MEMBER_ID_PATTERN = /^(?!\.{1,2}$)[A-Za-z0-9._-]{1,128}$/;
+/// An instance id: the grammar of one storage key segment.
+// SYNC: INSTANCE_ID_PATTERN <-> crates/weft-core/src/storage/key.rs valid_segment, crates/weft-core/src/instance.rs InstanceId::new
+export const INSTANCE_ID_PATTERN = /^(?!\.{1,2}$)[A-Za-z0-9._-]{1,128}$/;
 
 /// Validate files before they enter menus or dialogs. A type assertion alone
 /// cannot reject obsolete fields or malformed nested port maps.
@@ -88,14 +88,14 @@ export function parseRunSpec(value: unknown): RunSpec {
     }
   };
   const spec = object(value, 'spec');
-  fields(spec, ['name', 'from', 'target', 'before', 'feed', 'group', 'emit', 'fire', 'answers', 'caller', 'frozen_from', 'expected', 'member', 'run_class'], 'spec');
+  fields(spec, ['name', 'from', 'target', 'before', 'feed', 'group', 'emit', 'fire', 'answers', 'caller', 'frozen_from', 'expected', 'instance', 'run_class'], 'spec');
   string(spec.name, 'name');
   if (spec.run_class != null && spec.run_class !== 'short' && spec.run_class !== 'long') {
     throw new Error(`run_class: '${String(spec.run_class)}' is not a run class; use 'short' or 'long'`);
   }
-  if (spec.member != null) {
-    string(spec.member, 'member');
-    if (!MEMBER_ID_PATTERN.test(spec.member as string)) throw new Error(`member: '${spec.member}' is not a valid member id`);
+  if (spec.instance != null) {
+    string(spec.instance, 'instance');
+    if (!INSTANCE_ID_PATTERN.test(spec.instance as string)) throw new Error(`instance: '${spec.instance}' is not a valid instance id`);
   }
   for (const key of ['target', 'before', 'feed']) if (spec[key] !== undefined) {
     for (const id of array(spec[key], key)) string(id, key);
@@ -134,10 +134,15 @@ export function parseRunSpec(value: unknown): RunSpec {
     if (expected.focus !== undefined) for (const node of array(expected.focus, 'expected.focus')) string(node, 'expected.focus');
     for (const value of array(expected.wires, 'expected.wires')) {
       const wire = object(value, 'wire');
-      fields(wire, ['node', 'port', 'frames', 'value', 'ordinal', 'closed', 'error'], 'wire');
+      fields(wire, ['node', 'port', 'frames', 'value', 'ordinal', 'closed', 'failure'], 'wire');
       if (wire.ordinal !== undefined && (!Number.isSafeInteger(wire.ordinal) || Number(wire.ordinal) < 0)) throw new Error('wire: invalid ordinal');
       if (wire.closed !== undefined && typeof wire.closed !== 'boolean') throw new Error('wire: closed must be boolean');
-      if (wire.error != null) string(wire.error, 'wire error');
+      if (wire.failure != null) {
+        const failure = object(wire.failure, 'wire failure');
+        fields(failure, ['node', 'error'], 'wire failure');
+        string(failure.node, 'wire failure node');
+        string(failure.error, 'wire failure text');
+      }
       string(wire.node, 'wire node');
       string(wire.port, 'wire port');
       frames(wire.frames, 'wire frames');
@@ -145,7 +150,7 @@ export function parseRunSpec(value: unknown): RunSpec {
     }
   }
   const normalized = { ...spec };
-  for (const key of ['group', 'fire', 'frozen_from', 'expected', 'member']) if (normalized[key] === null) delete normalized[key];
+  for (const key of ['group', 'fire', 'frozen_from', 'expected', 'instance']) if (normalized[key] === null) delete normalized[key];
   return normalized as unknown as RunSpec;
 }
 
@@ -175,7 +180,7 @@ export interface Expected {
 export interface ExpectedWire {
   ordinal?: number;
   closed?: boolean;
-  error?: string | null;
+  failure?: Failure | null;
   node: string;
   port: string;
   frames?: Array<{ index: number }>;
@@ -371,4 +376,4 @@ export function exampleNameProblem(name: string): string | undefined {
   }
   return 'an example needs a name (a word, not a path or a directory)';
 }
-import type { Frame } from './protocol';
+import type { Failure, Frame } from './protocol';

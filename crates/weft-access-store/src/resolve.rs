@@ -121,36 +121,36 @@ struct WalledGrant {
     provider_account: Option<String>,
 }
 
-/// Who is about to use a connection. A member's connection is theirs,
-/// in their project, alone: only a run for that member of that project
-/// (or that member at their own door) may use it. Anyone else, the
-/// author's editor, a run for nobody, another member's run, reads it as
+/// Who is about to use a connection. An instance's connection is its own,
+/// in its project, alone: only a run for that instance of that project
+/// (or that instance at its own door) may use it. Anyone else, the
+/// author's editor, a run for nobody, another instance's run, reads it as
 /// not there. Every other connection is the tenant's, usable by any of
 /// them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GrantUser<'a> {
     /// The author, or a run for nobody in particular.
     Author,
-    Member { project_id: uuid::Uuid, member: &'a weft_core::member::MemberId },
+    Instance { project_id: uuid::Uuid, instance: &'a weft_core::instance::InstanceId },
 }
 
 impl<'a> GrantUser<'a> {
-    /// The user a carried scope names: that member, or the author.
-    pub fn of(scope: Option<&'a weft_core::member::MemberScope>) -> Self {
+    /// The user a carried scope names: that instance, or the author.
+    pub fn of(scope: Option<&'a weft_core::instance::InstanceScope>) -> Self {
         match scope {
-            Some(scope) => GrantUser::Member { project_id: scope.project_id, member: &scope.member },
+            Some(scope) => GrantUser::Instance { project_id: scope.project_id, instance: &scope.instance },
             None => GrantUser::Author,
         }
     }
 
     /// Whether this user may use a connection whose row says
-    /// `row_project` / `row_member`.
-    fn may_use(&self, row_project: Option<uuid::Uuid>, row_member: Option<&str>) -> bool {
-        match (row_member, self) {
+    /// `row_project` / `row_instance`.
+    fn may_use(&self, row_project: Option<uuid::Uuid>, row_instance: Option<&str>) -> bool {
+        match (row_instance, self) {
             (None, _) => true,
             (Some(_), GrantUser::Author) => false,
-            (Some(row_member), GrantUser::Member { project_id, member }) => {
-                row_project == Some(*project_id) && row_member == member.as_str()
+            (Some(row_instance), GrantUser::Instance { project_id, instance }) => {
+                row_project == Some(*project_id) && row_instance == instance.as_str()
             }
         }
     }
@@ -189,7 +189,7 @@ async fn read_walled_grant(
     // queueing). A Stored read takes no lock: it writes nothing.
     const COLUMNS: &str = "SELECT tenant_id, service, registration_sealed, spec_json, \
                            values_sealed, granted_scopes, permissions_verified, owner, door, \
-                           identity, provider_account, expires_at, member_id, project_id \
+                           identity, provider_account, expires_at, instance_id, project_id \
                            FROM access_grant WHERE id = $1";
     #[allow(clippy::type_complexity)]
     type Row = (
@@ -236,14 +236,14 @@ async fn read_walled_grant(
         identity,
         provider_account,
         expires_at,
-        member,
+        instance,
         row_project,
     )) = row
     else {
         return Err(AccessError::NotFound.into());
     };
     // Somebody else's reads the same as none at all: no existence leak.
-    if row_tenant != tenant || !user.may_use(row_project, member.as_deref()) {
+    if row_tenant != tenant || !user.may_use(row_project, instance.as_deref()) {
         return Err(AccessError::NotFound.into());
     }
     if row_service != service {
@@ -253,7 +253,7 @@ async fn read_walled_grant(
         ))
         .into());
     }
-    let owner = crate::owner_of(&owner, member.as_deref())?;
+    let owner = crate::owner_of(&owner, instance.as_deref())?;
     let door = crate::door_of(&door)?;
     let granted = scopes_of(&granted);
     if let Some(missing) = permission_shortfall(verified, &granted, required_permissions) {

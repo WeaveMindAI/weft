@@ -35,11 +35,14 @@ fn fixtures() -> anyhow::Result<Vec<PathBuf>> {
 fn every_fixture_catalog_parses() -> anyhow::Result<()> {
     let mut broken: Vec<String> = Vec::new();
     for fixture in fixtures()? {
-        if let Err(e) = weft_compiler::build::build_project_catalog(&fixture) {
-            broken.push(format!(
-                "{}: {e}",
-                fixture.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
-            ));
+        let name = fixture.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        match weft_compiler::build::build_project_catalog(&fixture) {
+            Err(e) => broken.push(format!("{name}: {e}")),
+            Ok(catalog) => {
+                for problem in catalog.problems() {
+                    broken.push(format!("{name}: {}", problem.error));
+                }
+            }
         }
     }
     anyhow::ensure!(broken.is_empty(), "fixture catalogs that do not parse:\n{}", broken.join("\n"));
@@ -104,14 +107,11 @@ fn every_fixture_graph_compiles() -> anyhow::Result<()> {
         // cargo test with no copying and no install.
         let mut roots = weft_compiler::project::node_roots(fixture).to_vec();
         roots.push(stdlib.clone());
-        let catalog = match weft_catalog::FsCatalog::discover_roots_with_policy(
-            &roots.iter().map(|r| r.as_path()).collect::<Vec<_>>(),
-            weft_catalog::DiscoverPolicy::Strict,
-        ) {
-            Ok(c) => c,
+        let catalog = match weft_catalog::FsCatalog::discover_roots(&roots.iter().map(|r| r.as_path()).collect::<Vec<_>>()) {
+            Ok(c) if c.problems().is_empty() => c,
             // The catalog's own failure is the other test's finding; not
             // repeating it here keeps one mistake to one report.
-            Err(_) => return Ok(None),
+            _ => return Ok(None),
         };
         // The two anchors the CLI gives a program, and they differ:
         // `@file("assets/...")` resolves from the PROJECT ROOT, while

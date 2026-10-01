@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use weft::access::client::required_str;
 use weft::node::NodeOutput;
-use weft::storage::{KeepTtl, StorageScope};
+use weft::storage::StorageScope;
 use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::drive;
@@ -40,7 +40,6 @@ impl Node for GoogleDriveDownloadNode {
         let account: Access = ctx.inputs.get("account")?;
         let file_id: String = ctx.inputs.get("fileId")?;
         let export_mime: Option<String> = ctx.inputs.opt("exportFormat")?;
-        let keep: bool = ctx.inputs.get("keep")?;
 
         let http = ctx.client(&account).await?;
         let meta: Value = drive::file_meta(
@@ -85,7 +84,8 @@ impl Node for GoogleDriveDownloadNode {
                 "google drive: download the file",
                 Some(&stored_mime),
                 &filename,
-                keep.then_some(KeepTtl::Default),
+                // Swept with the run like every node's file; KeepFile keeps it.
+                None,
             )
             .await?;
         ctx.pulse_downstream(NodeOutput::stored_file(stored)).await

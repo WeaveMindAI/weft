@@ -7,11 +7,11 @@
 //! points at the version it was edited from (`parent_id`; a tree root
 //! has none). A **run** is one execution under a version, with the run it
 //! was seeded from (`seed_execution_id`), the stale set of that seed edge, and
-//! the spec it ran. The files themselves live in the project's asset
-//! plane, published through `weft_assets::publish_files` under
-//! `asset/<project>/<sha>`: a blob identical to one any earlier version
-//! held costs nothing to record again, and `weft prune` reclaims what no
-//! surviving manifest names.
+//! the spec it ran. The files themselves live in the tenant's assets,
+//! published through `weft_assets::publish_files` under `asset/<sha>`: a
+//! blob identical to one any version of any of the tenant's projects held
+//! costs nothing to record again, and `weft prune` reclaims what no
+//! surviving manifest of any of them names.
 //!
 //! Head is two nullable columns on the `project` row (`head_version`,
 //! `head_run`), git's HEAD and nothing more: moved by `checkpoint`,
@@ -32,6 +32,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use weft_core::run_spec::RunSpec;
+use weft_core::versions::{Head, PrunePlan};
 use weft_core::ExecutionId;
 
 /// Postgres SQLSTATE for a foreign key violation.
@@ -162,20 +163,6 @@ pub struct RunRow {
     pub created_at: u64,
 }
 
-/// The project's head: where the next version parents and the next
-/// seed comes from, plus the versions the triggers are activated on.
-// SYNC: Head <-> crates/weft-cli/src/commands/versions.rs Head, extension-vscode/src/sidebar/version-tree.ts TreeJson.head
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Head {
-    pub head_version: Option<String>,
-    pub head_run: Option<ExecutionId>,
-    /// Every version some activation's listeners run (one per trigger
-    /// and owner at most, deduplicated, sorted). Empty while nothing
-    /// listens.
-    #[serde(default)]
-    pub activated_versions: Vec<String>,
-}
-
 #[async_trait]
 pub trait VersionStoreOps: Send + Sync {
     /// Record `version` unless the project already has it. Answers
@@ -301,18 +288,18 @@ async fn source_versions_in_use(
     project: uuid::Uuid,
     include_bakes: bool,
 ) -> anyhow::Result<BTreeSet<String>> {
-    let versions: Vec<Option<String>> = sqlx::query_scalar(
+    let versions: Vec<Option<String>> = sqlx::query_scalar(concat!(
         "SELECT source_version FROM signal WHERE project_id = $1 \
          UNION SELECT e.payload_json::jsonb ->> 'source_version' FROM exec_event e \
          WHERE e.kind = 'execution_started' AND e.payload_json::jsonb ->> 'project_id' = $1::text \
            AND (EXISTS (SELECT 1 FROM trigger_setup s WHERE s.execution_id = e.execution_id) \
              OR NOT EXISTS (SELECT 1 FROM exec_event t WHERE t.execution_id = e.execution_id \
-                 AND t.kind IN ('execution_completed', 'execution_failed', 'execution_cancelled')) \
+                 AND t.kind IN ", weft_journal::execution_terminal_kinds_sql!(), ") \
              OR (e.payload_json::jsonb ->> 'phase' = 'fire' \
                  AND EXISTS (SELECT 1 FROM execution ec WHERE ec.execution_id = e.execution_id AND ec.kind = 'execution') \
                  AND NOT EXISTS (SELECT 1 FROM version_run r WHERE r.execution_id::text = e.execution_id))) \
          UNION SELECT bake_json::jsonb ->> 'source_version' FROM trigger_bake WHERE project_id = $1 AND $2"
-    ).bind(project).bind(include_bakes).fetch_all(conn).await?;
+    )).bind(project).bind(include_bakes).fetch_all(conn).await?;
     Ok(versions.into_iter().flatten().collect())
 }
 
@@ -952,33 +939,6 @@ pub fn resolve_seed(
     }
 }
 
-/// The paths that differ between `parent` and `child`: added, removed,
-/// and changed, sorted. What `weft tree` prints next to a version.
-// SYNC: ManifestDiff <-> crates/weft-cli/src/commands/versions.rs ManifestDiff
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManifestDiff {
-    pub added: Vec<String>,
-    pub removed: Vec<String>,
-    pub changed: Vec<String>,
-}
-
-pub fn manifest_diff(parent: &Manifest, child: &Manifest) -> ManifestDiff {
-    let mut diff = ManifestDiff::default();
-    for (path, hash) in child {
-        match parent.get(path) {
-            None => diff.added.push(path.clone()),
-            Some(h) if h != hash => diff.changed.push(path.clone()),
-            Some(_) => {}
-        }
-    }
-    for path in parent.keys() {
-        if !child.contains_key(path) {
-            diff.removed.push(path.clone());
-        }
-    }
-    diff
-}
-
 /// Every version in the subtree rooted at `root`, `root` included,
 /// parents before children.
 pub fn subtree(versions: &[VersionRow], root: &str) -> Vec<String> {
@@ -1017,15 +977,6 @@ pub struct PruneRefusal {
     pub reasons: Vec<String>,
 }
 
-/// What `weft prune <version>` removes: the subtree's versions, every
-/// run under them, and the blobs no surviving manifest names.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PrunePlan {
-    pub versions: Vec<String>,
-    pub runs: Vec<ExecutionId>,
-    /// `sha256` of every blob only the pruned versions held.
-    pub blobs: Vec<String>,
-}
 
 /// Plan a prune, or refuse it: head's version (branch away first), a
 /// version that is or is an ancestor of a frozen example's origin
@@ -1169,16 +1120,6 @@ mod tests {
         assert_eq!(resolve_seed(&head, &versions, &runs, |_| true), SeedChoice::Nothing);
     }
 
-    #[test]
-    fn manifest_diff_names_every_kind_of_change() {
-        let parent = version("p", None, &[("a", "1"), ("b", "2"), ("c", "3")], 0).manifest;
-        let child = version("c", None, &[("a", "1"), ("b", "X"), ("d", "4")], 0).manifest;
-        let diff = manifest_diff(&parent, &child);
-        assert_eq!(diff.added, vec!["d"]);
-        assert_eq!(diff.removed, vec!["c"]);
-        assert_eq!(diff.changed, vec!["b"]);
-    }
-
     fn tree() -> Vec<VersionRow> {
         vec![
             version("root", None, &[("a", "1")], 1),
@@ -1211,7 +1152,7 @@ mod tests {
     }
 
     /// Any activation's version protects its subtree and keeps a bare
-    /// leaf from a bulk clean: one member's trigger on an old version
+    /// leaf from a bulk clean: one instance's trigger on an old version
     /// counts as much as the shared triggers on the newest.
     #[test]
     fn every_activated_version_is_protected() {

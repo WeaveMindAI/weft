@@ -174,7 +174,7 @@ pub struct BrokerRefused {
 ///   the command proceeds and completes normally.
 /// Conflating the two (one "raced" answer) once let a terminate whose
 /// row vanished mid-flight return early, complete as succeeded, and
-/// never delete the instance's workloads.
+/// never delete the copy's workloads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WriteOutcome<T> {
     Applied(T),
@@ -278,38 +278,38 @@ impl JournalClient for BrokerJournalClient {
     async fn record_event(
         &self,
         event: &ExecEvent,
-        instance: Option<&str>,
+        replica: Option<&str>,
     ) -> Result<()> {
         // The broker journal path is worker-only: every write is
         // fenced by the writer's process. A `None` here is a contract
         // violation (only the dispatcher's in-process writer is
         // process-less, and it never goes through the broker), so fail
         // loud rather than send a process-less write the broker rejects.
-        let instance = instance.ok_or_else(|| {
-            anyhow::anyhow!("broker journal write requires an instance (worker-only path)")
+        let replica = replica.ok_or_else(|| {
+            anyhow::anyhow!("broker journal write requires the writing replica (worker-only path)")
         })?;
         let req = JournalRecordRequest {
             event: event.clone(),
-            instance: instance.to_string(),
+            replica: replica.to_string(),
         };
         let _: JournalRecordResponse = self.http.post("/v1/journal/record", &req).await?;
         Ok(())
     }
 
-    async fn record_retroactively(&self, events: &[ExecEvent], instance: Option<&str>) -> Result<()> {
-        let instance = instance.ok_or_else(|| {
-            anyhow::anyhow!("broker journal write requires an instance (worker-only path)")
+    async fn record_retroactively(&self, events: &[ExecEvent], replica: Option<&str>) -> Result<()> {
+        let replica = replica.ok_or_else(|| {
+            anyhow::anyhow!("broker journal write requires the writing replica (worker-only path)")
         })?;
-        let req = JournalRecordRetroactiveRequest { events: events.to_vec(), instance: instance.to_string() };
+        let req = JournalRecordRetroactiveRequest { events: events.to_vec(), replica: replica.to_string() };
         let _: JournalRecordResponse = self.http.post("/v1/journal/record_retroactive", &req).await?;
         Ok(())
     }
 
-    async fn forget_unrecorded(&self, execution_id: ExecutionId, instance: Option<&str>) -> Result<()> {
-        let instance = instance.ok_or_else(|| {
-            anyhow::anyhow!("broker journal write requires an instance (worker-only path)")
+    async fn forget_unrecorded(&self, execution_id: ExecutionId, replica: Option<&str>) -> Result<()> {
+        let replica = replica.ok_or_else(|| {
+            anyhow::anyhow!("broker journal write requires the writing replica (worker-only path)")
         })?;
-        let req = JournalForgetUnrecordedRequest { execution_id: execution_id.to_string(), instance: instance.to_string() };
+        let req = JournalForgetUnrecordedRequest { execution_id: execution_id.to_string(), replica: replica.to_string() };
         let _: JournalRecordResponse = self.http.post("/v1/journal/forget_unrecorded", &req).await?;
         Ok(())
     }
@@ -393,12 +393,12 @@ impl TaskStoreClient for BrokerTaskStoreClient {
         .await
     }
 
-    async fn claim_one(&self, instance: &str, filter: ClaimFilter, wait: Duration) -> Result<Option<Task>> {
+    async fn claim_one(&self, replica: &str, filter: ClaimFilter, wait: Duration) -> Result<Option<Task>> {
         held(
             wait,
             |hold| {
                 let req = TaskClaimOneRequest {
-                    instance: instance.to_string(),
+                    replica: replica.to_string(),
                     filter: filter.clone(),
                     wait_ms: hold.as_millis() as u64,
                 };
@@ -412,38 +412,38 @@ impl TaskStoreClient for BrokerTaskStoreClient {
         .await
     }
 
-    async fn heartbeat(&self, task_id: Uuid, instance: &str) -> Result<bool> {
+    async fn heartbeat(&self, task_id: Uuid, replica: &str) -> Result<bool> {
         let req = TaskHeartbeatRequest {
             task_id,
-            instance: instance.to_string(),
+            replica: replica.to_string(),
         };
         let resp: TaskHeartbeatResponse = self.http.post("/v1/task/heartbeat", &req).await?;
         Ok(resp.renewed)
     }
 
-    async fn requeue(&self, task_id: Uuid, instance: &str) -> Result<bool> {
+    async fn requeue(&self, task_id: Uuid, replica: &str) -> Result<bool> {
         let req = TaskRequeueRequest {
             task_id,
-            instance: instance.to_string(),
+            replica: replica.to_string(),
         };
         let resp: TaskRequeueResponse = self.http.post("/v1/task/requeue", &req).await?;
         Ok(resp.requeued)
     }
 
-    async fn complete(&self, task_id: Uuid, instance: &str, result: Value) -> Result<()> {
+    async fn complete(&self, task_id: Uuid, replica: &str, result: Value) -> Result<()> {
         let req = TaskCompleteRequest {
             task_id,
-            instance: instance.to_string(),
+            replica: replica.to_string(),
             result,
         };
         let _: TaskCompleteResponse = self.http.post("/v1/task/complete", &req).await?;
         Ok(())
     }
 
-    async fn fail(&self, task_id: Uuid, instance: &str, error: String) -> Result<()> {
+    async fn fail(&self, task_id: Uuid, replica: &str, error: String) -> Result<()> {
         let req = TaskFailRequest {
             task_id,
-            instance: instance.to_string(),
+            replica: replica.to_string(),
             error,
         };
         let _: TaskFailResponse = self.http.post("/v1/task/fail", &req).await?;
@@ -568,13 +568,13 @@ impl InfraReader for BrokerInfraClient {
         &self,
         execution_id: weft_core::ExecutionId,
         node_id: &str,
-        per_member: bool,
+        per_instance: bool,
         endpoint_name: &str,
     ) -> Result<Option<weft_core::infra::EndpointAddress>> {
         let req = InfraEndpointUrlRequest {
             execution_id,
             node_id: node_id.to_string(),
-            per_member,
+            per_instance,
             endpoint_name: endpoint_name.to_string(),
         };
         let resp: InfraEndpointUrlResponse =
@@ -613,11 +613,11 @@ impl BrokerAccessClient {
         self.http.post("/v1/access/close", req).await
     }
 
-    pub async fn mint_member_token(
+    pub async fn mint_instance_token(
         &self,
-        req: &ProgramMintMemberTokenRequest,
-    ) -> Result<weft_core::program::MintedMemberToken> {
-        self.http.post("/v1/program/mint_member_token", req).await
+        req: &ProgramMintInstanceTokenRequest,
+    ) -> Result<weft_core::program::MintedInstanceToken> {
+        self.http.post("/v1/program/mint_instance_token", req).await
     }
 
     pub async fn publish_access(
@@ -658,12 +658,12 @@ impl BrokerExecutionClient {
         &self,
         execution_id: ExecutionId,
         tags: Vec<String>,
-        instance: &str,
+        replica: &str,
     ) -> Result<()> {
         let req = ExecutionTagRequest {
             execution_id: execution_id.to_string(),
             tags,
-            instance: instance.to_string(),
+            replica: replica.to_string(),
         };
         let _: ExecutionTagResponse = self.http.post("/v1/execution/tag", &req).await?;
         Ok(())
@@ -677,13 +677,13 @@ impl BrokerExecutionClient {
         execution_id: ExecutionId,
         tag: String,
         stop_self: weft_core::StopSelf,
-        instance: &str,
+        replica: &str,
     ) -> Result<ExecutionStopTaggedResponse> {
         let req = ExecutionStopTaggedRequest {
             execution_id: execution_id.to_string(),
             tag,
             stop_self,
-            instance: instance.to_string(),
+            replica: replica.to_string(),
         };
         self.http.post("/v1/execution/stop_tagged", &req).await
     }
@@ -751,8 +751,8 @@ impl BrokerSupervisorClient {
     /// `infra_owner` lease), and return the full set it now owns plus the
     /// ones this tick took on. The supervisor acts ONLY on the owned
     /// projects.
-    pub async fn sync_ownership(&self, instance: &str, held_projects: &[Uuid]) -> Result<SupervisorSyncOwnershipResponse> {
-        let req = SupervisorSyncOwnershipRequest { instance: instance.to_string(), held_projects: held_projects.to_vec() };
+    pub async fn sync_ownership(&self, replica: &str, held_projects: &[Uuid]) -> Result<SupervisorSyncOwnershipResponse> {
+        let req = SupervisorSyncOwnershipRequest { replica: replica.to_string(), held_projects: held_projects.to_vec() };
         let resp: SupervisorSyncOwnershipResponse = self
             .http
             .post("/v1/supervisor/sync_ownership", &req)
@@ -762,9 +762,9 @@ impl BrokerSupervisorClient {
 
     /// Pure read of the projects this process owns (no claim/renew). The work
     /// loops use this; ownership breadth changes only via `sync_ownership`.
-    pub async fn owned_projects(&self, instance: &str) -> Result<Vec<SupervisorProject>> {
+    pub async fn owned_projects(&self, replica: &str) -> Result<Vec<SupervisorProject>> {
         let req = SupervisorOwnedProjectsRequest {
-            instance: instance.to_string(),
+            replica: replica.to_string(),
         };
         let resp: SupervisorOwnedProjectsResponse = self
             .http
@@ -773,16 +773,16 @@ impl BrokerSupervisorClient {
         Ok(resp.owned)
     }
 
-    /// Which of `copies` of `project` are gone for good (their instance
-    /// ids), or `None` when `instance` does not hold the project's lease
+    /// Which of `copies` of `project` are gone for good (their copy
+    /// ids), or `None` when `replica` does not hold the project's lease
     /// and so may not judge them; see [`SupervisorGoneCopiesRequest`].
     pub async fn gone_copies(
         &self,
-        instance: &str,
+        replica: &str,
         project: Uuid,
         copies: &[weft_core::infra::NodeRef],
     ) -> Result<Option<Vec<String>>> {
-        let req = SupervisorGoneCopiesRequest { instance: instance.to_string(), project, copies: copies.to_vec() };
+        let req = SupervisorGoneCopiesRequest { replica: replica.to_string(), project, copies: copies.to_vec() };
         let path = "/v1/supervisor/gone_copies";
         match self.http.post_fenced::<_, SupervisorGoneCopiesResponse>(path, &req).await? {
             WriteOutcome::Applied(resp) => Ok(Some(resp.gone)),
@@ -819,7 +819,7 @@ impl BrokerSupervisorClient {
     /// up to `wait` for one to be issued when none is waiting.
     pub async fn claim_command(
         &self,
-        claimer_instance: &str,
+        claimer_replica: &str,
         busy_projects: &[Uuid],
         wait: Duration,
     ) -> Result<SupervisorClaim> {
@@ -827,7 +827,7 @@ impl BrokerSupervisorClient {
             wait,
             |hold| {
                 let req = SupervisorClaimCommandRequest {
-                    claimer_instance: claimer_instance.to_string(),
+                    claimer_replica: claimer_replica.to_string(),
                     busy_projects: busy_projects.to_vec(),
                     wait_ms: hold.as_millis() as u64,
                 };
@@ -844,14 +844,14 @@ impl BrokerSupervisorClient {
         &self,
         project_id: Uuid,
         node_id: Option<&str>,
-        member: Option<&weft_core::member::MemberId>,
+        instance: Option<&weft_core::instance::InstanceId>,
         event: crate::protocol::InfraEvent,
     ) -> Result<i64> {
         let (kind, payload) = event.into_record();
         let req = SupervisorEventRecordRequest {
             project_id,
             node_id: node_id.map(|s| s.to_string()),
-            member: member.cloned(),
+            instance: instance.cloned(),
             kind,
             payload,
         };
@@ -862,22 +862,22 @@ impl BrokerSupervisorClient {
 
     pub async fn set_status(
         &self,
-        instance: &str,
+        replica: &str,
         command_id: Option<i64>,
         project_id: Uuid,
         node_id: &str,
-        member: Option<&weft_core::member::MemberId>,
+        instance: Option<&weft_core::instance::InstanceId>,
         unit: Option<&str>,
         status: crate::protocol::InfraNodeStatus,
         failure_stage: Option<crate::protocol::FailureStage>,
         failure_message: Option<&str>,
     ) -> Result<WriteOutcome<SupervisorSetStatusResponse>> {
         let req = SupervisorSetStatusRequest {
-            instance: instance.to_string(),
+            replica: replica.to_string(),
             command_id,
             project_id,
             node_id: node_id.to_string(),
-            member: member.cloned(),
+            instance: instance.cloned(),
             unit: unit.map(|s| s.to_string()),
             status,
             failure_stage,
@@ -893,17 +893,17 @@ impl BrokerSupervisorClient {
     /// command for the new owner. `Applied(removed)` otherwise.
     pub async fn remove_node(
         &self,
-        instance: &str,
+        replica: &str,
         project_id: Uuid,
         node_id: &str,
-        member: Option<&weft_core::member::MemberId>,
+        instance: Option<&weft_core::instance::InstanceId>,
         command_id: i64,
     ) -> Result<WriteOutcome<SupervisorRemoveNodeResponse>> {
         let req = SupervisorRemoveNodeRequest {
-            instance: instance.to_string(),
+            replica: replica.to_string(),
             project_id,
             node_id: node_id.to_string(),
-            member: member.cloned(),
+            instance: instance.cloned(),
             command_id,
         };
         self.http
@@ -913,13 +913,13 @@ impl BrokerSupervisorClient {
 
     pub async fn command_complete(
         &self,
-        instance: &str,
+        replica: &str,
         command_id: i64,
         error: Option<&str>,
         cancelled: bool,
     ) -> Result<WriteOutcome<SupervisorCommandCompleteResponse>> {
         let req = SupervisorCommandCompleteRequest {
-            instance: instance.to_string(),
+            replica: replica.to_string(),
             command_id,
             error: error.map(|s| s.to_string()),
             cancelled,
@@ -943,7 +943,7 @@ impl BrokerSupervisorClient {
         Ok(resp.cancel_requested)
     }
 
-    pub async fn running_count(&self, project_id: Uuid, copies: &weft_core::member::Copies) -> Result<i64> {
+    pub async fn running_count(&self, project_id: Uuid, copies: &weft_core::instance::Copies) -> Result<i64> {
         let req = SupervisorRunningCountRequest {
             project_id,
             copies: copies.clone(),
@@ -982,27 +982,29 @@ impl BrokerSupervisorClient {
 
     pub async fn set_applied(
         &self,
-        instance: &str,
+        replica: &str,
         command_id: i64,
         project_id: Uuid,
         node_id: &str,
-        member: Option<&weft_core::member::MemberId>,
-        instance_id: &str,
+        instance: Option<&weft_core::instance::InstanceId>,
+        copy_id: &str,
         applied_spec_hash: &str,
         addresses: AppliedEndpoints,
         keep_disks: Vec<String>,
+        notes: Vec<String>,
         units: std::collections::BTreeMap<String, crate::protocol::UnitRuntime>,
     ) -> Result<WriteOutcome<SupervisorSetAppliedResponse>> {
         let req = SupervisorSetAppliedRequest {
-            instance: instance.to_string(),
+            replica: replica.to_string(),
             command_id,
             project_id,
             node_id: node_id.to_string(),
-            member: member.cloned(),
-            instance_id: instance_id.to_string(),
+            instance: instance.cloned(),
+            copy_id: copy_id.to_string(),
             applied_spec_hash: applied_spec_hash.to_string(),
             addresses,
             keep_disks,
+            notes,
             units,
         };
         self.http
@@ -1011,27 +1013,27 @@ impl BrokerSupervisorClient {
     }
 
     /// Pre-apply commitment: writes the infra_node row at
-    /// Provisioning status with the locked-in instance_id + keep_disks.
+    /// Provisioning status with the locked-in copy_id + keep_disks.
     /// A subsequent apply failure leaves a visible row the user can
     /// Terminate. Apply success flips to Running via `set_applied`.
     pub async fn set_provisioning(
         &self,
-        instance: &str,
+        replica: &str,
         command_id: i64,
         project_id: Uuid,
         node_id: &str,
-        member: Option<&weft_core::member::MemberId>,
-        instance_id: &str,
+        instance: Option<&weft_core::instance::InstanceId>,
+        copy_id: &str,
         keep_disks: Vec<String>,
         units: std::collections::BTreeMap<String, crate::protocol::UnitRuntime>,
     ) -> Result<WriteOutcome<SupervisorSetProvisioningResponse>> {
         let req = SupervisorSetProvisioningRequest {
-            instance: instance.to_string(),
+            replica: replica.to_string(),
             command_id,
             project_id,
             node_id: node_id.to_string(),
-            member: member.cloned(),
-            instance_id: instance_id.to_string(),
+            instance: instance.cloned(),
+            copy_id: copy_id.to_string(),
             keep_disks,
             units,
         };
@@ -1100,13 +1102,13 @@ impl BrokerInfraStateClient {
         &self,
         project_id: Uuid,
         node_id: &str,
-        member: Option<&weft_core::member::MemberId>,
+        instance: Option<&weft_core::instance::InstanceId>,
         spec_json: serde_json::Value,
     ) -> Result<i64> {
         let req = InfraEnqueueApplyRequest {
             project_id,
             node_id: node_id.to_string(),
-            member: member.cloned(),
+            instance: instance.cloned(),
             spec_json,
         };
         let resp: InfraEnqueueApplyResponse =

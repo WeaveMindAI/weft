@@ -93,5 +93,8 @@
       "type": "String",
       "description": "The telephony call id (Twilio numbers)."
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

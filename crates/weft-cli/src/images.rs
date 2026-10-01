@@ -402,7 +402,7 @@ async fn ensure_standard_worker(base: &str, rebuild: bool, suffix: Option<&str>)
             &stock.definition,
             &stock.catalog,
             &bases,
-            weft_compiler::codegen::NodeSet::Full,
+            weft_core::builds::NodeSet::Full,
         )?;
         docker_build_worker(&target, &build.build_context.join("Dockerfile"), &build.build_context, &[]).await?;
     }

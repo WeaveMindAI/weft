@@ -1,0 +1,95 @@
+{
+  "type": "TerminateInstanceInfra",
+  "label": "Terminate instance infra",
+  "description": "Delete one instance's copy of an infra node and its disk. The instance's triggers reading it go down with it, the way `triggers` says; the instance's runs using it follow `running`.",
+  "tags": [
+    "instances",
+    "infra",
+    "terminate",
+    "delete"
+  ],
+  "icon": "Trash2",
+  "color": "#0ea5e9",
+  "inputs": [
+    {
+      "name": "node",
+      "type": "String",
+      "required": true,
+      "description": "The infra node marked `@per_instance`, named the way the program writes it (`bridge`, or `one.bridge` inside an included file)."
+    },
+    {
+      "name": "instance",
+      "type": "String",
+      "required": true,
+      "description": "The instance, by the id your program gives it (`user-42`)."
+    },
+    {
+      "name": "triggers",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "park",
+          "hibernate",
+          "wipe"
+        ]
+      },
+      "default": "park",
+      "label": "Triggers",
+      "description": "What happens to the instance's triggers reading it: park keeps what arrives for later, hibernate keeps it for a grace window, wipe drops it."
+    },
+    {
+      "name": "running",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "wait",
+          "cancel"
+        ]
+      },
+      "default": "wait",
+      "label": "Running work",
+      "description": "What happens to the instance's runs still going: wait lets them finish, cancel stops them now. Wipe needs cancel."
+    },
+    {
+      "name": "graceMinutes",
+      "type": "Number",
+      "default": 15,
+      "label": "Grace minutes",
+      "description": "How long hibernate keeps accepting what arrives. Ignored by park and wipe."
+    },
+    {
+      "name": "includeSelf",
+      "type": "Boolean",
+      "widget": {
+        "kind": "checkbox"
+      },
+      "default": false,
+      "label": "Stop this run too",
+      "description": "Off: this run keeps going even when it is one of the runs reached. On: this run ends with them, cancelled."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "done",
+      "type": "Boolean",
+      "description": "True once the instance's triggers reading the copy are down and the terminate is handed to the supervisor, which deletes the copy on its own time. Wire it into the `_should_flow` of what must happen after."
+    }
+  ],
+  "requires_infra": false,
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": { "kind": "input_names", "port": "node", "names": { "node": { "role": "infra", "per_instance": true } } }
+      },
+      "then": {
+        "message": "TerminateInstanceInfra '{id}' names {names} in `node`, which is no infra node of this program marked `@per_instance`. Name one the way the program writes it (`bridge`, or `one.bridge` inside an included file).",
+        "level": "structural",
+        "severity": "error",
+        "port": "node"
+      }
+    }
+  ]
+}

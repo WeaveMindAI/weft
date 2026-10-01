@@ -689,6 +689,14 @@ pub async fn replay_from_origin(
     groups: &[&SchemaGroup],
     include_drafts: bool,
 ) -> anyhow::Result<()> {
+    replay_origins(pool, groups).await?;
+    replay_migrations(pool, groups, |m| include_drafts || !m.draft).await
+}
+
+/// Every group's frozen `origin.sql`: the database each group was on the
+/// day it shipped, before any migration ran.
+#[cfg(feature = "db-tests")]
+pub async fn replay_origins(pool: &PgPool, groups: &[&SchemaGroup]) -> anyhow::Result<()> {
     for group in groups {
         // Embedded at build time, like the migrations: the replay must
         // start from the SAME frozen text the boot checksums, so an
@@ -708,10 +716,23 @@ pub async fn replay_from_origin(
                 .map_err(|e| anyhow::anyhow!("origin of '{}' failed: {e}", group.name))?;
         }
     }
+    Ok(())
+}
+
+/// Run, in id order across every group, the migrations of `groups` that
+/// `keep` picks. A test that stops the history at one release (to write
+/// rows the way an older build wrote them) and then plays the rest picks
+/// the two halves by id.
+#[cfg(feature = "db-tests")]
+pub async fn replay_migrations(
+    pool: &PgPool,
+    groups: &[&SchemaGroup],
+    keep: impl Fn(&Migration) -> bool,
+) -> anyhow::Result<()> {
     let names: std::collections::HashSet<&str> = groups.iter().map(|g| g.name).collect();
     let mut all: Vec<&Migration> = MIGRATIONS
         .iter()
-        .filter(|m| names.contains(m.group) && (include_drafts || !m.draft))
+        .filter(|m| names.contains(m.group) && keep(m))
         .collect();
     all.sort_by_key(|m| m.id);
     for m in all {
@@ -863,29 +884,41 @@ fn owner_of(thing: &Thing) -> Owner {
 /// exact and runnable; the destructive and lossy ones (a dropped table, a
 /// changed column type) carry a comment above them saying what they cost,
 /// so the person releasing the migration decides with the price in view.
+///
+/// A rename cannot be read off two schemas (a dropped `note` and an added
+/// `title` of the same type may be one column renamed or two unrelated
+/// ones), so the person names each one in `renames`; they run first, in
+/// the order given, and the rest is diffed against the schema as it
+/// stands after them. A constraint or index whose definition then matches
+/// under another name is renamed rather than rebuilt.
 #[cfg(feature = "db-tests")]
-pub fn plan_migration(old: &[Thing], new: &[Thing]) -> Vec<Planned> {
+pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename]) -> anyhow::Result<Vec<Planned>> {
     let key = |t: &Thing| (t.kind.clone(), t.table.clone(), t.name.clone());
-    let old_by: HashMap<_, _> = old.iter().map(|t| (key(t), t.clone())).collect();
-    let new_by: HashMap<_, _> = new.iter().map(|t| (key(t), t.clone())).collect();
-
-    let mut plan: Vec<Planned> = Vec::new();
-    let old_tables: std::collections::HashSet<&str> =
-        old.iter().map(|t| t.table.as_str()).collect();
-    let mut created: std::collections::HashSet<&str> = Default::default();
+    let (old, mut plan) = apply_renames(old, renames)?;
+    let paired = pair_renamed_objects(&old, new);
+    plan.extend(paired.plan);
     // Indexes that BACK a constraint (a primary key, a unique): the
-    // ADD CONSTRAINT creates them, so planning the index too would fail
-    // on a duplicate name.
-    let constraint_backed: std::collections::HashSet<(&str, &str)> = new
+    // ADD CONSTRAINT creates them and a RENAME CONSTRAINT renames them,
+    // so planning the index too would fail on a duplicate name. Read
+    // before the paired constraints leave the lists below.
+    let constraint_backed: std::collections::HashSet<(String, String)> = new
         .iter()
         .chain(old.iter())
         .filter(|t| t.kind == "constraint")
-        .map(|t| (t.table.as_str(), t.name.as_str()))
+        .map(|t| (t.table.clone(), t.name.clone()))
         .collect();
+    let backs_constraint =
+        |t: &Thing| t.kind == "index" && constraint_backed.contains(&(t.table.clone(), t.name.clone()));
+    let old: Vec<Thing> = old.into_iter().filter(|t| !paired.old.contains(&key(t))).collect();
+    let new: Vec<Thing> = new.iter().filter(|t| !paired.new.contains(&key(t))).cloned().collect();
+    let (old, new) = (old.as_slice(), new.as_slice());
+    let old_by: HashMap<_, _> = old.iter().map(|t| (key(t), t.clone())).collect();
+    let new_by: HashMap<_, _> = new.iter().map(|t| (key(t), t.clone())).collect();
+    let old_tables: std::collections::HashSet<&str> =
+        old.iter().map(|t| t.table.as_str()).collect();
+    let mut created: std::collections::HashSet<&str> = Default::default();
     for thing in new {
-        if thing.kind == "index"
-            && constraint_backed.contains(&(thing.table.as_str(), thing.name.as_str()))
-        {
+        if backs_constraint(thing) {
             continue;
         }
         // A table nobody had before: its columns arrive with the CREATE
@@ -925,10 +958,8 @@ pub fn plan_migration(old: &[Thing], new: &[Thing]) -> Vec<Planned> {
     let mut dropped: std::collections::HashSet<&str> = Default::default();
     let mut dropped_functions: Vec<Planned> = Vec::new();
     for thing in old {
-        if thing.kind == "index"
-            && constraint_backed.contains(&(thing.table.as_str(), thing.name.as_str()))
-        {
-            // Its constraint's DROP (or survival) owns it.
+        if backs_constraint(thing) {
+            // Its constraint's DROP, RENAME or survival owns it.
             continue;
         }
         if !thing.table.is_empty() && !new_tables.contains(thing.table.as_str()) {
@@ -967,7 +998,204 @@ pub fn plan_migration(old: &[Thing], new: &[Thing]) -> Vec<Planned> {
     // would take a trigger still hanging off it, and the trigger's own
     // DROP would then fail on a trigger that is gone.
     plan.extend(dropped_functions);
-    plan
+    Ok(plan)
+}
+
+/// One rename the person releasing a migration names, because no diff
+/// can tell a renamed column from a dropped one and an added one.
+#[cfg(feature = "db-tests")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rename {
+    /// `--rename old_table=new_table`
+    Table { from: String, to: String },
+    /// `--rename table.old_column=new_column`
+    Column { table: String, from: String, to: String },
+}
+
+#[cfg(feature = "db-tests")]
+impl std::str::FromStr for Rename {
+    type Err = anyhow::Error;
+    fn from_str(spec: &str) -> anyhow::Result<Self> {
+        let valid = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        let (left, to) = spec.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("'{spec}' is no rename: write table.old_column=new_column, or old_table=new_table")
+        })?;
+        let rename = match left.split_once('.') {
+            Some((table, from)) => Rename::Column { table: table.into(), from: from.into(), to: to.into() },
+            None => Rename::Table { from: left.into(), to: to.into() },
+        };
+        let names: Vec<&str> = match &rename {
+            Rename::Table { from, to } => vec![from, to],
+            Rename::Column { table, from, to } => vec![table, from, to],
+        };
+        anyhow::ensure!(names.iter().all(|n| valid(n)), "'{spec}': names are lowercase letters, digits and _");
+        Ok(rename)
+    }
+}
+
+/// `old` as it reads once `renames` have run, in order, and the RENAME
+/// statements that get it there. A rename naming something `old` does
+/// not hold is refused: it is a typo, and running past it would plan the
+/// drop and add the rename was meant to prevent.
+#[cfg(feature = "db-tests")]
+fn apply_renames(old: &[Thing], renames: &[Rename]) -> anyhow::Result<(Vec<Thing>, Vec<Planned>)> {
+    let mut things = old.to_vec();
+    let mut plan = Vec::new();
+    for rename in renames {
+        match rename {
+            Rename::Table { from, to } => {
+                anyhow::ensure!(
+                    things.iter().any(|t| t.table == *from),
+                    "--rename {from}={to}: there is no table '{from}' to rename"
+                );
+                for thing in &mut things {
+                    if thing.table == *from {
+                        thing.table = to.clone();
+                    }
+                    thing.body = replace_ident(&thing.body, from, to);
+                }
+                plan.push(Planned {
+                    owner: Owner::Table(to.clone()),
+                    stmt: format!("ALTER TABLE {from} RENAME TO {to};"),
+                });
+            }
+            Rename::Column { table, from, to } => {
+                anyhow::ensure!(
+                    things.iter().any(|t| t.kind == "column" && t.table == *table && t.name == *from),
+                    "--rename {table}.{from}={to}: table '{table}' has no column '{from}' to rename"
+                );
+                for thing in things.iter_mut().filter(|t| t.table == *table) {
+                    if thing.kind == "column" && thing.name == *from {
+                        thing.name = to.clone();
+                    }
+                    thing.body = replace_ident(&thing.body, from, to);
+                }
+                plan.push(Planned {
+                    owner: Owner::Table(table.clone()),
+                    stmt: format!("ALTER TABLE {table} RENAME COLUMN {from} TO {to};"),
+                });
+            }
+        }
+    }
+    Ok((things, plan))
+}
+
+/// Columns and tables that leave while others arrive beside them: each
+/// could be a rename nobody named, which the plan would carry out as a
+/// drop (throwing the rows away) and an empty add. Empty when every such
+/// pair is accounted for.
+#[cfg(feature = "db-tests")]
+pub fn unnamed_renames(old: &[Thing], new: &[Thing], renames: &[Rename]) -> anyhow::Result<Vec<String>> {
+    let (old, _) = apply_renames(old, renames)?;
+    let tables = |things: &[Thing]| -> std::collections::BTreeSet<String> {
+        things.iter().filter(|t| t.kind == "column").map(|t| t.table.clone()).collect()
+    };
+    let columns = |things: &[Thing], table: &str| -> std::collections::BTreeSet<String> {
+        things.iter().filter(|t| t.kind == "column" && t.table == table).map(|t| t.name.clone()).collect()
+    };
+    let (old_tables, new_tables) = (tables(&old), tables(new));
+    let mut out = Vec::new();
+    let gone: Vec<&String> = old_tables.difference(&new_tables).collect();
+    let came: Vec<&String> = new_tables.difference(&old_tables).collect();
+    if !gone.is_empty() && !came.is_empty() {
+        out.push(format!("tables {gone:?} go while {came:?} arrive"));
+    }
+    for table in old_tables.intersection(&new_tables) {
+        let (was, now) = (columns(&old, table), columns(new, table));
+        let gone: Vec<&String> = was.difference(&now).collect();
+        let came: Vec<&String> = now.difference(&was).collect();
+        if !gone.is_empty() && !came.is_empty() {
+            out.push(format!("{table}: columns {gone:?} go while {came:?} arrive"));
+        }
+    }
+    Ok(out)
+}
+
+/// `text` with the identifier `from` replaced by `to` wherever it stands
+/// as a whole word.
+#[cfg(feature = "db-tests")]
+fn replace_ident(text: &str, from: &str, to: &str) -> String {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut prev: Option<char> = None;
+    while let Some(at) = rest.find(from) {
+        let before = rest[..at].chars().next_back().or(prev);
+        let after = rest[at + from.len()..].chars().next();
+        out.push_str(&rest[..at]);
+        if before.is_some_and(is_ident) || after.is_some_and(is_ident) {
+            out.push_str(from);
+        } else {
+            out.push_str(to);
+        }
+        prev = from.chars().next_back();
+        rest = &rest[at + from.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// What [`pair_renamed_objects`] found: the RENAME statements, and the
+/// old and new things they account for.
+#[cfg(feature = "db-tests")]
+struct Paired {
+    plan: Vec<Planned>,
+    old: std::collections::HashSet<(String, String, String)>,
+    new: std::collections::HashSet<(String, String, String)>,
+}
+
+/// Constraints and indexes that left under one name and arrived under
+/// another on the same table with the same definition (once the named
+/// renames have run): renamed, never rebuilt. They hold no rows, so
+/// pairing them is safe to do without being asked; a pair is made only
+/// when it is the one candidate on both sides.
+#[cfg(feature = "db-tests")]
+fn pair_renamed_objects(old: &[Thing], new: &[Thing]) -> Paired {
+    fn unique_match<'a>(
+        from: &Thing,
+        pool: &[&'a Thing],
+        same: &dyn Fn(&Thing, &Thing) -> bool,
+    ) -> Option<&'a Thing> {
+        let hits: Vec<&'a Thing> = pool
+            .iter()
+            .copied()
+            .filter(|c| c.kind == from.kind && c.table == from.table && same(from, c))
+            .collect();
+        (hits.len() == 1).then(|| hits[0])
+    }
+    let key = |t: &Thing| (t.kind.clone(), t.table.clone(), t.name.clone());
+    let old_keys: std::collections::HashSet<_> = old.iter().map(key).collect();
+    let new_keys: std::collections::HashSet<_> = new.iter().map(key).collect();
+    // An index that backs a constraint (a primary key, a unique) is
+    // renamed by its constraint's RENAME.
+    let backs_constraint = |t: &Thing| {
+        old.iter().chain(new.iter()).any(|c| c.kind == "constraint" && c.table == t.table && c.name == t.name)
+    };
+    let candidate = |t: &&Thing| {
+        (t.kind == "constraint" || (t.kind == "index" && !backs_constraint(t))) && !t.table.is_empty()
+    };
+    let gone: Vec<&Thing> = old.iter().filter(|t| !new_keys.contains(&key(t))).filter(candidate).collect();
+    let came: Vec<&Thing> = new.iter().filter(|t| !old_keys.contains(&key(t))).filter(candidate).collect();
+    // An index's definition carries its own name.
+    let same = |a: &Thing, b: &Thing| replace_ident(&a.body, &a.name, &b.name) == b.body;
+    let mut out = Paired { plan: Vec::new(), old: Default::default(), new: Default::default() };
+    for was in &gone {
+        let Some(now) = unique_match(was, &came, &same) else { continue };
+        if unique_match(now, &gone, &|b: &Thing, a: &Thing| same(a, b)).map(|t| t.name.as_str())
+            != Some(was.name.as_str())
+        {
+            continue;
+        }
+        let stmt = if was.kind == "index" {
+            format!("ALTER INDEX {} RENAME TO {};", was.name, now.name)
+        } else {
+            format!("ALTER TABLE {} RENAME CONSTRAINT {} TO {};", now.table, was.name, now.name)
+        };
+        out.plan.push(Planned { owner: owner_of(now), stmt });
+        out.old.insert(key(was));
+        out.new.insert(key(now));
+    }
+    out
 }
 
 /// The pieces of a column as Postgres reports them, parsed back out of
@@ -1177,7 +1405,10 @@ fn changed(was: &Thing, now: &Thing) -> String {
 #[cfg(feature = "db-tests")]
 fn removed(thing: &Thing) -> String {
     match thing.kind.as_str() {
-        "index" => format!("DROP INDEX {};", thing.name),
+        // IF EXISTS on an index or a constraint: one that names a column
+        // this same plan drops leaves with that column, whichever
+        // statement runs first.
+        "index" => format!("DROP INDEX IF EXISTS {};", thing.name),
         "trigger" => format!("DROP TRIGGER {} ON {};", thing.name, thing.table),
         // CASCADE, for anything still hanging off it that the plan does
         // not drop by name; the plan drops functions last, after the
@@ -1185,11 +1416,11 @@ fn removed(thing: &Thing) -> String {
         "function" => format!("DROP FUNCTION {} CASCADE;", thing.name),
         "type" => format!("DROP TYPE {};", thing.name),
         "constraint" => {
-            format!("ALTER TABLE {} DROP CONSTRAINT {};", thing.table, thing.name)
+            format!("ALTER TABLE {} DROP CONSTRAINT IF EXISTS {};", thing.table, thing.name)
         }
         _ => format!(
             "-- Throws away what is in {}.{}. Ship this in a later release than the one \n\
-             -- that stopped reading the column, so the old instances do not fall over.\n\
+             -- that stopped reading the column, so replicas still on the old release do not fall over.\n\
              ALTER TABLE {} DROP COLUMN {};",
             thing.table, thing.name, thing.table, thing.name
         ),
@@ -1561,8 +1792,8 @@ pub async fn assert_shape_check_restamps(pool: &PgPool, groups: &[&SchemaGroup])
 ///
 /// Reads the same env contract `./setup.sh --migration` provides:
 /// `DATABASE_URL` (a throwaway Postgres to build schemas in), the
-/// change name in argv, `--release`, and `WEFT_LIVE_DATABASE_URL` when
-/// releasing.
+/// change name in argv, `--release`, every `--rename <spec>`,
+/// `--unrelated`, and `WEFT_LIVE_DATABASE_URL` when releasing.
 #[cfg(feature = "db-tests")]
 pub async fn write_migration(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
     use anyhow::Context;
@@ -1606,7 +1837,40 @@ pub async fn write_migration(groups: &[&SchemaGroup]) -> anyhow::Result<()> {
     apply_groups(&pool, groups).await.context("build what the code declares")?;
     let after = read_schema(&pool).await?;
 
-    let plan = plan_migration(&before, &after);
+    let args: Vec<String> = std::env::args().collect();
+    let renames: Vec<Rename> = args
+        .windows(2)
+        .filter(|w| w[0] == "--rename")
+        .map(|w| w[1].parse::<Rename>())
+        .collect::<anyhow::Result<Vec<_>>>()?
+        .into_iter()
+        // Each crate's generator sees only its own groups; a rename of
+        // another crate's table is that crate's run's to carry. One that
+        // matches no crate at all leaves its drop and add unnamed, which
+        // the check below refuses.
+        .filter(|r| {
+            let table = match r {
+                Rename::Table { to, .. } => to,
+                Rename::Column { table, .. } => table,
+            };
+            groups.iter().any(|g| g.tables.contains(&table.as_str()))
+        })
+        .collect();
+    let unrelated = args.iter().any(|a| a == "--unrelated");
+    let unnamed = unnamed_renames(&before, &after, &renames)?;
+    anyhow::ensure!(
+        unnamed.is_empty() || unrelated,
+        "nothing was written: some things go while others arrive beside them, and each \
+         pair may be one thing renamed. Planned as they stand, the ones that go are \
+         dropped with their rows:\n  {}\nName every rename, in the order they happen \
+         (a swap is two, the one freeing a name first), and run the same command again:\n  \
+         ./setup.sh --migration {name}{} --rename table.old_column=new_column --rename \
+         old_table=new_table\nIf they really are unrelated, add --unrelated instead and \
+         the rows of the ones that go are thrown away.",
+        unnamed.join("\n  "),
+        if release { " --release" } else { "" }
+    );
+    let plan = plan_migration(&before, &after, &renames)?;
     if plan.is_empty() {
         println!("nothing changed: every group's migrations already reach its CREATE TABLE");
         return Ok(());
@@ -1770,9 +2034,113 @@ mod tests {
         let thing = |kind: &str, table: &str, name: &str| Thing { kind: kind.into(), table: table.into(), name: name.into(), body: String::new() };
         let kept = thing("column", "exec_event", "execution_id");
         let old = vec![thing("function", "", "check"), kept.clone(), thing("trigger", "exec_event", "check_on_insert")];
-        let plan: Vec<String> = plan_migration(&old, &[kept]).into_iter().map(|p| p.stmt).collect();
+        let plan: Vec<String> = plan_migration(&old, &[kept], &[]).unwrap().into_iter().map(|p| p.stmt).collect();
         assert_eq!(plan, ["DROP TRIGGER check_on_insert ON exec_event;", "DROP FUNCTION check CASCADE;"]);
     }
+    #[cfg(feature = "db-tests")]
+    #[test]
+    fn a_renamed_column_keeps_its_rows_and_its_constraint_and_index_follow() {
+        use super::{plan_migration, Thing};
+        let t = |kind: &str, name: &str, body: &str| Thing { kind: kind.into(), table: "g".into(), name: name.into(), body: body.into() };
+        let old = vec![
+            t("column", "id", "text null=NO default=-"),
+            t("column", "member_id", "text null=YES default=-"),
+            t("constraint", "g_member_has_id", "CHECK ((member_id IS NULL) OR (id IS NOT NULL))"),
+            t("index", "g_member", "CREATE INDEX g_member ON g USING btree (member_id)"),
+            t("index", "g_by_id", "CREATE INDEX g_by_id ON g USING btree (id, member_id)"),
+        ];
+        let new = vec![
+            t("column", "id", "text null=NO default=-"),
+            t("column", "instance_id", "text null=YES default=-"),
+            t("constraint", "g_instance_has_id", "CHECK ((instance_id IS NULL) OR (id IS NOT NULL))"),
+            t("index", "g_instance", "CREATE INDEX g_instance ON g USING btree (instance_id)"),
+            t("index", "g_by_id", "CREATE INDEX g_by_id ON g USING btree (id, instance_id)"),
+        ];
+        let renames = ["g.member_id=instance_id".parse().unwrap()];
+        let plan: Vec<String> = plan_migration(&old, &new, &renames).unwrap().into_iter().map(|p| p.stmt).collect();
+        assert_eq!(plan, [
+            "ALTER TABLE g RENAME COLUMN member_id TO instance_id;",
+            "ALTER TABLE g RENAME CONSTRAINT g_member_has_id TO g_instance_has_id;",
+            "ALTER INDEX g_member RENAME TO g_instance;",
+        ]);
+    }
+
+    #[cfg(feature = "db-tests")]
+    #[test]
+    fn a_swap_named_in_order_keeps_both_columns() {
+        use super::{plan_migration, unnamed_renames, Thing};
+        let c = |name: &str, body: &str| Thing { kind: "column".into(), table: "g".into(), name: name.into(), body: body.into() };
+        let old = [c("instance_id", "text null=NO default=''::text"), c("member_id", "text null=YES default=-")];
+        let new = [c("copy_id", "text null=NO default=''::text"), c("instance_id", "text null=YES default=-")];
+        let renames = ["g.instance_id=copy_id".parse().unwrap(), "g.member_id=instance_id".parse().unwrap()];
+        assert!(unnamed_renames(&old, &new, &renames).unwrap().is_empty());
+        let plan: Vec<String> = plan_migration(&old, &new, &renames).unwrap().into_iter().map(|p| p.stmt).collect();
+        assert_eq!(plan, [
+            "ALTER TABLE g RENAME COLUMN instance_id TO copy_id;",
+            "ALTER TABLE g RENAME COLUMN member_id TO instance_id;",
+        ]);
+    }
+
+    #[cfg(feature = "db-tests")]
+    #[test]
+    fn a_column_or_table_going_while_another_arrives_is_reported_until_named() {
+        use super::{unnamed_renames, Thing};
+        let c = |table: &str, name: &str| Thing { kind: "column".into(), table: table.into(), name: name.into(), body: "text null=YES default=-".into() };
+        let old = [c("g", "note"), c("member_value", "field")];
+        let new = [c("g", "title"), c("instance_value", "field")];
+        assert_eq!(unnamed_renames(&old, &new, &[]).unwrap().len(), 2);
+        let renames = ["g.note=title".parse().unwrap(), "member_value=instance_value".parse().unwrap()];
+        assert!(unnamed_renames(&old, &new, &renames).unwrap().is_empty());
+        // A column only added, or only dropped, is no rename to name.
+        assert!(unnamed_renames(&[c("g", "a")], &[c("g", "a"), c("g", "b")], &[]).unwrap().is_empty());
+    }
+
+    #[cfg(feature = "db-tests")]
+    #[test]
+    fn a_renamed_table_takes_its_indexes_along() {
+        use super::{plan_migration, Thing};
+        let t = |table: &str, kind: &str, name: &str, body: &str| Thing { kind: kind.into(), table: table.into(), name: name.into(), body: body.into() };
+        let old = [
+            t("member_value", "column", "grant_id", "uuid null=YES default=-"),
+            t("member_value", "index", "member_value_grant", "CREATE INDEX member_value_grant ON member_value USING btree (grant_id)"),
+            t("member_value", "constraint", "member_value_pkey", "PRIMARY KEY (grant_id)"),
+            t("member_value", "index", "member_value_pkey", "CREATE UNIQUE INDEX member_value_pkey ON member_value USING btree (grant_id)"),
+        ];
+        let new = [
+            t("instance_value", "column", "grant_id", "uuid null=YES default=-"),
+            t("instance_value", "index", "instance_value_grant", "CREATE INDEX instance_value_grant ON instance_value USING btree (grant_id)"),
+            t("instance_value", "constraint", "instance_value_pkey", "PRIMARY KEY (grant_id)"),
+            t("instance_value", "index", "instance_value_pkey", "CREATE UNIQUE INDEX instance_value_pkey ON instance_value USING btree (grant_id)"),
+        ];
+        let renames = ["member_value=instance_value".parse().unwrap()];
+        let plan: Vec<String> = plan_migration(&old, &new, &renames).unwrap().into_iter().map(|p| p.stmt).collect();
+        // The primary key's index follows its constraint's RENAME; planning
+        // it on its own would create a duplicate.
+        assert_eq!(plan, [
+            "ALTER TABLE member_value RENAME TO instance_value;",
+            "ALTER INDEX member_value_grant RENAME TO instance_value_grant;",
+            "ALTER TABLE instance_value RENAME CONSTRAINT member_value_pkey TO instance_value_pkey;",
+        ]);
+    }
+
+    #[cfg(feature = "db-tests")]
+    #[test]
+    fn a_rename_of_something_that_is_not_there_is_refused() {
+        use super::{plan_migration, Thing};
+        let c = Thing { kind: "column".into(), table: "g".into(), name: "a".into(), body: "text null=YES default=-".into() };
+        let Err(err) = plan_migration(std::slice::from_ref(&c), std::slice::from_ref(&c), &["g.typo=b".parse().unwrap()]) else {
+            panic!("a rename of a missing column must be refused");
+        };
+        let err = err.to_string();
+        assert!(err.contains("has no column 'typo'"), "{err}");
+    }
+
+    #[cfg(feature = "db-tests")]
+    #[test]
+    fn a_whole_identifier_is_replaced_never_part_of_one() {
+        assert_eq!(super::replace_ident("old_member_id, member_id)", "member_id", "instance_id"), "old_member_id, instance_id)");
+    }
+
     // Layer-1 tests for the pure parts: the fingerprint, and which migrations
     // a database still owes.
     use std::collections::HashMap;
@@ -1804,15 +2172,15 @@ mod tests {
     fn a_non_identifier_name_is_refused() {
         let bad = super::SchemaGroup {
             name: "worker'; DROP TABLE task; --",
-            tables: &["worker_instance"],
-            ddl: &["CREATE TABLE IF NOT EXISTS worker_instance (id INT)"],
+            tables: &["worker_replica"],
+            ddl: &["CREATE TABLE IF NOT EXISTS worker_replica (id INT)"],
             seed: &[],
         };
         let err = super::validate_identifiers(&[&bad]).expect_err("a quoted name must refuse");
         assert!(err.to_string().contains("non-identifier"), "{err}");
         let good = super::SchemaGroup {
-            name: "worker_instance",
-            tables: &["worker_instance", "infra_owner2"],
+            name: "worker_replica",
+            tables: &["worker_replica", "infra_owner2"],
             ddl: &[],
             seed: &[],
         };

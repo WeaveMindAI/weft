@@ -33,6 +33,10 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_script_with_a_placeholder_still_needs_the_port", script_with_placeholder),
         NodeTest::fake("a_placeholder_without_a_port_refuses_before_dialing", missing_port),
         NodeTest::fake("a_declared_port_that_stayed_silent_is_not_a_refusal", silent_optional_port),
+        NodeTest::fake("a_refused_query_fails_the_run_when_error_is_unwired", refused_unwired),
+        NodeTest::fake("a_refused_query_comes_out_on_error_when_it_is_wired", refused_wired),
+        NodeTest::fake("a_bad_connection_setting_fails_the_run_even_with_error_wired", bad_setting_wired),
+        NodeTest::fake("a_mistake_in_the_sql_fails_the_run_even_with_error_wired", sql_mistake_wired),
     ]
 }
 
@@ -403,5 +407,58 @@ fn shadowed_columns() -> WeftResult<()> {
     // node with no ports of its own can never clash at all.
     refuse_shadowed_columns(&Value::Null, &["rows", "count"])?;
     refuse_shadowed_columns(&json!({ "count": 9 }), &[])?;
+    Ok(())
+}
+
+/// A database that hangs up on every connection, so the failure is the
+/// connection's, an outcome of this run, which is what both `error`
+/// tests read.
+async fn refused_query(rig: &FakeRig) -> weft::RunOutcome {
+    connection(rig);
+    rig.connection_value("postgres", "host", "127.0.0.1");
+    rig.connection_value("postgres", "port", &rig.hang_up_server().to_string());
+    rig.connection_value("postgres", "sslmode", "disable");
+    run_query(rig).await
+}
+
+async fn refused_unwired(rig: FakeRig) -> WeftResult<()> {
+    let err = refused_query(&rig).await.failure()?;
+    assert!(err.contains("postgres: connect"), "{err}");
+    Ok(())
+}
+
+async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
+    rig.wire_output("error");
+    let outcome = refused_query(&rig).await.ok()?;
+    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    assert!(error.contains("postgres: connect"), "{error}");
+    assert!(!outcome.outputs.contains_key("rows") && !outcome.outputs.contains_key("count"));
+    Ok(())
+}
+
+/// A mistake in the program's own SQL (a positional `$1`) is fixed by
+/// editing the program, so it fails the run even with `error` wired.
+async fn sql_mistake_wired(rig: FakeRig) -> WeftResult<()> {
+    connection(&rig);
+    rig.wire_output("error");
+    let err = rig
+        .run(
+            &PostgresExecuteQueryNode,
+            json!({ "account": rig.access("postgres"), "query": "SELECT * FROM t WHERE id = $1" }),
+        )
+        .await
+        .failure()?;
+    assert!(err.starts_with("input error") && err.contains("`$1`"), "{err}");
+    Ok(())
+}
+
+/// A connection set up wrong is the program's own shape, never an
+/// outcome to route around: it fails the run even with `error` wired.
+async fn bad_setting_wired(rig: FakeRig) -> WeftResult<()> {
+    connection(&rig);
+    rig.connection_value("postgres", "sslmode", "sometimes");
+    rig.wire_output("error");
+    let err = run_query(&rig).await.failure()?;
+    assert!(err.contains("TLS setting"), "{err}");
     Ok(())
 }

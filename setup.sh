@@ -121,6 +121,14 @@
 #                     along: if it ran drafts, it is told the release is
 #                     already in it; if it never saw one, the release runs
 #                     on it now. One command either way, nothing is lost.
+#   --rename SPEC     With --migration: a rename, which no diff can tell
+#                     from a drop and an add (the drop throws the rows
+#                     away). SPEC is table.old_column=new_column or
+#                     old_table=new_table; repeat it, in the order the
+#                     renames happen. A migration where something goes
+#                     while something arrives beside it is refused until
+#                     every such pair is named, or --unrelated says they
+#                     are separate things.
 #
 # Removal:
 #   --uninstall   Remove user-facing pieces but preserve work. Stops
@@ -501,6 +509,7 @@ prefix="${HOME}/.local"
 do_uninstall=0
 do_purge=0
 write_migration=""
+migration_renames=()
 do_release=0
 rebuild_flag=""
 purge_debian=0
@@ -657,6 +666,11 @@ while [[ $# -gt 0 ]]; do
       [[ $# -gt 0 ]] || { fail "--migration needs a name: ./setup.sh --migration add_owner"; exit 1; }
       write_migration="$1" ;;
     --release)   do_release=1 ;;
+    --rename)
+      shift
+      [[ $# -gt 0 ]] || { fail "--rename needs what: --rename table.old_column=new_column, or --rename old_table=new_table"; exit 1; }
+      migration_renames+=(--rename "$1") ;;
+    --unrelated) migration_renames+=(--unrelated) ;;
 
     --from-source) from_source=1 ;;
 
@@ -941,6 +955,10 @@ acquire_prebuilt() {
 # must not be the one weft runs, so this runs a throwaway container and takes
 # it away again. Releasing also needs to reach the real one (the local
 # install's), to swap its drafts for the released file.
+if [[ ${#migration_renames[@]} -gt 0 && -z "${write_migration}" ]]; then
+  fail "--rename and --unrelated only mean something with --migration <name>"
+  exit 1
+fi
 if [[ $do_release -eq 1 && -z "${write_migration}" ]]; then
   fail "--release only means something with --migration <name>: it collapses that run's drafts"
   exit 1
@@ -999,7 +1017,7 @@ if [[ -n "${write_migration}" ]]; then
   for pkg in weft-dispatcher weft-broker; do
     # SYNC: the example name <-> crates/weft-dispatcher/Cargo.toml, crates/weft-broker/Cargo.toml
     if ! cargo run -q -p "${pkg}" --features db-tests --example "${pkg#weft-}_schema_migration" \
-        -- "${write_migration}" ${release_flag}; then
+        -- "${write_migration}" ${release_flag} ${migration_renames[@]+"${migration_renames[@]}"}; then
       fail "writing the migration failed in ${pkg}; fix the cause and re-run the same command"
       exit 1
     fi

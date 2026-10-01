@@ -6,9 +6,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
 
-use super::postgres::{connect, query_json, quote_ident};
+use super::postgres::{connect, mistake, query_json, quote_ident, refusal};
 
 /// The UPDATE for a table, its SET columns, and a WHERE condition.
 ///
@@ -31,10 +31,10 @@ pub fn update_sql(
     first_set_param: usize,
 ) -> WeftResult<String> {
     if columns.is_empty() {
-        weft::node_bail!("set holds no columns; nothing to update");
+        mistake!("set holds no columns; nothing to update");
     }
     if condition.trim().is_empty() {
-        weft::node_bail!(
+        mistake!(
             "where is empty; an unconditional update is almost always a mistake, write \
              `true` explicitly to update every row"
         );
@@ -75,7 +75,10 @@ async fn condition_params(
 ) -> WeftResult<usize> {
     let probe =
         format!("SELECT 1 FROM {} WHERE (\n{condition}\n) LIMIT 0", quote_ident(table)?);
-    let stmt = client.prepare(&probe).await.node_err("postgres: read the where condition")?;
+    let stmt = client
+        .prepare(&probe)
+        .await
+        .map_err(|e| refusal(format!("postgres: read the where condition: {e}"), &e))?;
     Ok(stmt.params().len())
 }
 
@@ -100,7 +103,7 @@ impl Node for PostgresUpdateRowsNode {
         let where_params: Vec<Value> = ctx.inputs.list("whereParams")?;
 
         let Some(obj) = set.as_object() else {
-            weft::node_bail!("set must be an object of column: value pairs");
+            mistake!("set must be an object of column: value pairs");
         };
         let columns: Vec<String> = obj.keys().cloned().collect();
 
@@ -120,7 +123,7 @@ impl Node for PostgresUpdateRowsNode {
         // worth trusting.
         let declared = condition_params(&client, &table, &condition).await?;
         if declared != where_params.len() {
-            weft::node_bail!(
+            mistake!(
                 "where names {declared} parameter(s) but whereParams carries {}; the \
                  condition's $1, $2, ... are positions in whereParams",
                 where_params.len()

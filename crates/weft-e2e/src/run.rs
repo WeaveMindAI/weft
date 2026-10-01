@@ -20,7 +20,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::client::{poll_until, poll_until_describing, Dispatcher};
-use crate::event::{Replay, TERMINAL_KINDS};
+use crate::event::Replay;
 use crate::project::Project;
 
 /// How long the rig waits for an execution to reach a terminal status. This is
@@ -116,24 +116,15 @@ pub async fn executions(disp: &Dispatcher, project_id: &Uuid) -> Result<HashSet<
     let mut execution_ids = HashSet::new();
     let mut offset = 0u32;
     loop {
-        let page: Value = disp
+        let page: weft_core::program::ExecutionPage = disp
             .get_json(&format!(
                 "/executions?project_id={project_id}&limit=200&offset={offset}"
             ))
             .await?;
-        let batch = page
-            .get("executions")
-            .and_then(Value::as_array)
-            .ok_or_else(|| anyhow::anyhow!("/executions returned no `executions` array: {page}"))?;
-        let n = batch.len() as u32;
-        execution_ids.extend(batch.iter().filter_map(|e| {
-            e.get("execution_id")
-                .and_then(Value::as_str)
-                .and_then(|c| Uuid::parse_str(c).ok())
-        }));
+        let n = page.executions.len() as u32;
+        execution_ids.extend(page.executions.iter().map(|e| e.execution_id));
         offset += n;
-        let total = page.get("total").and_then(Value::as_u64).unwrap_or(0) as u32;
-        if n == 0 || offset >= total {
+        if n == 0 || offset as u64 >= page.total {
             return Ok(execution_ids);
         }
     }
@@ -241,6 +232,35 @@ pub async fn wait_for_status(disp: &Dispatcher, execution_id: Uuid, status: &str
             }
         },
         || format!("last status observed: '{}'", last.lock().unwrap()),
+    )
+    .await
+}
+
+/// Poll until every one of `nodes` has started in `execution_id`: the
+/// moment a test that acts on a step mid-body (killing its worker, say)
+/// waits for. Bails as soon as the run settles first, since then the
+/// steps can no longer be caught running.
+pub async fn wait_for_nodes_started(disp: &Dispatcher, execution_id: Uuid, nodes: &[&str]) -> Result<()> {
+    let path = format!("/executions/{execution_id}/replay");
+    poll_until(
+        &format!("{nodes:?} of execution {execution_id} to start"),
+        RUN_SETTLE_DEADLINE,
+        RUN_SETTLE_POLL,
+        || {
+            let disp = disp.clone();
+            let path = path.clone();
+            async move {
+                let replay = Replay::from_array(disp.get_json(&path).await?);
+                let started = |node: &&str| replay.events.iter().any(|e| e.kind() == "node_started" && e.is_node(node));
+                if nodes.iter().all(started) {
+                    return Ok(Some(()));
+                }
+                if replay.has_terminal()? {
+                    bail!("execution {execution_id} settled before {nodes:?} all started");
+                }
+                Ok(None)
+            }
+        },
     )
     .await
 }
@@ -406,11 +426,17 @@ fn is_terminal_status(status: &str) -> bool {
 async fn fetch_replay(disp: &Dispatcher, execution_id: Uuid) -> Result<Replay> {
     let path = format!("/executions/{execution_id}/replay");
     let arr: Vec<Value> = disp.get_json(&path).await?;
+    // Every row decodes as the real event type first, so a shape the
+    // dispatcher and weft-core disagree on fails here, naming the row.
+    for row in &arr {
+        serde_json::from_value::<weft_core::live_event::LiveEvent>(row.clone())
+            .map_err(|e| anyhow::anyhow!("execution {execution_id}: a replay row does not decode as a LiveEvent ({e}): {row}"))?;
+    }
     let replay = Replay::from_array(arr);
     // Sanity: a settled run must carry exactly one terminal event. If the
     // status says terminal but the replay has none, the two read paths
     // disagree, which is a real bug we want loud, not a silent pass.
-    if !replay.has_any_kind(&TERMINAL_KINDS) {
+    if !replay.has_terminal()? {
         bail!(
             "execution {execution_id} reported a terminal status but its replay has no terminal event; \
              status/replay disagree"

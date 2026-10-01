@@ -24,7 +24,7 @@ describe('localInstallUrl', () => {
   });
 
   it('reads a named install from its own folder and refuses one never started', () => {
-    const env = { HOME: home, WEFT_INSTANCE: 'cell1' };
+    const env = { HOME: home, WEFT_INSTALL: 'cell1' };
     expect(installDir(env)).toBe(path.join(root, 'installs', 'cell1'));
     expect(() => localInstallUrl(env)).toThrow('weft daemon start');
     save(path.join(root, 'installs', 'cell1'), '{"public":15100}');
@@ -49,7 +49,7 @@ describe('localAddress', () => {
   });
 
   it('returns the reason instead of throwing when there is no address', () => {
-    const got = localAddress(undefined, { HOME: home, WEFT_INSTANCE: 'cell1' });
+    const got = localAddress(undefined, { HOME: home, WEFT_INSTALL: 'cell1' });
     expect('error' in got && got.error).toContain('weft daemon start');
   });
 });

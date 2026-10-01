@@ -1,7 +1,7 @@
 {
   "type": "Reply",
   "label": "Reply",
-  "description": "Answer the caller of this run with one message. Behind a Route it is the response: status, headers and body, and the exchange ends. Behind a Socket it is one message and the socket stays open (status and headers have no meaning there and are refused if set). The body's shape follows the trigger's dataType: any value for json, a String for text, a stored file for bytes. On a json route a stored file anywhere in the body (a picture kept at project scope, say) goes out as `{ url, mimeType, filename, sizeBytes }`, the url being a link the caller can fetch straight into an `<img>`.",
+  "description": "Answer the caller of this run with one message. Behind a Route it is the response: status, headers and body, and the exchange ends. Behind a Socket it is one message and the socket stays open (status and headers have no meaning there and are refused if set). The body's shape follows `Answer as`, or the trigger's dataType when it is unset: any value for json, a String for text, a stored file for bytes. A stored file sent as bytes goes out under its own content type and filename unless `headers` sets them. On a json route a stored file anywhere in the body (a picture kept at project scope, say) goes out as `{ url, mimeType, filename, sizeBytes }`, the url being a link the caller can fetch straight into an `<img>`.",
   "tags": [
     "api",
     "http",
@@ -17,6 +17,21 @@
       "type": "T",
       "required": true,
       "description": "What to send: any value on a json route (an object, a list, a string), a String on a text route, a stored file on a bytes route."
+    },
+    {
+      "name": "answerAs",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "",
+          "json",
+          "text",
+          "bytes"
+        ]
+      },
+      "label": "Answer as",
+      "description": "The shape of the answer. Empty (default) answers in the trigger's own `dataType`. Set it when the answer differs from what came in: a GET with no body that answers a picture sets `bytes` and sends a stored file."
     },
     {
       "name": "status",
@@ -45,6 +60,9 @@
     }
   ],
   "requires_infra": false,
+  "features": {
+    "answersCaller": "whole"
+  },
   "validate": [
     {
       "when": {
@@ -52,16 +70,56 @@
         "of": {
           "kind": "run_reaches",
           "direction": "upstream",
-          "types": [
-            "Route",
-            "Socket"
-          ]
+          "with": {
+            "liveConnection": true
+          }
         }
       },
       "then": {
-        "message": "Reply '{id}' answers nobody: no Route or Socket starts a run that reaches it. Wire it from the trigger's run (through data, or `_should_flow`), or put it in a group the trigger's `_should_flow` runs.",
+        "message": "Reply '{id}' answers nobody: no trigger with a live caller (a Route, a Socket) starts a run that reaches it. Wire it from the trigger's run (through data, or `_should_flow`), or put it in a group the trigger's `_should_flow` runs.",
         "level": "structural",
         "severity": "warning"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "downstream_of",
+            "with": {
+              "answersCaller": [
+                "stream"
+              ]
+            }
+          },
+          {
+            "kind": "run_reaches",
+            "direction": "upstream",
+            "with": {
+              "liveConnection": [
+                "http"
+              ]
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "run_reaches",
+              "direction": "upstream",
+              "with": {
+                "liveConnection": [
+                  "websocket"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Reply '{id}' runs after {with}, which already sent the response's head to the HTTP caller, so this answer can never go out. To end the exchange after a stream, use a Close.",
+        "level": "structural",
+        "severity": "error"
       }
     }
   ]

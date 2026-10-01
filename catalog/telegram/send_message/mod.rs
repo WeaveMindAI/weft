@@ -51,8 +51,12 @@ impl Node for TelegramSendMessageNode {
                     Some(serde_json::json!([{ "text": label, "url": url }]))
                 })
                 .collect();
+            // The buttons are the program's own value: a malformed one
+            // is an input mistake, never a caught failure.
             if rows.len() != entries.len() {
-                weft::node_bail!("every button needs a label and a url");
+                return Err(weft::WeftError::Input(
+                    "every button needs a label and a url".to_string(),
+                ));
             }
             // An empty list simply means no keyboard.
             if !rows.is_empty() {

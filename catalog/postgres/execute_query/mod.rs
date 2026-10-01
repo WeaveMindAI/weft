@@ -98,7 +98,7 @@ impl Node for PostgresExecuteQueryNode {
         // overwritten by the node a line below, silently.
         refuse_shadowed_columns(&first, &["rows", "count"])?;
         // ...and a port the author declared that no column answers.
-        refuse_unanswered_ports(&first, ctx.declared_outputs(), &["rows", "count"])?;
+        refuse_unanswered_ports(&first, &ctx.data_outputs(), &["rows", "count"])?;
         let output = ctx.fan_declared(&first).set("rows", json!(rows)).set("count", count);
         ctx.pulse_downstream(output).await
     }

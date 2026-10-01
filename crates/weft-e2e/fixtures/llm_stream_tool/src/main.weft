@@ -33,8 +33,8 @@ out_stream.data = live.response
 # The tool round trip. The first call is FORCED to call the tool; the
 # model's call comes out on toolCalls, ExecPython plays the tool (it
 # answers "Biscuit" and hands back the call id), Chat Message appends
-# the role-tool result to the history, and the second call re-enters
-# with the history alone (no prompt) to answer from the result.
+# the role-tool result to the conversation file, and the second call
+# re-enters with that file alone (no prompt) to answer from the result.
 dog = LlmTool {
   name: "dog_name",
   description: "Returns the name of the user's dog."
@@ -56,14 +56,14 @@ ext.calls = t1.toolCalls
 answer = ChatHistoryAppend {
   role: "tool"
 }
-answer.history = t1.history
+answer.historyFile = t1.historyFile
 answer.toolCallId = ext.call_id
 answer.text = "Biscuit"
 
 t2 = LlmInference -> (response: String) {
   toolChoice: "none"
 }
-t2.history = answer.history
+t2.historyFile = answer.historyFile
 t2.provider = prov.provider
 t2.params = params.params
 t2.tools = dog.tool

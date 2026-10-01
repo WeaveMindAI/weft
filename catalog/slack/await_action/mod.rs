@@ -51,11 +51,12 @@ impl Node for SlackAwaitActionNode {
         let entries = buttons
             .as_array()
             .filter(|b| !b.is_empty())
-            .node_err("buttons must be a non-empty list of { id, label } objects")?;
+            .ok_or_else(|| bad_buttons("buttons must be a non-empty list of { id, label } objects"))?;
         let mut elements = Vec::new();
         for b in entries {
-            let id = b["id"].as_str().node_err("every button needs an id")?;
-            let label = b["label"].as_str().node_err("every button needs a label")?;
+            let id = b["id"].as_str().ok_or_else(|| bad_buttons("every button needs an id"))?;
+            let label =
+                b["label"].as_str().ok_or_else(|| bad_buttons("every button needs a label"))?;
             let mut button = json!({
                 "type": "button",
                 "text": { "type": "plain_text", "text": label },
@@ -201,4 +202,10 @@ impl Node for SlackAwaitActionNode {
         )
         .await
     }
+}
+
+/// A button list the program wrote wrong: an input error, which
+/// `error` never catches (the fix is editing the program).
+fn bad_buttons(what: &str) -> weft::WeftError {
+    weft::WeftError::Input(what.to_string())
 }

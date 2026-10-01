@@ -12,11 +12,15 @@ A snapshot of your project's files, taken whenever you run, activate, or type
 |---|---|
 | Every `.weft` file, at any depth | Anything hidden at the top: `.git`, `.env`, `.weft` |
 | `weft.toml` | `layouts/`, because dragging a box is not a change to your program |
-| `src/**` and `nodes/**`, including a node that sits beside your code | `nodes/base_catalog/`, which belongs to the installed weft. A version records which weft that was instead |
-| `assets/**`, `prompts/**`, `scripts/**`, `sql/**` | `target/` at the root, and `node_modules` anywhere |
-| `examples/**`, so going back restores the examples that existed then | `front/`, which ships through your project's CI |
+| `src/**` and `nodes/**`, including a node that sits beside your code and the standard library in `nodes/base_catalog/`, edits and all | `target/` at the root, and `node_modules` anywhere |
+| `assets/**`, `prompts/**`, `scripts/**`, `sql/**` | `front/`, which ships through your project's CI |
+| `examples/**`, so going back restores the examples that existed then | |
 
-A file identical to one an earlier version held costs nothing to store.
+A file identical to one an earlier version held costs nothing to store, so
+the standard library is stored once and every later version reuses it. An
+install builds a version from exactly the files it holds and nothing of its
+own: if you deleted `nodes/base_catalog/`, the version has no standard
+library.
 
 ## head
 
@@ -64,6 +68,20 @@ twelve step program and steps one to eight cost real money.
 
 The invalidation spreads: if a step is not reusable, nothing downstream of it
 is either.
+
+### When a reused step's file changed
+
+A saved result that names a stored file says what the file held then. If the
+file has been edited since (a later step added to it, another run changed it)
+or is gone, the run is refused before anything starts:
+
+```text
+--seed would reuse what 'ask' produced on 'historyFile', but the file it names,
+'conversation.json', has changed since (that run left it at version 4, it is at
+version 6 now), so the saved result no longer says what that step made. Hand
+the file in yourself (`--emit ask='{"historyFile": ...}'`), or run 'ask' again
+by keeping it out of the seed (`--seed-before ask`).
+```
 
 ### The one that surprises people
 

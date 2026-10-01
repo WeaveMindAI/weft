@@ -314,11 +314,11 @@ pub struct LiveRequest {
     /// The connection (grant) id resolving the test's declared service.
     pub connection: String,
     /// The execution the run's cost attributes to, registered by
-    /// the install with `instance` as its driver.
+    /// the install with `replica` as its driver.
     pub execution_id: uuid::Uuid,
-    /// The instance id this run names itself with on the broker: the
+    /// The replica id this run names itself with on the broker: the
     /// driver the install appointed for `execution_id`.
-    pub instance: String,
+    pub replica: String,
     /// `WEFT_NODE_TEST_*` values the test reads (`LiveRig::fixture`).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub fixtures: std::collections::BTreeMap<String, String>,
@@ -358,11 +358,11 @@ async fn run_one(catalog: &'static dyn NodeCatalog, request: TestRequest, live_e
         (TestTier::Live, Some(live)) => {
             let env = live_env.ok_or_else(|| "a live test runs only in the install's test server".to_string())?;
             let service = declared.service.expect("NodeTest::live always carries its service");
-            let token = weft_broker_client::TokenSource::worker(env.identity.clone(), live.instance.clone());
+            let token = weft_broker_client::TokenSource::worker(env.identity.clone(), live.replica.clone());
             let runner = LiveTestRunner::new(
                 crate::EngineClients::from_broker(&env.broker_url, token),
                 catalog,
-                live.instance,
+                live.replica,
                 env.tenant_id.clone(),
                 env.project_id,
                 Some(live.execution_id),

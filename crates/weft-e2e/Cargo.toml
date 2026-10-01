@@ -36,11 +36,11 @@ e2e = ["dep:sqlx", "dep:dotenvy"]
 
 [dependencies]
 # Light real types reused for the wire-shape safety net. weft-core is
-# dependency-light; we deliberately do NOT depend on weft-dispatcher (heavy:
-# sqlx) even though it re-exports DispatcherEvent. The event envelope is
-# mirrored in src/event.rs with a SYNC marker instead, so the safety net stays
-# where it is cheap (the value types) without dragging the server's whole tree
-# into the test build.
+# dependency-light and owns the wire types themselves: every replay row is
+# decoded as `weft_core::live_event::LiveEvent` (src/run.rs `fetch_replay`),
+# so a shape the dispatcher and weft-core disagree on fails the test. We do
+# NOT depend on weft-dispatcher (heavy: sqlx), which would drag the server's
+# whole tree into the test build for types weft-core already has.
 weft-core = { workspace = true }
 # The structured `.weft` editor (`EditOp::SetConfig`), so a test sets a node's
 # config field the same way the editor does (parse the CST, edit structurally,

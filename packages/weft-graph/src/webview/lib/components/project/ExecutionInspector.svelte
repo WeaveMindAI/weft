@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { Search } from '@lucide/svelte';
 	import type { ExecutionTerminal, NodeExecution } from '../../types';
-	import { frameText, type BusInspectorEvent, type BusMeta, type CorruptionSite, type Frame, type LoopInspectorEvent } from '../../../../protocol';
+	import { frameText, type FileEditWire, type BusInspectorEvent, type BusMeta, type CorruptionSite, type Frame, type LoopInspectorEvent } from '../../../../protocol';
 	import { displayStatus, getStatusIcon, skipReasonText } from '../../utils/status';
 	import { formatClockTime, formatStreamBody } from '../../utils/stream-log';
 	import PayloadCards from './PayloadCards.svelte';
@@ -131,6 +131,29 @@
 			bucket.events.push(ev);
 		}
 		return Array.from(byKey.entries()).map(([key, v]) => ({ key, ...v }));
+	}
+
+	/// The versions one file edit moved between: `v4 → v5`, or `→ v5`
+	/// for an overwrite that never read the file first.
+	function fileEditVersions(edit: FileEditWire): string {
+		return edit.fromVersion === null ? `→ v${edit.toVersion}` : `v${edit.fromVersion} → v${edit.toVersion}`;
+	}
+
+	/// How one diff line reads: added, removed, a block header, the note
+	/// saying what was cut, or plain context.
+	function diffLineClass(line: string): string {
+		if (line.startsWith('+')) return 'text-green-700 bg-green-50';
+		if (line.startsWith('-')) return 'text-red-700 bg-red-50';
+		if (line.startsWith('@@')) return 'text-purple-600';
+		if (line.startsWith('... ')) return 'text-zinc-400 italic';
+		return 'text-zinc-600';
+	}
+
+	/// The file edits for the copy text, one section per edit. `null`
+	/// when the firing edited no file.
+	function formatFileEditsForCopy(edits: FileEditWire[] | undefined): string | null {
+		if (!edits || edits.length === 0) return null;
+		return edits.map((e) => `${e.filename} (${fileEditVersions(e)})\n${e.diff}`).join('\n');
 	}
 
 	/// Linearize the loop activity for the copy text, one section per
@@ -265,8 +288,8 @@
 		const origin =
 			firing.credentialOwner === 'author'
 				? ' (own key)'
-				: firing.credentialOwner === 'member'
-					? " (member's key)"
+				: firing.credentialOwner === 'instance'
+					? " (instance's key)"
 					: firing.credentialOwner === 'platform'
 						? ' (platform key)'
 						: firing.credentialOwner === 'mixed'
@@ -339,6 +362,7 @@
 {@const inputSection = [inputJson, portOriginsText, closedPortsText].filter(Boolean).join('\n') || '(none)'}
 {@const busSection = formatBusLogsForCopy(busLogs)}
 {@const loopSection = formatLoopEventsForCopy(loopEvents)}
+{@const fileEditSection = formatFileEditsForCopy(selected.fileEdits)}
 <!-- The copy text reads in the same order as the modal: values first,
      then everything about how the firing went. -->
 {@const fullCopyText = [
@@ -347,6 +371,7 @@
 	`--- Details ---`, detailsText, ``,
 	...(busSection ? [`--- Bus Communication ---`, busSection, ``] : []),
 	...(loopSection ? [`--- Loop Activity ---`, loopSection, ``] : []),
+	...(fileEditSection ? [`--- Files Edited ---`, fileEditSection, ``] : []),
 	`Status: ${selected.status} | Duration: ${formatDuration(selected.startedAt, selected.completedAt)}${costLabel(selected) ? ` | Cost: ${costLabel(selected)}` : ''} | ${new Date(selected.startedAt).toLocaleString()} | ${selected.id}`,
 ].join('\n')}
 <Dialog.Root bind:open>
@@ -508,6 +533,33 @@
 									<div class="flex items-baseline gap-1.5">
 										<span class="text-zinc-800 break-words">{loopEventLine(ev)}</span>
 									</div>
+								{/each}
+							</div>
+						</div>
+					{/each}
+				</div>
+			</div>
+		{/if}
+
+		<!-- Files edited: one entry per change this firing made to a
+		     stored file, with the versions it moved between and the
+		     readable diff the journal kept (already cut to a readable
+		     size, so it always fits a scroll box). -->
+		{#if selected.fileEdits && selected.fileEdits.length > 0}
+			<div class="border-t border-zinc-200 bg-zinc-50/50">
+				<div class="px-4 py-1.5 text-[10px] font-medium text-zinc-400 uppercase tracking-wider">
+					Files edited
+				</div>
+				<div class="flex flex-col gap-2 px-3 pb-3">
+					{#each selected.fileEdits as edit (`${edit.key}:${edit.toVersion}`)}
+						<div class="flex flex-col border border-zinc-200 rounded bg-white overflow-hidden">
+							<div class="flex items-center justify-between px-2 py-1 border-b border-zinc-200 bg-zinc-50">
+								<span class="text-[10px] font-mono text-zinc-600 truncate">{edit.filename}</span>
+								<span class="text-[9px] font-mono text-zinc-400 shrink-0">{fileEditVersions(edit)}</span>
+							</div>
+							<div class="overflow-auto font-mono text-[11px] leading-tight py-1 max-h-60">
+								{#each edit.diff.split('\n').filter((l, i, all) => l !== '' || i < all.length - 1) as line, idx (idx)}
+									<div class="px-2 whitespace-pre {diffLineClass(line)}">{line}</div>
 								{/each}
 							</div>
 						</div>

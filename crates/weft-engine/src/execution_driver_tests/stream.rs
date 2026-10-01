@@ -202,7 +202,7 @@
                     ExecEvent::ExecutionStarted {
                         execution_id, project_id: project.id, entry_node: root.into(),
                         phase: Phase::Fire, definition_hash: Some("test-hash".into()), program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
-                        subgraph: Some(selection), seed: None, member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+                        subgraph: Some(selection), seed: None, instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
                         run_class: weft_core::run_class::RunClass::Short,
                     },
                     ExecEvent::NodeKicked { execution_id, node_id: root.into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0 },

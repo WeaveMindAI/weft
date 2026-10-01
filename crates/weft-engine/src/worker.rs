@@ -15,7 +15,7 @@
 //!
 //! While it drives anything, the worker keeps one wait open on the broker
 //! for cancels of the executions it drives, so a `weft stop` reaches it at
-//! once. On shutdown (the platform stopping the instance) it cancels what
+//! once. On shutdown (the platform stopping the replica) it cancels what
 //! it drives, waits for those executions to write their endings, and
 //! settles the money.
 
@@ -117,9 +117,9 @@ pub fn identity_from_env() -> Result<Arc<dyn weft_platform_traits::IdentityToken
 pub struct WorkerConfig {
     pub project_id: uuid::Uuid,
     pub tenant_id: String,
-    /// This process's instance id: names its claims, the executions it
+    /// This process's replica id: names its claims, the executions it
     /// drives, and the journal rows it writes.
-    pub instance: String,
+    pub replica: String,
     pub door: WorkerDoor,
     /// The secret live-caller routing tickets are signed with; `None`
     /// when the install provisioned none, and then this worker takes no
@@ -193,7 +193,7 @@ impl Drop for ExecutionResidue {
                 target: "weft_engine::worker",
                 %execution_id,
                 "the live-config map is poisoned, so this execution's config was not dropped; \
-                 the connection server may still hand out a config for it until the instance exits"
+                 the connection server may still hand out a config for it until the replica exits"
             ),
         }
         self.caller_registry.detach(execution_id);
@@ -217,7 +217,7 @@ impl Drop for ExecutionResidue {
             Err(_) => tracing::error!(
                 target: "weft_engine::worker",
                 %execution_id,
-                "no runtime to drop this execution's cancel flag on (the instance is tearing down); \
+                "no runtime to drop this execution's cancel flag on (the replica is tearing down); \
                  the entry goes with the process"
             ),
         }
@@ -233,7 +233,7 @@ struct Worker {
     project_id: uuid::Uuid,
     catalog: Arc<dyn NodeCatalog>,
     clients: EngineClients,
-    instance: String,
+    replica: String,
     tenant_id: String,
     cancel_registry: CancelRegistry,
     /// Poked whenever the set of executions this worker drives changes, so
@@ -292,7 +292,7 @@ impl Worker {
         let Some(task) = self
             .clients
             .tasks
-            .claim_one(&self.instance, filter, std::time::Duration::ZERO)
+            .claim_one(&self.replica, filter, std::time::Duration::ZERO)
             .await
             .context("claim the execution's task")?
         else {
@@ -303,8 +303,8 @@ impl Worker {
         let drive = tokio::spawn(async move {
             let _token = token;
             let store = worker.clients.tasks.clone();
-            let instance = worker.instance.clone();
-            let end = weft_task_store::run_claimed_worker_task(store, &instance, &task, worker.drive(&task)).await;
+            let replica = worker.replica.clone();
+            let end = weft_task_store::run_claimed_worker_task(store, &replica, &task, worker.drive(&task)).await;
             RunAnswer::from(end)
         });
         drive.await.context("the drive panicked outside its guard")
@@ -374,7 +374,7 @@ impl Worker {
                     record.push(weft_journal::ExecEvent::ExecutionFailed { execution_id, error: error.clone(), at_unix: crate::now_unix() });
                     ctx.clients
                         .journal
-                        .record_retroactively(&record, Some(ctx.instance.as_str()))
+                        .record_retroactively(&record, Some(ctx.replica.as_str()))
                         .await
                         .map_err(|e| e.context(format!("record refused unrecorded run {execution_id}")))?;
                     anyhow::bail!(error);
@@ -430,7 +430,7 @@ impl Worker {
             ctx.catalog.clone(),
             execution_id,
             clients,
-            ctx.instance.clone(),
+            ctx.replica.clone(),
             ctx.tenant_id.clone(),
             flag,
             caller,
@@ -463,7 +463,8 @@ impl Worker {
                 Ok(ExecutionOutcome::AlreadySettled) => {
                     conn.surface_error("execution already ended before this worker claimed it").await
                 }
-                Ok(ExecutionOutcome::Completed) | Ok(ExecutionOutcome::Stalled) => conn.run_ended().await,
+                Ok(ExecutionOutcome::Completed) => conn.run_ended().await,
+                Ok(ExecutionOutcome::Stalled) => conn.run_parked().await,
             }
             conn.hang_up().await;
         }
@@ -479,7 +480,7 @@ impl Worker {
         // An unrecorded run is over, and so is everything it will write:
         // a failure is recorded whole, anything else is forgotten.
         if let Some(journal) = &unrecorded {
-            let settled = journal.settle(Some(ctx.instance.as_str())).await;
+            let settled = journal.settle(Some(ctx.replica.as_str())).await;
             match (&outcome, settled) {
                 (_, Ok(_)) => {}
                 // The run's own error says more than the settle's.
@@ -580,7 +581,7 @@ async fn attach_live_caller(
         }
         let journal: Arc<dyn crate::caller_conn::CallerJournalSink> = BrokerCallerJournal::start(
             journal,
-            ctx.instance.clone(),
+            ctx.replica.clone(),
             cfg.journal_policy(),
         );
         // The stand-in serves the REQUEST and records the answer, and
@@ -800,7 +801,7 @@ impl BrokerCallerJournal {
     /// behind.
     fn start(
         journal: Arc<dyn weft_journal::JournalClient>,
-        instance: String,
+        replica: String,
         policy: weft_core::stream_journal::JournalPolicy,
     ) -> Arc<Self> {
         let (rows, mut incoming) = tokio::sync::mpsc::unbounded_channel();
@@ -818,7 +819,7 @@ impl BrokerCallerJournal {
                         continue;
                     }
                 };
-                if let Err(e) = journal.record_event(&event, Some(&instance)).await {
+                if let Err(e) = journal.record_event(&event, Some(&replica)).await {
                     tracing::error!(
                         target: "weft_engine::caller_conn",
                         error = %e,
@@ -1043,7 +1044,7 @@ impl crate::caller_conn::CallerJournalSink for BrokerCallerJournal {
 /// or long after, the execute task) returns `None` and the server 404s.
 struct LiveConfigResolver {
     live_configs: LiveConfigMap,
-    instance: String,
+    replica: String,
 }
 
 impl crate::caller_conn::ConnConfigResolver for LiveConfigResolver {
@@ -1056,7 +1057,7 @@ impl crate::caller_conn::ConnConfigResolver for LiveConfigResolver {
             .cloned()?;
         let sink: Arc<dyn crate::caller_conn::CallerJournalSink> = BrokerCallerJournal::start(
             start.journal.clone(),
-            self.instance.clone(),
+            self.replica.clone(),
             start.runtime.journal,
         );
         Some(crate::caller_conn::ResolvedLiveStart {
@@ -1155,7 +1156,7 @@ fn new_worker(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config: &Wo
         project_id: config.project_id,
         catalog,
         clients,
-        instance: config.instance.clone(),
+        replica: config.replica.clone(),
         tenant_id: config.tenant_id.clone(),
         cancel_registry: Arc::new(Mutex::new(HashMap::new())),
         driving_changed: Arc::new(tokio::sync::Notify::new()),
@@ -1204,13 +1205,13 @@ pub async fn serve(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config
             registry: worker.caller_registry.clone(),
             token_secret: Arc::new(secret.clone()),
             project_id: worker.project_id,
-            resolver: Arc::new(LiveConfigResolver { live_configs: worker.live_configs.clone(), instance: worker.instance.clone() }),
+            resolver: Arc::new(LiveConfigResolver { live_configs: worker.live_configs.clone(), replica: worker.replica.clone() }),
             clock: worker.clients.clock.clone(),
             canceller: Arc::new(RegistryCanceller { cancel_registry: worker.cancel_registry.clone() }),
             starter: Arc::new(LiveStarter { worker: worker.clone() }),
             tasks: worker.clients.tasks.clone(),
             tenant_id: worker.tenant_id.clone(),
-            instance: worker.instance.clone(),
+            replica: worker.replica.clone(),
         })),
         None => {
             tracing::info!(
@@ -1400,7 +1401,7 @@ mod tests {
             &WorkerConfig {
                 project_id: uuid::Uuid::from_u128(1),
                 tenant_id: "t".into(),
-                instance: "worker-1".into(),
+                replica: "worker-1".into(),
                 door: WorkerDoor::Platform,
                 caller_token_secret: None,
                 port: 0,

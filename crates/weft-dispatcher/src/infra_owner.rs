@@ -1,7 +1,7 @@
 //! The exclusive ownership of a project's infrastructure.
 //!
-//! `infra_owner(project_id PK, supervisor_instance, tenant_id,
-//! leased_until_unix)`: exactly one supervisor instance applies a project's
+//! `infra_owner(project_id PK, supervisor_replica, tenant_id,
+//! leased_until_unix)`: exactly one supervisor replica applies a project's
 //! infra at a time, so two never change the same project's infrastructure
 //! at once (which would corrupt it). A supervisor claims and renews these
 //! leases on its ownership tick (the broker's `sync_ownership`); a dead
@@ -19,12 +19,12 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // path needs.
         r#"CREATE TABLE IF NOT EXISTS infra_owner (
             project_id          UUID PRIMARY KEY,
-            supervisor_instance TEXT NOT NULL,
+            supervisor_replica TEXT NOT NULL,
             tenant_id           TEXT NOT NULL,
             leased_until_unix   BIGINT NOT NULL
         )"#,
-        r#"CREATE INDEX IF NOT EXISTS idx_infra_owner_instance
-             ON infra_owner(supervisor_instance)"#,
+        r#"CREATE INDEX IF NOT EXISTS idx_infra_owner_replica
+             ON infra_owner(supervisor_replica)"#,
     ],
     seed: &[],
 };

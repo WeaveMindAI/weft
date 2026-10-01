@@ -30,7 +30,7 @@ async fn status(port: u16, method: &str, path: &str) -> Result<u16> {
 #[tokio::test]
 async fn the_outside_port_answers_only_the_outside_doors() -> Result<()> {
     let disp = ensure::up().await?;
-    let config_path = ensure::install_dir(&weft_core::infra::Instance::default_install()).join("config.json");
+    let config_path = ensure::install_dir(&weft_core::infra::Install::default_install()).join("config.json");
     let config: weft_platform_traits::InstallConfig = serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
     let port = config.listen.outside.context("every local install serves its outside port")?.port();
 

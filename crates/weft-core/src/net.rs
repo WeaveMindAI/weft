@@ -191,6 +191,23 @@ pub fn request_base_url(headers: &http::HeaderMap) -> Option<String> {
     Some(format!("{}{prefix}", parsed.origin().ascii_serialization()))
 }
 
+/// [`request_base_url`] over a request's headers carried as name/value
+/// pairs (how a request that already crossed a process boundary holds
+/// them, `crate::caller::LiveRequest::headers`). A pair that is not a
+/// valid header is skipped, as the HTTP stack would have refused it.
+pub fn request_base_url_of(headers: &[(String, String)]) -> Option<String> {
+    let map: http::HeaderMap = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            Some((
+                http::HeaderName::from_bytes(name.as_bytes()).ok()?,
+                http::HeaderValue::from_str(value).ok()?,
+            ))
+        })
+        .collect();
+    request_base_url(&map)
+}
+
 /// The first value of a header a chain of proxies may list comma-separated.
 fn first_hop(value: &http::HeaderValue) -> Option<&str> {
     let text = value.to_str().ok()?;
@@ -242,6 +259,35 @@ mod request_base_url_tests {
             );
         }
         h
+    }
+
+    /// A request carried as pairs (a live caller's, on its way to the
+    /// run) yields the same base the live request would: the door's
+    /// forwarded host and scheme, not the worker's own address.
+    #[test]
+    fn a_carried_request_yields_the_door_it_came_through() {
+        let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
+            list.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        };
+        assert_eq!(
+            super::request_base_url_of(&pairs(&[
+                ("host", "10.10.0.2:14113"),
+                ("x-forwarded-host", "127.0.0.1:14111"),
+                ("x-forwarded-proto", "http"),
+            ]))
+            .as_deref(),
+            Some("http://127.0.0.1:14111")
+        );
+        assert_eq!(
+            super::request_base_url_of(&pairs(&[
+                ("host", "10.10.0.2:14113"),
+                ("x-forwarded-host", "weft.example.com"),
+                ("x-forwarded-proto", "https"),
+            ]))
+            .as_deref(),
+            Some("https://weft.example.com")
+        );
+        assert_eq!(super::request_base_url_of(&pairs(&[("bad header", "x")])), None);
     }
 
     /// The caller's own host is the base, and a fronting proxy's

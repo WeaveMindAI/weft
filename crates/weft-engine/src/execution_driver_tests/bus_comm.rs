@@ -162,7 +162,7 @@
                     program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
                     subgraph: None,
                     seed: None,
-                    member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+                    instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
                     run_class: weft_core::run_class::RunClass::Short,
                 },
                 None,
@@ -305,7 +305,7 @@
         journal.record_event(&ExecEvent::ExecutionStarted {
             execution_id, project_id: project.id, entry_node: "waiter".into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
-            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
             run_class: weft_core::run_class::RunClass::Short,
         }, None).await.unwrap();
         journal.record_event(&ExecEvent::NodeKicked {
@@ -558,7 +558,7 @@
         journal.record_event(&ExecEvent::ExecutionStarted {
             execution_id, project_id: project.id, entry_node: creator.into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
-            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
             run_class: weft_core::run_class::RunClass::Short,
         }, None).await.unwrap();
         journal.record_event(&ExecEvent::NodeKicked {
@@ -577,15 +577,11 @@
         .expect("run_one_execution ok")
     }
 
-    /// A node body that PANICS must NOT re-run forever. The panicked
-    /// task never sends a NodeTaskResult, so before the task-id fix its
-    /// exec record stayed Running, the crashed-Running refold path
-    /// re-dispatched it on every respawn, and the node panicked in a
-    /// tight loop until the refetch wall-clock deadline (the execution
-    /// effectively hung). Now the loop maps the JoinError's task id back
-    /// to (node, frames) and journals a terminal NodeFailed, so the
-    /// execution unwinds promptly. The 10s timeout in `run_test` is the
-    /// hang tripwire.
+    /// A node body that PANICS fails its firing. The panicked task
+    /// never sends a NodeTaskResult; the loop maps the JoinError's task
+    /// id back to (node, frames) and journals a terminal NodeFailed, so
+    /// the execution unwinds promptly instead of leaving the record
+    /// Running. The 10s timeout in `run_test` is the hang tripwire.
     #[tokio::test]
     async fn panicking_node_body_fails_instead_of_re_running_forever() {
         let project = bus_topology("a", &[], "ch");
@@ -1047,7 +1043,7 @@
             journal.record_event(&ExecEvent::ExecutionStarted {
                 execution_id, project_id: pid, entry_node: "payer".into(),
                 phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
-            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
             run_class: weft_core::run_class::RunClass::Short,
             }, None).await.unwrap();
             journal.record_event(&ExecEvent::NodeKicked {
@@ -1306,7 +1302,7 @@
                     program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
                     subgraph: None,
                     seed: None,
-                    member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+                    instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
                     run_class: weft_core::run_class::RunClass::Short,
                 },
                 None,
@@ -2076,7 +2072,7 @@
                     program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
                     subgraph: None,
                     seed: None,
-                    member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+                    instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
                     run_class: weft_core::run_class::RunClass::Short,
                 },
                 None,
@@ -2406,7 +2402,7 @@
         journal.record_event(&ExecEvent::ExecutionStarted {
             execution_id, project_id: project.id, entry_node: "ra".into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("h".into()),
-            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
             run_class: weft_core::run_class::RunClass::Short,
         }, None).await.unwrap();
         for n in ["ra", "rb"] {

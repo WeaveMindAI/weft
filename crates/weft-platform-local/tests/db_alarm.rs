@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use sqlx::PgPool;
-use weft_platform_local::{Deliver, LocalAlarm};
+use weft_platform_local::{Deliver, LocalAlarm, NotTaken};
 use weft_platform_traits::{Alarm, CoreRole, Wake, WakeCall};
 
 #[derive(Default)]
@@ -18,9 +18,9 @@ struct Recorder {
 
 #[async_trait]
 impl Deliver for Recorder {
-    async fn deliver(&self, role: CoreRole, path: &str, call: WakeCall<serde_json::Value>) -> anyhow::Result<()> {
+    async fn deliver(&self, role: CoreRole, path: &str, call: WakeCall<serde_json::Value>) -> Result<(), NotTaken> {
         if *self.refuse.lock() {
-            anyhow::bail!("not now");
+            return Err(NotTaken::temporary("not now"));
         }
         self.got.lock().push((role, path.to_string(), call));
         Ok(())

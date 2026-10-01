@@ -49,9 +49,9 @@ pub struct DisplayKey {
     pub project: uuid::Uuid,
     pub source: DisplaySource,
     pub node: String,
-    /// Whose copy of a per-member infra node: absent for the shared one.
+    /// Whose copy of a per-instance infra node: absent for the shared one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub member: Option<weft_core::member::MemberId>,
+    pub instance: Option<weft_core::instance::InstanceId>,
 }
 
 /// What a node is showing, as the editor draws it.
@@ -228,8 +228,8 @@ pub struct StateReader(pub crate::state::DispatcherState);
 impl DisplayReader for StateReader {
     async fn read(&self, key: &DisplayKey) -> NodeFeed {
         let read = match key.source {
-            DisplaySource::Infra => crate::api::infra::read_live(&self.0, key.project, &key.node, key.member.as_ref()).await,
-            DisplaySource::Signal => crate::api::signal::read_signal_live(&self.0, key.project, &key.node, key.member.as_ref()).await,
+            DisplaySource::Infra => crate::api::infra::read_live(&self.0, key.project, &key.node, key.instance.as_ref()).await,
+            DisplaySource::Signal => crate::api::signal::read_signal_live(&self.0, key.project, &key.node, key.instance.as_ref()).await,
         };
         match read {
             Ok(feed) => NodeFeed::Ok { items: feed.items },
@@ -285,7 +285,7 @@ mod tests {
     }
 
     fn key(node: &str) -> DisplayKey {
-        DisplayKey { project: uuid::Uuid::nil(), source: DisplaySource::Infra, node: node.into(), member: None }
+        DisplayKey { project: uuid::Uuid::nil(), source: DisplaySource::Infra, node: node.into(), instance: None }
     }
 
     #[tokio::test(start_paused = true)]

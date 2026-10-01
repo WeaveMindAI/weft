@@ -75,25 +75,25 @@ export interface BasePortMenuOptions {
 	 *  to the legal alternatives. The handlers translate the chosen role to
 	 *  the right cascade of setConfig / updateGroupPorts ops. */
 	loopRole?: LoopPortRoleContext;
-	/** Set ONLY on an input whose value a member could fill: not wired,
+	/** Set ONLY on an input whose value each instance could fill: not wired,
 	 *  not a `_` key, not on an include. The menu then offers the same
-	 *  `@member_filled` toggle a right-click on the field offers. */
-	memberFilled?: MemberFilledToggle;
+	 *  `@instance_filled` toggle a right-click on the field offers. */
+	instanceFilled?: InstanceFilledToggle;
 }
 
-/** Whether a field is `@member_filled` now, and the writer that flips
+/** Whether a field is `@instance_filled` now, and the writer that flips
  *  it. The menu is a snapshot, so the row names the state it will
  *  leave, never a live read. */
-export interface MemberFilledToggle {
+export interface InstanceFilledToggle {
 	filled: boolean;
 	onToggle: () => void;
 }
 
-/** The one row that hands a field to each member, or takes it back.
- *  Shared by the port menu and the field's own right-click menu. */
-export function memberFilledMenuItem(toggle: MemberFilledToggle): PortMenuItem {
+/** The one row that gives a field its own value in each instance, or
+ *  takes it back. Shared by the port menu and the field's own right-click menu. */
+export function instanceFilledMenuItem(toggle: InstanceFilledToggle): PortMenuItem {
 	return {
-		label: toggle.filled ? '👤 Stop letting each member fill this' : '👤 Let each member fill this',
+		label: toggle.filled ? '⧉ Stop letting each instance fill this' : '⧉ Let each instance fill this',
 		onClick: toggle.onToggle,
 	};
 }
@@ -206,7 +206,7 @@ export function buildPortMenuItems(opts: BuildPortMenuOptions): PortMenuItem[] {
 		return items;
 	}
 
-	if (opts.memberFilled) items.push(memberFilledMenuItem(opts.memberFilled));
+	if (opts.instanceFilled) items.push(instanceFilledMenuItem(opts.instanceFilled));
 
 	// Required toggle (inputs only; outputs do not have runtime required
 	// semantics, and only an input caller hands over the writer).

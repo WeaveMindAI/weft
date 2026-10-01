@@ -117,8 +117,8 @@ struct ParsedNode {
     in_ports: Vec<ParsedPort>,
     out_ports: Vec<ParsedPort>,
     one_of_required: Vec<Vec<String>>,
-    /// The body says `@per_member`: this node exists once per member.
-    per_member: bool,
+    /// The body says `@per_instance`: this node exists once per instance.
+    per_instance: bool,
     /// Full source range of the declaration (header + config block).
     /// None for synthetic nodes (inline-expression children created
     /// during parsing have a span covering the inline fragment).
@@ -158,8 +158,8 @@ struct LoweredBody {
     optional_ports: std::collections::BTreeSet<String>,
     /// `@require_one_of(...)` groups written inside the body.
     one_of_required: Vec<Vec<String>>,
-    /// `@per_member` written inside the body.
-    per_member: bool,
+    /// `@per_instance` written inside the body.
+    per_instance: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -795,7 +795,7 @@ fn resolve_one_include(
                 out_ports: group.out_ports.iter().cloned()
                     .map(|mut p| { p.type_text = None; p }).collect(),
                 one_of_required: Vec::new(),
-                per_member: false,
+                per_instance: false,
                 span: Some(inc.span),
                 header_span: Some(inc.span),
                 config_spans: Default::default(),
@@ -958,10 +958,10 @@ fn collect_included_contents(
     seen: &mut Vec<std::path::PathBuf>,
     contents: &mut weft_core::project::IncludedContents,
 ) {
-    // A `@per_member` node is not counted: its copies are each member's
+    // A `@per_instance` node is not counted: its copies are each instance's
     // to run, so it gives the project nothing to activate or start.
     // SYNC: shared roles <-> crates/weft-dispatcher/src/api/project.rs gather_action_snapshot (source_infra, shared_triggers)
-    for node in group.nodes.iter().filter(|node| !node.per_member) {
+    for node in group.nodes.iter().filter(|node| !node.per_instance) {
         contents.node_types.push(node.node_type.clone());
     }
     for child in &group.child_groups {
@@ -1853,7 +1853,7 @@ fn lower_node(
         in_ports,
         out_ports,
         one_of_required,
-        per_member: body_out.per_member,
+        per_instance: body_out.per_instance,
         span: Some(li.span_of(n.syntax())),
         header_span: Some(li.span_of(header.syntax())),
         config_spans: body_out.config_spans,
@@ -1903,11 +1903,11 @@ fn lower_config_body(
                 // @require_one_of inside a config block: collected for the
                 // caller to merge onto the node.
                 Some(BodyDirective::RequireOneOf(g)) => out.one_of_required.push(g),
-                Some(BodyDirective::PerMember) if out.per_member => errors.push(CompileError::at(
+                Some(BodyDirective::PerInstance) if out.per_instance => errors.push(CompileError::at(
                     li.span_of(&child),
-                    format!("'{host_local}' says `@per_member` twice; once is enough"),
+                    format!("'{host_local}' says `@per_instance` twice; once is enough"),
                 )),
-                Some(BodyDirective::PerMember) => out.per_member = true,
+                Some(BodyDirective::PerInstance) => out.per_instance = true,
                 None => {}
             },
             K::TYPE_DECL => {
@@ -2102,7 +2102,7 @@ fn lower_inline_expr(
         in_ports,
         out_ports,
         one_of_required,
-        per_member: body_out.per_member,
+        per_instance: body_out.per_instance,
         span: Some(li.span_of(inline_node)),
         header_span: None,
         config_spans: body_out.config_spans,
@@ -2148,8 +2148,8 @@ fn merge_inline_nodes(dest: &mut Vec<ParsedNode>, incoming: Vec<ParsedNode>, err
 enum BodyDirective {
     /// `@require_one_of(a, b)`: at least one of these ports must get a value.
     RequireOneOf(Vec<String>),
-    /// `@per_member`: this node exists once per member of the program.
-    PerMember,
+    /// `@per_instance`: this node exists once per instance of the program.
+    PerInstance,
 }
 
 /// Lower a DIRECTIVE body item. The single home for directive handling,
@@ -2180,9 +2180,9 @@ fn lower_directive(
             }
         };
     }
-    if directive == weft_core::member::PER_MEMBER_DIRECTIVE {
-        // The whole line is the marker: `@per_member (x)` would lex as the
-        // bare marker plus stray tokens, which is as wrong as `@per_member(x)`.
+    if directive == weft_core::instance::PER_INSTANCE_DIRECTIVE {
+        // The whole line is the marker: `@per_instance (x)` would lex as the
+        // bare marker plus stray tokens, which is as wrong as `@per_instance(x)`.
         let line_is_marker = child
             .children_with_tokens()
             .filter_map(|e| e.into_token())
@@ -2192,17 +2192,17 @@ fn lower_directive(
         if !line_is_marker || crate::cst::marker::has_abutting_args(tok.text()) {
             errors.push(CompileError::at(
                 li.span_of(child),
-                "`@per_member` takes no arguments; write it alone on its line".to_string(),
+                "`@per_instance` takes no arguments; write it alone on its line".to_string(),
             ));
             return None;
         }
-        return Some(BodyDirective::PerMember);
+        return Some(BodyDirective::PerInstance);
     }
     errors.push(CompileError::at(
         li.span_of(child),
         format!(
             "unknown directive '@{directive}'; inside braces a line may be \
-             `@require_one_of(a, b)` or `@per_member`"
+             `@require_one_of(a, b)` or `@per_instance`"
         ),
     ));
     None
@@ -2793,12 +2793,12 @@ fn lower_grouplike_body_in_scope(
                 Some(BodyDirective::RequireOneOf(grp)) => {
                     refuse_scope_one_of(group.kind.noun(), &id, &[grp], li.span_of(&child), errors);
                 }
-                Some(BodyDirective::PerMember) => errors.push(CompileError::at(
+                Some(BodyDirective::PerInstance) => errors.push(CompileError::at(
                     li.span_of(&child),
                     format!(
-                        "{} '{id}': `@per_member` goes inside the braces of the node that exists \
-                         once per member (an infra node), not on a {}. For a connection each member \
-                         picks, write `@member_filled` on the input of the node that uses it",
+                        "{} '{id}': `@per_instance` goes inside the braces of the node that exists \
+                         once per instance (an infra node), not on a {}. For a connection each instance \
+                         picks, write `@instance_filled` on the input of the node that uses it",
                         group.kind.noun(),
                         group.kind.noun(),
                     ),
@@ -3288,27 +3288,27 @@ fn node_config_key_ok(key: &str, span: Span, errors: &mut Vec<CompileError>) -> 
 /// in the messages only; whether the key itself is allowed is the
 /// target's question (`node_config_key_ok` for a node, the signature
 /// for a container), asked where the target is known.
-/// `@member_filled` (each member provides the value) or
-/// `@member_filled(<value>)` (and a member who gave none gets `<value>`),
-/// lowered to [`weft_core::member::member_filled_literal`]. The fallback is
+/// `@instance_filled` (each instance provides the value) or
+/// `@instance_filled(<value>)` (and an instance that gave none gets `<value>`),
+/// lowered to [`weft_core::instance::instance_filled_literal`]. The fallback is
 /// any literal a field takes, read by the same reader, `@file`/`@asset`
 /// included (resolved like a written one, inside the marker); any other
 /// marker inside it is refused.
-fn member_filled_value(key: &str, raw: &str, span: Span, errors: &mut Vec<CompileError>) -> Option<serde_json::Value> {
+fn instance_filled_value(key: &str, raw: &str, span: Span, errors: &mut Vec<CompileError>) -> Option<serde_json::Value> {
     use crate::cst::marker::{args, MarkerArgs};
     if key.starts_with('_') {
         errors.push(CompileError::at(span, format!(
             "'{key}' is one of the program's own keys (the ones starting with `_`), so it holds one value \
-             for everyone and cannot be `@member_filled`"
+             for every instance and cannot be `@instance_filled`"
         )));
         return None;
     }
     let fallback = match args(raw) {
-        MarkerArgs::NoList if raw.trim() == format!("@{}", weft_core::member::MEMBER_FILLED_MARKER) => None,
+        MarkerArgs::NoList if raw.trim() == format!("@{}", weft_core::instance::INSTANCE_FILLED_MARKER) => None,
         MarkerArgs::Args(body) if body.trim().is_empty() => {
             errors.push(CompileError::at(span, format!(
-                "'{key}': `@member_filled()` names no value; write `@member_filled` alone, or put the value a \
-                 member who gives none gets inside the parentheses"
+                "'{key}': `@instance_filled()` names no value; write `@instance_filled` alone, or put the value an \
+                 instance that gives none gets inside the parentheses"
             )));
             return None;
         }
@@ -3316,7 +3316,7 @@ fn member_filled_value(key: &str, raw: &str, span: Span, errors: &mut Vec<Compil
             let body = body.trim();
             if body.starts_with('@') && !matches!(crate::cst::marker::directive(body), "file" | "asset") {
                 errors.push(CompileError::at(span, format!(
-                    "'{key}': the value inside `@member_filled(...)` is a value or a file (`@file(...)`, \
+                    "'{key}': the value inside `@instance_filled(...)` is a value or a file (`@file(...)`, \
                      `@asset(...)`), so it cannot be another marker (`{body}`)"
                 )));
                 return None;
@@ -3325,13 +3325,13 @@ fn member_filled_value(key: &str, raw: &str, span: Span, errors: &mut Vec<Compil
         }
         _ => {
             errors.push(CompileError::at(span, format!(
-                "'{key}' has a malformed `@member_filled` (`{raw}`): write `@member_filled`, or \
-                 `@member_filled(<value>)` with the parenthesis right after the name"
+                "'{key}' has a malformed `@instance_filled` (`{raw}`): write `@instance_filled`, or \
+                 `@instance_filled(<value>)` with the parenthesis right after the name"
             )));
             return None;
         }
     };
-    Some(weft_core::member::member_filled_literal(fallback))
+    Some(weft_core::instance::instance_filled_literal(fallback))
 }
 
 fn parse_config_literal(
@@ -3382,13 +3382,13 @@ fn parse_config_literal(
         // `[a, b]`-style typos); it fails loud, quoting what was written
         // rather than the rewritten text.
         match serde_json::from_str::<serde_json::Value>(&quote_markers(raw)) {
-            // The key a `@member_filled` lowers to is the language's: a
+            // The key an `@instance_filled` lowers to is the language's: a
             // written object carrying it would read as the marker.
-            Ok(v) if v.get(weft_core::member::MEMBER_FILLED_KEY).is_some() => {
+            Ok(v) if v.get(weft_core::instance::INSTANCE_FILLED_KEY).is_some() => {
                 errors.push(CompileError::at(span, format!(
-                    "'{key}': `{}` is a key the language uses for `@member_filled`; write `@member_filled` \
+                    "'{key}': `{}` is a key the language uses for `@instance_filled`; write `@instance_filled` \
                      instead, or name the key something else",
-                    weft_core::member::MEMBER_FILLED_KEY
+                    weft_core::instance::INSTANCE_FILLED_KEY
                 )));
                 return None;
             }
@@ -3415,17 +3415,17 @@ fn parse_config_literal(
         }
     } else if raw.starts_with('@') {
         // `@file(...)` / `@asset(...)` (resolved downstream by file_ref) and
-        // `@member_filled` are the ONLY markers valid as a config value.
+        // `@instance_filled` are the ONLY markers valid as a config value.
         // Any other `@...` (a typo, `@include`, `@require_one_of`, a bare
         // `@`) is not a value and fails loud rather than becoming a
         // literal string.
         match crate::cst::marker::directive(raw) {
             "file" | "asset" => serde_json::Value::String(raw.to_string()),
-            weft_core::member::MEMBER_FILLED_MARKER => return member_filled_value(key, raw, span, errors),
+            weft_core::instance::INSTANCE_FILLED_MARKER => return instance_filled_value(key, raw, span, errors),
             _ => {
                 errors.push(CompileError::at(span, format!(
                     "'{key}' has an invalid marker value `{raw}`: the only markers valid as a config value are \
-                     `@file(\"path\")`, `@asset(\"path\", Type)` and `@member_filled`."
+                     `@file(\"path\")`, `@asset(\"path\", Type)` and `@instance_filled`."
                 )));
                 return None;
             }
@@ -3869,12 +3869,12 @@ fn flatten_group(
         features: in_features,
         scope: boundary_scope.clone(),
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::In }),
-        requires_infra: false, per_member: None,
+        requires_infra: false, per_instance: None,
         images: Vec::new(),
         fires_with: Default::default(),
         published_service: None,
-        member_service: None,
-        member_rules: None,
+        instance_service: None,
+        instance_rules: None,
         span: None,
         // The group's header is where a diagnostic about either
         // boundary points: the boundaries are the header's two
@@ -3961,12 +3961,12 @@ fn flatten_group(
         features: NodeFeatures::default(),
         scope: boundary_scope.clone(),
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::Out }),
-        requires_infra: false, per_member: None,
+        requires_infra: false, per_instance: None,
         images: Vec::new(),
         fires_with: Default::default(),
         published_service: None,
-        member_service: None,
-        member_rules: None,
+        instance_service: None,
+        instance_rules: None,
         span: None,
         header_span: group.header_span,
         config_spans: Default::default(),
@@ -4082,12 +4082,12 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         requires_infra: false,
         // The mark only; enrich checks the node may carry it and the
         // propagation adds every node that reads from one.
-        per_member: pn.per_member.then_some(weft_core::member::PerMember::Marked),
+        per_instance: pn.per_instance.then_some(weft_core::instance::PerInstance::Marked),
         images: Vec::new(),
         fires_with: Default::default(),
         published_service: None,
-        member_service: None,
-        member_rules: None,
+        instance_service: None,
+        instance_rules: None,
         span: pn.span,
         header_span: pn.header_span,
         config_spans: pn.config_spans.clone(),

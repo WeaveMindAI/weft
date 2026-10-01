@@ -16,8 +16,8 @@
 //! a database nothing can sign in to.
 //!
 //! Nothing here is memoized with `ctx.run`, and it does not need to
-//! be: a body is re-run from the top if its worker dies mid-node, and
-//! every call this makes is safe to repeat. Reading the password is a
+//! be: the body never waits, so it is never replayed, and every call
+//! it makes is safe to repeat when somebody runs the step again. Reading the password is a
 //! read; publishing REPLACES one row keyed by this node; retiring is
 //! the same request with the same password, which the credential
 //! server answers the same way however many times it arrives.

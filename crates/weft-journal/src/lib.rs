@@ -17,7 +17,7 @@ pub mod traits;
 pub mod unrecorded;
 pub mod write;
 
-pub use events::{ExecEvent, Seed};
+pub use events::{ExecEvent, Seed, EXECUTION_TERMINAL_KINDS_SQL, RUN_PARKED_SQL};
 
 /// The channel every journal row notifies on when it commits, with its
 /// execution as the payload, from the `exec_event_notify_on_insert` trigger
@@ -41,5 +41,5 @@ pub fn decode_event(execution_id: weft_core::ExecutionId, payload: &str) -> Resu
 pub use traits::{JournalClient, JournalRow, NoopJournal, PostgresJournalClient, RawJournalRow};
 pub use unrecorded::UnrecordedJournal;
 pub use write::{
-    lock_execution_ids, record_event, record_event_dedup, record_event_from_instance, record_event_in, RecordError,
+    lock_execution_ids, record_event, record_event_dedup, record_event_from_replica, record_event_in, RecordError,
 };

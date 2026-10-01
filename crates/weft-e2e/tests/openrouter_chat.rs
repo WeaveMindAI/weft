@@ -1,16 +1,18 @@
-//! A real three-turn conversation through the typed `ChatHistory`
-//! value, with a stored image attached mid-conversation.
+//! A real three-turn conversation kept in one file, with a stored image
+//! attached mid-conversation.
 //!
 //! What it proves that the single-call openrouter test cannot:
-//! - the history one call emits FEEDS the next call: the model recalls
-//!   turn one's fact at turn three, so the full conversation really
-//!   reached the provider each time;
+//! - the file one call adds its turn to FEEDS the next call: the model
+//!   recalls turn one's fact at turn three, so the full conversation
+//!   really reached the provider each time;
 //! - a stored image attached via the `media` input reaches the model
 //!   (it names the square's color), i.e. externalize presigned the
 //!   stored bytes into a URL the provider could fetch;
-//! - the EMITTED history stays in stored form: the image slot holds the
-//!   stored-file value (never a presigned URL, never base64), so a
-//!   growing conversation journals references only;
+//! - the conversation file stays in stored form: the image slot holds
+//!   the stored-file value (never a presigned URL, never base64), so a
+//!   growing conversation holds references only;
+//! - each turn wrote the one file in place: turn one makes it at version
+//!   1, turns two and three edit it to 2 and 3, the same key throughout;
 //! - every one of the three calls landed its own resolved cost record.
 //!
 //! Spends real money (three calls on the cheapest vision-capable
@@ -21,7 +23,7 @@ use weft_e2e::access::{catalog_spec, connect_direct, set_account};
 use weft_e2e::{ensure, project::Project, run};
 
 #[tokio::test]
-async fn a_conversation_carries_history_and_media_through_typed_values() -> anyhow::Result<()> {
+async fn a_conversation_file_carries_turns_and_media() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let conn = connect_direct(
         &disp,
@@ -75,14 +77,27 @@ async fn a_conversation_carries_history_and_media_through_typed_values() -> anyh
         "the model did not recall the first turn's fact: {recalled:?}"
     );
 
-    // The emitted history is the whole conversation in STORED form:
-    // the seeded system message, then alternating turns, with the
+    // The conversation file holds the whole conversation in STORED
+    // form: the seeded system message, then alternating turns, with the
     // image slot holding the stored-file value, never a presigned URL
-    // and never inline base64.
-    let history = settled
+    // and never inline base64. It is the one file every turn edited.
+    let file = settled
         .input_of("hist")
         .and_then(|input| input.get("data").cloned())
-        .ok_or_else(|| anyhow::anyhow!("the history Debug never received a value"))?;
+        .ok_or_else(|| anyhow::anyhow!("the conversation Debug never received a value"))?;
+    let file = weft_core::storage::StoredFile::from_value(&file)?;
+    // Each turn wrote the same file, one version at a time.
+    for (turn, debug) in [(1, "hist1"), (2, "hist2"), (3, "hist")] {
+        let at = settled
+            .input_of(debug)
+            .and_then(|input| input.get("data").cloned())
+            .ok_or_else(|| anyhow::anyhow!("the turn {turn} conversation Debug never received a value"))?;
+        let at = weft_core::storage::StoredFile::from_value(&at)?;
+        anyhow::ensure!(at.key == file.key, "turn {turn} wrote a different file: {at:?} vs {file:?}");
+        anyhow::ensure!(at.version == turn, "turn {turn} left the file at the wrong version: {at:?}");
+    }
+    let history: serde_json::Value =
+        serde_json::from_slice(&weft_e2e::storage::download(&disp, &file.key).await?)?;
     let messages = history
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("history is not a list: {history}"))?;

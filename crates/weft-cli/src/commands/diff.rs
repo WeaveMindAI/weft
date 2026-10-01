@@ -25,8 +25,8 @@ pub async fn wires_of(ctx: &Ctx, client: &crate::client::DispatcherClient, refer
     } else {
         let tree = fetch_tree(client, &project_id).await?;
         let run = resolve_run(&tree, reference)?;
-        resolved_execution_id = run.execution_id.clone();
-        super::versions::output_wires(client, &project_id, &run.execution_id).await?
+        resolved_execution_id = run.execution_id.to_string();
+        super::versions::output_wires(client, &run.execution_id.to_string()).await?
     };
     // Label with the RESOLVED execution, not the prefix the user typed, so
     // `weft diff 3f a1b2c3d4` does not print one side as `3f` and the
@@ -106,7 +106,7 @@ pub fn render(left: &str, right: &str, diff: &WiresDiff, left_wires: &[ExpectedW
 fn output_text(wire: Option<&ExpectedWire>) -> String {
     match wire {
         None => "(missing)".into(),
-        Some(wire) if wire.closed => wire.error.as_ref().map(|error| format!("(closed: {error})")).unwrap_or_else(|| "(closed)".into()),
+        Some(wire) if wire.closed => wire.failure.as_ref().map(|failure| format!("(closed: {failure})")).unwrap_or_else(|| "(closed)".into()),
         Some(wire) => wire.value.to_string(),
     }
 }

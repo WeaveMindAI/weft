@@ -47,7 +47,7 @@ const NODE: &str = "bridge";
 
 /// A stop of every node's shared copies, in flight.
 fn whole_project_command() -> weft_broker_client::protocol::InFlightCommand {
-    weft_broker_client::protocol::InFlightCommand { node_id: None, copies: weft_core::member::Copies::Shared }
+    weft_broker_client::protocol::InFlightCommand { node_id: None, copies: weft_core::instance::Copies::Shared }
 }
 
 fn rig() -> SupervisorTestRig {
@@ -57,15 +57,15 @@ fn rig() -> SupervisorTestRig {
 }
 
 /// What the host reports for `project` from now on: each `(node,
-/// instance, unit, ready)`, and nothing else.
+/// copy_id, unit, ready)`, and nothing else.
 fn observe(rig: &SupervisorTestRig, project: uuid::Uuid, units: &[(&str, &str, &str, bool)]) {
     rig.host.clear_project(project);
-    for (node, instance, unit, ready) in units {
+    for (node, copy_id, unit, ready) in units {
         let copy = weft_core::infra::NodeRef {
             tenant: TENANT.into(),
             project,
             node: (*node).into(),
-            instance: (*instance).into(),
+            copy_id: (*copy_id).into(),
         };
         let state = if *ready { UnitRunState::Ready } else { UnitRunState::NotReady { why: "probe failing".into() } };
         rig.host.set_state(&copy, unit, state);
@@ -141,22 +141,22 @@ async fn health_skips_project_while_infra_command_in_flight() {
     );
 }
 
-/// A command in flight on one member's copy stands health down for that
+/// A command in flight on one instance's copy stands health down for that
 /// copy only: the shared copy of the same node, degraded, still turns
 /// flaky, while ada's copy (as degraded) is left to the command.
 #[tokio::test]
 async fn health_stands_down_only_for_the_copy_a_command_reaches() {
     let rig = rig();
-    let ada = weft_core::member::MemberId::new("ada").unwrap();
+    let ada = weft_core::instance::InstanceId::new("ada").unwrap();
     rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
-    rig.broker.add_member_infra_node(PROJECT, NODE, &ada, "inst-ada", Status::Running);
+    rig.broker.add_instance_infra_node(PROJECT, NODE, &ada, "inst-ada", Status::Running);
     observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", true), (NODE, "inst-ada", "bridge", true)]);
     rig.tick_health().await.unwrap();
     rig.broker.set_infra_commands_in_flight(
         PROJECT,
         vec![weft_broker_client::protocol::InFlightCommand {
             node_id: Some(NODE.to_string()),
-            copies: weft_core::member::Copies::Member(ada.clone()),
+            copies: weft_core::instance::Copies::Instance(ada.clone()),
         }],
     );
     observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", false), (NODE, "inst-ada", "bridge", false)]);
@@ -170,7 +170,7 @@ async fn health_stands_down_only_for_the_copy_a_command_reaches() {
     assert_eq!(rig.broker.infra_copy(PROJECT, NODE, None).unwrap().status, Status::Flaky);
     assert_eq!(rig.broker.infra_copy(PROJECT, NODE, Some(&ada)).unwrap().status, Status::Running);
     assert!(
-        !rig.broker.status_writes().iter().any(|(_, _, member, _)| member.is_some()),
+        !rig.broker.status_writes().iter().any(|(_, _, instance, _)| instance.is_some()),
         "no status write for the copy the command owns"
     );
 }
@@ -334,7 +334,7 @@ async fn stop_clears_health_state_then_start_does_not_flake() {
     // Stop: status flips to stopped. (Simulating what lifecycle's
     // stop verb would do; we just write directly here.)
     rig.broker
-        .set_status("test-instance", None, PROJECT, NODE, None, Some(NODE), Status::Stopped, None, None)
+        .set_status("test-replica", None, PROJECT, NODE, None, Some(NODE), Status::Stopped, None, None)
         .await
         .unwrap();
     observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", false)]);
@@ -346,7 +346,7 @@ async fn stop_clears_health_state_then_start_does_not_flake() {
 
     // Start: status flips back to running, replicas come back.
     rig.broker
-        .set_status("test-instance", None, PROJECT, NODE, None, Some(NODE), Status::Running, None, None)
+        .set_status("test-replica", None, PROJECT, NODE, None, Some(NODE), Status::Running, None, None)
         .await
         .unwrap();
     observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", true)]);
@@ -471,7 +471,7 @@ async fn restart_unit_restarts_only_the_named_unit() {
     let restarted: Vec<(String, String)> = calls
         .iter()
         .filter_map(|c| match c {
-            HostCall::Restart { instance, unit, .. } => Some((instance.clone(), unit.clone())),
+            HostCall::Restart { copy_id, unit, .. } => Some((copy_id.clone(), unit.clone())),
             _ => None,
         })
         .collect();
@@ -757,21 +757,21 @@ async fn default_protocol_parks_what_reads_the_broken_copy() {
     assert_eq!(
         parks[0].reach,
         weft_broker_client::protocol::TakeDownReach::ReadersOf {
-            broken: vec![weft_broker_client::protocol::InfraCopy { node_id: NODE.into(), member: None }]
+            broken: vec![weft_broker_client::protocol::InfraCopy { node_id: NODE.into(), instance: None }]
         }
     );
 }
 
-/// The incident: a member's copy was just applied (its row says
+/// The incident: an instance's copy was just applied (its row says
 /// Running) and the host has not reported it yet. Unknown is
 /// not broken: however long that lasts, nothing parks and nothing is
-/// called flaky. A member's copy that does break parks only that copy.
+/// called flaky. An instance's copy that does break parks only that copy.
 #[tokio::test]
 async fn a_copy_the_host_has_not_reported_never_parks_and_a_broken_one_parks_alone() {
     let rig = rig();
-    let ada = weft_core::member::MemberId::new("ada").unwrap();
+    let ada = weft_core::instance::InstanceId::new("ada").unwrap();
     rig.broker.add_infra_node(PROJECT, "shared", "inst-shared", Status::Running);
-    rig.broker.add_member_infra_node(PROJECT, NODE, &ada, "inst1", Status::Running);
+    rig.broker.add_instance_infra_node(PROJECT, NODE, &ada, "inst1", Status::Running);
     observe(&rig, PROJECT, &[("shared", "inst-shared", "shared", true)]);
     for _ in 0..4 {
         rig.advance(Duration::from_secs(60));
@@ -792,7 +792,7 @@ async fn a_copy_the_host_has_not_reported_never_parks_and_a_broken_one_parks_alo
     assert_eq!(
         parks[0].reach,
         weft_broker_client::protocol::TakeDownReach::ReadersOf {
-            broken: vec![weft_broker_client::protocol::InfraCopy { node_id: NODE.into(), member: Some(ada) }]
+            broken: vec![weft_broker_client::protocol::InfraCopy { node_id: NODE.into(), instance: Some(ada) }]
         },
         "only ada's copy is broken; the shared one is healthy"
     );

@@ -32,8 +32,7 @@ own machine and keeps the key to paste into `weft login`.
 
 Upgrading weft on the cloud is merging upstream into the fork and running
 the workflow again, then rebuilding the user's CLI from that commit
-(`./setup.sh --cli`), or `weft activate --on prod` refuses with "this
-version was written by weft X". If the machine is too small, the user sets
+(`./setup.sh --cli`). If the machine is too small, the user sets
 `WEFT_MACHINE_TYPE` in the fork (say `e2-small`, which is not free) and runs
 the workflow again; the machine stops, grows and starts with its disk.
 

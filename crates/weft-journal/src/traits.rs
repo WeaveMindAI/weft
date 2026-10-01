@@ -34,9 +34,9 @@ pub struct JournalRow {
 }
 
 /// Read + write surface used by the worker (engine) and the listener
-/// for journal operations. `instance` is the worker's instance id,
+/// for journal operations. `replica` is the worker's replica id,
 /// stamped on every write; the broker takes a write only from the
-/// instance that owns the execution's claim. Listener-side callers pass
+/// replica that owns the execution's claim. Listener-side callers pass
 /// `None`.
 #[async_trait]
 pub trait JournalClient: Send + Sync {
@@ -45,7 +45,7 @@ pub trait JournalClient: Send + Sync {
     async fn record_event(
         &self,
         event: &ExecEvent,
-        instance: Option<&str>,
+        replica: Option<&str>,
     ) -> anyhow::Result<()>;
 
     /// The rows of `execution_id` after `after_id`, in order, as RAW payload
@@ -103,8 +103,8 @@ pub trait JournalClient: Send + Sync {
     /// any other. Refused unless the execution is still unrecorded. Only a
     /// journal that reaches the database takes it; every other one
     /// refuses loudly.
-    async fn record_retroactively(&self, events: &[ExecEvent], instance: Option<&str>) -> anyhow::Result<()> {
-        let _ = (events, instance);
+    async fn record_retroactively(&self, events: &[ExecEvent], replica: Option<&str>) -> anyhow::Result<()> {
+        let _ = (events, replica);
         anyhow::bail!("this journal cannot record an unrecorded run afterwards")
     }
 
@@ -112,8 +112,8 @@ pub trait JournalClient: Send + Sync {
     /// when nothing of it reached the journal (the costs it reported
     /// keep it, since they are addressed by execution), and release its run
     /// files. Only a journal that reaches the database takes it.
-    async fn forget_unrecorded(&self, execution_id: weft_core::ExecutionId, instance: Option<&str>) -> anyhow::Result<()> {
-        let _ = (execution_id, instance);
+    async fn forget_unrecorded(&self, execution_id: weft_core::ExecutionId, replica: Option<&str>) -> anyhow::Result<()> {
+        let _ = (execution_id, replica);
         anyhow::bail!("this journal cannot forget an unrecorded run")
     }
 }
@@ -130,7 +130,7 @@ impl JournalClient for NoopJournal {
     async fn record_event(
         &self,
         _event: &ExecEvent,
-        _instance: Option<&str>,
+        _replica: Option<&str>,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -171,18 +171,18 @@ impl JournalClient for PostgresJournalClient {
     async fn record_event(
         &self,
         event: &ExecEvent,
-        instance: Option<&str>,
+        replica: Option<&str>,
     ) -> anyhow::Result<()> {
-        crate::write::record_event_from_instance(&self.pool, event, instance)
+        crate::write::record_event_from_replica(&self.pool, event, replica)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 
-    async fn record_retroactively(&self, events: &[ExecEvent], instance: Option<&str>) -> anyhow::Result<()> {
-        crate::unrecorded::record_retroactively(&self.pool, events, instance).await
+    async fn record_retroactively(&self, events: &[ExecEvent], replica: Option<&str>) -> anyhow::Result<()> {
+        crate::unrecorded::record_retroactively(&self.pool, events, replica).await
     }
 
-    async fn forget_unrecorded(&self, execution_id: weft_core::ExecutionId, _instance: Option<&str>) -> anyhow::Result<()> {
+    async fn forget_unrecorded(&self, execution_id: weft_core::ExecutionId, _replica: Option<&str>) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
         crate::unrecorded::forget_in(&mut tx, execution_id).await?;
         tx.commit().await?;
@@ -217,12 +217,13 @@ impl JournalClient for PostgresJournalClient {
     }
 
     async fn has_terminal_event(&self, execution_id: weft_core::ExecutionId) -> anyhow::Result<bool> {
-        let row: Option<(String,)> = sqlx::query_as(
+        let row: Option<(String,)> = sqlx::query_as(concat!(
             "SELECT kind FROM exec_event \
              WHERE execution_id = $1 \
-               AND kind IN ('execution_completed', 'execution_failed', 'execution_cancelled') \
-             LIMIT 1",
-        )
+               AND kind IN ",
+            crate::execution_terminal_kinds_sql!(),
+            " LIMIT 1",
+        ))
         .bind(execution_id.to_string())
         .fetch_optional(&self.pool)
         .await?;

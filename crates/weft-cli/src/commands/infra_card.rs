@@ -18,16 +18,16 @@ pub(crate) struct Card {
     client: DispatcherClient,
     base: String,
     query: String,
-    /// The instance as the daemon keys it (`one.db`).
+    /// The node's place as the daemon keys it (`one.db`).
     pub place: String,
 }
 
 impl Card {
-    pub async fn open(ctx: &Ctx, node: &str, member: Option<&weft_core::member::MemberId>) -> Result<Self> {
-        let place = super::infra::instance_named(ctx, node).await?;
+    pub async fn open(ctx: &Ctx, node: &str, instance: Option<&weft_core::instance::InstanceId>) -> Result<Self> {
+        let place = super::infra::place_named(ctx, node).await?;
         let (client, project_id, _) = super::resolve_project(ctx)?;
-        let query = match member {
-            Some(member) => format!("?member={member}"),
+        let query = match instance {
+            Some(instance) => format!("?instance={instance}"),
             None => String::new(),
         };
         let base = format!("/projects/{project_id}/infra/nodes/{place}");
@@ -41,11 +41,7 @@ impl Card {
 
     /// Press `action` and hand back what the node answered.
     pub async fn press(&self, action: &LiveAction) -> Result<Value> {
-        let body = serde_json::json!({
-            "kind": action.action_kind,
-            "payload": action.payload.clone().unwrap_or(Value::Null),
-        });
-        self.client.post_json(&format!("{}/action{}", self.base, self.query), &body).await
+        self.client.post_json(&format!("{}/action{}", self.base, self.query), &serde_json::to_value(action.press())?).await
     }
 }
 
@@ -62,13 +58,13 @@ const SECRET_SHOWN: &str = "(hidden; `weft infra env` writes it into a file)";
 
 pub struct ShowArgs {
     pub node: String,
-    pub member: Option<weft_core::member::MemberId>,
+    pub instance: Option<weft_core::instance::InstanceId>,
 }
 
 pub struct PressArgs {
     pub node: String,
     pub action: String,
-    pub member: Option<weft_core::member::MemberId>,
+    pub instance: Option<weft_core::instance::InstanceId>,
 }
 
 /// The card as `--json` reports it: every item and button, a secret
@@ -120,7 +116,7 @@ fn card_text(place: &str, feed: &LiveFeed) -> String {
 }
 
 pub async fn run_show(ctx: Ctx, args: ShowArgs) -> Result<()> {
-    let card = Card::open(&ctx, &args.node, args.member.as_ref()).await?;
+    let card = Card::open(&ctx, &args.node, args.instance.as_ref()).await?;
     let feed = card.read().await?;
     if !ctx.json_out(&card_json(&card.place, &feed))? {
         print!("{}", card_text(&card.place, &feed));
@@ -159,7 +155,7 @@ fn redact(answer: Value, secrets: &[String]) -> Value {
 }
 
 pub async fn run_press(ctx: Ctx, args: PressArgs) -> Result<()> {
-    let card = Card::open(&ctx, &args.node, args.member.as_ref()).await?;
+    let card = Card::open(&ctx, &args.node, args.instance.as_ref()).await?;
     let feed = card.read().await?;
     let action = find_button(&card.place, &feed, &args.action)?;
     // Naming the button's action on the command line is the choice the

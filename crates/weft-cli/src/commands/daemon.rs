@@ -31,7 +31,7 @@ use crate::images;
 
 /// Names a NAMED install: one that sits beside the default install on the
 /// same machine, with names, ports and files of its own (a test cell).
-use weft_core::infra::INSTANCE_ENV;
+use weft_core::infra::INSTALL_ENV;
 use weft_core::ports;
 
 /// The Postgres every local install runs.
@@ -81,7 +81,7 @@ pub async fn run(ctx: Ctx, action: DaemonAction) -> Result<()> {
         DaemonAction::Start { rebuild, public_url } => {
             if let Some(choice) = public_url {
                 anyhow::ensure!(
-                    install.instance.name().is_none(),
+                    install.id.name().is_none(),
                     "--public-url / --no-public-url open or close the default install's public address; a named install has none"
                 );
                 set_public_url_choice(choice)?;
@@ -107,7 +107,8 @@ pub fn postgres_data_dir() -> PathBuf {
 
 /// One install on this machine.
 pub struct Install {
-    pub instance: weft_core::infra::Instance,
+    /// Which install: the default one, or one named by `WEFT_INSTALL`.
+    pub id: weft_core::infra::Install,
     /// Its files: `config.json`, `secrets.env`, the runtime's log, its
     /// database files for a named install.
     pub dir: PathBuf,
@@ -115,15 +116,16 @@ pub struct Install {
 
 impl Install {
     pub fn from_env() -> Result<Self> {
-        let instance = weft_core::infra::Instance::from_env().map_err(anyhow::Error::msg)?;
-        let dir = instance.dir();
-        Ok(Self { instance, dir })
+        let id = weft_core::infra::Install::from_env().map_err(anyhow::Error::msg)?;
+        let dir = id.dir();
+        Ok(Self { id, dir })
     }
 
     fn config_path(&self) -> PathBuf {
         self.dir.join("config.json")
     }
 
+    // SYNC: secrets.env <-> setup.sh (the --migration --release block reads WEFT_DATABASE_URL from it)
     fn secrets_path(&self) -> PathBuf {
         self.dir.join("secrets.env")
     }
@@ -133,16 +135,17 @@ impl Install {
     }
 
     fn postgres_dir(&self) -> PathBuf {
-        match self.instance.name() {
+        match self.id.name() {
             None => postgres_data_dir(),
             Some(_) => self.dir.join("postgres-data"),
         }
     }
 
     fn prefix(&self) -> String {
-        self.instance.resource_prefix()
+        self.id.resource_prefix()
     }
 
+    // SYNC: secrets.env <-> setup.sh (the --migration --release block reads WEFT_DATABASE_URL from it)
     fn postgres_container(&self) -> String {
         format!("{}-postgres", self.prefix())
     }
@@ -190,7 +193,7 @@ impl PortUse {
     /// A port of `install`: the default install moves it with `env`, a
     /// named one in its `ports.json`.
     fn of(install: &Install, addr: std::net::SocketAddr, what: &'static str, env: &str) -> Self {
-        let move_it = match install.instance.name() {
+        let move_it = match install.id.name() {
             None => format!("{env}=<port> ./setup.sh (the install keeps that port from then on)"),
             Some(_) => format!("pick another port for this install in {}", Ports::path(&install.dir).display()),
         };
@@ -300,12 +303,12 @@ async fn port_holder(port: u16) -> Option<String> {
 /// its file.
 fn ports(install: &Install) -> Result<Ports> {
     let saved = Ports::load(&install.dir).map_err(anyhow::Error::msg)?;
-    let seeded = match (saved, install.instance.name()) {
+    let seeded = match (saved, install.id.name()) {
         (Some(saved), _) => saved,
         (None, None) => Ports::DEFAULT,
         (None, Some(_)) => Ports { public: free_port()?, internal: free_port()?, outside: free_port()?, postgres: free_port()? },
     };
-    let chosen = match install.instance.name() {
+    let chosen = match install.id.name() {
         Some(_) => seeded,
         None => moved_by_env(seeded, |name| std::env::var(name).ok())?,
     };
@@ -534,7 +537,7 @@ async fn ensure_postgres(install: &Install, port: u16) -> Result<()> {
         "-e", &format!("POSTGRES_PASSWORD={PG_PASSWORD}"),
         "-e", &format!("POSTGRES_DB={PG_DB}"),
         "-e", "PGDATA=/var/lib/postgresql/data/pgdata",
-        "--label", &format!("{}={}", weft_core::infra::INSTALL_LABEL, install.instance.label_value()),
+        "--label", &format!("{}={}", weft_core::infra::INSTALL_LABEL, install.id.label_value()),
         POSTGRES_IMAGE,
     ]
     .iter()
@@ -689,6 +692,7 @@ fn secrets(
     let old = read_env_file(&install.secrets_path());
     let keep_or = |name: &str, make: &mut dyn FnMut() -> String| old.get(name).filter(|v| !v.is_empty()).cloned().unwrap_or_else(make);
     let mut env = std::collections::BTreeMap::new();
+    // SYNC: secrets.env <-> setup.sh (the --migration --release block reads WEFT_DATABASE_URL from it)
     env.insert("WEFT_DATABASE_URL".to_string(), database_url(ports.postgres));
     env.insert("WEFT_IDENTITY_KEY".to_string(), keep_or("WEFT_IDENTITY_KEY", &mut random_hex_32));
     env.insert("WEFT_CALLER_TOKEN_SECRET".to_string(), keep_or("WEFT_CALLER_TOKEN_SECRET", &mut random_hex_32));
@@ -775,7 +779,7 @@ fn install_config(
     let workers = previous.as_ref().map(|p| p.workers.clone()).unwrap_or_default();
     let edge = edge_config(previous.as_ref().map(|p| p.edge))?;
     let config = InstallConfig {
-        instance: install.instance.clone(),
+        install: install.id.clone(),
         platform: PlatformConfig::Local(LocalPlatform {
             data_dir: install.dir.clone(),
             container_internal_url: container_internal_url(ports),
@@ -826,14 +830,14 @@ fn install_config(
 /// port: the doors outside callers use, never the management API.
 async fn reconcile_tunnel(install: &Install, ports: Ports) -> Result<Option<(String, bool)>> {
     let name = install.tunnel_container();
-    if install.instance.name().is_some() || !public_url_marker().exists() {
+    if install.id.name().is_some() || !public_url_marker().exists() {
         remove_container(&name).await?;
         let _ = std::fs::remove_file(public_url_file());
         return Ok(None);
     }
     let named = named_tunnel_config()?;
     let (network, origin) = tunnel_origin(ports);
-    let label = format!("{}={}", weft_core::infra::INSTALL_LABEL, install.instance.label_value());
+    let label = format!("{}={}", weft_core::infra::INSTALL_LABEL, install.id.label_value());
     let mut args: Vec<String> = ["run", "-d", "--name", &name, "--restart", "unless-stopped", "--network", &network, "--label", &label]
         .iter()
         .map(|s| s.to_string())
@@ -1023,7 +1027,7 @@ async fn start_runtime(install: &Install) -> Result<()> {
                 &unit,
                 format!(
                     "[Unit]\nDescription=weft runtime ({})\nAfter=network-online.target\n\n[Service]\nExecStart=/bin/sh -c \"{}\"\nRestart=always\nRestartSec=2\n\n[Install]\nWantedBy=default.target\n",
-                    install.instance.label_value(),
+                    install.id.label_value(),
                     line.replace('"', "\\\"")
                 ),
             )?;
@@ -1163,7 +1167,7 @@ async fn wait_for_runtime(install: &Install, public: u16) -> Result<()> {
 /// `kind` binary is gone is still caught.
 // SYNC: <-> scripts/lib/weft-cleanup.sh (weft_old_install_present)
 async fn refuse_an_older_install(install: &Install) -> Result<()> {
-    if install.instance.name().is_some() {
+    if install.id.name().is_some() {
         return Ok(());
     }
     let node = format!("{OLD_KIND_CLUSTER}-control-plane");
@@ -1218,17 +1222,21 @@ async fn start(install: &Install, rebuild: bool) -> Result<()> {
     refuse_taken_ports(&uses).await?;
     start_runtime(install).await?;
     wait_for_runtime(install, ports.public).await?;
+    let local = crate::client::DispatcherClient::new(format!("http://127.0.0.1:{}", ports.public), None);
+    super::catalog::preload_standard_library(&local)
+        .await
+        .context("store the standard library in this install's assets")?;
     if let Some((url, named)) = tunnel {
         announce_tunnel(&url, named, &install.tunnel_container(), ports).await?;
     }
-    println!("weft is running at http://127.0.0.1:{} (install '{}')", ports.public, install.instance.label_value());
+    println!("weft is running at http://127.0.0.1:{} (install '{}')", ports.public, install.id.label_value());
     Ok(())
 }
 
 /// The containers the runtime started for an install: its workers, and
 /// with `with_infra` its infra units too.
 async fn install_containers(install: &Install, with_infra: bool) -> Result<Vec<String>> {
-    let label = format!("label={}={}", weft_core::infra::INSTALL_LABEL, install.instance.label_value());
+    let label = format!("label={}={}", weft_core::infra::INSTALL_LABEL, install.id.label_value());
     let listing = docker_ok(&["ps", "-a", "--filter", &label, "--format", "{{.Names}}\t{{.Label \"weft.role\"}}"], "docker ps").await?;
     Ok(listing
         .lines()
@@ -1245,14 +1253,14 @@ async fn stop(install: &Install) -> Result<()> {
     for name in install_containers(install, false).await? {
         remove_container(&name).await?;
     }
-    println!("weft's runtime stopped (install '{}'); the database and infra keep running", install.instance.label_value());
+    println!("weft's runtime stopped (install '{}'); the database and infra keep running", install.id.label_value());
     Ok(())
 }
 
 async fn remove(install: &Install) -> Result<()> {
-    let Some(name) = install.instance.name() else {
+    let Some(name) = install.id.name() else {
         anyhow::bail!(
-            "`weft daemon remove` takes a named install ({INSTANCE_ENV}) off this machine, and none is set, which means the \
+            "`weft daemon remove` takes a named install ({INSTALL_ENV}) off this machine, and none is set, which means the \
              default install. That one holds every project on this machine; `./setup.sh --uninstall` is how it goes."
         );
     };
@@ -1263,7 +1271,7 @@ async fn remove(install: &Install) -> Result<()> {
     for c in install_containers(install, true).await? {
         remove_container(&c).await?;
     }
-    let label = format!("label={}={}", weft_core::infra::INSTALL_LABEL, install.instance.label_value());
+    let label = format!("label={}={}", weft_core::infra::INSTALL_LABEL, install.id.label_value());
     let volumes = docker_ok(&["volume", "ls", "-q", "--filter", &label], "docker volume ls").await?;
     for v in volumes.lines().filter(|l| !l.trim().is_empty()) {
         docker_ok(&["volume", "rm", "-f", v.trim()], "docker volume rm").await?;
@@ -1280,7 +1288,7 @@ async fn remove(install: &Install) -> Result<()> {
     Ok(())
 }
 
-/// Reports on the install this machine's `WEFT_INSTANCE` names (the one
+/// Reports on the install this machine's `WEFT_INSTALL` names (the one
 /// its label, log path and public address describe), so its address comes
 /// from that install's own ports, never from `--on`/`--dispatcher`, which
 /// are refused rather than ignored. `WEFT_DISPATCHER_URL` is ambient
@@ -1289,7 +1297,7 @@ async fn status(ctx: &Ctx, install: &Install) -> Result<()> {
     ctx.refuse_other_install("weft daemon status")?;
     // A named install that never started has no address at all: saying
     // so is this command's answer, not an error. `local_public_url` reads
-    // the same `WEFT_INSTANCE` that built `install`.
+    // the same `WEFT_INSTALL` that built `install`.
     match weft_core::ports::local_public_url() {
         Err(e) => println!("weft: no address to reach: {e}"),
         Ok(url) => {
@@ -1298,7 +1306,7 @@ async fn status(ctx: &Ctx, install: &Install) -> Result<()> {
             report_reachable(&crate::client::DispatcherClient::new(url, key), install).await;
         }
     }
-    if install.instance.name().is_some() {
+    if install.id.name().is_some() {
         println!("public address: none (a named install has none)");
         return Ok(());
     }
@@ -1316,7 +1324,7 @@ async fn report_reachable(client: &crate::client::DispatcherClient, install: &In
         Ok(v) => println!(
             "weft: running at {} (install '{}'); {} project(s)",
             client.base(),
-            install.instance.label_value(),
+            install.id.label_value(),
             v.as_array().map(|a| a.len()).unwrap_or(0)
         ),
         Err(e) => println!("weft: unreachable at {}: {e} (its log: {})", client.base(), install.log_path().display()),
@@ -1341,11 +1349,11 @@ mod tests {
     use super::*;
 
     fn install(name: Option<&str>) -> Install {
-        let instance = match name {
-            Some(n) => weft_core::infra::Instance::named(n).unwrap(),
-            None => weft_core::infra::Instance::default_install(),
+        let id = match name {
+            Some(n) => weft_core::infra::Install::named(n).unwrap(),
+            None => weft_core::infra::Install::default_install(),
         };
-        Install { instance, dir: "/home/u/.local/share/weft".into() }
+        Install { id, dir: "/home/u/.local/share/weft".into() }
     }
 
     #[test]
@@ -1398,7 +1406,7 @@ mod tests {
         let line = format!("/opt/weft/bin/weft-runtime serve --config {} --log {}", d.config_path().display(), d.log_path().display());
         assert!(is_runtime_command_line(&d, &line));
         assert!(!is_runtime_command_line(&d, "/usr/bin/vim notes.txt"));
-        let other = Install { instance: d.instance.clone(), dir: "/elsewhere".into() };
+        let other = Install { id: d.id.clone(), dir: "/elsewhere".into() };
         assert!(!is_runtime_command_line(&other, &line), "another install's runtime");
     }
 

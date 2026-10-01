@@ -46,7 +46,7 @@ impl Node for FalAnimateImageNode {
         let answer = run_queued(&ctx, &http, &model, &payload, "fal: animate the image").await?;
 
         let url = video_url(&answer).node_err("fal answered no video for this animation")?;
-        let ty = ctx.output_type("video").node_err("the video port declares no type")?;
+        let ty = ctx.output_type("video")?;
         let stored = ctx
             .storage(StorageScope::Execution)
             // The generated video is the run's product: keep it past the

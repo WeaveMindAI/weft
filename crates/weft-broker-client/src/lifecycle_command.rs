@@ -3,7 +3,7 @@
 //! Two consumers claim rows from this table, by DIFFERENT authorities:
 //!   - the dispatcher's `lifecycle_claimer` loop (dispatcher verbs:
 //!     deactivate / reactivate / upgrade) serializes via the per-command
-//!     `claimed_by_instance` claim lease (`claimable_predicate`), because the
+//!     `claimed_by_replica` claim lease (`claimable_predicate`), because the
 //!     dispatcher has no per-project ownership lease of its own;
 //!   - the broker's `supervisor_claim_command` handler
 //!     (`lifecycle_writes::next_command`; supervisor
@@ -31,7 +31,7 @@ use std::time::Duration;
 /// for hours if the person asked to wait), so the TTL only bounds how
 /// long a DEAD claimer's command waits to be taken over. A dispatcher
 /// process that gets `SIGTERM` mid-verb drops its claim implicitly (the row
-/// sits with `claimed_by_instance = <old>` until the lease expires).
+/// sits with `claimed_by_replica = <old>` until the lease expires).
 pub const CLAIM_LEASE_TTL: Duration = Duration::from_secs(300);
 
 /// How often a live dispatcher claimer renews its command's claim: a
@@ -63,7 +63,7 @@ pub const SUPERVISOR_CLAIM_BATCH: i64 = 16;
 ///
 /// ```ignore
 /// "UPDATE infra_lifecycle_command \
-///  SET claimed_by_instance = $1, claimed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT \
+///  SET claimed_by_replica = $1, claimed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT \
 ///  WHERE id = ( \
 ///     SELECT id FROM infra_lifecycle_command \
 ///     WHERE <caller's tenant/verb filter> AND <CLAIMABLE_PREDICATE> \
@@ -80,14 +80,14 @@ pub const SUPERVISOR_CLAIM_BATCH: i64 = 16;
 ///     by `claimable_predicate()`.
 pub fn claimable_predicate() -> String {
     format!(
-        "(claimed_by_instance IS NULL \
+        "(claimed_by_replica IS NULL \
           OR claimed_at_unix < EXTRACT(EPOCH FROM NOW() - INTERVAL '{secs} seconds')::BIGINT) \
          AND completed_at_unix IS NULL",
         secs = CLAIM_LEASE_TTL.as_secs()
     )
 }
 
-/// SQL `EXISTS (...)` fragment that is true iff `$instance_param` currently
+/// SQL `EXISTS (...)` fragment that is true iff `$replica_param` currently
 /// holds a LIVE `infra_owner` lease over the project named by
 /// `project_col`. This is the supervisor's ONE single-actor authority:
 /// a supervisor may run a project's lifecycle command, and write its
@@ -95,7 +95,7 @@ pub fn claimable_predicate() -> String {
 /// drain / lease-takeover moves ownership to another process, every write
 /// from the old process is rejected and the command flows to the new owner.
 ///
-/// Unlike the dispatcher's `claimed_by_instance` claim lease (which serializes
+/// Unlike the dispatcher's `claimed_by_replica` claim lease (which serializes
 /// the dispatcher's own verbs and is the right tool there), the
 /// supervisor needs no per-command claim lease at all: `infra_owner` is
 /// exclusive (one process per project) and continuously renewed on each
@@ -106,33 +106,33 @@ pub fn claimable_predicate() -> String {
 /// just-displaced owner converges rather than corrupts: it is the SAME
 /// command's desired state, re-applied.
 ///
-/// `$instance_param` is the 1-based bind index of the process name (e.g. `"$1"`);
+/// `$replica_param` is the 1-based bind index of the process name (e.g. `"$1"`);
 /// `project_col` is the SQL expression yielding the project id to check
 /// (a column reference like `"c.project_id"` or a bind like `"$2"`). All
 /// time comes from the DB clock so a skewed app host can't mis-judge the
 /// lease.
 ///
-/// The value bound at `$instance_param` is the supervisor's instance id (the
-/// key stored in `infra_owner.supervisor_instance`).
-// SYNC: supervisor instance (the infra_owner lease key compared here) <-> crates/weft-broker-client/src/protocol.rs (Supervisor*Request.instance), crates/weft-infra-supervisor/src/lib.rs (SupervisorState.instance)
-pub fn owns_project_predicate(instance_param: &str, project_col: &str) -> String {
-    live_lease_exists(Some(instance_param), project_col)
+/// The value bound at `$replica_param` is the supervisor's replica id (the
+/// key stored in `infra_owner.supervisor_replica`).
+// SYNC: supervisor replica (the infra_owner lease key compared here) <-> crates/weft-broker-client/src/protocol.rs (Supervisor*Request.replica), crates/weft-infra-supervisor/src/lib.rs (SupervisorState.replica)
+pub fn owns_project_predicate(replica_param: &str, project_col: &str) -> String {
+    live_lease_exists(Some(replica_param), project_col)
 }
 
 /// SQL `EXISTS (...)` fragment that is true iff a LIVE `infra_owner`
 /// lease covers the project named by `project_col`: held by the process
-/// bound at `instance_param` when one is given (that is
+/// bound at `replica_param` when one is given (that is
 /// [`owns_project_predicate`]), by any supervisor otherwise. Time comes
 /// from the DB clock.
-pub fn live_lease_exists(instance_param: Option<&str>, project_col: &str) -> String {
-    let instance = instance_param
-        .map(|p| format!("AND io.supervisor_instance = {p} "))
+pub fn live_lease_exists(replica_param: Option<&str>, project_col: &str) -> String {
+    let replica = replica_param
+        .map(|p| format!("AND io.supervisor_replica = {p} "))
         .unwrap_or_default();
     format!(
         "EXISTS ( \
             SELECT 1 FROM infra_owner io \
             WHERE io.project_id = {project_col} \
-              {instance}AND io.leased_until_unix >= EXTRACT(EPOCH FROM NOW())::BIGINT \
+              {replica}AND io.leased_until_unix >= EXTRACT(EPOCH FROM NOW())::BIGINT \
          )"
     )
 }
@@ -214,15 +214,15 @@ pub fn pending_supervisor_command(command_alias: &str) -> String {
 
 /// SQL condition that is true iff the `infra_lifecycle_command` row
 /// aliased `command_alias` acts on the infra copy `(node_expr,
-/// member_expr)`: it names that node or the whole project (`node_id IS
-/// NULL`), and its copies (`weft_core::member::Copies`) admit that
-/// member: every copy, or exactly that owner (the shared copy is the
-/// NULL member).
-// SYNC: command_reaches_copy <-> crates/weft-core/src/member.rs (Copies::admits), crates/weft-broker-client/src/protocol.rs (InFlightCommand::reaches)
-pub fn command_reaches_copy(command_alias: &str, node_expr: &str, member_expr: &str) -> String {
+/// instance_expr)`: it names that node or the whole project (`node_id IS
+/// NULL`), and its copies (`weft_core::instance::Copies`) admit that
+/// instance: every copy, or exactly that owner (the shared copy is the
+/// NULL instance).
+// SYNC: command_reaches_copy <-> crates/weft-core/src/instance.rs (Copies::admits), crates/weft-broker-client/src/protocol.rs (InFlightCommand::reaches)
+pub fn command_reaches_copy(command_alias: &str, node_expr: &str, instance_expr: &str) -> String {
     format!(
         "({c}.node_id = {node_expr} OR {c}.node_id IS NULL) \
-         AND ({c}.every_copy OR {c}.member_id IS NOT DISTINCT FROM {member_expr})",
+         AND ({c}.every_copy OR {c}.instance_id IS NOT DISTINCT FROM {instance_expr})",
         c = command_alias,
     )
 }

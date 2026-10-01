@@ -22,7 +22,7 @@ pub enum TaskKind {
     RegisterSignal,
     /// Dispatcher: a live caller's connection reached a worker; give
     /// birth to the execution the routing token promised, pinned to that
-    /// worker instance. Producer = worker (via broker). Nothing is born
+    /// worker replica. Producer = worker (via broker). Nothing is born
     /// at the handshake, so a caller who never follows the redirect
     /// leaves nothing behind.
     LiveArrival,
@@ -63,7 +63,7 @@ pub enum TaskKind {
     StopTagged,
     /// Dispatcher: one call a program makes on its own project
     /// (`weft_core::program::ProgramCall`: an infra copy, triggers, a
-    /// member's connections, costs, a clean, member tokens). Producer =
+    /// instance's connections, costs, a clean, instance tokens). Producer =
     /// worker (via broker, which pins the project and the asker to the
     /// run); the worker waits on the task's result.
     ProgramCall,
@@ -190,10 +190,10 @@ pub struct FiredExchange {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveArrivalPayload {
     pub token: String,
-    /// The worker instance the caller's connection reached: the birth
+    /// The worker replica the caller's connection reached: the birth
     /// pins the execution to it. The broker refuses an arrival naming
-    /// any instance but the one calling.
-    pub instance: String,
+    /// any replica but the one calling.
+    pub replica: String,
     pub method: String,
     #[serde(default)]
     pub query: std::collections::BTreeMap<String, String>,
@@ -216,7 +216,7 @@ pub fn live_arrival_dedup_key(execution_id: weft_core::ExecutionId) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum LiveArrivalResult {
-    Born { execution_id: String, instance: String },
+    Born { execution_id: String, replica: String },
     Refused { status: u16, message: String },
 }
 
@@ -315,7 +315,7 @@ mod live_arrival_wire_tests {
     fn the_arrival_payload_round_trips_and_the_key_is_per_execution_id() {
         let payload = LiveArrivalPayload {
             token: "v1.x.y".into(),
-            instance: "worker-a".into(),
+            replica: "worker-a".into(),
             method: "POST".into(),
             query: [("verbose".to_string(), "1".to_string())].into_iter().collect(),
             headers: vec![("content-type".into(), "application/json".into())],
@@ -323,10 +323,10 @@ mod live_arrival_wire_tests {
         let json = serde_json::to_value(&payload).unwrap();
         let back: LiveArrivalPayload = serde_json::from_value(json).unwrap();
         assert_eq!(back.method, "POST");
-        assert_eq!(back.instance, "worker-a");
+        assert_eq!(back.replica, "worker-a");
         assert_eq!(back.query["verbose"], "1");
         assert_eq!(back.headers.len(), 1);
-        let bare: LiveArrivalPayload = serde_json::from_value(serde_json::json!({ "token": "t", "instance": "w", "method": "GET" })).unwrap();
+        let bare: LiveArrivalPayload = serde_json::from_value(serde_json::json!({ "token": "t", "replica": "w", "method": "GET" })).unwrap();
         assert!(bare.query.is_empty() && bare.headers.is_empty());
         let execution_id = weft_core::ExecutionId::from_u128(7);
         assert_eq!(live_arrival_dedup_key(execution_id), format!("live-arrival:{execution_id}"));
@@ -342,7 +342,7 @@ mod tests {
     #[test]
     fn a_live_arrival_answer_round_trips() {
         for answer in [
-            LiveArrivalResult::Born { execution_id: "c".into(), instance: "p".into() },
+            LiveArrivalResult::Born { execution_id: "c".into(), replica: "p".into() },
             LiveArrivalResult::Refused { status: 422, message: "who is it for".into() },
         ] {
             let wire = serde_json::to_value(&answer).unwrap();

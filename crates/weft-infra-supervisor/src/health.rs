@@ -59,11 +59,12 @@ fn backoff_delay(consecutive_failures: u32) -> Duration {
 
 #[derive(Default)]
 pub struct HealthRegistry {
-    /// Per-(project, instance, unit) state tracking. Records when the
+    /// Per-(project, copy_id, unit) state tracking. Records when the
     /// unit was last seen Ready vs Not-Ready so we can apply windowed
     /// transitions (flaky_after, recovery_after). Health is per-unit of
-    /// one deployed copy: a node that exists once per member has one
-    /// instance per member, each with its own health.
+    /// one deployed copy: a node that exists once per instance
+    /// has one copy on the host per instance, each with its own
+    /// health.
     state: HashMap<(uuid::Uuid, String, String), NodeHealthState>,
     /// Per-project "currently in flight" protocol names. While a
     /// protocol is in flight, the supervisor doesn't re-fire any
@@ -164,7 +165,7 @@ pub async fn on_ownership_change(state: &SupervisorState, change: &crate::owners
 /// (rather than only running inside `run_loop`) so integration tests can
 /// step the loop one tick at a time.
 pub async fn tick(state: &SupervisorState) -> Result<()> {
-    let projects = state.broker.owned_projects(&state.instance).await?;
+    let projects = state.broker.owned_projects(&state.replica).await?;
     for project in &projects {
         if let Err(e) = tick_project(state, project).await {
             tracing::warn!(
@@ -202,19 +203,19 @@ async fn tick_project(
     let commands = state.broker.infra_commands_in_flight(project.project_id).await?;
     let nodes = state.broker.infra_nodes(project.project_id).await?;
 
-    // How the host sees every unit of the project, by `(instance,
+    // How the host sees every unit of the project, by `(copy_id,
     // unit)`. Health is PER-UNIT: one infra node runs N units, each with
     // independent health, so a flaky sidecar doesn't drag a healthy
     // primary into "node flaky" (and can be remediated on its own). The
-    // instance, not the node, is the key: a node that exists once per
-    // member runs one instance per member, and one member's broken copy
-    // says nothing about another's.
+    // copy, not the node, is the key: a node that exists once
+    // per instance runs one copy for each, and one
+    // instance's broken copy says nothing about another's.
     let seen: HashMap<(String, String), weft_platform_traits::UnitRunState> = state
         .host
         .observe(&project.tenant_id, project.project_id)
         .await?
         .into_iter()
-        .map(|o| ((o.instance, o.unit), o.state))
+        .map(|o| ((o.copy_id, o.unit), o.state))
         .collect();
 
     // Per unit of each copy: its windowed health (flaky/recovered
@@ -247,7 +248,7 @@ async fn tick_project(
     // either direction in one place.
     let mut decisions: Vec<(
         String,
-        Option<weft_core::member::MemberId>,
+        Option<weft_core::instance::InstanceId>,
         String,
         NodeDecision,
         weft_broker_client::protocol::InfraNodeStatus,
@@ -257,14 +258,14 @@ async fn tick_project(
     {
         let mut registry = state.health.lock().await;
         for n in &nodes {
-            let stood_down = commands.iter().any(|c| c.reaches(&n.node_id, n.member.as_ref()));
+            let stood_down = commands.iter().any(|c| c.reaches(&n.node_id, n.instance.as_ref()));
             for (unit, unit_rt) in &n.units {
-                let key = (project.project_id, n.instance_id.clone(), unit.clone());
+                let key = (project.project_id, n.copy_id.clone(), unit.clone());
                 if stood_down || !unit_rt.status.expects_running_units() {
                     registry.state.remove(&key);
                     continue;
                 }
-                let reading = seen.get(&(n.instance_id.clone(), unit.clone()));
+                let reading = seen.get(&(n.copy_id.clone(), unit.clone()));
                 let observed = reading.map(|s| NodeObservation { ready: *s == weft_platform_traits::UnitRunState::Ready });
                 // No latch yet (first look by this supervisor, or the copy's
                 // latches were cleared by a lifecycle command): start
@@ -291,7 +292,7 @@ async fn tick_project(
                 };
                 units.push(UnitView {
                     node_id: n.node_id.clone(),
-                    member: n.member.clone(),
+                    instance: n.instance.clone(),
                     unit: unit.clone(),
                     ready: observed.is_some_and(|o| o.ready),
                     flaky: decision.next.declared_flaky,
@@ -307,7 +308,7 @@ async fn tick_project(
                     Some(weft_platform_traits::UnitRunState::Ready) => "ready".into(),
                     None => "the host no longer reports it".into(),
                 };
-                decisions.push((n.node_id.clone(), n.member.clone(), unit.clone(), decision, unit_rt.status, why));
+                decisions.push((n.node_id.clone(), n.instance.clone(), unit.clone(), decision, unit_rt.status, why));
             }
         }
 
@@ -338,7 +339,7 @@ async fn tick_project(
     //      The latch is the single source of truth for the row's
     //      status; the broker write is a reconcile, not a
     //      consequence of the edge.
-    for (node_id, member, unit, decision, observed_status, why) in decisions {
+    for (node_id, instance, unit, decision, observed_status, why) in decisions {
         if let Some(edge) = decision.event {
             let infra_event = match edge {
                 NodeEdgeEvent::BecameFlaky => weft_broker_client::protocol::InfraEvent::Flaky(
@@ -350,7 +351,7 @@ async fn tick_project(
             };
             state
                 .broker
-                .event_record(project.project_id, Some(&node_id), member.as_ref(), infra_event)
+                .event_record(project.project_id, Some(&node_id), instance.as_ref(), infra_event)
                 .await?;
         }
         if observed_status != decision.desired_status {
@@ -366,11 +367,11 @@ async fn tick_project(
             let outcome = state
                 .broker
                 .set_status(
-                    &state.instance,
+                    &state.replica,
                     None,
                     project.project_id,
                     &node_id,
-                    member.as_ref(),
+                    instance.as_ref(),
                     Some(&unit),
                     decision.desired_status,
                     None,
@@ -588,27 +589,27 @@ pub(crate) enum ActionPlan {
         spec: weft_broker_client::protocol::LifecycleSpec,
     },
     /// Restart `unit` in the copies of the node owned by whoever owns a
-    /// broken copy (the protocol's scope). Each copy's instance is
+    /// broken copy (the protocol's scope). Each copy's id is
     /// resolved from the broker's `infra_nodes` list ahead of dispatch.
-    RestartUnit { copies: Vec<CopyInstance>, unit: String },
+    RestartUnit { copies: Vec<HostCopy>, unit: String },
     /// The action references a node with no copy at all in the
     /// project's `infra_nodes`. Logged via tracing; otherwise no-op.
     NodeMissing { node_id: String },
     /// The node has copies, but none belongs to the owners of the broken
     /// copies (`owners`: `None` for the shared copy): the action names a
-    /// node on the other side (a shared node for a broken member's copy,
+    /// node on the other side (a shared node for a broken instance's copy,
     /// or the reverse). Logged via tracing; otherwise no-op.
     NoCopyForOwners {
         node_id: String,
-        owners: Vec<Option<weft_core::member::MemberId>>,
+        owners: Vec<Option<weft_core::instance::InstanceId>>,
     },
 }
 
-/// One copy of a node and the instance the host runs it as.
+/// One copy of a node and the id the host runs it under.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CopyInstance {
+pub(crate) struct HostCopy {
     pub copy: weft_broker_client::protocol::InfraCopy,
-    pub instance_id: String,
+    pub copy_id: String,
 }
 
 /// Pure: given the matched protocol, the broken copies it aims at (its
@@ -679,25 +680,25 @@ fn copies_of(
     infra_nodes: &[weft_broker_client::protocol::SupervisorInfraNode],
     node_id: &str,
     scope: &std::collections::BTreeSet<weft_broker_client::protocol::InfraCopy>,
-    act: impl FnOnce(Vec<CopyInstance>) -> ActionPlan,
+    act: impl FnOnce(Vec<HostCopy>) -> ActionPlan,
 ) -> ActionPlan {
     let copies: Vec<_> = infra_nodes.iter().filter(|n| n.node_id == node_id).collect();
     if copies.is_empty() {
         return ActionPlan::NodeMissing { node_id: node_id.to_string() };
     }
-    let instances: Vec<CopyInstance> = copies
+    let targets: Vec<HostCopy> = copies
         .iter()
-        .filter(|n| scope.iter().any(|broken| broken.member == n.member))
-        .map(|n| CopyInstance {
-            copy: weft_broker_client::protocol::InfraCopy { node_id: n.node_id.clone(), member: n.member.clone() },
-            instance_id: n.instance_id.clone(),
+        .filter(|n| scope.iter().any(|broken| broken.instance == n.instance))
+        .map(|n| HostCopy {
+            copy: weft_broker_client::protocol::InfraCopy { node_id: n.node_id.clone(), instance: n.instance.clone() },
+            copy_id: n.copy_id.clone(),
         })
         .collect();
-    if instances.is_empty() {
-        let owners: std::collections::BTreeSet<_> = scope.iter().map(|broken| broken.member.clone()).collect();
+    if targets.is_empty() {
+        let owners: std::collections::BTreeSet<_> = scope.iter().map(|broken| broken.instance.clone()).collect();
         return ActionPlan::NoCopyForOwners { node_id: node_id.to_string(), owners: owners.into_iter().collect() };
     }
-    act(instances)
+    act(targets)
 }
 
 async fn run_action(
@@ -707,7 +708,7 @@ async fn run_action(
     scope: &std::collections::BTreeSet<weft_broker_client::protocol::InfraCopy>,
 ) -> Result<()> {
     // For RestartUnit we need the current infra_nodes list to resolve
-    // node_id → instance_id. EnqueueLifecycle / Notify don't
+    // node_id → copy_id. EnqueueLifecycle / Notify don't
     // need it; pay the broker round-trip up front to keep the
     // planner pure regardless.
     let nodes = state.broker.infra_nodes(project.project_id).await?;
@@ -732,12 +733,12 @@ async fn run_action(
             // action, which releases the protocol's latch so it retries
             // next tick (a restart is idempotent).
             let mut failed = Vec::new();
-            for CopyInstance { copy, instance_id } in copies {
+            for HostCopy { copy, copy_id } in copies {
                 let node = weft_core::infra::NodeRef {
                     tenant: project.tenant_id.clone(),
                     project: project.project_id,
                     node: copy.node_id.clone(),
-                    instance: instance_id,
+                    copy_id,
                 };
                 if let Err(e) = state.host.restart_unit(&node, &unit).await {
                     failed.push(format!("{}: {e:#}", copy.node_id));
@@ -789,17 +790,17 @@ mod tests {
         }
     }
 
-    fn node(node_id: &str, instance_id: &str) -> SupervisorInfraNode {
+    fn node(node_id: &str, copy_id: &str) -> SupervisorInfraNode {
         SupervisorInfraNode {
             node_id: node_id.to_string(),
-            instance_id: instance_id.to_string(),
+            copy_id: copy_id.to_string(),
             status: weft_broker_client::protocol::InfraNodeStatus::Running,
             applied_spec_hash: None,
             applied_at_unix: None,
             addresses: Default::default(),
             keep_disks: Vec::new(),
             units: Default::default(),
-            member: None,
+            instance: None,
         }
     }
 
@@ -829,7 +830,7 @@ mod tests {
             DeactivationMode, LifecycleSpec, RunningPolicy,
         };
         let p = proto(ProtocolAction::ParkTriggers);
-        let ada_svc = InfraCopy { node_id: "svc".into(), member: Some(weft_core::member::MemberId::new("ada").unwrap()) };
+        let ada_svc = InfraCopy { node_id: "svc".into(), instance: Some(weft_core::instance::InstanceId::new("ada").unwrap()) };
         match plan_action(&p, &std::collections::BTreeSet::from([ada_svc.clone()]), &[]) {
             ActionPlan::EnqueueLifecycle {
                 spec: LifecycleSpec::Deactivate(d),
@@ -898,7 +899,7 @@ mod tests {
     fn plan_auto_recover_enqueues_reactivate() {
         use weft_broker_client::protocol::LifecycleSpec;
         let p = proto(ProtocolAction::AutoRecover);
-        let shared = InfraCopy { node_id: "svc".into(), member: None };
+        let shared = InfraCopy { node_id: "svc".into(), instance: None };
         match plan_action(&p, &std::collections::BTreeSet::from([shared.clone()]), &[]) {
             ActionPlan::EnqueueLifecycle {
                 spec: LifecycleSpec::Reactivate(restore),
@@ -907,12 +908,12 @@ mod tests {
         }
     }
 
-    fn shared_instance(node_id: &str, instance_id: &str) -> CopyInstance {
-        CopyInstance { copy: InfraCopy { node_id: node_id.into(), member: None }, instance_id: instance_id.into() }
+    fn shared_copy(node_id: &str, copy_id: &str) -> HostCopy {
+        HostCopy { copy: InfraCopy { node_id: node_id.into(), instance: None }, copy_id: copy_id.into() }
     }
 
     fn shared_broken(node_id: &str) -> std::collections::BTreeSet<InfraCopy> {
-        std::collections::BTreeSet::from([InfraCopy { node_id: node_id.into(), member: None }])
+        std::collections::BTreeSet::from([InfraCopy { node_id: node_id.into(), instance: None }])
     }
 
     /// A restart reaches the copies owned by whoever owns a broken copy:
@@ -921,34 +922,34 @@ mod tests {
     #[test]
     fn plan_restart_reaches_only_the_broken_owners_copy() {
         let p = proto(ProtocolAction::RestartUnit { node_id: "n1".into(), unit: "main".into() });
-        let ada_id = weft_core::member::MemberId::new("ada").unwrap();
+        let ada_id = weft_core::instance::InstanceId::new("ada").unwrap();
         let mut ada = node("n1", "inst-ada");
-        ada.member = Some(ada_id.clone());
+        ada.instance = Some(ada_id.clone());
         let mut bob = node("n1", "inst-bob");
-        bob.member = Some(weft_core::member::MemberId::new("bob").unwrap());
+        bob.instance = Some(weft_core::instance::InstanceId::new("bob").unwrap());
         let nodes = vec![node("n1", "inst-shared"), ada, bob, node("n2", "inst-other")];
-        let ada_broken = std::collections::BTreeSet::from([InfraCopy { node_id: "n1".into(), member: Some(ada_id.clone()) }]);
+        let ada_broken = std::collections::BTreeSet::from([InfraCopy { node_id: "n1".into(), instance: Some(ada_id.clone()) }]);
         assert_eq!(
             plan_action(&p, &ada_broken, &nodes),
             ActionPlan::RestartUnit {
-                copies: vec![CopyInstance {
-                    copy: InfraCopy { node_id: "n1".into(), member: Some(ada_id) },
-                    instance_id: "inst-ada".into(),
+                copies: vec![HostCopy {
+                    copy: InfraCopy { node_id: "n1".into(), instance: Some(ada_id) },
+                    copy_id: "inst-ada".into(),
                 }],
                 unit: "main".into(),
             }
         );
         assert_eq!(
             plan_action(&p, &shared_broken("db"), &nodes),
-            ActionPlan::RestartUnit { copies: vec![shared_instance("n1", "inst-shared")], unit: "main".into() }
+            ActionPlan::RestartUnit { copies: vec![shared_copy("n1", "inst-shared")], unit: "main".into() }
         );
     }
 
     #[test]
     fn plan_names_the_owners_when_the_node_is_on_the_other_side() {
         let p = proto(ProtocolAction::RestartUnit { node_id: "n1".into(), unit: "main".into() });
-        let ada = weft_core::member::MemberId::new("ada").unwrap();
-        let broken = std::collections::BTreeSet::from([InfraCopy { node_id: "db".into(), member: Some(ada.clone()) }]);
+        let ada = weft_core::instance::InstanceId::new("ada").unwrap();
+        let broken = std::collections::BTreeSet::from([InfraCopy { node_id: "db".into(), instance: Some(ada.clone()) }]);
         assert_eq!(
             plan_action(&p, &broken, &[node("n1", "inst-shared")]),
             ActionPlan::NoCopyForOwners { node_id: "n1".into(), owners: vec![Some(ada)] }

@@ -27,12 +27,17 @@ import type { CancelCause, ExecutionPhase } from '../../../packages/weft-graph/s
 
 export type ExecutionsMode = 'flat' | 'byVersion';
 
-// SYNC: ExecutionSummary <-> crates/weft-dispatcher/src/journal/mod.rs (ExecutionSummary), weavemind/website/src/routes/(app)/executions/+page.ts (Execution)
+/** Where a run stands, or `corrupt` when its journal row no longer
+ *  decodes (then `entry_node` is empty). */
+// SYNC: SummaryStatus <-> crates/weft-core/src/program.rs SummaryStatus (and RunStatus)
+export type SummaryStatus = 'running' | 'waiting_for_input' | 'completed' | 'failed' | 'cancelled' | 'corrupt';
+
+// SYNC: ExecutionSummary <-> crates/weft-core/src/program.rs (ExecutionSummary), weavemind/website/src/routes/(app)/executions/+page.ts (Execution)
 export interface ExecutionSummary {
   execution_id: string;
   project_id: string;
   entry_node: string;
-  status: string;
+  status: SummaryStatus;
   /** A trigger fire or manual run (`fire`), or one of the two setup
    *  runs an activate / resync / infra start makes. */
   phase: ExecutionPhase;
@@ -44,6 +49,8 @@ export interface ExecutionSummary {
   /** For a cancelled run: who or what stopped it. Decides the row's
    *  icon (a person stopping it is not the runtime cutting it). */
   cancel_cause?: CancelCause | null;
+  /** For a failed run: what failed it. */
+  error?: string;
   /** Node firings the run skipped; said beside `completed`, never
    *  drawn as a different icon (a skipped branch is a normal run). */
   skipped_nodes?: number;
@@ -494,7 +501,8 @@ export class VersionNode extends vscode.TreeItem {
 /** One run under a version. Opens in the graph like a flat row; carries
  *  its version so the graph can say when the code on disk differs. */
 export class RunNode extends vscode.TreeItem {
-  readonly summary: ExecutionSummary;
+  /** What opening this run needs: its project and its id. */
+  readonly summary: Pick<ExecutionSummary, 'project_id' | 'execution_id'>;
   constructor(
     public readonly run: RunSummary,
     public readonly versionId: string,
@@ -507,32 +515,21 @@ export class RunNode extends vscode.TreeItem {
   ) {
     super(`${scopedToFocus ? '◉ ' : ''}${run.execution_id.slice(0, 8)}`, vscode.TreeItemCollapsibleState.None);
     this.id = `run:${run.execution_id}`;
-    this.summary = {
-      execution_id: run.execution_id,
-      project_id: projectId,
-      entry_node: run.spec?.name ?? '',
-      status: run.status,
-      phase: 'fire',
-      started_at: run.started_at,
-      completed_at: run.completed_at,
-      tags: [],
-      cancel_cause: run.cancel_cause,
-      skipped_nodes: run.skipped_nodes,
-    };
+    this.summary = { execution_id: run.execution_id, project_id: projectId };
     this.description = runDescription(run, headRun);
     this.tooltip = new vscode.MarkdownString(
       [
         `**run** ${run.execution_id}`,
         `**version** ${versionId}`,
-        `**status** ${run.status}`,
+        `**status** ${run.status ?? 'unknown'}`,
         ...(run.seed_execution_id ? [`**seed** ${run.seed_execution_id} (stale: ${run.stale.join(', ') || 'none'})`] : []),
         ...(run.spec ? [`**spec** ${run.spec.name}`] : []),
         ...(run.example ? [`**example** ${run.example}`] : []),
         `**started** ${new Date(run.started_at * 1000).toLocaleString()}`,
       ].join('\n\n'),
     );
-    this.contextValue = `weftRun-${run.status.toLowerCase()}`;
-    this.iconPath = statusThemeIcon(run.status, run.cancel_cause);
+    this.contextValue = `weftRun-${run.status ?? 'unknown'}`;
+    this.iconPath = statusThemeIcon(run.status ?? 'unknown', run.cancel_cause);
     this.command = { command: 'weft.viewExecution', title: 'View', arguments: [this] };
   }
 }
@@ -549,7 +546,7 @@ export class LoadMoreNode extends vscode.TreeItem {
 }
 
 /** The `/executions` response: a page plus the total matching count. */
-// SYNC: ExecutionPage <-> crates/weft-dispatcher/src/journal/mod.rs (ExecutionPage), weavemind/website/src/routes/(app)/executions/+page.ts (ExecutionPage)
+// SYNC: ExecutionPage <-> crates/weft-core/src/program.rs (ExecutionPage), weavemind/website/src/routes/(app)/executions/+page.ts (ExecutionPage)
 interface ExecutionPage {
   executions: ExecutionSummary[];
   total: number;
@@ -574,6 +571,7 @@ export class ExecutionNode extends vscode.TreeItem {
         `**project** ${summary.project_id}`,
         `**entry** ${summary.entry_node}`,
         `**status** ${summary.status}`,
+        ...(summary.error ? [`**error** ${summary.error}`] : []),
         ...(tags.length > 0 ? [`**tags** ${tags.join(', ')}`] : []),
         `**started** ${started}`,
       ].join('\n\n'),

@@ -48,7 +48,7 @@ pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>, caller_t
                     caller_token_secret: Some(caller_token_secret.to_string()),
                     idle_stop: Duration::from_secs(local.worker_idle_stop_seconds),
                     scratch_dir: scratch.clone(),
-                    install: config.instance.clone(),
+                    install: config.install.clone(),
                     time_scale: weft_core::time_scale::factor(),
                 },
             ));
@@ -61,7 +61,7 @@ pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>, caller_t
                     gpu,
                     disks: weft_platform_local::DiskBacking::Volumes,
                     publish: weft_platform_local::Publish::Loopback,
-                    install: config.instance.clone(),
+                    install: config.install.clone(),
                 },
             ));
             let alarm = Arc::new(weft_platform_local::LocalAlarm::new(pool.clone()));
@@ -111,9 +111,9 @@ pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>, caller_t
             let tokens = Arc::new(weft_platform_gcp::MetadataTokens::new());
             let google = weft_platform_gcp::Google::new(tokens.clone());
             Ok(Parts {
-                runner: Arc::new(weft_platform_gcp::CloudRunRunner::new(google.clone(), gcp.clone(), config.role_addresses(Vantage::Private).broker, config.instance.clone())),
+                runner: Arc::new(weft_platform_gcp::CloudRunRunner::new(google.clone(), gcp.clone(), config.role_addresses(Vantage::Private).broker, config.install.clone())),
                 images: Arc::new(weft_platform_gcp::CloudBuildImages::new(google.clone(), gcp.clone())?),
-                host: Arc::new(weft_platform_gcp::ComputeInfraHost::new(google.clone(), gcp.clone(), config.instance.clone())),
+                host: Arc::new(weft_platform_gcp::ComputeInfraHost::new(google.clone(), gcp.clone(), config.install.clone())),
                 alarm: Arc::new(weft_platform_gcp::CloudTasksAlarm::new(google, gcp.clone(), config.role_addresses(Vantage::Public))),
                 identity: Arc::new(weft_platform_gcp::GoogleIdentity::new(
                     gcp.project.clone(),

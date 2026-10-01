@@ -1,12 +1,13 @@
-//! What the install's infra endpoints answer and the CLI reads: one
-//! Rust type per answer, so the two ends cannot drift.
+//! What the install's infra endpoints read and answer, and the CLI sends
+//! and reads: one Rust type per message, so the two ends cannot drift.
 
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::member::MemberId;
+use crate::instance::InstanceId;
+use crate::running_policy::{DeactivateSpec, RunningChoice};
 
 /// `GET /projects/{id}/infra/doors`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,14 +20,14 @@ pub struct DoorsResponse {
     pub applying: Vec<CopyRef>,
 }
 
-/// One copy of an infra node: the shared one, or a member's.
+/// One copy of an infra node: the shared one, or an instance's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CopyRef {
     /// The node as the program spells it.
     pub node: String,
-    /// Whose copy: absent for the shared one.
+    /// Which instance's copy: absent for the shared one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub member: Option<MemberId>,
+    pub instance: Option<InstanceId>,
 }
 
 /// One door serving right now.
@@ -172,15 +173,15 @@ pub struct LogBlock {
 pub struct LogCursor(pub BTreeMap<String, LogMark>);
 
 impl LogCursor {
-    /// One container of one unit of one copy (`instance` is the copy's
-    /// stable id, so two members' copies never share a key).
-    pub fn key(instance: &str, unit: &str, source: &str) -> String {
-        format!("{instance}/{unit}/{source}")
+    /// One container of one unit of one copy (`copy_id` is the copy's
+    /// stable id, so two instances' copies never share a key).
+    pub fn key(copy_id: &str, unit: &str, source: &str) -> String {
+        format!("{copy_id}/{unit}/{source}")
     }
 
     /// The marks of one unit, keyed by source, as a host reads them.
-    pub fn for_unit(&self, instance: &str, unit: &str) -> BTreeMap<String, LogMark> {
-        let prefix = format!("{instance}/{unit}/");
+    pub fn for_unit(&self, copy_id: &str, unit: &str) -> BTreeMap<String, LogMark> {
+        let prefix = format!("{copy_id}/{unit}/");
         self.0
             .iter()
             .filter_map(|(k, m)| k.strip_prefix(&prefix).map(|source| (source.to_string(), *m)))
@@ -188,9 +189,216 @@ impl LogCursor {
     }
 }
 
+/// A shared infra place with no copy and nothing starting one, in the
+/// project status.
+// SYNC: INFRA_NOT_STARTED <-> packages/weft-graph/src/protocol.ts InfraPlacementStatus.status
+pub const INFRA_NOT_STARTED: &str = "not_started";
+/// A `@per_instance` infra place in the project status: it has no shared
+/// copy, only its instances'.
+// SYNC: INFRA_PER_INSTANCE <-> packages/weft-graph/src/protocol.ts InfraPlacementStatus.status
+pub const INFRA_PER_INSTANCE: &str = "per_instance";
+
+/// `POST /projects/{id}/infra/sync`: bring the infra up on a build.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyncRequest {
+    /// The build the client just made (`POST /projects/{id}/builds`).
+    /// Named, the sync applies it and refuses when the registered build
+    /// is another (a teammate's landed between the two). Absent (a
+    /// program starting an instance's copy, which builds nothing), it
+    /// applies the registered build. The images every place runs come
+    /// with the build, never from here.
+    #[serde(flatten)]
+    pub build: crate::builds::BuildHashes,
+    /// How the worker reconciliation inside sync (and an upgrade's
+    /// stop leg) treats executions still running on an older image once
+    /// a new one went live. `cancel` (the default) cancels them; `wait`
+    /// lets them finish up to `drainTimeoutSecs`, then cancels what is
+    /// left. Never a silent kill.
+    /// On an upgrade, outranked by `triggerDeactivation`'s answer when
+    /// that picker was shown.
+    #[serde(flatten)]
+    pub running: RunningChoice,
+    /// Whose copies: an instance's copies of the nodes marked
+    /// `@per_instance`, or (absent) the shared nodes. `weft infra start
+    /// --instance`, and a program's `ctx.infra(..).instance(..).start()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<InstanceId>,
+    /// Only these infra nodes (by place), every one of the owner's kind
+    /// when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<String>,
+}
+
+/// `POST /projects/{id}/infra/upgrade`: cycle the running infra onto the
+/// current specs (the triggers reading it taken down per
+/// `triggerDeactivation`, then a stop leg, then the start). What to run
+/// is the sync body's.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpgradeRequest {
+    #[serde(flatten)]
+    pub sync: SyncRequest,
+    /// How to deactivate the triggers reading this infra when one is on
+    /// (required then: 428 with the trigger-choice header otherwise).
+    /// Same `DeactivateSpec` shape as the standalone `/deactivate`
+    /// endpoint, so clients reuse one picker.
+    #[serde(default, rename = "triggerDeactivation", skip_serializing_if = "Option::is_none")]
+    pub trigger_deactivation: Option<DeactivateSpec>,
+}
+
+/// `POST /projects/{id}/infra/stop` and `/infra/terminate`. Carries the
+/// trigger-deactivation choice when the project is Active (the same
+/// picker as the standalone Deactivate verb, and its answer governs
+/// the running executions), and the running-work choice on its own
+/// for when it is not: an inactive project can still have executions
+/// running on this infra, and `wait` lets them land before the
+/// supervisor scales it down.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StopRequest {
+    #[serde(default, rename = "triggerDeactivation", skip_serializing_if = "Option::is_none")]
+    pub trigger_deactivation: Option<DeactivateSpec>,
+    #[serde(flatten)]
+    pub running: RunningChoice,
+    /// Whose copies: one instance's (`--instance`), or (absent) the shared
+    /// ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<InstanceId>,
+}
+
+/// `POST /projects/{id}/infra/nodes/{node}/stop` and `/terminate`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PerNodeRequest {
+    /// What happens to the running executions this copy can reach.
+    /// Which ones use this one instance is not recorded, so for the
+    /// shared copy `cancel` (the default) ends every running execution
+    /// of the project, and for an instance's copy every run of that
+    /// instance; `wait` lets the same set land first.
+    #[serde(flatten)]
+    pub running: RunningChoice,
+    /// Stop only: force scale-to-zero every unit, ignoring `on_stop`.
+    /// Lets the user take down a unit that would normally stay up
+    /// (NoOp) so they can update it on the next start. Ignored by
+    /// terminate (terminate already removes everything).
+    #[serde(default)]
+    pub force: bool,
+    /// Whose copy of the node: an instance's copy of a per-instance node,
+    /// or (absent) the shared one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<InstanceId>,
+}
+
+/// What a sync answers, and `GET /projects/{id}/infra/status`: every
+/// copy that exists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfraStatus {
+    pub nodes: Vec<InfraStatusEntry>,
+}
+
+impl InfraStatus {
+    /// What the host runs differently from what each copy asked (a GPU
+    /// kind a local install cannot choose), across every copy.
+    pub fn host_notes(&self) -> impl Iterator<Item = &str> {
+        self.nodes.iter().flat_map(|entry| entry.notes.iter().map(String::as_str))
+    }
+}
+
+/// One copy of an infra node, and its state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfraStatusEntry {
+    /// The node's placement, spelled the way a person writes the node
+    /// (`db`, `one.db`): what a person is shown, what the editor matches
+    /// against its canvas, and what every per-node verb takes.
+    pub node: String,
+    /// Whose copy: absent for the shared one, else the instance's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<InstanceId>,
+    pub status: String,
+    pub endpoint_url: Option<String>,
+    /// Endpoint name to the address a caller outside the install uses,
+    /// for each `Public` endpoint (the same address
+    /// `ctx.endpoint(name)?.public_url()` gives the node).
+    pub public_urls: BTreeMap<String, String>,
+    pub failure_stage: Option<String>,
+    pub failure_message: Option<String>,
+    /// What the host runs differently from what was asked (a GPU kind it
+    /// cannot choose), one plain sentence each; the CLI prints them as
+    /// warnings. Empty when the copy runs as asked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+/// What a verb that enqueues a lifecycle command answers (202). No
+/// `nodes`: the command has not been claimed yet, so any snapshot would
+/// be the state before the action. Clients follow the command
+/// (`/infra/commands/{id}`) for its outcome.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LifecycleCommandIssued {
+    pub command_id: i64,
+}
+
+/// `GET /projects/{id}/infra/commands/{cmd_id}`: whether the command
+/// finished, and how.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandStatus {
+    /// True once the supervisor marked the command complete.
+    pub done: bool,
+    /// How it ended, only when `done`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<CommandOutcome>,
+    /// Error (on failed) or reason (on cancelled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// How a finished lifecycle command ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandOutcome {
+    Succeeded,
+    Failed,
+    /// `weft infra cancel` halted it between steps.
+    Cancelled,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_status_hands_its_host_notes_over_and_reads_an_entry_without_any() {
+        let status: InfraStatus = serde_json::from_value(serde_json::json!({ "nodes": [
+            { "node": "llm", "status": "running", "endpoint_url": null, "public_urls": {},
+              "failure_stage": null, "failure_message": null, "notes": ["asked for 1 x l4"] },
+            { "node": "db", "instance": "ann", "status": "running", "endpoint_url": "http://x", "public_urls": {},
+              "failure_stage": null, "failure_message": null },
+        ] }))
+        .unwrap();
+        assert_eq!(status.host_notes().collect::<Vec<_>>(), vec!["asked for 1 x l4"]);
+        assert_eq!(status.nodes[1].instance.as_ref().map(InstanceId::as_str), Some("ann"));
+    }
+
+    #[test]
+    fn a_command_outcome_is_one_lower_case_word() {
+        let done: CommandStatus =
+            serde_json::from_value(serde_json::json!({ "done": true, "outcome": "cancelled", "message": "why" })).unwrap();
+        assert_eq!(done.outcome, Some(CommandOutcome::Cancelled));
+        let pending = serde_json::to_value(CommandStatus { done: false, outcome: None, message: None }).unwrap();
+        assert_eq!(pending, serde_json::json!({ "done": false }));
+    }
+
+    #[test]
+    fn a_sync_names_only_what_it_was_given() {
+        let wire = serde_json::to_value(SyncRequest {
+            build: crate::builds::BuildHashes { infra_hash: Some("i".into()), ..Default::default() },
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(wire, serde_json::json!({ "infraHash": "i" }));
+        let upgrade: UpgradeRequest = serde_json::from_value(serde_json::json!({
+            "infraHash": "i", "triggerDeactivation": { "mode": "park", "runningPolicy": "wait" }
+        }))
+        .unwrap();
+        assert_eq!(upgrade.sync.build.infra_hash.as_deref(), Some("i"));
+        assert!(upgrade.trigger_deactivation.is_some());
+    }
 
     fn at(nanos: u32) -> DateTime<Utc> {
         DateTime::from_timestamp(1_700_000_000, nanos).unwrap()

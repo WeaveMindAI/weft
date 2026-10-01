@@ -23,7 +23,7 @@
 //!
 //! TLS terminates at the gateway; this server speaks plain HTTP/WS over
 //! the private install network and trusts the dispatcher-signed token
-//! (verified in [`crate::run_instance`]'s accept path) for authentication.
+//! (verified in `handle_connect`'s accept path) for authentication.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -364,6 +364,23 @@ struct ConnInner {
     wire_started: bool,
 }
 
+/// Why an exchange whose run parked ends here: the run outlives its
+/// caller (`outlivesCaller`), so its worker leaves while it waits and
+/// whatever it says once resumed goes nowhere. Said to the caller (an
+/// error before the first byte, in-band after it, a `1011` close on a
+/// socket) and recorded on the exchange.
+pub const PARKED: &str = "the run is waiting on a signal and carries on without this caller \
+     (its route outlives its caller): no answer will come on this request";
+
+impl ConnInner {
+    /// An HTTP caller that has not heard a word yet: the run owes it an
+    /// answer, and ending without one is a failure. The one rule,
+    /// read by `owes_answer` and `run_ended`.
+    fn unanswered_http(&self, protocol: Protocol) -> bool {
+        protocol == Protocol::Http && !self.wire_started
+    }
+}
+
 impl LiveCallerConnection {
     /// The sink the exchange is recorded through, for the run to close
     /// once it is over.
@@ -440,23 +457,43 @@ impl LiveCallerConnection {
     /// would see a gateway `503` with no hint of why. A program that
     /// already terminated the exchange is left alone.
     pub async fn run_ended(&self) {
-        let silent_http = {
-            let mut g = self.inner.lock().expect("caller conn poisoned");
-            if g.terminated {
-                return;
-            }
-            g.terminated = true;
-            let silent_http = self.config.protocol == Protocol::Http && !g.wire_started;
-            g.wire_started = true;
-            silent_http
+        let Some(silent_http) = self.take_end(|g| g.unanswered_http(self.config.protocol)) else {
+            return;
         };
         if silent_http {
-            let message = "the run ended without answering";
+            let message = weft_core::caller::NO_ANSWER;
             self.record.errored(message);
             self.outbound.push_terminal(Outbound::Error(message.to_string()));
         } else {
             self.outbound.push_terminal(Outbound::Terminate(None, None));
         }
+    }
+
+    /// The run parked on a wait and its worker is leaving (the drive
+    /// ended `Stalled`): the run has NOT ended, so this never says it
+    /// did. Whatever the exchange was doing, it stops here with
+    /// [`PARKED`]. A program that already terminated the exchange is
+    /// left alone.
+    pub async fn run_parked(&self) {
+        if self.take_end(|_| ()).is_none() {
+            return;
+        }
+        self.record.errored(PARKED);
+        self.outbound.push_terminal(Outbound::Error(PARKED.to_string()));
+    }
+
+    /// Claim the exchange's end once: `None` when it was already
+    /// terminated, otherwise `read` of the state before the end marks
+    /// the wire started.
+    fn take_end<T>(&self, read: impl FnOnce(&ConnInner) -> T) -> Option<T> {
+        let mut g = self.inner.lock().expect("caller conn poisoned");
+        if g.terminated {
+            return None;
+        }
+        g.terminated = true;
+        let seen = read(&g);
+        g.wire_started = true;
+        Some(seen)
     }
 
     /// Resolve a gone-caller talk into the policy-correct outcome (cancel
@@ -508,6 +545,11 @@ impl CallerConnection for LiveCallerConnection {
 
     fn wire_started(&self) -> bool {
         self.inner.lock().expect("caller conn poisoned").wire_started
+    }
+
+    fn owes_answer(&self) -> bool {
+        self.is_connected()
+            && self.inner.lock().expect("caller conn poisoned").unanswered_http(self.config.protocol)
     }
 
     async fn ensure_connected(&self) -> Result<(), CallerError> {
@@ -902,7 +944,7 @@ impl CallerRegistry {
                 target: "weft_engine::caller_conn",
                 %execution_id,
                 "the caller registry is poisoned, so this execution's connection entry was not \
-                 dropped; it goes with the instance"
+                 dropped; it goes with the replica"
             ),
         }
     }
@@ -1004,9 +1046,9 @@ pub struct ConnServerState {
     /// The project this worker serves; a ticket for another project is
     /// refused.
     pub project_id: uuid::Uuid,
-    /// This worker's instance: the execution an arriving caller brings is
+    /// This worker's replica: the execution an arriving caller brings is
     /// born pinned to it.
-    pub instance: String,
+    pub replica: String,
     /// Starts the drive of an execution once its birth is in.
     pub starter: Arc<dyn LiveStarter>,
     /// Resolves the per-execution runtime config + journal sink. Set by the
@@ -1041,7 +1083,7 @@ const ARRIVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// captures) rides the token instead.
 fn arrival_payload(
     token: &str,
-    instance: &str,
+    replica: &str,
     raw_query: &str,
     request: &axum::extract::Request,
 ) -> weft_task_store::kinds::LiveArrivalPayload {
@@ -1049,7 +1091,7 @@ fn arrival_payload(
     query.remove("wct");
     weft_task_store::kinds::LiveArrivalPayload {
         token: token.to_string(),
-        instance: instance.to_string(),
+        replica: replica.to_string(),
         method: request.method().as_str().to_string(),
         query,
         headers: request
@@ -1091,7 +1133,7 @@ async fn ask_for_birth(
             // source for it anyway.
             execution_id: None,
             tenant_id: state.tenant_id.clone(),
-            target_instance: None,
+            target_replica: None,
             binary_hash: None,
             payload: serde_json::to_value(&payload).expect("the arrival payload serializes"),
         })
@@ -1112,7 +1154,7 @@ async fn ask_for_birth(
     };
     match outcome.status {
         TaskStatus::Complete => match outcome.result.map(serde_json::from_value::<weft_task_store::kinds::LiveArrivalResult>) {
-            Some(Ok(weft_task_store::kinds::LiveArrivalResult::Born { instance, .. })) if instance == state.instance => Ok(()),
+            Some(Ok(weft_task_store::kinds::LiveArrivalResult::Born { replica, .. })) if replica == state.replica => Ok(()),
             // A resent request that the platform handed to another copy
             // of the worker: the run was born on the first one and is
             // driven there, so this copy has nothing to attach to.
@@ -1556,7 +1598,7 @@ async fn handle_connect(
     //    start driving it. Nothing was born at the handshake (a caller who
     //    never follows the redirect leaves nothing behind); the routing
     //    token is the dispatcher's promise, and this is where it is kept.
-    let arrival = arrival_payload(&token, &state.instance, &raw_query, &request);
+    let arrival = arrival_payload(&token, &state.replica, &raw_query, &request);
     if let Err(response) = ask_for_birth(&state, &claims, arrival).await {
         return response;
     }
@@ -1761,7 +1803,8 @@ async fn drive_http(
                             head.commit_error();
                             let _ = tx.try_send(Ok(msg.into_bytes()));
                         } else {
-                            let sent = async { tx.send(Ok(format!("\n[error] {msg}").into_bytes())).await.is_ok() };
+                            let line = head.in_band_error(&msg);
+                            let sent = async { tx.send(Ok(line)).await.is_ok() };
                             // The program answered: a last write the caller no
                             // longer reads still ends the exchange on the
                             // program's side, never as a hang-up (which would
@@ -1840,15 +1883,15 @@ async fn drive_http(
 struct HeldHead {
     tx: Option<tokio::sync::oneshot::Sender<ResponseHead>>,
     explicit: Option<ResponseHead>,
-    /// The committed head's filler (see `ResponseHead::keepalive`),
-    /// what the drainer writes on a quiet heartbeat; `None` until the
-    /// head went out, and for a body whose framing has none.
-    keepalive: Option<String>,
+    /// The head that went out, `None` until then. It names the body's
+    /// framing: the filler the drainer writes on a quiet heartbeat (see
+    /// `ResponseHead::keepalive`) and how an error is written in-band.
+    committed: Option<ResponseHead>,
 }
 
 impl HeldHead {
     fn new(tx: tokio::sync::oneshot::Sender<ResponseHead>) -> Self {
-        Self { tx: Some(tx), explicit: None, keepalive: None }
+        Self { tx: Some(tx), explicit: None, committed: None }
     }
 
     fn is_pending(&self) -> bool {
@@ -1856,7 +1899,16 @@ impl HeldHead {
     }
 
     fn keepalive(&self) -> Option<&str> {
-        self.keepalive.as_deref()
+        self.committed.as_ref().and_then(|h| h.keepalive.as_deref())
+    }
+
+    /// The error written into a body already under way, in the
+    /// committed head's framing (see `ResponseHead::in_band_error`).
+    fn in_band_error(&self, message: &str) -> Vec<u8> {
+        match &self.committed {
+            Some(head) => head.in_band_error(message),
+            None => ResponseHead::default().in_band_error(message),
+        }
     }
 
     /// The program set the head explicitly; it goes out with the item
@@ -1887,7 +1939,7 @@ impl HeldHead {
             (None, Some(c)) => ResponseHead::default().with_content_type_for(c),
             (None, None) => ResponseHead::new(204),
         };
-        self.keepalive = head.keepalive.clone();
+        self.committed = Some(head.clone());
         tx.send(head).is_ok()
     }
 
@@ -2105,6 +2157,24 @@ mod tests {
     use weft_core::wait::SuspendPolicy;
 
     const PROJECT: uuid::Uuid = uuid::Uuid::from_u128(1);
+
+    /// An error after the head went out is written in the framing that
+    /// head committed: a JSON line for a JSON-lines stream, a text line
+    /// for a text one.
+    #[test]
+    fn held_head_writes_the_error_in_the_committed_framing() {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let mut ndjson = HeldHead::new(tx);
+        ndjson.explicit(ResponseHead::new(200).with_header("content-type", "application/x-ndjson").with_keepalive("\n"));
+        assert!(ndjson.commit_for(Some(&OutboundChunk::Text("{\"a\":1}\n".into()))));
+        assert_eq!(ndjson.in_band_error("boom"), b"\n{\"error\":\"boom\"}\n");
+        assert_eq!(ndjson.keepalive(), Some("\n"), "the filler still comes off the committed head");
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let mut text = HeldHead::new(tx);
+        assert!(text.commit_for(Some(&OutboundChunk::Text("partial".into()))));
+        assert_eq!(text.in_band_error("boom"), b"\n[error] boom");
+    }
 
     /// Recording journal sink: appends every event so tests assert the
     /// observable exchange was journaled in order.
@@ -2565,7 +2635,7 @@ mod tests {
             registry: CallerRegistry::new(),
             token_secret: Arc::new(Vec::new()),
             project_id: PROJECT,
-            instance: "worker-a".into(),
+            replica: "worker-a".into(),
             starter: Arc::new(RecordingStarter::default()),
             resolver: Arc::new(NoResolver),
             clock: weft_platform_traits::FakeClock::new(),
@@ -2616,22 +2686,22 @@ mod tests {
         }
         async fn claim_one(
             &self,
-            _instance: &str,
+            _replica: &str,
             _filter: weft_task_store::tasks::ClaimFilter,
             _wait: std::time::Duration,
         ) -> anyhow::Result<Option<weft_task_store::tasks::Task>> {
             Ok(None)
         }
-        async fn heartbeat(&self, _task_id: uuid::Uuid, _instance: &str) -> anyhow::Result<bool> {
+        async fn heartbeat(&self, _task_id: uuid::Uuid, _replica: &str) -> anyhow::Result<bool> {
             Ok(true)
         }
-        async fn requeue(&self, _task_id: uuid::Uuid, _instance: &str) -> anyhow::Result<bool> {
+        async fn requeue(&self, _task_id: uuid::Uuid, _replica: &str) -> anyhow::Result<bool> {
             Ok(true)
         }
-        async fn complete(&self, _task_id: uuid::Uuid, _instance: &str, _result: serde_json::Value) -> anyhow::Result<()> {
+        async fn complete(&self, _task_id: uuid::Uuid, _replica: &str, _result: serde_json::Value) -> anyhow::Result<()> {
             Ok(())
         }
-        async fn fail(&self, _task_id: uuid::Uuid, _instance: &str, _error: String) -> anyhow::Result<()> {
+        async fn fail(&self, _task_id: uuid::Uuid, _replica: &str, _error: String) -> anyhow::Result<()> {
             Ok(())
         }
     }
@@ -2660,7 +2730,7 @@ mod tests {
                 params: [("room".to_string(), "room7".to_string())].into_iter().collect(),
                 caller: None,
                 approved,
-                member: None,
+                instance: None,
                 exp,
             },
         );
@@ -2828,7 +2898,7 @@ mod tests {
         assert_eq!(task.tenant_id, "tenant-a");
         let payload: weft_task_store::kinds::LiveArrivalPayload = serde_json::from_value(task.payload.clone()).unwrap();
         assert_eq!(payload.token, token);
-        assert_eq!(payload.instance, "worker-a", "the birth is pinned to the worker the caller reached");
+        assert_eq!(payload.replica, "worker-a", "the birth is pinned to the worker the caller reached");
         assert_eq!(payload.method, "POST");
         assert_eq!(payload.query.get("verbose").map(String::as_str), Some("1"));
         assert!(!payload.query.contains_key("wct"), "the routing token is the hop's, never the program's");
@@ -2850,7 +2920,7 @@ mod tests {
         *tasks.born.lock().unwrap() = Some(
             serde_json::to_value(weft_task_store::kinds::LiveArrivalResult::Born {
                 execution_id: execution_id.to_string(),
-                instance: "worker-a".into(),
+                replica: "worker-a".into(),
             })
             .unwrap(),
         );
@@ -3193,7 +3263,19 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(header(&headers, "content-type"), Some("text/plain; charset=utf-8"));
-        assert_eq!(body, "the run ended without answering");
+        assert_eq!(body, weft_core::caller::NO_ANSWER);
+    }
+
+    /// A run that parked has not ended: its caller hears that it
+    /// carries on without them, never that it ended unanswered.
+    #[tokio::test]
+    async fn a_run_that_parks_says_so_and_never_claims_it_ended() {
+        let (status, _headers, body) = exchange("{}", |conn| async move {
+            conn.run_parked().await;
+        })
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, PARKED);
     }
 
     #[tokio::test]

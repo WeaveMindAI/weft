@@ -42,7 +42,7 @@ error rather than a trigger that quietly never fires.
 | `node_type` | `String` | Its catalog type, such as `ExecPython` |
 | `node_label` | `Option<String>` | The title shown on the box, if it has one |
 | `frames` | `LoopFrames` | Which loop iterations this firing sits inside |
-| `member()` | `Option<&MemberId>` | Who this run is for, when it is for one member of the program (see [programs with members](../running/members.md)) |
+| `instance()` | `Option<&InstanceId>` | Which instance this run is for, when it is for one instance of the program (see [programs with instances](../running/instances.md)) |
 
 ## Reading inputs
 
@@ -62,7 +62,7 @@ event payload, and only on the trigger that actually fired. Both are a
 | `object()` / `record()` | The whole bag as one record | On a wake bag whose event was missing or not an object |
 | `nested("name")` | The object under `name`, as its own bag | The value is there and is not an object |
 | `iter()` | Every named value | never |
-| `custom()` | Only the ports this instance added, not the type's own settings | never |
+| `custom()` | Only the ports this node added in the program, not the type's own settings | never |
 | `declared()` | Only the type's own declared settings | never |
 | `in_order()` | Every input that arrived, in source order | On a wake or nested bag |
 | `declares("name")` | Whether the node declares this input at all | never |
@@ -76,13 +76,15 @@ honestly.
 
 | Call | What it does | It fails when |
 |---|---|---|
-| `pulse_downstream(output).await` | Sends values on. The only way a node emits | A port is mentioned twice, is not declared, or gets a value its type does not allow |
+| `pulse_downstream(output).await` | Sends values on | A port is mentioned twice, is not declared, gets a value its type does not allow, or is `error` on a node with `catchErrors` |
 | `yield_downstream(output).await` | The same, but waits until the value was taken | Same, plus a delivery that can never happen, and an empty output |
-| `close_port("port").await` | Closes one output. On a stream port this is the end of the stream | The port was already mentioned this firing |
+| `close_port("port").await` | Closes one output. On a stream port this is the end of the stream | The port was already mentioned this firing, or is `error` on a node with `catchErrors` |
 | `set_max_buffered_items("port", n)` | Raises the un-taken cap on a stream port above 4096 | The port is not a stream output, or `n` is 0 |
-| `fan_declared(&value)` | Builds an output by matching an object's keys to your declared ports, skipping the rest | never |
-| `output_type("port")` | The resolved type of one output | never |
-| `declared_outputs()` / `declared_inputs()` | Every port this instance declares, with its type | never |
+| `fan_declared(&value)` | Builds an output by matching an object's keys to your declared ports, skipping the rest. On a node with `catchErrors` it never fills `error`: a key called `error` in the data is data | never |
+| `data_outputs()` | Your declared ports, minus `error` on a node with `catchErrors`: the ones a node fills from data (a row's columns, a response's fields) | never |
+| `output_type("port")?` | The resolved type of one output | The node does not declare that output: a type error, so it fails the run even with `error` wired |
+| `declared_outputs()` / `declared_inputs()` | Every port this node declares in the program, with its type | never |
+| `is_output_wired("port")` | Whether anything downstream reads that output in this run | never |
 
 An ordinary port emits at most once per firing. Whatever you never mention is
 closed for you when the body returns. A `Generator[T]` port emits as often as
@@ -106,9 +108,9 @@ you like until you close it.
 | `register_signal(kind).await` | Sets up a trigger that starts a new run on every fire. Called during setup | Called twice for one node in one setup |
 | `run("name", closure).await` | Runs the closure and writes down its result, or gives back what was written down last time | The closure itself fails |
 
-`ctx.run` is how you stop a replay from doing an expensive thing twice. It
-cannot stop it from doing it twice when the worker dies between the action and
-the write, so a service you call more than once has to cope with that itself.
+`ctx.run` is how you stop a replay from doing an expensive thing twice. A body
+only replays after a wait; if the worker dies while it is running, the step is
+failed instead (go and read [surviving a restart](durable-execution.md)).
 
 ## Connections
 
@@ -136,8 +138,8 @@ knowing where it came from.
 | Scope | Where it lives, and how long |
 |---|---|
 | `Execution` (the default) | This run only, swept after it ends unless you keep it |
-| `Project` | Outlives runs, gone on `weft clean` or `weft rm` |
-| `Shared { name }` | Shared across projects that name the same space |
+| `Project` | Outlives runs, gone on `weft clean` or `weft rm`, or when a lifetime you gave it runs out |
+| `Shared { name }` | Shared across projects that name the same space, until removed or its lifetime runs out |
 | `Asset` | The project's published assets. Readable, and the worker refuses writes |
 
 | Call | What it does |
@@ -148,20 +150,23 @@ knowing where it came from.
 | `put_response(resp, what, mime, filename, keep)` | Streams an HTTP response you already made into storage |
 | `put_from_url(url, filename, keep)` | Fetches a URL straight into storage |
 | `copy(&file, keep)` | Copies a file into this handle's scope, leaving the original |
+| `edit(&file, \|old\| ...)` | Changes the file's content in place: reads it, runs your function on the bytes, writes back what it returns. Another write of the same file is never lost (it reads again and reruns the function), so your function must use nothing but the bytes it is given. Same key, name, type and lifetime, new size and version |
+| `replace(&file, bytes)` | Overwrites the file's content in place, whatever it holds now |
 | `get(&file)` | The file's bytes, as a stream |
 | `get_range(&file, range)` | Part of the file |
 | `get_bytes(&file)` | The whole file in memory. Only for small ones |
 | `delete(&file)` | Deletes it. Stored files only, not URL-backed ones |
 | `list()` | Everything under this scope |
-| `keep(&file, ttl)` | Saves a run-scoped file from the sweep. There is no un-keep |
+| `keep(&file, ttl)` | Sets how long the file lives from now on, and saves a run-scoped one from the sweep (that part cannot be undone) |
 | `presign(&file, ttl)` | A temporary link. `None` means the default, about 15 minutes |
 | `public_link(&file, ttl)` | A link the open internet can fetch, or `None` if this install serves none |
-| `caller_link(&file, ttl)` | A link a caller of this install can fetch |
+| `caller_link(&file, ttl)` | A link the caller of this run can fetch, on the address its request came in on |
 | `externalize(&value, &ty, policy)` | Turns every file inside a typed value into a link or inline bytes, for handing out |
 | `internalize(&value, &ty, keep)` | The reverse: pulls URLs and inline data into stored files |
 
 `keep` takes `KeepTtl::Default` (30 days, pushed back each time the file is
-read), `Secs { secs }`, or `Never`.
+read), `Secs { secs }`, or `Never`, in every scope but `Asset`. For what it
+means in each scope, go and read [how long a file lives](storage.md#how-long-a-file-lives).
 
 What comes out of `externalize` is no longer a value of that type, because the
 links expire. Hand it to whoever asked and do not store it.
@@ -215,32 +220,33 @@ ends this run too.
 
 The runtime answers each of these calls on behalf of this run and writes the
 answer into the run's journal, so a replay reads the answer back instead of
-asking again. Most of them take an optional `.member(id)`, which picks that
-member's copy instead of the shared one; `values()`, `connections()` and
-`tokens().member(..)` always name a member.
+asking again. Most of them take an optional `.instance(id)`, which picks that
+instance's copy instead of the shared one; `values()`, `connections()` and
+`tokens().instance(..)` always name an instance.
 
 | Call | What it does |
 |---|---|
 | `infra("bridge").start().await` | Brings the shared copy up. Returns once it runs, parking the run between looks; fails with the reason if it does not come up, or if somebody stops it while this waits |
 | `infra("bridge").stop(spec, stop_self).await` | Scales the copy down, keeping its disk |
 | `infra("bridge").terminate(spec, stop_self).await` | Deletes the copy and its disks, except the ones listed in `keepOnTerminate` |
-| `infra("bridge").member(id).wipe(spec, stop_self).await` | Deletes the member's copy and every one of its disks, the kept ones too, even if the copy was already terminated |
+| `infra("bridge").instance(id).wipe(spec, stop_self).await` | Deletes the instance's copy and every one of its disks, the kept ones too, even if the copy was already terminated |
 | `infra("bridge").status().await` | The copy's state, `None` when there is none. A start or stop on its way reads `provisioning` or `stopping` at once, the same answer `weft status` gives |
-| `infra("bridge").copies().await` | Every copy: the shared one and each member's |
+| `infra("bridge").copies().await` | Every copy: the shared one and each instance's |
 | `trigger("receive").activate().await` | Turns one trigger on |
-| `triggers().deactivate(spec, stop_self).await` | Turns off every trigger of the program (or of one member, with `.member(id)`); if you want only some, name them with `.only([..])` |
-| `values().member(id).get().await` | What the member gave for the program's `@member_filled` fields, by step and field |
-| `values().member(id).set(step, field, value).clear(step, field).apply().await` | Gives and clears values in one change, each checked against its node's rules; the member's live triggers reading one are set up again, and their names come back |
-| `values().member(id).forget().await` | Forgets everything the member gave |
-| `connections().member(id).list() / forget()` | Lists a member's connections, or forgets all of them (the values naming them go too) |
-| `members().list().await` | Every member weft holds anything for, one entry each: how many values, connections and live tokens, their infra copies, and their triggers, each with the events waiting on a field they have not filled and why |
-| `costs().member(id).service(s).since(t).list().await` | The cost records, each saying whose credential paid, narrowed by member, node, service, run, `paid_by` or `since` (unix seconds) |
-| `runs().member(id).status(s).older_than(d).clean(running, stop_self).await` | Deletes runs; runs still going follow `running` |
-| `tokens().mint_for_member(id, expires_in).await` | A member token, value shown once |
-| `tokens().member(id).revoke().await` | Revokes a member's tokens |
+| `triggers().deactivate(spec, stop_self).await` | Turns off every trigger of the program (or of one instance, with `.instance(id)`); if you want only some, name them with `.only([..])` |
+| `values().instance(id).get().await` | The instance's values for the program's `@instance_filled` fields, by step and field |
+| `values().instance(id).set(step, field, value).clear(step, field).apply().await` | Gives and clears values in one change, each checked against its node's rules; the instance's live triggers reading one are set up again, and their names come back |
+| `values().instance(id).forget().await` | Forgets every value the instance was given |
+| `connections().instance(id).list() / forget()` | Lists an instance's connections, or forgets all of them (the values naming them go too) |
+| `instances().list().await` | Every instance weft holds anything for, one entry each: how many values, connections and live tokens, its infra copies, and its triggers, each with the events waiting on a field not yet filled and why |
+| `costs().instance(id).service(s).since(t).list().await` | The cost records, each saying whose credential paid, narrowed by instance, node, service, run, `paid_by` or `since` (unix seconds) |
+| `runs().instance(id).status(s).older_than(d).clean(running, stop_self).await` | Deletes runs; runs still going follow `running` |
+| `runs()...list(limit).await` / `.count().await` | The newest `limit` matching runs (1 to 200) with how many match in all, or just the count; same filters as `clean` |
+| `tokens().mint_for_instance(id, expires_in).await` | An instance token, value shown once |
+| `tokens().instance(id).revoke().await` | Revokes an instance's tokens |
 
 For what `spec` and `stop_self` decide, go and read
-[taking something down from a run](../running/members.md#taking-something-down-from-a-run).
+[taking something down from a run](../running/instances.md#taking-something-down-from-a-run).
 
 ## What is not here
 

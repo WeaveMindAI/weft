@@ -76,7 +76,7 @@ pub struct ExecutionTask<'a> {
     pub binary_hash: &'a str,
     pub tenant_id: &'a str,
     pub run_class: weft_core::run_class::RunClass,
-    /// The worker instance a live run is pinned to (the one its caller's
+    /// The worker replica a live run is pinned to (the one its caller's
     /// connection reached); `None` for everything else, which is
     /// delivered to whichever worker the platform gives.
     pub pinned_to: Option<String>,
@@ -113,7 +113,7 @@ pub fn execution_task_spec(task: ExecutionTask<'_>) -> Result<NewTask> {
         dedup_key: Some(dedup),
         execution_id: Some(execution_id_str),
         tenant_id: task.tenant_id.to_string(),
-        target_instance: task.pinned_to,
+        target_replica: task.pinned_to,
         binary_hash: Some(task.binary_hash.to_string()),
         payload: serde_json::to_value(&payload)?,
     })
@@ -167,7 +167,7 @@ pub async fn enqueue_cancel_in(
             dedup_key: Some(format!("{execution_id_str}:cancel")),
             execution_id: Some(execution_id_str),
             tenant_id: tenant_id.to_string(),
-            target_instance: None,
+            target_replica: None,
             binary_hash: None,
             payload: serde_json::to_value(&payload)?,
         },

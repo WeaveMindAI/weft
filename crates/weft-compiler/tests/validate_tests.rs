@@ -986,7 +986,7 @@ fn storage_plane_example_chain_validates_clean() {
         r#"
 file_url = Text { value: "https://example.com/x.png" }
 
-fetch = FetchToStorage -> (file: Image) { keep: false }
+fetch = FetchToStorage -> (file: Image)
 fetch.url = file_url.value
 
 show = MediaDisplay
@@ -1011,7 +1011,7 @@ fn output_narrow_to_incompatible_type_is_rejected() {
     // type. This is the legality gate behind output-port type narrowing.
     let mut project = compile(
         r#"
-fetch = FetchToStorage -> (file: Number) { keep: false }
+fetch = FetchToStorage -> (file: Number)
 "#,
         uuid::Uuid::new_v4(),
         CompileFs::none(),
@@ -1298,6 +1298,47 @@ out.data = cfg.params
     );
     let d = validate(&project, &catalog());
     assert!(!codes(&d).contains(&"literal-out-of-range"), "{:?}", d);
+}
+
+#[test]
+fn a_literal_outside_a_selects_options_is_rejected_naming_them() {
+    // HttpRequest's `method` is a select over the methods it takes.
+    let project = parse_enrich(
+        r#"
+req = HttpRequest { url: "http://x", method: "FETCH" }
+out = Debug
+out.data = req.body
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let refusal = d.iter().find(|d| d.code.as_deref() == Some("literal-not-an-option")).unwrap_or_else(|| panic!("{d:?}"));
+    assert!(refusal.message.contains("'FETCH' is not one of the options"), "{}", refusal.message);
+    assert!(refusal.message.contains("'GET', 'POST'"), "{}", refusal.message);
+
+    let project = parse_enrich(
+        r#"
+req = HttpRequest { url: "http://x", method: "POST" }
+out = Debug
+out.data = req.body
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(!codes(&d).contains(&"literal-not-an-option"), "{:?}", d);
+}
+
+#[test]
+fn a_free_text_select_takes_a_value_its_options_never_listed() {
+    // LlmParams' `reasoningEffort` lists suggestions (`free_text`): an
+    // effort level a provider added after the list was written compiles.
+    let project = parse_enrich(
+        r#"
+cfg = LlmParams { reasoningEffort: "xhigh" }
+out = Debug
+out.data = cfg.params
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(!codes(&d).contains(&"literal-not-an-option"), "{:?}", d);
 }
 
 #[test]
@@ -2579,10 +2620,10 @@ fn a_connection_written_in_the_source_is_refused() {
 }
 
 #[test]
-fn a_members_fallback_connection_is_refused() {
+fn an_instances_fallback_connection_is_refused() {
     use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
     let mut project = compile_with_mode(
-        "ws = SlackAccess { account: @member_filled({\"id\":\"g-1\",\"identity\":\"q\"}) }\n",
+        "ws = SlackAccess { account: @instance_filled({\"id\":\"g-1\",\"identity\":\"q\"}) }\n",
         uuid::Uuid::new_v4(),
         CompileFs::none(),
         IncludeMode::Full,
@@ -2590,12 +2631,12 @@ fn a_members_fallback_connection_is_refused() {
     )
     .unwrap();
     let e = enrich(&mut project, &catalog()).unwrap_err().to_string();
-    assert!(e.contains("falls back to a connection") && e.contains("`@member_filled` alone"), "{e}");
+    assert!(e.contains("falls back to a connection") && e.contains("`@instance_filled` alone"), "{e}");
 }
 
 /// A metadata that still carries its OWN rule on the picker field (a
 /// project's copied catalog predating the synthesized rule) checks a
-/// member's connection ONCE: the declared rule stands, the twin is not
+/// instance's connection ONCE: the declared rule stands, the twin is not
 /// synthesized.
 #[test]
 fn declared_picker_rule_suppresses_the_synthesized_twin() {
@@ -2627,9 +2668,9 @@ fn declared_picker_rule_suppresses_the_synthesized_twin() {
     .unwrap();
     let legacy = FsCatalog::discover(dir.path()).expect("legacy catalog");
     let mut project =
-        compile("a = LegacyAccess { account: @member_filled }\n", uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+        compile("a = LegacyAccess { account: @instance_filled }\n", uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     enrich(&mut project, &legacy).expect("enrich");
-    let rules = &project.nodes[0].member_rules.as_ref().expect("a member's rules ride along").rules;
+    let rules = &project.nodes[0].instance_rules.as_ref().expect("an instance's rules ride along").rules;
     let on_account: Vec<_> = rules.iter().filter(|r| r.then.field.as_deref() == Some("account")).collect();
     assert_eq!(on_account.len(), 1, "exactly one rule: {rules:?}");
     assert!(on_account[0].then.message.contains("old boilerplate"), "the DECLARED rule wins: {}", on_account[0].then.message);
@@ -2639,7 +2680,7 @@ fn declared_picker_rule_suppresses_the_synthesized_twin() {
 /// UNRELATED declared rule on the picker field (any condition other
 /// than the synthesized not-nonempty shape) must not swallow the
 /// connection requirement, so the synthesized "no connection picked"
-/// is still among the rules a member's connection is held to.
+/// is still among the rules an instance's connection is held to.
 #[test]
 fn unrelated_picker_rule_does_not_suppress_the_synthesized_one() {
     let dir = tempfile::tempdir().unwrap();
@@ -2670,9 +2711,9 @@ fn unrelated_picker_rule_does_not_suppress_the_synthesized_one() {
     .unwrap();
     let legacy = FsCatalog::discover(dir.path()).expect("legacy catalog");
     let mut project =
-        compile("a = LegacyAccess { account: @member_filled }\n", uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+        compile("a = LegacyAccess { account: @instance_filled }\n", uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
     enrich(&mut project, &legacy).expect("enrich");
-    let rules = &project.nodes[0].member_rules.as_ref().expect("a member's rules ride along").rules;
+    let rules = &project.nodes[0].instance_rules.as_ref().expect("an instance's rules ride along").rules;
     assert!(
         rules.iter().any(|r| r.then.message.contains("has no legacy connection picked")),
         "the synthesized rule is still there: {rules:?}"
@@ -3227,7 +3268,7 @@ fn a_level_past_fifteen_warns_and_a_grouped_one_does_not() {
     let warned = level_warnings(&d);
     assert_eq!(warned.len(), 1, "one warning for the one crowded level: {d:?}");
     assert!(
-        warned[0].message.contains("one connected branch at the top level holds 16 items"),
+        warned[0].message.contains("one connected part of the top level holds 16 items"),
         "{}",
         warned[0].message
     );
@@ -3258,44 +3299,29 @@ fn two_unconnected_branches_answer_for_their_own_width() {
     assert!(!codes(&d).contains(&"level-too-large"), "{d:?}");
 }
 
-/// An infra node joins nothing: two chains that both read one
-/// database are still two branches, each counting the database once.
-/// Eight plus the database and seven plus the database stay quiet;
-/// fifteen plus the database is sixteen, and warns.
+/// A database both chains read links them: the top level splits only
+/// where no wire links anything, so eight and seven plus the database
+/// is one part of sixteen and warns, anchored on the first item written.
 #[test]
-fn an_infra_node_ends_the_walk_and_counts_on_each_branch_it_touches() {
-    let quiet = format!(
+fn an_infra_node_links_the_chains_that_read_it() {
+    let src = format!(
         "\ndb = Debug {{ data: \"shared\" }}\n{}{}",
         chain("a", 8, Some("db.data")).trim_start_matches('\n'),
         chain("b", 7, Some("db.data")).trim_start_matches('\n')
     );
-    let mut project = parse_enrich(&quiet);
-    mark_infra(&mut project, "db");
-    let d = validate(&project, &catalog());
-    assert!(!codes(&d).contains(&"level-too-large"), "9 and 8 with the database: {d:?}");
-
-    let crowded = format!(
-        "\ndb = Debug {{ data: \"shared\" }}\n{}",
-        chain("a", 15, Some("db.data")).trim_start_matches('\n')
-    );
-    let mut project = parse_enrich(&crowded);
+    let mut project = parse_enrich(&src);
     mark_infra(&mut project, "db");
     let d = validate(&project, &catalog());
     let warned = level_warnings(&d);
     assert_eq!(warned.len(), 1, "{d:?}");
-    assert!(
-        warned[0].message.contains("one connected branch at the top level holds 16 items"),
-        "{}",
-        warned[0].message
-    );
-    assert_eq!(warned[0].line, 3, "anchored on the branch's first node, not the database: {warned:?}");
+    assert!(warned[0].message.contains("one connected part of the top level holds 16 items"), "{}", warned[0].message);
+    assert_eq!(warned[0].line, 2, "anchored on the first item written: {warned:?}");
 }
 
-/// The database counts on EACH branch it touches: two chains of fifteen
-/// both reading one infra node are two branches of sixteen, and warn
-/// twice, each anchored on its own first node.
+/// Two chains of fifteen reading one database are one part of thirty
+/// one, and warn once.
 #[test]
-fn a_shared_infra_node_counts_once_per_branch() {
+fn chains_sharing_an_infra_node_warn_once_as_one_part() {
     let src = format!(
         "\ndb = Debug {{ data: \"shared\" }}\n{}{}",
         chain("a", 15, Some("db.data")).trim_start_matches('\n'),
@@ -3303,18 +3329,7 @@ fn a_shared_infra_node_counts_once_per_branch() {
     );
     let mut project = parse_enrich(&src);
     mark_infra(&mut project, "db");
-    let d = validate(&project, &catalog());
-    let warned = level_warnings(&d);
-    assert_eq!(warned.len(), 2, "two branches of 16: {d:?}");
-    for w in &warned {
-        assert!(
-            w.message.contains("one connected branch at the top level holds 16 items"),
-            "{}",
-            w.message
-        );
-    }
-    let lines: Vec<usize> = warned.iter().map(|w| w.line).collect();
-    assert_eq!(lines, vec![3, 18], "anchored on each branch's first node: {warned:?}");
+    assert_eq!(level_warnings(&validate(&project, &catalog())).len(), 1);
 }
 
 /// The flattened node list puts a scope's plain nodes before its
@@ -3410,7 +3425,7 @@ fn a_wire_into_a_group_joins_the_group_to_the_branch() {
     let warned = level_warnings(&d);
     assert_eq!(warned.len(), 1, "16 connected items at the top level: {d:?}");
     assert!(
-        warned[0].message.contains("one connected branch at the top level holds 16 items"),
+        warned[0].message.contains("one connected part of the top level holds 16 items"),
         "{}",
         warned[0].message
     );
@@ -3431,7 +3446,7 @@ fn a_component_files_top_level_is_measured_per_branch() {
     let warned = level_warnings(&d);
     assert_eq!(warned.len(), 1, "{d:?}");
     assert!(
-        warned[0].message.contains("one connected branch at the top level holds 16 items"),
+        warned[0].message.contains("one connected part of the top level holds 16 items"),
         "{}",
         warned[0].message
     );
@@ -3460,7 +3475,7 @@ fn a_group_counts_as_one_item_and_its_two_halves_dedupe() {
     let warned = level_warnings(&d);
     assert_eq!(warned.len(), 1, "16 items at the top level: {d:?}");
     assert!(
-        warned[0].message.contains("one connected branch at the top level holds 16 items"),
+        warned[0].message.contains("one connected part of the top level holds 16 items"),
         "{}",
         warned[0].message
     );
@@ -3506,7 +3521,7 @@ fn a_top_level_of_only_groups_warns_too() {
     let warned = level_warnings(&d);
     assert_eq!(warned.len(), 1, "each group holds one node; only the top level is crowded: {d:?}");
     assert!(
-        warned[0].message.contains("one connected branch at the top level holds 16 items"),
+        warned[0].message.contains("one connected part of the top level holds 16 items"),
         "{}",
         warned[0].message
     );
@@ -3707,6 +3722,116 @@ fn a_route_whose_run_answers_nobody_is_flagged_and_a_gated_group_counts() {
     // A route whose only connection is to a group's door, with nothing inside.
     let empty = "t = Route { path: \"hook\" }\nwork = Group() {\n  n = ExecPython() -> (out: String) { code: \"return {'out': 'x'}\" }\n}\nwork._should_flow = t.method\n";
     assert!(!answers(empty));
+}
+
+fn messages(source: &str) -> Vec<String> {
+    validate(&parse_enrich(source), &catalog()).into_iter().map(|d| d.message).collect()
+}
+
+/// `per_instance`: a route that reads an instance's value would need
+/// one public address per instance, so it is refused naming the node
+/// that made it per instance and the way that works. A shared route is
+/// fine.
+#[test]
+fn a_route_that_ended_up_per_instance_is_refused_naming_why() {
+    let per_instance = "gate = ApiKeyAuth { account: @instance_filled }\nt = Route { path: \"hook\" }\nt.auth = gate.access\nr = Reply { body: \"x\" }\nr._should_flow = t.method\n";
+    let found = messages(per_instance);
+    let hit = found.iter().find(|m| m.contains("would exist once per instance"));
+    assert!(hit.is_some_and(|m| m.contains("because it reads 'gate'") && m.contains("Weft-Instance")), "{found:?}");
+    let shared = "gate = ApiKeyAuth {}\nt = Route { path: \"hook\" }\nt.auth = gate.access\nr = Reply { body: \"x\" }\nr._should_flow = t.method\n";
+    assert!(!messages(shared).iter().any(|m| m.contains("would exist once per instance")));
+}
+
+/// The refusal tells the path the way it runs. A route reading a group's
+/// port that carries the instance's value reads that value. A route
+/// reading ANOTHER port of a group that receives one is per instance
+/// only because the group is (a group receiving a per-instance value on
+/// any port makes everything reading its ports per instance), so the
+/// message says it sits inside that group.
+#[test]
+fn the_per_instance_refusal_names_the_path_through_a_group() {
+    let refusal = |source: &str| -> String {
+        let found = messages(source);
+        found.into_iter().find(|m| m.contains("would exist once per instance")).expect("the route is refused")
+    };
+    let through_port = "gate = ApiKeyAuth { account: @instance_filled }\nwork = Group(k: Access) {\n  t = Route { path: \"hook\" }\n  t.auth = self.k\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n}\nwork.k = gate.access\n";
+    let m = refusal(through_port);
+    assert!(m.contains("because it reads 'gate', but"), "{m}");
+
+    let beside = "gate = ApiKeyAuth { account: @instance_filled }\nshared = ApiKeyAuth {}\nwork = Group(k: Access, o: Access) {\n  t = Route { path: \"hook\" }\n  t.auth = self.o\n  r = Reply { body: \"x\" }\n  r._should_flow = t.method\n  d = Debug\n  d.data = self.k\n}\nwork.k = gate.access\nwork.o = shared.access\n";
+    let m = refusal(beside);
+    assert!(m.contains("because it sits inside group 'work', which receives 'gate', but"), "{m}");
+    assert!(!m.contains("it reads"), "{m}");
+}
+
+/// `run_reaches` with a capability: a route counts any node declaring
+/// `answersCaller`, and an answering node counts any trigger declaring
+/// `liveConnection`, whatever their types.
+#[test]
+fn a_route_counts_any_node_that_answers_its_caller() {
+    for answer in ["Reply { body: \"x\" }", "Close { status: 404 }", "Stream {}"] {
+        let source = format!("t = Route {{ path: \"hook\" }}\na = {answer}\na._should_flow = t.method\n");
+        let found = messages(&source);
+        assert!(!found.iter().any(|m| m.contains("never answers its caller") || m.contains("answers nobody")), "{answer}: {found:?}");
+    }
+}
+
+/// `downstream_of`: a Reply or a Stream after a Stream on an HTTP caller
+/// can never go out (the head already did), so it is refused pointing at
+/// Close. A Close after it is the right shape, and a socket has no head.
+#[test]
+fn a_second_response_head_after_a_stream_is_refused() {
+    let after = |trigger: &str, next: &str| -> Vec<String> {
+        messages(&format!(
+            "t = {trigger} {{ path: \"hook\" }}\ns = Stream {{}}\ns._should_flow = t.method\nn = {next}\nn._should_flow = s.done\n"
+        ))
+    };
+    let reply = after("Route", "Reply { body: \"x\" }");
+    assert!(reply.iter().any(|m| m.contains("runs after 's'") && m.contains("Close")), "{reply:?}");
+    let stream = after("Route", "Stream {}");
+    assert!(stream.iter().any(|m| m.contains("runs after 's'")), "{stream:?}");
+    assert!(!after("Route", "Close {}").iter().any(|m| m.contains("runs after")));
+    assert!(!after("Socket", "Reply { body: \"x\" }").iter().any(|m| m.contains("runs after")));
+    // A Reply BEFORE the stream (the stream waits on it) is no second head.
+    let before = messages(
+        "t = Route { path: \"hook\" }\nr = Reply { body: \"x\" }\nr._should_flow = t.method\ns = Stream {}\ns._should_flow = r.done\n",
+    );
+    assert!(!before.iter().any(|m| m.contains("'r' runs after")), "{before:?}");
+}
+
+/// `input_names` with a node: a node naming an infra node by text is held to
+/// the program's infra nodes and their kind at compile time; a wired
+/// name is known only at run time and not checked.
+#[test]
+fn an_infra_name_is_held_to_the_programs_infra_nodes() {
+    let base = "bridge = BaileyBridge {\n  @per_instance\n}\npg = PostgresDatabase { database: \"app\" }\n";
+    let named = |node: &str| messages(&format!("{base}{node}\n"));
+    let refused = |found: &[String], name: &str| found.iter().any(|m| m.contains(&format!("names '{name}'")));
+    assert!(!refused(&named("go = StartInstanceInfra { node: \"bridge\", instance: \"u1\" }"), "bridge"));
+    assert!(refused(&named("go = StartInstanceInfra { node: \"ghost\", instance: \"u1\" }"), "ghost"));
+    assert!(refused(&named("go = StopInstanceInfra { node: \"pg\", instance: \"u1\" }"), "pg"), "shared infra is no instance's");
+    assert!(!refused(&named("ls = ListInstanceInfra { node: \"pg\" }"), "pg"), "listing takes a shared one");
+    let wipe = named("w = WipeInstance { instance: \"u1\", infra: [\"bridge\", \"ghost\"] }");
+    assert!(refused(&wipe, "ghost") && !refused(&wipe, "bridge"), "{wipe:?}");
+    let wired = named("pick = Text { value: \"ghost\" }\ngo = StartInstanceInfra { instance: \"u1\" }\ngo.node = pick.value");
+    assert!(!refused(&wired, "ghost"), "{wired:?}");
+}
+
+/// `input_names` with a field: SetInstanceValues keys its `values` and
+/// lists its `clear` by `node.field`, and each must be a field this
+/// program writes `@instance_filled`. Renaming the step leaves the old
+/// name behind, and the compiler says so.
+#[test]
+fn set_instance_values_names_fields_an_instance_fills() {
+    let base = "cron = Cron { cron: @instance_filled }\n";
+    let named = |node: &str| messages(&format!("{base}{node}\n"));
+    let refused = |found: &[String], name: &str| found.iter().any(|m| m.contains(&format!("'{name}'")) && m.contains("@instance_filled"));
+    let good = named("set = SetInstanceValues { instance: \"u1\", values: {\"cron.cron\": \"0 0 7 * * *\"}, clear: [\"cron.cron\"] }");
+    assert!(!good.iter().any(|m| m.contains("SetInstanceValues")), "{good:?}");
+    let renamed = named("set = SetInstanceValues { instance: \"u1\", values: {\"digest.cron\": \"0 0 7 * * *\"}, clear: [\"digest.cron\"] }");
+    assert_eq!(renamed.iter().filter(|m| m.contains("'digest.cron'")).count(), 2, "{renamed:?}");
+    assert!(refused(&named("set = SetInstanceValues { instance: \"u1\", clear: [\"cron.nope\"] }"), "cron.nope"), "no such field");
+    assert!(refused(&named("set = SetInstanceValues { instance: \"u1\", clear: [\"set.instance\"] }"), "set.instance"), "a field nobody fills");
 }
 
 /// A trigger fires on its event, never on its inputs, so the all-optional
@@ -4142,8 +4267,12 @@ fn a_method_that_is_not_an_http_method_is_refused() {
     let d = validate(&p, &catalog());
     let found = d
         .iter()
-        .find(|x| x.code.as_deref() == Some("route-method-unknown"))
+        .find(|x| x.code.as_deref() == Some("literal-not-an-option"))
         .unwrap_or_else(|| panic!("{d:?}"));
+    assert!(
+        !d.iter().any(|x| x.code.as_deref() == Some("route-method-unknown")),
+        "one finding for one mistake: {d:?}"
+    );
     assert!(
         found.message.contains("GTE") && found.message.contains("GET"),
         "it names the typo and the methods there are: {}",
@@ -4340,6 +4469,35 @@ fn an_include_input_a_required_node_needs_must_be_connected() {
     assert!(unmet_is_empty(&entry_program(wired, dir.path())));
 }
 
+/// The same file opened on its own (the editor's view of it) is a
+/// component: its root's inputs are its interface, which only an include
+/// site can leave unconnected, so the file itself is clean. An internal
+/// group's input still answers inside the file.
+#[test]
+fn a_component_root_input_is_the_include_sites_to_connect() {
+    let busy = "Group(chat: String) -> (out: String) {\n  f = Format(y: String) { template: \"{{y}}\", y: self.chat }\n  self.out = f.text\n}\n";
+    let d = validate(&parse_enrich(busy), &catalog());
+    assert!(unmet_is_empty(&d), "{d:?}");
+
+    let inner = "Group(chat: String) -> (out: String) {\n  g = Group(b: String) -> (out: String) {\n    f = Format(y: String) { template: \"{{y}}\", y: self.b }\n    self.out = f.text\n  }\n  self.out = g.out\n}\n";
+    let d = validate(&parse_enrich(inner), &catalog());
+    let unmet = unmet(&d);
+    assert_eq!(unmet.len(), 1, "{d:?}");
+    assert!(unmet[0].contains(".g.b'"), "{}", unmet[0]);
+
+    // A component that itself includes a file: that file's body sits at
+    // the top level beside the root and leaves it a component.
+    use weft_compiler::weft_compiler::{compile_with_mode, IncludeMode};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("echo.weft"), "Group(v: String) -> (out: String) {\n  self.out = self.v\n}\n").unwrap();
+    let nesting = "Group(chat: String) -> (out: String) {\n  e = @include(\"echo.weft\")\n  f = Format(y: String) { template: \"{{y}}\", y: self.chat }\n  e.v = f.text\n  self.out = e.out\n}\n";
+    let mut p = compile_with_mode(nesting, uuid::Uuid::new_v4(), CompileFs::disk(dir.path()), IncludeMode::Full, COMPONENT)
+        .expect("compile ok");
+    enrich(&mut p, &catalog()).expect("enrich ok");
+    let d = validate(&p, &catalog());
+    assert!(unmet_is_empty(&d), "{d:?}");
+}
+
 /// A loop's port it neither iterates nor carries is walked through like
 /// a group's.
 #[test]
@@ -4400,19 +4558,17 @@ fn a_one_of_member_fed_by_the_loop_index_is_fed() {
     assert!(unmet_is_empty(&entry_program(src, dir.path())));
 }
 
-/// A connection node joins nothing either: one key set gating two
-/// otherwise separate branches leaves them two branches, each counting
-/// the key set once. Eight and seven stay quiet, where one joined
-/// branch of seventeen would warn.
+/// A key set gating two chains links them too: eight and seven plus the
+/// key set is one part of sixteen, and warns.
 #[test]
-fn a_connection_node_ends_the_walk_like_infra() {
+fn a_connection_node_links_the_chains_it_gates() {
     let src = format!(
         "\ngate = ApiKeyAuth\n{}{}",
         chain("a", 8, Some("gate.access")).trim_start_matches('\n'),
         chain("b", 7, Some("gate.access")).trim_start_matches('\n')
     );
     let d = validate(&parse_enrich(&src), &catalog());
-    assert!(!codes(&d).contains(&"level-too-large"), "9 and 8 with the key set: {d:?}");
+    assert_eq!(level_warnings(&d).len(), 1, "one part of 16 with the key set: {d:?}");
 }
 
 /// A provider's model counts as given whether it is written on the node
@@ -4443,4 +4599,31 @@ fn a_five_field_cron_is_refused_as_it_is_typed() {
     assert!(refused("0 3 * * *"));
     assert!(!refused("0 0 3 * * *"));
     assert!(!refused("0 0 3 * * * 2027"));
+}
+
+
+/// An included file's page has no header of its own in any file, so a
+/// crowded one warns on its first item instead of crashing the checker
+/// looking for one.
+#[test]
+fn a_crowded_included_file_warns_on_its_first_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut body = String::from("Group(seed: String) -> (out: String) {\n");
+    body.push_str("  t0 = Debug { data: self.seed }\n");
+    for i in 1..16 {
+        body.push_str(&format!("  t{i} = Debug {{ data: t{}.data }}\n", i - 1));
+    }
+    body.push_str("  self.out = t15.data\n}\n");
+    std::fs::write(dir.path().join("crowd.weft"), body).unwrap();
+    let mut project = compile(
+        "c = @include(\"crowd.weft\")\nc.seed = \"go\"\n",
+        uuid::Uuid::new_v4(),
+        CompileFs::disk(dir.path()),
+    )
+    .expect("compile ok");
+    enrich(&mut project, &catalog()).expect("enrich ok");
+    let d = validate(&project, &catalog());
+    let warned = level_warnings(&d);
+    assert_eq!(warned.len(), 1, "{d:?}");
+    assert!(warned[0].message.contains("this included file holds 16 items"), "{}", warned[0].message);
 }

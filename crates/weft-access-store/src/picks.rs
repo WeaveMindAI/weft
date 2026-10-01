@@ -18,7 +18,7 @@ pub struct PickWrite {
 
 /// Keep `writes` and forget `clears` (step, field) for `project_id`, all
 /// or none, on `conn` (the caller's transaction). A pick must name one of
-/// the author's own connections (never a member's: that would spend their
+/// the author's own connections (never an instance's: that would spend its
 /// account on everybody's runs) to the field's service, or the whole
 /// change is refused.
 pub async fn change_install_picks(
@@ -30,7 +30,7 @@ pub async fn change_install_picks(
 ) -> anyhow::Result<()> {
     for write in writes {
         let owned: Option<(String,)> = sqlx::query_as(
-            "SELECT service FROM access_grant WHERE id = $1 AND tenant_id = $2 AND member_id IS NULL",
+            "SELECT service FROM access_grant WHERE id = $1 AND tenant_id = $2 AND instance_id IS NULL",
         )
         .bind(write.grant_id)
         .bind(tenant)
@@ -100,4 +100,73 @@ pub async fn install_picks<'e>(
         picks.entry(step).or_default().insert(field, connection_handle(grant_id, identity.as_deref()));
     }
     Ok(picks)
+}
+
+/// Everything the install keeps at a place of `project_id`, one row per
+/// field: the picks (no instance) and every instance's values, each
+/// connection with its service. What an activation holds against the
+/// program (`weft_core::picks::activation_picks`) and a move against the
+/// place it leaves (`weft_core::picks::check_move`).
+pub async fn stored_fields<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    tenant: &str,
+    project_id: uuid::Uuid,
+) -> anyhow::Result<Vec<weft_core::picks::StoredField>> {
+    let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT p.step, p.field, g.service, NULL::TEXT FROM install_pick p
+         JOIN access_grant g ON g.id = p.grant_id
+         WHERE p.tenant_id = $1 AND p.project_id = $2
+         UNION ALL
+         SELECT v.step, v.field, g.service, v.instance_id FROM instance_value v
+         LEFT JOIN access_grant g ON g.id = v.grant_id
+         WHERE v.tenant_id = $1 AND v.project_id = $2",
+    )
+    .bind(tenant)
+    .bind(project_id)
+    .fetch_all(executor)
+    .await?;
+    rows.into_iter()
+        .map(|(step, field, service, instance)| {
+            let instance = instance
+                .map(weft_core::instance::InstanceId::new)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("a stored instance id is invalid: {e}"))?;
+            Ok(weft_core::picks::StoredField { step, field, service, instance })
+        })
+        .collect()
+}
+
+/// Carry every pick and every instance's value kept at the place `from`
+/// of `project_id` to the place `to`, on `conn` (the caller's
+/// transaction, which checked the move first with
+/// `weft_core::picks::check_move`). Answers how many picks and how many
+/// instance values moved.
+pub async fn move_stored(
+    conn: &mut sqlx::PgConnection,
+    tenant: &str,
+    project_id: uuid::Uuid,
+    from: &str,
+    to: &str,
+) -> anyhow::Result<(u64, u64)> {
+    let picks = sqlx::query(
+        "UPDATE install_pick SET step = $4, set_at = now() WHERE tenant_id = $1 AND project_id = $2 AND step = $3",
+    )
+    .bind(tenant)
+    .bind(project_id)
+    .bind(from)
+    .bind(to)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    let values = sqlx::query(
+        "UPDATE instance_value SET step = $4, set_at = now() WHERE tenant_id = $1 AND project_id = $2 AND step = $3",
+    )
+    .bind(tenant)
+    .bind(project_id)
+    .bind(from)
+    .bind(to)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    Ok((picks, values))
 }

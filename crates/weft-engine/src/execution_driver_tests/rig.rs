@@ -162,7 +162,7 @@
     pub(super) struct NoopInfraState;
     #[async_trait]
     impl InfraStateClient for NoopInfraState {
-        async fn enqueue_apply(&self, _p: uuid::Uuid, _n: &str, _m: Option<&weft_core::member::MemberId>, _s: serde_json::Value) -> anyhow::Result<i64> { Ok(0) }
+        async fn enqueue_apply(&self, _p: uuid::Uuid, _n: &str, _m: Option<&weft_core::instance::InstanceId>, _s: serde_json::Value) -> anyhow::Result<i64> { Ok(0) }
         async fn wait_apply(&self, _p: uuid::Uuid, _c: i64, _w: std::time::Duration) -> anyhow::Result<weft_broker_client::protocol::InfraWaitApplyResponse> {
             Ok(weft_broker_client::protocol::InfraWaitApplyResponse {
                 completed: true,
@@ -290,7 +290,7 @@
             subgraph: subgraph.map(|s| weft_core::project::selection::RunSelection::restricted(
                 &project, s.iter().map(|n| weft_core::frames::Located::top(*n)).collect()).expect("valid test selection")),
             seed: None,
-            member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+            instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
             run_class: weft_core::run_class::RunClass::Short,
         }];
         for kick in kicks {
@@ -348,7 +348,7 @@
         /// One pulse as compared: node, id, status, closed, close
         /// error, frames, port, value (as its JSON text, so the row
         /// orders totally).
-        type PulseRow = (String, uuid::Uuid, String, bool, Option<String>, Vec<u32>, String, String, bool, bool, Option<uuid::Uuid>);
+        type PulseRow = (String, uuid::Uuid, String, bool, Option<weft_core::pulse::Failure>, Vec<u32>, String, String, bool, bool, Option<uuid::Uuid>);
         /// One record as compared: node, frames, ordinal, status,
         /// error, suspension token, absorbed pulses.
         type RecordRow =
@@ -395,7 +395,7 @@
                             p.id,
                             format!("{:?}", p.status),
                             p.closed,
-                            p.close_error.clone(),
+                            p.failure.clone(),
                             p.frames.iter().map(|f| f.loop_index().expect("loop frame")).collect::<Vec<_>>(),
                             p.target_port.clone(),
                             p.value.to_string(),

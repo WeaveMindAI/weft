@@ -60,5 +60,8 @@
       "type": "String",
       "description": "The sent message's Message-ID header."
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

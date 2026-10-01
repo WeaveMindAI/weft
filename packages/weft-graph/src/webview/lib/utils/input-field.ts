@@ -148,6 +148,7 @@ function fieldFromWidget(key: string, label: string, w: Widget): FieldDefinition
 		case 'select':
 		case 'multiselect':
 			field.options = w.options;
+			if (w.free_text) field.freeText = true;
 			break;
 		case 'number':
 			if (w.min != null) field.min = w.min;

@@ -1,0 +1,14 @@
+[package]
+name = "instances"
+
+# Nodes for a program that runs several instances: separate running
+# copies of part of the program, each under its own id. Bringing an
+# instance's own infra up and down, turning its triggers on and off,
+# handing a browser an instance token, reading and setting the values an
+# instance was given, reading which instance a run is for, what an
+# instance spent, which infra copies exist and every instance weft holds
+# anything for, and wiping everything an instance has. Each is a thin
+# node over the ctx calls (`ctx.infra(..)`, `ctx.triggers()`,
+# `ctx.tokens()`, `ctx.instance()`, `ctx.values()`, `ctx.instances()`,
+# `ctx.costs()`, ...); `lifecycle.rs` is how the nodes read an instance
+# id and the take-down choices.

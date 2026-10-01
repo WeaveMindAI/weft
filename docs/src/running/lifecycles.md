@@ -90,10 +90,10 @@ turns on one and leaves the rest alone; for the other flags, go and read
 listens and none is part way through turning on or off, and `weft status` lists
 each trigger's own state under `triggers:`.
 
-A trigger that reads a member's copy or a member's value (`@per_member`,
-`@member_filled`) exists once per member, and its copies are turned on with
-`--member <id>`. For those, go and read
-[programs with members](members.md).
+A trigger that reads an instance's copy or an instance's value
+(`@per_instance`, `@instance_filled`) exists once per instance, and its copies
+are turned on with `--instance <id>`. For those, go and read
+[programs with instances](instances.md).
 
 ### Frozen inputs
 
@@ -123,8 +123,8 @@ cancel-running` ends that wait early.
 
 The infra verbs that take triggers down (`weft infra stop`, `terminate`,
 `upgrade`) ask you the same thing, and their answer means the same. They ask
-only when a trigger reading that infrastructure is on, the program's own or a
-member's. With no terminal, or with `--json`, they do not pick for you: they
+only when a trigger reading that infrastructure is on, the program's own or an
+instance's. With no terminal, or with `--json`, they do not pick for you: they
 stop and name the flags, for example `--mode park --running-policy wait`, and
 if you passed those flags already they are used. When no trigger reading it is
 on, nothing is asked, but a run may still be using that infrastructure:

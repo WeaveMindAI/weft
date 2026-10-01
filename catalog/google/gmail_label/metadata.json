@@ -42,5 +42,8 @@
       "type": "List[String]",
       "description": "The message's label ids after the change."
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

@@ -84,7 +84,7 @@ fn held_select() -> String {
     format!(
         "SELECT s.token, s.tenant_id, s.node_id, s.spec_json, s.is_resume, s.execution_id, \
                 s.surface_kind, s.mount_path, s.mount_methods, s.auth_kind, s.auth_config, \
-                s.kind_state, s.kind_state_seq, s.project_id, s.member_id \
+                s.kind_state, s.kind_state_seq, s.project_id, s.instance_id \
          FROM signal s {SIGNAL_ACTIVATION_JOIN}"
     )
 }
@@ -99,12 +99,12 @@ fn decode(r: sqlx::postgres::PgRow) -> anyhow::Result<SignalRowWire> {
     let auth_str: String = r.try_get("auth_kind")?;
     let auth_kind = SignalAuthKind::parse(&auth_str)
         .ok_or_else(|| anyhow::anyhow!("unknown auth_kind '{auth_str}'"))?;
-    let for_member = weft_core::member::MemberScope::from_columns(r.try_get("project_id")?, r.try_get("member_id")?)
-        .map_err(|e| anyhow::anyhow!("corrupt member_id: {e}"))?;
+    let for_instance = weft_core::instance::InstanceScope::from_columns(r.try_get("project_id")?, r.try_get("instance_id")?)
+        .map_err(|e| anyhow::anyhow!("corrupt instance_id: {e}"))?;
     Ok(SignalRowWire {
         token: r.try_get("token")?,
         tenant_id: r.try_get("tenant_id")?,
-        for_member,
+        for_instance,
         node_id: r.try_get("node_id")?,
         spec_json: r.try_get("spec_json")?,
         is_resume: r.try_get("is_resume")?,

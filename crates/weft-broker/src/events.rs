@@ -74,7 +74,7 @@ pub fn receiver_url(state: &BrokerState, service: &str, topic: &str) -> Option<S
 /// POST /v1/access/listener-resolve: the connection's auth values,
 /// its event topics, and the recipe-named extra values, fresh (the
 /// same lazy refresh a worker resolve runs). Listener role only; the
-/// tenant and the member are the registered signal's (they traveled
+/// tenant and the instance are the registered signal's (they traveled
 /// with its registration), the same trust the listener's fires already
 /// ride on.
 async fn listener_resolve(
@@ -87,7 +87,7 @@ async fn listener_resolve(
     let source = weft_access_store::resolve_event_source(
         &state.pool,
         &req.tenant,
-        weft_access_store::GrantUser::of(req.for_member.as_ref()),
+        weft_access_store::GrantUser::of(req.for_instance.as_ref()),
         access_id,
         &req.service,
         &req.required_values,
@@ -170,7 +170,7 @@ async fn subscription_ensure(
     let ensured = weft_access_store::ensure_subscription(
         &state.pool,
         &weft_access_store::EnsureSubscription {
-            for_member: req.for_member,
+            for_instance: req.for_instance,
             tenant: req.tenant,
             service: req.service,
             topic: req.topic,

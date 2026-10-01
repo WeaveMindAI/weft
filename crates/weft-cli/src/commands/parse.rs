@@ -41,6 +41,13 @@ struct ParseResponse {
 #[derive(Debug, Serialize)]
 struct ValidateResponse {
     diagnostics: Vec<Diagnostic>,
+    /// One line per catalog folder left out and why (a broken
+    /// `metadata.json`, a node with no code yet, an empty package), the
+    /// same lines `weft describe-nodes` warns with. Never a failure on
+    /// their own: a program naming a left-out node gets its own
+    /// diagnostic.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 fn read_stdin() -> Result<String> {
@@ -458,8 +465,8 @@ fn preview_program(
         let root = weft_compiler::build::resolve_weft_root()?;
         Ok(weft_core::project::hash::ProgramIdentity {
             definition_hash: weft_compiler::hash::compute_definition_hash(definition)?,
-            binary_hash: weft_compiler::hash::compute_binary_hash(definition, project, &root, catalog, weft_compiler::codegen::NodeSet::Full)?,
-            implementations: weft_compiler::hash::implementation_hashes(definition, project, &root, catalog, weft_compiler::codegen::NodeSet::Full)?,
+            binary_hash: weft_compiler::hash::compute_binary_hash(definition, project, &root, catalog, weft_core::builds::NodeSet::Full)?,
+            implementations: weft_compiler::hash::implementation_hashes(definition, project, &root, catalog, weft_core::builds::NodeSet::Full)?,
         })
     };
     facts().map_err(|error| format!("cannot verify the buffer's trigger bake: {error:#}"))
@@ -583,6 +590,11 @@ pub async fn validate(ctx: Ctx, file: Option<std::path::PathBuf>) -> Result<()> 
     // shape plus runtime rules like missing credentials); callers that want
     // the structural tier go through the parse-server's mode field.
     let resp = do_validate(&source, project.id(), &anchor, &catalog, file.as_deref(), ValidationMode::Runtime);
+    // The catalog's left-out folders go to stderr either way, as
+    // `weft describe-nodes` does; the JSON on stdout carries them too.
+    for warning in &resp.warnings {
+        eprintln!("warning: {warning}");
+    }
     println!("{}", serde_json::to_string(&resp).context("serialize validate response")?);
     Ok(())
 }
@@ -611,7 +623,7 @@ fn do_validate(
         mode,
         source_id.as_deref(),
     );
-    ValidateResponse { diagnostics }
+    ValidateResponse { diagnostics, warnings: catalog.warnings().to_vec() }
 }
 
 /// For each node type in the project, pull its catalog entry. Hidden
@@ -643,6 +655,29 @@ fn collect_catalog(
 mod tests {
     use super::{file_dir, handle_request, ServerRequest, ServerRequestKind};
     use std::path::Path;
+
+    /// A broken catalog folder is a warning on the answer, never a
+    /// failure of a program that does not name it.
+    #[test]
+    fn validate_lists_the_catalog_folders_left_out_without_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("nodes/broken")).unwrap();
+        std::fs::write(dir.path().join("nodes/broken/metadata.json"), "{ not json").unwrap();
+        let catalog = weft_compiler::build::build_project_catalog(dir.path()).unwrap();
+        let anchor = super::anchor_for(None, Some(dir.path()));
+        let resp = super::do_validate(
+            "",
+            uuid::Uuid::nil(),
+            &anchor,
+            &catalog,
+            None,
+            weft_compiler::validate::ValidationMode::Runtime,
+        );
+        assert!(resp.diagnostics.is_empty(), "{:?}", resp.diagnostics);
+        assert!(resp.warnings.iter().any(|w| w.contains("broken")), "{:?}", resp.warnings);
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["warnings"].as_array().map(|w| w.len()), Some(resp.warnings.len()));
+    }
 
     #[test]
     fn runtime_preview_expands_includes_using_the_unsaved_file() {

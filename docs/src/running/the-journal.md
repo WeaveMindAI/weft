@@ -64,19 +64,13 @@ rebuilding half a world and carrying on would be worse than stopping.
 
 ## The execution guarantee
 
-**At least once.** A thing can happen twice, and here is exactly where.
+A node's completion is written after the node finishes. If the worker dies
+before that, the next worker finds no completion for the step and fails it,
+saying the worker went away and the step was not run again.
 
-A node's completion is written after the node finishes. If the worker dies in
-between, the run is rebuilt without that completion and the node runs again.
-Inside the body, `ctx.run` gives back a saved result instead of redoing the
-work, but if the worker died between the action and the write, the action
-happened and nothing recorded it.
-
-So an external action can repeat, and weft says so rather than pretending
-otherwise: a failed save names the action and tells you to look before you run
-it again.
-
-For what that means when you are writing a node, go and read
+A step that was waiting on an answer replays instead. For how that replay
+works, what `catchErrors` does with this failure, and what happens when
+`ctx.run` cannot save a result, go and read
 [surviving a restart](../nodes/durable-execution.md).
 
 ## Why a failed write stops the worker

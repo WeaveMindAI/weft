@@ -20,10 +20,11 @@ which is mostly waiting, and decide which services you want weft to keep keys
 for. Then make a project:
 
 ```bash
-weft new hello --assistant claude-code
+weft new hello --assistant claude-code --remember
 ```
 
-That puts Tangle in the project. Tangle is our weft specialist: it knows the
+That puts Tangle in the project, and `--remember` makes Claude Code the default
+so your next `weft new` needs no flag. Tangle is our weft specialist: it knows the
 language, reads the catalog on your disk before it wires anything, writes any
 step you are missing, and will build you a web frontend if you ask for one.
 It also tests what it builds. It runs one piece at a time on a real input, looks

@@ -131,6 +131,14 @@ with a preview panel (description, input chips, output chips, tags).
 
 Every GUI edit is a structured edit applied through the compiler, so the
 text and the picture cannot drift, and Ctrl+Z undoes in either view.
+
+The graph never writes over a text edit. When the text changes outside the
+graph (the user typing, an AI editing the file), the graph drops the undo
+steps it held for the old text, and Ctrl+Z in the graph then says "the text
+changed since the graph edits, so they can no longer be undone or redone
+from the graph; undo them in the text editor instead". And if the file on
+disk is newer than the open one, weft refuses to save over it: VS Code
+offers to compare or overwrite, and the person picks.
 Simplified view refuses structure edits with "Simplified view is
 read-only (you can still move, expand, and collapse).".
 

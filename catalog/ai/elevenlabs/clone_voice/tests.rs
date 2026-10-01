@@ -9,7 +9,9 @@ use super::ElevenLabsCloneVoiceNode;
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("clones_and_emits_the_voice_id", clones),
-        NodeTest::fake("no_samples_refuses", no_samples),
+        NodeTest::fake("no_samples_fails_the_run_even_when_error_is_wired", no_samples),
+        NodeTest::fake("a_refused_clone_fails_the_run_when_error_is_unwired", refused_unwired),
+        NodeTest::fake("a_refused_clone_comes_out_on_error_when_it_is_wired", refused_wired),
         NodeTest::live("one_real_clone_created_and_deleted", "elevenlabs", live_clone),
     ]
 }
@@ -74,8 +76,11 @@ async fn clones(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
+/// No samples is a mistake in the program, not the service's answer:
+/// a wired `error` must not swallow it.
 async fn no_samples(rig: FakeRig) -> WeftResult<()> {
-    let outcome = rig
+    rig.wire_output("error");
+    let err = rig
         .run(
             &ElevenLabsCloneVoiceNode,
             json!({
@@ -85,8 +90,38 @@ async fn no_samples(rig: FakeRig) -> WeftResult<()> {
                 "removeBackgroundNoise": false,
             }),
         )
-        .await;
-    let err = outcome.result.expect_err("no samples must refuse").to_string();
+        .await
+        .failure()?;
+    assert!(err.starts_with("input error"), "{err}");
     assert!(err.contains("at least one sample"), "{err}");
+    Ok(())
+}
+
+/// Two stored samples and the clone call refused by elevenlabs.
+fn refuse_the_clone(rig: &FakeRig) -> serde_json::Value {
+    rig.respond_status("POST", "/v1/voices/add", 401, json!({ "detail": "bad key" }));
+    let a = rig.store_file("sample_a.mp3", "audio/mpeg", b"aaa".to_vec());
+    json!({
+        "account": rig.access("elevenlabs"),
+        "name": "Narrator",
+        "samples": [a],
+        "removeBackgroundNoise": false,
+    })
+}
+
+async fn refused_unwired(rig: FakeRig) -> WeftResult<()> {
+    let inputs = refuse_the_clone(&rig);
+    let err = rig.run(&ElevenLabsCloneVoiceNode, inputs).await.failure()?;
+    assert!(err.contains("bad key"), "{err}");
+    Ok(())
+}
+
+async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
+    let inputs = refuse_the_clone(&rig);
+    rig.wire_output("error");
+    let outcome = rig.run(&ElevenLabsCloneVoiceNode, inputs).await.ok()?;
+    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    assert!(error.contains("bad key"), "{error}");
+    assert!(!outcome.outputs.contains_key("voiceId"), "a caught failure emits no voiceId");
     Ok(())
 }

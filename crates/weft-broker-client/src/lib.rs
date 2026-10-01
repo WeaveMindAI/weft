@@ -4,7 +4,7 @@
 //! Postgres clients.
 //!
 //! Authentication: every call carries the caller's platform identity for
-//! the broker's address and the id of the calling process instance (see
+//! the broker's address and the id of the calling process replica (see
 //! `token::TokenSource`).
 
 pub mod activation;

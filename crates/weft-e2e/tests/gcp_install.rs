@@ -42,7 +42,7 @@ async fn a_project_runs_on_a_real_gcp_install_and_idles_at_zero() -> anyhow::Res
         return Ok(());
     };
     let [url, key, gcp_project, region] = <[String; 4]>::try_from(env).expect("four vars requested");
-    let disp = Dispatcher::for_install(&url, weft_core::infra::Instance::default_install())?
+    let disp = Dispatcher::for_install(&url, weft_core::infra::Install::default_install())?
         .with_auth(Arc::new(OperatorKey(key)));
     ensure::wait_healthy(&disp).await?;
 

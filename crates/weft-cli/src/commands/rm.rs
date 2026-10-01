@@ -6,7 +6,7 @@
 //! | flag        | action                                                  |
 //! |-------------|---------------------------------------------------------|
 //! | (none)      | unregister: the dispatcher deactivates the project,     |
-//! |             | terminates its infra processes (PVCs included), reclaims its |
+//! |             | terminates its infra containers and disks, reclaims its     |
 //! |             | stored data, and drops the row                          |
 //! | `--journal` | also drop this project's execution + log rows           |
 //! | `--local`   | also wipe this project's build artifacts on the host    |
@@ -133,21 +133,11 @@ async fn journal_page(
     client: &crate::client::DispatcherClient,
     project_id: &str,
 ) -> Result<Vec<String>> {
-    let page: serde_json::Value = client
-        .get_json(&format!("/executions?project_id={project_id}"))
-        .await
-        .context("list executions")?;
-    let Some(arr) = page.get("executions").and_then(|v| v.as_array()) else {
-        anyhow::bail!("/executions returned no `executions` array: {page}");
-    };
-    arr.iter()
-        .map(|e| {
-            e.get("execution_id")
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .ok_or_else(|| anyhow::anyhow!("/executions row without an execution: {e}"))
-        })
-        .collect()
+    let page: weft_core::program::ExecutionPage = serde_json::from_value(
+        client.get_json(&format!("/executions?project_id={project_id}")).await.context("list executions")?,
+    )
+    .context("read the executions listing")?;
+    Ok(page.executions.iter().map(|e| e.execution_id.to_string()).collect())
 }
 
 async fn drop_journal_rows(

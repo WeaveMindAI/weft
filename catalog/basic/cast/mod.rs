@@ -31,11 +31,8 @@ impl Node for CastNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let value: serde_json::Value = ctx.inputs.get("value")?;
         // The metadata ships MustOverride and the compiler refuses an
-        // un-overridden one, so an absent type here is a compiler
-        // regression, not something the user did.
-        let Some(target) = ctx.output_type("value") else {
-            node_bail!("internal: the Cast output type was not resolved at compile time");
-        };
+        // un-overridden one, so the type is always resolved here.
+        let target = ctx.output_type("value")?;
         match target.cast_value(&value) {
             Ok(cast) => ctx.pulse_downstream(NodeOutput::new().set("value", cast)).await,
             Err(e) => node_bail!("cannot cast the value into {target}: {e}"),

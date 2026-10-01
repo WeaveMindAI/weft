@@ -77,5 +77,8 @@
       "name": "attachments",
       "type": "List[File]"
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

@@ -59,6 +59,7 @@ export type {
   CatalogEntry,
   CancelCause,
   SkipReason,
+  Failure,
 } from './protocol';
 
 // The editor's view of a project + execution state, for consumers that build

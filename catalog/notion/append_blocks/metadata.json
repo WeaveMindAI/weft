@@ -52,5 +52,8 @@
       "type": "Number",
       "description": "How many blocks were appended."
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

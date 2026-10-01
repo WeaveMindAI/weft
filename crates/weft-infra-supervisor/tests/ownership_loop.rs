@@ -4,7 +4,7 @@
 //! supervisor's exclusive project leases, and sweeps what the host still
 //! runs for projects that are gone. These tests exercise the loop's
 //! broker and host contract against the in-memory fakes:
-//!   - the tick calls `sync_ownership` with THIS supervisor's instance
+//!   - the tick calls `sync_ownership` with THIS supervisor's replica
 //!     (so the broker claims under the right identity),
 //!   - the work loops read the owned set via `owned_projects`, and
 //!   - a copy whose project is gone is terminated, one whose project
@@ -35,7 +35,7 @@ async fn ownership_tick_syncs_under_this_supervisors_identity() {
         .broker
         .calls()
         .iter()
-        .any(|c| matches!(c, BrokerCall::SyncOwnership { instance, .. } if instance == "test-supervisor"));
+        .any(|c| matches!(c, BrokerCall::SyncOwnership { replica, .. } if replica == "test-supervisor"));
     assert!(synced, "ownership tick must sync_ownership(test-supervisor)");
 }
 
@@ -52,7 +52,7 @@ async fn work_loops_read_owned_projects_not_a_global_list() {
         .broker
         .calls()
         .iter()
-        .any(|c| matches!(c, BrokerCall::OwnedProjects { instance } if instance == "test-supervisor"));
+        .any(|c| matches!(c, BrokerCall::OwnedProjects { replica } if replica == "test-supervisor"));
     assert!(read_owned, "health tick must read owned_projects(test-supervisor), not a global project list");
 }
 
@@ -63,11 +63,11 @@ async fn work_loops_read_owned_projects_not_a_global_list() {
 async fn a_copy_of_a_gone_project_is_terminated() {
     let rig = SupervisorTestRig::with_tenant("alice");
     rig.broker.add_project(P1);
-    let copy = |project, instance: &str| weft_core::infra::NodeRef {
+    let copy = |project, copy_id: &str| weft_core::infra::NodeRef {
         tenant: "alice".into(),
         project,
         node: "db".into(),
-        instance: instance.into(),
+        copy_id: copy_id.into(),
     };
     rig.host.set_state(&copy(P1, "live"), "db", weft_platform_traits::UnitRunState::Ready);
     rig.host.set_state(&copy(GONE, "orphan"), "db", weft_platform_traits::UnitRunState::Ready);
@@ -79,7 +79,7 @@ async fn a_copy_of_a_gone_project_is_terminated() {
         .calls()
         .into_iter()
         .filter_map(|c| match c {
-            HostCall::Terminate { instance, .. } => Some(instance),
+            HostCall::Terminate { copy_id, .. } => Some(copy_id),
             _ => None,
         })
         .collect();
@@ -99,11 +99,11 @@ async fn a_kept_copy_the_program_no_longer_declares_loses_its_kept_disks() {
     rig.broker.add_project(P1);
     rig.broker.add_project(OTHER);
     rig.broker.set_project_owned(OTHER, false);
-    let copy = |project, node: &str, instance: &str| weft_core::infra::NodeRef {
+    let copy = |project, node: &str, copy_id: &str| weft_core::infra::NodeRef {
         tenant: "alice".into(),
         project,
         node: node.into(),
-        instance: instance.into(),
+        copy_id: copy_id.into(),
     };
     for c in [copy(P1, "removed", "i-removed"), copy(P1, "db", "i-db"), copy(OTHER, "removed", "i-other")] {
         rig.host.set_state(&c, "main", weft_platform_traits::UnitRunState::Ready);
@@ -119,7 +119,7 @@ async fn a_kept_copy_the_program_no_longer_declares_loses_its_kept_disks() {
     rig.tick_ownership().await.unwrap();
 
     let terminated: Vec<HostCall> = rig.host.calls().into_iter().skip(before).collect();
-    assert_eq!(terminated, vec![HostCall::Terminate { instance: "i-removed".into(), keep: vec![] }]);
+    assert_eq!(terminated, vec![HostCall::Terminate { copy_id: "i-removed".into(), keep: vec![] }]);
     assert!(rig.host.kept_disks("i-removed").is_empty());
     assert_eq!(rig.host.kept_disks("i-db"), ["data"], "a declared copy keeps its disks for its next start");
 }
@@ -130,14 +130,14 @@ async fn a_kept_copy_the_program_no_longer_declares_loses_its_kept_disks() {
 #[tokio::test]
 async fn a_failed_deletion_does_not_stop_the_sweep() {
     let rig = SupervisorTestRig::with_tenant("alice");
-    let copy = |instance: &str| weft_core::infra::NodeRef {
+    let copy = |copy_id: &str| weft_core::infra::NodeRef {
         tenant: "alice".into(),
         project: GONE,
         node: "db".into(),
-        instance: instance.into(),
+        copy_id: copy_id.into(),
     };
-    for instance in ["a-stuck", "b-orphan"] {
-        rig.host.set_state(&copy(instance), "db", weft_platform_traits::UnitRunState::Ready);
+    for copy_id in ["a-stuck", "b-orphan"] {
+        rig.host.set_state(&copy(copy_id), "db", weft_platform_traits::UnitRunState::Ready);
     }
     rig.host.fail_terminates_of("a-stuck");
 
@@ -147,7 +147,7 @@ async fn a_failed_deletion_does_not_stop_the_sweep() {
         .await
         .unwrap()
         .into_iter()
-        .map(|c| c.instance)
+        .map(|c| c.copy_id)
         .collect();
     assert_eq!(held, vec!["a-stuck".to_string()], "the orphan is deleted even though the stuck copy failed first");
 }
@@ -163,7 +163,7 @@ async fn a_project_a_command_holds_is_swept_only_after_it_lets_go() {
         tenant: "alice".into(),
         project: P1,
         node: "removed".into(),
-        instance: "i-removed".into(),
+        copy_id: "i-removed".into(),
     };
     rig.host.set_state(&removed, "main", weft_platform_traits::UnitRunState::Ready);
     rig.broker.undeclare(P1, "removed");
@@ -177,7 +177,7 @@ async fn a_project_a_command_holds_is_swept_only_after_it_lets_go() {
     drop(command);
     rig.tick_ownership().await.unwrap();
 
-    assert!(rig.host.calls().contains(&HostCall::Terminate { instance: "i-removed".into(), keep: vec![] }));
+    assert!(rig.host.calls().contains(&HostCall::Terminate { copy_id: "i-removed".into(), keep: vec![] }));
 }
 
 /// A project that still exists but declares no infra and has no row left
@@ -193,7 +193,7 @@ async fn an_unleased_projects_copy_is_claimed_then_swept() {
         tenant: "alice".into(),
         project: IDLE,
         node: "db".into(),
-        instance: "i-kept".into(),
+        copy_id: "i-kept".into(),
     };
     rig.host.set_state(&kept, "main", weft_platform_traits::UnitRunState::Ready);
     weft_platform_traits::InfraHost::terminate(rig.host.as_ref(), &kept, &["data".to_string()]).await.unwrap();
@@ -210,7 +210,7 @@ async fn an_unleased_projects_copy_is_claimed_then_swept() {
         .position(|c| matches!(c, BrokerCall::GoneCopies { project, .. } if *project == IDLE))
         .expect("the project is judged once leased");
     assert!(synced < judged, "the lease is claimed before the judgment");
-    assert!(rig.host.calls().contains(&HostCall::Terminate { instance: "i-kept".into(), keep: vec![] }));
+    assert!(rig.host.calls().contains(&HostCall::Terminate { copy_id: "i-kept".into(), keep: vec![] }));
     assert!(rig.host.kept_disks("i-kept").is_empty());
     assert_eq!(
         change,
@@ -236,7 +236,7 @@ fn stop_of(id: i64, project: uuid::Uuid) -> weft_broker_client::protocol::Superv
         spec_json: None,
         force: false,
         drain_timeout_secs: weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
-        copies: weft_core::member::Copies::Shared,
+        copies: weft_core::instance::Copies::Shared,
     }
 }
 
@@ -287,7 +287,7 @@ async fn a_sweep_whose_lease_moved_after_judging_deletes_nothing() {
         tenant: "alice".into(),
         project: P1,
         node: "removed".into(),
-        instance: "i-removed".into(),
+        copy_id: "i-removed".into(),
     };
     rig.host.set_state(&removed, "main", weft_platform_traits::UnitRunState::Ready);
     rig.broker.undeclare(P1, "removed");

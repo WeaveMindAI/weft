@@ -42,9 +42,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             lane INTEGER NOT NULL,
             status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'cancelled')),
             reason TEXT,
-            -- The dispatcher instance driving the build, and until when its
+            -- The dispatcher replica driving the build, and until when its
             -- hold lasts without renewal.
-            driver_instance TEXT NOT NULL,
+            driver_replica TEXT NOT NULL,
             driver_until BIGINT NOT NULL,
             started_at BIGINT NOT NULL,
             finished_at BIGINT
@@ -114,14 +114,14 @@ pub async fn claim(
     image_ref: &str,
     project_id: uuid::Uuid,
     tenant: &str,
-    instance: &str,
+    replica: &str,
     lanes: u32,
     now: i64,
 ) -> Result<Claim> {
     let mut tx = pool.begin().await.context("begin the build claim")?;
     lock_image(&mut tx, image_ref).await?;
     let running: Option<(String, String, i64, uuid::Uuid)> = sqlx::query_as(
-        "SELECT build_name, driver_instance, driver_until, project_id FROM image_build \
+        "SELECT build_name, driver_replica, driver_until, project_id FROM image_build \
          WHERE image_ref = $1 AND status = 'running'",
     )
     .bind(image_ref)
@@ -133,12 +133,12 @@ pub async fn claim(
         // dispatcher restarted under the same name lost track of its
         // build, like any other gone driver.
         let claim = if driver_until < now {
-            let (new, lane) = take_over_in(&mut tx, image_ref, &name, instance, lanes, now)
+            let (new, lane) = take_over_in(&mut tx, image_ref, &name, replica, lanes, now)
                 .await?
                 .context("a lapsed build under the image lock could not be taken over")?;
             Claim::Adopt { gone: name, name: new, lane, ours }
         } else {
-            Claim::Join { driving: driver == instance, ours, name }
+            Claim::Join { driving: driver == replica, ours, name }
         };
         tx.commit().await.context("commit the build claim")?;
         return Ok(claim);
@@ -147,11 +147,11 @@ pub async fn claim(
     let name = build_name();
     sqlx::query(
         "INSERT INTO image_build (image_ref, project_id, tenant_id, build_name, lane, status, reason, \
-                                  driver_instance, driver_until, started_at, finished_at) \
+                                  driver_replica, driver_until, started_at, finished_at) \
          VALUES ($1, $2, $3, $4, $5, 'running', NULL, $6, $7, $8, NULL) \
          ON CONFLICT (image_ref) DO UPDATE SET project_id = EXCLUDED.project_id, tenant_id = EXCLUDED.tenant_id, \
              build_name = EXCLUDED.build_name, lane = EXCLUDED.lane, status = 'running', reason = NULL, \
-             driver_instance = EXCLUDED.driver_instance, driver_until = EXCLUDED.driver_until, \
+             driver_replica = EXCLUDED.driver_replica, driver_until = EXCLUDED.driver_until, \
              started_at = EXCLUDED.started_at, finished_at = NULL",
     )
     .bind(image_ref)
@@ -159,7 +159,7 @@ pub async fn claim(
     .bind(tenant)
     .bind(&name)
     .bind(lane as i32)
-    .bind(instance)
+    .bind(replica)
     .bind(now + DRIVER_LEASE_SECS)
     .bind(now)
     .execute(&mut *tx)
@@ -178,13 +178,13 @@ pub async fn take_over(
     pool: &PgPool,
     image_ref: &str,
     gone: &str,
-    instance: &str,
+    replica: &str,
     lanes: u32,
     now: i64,
 ) -> Result<Option<(String, u32)>> {
     let mut tx = pool.begin().await.context("begin the build take-over")?;
     lock_image(&mut tx, image_ref).await?;
-    let taken = take_over_in(&mut tx, image_ref, gone, instance, lanes, now).await?;
+    let taken = take_over_in(&mut tx, image_ref, gone, replica, lanes, now).await?;
     tx.commit().await.context("commit the build take-over")?;
     Ok(taken)
 }
@@ -193,21 +193,21 @@ async fn take_over_in(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     image_ref: &str,
     gone: &str,
-    instance: &str,
+    replica: &str,
     lanes: u32,
     now: i64,
 ) -> Result<Option<(String, u32)>> {
     let lane = pick_lane(tx, lanes).await?;
     let name = build_name();
     let res = sqlx::query(
-        "UPDATE image_build SET build_name = $3, lane = $4, driver_instance = $5, driver_until = $6, started_at = $7 \
+        "UPDATE image_build SET build_name = $3, lane = $4, driver_replica = $5, driver_until = $6, started_at = $7 \
          WHERE image_ref = $1 AND build_name = $2 AND status = 'running' AND driver_until < $7",
     )
     .bind(image_ref)
     .bind(gone)
     .bind(&name)
     .bind(lane as i32)
-    .bind(instance)
+    .bind(replica)
     .bind(now + DRIVER_LEASE_SECS)
     .bind(now)
     .execute(&mut **tx)
@@ -249,14 +249,14 @@ fn build_name() -> String {
 }
 
 /// Extend this process's hold on the build it drives.
-pub async fn renew(pool: &PgPool, image_ref: &str, name: &str, instance: &str, now: i64) -> Result<()> {
+pub async fn renew(pool: &PgPool, image_ref: &str, name: &str, replica: &str, now: i64) -> Result<()> {
     sqlx::query(
         "UPDATE image_build SET driver_until = $4 \
-         WHERE image_ref = $1 AND build_name = $2 AND driver_instance = $3 AND status = 'running'",
+         WHERE image_ref = $1 AND build_name = $2 AND driver_replica = $3 AND status = 'running'",
     )
     .bind(image_ref)
     .bind(name)
-    .bind(instance)
+    .bind(replica)
     .bind(now + DRIVER_LEASE_SECS)
     .execute(pool)
     .await
@@ -312,7 +312,7 @@ pub enum Seen {
 /// all the same (the module doc).
 pub async fn look(pool: &PgPool, image_ref: &str, name: &str) -> Result<Seen> {
     let row: Option<(String, String, Option<String>, String, i64)> = sqlx::query_as(
-        "SELECT build_name, status, reason, driver_instance, driver_until FROM image_build WHERE image_ref = $1",
+        "SELECT build_name, status, reason, driver_replica, driver_until FROM image_build WHERE image_ref = $1",
     )
     .bind(image_ref)
     .fetch_optional(pool)
@@ -368,7 +368,7 @@ pub async fn unused_images(pool: &PgPool) -> Result<Vec<String>> {
 /// another standard worker. Recording it twice changes nothing.
 pub async fn note_shared(pool: &PgPool, image_ref: &str, now: i64) -> Result<()> {
     sqlx::query(
-        "INSERT INTO image_build (image_ref, project_id, tenant_id, build_name, lane, status, driver_instance, driver_until, started_at, finished_at) \
+        "INSERT INTO image_build (image_ref, project_id, tenant_id, build_name, lane, status, driver_replica, driver_until, started_at, finished_at) \
          VALUES ($1, $2, '', 'shared', 0, 'succeeded', '', 0, $3, $3) ON CONFLICT (image_ref) DO NOTHING",
     )
     .bind(image_ref)

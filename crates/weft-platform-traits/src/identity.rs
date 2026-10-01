@@ -94,15 +94,15 @@ impl IdentityTokens for FixedToken {
 }
 
 /// The header a worker process names itself with on every call to the
-/// broker: a random id it mints at boot. The principal says WHICH
-/// project; this says which running copy of it, so a claim, the
+/// broker: a random replica id it mints at boot. The principal says WHICH
+/// project; this says which running process of it, so a claim, the
 /// ownership of the execution it drives, and the journal rows it writes all
 /// name the same writer. It is self-asserted, and that is enough: it
 /// only orders writers inside one project, all of which are the same
 /// principal.
-// SYNC: INSTANCE_HEADER <-> crates/weft-broker/src/auth.rs (read),
-//       crates/weft-broker-client/src/client.rs (sent)
-pub const INSTANCE_HEADER: &str = "x-weft-instance";
+// SYNC: REPLICA_HEADER <-> crates/weft-broker/src/auth.rs (read),
+//       crates/weft-broker-client/src/token.rs (sent)
+pub const REPLICA_HEADER: &str = "x-weft-replica";
 
 /// The header one of weft's own roles names itself with. A weft role is
 /// trusted, so this only says which of its surfaces a call is for (a
@@ -114,8 +114,9 @@ pub const INSTANCE_HEADER: &str = "x-weft-instance";
 //       crates/weft-broker-client/src/token.rs (sent)
 pub const ROLE_HEADER: &str = "x-weft-role";
 
-/// A fresh instance id for this process.
-pub fn mint_instance_id(role: &str) -> String {
+/// A fresh replica id for this process: which running copy of a role
+/// (or of a project's worker) it is.
+pub fn mint_replica_id(role: &str) -> String {
     format!("{role}-{}", uuid::Uuid::new_v4().simple())
 }
 
@@ -136,9 +137,9 @@ mod tests {
     }
 
     #[test]
-    fn instance_ids_are_unique_and_name_their_role() {
-        let a = mint_instance_id("worker");
-        let b = mint_instance_id("worker");
+    fn replica_ids_are_unique_and_name_their_role() {
+        let a = mint_replica_id("worker");
+        let b = mint_replica_id("worker");
         assert_ne!(a, b);
         assert!(a.starts_with("worker-"));
     }

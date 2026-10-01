@@ -14,12 +14,12 @@ import * as path from 'node:path';
 export const DEFAULT_LOCAL_URL = 'http://127.0.0.1:14111';
 
 /// The folder an install keeps its files in: weft's data folder for the
-/// default install, `installs/<name>` under it for the one `WEFT_INSTANCE`
+/// default install, `installs/<name>` under it for the one `WEFT_INSTALL`
 /// names.
-// SYNC: <-> crates/weft-core/src/infra/instance.rs (data_dir, Instance::dir, Instance::from_env)
+// SYNC: <-> crates/weft-core/src/infra/install.rs (data_dir, Install::dir, Install::from_env)
 export function installDir(env: NodeJS.ProcessEnv = process.env, home: string = os.homedir()): string {
   const root = path.join(env.HOME ?? home, '.local', 'share', 'weft');
-  const name = env.WEFT_INSTANCE?.trim();
+  const name = env.WEFT_INSTALL?.trim();
   return name ? path.join(root, 'installs', name) : root;
 }
 
@@ -36,7 +36,7 @@ export function localInstallUrl(env: NodeJS.ProcessEnv = process.env, home: stri
     raw = fs.readFileSync(file, 'utf8');
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error(`cannot read ${file}: ${e}`);
-    const name = env.WEFT_INSTANCE?.trim();
+    const name = env.WEFT_INSTALL?.trim();
     if (!name) return DEFAULT_LOCAL_URL;
     throw new Error(`install '${name}' has no ports yet (${file} does not exist); start it with \`weft daemon start\``);
   }

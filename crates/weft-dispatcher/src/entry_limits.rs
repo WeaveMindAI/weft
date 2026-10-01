@@ -296,14 +296,19 @@ pub async fn recent_refusals(pool: &PgPool, token: &str, now: i64) -> Result<Vec
 
 /// The condition, on an `entry_slot s`, under which a slot no longer
 /// counts toward its entry's at-once limit, with `now` bound at `now_param`:
-/// its run never started and its hold passed, or its run ended (a terminal
-/// event is in the journal, whether or not the bridge freed the slot yet).
+/// its run never started (or was an unrecorded run, forgotten with its
+/// row) and its hold passed, or its run ended, whether or not the bridge
+/// freed the slot yet: a terminal event is in the journal, or an
+/// unrecorded run whose costs kept its row is stamped ended.
 fn slot_stopped_counting(now_param: &str) -> String {
     format!(
         "((s.unborn_until < {now_param} \
            AND NOT EXISTS (SELECT 1 FROM execution ec WHERE ec.execution_id = s.execution_id)) \
+          OR EXISTS (SELECT 1 FROM execution ec WHERE ec.execution_id = s.execution_id \
+                     AND ec.ended_at_unix IS NOT NULL) \
           OR EXISTS (SELECT 1 FROM exec_event e WHERE e.execution_id = s.execution_id \
-                     AND e.kind IN ('execution_completed', 'execution_failed', 'execution_cancelled')))"
+                     AND e.kind IN {terminal}))",
+        terminal = weft_journal::EXECUTION_TERMINAL_KINDS_SQL,
     )
 }
 

@@ -252,10 +252,10 @@ weft connect --on prod
 
 If a run on prod reaches a step with nothing picked there, it is refused
 before it starts, and the message names the step and
-`weft connect --node <step>`; add `--on prod`. A member's own connection (a
-field written `@member_filled`) lives in the install the member made it on,
-so members connect through your frontend on prod, the same way
-they do locally.
+`weft connect --node <step>`; add `--on prod`. An instance's own connection (a
+field written `@instance_filled`) lives in the install it was made on, so
+your customers connect through your frontend on prod, the same way they do
+locally.
 
 ### Look at prod from the editor
 
@@ -359,9 +359,6 @@ them to `0` to turn it off. A call past a limit gets `429` with
 - **`401` on every command**: the key is wrong or was revoked. Run
   `weft login prod` again. In CI, run `weft target export prod --github`
   again.
-- **`this version was written by weft X, and this install runs weft Y`**:
-  your CLI was built from a different commit than the install. Check out the commit your
-  install was built from and run `./setup.sh --cli`.
 - **HTTPS fails right after the install, or right after `weft domain add`**:
   the certificate is not issued yet. For a domain, check that its record
   points at the address `weft domain list --on prod` prints. The machine's

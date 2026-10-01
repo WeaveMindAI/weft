@@ -6,9 +6,9 @@
 //! Each returns a `Result` so a test can `?` them; a failed check is an `Err`
 //! carrying enough of the replay to see why, never a silent pass.
 //!
-//! Field-name knowledge (which event carries which value) lives in [`crate::event`]
-//! and is SYNC'd by string against the dispatcher's DispatcherEvent. These
-//! helpers stay above that, reading through the [`Replay`] accessors.
+//! Field-name knowledge (which event carries which value) lives in
+//! [`crate::event`]. These helpers stay above that, reading through the
+//! [`Replay`] accessors.
 
 use anyhow::{bail, Result};
 use serde_json::Value;

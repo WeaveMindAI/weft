@@ -11,6 +11,13 @@ what it is given and what comes back. And [params], the node wired into
 an LLM node's `params` input, says how it thinks: everything below that
 is not about the prompt is a setting on it.
 
+If you need a real model id for the provider node, run `weft options <step>
+model --search <text>` from the project, with the provider node's name as
+`<step>`. It prints one `id  label` line per matching model, the same list
+the editor's search shows, read through the connection picked on that node,
+and the id is what you write in `model`. Never guess an id, and never ask the
+provider's API yourself.
+
 Everything here is about the model's behaviour, which no metadata file
 can tell you: what a setting DOES to an answer, what it costs, and how
 the pieces interact across a chain of calls.
@@ -87,16 +94,16 @@ on the messages themselves and the library translates them per provider,
 so you write nothing provider-specific.
 
 A node with `autoCache` on (the default wherever the input exists) places
-[mark]s for you: with a wired history that carries no [mark], the request
-marks the system message and the last history message before this call's
-new turn (a history with no system message marks the last one alone). The
-[mark]s live on the request alone; the emitted `history` is the
+[mark]s for you: with a conversation that carries no [mark], the request
+marks the system message and the last message before this call's new turn
+(a conversation with no system message marks the last one alone). The
+[mark]s live on the request alone; the conversation file keeps the
 conversation as written, so each call in a chain marks the prefix it sees.
-You chain the calls through `history`, and the shared prefix is cached
-from the second call on.
+You chain the calls through one conversation file (`historyFile`), and the
+shared prefix is cached from the second call on.
 
 To place [mark]s yourself, set `cacheBreakpoint: true` on a Chat Message
-node: everything up to and including that message is cached. A history
+node: everything up to and including that message is cached. A conversation
 that carries any [mark] of yours turns the automatic ones off, so you
 place them all or none. The wires that translate [mark]s (the Anthropic
 family, and OpenRouter where it fronts one) keep at most four, the last

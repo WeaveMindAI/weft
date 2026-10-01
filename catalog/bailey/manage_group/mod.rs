@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use serde_json::json;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct BaileyManageGroupNode;
@@ -28,16 +28,22 @@ fn bridge_call(
     description: Option<&str>,
     participants: &[String],
 ) -> WeftResult<(&'static str, serde_json::Value)> {
-    let need_group = || group_id.map(str::to_string).node_err(format!("'{action}' needs groupId"));
+    // Every refusal here is the program's own settings missing a value
+    // its action needs, so none is catchable on `error`.
+    let mistake = WeftError::Input;
+    let need_group =
+        || group_id.map(str::to_string).ok_or_else(|| mistake(format!("'{action}' needs groupId")));
     let need_participants = || {
         if participants.is_empty() {
-            weft::node_bail!("'{action}' needs at least one participant");
+            return Err(mistake(format!("'{action}' needs at least one participant")));
         }
         Ok(participants)
     };
     match action {
         "create" => {
-            let name = name.filter(|n| !n.is_empty()).node_err("'create' needs a group name")?;
+            let name = name
+                .filter(|n| !n.is_empty())
+                .ok_or_else(|| mistake("'create' needs a group name".to_string()))?;
             let participants = need_participants()?;
             Ok(("createGroup", json!({ "name": name, "participants": participants })))
         }
@@ -46,14 +52,16 @@ fn bridge_call(
         "promote" => Ok(("groupPromote", json!({ "groupId": need_group()?, "participants": need_participants()? }))),
         "demote" => Ok(("groupDemote", json!({ "groupId": need_group()?, "participants": need_participants()? }))),
         "rename" => {
-            let subject = name.filter(|n| !n.is_empty()).node_err("'rename' needs the new name")?;
+            let subject = name
+                .filter(|n| !n.is_empty())
+                .ok_or_else(|| mistake("'rename' needs the new name".to_string()))?;
             Ok(("groupUpdateSubject", json!({ "groupId": need_group()?, "subject": subject })))
         }
         "describe" => Ok((
             "groupUpdateDescription",
             json!({ "groupId": need_group()?, "description": description.unwrap_or("") }),
         )),
-        other => weft::node_bail!("'{other}' is not a group action this node knows"),
+        other => Err(mistake(format!("'{other}' is not a group action this node knows"))),
     }
 }
 

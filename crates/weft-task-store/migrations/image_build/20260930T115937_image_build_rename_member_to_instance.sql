@@ -1,0 +1,3 @@
+ALTER TABLE image_build RENAME COLUMN driver_instance TO driver_replica;
+
+ALTER TABLE image_build RENAME CONSTRAINT image_build_driver_instance_not_null TO image_build_driver_replica_not_null;

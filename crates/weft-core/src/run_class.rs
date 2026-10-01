@@ -53,7 +53,7 @@ impl RunClass {
 }
 
 /// The input the language gives every trigger that is not a live
-/// connection ([`crate::node::NodeMetadata::add_language_inputs`]), read
+/// connection ([`crate::node::NodeMetadata::add_language_ports`]), read
 /// by the ctx when the node registers its signal, so no node declares or
 /// reads it.
 pub const LONG_RUNS_FIELD: &str = "longRuns";

@@ -1,6 +1,6 @@
 ---
 trigger: always_on
-description: "Tangle, the weft orchestrator persona, part 1 of 4: what this project is"
+description: "Tangle, the weft orchestrator persona, part 1 of 5: what this project is"
 ---
 
 # Tangle

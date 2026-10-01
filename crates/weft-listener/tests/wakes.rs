@@ -165,7 +165,7 @@ async fn rig(placement: Placement) -> Rig {
     let tasks = Arc::new(FakeTasks::default());
     let alarm = Arc::new(FakeAlarm::new());
     let state = ListenerState::new(
-        ListenerConfig { instance: "test-listener".into(), broker_url: broker, placement },
+        ListenerConfig { replica: "test-listener".into(), broker_url: broker, placement },
         tasks.clone(),
         weft_broker_client::TokenSource::role(
             Arc::new(weft_platform_traits::FixedToken("test-token".into())),
@@ -191,7 +191,7 @@ fn identity(token: &str, spec: weft_core::primitive::SignalSpec) -> SignalIdenti
 /// The row the dispatcher would write for a registration.
 fn row(token: &str, spec: &weft_core::primitive::SignalSpec, kind_state: Value, seq: i64) -> Value {
     json!({
-        "token": token, "tenant_id": "tenant-a", "for_member": null, "node_id": "tick",
+        "token": token, "tenant_id": "tenant-a", "for_instance": null, "node_id": "tick",
         "spec_json": serde_json::to_string(spec).unwrap(), "is_resume": false, "execution_id": null,
         "surface_kind": "internal", "mount_path": null, "mount_methods": [], "auth_kind": "none",
         "auth_config": null, "kind_state": kind_state, "kind_state_seq": seq
@@ -711,4 +711,65 @@ async fn wait_for(mut done: impl FnMut() -> bool) {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     panic!("the detached teardown never ran");
+}
+
+// ---------- The `/wake` door ----------
+
+/// Serve the listener's real router on a local port; answers its base URL.
+async fn serve(state: ListenerState) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, weft_listener::router(state)).await.unwrap() });
+    format!("http://{addr}")
+}
+
+/// Every log line written while the guard lives, as text.
+#[derive(Clone, Default)]
+struct Logs(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Logs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A body that can never be a wake is answered 200 (so a retrying queue
+/// like Cloud Tasks stops), says it was dropped and why, and is logged
+/// as an error carrying the body.
+#[tokio::test]
+async fn a_wake_body_that_can_never_be_read_is_dropped_with_a_success_and_logged() {
+    let logs = Logs::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt().with_ansi(false).with_writer(move || writer.clone()).finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let rig = rig(Placement::Serverless).await;
+    let base = serve(rig.state.clone()).await;
+    let http = reqwest::Client::new();
+    for body in ["not json at all", r#"{"at_unix_ms": 1, "body": {"tok": "x"}}"#] {
+        let answer = http.post(format!("{base}/wake")).body(body).send().await.unwrap();
+        assert_eq!(answer.status(), 200, "{body}");
+        let said: Value = answer.json().await.unwrap();
+        assert_eq!(said["dropped"], true, "{said}");
+        assert!(said["reason"].as_str().unwrap().contains("not a wake call"), "{said}");
+    }
+    let written = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(written.contains("ERROR") && written.contains("not json at all"), "{written}");
+    assert!(rig.tasks.enqueued.lock().unwrap().is_empty());
+}
+
+/// A readable wake whose processing fails answers 500, so the alarm tries
+/// it again.
+#[tokio::test]
+async fn a_readable_wake_that_fails_answers_500_for_a_retry() {
+    let rig = rig(Placement::Serverless).await;
+    rig.get_held.failing.store(usize::MAX, std::sync::atomic::Ordering::SeqCst);
+    let base = serve(rig.state.clone()).await;
+    let call = json!({ "at_unix_ms": now_ms(), "body": { "token": "tok", "due_at_ms": now_ms() } });
+    let answer = reqwest::Client::new().post(format!("{base}/wake")).json(&call).send().await.unwrap();
+    assert_eq!(answer.status(), 500);
 }

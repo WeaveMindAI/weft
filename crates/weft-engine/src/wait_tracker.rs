@@ -381,8 +381,8 @@ impl WaitLiveness for WaitTracker {
 /// The acknowledgement condition IS pulse absorption: the engine
 /// already has that exact first-class event, attached to the individual
 /// value, so no second notion of "dispatched" exists beside it. The
-/// gate resolves ONCE: a later un-absorb (a crashed-Running resume
-/// flipping pulses back to Pending) must never re-arm it, because the
+/// gate resolves ONCE: a later un-absorb (a boundary re-fired after a
+/// refold flipping pulses back to Pending) must never re-arm it, because the
 /// producer already resumed and moved on.
 pub struct DeliveryGate {
     state: Mutex<GateState>,

@@ -1,7 +1,7 @@
 {
   "type": "PostgresUpdateRows",
   "label": "Postgres: Update Rows",
-  "description": "Update matching rows: SET columns from a JSON object, WHERE from a SQL condition (its $1-style placeholders read from whereParams). Emits the changed rows.",
+  "description": "Update matching rows: SET columns from a JSON object, WHERE from a SQL condition (its $1-style placeholders read from whereParams). Emits the changed rows. A database that cannot be reached or refuses the update (a broken constraint) is a failure `error` catches when wired; a mistake in the program (a syntax error in `where`, a column that does not exist, a `whereParams` count that does not match) always fails the run.",
   "tags": [
     "postgres",
     "database",
@@ -58,5 +58,8 @@
       "name": "count",
       "type": "Number"
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

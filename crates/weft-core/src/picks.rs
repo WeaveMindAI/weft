@@ -5,26 +5,26 @@
 //! nothing on another install: a pick written into the source worked on
 //! the machine that made it and nowhere else. So the source never holds
 //! one. The compiler marks every access node's connection field that is
-//! neither wired nor `@member_filled` as picked on the install
+//! neither wired nor `@instance_filled` as picked on the install
 //! ([`install_picked_literal`]); each install keeps what was picked for it
 //! (`weft connect`, the editor's Connect button, with `--on <target>` for
-//! another install) beside the values members give, with the program as
-//! the owner; and a run carries the picks it was born with, which the
-//! engine puts where the marker stands, exactly as it does a member's
-//! values.
+//! another install) beside the values instances are given, with the
+//! program as the owner; and a run carries the picks it was born with,
+//! which the engine puts where the marker stands, exactly as it does an
+//! instance's values.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::member::{MemberValues, PlaceValues};
+use crate::instance::{InstanceValues, PlaceValues};
 use crate::project::{NodeDefinition, ProjectDefinition};
 use crate::run_spec::Refusal;
 
 /// The key the marker is lowered to, a structured value no string a
 /// program writes can read as (the same reasoning as
-/// [`crate::member::MEMBER_FILLED_KEY`]).
+/// [`crate::instance::INSTANCE_FILLED_KEY`]).
 // SYNC: INSTALL_PICKED_KEY <-> packages/weft-graph/src/protocol.ts INSTALL_PICKED_KEY
 pub const INSTALL_PICKED_KEY: &str = "__weft_install_picked__";
 
@@ -42,11 +42,11 @@ pub fn is_install_picked(value: &Value) -> bool {
     matches!(value, Value::Object(map) if map.len() == 1 && map.get(INSTALL_PICKED_KEY).is_some_and(Value::is_object))
 }
 
-/// Whether a written literal names no value yet: a field a member fills
-/// or one picked on the install. What every reader that must not judge
-/// the marker itself (readiness, the rules, the port-type check) asks.
+/// Whether a written literal names no value yet: a field an instance
+/// fills or one picked on the install. What every reader that must not
+/// judge the marker itself (readiness, the rules, the port-type check) asks.
 pub fn fills_later(value: &Value) -> bool {
-    crate::member::as_member_filled(value).is_some() || is_install_picked(value)
+    crate::instance::as_instance_filled(value).is_some() || is_install_picked(value)
 }
 
 /// The fields of `node` picked on the install.
@@ -56,7 +56,7 @@ pub fn picked_fields(node: &NodeDefinition) -> impl Iterator<Item = &str> {
 
 /// The picks a run carries: place (`slack`, `one.slack`) -> field -> the
 /// connection handle (`{id, identity}`), read when the run is born.
-pub type Picks = MemberValues;
+pub type Picks = InstanceValues;
 
 /// Put the install's picks into `literals` (the constants delivered to
 /// one firing of `node` at one place): each picked field takes its
@@ -167,7 +167,7 @@ pub struct ChangePicks {
     #[serde(default)]
     pub set: Vec<PickInput>,
     #[serde(default)]
-    pub clear: Vec<crate::run_spec::MemberFieldRef>,
+    pub clear: Vec<crate::run_spec::InstanceFieldRef>,
 }
 
 /// A [`PickInput`] the program accepts, with the service its field
@@ -185,7 +185,7 @@ pub struct CheckedPick {
 /// field picked on the install there, to its service. A place it does not
 /// have yet is kept as asked: connecting comes before the first build as
 /// often as after it, and a pick the program never reads stays stored and
-/// unused, as a member's value for a field no longer filled does. Whether
+/// unused, as an instance's value for a field no longer filled does. Whether
 /// the connection is the author's and of that service is the store's to
 /// check, where the connection is. All or nothing: the refusal names
 /// every pick refused.
@@ -226,6 +226,176 @@ pub fn check_picks(project: Option<&ProjectDefinition>, inputs: &[PickInput]) ->
         });
     }
     if refusal.is_empty() { Ok(checked) } else { Err(refusal) }
+}
+
+/// One thing the install keeps at a place, read back to check it against
+/// the program: a pick (`instance: None`) or one instance's value for a
+/// field written `@instance_filled`. `service` is the connection's
+/// service when the value is a connection, else `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredField {
+    pub step: String,
+    pub field: String,
+    pub service: Option<String>,
+    pub instance: Option<crate::instance::InstanceId>,
+}
+
+/// A place the install keeps picks or values for that the program no
+/// longer has, and the places it has now that could be where that node
+/// went (best guess first): each has the same fields, to the same
+/// services, and nothing stored for them yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stranded {
+    pub step: String,
+    pub candidates: Vec<String>,
+}
+
+impl Stranded {
+    /// What a person reads: both addresses and the command that moves
+    /// the picks across.
+    pub fn message(&self) -> String {
+        let first = &self.candidates[0];
+        let others = if self.candidates.len() > 1 {
+            format!(" (or {})", self.candidates[1..].iter().map(|c| format!("'{c}'")).collect::<Vec<_>>().join(", "))
+        } else {
+            String::new()
+        };
+        format!(
+            "'{}' has connections or values stored on this install and is no longer in the program; \
+             did you move it to '{first}'{others}? `weft connect --move {} {first}` carries them across",
+            self.step, self.step
+        )
+    }
+}
+
+/// Every place of `project`, spelled, with its node.
+fn places_of(project: &ProjectDefinition) -> BTreeMap<String, &NodeDefinition> {
+    crate::project::selection::every_place(project)
+        .into_iter()
+        .filter_map(|place| {
+            let node = project.nodes.iter().find(|n| n.id == place.id)?;
+            Some((crate::project::address_of(project, &place.id, &place.path), node))
+        })
+        .collect()
+}
+
+/// Whether `node` can hold `stored`: the same field, filled the same way
+/// (picked on the install for a pick, `@instance_filled` for an
+/// instance's value), connecting to the same service when it is a
+/// connection.
+fn holds(node: &NodeDefinition, stored: &StoredField) -> bool {
+    let filled_the_same_way = match stored.instance {
+        None => picked_fields(node).any(|f| f == stored.field),
+        Some(_) => crate::instance::instance_filled_fields(node).any(|(f, _)| f == stored.field),
+    };
+    filled_the_same_way && stored.service.as_deref().is_none_or(|service| service_of(node, &stored.field) == Some(service))
+}
+
+/// How many dotted segments two addresses share at the end: a node moved
+/// into a folder keeps its own name and the names under it.
+fn shared_tail(a: &str, b: &str) -> usize {
+    a.rsplit('.').zip(b.rsplit('.')).take_while(|(x, y)| x == y).count()
+}
+
+/// The places `stored` keeps things for that `project` no longer has, each
+/// with the places that could have taken its node over (see [`Stranded`]).
+/// A place with no such candidate is left out: its node is gone, and what
+/// it kept stays stored and unused, the same as a pick made before the
+/// first build.
+pub fn stranded(project: &ProjectDefinition, stored: &[StoredField]) -> Vec<Stranded> {
+    let places = places_of(project);
+    let taken: BTreeSet<(&str, &str)> = stored.iter().map(|s| (s.step.as_str(), s.field.as_str())).collect();
+    let mut by_step: BTreeMap<&str, Vec<&StoredField>> = BTreeMap::new();
+    for s in stored.iter().filter(|s| !places.contains_key(&s.step)) {
+        by_step.entry(s.step.as_str()).or_default().push(s);
+    }
+    by_step
+        .into_iter()
+        .filter_map(|(step, fields)| {
+            let mut candidates: Vec<&String> = places
+                .iter()
+                .filter(|(place, node)| {
+                    fields.iter().all(|s| holds(node, s) && !taken.contains(&(place.as_str(), s.field.as_str())))
+                })
+                .map(|(place, _)| place)
+                .collect();
+            if candidates.is_empty() {
+                return None;
+            }
+            candidates.sort_by_key(|place| std::cmp::Reverse(shared_tail(step, place)));
+            Some(Stranded { step: step.to_string(), candidates: candidates.into_iter().cloned().collect() })
+        })
+        .collect()
+}
+
+/// What an activation checks of the install's picks before any trigger
+/// moves: every connection the program needs picked on the install is
+/// picked (an instance's own fields are the instance's to fill, per call),
+/// and nothing is stored under a place the program moved away from. The
+/// refusal names every gap, each with its fix.
+pub fn activation_picks(project: &ProjectDefinition, picks: &Picks, stored: &[StoredField]) -> Result<(), Refusal> {
+    let mut refusal = match run_picks(project, &crate::project::selection::RunSelection::whole(project), picks) {
+        Ok(_) => Refusal { errors: Vec::new() },
+        Err(refusal) => refusal,
+    };
+    refusal.errors.extend(stranded(project, stored).iter().map(Stranded::message));
+    if refusal.is_empty() { Ok(()) } else { Err(refusal) }
+}
+
+/// Body for `POST /projects/{id}/picks/move`: carry everything the install
+/// keeps at the place `from` (its picks and every instance's values) to
+/// the place `to`. What `weft connect --move` sends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MovePicks {
+    pub from: String,
+    pub to: String,
+}
+
+/// What a move carried, and the triggers it set up again.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PicksMoved {
+    pub picks: u64,
+    pub instance_values: u64,
+    pub rearmed: Vec<String>,
+}
+
+/// Hold a move to the program and to what is stored: `to` is a place of
+/// the program with nothing stored yet, `from` has something stored, and
+/// the node at `to` can hold every field kept at `from` (the same field,
+/// filled the same way, to the same service). A move never merges and
+/// never happens on its own: the person names both places.
+pub fn check_move(project: &ProjectDefinition, stored: &[StoredField], request: &MovePicks) -> Result<(), String> {
+    let MovePicks { from, to } = request;
+    if from == to {
+        return Err(format!("'{from}' is both where the picks are and where they would go"));
+    }
+    let places = places_of(project);
+    let Some(node) = places.get(to) else {
+        return Err(format!(
+            "'{to}' is no place of the program this install last built; build the program with the \
+             node there first, and name it the way the program spells it (`one.step` inside an included file)"
+        ));
+    };
+    let moving: Vec<&StoredField> = stored.iter().filter(|s| &s.step == from).collect();
+    if moving.is_empty() {
+        return Err(format!("nothing is stored at '{from}' on this install"));
+    }
+    if stored.iter().any(|s| &s.step == to) {
+        return Err(format!(
+            "'{to}' already has connections or values stored; a move never merges, so clear them first \
+             (`weft connect --node {to} --disconnect`, and `--instance <id>` for an instance's)"
+        ));
+    }
+    let misfits: BTreeSet<&str> = moving.iter().filter(|s| !holds(node, s)).map(|s| s.field.as_str()).collect();
+    if !misfits.is_empty() {
+        return Err(format!(
+            "'{to}' is a {} that cannot take what '{from}' keeps ({}): not the same field, filled the same \
+             way, to the same service, so it is not the same kind of node",
+            node.node_type,
+            misfits.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -283,6 +453,79 @@ mod tests {
         let mut literals: serde_json::Map<String, Value> = node.port_literals.clone().into_iter().collect();
         fill_picks(&node, &mut literals, Some(&BTreeMap::from([("access".into(), handle.clone())])));
         assert_eq!(literals["access"], handle);
+    }
+
+    fn instance_filled_node(id: &str) -> NodeDefinition {
+        let mut node = access_node(id, false);
+        node.port_literals.insert("access".into(), crate::instance::instance_filled_literal(None));
+        node
+    }
+
+    fn kept(step: &str, service: Option<&str>, instance: Option<&str>) -> StoredField {
+        StoredField {
+            step: step.into(),
+            field: "access".into(),
+            service: service.map(Into::into),
+            instance: instance.map(|i| crate::instance::InstanceId::new(i).unwrap()),
+        }
+    }
+
+    #[test]
+    fn a_pick_left_behind_by_a_moved_node_names_where_it_went() {
+        let p = project(vec![access_node("studio_agent", false), access_node("agent", false)]);
+        // `agent` has its pick; `studio_agent` lacks one and could take the old one.
+        let stored = [kept("old.agent", Some("slack"), None), kept("agent", Some("slack"), None)];
+        let found = stranded(&p, &stored);
+        assert_eq!(found, vec![Stranded { step: "old.agent".into(), candidates: vec!["studio_agent".into()] }]);
+        assert!(found[0].message().contains("weft connect --move old.agent studio_agent"), "{}", found[0].message());
+    }
+
+    #[test]
+    fn the_candidate_sharing_the_longest_tail_comes_first() {
+        let p = project(vec![access_node("x", false), access_node("agent", false)]);
+        let found = stranded(&p, &[kept("chat.agent", Some("slack"), None)]);
+        assert_eq!(found[0].candidates, vec!["agent".to_string(), "x".to_string()]);
+    }
+
+    #[test]
+    fn a_place_nothing_could_have_taken_over_is_not_stranded() {
+        let p = project(vec![access_node("agent", false)]);
+        assert!(stranded(&p, &[kept("gone", Some("github"), None)]).is_empty(), "another service");
+        assert!(stranded(&p, &[kept("gone", Some("slack"), Some("m"))]).is_empty(), "an instance value needs @instance_filled");
+        let with_values = project(vec![instance_filled_node("agent")]);
+        let found = stranded(&with_values, &[kept("gone", Some("slack"), Some("m"))]);
+        assert_eq!(found[0].candidates, vec!["agent".to_string()]);
+        let taken = [kept("gone", Some("slack"), Some("m")), kept("agent", Some("slack"), Some("n"))];
+        assert!(stranded(&with_values, &taken).is_empty(), "another instance already filled the new place");
+    }
+
+    #[test]
+    fn activation_names_the_missing_pick_and_where_it_was_left() {
+        let p = project(vec![access_node("studio_agent", false)]);
+        let refused = activation_picks(&p, &Picks::new(), &[kept("agent", Some("slack"), None)]).unwrap_err();
+        assert_eq!(refused.errors.len(), 2, "{refused:?}");
+        assert!(refused.errors[0].contains("weft connect --node studio_agent"), "{refused:?}");
+        assert!(refused.errors[1].contains("weft connect --move agent studio_agent"), "{refused:?}");
+        let handle = json!({ "id": uuid::Uuid::nil() });
+        let picks: Picks = BTreeMap::from([("studio_agent".into(), BTreeMap::from([("access".into(), handle)]))]);
+        assert!(activation_picks(&p, &picks, &[kept("studio_agent", Some("slack"), None)]).is_ok());
+    }
+
+    #[test]
+    fn a_move_is_held_to_the_program_and_to_what_is_stored() {
+        let p = project(vec![access_node("to", false), instance_filled_node("filled")]);
+        let ask = |from: &str, to: &str| MovePicks { from: from.into(), to: to.into() };
+        let stored = [kept("from", Some("slack"), None)];
+        assert!(check_move(&p, &stored, &ask("from", "to")).is_ok());
+        assert!(check_move(&p, &stored, &ask("from", "nowhere")).unwrap_err().contains("no place"));
+        assert!(check_move(&p, &stored, &ask("empty", "to")).unwrap_err().contains("nothing is stored"));
+        let both = [kept("from", Some("slack"), None), kept("to", Some("slack"), None)];
+        assert!(check_move(&p, &both, &ask("from", "to")).unwrap_err().contains("never merges"));
+        assert!(check_move(&p, &stored, &ask("from", "filled")).unwrap_err().contains("not the same kind"));
+        let other_service = [kept("from", Some("github"), None)];
+        assert!(check_move(&p, &other_service, &ask("from", "to")).unwrap_err().contains("not the same kind"));
+        let values = [kept("from", Some("slack"), Some("m")), kept("from", None, Some("n"))];
+        assert!(check_move(&p, &values, &ask("from", "filled")).is_ok(), "every instance's values move together");
     }
 
     #[test]

@@ -23,6 +23,7 @@ import type {
   CancelCause,
   CredentialOwner,
   CorruptionSite,
+  FileEditWire,
   ExecutionPhase,
   HostMessage,
   Frame,
@@ -36,8 +37,8 @@ import type {
 // data by bytes, since a single node result can be much larger than a status.
 export const MAX_REPLAY_BUFFER_BYTES = 8 * 1024 * 1024;
 
-// SYNC: DispatcherEvent <-> crates/weft-dispatcher/src/events.rs DispatcherEvent, weavemind/website/src/lib/graph/dispatcher-host.ts translateDispatcherEvent
-// SYNC: event_id <-> crates/weft-dispatcher/src/events.rs IdentifiedEvent
+// SYNC: DispatcherEvent <-> crates/weft-core/src/live_event.rs DispatcherEvent, weavemind/website/src/lib/graph/dispatcher-host.ts translateDispatcherEvent
+// SYNC: event_id <-> crates/weft-core/src/live_event.rs IdentifiedEvent
 export type DispatcherEvent = { event_id: string } & (
   // `phase`: a run of the graph (`fire`) or the setup an `infra start`
   // (`infra_setup`) or an activation (`trigger_setup`) runs.
@@ -45,7 +46,7 @@ export type DispatcherEvent = { event_id: string } & (
   // `inherited_from` is set when the firing was taken from the run this
   // one was seeded from (`weft run --seed`); `provided_ports` names the
   // input ports supplied at a run's `--from` or `--group` start.
-  // SYNC: input origins <-> crates/weft-dispatcher/src/events.rs DispatcherEvent, packages/weft-graph/src/protocol.ts NodeExecEvent, packages/weft-graph/src/webview/lib/types/index.ts NodeExecution
+  // SYNC: input origins <-> crates/weft-core/src/live_event.rs DispatcherEvent, packages/weft-graph/src/protocol.ts NodeExecEvent, packages/weft-graph/src/webview/lib/types/index.ts NodeExecution
   | { kind: 'node_started'; execution_id: string; node: string; frames: Frame[]; input: unknown; closed_ports: string[]; provided_ports?: string[]; backup_ports?: string[]; inherited_ports?: Record<string, string>; inherited_from?: string; project_id: string; at_unix: number }
   | { kind: 'node_suspended'; execution_id: string; node: string; frames: Frame[]; token: string; inherited_from?: string; project_id: string; at_unix: number }
   | { kind: 'node_resumed'; execution_id: string; node: string; frames: Frame[]; token: string | null; value: unknown; inherited_from?: string; project_id: string; at_unix: number }
@@ -88,8 +89,12 @@ export type DispatcherEvent = { event_id: string } & (
   // to the exact firing. amount_usd null = the meter could not resolve the
   // figure. cost_id is the record's stable identity (the webview dedups on
   // it: the same journal row can arrive via both replay and live streams).
-  // SYNC: inherited cost <-> crates/weft-dispatcher/src/events.rs CostReported
+  // SYNC: cost_reported <-> crates/weft-core/src/live_event.rs CostReported, packages/weft-graph/src/protocol.ts execCost
   | { kind: 'cost_reported'; execution_id: string; inherited_from?: string; project_id: string; node_id: string; frames: Frame[]; cost_id: string; service: string; amount_usd: number | null; origin: CredentialOwner; at_unix: number }
+  // A firing changed a stored file's content in place: the file, the
+  // versions and a readable diff, for the inspector's "Files edited" card.
+  // SYNC: file_edited <-> crates/weft-core/src/live_event.rs FileEdited, packages/weft-graph/src/protocol.ts execFileEdit
+  | { kind: 'file_edited'; execution_id: string; inherited_from?: string; project_id: string; node_id: string; frames: Frame[]; edit: FileEditWire; at_unix: number }
   // Operator-visible banner: the supervisor couldn't parse the
   // project's `health_protocols_json`. Surfaces as an action-bar
   // banner; the user fixes the config and the next tick recovers.
@@ -105,13 +110,14 @@ export type DispatcherEvent = { event_id: string } & (
   // SYNC: DispatcherEvent 'bus_window' totals <-> crates/weft-core/src/bus.rs BusWindowTotal, packages/weft-graph/src/protocol.ts BusInspectorEvent 'window' totals
   | { kind: 'bus_joined'; execution_id: string; project_id: string; bus_id: string; offset: number; name: string; at_unix: number }
   | { kind: 'bus_left'; execution_id: string; project_id: string; bus_id: string; offset: number; name: string; at_unix: number }
+  // SYNC: DispatcherEvent 'bus_window' <-> crates/weft-journal/src/events.rs BusWindow, crates/weft-core/src/live_event.rs BusWindow, packages/weft-graph/src/protocol.ts BusInspectorEvent 'window'
   | { kind: 'bus_window'; execution_id: string; project_id: string; bus_id: string; first_offset: number; last_offset: number; messages: Array<{ offset: number; from: string; msg_kind: string; payload?: WirePayload; payload_byte_size: number; trimmed?: boolean; at_unix: number }>; totals: Array<{ from: string; msg_kind: string; count: number; bytes: number }>; at_unix: number }
   | { kind: 'bus_closed'; execution_id: string; project_id: string; bus_id: string; offset: number; at_unix: number }
   // Live caller connection events. One caller per execution (keyed by
   // execution, no bus_id). The webview replays the caller exchange the same
   // way it replays a bus; `payload` is the same tagged WirePayload a
   // bus window's messages carry.
-  // SYNC: DispatcherEvent 'caller_window' <-> crates/weft-journal/src/events.rs CallerWindow, crates/weft-dispatcher/src/events.rs CallerWindow, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'window'
+  // SYNC: DispatcherEvent 'caller_window' <-> crates/weft-journal/src/events.rs CallerWindow, crates/weft-core/src/live_event.rs CallerWindow, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'window'
   | { kind: 'caller_connected'; execution_id: string; project_id: string; offset: number; protocol: string; at_unix: number }
   | { kind: 'caller_window'; execution_id: string; project_id: string; first_offset: number; last_offset: number; messages: Array<{ offset: number; direction: 'inbound' | 'outbound'; payload?: WirePayload; payload_byte_size: number; trimmed?: boolean; terminal?: boolean; at_unix: number }>; totals: Array<{ direction: 'inbound' | 'outbound'; count: number; bytes: number }>; at_unix: number }
   | { kind: 'caller_errored'; execution_id: string; project_id: string; offset: number; message: string; at_unix: number }
@@ -119,7 +125,7 @@ export type DispatcherEvent = { event_id: string } & (
   // Loop events. Carry the inspector groupId + parent_frames so
   // nested loops and parallel sibling iterations route to distinct
   // inspector cards.
-  // SYNC: loop_instantiated <-> crates/weft-dispatcher/src/events.rs LoopInstantiated, packages/weft-graph/src/protocol.ts LoopInspectorEvent 'instantiated'
+  // SYNC: loop_instantiated <-> crates/weft-core/src/live_event.rs LoopInstantiated, packages/weft-graph/src/protocol.ts LoopInspectorEvent 'instantiated'
   | { kind: 'loop_instantiated'; execution_id: string; project_id: string; group_id: string; parent_frames: Frame[]; iter_cap: number | null; parallel: boolean; at_unix: number }
   | { kind: 'loop_iteration_launched'; execution_id: string; project_id: string; group_id: string; parent_frames: Frame[]; index: number; at_unix: number }
   | { kind: 'loop_out_fired'; execution_id: string; project_id: string; group_id: string; parent_frames: Frame[]; index: number; done_vote?: boolean | null; at_unix: number }
@@ -593,6 +599,17 @@ export class ExecutionFollower implements vscode.Disposable {
           kind: 'journalCorruption',
           site: e.site,
           reason: e.reason,
+        });
+        break;
+      case 'file_edited':
+        // One change a firing made to a stored file: fold it onto the
+        // firing's row (the webview dedups across replay/live overlap).
+        this.post({
+          kind: 'execFileEdit',
+          nodeId: e.node_id,
+          frames: e.frames,
+          inheritedFrom: e.inherited_from ?? null,
+          edit: e.edit,
         });
         break;
       case 'cost_reported':

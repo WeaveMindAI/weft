@@ -37,5 +37,8 @@
       "name": "pageCount",
       "type": "Number"
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

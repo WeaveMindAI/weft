@@ -27,6 +27,14 @@ sweep: thirty days by default, a span you choose, or forever.
 
 Reading a file postpones its expiry, so one that is still in use stays.
 
+In a graph, the storage nodes `TextToFile`, `FetchToStorage` and `KeepFile`
+take the same two settings: `scope` (`execution`, this run only, or
+`project`, every later run of the project can read it) and `ttl_days` (how
+long it lives once nobody touches it, `0` for never expiring). Every other
+node that makes a file, a download from S3, Slack or Drive included, stores
+it for its run only. If you want such a file longer, or in a later run, wire
+it through `KeepFile`.
+
 There is no un-keep. A file marked to survive survives until somebody removes
 it.
 

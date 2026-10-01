@@ -489,6 +489,8 @@ export class GraphViewController {
       },
     );
 
+    // The tab shows the same mark as a .weft file.
+    this.panel.iconPath = vscode.Uri.joinPath(this.context.extensionUri, 'media', 'weft-file-icon.png');
     this.panel.webview.html = this.renderHtml();
     this.watchedDoc = doc;
 
@@ -1018,10 +1020,10 @@ export class GraphViewController {
     // node keeps its id when its type changes.
     const showing = new Map<string, DisplayRoute>();
     for (const n of nodes) {
-      // A node that exists once per member has no one display to show
-      // here: each member's copy shows its own, to that member, through
-      // the member door. The editor shows the shared program alone.
-      if (n.perMember) continue;
+      // A node that exists once per instance has no one display to show
+      // here: each instance's copy shows its own through the instance
+      // door. The editor shows the shared program alone.
+      if (n.perInstance) continue;
       // Both doors take the place spelled the way a person writes it
       // (`one.door` for the `door` inside the file the site `one`
       // includes): the node under the calls this view descended through.
@@ -1115,7 +1117,7 @@ export class GraphViewController {
   /// trigger's display is read-only, and a press on one is dropped
   /// here rather than sent to a door that would refuse it.
   ///
-  /// On success every dispatcher instance watching the node's display looks
+  /// On success every dispatcher replica watching the node's display looks
   /// again at once (the press is announced to all of them), so the panel
   /// shows what the press changed without waiting for the next look.
   ///
@@ -1157,9 +1159,10 @@ export class GraphViewController {
       return;
     }
     // The button was pressed on the node as this view shows it, so the
-    // press goes to the instance at this view's place.
+    // press goes to the placement this view shows.
     const place = addressOf(this.viewPlace().callPath, nodeId);
     try {
+      // SYNC: the press <-> crates/weft-core/src/live.rs LivePress
       await this.client.post(
         `/projects/${projectId}/infra/nodes/${place}/action`,
         { kind: actionKind, payload: payload ?? null },
@@ -1217,7 +1220,8 @@ export class GraphViewController {
     // Per-node stop from the graph forces: the user explicitly picked
     // one node to take down, so NoOp units come down too (otherwise a
     // right-click stop on a NoOp-only node would silently do nothing).
-    const args = verb === 'stop' ? ['node-stop', node, '--force'] : ['node-terminate', node];
+    // Terminate passes `--yes`: the quick pick above was the confirmation.
+    const args = verb === 'stop' ? ['node-stop', node, '--force'] : ['node-terminate', node, '--yes'];
     void this.dispatchVerb('infra', args);
   }
 
@@ -1377,10 +1381,24 @@ export class GraphViewController {
         ]);
         break;
       case 'infraTerminate':
-        void this.dispatchVerb('infra', [
-          'terminate',
-          ...(msg.deactivation ? this.deactivationFlags(msg.deactivation) : []),
-        ]);
+        // Asked once, on the first click: a second send carries the
+        // trigger choice the dispatcher asked for, after this confirmed.
+        void (async () => {
+          if (!msg.deactivation) {
+            const confirm = await vscode.window.showWarningMessage(
+              'Terminate the infra? Every resource is deleted, stored data included unless the node keeps it.',
+              { modal: true },
+              'Terminate',
+            );
+            if (confirm !== 'Terminate') return;
+          }
+          // The confirmation happened here, so the CLI is told it did.
+          void this.dispatchVerb('infra', [
+            'terminate',
+            '--yes',
+            ...(msg.deactivation ? this.deactivationFlags(msg.deactivation) : []),
+          ]);
+        })();
         break;
       case 'infraCancel':
         void this.dispatchVerb('infra', ['cancel']);
@@ -1624,7 +1642,7 @@ export class GraphViewController {
           result = {};
         }
       } else {
-        // SYNC: body <-> crates/weft-dispatcher/src/api/project.rs DeclareRequest
+        // SYNC: body <-> crates/weft-core/src/projects.rs DeclareRequest
         await this.client.post<unknown>('/projects', {
           id: projectId,
           name: readProjectNameFromToml(docPath) ?? projectId,
@@ -1769,7 +1787,7 @@ export class GraphViewController {
     try {
       const resp = await this.client.post<{ url: string }>(
         '/storage/files/download',
-        { key, project: this.watchedProjectId ?? null },
+        { key },
       );
       await vscode.env.openExternal(vscode.Uri.parse(resp.url));
     } catch (e) {
@@ -1816,16 +1834,25 @@ export class GraphViewController {
       // they clicked Run.
       this.selfWriteDepth++;
       try {
-        if (!(await doc.save())) {
-          throw new Error(
-            `${nodePath.basename(doc.uri.fsPath)} has unsaved changes that could not be saved; ` +
-              'running now would build the stale on-disk source. Save the file first.',
-          );
-        }
+        await this.saveOrRefuse(doc, 'running now would build the stale on-disk source');
       } finally {
         this.selfWriteDepth--;
       }
     }
+  }
+
+  /// Save `doc`, or throw naming why weft stopped. VS Code's own save checks
+  /// the file on disk: when another program (an AI, a git checkout) wrote it
+  /// after this buffer was loaded, the save does NOT overwrite it, VS Code
+  /// shows its "file is newer" prompt (Compare / Overwrite), and save()
+  /// resolves false. Weft never works around that: the person picks.
+  private async saveOrRefuse(doc: vscode.TextDocument, consequence: string): Promise<void> {
+    if (await doc.save()) return;
+    throw new Error(
+      `${nodePath.basename(doc.uri.fsPath)} could not be saved (most often the file on disk changed since ` +
+        `your unsaved edits; VS Code offers to compare or overwrite). Weft did not touch it: ${consequence}. ` +
+        'Resolve it in the text editor (save, or revert to the disk version), then try again.',
+    );
   }
 
   /// In-flight full-text write per file (keyed by resolved fsPath). Each write
@@ -1935,7 +1962,7 @@ export class GraphViewController {
         if (!(await vscode.workspace.applyEdit(edit))) {
           throw new Error('document edit failed to apply (buffer changed mid-write)');
         }
-        await openDoc.save();
+        await this.saveOrRefuse(openDoc, 'the graph edit is in the buffer but not on disk');
       } finally {
         this.selfWriteDepth--;
       }
@@ -1992,6 +2019,18 @@ export class GraphViewController {
         // webview's standard rejection path rolls the gesture back. This is
         // the race-safe third layer under the webview's preflight lock and
         // the 1s auto-lock window.
+        // Unsaved text in the buffer: save it FIRST, before computing
+        // anything. If the file on disk is newer (another program wrote it),
+        // VS Code refuses that save and this refuses the graph edit, so the
+        // graph never writes a stale buffer over a newer disk file.
+        if (openDoc.isDirty) {
+          this.selfWriteDepth++;
+          try {
+            await this.saveOrRefuse(openDoc, 'the graph edit was not applied');
+          } finally {
+            this.selfWriteDepth--;
+          }
+        }
         const versionBefore = openDoc.version;
         const r = await this.parseServer.request<{ source: string; parse: ParseResponse; inverse: TextEdit }>({
           ...req,

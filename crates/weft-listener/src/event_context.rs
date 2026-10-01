@@ -46,10 +46,10 @@ pub struct FireContext {
     /// The signal's tenant, stamped on every enqueued fire (the
     /// listener serves many tenants, so it travels per signal).
     tenant_id: String,
-    /// Whose signal it is (`None` for a shared one), as the dispatcher
-    /// registered it: a member's trigger reads through that member's
-    /// connections alone.
-    for_member: Option<weft_core::member::MemberScope>,
+    /// Which instance the signal belongs to (`None` for a shared one), as
+    /// the dispatcher registered it: an instance's trigger reads through
+    /// that instance's connections alone.
+    for_instance: Option<weft_core::instance::InstanceScope>,
     /// The spec-level pre-fire filter. Empty = fire on everything.
     predicates: Vec<Predicate>,
 }
@@ -59,10 +59,10 @@ impl FireContext {
         sink: FireSignalSink,
         token: String,
         tenant_id: String,
-        for_member: Option<weft_core::member::MemberScope>,
+        for_instance: Option<weft_core::instance::InstanceScope>,
         predicates: Vec<Predicate>,
     ) -> Self {
-        Self { sink, token, tenant_id, for_member, predicates }
+        Self { sink, token, tenant_id, for_instance, predicates }
     }
 
     pub fn token(&self) -> &str {
@@ -73,8 +73,8 @@ impl FireContext {
         &self.tenant_id
     }
 
-    pub fn for_member(&self) -> Option<&weft_core::member::MemberScope> {
-        self.for_member.as_ref()
+    pub fn for_instance(&self) -> Option<&weft_core::instance::InstanceScope> {
+        self.for_instance.as_ref()
     }
 
     /// Fire one payload: evaluate the signal's filter, then enqueue.

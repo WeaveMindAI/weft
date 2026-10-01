@@ -9,6 +9,9 @@
 //!   execution, show those logs.
 //! - UUID argument: treat as execution, show those logs.
 
+use anyhow::Context;
+use weft_core::program::{ExecutionLogs, ExecutionSummary};
+
 use super::{local_time, resolve_project_id, Ctx};
 
 /// The nodes a run skipped, with why, spelled the way the program
@@ -20,54 +23,37 @@ async fn skipped_nodes(ctx: &Ctx, execution_id: &str) -> anyhow::Result<Vec<(Str
     let definition = ctx.project().ok()
         .and_then(|project| weft_compiler::hash::load_enriched_project(project).ok())
         .map(|(definition, _)| definition);
-    let replay: serde_json::Value =
-        ctx.client()?.get_json(&format!("/executions/{execution_id}/replay")).await?;
-    let rows = replay
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("/executions/{execution_id}/replay returned no array: {replay}"))?;
+    let rows = super::versions::replay_rows(&ctx.client()?, execution_id).await?;
     let mut skipped = Vec::new();
-    for row in rows {
-        if row.get("kind").and_then(|v| v.as_str()) != Some("node_skipped") {
+    for row in &rows {
+        let weft_core::live_event::DispatcherEvent::NodeSkipped { node, frames, reason, .. } = &row.event else {
             continue;
-        }
+        };
         // Spelled exactly as `weft events` spells it, including the rows
         // it drops (an included file's own boundary has no place in the
         // program a person wrote, so neither command prints it).
-        let row = match &definition {
-            Some(definition) => match super::executions::spell_node(row.clone(), definition) {
-                Some(row) => row,
+        let node = match &definition {
+            Some(definition) => match super::executions::spell_node(serde_json::to_value(row)?, definition) {
+                Some(spelled) => spelled.get("node").and_then(|v| v.as_str()).unwrap_or(node).to_string(),
                 None => continue,
             },
-            None => row.clone(),
+            None => node.clone(),
         };
-        let node = row.get("node").and_then(|v| v.as_str()).unwrap_or("?").to_string();
-        // The reason is the engine's own, rendered by its own words;
-        // a row an older dispatcher wrote without one says so.
-        let reason = row
-            .get("reason")
-            .cloned()
-            .and_then(|r| serde_json::from_value::<weft_core::exec::skip::SkipReason>(r).ok())
-            .map(|r| r.to_string())
-            .unwrap_or_else(|| "(no reason recorded)".to_string());
-        skipped.push((format!("{node}{}", frames_suffix(&row)), reason));
+        // The reason is the engine's own, rendered by its own words; a
+        // row written without one says so.
+        let reason = reason.as_ref().map(|r| r.to_string()).unwrap_or_else(|| "(no reason recorded)".to_string());
+        skipped.push((format!("{node}{}", frames_suffix(frames)), reason));
     }
     Ok(skipped)
 }
 
 /// The loop iteration a line was written in, as `#3` (or `#3.0` for a
 /// loop inside a loop). Empty at the root.
-fn frames_suffix(entry: &serde_json::Value) -> String {
-    let Some(frames) = entry.get("frames").and_then(|v| v.as_array()) else {
-        return String::new();
-    };
+fn frames_suffix(frames: &[weft_core::frames::Frame]) -> String {
     if frames.is_empty() {
         return String::new();
     }
-    let path: Vec<String> = frames
-        .iter()
-        .filter_map(|f| f.get("index").and_then(|i| i.as_u64()))
-        .map(|i| i.to_string())
-        .collect();
+    let path: Vec<String> = frames.iter().filter_map(|f| f.loop_index()).map(|i| i.to_string()).collect();
     format!("#{}", path.join("."))
 }
 
@@ -76,31 +62,25 @@ pub async fn run(ctx: Ctx, target: Option<String>, limit: Option<u32>) -> anyhow
         Some(raw) => super::resolve_execution_id(&ctx, &raw).await?,
         None => {
             let project_id = resolve_project_id(&ctx, None)?;
-            let resp: serde_json::Value = ctx
+            let resp = ctx
                 .client()?
                 .get_json(&format!("/projects/{project_id}/executions/latest"))
                 .await
                 .map_err(|e| anyhow::anyhow!("no executions for project {project_id}: {e}"))?;
-            resp.get("execution_id")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("dispatcher response missing execution"))?
+            serde_json::from_value::<ExecutionSummary>(resp)
+                .context("read the project's latest execution")?
+                .execution_id
                 .to_string()
         }
     };
 
     let query = limit.map(|n| format!("?limit={n}")).unwrap_or_default();
-    let mut logs: serde_json::Value =
-        ctx.client()?.get_json(&format!("/executions/{execution_id}/logs{query}")).await?;
-    let arr = logs["lines"]
-        .as_array()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("/executions/{execution_id}/logs returned no lines: {logs}"))?;
+    let mut answer = ctx.client()?.get_json(&format!("/executions/{execution_id}/logs{query}")).await?;
     // The limit that cut the tail comes back with it, so the notice
     // below is right whether the reader chose one or the dispatcher's
     // default applied.
-    let limit = logs["limit"]
-        .as_u64()
-        .ok_or_else(|| anyhow::anyhow!("/executions/{execution_id}/logs returned no limit: {logs}"))?;
+    let logs: ExecutionLogs = serde_json::from_value(answer.clone()).context("read the run's log")?;
+    let (arr, limit) = (&logs.lines, logs.limit as u64);
     // A run that wrote nothing usually did nothing, and the reason is
     // a skip: a required input closed, a gate said no. The skip is a
     // lifecycle event, not a log line, so it is fetched here rather
@@ -111,12 +91,12 @@ pub async fn run(ctx: Ctx, target: Option<String>, limit: Option<u32>) -> anyhow
     // same list under `skipped`, since an agent reads that shape.
     let skipped = if arr.is_empty() { skipped_nodes(&ctx, &execution_id).await? } else { Vec::new() };
     if arr.is_empty() {
-        logs["skipped"] = skipped
+        answer["skipped"] = skipped
             .iter()
             .map(|(node, reason)| serde_json::json!({ "node": node, "reason": reason }))
             .collect();
     }
-    if ctx.json_out(&logs)? {
+    if ctx.json_out(&answer)? {
         return Ok(());
     }
     if arr.is_empty() {
@@ -126,23 +106,18 @@ pub async fn run(ctx: Ctx, target: Option<String>, limit: Option<u32>) -> anyhow
         }
         return Ok(());
     }
-    for entry in &arr {
-        let level = entry.get("level").and_then(|v| v.as_str()).unwrap_or("info");
-        let msg = entry.get("message").and_then(|v| v.as_str()).unwrap_or("");
-        let at = entry.get("at_unix").and_then(|v| v.as_u64()).unwrap_or(0);
+    for entry in arr {
+        let (level, msg) = (&entry.level, &entry.message);
         // The node column only for the lines that are about one
         // firing; a run-level line (the run failing) has none. Inside
         // a loop the iteration rides along (`llm#3:`), because two
         // hundred identical lines name nothing.
-        let node = entry
-            .get("node")
-            .and_then(|v| v.as_str())
-            .map(|n| format!(" {n}{}:", frames_suffix(entry)))
+        let node = entry.node.as_ref().map(|n| format!(" {n}{}:", frames_suffix(&entry.frames))).unwrap_or_default();
+        let inherited = entry
+            .inherited_from
+            .map(|execution_id| format!(" [inherited from {}]", super::versions::short(&execution_id.to_string())))
             .unwrap_or_default();
-        let inherited = entry.get("inherited_from").and_then(|v| v.as_str())
-            .map(|execution_id| format!(" [inherited from {}]", super::versions::short(execution_id)))
-            .unwrap_or_default();
-        println!("[{}] {level:>5}{node}{inherited} {msg}", local_time(at));
+        println!("[{}] {level:>5}{node}{inherited} {msg}", local_time(entry.at_unix));
     }
     // The dispatcher answers the tail, so a full page means the run
     // may have written more than this; a cut log must never read as

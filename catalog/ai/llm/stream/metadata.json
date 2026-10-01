@@ -1,7 +1,7 @@
 {
   "type": "LlmStream",
   "label": "LLM Stream",
-  "description": "AI language model completion whose reply streams live: each text delta is sent onto the stream bus the moment the model produces it, and the whole reply then pulses on the normal ports. Same provider/params/history/tools wiring as the LLM node; use this one when a consumer should see the text as it is generated.",
+  "description": "AI language model completion whose reply streams live: each text delta is sent onto the stream bus the moment the model produces it, and the whole reply then pulses on the normal ports. Same provider/params/historyFile/tools wiring as the LLM node; use this one when a consumer should see the text as it is generated. A failure after the stream has opened fails the run, so a reader never mistakes a cut-off stream for a finished one.",
   "tags": [
     "ai",
     "stream",
@@ -17,13 +17,13 @@
       "name": "prompt",
       "type": "String",
       "widget": { "kind": "textarea" },
-      "description": "The prompt to send, appended as the newest user message. Optional when a history is wired (a tool-result round re-enters with the history alone)."
+      "description": "The prompt to send, appended as the newest user message. Optional when a `historyFile` is wired (a tool-result round re-enters with the conversation alone)."
     },
     {
-      "name": "history",
-      "type": "ChatHistory",
+      "name": "historyFile",
+      "type": "File",
       "accepts": ["wire"],
-      "description": "The conversation so far (a Chat Message chain or a previous call's history output)."
+      "description": "The conversation so far, kept in a stored file (a previous call's or a Chat Message node's `historyFile` output, or a file holding `[]` to start one that later runs will continue: store it in the project scope). This call's turn is added to this same file, in place, and the file comes out on `historyFile`. Unwired, the call starts from no conversation."
     },
     {
       "name": "media",
@@ -66,7 +66,7 @@
       "widget": { "kind": "checkbox" },
       "default": true,
       "label": "Automatic prompt caching",
-      "description": "On: when the wired history carries no cache mark, the request marks the system message and the last history message before this call's new turn, so a chain of calls reuses its stable prefix. The marks live on the request alone: the `history` output carries the conversation as written, so the next call in the chain places its own. A history that already carries marks (Chat Message's `cacheBreakpoint`) is sent as placed."
+      "description": "On: when the conversation carries no cache mark, the request marks the system message and the last message before this call's new turn, so a chain of calls reuses its stable prefix. The marks live on the request alone: the `historyFile` keeps the conversation as written, so the next call in the chain places its own. A conversation that already carries marks (Chat Message's `cacheBreakpoint`) is sent as placed."
     }
   ],
   "outputs": [
@@ -81,18 +81,18 @@
       "description": "The whole reply, once generation finishes."
     },
     {
-      "name": "history",
-      "type": "ChatHistory",
-      "description": "The conversation including this call: the input history plus the new user message and the assistant reply. Wire it onward to continue the conversation."
+      "name": "historyFile",
+      "type": "File",
+      "description": "The conversation including this call, kept in a file: the `historyFile` that came in, with this call's user message and reply added to it in place (same file, next version), or, when none came in, a new file holding this turn, kept past the run. Wire it into the next call's or Chat Message node's `historyFile`. Left unwired with no file in, the call is a one-shot and keeps nothing."
     },
     {
       "name": "toolCalls",
       "type": "List[ToolCall]",
-      "description": "The tool calls the model made, if any. Pulses only when the model called tools; append each result with a Chat Message node (role: tool) and wire the history back into the next LLM call."
+      "description": "The tool calls the model made, if any. Pulses only when the model called tools; append each result with a Chat Message node (role: tool) and wire the `historyFile` back into the next LLM call. A call left without an answer (the run stopped before its result was appended) is answered `cancelled` by the next call on its own, so the conversation keeps working."
     }
   ],
   "requires_infra": false,
   "features": {
-    "oneOfRequired": [["prompt", "history", "media"]]
+    "oneOfRequired": [["prompt", "historyFile", "media"]]
   }
 }

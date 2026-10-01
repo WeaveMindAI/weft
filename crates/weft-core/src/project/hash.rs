@@ -73,8 +73,9 @@ impl ProgramIdentity {
     /// that reaches it, since what feeds it there is that call's chain.
     pub fn slice_hashes(&self, project: &ProjectDefinition) -> anyhow::Result<BTreeMap<Located, SourceHash>> {
         anyhow::ensure!(self.definition_hash == compute_definition_hash(project)?, "program identity does not match its graph");
-        super::selection::every_place(project).into_iter().map(|place| {
-            let selection = super::selection::RunSelection::dependencies(project, std::slice::from_ref(&place));
+        let graph = super::graph::ProjectGraph::new(project);
+        super::selection::every_place_in(&graph).into_iter().map(|place| {
+            let selection = super::selection::RunSelection::dependencies_in(&graph, std::slice::from_ref(&place));
             let ids: HashSet<String> = selection.nodes.iter().map(|p| p.id.clone()).collect();
             let mut slice = project.clone();
             slice.nodes.retain(|node| ids.contains(&node.id));
@@ -330,16 +331,9 @@ pub fn canonical_json(value: &serde_json::Value) -> String {
     serde_json::to_string(&v).expect("a serde_json::Value always serializes")
 }
 
-/// A manifest: every covered file of a project, `path -> sha256`, plus
-/// one pseudo-entry naming the installed weft.
+/// A manifest: every covered file of a project, `path -> sha256`, the
+/// standard library under `nodes/base_catalog/` included like any other.
 pub type Manifest = BTreeMap<String, String>;
-
-/// The pseudo-entry prefix a manifest carries for the installed weft
-/// (`weft:<version>:<catalog hash>`), whose value is empty because it
-/// names no blob. Lives here, next to the derivation that reads it, so
-/// the CLI that writes a manifest and the dispatcher that validates one
-/// agree on which entry is not a file.
-pub const WEFT_ENTRY_PREFIX: &str = "weft:";
 
 /// The id of the version a manifest (`path -> sha256`) describes: the
 /// sha256 of its canonical JSON. THE one derivation, read by the CLI

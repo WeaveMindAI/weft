@@ -12,16 +12,16 @@ use weft_core::ExecutionId;
 
 use weft_journal::ExecEvent;
 use crate::journal::{
-    SignalToken, ExecutionIdLookup, ExecutionOwner, ExecutionPage, ExecutionQuery, ExecutionSummary,
-    Journal, LogEntry, SignalRegistration,
+    SignalToken, ExecutionIdLookup, ExecutionOwner, ExecutionQuery, Journal, LogEntry, SignalRegistration,
 };
+use weft_core::program::{ExecutionPage, ExecutionSummary};
 
 #[derive(Default)]
 struct FakeState {
     /// Setup run execution -> its project: several setups of one project may
     /// run at once, each over its own triggers.
     trigger_setups: HashMap<ExecutionId, uuid::Uuid>,
-    trigger_bakes: HashMap<(uuid::Uuid, Option<weft_core::member::MemberId>, String), super::TriggerBake>,
+    trigger_bakes: HashMap<(uuid::Uuid, Option<weft_core::instance::InstanceId>, String), super::TriggerBake>,
     events: Vec<ExecEvent>,
     signal_tokens: HashMap<String, SignalToken>,
     /// One entry per `signal` row.
@@ -99,30 +99,32 @@ impl FakeJournal {
     /// `summary_from_payloads` helper.
     fn summary_for_execution_id(&self, execution_id: ExecutionId) -> Option<ExecutionSummary> {
         let g = self.inner.lock().unwrap();
-        let (project_id, entry_node, phase, started_at, member) = g.events.iter().find_map(|e| match e {
-            ExecEvent::ExecutionStarted { execution_id: c, project_id, entry_node, phase, at_unix, member, .. }
+        let (project_id, entry_node, phase, started_at, instance) = g.events.iter().find_map(|e| match e {
+            ExecEvent::ExecutionStarted { execution_id: c, project_id, entry_node, phase, at_unix, instance, .. }
                 if *c == execution_id =>
             {
-                Some((*project_id, entry_node.clone(), *phase, *at_unix, member.clone()))
+                Some((*project_id, entry_node.clone(), *phase, *at_unix, instance.clone()))
             }
             _ => None,
         })?;
-        let mut status = "running".to_string();
+        let mut status = weft_core::program::RunStatus::Running;
         let mut completed_at = None;
         let mut cancel_cause = None;
+        let mut error = None;
         let mut skipped_nodes = 0u64;
         for tail in g.events.iter().filter(|e| e.execution_id() == execution_id) {
             match tail {
                 ExecEvent::ExecutionCompleted { at_unix, .. } => {
-                    status = "completed".into();
+                    status = weft_core::program::RunStatus::Completed;
                     completed_at = Some(*at_unix);
                 }
-                ExecEvent::ExecutionFailed { at_unix, .. } => {
-                    status = "failed".into();
+                ExecEvent::ExecutionFailed { at_unix, error: why, .. } => {
+                    status = weft_core::program::RunStatus::Failed;
                     completed_at = Some(*at_unix);
+                    error = Some(why.clone());
                 }
                 ExecEvent::ExecutionCancelled { at_unix, cause, .. } => {
-                    status = "cancelled".into();
+                    status = weft_core::program::RunStatus::Cancelled;
                     completed_at = Some(*at_unix);
                     cancel_cause = cause.clone();
                 }
@@ -138,7 +140,7 @@ impl FakeJournal {
             .collect();
         tagged.sort();
         let tags = tagged.into_iter().map(|(_, tag)| tag).collect();
-        Some(ExecutionSummary { execution_id, project_id, entry_node, status, phase, started_at, completed_at, tags, cancel_cause, skipped_nodes, member })
+        Some(ExecutionSummary { execution_id, project_id, entry_node, status: status.into(), phase, started_at, completed_at, tags, cancel_cause, error, skipped_nodes, instance })
     }
 
     /// Every execution summary owned by `tenant` (unordered). Tenant ownership
@@ -202,14 +204,14 @@ struct ExecutionRow {
     /// narrows on.
     phase: &'static str,
     /// Who the run is for, and the trigger that fired it (the Postgres
-    /// `member_id` / `fired_by` columns).
-    member: Option<weft_core::member::MemberId>,
+    /// `instance_id` / `fired_by` columns).
+    instance: Option<weft_core::instance::InstanceId>,
     fired_by: Option<String>,
 }
 
 /// Write `from`'s refreshed columns over `row` and move its version one
 /// past `from`'s: what Postgres's `signal_insert` refresh and
-/// `signal_restore` write. The row's identity (tenant, project, member,
+/// `signal_restore` write. The row's identity (tenant, project, instance,
 /// execution, node, is_resume, activation_trigger) stays as it is.
 // SYNC: copy_refreshed <-> journal/postgres.rs SIGNAL_REFRESHED_COLUMNS
 fn copy_refreshed(row: &mut SignalRegistration, from: &SignalRegistration) {
@@ -232,7 +234,7 @@ fn copy_refreshed(row: &mut SignalRegistration, from: &SignalRegistration) {
 }
 
 fn seed_execution(state: &mut FakeState, start: &ExecEvent) -> anyhow::Result<()> {
-    let ExecEvent::ExecutionStarted { execution_id, project_id, run_kind, phase, member, fired_trigger, .. } = start else {
+    let ExecEvent::ExecutionStarted { execution_id, project_id, run_kind, phase, instance, fired_trigger, .. } = start else {
         anyhow::bail!("an execution seed is written from an ExecutionStarted");
     };
     let (execution_id, project_id, run_kind, phase) = (*execution_id, *project_id, *run_kind, *phase);
@@ -257,7 +259,7 @@ fn seed_execution(state: &mut FakeState, start: &ExecEvent) -> anyhow::Result<()
             tenant_id: tenant,
             kind: run_kind.as_str(),
             phase: phase.as_str(),
-            member: member.clone(),
+            instance: instance.clone(),
             fired_by: fired_trigger.clone(),
         },
     );
@@ -276,7 +278,7 @@ impl Journal for FakeJournal {
         if let Some(project) = project {
             if let Some(bake) = bake {
                 anyhow::ensure!(bake.project_id == project && bake.execution_id == execution_id, "bake does not belong to its setup");
-                let key = (project, bake.member.clone(), bake.program.digest());
+                let key = (project, bake.instance.clone(), bake.program.digest());
                 let merged = match g.trigger_bakes.remove(&key) {
                     Some(prior) => prior.refreshed_by(bake),
                     None => bake.clone(),
@@ -288,9 +290,9 @@ impl Journal for FakeJournal {
         Ok(())
     }
 
-    async fn trigger_bakes(&self, project_id: uuid::Uuid, member: Option<&weft_core::member::MemberId>) -> anyhow::Result<Vec<super::TriggerBake>> {
+    async fn trigger_bakes(&self, project_id: uuid::Uuid, instance: Option<&weft_core::instance::InstanceId>) -> anyhow::Result<Vec<super::TriggerBake>> {
         Ok(self.inner.lock().unwrap().trigger_bakes.values()
-            .filter(|bake| bake.project_id == project_id && bake.member.as_ref() == member).cloned().collect())
+            .filter(|bake| bake.project_id == project_id && bake.instance.as_ref() == instance).cloned().collect())
     }
     async fn record_event(&self, event: &ExecEvent) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
@@ -350,10 +352,10 @@ impl Journal for FakeJournal {
         };
         if g.executions.contains_key(execution_id) {
             let admitted = g.tasks.iter().find(|task| task.execution_id.as_deref() == Some(execution_id.to_string().as_str()));
-            let instance = admitted.and_then(|task| task.target_instance.clone()).ok_or_else(|| {
+            let replica = admitted.and_then(|task| task.target_replica.clone()).ok_or_else(|| {
                 anyhow::anyhow!("live execution {execution_id} already started and no longer has an active admission; open a new connection")
             })?;
-            return Ok(weft_task_store::tasks::LiveAdmitOutcome::AlreadyAdmitted { instance });
+            return Ok(weft_task_store::tasks::LiveAdmitOutcome::AlreadyAdmitted { replica });
         }
         seed_execution(&mut g, start)?;
         // An unrecorded run is born with its execution row alone, like the
@@ -362,7 +364,7 @@ impl Journal for FakeJournal {
             g.events.push(start.clone());
             g.events.extend(kicks.iter().cloned());
         }
-        anyhow::ensure!(task.target_instance.is_some(), "live admission requires the worker instance the caller reached");
+        anyhow::ensure!(task.target_replica.is_some(), "live admission requires the worker replica the caller reached");
         g.tasks.push(task);
         Ok(weft_task_store::tasks::LiveAdmitOutcome::Admitted)
     }
@@ -462,7 +464,7 @@ impl Journal for FakeJournal {
         let held = g
             .signal_tokens
             .values()
-            .any(|t| t.tenant_id == tok.tenant_id && t.kind == crate::journal::TokenKind::Operator);
+            .any(|t| t.tenant_id == tok.tenant_id && t.kind == weft_core::signal_token::TokenKind::Operator);
         if held || g.signal_tokens.contains_key(&tok.token_hash) {
             return Ok(false);
         }
@@ -505,7 +507,7 @@ impl Journal for FakeJournal {
         Ok(self.inner.lock().unwrap().executions.get(&execution_id).map(|r| ExecutionOwner {
             project_id: r.project_id,
             tenant: r.tenant_id.clone(),
-            member: r.member.clone(),
+            instance: r.instance.clone(),
             fired_by: r.fired_by.clone(),
         }))
     }
@@ -575,6 +577,11 @@ impl Journal for FakeJournal {
     ) -> anyhow::Result<ExecutionPage> {
         // Every summary for this tenant, newest first, then apply the same
         // project + start-time filters the Postgres query does, then page.
+        // A run parked on a wait (a resume signal registered for it) reads
+        // `waiting_for_input` to the status filter, as the SQL's does.
+        let parked: std::collections::HashSet<ExecutionId> = self.inner.lock().unwrap().signals.values()
+            .filter(|s| s.is_resume).filter_map(|s| s.execution_id).collect();
+        let honest = |s: &ExecutionSummary| s.status.parked(parked.contains(&s.execution_id));
         let mut all: Vec<ExecutionSummary> = self
             .tenant_summaries(tenant)
             .into_iter()
@@ -583,8 +590,11 @@ impl Journal for FakeJournal {
             .filter(|s| query.started_before.is_none_or(|b| s.started_at < b))
             .filter(|s| query.phase.is_none_or(|p| s.phase == p))
             .filter(|s| query.entry_node.as_deref().is_none_or(|n| s.entry_node == n))
-            .filter(|s| query.status.as_deref().is_none_or(|st| s.status == st))
-            .filter(|s| query.member.as_ref().is_none_or(|m| s.member.as_ref() == Some(m)))
+            // The fake holds typed events, so it never has a row that
+            // fails to decode: for every row it can hold, `reaches` on the
+            // honest status is exactly the Postgres status clause.
+            .filter(|s| query.status.is_none_or(|st| st.reaches(honest(s))))
+            .filter(|s| query.instance.as_ref().is_none_or(|m| s.instance.as_ref() == Some(m)))
             .filter(|s| query.tag.as_deref().is_none_or(|t| s.tags.iter().any(|x| x == t)))
             .collect();
         all.sort_by(|a, b| b.started_at.cmp(&a.started_at).then(b.execution_id.cmp(&a.execution_id)));
@@ -846,7 +856,7 @@ impl Journal for FakeJournal {
         &self,
         project_id: uuid::Uuid,
         node: &str,
-        member: Option<&weft_core::member::MemberId>,
+        instance: Option<&weft_core::instance::InstanceId>,
     ) -> anyhow::Result<Option<SignalRegistration>> {
         Ok(self
             .inner
@@ -855,7 +865,7 @@ impl Journal for FakeJournal {
             .signals
             .values()
             .find(|s| {
-                !s.is_resume && s.project_id == project_id && s.node_id == node && s.member.as_ref() == member
+                !s.is_resume && s.project_id == project_id && s.node_id == node && s.instance.as_ref() == instance
             })
             .cloned())
     }
@@ -950,7 +960,7 @@ pub(crate) mod tests {
     /// A bare entry row under `token`, for tests to adjust.
     pub(crate) fn registration(token: &str) -> SignalRegistration {
         SignalRegistration {
-            member: None,
+            instance: None,
             activation_trigger: None,
             source_version: None,
             setup_execution_id: None,
@@ -1070,7 +1080,7 @@ pub(crate) mod tests {
             program: None, source_version: None, run_kind: weft_core::exec::RunKind::NodeTest,
             subgraph: None,
             seed: None,
-            member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+            instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
             run_class: weft_core::run_class::RunClass::Short,
         })
         .await
@@ -1088,8 +1098,8 @@ pub(crate) mod tests {
         j.set_project_tenant(PROJECT, "t");
         let execution_id = weft_core::ExecutionId::new_v4();
         let start = match started(execution_id, PROJECT) {
-            ExecEvent::ExecutionStarted { execution_id, project_id, entry_node, phase, definition_hash, program, source_version, subgraph, seed, member, member_values, picks, fired_trigger, at_unix, .. } =>
-                ExecEvent::ExecutionStarted { execution_id, project_id, entry_node, phase, definition_hash, program, source_version, run_kind: weft_core::exec::RunKind::Unrecorded, subgraph, seed, member, member_values, picks, fired_trigger, at_unix, run_class: weft_core::run_class::RunClass::Short },
+            ExecEvent::ExecutionStarted { execution_id, project_id, entry_node, phase, definition_hash, program, source_version, subgraph, seed, instance, instance_values, picks, fired_trigger, at_unix, .. } =>
+                ExecEvent::ExecutionStarted { execution_id, project_id, entry_node, phase, definition_hash, program, source_version, run_kind: weft_core::exec::RunKind::Unrecorded, subgraph, seed, instance, instance_values, picks, fired_trigger, at_unix, run_class: weft_core::run_class::RunClass::Short },
             _ => unreachable!(),
         };
         let kick = ExecEvent::NodeKicked { execution_id, node_id: "entry".into(), frames: vec![], firing: true, payload: None, port_snapshot: None, at_unix: 0 };
@@ -1126,7 +1136,7 @@ pub(crate) mod tests {
             program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
             subgraph: None,
             seed: None,
-            member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+            instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
             run_class: weft_core::run_class::RunClass::Short,
         }
     }
@@ -1189,7 +1199,7 @@ pub(crate) mod tests {
             program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
             subgraph: None,
             seed: None,
-            member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix,
+            instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix,
             run_class: weft_core::run_class::RunClass::Short,
         }
     }
@@ -1270,7 +1280,7 @@ pub(crate) mod tests {
 
         let s = j.execution_summary(c).await.unwrap().expect("found by execution");
         assert_eq!(s.execution_id, c);
-        assert_eq!(s.status, "completed");
+        assert_eq!(s.status.as_str(), "completed");
         assert_eq!(s.completed_at, Some(150));
         // An execution that never started is absent, not an error.
         assert!(j.execution_summary(weft_core::ExecutionId::new_v4()).await.unwrap().is_none());
@@ -1392,7 +1402,7 @@ pub(crate) mod tests {
 
         let of = |status: &str| ExecutionQuery {
             limit: 50,
-            status: Some(status.to_string()),
+            status: Some(weft_core::program::RunStatus::parse(status).expect("a run status")),
             ..Default::default()
         };
         let failed = j.list_executions("t", &of("failed")).await.unwrap();
@@ -1405,6 +1415,35 @@ pub(crate) mod tests {
         let running = j.list_executions("t", &of("running")).await.unwrap();
         assert_eq!(running.total, 1, "a run with no terminal event is still going");
         assert_eq!(running.executions[0].execution_id, going);
+    }
+
+    /// A run parked on a wait is still running, and is the only one
+    /// `waiting_for_input` reaches; a finished run is reached by its end.
+    #[tokio::test]
+    async fn the_status_filter_reaches_runs_as_the_listing_reads_them() {
+        use weft_core::program::RunStatus;
+        let j = FakeJournal::new();
+        j.set_project_tenant(PROJECT, "t");
+        let (going, parked, done) = (ExecutionId::new_v4(), ExecutionId::new_v4(), ExecutionId::new_v4());
+        for execution_id in [going, parked, done] {
+            j.record_event(&started_at(execution_id, PROJECT, 10)).await.unwrap();
+        }
+        j.record_event(&ExecEvent::ExecutionCancelled { execution_id: done, reason: "stop".into(), cause: None, at_unix: 11 }).await.unwrap();
+        j.signal_insert(&SignalRegistration { execution_id: Some(parked), is_resume: true, ..registration("wait") }).await.unwrap();
+        let reached = |status: RunStatus| {
+            let q = ExecutionQuery { limit: 10, status: Some(status), ..Default::default() };
+            let j = &j;
+            async move {
+                let mut ids: Vec<ExecutionId> = j.list_executions("t", &q).await.unwrap().executions.into_iter().map(|s| s.execution_id).collect();
+                ids.sort();
+                ids
+            }
+        };
+        let sorted = |mut ids: Vec<ExecutionId>| { ids.sort(); ids };
+        assert_eq!(reached(RunStatus::Running).await, sorted(vec![going, parked]));
+        assert_eq!(reached(RunStatus::WaitingForInput).await, vec![parked]);
+        assert_eq!(reached(RunStatus::Cancelled).await, vec![done]);
+        assert!(reached(RunStatus::Failed).await.is_empty());
     }
 
     /// A walk that hands each page's last run back as `below` reaches
@@ -1422,7 +1461,7 @@ pub(crate) mod tests {
         let mut reached = Vec::new();
         let mut below = None;
         loop {
-            let q = ExecutionQuery { limit: 2, status: Some("running".into()), below, ..Default::default() };
+            let q = ExecutionQuery { limit: 2, status: Some(weft_core::program::RunStatus::Running), below, ..Default::default() };
             let page = j.list_executions("t", &q).await.unwrap();
             let Some(last) = page.executions.last() else { break };
             below = Some((last.started_at, last.execution_id));
@@ -1463,7 +1502,7 @@ pub(crate) mod tests {
             source_version: None,
             subgraph,
             seed,
-            member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix,
+            instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix,
             run_class: weft_core::run_class::RunClass::Short,
         })
         .await
@@ -1481,5 +1520,39 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(fires.total, 1);
         assert_eq!(fires.executions[0].execution_id, fire);
+    }
+
+    /// A program's `ctx.runs()` filter reads as one journal query for
+    /// clean, list and count alike: "older than" keeps a run started
+    /// exactly that long ago, a count asks for no rows and still gets the
+    /// total, and a run started after the question is never reached.
+    #[tokio::test]
+    async fn a_run_filter_reads_the_same_for_every_door() {
+        let j = FakeJournal::new();
+        j.set_project_tenant(PROJECT, "t");
+        let old = weft_core::ExecutionId::new_v4();
+        let edge = weft_core::ExecutionId::new_v4();
+        let fresh = weft_core::ExecutionId::new_v4();
+        let later = weft_core::ExecutionId::new_v4();
+        j.record_event(&started_at(old, PROJECT, 10)).await.unwrap();
+        j.record_event(&started_at(edge, PROJECT, 40)).await.unwrap();
+        j.record_event(&started_at(fresh, PROJECT, 90)).await.unwrap();
+        j.record_event(&started_at(later, PROJECT, 101)).await.unwrap();
+        j.tag_execution(old, &["draft"], 11);
+        j.tag_execution(edge, &["draft"], 41);
+
+        let now = 100;
+        let older = weft_core::program::RunFilter { older_than_secs: Some(60), ..Default::default() };
+        let page = j.list_executions("t", &crate::api::execution::run_query(Some(PROJECT), &older, 50, now)).await.unwrap();
+        let ids: Vec<_> = page.executions.iter().map(|e| e.execution_id).collect();
+        assert_eq!(ids, [edge, old], "started 60s ago counts as at least 60s old");
+
+        let all = weft_core::program::RunFilter::default();
+        let page = j.list_executions("t", &crate::api::execution::run_query(Some(PROJECT), &all, 1, now)).await.unwrap();
+        assert_eq!((page.total, page.executions[0].execution_id), (3, fresh), "newest first, nothing after the question");
+
+        let tagged = weft_core::program::RunFilter { tag: Some("draft".into()), ..Default::default() };
+        let count = j.list_executions("t", &crate::api::execution::run_query(Some(PROJECT), &tagged, 0, now)).await.unwrap();
+        assert_eq!((count.total, count.executions.len()), (2, 0), "a count reads the total and no rows");
     }
 }

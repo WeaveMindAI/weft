@@ -190,12 +190,12 @@
                 },
             ],
             features: Default::default(),
-            requires_infra: false, per_member: None,
+            requires_infra: false, per_instance: None,
             fires_with: Default::default(),
             images: vec![],
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -248,12 +248,12 @@
                 declared_type: None,
             }],
             features: Default::default(),
-            requires_infra: false, per_member: None,
+            requires_infra: false, per_instance: None,
             fires_with: Default::default(),
             images: vec![],
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -293,12 +293,12 @@
                 declared_type: None,
             }],
             features: Default::default(),
-            requires_infra: false, per_member: None,
+            requires_infra: false, per_instance: None,
             fires_with: Default::default(),
             images: vec![],
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -329,12 +329,12 @@
             }]),
             outputs: vec![],
             features: Default::default(),
-            requires_infra: false, per_member: None,
+            requires_infra: false, per_instance: None,
             fires_with: Default::default(),
             images: vec![],
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -1083,12 +1083,12 @@
                 })
                 .collect(),
             features: Default::default(),
-            requires_infra: false, per_member: None,
+            requires_infra: false, per_instance: None,
             fires_with: Default::default(),
             images: vec![],
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -1141,10 +1141,10 @@
                 PortDefinition { name: "acc".into(),   port_type: primitive(WeftPrimitive::String), required: false, description: None, synthesized_from_carry: false, declared_type: None },
                 PortDefinition { name: "index".into(), port_type: primitive(WeftPrimitive::Number), required: false, description: None, synthesized_from_carry: false, declared_type: None },
             ],
-            features: Default::default(), requires_infra: false, per_member: None, images: vec![], fires_with: Default::default(),
+            features: Default::default(), requires_infra: false, per_instance: None, images: vec![], fires_with: Default::default(),
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None, header_span: None, config_spans: Default::default(),
             optional_ports: Default::default(),
             port_literals: Default::default(), port_literal_spans: Default::default(),
@@ -1166,10 +1166,10 @@
                 PortDefinition { name: "results".into(), port_type: list_of_nullable(primitive(WeftPrimitive::String)), required: false, description: None, synthesized_from_carry: false, declared_type: None },
                 PortDefinition { name: "acc".into(),     port_type: primitive(WeftPrimitive::String),                   required: false, description: None, synthesized_from_carry: false, declared_type: None },
             ],
-            features: Default::default(), requires_infra: false, per_member: None, images: vec![], fires_with: Default::default(),
+            features: Default::default(), requires_infra: false, per_instance: None, images: vec![], fires_with: Default::default(),
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None, header_span: None, config_spans: Default::default(),
             optional_ports: Default::default(),
             port_literals: Default::default(), port_literal_spans: Default::default(),
@@ -1192,10 +1192,10 @@
                 PortDefinition { name: "acc".into(), port_type: primitive(WeftPrimitive::String), required: false, description: None, synthesized_from_carry: false, declared_type: None },
                 PortDefinition { name: "done".into(), port_type: primitive(WeftPrimitive::Boolean), required: false, description: None, synthesized_from_carry: false, declared_type: None },
             ],
-            features: Default::default(), requires_infra: false, per_member: None, images: vec![], fires_with: Default::default(),
+            features: Default::default(), requires_infra: false, per_instance: None, images: vec![], fires_with: Default::default(),
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None, header_span: None, config_spans: Default::default(),
             optional_ports: Default::default(),
             port_literals: Default::default(), port_literal_spans: Default::default(),
@@ -1209,10 +1209,10 @@
                 PortDefinition { name: "data".into(),  port_type: list_of_nullable(primitive(WeftPrimitive::String)), required: true, description: None, synthesized_from_carry: false, declared_type: None },
                 PortDefinition { name: "final".into(), port_type: primitive(WeftPrimitive::String),                    required: true, description: None, synthesized_from_carry: false, declared_type: None },
             ]),
-            outputs: vec![], features: Default::default(), requires_infra: false, per_member: None, images: vec![], fires_with: Default::default(),
+            outputs: vec![], features: Default::default(), requires_infra: false, per_instance: None, images: vec![], fires_with: Default::default(),
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None, header_span: None, config_spans: Default::default(),
             optional_ports: Default::default(),
             port_literals: Default::default(), port_literal_spans: Default::default(),
@@ -1438,4 +1438,86 @@
         };
         use weft_core::primitive::LoopTerminationReason;
         assert_eq!(rt.get(&key).unwrap().terminated, Some(LoopTerminationReason::DoneVoted));
+    }
+
+    /// Fire LoopOut for iteration `iter` with `acc` closed (with
+    /// `failure` as the closure's error when set) and a gathered value,
+    /// returning the handler's outcome.
+    async fn fire_loop_out_with_closed_carry(
+        lp: &LoopProject,
+        iter: u32,
+        failure: Option<&str>,
+        rt: &mut LoopRuntime,
+        pulses: &mut PulseTable,
+        journal: &CapturingJournal,
+    ) -> Result<(), String> {
+        let edge_idx = weft_core::project::EdgeIndex::build(&lp.project);
+        let loop_out = lp.project.nodes.iter().find(|n| n.id == lp.loop_out_id).unwrap();
+        let mut received = weft_core::exec::ready::FiringInput {
+            input: bag(serde_json::json!({"results": "r"})),
+            closed_ports: vec!["acc".to_string()],
+            ..Default::default()
+        };
+        if let Some(error) = failure {
+            received.closed_failures.insert(
+                "acc".to_string(),
+                weft_core::pulse::Failure { node: "ask".into(), error: error.to_string() },
+            );
+        }
+        let group = ReadyGroup {
+            frames: vec![Frame::Loop { index: iter }],
+            execution_id: uuid::Uuid::nil(),
+            received,
+            skip: None,
+            pulse_ids: Vec::new(),
+            error: None,
+            out_of_scope: false,
+        };
+        let mut stream_rt =
+            crate::stream_runtime::StreamRuntime::new(crate::wait_tracker::WaitTracker::new());
+        handle_loop_boundary_firing(
+            loop_out, &group, &lp.project, &edge_idx, pulses, journal,
+            "test-instance", rt, &mut stream_rt, &mut std::collections::HashMap::new(),
+        )
+        .await
+    }
+
+    /// A carried value closed because a node inside the loop failed
+    /// stops the loop: the LoopOut firing fails (the driver then tears
+    /// the loop down as Failed) with the iteration, the port and the
+    /// error, and no next iteration launches from the stale carry.
+    #[tokio::test]
+    async fn carry_closed_by_a_failure_fails_the_loop() {
+        let lp = build_sequential_fold_project();
+        let mut rt = LoopRuntime::new();
+        let mut pulses = PulseTable::default();
+        let journal = CapturingJournal::default();
+        fire_loop_in(&lp, serde_json::json!({"items": ["a", "b", "c"], "acc": ""}), &mut rt, &mut pulses, &journal).await;
+        fire_loop_out(&lp, 0, serde_json::json!({"results": "a", "acc": "a"}), Vec::new(), &mut rt, &mut pulses, &journal).await;
+        let err = fire_loop_out_with_closed_carry(&lp, 1, Some("the model answered 500"), &mut rt, &mut pulses, &journal)
+            .await
+            .expect_err("a failed carry fails the loop");
+        assert!(err.contains("iteration 1") && err.contains("'acc'"), "{err}");
+        assert!(err.contains("because 'ask' failed: the model answered 500"), "names the node that broke: {err}");
+        let key = LoopInstanceKey { group_id: lp.group_id.clone(), parent_frames: Vec::new(), execution_id: uuid::Uuid::nil() };
+        assert_eq!(rt.get(&key).unwrap().launched, vec![0, 1], "iteration 2 never launches");
+    }
+
+    /// A carried value closed with no failure (a branch not taken, a
+    /// gate) keeps its previous value and the loop goes on.
+    #[tokio::test]
+    async fn carry_closed_by_a_gate_keeps_its_value() {
+        let lp = build_sequential_fold_project();
+        let mut rt = LoopRuntime::new();
+        let mut pulses = PulseTable::default();
+        let journal = CapturingJournal::default();
+        fire_loop_in(&lp, serde_json::json!({"items": ["a", "b", "c"], "acc": ""}), &mut rt, &mut pulses, &journal).await;
+        fire_loop_out(&lp, 0, serde_json::json!({"results": "a", "acc": "a"}), Vec::new(), &mut rt, &mut pulses, &journal).await;
+        fire_loop_out_with_closed_carry(&lp, 1, None, &mut rt, &mut pulses, &journal).await.expect("a plain closure is fine");
+        let carry_at_2: Vec<_> = pulses[&lp.body_id]
+            .iter()
+            .filter(|p| p.frames == vec![Frame::Loop { index: 2 }] && p.target_port == "left" && !p.closed)
+            .map(|p| (*p.value).clone())
+            .collect();
+        assert_eq!(carry_at_2, vec![serde_json::json!("a")], "iteration 2 starts from the kept carry");
     }

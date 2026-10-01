@@ -81,7 +81,7 @@ async fn start_execution(
             source_version: None,
             subgraph: None,
             seed: None,
-            member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 1,
+            instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 1,
             run_class: weft_core::run_class::RunClass::Short,
         })
         .await
@@ -110,7 +110,7 @@ async fn tag_rows_are_ordered_by_write_and_idempotent(pool: PgPool) {
 
     tag(&pool, first, &["user_7"], 10).await;
     tag(&pool, second, &["user_7", "batch_a"], 11).await;
-    // Re-tagging the first run (a body re-run after a crash) must not
+    // Re-tagging the first run (a body replayed after a durable wait) must not
     // move it after the second in the order.
     tag(&pool, first, &["user_7"], 12).await;
 
@@ -246,7 +246,7 @@ async fn cancel_terminals_carry_the_cause_and_clean_removes_tags(pool: PgPool) {
         .expect("terminal written");
     assert_eq!(terminal, (cause.to_string(), Some(cause.clone())));
     assert_eq!(
-        journal.execution_summary(victim).await.unwrap().unwrap().status,
+        journal.execution_summary(victim).await.unwrap().unwrap().status.as_str(),
         "cancelled"
     );
     // Terminal now: out of the live set.
@@ -281,7 +281,7 @@ async fn cancel_leaves_a_finished_run_alone_and_strips_an_unstarted_execution_id
     let write = journal.cancel_execution(done, Some(&program), &CancelCause::User).await.unwrap();
     assert!(write.removed.is_empty() && write.node_cancellations.is_none() && !write.task_enqueued, "{write:?}");
     assert_eq!(journal.events_log(done).await.unwrap().len(), before.len(), "a finished run keeps its terminal");
-    assert_eq!(journal.execution_summary(done).await.unwrap().unwrap().status, "completed");
+    assert_eq!(journal.execution_summary(done).await.unwrap().unwrap().status.as_str(), "completed");
 
     // Never started: a stray resume signal on an unknown execution goes,
     // and no journal is opened for it.
@@ -293,10 +293,85 @@ async fn cancel_leaves_a_finished_run_alone_and_strips_an_unstarted_execution_id
     assert!(journal.events_log(ghost).await.unwrap().is_empty());
 }
 
+/// The listing's status filter: a run with no ending and a resume signal
+/// parked on it is `waiting_for_input` and also reached by `running`; a
+/// run with no ending and nothing parked is only `running`; an ended run
+/// is neither.
+#[sqlx::test]
+async fn the_status_filter_finds_a_parked_run_under_waiting_and_running(pool: PgPool) {
+    use weft_core::program::RunStatus;
+    let (journal, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project).await;
+    let parked = start_execution(&journal, project, weft_core::exec::RunKind::Execution).await;
+    let plain = start_execution(&journal, project, weft_core::exec::RunKind::Execution).await;
+    let ended = start_execution(&journal, project, weft_core::exec::RunKind::Execution).await;
+    journal.signal_insert(&resume_signal("form-parked", project, parked)).await.unwrap();
+    journal
+        .record_event(&ExecEvent::ExecutionCompleted { execution_id: ended, at_unix: 2 })
+        .await
+        .expect("ExecutionCompleted");
+
+    let listed = |status: RunStatus| {
+        let journal = &journal;
+        async move {
+            let query = weft_dispatcher::journal::ExecutionQuery { limit: 10, status: Some(status), ..Default::default() };
+            let mut ids: Vec<_> =
+                journal.list_executions(TENANT, &query).await.unwrap().executions.into_iter().map(|s| s.execution_id).collect();
+            ids.sort();
+            ids
+        }
+    };
+    assert_eq!(listed(RunStatus::WaitingForInput).await, vec![parked]);
+    let mut running = vec![parked, plain];
+    running.sort();
+    assert_eq!(listed(RunStatus::Running).await, running);
+    assert_eq!(listed(RunStatus::Completed).await, vec![ended]);
+}
+
+/// A run whose birth no longer decodes still lists under a status
+/// filter the SQL clause matches, shown as `corrupt`, and the count agrees
+/// with the list. `RunStatus::reaches` (what a filtered clean deletes by)
+/// reaches no corrupt row.
+#[sqlx::test]
+async fn a_corrupt_run_lists_as_corrupt_under_a_status_filter(pool: PgPool) {
+    use weft_core::program::{RunStatus, SummaryStatus};
+    let (journal, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project).await;
+    let corrupt = start_execution(&journal, project, weft_core::exec::RunKind::Execution).await;
+    let plain = start_execution(&journal, project, weft_core::exec::RunKind::Execution).await;
+    sqlx::query("UPDATE exec_event SET payload_json = '{}' WHERE execution_id = $1 AND kind = 'execution_started'")
+        .bind(corrupt.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let listed = |status: Option<RunStatus>| {
+        let journal = &journal;
+        async move {
+            let query = weft_dispatcher::journal::ExecutionQuery { limit: 10, status, ..Default::default() };
+            journal.list_executions(TENANT, &query).await.unwrap()
+        }
+    };
+    // No ending, so the `running` clause matches it.
+    let running = listed(Some(RunStatus::Running)).await;
+    assert_eq!(running.total, 2, "the count agrees with the list: {running:?}");
+    let shown = running.executions.iter().find(|s| s.execution_id == corrupt).expect("listed under the filter");
+    assert_eq!(shown.status, SummaryStatus::Corrupt);
+    assert!(running.executions.iter().any(|s| s.execution_id == plain));
+    assert!(RunStatus::VARIANTS.iter().all(|f| !f.reaches(shown.status)), "a filtered clean never deletes it");
+    let completed = listed(Some(RunStatus::Completed)).await;
+    assert_eq!((completed.total, completed.executions.len()), (0, 0), "{completed:?}");
+    let all = listed(None).await;
+    assert_eq!(all.total, 2);
+    assert!(all.executions.iter().any(|s| s.execution_id == corrupt && s.status == SummaryStatus::Corrupt));
+}
+
 /// A resume (form) signal parked on `execution_id`.
 fn resume_signal(token: &str, project_id: Uuid, execution_id: weft_core::ExecutionId) -> SignalRegistration {
     SignalRegistration {
-        member: None,
+        instance: None,
         activation_trigger: None,
         source_version: None,
         setup_execution_id: None,
@@ -323,16 +398,16 @@ fn resume_signal(token: &str, project_id: Uuid, execution_id: weft_core::Executi
     }
 }
 
-/// A member token names exactly one project and always expires, and
-/// revoking a member's tokens takes theirs and nobody else's.
+/// An instance token names exactly one project and always expires, and
+/// revoking an instance's tokens takes its own and nobody else's.
 #[sqlx::test]
-async fn a_member_token_is_one_project_and_expires(pool: PgPool) {
-    use weft_core::member::MemberId;
+async fn an_instance_token_is_one_project_and_expires(pool: PgPool) {
+    use weft_core::instance::InstanceId;
     use weft_dispatcher::journal::SignalToken;
     let (journal, _) = setup(&pool).await;
     let project = Uuid::new_v4();
-    let ada = MemberId::new("ada").unwrap();
-    let token = |hash: &str, member: Option<&MemberId>, projects: Vec<Uuid>, expires_at: Option<u64>| SignalToken {
+    let ada = InstanceId::new("ada").unwrap();
+    let token = |hash: &str, instance: Option<&InstanceId>, projects: Vec<Uuid>, expires_at: Option<u64>| SignalToken {
         id: Uuid::new_v4(),
         token_hash: hash.into(),
         recognizer: "wft-test-...".into(),
@@ -343,32 +418,32 @@ async fn a_member_token_is_one_project_and_expires(pool: PgPool) {
         allowed_displays: Vec::new(),
         all_displays: false,
         created_at: 0,
-        member: member.cloned(),
+        instance: instance.cloned(),
         expires_at,
-        kind: weft_dispatcher::journal::TokenKind::Caller,
+        kind: weft_core::signal_token::TokenKind::Caller,
     };
     let err = journal.mint_signal_token(&token("h1", Some(&ada), vec![], Some(10))).await.unwrap_err();
-    assert!(format!("{err:#}").contains("signal_token_member_has_one_project"), "{err:#}");
+    assert!(format!("{err:#}").contains("signal_token_instance_has_one_project"), "{err:#}");
     let err = journal.mint_signal_token(&token("h2", Some(&ada), vec![project], None)).await.unwrap_err();
-    assert!(format!("{err:#}").contains("signal_token_member_expires"), "{err:#}");
-    let operator_member = SignalToken {
-        kind: weft_dispatcher::journal::TokenKind::Operator,
+    assert!(format!("{err:#}").contains("signal_token_instance_expires"), "{err:#}");
+    let operator_instance = SignalToken {
+        kind: weft_core::signal_token::TokenKind::Operator,
         ..token("h3", Some(&ada), vec![project], Some(10))
     };
-    let err = journal.mint_signal_token(&operator_member).await.unwrap_err();
+    let err = journal.mint_signal_token(&operator_instance).await.unwrap_err();
     assert!(format!("{err:#}").contains("signal_token_operator_is_nobody"), "{err:#}");
 
     journal.mint_signal_token(&token("ada-1", Some(&ada), vec![project], Some(10))).await.unwrap();
     journal.mint_signal_token(&token("ada-2", Some(&ada), vec![project], Some(20))).await.unwrap();
-    let bob = MemberId::new("bob").unwrap();
+    let bob = InstanceId::new("bob").unwrap();
     journal.mint_signal_token(&token("bob-1", Some(&bob), vec![project], Some(10))).await.unwrap();
     journal.mint_signal_token(&token("author", None, vec![project], None)).await.unwrap();
     let read = journal.get_signal_token("ada-1").await.unwrap().expect("stored");
-    assert_eq!((read.member.as_ref(), read.expires_at), (Some(&ada), Some(10)));
+    assert_eq!((read.instance.as_ref(), read.expires_at), (Some(&ada), Some(10)));
     assert!(read.expired(10) && !read.expired(9));
 
     let other_project = Uuid::new_v4();
-    let revoke = weft_dispatcher::journal::postgres::revoke_member_tokens;
+    let revoke = weft_dispatcher::journal::postgres::revoke_instance_tokens;
     assert_eq!(revoke(&pool, TENANT, other_project, &ada, None).await.unwrap(), 0);
     assert_eq!(revoke(&pool, "tenant-2", project, &ada, None).await.unwrap(), 0);
     assert_eq!(revoke(&pool, TENANT, project, &ada, Some(read.id)).await.unwrap(), 1);

@@ -46,6 +46,25 @@ So folding a group in the editor costs nothing, nesting five deep costs
 nothing, and a group is never a thing the runtime has to step through. It is a
 way of writing and reading, and it is gone by the time anything runs.
 
+## When a group starts
+
+The node holding a group's inputs fires like any other node: once everything
+the run wires into it has arrived, `_should_flow` included. A closed input
+counts as arrived. An included file is a group, so each `@include` starts the
+same way.
+
+When it fires, every step inside that no wire feeds starts with it. So a step
+with no inputs needs no `_should_flow` to get its turn, and it never runs
+before the group's slowest input has landed.
+
+It only runs in a run that takes it along, though. A trigger's run holds what
+the trigger feeds plus what those steps read, so a step with no inputs inside a
+group comes along when something that run uses reads it, or when the run feeds
+the group's `_should_flow`, which brings the whole group in. If several routes
+feed one include, a route that did not fire never holds it up: it is either
+left out of the run, or it runs only to close its outputs, and a closure counts
+as arrived.
+
 ## Why a required group input does not skip the group
 
 This is the part that surprises people.
@@ -144,3 +163,10 @@ fifteen, names the level, and tells you to group.
 A group counts as **one** item on its parent's level, whatever is inside it. So
 a program grows downward into nested folders rather than sideways into a wall,
 and every level stays something you can hold in your head.
+
+A file's top level is counted per connected part. Everything a wire links
+counts together, a database or a key set that several pieces use included, so
+the warning reads "one connected part of the top level holds N items". Only
+pieces that share no wire at all are counted apart. The inside of a group, a
+loop and an included file is counted whole ("this included file holds N
+items").

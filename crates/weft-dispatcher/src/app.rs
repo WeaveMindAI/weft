@@ -126,8 +126,8 @@ pub const DISPATCHER_CHANNELS: &[&str] = &[
 /// runtime process shares among its roles.
 pub struct DispatcherSettings<'a> {
     pub config: &'a InstallConfig,
-    /// This process's instance id.
-    pub instance: String,
+    /// This process's replica id.
+    pub replica: String,
     pub pool: sqlx::PgPool,
     /// A pool of its own for the project transition lock (see
     /// `DispatcherState::lock_pool`).
@@ -148,7 +148,7 @@ pub struct DispatcherSettings<'a> {
 /// Build the dispatcher state.
 pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -> anyhow::Result<DispatcherState> {
     let Defaults { authenticator, tenant_router, project_reclaimer } = defaults;
-    let DispatcherSettings { config, instance, pool, lock_pool, signals, runner, host, images, tokens, kick, caller_token_secret } =
+    let DispatcherSettings { config, replica, pool, lock_pool, signals, runner, host, images, tokens, kick, caller_token_secret } =
         settings;
     for channel in DISPATCHER_CHANNELS {
         signals.require(channel)?;
@@ -157,7 +157,7 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         !caller_token_secret.is_empty(),
         "WEFT_CALLER_TOKEN_SECRET is empty: live-caller tickets would verify under an empty key"
     );
-    info!("dispatcher instance: {instance}");
+    info!("dispatcher replica: {replica}");
     let journal = PostgresJournal::from_pool(pool.clone());
     let projects: crate::ProjectStore = Arc::new(crate::PostgresProjectStore::new(pool.clone()));
     let activations: crate::activation_store::ActivationStore =
@@ -176,10 +176,11 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         },
         images,
         pool: pool.clone(),
-        instance: instance.clone(),
+        replica: replica.clone(),
         compile_lanes: config.build.compile_lanes,
         poll_every: weft_core::time_scale::scaled(std::time::Duration::from_secs(2)),
         prunes: Default::default(),
+        blobs: crate::build::blob_cache::BlobCache::in_temp_dir(),
     });
     // Every peer this client talks to (the broker and listener roles, an
     // infra unit's `/live` and `/action`, a worker) answers in place; a
@@ -190,7 +191,7 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         .build()
         .expect("a default reqwest client builds");
     Ok(DispatcherState {
-        instance,
+        replica,
         journal: Arc::new(journal),
         pg_pool: pool,
         lock_pool,
@@ -276,7 +277,7 @@ pub fn drain_loops(state: &DispatcherState, registry: crate::task_executor::Task
             .context("the dispatcher's signal watch listens on every task channel")?,
     );
     let mut loops = vec![
-        weft_task_store::dispatcher_picker_loop(picker_store, state.clone(), registry, state.instance.clone()),
+        weft_task_store::dispatcher_picker_loop(picker_store, state.clone(), registry, state.replica.clone()),
         crate::delivery::drain_loop(state.clone()),
         crate::lifecycle_claimer::drain_loop(state.clone()),
         crate::journal_bridge::drain_loop(state.clone()),
@@ -341,7 +342,7 @@ pub async fn seed_bootstrap_operator_key(state: &DispatcherState, key: &str) -> 
     );
     let token = crate::journal::SignalToken {
         id: uuid::Uuid::new_v4(),
-        kind: crate::journal::TokenKind::Operator,
+        kind: weft_core::signal_token::TokenKind::Operator,
         token_hash: names::token_hash(key),
         recognizer: names::recognizer(key),
         tenant_id: crate::tenant::TenantId::local().as_str().to_string(),
@@ -351,7 +352,7 @@ pub async fn seed_bootstrap_operator_key(state: &DispatcherState, key: &str) -> 
         allowed_displays: Vec::new(),
         all_displays: false,
         created_at: crate::lease::now_unix() as u64,
-        member: None,
+        instance: None,
         expires_at: None,
     };
     if state.journal.seed_operator_token(&token).await.context("seed the bootstrap operator key")? {

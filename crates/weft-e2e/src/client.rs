@@ -54,7 +54,7 @@ pub struct Dispatcher {
     /// default one, or a test cell ([`crate::cell::Cell`]). What reaches
     /// behind the API (the platform layer, the `weft` CLI) follows it to
     /// the right files and database.
-    instance: weft_core::infra::Instance,
+    install: weft_core::infra::Install,
 }
 
 impl Dispatcher {
@@ -66,12 +66,12 @@ impl Dispatcher {
     pub fn from_env() -> Result<Self> {
         let base = std::env::var("WEFT_DISPATCHER_URL")
             .unwrap_or_else(|_| DEFAULT_DISPATCHER_URL.to_string());
-        Self::for_install(&base, weft_core::infra::Instance::default_install())
+        Self::for_install(&base, weft_core::infra::Install::default_install())
     }
 
-    /// An UNAUTHENTICATED client for the dispatcher of `instance`, answering
+    /// An UNAUTHENTICATED client for the dispatcher of `install`, answering
     /// at `base`.
-    pub fn for_install(base: &str, instance: weft_core::infra::Instance) -> Result<Self> {
+    pub fn for_install(base: &str, install: weft_core::infra::Install) -> Result<Self> {
         let http = reqwest::Client::builder()
             .build()
             .context("build reqwest client")?;
@@ -79,13 +79,13 @@ impl Dispatcher {
             base: base.trim_end_matches('/').to_string(),
             http,
             auth: None,
-            instance,
+            install,
         })
     }
 
     /// The install this dispatcher belongs to.
-    pub fn instance(&self) -> &weft_core::infra::Instance {
-        &self.instance
+    pub fn install(&self) -> &weft_core::infra::Install {
+        &self.install
     }
 
     /// A clone of this client that authenticates every request via `auth`. A
@@ -312,9 +312,9 @@ pub async fn cli(disp: &Dispatcher, dir: &Path, args: &[&str]) -> Result<CliOutp
     cmd.current_dir(dir);
     cmd.args(args);
     cmd.env("WEFT_DISPATCHER_URL", disp.base());
-    match disp.instance().name() {
-        Some(name) => cmd.env(weft_core::infra::INSTANCE_ENV, name),
-        None => cmd.env_remove(weft_core::infra::INSTANCE_ENV),
+    match disp.install().name() {
+        Some(name) => cmd.env(weft_core::infra::INSTALL_ENV, name),
+        None => cmd.env_remove(weft_core::infra::INSTALL_ENV),
     };
     // The rig is non-interactive by construction: a verb that wants a
     // prompt must receive its answer via flags. With an inherited stdin

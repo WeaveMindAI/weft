@@ -5,7 +5,7 @@
 //! that restart the runtime, or wait on its own timers at a faster pace.
 //! Those tests start a cell.
 //!
-//! A cell is a named install (`weft_core::infra::Instance`) on the same
+//! A cell is a named install (`weft_core::infra::Install`) on the same
 //! machine: its own runtime, Postgres and ports, sharing only the object
 //! store and the images. It starts from the images the default install
 //! already has, so nothing is built.
@@ -32,7 +32,7 @@ pub const CELL_NAME_PREFIX: &str = "e2e";
 
 /// A cell of a test's own. See the module docs.
 pub struct Cell {
-    instance: weft_core::infra::Instance,
+    install: weft_core::infra::Install,
     /// `None` only while [`Self::start`] is still bringing it up.
     dispatcher: Option<Dispatcher>,
     time_scale: f64,
@@ -44,21 +44,21 @@ impl Cell {
     /// (`1.0` for real time, less for a test that waits on them), and
     /// wait until its dispatcher answers.
     pub async fn start(time_scale: f64) -> Result<Self> {
-        // Fits `weft_core::infra::MAX_INSTANCE_NAME`: the prefix and nine
+        // Fits `weft_core::infra::MAX_INSTALL_NAME`: the prefix and nine
         // characters of a fresh id.
         let name = format!("{CELL_NAME_PREFIX}{}", &uuid::Uuid::new_v4().simple().to_string()[..9]);
         // Said before anything is made, for the post-mortem of a test the
         // runner stops for running too long (its guards never drop).
         // SYNC: this line <-> scripts/run-e2e.sh (post_mortem)
         eprintln!("weft-e2e: made cell '{name}'");
-        let instance =
-            weft_core::infra::Instance::named(&name).map_err(anyhow::Error::msg)?;
+        let install =
+            weft_core::infra::Install::named(&name).map_err(anyhow::Error::msg)?;
         // From here on the cell exists, whole or in part: the guard keeps
         // it for inspection if anything below fails.
-        let mut cell = Self { instance: instance.clone(), dispatcher: None, time_scale, finished: false };
+        let mut cell = Self { install: install.clone(), dispatcher: None, time_scale, finished: false };
         cell.daemon("start").await?;
-        let port = public_port(&instance)?;
-        let dispatcher = Dispatcher::for_install(&format!("http://127.0.0.1:{port}"), instance)?;
+        let port = public_port(&install)?;
+        let dispatcher = Dispatcher::for_install(&format!("http://127.0.0.1:{port}"), install)?;
         crate::ensure::wait_healthy(&dispatcher).await?;
         cell.dispatcher = Some(dispatcher);
         Ok(cell)
@@ -82,7 +82,7 @@ impl Cell {
             .args(["daemon", verb])
             .current_dir(&root)
             .env("WEFT_REPO_ROOT", &root)
-            .env(weft_core::infra::INSTANCE_ENV, name)
+            .env(weft_core::infra::INSTALL_ENV, name)
             .env(weft_core::time_scale::TIME_SCALE_ENV, self.time_scale.to_string())
             .stdin(std::process::Stdio::null())
             .output()
@@ -126,7 +126,7 @@ impl Cell {
     }
 
     fn name(&self) -> &str {
-        self.instance.name().expect("a cell is a named install")
+        self.install.name().expect("a cell is a named install")
     }
 }
 
@@ -141,18 +141,18 @@ impl Drop for Cell {
         eprintln!(
             "weft-e2e: cell '{name}' NOT finished (test ended early); keeping it for \
              inspection{at}. Its files are in {dir}. Remove it with \
-             `WEFT_INSTANCE={name} weft daemon remove`, or every kept cell with \
+             `WEFT_INSTALL={name} weft daemon remove`, or every kept cell with \
              `scripts/run-e2e.sh --clean`.",
             name = self.name(),
-            dir = crate::ensure::install_dir(&self.instance).display(),
+            dir = crate::ensure::install_dir(&self.install).display(),
         );
     }
 }
 
 /// The port the cell's runtime answers on, from the config its start
 /// wrote.
-fn public_port(instance: &weft_core::infra::Instance) -> Result<u16> {
-    let path = crate::ensure::install_dir(instance).join("config.json");
+fn public_port(install: &weft_core::infra::Install) -> Result<u16> {
+    let path = crate::ensure::install_dir(install).join("config.json");
     let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let config: weft_platform_traits::InstallConfig =
         serde_json::from_str(&raw).with_context(|| format!("{} is not an install config", path.display()))?;

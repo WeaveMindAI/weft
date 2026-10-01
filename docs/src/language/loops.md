@@ -52,7 +52,8 @@ The list that comes out is built for every gathered port, even one that no
 iteration ever wrote, because a port that produces nothing at all would leave
 whatever is downstream waiting forever.
 
-A carried value that an iteration does not write keeps what it had. If you do
+A carried value that an iteration does not write keeps what it had, as long as
+nothing broke: a branch not taken or a gate that said no is fine. If you do
 not wire a seed, it starts at the zero for its type: `0` for a number, `""` for
 a string, `[]` for a list.
 
@@ -87,6 +88,7 @@ last one wrote.
 - It runs out of items in `over`.
 - It hits `max_iters`.
 - The body writes `self.done = true`, on a sequential loop.
+- A carried value is lost to a failure, and then the loop fails (see below).
 
 A sequential loop with none of those is the
 `loop-unbounded-no-termination` error, refused at compile time rather than
@@ -98,12 +100,28 @@ naming the lengths.
 
 ## When an iteration fails
 
-The run carries on. That iteration's slot in every gathered list is `null`, and
-a carried value keeps what it had.
+If you only gather, the run carries on. That iteration's slot in every
+gathered list is `null`, so a loop over a hundred rows where three fail gives
+you a hundred slots with three nulls in them. Whatever reads that list decides
+what a null means.
 
-So a loop over a hundred rows where three fail gives you a hundred slots with
-three nulls in them, rather than nothing at all. Whatever reads that list
-decides what a null means.
+If the failure means a carried value never got written, the loop stops there
+and fails. The next iteration would start from the same value and meet the
+same failure: an agent loop whose model call broke would otherwise pay for
+the same doomed call up to `max_iters` times, then hand on a stale history as
+if all went well. The loop's step fails with
+
+```
+loop 'agent' stopped at iteration 4: its carried value 'history' could not be updated because 'ask' failed: <the error>
+```
+
+where `ask` is the step that actually broke, even when other steps between it
+and the loop's end skipped because of it. Everything reading the loop's outputs
+sees a failure, the same as for any failed step, and `ask` shows as failed in
+that iteration too.
+
+A carried value that closed with no failure behind it, because a branch was not
+taken or a gate said no, still keeps what it had.
 
 ## What cannot go in one
 

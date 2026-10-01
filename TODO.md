@@ -420,7 +420,7 @@ A connection a program's own node uses is picked per install, in the
 install's store, never in the source. A plain value can differ between
 installs too (a channel id, a sheet id, an API base address), and today it
 can only be written in the source, the same on every install. A marker
-like `@install_filled`, the sibling of `@member_filled` ("filled once per
+like `@install_filled`, the sibling of `@instance_filled` ("filled once per
 install, for everybody"), would put such a value in the same store. Not
 decided: whether it is needed at all, and whether it would be opt-in per
 field.
@@ -428,7 +428,7 @@ field.
 It might just be environment variables instead: variables set per project
 on each install (never install-wide), which a node field reads. Most such
 values are the same in dev and prod anyway, are computed by a wired node,
-or are a member's (`@member_filled`); what is left (a test deployment
+or are an instance's (`@instance_filled`); what is left (a test deployment
 beside a real one) is the case env vars already answer everywhere else.
 
 ## `[T]` instead of `List[T]`

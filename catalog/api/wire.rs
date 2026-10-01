@@ -24,12 +24,12 @@ use weft::caller::{InboundMessage, LiveRequest, OutboundChunk, ResponseHead};
 use weft::node::NodeOutput;
 use weft::signal::DataType;
 use weft::storage::{FileHandle, StorageScope, StoredFile};
-use weft::{ExecutionContext, WeftResult, WeftType};
+use weft::{ExecutionContext, WeftError, WeftResult, WeftType};
 
 /// The fixed ports both triggers emit from the caller's opening
 /// request. A body key of the same name is shadowed by these (the
 /// request wins), which the trigger docs say.
-pub const REQUEST_PORTS: &[&str] = &["method", "path", "params", "query", "headers", "caller"];
+pub const REQUEST_PORTS: &[&str] = &["fired", "method", "path", "params", "query", "headers", "caller"];
 
 /// The opening request the trigger woke on, out of the wake payload.
 /// Both triggers read the same payload, so they read it here and a
@@ -43,9 +43,11 @@ pub fn opening_request(ctx: &ExecutionContext) -> WeftResult<LiveRequest> {
 
 /// The fixed request ports' values, as `(port, value)` pairs, from the
 /// caller's opening request. A trigger sets the ones it declares
-/// (`Route` all six, `Socket` everything but `method`: an upgrade is
+/// (`Route` all seven, `Socket` everything but `method`: an upgrade is
 /// always a GET) AFTER the body ports, so a body key cannot shadow
-/// them. Header names are lowercased, as HTTP reads them.
+/// them. `fired` is always true: a port a program can gate on "the
+/// trigger was called" without reading any request part. Header names
+/// are lowercased, as HTTP reads them.
 pub fn request_ports(request: &LiveRequest) -> Vec<(&'static str, Value)> {
     let headers: serde_json::Map<String, Value> = request
         .headers
@@ -53,6 +55,7 @@ pub fn request_ports(request: &LiveRequest) -> Vec<(&'static str, Value)> {
         .map(|(k, v)| (k.to_ascii_lowercase(), Value::String(v.clone())))
         .collect();
     vec![
+        ("fired", Value::Bool(true)),
         ("method", Value::String(request.method.clone())),
         ("path", Value::String(request.path.clone())),
         ("params", serde_json::to_value(&request.params).expect("a string map serializes")),
@@ -263,6 +266,49 @@ pub async fn link_files(ctx: &ExecutionContext, value: Value) -> WeftResult<Valu
         }
         other => Ok(other),
     }
+}
+
+/// The shape an answer node (`Reply`, `Stream`) sends in: its own
+/// `answerAs` when set, else the shape the trigger's `dataType` declares.
+/// Apart because what comes in and what goes out differ often: a GET has
+/// no body at all and may still answer a picture as bytes.
+pub fn answer_type(ctx: &ExecutionContext) -> WeftResult<DataType> {
+    match ctx.inputs.opt::<String>("answerAs")?.filter(|raw| !raw.is_empty()) {
+        Some(raw) => DataType::parse_field(&raw)
+            .map_err(|_| WeftError::Input(format!("answerAs must be json, text or bytes, got '{raw}'"))),
+        None => Ok(ctx.caller_data_type().unwrap_or_default()),
+    }
+}
+
+/// A stored file answered as bytes: the file's own type, and its name as
+/// an inline `content-disposition` (a browser shows the picture, and
+/// saving it keeps the name). Whatever the program set itself wins.
+pub fn with_file_head(mut head: ResponseHead, file: &StoredFile) -> ResponseHead {
+    if !head.has_content_type() {
+        head = head.with_header("content-type", file.mime_type.clone());
+    }
+    if head.header("content-disposition").is_none() && !file.filename.is_empty() {
+        head = head.with_header("content-disposition", inline_disposition(&file.filename));
+    }
+    head
+}
+
+/// `inline; filename="..."; filename*=UTF-8''...`: the quoted form for
+/// old clients (ASCII only, quotes and backslashes dropped), the encoded
+/// form for the exact name.
+fn inline_disposition(filename: &str) -> String {
+    let plain: String = filename
+        .chars()
+        .map(|c| if c.is_ascii() && !c.is_ascii_control() && c != '"' && c != '\\' { c } else { '_' })
+        .collect();
+    let encoded: String = filename
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' | b'~' => (b as char).to_string(),
+            other => format!("%{other:02X}"),
+        })
+        .collect();
+    format!("inline; filename=\"{plain}\"; filename*=UTF-8''{encoded}")
 }
 
 /// The response head a node's `status` and `headers` inputs describe.

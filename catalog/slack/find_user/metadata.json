@@ -58,5 +58,8 @@
       "type": "JsonDict",
       "description": "The full user object as Slack returns it."
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

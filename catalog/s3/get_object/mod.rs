@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::storage::{KeepTtl, StorageScope};
+use weft::storage::StorageScope;
 use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::s3;
@@ -28,7 +28,6 @@ impl Node for S3GetObjectNode {
         let access: Access = ctx.inputs.get("account")?;
         let bucket: String = ctx.inputs.get("bucket")?;
         let key: String = ctx.inputs.get("key")?;
-        let keep: bool = ctx.inputs.get("keep")?;
 
         let s3 = ctx.client(&access).await?;
         let resp = s3
@@ -46,7 +45,8 @@ impl Node for S3GetObjectNode {
                 "s3: read the object",
                 None,
                 &filename,
-                keep.then_some(KeepTtl::Default),
+                // Swept with the run like every node's file; KeepFile keeps it.
+                None,
             )
             .await?;
         ctx.pulse_downstream(NodeOutput::stored_file(stored)).await

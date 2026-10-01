@@ -23,31 +23,31 @@ pub async fn run(ctx: Ctx, name: String, execution_id: Option<String>, expect: V
     let run = match execution_id {
         Some(c) => resolve_run(&tree, &c)?.clone(),
         None => {
-            let head = tree.head.head_run.clone().ok_or_else(|| {
+            let head = tree.head.head_run.ok_or_else(|| {
                 anyhow::anyhow!("head has no run to freeze; name an execution (`weft tree` lists them) or run first")
             })?;
-            resolve_run(&tree, &head)?.clone()
+            resolve_run(&tree, &head.to_string())?.clone()
         }
     };
-    if run.status != "completed" {
+    if run.status != Some(weft_core::program::RunStatus::Completed.into()) {
         bail!(
             "run {} is {}; only a completed run freezes (`weft stop`, fix, run again)",
-            short(&run.execution_id),
-            run.status
+            short(&run.execution_id.to_string()),
+            run.status.map_or("unknown", |s| s.as_str())
         );
     }
-    let rows = super::versions::replay_rows(&client, &run.execution_id).await?;
-    let mut expected = super::versions::output_wires(&client, &project_id, &run.execution_id).await?;
+    let rows = super::versions::replay_rows(&client, &run.execution_id.to_string()).await?;
+    let mut expected = super::versions::output_wires(&client, &run.execution_id.to_string()).await?;
     // `--expect` and the run's node list are both spelled from the top
     // (`triage.last`, `one.strip` through its site).
     for node in &expect {
         if let Some((group, _)) = node.rsplit_once("__in").or_else(|| node.rsplit_once("__out")).filter(|(_, rest)| rest.is_empty()) {
             bail!("cannot focus '{node}': it is a group boundary the compiler made; name the group, `--expect {group}`");
         }
-        if !expected.nodes.contains(node) { bail!("cannot focus '{node}': this node did not exist in run {}", short(&run.execution_id)); }
+        if !expected.nodes.contains(node) { bail!("cannot focus '{node}': this node did not exist in run {}", short(&run.execution_id.to_string())); }
     }
     expected.focus = expect.into_iter().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
-    let facts = outside_facts(&rows);
+    let facts = outside_facts(&rows)?;
 
     // A file that exists but does not parse is an
     // error, never an absence: overwriting it would destroy a spec
@@ -64,7 +64,7 @@ pub async fn run(ctx: Ctx, name: String, execution_id: Option<String>, expect: V
     spec.caller = facts.caller;
     spec.frozen_from = Some(FrozenFrom {
         version: run.version_id.clone(),
-        execution_id: run.execution_id.parse().context("run execution")?,
+        execution_id: run.execution_id,
         definition_hash: run.definition_hash.clone(),
     });
     spec.expected = Some(expected);
@@ -73,7 +73,7 @@ pub async fn run(ctx: Ctx, name: String, execution_id: Option<String>, expect: V
     client
         .put_with_body(
             &format!("/projects/{project_id}/versions/runs/{}", run.execution_id),
-            &serde_json::json!({ "example": name }),
+            &serde_json::to_value(weft_core::versions::RunUpdate { example: Some(Some(name.clone())) })?,
         )
         .await
         .context("record the example on the run")?;
@@ -86,7 +86,7 @@ pub async fn run(ctx: Ctx, name: String, execution_id: Option<String>, expect: V
     println!(
         "froze {} from run {} ({} wires, {} answers)",
         path.display(),
-        short(&run.execution_id),
+        short(&run.execution_id.to_string()),
         spec.expected.as_ref().map(|e| e.wires.len()).unwrap_or(0),
         spec.answers.len()
     );

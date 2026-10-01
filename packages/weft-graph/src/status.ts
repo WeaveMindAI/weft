@@ -17,7 +17,7 @@ import { EXECUTION_PHASES } from './protocol';
 
 /// The raw dispatcher status payload (snake_case wire shape). Only the
 /// fields the frontends consume; extra fields are ignored.
-// SYNC: RawStatusPayload <-> crates/weft-dispatcher/src/api/project.rs ProjectStatusResponse
+// SYNC: RawStatusPayload <-> crates/weft-core/src/projects.rs ProjectStatusResponse
 export interface RawStatusPayload {
   status?: string;
   transition?: string;
@@ -33,7 +33,7 @@ export interface RawStatusPayload {
     status?: string;
     failureStage?: string;
     failureMessage?: string;
-    member_copies?: number;
+    instance_copy_count?: number;
   }>;
   drift?: {
     binary_drift?: boolean;
@@ -53,7 +53,7 @@ export interface RawStatusPayload {
   };
 }
 
-// SYNC: infra_rollup values <-> crates/weft-dispatcher/src/api/project.rs (infra_rollup)
+// SYNC: infra_rollup values <-> crates/weft-core/src/projects.rs ProjectStatusResponse.infra_rollup
 const VALID_ROLLUPS = [
   'none',
   'stopped',
@@ -74,7 +74,7 @@ const VALID_STATUSES = [
   'inactive',
 ] as const;
 
-// SYNC: VALID_TRANSITIONS <-> crates/weft-dispatcher/src/project_store.rs ProjectTransition, packages/weft-graph/src/protocol.ts ProjectTransition, crates/weft-dispatcher/src/api/project.rs ProjectStatusResponse.transition
+// SYNC: VALID_TRANSITIONS <-> crates/weft-core/src/projects.rs ProjectTransition, packages/weft-graph/src/protocol.ts ProjectTransition
 const VALID_TRANSITIONS: ProjectTransition[] = ['none', 'building', 'cancelling_build'];
 
 /// Collapse a raw transition string to the enum, resting on 'none' for
@@ -131,7 +131,7 @@ export function parseStatusPayload(raw: RawStatusPayload): ActionAvailability {
     status: n.status ?? 'unknown',
     ...(n.failureStage !== undefined ? { failureStage: n.failureStage } : {}),
     ...(n.failureMessage !== undefined ? { failureMessage: n.failureMessage } : {}),
-    ...(n.member_copies !== undefined ? { memberCopies: n.member_copies } : {}),
+    ...(n.instance_copy_count !== undefined ? { instanceCopyCount: n.instance_copy_count } : {}),
   }));
   return {
     availableActions: (Array.isArray(raw.available_actions)
@@ -157,7 +157,7 @@ export function parseStatusPayload(raw: RawStatusPayload): ActionAvailability {
 }
 
 /// One execution running right now, and what it is for.
-// SYNC: RunningExecution <-> crates/weft-dispatcher/src/api/project.rs RunningExecution
+// SYNC: RunningExecution <-> crates/weft-core/src/projects.rs RunningExecution
 export interface RunningExecution {
   execution_id: string;
   phase: ExecutionPhase;

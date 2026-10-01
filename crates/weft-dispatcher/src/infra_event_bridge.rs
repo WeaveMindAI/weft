@@ -250,7 +250,7 @@ mod tests {
     fn started_maps_to_status_running() {
         let r = row(
             InfraEvent::Started(StartedPayload {
-                instance_id: "inst1".into(),
+                copy_id: "inst1".into(),
                 mode: weft_broker_client::protocol::StartMode::Fresh,
             }),
             Some("n1"),

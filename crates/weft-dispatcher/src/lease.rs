@@ -88,7 +88,7 @@ pub const SIGNAL_MOUNT_DOMAIN: &str = "weft_signal_mount";
 /// time and the others skip that turn (see `reaper`).
 pub const REAPER_DOMAIN: &str = "weft_reaper";
 /// Serializes issuing an upgrade of one owner's copies, keyed by
-/// `<project>/<member>` (empty member: the shared copies), so the
+/// `<project>/<instance>` (empty instance: the shared copies), so the
 /// in-flight check and the insert are one step install-wide.
 pub const UPGRADE_ISSUE_DOMAIN: &str = "weft_upgrade_issue";
 

@@ -2,8 +2,10 @@
 name = "storage"
 
 # Nodes that exercise the storage plane: fetch a file into storage,
-# keep it past the run, and surface it in the graph (inline image,
-# download link). They use only the language's own storage
+# keep it past the run, turn text into a file and back, and surface it
+# in the graph (inline image, download link). The scope and lifetime
+# settings they share are read in one place, `lifetime.rs`. They use
+# only the language's own storage
 # capabilities on ctx (including put_from_url, which fetches a URL
 # straight into storage), so no extra HTTP/stream dependency is
 # needed here.

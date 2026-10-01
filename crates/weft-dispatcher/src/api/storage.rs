@@ -16,16 +16,39 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde::Deserialize;
 
 use crate::authenticator::CallerTenant;
 use crate::state::DispatcherState;
 use crate::tenant::TenantId;
 
-type ApiError = (StatusCode, String);
+/// A refusal: a status and a message, plus the broker's "still completing"
+/// marker ([`weft_core::storage::COMPLETING_HEADER`]) passed through when the
+/// broker set it.
+#[derive(Debug)]
+pub struct ApiError {
+    status: StatusCode,
+    message: String,
+    completing: bool,
+}
+
+impl From<(StatusCode, String)> for ApiError {
+    fn from((status, message): (StatusCode, String)) -> Self {
+        Self { status, message, completing: false }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        if self.completing {
+            (self.status, [(weft_core::storage::COMPLETING_HEADER, "retry")], self.message).into_response()
+        } else {
+            (self.status, self.message).into_response()
+        }
+    }
+}
 
 fn internal(e: impl std::fmt::Display) -> ApiError {
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"))
+    (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into()
 }
 
 /// Map a storage-proxy error to an HTTP status. A broker 404 (the file doesn't
@@ -37,14 +60,14 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
 /// dispatcher/transport fault) is a 500.
 pub(crate) fn storage_err(e: anyhow::Error) -> ApiError {
     if e.downcast_ref::<crate::storage::StorageNotFound>().is_some() {
-        return (StatusCode::NOT_FOUND, format!("{e:#}"));
+        return (StatusCode::NOT_FOUND, format!("{e:#}")).into();
     }
     if let Some(rejected) = e.downcast_ref::<crate::storage::BrokerRejected>() {
         // Re-map the broker's own 4xx onto our axum StatusCode. Fall back to 500 if
         // it isn't a valid/expected client-error code.
         if let Ok(status) = StatusCode::from_u16(rejected.status.as_u16()) {
             if status.is_client_error() {
-                return (status, format!("{e}"));
+                return ApiError { status, message: format!("{e}"), completing: rejected.completing };
             }
         }
     }
@@ -79,20 +102,9 @@ pub async fn list_files(
 pub async fn usage(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<weft_core::storage::TenantUsage>, ApiError> {
     let tenant = caller.0;
-    let u = crate::storage::tenant_usage(&state, tenant.as_str()).await.map_err(storage_err)?;
-    Ok(Json(serde_json::json!({
-        "storedBytes": u.stored_bytes,
-        "fileCount": u.file_count,
-    })))
-}
-
-#[derive(Debug, Deserialize)]
-pub struct DownloadRequest {
-    pub key: String,
-    /// Download-link lifetime; None = broker default (~15 min).
-    pub ttl_secs: Option<u64>,
+    Ok(Json(crate::storage::tenant_usage(&state, tenant.as_str()).await.map_err(storage_err)?))
 }
 
 /// POST /storage/files/download: resolve the acting tenant, prefix the key, and
@@ -108,7 +120,7 @@ pub async fn download(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     headers: axum::http::HeaderMap,
-    Json(req): Json<DownloadRequest>,
+    Json(req): Json<weft_core::storage::DownloadRequest>,
 ) -> Result<Json<weft_core::storage::PresignResult>, ApiError> {
     let tenant = caller.0;
     let key = ensure_tenant_key(&tenant, &req.key)?;
@@ -126,14 +138,13 @@ fn ensure_tenant_key(tenant: &TenantId, key: &str) -> Result<String, ApiError> {
     if key.starts_with(&prefix) {
         return Ok(key.to_string());
     }
-    // A bare 3-segment scope key gets the caller's tenant prepended; anything
-    // else (a 4-segment key with a non-matching tenant, or junk) is denied. The
-    // tag set comes from the shared `is_scope_tag` so it can't fork from the
-    // broker's grammar.
-    let segs: Vec<&str> = key.split('/').collect();
-    match segs.as_slice() {
-        [scope, _, _] if weft_core::storage::key::is_scope_tag(scope) => Ok(format!("{prefix}{key}")),
-        _ => Err((StatusCode::FORBIDDEN, "key does not belong to the caller's tenant".into())),
+    // A bare scope key gets the caller's tenant prepended; anything else (a
+    // key with a non-matching tenant, or junk) is denied. The grammar is the
+    // shared `is_scope_key`, so it can't fork from the broker's.
+    if weft_core::storage::key::is_scope_key(key) {
+        Ok(format!("{prefix}{key}"))
+    } else {
+        Err(ApiError::from((StatusCode::FORBIDDEN, "key does not belong to the caller's tenant".into())))
     }
 }
 
@@ -166,7 +177,7 @@ pub async fn public_file(
         // The broker's own answer (404 unknown/expired) keeps its
         // status; only its body text is echoed, never internals.
         let msg = upstream.text().await.unwrap_or_default();
-        return Err((status, msg));
+        return Err(ApiError::from((status, msg)));
     }
     let mut builder = Response::builder();
     for header in ["content-type", "content-length", "content-disposition"] {
@@ -179,84 +190,41 @@ pub async fn public_file(
         .map_err(internal)
 }
 
-// ---------- editor upload (the file-drop config field) ----------
+// ---------- asset upload (the pre-build sync) ----------
 //
-// The editor drives the broker's multipart upload contract through these
+// The CLI drives the broker's multipart upload contract through these
 // routes: begin mints a PROJECT-scoped key, parts/resume return part URLs
-// presigned for the browser (bytes go editor -> bucket directly), complete
-// returns the stored-file marker value the field's config holds. Keys are
-// tenant-walled exactly like the download verb.
+// presigned for the client (bytes go client -> bucket directly), complete
+// returns the stored-file marker value. Keys are tenant-walled exactly like
+// the download verb.
 
-/// `POST /storage/upload/begin` body: an ASSET upload (the pre-build sync
-/// publishing a source-referenced media file). `content_hash` is the sha256
-/// that becomes the content-addressed key id.
-// SYNC: EditorUploadBeginRequest <-> crates/weft-cli/src/commands/assets.rs (DispatcherStore begin body)
-#[derive(Debug, Deserialize)]
-pub struct EditorUploadBeginRequest {
-    pub project: String,
-    pub mime_type: String,
-    pub filename: String,
-    #[serde(default)]
-    pub declared_size: Option<u64>,
-    pub content_hash: String,
-}
-
-/// POST /storage/upload/begin: start a project-scoped upload for the caller's
-/// tenant. Returns the minted key (tenant-anchored) + fixed part size.
+/// POST /storage/upload/begin: start an upload into the caller's tenant's
+/// assets. Returns the minted key (`<tenant>/asset/<sha256>`) + fixed part
+/// size, or that the tenant already stores this content.
 ///
 /// The wall here is the TENANT (from auth), the same boundary every other verb
-/// on this plane holds (download/delete/list are tenant-walled, no project
-/// gate). The named project only scopes the key WITHIN the caller's own tenant
-/// (`<tenant>/project/<id>/...`), so no cross-tenant reach is possible whatever
-/// project id is claimed, and the quota charged is the caller's own.
-/// Deliberately NO project-existence check: the editor legitimately uploads
-/// into a project the dispatcher has never seen (a local project that has not
-/// been run yet registers only on first activate), and refusing that would
-/// break the file-drop field on every fresh project. The id's shape is still
-/// validated (a uuid) so a junk string cannot become a key segment.
+/// on this plane holds, and the quota charged is the caller's own. No project
+/// is named: an asset is one file per tenant whichever projects hold it.
 pub async fn upload_begin(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Json(req): Json<EditorUploadBeginRequest>,
+    Json(req): Json<weft_core::storage::AssetUploadBeginRequest>,
 ) -> Result<Json<weft_core::storage::UploadBeginResponse>, ApiError> {
     let tenant = caller.0;
-    req.project
-        .parse::<uuid::Uuid>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "project is not a valid id".to_string()))?;
-    let out = crate::storage::upload_begin(
-        &state,
-        tenant.as_str(),
-        &req.project,
-        crate::storage::UploadBeginParams {
-            mime_type: req.mime_type,
-            filename: req.filename,
-            declared_size: req.declared_size,
-            content_hash: req.content_hash,
-        },
-    )
-    .await
-    .map_err(storage_err)?;
+    let out = crate::storage::upload_begin(&state, tenant.as_str(), req).await.map_err(storage_err)?;
     Ok(Json(out))
 }
 
-/// POST /storage/assets/list: the project's published assets (the pre-build
-/// sync's diff input). Tenant from auth; `project` names whose assets, walled
-/// by the asset-prefix grammar so it can only range the caller's tenant.
-pub async fn assets_list(
+/// POST /storage/assets/held: which of the named contents the caller's
+/// tenant already stores (a publish's diff input). Tenant from auth, so the
+/// answer never reaches another tenant's files.
+pub async fn assets_held(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Json(req): Json<AssetsListRequest>,
-) -> Result<Json<weft_core::storage::ListFilesResponse>, ApiError> {
-    let tenant = caller.0;
-    let files = crate::storage::asset_list(&state, tenant.as_str(), &req.project)
-        .await
-        .map_err(storage_err)?;
-    Ok(Json(weft_core::storage::ListFilesResponse { files }))
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AssetsListRequest {
-    pub project: String,
+    Json(req): Json<weft_core::storage::AssetsHeldRequest>,
+) -> Result<Json<weft_core::storage::AssetsHeldResponse>, ApiError> {
+    let held = crate::storage::assets_held(&state, caller.0.as_str(), req).await.map_err(storage_err)?;
+    Ok(Json(held))
 }
 
 /// Publish the complete asset set of the successfully resolved source.
@@ -269,31 +237,31 @@ pub async fn asset_references(
     let project = req.project.parse::<uuid::Uuid>()
         .map_err(|_| (StatusCode::BAD_REQUEST, "project is not a valid id".to_string()))?;
     // The build's own assets, plus every blob a surviving version of the
-    // project names: the version tree shares the asset plane, and a
-    // version's files must outlive the builds that stopped referencing
-    // them. What no version and no build names expires as before, which
-    // is how a prune reclaims its blobs. A version's blob is KEPT, not
+    // project names: a version's files are the tenant's assets too, and
+    // must outlive the builds that stopped referencing them. What no
+    // version and no build of ANY of the tenant's projects names expires,
+    // which is how a prune reclaims its blobs. A version's blob is KEPT, not
     // required: one that expired or was removed is that version's loss
     // (it cannot be branched back to), never a reason the next build
     // cannot publish. Requiring it left a project unable to build at
     // all, with the way out being the build itself.
-    let versions = state.versions.versions(project).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("version blobs: {e}")))?;
+    // Read once and computed once: a prune between two reads would make
+    // the kept set and the warnings disagree about which versions exist.
+    let blob_err = |e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("version blobs: {e}"));
+    let versions = state.versions.versions(project).await.map_err(blob_err)?;
+    let source = state.versions.registered_source(project).await.map_err(blob_err)?;
     // Which versions name each blob, so a missing one is reported as
     // the version's loss, by the id `weft tree` shows.
     let mut named_by: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
     for version in &versions {
-        for key in crate::api::versions::blob_keys(project, std::iter::once((version.id.as_str(), &version.manifest)))
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("version blobs: {e}")))?
-        {
+        for key in crate::api::versions::blob_keys(std::iter::once((version.id.as_str(), &version.manifest))).map_err(blob_err)? {
             named_by.entry(ensure_tenant_key(&caller.0, &key)?).or_default().push(version.id[..8].to_string());
         }
     }
-    req.kept.extend(
-        crate::api::versions::version_blob_keys(&state, project)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("version blobs: {e}")))?,
-    );
+    req.kept.extend(named_by.keys().cloned());
+    if let Some(source) = &source {
+        req.kept.extend(crate::api::versions::blob_keys(std::iter::once(("registered sources", source))).map_err(blob_err)?);
+    }
     for key in req.keys.iter_mut().chain(req.kept.iter_mut()) {
         *key = ensure_tenant_key(&caller.0, key)?;
     }
@@ -372,26 +340,18 @@ pub async fn upload_abort(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Debug, Deserialize)]
-pub struct RemoveRequest {
-    /// Exactly one of `key` (one file) or `prefix` (a whole space, e.g.
-    /// `shared/team/` or `exec/<execution_id>/`).
-    pub key: Option<String>,
-    pub prefix: Option<String>,
-}
-
 /// DELETE /storage/files.
 pub async fn remove(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Json(req): Json<RemoveRequest>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+    Json(req): Json<weft_core::storage::RemoveFilesRequest>,
+) -> Result<Json<weft_core::storage::FilesRemoved>, ApiError> {
     let tenant = caller.0;
     match (&req.key, &req.prefix) {
         (Some(key), None) => {
             let key = ensure_tenant_key(&tenant, key)?;
             crate::storage::delete_key(&state, &key).await.map_err(storage_err)?;
-            Ok(Json(serde_json::json!({ "removed": 1 })))
+            Ok(Json(weft_core::storage::FilesRemoved { removed: 1 }))
         }
         (None, Some(prefix)) => {
             let prefix = ensure_tenant_prefix(&tenant, prefix)?;
@@ -399,9 +359,9 @@ pub async fn remove(
             // `validate_wipe_prefix` refusing a malformed prefix) must reach the CLI
             // as that 4xx, not collapse into an opaque 500 the user can't act on.
             let wiped = crate::storage::wipe_prefix(&state, &prefix).await.map_err(storage_err)?;
-            Ok(Json(serde_json::json!({ "removed": wiped })))
+            Ok(Json(weft_core::storage::FilesRemoved { removed: wiped }))
         }
-        _ => Err((StatusCode::BAD_REQUEST, "provide exactly one of `key` or `prefix`".into())),
+        _ => Err(ApiError::from((StatusCode::BAD_REQUEST, "provide exactly one of `key` or `prefix`".into()))),
     }
 }
 
@@ -418,7 +378,7 @@ fn ensure_tenant_prefix(tenant: &TenantId, prefix: &str) -> Result<String, ApiEr
     if weft_core::storage::key::is_scope_tag(first) {
         Ok(format!("{t}{prefix}"))
     } else {
-        Err((StatusCode::FORBIDDEN, "prefix does not belong to the caller's tenant".into()))
+        Err(ApiError::from((StatusCode::FORBIDDEN, "prefix does not belong to the caller's tenant".into())))
     }
 }
 
@@ -436,12 +396,14 @@ mod tests {
         assert_eq!(ensure_tenant_key(&t(), "project/p1/f").unwrap(), "alice/project/p1/f");
         assert_eq!(ensure_tenant_key(&t(), "shared/team/f").unwrap(), "alice/shared/team/f");
         assert_eq!(ensure_tenant_key(&t(), "alice/exec/c1/f").unwrap(), "alice/exec/c1/f");
+        let sha = "a".repeat(64);
+        assert_eq!(ensure_tenant_key(&t(), &format!("asset/{sha}")).unwrap(), format!("alice/asset/{sha}"));
     }
 
     #[test]
     fn ensure_tenant_key_rejects_cross_tenant_reach() {
         let err = ensure_tenant_key(&t(), "bob/exec/c1/f").unwrap_err();
-        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
         assert!(ensure_tenant_key(&t(), "garbage").is_err());
     }
 
@@ -452,15 +414,36 @@ mod tests {
         // decides what the CLI user sees; pin it.
         let nf = anyhow::Error::new(crate::storage::StorageNotFound)
             .context("File expired or was deleted. Upload it again and start a new run.");
-        let (status, message) = storage_err(nf);
+        let ApiError { status, message, .. } = storage_err(nf);
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(message.contains("expired") && message.contains("start a new run"), "{message}");
         let rejected = anyhow::Error::new(crate::storage::BrokerRejected {
             status: reqwest::StatusCode::FORBIDDEN,
+            completing: false,
         })
         .context("x");
-        assert_eq!(storage_err(rejected).0, StatusCode::FORBIDDEN);
-        assert_eq!(storage_err(anyhow::anyhow!("boom")).0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(storage_err(rejected).status, StatusCode::FORBIDDEN);
+        assert_eq!(storage_err(anyhow::anyhow!("boom")).status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// The broker's "still completing" marker reaches the caller, so a
+    /// client can tell "ask again shortly" from a conflict that stays.
+    #[test]
+    fn storage_err_passes_the_completing_marker_through() {
+        let completing = anyhow::Error::new(crate::storage::BrokerRejected {
+            status: reqwest::StatusCode::CONFLICT,
+            completing: true,
+        })
+        .context("x");
+        let response = storage_err(completing).into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(response.headers().contains_key(weft_core::storage::COMPLETING_HEADER));
+        let conflict = anyhow::Error::new(crate::storage::BrokerRejected {
+            status: reqwest::StatusCode::CONFLICT,
+            completing: false,
+        })
+        .context("x");
+        assert!(!storage_err(conflict).into_response().headers().contains_key(weft_core::storage::COMPLETING_HEADER));
     }
 
     #[test]

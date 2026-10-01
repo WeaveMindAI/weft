@@ -3,6 +3,7 @@
 //! the scripting surface.
 
 use anyhow::Context;
+use weft_core::program::ExecutionPage;
 
 use super::{local_time, Ctx};
 
@@ -25,13 +26,13 @@ fn query_escaped(value: &str) -> String {
         .collect()
 }
 
-/// One page of the dispatcher's execution listing. The body is
-/// `{"executions": [...], "total": N}`; anything else is a broken
-/// contract and fails loudly rather than reading as "no executions".
+/// One page of the dispatcher's execution listing. Anything that does
+/// not read as one is a broken contract and fails loudly rather than
+/// reading as "no executions".
 async fn executions_page(
     client: &crate::client::DispatcherClient,
     filter: &ListFilter,
-) -> anyhow::Result<(Vec<serde_json::Value>, u64)> {
+) -> anyhow::Result<ExecutionPage> {
     let mut path =
         format!("/executions?limit={}&offset={}", filter.limit, filter.offset);
     if let Some(p) = &filter.project {
@@ -49,25 +50,13 @@ async fn executions_page(
     if let Some(status) = &filter.status {
         path.push_str(&format!("&status={status}"));
     }
-    if let Some(member) = &filter.member {
-        path.push_str(&format!("&member={member}"));
+    if let Some(instance) = &filter.instance {
+        path.push_str(&format!("&instance={instance}"));
     }
     if let Some(tag) = &filter.tag {
         path.push_str(&format!("&tag={}", query_escaped(tag)));
     }
-    let resp: serde_json::Value = client.get_json(&path).await?;
-    let rows = resp
-        .get("executions")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .ok_or_else(|| {
-            anyhow::anyhow!("/executions returned no `executions` array: {resp}")
-        })?;
-    let total = resp
-        .get("total")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow::anyhow!("/executions returned no `total`: {resp}"))?;
-    Ok((rows, total))
+    serde_json::from_value(client.get_json(&path).await?).context("read the executions listing")
 }
 
 /// What `weft executions` narrows the listing to. One struct rather
@@ -83,21 +72,21 @@ pub struct ListFilter {
     pub node: Option<String>,
     /// Unix second: only runs that started at or after it.
     pub since: Option<u64>,
-    /// How the run ended: completed, failed, cancelled, or running.
-    pub status: Option<String>,
-    /// Who the run is for.
-    pub member: Option<weft_core::member::MemberId>,
+    /// Where the run stands.
+    pub status: Option<weft_core::program::RunStatus>,
+    /// Which instance the run is in.
+    pub instance: Option<weft_core::instance::InstanceId>,
     /// A tag the run carries.
     pub tag: Option<String>,
 }
 
 pub async fn list(ctx: Ctx, filter: ListFilter) -> anyhow::Result<()> {
     let client = ctx.client()?;
-    let (arr, total) = executions_page(&client, &filter).await?;
-    if ctx.json_out(&serde_json::json!({ "executions": arr, "total": total }))? {
+    let page = executions_page(&client, &filter).await?;
+    if ctx.json_out(&serde_json::to_value(&page)?)? {
         return Ok(());
     }
-    if arr.is_empty() {
+    if page.executions.is_empty() {
         println!("(no executions)");
         return Ok(());
     }
@@ -105,42 +94,31 @@ pub async fn list(ctx: Ctx, filter: ListFilter) -> anyhow::Result<()> {
         "{:<36}  {:<9}  {:<13}  {:<19}  {:<36}  entry_node  tags",
         "execution_id", "status", "phase", "started", "project_id"
     );
-    for row in &arr {
-        let execution_id = row.get("execution_id").and_then(|v| v.as_str()).unwrap_or("?");
-        let project = row.get("project_id").and_then(|v| v.as_str()).unwrap_or("?");
-        let status = row.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-        let phase = row.get("phase").and_then(|v| v.as_str()).unwrap_or("?");
-        let started = row.get("started_at").and_then(|v| v.as_u64()).unwrap_or(0);
-        let entry = row.get("entry_node").and_then(|v| v.as_str()).unwrap_or("?");
+    for row in &page.executions {
+        let execution_id = row.execution_id.to_string();
+        let project = row.project_id.to_string();
+        let (status, phase, entry) = (&row.status, row.phase.as_str(), &row.entry_node);
         // The tags the run put on itself (`ctx.tag_execution`), the
         // handle a sibling's `ctx.stop_tagged` selects on.
-        let tags: Vec<&str> = row
-            .get("tags")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|t| t.as_str()).collect())
-            .unwrap_or_default();
-        let tags = if tags.is_empty() { String::new() } else { format!("  {}", tags.join(",")) };
-        // Who the run is for, when it is for a member.
-        let member = row
-            .get("member")
-            .and_then(|v| v.as_str())
-            .map(|m| format!("  (member {m})"))
-            .unwrap_or_default();
+        let tags = if row.tags.is_empty() { String::new() } else { format!("  {}", row.tags.join(",")) };
+        // Which instance the run is in, when it is in one.
+        let instance = row.instance.as_ref().map(|m| format!("  (instance {m})")).unwrap_or_default();
         println!(
-            "{execution_id:<36}  {status:<9}  {phase:<13}  {:<19}  {project:<36}  {entry}{tags}{member}",
-            local_time(started)
+            "{execution_id:<36}  {status:<9}  {phase:<13}  {:<19}  {project:<36}  {entry}{tags}{instance}",
+            local_time(row.started_at)
         );
     }
     // The server clamps the page size, so a big --limit can come back
     // short; say so rather than letting the page read as the total.
     // It does NOT say "raise --limit": past the server's cap that is
     // advice the CLI knows will not work.
-    if (arr.len() as u64) < total {
+    let shown = page.executions.len() as u64;
+    if shown < page.total {
         println!(
-            "showing {} of {total} (one page; the dispatcher caps how many a page can hold, \
+            "showing {shown} of {} (one page; the dispatcher caps how many a page can hold, \
              so walk the rest with --offset {}, or narrow with --node / --since)",
-            arr.len(),
-            filter.offset as u64 + arr.len() as u64
+            page.total,
+            filter.offset as u64 + shown
         );
     }
     Ok(())
@@ -158,7 +136,26 @@ pub struct EventsFilter {
     /// id (`Auth.check` under `["auth"]`). Empty = any, or none.
     pub call_path: Vec<String>,
     pub kind: Option<String>,
+    /// Loop iterations, outermost first (`--iteration 3` or `3.0` for the
+    /// first inner iteration inside the fourth outer one): only the rows
+    /// fired inside them pass. Empty = any.
+    pub iteration: Vec<u32>,
     pub full: bool,
+}
+
+/// Read `--iteration`: iteration numbers from 0, outermost loop first,
+/// joined by `.` (`3`, `3.0`).
+pub fn parse_iteration(text: &str) -> anyhow::Result<Vec<u32>> {
+    text.split('.')
+        .map(|part| {
+            part.trim().parse::<u32>().map_err(|_| {
+                anyhow::anyhow!(
+                    "--iteration takes loop iteration numbers from 0, outermost loop first, joined by '.' \
+                     (`3`, or `3.0` for an inner loop's first iteration); got '{text}'"
+                )
+            })
+        })
+        .collect()
 }
 
 impl EventsFilter {
@@ -193,21 +190,26 @@ impl EventsFilter {
     /// that call path pass. A kind filter matches the kind exactly or
     /// as a substring, so `failed` finds both `node_failed` and
     /// `execution_failed`, and `loop` finds the loop lifecycle.
-    pub fn keeps(&self, row: &serde_json::Value) -> bool {
+    /// `row` is `event` as it reads on the wire: the kind and node filters
+    /// read the wire spelling, the frame filters the typed firing.
+    pub fn keeps(&self, event: &weft_core::live_event::DispatcherEvent, row: &serde_json::Value) -> bool {
         let kind = row.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         let kind_ok = self.kind.as_deref().is_none_or(|k| kind == k || kind.contains(k));
         // `--node gate` names the group: its own two boundaries are
         // its rows too.
         let node_ok = self.node.as_deref().is_none_or(|n| row_node(row).is_some_and(|id|
             id == n || id == weft_core::project::boundary_in_id(n) || id == weft_core::project::boundary_out_id(n)));
-        let call_ok = self.call_path.is_empty() || {
-            let frames: weft_core::frames::LoopFrames = row
-                .get("frames")
-                .and_then(|f| serde_json::from_value(f.clone()).ok())
-                .unwrap_or_default();
-            weft_core::frames::call_path(&frames) == self.call_path.iter().map(String::as_str).collect::<Vec<_>>()
-        };
-        kind_ok && node_ok && call_ok
+        let frames = event.firing_frames();
+        let call_ok = self.call_path.is_empty()
+            || frames.is_some_and(|frames| {
+                weft_core::frames::call_path(frames) == self.call_path.iter().map(String::as_str).collect::<Vec<_>>()
+            });
+        // A row inside the named iterations: its own iterations, outermost
+        // first, start with them (an inner loop's rows belong to the outer
+        // iteration they ran in). A run-level row is inside none.
+        let iteration_ok = self.iteration.is_empty()
+            || frames.is_some_and(|frames| weft_core::frames::loop_indices(frames).starts_with(&self.iteration));
+        kind_ok && node_ok && call_ok && iteration_ok
     }
 }
 
@@ -362,12 +364,11 @@ pub async fn events(ctx: Ctx, execution_id: String, mut filter: EventsFilter) ->
     });
     let definition = match loaded {
         Ok(Some((project, definition))) => {
-            let summary: serde_json::Value = client.get_json(&format!("/executions/{execution_id}")).await?;
-            let run_project = summary
-                .get("project_id")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("/executions/{execution_id} named no project_id: {summary}"))?;
-            if run_project == definition.id.to_string() {
+            let detail: weft_core::program::ExecutionDetail =
+                serde_json::from_value(client.get_json(&format!("/executions/{execution_id}")).await?)
+                    .context("read the run")?;
+            let run_project = detail.summary.project_id;
+            if run_project == definition.id {
                 filter.resolve_node(project, &definition)?;
                 Some(definition)
             } else if filter.node.is_some() {
@@ -393,13 +394,14 @@ pub async fn events(ctx: Ctx, execution_id: String, mut filter: EventsFilter) ->
             None
         }
     };
-    let resp: serde_json::Value = client
-        .get_json(&format!("/executions/{execution_id}/replay"))
-        .await?;
-    let arr = resp
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("/executions/{execution_id}/replay returned no array: {resp}"))?;
-    let kept: Vec<serde_json::Value> = arr.iter().filter(|row| filter.keeps(row))
+    // Typed first, so a row the dispatcher and this CLI disagree on
+    // fails here by name; the printing below then reads each row as the
+    // JSON object it is on the wire, since its generic tail prints
+    // whatever fields a kind carries.
+    let typed = super::versions::replay_rows(&client, &execution_id).await?;
+    let arr = typed.iter().map(serde_json::to_value).collect::<Result<Vec<_>, _>>()?;
+    let kept: Vec<serde_json::Value> = typed.iter().zip(&arr).filter(|(event, row)| filter.keeps(&event.event, row))
+        .map(|(_, row)| row)
         .filter_map(|row| match &definition { Some(definition) => spell_node(row.clone(), definition), None => Some(row.clone()) })
         .collect();
     if ctx.json_out(&kept)? {
@@ -510,8 +512,8 @@ pub fn spell_node(mut row: serde_json::Value, project: &weft_core::ProjectDefini
 /// program's `ctx.runs()` takes (`weft_core::program::RunFilter`).
 #[derive(Debug, Default)]
 pub struct CleanNarrowing {
-    pub member: Option<weft_core::member::MemberId>,
-    pub status: Option<String>,
+    pub instance: Option<weft_core::instance::InstanceId>,
+    pub status: Option<weft_core::program::RunStatus>,
     pub node: Option<String>,
     pub tag: Option<String>,
     /// Cancel matching runs still going, instead of leaving them.
@@ -555,6 +557,9 @@ pub async fn clean(
     };
 
     let client = ctx.client()?;
+    let project = project
+        .map(|p| p.parse::<uuid::Uuid>().map_err(|_| anyhow::anyhow!("--project takes a project id, and '{p}' is not one")))
+        .transpose()?;
     if let Some(c) = execution_id {
         anyhow::ensure!(
             project.is_none(),
@@ -565,13 +570,15 @@ pub async fn clean(
         if !confirm(format!("execution {c}"))? {
             return Ok(());
         }
-        let deleted = client.delete_json(&format!("/executions/{c}")).await?;
+        let deleted: weft_core::program::DeletedExecution =
+            serde_json::from_value(client.delete_json(&format!("/executions/{c}")).await?)
+                .context("read what the delete removed")?;
         println!("deleted {c}");
         // The sweep of whatever version this run left bare happens on the
         // dispatcher, inside the delete: the run's own project is the one
         // to sweep, and an execution can be cleaned from anywhere, so no
         // client is in a position to know it. This just reports it.
-        let swept = deleted.get("swept").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+        let swept = deleted.swept.len();
         if swept > 0 {
             println!("dropped {swept} bare versions");
         }
@@ -579,10 +586,10 @@ pub async fn clean(
     }
 
     // Bulk clean. Naming a SUBJECT means you mean all of it (an execution
-    // deletes outright; a project, a member or a tag takes every run it
+    // deletes outright; a project, an instance or a tag takes every run it
     // names), so the 30-day default guards only the sweep that names
     // nothing. `--keep-days` still narrows any of them when asked for.
-    let named = project.is_some() || narrow.member.is_some() || narrow.tag.is_some();
+    let named = project.is_some() || narrow.instance.is_some() || narrow.tag.is_some();
     let days = match (keep_days, all, named) {
         (Some(d), _, _) => Some(d),
         (None, true, _) => None,  // --all: no cutoff
@@ -593,8 +600,8 @@ pub async fn clean(
         Some(p) => format!(" of project {p}"),
         None => String::new(),
     };
-    if let Some(member) = &narrow.member {
-        scope.push_str(&format!(" for member {member}"));
+    if let Some(instance) = &narrow.instance {
+        scope.push_str(&format!(" in instance {instance}"));
     }
     if let Some(tag) = &narrow.tag {
         scope.push_str(&format!(" tagged {tag}"));
@@ -613,7 +620,7 @@ pub async fn clean(
         return Ok(());
     }
     let filter = weft_core::program::RunFilter {
-        member: narrow.member,
+        instance: narrow.instance,
         status: narrow.status,
         node: narrow.node,
         tag: narrow.tag,
@@ -623,12 +630,12 @@ pub async fn clean(
     // versions the deletes left bare, project by project; a run still
     // going follows `--cancel-running` (stopped now, its rows gone with
     // the next clean) or is left to finish.
-    let body = serde_json::json!({
-        "project": project,
-        "filter": filter,
-        "running": if narrow.cancel_running { "cancel" } else { "wait" },
-    });
-    let answer: weft_core::program::CleanOutcome = serde_json::from_value(client.post_json("/executions/clean", &body).await?)
+    let body = weft_core::program::CleanRequest {
+        project,
+        filter,
+        running: if narrow.cancel_running { weft_core::RunningPolicy::Cancel } else { weft_core::RunningPolicy::Wait },
+    };
+    let answer: weft_core::program::CleanOutcome = serde_json::from_value(client.post_json("/executions/clean", &serde_json::to_value(&body)?).await?)
         .map_err(|e| anyhow::anyhow!("unexpected /executions/clean answer: {e}"))?;
     if ctx.json_out(&serde_json::to_value(&answer)?)? {
         return Ok(());
@@ -1133,28 +1140,73 @@ mod tests {
     use super::{event_line, EventsFilter, Reclaimed};
     use serde_json::json;
 
+    /// One replay row, typed and as it reads on the wire, from the fields
+    /// that matter to a filter (the rest filled with throwaway values).
+    fn replay_row(mut fields: serde_json::Value) -> (weft_core::live_event::DispatcherEvent, serde_json::Value) {
+        let row = fields.as_object_mut().unwrap();
+        let filler = json!({
+            "execution_id": "00000000-0000-0000-0000-000000000001",
+            "project_id": "00000000-0000-0000-0000-000000000002",
+            "at_unix": 1u64, "frames": [], "error": "e", "output": null, "outputs": null,
+        });
+        let kind = row["kind"].as_str().unwrap().to_string();
+        for (key, value) in filler.as_object().unwrap() {
+            let wanted = match key.as_str() {
+                "frames" | "output" => kind.starts_with("node_") && (key != "output" || kind == "node_completed"),
+                "error" => kind.ends_with("_failed"),
+                "outputs" => kind == "execution_completed",
+                _ => true,
+            };
+            if wanted {
+                row.entry(key.clone()).or_insert(value.clone());
+            }
+        }
+        let event: weft_core::live_event::DispatcherEvent = serde_json::from_value(fields.clone()).unwrap();
+        let wire = serde_json::to_value(&event).unwrap();
+        (event, wire)
+    }
+
+    fn keeps(filter: &EventsFilter, (event, row): &(weft_core::live_event::DispatcherEvent, serde_json::Value)) -> bool {
+        filter.keeps(event, row)
+    }
+
     /// The kind filter matches exactly or by substring, the node filter
     /// exactly, and a run-level row (no node) never passes a node filter.
     #[test]
     fn events_filter_narrows_by_node_and_kind() {
-        let failed = json!({"kind": "node_failed", "node": "llm"});
-        let done = json!({"kind": "node_completed", "node": "reply"});
-        let run_failed = json!({"kind": "execution_failed"});
+        let failed = replay_row(json!({"kind": "node_failed", "node": "llm"}));
+        let done = replay_row(json!({"kind": "node_completed", "node": "reply"}));
+        let run_failed = replay_row(json!({"kind": "execution_failed"}));
         let all = EventsFilter::default();
-        assert!(all.keeps(&failed) && all.keeps(&done) && all.keeps(&run_failed));
+        assert!(keeps(&all, &failed) && keeps(&all, &done) && keeps(&all, &run_failed));
         let by_kind = EventsFilter { kind: Some("failed".into()), ..Default::default() };
-        assert!(by_kind.keeps(&failed) && by_kind.keeps(&run_failed) && !by_kind.keeps(&done));
+        assert!(keeps(&by_kind, &failed) && keeps(&by_kind, &run_failed) && !keeps(&by_kind, &done));
         let exact = EventsFilter { kind: Some("node_completed".into()), ..Default::default() };
-        assert!(exact.keeps(&done) && !exact.keeps(&failed));
+        assert!(keeps(&exact, &done) && !keeps(&exact, &failed));
         let by_node = EventsFilter { node: Some("llm".into()), ..Default::default() };
-        assert!(by_node.keeps(&failed) && !by_node.keeps(&done) && !by_node.keeps(&run_failed));
+        assert!(keeps(&by_node, &failed) && !keeps(&by_node, &done) && !keeps(&by_node, &run_failed));
         // Named through a call site, only the rows under that call pass.
-        let in_call = json!({"kind": "node_completed", "node": "Auth.check", "frames": [{"site": "auth"}]});
-        let other_call = json!({"kind": "node_completed", "node": "Auth.check", "frames": [{"index": 1}, {"site": "again"}]});
+        let in_call = replay_row(json!({"kind": "node_completed", "node": "Auth.check", "frames": [{"site": "auth"}]}));
+        let other_call = replay_row(json!({"kind": "node_completed", "node": "Auth.check", "frames": [{"index": 1}, {"site": "again"}]}));
         let by_call = EventsFilter { node: Some("Auth.check".into()), call_path: vec!["auth".into()], ..Default::default() };
-        assert!(by_call.keeps(&in_call) && !by_call.keeps(&other_call));
+        assert!(keeps(&by_call, &in_call) && !keeps(&by_call, &other_call));
         let any_call = EventsFilter { node: Some("Auth.check".into()), ..Default::default() };
-        assert!(any_call.keeps(&in_call) && any_call.keeps(&other_call));
+        assert!(keeps(&any_call, &in_call) && keeps(&any_call, &other_call));
+    }
+
+    /// `--iteration` keeps the rows fired inside those loop iterations,
+    /// an inner loop's rows under the outer iteration they ran in.
+    #[test]
+    fn events_filter_narrows_by_loop_iteration() {
+        let outer_three = replay_row(json!({"kind": "node_completed", "node": "step", "frames": [{"index": 3}]}));
+        let inner = replay_row(json!({"kind": "node_completed", "node": "step", "frames": [{"index": 3}, {"site": "auth"}, {"index": 0}]}));
+        let outer_one = replay_row(json!({"kind": "node_completed", "node": "step", "frames": [{"index": 1}]}));
+        let run_level = replay_row(json!({"kind": "execution_completed"}));
+        let third = EventsFilter { iteration: super::parse_iteration("3").unwrap(), ..Default::default() };
+        assert!(keeps(&third, &outer_three) && keeps(&third, &inner) && !keeps(&third, &outer_one) && !keeps(&third, &run_level));
+        let nested = EventsFilter { iteration: super::parse_iteration("3.0").unwrap(), ..Default::default() };
+        assert!(keeps(&nested, &inner) && !keeps(&nested, &outer_three));
+        assert!(super::parse_iteration("x").is_err() && super::parse_iteration("3.").is_err());
     }
 
     /// The compact line cuts a long value at the summary width on a

@@ -1,7 +1,7 @@
 //! `live_arrival` task: a live caller followed the handshake's redirect
 //! and reached one of the project's workers through the live door; give
 //! birth to the execution the routing token promised, pinned to that
-//! worker instance, which drives it inside the caller's own request.
+//! worker replica, which drives it inside the caller's own request.
 //!
 //! Nothing is born at the handshake. The dispatcher matched the route,
 //! gated the caller and signed all of that into the routing token; a
@@ -14,7 +14,7 @@
 //! The dedup key is `live-arrival:{execution_id}`: a caller's client that resent
 //! the request (a retried POST, a browser's second attempt) converges on
 //! one task and one execution, and `start_live_execution` answers a
-//! second birth of the same execution with the instance it already sits on.
+//! second birth of the same execution with the replica it already sits on.
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -34,9 +34,9 @@ impl TaskExecutor<DispatcherState> for LiveArrivalExecutor {
         let payload: LiveArrivalPayload = serde_json::from_value(task.payload.clone())?;
         // The token is the proof: signed by this dispatcher at the
         // handshake, unexpired, and naming the execution. A worker cannot ask
-        // for a birth the handshake did not promise. The instance is the
+        // for a birth the handshake did not promise. The replica is the
         // caller's own worker: the broker refuses an arrival naming any
-        // instance but the one asking.
+        // replica but the one asking.
         let claims = weft_core::caller_token::validate(
             &state.caller_token_secret,
             &payload.token,
@@ -70,6 +70,10 @@ impl TaskExecutor<DispatcherState> for LiveArrivalExecutor {
             .tenant_for_project(route.project_id)
             .await
             .context("tenant for the arriving caller's project")?;
+        // The address the caller used, read off the request as it reached
+        // the worker (the door forwarded its host and scheme): what every
+        // link this caller will fetch is built on.
+        let base_url = weft_core::net::request_base_url_of(&payload.headers);
         let request = weft_core::caller::LiveRequest {
             method: payload.method,
             path: claims.path,
@@ -77,15 +81,16 @@ impl TaskExecutor<DispatcherState> for LiveArrivalExecutor {
             query: payload.query,
             headers: payload.headers,
             caller: claims.caller,
+            base_url,
         };
-        let instance = match crate::api::signal::birth_on_arrival(
-            state, &route, &request, tenant.as_str(), claims.execution_id, &payload.instance,
-            claims.member.as_ref(),
+        let replica = match crate::api::signal::birth_on_arrival(
+            state, &route, &request, tenant.as_str(), claims.execution_id, &payload.replica,
+            claims.instance.as_ref(),
         )
         .await
         {
-            Ok(instance) => instance,
-            // A run refused before it was born (a member gap, a bad
+            Ok(replica) => replica,
+            // A run refused before it was born (an instance gap, a bad
             // payload) is the caller's answer, not this task failing.
             Err((status, message)) if status.is_client_error() => {
                 return Ok(serde_json::to_value(LiveArrivalResult::Refused { status: status.as_u16(), message })?);
@@ -94,11 +99,11 @@ impl TaskExecutor<DispatcherState> for LiveArrivalExecutor {
         };
         tracing::info!(
             target: "weft_dispatcher::live_arrival",
-            execution_id = %claims.execution_id, %instance,
+            execution_id = %claims.execution_id, %replica,
             node = %route.node_id,
             "live caller arrived; execution born on its worker"
         );
-        Ok(serde_json::to_value(LiveArrivalResult::Born { execution_id: claims.execution_id.to_string(), instance })?)
+        Ok(serde_json::to_value(LiveArrivalResult::Born { execution_id: claims.execution_id.to_string(), replica })?)
     }
 }
 

@@ -101,21 +101,21 @@ impl InstallPorts {
     }
 }
 
-/// Where the install this process acts on ([`Instance::from_env`])
+/// Where the install this process acts on ([`Install::from_env`])
 /// answers on this machine: the public port it saved. A default install
 /// never started answers nowhere yet, and its first start takes
 /// [`PUBLIC`] unless told otherwise, so that is its address until then;
 /// a named install never started has no port at all, and saying so beats
 /// pointing at the default install's.
 ///
-/// [`Instance::from_env`]: crate::infra::Instance::from_env
+/// [`Install::from_env`]: crate::infra::Install::from_env
 pub fn local_public_url() -> Result<String, String> {
-    let instance = crate::infra::Instance::from_env()?;
-    local_public_url_in(&instance, &instance.dir())
+    let install = crate::infra::Install::from_env()?;
+    local_public_url_in(&install, &install.dir())
 }
 
-fn local_public_url_in(instance: &crate::infra::Instance, dir: &std::path::Path) -> Result<String, String> {
-    match (InstallPorts::load(dir)?, instance.name()) {
+fn local_public_url_in(install: &crate::infra::Install, dir: &std::path::Path) -> Result<String, String> {
+    match (InstallPorts::load(dir)?, install.name()) {
         (Some(saved), _) => Ok(saved.public_url()),
         (None, None) => Ok(LOCAL_PUBLIC_URL.to_string()),
         (None, Some(name)) => Err(format!(
@@ -136,12 +136,12 @@ mod tests {
 
     #[test]
     fn the_local_url_is_the_saved_public_port_once_there_is_one() {
-        use crate::infra::Instance;
+        use crate::infra::Install;
         let dir = std::env::temp_dir().join(format!("weft-ports-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let default = Instance::default_install();
+        let default = Install::default_install();
         assert_eq!(local_public_url_in(&default, &dir).unwrap(), LOCAL_PUBLIC_URL);
-        let named = Instance::named("cell1").unwrap();
+        let named = Install::named("cell1").unwrap();
         assert!(local_public_url_in(&named, &dir).unwrap_err().contains("weft daemon start"));
         let moved = InstallPorts { public: 15000, ..InstallPorts::DEFAULT };
         moved.save(&dir).unwrap();

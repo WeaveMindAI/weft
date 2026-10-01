@@ -63,7 +63,7 @@ impl Node for FalEditImageNode {
             .or_else(|| answer["image"]["url"].as_str());
         let url = url.node_err("fal answered no image for this edit")?;
 
-        let ty = ctx.output_type("image").node_err("the image port declares no type")?;
+        let ty = ctx.output_type("image")?;
         let stored = ctx
             .storage(StorageScope::Execution)
             // The edited image is the run's product: keep it past the

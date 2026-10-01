@@ -1,0 +1,71 @@
+{
+  "type": "InstanceCosts",
+  "label": "Instance costs",
+  "description": "Read what one instance's runs cost: every call that booked a price, each saying whose credential paid (the runtime's credit, your own connection, or the instance's own), plus the total. Narrow by service, node, who paid, or a start time. Weft reports what it measured; what you bill for it is your program's to decide.",
+  "tags": [
+    "instances",
+    "costs",
+    "billing"
+  ],
+  "icon": "Receipt",
+  "color": "#0ea5e9",
+  "inputs": [
+    {
+      "name": "instance",
+      "type": "String",
+      "required": true,
+      "description": "The instance, by the id your program gives it (`user-42`)."
+    },
+    {
+      "name": "service",
+      "type": "String",
+      "description": "Only this service's costs (`openrouter`, `elevenlabs`)."
+    },
+    {
+      "name": "node",
+      "type": "String",
+      "description": "Only the costs this node booked, named the way the program writes it."
+    },
+    {
+      "name": "paidBy",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": ["platform", "author", "instance"]
+      },
+      "description": "Only the costs paid from this kind of credential: `platform` (the runtime's credit), `author` (your own connection) or `instance` (the instance's own)."
+    },
+    {
+      "name": "since",
+      "type": "Number",
+      "description": "Only the costs booked at or after this moment, in unix seconds."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "records",
+      "type": "List[JsonDict]",
+      "description": "One entry per priced call: `{ run, instance, node, service, model?, amount_usd, paid_by, at_unix }`. `amount_usd` is null when the service's price could not be measured."
+    },
+    {
+      "name": "totalUsd",
+      "type": "Number",
+      "description": "The sum of every measured `amount_usd`, in US dollars."
+    }
+  ],
+  "requires_infra": false,
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": { "kind": "input_names", "port": "node", "names": { "node": {} } }
+      },
+      "then": {
+        "message": "InstanceCosts '{id}' names {names} in `node`, which is no node of this program. Name it the way the program writes it (`draft`, or `one.draft` inside an included file).",
+        "level": "structural",
+        "severity": "error",
+        "port": "node"
+      }
+    }
+  ]
+}

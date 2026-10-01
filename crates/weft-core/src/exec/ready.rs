@@ -16,7 +16,7 @@ use crate::exec::skip::{check_flow_permission, check_should_skip, SkipReason};
 use crate::frames::{Located, LoopFrames};
 use crate::project::{Edge, EdgeIndex, GroupBoundaryRole, NodeDefinition, ProjectDefinition};
 use crate::primitive::Phase;
-use crate::pulse::{Pulse, PulseStatus, PulseTable};
+use crate::pulse::{Failure, Pulse, PulseStatus, PulseTable};
 use crate::weft_type::WeftType;
 use crate::ExecutionId;
 
@@ -96,7 +96,7 @@ pub fn effective_input_pulses(
     for port in &node.inputs {
         if !selection.includes_port(&at, node, &port.name) { continue; }
         let winner = resolve_port_value(actual, &port.name);
-        if winner.is_some_and(|pulse| !pulse.closed || pulse.close_error.is_some()) { continue; }
+        if winner.is_some_and(|pulse| !pulse.closed || pulse.failure.is_some()) { continue; }
         if winner.is_none() && selection.has_supplier(project, &at, &port.name) { continue; }
         if winner.is_none() && !wired.contains(port.name.as_str())
             && node.port_literals.get(&port.name).is_some_and(|v| literal_is_data(node, &port.name, v))
@@ -439,11 +439,11 @@ pub struct FiringInput {
     pub closed_ports: Vec<String>,
     /// The subset of `closed_ports` whose closure carries WHY: the
     /// producer failed (or was cancelled) rather than declining to emit,
-    /// keyed by port, with the error text. A boundary forwarding a
-    /// closure keeps this on the same-named output, so "broke" never
-    /// reads as "nothing there" one scope level up (the inverted gate
-    /// tells the two apart).
-    pub closed_with_error: BTreeMap<String, String>,
+    /// keyed by port, with the failure the closure carried. A boundary
+    /// forwarding a closure keeps this on the same-named output, so
+    /// "broke" never reads as "nothing there" one scope level up (the
+    /// inverted gate tells the two apart).
+    pub closed_failures: BTreeMap<String, Failure>,
     pub type_errors: Vec<String>,
     pub provided_ports: Vec<String>,
     pub backup_ports: Vec<String>,
@@ -505,12 +505,12 @@ pub fn firing_input(
         .map(|p| p.to_string())
         .collect();
     closed_ports.sort();
-    let closed_with_error: BTreeMap<String, String> = closed_ports
+    let closed_failures: BTreeMap<String, Failure> = closed_ports
         .iter()
         .filter_map(|port| {
             resolve_port_value(group_pulses, port)
-                .and_then(|p| p.close_error.clone())
-                .map(|error| (port.clone(), error))
+                .and_then(|p| p.failure.clone())
+                .map(|failure| (port.clone(), failure))
         })
         .collect();
 
@@ -524,7 +524,7 @@ pub fn firing_input(
             if let Some(origin) = winner.inherited_from { inherited_ports.insert(port.to_string(), origin); }
         }
     }
-    FiringInput { input: obj, closed_ports, closed_with_error, type_errors, provided_ports, backup_ports, inherited_ports }
+    FiringInput { input: obj, closed_ports, closed_failures, type_errors, provided_ports, backup_ports, inherited_ports }
 }
 
 /// Runtime type enforcement on input ports: the single check point
@@ -584,9 +584,9 @@ enum InputCheck {
 /// kick-driven dispatch path (`build_kicked_input` below) so the two
 /// paths can't disagree on what counts as "body-supplied".
 ///
-/// A `@member_filled` literal (and a connection picked on the install) is
+/// An `@instance_filled` literal (and a connection picked on the install) is
 /// left out: it names no value until the engine swaps in what the run's
-/// member provides or the install picked (checked when the run was born),
+/// instance provides or the install picked (checked when the run was born),
 /// so judging the marker itself against the port's type here would refuse
 /// every such field. It still counts
 /// as filled for readiness, since a run is only born once every such
@@ -609,13 +609,13 @@ pub fn fill_input_from_literals(
 }
 
 /// The unwired ports a written constant fills at `frames`: what keeps a
-/// node with no live wire alive in the skip rules. A `@member_filled`
+/// node with no live wire alive in the skip rules. An `@instance_filled`
 /// literal counts, since a run is only born once each such field it
-/// needs has the member's value or a fallback; it is left out of the
+/// needs has the instance's value or a fallback; it is left out of the
 /// bag itself ([`fill_input_from_literals`]) only until the engine puts
 /// that value in. The ONE reading both the pulse path and a kicked
 /// scope root use: reading it off the bag instead made a step whose
-/// every setting is `@member_filled` look like it had nothing, and skip.
+/// every setting is `@instance_filled` look like it had nothing, and skip.
 pub fn literal_filled_ports<'a>(
     node: &'a NodeDefinition,
     wired: &HashSet<&str>,
@@ -927,17 +927,17 @@ mod tests {
                 other => panic!("{bad} must be refused by the widget, got {other:?}"),
             }
         }
-        // A widget's OPTION LIST is what the editor offers, not a
-        // domain rule: a node's code routinely takes more than the list
-        // names (any HTTP method, a model id shipped after the list was
-        // written), so a wired value outside it runs and the node's own
-        // code decides.
+        // A select's options are a domain rule too: a wired value
+        // outside them is refused the way a written one is.
         let mode: InputDefinition = serde_json::from_value(json!({
             "name": "mode", "portType": "String", "required": false,
             "widget": { "kind": "select", "options": ["added", "removed", "both"] }
         })).unwrap();
         assert_eq!(check_input(&mode, &json!("both")), InputCheck::Ok);
-        assert_eq!(check_input(&mode, &json!("sideways")), InputCheck::Ok);
+        match check_input(&mode, &json!("sideways")) {
+            InputCheck::Fail(msg) => assert!(msg.contains("'mode'") && msg.contains("'added'"), "{msg}"),
+            other => panic!("a value outside the options must be refused, got {other:?}"),
+        }
     }
 
     /// A whole-number step means the input takes whole numbers. A
@@ -1027,12 +1027,12 @@ mod tests {
         assert_eq!(input.get("account").map(|v| &**v), Some(&handle), "the handle reaches the bag intact");
     }
 
-    /// A `@member_filled` field reaches the bag only once the engine swaps
-    /// in the member's value: the marker itself is never judged against
+    /// An `@instance_filled` field reaches the bag only once the engine swaps
+    /// in the instance's value: the marker itself is never judged against
     /// the port (a String port would refuse the marker's object).
     #[test]
-    fn a_member_filled_literal_waits_for_the_members_value() {
-        let marker = crate::member::member_filled_literal(Some(json!("0 0 3 * * *")));
+    fn an_instance_filled_literal_waits_for_the_instances_value() {
+        let marker = crate::instance::instance_filled_literal(Some(json!("0 0 3 * * *")));
         let node = kicked_node("Cron", vec![port("String", true)], json!({ "p": marker }));
         let (input, refusals) = build_kicked_input(&node, None);
         assert!(refusals.is_empty(), "{refusals:?}");
@@ -1070,12 +1070,12 @@ mod tests {
             features: NodeFeatures::default(),
             scope: Vec::new(),
             group_boundary: None,
-            requires_infra: false, per_member: None,
+            requires_infra: false, per_instance: None,
             images: Vec::new(),
             fires_with: Default::default(),
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None,
             header_span: None,
             config_spans: Default::default(),
@@ -1117,14 +1117,14 @@ mod tests {
         assert!(received.type_errors.is_empty(), "the excluded invalid literal cannot fail this boundary");
     }
 
-    /// A scope root whose only setting is `@member_filled` runs when its
+    /// A scope root whose only setting is `@instance_filled` runs when its
     /// scope starts, like one with a written value: the marker stays out
-    /// of the bag until the engine puts the member's value in, and must
+    /// of the bag until the engine puts the instance's value in, and must
     /// not read as "nothing will ever come" (it used to skip with every
     /// input closed, silently, in a completed run).
     #[test]
-    fn a_kicked_root_whose_setting_each_member_fills_runs() {
-        let marker = crate::member::member_filled_literal(None);
+    fn a_kicked_root_whose_setting_each_instance_fills_runs() {
+        let marker = crate::instance::instance_filled_literal(None);
         let node = kicked_node("X", vec![port("String", true)], json!({ "p": marker }));
         let project = ProjectDefinition {
             id: uuid::Uuid::nil(), nodes: vec![node.clone()], edges: vec![], groups: vec![],
@@ -1136,7 +1136,7 @@ mod tests {
         };
         let group = super::kicked_group(&node, &kick, &vec![], project.id, &project, &index);
         assert!(group.skip.is_none(), "{:?}", group.skip);
-        assert!(!group.received.input.contains_key("p"), "the marker waits for the member's value");
+        assert!(!group.received.input.contains_key("p"), "the marker waits for the instance's value");
     }
 
     #[test]
@@ -1174,10 +1174,11 @@ mod tests {
         let effective = effective_input_pulses(&node, &[&null], &wired, &project, &index, execution_id, &vec![]);
         assert!(!firing_input(&node, &effective.iter().collect::<Vec<_>>(), &wired, &vec![], &index).type_errors.is_empty());
         assert!(!effective.iter().any(|p| p.provided), "invalid real data does not choose a backup");
-        let failed = Pulse::closure_with_error(uuid::Uuid::new_v4(), execution_id, vec![], "k", "p", Some("producer failed".into()));
+        let failure = crate::pulse::Failure { node: "producer".into(), error: "producer failed".into() };
+        let failed = Pulse::closure_with_failure(uuid::Uuid::new_v4(), execution_id, vec![], "k", "p", Some(failure.clone()));
         let effective = effective_input_pulses(&node, &[&failed], &wired, &project, &index, execution_id, &vec![]);
         assert!(effective.iter().all(|p| !p.backup));
-        assert_eq!(effective[0].close_error.as_deref(), Some("producer failed"));
+        assert_eq!(effective[0].failure.as_ref(), Some(&failure));
     }
 
     /// Regression: a kicked orphan node (entry node with no incoming

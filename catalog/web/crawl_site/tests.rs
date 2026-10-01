@@ -12,6 +12,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("crawls_and_accumulates_pages_across_links", crawl_accumulates),
         NodeTest::fake("a_failed_crawl_fails_loud", failed_crawl),
         NodeTest::fake("an_unknown_status_fails_loud", unknown_status),
+        NodeTest::fake("a_failed_crawl_comes_out_on_error_when_it_is_wired", failed_crawl_wired),
         NodeTest::live("one_real_single_page_crawl", "firecrawl", live_crawl),
     ]
 }
@@ -115,6 +116,33 @@ async fn failed_crawl(rig: FakeRig) -> WeftResult<()> {
         .await;
     let err = outcome.result.expect_err("a failed crawl is loud").to_string();
     assert!(err.contains("robots.txt forbids crawling"), "{err}");
+    Ok(())
+}
+
+async fn failed_crawl_wired(rig: FakeRig) -> WeftResult<()> {
+    rig.respond("POST", "/v2/crawl", json!({ "success": true, "id": "job-4" }));
+    rig.respond(
+        "GET",
+        "/v2/crawl/job-4",
+        json!({ "status": "failed", "error": "robots.txt forbids crawling" }),
+    );
+    rig.wire_output("error");
+    let outcome = rig
+        .run(
+            &CrawlSiteNode,
+            json!({
+                "account": rig.access("firecrawl"),
+                "url": "https://ex.com",
+                "limit": 5,
+            }),
+        )
+        .await
+        .ok()?;
+    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    assert!(error.contains("robots.txt forbids crawling"), "{error}");
+    for port in ["pages", "count"] {
+        assert!(!outcome.outputs.contains_key(port), "a caught failure emits nothing on {port}");
+    }
     Ok(())
 }
 

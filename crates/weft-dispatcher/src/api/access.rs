@@ -122,7 +122,7 @@ pub async fn doors(
 
 /// Which doors a connect page offers for `req`'s service, and where its
 /// consent comes back: what `/access/doors` answers the editor and
-/// `/member/doors` a member.
+/// `/instance/doors` an instance.
 pub(crate) async fn doors_status(state: &DispatcherState, req: &DoorsRequest) -> Result<DoorsStatus, ApiError> {
     let doors: DoorsAnswer =
         crate::broker_admin::forward_json(state, "/v1/access/admin/doors", req).await?;
@@ -158,8 +158,8 @@ pub struct ListQuery {
 }
 
 /// GET /access/grants?service=: the author's connected accounts
-/// (summaries only). A member's own connections are theirs, listed
-/// through the member door, never here.
+/// (summaries only). An instance's own connections belong to it, listed
+/// through the instance door, never here.
 pub async fn list_grants(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
@@ -233,9 +233,9 @@ pub async fn connect_direct(
     caller: CallerTenant,
     Json(mut req): Json<SharedDoorPick<ConnectDirect>>,
 ) -> Result<Json<CompletedConnect>, ApiError> {
-    // The author's door makes the author's connections; a member's are
-    // made at the member door, as that member.
-    req.inner.member = None;
+    // The author's door makes the author's connections; an instance's are
+    // made at the instance door, as that instance.
+    req.inner.instance = None;
     crate::broker_admin::forward_json(
         &state,
         "/v1/access/admin/connect/direct",
@@ -254,7 +254,7 @@ pub async fn connect_begin(
     caller: CallerTenant,
     Json(mut req): Json<SharedDoorPick<BeginOAuth>>,
 ) -> Result<Json<StartedOAuth>, ApiError> {
-    req.inner.member = None;
+    req.inner.instance = None;
     req.inner.redirect_uri = redirect_uri(&state, &req.inner.spec).await?;
     crate::broker_admin::forward_json(
         &state,
@@ -365,9 +365,9 @@ pub async fn lookup(
     caller: CallerTenant,
     Json(mut req): Json<weft_access_store::LookupRequest>,
 ) -> Result<Json<weft_access_store::LookupPage>, ApiError> {
-    // The author's door: a member's connection is never theirs to read
+    // The author's door: an instance's connection is never the author's to read
     // through, whatever the body claims.
-    req.for_member = None;
+    req.for_instance = None;
     crate::broker_admin::forward_json(
         &state,
         "/v1/access/admin/lookup",
@@ -391,7 +391,7 @@ pub async fn picker_begin(
     Json(mut req): Json<weft_access_store::BeginPicker>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // The author's door (see `lookup`).
-    req.for_member = None;
+    req.for_instance = None;
     let base = crate::storage::LinkBase::for_request(&headers).map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     let picker_state = weft_access_store::begin_picker(&state.pg_pool, &caller.0 .0, req)
         .await
@@ -431,7 +431,7 @@ pub async fn picker_page(
     struct TokenQuery {
         access_id: uuid::Uuid,
         service: String,
-        for_member: Option<weft_core::member::MemberScope>,
+        for_instance: Option<weft_core::instance::InstanceScope>,
     }
     #[derive(Deserialize)]
     struct Token {
@@ -446,7 +446,7 @@ pub async fn picker_page(
             inner: TokenQuery {
                 access_id: session.access_id,
                 service: session.service.clone(),
-                for_member: session.for_member.clone(),
+                for_instance: session.for_instance.clone(),
             },
         },
     )
@@ -580,7 +580,7 @@ pub async fn granted(
     Json(mut req): Json<weft_access_store::GrantedQuery>,
 ) -> Result<Json<Vec<weft_access_store::LookupItem>>, ApiError> {
     // The author's door (see `lookup`).
-    req.for_member = None;
+    req.for_instance = None;
     crate::broker_admin::forward_json(
         &state,
         "/v1/access/admin/granted",
@@ -602,7 +602,7 @@ mod credential_stamp_tests {
             id: uuid::Uuid::new_v4(),
             service: service.into(),
             project_id: None,
-            member: None,
+            instance: None,
             identity: None,
             label: None,
             scopes: vec![],

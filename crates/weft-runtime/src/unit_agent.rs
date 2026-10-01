@@ -171,7 +171,7 @@ pub async fn host() -> anyhow::Result<()> {
             disks: DiskBacking::MountedUnder("/mnt/disks".into()),
             publish: Publish::AllPorts,
             // A machine runs one unit of one install.
-            install: weft_core::infra::Instance::default_install(),
+            install: weft_core::infra::Install::default_install(),
         },
     ));
     let host = Host {

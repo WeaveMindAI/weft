@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { diffConfigOps, diffPortLiteralOps } from './config-diff';
-import { memberFilledValue, type ConfigFieldSpan } from '../../../protocol';
+import { instanceFilledValue, type ConfigFieldSpan } from '../../../protocol';
 
 describe('diffConfigOps', () => {
 	it('a full-config spread with nothing changed emits ZERO ops (the toggle regression)', () => {
@@ -66,7 +66,7 @@ describe('diffPortLiteralOps', () => {
 
 	it('writes a real value set over the install-picked marker', () => {
 		const marker = { __weft_install_picked__: {} };
-		const ops = diffPortLiteralOps('n', { account: memberFilledValue() }, { account: marker }, {}, 'inline');
+		const ops = diffPortLiteralOps('n', { account: instanceFilledValue() }, { account: marker }, {}, 'inline');
 		expect(ops).toHaveLength(1);
 		expect(ops[0]).toMatchObject({ op: 'setConfig', node: 'n', key: 'account', form: 'inline' });
 	});

@@ -17,21 +17,23 @@ pub mod fake;
 #[cfg(any(test, feature = "test-helpers"))]
 pub use fake::FakeJournal;
 
+use weft_core::signal_token::TokenKind;
 use weft_journal::ExecEvent;
 
 use async_trait::async_trait;
 use serde_json::Value;
 
+use weft_core::program::{ExecutionPage, ExecutionSummary};
 use weft_core::ExecutionId;
 
 /// A successful setup, independent of whether its listeners are armed.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TriggerBake {
     pub project_id: uuid::Uuid,
-    /// Whose triggers these are: the setup run's member, `None` for the
+    /// Whose triggers these are: the setup run's instance, `None` for the
     /// shared ones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub member: Option<weft_core::member::MemberId>,
+    pub instance: Option<weft_core::instance::InstanceId>,
     pub source_version: String,
     pub program: weft_core::project::hash::ProgramIdentity,
     pub execution_id: ExecutionId,
@@ -77,7 +79,7 @@ impl TriggerBake {
     /// leaves its trigger absent from this capture, including on a refresh.
     pub fn from_events(events: &[ExecEvent]) -> anyhow::Result<Option<Self>> {
         let Some(ExecEvent::ExecutionStarted { execution_id, project_id, program: Some(program), definition_hash, source_version: Some(source_version),
-            phase: weft_core::context::Phase::TriggerSetup, member, .. }) = events.first() else {
+            phase: weft_core::context::Phase::TriggerSetup, instance, .. }) = events.first() else {
             anyhow::bail!("trigger setup has no original program or source identity");
         };
         anyhow::ensure!(definition_hash.as_ref() == Some(&program.definition_hash),
@@ -98,7 +100,7 @@ impl TriggerBake {
                 }).is_none(), "trigger '{node_id}' captured twice in setup {execution_id}");
             }
         }
-        Ok(Some(Self { project_id: *project_id, member: member.clone(), program: program.clone(), execution_id: *execution_id,
+        Ok(Some(Self { project_id: *project_id, instance: instance.clone(), program: program.clone(), execution_id: *execution_id,
             source_version: source_version.clone(),
             captured, targets: Default::default(), at_unix: *at_unix }))
     }
@@ -129,9 +131,9 @@ pub trait Journal: Send + Sync {
     /// A failed/cancelled setup releases ownership without replacing any bake.
     async fn finish_trigger_setup(&self, execution_id: ExecutionId, bake: Option<&TriggerBake>) -> anyhow::Result<()>;
 
-    /// The bakes of one owner's triggers: the shared ones for `None`, a
-    /// member's for `Some`.
-    async fn trigger_bakes(&self, project_id: uuid::Uuid, member: Option<&weft_core::member::MemberId>) -> anyhow::Result<Vec<TriggerBake>>;
+    /// The bakes of one owner's triggers: the shared ones for `None`, an
+    /// instance's for `Some`.
+    async fn trigger_bakes(&self, project_id: uuid::Uuid, instance: Option<&weft_core::instance::InstanceId>) -> anyhow::Result<Vec<TriggerBake>>;
 
     // ----- Event log (state source of truth) -------------------------
 
@@ -193,9 +195,9 @@ pub trait Journal: Send + Sync {
 
     /// The live-connection variant of [`Journal::start_execution`]: the birth
     /// commits atomically WITH the admission of the execute task pinned to
-    /// the worker instance the caller reached (`task.target_instance`).
+    /// the worker replica the caller reached (`task.target_replica`).
     /// `AlreadyAdmitted` (a retry of the same arrival) writes nothing new and
-    /// returns the instance the execution was born on.
+    /// returns the replica the execution was born on.
     async fn start_live_execution(
         &self,
         start: &ExecEvent,
@@ -429,16 +431,16 @@ pub trait Journal: Send + Sync {
 
     /// The ENTRY registered at the place `node` spells in `project_id`
     /// (`door`, or `one.door` inside the file the site `one` includes)
-    /// for `member`'s copy (`None`: the shared one), or `None` when
+    /// for `instance`'s copy (`None`: the shared one), or `None` when
     /// nothing is armed there. One row at most: entries are unique per
-    /// (project, place, member) (`idx_signal_entry_node`). A resume row
+    /// (project, place, instance) (`idx_signal_entry_node`). A resume row
     /// of the same node is another registration entirely and is never
     /// this.
     async fn signal_entry_at(
         &self,
         project_id: uuid::Uuid,
         node: &str,
-        member: Option<&weft_core::member::MemberId>,
+        instance: Option<&weft_core::instance::InstanceId>,
     ) -> anyhow::Result<Option<SignalRegistration>>;
 
 
@@ -516,10 +518,10 @@ pub trait Journal: Send + Sync {
 /// Durable replacement for the in-RAM `SignalTracker` row.
 #[derive(Debug, Clone)]
 pub struct SignalRegistration {
-    /// Whose signal: the member whose copy of a per-member trigger this
+    /// Whose signal: the instance whose copy of a per-instance trigger this
     /// is, or whose run waits on it. `None` for the program's shared ones.
-    pub member: Option<weft_core::member::MemberId>,
-    /// The trigger whose activation gates this signal (with `member`):
+    pub instance: Option<weft_core::instance::InstanceId>,
+    /// The trigger whose activation gates this signal (with `instance`):
     /// an entry signal's own trigger, or the trigger that fired the run a
     /// wait belongs to. `None` for a wait of a run started by hand, which
     /// no activation governs, so it is always live.
@@ -710,51 +712,10 @@ pub struct CancelWrite {
 pub struct ExecutionOwner {
     pub project_id: uuid::Uuid,
     pub tenant: String,
-    /// Who the run is for (`execution.member_id`).
-    pub member: Option<weft_core::member::MemberId>,
+    /// Who the run is for (`execution.instance_id`).
+    pub instance: Option<weft_core::instance::InstanceId>,
     /// The trigger that fired the run (`execution.fired_by`).
     pub fired_by: Option<String>,
-}
-
-// SYNC: ExecutionSummary <-> weavemind/website/src/routes/(app)/executions/+page.ts (Execution),
-//       extension-vscode/src/sidebar/executions.ts (ExecutionSummary)
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ExecutionSummary {
-    pub execution_id: ExecutionId,
-    pub project_id: uuid::Uuid,
-    pub entry_node: String,
-    /// One of `running`, `completed`, `failed`, `cancelled`, or
-    /// `corrupt` (the row no longer decodes; `entry_node` is empty
-    /// then, and the row is listed so it can be inspected via replay
-    /// and deleted).
-    pub status: String,
-    /// What kind of run this was: a `fire` (a trigger fired or a
-    /// manual run), or one of the two setup phases an activate /
-    /// resync / infra start runs. The listing mixes all three, and
-    /// "has my trigger fired since the change" is unanswerable without
-    /// it. Copied from the `ExecutionStarted` row, or, when that row
-    /// no longer decodes, from the `execution.phase` column the
-    /// listing filtered on.
-    pub phase: weft_core::context::Phase,
-    pub started_at: u64,
-    pub completed_at: Option<u64>,
-    /// The tags the run put on itself (`ctx.tag_execution`), in the
-    /// order it claimed them. Empty for a run that never tagged.
-    pub tags: Vec<String>,
-    /// For a `cancelled` run: who or what stopped it (a person, a
-    /// sibling run, the caller leaving, the runtime). What the
-    /// executions panel draws the row's icon and words from. `None`
-    /// for every other status, and for a cancel row written without
-    /// a cause.
-    pub cancel_cause: Option<weft_core::exec::CancelCause>,
-    /// How many node firings the run skipped (a branch that did not
-    /// flow). A completed run with skips is still completed; the count
-    /// is what the panel says beside it.
-    pub skipped_nodes: u64,
-    /// Who the run is for (`ExecutionStarted.member`); `None` for a run
-    /// for nobody in particular.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub member: Option<weft_core::member::MemberId>,
 }
 
 /// The query for a page of a tenant's executions: pagination plus optional
@@ -780,12 +741,11 @@ pub struct ExecutionQuery {
     /// that is answering thousands: everything else about a run
     /// (project, phase, when) is shared by every run beside it.
     pub entry_node: Option<String>,
-    /// Only runs that ended this way: `completed`, `failed`,
-    /// `cancelled`, or `running` for the ones that have not ended at
-    /// all. "Which of mine broke" in one question.
-    pub status: Option<String>,
-    /// Only runs for this member.
-    pub member: Option<weft_core::member::MemberId>,
+    /// Only runs standing this way ([`weft_core::program::RunStatus`]).
+    /// "Which of mine broke" in one question.
+    pub status: Option<weft_core::program::RunStatus>,
+    /// Only runs for this instance.
+    pub instance: Option<weft_core::instance::InstanceId>,
     /// Only runs carrying this tag (`ctx.tag_execution`).
     pub tag: Option<String>,
     /// Keyset cursor: only runs strictly after this `(started_at,
@@ -794,50 +754,6 @@ pub struct ExecutionQuery {
     /// reaches every run exactly once, whatever it deletes or changes
     /// behind itself. `total` ignores it.
     pub below: Option<(u64, ExecutionId)>,
-}
-
-/// One page of executions plus the total number matching the same filters
-/// (ignoring limit/offset), so a consumer can render page controls without a
-/// second count round-trip.
-// SYNC: ExecutionPage <-> weavemind/website/src/routes/(app)/executions/+page.ts (ExecutionPage),
-//       extension-vscode/src/sidebar/executions.ts (ExecutionPage)
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ExecutionPage {
-    pub executions: Vec<ExecutionSummary>,
-    pub total: u64,
-}
-
-/// What a token may do. One table, one hash, one mint/list/revoke
-/// surface for both, and the kind is checked at each door: a caller
-/// token never opens the admin surface, and an operator key is never
-/// taken on the outside-caller doors, so a frontend's leaked token can
-/// never administer the install and an admin key is never pasted into
-/// a frontend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TokenKind {
-    /// An outside caller's scoped credential: signals, displays.
-    Caller,
-    /// Full admin of the tenant: every CLI and editor verb.
-    Operator,
-}
-
-impl TokenKind {
-    // SYNC: kind column values <-> the CHECK on signal_token.kind in journal::postgres::GROUP
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TokenKind::Caller => "caller",
-            TokenKind::Operator => "operator",
-        }
-    }
-
-    pub fn parse(s: &str) -> anyhow::Result<Self> {
-        match s {
-            "caller" => Ok(TokenKind::Caller),
-            "operator" => Ok(TokenKind::Operator),
-            other => anyhow::bail!("unknown token kind '{other}'"),
-        }
-    }
 }
 
 /// A hashed bearer credential. A `Caller` token is used by external
@@ -894,12 +810,11 @@ pub struct SignalToken {
     /// ones. What `weft token mint --displays` sets.
     pub all_displays: bool,
     pub created_at: u64,
-    /// A member token: the member it acts as, in its one project. It
-    /// starts runs as that member, answers that member's waits, reads
-    /// that member's displays, and manages that member's connections;
-    /// nothing else.
-    pub member: Option<weft_core::member::MemberId>,
-    /// When it stops working (unix seconds); `None` never. A member
+    /// An instance token: the one instance it acts inside, in its one
+    /// project. It starts that instance's runs, answers its waits, reads
+    /// its displays, and connects its accounts; nothing else.
+    pub instance: Option<weft_core::instance::InstanceId>,
+    /// When it stops working (unix seconds); `None` never. An instance
     /// token always has one.
     pub expires_at: Option<u64>,
 }
@@ -910,10 +825,10 @@ impl SignalToken {
         self.expires_at.is_some_and(|at| now >= at)
     }
 
-    /// The member and project a member token acts as.
-    pub fn member_scope(&self) -> Option<(uuid::Uuid, &weft_core::member::MemberId)> {
-        let member = self.member.as_ref()?;
-        Some((*self.allowed_projects.first()?, member))
+    /// The instance and project an instance token acts inside.
+    pub fn instance_scope(&self) -> Option<(uuid::Uuid, &weft_core::instance::InstanceId)> {
+        let instance = self.instance.as_ref()?;
+        Some((*self.allowed_projects.first()?, instance))
     }
 
     /// Does this token's project scope cover `project_id`?
@@ -1116,7 +1031,7 @@ mod bake_tests {
                 program: Some(weft_core::project::hash::ProgramIdentity {
                     definition_hash: "graph".into(), binary_hash: "binary".into(), implementations: Default::default(),
                 }),
-                source_version: Some("source".into()), run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 1,
+                source_version: Some("source".into()), run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 1,
                 run_class: weft_core::run_class::RunClass::Short,
             },
             ExecEvent::ExecutionCompleted { execution_id, at_unix: 2 },

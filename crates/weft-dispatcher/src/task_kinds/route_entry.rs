@@ -128,7 +128,7 @@ impl TaskExecutor<DispatcherState> for RouteEntryExecutor {
                 Ok(v) => v,
                 Err(e) => return park_fire(state, task, &payload, &Unrouted::of(e)).await,
             };
-            let RoutedFire { signal, program, fire, member_values, picks } = routed;
+            let RoutedFire { signal, program, fire, instance_values, picks } = routed;
             let candidate_hash = program.definition_hash.clone();
             // A trigger that reaches no output has nothing to run: not a
             // failure, not a park (a park would drain it back into this
@@ -157,7 +157,7 @@ impl TaskExecutor<DispatcherState> for RouteEntryExecutor {
                 subgraph: Some(&fire.subgraph),
                 seed: None,
                 source_version: Some(source_version),
-                member: signal.member.as_ref().map(|member| crate::api::project::RunFor { member, values: &member_values }),
+                instance: signal.instance.as_ref().map(|instance| crate::api::project::RunFor { instance, values: &instance_values }),
                 picks: &picks,
                 fired_trigger: Some(&signal.node_id),
                 run_kind: weft_core::exec::RunKind::Execution,
@@ -259,7 +259,7 @@ async fn refinish_drain(state: &DispatcherState, task: &Task) {
         }
     };
     let Some(trigger) = signal.activation_trigger else { return };
-    let key = weft_core::activation::ActivationKey::new(trigger, weft_core::member::Owner::from_member(signal.member));
+    let key = weft_core::activation::ActivationKey::new(trigger, weft_core::instance::Owner::from_instance(signal.instance));
     if let Err(e) = crate::journal_bridge::try_finish_drain(state, project_id, &key, Some(task.id)).await {
         tracing::error!(
             target: "weft_dispatcher::route_entry",
@@ -344,22 +344,22 @@ async fn pre_journal_route(
         &payload.payload,
         signal.port_snapshot.as_ref(),
     ).map_err(anyhow::Error::msg)?;
-    // A per-member trigger copy fires for its member. What the fire
-    // reaches must be ready for that member (their values filled and
+    // A per-instance trigger copy fires for its instance. What the fire
+    // reaches must be ready for that instance (its values filled and
     // valid, infra up); when it is not, the fire parks. One waiting on
-    // the member's values routes again when they change them; one
-    // waiting on anything else (their copy coming up) retries on the
+    // the instance's values routes again when they change; one
+    // waiting on anything else (its copy coming up) retries on the
     // backoff. The values read here are the run's.
-    let member_values = crate::api::project::refuse_member_gaps(
+    let instance_values = crate::api::project::refuse_instance_gaps(
         state,
         signal.project_id,
         &project_def,
         &fire.subgraph,
-        signal.member.as_ref(),
+        signal.instance.as_ref(),
     )
     .await
     .map_err(|gap| match gap {
-        crate::api::project::RunGap::MemberValues(refusal) => anyhow::Error::new(MemberValuesGap(refusal.to_string())),
+        crate::api::project::RunGap::InstanceValues(refusal) => anyhow::Error::new(InstanceValuesGap(refusal.to_string())),
         crate::api::project::RunGap::Other((_, why)) => anyhow::anyhow!("{why}"),
     })?;
     // The program's own connections, as this install picked them. One
@@ -368,44 +368,44 @@ async fn pre_journal_route(
     let picks = crate::api::project::picks_for_run(state, signal.project_id, &project_def, &fire.subgraph)
         .await
         .map_err(|(_, why)| anyhow::anyhow!("{why}"))?;
-    Ok(RoutedFire { signal, program, fire, member_values, picks })
+    Ok(RoutedFire { signal, program, fire, instance_values, picks })
 }
 
-/// A fire refused because its member has not given (or gave an invalid)
+/// A fire refused because its instance has not given (or gave an invalid)
 /// value it needs: the refusal, naming each field.
 #[derive(Debug)]
-struct MemberValuesGap(String);
+struct InstanceValuesGap(String);
 
-impl std::fmt::Display for MemberValuesGap {
+impl std::fmt::Display for InstanceValuesGap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-impl std::error::Error for MemberValuesGap {}
+impl std::error::Error for InstanceValuesGap {}
 
 /// Why a fire could not be routed, which decides when it is tried again.
 enum Unrouted {
-    /// Waiting on the member's values: routed again when they change
-    /// (`member_values::change`) or the trigger is activated, never on a
+    /// Waiting on the instance's values: routed again when they change
+    /// (`instance_values::change`) or the trigger is activated, never on a
     /// timer, since nothing else can close the gap.
-    MemberValues(String),
+    InstanceValues(String),
     /// Anything else (a transient read, the trigger not Active at route
-    /// time, the member's copy still down): retried on the backoff.
+    /// time, the instance's copy still down): retried on the backoff.
     Retry(String),
 }
 
 impl Unrouted {
     fn of(error: anyhow::Error) -> Self {
-        match error.downcast::<MemberValuesGap>() {
-            Ok(MemberValuesGap(reason)) => Unrouted::MemberValues(reason),
+        match error.downcast::<InstanceValuesGap>() {
+            Ok(InstanceValuesGap(reason)) => Unrouted::InstanceValues(reason),
             Err(other) => Unrouted::Retry(other.to_string()),
         }
     }
 
     fn reason(&self) -> &str {
         match self {
-            Unrouted::MemberValues(reason) | Unrouted::Retry(reason) => reason,
+            Unrouted::InstanceValues(reason) | Unrouted::Retry(reason) => reason,
         }
     }
 }
@@ -417,8 +417,8 @@ struct RoutedFire {
     signal: crate::journal::SignalRegistration,
     program: weft_core::project::hash::ProgramIdentity,
     fire: crate::api::project::TriggerFire,
-    /// What the fire's member provides, as the gate read and checked it.
-    member_values: weft_core::member::MemberValues,
+    /// What the fire's instance provides, as the gate read and checked it.
+    instance_values: weft_core::instance::InstanceValues,
     /// The install's picks the run carries.
     picks: weft_core::picks::Picks,
 }
@@ -461,7 +461,7 @@ async fn definition_for(
 /// Re-park a fire whose pre-journal routing failed (or which arrived at
 /// a non-Active project), so it survives instead of being lost when the
 /// task goes terminal: the reaper's parked-fire sweep retries it after
-/// its backoff, or, for one waiting on its member's values, their next
+/// its backoff, or, for one waiting on its instance's values, its next
 /// change of values routes it; the next activate drains either. Idempotent on retry (task id
 /// is the fire identity). Then re-drive the drain CAS, since this task
 /// may have been the last in-flight item keeping `running_count` above
@@ -487,15 +487,15 @@ async fn park_fire(
         payload: payload.payload.clone(),
         received_at_unix: now,
         attempts,
-        // A fire waiting on its member's values carries no backoff: only
+        // A fire waiting on its instance's values carries no backoff: only
         // their next change (or the trigger's activation) routes it, and
         // that drain must find it due.
         not_before_unix: match unrouted {
-            Unrouted::MemberValues(_) => 0,
+            Unrouted::InstanceValues(_) => 0,
             Unrouted::Retry(_) => now + crate::api::signal::park_backoff_secs(attempts),
         },
-        member_gap: match unrouted {
-            Unrouted::MemberValues(reason) => Some(reason.clone()),
+        instance_gap: match unrouted {
+            Unrouted::InstanceValues(reason) => Some(reason.clone()),
             Unrouted::Retry(_) => None,
         },
     };
@@ -564,7 +564,7 @@ async fn park_fire(
     refinish_drain(state, task).await;
     // No immediate re-drain: the element carries its backoff stamp, and
     // the reaper's parked-fire sweep (`drain_due_parked_fires`) re-drives
-    // the token once it is due (one waiting on its member's values waits
+    // the token once it is due (one waiting on its instance's values waits
     // for their next change instead). A persistent failure therefore retries
     // every few minutes at most, instead of park / drain / enqueue / fail
     // spinning against Postgres and the logs. This task's dedup slot

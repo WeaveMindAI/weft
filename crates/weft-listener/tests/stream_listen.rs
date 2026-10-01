@@ -212,7 +212,7 @@ async fn run_scenario() {
     let tasks = Arc::new(FakeTasks { enqueued: Mutex::new(Vec::new()) });
     let state = ListenerState::new(
         ListenerConfig {
-            instance: format!("test-listener-{run_id}"),
+            replica: format!("test-listener-{run_id}"),
             broker_url: broker_base,
             placement: weft_platform_traits::Placement::Machine,
         },
@@ -243,7 +243,7 @@ async fn run_scenario() {
 
     // Brought up from its row, the way a restarted listener does.
     let row = json!({
-        "token": sig_token, "tenant_id": "tenant-a", "for_member": null, "node_id": "node-1",
+        "token": sig_token, "tenant_id": "tenant-a", "for_instance": null, "node_id": "node-1",
         "spec_json": serde_json::to_string(&to_spec(kind)).unwrap(), "is_resume": false, "execution_id": null,
         "surface_kind": "internal", "mount_path": null, "mount_methods": [], "auth_kind": "none",
         "auth_config": null, "kind_state": {}, "kind_state_seq": 1

@@ -37,7 +37,7 @@ async fn seed_execution_id(pool: &PgPool, execution_id: &str) {
 }
 
 async fn execution_id_owner(pool: &PgPool, execution_id: &str) -> Option<String> {
-    let row: Option<(Option<String>,)> = sqlx::query_as("SELECT owner_instance FROM execution WHERE execution_id = $1")
+    let row: Option<(Option<String>,)> = sqlx::query_as("SELECT owner_replica FROM execution WHERE execution_id = $1")
         .bind(execution_id)
         .fetch_optional(pool)
         .await
@@ -54,7 +54,7 @@ fn execute(execution_id: &str, run_class: &str) -> tasks::NewTask {
         dedup_key: Some(format!("{execution_id}:execute")),
         execution_id: Some(execution_id.to_string()),
         tenant_id: TENANT.to_string(),
-        target_instance: None,
+        target_replica: None,
         binary_hash: Some("bin-1".into()),
         payload,
     }
@@ -73,10 +73,10 @@ fn live_payload(execution_id: &str) -> Value {
     })
 }
 
-async fn admit(pool: &PgPool, execution_id: &str, instance: &str) -> LiveAdmitOutcome {
+async fn admit(pool: &PgPool, execution_id: &str, replica: &str) -> LiveAdmitOutcome {
     let mut tx = pool.begin().await.unwrap();
     let spec = tasks::NewTask {
-        target_instance: Some(instance.to_string()),
+        target_replica: Some(replica.to_string()),
         payload: live_payload(execution_id),
         ..execute(execution_id, "short")
     };
@@ -228,8 +228,8 @@ async fn a_live_run_is_pinned_to_the_worker_its_caller_reached(pool: PgPool) {
     let execution_id = Uuid::new_v4().to_string();
     seed_execution_id(&pool, &execution_id).await;
     assert_eq!(admit(&pool, &execution_id, "worker-a").await, LiveAdmitOutcome::Admitted);
-    assert_eq!(admit(&pool, &execution_id, "worker-a").await, LiveAdmitOutcome::AlreadyAdmitted { instance: "worker-a".into() });
-    assert_eq!(admit(&pool, &execution_id, "worker-b").await, LiveAdmitOutcome::AlreadyAdmitted { instance: "worker-a".into() });
+    assert_eq!(admit(&pool, &execution_id, "worker-a").await, LiveAdmitOutcome::AlreadyAdmitted { replica: "worker-a".into() });
+    assert_eq!(admit(&pool, &execution_id, "worker-b").await, LiveAdmitOutcome::AlreadyAdmitted { replica: "worker-a".into() });
     assert!(claim_one(&pool, "worker-b", &execution_id_filter(&execution_id)).await.unwrap().is_none(), "pinned elsewhere");
     assert!(claim_one(&pool, "worker-a", &execution_id_filter(&execution_id)).await.unwrap().is_some());
 }
@@ -268,7 +268,7 @@ fn cancel(execution_id: &str) -> tasks::NewTask {
         dedup_key: Some(format!("{execution_id}:cancel")),
         execution_id: Some(execution_id.to_string()),
         tenant_id: TENANT.to_string(),
-        target_instance: None,
+        target_replica: None,
         binary_hash: None,
         payload: json!({ "project_id": PROJECT, "execution_id": execution_id, "cause": { "kind": "user" } }),
     }
@@ -347,7 +347,7 @@ fn dispatcher_task(dedup: &str) -> tasks::NewTask {
         dedup_key: Some(dedup.to_string()),
         execution_id: None,
         tenant_id: TENANT.to_string(),
-        target_instance: None,
+        target_replica: None,
         binary_hash: None,
         payload: json!({}),
     }

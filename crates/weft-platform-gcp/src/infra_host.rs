@@ -80,11 +80,11 @@ docker run -d --name weft-host-agent --restart always --network host \
 pub struct ComputeInfraHost {
     google: Google,
     gcp: GcpPlatform,
-    install: weft_core::infra::Instance,
+    install: weft_core::infra::Install,
 }
 
 impl ComputeInfraHost {
-    pub fn new(google: Google, gcp: GcpPlatform, install: weft_core::infra::Instance) -> Self {
+    pub fn new(google: Google, gcp: GcpPlatform, install: weft_core::infra::Install) -> Self {
         Self { google, gcp, install }
     }
 
@@ -414,7 +414,7 @@ fn mounts(unit: &ResolvedUnit, volume: &str) -> bool {
 
 /// Labels on everything of `unit` of `node` (a label value holds at most
 /// 63 lowercase letters, digits, `-` and `_`).
-fn labels(install: &weft_core::infra::Instance, node: &NodeRef, unit: &str, hash: Option<&str>) -> Value {
+fn labels(install: &weft_core::infra::Install, node: &NodeRef, unit: &str, hash: Option<&str>) -> Value {
     let mut l = json!({
         weft_core::infra::INSTALL_LABEL: install.label_value(),
         "weft-project": node.project.simple().to_string(),
@@ -449,15 +449,25 @@ fn label<'a>(machine: &'a Value, key: &str) -> Option<&'a str> {
     machine.get("labels").and_then(|l| l.get(key)).and_then(Value::as_str)
 }
 
-/// The unit a machine was given, from its metadata.
-fn assignment(machine: &Value) -> Option<UnitAssignment> {
-    machine
+/// The unit a machine was given, from its metadata. None for a machine
+/// that carries no assignment (one of the install's own); an assignment
+/// that does not read is an error naming the machine, never a silent
+/// skip, and each caller says what that error stops.
+fn assignment(machine: &Value) -> anyhow::Result<Option<UnitAssignment>> {
+    let Some(item) = machine
         .pointer("/metadata/items")
-        .and_then(Value::as_array)?
-        .iter()
-        .find(|i| i.get("key").and_then(Value::as_str) == Some(MD_UNIT))
-        .and_then(|i| i.get("value").and_then(Value::as_str))
-        .and_then(|v| serde_json::from_str(v).ok())
+        .and_then(Value::as_array)
+        .and_then(|items| items.iter().find(|i| i.get("key").and_then(Value::as_str) == Some(MD_UNIT)))
+    else {
+        return Ok(None);
+    };
+    let raw = item
+        .get("value")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("machine '{}': its '{MD_UNIT}' metadata has no text value", name_of(machine)))?;
+    serde_json::from_str(raw)
+        .map(Some)
+        .map_err(|e| anyhow::anyhow!("machine '{}': its '{MD_UNIT}' metadata is not a unit assignment: {e}", name_of(machine)))
 }
 
 #[async_trait]
@@ -569,9 +579,12 @@ impl InfraHost for ComputeInfraHost {
     async fn observe(&self, _tenant: &str, project: uuid::Uuid) -> anyhow::Result<Vec<UnitObservation>> {
         let mut out = Vec::new();
         for m in self.machines(&[("weft-project", &project.simple().to_string())]).await? {
-            let Some(a) = assignment(&m) else { continue };
+            // Every machine labeled with a project is one of its units.
+            let a = assignment(&m)?.ok_or_else(|| {
+                anyhow::anyhow!("machine '{}' is labeled for project {project} but carries no '{MD_UNIT}' metadata", name_of(&m))
+            })?;
             let hash = a.node.unit(&a.unit).map(|u| u.hash.clone()).unwrap_or_default();
-            let at = |state| UnitObservation { instance: a.node.node.instance.clone(), unit: a.unit.clone(), hash: hash.clone(), state };
+            let at = |state| UnitObservation { copy_id: a.node.node.copy_id.clone(), unit: a.unit.clone(), hash: hash.clone(), state };
             match m.get("status").and_then(Value::as_str) {
                 Some("RUNNING") => match self.agent(&m, reqwest::Method::GET, HOST_OBSERVE).await {
                     Ok(resp) => out.extend(resp.json::<Vec<UnitObservation>>().await?),
@@ -587,25 +600,31 @@ impl InfraHost for ComputeInfraHost {
     }
 
     async fn copies(&self) -> anyhow::Result<Vec<NodeRef>> {
+        // A machine or disk that cannot be read as part of a copy cannot be
+        // judged, so it is left alone and logged as an error naming it, so a
+        // person can look; failing the whole listing would stop every
+        // other copy's sweep. (`observe`, which asks about one project,
+        // fails loudly instead.)
         let mut seen = BTreeMap::new();
         for m in self.machines(&[]).await? {
-            if let Some(a) = assignment(&m) {
-                seen.insert(a.node.node.instance.clone(), a.node.node);
+            match assignment(&m) {
+                Ok(Some(a)) => {
+                    seen.insert(a.node.node.copy_id.clone(), a.node.node);
+                }
+                Ok(None) => {}
+                Err(e) => tracing::error!(machine = %name_of(&m), error = %e, "a machine's unit assignment does not read; leaving it alone"),
             }
         }
         // A terminated copy that kept disks has no machine left; its
         // disks name it. Only a copy's disks carry `weft-copy` (the
         // install's own machine disks do not).
         let install = format!("labels.{}={}", weft_core::infra::INSTALL_LABEL, self.install.label_value());
-        // A disk whose description does not name its copy cannot be
-        // judged, so it is left alone (and named, so a person can look);
-        // failing the whole listing would stop every other copy's sweep.
         for d in self.list("disks", &install).await?.iter().filter(|d| label(d, "weft-copy").is_some()) {
             match disk_copy(d) {
                 Ok(copy) => {
-                    seen.entry(copy.instance.clone()).or_insert(copy);
+                    seen.entry(copy.copy_id.clone()).or_insert(copy);
                 }
-                Err(e) => tracing::warn!(disk = %name_of(d), error = %e, "a copy's disk names no copy; leaving it alone"),
+                Err(e) => tracing::error!(disk = %name_of(d), error = %e, "a copy's disk names no copy; leaving it alone"),
             }
         }
         Ok(seen.into_values().collect())
@@ -714,7 +733,7 @@ mod tests {
 
     #[test]
     fn a_disk_names_its_copy_by_its_description() {
-        let copy = NodeRef { tenant: "t".into(), project: uuid::Uuid::from_u128(1), node: "one.db".into(), instance: "wn-1".into() };
+        let copy = NodeRef { tenant: "t".into(), project: uuid::Uuid::from_u128(1), node: "one.db".into(), copy_id: "wn-1".into() };
         let disk = json!({ "name": "d", "description": serde_json::to_string(&copy).unwrap() });
         assert_eq!(disk_copy(&disk).unwrap(), copy);
         let err = disk_copy(&json!({ "name": "d" })).unwrap_err().to_string();

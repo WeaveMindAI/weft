@@ -1,5 +1,5 @@
 //! The public door of an infra node's endpoint marked `Expose::Public`:
-//! `/infra/<project>/<instance>/<path>` on the install's address, passed on
+//! `/infra/<project>/<copy_id>/<path>` on the install's address, passed on
 //! to the endpoint with the prefix taken off.
 //!
 //! The unit's own address is on the install's network only; this door is
@@ -17,12 +17,12 @@ use crate::state::DispatcherState;
 // SYNC: public infra path <-> crates/weft-core/src/infra/resolve.rs (public_path)
 pub(crate) const INFRA_PREFIX: &str = "/infra";
 
-/// `(project, instance)` of a door path, or `None`.
+/// `(project, copy_id)` of a door path, or `None`.
 fn split(path: &str) -> Option<(uuid::Uuid, &str)> {
     let rest = path.strip_prefix(INFRA_PREFIX)?.strip_prefix('/')?;
     let (project, rest) = rest.split_once('/').unwrap_or((rest, ""));
-    let instance = rest.split('/').next().filter(|i| !i.is_empty())?;
-    Some((project.parse().ok()?, instance))
+    let copy_id = rest.split('/').next().filter(|i| !i.is_empty())?;
+    Some((project.parse().ok()?, copy_id))
 }
 
 /// The endpoint whose public path is the longest prefix of `path` (at a
@@ -40,17 +40,17 @@ fn route<'a>(public_paths: impl Iterator<Item = (&'a String, &'a String)>, path:
         })
 }
 
-/// `ANY /infra/{project}/{instance}/...`
+/// `ANY /infra/{project}/{copy_id}/...`
 pub async fn forward(State(state): State<DispatcherState>, request: Request) -> Response {
     let path = request.uri().path().to_string();
-    let Some((project, instance)) = split(&path) else {
+    let Some((project, copy_id)) = split(&path) else {
         return (StatusCode::NOT_FOUND, "no infra endpoint at this path").into_response();
     };
     let rows = match crate::infra_node::list_for_project(&state.pg_pool, project).await {
         Ok(rows) => rows,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("read the project's infra: {e:#}")).into_response(),
     };
-    let Some(row) = rows.iter().find(|r| r.instance_id == instance) else {
+    let Some(row) = rows.iter().find(|r| r.copy_id == copy_id) else {
         return (StatusCode::NOT_FOUND, "no infra endpoint at this path").into_response();
     };
     let Some((endpoint, under)) = route(row.public_paths.iter(), &path) else {

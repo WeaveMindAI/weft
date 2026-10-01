@@ -15,7 +15,10 @@
 use anyhow::Result;
 
 use super::Ctx;
-use weft_core::infra::wire::{CopyRef, DoorsResponse, InfraLogs, LogBlock};
+use weft_core::infra::wire::{
+    CommandOutcome, CommandStatus, CopyRef, DoorsResponse, InfraLogs, InfraStatus, LifecycleCommandIssued, LogBlock,
+    PerNodeRequest, StopRequest, SyncRequest, UpgradeRequest,
+};
 use anyhow::Context;
 
 use crate::progress::{ActionVerb, Progress};
@@ -25,7 +28,8 @@ pub enum InfraAction {
     Start,
     Upgrade,
     Stop,
-    Terminate,
+    /// `yes`: the confirmation, answered up front (`--yes`).
+    Terminate { yes: bool },
     Status,
     /// The doors this project's infrastructure has. Read-only: a door
     /// is part of what a node IS (its endpoint declares it), so there
@@ -35,11 +39,12 @@ pub enum InfraAction {
     /// between platform calls; unclaimed ones cancel outright; the
     /// provisioning execution is interrupted). HALT, not rollback.
     Cancel,
-    /// Per-instance verbs. `node` is the instance's PLACE as a person
-    /// spells it (`one.db`), checked and written canonical by
-    /// `instance_named` before the daemon sees it.
+    /// Per-node verbs. `node` is the node's PLACE as a person spells it
+    /// (`one.db`), checked and written canonical by `place_named`
+    /// before the daemon sees it.
     NodeStop { node: String, force: bool },
-    NodeTerminate { node: String },
+    /// `yes`: the confirmation, answered up front (`--yes`).
+    NodeTerminate { node: String, yes: bool },
     /// What the infra containers wrote, read straight off the processes.
     Logs { node: Option<String>, tail: usize, follow: bool },
 }
@@ -60,8 +65,8 @@ pub enum InfraAction {
 #[derive(Default, Clone)]
 pub struct InfraOpts {
     pub trigger: super::deactivate::TriggerChoiceFlags,
-    /// A member's copies (`--member`); the shared infra when absent.
-    pub member: Option<weft_core::member::MemberId>,
+    /// An instance's copies (`--instance`); the shared infra when absent.
+    pub instance: Option<weft_core::instance::InstanceId>,
 }
 
 pub async fn run(ctx: Ctx, action: InfraAction, opts: InfraOpts) -> Result<()> {
@@ -73,16 +78,34 @@ pub async fn run(ctx: Ctx, action: InfraAction, opts: InfraOpts) -> Result<()> {
     }
     if let InfraAction::Logs { node, tail, follow } = action {
         let node = match node {
-            Some(node) => Some(instance_named(&ctx, &node).await?),
+            Some(node) => Some(place_named(&ctx, &node).await?),
             None => None,
         };
         return infra_logs(&ctx, node.as_deref(), tail, follow).await;
+    }
+    // Terminating deletes resources, stored data included unless a node
+    // keeps it, so it never runs on a bare command: a terminal is asked,
+    // and a script says `--yes`.
+    let copies_of = |what: &str| match &opts.instance {
+        Some(instance) => format!("instance '{instance}''s copies of {what}"),
+        None => what.to_string(),
+    };
+    let unconfirmed = match &action {
+        InfraAction::Terminate { yes: false } => Some(copies_of("the program's shared infra")),
+        InfraAction::NodeTerminate { node, yes: false } => Some(copies_of(&format!("infra node '{node}'"))),
+        _ => None,
+    };
+    if let Some(whose) = unconfirmed {
+        if !confirm_terminate(&ctx, &whose)? {
+            println!("aborted");
+            return Ok(());
+        }
     }
     let verb = match &action {
         InfraAction::Start => ActionVerb::InfraStart,
         InfraAction::Upgrade => ActionVerb::InfraUpgrade,
         InfraAction::Stop => ActionVerb::InfraStop,
-        InfraAction::Terminate => ActionVerb::InfraTerminate,
+        InfraAction::Terminate { .. } => ActionVerb::InfraTerminate,
         InfraAction::Cancel => ActionVerb::InfraCancel,
         InfraAction::NodeStop { .. } => ActionVerb::InfraNodeStop,
         InfraAction::NodeTerminate { .. } => ActionVerb::InfraNodeTerminate,
@@ -112,7 +135,7 @@ async fn run_inner(
         InfraAction::Start => "infra started",
         InfraAction::Upgrade => "infra upgraded",
         InfraAction::Stop => "infra stopped",
-        InfraAction::Terminate => "infra terminated",
+        InfraAction::Terminate { .. } => "infra terminated",
         InfraAction::Cancel => "infra cancel issued",
         InfraAction::NodeStop { .. } => "infra node stopped",
         InfraAction::NodeTerminate { .. } => "infra node terminated",
@@ -127,18 +150,18 @@ async fn run_inner(
         // so every client gets the same upgrade from a single request.
         InfraAction::Upgrade => infra_sync(ctx, progress, action, opts).await?,
         InfraAction::Stop => infra_stop(ctx, progress, opts).await?,
-        InfraAction::Terminate => infra_terminate(ctx, progress, opts).await?,
-        InfraAction::Cancel => infra_cancel(ctx, progress, opts.member.as_ref()).await?,
+        InfraAction::Terminate { .. } => infra_terminate(ctx, progress, opts).await?,
+        InfraAction::Cancel => infra_cancel(ctx, progress, opts.instance.as_ref()).await?,
         // The place is read here, inside the progress wrapper, so a
         // refusal ("names no node") reaches the graph's action bar as
         // this verb's error like every other failure of the verb; the
         // per-node menu is exactly the caller reading those events.
         InfraAction::NodeStop { node, force } => {
-            let place = instance_named(ctx, &node).await?;
+            let place = place_named(ctx, &node).await?;
             infra_node_verb(ctx, progress, &place, "stop", force, &opts).await?
         }
-        InfraAction::NodeTerminate { node } => {
-            let place = instance_named(ctx, &node).await?;
+        InfraAction::NodeTerminate { node, .. } => {
+            let place = place_named(ctx, &node).await?;
             infra_node_verb(ctx, progress, &place, "terminate", false, &opts).await?
         }
         InfraAction::Status | InfraAction::ListDoors | InfraAction::Logs { .. } => unreachable!(),
@@ -149,12 +172,12 @@ async fn run_inner(
 
 /// POST `/infra/cancel`: halt/cancel in-flight infra work. 202 on
 /// success (cancel reconciles, never asserts: poll `weft status` for
-/// where things settled); 412 when nothing is in flight. With a member,
-/// only that member's copies' work is cancelled.
-async fn infra_cancel(ctx: &Ctx, progress: &Progress, member: Option<&weft_core::member::MemberId>) -> Result<()> {
+/// where things settled); 412 when nothing is in flight. With an
+/// instance, only that instance's work is cancelled.
+async fn infra_cancel(ctx: &Ctx, progress: &Progress, instance: Option<&weft_core::instance::InstanceId>) -> Result<()> {
     let (client, project_id, _name) = super::resolve_project(ctx)?;
-    let path = match member {
-        Some(member) => format!("/projects/{project_id}/infra/cancel?member={member}"),
+    let path = match instance {
+        Some(instance) => format!("/projects/{project_id}/infra/cancel?instance={instance}"),
         None => format!("/projects/{project_id}/infra/cancel"),
     };
     progress.dispatcher_call_start(&path);
@@ -163,15 +186,15 @@ async fn infra_cancel(ctx: &Ctx, progress: &Progress, member: Option<&weft_core:
     Ok(())
 }
 
-/// The infra instance a person named, as the daemon keys it: the place
+/// The infra node a person named, as the daemon keys it: the place
 /// spelling (`one.db`), checked against the program and written
-/// canonical, the way `weft wake` does. An instance the program no
+/// canonical, the way `weft wake` does. A node the program no
 /// longer declares (its node deleted, or the include that reached it)
 /// is still live until it is stopped or terminated by hand, which is
 /// what these verbs are for; so a spelling the program does not know is
-/// taken as typed when the daemon lists an instance under it, and
+/// taken as typed when the daemon lists a node under it, and
 /// refused with the program's answer otherwise.
-pub(crate) async fn instance_named(ctx: &Ctx, spelled: &str) -> Result<String> {
+pub(crate) async fn place_named(ctx: &Ctx, spelled: &str) -> Result<String> {
     let refusal = match super::node_address_for(ctx, spelled) {
         Ok(place) => return Ok(place),
         Err(refusal) => refusal,
@@ -183,13 +206,8 @@ pub(crate) async fn instance_named(ctx: &Ctx, spelled: &str) -> Result<String> {
     // "connection refused".
     let live = async {
         let (client, project_id, _) = super::resolve_project(ctx)?;
-        let status = client.get_json(&format!("/projects/{project_id}/infra/status")).await?;
-        anyhow::Ok(
-            status
-                .get("nodes")
-                .and_then(|n| n.as_array())
-                .is_some_and(|nodes| nodes.iter().any(|n| n.get("node").and_then(|v| v.as_str()) == Some(spelled))),
-        )
+        let status = infra_status_of(&client, &project_id).await?;
+        anyhow::Ok(status.nodes.iter().any(|n| n.node == spelled))
     }
     .await
     .unwrap_or(false);
@@ -216,31 +234,24 @@ async fn infra_node_verb(
         opts.trigger.running_policy.as_deref(),
         opts.trigger.drain_timeout,
     )?;
-    let mut body = super::ensure::running_choice_fields(running_policy, drain_timeout);
-    body.insert("force".into(), serde_json::json!(force));
-    if let Some(member) = &opts.member {
-        body.insert("member".into(), serde_json::json!(member));
-    }
-    let body = serde_json::Value::Object(body);
-    progress.drain_wait(&body, drain_timeout);
+    let body = PerNodeRequest {
+        running: super::ensure::running_choice(running_policy, drain_timeout),
+        force,
+        instance: opts.instance.clone(),
+    };
+    progress.drain_wait(running_policy, drain_timeout);
     progress.dispatcher_call_start(&path);
-    // 202 Accepted with { command_id }.
-    let issued: serde_json::Value = client.post_json(&path, &body).await?;
+    // 202 Accepted with the command it runs as.
+    let issued = issued_command(client.post_json(&path, &serde_json::to_value(&body)?).await?, verb)?;
     progress.dispatcher_call_done(serde_json::json!({ "project_id": project_id, "node": place }));
-    let command_id = issued
-        .get("command_id")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| anyhow::anyhow!("infra node {verb}: response missing command_id"))?;
+    let command_id = issued.command_id;
     // Wait on the command, not a per-node status: a NoOp unit staying
     // up means the node never reaches "stopped", so the command
     // outcome is the honest done signal (and a force-stop completing
     // is what we actually want to wait for).
     wait_for_command(progress, &client, &project_id, command_id, verb).await?;
     if !ctx.json() {
-        let final_resp: serde_json::Value = client
-            .get_json(&format!("/projects/{project_id}/infra/status"))
-            .await?;
-        print_status(&name, &project_id, &final_resp);
+        print_status(&name, &project_id, &infra_status_of(&client, &project_id).await?);
     }
     // Terminal event emitted once by `run_inner` (see infra_sync note).
     Ok(())
@@ -254,7 +265,7 @@ async fn infra_sync(
 ) -> Result<()> {
     // The build registers the infra images every place runs alongside the
     // program; the sync names that build and applies it.
-    let handle = super::ensure::ensure_registered(ctx, progress, weft_compiler::codegen::NodeSet::Full).await?;
+    let handle = super::ensure::ensure_registered(ctx, progress, weft_core::builds::NodeSet::Full).await?;
 
     // A START never deactivates: an active project's triggers stay
     // live while infra comes up (only executions that actually touch
@@ -275,7 +286,7 @@ async fn infra_sync(
     )?;
     // Only an upgrade carries the choice (the dispatcher refuses it on a
     // plain start), and only the dispatcher knows whether a trigger
-    // reading this infra is on, the program's or a member's: a given
+    // reading this infra is on, the program's or an instance's: a given
     // choice always goes, and otherwise `post_with_trigger_choice` asks
     // or names the flags when the dispatcher says it needs one.
     let upgrade = matches!(action, InfraAction::Upgrade);
@@ -291,51 +302,53 @@ async fn infra_sync(
         None
     };
 
-    // SYNC: sync body keys <-> crates/weft-dispatcher/src/api/infra.rs
-    // (SyncRequest, and UpgradeRequest which adds `triggerDeactivation`).
-    // All its fields are serde-defaulted, so a key drift here would
-    // silently become the default at the receiving end; change both together.
-    let mut body = serde_json::Map::new();
-    handle.inject_hash_fields(&mut body);
-    body.extend(super::ensure::running_choice_fields(running_policy, drain_timeout));
-    if let Some(member) = &opts.member {
-        body.insert("member".into(), serde_json::json!(member));
-    }
+    let sync = SyncRequest {
+        build: handle.built.named(),
+        running: super::ensure::running_choice(running_policy, drain_timeout),
+        instance: opts.instance.clone(),
+        nodes: Vec::new(),
+    };
     let path = format!("/projects/{}/infra/{}", handle.id, if upgrade { "upgrade" } else { "sync" });
     // The one line that says the call may now sit for a while (an
     // upgrade's stop leg, or the worker replacement, draining up to the
     // cap), so a quiet terminal is a wait and not a hang.
-    progress.drain_wait(&serde_json::Value::Object(body.clone()), drain_timeout);
+    progress.drain_wait(running_policy, drain_timeout);
     // The places the build registered an infra image for: the ones the
     // sync provisions.
     let node_ids: Vec<String> = handle.built.infra_images.keys().cloned().collect();
     progress.infra_provision_start(&node_ids);
     progress.dispatcher_call_start(&path);
-    let resp = super::deactivate::post_with_trigger_choice(
-        &handle.client,
-        &path,
-        body,
-        ctx.json(),
-        given,
-        running_policy,
-        drain_timeout,
-    )
-    .await?;
-    progress.dispatcher_call_done(serde_json::json!({ "project_id": handle.id }));
     // An upgrade answers 202 with the command the dispatcher runs it
     // as; its outcome is the upgrade's, and the infra status after it
-    // is what is shown. A sync answers with the status itself.
+    // is what is shown. Only an upgrade carries the trigger choice. A
+    // sync answers with the status itself.
     let resp = if upgrade {
-        let command_id = resp
-            .get("command_id")
-            .and_then(|v| v.as_i64())
-            .ok_or_else(|| anyhow::anyhow!("infra upgrade: response missing command_id"))?;
-        wait_for_command(progress, &handle.client, &handle.id, command_id, "upgrade").await?;
-        handle.client.get_json(&format!("/projects/{}/infra/status", handle.id)).await?
+        let body = UpgradeRequest { sync, trigger_deactivation: None };
+        let answer = super::deactivate::post_with_trigger_choice(
+            &handle.client,
+            &path,
+            body,
+            ctx.json(),
+            given,
+            running_policy,
+            drain_timeout,
+        )
+        .await?;
+        progress.dispatcher_call_done(serde_json::json!({ "project_id": handle.id }));
+        let issued = issued_command(answer, "upgrade")?;
+        wait_for_command(progress, &handle.client, &handle.id, issued.command_id, "upgrade").await?;
+        infra_status_of(&handle.client, &handle.id).await?
     } else {
-        resp
+        let answer = handle.client.post_json(&path, &serde_json::to_value(&sync)?).await?;
+        progress.dispatcher_call_done(serde_json::json!({ "project_id": handle.id }));
+        serde_json::from_value(answer).context("read the infra status the sync answered")?
     };
     progress.infra_provision_done();
+    // A copy the host runs differently from what it asked (a GPU kind a
+    // local install cannot choose) is told here, to the person starting it.
+    for note in resp.host_notes() {
+        progress.warn(note);
+    }
     if !ctx.json() {
         print_status(&handle.name, &handle.id, &resp);
     }
@@ -359,7 +372,7 @@ async fn infra_terminate(ctx: &Ctx, progress: &Progress, opts: InfraOpts) -> Res
 /// Stop / Terminate share this body. The trigger-deactivation choice
 /// goes along when it was given; otherwise the dispatcher, which knows
 /// whether a trigger reading this infra is on (the program's or a
-/// member's), asks for it and `post_with_trigger_choice` prompts or
+/// instance's), asks for it and `post_with_trigger_choice` prompts or
 /// names the flags. The running-work choice goes on the body either
 /// way, because with no trigger on there can still be executions
 /// running on this infra and `wait` is how they get to land first. Waits on the COMMAND's completion (not the
@@ -387,27 +400,22 @@ async fn infra_destroy(
     )?;
     let (client, id, name) = super::resolve_project(ctx)?;
     let path = format!("/projects/{id}/infra/{verb}");
-    let mut body = super::ensure::running_choice_fields(running_policy, drain_timeout);
-    if let Some(member) = &opts.member {
-        body.insert("member".into(), serde_json::json!(member));
-    }
-    progress.drain_wait(&serde_json::Value::Object(body.clone()), drain_timeout);
+    let body = StopRequest {
+        trigger_deactivation: None,
+        running: super::ensure::running_choice(running_policy, drain_timeout),
+        instance: opts.instance.clone(),
+    };
+    progress.drain_wait(running_policy, drain_timeout);
     progress.dispatcher_call_start(&path);
-    // 202 Accepted with { command_id }.
-    let issued =
+    // 202 Accepted with the command it runs as.
+    let answer =
         super::deactivate::post_with_trigger_choice(&client, &path, body, ctx.json(), given, running_policy, drain_timeout)
             .await?;
     progress.dispatcher_call_done(serde_json::json!({ "project_id": id }));
-    let command_id = issued
-        .get("command_id")
-        .and_then(|v| v.as_i64())
-        .ok_or_else(|| anyhow::anyhow!("infra {verb}: response missing command_id"))?;
-    wait_for_command(progress, &client, &id, command_id, verb).await?;
+    let issued = issued_command(answer, verb)?;
+    wait_for_command(progress, &client, &id, issued.command_id, verb).await?;
     if !ctx.json() {
-        let final_resp: serde_json::Value = client
-            .get_json(&format!("/projects/{id}/infra/status"))
-            .await?;
-        print_status(&name, &id, &final_resp);
+        print_status(&name, &id, &infra_status_of(&client, &id).await?);
     }
     // Terminal event emitted once by `run_inner` (see infra_sync note).
     Ok(())
@@ -439,45 +447,40 @@ async fn wait_for_command(
         // Held by the dispatcher until the command completes or the hold
         // runs out (at most `COMMAND_HOLD`), so the loop asks again at
         // once either way.
-        let resp: serde_json::Value = client
+        let resp = client
             .get_json(&format!(
                 "/projects/{project_id}/infra/commands/{command_id}?wait_ms={}",
                 COMMAND_HOLD.as_millis()
             ))
             .await
             .with_context(|| format!("waiting on infra {verb} command {command_id}"))?;
-        // No `unwrap_or` on the contract fields: a missing `done` must
-        // NOT be silently read as "not done" (now an UNBOUNDED wait, it
-        // would loop forever), and a missing `outcome` must not be read
-        // as success. A wire-contract violation fails loud with the
-        // version-mismatch recovery, same posture as the drain wait.
-        let done = resp.get("done").and_then(|v| v.as_bool()).ok_or_else(|| {
+        // A status that does not read fails loud: a missing `done` read
+        // as "not done" would loop forever (the wait is unbounded).
+        let status: CommandStatus = serde_json::from_value(resp).map_err(|e| {
             anyhow::anyhow!(
-                "infra {verb}: command-status response missing or non-bool `done`; a wire \
-                 contract violation between this CLI and the dispatcher. Recovery: upgrade the \
-                 dispatcher (or this CLI) so the versions match"
+                "infra {verb}: the command status does not read ({e}); upgrade the dispatcher \
+                 (or this CLI) so the versions match"
             )
         })?;
-        if done {
-            let outcome = resp.get("outcome").and_then(|v| v.as_str()).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "infra {verb}: command marked done but the response is missing or has a \
-                     non-string `outcome`; wire contract violation, treating it as success would \
-                     hide a failed command. Recovery: upgrade the dispatcher or this CLI"
-                )
-            })?;
-            if outcome == "failed" {
-                let msg = resp.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error");
-                anyhow::bail!("infra {verb} failed: {msg}");
-            }
-            if outcome == "cancelled" {
-                anyhow::bail!(
+        if status.done {
+            match status.outcome {
+                Some(CommandOutcome::Succeeded) => return Ok(()),
+                Some(CommandOutcome::Failed) => {
+                    let msg = status.message.as_deref().unwrap_or("unknown error");
+                    anyhow::bail!("infra {verb} failed: {msg}");
+                }
+                Some(CommandOutcome::Cancelled) => anyhow::bail!(
                     "infra {verb} cancelled (`weft infra cancel`): the operation was halted \
                      between steps and did NOT complete; infra is left as-is (check `weft infra \
                      status`), re-run the verb to finish or act per node"
-                );
+                ),
+                // Treating a done command with no outcome as success
+                // would hide a failed one.
+                None => anyhow::bail!(
+                    "infra {verb}: the command is marked done with no outcome; upgrade the \
+                     dispatcher or this CLI so the versions match"
+                ),
             }
-            return Ok(());
         }
         let now = std::time::Instant::now();
         if now >= next_breadcrumb {
@@ -541,8 +544,8 @@ fn format_log_blocks(blocks: &[LogBlock]) -> String {
 
 /// A copy the way the source spells its node, with whose copy it is.
 fn copy_label(copy: &CopyRef) -> String {
-    match &copy.member {
-        Some(member) => format!("{} (member {member})", copy.node),
+    match &copy.instance {
+        Some(instance) => format!("{} (instance {instance})", copy.node),
         None => copy.node.clone(),
     }
 }
@@ -575,7 +578,7 @@ fn format_doors(answer: &DoorsResponse) -> String {
     }
     let mut out = String::new();
     for door in &answer.doors {
-        let door_name = CopyRef { node: format!("{}.{}", door.copy.node, door.endpoint), member: door.copy.member.clone() };
+        let door_name = CopyRef { node: format!("{}.{}", door.copy.node, door.endpoint), instance: door.copy.instance.clone() };
         out.push_str(&format!("{}  {}\n", copy_label(&door_name), door.address));
     }
     for copy in &answer.applying {
@@ -587,22 +590,44 @@ fn format_doors(answer: &DoorsResponse) -> String {
     out
 }
 
+/// Asks before a terminate deletes `whose` resources. Off a terminal or
+/// under `--json` there is nobody to ask, so the command refuses and
+/// names `--yes`. False when the person declined.
+fn confirm_terminate(ctx: &Ctx, whose: &str) -> Result<bool> {
+    if ctx.json() || !crate::prompt::is_interactive() {
+        anyhow::bail!("terminating deletes every resource of {whose}; pass --yes");
+    }
+    println!("About to terminate {whose}: every resource is deleted, stored data included unless the node keeps it.");
+    crate::prompt::confirm("Type 'yes' to confirm: ", "--yes")
+}
+
 async fn infra_status(ctx: &Ctx) -> Result<()> {
     let (client, id, name) = super::resolve_project(ctx)?;
-    let resp: serde_json::Value = client
-        .get_json(&format!("/projects/{id}/infra/status"))
-        .await?;
-    print_status(&name, &id, &resp);
+    let status = infra_status_of(&client, &id).await?;
+    if ctx.json_out(&status)? {
+        return Ok(());
+    }
+    print_status(&name, &id, &status);
+    for note in status.host_notes() {
+        eprintln!("warning: {note}");
+    }
     Ok(())
 }
 
+/// Every infra copy of the project, and its state.
+async fn infra_status_of(client: &crate::client::DispatcherClient, project_id: &str) -> Result<InfraStatus> {
+    serde_json::from_value(client.get_json(&format!("/projects/{project_id}/infra/status")).await?)
+        .context("read the infra status")
+}
 
-fn print_status(name: &str, id: &str, resp: &serde_json::Value) {
-    let nodes = resp
-        .get("nodes")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+/// The command a lifecycle verb was enqueued as (its 202 answer).
+fn issued_command(answer: serde_json::Value, verb: &str) -> Result<LifecycleCommandIssued> {
+    serde_json::from_value(answer).with_context(|| format!("infra {verb}: read the command it was issued as"))
+}
+
+
+fn print_status(name: &str, id: &str, status: &InfraStatus) {
+    let nodes = &status.nodes;
     // The copies that exist, not the nodes the program declares (`weft
     // status` lists those, started or not).
     if nodes.is_empty() {
@@ -611,31 +636,23 @@ fn print_status(name: &str, id: &str, resp: &serde_json::Value) {
     }
     println!("infra for {name} ({id}):");
     for n in nodes {
-        // `node` is the instance's place, spelled the way the source
+        // `node` is the node's place, spelled the way the source
         // reads it (`one.db`): the key and the label are one.
-        let node = n.get("node").and_then(|v| v.as_str()).unwrap_or("?");
-        // A member's copy of a `@per_member` node is its own row.
-        let node = match n.get("member").and_then(|v| v.as_str()) {
-            Some(member) => format!("{node} (member {member})"),
-            None => node.to_string(),
+        // An instance's copy of a `@per_instance` node is its own row.
+        let node = match &n.instance {
+            Some(instance) => format!("{} (instance {instance})", n.node),
+            None => n.node.clone(),
         };
-        let status = n.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-        let url = n
-            .get("endpoint_url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("(no endpoint)");
-        println!("  {node} [{status}] -> {url}");
+        let url = n.endpoint_url.as_deref().unwrap_or("(no endpoint)");
+        println!("  {node} [{}] -> {url}", n.status);
         // A public endpoint's outside address: what to hand to whoever
         // calls in (the node declared only its own path).
-        if let Some(public) = n.get("public_urls").and_then(|v| v.as_object()) {
-            for (endpoint, address) in public {
-                if let Some(address) = address.as_str() {
-                    println!("    {endpoint} is public at {address}");
-                }
-            }
+        for (endpoint, address) in &n.public_urls {
+            println!("    {endpoint} is public at {address}");
         }
     }
 }
+
 
 
 #[cfg(test)]
@@ -643,29 +660,29 @@ mod tests {
     use super::*;
     use weft_core::infra::wire::{Door, LogLine, LogMark, LogStream, Pipe};
 
-    fn member(id: &str) -> Option<weft_core::member::MemberId> {
-        Some(weft_core::member::MemberId::new(id).unwrap())
+    fn instance(id: &str) -> Option<weft_core::instance::InstanceId> {
+        Some(weft_core::instance::InstanceId::new(id).unwrap())
     }
 
     #[test]
     fn doors_name_whose_copy_and_the_copies_still_applying() {
         let answer = DoorsResponse {
             doors: vec![
-                Door { copy: CopyRef { node: "db".into(), member: None }, endpoint: "pg".into(), address: "10.0.0.2:5432".into() },
-                Door { copy: CopyRef { node: "db".into(), member: member("ann") }, endpoint: "pg".into(), address: "10.0.0.3:5432".into() },
+                Door { copy: CopyRef { node: "db".into(), instance: None }, endpoint: "pg".into(), address: "10.0.0.2:5432".into() },
+                Door { copy: CopyRef { node: "db".into(), instance: instance("ann") }, endpoint: "pg".into(), address: "10.0.0.3:5432".into() },
             ],
-            applying: vec![CopyRef { node: "cache".into(), member: None }],
+            applying: vec![CopyRef { node: "cache".into(), instance: None }],
         };
         let out = format_doors(&answer);
         assert!(out.contains("db.pg  10.0.0.2:5432"), "{out}");
-        assert!(out.contains("db.pg (member ann)  10.0.0.3:5432"), "{out}");
+        assert!(out.contains("db.pg (instance ann)  10.0.0.3:5432"), "{out}");
         assert!(out.contains("cache  (still being applied"), "{out}");
     }
 
     #[test]
     fn log_blocks_are_headed_by_what_wrote_them() {
         let blocks = vec![LogBlock {
-            copy: CopyRef { node: "db".into(), member: member("ann") },
+            copy: CopyRef { node: "db".into(), instance: instance("ann") },
             unit: "main".into(),
             stream: LogStream {
                 source: "app".into(),
@@ -673,6 +690,6 @@ mod tests {
                 mark: LogMark::start(Default::default()),
             },
         }];
-        assert_eq!(format_log_blocks(&blocks), "=== db (member ann) main app ===\nready\n");
+        assert_eq!(format_log_blocks(&blocks), "=== db (instance ann) main app ===\nready\n");
     }
 }

@@ -1300,7 +1300,7 @@ export function activate(context: vscode.ExtensionContext) {
     return weftOutputChannel;
   }
 
-  async function viewExecution(summary: ExecutionSummary, version?: string): Promise<void> {
+  async function viewExecution(summary: Pick<ExecutionSummary, 'project_id' | 'execution_id'>, version?: string): Promise<void> {
     // Find (or hint) the project that produced this execution and
     // switch the graph to it, then pin auto-follow on it. The
     // controller handles the replay itself.

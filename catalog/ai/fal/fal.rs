@@ -32,7 +32,9 @@ pub fn checked_model(model: &str) -> WeftResult<&str> {
     let mut segs = model.split('/');
     let ok = segs.next().is_some_and(clean) && segs.next().is_some_and(clean) && segs.all(clean);
     if !ok {
-        weft::node_bail!("'{model}' is not a fal model id (expected e.g. fal-ai/flux/dev)");
+        return Err(weft::WeftError::Input(format!(
+            "'{model}' is not a fal model id (expected e.g. fal-ai/flux/dev)"
+        )));
     }
     Ok(model)
 }
@@ -123,7 +125,9 @@ pub fn video_url(answer: &Value) -> Option<&str> {
 pub fn merge_params(payload: &mut Value, params: Option<&Value>) -> WeftResult<()> {
     let Some(params) = params else { return Ok(()) };
     let Some(extra) = params.as_object() else {
-        weft::node_bail!("params must be an object of model parameters");
+        return Err(weft::WeftError::Input(
+            "params must be an object of model parameters".into(),
+        ));
     };
     let base = payload.as_object_mut().expect("payloads are objects");
     for (k, v) in extra {

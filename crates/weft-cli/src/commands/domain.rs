@@ -8,6 +8,9 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
+use anyhow::Context;
+use weft_core::install::{Domain, DomainEntry, DomainServes};
+
 use super::Ctx;
 
 /// What a domain serves, as the flags spell it.
@@ -38,20 +41,19 @@ pub async fn run(ctx: Ctx, action: DomainAction) -> anyhow::Result<()> {
             if ctx.json_out(&entries)? {
                 return Ok(());
             }
-            let entries = entries.as_array().cloned().unwrap_or_default();
+            let entries: Vec<DomainEntry> = serde_json::from_value(entries).context("read the install's domains")?;
             if entries.is_empty() {
                 println!("no domains; the install answers at its own address only (add one with `weft domain add <name>`)");
                 return Ok(());
             }
             for e in entries {
-                let serves = &e["domain"]["for"];
-                let what = match serves["kind"].as_str().unwrap_or_default() {
-                    "frontend" => format!("frontend of {} ({})", serves["project"].as_str().unwrap_or_default(), serves["upstream"].as_str().unwrap_or_default()),
-                    "api" => format!("API of {}", serves["project"].as_str().unwrap_or_default()),
-                    other => other.to_string(),
+                let what = match &e.domain.serves {
+                    DomainServes::Frontend { project, upstream } => format!("frontend of {project} ({upstream})"),
+                    DomainServes::Api { project } => format!("API of {project}"),
+                    DomainServes::Install => "install".to_string(),
                 };
-                println!("{:<32} {what}", e["domain"]["name"].as_str().unwrap_or_default());
-                println!("  DNS: {}", record_line(&e["record"]));
+                println!("{:<32} {what}", e.domain.name);
+                println!("  DNS: {}", e.record);
             }
             Ok(())
         }
@@ -64,42 +66,36 @@ pub async fn run(ctx: Ctx, action: DomainAction) -> anyhow::Result<()> {
             let name = weft_core::install::normalize_domain_name(&name).map_err(anyhow::Error::msg)?;
             let project = || -> anyhow::Result<uuid::Uuid> { Ok(ctx.project()?.id()) };
             let serves = match (serves, to) {
-                (Serves::Install, None) => serde_json::json!({ "kind": "install" }),
-                (Serves::Frontend, Some(upstream)) => serde_json::json!({ "kind": "frontend", "project": project()?, "upstream": upstream }),
+                (Serves::Install, None) => DomainServes::Install,
+                (Serves::Frontend, Some(upstream)) => DomainServes::Frontend { project: project()?, upstream },
                 (Serves::Frontend, None) => anyhow::bail!(
                     "a frontend domain needs where the frontend runs: add `--to <its https address>` (the address its CI printed)"
                 ),
-                (Serves::Api, None) => serde_json::json!({ "kind": "api", "project": project()? }),
+                (Serves::Api, None) => DomainServes::Api { project: project()? },
                 (_, Some(_)) => anyhow::bail!("--to is only for a frontend domain"),
             };
-            let entry = client.post_json("/install/domains", &serde_json::json!({ "name": name, "for": serves })).await?;
-            if ctx.json_out(&entry)? {
+            let domain = Domain { name: name.clone(), serves };
+            let answer = client.post_json("/install/domains", &serde_json::to_value(&domain)?).await?;
+            if ctx.json_out(&answer)? {
                 return Ok(());
             }
+            let entry: DomainEntry = serde_json::from_value(answer).context("read the stored domain")?;
             println!("added {name}. At your domain's registrar, set this DNS record:");
-            println!("  {}", record_line(&entry["record"]));
+            println!("  {}", entry.record);
             if no_wait {
                 println!("the install gets the domain's certificate once the record is in place (`weft domain list` shows it again)");
                 return Ok(());
             }
-            let address: IpAddr = entry["record"]["value"]
-                .as_str()
-                .and_then(|v| v.parse().ok())
-                .ok_or_else(|| anyhow::anyhow!("the install answered no address for the record: {entry}"))?;
+            let address: IpAddr = entry
+                .record
+                .value
+                .parse()
+                .map_err(|_| anyhow::anyhow!("the install answered '{}' as the record's address", entry.record.value))?;
             wait_for_dns(&name, address).await;
             println!("{name} points at the install; its certificate follows within a minute, then https://{name} works");
             Ok(())
         }
     }
-}
-
-fn record_line(record: &serde_json::Value) -> String {
-    format!(
-        "{} record, name {}, value {}",
-        record["type"].as_str().unwrap_or_default(),
-        record["name"].as_str().unwrap_or_default(),
-        record["value"].as_str().unwrap_or_default()
-    )
 }
 
 /// Wait, for as long as it takes, until `name` resolves to `address`. DNS

@@ -11,7 +11,7 @@ use anyhow::Result;
 use super::Ctx;
 use crate::progress::ActionVerb;
 
-pub async fn run(ctx: Ctx, node_set: weft_compiler::codegen::NodeSet) -> Result<()> {
+pub async fn run(ctx: Ctx, node_set: weft_core::builds::NodeSet) -> Result<()> {
     let inner = ctx.clone();
     ctx.with_progress(ActionVerb::Build, |progress| async move {
         // Build IS "make the dispatcher's picture of this project match

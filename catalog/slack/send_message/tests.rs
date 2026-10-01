@@ -18,6 +18,9 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("blocks_and_thread_ts_ride_the_post", blocks_and_thread),
         NodeTest::fake("a_post_at_schedules_instead_of_posting", scheduled_post),
         NodeTest::fake("refuses_two_destinations", refuses_two_destinations),
+        NodeTest::fake("a_refused_post_fails_the_run_when_error_is_unwired", refused_unwired),
+        NodeTest::fake("a_refused_post_comes_out_on_error_when_it_is_wired", refused_wired),
+        NodeTest::fake("a_missing_destination_fails_the_run_even_with_error_wired", no_destination_wired),
         NodeTest::live("one_real_send_then_delete", "slack", live_send_then_delete).with_fixture(
             fixture_spec(
                 "SLACK_CHANNEL_ID",
@@ -273,6 +276,50 @@ async fn refuses_two_destinations(rig: FakeRig) -> WeftResult<()> {
         .await;
     let err = outcome.result.expect_err("both destinations must refuse").to_string();
     assert!(err.contains("ONE destination"), "{err}");
+    assert!(rig.requests().is_empty(), "refused before any call");
+    Ok(())
+}
+
+/// Slack refusing the post, the failure both `error` tests read.
+fn refuse_the_post(rig: &FakeRig) {
+    rig.respond(
+        "POST",
+        "/api/chat.postMessage",
+        json!({ "ok": false, "error": "not_in_channel" }),
+    );
+}
+
+fn post_inputs(rig: &FakeRig) -> serde_json::Value {
+    json!({ "account": rig.access("slack"), "channel": "C42", "text": "hello" })
+}
+
+async fn refused_unwired(rig: FakeRig) -> WeftResult<()> {
+    refuse_the_post(&rig);
+    let err = rig.run(&SlackSendMessageNode, post_inputs(&rig)).await.failure()?;
+    assert!(err.contains("not_in_channel"), "{err}");
+    Ok(())
+}
+
+async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
+    refuse_the_post(&rig);
+    rig.wire_output("error");
+    let outcome = rig.run(&SlackSendMessageNode, post_inputs(&rig)).await.ok()?;
+    let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
+    assert!(error.contains("not_in_channel"), "{error}");
+    for port in ["ts", "channel", "permalink", "scheduledId"] {
+        assert!(!outcome.outputs.contains_key(port), "a caught failure emits nothing on {port}");
+    }
+    Ok(())
+}
+
+async fn no_destination_wired(rig: FakeRig) -> WeftResult<()> {
+    rig.wire_output("error");
+    let err = rig
+        .run(&SlackSendMessageNode, json!({ "account": rig.access("slack"), "text": "hello" }))
+        .await
+        .failure()?;
+    assert!(err.starts_with("input error"), "a program mistake is never caught: {err}");
+    assert!(err.contains("pick a destination"), "{err}");
     assert!(rig.requests().is_empty(), "refused before any call");
     Ok(())
 }

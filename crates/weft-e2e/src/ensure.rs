@@ -122,10 +122,10 @@ pub async fn wait_healthy(disp: &Dispatcher) -> Result<()> {
 /// Where a local install keeps its files.
 // SYNC: the install's directory <-> crates/weft-cli/src/commands/daemon.rs
 //       (data_dir, Install::from_env: `installs/<name>` for a named one)
-pub fn install_dir(instance: &weft_core::infra::Instance) -> std::path::PathBuf {
+pub fn install_dir(install: &weft_core::infra::Install) -> std::path::PathBuf {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_default();
     let root = home.join(".local/share/weft");
-    match instance.name() {
+    match install.name() {
         None => root,
         Some(name) => root.join("installs").join(name),
     }

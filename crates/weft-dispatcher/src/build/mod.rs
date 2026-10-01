@@ -19,6 +19,7 @@
 //! from the store here and rebuilt from what the store says; a text
 //! resolution is program data, the same as the source it came with.
 
+pub mod blob_cache;
 pub mod ledger;
 pub mod prune;
 pub mod source;
@@ -27,11 +28,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
-use serde::{Deserialize, Serialize};
-
 use async_trait::async_trait;
 use weft_platform_traits::{BuildHandle, BuildRequest, BuildStatus, ImageBuilder};
-use weft_core::project::hash::Manifest;
 
 /// The control point the version builder (`crate::build`) calls around REAL build work, so the
 /// dispatcher's `building` transition only engages when something actually
@@ -69,68 +67,33 @@ impl weft_compiler::build_plan::TagPolicy for ImageTags<'_> {
     }
 }
 
-/// `POST /projects/{id}/builds`: build this version of the project.
-// SYNC: VersionBuildRequest <-> crates/weft-cli/src/commands/ensure.rs (the build body)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VersionBuildRequest {
-    /// The project's name, as its `weft.toml` says.
-    pub name: String,
-    /// The version: every covered file's hash, plus the pseudo-entry naming
-    /// the weft and catalog it was written against. Every blob is already
-    /// in the project's asset plane (the CLI's snapshot put them there).
-    pub manifest: Manifest,
-    /// Compile every catalog node into the worker (`full`) or only the
-    /// ones the program references (`referenced`).
-    #[serde(rename = "nodeSet")]
-    pub node_set: NodeSetWire,
-    /// `@asset` resolutions the author's machine produced, by resolution
-    /// key (`FileRef::resolution_key`).
-    #[serde(default)]
-    pub assets: BTreeMap<String, serde_json::Value>,
+/// The infra places of `after` whose images differ from `before` (what
+/// the last build registered), sorted. A place new to this build replaces
+/// nothing, so it is left out.
+pub fn replaced_infra_images(
+    before: &crate::project_store::InfraImageTags,
+    after: &BTreeMap<String, BTreeMap<String, String>>,
+) -> Vec<String> {
+    after
+        .iter()
+        .filter(|(place, images)| {
+            before.get(*place).is_some_and(|old| {
+                old.len() != images.len() || images.iter().any(|(name, image)| old.get(name) != Some(image))
+            })
+        })
+        .map(|(place, _)| place.clone())
+        .collect()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeSetWire {
-    Full,
-    Referenced,
-}
-
-impl From<NodeSetWire> for weft_compiler::codegen::NodeSet {
-    fn from(n: NodeSetWire) -> Self {
-        match n {
-            NodeSetWire::Full => weft_compiler::codegen::NodeSet::Full,
-            NodeSetWire::Referenced => weft_compiler::codegen::NodeSet::Referenced,
-        }
-    }
-}
-
-/// What a build produced: the compiled program, its three hashes and the
-/// implementations its worker carries, and the infra image every infra
-/// place resolves to. The caller registers all of it in one transaction.
-// SYNC: BuiltProgram <-> crates/weft-cli/src/commands/ensure.rs (BuiltProgram)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BuiltProgram {
-    pub definition: weft_core::ProjectDefinition,
-    #[serde(rename = "binaryHash")]
-    pub binary_hash: String,
-    #[serde(rename = "definitionHash")]
-    pub definition_hash: String,
-    #[serde(rename = "infraHash")]
-    pub infra_hash: String,
-    pub implementations: BTreeMap<String, String>,
-    /// `place -> { image name -> image ref }`, keyed the way each infra
-    /// place's row is (`one.db`), which is how the supervisor reads it.
-    #[serde(rename = "infraImages")]
-    pub infra_images: BTreeMap<String, BTreeMap<String, String>>,
-    /// The image refs this build had to build (absent from the registry
-    /// when it began); empty when every image was already there.
-    #[serde(rename = "builtImages")]
-    pub built_images: Vec<String>,
+/// What a build produced: the answer the caller registers and hands the
+/// client (its `replaced_infra_images` filled at registration, from
+/// [`replaced_infra_images`]), and the images the version runs.
+#[derive(Debug, Clone)]
+pub struct Build {
+    pub program: weft_core::builds::BuiltProgram,
     /// Every image ref this version runs, built now or found already
     /// there. Registration records them as the project's running version
     /// (`ledger::note_running`); the client has no use for it.
-    #[serde(skip)]
     pub images: Vec<String>,
 }
 
@@ -155,8 +118,8 @@ pub struct VersionBuilder {
     pub bases: weft_compiler::worker_image::BaseImages,
     pub images: Arc<dyn ImageBuilder>,
     pub pool: sqlx::PgPool,
-    /// This dispatcher instance: the owner of the builds it drives.
-    pub instance: String,
+    /// This dispatcher replica: the owner of the builds it drives.
+    pub replica: String,
     /// How many worker builds compile side by side, each in a compile
     /// cache of its own (`weft_compiler::worker_image::COMPILE_LANE_ARG`).
     pub compile_lanes: u32,
@@ -164,6 +127,8 @@ pub struct VersionBuilder {
     pub poll_every: std::time::Duration,
     /// The reclaims registered builds asked for (`prune::AfterBuildPrunes`).
     pub prunes: Arc<prune::AfterBuildPrunes>,
+    /// The version files this replica fetched before (`blob_cache`).
+    pub blobs: blob_cache::BlobCache,
 }
 
 impl VersionBuilder {
@@ -177,19 +142,19 @@ impl VersionBuilder {
         storage: &dyn ProjectStorage,
         project_id: uuid::Uuid,
         tenant: &str,
-        request: &VersionBuildRequest,
+        request: &weft_core::builds::VersionBuildRequest,
         gate: &dyn BuildGate,
         hold: &prune::ImageHold,
-    ) -> Result<BuiltProgram> {
+    ) -> Result<Build> {
         let workdir = tempfile::Builder::new()
             .prefix("weft-version-")
             .tempdir()
             .context("create the build's working directory")?;
         let root = workdir.path().to_path_buf();
-        source::materialize(storage, tenant, project_id, &request.manifest, &root).await?;
+        source::materialize(storage, &self.blobs, tenant, &request.manifest, &root).await?;
 
         let assets = request.assets.clone();
-        let node_set = request.node_set.into();
+        let node_set = request.node_set;
         let bases = self.bases.clone();
         let images = self.images.clone();
         // The compile and the staging are blocking filesystem work.
@@ -217,15 +182,18 @@ impl VersionBuilder {
             plan.images.iter().map(|image| image.image_ref.clone()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
         let infra_images = infra_places(&definition, &plan.images)?;
         drop(workdir);
-        Ok(BuiltProgram {
-            built_images,
+        Ok(Build {
+            program: weft_core::builds::BuiltProgram {
+                built_images,
+                definition,
+                binary_hash: plan.binary_hash,
+                definition_hash: plan.definition_hash,
+                infra_hash: plan.infra_hash,
+                implementations: plan.implementations,
+                infra_images,
+                replaced_infra_images: Vec::new(),
+            },
             images,
-            definition,
-            binary_hash: plan.binary_hash,
-            definition_hash: plan.definition_hash,
-            infra_hash: plan.infra_hash,
-            implementations: plan.implementations,
-            infra_images,
         })
     }
 
@@ -324,7 +292,7 @@ impl VersionBuilder {
         cancelled: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
         let now = crate::lease::now_unix();
-        let claim = ledger::claim(&self.pool, &image.image_ref, project_id, tenant, &self.instance, self.compile_lanes, now)
+        let claim = ledger::claim(&self.pool, &image.image_ref, project_id, tenant, &self.replica, self.compile_lanes, now)
             .await?;
         let stoppable = claim.stoppable();
         let mut follow = Follow { name: String::new(), driving: true, started: Vec::new() };
@@ -493,13 +461,13 @@ impl VersionBuilder {
                         // Taken over under another name (the ledger doc).
                         follow.name = name;
                     }
-                    follow.driving = driver == self.instance;
+                    follow.driving = driver == self.replica;
                     if !follow.driving && driver_until < now {
                         if let Some((name, lane)) = ledger::take_over(
                             &self.pool,
                             &image.image_ref,
                             &follow.name,
-                            &self.instance,
+                            &self.replica,
                             self.compile_lanes,
                             now,
                         )
@@ -517,7 +485,7 @@ impl VersionBuilder {
             let outcome = match self.images.poll(&handle).await? {
                 BuildStatus::Pending => {
                     if follow.driving {
-                        ledger::renew(&self.pool, &image.image_ref, &follow.name, &self.instance, now).await?;
+                        ledger::renew(&self.pool, &image.image_ref, &follow.name, &self.replica, now).await?;
                     }
                     tokio::time::sleep(self.poll_every).await;
                     continue;
@@ -609,12 +577,7 @@ async fn resolve_assets(
             continue;
         }
         let meta = storage.meta(&claimed.key).await.with_context(|| format!("read the stored file behind @asset({:?})", r.path))?;
-        let file = weft_core::storage::StoredFile {
-            key: meta.key.clone(),
-            mime_type: meta.mime_type.clone(),
-            size_bytes: meta.size_bytes,
-            filename: meta.filename.clone(),
-        };
+        let file = weft_core::storage::StoredFile::from(&meta);
         if let Some(declared) = r.ty.concrete_file_kind() {
             if declared != weft_core::weft_type::FileKind::Blob && file.kind() != declared {
                 refused.push(format!(

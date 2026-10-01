@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use reqwest::Method;
 use serde_json::Value;
 
-use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
 use weft::node::NodeOutput;
 
 #[derive(NodeManifest)]
@@ -24,10 +24,12 @@ impl Node for HttpRequestNode {
     }
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+        // A failure is no answer at all or an unreadable body. An answer
+        // with any status is a success: `status` and `ok` say it.
         let url: String = ctx.inputs.get("url")?;
         let method_str: String = ctx.inputs.get("method")?;
         let method = Method::from_bytes(method_str.as_bytes())
-            .node_err(format!("bad method '{method_str}'"))?;
+            .map_err(|_| WeftError::Input(format!("bad method '{method_str}'")))?;
 
         let body: Option<Value> = ctx.inputs.opt("body")?;
         let headers: Option<HashMap<String, String>> = ctx.inputs.opt("headers")?;

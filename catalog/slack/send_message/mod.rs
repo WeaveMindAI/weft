@@ -64,10 +64,18 @@ impl Node for SlackSendMessageNode {
                     api::call(&ctx, &access, "conversations.open", json!({ "users": u })).await?;
                 api::required_str(&opened["channel"], "conversations.open", "id")?.to_string()
             }
+            // The destination is the program's choice, so a wrong pair
+            // is an input mistake, never a caught failure.
             (Some(_), Some(_)) => {
-                weft::node_bail!("pick ONE destination: a channel or a user, not both")
+                return Err(weft::WeftError::Input(
+                    "pick ONE destination: a channel or a user, not both".to_string(),
+                ));
             }
-            (None, None) => weft::node_bail!("pick a destination: a channel or a user"),
+            (None, None) => {
+                return Err(weft::WeftError::Input(
+                    "pick a destination: a channel or a user".to_string(),
+                ));
+            }
         };
 
         let mut payload = json!({ "channel": destination });

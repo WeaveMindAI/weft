@@ -39,10 +39,10 @@ pub mod testing;
 #[derive(Clone)]
 pub struct SupervisorState {
     pub broker: Arc<dyn broker_ops::BrokerSupervisorOps>,
-    /// This supervisor instance's id: it identifies its command claims
+    /// This supervisor replica's id: it identifies its command claims
     /// AND keys its `infra_owner` leases, sent on every broker write so
     /// the broker's ownership gate compares the lease against THIS.
-    pub instance: String,
+    pub replica: String,
     /// Where the infrastructure runs.
     pub host: Arc<dyn InfraHost>,
     pub clock: Arc<dyn Clock>,
@@ -67,7 +67,7 @@ pub struct SupervisorState {
 /// One lock per project, so this process's sweep deletion and apply of
 /// the same project never interleave on the host.
 ///
-/// A copy's id is derived from (project, node, member), so a node removed
+/// A copy's id is derived from (project, node, instance), so a node removed
 /// and then added back names the very same copy. Without this, the sweep
 /// could judge the copy gone, an apply of the re-added node could adopt
 /// its kept disks, and the sweep's delete would then take the disks and

@@ -1,6 +1,6 @@
 ---
 name: weft-frontend
-description: "Read when the user wants a page, app or site for the program, and before dispatching the frontend-builder: the verified scaffold commands, the default stack (pnpm, SvelteKit, PostgreSQL, BetterAuth, shadcn-svelte), calling the program's own routes and signal doors, the three variables that say where the program is, one shared PostgreSQL, where the api token lives, pictures as links, the build and its Dockerfile, and the shape for a site whose people each bring their own accounts or settings (members: the manager routes, the member header and token, their settings page)."
+description: "Read when the user wants a page, app or site for the program, and before dispatching the frontend-builder: the verified scaffold commands, the default stack (pnpm, SvelteKit, PostgreSQL, BetterAuth, shadcn-svelte), calling the program's own routes and signal doors, the three variables that say where the program is, one shared PostgreSQL, where the api token lives, pictures as links, the build and its Dockerfile, and the shape for a site whose people each bring their own accounts or settings (the manager routes, the instance header and token, the settings page)."
 ---
 
 
@@ -376,6 +376,27 @@ environment, call the doors from a `+page.server.ts` or a `+server.ts`, and
 never ship it to the browser. A program route that needs the token is called
 server side too.
 
+A route gated by `ApiKeyAuth` needs one of the keys stored on its
+connection, which is a different thing from `WEFT_TOKEN` (weft's own token
+for the signal doors). Keep it in the server's environment under a name of
+its own, `WEFT_ROUTE_KEY` unless the brief names another, and send it as
+`X-Api-Key: <key>` (or `Authorization: Bearer <key>`). For any other gate,
+the gate's own description names the header.
+
+Call a route with a plain server `fetch`: a live route answers `307` to
+send the caller to the worker serving it, and `fetch` follows that by
+itself. Never follow it by hand and never set `redirect: 'manual'`.
+
+A route counts calls per caller, 60 a minute by default, and the server is
+one caller. A page that polls about once a second sits exactly at that
+limit, and the calls past it get `429`: ask Tangle to raise
+`callsPerMinutePerCaller` on that route (`0` turns the limit off), or poll
+less often.
+
+If a page shows whether something is still working, it asks the program
+(a route answering from `ListRuns` or `CountRuns`), never a status column
+the run was meant to update: a run that fails leaves that column stuck.
+
 The server finds [the program] in three environment variables, and never in
 an address written into the code, because the same frontend runs on this
 machine and on a cloud install:
@@ -445,49 +466,56 @@ read the session.
 
 Some requests are about other people: "each customer connects their own
 WhatsApp", "users log in and use their own OpenAI key", "every client gets a
-bot on their own Slack". That is a program with members (the `weft-members`
-skill), and the frontend is where those members live. You never build one
-project per person, and you never ask each person for a key in a form field.
+bot on their own Slack". That is a program with instances for several people:
+read the `weft-instances` skill (the marks, the shared routes, the lifecycle)
+and the `weft-members` skill (the table of who owns which instance, the admin
+route, the settings page). The frontend is where those people live. You never
+build one project per person, and you never ask each person for a key in a
+form field.
 
 The shape, unless the user asks for another:
 
-- **The frontend owns the accounts.** BetterAuth on the shared Postgres signs
-  people in, and a person's member id is their BetterAuth user id. weft keeps
-  no list of members: an id becomes a member the first time the program
-  starts something for it.
-- **The program has manager routes**, gated by an `ApiKeyAuth` key set whose
-  key lives only in the frontend's server environment. They are the only way
-  anything starts, stops or removes a member's things: one that brings a
-  member on (starts their copy, waits until it runs, turns on their
-  triggers), one that mints them a member token, one that reads where they
-  stand, and one that wipes them. A copy can take minutes to come up, so the
-  bring-on route answers first and keeps working after its reply.
+- **The frontend signs people in.** BetterAuth on the shared Postgres signs
+  people in, and a table in that same database says which instances belong
+  to which person. With one instance per person, the instance id is simply
+  their BetterAuth user id. weft keeps no list of instances: an id becomes an
+  instance the first time the program starts something for it.
+- **The program has manager routes**, shared (a route can never be per
+  instance) and gated by an `ApiKeyAuth` key set whose key lives only in the
+  frontend's server environment. They are the only way anything starts,
+  stops or removes an instance's things: one that creates an instance (starts
+  its container, turns on its triggers), one that mints an instance token
+  for an instance the person owns, one that reads where the instance stands,
+  and one that wipes it. A container can take minutes to come up, so the
+  create route answers first and keeps working after its reply.
 - **Every page shows what is happening, never a stale "not started".** After
   a person presses a button that starts something, the page reads where it
-  stands and says so: the member token's display listing
+  stands and says so: the instance token's display listing
   (`GET /signal-token/displays`) gives each infra display a `status`
   (`provisioning` is "starting…", `running` shows the display, `stopped` or
-  `absent` offers the start button, `failed` shows the error), and the page
+  `none` offers the start button, `failed` shows the error), and the page
   reads it again every few seconds until it settles. A display read that
   answers 404 while the listing says `provisioning` is "starting", never "not
-  started". The `members` catalog nodes do each of
+  started". The `instances` catalog nodes do each of
   those. A `+server.ts` calls them only after reading the session, and it
-  takes the member id from the session, never from the request body.
+  picks the instance id from what the session's person owns, never from the
+  request body.
 - **A signed-in person's own runs** go through the program's routes gated
   the same way, called from the frontend's server with
-  `Weft-Member: <session user id>`. The header is honoured only on a gated
+  `Weft-Instance: <instance id>`. The header is honoured only on a gated
   route, and only the server may send it.
-- **What the browser does as the member** carries a member token the program
-  minted for that person (short-lived, handed over once, on their login):
-  their settings page, their own displays (a bridge's QR code), a route they
-  call from the page with `Weft-Member-Token`. A member token acts as that
-  person in this one program and nothing else.
+- **What the browser does inside an instance** carries an instance token the
+  program minted for it (short-lived, handed over once, on the person's login):
+  its settings page, its own displays (a bridge's QR code), a route called
+  from the page with `Weft-Instance-Token`. An instance token acts inside that
+  one instance of this program: it starts its runs, answers its waits, shows
+  its displays and connects its accounts, and it always expires.
 - **The browser only ever talks to its own site.** The dispatcher's address
   is often one the browser cannot reach (a loopback port on the machine
   running weft, which a Windows browser in front of a WSL install cannot
   see, or a dispatcher that is not public at all), and the site's server
   always can. So the site mounts the pass-through the connect library ships,
-  and every member door, signal door and display call a page makes goes to
+  and every instance door, signal door and display call a page makes goes to
   `/weft/...` on the site itself:
 
   ```ts
@@ -504,30 +532,34 @@ The shape, unless the user asks for another:
   `WEFT_DISPATCHER_URL` (the address `weft token mint` printed before
   `/signal-token/`, `http://127.0.0.1:14111` on a local install) goes in the
   server's environment and nowhere a page can read it. The pass-through
-  forwards only `/member/`, `/signal/`, `/signal-token/` and the program's
+  forwards only `/instance/`, `/signal/`, `/signal-token/`, the program's
   own routes (`/connect/<tenant>/<path>`, following the route's redirect to
-  the worker itself), carries the caller's token and body, and keeps the
-  site's cookies and the `Weft-Member` header back. A page fetches
-  `/weft/signal-token/displays` with the member token as bearer, calls a
-  program route as `/weft/connect/<tenant>/<path>` with the member token in
-  `Weft-Member-Token`, and `new MemberDoor(memberToken)` already calls
-  `/weft/member/...`. If you catch yourself putting the dispatcher's
+  the worker itself) and the picture links in their answers
+  (`/public/files/<token>`), carries the caller's token and body, and keeps the
+  site's cookies and the `Weft-Instance` header back. A page fetches
+  `/weft/signal-token/displays` with the instance token as bearer, calls a
+  program route as `/weft/connect/<tenant>/<path>` with the instance token in
+  `Weft-Instance-Token`, and `new InstanceDoor(instanceToken)` already calls
+  `/weft/instance/...`. A route called through the pass-through builds the
+  picture links in its answer on the site's own address, so those pictures
+  load through the same pass-through, and you write no proxy route for them.
+  If you catch yourself putting the dispatcher's
   address in a page, stop and write: "Wait. The browser talks to its own
   site." Then call `/weft/...`. If the site sends everyone not signed in to
   its login page (a check in `hooks.server.ts`, say), let `/weft/...` past
-  that check: each of those calls carries the member's own weft token, and
+  that check: each of those calls carries the instance's own weft token, and
   weft checks it.
-- **Each person fills in what the program asks of them** (every field it
-  writes `@member_filled`: their accounts, their spreadsheet, their model,
-  their schedule) on a settings page you mount with `MemberSettings` and a
-  `MemberDoor` from the connect library: the same pickers and list fields the
+- **Each person fills in what the program asks of their instance** (every field it
+  writes `@instance_filled`: their accounts, their spreadsheet, their model,
+  their schedule) on a settings page you mount with `InstanceSettings` and an
+  `InstanceDoor` from the connect library: the same pickers and list fields the
   weft editor shows, restyled to the site, and never the author's shared key.
   A save that changes a value one of their live triggers reads re-arms it
   before it answers, and the page says so; nothing else to call. The page
   titles each step with the program's own label and each field with the
   node's own name for it ("Value"), both written for the program's author,
-  so you name every field a member sees in your own words:
-  `<MemberSettings {door} labels={{ 'greet': 'Your greeting', 'greet.value': 'How the bot greets you' }} />`,
+  so you name every field a person sees in your own words:
+  `<InstanceSettings {door} labels={{ 'greet': 'Your greeting', 'greet.value': 'How the bot greets you' }} />`,
   a step's id for its title and `step.field` for a field (`door.fields()`
   lists both). If the page
   must look different, build it from `door.fields()`, `door.setValues(..)` and
@@ -539,15 +571,17 @@ The shape, unless the user asks for another:
   along has the lines that mount both. Run it again
   after weft is updated, and never edit inside that folder, because the next
   run replaces it.
-- **A cron in the program tidies up**: members who left, copies idle too
-  long. It is the program's, not the frontend's.
-- **If the site bills its users**, a manager route reads `ctx.costs()` for a
-  member (whose credential paid each call) and the frontend shows or charges
+- **A cron in the program stops idle instances**: weft stops none by itself,
+  so the program keeps a last-used time per instance and stops or removes
+  the ones idle past the limit the user chose (the `weft-instances` skill).
+  It is the program's, not the frontend's.
+- **If the site bills its users**, a manager route reads `ctx.costs()` for an
+  instance (whose credential paid each call) and the frontend shows or charges
   it; weft only records the cost.
 
 [the brief] for such a frontend names every manager route with its body and
 reply, says each one is callable by the frontend's server alone after a
-session check, and names which pages carry a member token and which calls
+session check, and names which pages carry an instance token and which calls
 carry the header.
 
 ## House rules
@@ -559,15 +593,31 @@ carry the header.
   `pnpm run dev`. You hand the user those exact commands in the report.
 - `front/Dockerfile` builds the frontend into a server that listens on
   `$PORT`: that is what the deploy workflow runs on the cloud. For SvelteKit
-  that means `@sveltejs/adapter-node` in `svelte.config.js`, and the image
-  runs `node build`.
+  that means `pnpm add -D @sveltejs/adapter-node`, then, in
+  `front/vite.config.ts`, importing `adapter` from `@sveltejs/adapter-node`
+  where the scaffold imports it from `@sveltejs/adapter-auto` (the scaffold
+  writes no `svelte.config.js`: the adapter is set inside `sveltekit({ ... })`
+  there). The image runs `node build`, and on the cloud the deploy step
+  provides the environment. The built server does not read `.env`, so if you
+  run it by hand, run `node --env-file=.env build`.
 
 - A picture [the program] answers with arrives as `{ url, mimeType,
-  filename, sizeBytes }`: you put the `url` in an `<img>`. A picture the page
+  filename, sizeBytes }`: you put the `url` in an `<img>`. That link is built
+  on the address the route was called on, so a page calls routes through the
+  pass-through (`/weft/connect/...`), never from its own server code straight
+  to the dispatcher: called that way, the links point at an address the
+  browser may not reach. A picture the page
   sends goes in the JSON body as a `data:` URL on the key the route declares
   as `Image`; never as multipart, never as a separate upload.
+- If a page shows a conversation read from a conversation file (the AI
+  nodes' `historyFile`), it skips the messages whose `role` is `system`: the
+  file can open with the system prompt as its first message. It finds
+  messages by their `role`, never by their position in the list.
 - Seed data and demo accounts are fine; the report says they are seed data,
   and no page depends on one to look alive.
+- An infra node's card (what `weft infra show` prints) is for the program's
+  author. A page never parses its text for state and never shows its labels
+  to people as they are: it asks the program, and chooses its own words.
 - Plain: shadcn-svelte components, little custom CSS, no design system the
   request did not ask for.
 

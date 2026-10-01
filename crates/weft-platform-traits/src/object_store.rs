@@ -193,6 +193,16 @@ pub trait ObjectStore: Send + Sync {
     /// in flight while the abort runs can still land afterwards, so a
     /// caller that must guarantee zero residue re-aborts on its sweep.
     async fn abort_multipart(&self, key: &str, upload_id: &str) -> Result<()>;
+
+    /// Whether the multipart upload is still open: true while it can take
+    /// parts and be completed, false once it is gone (completed, aborted,
+    /// or never existed). Read through ListParts, which answers 404
+    /// `NoSuchUpload` for a gone upload on S3, the GCS XML API and
+    /// SeaweedFS alike (SeaweedFS removes the upload's folder when it
+    /// completes). It cannot say WHICH way the upload went; a caller that
+    /// never aborts an upload it is completing reads "gone" as "completed"
+    /// and checks the object.
+    async fn multipart_exists(&self, key: &str, upload_id: &str) -> Result<bool>;
 }
 
 /// The deploy-time slot config: where the bucket lives and how to reach it.
@@ -730,6 +740,23 @@ impl ObjectStore for S3ObjectStore {
             Err(e) => Err(e).with_context(|| format!("object-store abort-multipart {key}")),
         }
     }
+
+    async fn multipart_exists(&self, key: &str, upload_id: &str) -> Result<bool> {
+        match self
+            .client
+            .list_parts()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .max_parts(1)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) if Self::is_not_found(&e) => Ok(false),
+            Err(e) => Err(e).with_context(|| format!("object-store list-parts {key}")),
+        }
+    }
 }
 
 /// In-memory `ObjectStore` for tests: a map plus an append-only call log.
@@ -782,6 +809,13 @@ pub mod fake {
         /// Keys whose NEXT `delete` fails (one-shot, then cleared), for
         /// exercising callers' reap-retry paths. Dumb injection, no logic.
         fail_delete_once: Mutex<std::collections::BTreeSet<String>>,
+        /// Make the next `complete_multipart` fail with the upload left
+        /// open (one-shot), like a bucket that was briefly unreachable.
+        fail_complete_once: Mutex<bool>,
+        /// One-shot pause for the next completion, after the bytes are
+        /// swapped in and before it answers: (tell the test it got there,
+        /// wait for the test to let it go). Dumb injection, no logic.
+        hold_complete: Mutex<Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>>,
     }
 
     impl FakeObjectStore {
@@ -792,6 +826,66 @@ pub mod fake {
         /// Make the next `delete(key)` fail once (subsequent deletes succeed).
         pub fn fail_next_delete(&self, key: &str) {
             self.fail_delete_once.lock().insert(key.to_string());
+        }
+
+        /// Pause the next `complete_multipart` once its object holds the new
+        /// bytes. Returns (resolves when it got there, send to let it answer).
+        pub fn hold_next_complete(&self) -> (tokio::sync::oneshot::Receiver<()>, tokio::sync::oneshot::Sender<()>) {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            *self.hold_complete.lock() = Some((entered_tx, release_rx));
+            (entered_rx, release_tx)
+        }
+
+        /// Assemble an in-progress upload's parts into its object, the way
+        /// the bucket's completion does. The upload is gone afterwards, so
+        /// a second completion of it fails like the real backends'
+        /// `NoSuchUpload`.
+        fn assemble(&self, key: &str, upload_id: &str, parts: &[(i32, String)]) -> Result<u64> {
+            let mut uploads = self.uploads.lock();
+            let upload = uploads
+                .get(upload_id)
+                .ok_or_else(|| anyhow!("no such upload {upload_id}"))?;
+            if upload.key != key {
+                anyhow::bail!("upload {upload_id} is for key {}, not {key}", upload.key);
+            }
+            // Real S3/SeaweedFS reject a completion with no parts (there is no
+            // multipart way to make a zero-byte object) with InvalidPart /
+            // MalformedXML. Model that so the empty-object path is never
+            // (re)routed through multipart by mistake.
+            if parts.is_empty() {
+                anyhow::bail!("InvalidPart: multipart completion needs at least one part");
+            }
+            let mut assembled = Vec::new();
+            let mut last = 0;
+            for (n, etag) in parts {
+                if *n <= last {
+                    anyhow::bail!("parts not ascending at #{n}");
+                }
+                last = *n;
+                let (landed_etag, bytes) = upload
+                    .parts
+                    .get(n)
+                    .ok_or_else(|| anyhow!("InvalidPart: part #{n} never landed"))?;
+                if landed_etag != etag {
+                    anyhow::bail!("InvalidPart: part #{n} etag mismatch");
+                }
+                // Real S3 also rejects a zero-byte part; the store must never
+                // reserve one (an empty object uploads zero parts instead).
+                if bytes.is_empty() {
+                    anyhow::bail!("InvalidPart: part #{n} is empty (parts must be non-empty)");
+                }
+                assembled.extend_from_slice(bytes);
+            }
+            uploads.remove(upload_id);
+            let size = assembled.len() as u64;
+            self.objects.lock().insert(key.to_string(), Bytes::from(assembled));
+            Ok(size)
+        }
+
+        /// Make the next `complete_multipart` fail, leaving the upload open.
+        pub fn fail_next_complete(&self) {
+            *self.fail_complete_once.lock() = true;
         }
 
         /// Snapshot of every recorded call, in order.
@@ -1041,44 +1135,15 @@ pub mod fake {
                 upload_id: upload_id.to_string(),
                 parts: parts.len(),
             });
-            let mut uploads = self.uploads.lock();
-            let upload = uploads
-                .get(upload_id)
-                .ok_or_else(|| anyhow!("no such upload {upload_id}"))?;
-            if upload.key != key {
-                anyhow::bail!("upload {upload_id} is for key {}, not {key}", upload.key);
+            if std::mem::take(&mut *self.fail_complete_once.lock()) {
+                bail!("injected: the bucket is unreachable");
             }
-            // Real S3/SeaweedFS reject a completion with no parts (there is no
-            // multipart way to make a zero-byte object) with InvalidPart /
-            // MalformedXML. Model that so the empty-object path is never
-            // (re)routed through multipart by mistake.
-            if parts.is_empty() {
-                anyhow::bail!("InvalidPart: multipart completion needs at least one part");
+            let size = self.assemble(key, upload_id, parts)?;
+            let hold = self.hold_complete.lock().take();
+            if let Some((entered, release)) = hold {
+                let _ = entered.send(());
+                let _ = release.await;
             }
-            let mut assembled = Vec::new();
-            let mut last = 0;
-            for (n, etag) in parts {
-                if *n <= last {
-                    anyhow::bail!("parts not ascending at #{n}");
-                }
-                last = *n;
-                let (landed_etag, bytes) = upload
-                    .parts
-                    .get(n)
-                    .ok_or_else(|| anyhow!("InvalidPart: part #{n} never landed"))?;
-                if landed_etag != etag {
-                    anyhow::bail!("InvalidPart: part #{n} etag mismatch");
-                }
-                // Real S3 also rejects a zero-byte part; the store must never
-                // reserve one (an empty object uploads zero parts instead).
-                if bytes.is_empty() {
-                    anyhow::bail!("InvalidPart: part #{n} is empty (parts must be non-empty)");
-                }
-                assembled.extend_from_slice(bytes);
-            }
-            uploads.remove(upload_id);
-            let size = assembled.len() as u64;
-            self.objects.lock().insert(key.to_string(), Bytes::from(assembled));
             Ok(size)
         }
 
@@ -1090,6 +1155,10 @@ pub mod fake {
             // Removing an absent upload is the idempotent success case.
             self.uploads.lock().remove(upload_id);
             Ok(())
+        }
+
+        async fn multipart_exists(&self, _key: &str, upload_id: &str) -> Result<bool> {
+            Ok(self.uploads.lock().contains_key(upload_id))
         }
     }
 }
@@ -1216,10 +1285,16 @@ mod tests {
         // Land them out of order; completion order comes from the part list.
         let e2 = store.put_part(&u2, Bytes::from_static(b"de")).unwrap();
         let e1 = store.put_part(&u1, Bytes::from_static(b"abc")).unwrap();
-        let size = store.complete_multipart("k", &id, &[(1, e1), (2, e2)]).await.unwrap();
+        assert!(store.multipart_exists("k", &id).await.unwrap(), "open until completed");
+        let parts = [(1, e1), (2, e2)];
+        let size = store.complete_multipart("k", &id, &parts).await.unwrap();
         assert_eq!(size, 5);
         assert_eq!(store.get("k").await.unwrap().as_deref(), Some(&b"abcde"[..]));
         assert!(store.in_progress_uploads().is_empty());
+        // Like S3, GCS and SeaweedFS: a completed upload is gone, so it no
+        // longer lists and a second completion is refused.
+        assert!(!store.multipart_exists("k", &id).await.unwrap());
+        assert!(store.complete_multipart("k", &id, &parts).await.is_err());
     }
 
     #[tokio::test]

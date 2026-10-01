@@ -1,16 +1,16 @@
 //! One engine for every take-down.
 //!
 //! `weft deactivate` (the whole project's shared triggers, or the ones
-//! `--trigger` / `--member` name), `weft resync`'s first half, the infra
+//! `--trigger` / `--instance` name), `weft resync`'s first half, the infra
 //! verbs that take triggers down with their containers, the health loop
 //! parking what reads a broken container, project removal, and a program's
-//! own `ctx.trigger(..).deactivate(..)` / `ctx.triggers().member(..)`
+//! own `ctx.trigger(..).deactivate(..)` / `ctx.triggers().instance(..)`
 //! calls all send the same request: a TARGET, a [`DeactivateSpec`] (what
 //! happens to parked work: wipe, hibernate, park; and to running work:
 //! cancel, or wait up to a cap), and the run that asked, if one did.
 //!
 //! [`affected_runs`] decides, in one place, which runs a target reaches:
-//! the runs its triggers fired (for their member), or every run for the
+//! the runs its triggers fired (for their instance), or every run for the
 //! whole project. The run that asked is never among them: a program that
 //! takes its own trigger down keeps running unless it asked to be stopped
 //! too (`StopSelf::Include`), which the asking side carries out once this
@@ -19,7 +19,7 @@
 use axum::http::StatusCode;
 
 use weft_core::activation::ActivationKey;
-use weft_core::member::MemberId;
+use weft_core::instance::InstanceId;
 use weft_core::running_policy::{DeactivateSpec, DeactivationMode, RunningPolicy};
 use weft_core::ExecutionId;
 
@@ -42,7 +42,7 @@ pub enum TakeDownTarget {
 pub struct RunFacts {
     pub execution_id: ExecutionId,
     /// Who the run is for.
-    pub member: Option<MemberId>,
+    pub instance: Option<InstanceId>,
     /// The trigger that fired it (`None` for a run started by hand).
     pub fired_by: Option<String>,
     /// Parked on a wait (a resume signal), rather than working now.
@@ -53,7 +53,7 @@ impl RunFacts {
     /// Whether this run belongs to the activation `key`: its trigger
     /// fired it, for its owner.
     pub fn fired_by(&self, key: &ActivationKey) -> bool {
-        self.fired_by.as_deref() == Some(key.trigger.as_str()) && self.member.as_ref() == key.member()
+        self.fired_by.as_deref() == Some(key.trigger.as_str()) && self.instance.as_ref() == key.instance()
     }
 }
 
@@ -71,18 +71,18 @@ pub fn affected_runs<'a>(target: &TakeDownTarget, runs: &'a [RunFacts], asked_by
 
 /// The live runs an infra copy going reaches, never the run that asked.
 /// Which run uses which copy is not recorded, so a shared copy's going
-/// reaches every run, and a member's copy going reaches that member's runs
-/// (another member's never touch it).
+/// reaches every run, and an instance's copy going reaches that instance's runs
+/// (another instance's never touch it).
 pub fn runs_using_copies<'a>(
-    copies: &weft_core::member::Copies,
+    copies: &weft_core::instance::Copies,
     runs: &'a [RunFacts],
     asked_by: Option<ExecutionId>,
 ) -> Vec<&'a RunFacts> {
     runs.iter()
         .filter(|run| Some(run.execution_id) != asked_by)
         .filter(|run| match copies {
-            weft_core::member::Copies::Member(m) => run.member.as_ref() == Some(m),
-            weft_core::member::Copies::Shared | weft_core::member::Copies::Every => true,
+            weft_core::instance::Copies::Instance(m) => run.instance.as_ref() == Some(m),
+            weft_core::instance::Copies::Shared | weft_core::instance::Copies::Every => true,
         })
         .collect()
 }
@@ -114,20 +114,20 @@ pub(crate) async fn live_runs(state: &DispatcherState, project_id: uuid::Uuid) -
         .collect();
     let suspended = crate::api::project::suspended_execution_id_set(state, project_id).await?;
     let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT execution_id, member_id, fired_by FROM execution \
+        "SELECT execution_id, instance_id, fired_by FROM execution \
          WHERE project_id = $1 AND kind IN ('execution', 'unrecorded')",
     )
     .bind(project_id)
     .fetch_all(&state.pg_pool)
     .await?;
     let mut out = Vec::new();
-    for (execution_id, member, fired_by) in rows {
+    for (execution_id, instance, fired_by) in rows {
         let execution_id: ExecutionId = execution_id.parse().map_err(|e| anyhow::anyhow!("corrupt execution.execution '{execution_id}': {e}"))?;
         if !live.contains(&execution_id) {
             continue;
         }
-        let member = member.map(MemberId::new).transpose().map_err(|e| anyhow::anyhow!("corrupt execution.member_id: {e}"))?;
-        out.push(RunFacts { execution_id, member, fired_by, suspended: suspended.contains(&execution_id) });
+        let instance = instance.map(InstanceId::new).transpose().map_err(|e| anyhow::anyhow!("corrupt execution.instance_id: {e}"))?;
+        out.push(RunFacts { execution_id, instance, fired_by, suspended: suspended.contains(&execution_id) });
     }
     Ok(out)
 }
@@ -179,7 +179,7 @@ pub async fn take_down(
     // trigger began activating, a build started) or the project is gone,
     // nothing has been cancelled or unregistered yet. A wipe deletes the
     // signals in that same transaction, so the activation rows (a
-    // member's wiped row goes) and their signals leave together: a
+    // instance's wiped row goes) and their signals leave together: a
     // failure after it leaves nothing registered for a row that is gone,
     // and the cancels below are safe to repeat. A park or a hibernate
     // keeps the rows (the parking gate needs them) and reads them in that
@@ -293,38 +293,38 @@ pub async fn wait_until_no_live_runs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use weft_core::member::Owner;
+    use weft_core::instance::Owner;
 
-    fn run(execution_id: u128, member: Option<&str>, fired_by: Option<&str>) -> RunFacts {
+    fn run(execution_id: u128, instance: Option<&str>, fired_by: Option<&str>) -> RunFacts {
         RunFacts {
             execution_id: ExecutionId::from_u128(execution_id),
-            member: member.map(|m| MemberId::new(m).unwrap()),
+            instance: instance.map(|m| InstanceId::new(m).unwrap()),
             fired_by: fired_by.map(str::to_string),
             suspended: false,
         }
     }
 
     #[test]
-    fn a_members_copy_going_reaches_that_members_runs_and_never_the_asker() {
+    fn an_instances_copy_going_reaches_that_instances_runs_and_never_the_asker() {
         let runs = [run(1, Some("a"), None), run(2, Some("b"), None), run(3, None, None), run(4, Some("a"), None)];
-        let a = weft_core::member::Copies::Member(MemberId::new("a").unwrap());
+        let a = weft_core::instance::Copies::Instance(InstanceId::new("a").unwrap());
         assert_eq!(execution_ids(runs_using_copies(&a, &runs, Some(ExecutionId::from_u128(4)))), vec![1]);
-        assert_eq!(execution_ids(runs_using_copies(&weft_core::member::Copies::Shared, &runs, None)), vec![1, 2, 3, 4]);
+        assert_eq!(execution_ids(runs_using_copies(&weft_core::instance::Copies::Shared, &runs, None)), vec![1, 2, 3, 4]);
     }
 
     fn execution_ids(runs: Vec<&RunFacts>) -> Vec<u128> {
         runs.into_iter().map(|r| r.execution_id.as_u128()).collect()
     }
 
-    fn member(id: &str) -> Owner {
-        Owner::Member(MemberId::new(id).unwrap())
+    fn instance(id: &str) -> Owner {
+        Owner::Instance(InstanceId::new(id).unwrap())
     }
 
-    /// A member's trigger reaches that member's runs of it, and nothing
-    /// else: not another member's, not the shared copy's, not a run
+    /// An instance's trigger reaches that instance's runs of it, and nothing
+    /// else: not another instance's, not the shared copy's, not a run
     /// started by hand.
     #[test]
-    fn a_members_activation_reaches_only_its_runs() {
+    fn an_instances_activation_reaches_only_its_runs() {
         let runs = [
             run(1, Some("a"), Some("receive")),
             run(2, Some("b"), Some("receive")),
@@ -332,7 +332,7 @@ mod tests {
             run(4, Some("a"), None),
             run(5, Some("a"), Some("cron")),
         ];
-        let target = TakeDownTarget::Activations(vec![ActivationKey::new("receive", member("a"))]);
+        let target = TakeDownTarget::Activations(vec![ActivationKey::new("receive", instance("a"))]);
         assert_eq!(execution_ids(affected_runs(&target, &runs, None)), vec![1]);
         let target = TakeDownTarget::Activations(vec![ActivationKey::new("receive", Owner::Shared)]);
         assert_eq!(execution_ids(affected_runs(&target, &runs, None)), vec![3]);
@@ -345,7 +345,7 @@ mod tests {
         let runs = [run(1, Some("a"), Some("receive")), run(2, None, None)];
         assert_eq!(execution_ids(affected_runs(&TakeDownTarget::WholeProject, &runs, None)), vec![1, 2]);
         assert_eq!(execution_ids(affected_runs(&TakeDownTarget::WholeProject, &runs, Some(ExecutionId::from_u128(1)))), vec![2]);
-        let target = TakeDownTarget::Activations(vec![ActivationKey::new("receive", member("a"))]);
+        let target = TakeDownTarget::Activations(vec![ActivationKey::new("receive", instance("a"))]);
         assert!(affected_runs(&target, &runs, Some(ExecutionId::from_u128(1))).is_empty());
     }
 

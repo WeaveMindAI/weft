@@ -111,7 +111,7 @@ export class FakeHost implements EngineHost {
 	}
 }
 
-export const inverse: TextEdit = { start: 0, end: 5, text: 'old' };
+export const inverse: TextEdit = { start: 0, end: 5, text: 'old', expected: 'new__' };
 
 export function ok(p: ProjectDefinition, weftCode = 'code', hold = false): EditScriptEntry {
 	return { kind: 'ok', result: { inverse, project: p, weftCode }, hold };

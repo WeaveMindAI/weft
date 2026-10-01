@@ -164,11 +164,28 @@ fn assert_reversible(source: &str, ops: Vec<EditOp>) {
 fn apply_text_edit_rejects_bad_offsets_loudly() {
     // Untrusted host offsets must fail loud, never panic the server.
     let src = "café = Text {}\n"; // 'é' is 2 bytes, byte 4 is mid-char
-    assert!(matches!(apply_text_edit(src, &TextEdit { start: 4, end: 4, text: "".into() }), Err(EditError::InvalidArgument(_))));
-    assert!(matches!(apply_text_edit(src, &TextEdit { start: 0, end: 9999, text: "".into() }), Err(EditError::InvalidArgument(_))));
-    assert!(matches!(apply_text_edit(src, &TextEdit { start: 5, end: 2, text: "".into() }), Err(EditError::InvalidArgument(_))));
+    let edit = |start, end| TextEdit { start, end, text: "".into(), expected: "".into() };
+    assert!(matches!(apply_text_edit(src, &edit(4, 4)), Err(EditError::InvalidArgument(_))));
+    assert!(matches!(apply_text_edit(src, &edit(0, 9999)), Err(EditError::InvalidArgument(_))));
+    assert!(matches!(apply_text_edit(src, &edit(5, 2)), Err(EditError::InvalidArgument(_))));
     // A valid boundary edit still works.
-    assert_eq!(apply_text_edit("abc\n", &TextEdit { start: 0, end: 3, text: "xyz".into() }).unwrap(), "xyz\n");
+    let ok = TextEdit { start: 0, end: 3, text: "xyz".into(), expected: "abc".into() };
+    assert_eq!(apply_text_edit("abc\n", &ok).unwrap(), "xyz\n");
+}
+
+#[test]
+fn stale_inverse_refuses_instead_of_overwriting_a_text_edit() {
+    // A graph edit, then somebody edits the text at the same place, then graph
+    // undo: the inverse must refuse, never splice old bytes over the new text.
+    let src = "t = Text {\n  value: \"a\"\n}\n";
+    let (new_source, inverse) = apply_edits(src, "Untitled", &[
+        EditOp::SetConfig { node: "t".into(), key: "value".into(), value: "\"graph\"".into(), form: None },
+    ]).expect("edits apply");
+    let typed = new_source.replace("\"graph\"", "\"typed\"");
+    assert_eq!(typed.len(), new_source.len(), "same offsets, different bytes");
+    assert!(matches!(apply_text_edit(&typed, &inverse), Err(EditError::StaleTextEdit)));
+    // Untouched text still undoes.
+    assert_eq!(apply_text_edit(&new_source, &inverse).unwrap(), src);
 }
 
 #[test]
@@ -3922,59 +3939,59 @@ fn the_gate_toggles_between_its_two_spellings() {
     parse_ok(&flipped);
 }
 
-fn per_member_of(source: &str, id: &str) -> Option<weft_core::member::PerMember> {
+fn per_instance_of(source: &str, id: &str) -> Option<weft_core::instance::PerInstance> {
     let (project, errors) = crate::weft_compiler::compile_lenient(
         source, uuid::Uuid::nil(), crate::file_reader::CompileFs::none(),
         crate::weft_compiler::IncludeMode::Full, None,
     );
     assert!(errors.is_empty(), "{errors:?}");
-    project.nodes.into_iter().find(|n| n.id == id).and_then(|n| n.per_member)
+    project.nodes.into_iter().find(|n| n.id == id).and_then(|n| n.per_instance)
 }
 
-fn set_per_member(node: &str, per_member: bool) -> EditOp {
-    EditOp::SetPerMember { node: node.into(), per_member }
+fn set_per_instance(node: &str, per_instance: bool) -> EditOp {
+    EditOp::SetPerInstance { node: node.into(), per_instance }
 }
 
 /// The toggle round-trips every body shape: none, one line, many lines.
 /// The lowering reads the written line back as the mark.
 #[test]
-fn set_per_member_adds_and_removes_the_line() {
+fn set_per_instance_adds_and_removes_the_line() {
     for src in [
         "bridge = Bridge\n",
         "bridge = Bridge {}\n",
         "bridge = Bridge { a: 1 }\n",
         "bridge = Bridge {\n  a: 1\n}\n",
     ] {
-        let on = apply(src, vec![set_per_member("bridge", true)]);
+        let on = apply(src, vec![set_per_instance("bridge", true)]);
         parse_ok(&on);
-        assert!(on.contains("\n  @per_member\n"), "{src:?} -> {on:?}");
-        assert_eq!(per_member_of(&on, "bridge"), Some(weft_core::member::PerMember::Marked), "{on}");
-        let again = apply(&on, vec![set_per_member("bridge", true)]);
+        assert!(on.contains("\n  @per_instance\n"), "{src:?} -> {on:?}");
+        assert_eq!(per_instance_of(&on, "bridge"), Some(weft_core::instance::PerInstance::Marked), "{on}");
+        let again = apply(&on, vec![set_per_instance("bridge", true)]);
         assert_eq!(again, on, "adding twice writes one line");
-        let off = apply(&on, vec![set_per_member("bridge", false)]);
+        let off = apply(&on, vec![set_per_instance("bridge", false)]);
         parse_ok(&off);
-        assert!(!off.contains("@per_member"), "{off}");
-        assert_eq!(per_member_of(&off, "bridge"), None, "{off}");
+        assert!(!off.contains("@per_instance"), "{off}");
+        assert_eq!(per_instance_of(&off, "bridge"), None, "{off}");
     }
 }
 
 /// A node nested in a group gets the line at the node's own indent.
 #[test]
-fn set_per_member_inside_a_group() {
+fn set_per_instance_inside_a_group() {
     let src = "g = Group() -> () {\n  bridge = Bridge {\n    a: 1\n  }\n}\n";
-    let on = apply(src, vec![set_per_member("g.bridge", true)]);
+    let on = apply(src, vec![set_per_instance("g.bridge", true)]);
     parse_ok(&on);
-    assert!(on.contains("    a: 1\n    @per_member\n  }"), "{on}");
-    let off = apply(&on, vec![set_per_member("g.bridge", false)]);
+    assert!(on.contains("    a: 1\n    @per_instance\n  }"), "{on}");
+    let off = apply(&on, vec![set_per_instance("g.bridge", false)]);
     assert_eq!(off, src);
 }
 
 /// Only a node carries it: a group, and a node written inside another
 /// node's value, are refused with the reason.
 #[test]
-fn set_per_member_refuses_what_cannot_carry_it() {
-    let err = apply_err("g = Group() -> () {}\n", vec![set_per_member("g", true)]);
-    assert!(err.contains("setPerMember"), "{err}");
-    let err = apply_err("d = Debug {\n  data: Text { value: \"x\" }.value\n}\n", vec![set_per_member("d__data", true)]);
+fn set_per_instance_refuses_what_cannot_carry_it() {
+    let err = apply_err("g = Group() -> () {}\n", vec![set_per_instance("g", true)]);
+    assert!(err.contains("setPerInstance"), "{err}");
+    let err = apply_err("d = Debug {\n  data: Text { value: \"x\" }.value\n}\n", vec![set_per_instance("d__data", true)]);
     assert!(err.contains("its own line"), "{err}");
 }

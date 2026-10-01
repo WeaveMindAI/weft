@@ -17,7 +17,7 @@ pub mod images;
 pub mod infra_host;
 pub mod runner;
 
-pub use alarm::{Deliver, HttpDeliver, LocalAlarm};
+pub use alarm::{Deliver, HttpDeliver, LocalAlarm, NotTaken};
 pub use docker::{Docker, DockerCli};
 pub use identity::LocalIdentity;
 pub use images::{bound_build_cache, DockerImageBuilder};

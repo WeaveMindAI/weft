@@ -10,14 +10,12 @@ use anyhow::Context;
 
 use super::Ctx;
 
-fn project_query(ctx: &Ctx) -> String {
-    // Best-effort project context (tenant resolution on the dispatcher);
-    // `weft files` outside a project dir still works on the caller's
-    // tenant.
-    match ctx.project() {
-        Ok(p) => format!("?project={}", p.id()),
-        Err(_) => String::new(),
-    }
+/// Every file in the caller's tenant (the dispatcher takes the tenant
+/// from the credential, so this works outside a project folder too).
+async fn list_files(client: &crate::client::DispatcherClient) -> anyhow::Result<Vec<weft_core::storage::StoredFileMeta>> {
+    let listing: weft_core::storage::ListFilesResponse =
+        serde_json::from_value(client.get_json("/storage/files").await?).context("parse files listing")?;
+    Ok(listing.files)
 }
 
 /// The SCOPE portion of a wire key: the bucket is shared and keys
@@ -58,14 +56,8 @@ fn fmt_remaining(secs: i64) -> String {
 /// `weft files ls [PREFIX]`: list, organized by scope (project
 /// spaces / shared spaces / past-execution survivors + scratch).
 pub async fn ls(ctx: Ctx, prefix: Option<String>) -> anyhow::Result<()> {
-    let client = ctx.client()?;
-    let resp = client
-        .get_json(&format!("/storage/files{}", project_query(&ctx)))
-        .await?;
-    let files: Vec<weft_core::storage::StoredFileMeta> =
-        serde_json::from_value(resp.get("files").cloned().unwrap_or_default())
-            .context("parse files listing")?;
-    let files: Vec<_> = files
+    let files: Vec<_> = list_files(&ctx.client()?)
+        .await?
         .into_iter()
         .filter(|f| prefix.as_deref().map(|p| scope_key(&f.key).starts_with(p)).unwrap_or(true))
         .collect();
@@ -122,12 +114,7 @@ pub async fn ls(ctx: Ctx, prefix: Option<String>) -> anyhow::Result<()> {
 
 /// `weft files inspect <KEY>`.
 pub async fn inspect(ctx: Ctx, key: String) -> anyhow::Result<()> {
-    let client = ctx.client()?;
-    let resp = client
-        .get_json(&format!("/storage/files{}", project_query(&ctx)))
-        .await?;
-    let files: Vec<weft_core::storage::StoredFileMeta> =
-        serde_json::from_value(resp.get("files").cloned().unwrap_or_default())?;
+    let files = list_files(&ctx.client()?).await?;
     // The user types the scope key; match it against each wire key's
     // scope portion (tenant stripped).
     let Some(meta) = files.into_iter().find(|f| scope_key(&f.key) == key) else {
@@ -148,27 +135,13 @@ pub async fn inspect(ctx: Ctx, key: String) -> anyhow::Result<()> {
 /// offset failing over and over) is abandoned.
 const DOWNLOAD_RESUME_ATTEMPTS: u32 = 20;
 
-/// The download handshake result: the presigned bucket URL + the file's name +
-/// total size. A presigned S3 GET carries no `x-weft-meta`, so the name (default
-/// output path) and size (completeness check) come from the handshake, not the
-/// byte stream's headers.
-struct DownloadHandshake {
-    url: String,
-    filename: String,
-    size_bytes: u64,
-}
-
 /// The whole content of one stored file, in memory: the build's read of a
 /// text-typed `@asset` that names a stored key. Small files by contract
 /// (a prompt, a JSON shape), so no streaming, no resume; the size the
 /// handshake promised is checked so a cut transfer is never cast as a
 /// value.
-pub(crate) async fn download_bytes(
-    client: &crate::client::DispatcherClient,
-    key: &str,
-    project: &Option<String>,
-) -> anyhow::Result<Vec<u8>> {
-    let handshake = mint_download_url(client, key, project).await?;
+pub(crate) async fn download_bytes(client: &crate::client::DispatcherClient, key: &str) -> anyhow::Result<Vec<u8>> {
+    let handshake = mint_download_url(client, key).await?;
     let resp = reqwest::Client::new()
         .get(&handshake.url)
         .send()
@@ -192,40 +165,27 @@ pub(crate) async fn download_bytes(
 /// Ask the dispatcher for a fresh download pass (the brokered handshake): the
 /// dispatcher authenticates, then returns a short-lived presigned bucket URL for
 /// the single file plus its name + size. The bytes stream DIRECTLY from the
-/// storage bucket at that URL; the dispatcher is not in the byte path.
+/// storage bucket at that URL; the dispatcher is not in the byte path. A
+/// presigned GET carries no per-file metadata, so the file's name (the default
+/// output path) and size (the completeness check) come from this answer.
 async fn mint_download_url(
     client: &crate::client::DispatcherClient,
     key: &str,
-    project: &Option<String>,
-) -> anyhow::Result<DownloadHandshake> {
-    let resp = client
-        .post_json(
-            "/storage/files/download",
-            &serde_json::json!({ "key": key, "project": project }),
-        )
-        .await?;
-    let url = resp
-        .get("url")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .context("dispatcher returned no download url")?;
-    let filename = resp.get("filename").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let size_bytes = resp.get("sizeBytes").and_then(|v| v.as_u64()).context(
-        "download handshake returned no sizeBytes; cannot verify completeness",
-    )?;
-    Ok(DownloadHandshake { url, filename, size_bytes })
+) -> anyhow::Result<weft_core::storage::PresignResult> {
+    let body = weft_core::storage::DownloadRequest { key: key.to_string(), ttl_secs: None };
+    serde_json::from_value(client.post_json("/storage/files/download", &serde_json::to_value(&body)?).await?)
+        .context("read the download handshake")
 }
 
 pub async fn download(ctx: Ctx, key: String, output: Option<String>) -> anyhow::Result<()> {
     let client = ctx.client()?;
-    let project = ctx.project().ok().map(|p| p.id().to_string());
     let http = reqwest::Client::new();
 
     // First handshake: returns the presigned URL + the file's name (default
     // output path) and total size (the completeness signal). The presigned
     // bucket GET carries no per-file metadata header, so the size comes from the
     // handshake, a trusted control-plane source, not the byte stream.
-    let handshake = mint_download_url(&client, &key, &project).await?;
+    let handshake = mint_download_url(&client, &key).await?;
     let url = handshake.url;
     let total = handshake.size_bytes;
     let out_path = output.unwrap_or_else(|| {
@@ -241,7 +201,7 @@ pub async fn download(ctx: Ctx, key: String, output: Option<String>) -> anyhow::
     // destroyed the user's previous copy). The temp lives in the same directory so
     // the rename is a same-filesystem atomic move. On any error we remove it.
     let tmp_path = format!("{out_path}.{}.weft-partial", uuid::Uuid::new_v4().simple());
-    let result = download_to_tmp(&http, &client, &key, &project, url, total, &tmp_path).await;
+    let result = download_to_tmp(&http, &client, &key, url, total, &tmp_path).await;
     match result {
         Ok(written) => {
             tokio::fs::rename(&tmp_path, &out_path)
@@ -268,12 +228,10 @@ pub async fn download(ctx: Ctx, key: String, output: Option<String>) -> anyhow::
 /// total bytes written on success. All failure surfaces (network stall, bad
 /// resume, local write error, truncated result) return `Err` and leave the temp
 /// file for the caller to clean up.
-#[allow(clippy::too_many_arguments)]
 async fn download_to_tmp(
     http: &reqwest::Client,
     client: &crate::client::DispatcherClient,
     key: &str,
-    project: &Option<String>,
     first_url: String,
     total: u64,
     tmp_path: &str,
@@ -352,7 +310,7 @@ async fn download_to_tmp(
             fmt_size(written),
             body_err
         );
-        url = mint_download_url(client, key, project).await?.url;
+        url = mint_download_url(client, key).await?.url;
         let resumed = http
             .get(&url)
             .header("range", format!("bytes={written}-"))
@@ -451,7 +409,6 @@ fn parse_content_range_start(header: &str) -> Option<u64> {
 /// trailing `/` removes the whole space (prefix).
 pub async fn rm(ctx: Ctx, target: String, yes: bool) -> anyhow::Result<()> {
     let client = ctx.client()?;
-    let project = ctx.project().ok().map(|p| p.id().to_string());
     let is_prefix = target.ends_with('/');
 
     // Confirm before deleting: a prefix wipe removes a whole space,
@@ -465,12 +422,7 @@ pub async fn rm(ctx: Ctx, target: String, yes: bool) -> anyhow::Result<()> {
         if is_prefix {
             // List what falls under the prefix so the user sees exactly
             // what is about to go (count + kept-file count).
-            let resp = client
-                .get_json(&format!("/storage/files{}", project_query(&ctx)))
-                .await?;
-            let files: Vec<weft_core::storage::StoredFileMeta> =
-                serde_json::from_value(resp.get("files").cloned().unwrap_or_default())
-                    .context("parse files listing")?;
+            let files = list_files(&client).await?;
             // `target` is a scope prefix/key; match each wire key's scope
             // portion (tenant stripped) so the preview shows the real
             // blast radius the dispatcher will wipe.
@@ -496,31 +448,29 @@ pub async fn rm(ctx: Ctx, target: String, yes: bool) -> anyhow::Result<()> {
     }
 
     let body = if is_prefix {
-        serde_json::json!({ "prefix": target, "project": project })
+        weft_core::storage::RemoveFilesRequest { key: None, prefix: Some(target) }
     } else {
-        serde_json::json!({ "key": target, "project": project })
+        weft_core::storage::RemoveFilesRequest { key: Some(target), prefix: None }
     };
-    let resp = client.delete_with_body("/storage/files", &body).await?;
-    let removed = resp.get("removed").and_then(|v| v.as_u64()).unwrap_or(0);
-    println!("removed {removed} file(s)");
+    let removed: weft_core::storage::FilesRemoved =
+        serde_json::from_value(client.delete_with_body("/storage/files", &serde_json::to_value(&body)?).await?)
+            .context("read the removal answer")?;
+    println!("removed {} file(s)", removed.removed);
     Ok(())
 }
 
 /// `weft files usage`.
 pub async fn usage(ctx: Ctx) -> anyhow::Result<()> {
     let client = ctx.client()?;
-    let resp = client
-        .get_json(&format!("/storage/usage{}", project_query(&ctx)))
-        .await?;
+    let resp = client.get_json("/storage/usage").await?;
     if ctx.json_out(&resp)? {
         return Ok(());
     }
-    let stored = resp.get("storedBytes").and_then(|v| v.as_u64()).unwrap_or(0);
-    let count = resp.get("fileCount").and_then(|v| v.as_u64()).unwrap_or(0);
-    if count == 0 {
+    let usage: weft_core::storage::TenantUsage = serde_json::from_value(resp).context("read the storage usage")?;
+    if usage.file_count == 0 {
         println!("nothing stored");
     } else {
-        println!("stored: {} across {count} file(s)", fmt_size(stored));
+        println!("stored: {} across {} file(s)", fmt_size(usage.stored_bytes), usage.file_count);
     }
     Ok(())
 }

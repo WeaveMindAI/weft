@@ -14,13 +14,14 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use weft_core::activation::ActivationKey;
-use weft_core::member::Owner;
+use weft_core::instance::Owner;
 use weft_core::run_spec::RunSpec;
 use weft_core::ProjectDefinition;
 use weft_dispatcher::activation_store::{ActivationLifecycle, ActivationStoreOps, PostgresActivationStore, SignalsGoing};
 use weft_dispatcher::journal::postgres::PostgresJournal;
 use weft_dispatcher::journal::Journal;
-use weft_dispatcher::versions::{version_id, Head, PostgresVersionStore, RunRow, VersionRow, VersionStoreOps};
+use weft_core::versions::Head;
+use weft_dispatcher::versions::{version_id, PostgresVersionStore, RunRow, VersionRow, VersionStoreOps};
 use weft_journal::ExecEvent;
 
 const TENANT: &str = "tenant-1";
@@ -104,7 +105,7 @@ async fn retention_keeps_program_references_when_execution_selection_has_changed
     let birth = ExecEvent::ExecutionStarted {
         execution_id, project_id: project, entry_node: "mid".into(),
         phase: weft_core::context::Phase::Fire, definition_hash: Some("def-1".into()),
-        program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+        program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
         run_class: weft_core::run_class::RunClass::Short,
     };
     journal.record_event(&birth).await.unwrap();
@@ -222,7 +223,7 @@ async fn deleting_a_run_clears_its_row_and_head_run(pool: PgPool) {
             program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
             subgraph: None,
             seed: None,
-            member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+            instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
             run_class: weft_core::run_class::RunClass::Short,
         })
         .await

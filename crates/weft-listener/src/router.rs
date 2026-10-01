@@ -29,6 +29,7 @@
 use axum::{
     extract::State,
     http::StatusCode,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -199,12 +200,31 @@ async fn wake_by_hand(
 /// answers 500, which every alarm takes as "try again"; the kind's claim
 /// keeps a retried wake from acting twice. The moment it was aimed at
 /// rides in the body (`WakeBody::due_at_ms`), not the delivery time.
-async fn wake(
-    State(state): State<ListenerState>,
-    Json(req): Json<weft_platform_traits::WakeCall<kinds::WakeBody>>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    kinds::wake(&state, req.body).await.map_err(internal)?;
-    Ok(StatusCode::NO_CONTENT)
+///
+/// A body that can never be read as a wake (not JSON, the wrong shape)
+/// is dropped here, on every platform the same way: logged as an error
+/// with the body and the reason, and answered 200 with
+/// `{"dropped": true, "reason": ...}`. Only a success stops a retrying
+/// queue (Cloud Tasks retries every non-2xx until the task expires), so
+/// a 4xx would redeliver the same unreadable body forever. The body is
+/// read by hand for that reason: axum's `Json` extractor would answer
+/// the 4xx itself.
+async fn wake(State(state): State<ListenerState>, body: axum::body::Bytes) -> Result<Response, (StatusCode, String)> {
+    let call: weft_platform_traits::WakeCall<kinds::WakeBody> = match serde_json::from_slice(&body) {
+        Ok(call) => call,
+        Err(e) => {
+            let reason = format!("the wake body is not a wake call ({{at_unix_ms, body: {{token, due_at_ms}}}}): {e}");
+            tracing::error!(
+                target: "weft_listener::wake",
+                body = %String::from_utf8_lossy(&body),
+                %reason,
+                "dropped a wake that can never be read; the alarm that sent it is wrong"
+            );
+            return Ok((StatusCode::OK, Json(serde_json::json!({ "dropped": true, "reason": reason }))).into_response());
+        }
+    };
+    kinds::wake(&state, call.body).await.map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn list_signals(State(state): State<ListenerState>) -> Json<Value> {

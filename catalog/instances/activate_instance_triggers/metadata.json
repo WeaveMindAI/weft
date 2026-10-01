@@ -1,0 +1,47 @@
+{
+  "type": "ActivateInstanceTriggers",
+  "label": "Activate instance triggers",
+  "description": "Turn on one instance's own triggers (the ones that exist once per instance). A trigger reading the instance's infra copy needs that copy running first. Triggers already on stay as they are.",
+  "tags": [
+    "instances",
+    "triggers",
+    "activate"
+  ],
+  "icon": "Zap",
+  "color": "#0ea5e9",
+  "inputs": [
+    {
+      "name": "instance",
+      "type": "String",
+      "required": true,
+      "description": "The instance, by the id your program gives it (`user-42`)."
+    },
+    {
+      "name": "only",
+      "type": "List[String]",
+      "description": "Only these triggers, named the way the program writes them. Every per-instance trigger when not wired."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "done",
+      "type": "Boolean",
+      "description": "True once the triggers are on. Wire it into the `_should_flow` of what must happen after."
+    }
+  ],
+  "requires_infra": false,
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": { "kind": "input_names", "port": "only", "names": { "node": { "role": "trigger", "per_instance": true } } }
+      },
+      "then": {
+        "message": "ActivateInstanceTriggers '{id}' names {names} in `only`, which is no per-instance trigger of this program. Name each the way the program writes it (`inbox`, or `one.inbox` inside an included file).",
+        "level": "structural",
+        "severity": "error",
+        "port": "only"
+      }
+    }
+  ]
+}

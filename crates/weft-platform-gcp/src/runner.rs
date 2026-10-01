@@ -287,7 +287,7 @@ pub struct CloudRunRunner {
     gcp: GcpPlatform,
     /// The broker's address as a worker reaches it.
     broker_url: String,
-    install: weft_core::infra::Instance,
+    install: weft_core::infra::Install,
     /// One deploy at a time per service or job in this process (two specs
     /// of one name included), while deploys are in flight. Only spares
     /// duplicate work: whether one is deployed is read from Cloud Run
@@ -301,7 +301,7 @@ pub struct CloudRunRunner {
 }
 
 impl CloudRunRunner {
-    pub fn new(google: Google, gcp: GcpPlatform, broker_url: String, install: weft_core::infra::Instance) -> Self {
+    pub fn new(google: Google, gcp: GcpPlatform, broker_url: String, install: weft_core::infra::Install) -> Self {
         Self {
             google,
             gcp,
@@ -706,7 +706,7 @@ mod tests {
 
     #[test]
     fn a_service_carries_every_worker_lever_and_scales_to_zero_by_default() {
-        let r = CloudRunRunner::new(Google::new(Arc::new(crate::metadata::MetadataTokens::new())), gcp(), "http://10.10.0.2:14113/broker".into(), weft_core::infra::Instance::default_install());
+        let r = CloudRunRunner::new(Google::new(Arc::new(crate::metadata::MetadataTokens::new())), gcp(), "http://10.10.0.2:14113/broker".into(), weft_core::infra::Install::default_install());
         let body = r.service_body(&target(WorkerSettings::default()), "wp-x@acme.iam.gserviceaccount.com");
         let t = &body["template"];
         assert_eq!(t["scaling"]["minInstanceCount"], 0);
@@ -729,7 +729,7 @@ mod tests {
     /// the body without it, so a read compares like with like.
     #[test]
     fn the_spec_label_rides_the_body_it_names() {
-        let r = CloudRunRunner::new(Google::new(Arc::new(crate::metadata::MetadataTokens::new())), gcp(), "b".into(), weft_core::infra::Instance::default_install());
+        let r = CloudRunRunner::new(Google::new(Arc::new(crate::metadata::MetadataTokens::new())), gcp(), "b".into(), weft_core::infra::Install::default_install());
         for body in [r.service_body(&target(WorkerSettings::default()), "a"), r.job_body(&target(WorkerSettings::default()), "a")] {
             let spec = spec_of(&body);
             let written = labelled(&body, &spec);
@@ -744,7 +744,7 @@ mod tests {
     /// included. A job is written as is.
     #[test]
     fn every_attempt_is_a_new_revision_of_the_same_spec() {
-        let r = CloudRunRunner::new(Google::new(Arc::new(crate::metadata::MetadataTokens::new())), gcp(), "b".into(), weft_core::infra::Instance::default_install());
+        let r = CloudRunRunner::new(Google::new(Arc::new(crate::metadata::MetadataTokens::new())), gcp(), "b".into(), weft_core::infra::Install::default_install());
         let body = labelled(&r.service_body(&target(WorkerSettings::default()), "a"), "s");
         let (one, two) = (attempt(&body, Kind::Service), attempt(&body, Kind::Service));
         assert_ne!(one["template"], two["template"]);
@@ -836,7 +836,7 @@ mod tests {
 
     #[test]
     fn a_long_run_has_no_port_and_no_short_cap() {
-        let r = CloudRunRunner::new(Google::new(Arc::new(crate::metadata::MetadataTokens::new())), gcp(), "b".into(), weft_core::infra::Instance::default_install());
+        let r = CloudRunRunner::new(Google::new(Arc::new(crate::metadata::MetadataTokens::new())), gcp(), "b".into(), weft_core::infra::Install::default_install());
         let c = r.container(&target(WorkerSettings::default()), true);
         assert!(c.get("ports").is_none());
         assert!(!c["env"].as_array().unwrap().iter().any(|e| e["name"] == "WEFT_SHORT_RUN_CAP_SECS"));

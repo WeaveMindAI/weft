@@ -25,119 +25,18 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::api::project::StatusError;
 use crate::authenticator::{authorize_project, CallerTenant};
 use crate::infra_lifecycle_command::{self, InfraLifecycleVerb, TakeDown};
-use weft_core::infra::wire::{CopyRef, Door, DoorsResponse, InfraLogs, LogBlock, LogCursor, LogsFrom};
+use weft_core::infra::wire::{
+    CommandOutcome, CommandStatus, CopyRef, Door, DoorsResponse, InfraLogs, InfraStatus, InfraStatusEntry,
+    LifecycleCommandIssued, LogBlock, LogCursor, LogsFrom, PerNodeRequest, StopRequest, SyncRequest, UpgradeRequest,
+};
 use weft_core::{DeactivateSpec, RunningChoice, RunningPolicy};
 use crate::infra_node::{self, InfraNodeRow, InfraNodeStatus};
 use crate::state::DispatcherState;
-
-// =================================================================
-// Sync request (Start / Restart / Upgrade)
-// =================================================================
-
-// SYNC: SyncRequest body keys <-> crates/weft-cli/src/commands/infra.rs (the
-// hand-built sync body map). The optional fields are `#[serde(default)]`, so
-// a renamed optional key would silently deserialize to its default instead
-// of failing: change both sides together.
-#[derive(Debug, Default, Deserialize)]
-pub struct SyncRequest {
-    /// The build the client just made (`POST /projects/{id}/builds`).
-    /// Named, the sync applies it and refuses when the registered build
-    /// is another (a teammate's landed between the two). Absent (a
-    /// program starting a member's copy, which builds nothing), it
-    /// applies the registered build. The images every place runs come
-    /// with the build, never from here.
-    #[serde(default, rename = "binaryHash")]
-    pub binary_hash: Option<String>,
-    #[serde(default, rename = "definitionHash")]
-    pub definition_hash: Option<String>,
-    #[serde(default, rename = "infraHash")]
-    pub infra_hash: Option<String>,
-    /// How the worker reconciliation inside sync (and an upgrade's
-    /// stop leg) treats executions still running on an older image once
-    /// a new one went live. `cancel` (the default) cancels them; `wait`
-    /// lets them finish up to `drainTimeoutSecs`, then cancels what is
-    /// left. Never a silent kill.
-    /// On an upgrade, outranked by `triggerDeactivation`'s answer when
-    /// that picker was shown.
-    #[serde(flatten)]
-    pub running: RunningChoice,
-    /// Whose copies: a member's copies of the nodes marked
-    /// `@per_member`, or (absent) the shared nodes. `weft infra start
-    /// --member`, and a program's `ctx.infra(..).member(..).start()`.
-    #[serde(default)]
-    pub member: Option<weft_core::member::MemberId>,
-    /// Only these infra nodes (by place), every one of the owner's kind
-    /// when empty.
-    #[serde(default)]
-    pub nodes: Vec<String>,
-}
-
-/// Body for `/infra/sync`: the sync request, plus the two keys an
-/// upgrade used to ride on this route with. A client that still sends
-/// them wants an upgrade, and a plain start in its place would drop the
-/// answer it gave, so the route refuses them naming `/infra/upgrade`.
-#[derive(Debug, Default, Deserialize)]
-pub struct SyncBody {
-    #[serde(flatten)]
-    pub sync: SyncRequest,
-    #[serde(default)]
-    upgrade: Option<serde_json::Value>,
-    #[serde(default, rename = "triggerDeactivation")]
-    trigger_deactivation: Option<serde_json::Value>,
-    /// The image map clients used to send, from before the install built
-    /// the images itself: refused, so an old client learns it is old
-    /// rather than having the images it names quietly ignored.
-    #[serde(default, rename = "imageHashes")]
-    image_hashes: Option<serde_json::Value>,
-}
-
-impl SyncBody {
-    fn into_sync(self) -> Result<SyncRequest, (StatusCode, String)> {
-        if self.image_hashes.is_some() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "`imageHashes` is not a key of /infra/sync any more: the install builds every \
-                 image with the version (POST /projects/{id}/builds); update the client"
-                    .into(),
-            ));
-        }
-        if self.upgrade.is_some() || self.trigger_deactivation.is_some() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "an upgrade is its own route now: POST /projects/{id}/infra/upgrade \
-                 (`upgrade` and `triggerDeactivation` are not keys of /infra/sync); \
-                 update the client"
-                    .into(),
-            ));
-        }
-        Ok(self.sync)
-    }
-}
-
-/// Body for `/infra/upgrade`: cycle the running infra onto the current
-/// specs (the triggers reading it taken down per `triggerDeactivation`,
-/// then a stop leg, then the start). What to run is the sync body's.
-#[derive(Debug, Default, Deserialize)]
-pub struct UpgradeRequest {
-    #[serde(flatten)]
-    pub sync: SyncRequest,
-    /// How to deactivate the triggers reading this infra when one is on
-    /// (required then: 428 with the trigger-choice header otherwise).
-    /// Same `DeactivateSpec` shape as the standalone `/deactivate`
-    /// endpoint, so clients reuse one picker.
-    #[serde(default, rename = "triggerDeactivation")]
-    pub trigger_deactivation: Option<DeactivateSpec>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SyncResponse {
-    pub nodes: Vec<InfraStatusEntry>,
-}
 
 /// Make `cancel` mean cancel before an infra command that will take
 /// the containers away. The supervisor treats a `cancel` command as
@@ -151,7 +50,7 @@ pub struct SyncResponse {
 pub(crate) async fn settle_running_before_infra_op(
     state: &DispatcherState,
     project_id: uuid::Uuid,
-    copies: &weft_core::member::Copies,
+    copies: &weft_core::instance::Copies,
     running_policy: RunningPolicy,
     trigger_deactivation_ran: bool,
     // The run that asked (a program's `ctx.infra(..).stop(..)`): never
@@ -178,13 +77,13 @@ pub(crate) async fn settle_running_before_infra_op(
 
 /// The activations whose triggers read any of `nodes` (places) in one of
 /// `copies`: a shared copy feeds every owner's triggers that read it; a
-/// member's copy feeds only that member's.
+/// instance's copy feeds only that instance's.
 pub(crate) async fn activations_reading(
     state: &DispatcherState,
     project_id: uuid::Uuid,
     project: &weft_core::ProjectDefinition,
     nodes: &std::collections::BTreeSet<String>,
-    copies: &weft_core::member::Copies,
+    copies: &weft_core::instance::Copies,
 ) -> Result<Vec<crate::activation_store::Activation>, (StatusCode, String)> {
     let deps = crate::api::project::compute_trigger_deps(project);
     Ok(state
@@ -204,53 +103,53 @@ pub(crate) fn reads(
     deps: &[(String, String)],
     key: &weft_core::activation::ActivationKey,
     nodes: &std::collections::BTreeSet<String>,
-    copies: &weft_core::member::Copies,
+    copies: &weft_core::instance::Copies,
 ) -> bool {
     let reads_a_node = deps.iter().any(|(infra, trigger)| *trigger == key.trigger && nodes.contains(infra));
     reads_a_node
         && match copies {
-            weft_core::member::Copies::Member(m) => key.member() == Some(m),
-            weft_core::member::Copies::Shared | weft_core::member::Copies::Every => true,
+            weft_core::instance::Copies::Instance(m) => key.instance() == Some(m),
+            weft_core::instance::Copies::Shared | weft_core::instance::Copies::Every => true,
         }
 }
 
 /// Whether the infra place `spelled` (`one.db`) is a node that exists
-/// once per member.
-pub(crate) fn is_per_member_place(project: &weft_core::ProjectDefinition, spelled: &str) -> bool {
+/// once per instance.
+pub(crate) fn is_per_instance_place(project: &weft_core::ProjectDefinition, spelled: &str) -> bool {
     let (id, _) = weft_core::project::resolve_address(project, spelled);
-    project.nodes.iter().any(|n| n.id == id && n.per_member.is_some())
+    project.nodes.iter().any(|n| n.id == id && n.per_instance.is_some())
 }
 
 /// The infra places a verb aimed at `nodes` (every infra node when
-/// empty) for `member` acts on: the nodes marked per member for a
-/// member, the shared ones otherwise. A mismatch is refused naming the
+/// empty) for `instance` acts on: the nodes marked per instance for an
+/// instance, the shared ones otherwise. A mismatch is refused naming the
 /// fix, like the trigger verbs do.
 pub(crate) fn resolve_infra_nodes(
     project: &weft_core::ProjectDefinition,
     nodes: &[String],
-    member: Option<&weft_core::member::MemberId>,
+    instance: Option<&weft_core::instance::InstanceId>,
 ) -> Result<std::collections::BTreeSet<String>, (StatusCode, String)> {
-    let per_member_of = |spelled: &str| is_per_member_place(project, spelled);
+    let per_instance_of = |spelled: &str| is_per_instance_place(project, spelled);
     let declared = weft_core::project::infra_place_spellings(project);
     if nodes.is_empty() {
-        return Ok(declared.into_iter().filter(|n| per_member_of(n) == member.is_some()).collect());
+        return Ok(declared.into_iter().filter(|n| per_instance_of(n) == instance.is_some()).collect());
     }
     let mut out = std::collections::BTreeSet::new();
     for node in nodes {
         if !declared.contains(node) {
             return Err((StatusCode::NOT_FOUND, format!("'{node}' is no infra node of this program")));
         }
-        match (per_member_of(node), member) {
+        match (per_instance_of(node), instance) {
             (true, None) => {
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    format!("infra node '{node}' exists once per member; name whose copy with --member <id>"),
+                    format!("infra node '{node}' exists once per instance; name whose copy with --instance <id>"),
                 ));
             }
             (false, Some(m)) => {
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    format!("infra node '{node}' is shared by every member, so there is no copy of it for '{m}'; leave --member out"),
+                    format!("infra node '{node}' is shared by every instance, so there is no copy of it for '{m}'; leave --instance out"),
                 ));
             }
             _ => {
@@ -259,75 +158,6 @@ pub(crate) fn resolve_infra_nodes(
         }
     }
     Ok(out)
-}
-
-/// Return shape for verbs that asynchronously enqueue a lifecycle
-/// command. The body intentionally does NOT contain `nodes`: the
-/// command hasn't been claimed yet, so any snapshot would be the
-/// pre-action state, misleading the caller. Clients poll `/status`
-/// (or subscribe to the event SSE) for the post-action shape.
-#[derive(Debug, Serialize)]
-pub struct LifecycleCommandIssued {
-    pub command_id: i64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct InfraStatusEntry {
-    /// The instance's place, spelled the way a person writes the node
-    /// (`db`, `one.db`): what a person is shown, what the editor matches
-    /// against its canvas, and what every per-node verb takes.
-    pub node: String,
-    /// Whose copy: absent for the shared one, else the member's.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub member: Option<weft_core::member::MemberId>,
-    pub status: String,
-    pub endpoint_url: Option<String>,
-    /// Endpoint name to the address a caller outside the install uses,
-    /// for each `Public` endpoint (the same address
-    /// `ctx.endpoint(name)?.public_url()` gives the node).
-    pub public_urls: std::collections::BTreeMap<String, String>,
-    pub failure_stage: Option<String>,
-    pub failure_message: Option<String>,
-}
-
-/// Body for `/infra/stop` and `/infra/terminate`. Carries the
-/// trigger-deactivation choice when the project is Active (the same
-/// picker as the standalone Deactivate verb, and its answer governs
-/// the running executions), and the running-work choice on its own
-/// for when it is not: an inactive project can still have executions
-/// running on this infra, and `wait` lets them land before the
-/// supervisor scales it down.
-#[derive(Debug, Default, Deserialize)]
-pub struct StopRequest {
-    #[serde(default, rename = "triggerDeactivation")]
-    pub trigger_deactivation: Option<DeactivateSpec>,
-    #[serde(flatten)]
-    pub running: RunningChoice,
-    /// Whose copies: one member's (`--member`), or (absent) the shared
-    /// ones.
-    #[serde(default)]
-    pub member: Option<weft_core::member::MemberId>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct PerNodeRequest {
-    /// What happens to the running executions this copy can reach.
-    /// Which ones use this one instance is not recorded, so for the
-    /// shared copy `cancel` (the default) ends every running execution
-    /// of the project, and for a member's copy every run of that
-    /// member; `wait` lets the same set land first.
-    #[serde(flatten)]
-    pub running: RunningChoice,
-    /// Stop only: force scale-to-zero every unit, ignoring `on_stop`.
-    /// Lets the user take down a unit that would normally stay up
-    /// (NoOp) so they can update it on the next start. Ignored by
-    /// terminate (terminate already removes everything).
-    #[serde(default)]
-    pub force: bool,
-    /// Whose copy of the node: a member's copy of a per-member node,
-    /// or (absent) the shared one.
-    #[serde(default)]
-    pub member: Option<weft_core::member::MemberId>,
 }
 
 // =================================================================
@@ -339,10 +169,10 @@ pub async fn sync(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(id): Path<uuid::Uuid>,
-    body: Option<Json<SyncBody>>,
-) -> Result<Json<SyncResponse>, StatusError> {
+    body: Option<Json<SyncRequest>>,
+) -> Result<Json<InfraStatus>, StatusError> {
     authorize_project(&state, &caller.0, id).await?;
-    let body = body.map(|Json(b)| b).unwrap_or_default().into_sync()?;
+    let body = body.map(|Json(b)| b).unwrap_or_default();
 
     sync_inner(state, id, body).await
 }
@@ -351,10 +181,10 @@ pub(super) async fn sync_inner(
     state: DispatcherState,
     id: uuid::Uuid,
     body: SyncRequest,
-) -> Result<Json<SyncResponse>, StatusError> {
+) -> Result<Json<InfraStatus>, StatusError> {
     let begun = begin_sync(&state, id, &body).await?;
     finish_sync(&state, id, begun).await?;
-    Ok(Json(SyncResponse {
+    Ok(Json(InfraStatus {
         nodes: read_infra_entries(&state, id).await?,
     }))
 }
@@ -383,9 +213,9 @@ pub async fn upgrade(
         running_policy,
         drain_timeout_secs,
         trigger_deactivation: if gated.triggers_on { trigger_deactivation } else { None },
-        binary_hash: sync.binary_hash,
-        definition_hash: sync.definition_hash,
-        infra_hash: sync.infra_hash,
+        binary_hash: sync.build.binary_hash,
+        definition_hash: sync.build.definition_hash,
+        infra_hash: sync.build.infra_hash,
         stopped: false,
     };
     let tenant = state
@@ -397,9 +227,9 @@ pub async fn upgrade(
         &state.pg_pool,
         tenant.as_str(),
         id,
-        sync.member.as_ref(),
+        sync.instance.as_ref(),
         &work,
-        state.instance.as_str(),
+        state.replica.as_str(),
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("issue upgrade: {e:#}")))?;
@@ -424,7 +254,7 @@ pub(crate) enum UpgradeEnd {
     Cancelled(String),
 }
 
-/// Carry out upgrade command `command_id` of `project_id`: `member`'s
+/// Carry out upgrade command `command_id` of `project_id`: `instance`'s
 /// copies (the shared ones for `None`). The triggers reading them down
 /// and the stop leg (unless a claimer before this one already landed
 /// it, `work.stopped`), then the start, exactly a sync's. Safe to run
@@ -435,10 +265,10 @@ pub(crate) async fn run_upgrade(
     state: &DispatcherState,
     id: uuid::Uuid,
     command_id: i64,
-    member: Option<&weft_core::member::MemberId>,
+    instance: Option<&weft_core::instance::InstanceId>,
     work: &infra_lifecycle_command::UpgradeWork,
 ) -> Result<UpgradeEnd, (StatusCode, String)> {
-    match upgrade_legs(state, id, command_id, member, work).await {
+    match upgrade_legs(state, id, command_id, instance, work).await {
         Ok(end) => Ok(end),
         Err(crate::api::project::SyncNotLanded::Cancelled(reason)) => Ok(UpgradeEnd::Cancelled(reason)),
         // An infra cancel ends the setup or the stop it lands in, and
@@ -461,7 +291,7 @@ async fn upgrade_legs(
     state: &DispatcherState,
     id: uuid::Uuid,
     command_id: i64,
-    member: Option<&weft_core::member::MemberId>,
+    instance: Option<&weft_core::instance::InstanceId>,
     work: &infra_lifecycle_command::UpgradeWork,
 ) -> Result<UpgradeEnd, crate::api::project::SyncNotLanded> {
     let Some(project) = state
@@ -472,9 +302,9 @@ async fn upgrade_legs(
     else {
         return Ok(UpgradeEnd::Cancelled(format!("project {id} no longer exists")));
     };
-    let copies = weft_core::member::Copies::of(member.cloned());
+    let copies = weft_core::instance::Copies::of(instance.cloned());
     if !work.stopped {
-        let targeted = resolve_infra_nodes(&project, &work.nodes, member)?;
+        let targeted = resolve_infra_nodes(&project, &work.nodes, instance)?;
         let triggers_taken_down = take_down_upgrade_readers(state, id, &project, &targeted, &copies, work).await?;
         // The apply path leaves up units frozen, so to cycle a running
         // unit onto a new spec the stop comes first (respecting each
@@ -536,7 +366,7 @@ async fn upgrade_legs(
                 );
             }
         }
-        let still_ours = infra_lifecycle_command::mark_upgrade_stopped(&state.pg_pool, command_id, state.instance.as_str())
+        let still_ours = infra_lifecycle_command::mark_upgrade_stopped(&state.pg_pool, command_id, state.replica.as_str())
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("record the stop leg: {e:#}")))?;
         if !still_ours {
@@ -557,7 +387,7 @@ async fn upgrade_legs(
     // Its outcome is not this upgrade's: whatever it ended in, the start
     // below goes again (a cancel meant for this upgrade is read off the
     // command's own flag, right after).
-    let left = crate::api::project::live_infra_setup_execution_ids(state, id, Some(member))
+    let left = crate::api::project::live_infra_setup_execution_ids(state, id, Some(instance))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_setup executions: {e:#}")))?;
     for execution_id in left {
@@ -575,14 +405,16 @@ async fn upgrade_legs(
         return Ok(UpgradeEnd::Cancelled("cancelled before the start; the infra is stopped".into()));
     }
     let body = SyncRequest {
-        binary_hash: work.binary_hash.clone(),
-        definition_hash: work.definition_hash.clone(),
-        infra_hash: work.infra_hash.clone(),
+        build: weft_core::builds::BuildHashes {
+            binary_hash: work.binary_hash.clone(),
+            definition_hash: work.definition_hash.clone(),
+            infra_hash: work.infra_hash.clone(),
+        },
         running: RunningChoice {
             running_policy: Some(work.running_policy),
             drain_timeout_secs: Some(work.drain_timeout_secs),
         },
-        member: member.cloned(),
+        instance: instance.cloned(),
         nodes: work.nodes.clone(),
     };
     let begun = apply_sync(state, id, &body).await?;
@@ -599,7 +431,7 @@ async fn take_down_upgrade_readers(
     id: uuid::Uuid,
     project: &weft_core::ProjectDefinition,
     targeted: &std::collections::BTreeSet<String>,
-    copies: &weft_core::member::Copies,
+    copies: &weft_core::instance::Copies,
     work: &infra_lifecycle_command::UpgradeWork,
 ) -> Result<bool, (StatusCode, String)> {
     let live = live_reader_keys(&activations_reading(state, id, project, targeted, copies).await?);
@@ -672,8 +504,8 @@ async fn gate_sync(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
-    let copies = weft_core::member::Copies::of(body.member.clone());
-    let targeted = resolve_infra_nodes(&registered, &body.nodes, body.member.as_ref())?;
+    let copies = weft_core::instance::Copies::of(body.instance.clone());
+    let targeted = resolve_infra_nodes(&registered, &body.nodes, body.instance.as_ref())?;
     let readers = activations_reading(state, id, &registered, &targeted, &copies).await?;
     if let Some(busy) = readers.iter().find(|a| {
         matches!(
@@ -707,7 +539,7 @@ async fn gate_sync(
     }
     // Fast reject before any side effect; re-checked under the lock
     // in `apply_sync` (the locked re-check is the race-safe one).
-    if crate::api::project::infra_setup_in_flight(state, id, Some(body.member.as_ref()))
+    if crate::api::project::infra_setup_in_flight(state, id, Some(body.instance.as_ref()))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_setup_in_flight: {e}")))?
     {
@@ -723,14 +555,7 @@ async fn gate_sync(
     // a client names are the build it just made, and a sync against
     // another one (a teammate's build landed between the two) is refused
     // rather than applied under the wrong name.
-    crate::api::project::require_registered_build(
-        state,
-        id,
-        body.binary_hash.as_deref(),
-        body.definition_hash.as_deref(),
-        body.infra_hash.as_deref(),
-    )
-    .await?;
+    crate::api::project::require_registered_build(state, id, &body.build).await?;
 
     // Enforce against the same reconciliation the action bar renders:
     // the two faces of sync are distinct table verbs. A plain START is
@@ -738,9 +563,9 @@ async fn gate_sync(
     // when everything already runs); an UPGRADE is `infra_upgrade`
     // (re-cycle running infra onto current specs).
     // The action table is the project's SHARED infra (what the editor's
-    // bar starts and stops); a member's copies are started by the
-    // program or `--member`, and gated by their own checks above.
-    if body.member.is_none() {
+    // bar starts and stops); an instance's copies are started by the
+    // program or `--instance`, and gated by its own checks above.
+    if body.instance.is_none() {
         let action = match kind {
             SyncKind::Start => "infra_start",
             SyncKind::Upgrade { .. } => "infra_upgrade",
@@ -821,7 +646,7 @@ async fn apply_sync(
 
     let started: Result<Option<crate::api::project::InfraSetupRun>, (StatusCode, String)> =
         crate::lease::with_project_transition_lock(&state.lock_pool, id, || async {
-            if crate::api::project::infra_setup_in_flight(state, id, Some(body.member.as_ref())).await? {
+            if crate::api::project::infra_setup_in_flight(state, id, Some(body.instance.as_ref())).await? {
                 return Ok(Err((
                     StatusCode::CONFLICT,
                     "an infra sync is already in flight for these copies; wait for it \
@@ -829,7 +654,7 @@ async fn apply_sync(
                         .into(),
                 )));
             }
-            Ok(crate::api::project::start_infra_setup(state, id, body.member.as_ref(), &body.nodes).await)
+            Ok(crate::api::project::start_infra_setup(state, id, body.instance.as_ref(), &body.nodes).await)
         })
         .await
         .map_err(|e| crate::lease::lock_answer("project transition lock", e))?;
@@ -889,9 +714,9 @@ pub async fn terminate(
     issue_destroy(state, id, InfraLifecycleVerb::Terminate, body).await
 }
 
-/// `POST /projects/{id}/infra/cancel[?member=<id>]`. Cancel one
-/// owner's in-flight infra work: the shared copies' (no `member`) or
-/// one member's. Flags that owner's claimed supervisor commands (the
+/// `POST /projects/{id}/infra/cancel[?instance=<id>]`. Cancel one
+/// owner's in-flight infra work: the shared copies' (no `instance`) or
+/// one instance's. Flags that owner's claimed supervisor commands (the
 /// executing supervisor halts between platform calls), cancels its
 /// still-unclaimed ones outright, and cancels its non-terminal
 /// InfraSetup provisioning execution. Dispatcher-owned verbs
@@ -911,13 +736,13 @@ pub async fn cancel(
 ) -> Result<StatusCode, (StatusCode, String)> {
     authorize_project(&state, &caller.0, id).await?;
 
-    let touched = infra_lifecycle_command::request_cancel_owner(&state.pg_pool, id, copy.member.as_ref())
+    let touched = infra_lifecycle_command::request_cancel_owner(&state.pg_pool, id, copy.instance.as_ref())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("request cancel: {e}")))?;
 
     // Cancel the provisioning sub-execution too (the InfraSetup worker
     // run that computes specs and enqueues applies).
-    let execution_ids = crate::api::project::non_terminal_infra_setup_execution_ids(&state, id, Some(copy.member.as_ref()))
+    let execution_ids = crate::api::project::non_terminal_infra_setup_execution_ids(&state, id, Some(copy.instance.as_ref()))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_setup executions: {e}")))?;
     let had_setup = !execution_ids.is_empty();
@@ -968,8 +793,8 @@ async fn issue_destroy(
     // Reject-don't-crash against the same reconciliation the action
     // bar renders (a stale tab firing stop into a transitional /
     // already-stopped project). The bar is the SHARED infra's; a
-    // member's copies are the program's and `--member`'s to manage.
-    if body.member.is_none() {
+    // instance's copies are the program's and `--instance`'s to manage.
+    if body.instance.is_none() {
         crate::api::project::require_action(&state, id, None, &[action]).await?;
     }
     let project = state
@@ -978,8 +803,8 @@ async fn issue_destroy(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("project: {e}")))?
         .ok_or((StatusCode::NOT_FOUND, "project not found".into()))?;
-    let copies = weft_core::member::Copies::of(body.member.clone());
-    let targeted = resolve_infra_nodes(&project, &[], body.member.as_ref())?;
+    let copies = weft_core::instance::Copies::of(body.instance.clone());
+    let targeted = resolve_infra_nodes(&project, &[], body.instance.as_ref())?;
     let readers = activations_reading(&state, id, &project, &targeted, &copies).await?;
     if let Some(busy) = readers.iter().find(|a| a.lifecycle.status == crate::activation_store::ProjectStatus::Activating) {
         return Err(StatusError::Other(
@@ -1030,7 +855,7 @@ async fn issue_destroy(
 }
 
 /// `POST /projects/{id}/infra/nodes/{node}/stop`, `{node}` being the
-/// instance's place as a person spells it (`one.db`).
+/// node's placement as a person spells it (`one.db`).
 pub async fn stop_node(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
@@ -1066,7 +891,7 @@ async fn issue_per_node(
     // assumed, for one node exactly as for the project.
     let (running_policy, drain_timeout_secs) = body.running.resolve(None);
     // The place has to be a copy the program declares (a declared node
-    // on the side `member` names: a member's copy of a per-member node,
+    // on the side `instance` names: an instance's copy of a per-instance node,
     // the shared copy of a shared one), or one a live row still holds:
     // an orphan the user is taking down by hand, left behind when the
     // node was removed or changed side. A spelling that is neither would
@@ -1082,10 +907,10 @@ async fn issue_per_node(
     // An orphan is no copy of the program's: no trigger reads it and no
     // run of the program reaches it, so neither the reader guard nor the
     // runs' settling below concern it.
-    let orphan = match resolve_infra_nodes(&project, std::slice::from_ref(&node), body.member.as_ref()) {
+    let orphan = match resolve_infra_nodes(&project, std::slice::from_ref(&node), body.instance.as_ref()) {
         Ok(_) => false,
         Err(refusal) => {
-            let held = infra_node::get(&state.pg_pool, id, &node, body.member.as_ref())
+            let held = infra_node::get(&state.pg_pool, id, &node, body.instance.as_ref())
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node lookup: {e}")))?
                 .is_some();
@@ -1110,7 +935,7 @@ async fn issue_per_node(
             ))
         }
     };
-    if body.member.is_none() {
+    if body.instance.is_none() {
         crate::api::project::require_action(&state, id, None, &[action]).await?;
     }
 
@@ -1121,7 +946,7 @@ async fn issue_per_node(
     // how), then retries the per-node verb. Both sides are spelled per
     // place: the trigger under `one` depends on the instance under
     // `one`, and stopping `two.db` leaves it alone.
-    let copies = weft_core::member::Copies::of(body.member.clone());
+    let copies = weft_core::instance::Copies::of(body.instance.clone());
     let live_readers: Vec<String> = if orphan {
         Vec::new()
     } else {
@@ -1151,7 +976,7 @@ async fn issue_per_node(
     // instance is not something the journal records, so under cancel
     // every run the copy can reach is cancelled, the ones that never
     // touched it included: every run of the project for the shared
-    // copy, every run of that member for a member's copy
+    // copy, every run of that instance for an instance's copy
     // (`take_down::runs_using_copies`). The verb's help says so, and
     // `wait` is the way to let them land first.
     if !orphan {
@@ -1177,9 +1002,9 @@ pub async fn status(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(id): Path<uuid::Uuid>,
-) -> Result<Json<SyncResponse>, (StatusCode, String)> {
+) -> Result<Json<InfraStatus>, (StatusCode, String)> {
     authorize_project(&state, &caller.0, id).await?;
-    Ok(Json(SyncResponse {
+    Ok(Json(InfraStatus {
         nodes: read_infra_entries(&state, id).await?,
     }))
 }
@@ -1201,7 +1026,7 @@ pub async fn doors(
 }
 
 fn copy_ref(row: &InfraNodeRow) -> CopyRef {
-    CopyRef { node: row.node_id.clone(), member: row.member.clone() }
+    CopyRef { node: row.node_id.clone(), instance: row.instance.clone() }
 }
 
 /// One entry per door of each row, at its address as the host wrote it,
@@ -1225,7 +1050,7 @@ fn doors_of(rows: &[InfraNodeRow]) -> DoorsResponse {
 /// `GET /projects/{id}/infra/logs?node=&tail=&after=`.
 #[derive(Deserialize)]
 pub struct LogsQuery {
-    /// One infra instance (`db`, `one.db`); every one when absent.
+    /// One infra placement (`db`, `one.db`); every one when absent.
     pub node: Option<String>,
     #[serde(default = "default_tail")]
     pub tail: usize,
@@ -1260,7 +1085,7 @@ pub async fn logs(
     let rows: Vec<&InfraNodeRow> = rows.iter().filter(|r| q.node.as_deref().is_none_or(|n| r.node_id == n)).collect();
     if rows.is_empty() {
         let why = match &q.node {
-            Some(node) => format!("no infra instance `{node}`: it is not provisioned (`weft infra status` says where each instance stands), or it is not an infra node"),
+            Some(node) => format!("no infra node at `{node}`: it is not provisioned (`weft infra status` says where each one stands), or it is not an infra node"),
             None => "nothing is provisioned for this project (`weft infra start`)".to_string(),
         };
         return Err((StatusCode::NOT_FOUND, why));
@@ -1271,11 +1096,11 @@ pub async fn logs(
             tenant: caller.0.as_str().to_string(),
             project: id,
             node: row.node_id.clone(),
-            instance: row.instance_id.clone(),
+            copy_id: row.copy_id.clone(),
         };
         for unit in row.units.keys() {
             let from = match &after {
-                Some(cursor) => LogsFrom::After(cursor.for_unit(&row.instance_id, unit)),
+                Some(cursor) => LogsFrom::After(cursor.for_unit(&row.copy_id, unit)),
                 None => LogsFrom::Tail(q.tail),
             };
             let streams = state
@@ -1286,7 +1111,7 @@ pub async fn logs(
             for stream in streams {
                 // The host made the mark: it reads the clock that stamped
                 // the lines, which this process's clock may not agree with.
-                out.cursor.0.insert(LogCursor::key(&row.instance_id, unit, &stream.source), stream.mark);
+                out.cursor.0.insert(LogCursor::key(&row.copy_id, unit, &stream.source), stream.mark);
                 if !stream.lines.is_empty() {
                     out.blocks.push(LogBlock { copy: copy_ref(row), unit: unit.clone(), stream });
                 }
@@ -1294,18 +1119,6 @@ pub async fn logs(
         }
     }
     Ok(Json(out))
-}
-
-#[derive(serde::Serialize)]
-pub struct CommandStatusResponse {
-    /// True once the supervisor marked the command complete.
-    pub done: bool,
-    /// `succeeded` / `failed` / `cancelled`, only when `done`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub outcome: Option<&'static str>,
-    /// Error (on failed) or reason (on cancelled).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
 }
 
 /// Poll target for a stop / terminate command's completion. The
@@ -1317,7 +1130,7 @@ pub async fn command_status(
     caller: CallerTenant,
     Path((id, cmd_id)): Path<(uuid::Uuid, i64)>,
     Query(hold): Query<super::HoldQuery>,
-) -> Result<Json<CommandStatusResponse>, (StatusCode, String)> {
+) -> Result<Json<CommandStatus>, (StatusCode, String)> {
     // Scope the command read to this project: the command is looked up
     // by `(id, project_id)`, so a caller can't read another project's
     // command outcome by enumerating the sequential id.
@@ -1333,22 +1146,22 @@ pub async fn command_status(
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read command: {e}")))?;
     Ok(Json(match outcome {
-        None => CommandStatusResponse { done: false, outcome: None, message: None },
+        None => CommandStatus { done: false, outcome: None, message: None },
         Some(WaitOutcome::Succeeded) => {
-            CommandStatusResponse { done: true, outcome: Some("succeeded"), message: None }
+            CommandStatus { done: true, outcome: Some(CommandOutcome::Succeeded), message: None }
         }
-        Some(WaitOutcome::Failed { error }) => CommandStatusResponse {
+        Some(WaitOutcome::Failed { error }) => CommandStatus {
             done: true,
-            outcome: Some("failed"),
+            outcome: Some(CommandOutcome::Failed),
             message: Some(error),
         },
-        Some(WaitOutcome::Cancelled { reason }) => CommandStatusResponse {
+        Some(WaitOutcome::Cancelled { reason }) => CommandStatus {
             done: true,
-            outcome: Some("cancelled"),
+            outcome: Some(CommandOutcome::Cancelled),
             message: Some(reason),
         },
         // read_command_outcome never returns Timeout (non-blocking).
-        Some(WaitOutcome::Timeout) => CommandStatusResponse { done: false, outcome: None, message: None },
+        Some(WaitOutcome::Timeout) => CommandStatus { done: false, outcome: None, message: None },
     }))
 }
 
@@ -1357,11 +1170,11 @@ pub async fn command_status(
 #[derive(Debug, Default, Deserialize)]
 pub struct CopyQuery {
     #[serde(default)]
-    pub member: Option<weft_core::member::MemberId>,
+    pub instance: Option<weft_core::instance::InstanceId>,
 }
 
 /// `GET /projects/{id}/infra/nodes/{node}/live`, `{node}` being the
-/// instance's place as a person spells it (`one.db`).
+/// node's placement as a person spells it (`one.db`).
 pub async fn live(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
@@ -1369,7 +1182,7 @@ pub async fn live(
     Query(copy): Query<CopyQuery>,
 ) -> Result<Json<weft_core::live::LiveFeed>, (StatusCode, String)> {
     authorize_project(&state, &caller.0, id).await?;
-    Ok(Json(read_live(&state, id, &node, copy.member.as_ref()).await?))
+    Ok(Json(read_live(&state, id, &node, copy.instance.as_ref()).await?))
 }
 
 /// What an infra node's container is showing right now.
@@ -1385,9 +1198,9 @@ pub(crate) async fn read_live(
     state: &DispatcherState,
     id: uuid::Uuid,
     node: &str,
-    member: Option<&weft_core::member::MemberId>,
+    instance: Option<&weft_core::instance::InstanceId>,
 ) -> Result<weft_core::live::LiveFeed, (StatusCode, String)> {
-    let endpoint_url = live_endpoint_url(state, id, node, member).await?;
+    let endpoint_url = live_endpoint_url(state, id, node, instance).await?;
     let live_url = format!("{}/live", endpoint_url.trim_end_matches('/'));
     // Reuse the dispatcher's shared HTTP client (one connection pool for the
     // process, not a fresh pool per request). Bound the WHOLE exchange, connect +
@@ -1413,23 +1226,8 @@ pub(crate) async fn read_live(
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("the container's /live: {e}")))
 }
 
-/// Body for `/infra/nodes/{node}/action`: the button a `/live` item
-/// carries, pressed.
-///
-/// The one press body on this side of weft, shared by the editor's
-/// door here and the token door at `/signal-token/displays/.../action`,
-/// so a node's author writes one `/action` handler and both reach it.
-/// Only an INFRA node's display has buttons; a trigger's is read-only.
-// SYNC: InfraActionBody <-> crates/weft-core/src/live.rs LiveAction, packages/weft-graph/src/protocol.ts LiveDataItem.action
-#[derive(Debug, Deserialize)]
-pub struct InfraActionBody {
-    pub kind: String,
-    #[serde(default)]
-    pub payload: serde_json::Value,
-}
-
 /// POST /projects/{id}/infra/nodes/{node}/action, `{node}` being the
-/// instance's place as a person spells it (`one.db`): press a button a
+/// node's placement as a person spells it (`one.db`): press a button a
 /// `/live` item offered. The container serving `/live` also serves
 /// `/action` with the bridge envelope (`{ "action", "payload" }` in,
 /// `{ "result" }` out; a `result.error` is the container refusing),
@@ -1448,10 +1246,10 @@ pub async fn action(
     caller: CallerTenant,
     Path((id, node)): Path<(uuid::Uuid, String)>,
     Query(copy): Query<CopyQuery>,
-    Json(body): Json<InfraActionBody>,
+    Json(body): Json<weft_core::live::LivePress>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     authorize_project(&state, &caller.0, id).await?;
-    Ok(Json(press_live(&state, id, &node, copy.member.as_ref(), &body.kind, &body.payload).await?))
+    Ok(Json(press_live(&state, id, &node, copy.instance.as_ref(), &body.kind, &body.payload).await?))
 }
 
 /// Press a button one of an infra node's `/live` items carries. The
@@ -1461,11 +1259,11 @@ pub(crate) async fn press_live(
     state: &DispatcherState,
     id: uuid::Uuid,
     node: &str,
-    member: Option<&weft_core::member::MemberId>,
+    instance: Option<&weft_core::instance::InstanceId>,
     kind: &str,
     payload: &serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
-    let endpoint_url = live_endpoint_url(state, id, node, member).await?;
+    let endpoint_url = live_endpoint_url(state, id, node, instance).await?;
     let action_url = format!("{}/action", endpoint_url.trim_end_matches('/'));
     let resp = state
         .http
@@ -1500,7 +1298,7 @@ pub(crate) async fn press_live(
             project: id,
             source: crate::display_feeds::DisplaySource::Infra,
             node: node.to_string(),
-            member: member.cloned(),
+            instance: instance.cloned(),
         },
     )
     .await;
@@ -1539,7 +1337,7 @@ pub(crate) async fn live_endpoint_url(
     state: &DispatcherState,
     id: uuid::Uuid,
     node: &str,
-    member: Option<&weft_core::member::MemberId>,
+    instance: Option<&weft_core::instance::InstanceId>,
 ) -> Result<String, (StatusCode, String)> {
     let project = state
         .projects
@@ -1559,11 +1357,11 @@ pub(crate) async fn live_endpoint_url(
         StatusCode::NOT_FOUND,
         "node does not expose a /live endpoint".to_string(),
     ))?;
-    let row = infra_node::get(&state.pg_pool, id, node, member)
+    let row = infra_node::get(&state.pg_pool, id, node, instance)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node lookup: {e}")))?
-        .ok_or_else(|| match member {
-            Some(member) => (StatusCode::NOT_FOUND, format!("member '{member}' has no copy of infra node '{node}'")),
+        .ok_or_else(|| match instance {
+            Some(instance) => (StatusCode::NOT_FOUND, format!("instance '{instance}' has no copy of infra node '{node}'")),
             None => (StatusCode::NOT_FOUND, "no such infra node".to_string()),
         })?;
     // A copy that is not up has nothing behind its address (a stopped
@@ -1605,14 +1403,15 @@ async fn read_infra_entries(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra copies: {e:#}")))?;
     let mut entries: Vec<InfraStatusEntry> =
         copies.rows.into_iter().map(|row| row_to_entry(row, state.external_base_url())).collect();
-    entries.extend(copies.starting.into_iter().map(|(node, member)| InfraStatusEntry {
+    entries.extend(copies.starting.into_iter().map(|(node, instance)| InfraStatusEntry {
         node,
-        member,
+        instance,
         status: infra_node::InfraNodeStatus::Provisioning.as_str().to_string(),
         endpoint_url: None,
         public_urls: Default::default(),
         failure_stage: None,
         failure_message: None,
+        notes: Vec::new(),
     }));
     Ok(entries)
 }
@@ -1625,7 +1424,7 @@ fn row_to_entry(row: InfraNodeRow, front_door: &str) -> InfraStatusEntry {
             .map(|(name, path)| (name.clone(), weft_core::infra::public_url(front_door, path)))
             .collect(),
         node: row.node_id,
-        member: row.member,
+        instance: row.instance,
         status: row.status.as_str().to_string(),
         // Coarse UI hint: the first endpoint by name (BTreeMap, so
         // deterministic). Node code resolves a specific endpoint by
@@ -1633,6 +1432,7 @@ fn row_to_entry(row: InfraNodeRow, front_door: &str) -> InfraStatusEntry {
         endpoint_url: row.install_endpoints.values().next().cloned(),
         failure_stage: row.failure_stage.map(|f| f.as_str().to_string()),
         failure_message: row.failure_message,
+        notes: row.notes,
     }
 }
 
@@ -1647,7 +1447,7 @@ pub(crate) async fn issue_lifecycle_kicking_supervisor(
     state: &DispatcherState,
     project_id: uuid::Uuid,
     node_id: Option<&str>,
-    copies: &weft_core::member::Copies,
+    copies: &weft_core::instance::Copies,
     take_down: TakeDown,
     running_policy: RunningPolicy,
     drain_timeout_secs: u64,
@@ -1666,7 +1466,7 @@ pub(crate) async fn issue_lifecycle_kicking_supervisor(
         take_down,
         running_policy,
         drain_timeout_secs,
-        state.instance.as_str(),
+        state.replica.as_str(),
     )
     .await
     .map_err(|e| {
@@ -1685,7 +1485,7 @@ async fn issue_per_nodes_kicking_supervisor(
     state: &DispatcherState,
     project_id: uuid::Uuid,
     nodes: &std::collections::BTreeSet<String>,
-    copies: &weft_core::member::Copies,
+    copies: &weft_core::instance::Copies,
     take_down: TakeDown,
     running_policy: RunningPolicy,
     drain_timeout_secs: u64,
@@ -1734,12 +1534,12 @@ async fn reap_orphans(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node list: {e}")))?;
     // A copy the source no longer declares: the node is gone, or it
-    // changed sides (a node no longer per member leaves its members'
-    // copies behind, a node now per member leaves its shared one).
-    let orphans: Vec<(String, Option<weft_core::member::MemberId>)> = rows
+    // changed sides (a node no longer per instance leaves its instances'
+    // copies behind, a node now per instance leaves its shared one).
+    let orphans: Vec<(String, Option<weft_core::instance::InstanceId>)> = rows
         .into_iter()
-        .filter(|r| !declared.declares(&r.node_id, r.member.is_some()))
-        .map(|r| (r.node_id, r.member))
+        .filter(|r| !declared.declares(&r.node_id, r.instance.is_some()))
+        .map(|r| (r.node_id, r.instance))
         .collect();
     if orphans.is_empty() {
         return Ok(());
@@ -1753,12 +1553,12 @@ async fn reap_orphans(
     // Step 1: issue every terminate in parallel. issue_lifecycle is
     // a single INSERT; bundling them keeps DB roundtrip cost flat
     // regardless of orphan count.
-    let issue_futures = orphans.iter().map(|(node_id, member)| {
+    let issue_futures = orphans.iter().map(|(node_id, instance)| {
         let tenant_str = tenant.as_str().to_string();
         let node_id = node_id.clone();
-        let copies = weft_core::member::Copies::of(member.clone());
+        let copies = weft_core::instance::Copies::of(instance.clone());
         let pool = state.pg_pool.clone();
-        let instance = state.instance.as_str().to_string();
+        let replica = state.replica.as_str().to_string();
         async move {
             let res = infra_lifecycle_command::issue_lifecycle(
                 &pool,
@@ -1771,7 +1571,7 @@ async fn reap_orphans(
                 // Cancel never drains; the cap is inert. Default keeps
                 // the row honest.
                 weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
-                &instance,
+                &replica,
             )
             .await;
             (node_id, res)
@@ -1855,7 +1655,7 @@ async fn reap_orphans(
 /// Project deletion entry point. Called by `weft rm`.
 ///
 /// For a project with infra, issues a `Terminate` of every copy (the
-/// shared ones and each member's) and waits up to 120s for the
+/// shared ones and each instance's) and waits up to 120s for the
 /// supervisor to complete it. Then removes the connections the
 /// project's nodes published and releases the project's supervisor
 /// lease. The `infra_*` rows go with the project row itself
@@ -1896,7 +1696,7 @@ pub async fn delete_project(
             state,
             id,
             None,
-            &weft_core::member::Copies::Every,
+            &weft_core::instance::Copies::Every,
             // The disks the nodes keep go with the project: the
             // supervisor's sweep deletes a removed project's copies.
             TakeDown::TERMINATE,
@@ -1996,26 +1796,12 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// An older client asking for an upgrade through `/infra/sync` is
-    /// refused naming the upgrade route, never handed a plain start.
-    #[test]
-    fn a_sync_body_carrying_upgrade_keys_is_refused() {
-        for body in [json!({ "upgrade": true }), json!({ "triggerDeactivation": { "all": true } })] {
-            let parsed: SyncBody = serde_json::from_value(body).unwrap();
-            let (code, why) = parsed.into_sync().unwrap_err();
-            assert_eq!(code, StatusCode::BAD_REQUEST);
-            assert!(why.contains("/infra/upgrade"), "{why}");
-        }
-        let plain: SyncBody = serde_json::from_value(json!({ "binaryHash": "h" })).unwrap();
-        assert_eq!(plain.into_sync().unwrap().binary_hash.as_deref(), Some("h"));
-    }
-
-    fn door_row(node_id: &str, member: Option<&str>, status: InfraNodeStatus, doors: &[(&str, &str)]) -> InfraNodeRow {
+    fn door_row(node_id: &str, instance: Option<&str>, status: InfraNodeStatus, doors: &[(&str, &str)]) -> InfraNodeRow {
         InfraNodeRow {
             project_id: uuid::Uuid::nil(),
             node_id: node_id.into(),
-            member: member.map(|m| weft_core::member::MemberId::new(m).unwrap()),
-            instance_id: String::new(),
+            instance: instance.map(|m| weft_core::instance::InstanceId::new(m).unwrap()),
+            copy_id: String::new(),
             status,
             failure_stage: None,
             failure_message: None,
@@ -2027,6 +1813,7 @@ mod tests {
             install_endpoints: Default::default(),
             keep_disks: Vec::new(),
             units: Default::default(),
+            notes: Vec::new(),
         }
     }
 
@@ -2043,8 +1830,8 @@ mod tests {
         let answer = doors_of(&rows);
         assert_eq!(answer.doors.len(), 2);
         assert_eq!(answer.doors[0].address, "weft-db-main:5432");
-        assert_eq!(answer.doors[1].copy.member.as_ref().map(|m| m.as_str()), Some("ann"));
-        assert_eq!(answer.applying, vec![CopyRef { node: "cache".into(), member: None }]);
+        assert_eq!(answer.doors[1].copy.instance.as_ref().map(|m| m.as_str()), Some("ann"));
+        assert_eq!(answer.applying, vec![CopyRef { node: "cache".into(), instance: None }]);
     }
 
     fn build() -> serde_json::Value {
@@ -2054,13 +1841,11 @@ mod tests {
     #[test]
     fn a_sync_names_the_build_it_applies_or_none() {
         let r: SyncRequest = serde_json::from_value(build()).unwrap();
-        assert_eq!(r.binary_hash.as_deref(), Some("abc"));
-        assert_eq!(r.definition_hash.as_deref(), Some("def0"));
-        assert_eq!(r.infra_hash.as_deref(), Some("def"));
+        assert_eq!(r.build.binary_hash.as_deref(), Some("abc"));
+        assert_eq!(r.build.definition_hash.as_deref(), Some("def0"));
+        assert_eq!(r.build.infra_hash.as_deref(), Some("def"));
         let bare: SyncRequest = serde_json::from_value(json!({})).unwrap();
-        assert!(bare.binary_hash.is_none(), "a program's sync applies the registered build");
-        let old: SyncBody = serde_json::from_value(json!({ "imageHashes": {} })).unwrap();
-        assert!(old.into_sync().unwrap_err().1.contains("builds"), "images come with the build, never from the client");
+        assert!(bare.build.binary_hash.is_none(), "a program's sync applies the registered build");
         assert_eq!(r.running, RunningChoice::default());
     }
 
@@ -2084,7 +1869,7 @@ mod tests {
         let mut body = build();
         body["triggerDeactivation"] = json!({ "mode": "park", "graceMinutes": 30, "runningPolicy": "wait" });
         let camel: UpgradeRequest = serde_json::from_value(body).unwrap();
-        assert_eq!(camel.sync.binary_hash.as_deref(), Some("abc"));
+        assert_eq!(camel.sync.build.binary_hash.as_deref(), Some("abc"));
         let td = camel.trigger_deactivation.expect("trigger_deactivation present");
         assert_eq!(td.mode, crate::api::project::DeactivationMode::Park);
         assert_eq!(td.grace_minutes, 30);
@@ -2096,7 +1881,7 @@ mod tests {
             "binary_hash": "abc", "definition_hash": "d", "infra_hash": "i",
         }))
         .unwrap();
-        assert!(snake.binary_hash.is_none());
+        assert!(snake.build.binary_hash.is_none());
         // A required inner field spelled snake_case fails the parse
         // outright (`runningPolicy` has no default).
         let mut body = build();

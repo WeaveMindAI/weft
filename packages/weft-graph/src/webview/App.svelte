@@ -581,6 +581,29 @@
         });
         return;
       }
+      if (msg.kind === 'execFileEdit') {
+        // One change a firing made to a stored file, appended to that
+        // firing's row for the inspector's "Files edited" card. Dedup on
+        // the file's key and the version the change produced: the same
+        // journal row arrives twice when replay and live overlap.
+        const framesKey = JSON.stringify(msg.frames);
+        const rows = executionState.nodeExecutions[msg.nodeId];
+        const idx = rows?.findIndex((r) => r.framesKey === framesKey) ?? -1;
+        if (!rows || idx < 0) {
+          // node_started precedes every edit on both paths: a miss is an
+          // ordering or keying regression, surfaced instead of hidden.
+          console.warn('[weft] file edit for an unknown firing', msg);
+          return;
+        }
+        const seen = rows[idx].fileEdits ?? [];
+        if (seen.some((f) => f.key === msg.edit.key && f.toVersion === msg.edit.toVersion)) {
+          return;
+        }
+        executionState.nodeExecutions = bareRecord(executionState.nodeExecutions, {
+          [msg.nodeId]: rows.map((r, i) => (i === idx ? { ...r, fileEdits: [...seen, msg.edit] } : r)),
+        });
+        return;
+      }
       if (msg.kind === 'execEvent') {
         const e = msg.event;
         const state = e.state;
@@ -991,7 +1014,7 @@
   function onResync() {
     // Resync deactivates first, and the user picks how (same shared
     // picker as Deactivate). The dispatcher offers it only while some
-    // trigger is on, the program's or a member's (a member's can be on
+    // trigger is on, the program's or an instance's (an instance's can be on
     // while the program's own are off, so the project status is no
     // guide here), which means the choice is always needed.
     deactivationIntent = 'resync';
@@ -1001,7 +1024,7 @@
     send({ kind: 'infraStart' });
   }
   // The infra verbs go without a choice: only the dispatcher knows
-  // whether a trigger is on (the program's or a member's), and when one
+  // whether a trigger is on (the program's or an instance's), and when one
   // is, the host answers `needsTriggerChoice` and the picker opens.
   function onStopInfra() {
     send({ kind: 'infraStop' });

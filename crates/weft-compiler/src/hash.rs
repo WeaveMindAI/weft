@@ -116,7 +116,7 @@ mod fs_hashes {
 
     use super::{hex, SourceHash};
     use weft_core::project::hash::hash_definition_slice;
-    use weft_core::project::{infra_ids, upstream_closure, EdgeIndex};
+    use weft_core::project::{graph::ProjectGraph, infra_ids, upstream_closure};
     use crate::project::Project;
 
     /// Dockerfile (relative to the weft root) that builds the shared
@@ -162,12 +162,18 @@ mod fs_hashes {
         for rel in [BUILDER_BASE_DOCKERFILE, BUILDER_BASE_SPLIT_SCRIPT] {
             hash_path(hasher, rel, &weft_root.join(rel))?;
         }
-        // The stdlib packages' dependency declarations. The builder base
-        // compiles the stock worker, whose dependency tree (and the
-        // feature unification of every shared crate in it) is the fixed
-        // set plus what these files add; a change here makes the baked
-        // rlibs and the host compile cache dead weight, a node body edit
-        // does not (that only moves one package's content slot).
+        Ok(())
+    }
+
+    /// The installation's stdlib packages' dependency declarations. Only
+    /// weft's own shared images read them: the builder base compiles the
+    /// stock worker, whose dependency tree (and the feature unification
+    /// of every shared crate in it) is the fixed set plus what these files
+    /// add, so a change here makes the baked rlibs and the host compile
+    /// cache dead weight. A user project's hashes never read them: its
+    /// own `nodes/base_catalog/` deps.toml files are hashed with the rest
+    /// of each referenced package (`hash_package_roots`).
+    fn hash_installed_stdlib_deps(hasher: &mut Sha256) -> Result<()> {
         let stdlib = weft_catalog::stdlib_root().map_err(|e| anyhow::anyhow!("{e}"))?;
         for path in walk_dir(&stdlib)?.into_iter().filter(|p| p.file_name().is_some_and(|n| n == "deps.toml")) {
             let rel = path.strip_prefix(&stdlib).map_err(|_| anyhow::anyhow!("{} is outside the stdlib", path.display()))?;
@@ -198,7 +204,7 @@ mod fs_hashes {
         project: &Project,
         weft_root: &Path,
         catalog: &FsCatalog,
-        node_set: crate::codegen::NodeSet,
+        node_set: weft_core::builds::NodeSet,
     ) -> Result<SourceHash> {
         let project_root = project.root.as_path();
         let mut hasher = Sha256::new();
@@ -254,7 +260,7 @@ mod fs_hashes {
         project: &Project,
         weft_root: &Path,
         catalog: &FsCatalog,
-        node_set: crate::codegen::NodeSet,
+        node_set: weft_core::builds::NodeSet,
     ) -> Result<std::collections::BTreeMap<String, SourceHash>> {
         let mut shared = Sha256::new();
         shared.update(b"weft-implementation-v1\n");
@@ -446,7 +452,7 @@ mod fs_hashes {
         // running bridge process). Same canonical form as the definition hash:
         // spans / positions / file-ref paths stripped, nodes and edges
         // sorted, so a comment or a canvas drag cannot flip it either.
-        let closure = upstream_closure(project, &EdgeIndex::build(project), &infra_ids(project));
+        let closure = upstream_closure(&ProjectGraph::new(project), &infra_ids(project));
         hash_definition_slice(&mut hasher, project, &closure)?;
         hash_path(&mut hasher, "weft.toml", &project_root.join("weft.toml"))?;
 
@@ -487,13 +493,15 @@ mod fs_hashes {
     /// itself. An engine bump or toolchain change flips this hash and
     /// triggers a fresh base image; per-project worker images then FROM
     /// the new tag. Scoped to engine-affecting inputs only, NOT project
-    /// or catalog inputs (those don't change the base). The input set is
-    /// exactly `hash_worker_build_env`, shared with the binary / infra
-    /// hashes so a base-affecting edit flips all three together.
+    /// inputs (those don't change the base): `hash_worker_build_env`,
+    /// shared with the binary / infra hashes so a base-affecting edit
+    /// flips all three together, plus the installation's stdlib
+    /// `deps.toml` files the stock worker it bakes compiles against.
     pub fn compute_builder_base_hash(weft_root: &Path) -> Result<SourceHash> {
         let mut hasher = Sha256::new();
         hasher.update(b"weft-builder-base-v1\n");
         hash_worker_build_env(&mut hasher, weft_root)?;
+        hash_installed_stdlib_deps(&mut hasher)?;
         Ok(hex(&hasher.finalize()))
     }
 
@@ -514,6 +522,7 @@ mod fs_hashes {
         hasher.update(builder.as_bytes());
         hasher.update(b"\n");
         hash_worker_build_env(&mut hasher, weft_root)?;
+        hash_installed_stdlib_deps(&mut hasher)?;
         Ok(hex(&hasher.finalize()).chars().take(16).collect())
     }
 
@@ -737,12 +746,12 @@ mod fs_hashes {
                 "id":"g__in", "nodeType":"Passthrough", "inputs":[], "outputs":[], "position":{"x":0,"y":0},
                 "groupBoundary":{"groupId":"g","role":"In"}
             })).unwrap());
-            for set in [crate::codegen::NodeSet::Full, crate::codegen::NodeSet::Referenced] {
+            for set in [weft_core::builds::NodeSet::Full, weft_core::builds::NodeSet::Referenced] {
                 let before = implementation_hashes(&empty, &project, root, &catalog, set).unwrap();
                 let after = implementation_hashes(&grouped, &project, root, &catalog, set).unwrap();
                 assert_eq!(before, after, "adding a built-in boundary does not change the worker's implementation map");
                 assert!(before.contains_key("Passthrough") && before.contains_key("IncludeIn") && before.contains_key("CallOut"));
-                if matches!(set, crate::codegen::NodeSet::Full) { assert!(before.contains_key("Text")); }
+                if matches!(set, weft_core::builds::NodeSet::Full) { assert!(before.contains_key("Text")); }
             }
         }
 
@@ -769,13 +778,38 @@ mod fs_hashes {
             let mut graph: ProjectDefinition = serde_json::from_value(serde_json::json!({
                 "id":project.id(), "nodes":[{"id":"text", "nodeType":"Text", "config":{"value":"before"}, "position":{"x":0,"y":0}}], "edges":[]
             })).unwrap();
-            let hash = |graph: &ProjectDefinition| compute_binary_hash(graph, &project, root, &catalog, crate::codegen::NodeSet::Full).unwrap();
+            let hash = |graph: &ProjectDefinition| compute_binary_hash(graph, &project, root, &catalog, weft_core::builds::NodeSet::Full).unwrap();
             let initial = hash(&graph);
             assert_eq!(hash(&graph), initial);
             graph.nodes[0].config = serde_json::json!({"value":"after"});
             assert_eq!(hash(&graph), initial, "config belongs to the execution definition");
             graph.nodes[0].node_type = "Format".into();
             assert_eq!(hash(&graph), initial, "all catalog implementations were already compiled");
+        }
+
+        /// The project's own copy of the standard library is what the
+        /// binary hash reads: editing a `deps.toml` under its
+        /// `nodes/base_catalog/` flips it, whatever the installation holds.
+        #[test]
+        fn the_projects_own_stdlib_deps_flip_the_binary_hash() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("weft.toml"), "[package]\nname = 'test'\nid = '00000000-0000-0000-0000-000000000001'\n").unwrap();
+            crate::project::seed_base_catalog(dir.path()).unwrap();
+            let project = Project::load(dir.path()).unwrap();
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+            let graph: ProjectDefinition = serde_json::from_value(serde_json::json!({
+                "id":project.id(), "nodes":[{"id":"req", "nodeType":"HttpRequest", "config":{}, "position":{"x":0,"y":0}}], "edges":[]
+            })).unwrap();
+            let hash = || {
+                let catalog = crate::build::build_project_catalog(dir.path()).unwrap();
+                compute_binary_hash(&graph, &project, root, &catalog, weft_core::builds::NodeSet::Full).unwrap()
+            };
+            let before = hash();
+            let deps = dir.path().join("nodes/base_catalog/http/request/deps.toml");
+            let mut text = std::fs::read_to_string(&deps).unwrap();
+            text.push_str("\n# edited in the project\n");
+            std::fs::write(&deps, text).unwrap();
+            assert_ne!(hash(), before);
         }
 
         fn digest(roots: &[PathBuf], bases: &[&Path]) -> String {

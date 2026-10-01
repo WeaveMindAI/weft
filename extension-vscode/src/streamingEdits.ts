@@ -121,26 +121,28 @@ function stripTrailingNewline(s: string): string {
   return s.endsWith('\n') ? s.slice(0, -1) : s;
 }
 
+/** Where `searchText` sits in `text`, as the exact `[start, end)` range to
+ *  replace, or null. Falls back to the trimmed search (whitespace drift at
+ *  the block's edges), and then the range is the TRIMMED match's length:
+ *  using the untrimmed length would delete text past the match. */
+export function findBlockRange(text: string, searchText: string): { start: number; end: number } | null {
+  const exact = text.indexOf(searchText);
+  if (exact >= 0) return { start: exact, end: exact + searchText.length };
+  const trimmed = searchText.trim();
+  if (!trimmed) return null;
+  const idx = text.indexOf(trimmed);
+  return idx < 0 ? null : { start: idx, end: idx + trimmed.length };
+}
+
 async function applyBlock(
   doc: vscode.TextDocument,
   searchText: string,
   replaceText: string,
 ): Promise<boolean> {
-  const text = doc.getText();
-  let idx = text.indexOf(searchText);
-  if (idx < 0) {
-    // Fall back to trim-tolerant match (both sides trimmed). v1
-    // does the same; otherwise whitespace drift breaks patches.
-    const trimmed = searchText.trim();
-    if (trimmed) {
-      idx = text.indexOf(trimmed);
-    }
-    if (idx < 0) return false;
-  }
-  const startPos = doc.positionAt(idx);
-  const endPos = doc.positionAt(idx + searchText.length);
+  const range = findBlockRange(doc.getText(), searchText);
+  if (!range) return false;
   const edit = new vscode.WorkspaceEdit();
-  edit.replace(doc.uri, new vscode.Range(startPos, endPos), replaceText);
+  edit.replace(doc.uri, new vscode.Range(doc.positionAt(range.start), doc.positionAt(range.end)), replaceText);
   return vscode.workspace.applyEdit(edit);
 }
 

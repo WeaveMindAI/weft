@@ -89,7 +89,7 @@ impl axum::extract::FromRequestParts<DispatcherState> for CallerAddress {
 /// Whether a path is one of the token doors, where a refused answer
 /// means somebody presented a token that does not work.
 fn is_token_door(path: &str) -> bool {
-    ["/signal/", "/signal-token/", "/connect/", "/member/"].iter().any(|p| path.starts_with(p))
+    ["/signal/", "/signal-token/", "/connect/", "/instance/"].iter().any(|p| path.starts_with(p))
 }
 
 /// The layer over the outside-caller surface that stops token guessing:
@@ -157,7 +157,7 @@ mod display;
 // exercises against a real Postgres.
 pub mod signal;
 pub mod access;
-pub mod member_door;
+pub mod instance_door;
 mod picks;
 mod workers;
 pub mod node_tests;
@@ -206,6 +206,7 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         // The connections the program's own access nodes use on this
         // install, never written in the source.
         .route("/projects/{id}/picks", get(picks::list).put(picks::change))
+        .route("/projects/{id}/picks/move", post(picks::move_picks))
         // The project's own worker levers.
         .route("/projects/{id}/workers", get(workers::get).put(workers::put))
         .route("/projects/{id}/executions/latest", get(execution::latest_for_project))
@@ -241,9 +242,9 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         // rollback: per-node partial state stays visible.
         .route("/projects/{id}/infra/cancel", post(infra::cancel))
         // Per-node verbs for partial-state recovery.
-        // `{node}` on every per-node infra route is the instance's
-        // PLACE as a person spells it (`one.db`): an infra node inside
-        // a file included twice is two instances with two names.
+        // `{node}` on every per-node infra route is the node's
+        // PLACEMENT as a person spells it (`one.db`): an infra node inside
+        // a file included twice is two placements with two names.
         .route("/projects/{id}/infra/nodes/{node}/stop", post(infra::stop_node))
         .route("/projects/{id}/infra/nodes/{node}/terminate", post(infra::terminate_node))
         .route("/projects/{id}/infra/status", get(infra::status))
@@ -289,7 +290,7 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         // URLs are caller-facing so bytes go straight to the bucket.
         .route("/storage/upload/begin", post(storage::upload_begin))
         // The pre-build asset sync's diff input: the project's published assets.
-        .route("/storage/assets/list", post(storage::assets_list))
+        .route("/storage/assets/held", post(storage::assets_held))
         .route("/storage/assets/references", post(storage::asset_references))
         .route("/storage/upload/parts", post(storage::upload_parts))
         .route("/storage/upload/part-done", post(storage::upload_part_done))
@@ -370,19 +371,19 @@ fn outside_caller_routes(state: DispatcherState) -> Router<DispatcherState> {
             get(signal::signal_file_for_token),
         )
         .route("/signal-token/health", get(signal::signal_token_health))
-        // The member door: one member of one program, with their member
-        // token in `Authorization: Bearer` (see `api/member_door.rs`).
-        .route("/member/fields", get(member_door::fields))
-        .route("/member/values", axum::routing::put(member_door::set_values))
-        .route("/member/lookup", post(member_door::lookup))
-        .route("/member/picker", post(member_door::picker))
-        .route("/member/connections", get(member_door::list_connections))
-        .route("/member/connections/{id}", axum::routing::delete(member_door::delete_connection))
-        .route("/member/connections/direct", post(member_door::connect_direct))
-        .route("/member/connections/begin", post(member_door::connect_begin))
-        .route("/member/connections/status", get(member_door::connect_status))
-        .route("/member/doors", post(member_door::doors))
-        .route("/member/runs", get(member_door::runs))
+        // The instance door: one instance of one program, with that instance's
+        // token in `Authorization: Bearer` (see `api/instance_door.rs`).
+        .route("/instance/fields", get(instance_door::fields))
+        .route("/instance/values", axum::routing::put(instance_door::set_values))
+        .route("/instance/lookup", post(instance_door::lookup))
+        .route("/instance/picker", post(instance_door::picker))
+        .route("/instance/connections", get(instance_door::list_connections))
+        .route("/instance/connections/{id}", axum::routing::delete(instance_door::delete_connection))
+        .route("/instance/connections/direct", post(instance_door::connect_direct))
+        .route("/instance/connections/begin", post(instance_door::connect_begin))
+        .route("/instance/connections/status", get(instance_door::connect_status))
+        .route("/instance/doors", post(instance_door::doors))
+        .route("/instance/runs", get(instance_door::runs))
         // What a node is SHOWING, for a client built on top of a weft
         // program (a website that renders the bridge's QR code rather
         // than sending its user to the editor). The same two feeds the

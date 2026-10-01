@@ -4,8 +4,9 @@
 //! dirty tree naming the files; `--discard` overrides.
 
 use anyhow::{bail, Context};
+use weft_core::versions::{HeadRequest, HeadResponse};
 
-use super::versions::{fetch_tree, local_manifest, manifest_files, resolve_run, resolve_version, short, Manifest};
+use super::versions::{fetch_tree, local_manifest, resolve_run, resolve_version, short, Manifest};
 use super::Ctx;
 
 pub async fn run(ctx: Ctx, reference: String, discard: bool) -> anyhow::Result<()> {
@@ -32,10 +33,10 @@ pub async fn run(ctx: Ctx, reference: String, discard: bool) -> anyhow::Result<(
 
     // An execution means its version and becomes head's run.
     let (body, version_id) = match resolve_run(&tree, &reference) {
-        Ok(run) => (serde_json::json!({ "run": run.execution_id }), run.version_id.clone()),
+        Ok(run) => (HeadRequest { run: Some(run.execution_id), version: None }, run.version_id.clone()),
         Err(_) => {
             let version = resolve_version(&tree, &reference)?;
-            (serde_json::json!({ "version": version.id.clone() }), version.id.clone())
+            (HeadRequest { version: Some(version.id.clone()), run: None }, version.id.clone())
         }
     };
     let manifest: Manifest = tree
@@ -63,9 +64,8 @@ pub async fn run(ctx: Ctx, reference: String, discard: bool) -> anyhow::Result<(
             short(&version_id)
         )
     })?;
-    // SYNC: body <-> crates/weft-dispatcher/src/api/versions.rs HeadRequest
     let resp = client
-        .put_json(&format!("/projects/{id}/versions/head"), &body)
+        .put_json(&format!("/projects/{id}/versions/head"), &serde_json::to_value(&body)?)
         .await
         .with_context(|| {
             format!(
@@ -79,36 +79,30 @@ pub async fn run(ctx: Ctx, reference: String, discard: bool) -> anyhow::Result<(
                 short(&version_id)
             )
         })?;
-    // The response's version is the contract, not a nicety: answering
-    // without one means the shape drifted, and printing the version we
-    // ASKED for would hide that behind a confident line.
-    let version = resp
-        .get("version")
-        .and_then(|v| v.as_str())
-        .context("head response missing version")?
-        .to_string();
+    // The answer's version is what is printed, never the one we ASKED
+    // for: an answer that does not read means the shape drifted.
+    let moved: HeadResponse = serde_json::from_value(resp.clone()).context("read the head answer")?;
 
     if ctx.json_out(&resp)? {
         return Ok(());
     }
-    match resp.get("run").and_then(|v| v.as_str()) {
-        Some(run) => println!("head is now run {} on version {}", short(run), short(&version)),
-        None => println!("head is now version {}", short(&version)),
+    match moved.run {
+        Some(run) => println!("head is now run {} on version {}", short(&run.to_string()), short(&moved.version)),
+        None => println!("head is now version {}", short(&moved.version)),
     }
     Ok(())
 }
 
 /// The covered paths whose bytes differ between head's manifest and
-/// the disk (added, removed, or changed), sorted. The pseudo-entry
-/// (the installed weft) is ignored: a different weft is not an edit.
+/// the disk (added, removed, or changed), sorted.
 pub fn dirty_files(head: &Manifest, local: &Manifest) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for (path, hash) in manifest_files(local) {
+    for (path, hash) in local.iter() {
         if head.get(path) != Some(hash) {
             out.push(path.clone());
         }
     }
-    for (path, _) in manifest_files(head) {
+    for (path, _) in head.iter() {
         if !local.contains_key(path) {
             out.push(path.clone());
         }
@@ -151,7 +145,7 @@ async fn restore(client: &crate::client::DispatcherClient, project: &weft_compil
     // Download before changing the working tree. Deleting obsolete files first
     // then permits a path to change between a file and a directory.
     let staged = tempfile::tempdir()?;
-    download_into(client, &project.id().to_string(), manifest, &local, staged.path()).await?;
+    download_into(client, manifest, &local, staged.path()).await?;
     // From here the working tree changes. Nothing above touched it, so a
     // failure above leaves the person exactly where they were; a failure
     // below may leave a mixture of two versions, and says which.
@@ -171,13 +165,11 @@ async fn restore(client: &crate::client::DispatcherClient, project: &weft_compil
 /// caller; the hashes are checked here, through the key grammar.
 pub(crate) async fn download_into(
     client: &crate::client::DispatcherClient,
-    project_id: &str,
     manifest: &Manifest,
     have: &Manifest,
     dest: &std::path::Path,
 ) -> anyhow::Result<()> {
-    let scope_project = Some(project_id.to_string());
-    for (path, hash) in manifest_files(manifest) {
+    for (path, hash) in manifest.iter() {
         if have.get(path) == Some(hash) {
             continue;
         }
@@ -185,11 +177,11 @@ pub(crate) async fn download_into(
         // off a manifest the dispatcher sent, so it is not this side's
         // to trust. Named by PATH, which is the file the person can
         // actually look at.
-        let scope = weft_core::storage::key::KeyScope::Asset { project_id: project_id.to_string() };
+        let scope = weft_core::storage::key::KeyScope::Asset;
         let key = weft_core::storage::key::scope_key(&scope, hash).map_err(|e| {
             anyhow::anyhow!("this version lists '{path}' as '{hash}', which is not a storable address ({e})")
         })?;
-        let bytes = super::files::download_bytes(client, &key, &scope_project)
+        let bytes = super::files::download_bytes(client, &key)
             .await
             .with_context(|| format!("download {path} ({hash})"))?;
         let full = dest.join(path);
@@ -205,7 +197,7 @@ pub(crate) async fn download_into(
 /// absolute, a backslash, or a `.`/`..`/empty segment): a path off the
 /// wire that would write outside the folder it is restored into.
 pub(crate) fn unrecordable_paths(manifest: &Manifest) -> Vec<&String> {
-    manifest_files(manifest)
+    manifest.iter()
         .filter(|(path, _)| {
             path.is_empty()
                 || path.starts_with('/')
@@ -217,7 +209,7 @@ pub(crate) fn unrecordable_paths(manifest: &Manifest) -> Vec<&String> {
 }
 
 fn validate_destinations(root: &std::path::Path, manifest: &Manifest) -> anyhow::Result<()> {
-    for (path, _) in manifest_files(manifest) {
+    for (path, _) in manifest.iter() {
         let mut full = root.to_path_buf();
         for part in std::path::Path::new(path).components() {
             full.push(part);
@@ -243,7 +235,7 @@ fn apply_restore(root: &std::path::Path, local: &Manifest, manifest: &Manifest, 
     // Checked again right before the first write: the downloads above
     // took time, and a symlink planted meanwhile would be written through.
     validate_destinations(root, manifest)?;
-    for (path, _) in manifest_files(local) {
+    for (path, _) in local.iter() {
         if !manifest.contains_key(path) {
             let full = root.join(path);
             std::fs::remove_file(&full).with_context(|| format!("remove {}", full.display()))?;
@@ -264,7 +256,7 @@ fn apply_restore(root: &std::path::Path, local: &Manifest, manifest: &Manifest, 
             }
         }
     }
-    for (path, hash) in manifest_files(manifest) {
+    for (path, hash) in manifest.iter() {
         if local.get(path) == Some(hash) { continue; }
         let full = root.join(path);
         if full.is_dir() {
@@ -291,9 +283,9 @@ mod tests {
     }
 
     #[test]
-    fn dirty_files_names_added_removed_and_changed_but_not_the_weft_entry() {
-        let head = m(&[("main.weft", "1"), ("gone.weft", "2"), ("weft:0.1:abc", "")]);
-        let local = m(&[("main.weft", "X"), ("new.weft", "3"), ("weft:0.2:def", "")]);
+    fn dirty_files_names_added_removed_and_changed() {
+        let head = m(&[("main.weft", "1"), ("gone.weft", "2")]);
+        let local = m(&[("main.weft", "X"), ("new.weft", "3")]);
         assert_eq!(dirty_files(&head, &local), vec!["gone.weft", "main.weft", "new.weft"]);
         assert!(dirty_files(&head, &head).is_empty());
     }

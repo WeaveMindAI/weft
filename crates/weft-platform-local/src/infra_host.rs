@@ -54,7 +54,7 @@ pub struct LocalInfraHostConfig {
     /// Which of a unit's ports are published on the machine.
     pub publish: Publish,
     /// The install these units belong to.
-    pub install: weft_core::infra::Instance,
+    pub install: weft_core::infra::Install,
 }
 
 /// How a container reaches the machine's GPUs.
@@ -129,7 +129,7 @@ impl LocalInfraHost {
         docker::containers(
             self.docker.as_ref(),
             self.cfg.install.label_value(),
-            &[(labels::ROLE, roles::INFRA), (labels::INSTANCE, &node.instance), (labels::UNIT, unit)],
+            &[(labels::ROLE, roles::INFRA), (labels::COPY, &node.copy_id), (labels::UNIT, unit)],
         )
         .await
     }
@@ -393,6 +393,27 @@ impl InfraHost for LocalInfraHost {
         Ok(())
     }
 
+    fn notes(&self, node: &ResolvedNode) -> Vec<String> {
+        // Docker's NVIDIA runtime cannot pick a GPU by kind, so a unit
+        // asking for one gets every GPU the machine has (`--gpus all`,
+        // see `container_args`). A Container-Optimized OS machine was
+        // made with the kind asked, so it has nothing to say.
+        if self.cfg.gpu != GpuAccess::DockerGpus {
+            return Vec::new();
+        }
+        node.units
+            .iter()
+            .filter_map(|u| u.unit.machine.gpu.as_ref().map(|gpu| (u, gpu)))
+            .map(|(u, gpu)| {
+                format!(
+                    "unit '{}' of '{}' asked for {} x {}; a local install cannot choose a GPU by kind, \
+                     so it hands the container every GPU on this machine",
+                    u.unit.name, node.node.node, gpu.count, gpu.kind
+                )
+            })
+            .collect()
+    }
+
     async fn apply_unit(&self, node: &ResolvedNode, unit: &str) -> anyhow::Result<()> {
         let resolved = Self::unit(node, unit)?;
         let rows = self.unit_containers(&node.node, unit).await?;
@@ -434,7 +455,7 @@ impl InfraHost for LocalInfraHost {
     async fn remove_unit(&self, node: &NodeRef, unit: &str) -> anyhow::Result<()> {
         self.remove_unit_containers(node, unit).await?;
         let scratch: Vec<String> = self
-            .volumes(&[(labels::INSTANCE, &node.instance), (labels::UNIT, unit), (VOLUME_KIND, "scratch")])
+            .volumes(&[(labels::COPY, &node.copy_id), (labels::UNIT, unit), (VOLUME_KIND, "scratch")])
             .await?
             .into_iter()
             .map(|(name, _)| name)
@@ -444,14 +465,14 @@ impl InfraHost for LocalInfraHost {
 
     async fn terminate(&self, node: &NodeRef, keep_disks: &[String]) -> anyhow::Result<()> {
         let names: Vec<String> =
-            docker::containers(self.docker.as_ref(), self.cfg.install.label_value(), &[(labels::ROLE, roles::INFRA), (labels::INSTANCE, &node.instance)])
+            docker::containers(self.docker.as_ref(), self.cfg.install.label_value(), &[(labels::ROLE, roles::INFRA), (labels::COPY, &node.copy_id)])
                 .await?
                 .into_iter()
                 .map(|c| c.name)
                 .collect();
         docker::remove_containers(self.docker.as_ref(), &names).await?;
         let gone: Vec<String> = self
-            .volumes(&[(labels::INSTANCE, &node.instance)])
+            .volumes(&[(labels::COPY, &node.copy_id)])
             .await?
             .into_iter()
             .filter(|(_, l)| !(l.get(VOLUME_KIND).map(String::as_str) == Some("disk") && l.get(VOLUME).is_some_and(|v| keep_disks.contains(v))))
@@ -465,11 +486,11 @@ impl InfraHost for LocalInfraHost {
         let rows = docker::containers(self.docker.as_ref(), self.cfg.install.label_value(), &[(labels::ROLE, roles::INFRA), (labels::PROJECT, &project_label)]).await?;
         let mut by_unit: BTreeMap<(String, String), Vec<ContainerRow>> = BTreeMap::new();
         for r in rows {
-            let (Some(i), Some(u)) = (r.label(labels::INSTANCE), r.label(labels::UNIT)) else { continue };
-            by_unit.entry((i.to_string(), u.to_string())).or_default().push(r);
+            let (Some(c), Some(u)) = (r.label(labels::COPY), r.label(labels::UNIT)) else { continue };
+            by_unit.entry((c.to_string(), u.to_string())).or_default().push(r);
         }
         let mut out = Vec::with_capacity(by_unit.len());
-        for ((instance, unit), rows) in by_unit {
+        for ((copy_id, unit), rows) in by_unit {
             let hash = rows.iter().find_map(|r| r.label(labels::UNIT_HASH)).unwrap_or_default().to_string();
             let mut probes = HashMap::new();
             for r in &rows {
@@ -478,7 +499,7 @@ impl InfraHost for LocalInfraHost {
                 }
             }
             let state = self.unit_state(&probes, &rows).await?;
-            out.push(UnitObservation { instance, unit, hash, state });
+            out.push(UnitObservation { copy_id, unit, hash, state });
         }
         Ok(out)
     }
@@ -494,16 +515,16 @@ impl InfraHost for LocalInfraHost {
         let mut seen = BTreeSet::new();
         let mut out = Vec::new();
         for l in agents.chain(disks) {
-            let (Some(tenant), Some(project), Some(node), Some(instance)) = (
+            let (Some(tenant), Some(project), Some(node), Some(copy_id)) = (
                 l.get(labels::TENANT),
                 l.get(labels::PROJECT).and_then(|p| p.parse::<uuid::Uuid>().ok()),
                 l.get(labels::NODE),
-                l.get(labels::INSTANCE),
+                l.get(labels::COPY),
             ) else {
                 continue;
             };
-            if seen.insert(instance.clone()) {
-                out.push(NodeRef { tenant: tenant.clone(), project, node: node.clone(), instance: instance.clone() });
+            if seen.insert(copy_id.clone()) {
+                out.push(NodeRef { tenant: tenant.clone(), project, node: node.clone(), copy_id: copy_id.clone() });
             }
         }
         Ok(out)
@@ -632,19 +653,19 @@ fn mounted_volumes(unit: &ResolvedUnit) -> BTreeSet<&str> {
         .collect()
 }
 
-fn base_labels(install: &weft_core::infra::Instance, node: &NodeRef, unit: &str) -> BTreeMap<&'static str, String> {
+fn base_labels(install: &weft_core::infra::Install, node: &NodeRef, unit: &str) -> BTreeMap<&'static str, String> {
     let mut l = BTreeMap::new();
     l.insert(labels::INSTALL, install.label_value().to_string());
     l.insert(labels::ROLE, roles::INFRA.to_string());
     l.insert(labels::TENANT, node.tenant.clone());
     l.insert(labels::PROJECT, node.project.to_string());
     l.insert(labels::NODE, node.node.clone());
-    l.insert(labels::INSTANCE, node.instance.clone());
+    l.insert(labels::COPY, node.copy_id.clone());
     l.insert(labels::UNIT, unit.to_string());
     l
 }
 
-fn volume_create_args(install: &weft_core::infra::Instance, node: &NodeRef, unit: &str, volume: &str, disk: bool) -> Vec<String> {
+fn volume_create_args(install: &weft_core::infra::Install, node: &NodeRef, unit: &str, volume: &str, disk: bool) -> Vec<String> {
     let mut l = base_labels(install, node, unit);
     l.insert(VOLUME, volume.to_string());
     l.insert(VOLUME_KIND, if disk { "disk" } else { "scratch" }.to_string());
@@ -881,7 +902,7 @@ mod tests {
     };
 
     fn node_ref() -> NodeRef {
-        NodeRef { tenant: "local".into(), project: uuid::Uuid::from_u128(5), node: "db".into(), instance: "wn-1".into() }
+        NodeRef { tenant: "local".into(), project: uuid::Uuid::from_u128(5), node: "db".into(), copy_id: "wn-1".into() }
     }
 
     fn spec() -> InfraSpec {
@@ -915,7 +936,7 @@ mod tests {
 
     fn cfg(gpu: GpuAccess) -> LocalInfraHostConfig {
         let dir = std::env::temp_dir().join(format!("weft-infra-test-{}", uuid::Uuid::new_v4().simple()));
-        LocalInfraHostConfig { agent_image: "weft-runtime:t".into(), scratch_dir: dir, gpu, disks: DiskBacking::Volumes, publish: Publish::Loopback, install: weft_core::infra::Instance::default_install() }
+        LocalInfraHostConfig { agent_image: "weft-runtime:t".into(), scratch_dir: dir, gpu, disks: DiskBacking::Volumes, publish: Publish::Loopback, install: weft_core::infra::Install::default_install() }
     }
 
     fn host(docker: Arc<FakeDocker>, gpu: bool) -> LocalInfraHost {
@@ -974,6 +995,19 @@ mod tests {
         let err = host(Arc::new(FakeDocker::new()), false).check(&node).unwrap_err();
         assert!(err.contains("machine.gpu"), "{err}");
         assert!(host(Arc::new(FakeDocker::new()), true).check(&node).is_ok());
+    }
+
+    #[test]
+    fn a_gpu_kind_asked_on_docker_says_every_gpu_is_handed_over() {
+        let mut s = spec();
+        s.units[0].machine.gpu = Some(weft_core::infra::Gpu { kind: "nvidia-l4".into(), count: 1 });
+        let node = resolve(&s, &node_ref(), &BTreeMap::new()).unwrap();
+        let notes = host(Arc::new(FakeDocker::new()), true).notes(&node);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("nvidia-l4") && notes[0].contains("every GPU"), "{notes:?}");
+        let cos = LocalInfraHost::new(Arc::new(FakeDocker::new()), cfg(GpuAccess::CosDriver));
+        assert!(cos.notes(&node).is_empty(), "a machine made with the kind asked runs it as asked");
+        assert!(host(Arc::new(FakeDocker::new()), true).notes(&resolve(&spec(), &node_ref(), &BTreeMap::new()).unwrap()).is_empty());
     }
 
     #[test]
@@ -1059,18 +1093,18 @@ mod tests {
         let p = uuid::Uuid::from_u128(1);
         docker.answer(
             &["ps"],
-            &format!(r#"{{"Names":"a","State":"running","Labels":"weft.tenant=t,weft.project={p},weft.node=api,weft.instance=i-api"}}"#),
+            &format!(r#"{{"Names":"a","State":"running","Labels":"weft.tenant=t,weft.project={p},weft.node=api,weft.copy=i-api"}}"#),
         );
         docker.answer(
             &["volume", "ls"],
             &format!(
                 "{}\n{}\n",
-                format_args!(r#"{{"Name":"v-api","Labels":"weft.tenant=t,weft.project={p},weft.node=api,weft.instance=i-api,weft.volume=data,weft.volume-kind=disk"}}"#),
-                format_args!(r#"{{"Name":"v-db","Labels":"weft.tenant=t,weft.project={p},weft.node=db,weft.instance=i-db,weft.volume=data,weft.volume-kind=disk"}}"#),
+                format_args!(r#"{{"Name":"v-api","Labels":"weft.tenant=t,weft.project={p},weft.node=api,weft.copy=i-api,weft.volume=data,weft.volume-kind=disk"}}"#),
+                format_args!(r#"{{"Name":"v-db","Labels":"weft.tenant=t,weft.project={p},weft.node=db,weft.copy=i-db,weft.volume=data,weft.volume-kind=disk"}}"#),
             ),
         );
         let mut copies: Vec<(String, String)> =
-            host(docker.clone(), false).copies().await.unwrap().into_iter().map(|c| (c.node, c.instance)).collect();
+            host(docker.clone(), false).copies().await.unwrap().into_iter().map(|c| (c.node, c.copy_id)).collect();
         copies.sort();
         assert_eq!(copies, [("api".to_string(), "i-api".to_string()), ("db".to_string(), "i-db".to_string())], "each copy once, the disk-only one included");
     }

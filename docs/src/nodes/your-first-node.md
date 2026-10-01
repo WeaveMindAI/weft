@@ -49,7 +49,11 @@ Read an input, send an output. That is the shape of every node.
 ## Write one
 
 Make a folder under your project's `nodes/`, anywhere except
-`nodes/base_catalog/`, which gets replaced when you update weft.
+`nodes/base_catalog/`. That folder holds the standard library, and it is a
+folder of nodes like any other: weft loads and builds it the same way, and
+you can delete it if you do not use it. The one thing particular to it is
+that `weft catalog update` replaces it with the installed weft's copy, so
+anything of yours in there would be lost.
 
 ```text
 nodes/word_count/

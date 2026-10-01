@@ -106,7 +106,7 @@ export function diffPortLiteralOps(
   // A connection the install keeps is marked by the compiler, never
   // written in the source. An updated marker is the compiled marker
   // echoed back: no value to write. A real value over a marker (turning
-  // on `@member_filled`) is written; a marker the update drops is no
+  // on `@instance_filled`) is written; a marker the update drops is no
   // literal to remove.
   for (const [key, value] of Object.entries(updated)) {
     if (installPicked(value)) continue;

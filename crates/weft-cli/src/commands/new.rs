@@ -2,10 +2,11 @@
 //! weft.toml, src/main.weft, nodes/, .weft/, and an initialized git
 //! repo. With `--assistant <name>`, also install the Tangle
 //! assistant persona for that AI coding assistant, copied out of
-//! the weft checkout (see `AssistantSpec`). The choice is
-//! remembered, so later `weft new` calls install the same
-//! assistants without repeating the flag; `--assistant none`
-//! clears it, and `--assistant agents` is the fallback for an
+//! the weft checkout (see `AssistantSpec`). The choice is for this
+//! project only, unless `--remember` makes it the default later
+//! `weft new` calls install without the flag (`--assistant none
+//! --remember` clears it): a scratch project made by an agent never
+//! changes what the user picked. `--assistant agents` is the fallback for an
 //! assistant weft has no template for. With `--ci <cloud>`, also the
 //! deploy workflow `weft ci add` writes.
 
@@ -242,6 +243,7 @@ pub async fn run(
     _ctx: Ctx,
     name: String,
     assistants: Vec<String>,
+    remember: bool,
     ci: Option<super::ci::Cloud>,
 ) -> anyhow::Result<()> {
     if name.is_empty() {
@@ -252,9 +254,11 @@ pub async fn run(
         anyhow::bail!("{} already exists", root.display());
     }
 
-    // `--assistant none` is the explicit opt-out: install nothing and
-    // clear the memory. Any other explicit choice installs and becomes
-    // the new memory. No flag at all falls back to the memory.
+    // `--assistant` picks for this project alone; `--remember` also makes
+    // that pick the default (`none` clears it). No flag at all falls back
+    // to the default. Remembering is never a side effect, because agents
+    // make scratch projects with whatever flag suits the moment.
+    // (clap refuses `--remember` without an `--assistant`.)
     let explicit = !assistants.is_empty();
     let opt_out = explicit && assistants.iter().all(|a| a == "none");
     let installed = if opt_out {
@@ -305,7 +309,7 @@ pub async fn run(
         Ok(project)
     })?;
 
-    if explicit {
+    if remember {
         write_recorded_assistants(&installed)?;
     }
 
@@ -317,20 +321,28 @@ pub async fn run(
     );
     let shown: Vec<&str> = installed.iter().map(|s| s.dir).collect();
     if !installed.is_empty() {
-        if explicit {
+        if !explicit {
             println!(
-                "tangle ({}) installed: open the project in that assistant and it is there",
+                "tangle ({}) installed (your default; --assistant <name> --remember changes it, \
+                 --assistant none --remember clears it)",
+                shown.join(", ")
+            );
+        } else if remember {
+            println!(
+                "tangle ({}) installed, and remembered as the default for future projects",
                 shown.join(", ")
             );
         } else {
             println!(
-                "tangle ({}) installed (remembered from your last choice; \
-                 --assistant <name> changes it, --assistant none stops it)",
+                "tangle ({}) installed: open the project in that assistant and it is there \
+                 (add --remember to make it the default for future projects)",
                 shown.join(", ")
             );
         }
-    } else if opt_out {
+    } else if opt_out && remember {
         println!("tangle default cleared; future projects start without it");
+    } else if opt_out {
+        println!("no tangle in this project; your default is unchanged");
     } else {
         let known = ASSISTANTS
             .iter()
@@ -339,7 +351,7 @@ pub async fn run(
             .join(", ");
         println!(
             "tip: --assistant <name> installs tangle, the AI builder persona, into the project; \
-             the choice is remembered"
+             add --remember to make it the default"
         );
         println!("     {known}");
         println!(
@@ -347,7 +359,7 @@ pub async fn run(
             FALLBACK.shorthand
         );
     }
-    println!("next: cd {name} && weft daemon start && weft run");
+    println!("next: cd {name} && weft run");
     Ok(())
 }
 

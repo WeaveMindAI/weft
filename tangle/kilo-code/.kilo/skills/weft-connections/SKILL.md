@@ -150,7 +150,7 @@ answer resumes the run from where it stopped, seconds or weeks later.
 
 ## A public address
 
-Webhook-style triggers (an `ApiEndpoint`, a Drive watch, a Slack app
+Webhook-style triggers (a `Route`, a Drive watch, a Slack app
 installed in other workspaces) need the runtime reachable from the
 internet. Polling triggers (Telegram, email, sheets, RSS, cron) and
 everything local work without one.

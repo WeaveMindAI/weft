@@ -1,0 +1,7 @@
+ALTER TABLE infra_lifecycle_command RENAME COLUMN issued_by_instance TO issued_by_replica;
+
+ALTER TABLE infra_lifecycle_command RENAME COLUMN claimed_by_instance TO claimed_by_replica;
+
+ALTER TABLE infra_lifecycle_command RENAME COLUMN member_id TO instance_id;
+
+ALTER TABLE infra_lifecycle_command RENAME CONSTRAINT infra_lifecycle_command_issued_by_instance_not_null TO infra_lifecycle_command_issued_by_replica_not_null;

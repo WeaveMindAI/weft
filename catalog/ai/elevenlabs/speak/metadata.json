@@ -1,7 +1,7 @@
 {
   "type": "ElevenLabsSpeak",
   "label": "Speak (streaming)",
-  "description": "Streaming text-to-speech: a live text bus in (an LLM stream, a transcript), a live audio bus out, spoken as the text arrives. The full audio also lands as a file at the end. For whole-text-in, file-out, use Speak to File.",
+  "description": "Streaming text-to-speech: a live text bus in (an LLM stream, a transcript), a live audio bus out, spoken as the text arrives. The full audio also lands as a file at the end. For whole-text-in, file-out, use Speak to File. A failure after the stream has opened fails the run, so a reader never mistakes a cut-off stream for a finished one.",
   "tags": [
     "ai",
     "audio",
@@ -51,6 +51,7 @@
       "default": "eleven_flash_v2_5",
       "widget": {
         "kind": "select",
+        "free_text": true,
         "options": [
           "eleven_flash_v2_5",
           "eleven_turbo_v2_5",

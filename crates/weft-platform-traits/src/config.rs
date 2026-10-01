@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
-use weft_core::infra::Instance;
+use weft_core::infra::Install;
 
 use crate::roles::{CoreRole, Placement, RoleAddresses, RolePlacement, Vantage, INTERNAL_DOOR};
 use crate::runner::WorkerSettings;
@@ -21,7 +21,7 @@ use crate::runner::WorkerSettings;
 pub struct InstallConfig {
     /// Which install this is when a machine holds several.
     #[serde(default)]
-    pub instance: Instance,
+    pub install: Install,
     pub platform: PlatformConfig,
     pub auth: AuthMode,
     /// The stable address people and editors reach the install at.
@@ -426,7 +426,7 @@ pub(crate) mod tests {
 
     pub fn local() -> InstallConfig {
         InstallConfig {
-            instance: Instance::default_install(),
+            install: Install::default_install(),
             platform: PlatformConfig::Local(LocalPlatform {
                 data_dir: "/home/u/.local/share/weft".into(),
                 container_internal_url: "http://host.docker.internal:14113".into(),

@@ -292,16 +292,14 @@ impl Progress {
     }
 
     /// Say what the call about to be made will wait for, and for how
-    /// long. `deactivation` is the wire object the verb is about to
-    /// send.
+    /// long: the running policy and cap the verb is about to send.
     ///
     /// The POLICY decides whether there is a wait, and the mode has no
     /// say: it is the same rule as `DeactivateSpec::drains`, so park and
     /// hibernate both wait when the person asked to wait. (Wipe cannot
     /// reach here with `wait`; the spec's validator refuses that pair.)
-    pub fn drain_wait(&self, deactivation: &Value, cap_seconds: Option<u64>) {
-        let field = |name: &str| deactivation.get(name).and_then(|v| v.as_str());
-        if field("runningPolicy") != Some("wait") {
+    pub fn drain_wait(&self, policy: weft_core::RunningPolicy, cap_seconds: Option<u64>) {
+        if policy != weft_core::RunningPolicy::Wait {
             return;
         }
         self.emit(

@@ -268,6 +268,18 @@ one command, and it all lands in one transaction, so a refusal leaves your
 tree and your database as they were. Forget the step and the
 `schema_agreement` test fails.
 
+If you renamed a column or a table, say so. The diff alone sees a column going
+and another arriving, and would drop the old one with its rows, so the command
+stops and lists every such pair until you name each rename, in the order they
+happen:
+
+```bash
+./setup.sh --migration rename_owner --rename project.owner=owner_id --rename old_table=new_table
+```
+
+If the pair it lists really is two unrelated columns, add `--unrelated` instead,
+and the old one's rows are thrown away.
+
 Never edit a released migration by hand: the boot checksums every applied one and refuses the change. Ask for a new migration instead.
 
 ### Running the SQL tests

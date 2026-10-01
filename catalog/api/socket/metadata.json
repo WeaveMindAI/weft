@@ -104,6 +104,11 @@
   ],
   "outputs": [
     {
+      "name": "fired",
+      "type": "Boolean",
+      "description": "Always true when a caller opens the socket. Wire it to gate work on \"somebody connected\" without reading any request part."
+    },
+    {
       "name": "path",
       "type": "String",
       "description": "The path as called under the project (no leading slash)."
@@ -144,11 +149,12 @@
     "params?": "Dict[String, String]",
     "query?": "Dict[String, String]",
     "headers?": "List[List[String]]",
-    "caller?": "JsonDict"
+    "caller?": "JsonDict",
+    "base_url?": "String"
   },
   "features": {
     "isTrigger": true,
-    "liveConnection": true,
+    "liveConnection": "websocket",
     "canAddOutputPorts": true
   },
   "validate": [
@@ -171,17 +177,25 @@
         "of": {
           "kind": "run_reaches",
           "direction": "downstream",
-          "types": [
-            "Reply",
-            "Stream",
-            "Close"
-          ]
+          "with": {
+            "answersCaller": true
+          }
         }
       },
       "then": {
-        "message": "Socket '{id}' starts a run that never answers its caller: no Reply, Stream or Close is in it. Wire the answering node so the run reaches it (through data, or `_should_flow` on the node or on the group it sits in); a custom node answering through the ctx is the one case to ignore this.",
+        "message": "Socket '{id}' starts a run that never answers its caller: no node that answers it (a Reply, a Stream, a Close) is in it. Wire the answering node so the run reaches it (through data, or `_should_flow` on the node or on the group it sits in).",
         "level": "structural",
         "severity": "warning"
+      }
+    },
+    {
+      "when": {
+        "kind": "per_instance"
+      },
+      "then": {
+        "message": "Socket '{id}' would exist once per instance, because {per_instance_reason}, but its public address is one for every instance. Keep the socket shared and pick the instance per call: the `Weft-Instance` header on a socket gated by a connection, or an instance token.",
+        "level": "structural",
+        "severity": "error"
       }
     }
   ]

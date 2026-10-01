@@ -22,7 +22,6 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
-use serde_json::{json, Value};
 
 use weft_catalog::FsCatalog;
 use weft_core::access::spec::{AccessSpec, Acquisition, CredentialField, Door};
@@ -31,6 +30,7 @@ use weft_core::node::MetadataCatalog;
 use weft_core::node_test::{
     concurrency_limit, report_line, NodeTestsListing, RunAllReport, TestListing, TestReport,
 };
+use weft_core::task::TaskStatus;
 use weft_core::TestTier;
 
 use super::Ctx;
@@ -1051,7 +1051,7 @@ async fn create_ephemeral_grant(ctx: &Ctx, key: PreparedKey) -> Result<uuid::Uui
             registration: None,
             paste: key.paste,
             project_id: None,
-            member: None,
+            instance: None,
         },
         None,
     )
@@ -1074,8 +1074,9 @@ async fn run_live_tests(
     let project = ctx.project()?;
     // The test image is built into THIS machine's Docker, which only a
     // local install runs images from.
-    let install = client.get_json("/install").await?;
-    if !install.get("cloud").is_none_or(serde_json::Value::is_null) {
+    let install: weft_core::install::InstallInfo =
+        serde_json::from_value(client.get_json("/install").await?).context("read the install's description")?;
+    if install.cloud.is_some() {
         bail!(
             "live node tests run on a local install: the test image is built into this machine's Docker, which {} \
              cannot reach. Target a local install and run them there.",
@@ -1199,43 +1200,42 @@ async fn run_one_live_test(
     let resp = client
         .post_json(
             &format!("/projects/{project_id}/node-tests/run"),
-            &json!({
-                "imageRef": image,
-                "node": run.node,
-                "test": run.test,
-                "liveConnection": connection,
-                "fixtures": fixtures,
-            }),
+            &serde_json::to_value(weft_core::node_test::RunNodeTestRequest {
+                image_ref: image.to_string(),
+                node: run.node.clone(),
+                test: run.test.clone(),
+                live_connection: Some(connection.to_string()),
+                fixtures: fixtures.clone(),
+            })?,
         )
         .await
         .context("start the node-test run")?;
-    let task_id = resp
-        .get("taskId")
-        .and_then(Value::as_str)
-        .context("run answered without a task id")?
-        .to_string();
+    let task_id = serde_json::from_value::<weft_core::node_test::RunNodeTestResponse>(resp)
+        .context("read the started node-test run")?
+        .task_id;
 
     let started = std::time::Instant::now();
     let mut last_breadcrumb = std::time::Instant::now();
     let report = loop {
         // Held by the dispatcher until the run finishes or the hold runs
         // out, so the loop asks again at once either way.
-        let status = client
-            .get_json(&format!(
-                "/projects/{project_id}/node-tests/runs/{task_id}?wait_ms={}",
-                RUN_HOLD.as_millis()
-            ))
-            .await
-            .context("wait on the node-test run")?;
-        match status.get("status").and_then(Value::as_str) {
-            Some("complete") => {
-                break status.get("report").cloned().context("completed without a report")?
-            }
-            Some("failed") => bail!(
+        let status: weft_core::node_test::NodeTestRunStatus = serde_json::from_value(
+            client
+                .get_json(&format!(
+                    "/projects/{project_id}/node-tests/runs/{task_id}?wait_ms={}",
+                    RUN_HOLD.as_millis()
+                ))
+                .await
+                .context("wait on the node-test run")?,
+        )
+        .context("read the node-test run's status")?;
+        match status.status {
+            TaskStatus::Complete => break status.report.context("completed without a report")?,
+            TaskStatus::Failed => bail!(
                 "the node-test run itself failed (not the test): {}",
-                status.get("error").and_then(Value::as_str).unwrap_or("unknown")
+                status.error.as_deref().unwrap_or("unknown")
             ),
-            Some(in_progress @ ("pending" | "claimed")) => {
+            in_progress @ (TaskStatus::Pending | TaskStatus::Claimed) => {
                 if last_breadcrumb.elapsed() >= std::time::Duration::from_secs(15) {
                     last_breadcrumb = std::time::Instant::now();
                     progress.note(&format!(
@@ -1247,13 +1247,8 @@ async fn run_one_live_test(
                     ));
                 }
             }
-            other => bail!(
-                "unexpected node-test run status {other:?} for task {task_id}; \
-                 the dispatcher and this CLI disagree on the task states"
-            ),
         }
     };
-    let report: TestReport = serde_json::from_value(report).context("parse live test report")?;
     progress.finished(&run.package, &run.test, report.passed, report.error.as_deref());
     Ok(report)
 }

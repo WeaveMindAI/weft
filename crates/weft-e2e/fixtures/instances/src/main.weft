@@ -1,0 +1,21 @@
+# A program with instances. `hook` is the author's route, gated by the
+# author's own key set; `theirs` is a key set each instance connects for
+# itself (`@instance_filled`), so every run through `hook` needs to
+# know which instance it is in. `probe` shows which instance's connection
+# the run got, and writes a file into that instance's storage. `open` is
+# an ungated route, where naming an instance is refused.
+
+keys = ApiKeyAuth
+hook = Route -> (text: String) { path: "__E2E_PATH__/hook", method: "POST" }
+hook.auth = keys.access
+
+theirs = ApiKeyAuth { account: @instance_filled }
+probe = InstanceProbe
+probe.text = hook.text
+probe.key = theirs.access
+answer = Reply
+answer.body = probe.body
+
+open = Route -> (text: String) { path: "__E2E_PATH__/open", method: "POST" }
+echo = Reply
+echo.body = open.text

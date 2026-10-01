@@ -107,5 +107,8 @@
       "type": "JsonDict",
       "description": "The created record (id, createdTime, fields)."
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

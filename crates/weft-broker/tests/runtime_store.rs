@@ -20,7 +20,7 @@ use sqlx::PgPool;
 use weft_broker::entitlement::{Entitlement, EntitlementSource};
 use weft_broker::runtime_store::{
     charged_bytes_for, BeginUpload, RuntimeStore, RuntimeStoreError, UploadSpec,
-    DEFAULT_KEEP_TTL_SECS, DEFAULT_PART_SIZE_BYTES, EXEC_LINGER_TTL_SECS,
+    COMPLETING_LEASE_SECS, DEFAULT_KEEP_TTL_SECS, DEFAULT_PART_SIZE_BYTES, EXEC_LINGER_TTL_SECS,
 };
 use weft_core::storage::key::CallerAuth;
 use weft_core::storage::{bytes_stream, ByteRange, KeepTtl, PartAsk, StorageScope, StoredFileMeta};
@@ -47,7 +47,7 @@ fn worker(tenant: &str, project: &str, execution_id: Option<&str>) -> CallerAuth
         tenant: tenant.into(),
         project_id: project.into(),
         execution_id: execution_id.map(String::from),
-        member: None,
+        instance: None,
     }
 }
 
@@ -766,7 +766,7 @@ async fn list_is_scoped_and_wipe_prefix_clears_it(pool: PgPool) {
 #[sqlx::test]
 async fn assemble_concatenates_existing_objects_into_an_asset(pool: PgPool) {
     let (s, bucket, _c) = store(&pool).await;
-    let w = worker("t1", "p1", None);
+    let w = acting("t1");
 
     // Two "chunk" objects already in the bucket (another storage plane);
     // assembly must concatenate them in order into one ledgered asset without
@@ -787,13 +787,13 @@ async fn assemble_concatenates_existing_objects_into_an_asset(pool: PgPool) {
     let sources = vec![("chunks/c1".to_string(), 6u64), ("chunks/c2".to_string(), 5u64)];
     let meta = s.assemble(&w, &spec, &sources, &big()).await.unwrap();
     assert_eq!(meta.size_bytes, 11);
-    assert_eq!(meta.key, format!("t1/asset/p1/{sha}"));
+    assert_eq!(meta.key, format!("t1/asset/{sha}"));
 
     // The assembled object is byte-exact and ledgered (listed + downloadable).
     let obj = bucket.get(&object_key(&meta.key)).await.unwrap().expect("assembled object");
     assert_eq!(&obj[..], b"HELLO WORLD");
-    let prefix = weft_core::storage::key::ParsedKey::asset_prefix("t1", "p1").unwrap();
-    assert_eq!(s.list(&prefix).await.unwrap().len(), 1);
+    let prefix = "t1/asset/";
+    assert_eq!(s.list(prefix).await.unwrap().len(), 1);
 
     // Re-assembling ACTIVE content is the idempotent success (content
     // addressed: same bytes = same asset): the existing file's meta comes
@@ -801,7 +801,7 @@ async fn assemble_concatenates_existing_objects_into_an_asset(pool: PgPool) {
     let again = s.assemble(&w, &spec, &sources, &big()).await.unwrap();
     assert_eq!(again.key, meta.key);
     assert_eq!(again.size_bytes, 11);
-    assert_eq!(s.list(&prefix).await.unwrap().len(), 1, "no second copy");
+    assert_eq!(s.list(prefix).await.unwrap().len(), 1, "no second copy");
 
     // A missing source aborts loudly and leaves NOTHING: no pending row, no
     // partial object, reservation freed.
@@ -812,7 +812,7 @@ async fn assemble_concatenates_existing_objects_into_an_asset(pool: PgPool) {
         s.assemble(&w, &bad_spec, &bad, &big()).await,
         Err(RuntimeStoreError::Invalid(_))
     ));
-    assert_eq!(s.list(&prefix).await.unwrap().len(), 1, "only the first asset exists");
+    assert_eq!(s.list(prefix).await.unwrap().len(), 1, "only the first asset exists");
     let pending: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM runtime_file WHERE status = 'pending'")
             .fetch_one(&pool)
@@ -824,7 +824,7 @@ async fn assemble_concatenates_existing_objects_into_an_asset(pool: PgPool) {
 #[sqlx::test]
 async fn asset_uploads_are_content_addressed_and_conflict_on_duplicates(pool: PgPool) {
     let (s, bucket, _c) = store(&pool).await;
-    let w = worker("t1", "p1", None);
+    let w = acting("t1");
     let sha = "ab".repeat(32);
     let asset_spec = |hash: Option<&'static str>| UploadSpec {
         scope: &StorageScope::Asset,
@@ -847,16 +847,16 @@ async fn asset_uploads_are_content_addressed_and_conflict_on_duplicates(pool: Pg
     ));
     // A hash on a non-asset scope is refused too (uuid minting is the contract).
     let bad = UploadSpec { scope: &StorageScope::Project, content_hash: Some("aa"), ..asset_spec(None) };
-    assert!(matches!(s.begin_upload(&w, &bad, &big()).await, Err(RuntimeStoreError::Invalid(_))));
+    assert!(matches!(s.begin_upload(&worker("t1", "p1", None), &bad, &big()).await, Err(RuntimeStoreError::Invalid(_))));
 
-    // A real asset upload lands under `<tenant>/asset/<project>/<sha>`.
+    // A real asset upload lands under `<tenant>/asset/<sha>`.
     let sha_static: &'static str = Box::leak(sha.clone().into_boxed_str());
     let BeginUpload::Ready { key, part_size } =
         s.begin_upload(&w, &asset_spec(Some(sha_static)), &big()).await.unwrap()
     else {
         panic!("fresh asset content must reserve a real upload");
     };
-    assert_eq!(key, format!("t1/asset/p1/{sha}"));
+    assert_eq!(key, format!("t1/asset/{sha}"));
 
     // Re-beginning while the first upload is PENDING hands back that same
     // upload to carry on with, under the store's own key. It used to be a
@@ -886,12 +886,11 @@ async fn asset_uploads_are_content_addressed_and_conflict_on_duplicates(pool: Pg
         BeginUpload::AlreadyStored { key: key.clone() }
     );
 
-    // The asset lists under its own prefix and deletes like any file.
-    let prefix = weft_core::storage::key::ParsedKey::asset_prefix("t1", "p1").unwrap();
-    assert_eq!(s.list(&prefix).await.unwrap().len(), 1);
+    // The asset lists under the tenant's assets and deletes like any file.
+    assert_eq!(s.list("t1/asset/").await.unwrap().len(), 1);
     let parsed = weft_core::storage::key::parse_key(&key).unwrap();
     s.delete(&parsed).await.unwrap();
-    assert_eq!(s.list(&prefix).await.unwrap().len(), 0);
+    assert_eq!(s.list("t1/asset/").await.unwrap().len(), 0);
 }
 
 #[sqlx::test]
@@ -907,14 +906,19 @@ async fn delete_removes_and_presign_requires_existing(pool: PgPool) {
     assert!(matches!(s.presign(&parsed, None).await, Err(RuntimeStoreError::NotFound(_))));
 }
 
-async fn asset_via(
-    s: &RuntimeStore,
-    bucket: &FakeObjectStore,
-    tenant: &str,
-    project: &str,
-    id: u64,
-) -> StoredFileMeta {
-    let caller = worker(tenant, project, None);
+/// The dispatcher acting for `tenant` on its assets: the admin upload
+/// surface's caller.
+fn acting(tenant: &str) -> CallerAuth {
+    CallerAuth::Tenant { tenant: tenant.into() }
+}
+
+/// The asset named `id` (its hash is `id` spelled as 64 hex digits).
+fn asset_key(tenant: &str, id: u64) -> String {
+    format!("{tenant}/asset/{id:064x}")
+}
+
+async fn asset_via(s: &RuntimeStore, bucket: &FakeObjectStore, tenant: &str, id: u64) -> StoredFileMeta {
+    let caller = acting(tenant);
     let hash = format!("{id:064x}");
     let spec = UploadSpec {
         scope: &StorageScope::Asset,
@@ -935,8 +939,8 @@ async fn asset_via(
 #[sqlx::test]
 async fn asset_lifetime_keeps_current_and_expires_removed_files_after_last_access(pool: PgPool) {
     let (s, bucket, clock) = store(&pool).await;
-    let old = asset_via(&s, &bucket, "t1", "p1", 1).await;
-    let current = asset_via(&s, &bucket, "t1", "p1", 2).await;
+    let old = asset_via(&s, &bucket, "t1", 1).await;
+    let current = asset_via(&s, &bucket, "t1", 2).await;
     let old_key = weft_core::storage::key::parse_key(&old.key).unwrap();
     s.set_asset_references("t1", "p1", &[old.key.clone(), current.key.clone()], &[]).await.unwrap();
     clock.advance(Duration::from_secs(400 * 86400));
@@ -965,8 +969,8 @@ async fn an_asset_the_sync_never_publishes_expires_on_its_own(pool: PgPool) {
     // The build failed after the transfer: nothing ever referenced the
     // upload, so it counts down from completion. Publishing clears it.
     let (s, bucket, clock) = store(&pool).await;
-    let orphan = asset_via(&s, &bucket, "t1", "p1", 1).await;
-    let published = asset_via(&s, &bucket, "t1", "p1", 2).await;
+    let orphan = asset_via(&s, &bucket, "t1", 1).await;
+    let published = asset_via(&s, &bucket, "t1", 2).await;
     let orphan_key = weft_core::storage::key::parse_key(&orphan.key).unwrap();
     assert_eq!(orphan.expires_at_unix, Some(clock.now_unix() + DEFAULT_KEEP_TTL_SECS as i64));
     s.set_asset_references("t1", "p1", std::slice::from_ref(&published.key), &[]).await.unwrap();
@@ -982,8 +986,9 @@ async fn an_asset_the_sync_never_publishes_expires_on_its_own(pool: PgPool) {
 #[sqlx::test]
 async fn asset_lifetime_removing_last_reference_and_restoring_it_are_both_supported(pool: PgPool) {
     let (s, bucket, clock) = store(&pool).await;
-    let file = asset_via(&s, &bucket, "t1", "p1", 1).await;
+    let file = asset_via(&s, &bucket, "t1", 1).await;
     let parsed = weft_core::storage::key::parse_key(&file.key).unwrap();
+    s.set_asset_references("t1", "p1", std::slice::from_ref(&file.key), &[]).await.unwrap();
     s.set_asset_references("t1", "p1", &[], &[]).await.unwrap();
     assert_eq!(s.meta(&parsed).await.unwrap().keep_ttl_secs, Some(DEFAULT_KEEP_TTL_SECS));
     s.set_asset_references("t1", "p1", std::slice::from_ref(&file.key), &[]).await.unwrap();
@@ -996,28 +1001,111 @@ async fn asset_lifetime_removing_last_reference_and_restoring_it_are_both_suppor
     assert_eq!(s.sweep_expired().await.unwrap(), 0);
 }
 
+/// One content is one file per tenant: a second project storing it uploads
+/// nothing, the tenant pays for it once, and another tenant's copy of the
+/// same bytes is that tenant's own file.
 #[sqlx::test]
-async fn asset_lifetime_is_walled_and_preserves_node_selected_ttls(pool: PgPool) {
+async fn an_asset_is_stored_and_charged_once_per_tenant(pool: PgPool) {
     let (s, bucket, _) = store(&pool).await;
-    let own = asset_via(&s, &bucket, "t1", "p1", 1).await;
-    let sibling = asset_via(&s, &bucket, "t1", "p2", 1).await;
-    let foreign = asset_via(&s, &bucket, "t2", "p1", 1).await;
+    let first = asset_via(&s, &bucket, "t1", 1).await;
+    assert_eq!(first.key, asset_key("t1", 1));
+    let hash = format!("{:064x}", 1);
+    let spec = UploadSpec {
+        scope: &StorageScope::Asset,
+        mime: "image/png",
+        filename: "cat.png",
+        keep: None,
+        declared_size: Some(3),
+        content_hash: Some(&hash),
+        identity: None,
+    };
+    assert_eq!(
+        s.begin_upload(&acting("t1"), &spec, &big()).await.unwrap(),
+        BeginUpload::AlreadyStored { key: first.key.clone() },
+        "the tenant already stores this content, whichever project stored it"
+    );
+    s.set_asset_references("t1", "p1", std::slice::from_ref(&first.key), &[]).await.unwrap();
+    s.set_asset_references("t1", "p2", std::slice::from_ref(&first.key), &[]).await.unwrap();
+    assert_eq!(s.tenant_usage("t1").await.unwrap(), (1, 3), "one file, charged once");
+
+    // Another tenant: nothing of t1's answers for it.
+    let held = s.held_assets("t2", std::slice::from_ref(&hash)).await.unwrap();
+    assert!(held.is_empty(), "{held:?}");
+    let theirs = asset_via(&s, &bucket, "t2", 1).await;
+    assert_eq!(theirs.key, asset_key("t2", 1));
+    assert_eq!(s.tenant_usage("t2").await.unwrap(), (1, 3));
+    assert_eq!(s.tenant_usage("t1").await.unwrap(), (1, 3));
+    assert_eq!(
+        s.held_assets("t1", &[hash.clone(), format!("{:064x}", 2)]).await.unwrap(),
+        [(hash.clone(), first.key.clone())].into_iter().collect(),
+        "only what the tenant stores whole, under its own key"
+    );
+    assert!(matches!(s.held_assets("t1", &["nothex".into()]).await, Err(RuntimeStoreError::Invalid(_))));
+}
+
+/// An asset lives while any project of its tenant references it: one
+/// project dropping it leaves it pinned, the last one starts its countdown.
+#[sqlx::test]
+async fn an_asset_lives_while_any_project_references_it(pool: PgPool) {
+    let (s, bucket, clock) = store(&pool).await;
+    let shared = asset_via(&s, &bucket, "t1", 1).await;
+    let parsed = weft_core::storage::key::parse_key(&shared.key).unwrap();
+    s.set_asset_references("t1", "p1", std::slice::from_ref(&shared.key), &[]).await.unwrap();
+    s.set_asset_references("t1", "p2", &[], std::slice::from_ref(&shared.key)).await.unwrap();
+    s.set_asset_references("t1", "p1", &[], &[]).await.unwrap();
+    assert_eq!(s.meta(&parsed).await.unwrap().expires_at_unix, None, "p2 still references it");
+    clock.advance(Duration::from_secs(DEFAULT_KEEP_TTL_SECS + 1));
+    assert_eq!(s.sweep_expired().await.unwrap(), 0);
+
+    s.set_asset_references("t1", "p2", &[], &[]).await.unwrap();
+    assert_eq!(
+        s.meta(&parsed).await.unwrap().expires_at_unix,
+        Some(clock.now_unix() + DEFAULT_KEEP_TTL_SECS as i64),
+        "the last reference gone, the countdown starts"
+    );
+    clock.advance(Duration::from_secs(DEFAULT_KEEP_TTL_SECS + 1));
+    assert_eq!(s.sweep_expired().await.unwrap(), 1);
+    assert!(bucket.get(&object_key(&shared.key)).await.unwrap().is_none());
+}
+
+#[sqlx::test]
+async fn asset_references_are_walled_by_tenant_and_preserve_node_selected_ttls(pool: PgPool) {
+    let (s, bucket, _) = store(&pool).await;
+    let own = asset_via(&s, &bucket, "t1", 1).await;
+    let foreign = asset_via(&s, &bucket, "t2", 2).await;
     let w = worker("t1", "p1", Some("c1"));
     let generated = put_via(&s, &bucket, &w, &StorageScope::Execution, "image/png", "generated.png",
         Some(KeepTtl::Secs { secs: 60 }), &big(), body(b"png")).await.unwrap();
-    for forbidden in [&sibling.key, &foreign.key, &generated.key] {
+    for forbidden in [&foreign.key, &generated.key] {
         assert!(matches!(s.set_asset_references("t1", "p1", std::slice::from_ref(forbidden), &[]).await,
             Err(RuntimeStoreError::Denied(_))));
+        assert!(matches!(s.set_asset_references("t1", "p1", &[], std::slice::from_ref(forbidden)).await,
+            Err(RuntimeStoreError::Denied(_))));
     }
-    s.set_asset_references("t1", "p1", &[], &[]).await.unwrap();
-    for unaffected in [&sibling, &foreign, &generated] {
+    s.set_asset_references("t1", "p1", std::slice::from_ref(&own.key), &[]).await.unwrap();
+    s.set_asset_references("t2", "p1", &[], &[]).await.unwrap();
+    for unaffected in [&foreign, &generated] {
         let parsed = weft_core::storage::key::parse_key(&unaffected.key).unwrap();
         let meta = s.meta(&parsed).await.unwrap();
         assert_eq!(meta.keep_ttl_secs, unaffected.keep_ttl_secs);
         assert_eq!(meta.expires_at_unix, unaffected.expires_at_unix);
     }
     let own = weft_core::storage::key::parse_key(&own.key).unwrap();
-    assert!(s.meta(&own).await.unwrap().expires_at_unix.is_some());
+    assert_eq!(s.meta(&own).await.unwrap().expires_at_unix, None, "another tenant's publish never touches t1's references");
+}
+
+/// Wiping a whole tenant takes its asset references with its assets, so
+/// nothing is left claiming files that are gone.
+#[sqlx::test]
+async fn a_tenant_wipe_drops_its_asset_references(pool: PgPool) {
+    let (s, bucket, _) = store(&pool).await;
+    let own = asset_via(&s, &bucket, "t1", 1).await;
+    let other = asset_via(&s, &bucket, "t2", 1).await;
+    s.set_asset_references("t1", "p1", std::slice::from_ref(&own.key), &[]).await.unwrap();
+    s.set_asset_references("t2", "p1", std::slice::from_ref(&other.key), &[]).await.unwrap();
+    assert_eq!(s.wipe_prefix("t1/").await.unwrap(), 1);
+    let left: Vec<String> = sqlx::query_scalar("SELECT key FROM asset_reference ORDER BY key").fetch_all(&pool).await.unwrap();
+    assert_eq!(left, vec![other.key]);
 }
 
 /// A kept file (one an older version names) that is gone is reported,
@@ -1026,8 +1114,8 @@ async fn asset_lifetime_is_walled_and_preserves_node_selected_ttls(pool: PgPool)
 #[sqlx::test]
 async fn asset_lifetime_missing_kept_file_is_reported_and_pins_the_rest(pool: PgPool) {
     let (s, bucket, _) = store(&pool).await;
-    let own = asset_via(&s, &bucket, "t1", "p1", 1).await;
-    let gone = format!("t1/asset/p1/{}", "f".repeat(64));
+    let own = asset_via(&s, &bucket, "t1", 1).await;
+    let gone = format!("t1/asset/{}", "f".repeat(64));
     let missing = s.set_asset_references("t1", "p1", std::slice::from_ref(&own.key), std::slice::from_ref(&gone)).await.unwrap();
     assert_eq!(missing, vec![gone]);
     let parsed = weft_core::storage::key::parse_key(&own.key).unwrap();
@@ -1037,25 +1125,453 @@ async fn asset_lifetime_missing_kept_file_is_reported_and_pins_the_rest(pool: Pg
 #[sqlx::test]
 async fn asset_lifetime_missing_current_file_does_not_retire_other_files(pool: PgPool) {
     let (s, bucket, _) = store(&pool).await;
-    let own = asset_via(&s, &bucket, "t1", "p1", 1).await;
-    let missing = format!("t1/asset/p1/{}", "f".repeat(64));
+    let own = asset_via(&s, &bucket, "t1", 1).await;
+    s.set_asset_references("t1", "p1", std::slice::from_ref(&own.key), &[]).await.unwrap();
+    let missing = format!("t1/asset/{}", "f".repeat(64));
     assert!(matches!(s.set_asset_references("t1", "p1", &[missing], &[]).await,
         Err(RuntimeStoreError::NotFound(_))));
-    // The failed publish touched nothing: the upload keeps the countdown
-    // it started with, neither cleared nor restarted.
+    // The failed publish touched nothing: the asset is still referenced,
+    // so it keeps no countdown.
     let parsed = weft_core::storage::key::parse_key(&own.key).unwrap();
-    assert_eq!(s.meta(&parsed).await.unwrap().expires_at_unix, own.expires_at_unix);
+    assert_eq!(s.meta(&parsed).await.unwrap().expires_at_unix, None);
 }
 
 #[sqlx::test]
-async fn keep_rejects_non_exec_scope(pool: PgPool) {
-    let (s, bucket, _c) = store(&pool).await;
+async fn a_lifetime_expires_a_project_file_like_a_kept_one(pool: PgPool) {
+    // Expiry works in every scope a node writes: a project file stored with
+    // a lifetime expires once nobody touched it for that long, an access
+    // renews it, and it never carries the execution-only keep flag.
+    let (s, bucket, clock) = store(&pool).await;
     let w = worker("t1", "p1", Some("c1"));
-    // project files are persistent without a flag: keep at upload is rejected.
-    let err = put_via(&s, &bucket, &w, &StorageScope::Project, "b", "f", Some(KeepTtl::Default), &big(), body(b"x"))
+    let f = put_via(&s, &bucket, &w, &StorageScope::Project, "b", "f", Some(KeepTtl::Secs { secs: 100 }), &big(), body(b"x"))
+        .await
+        .unwrap();
+    assert!(!f.keep, "the keep flag is the execution sweep's exemption only");
+    assert_eq!(f.keep_ttl_secs, Some(100));
+    let parsed = weft_core::storage::key::parse_key(&f.key).unwrap();
+    clock.advance(Duration::from_secs(80));
+    assert!(get_via(&s, &bucket, &parsed, None).await.is_ok(), "an access renews it");
+    clock.advance(Duration::from_secs(80));
+    assert_eq!(s.sweep_expired().await.unwrap(), 0, "renewed by the access");
+    clock.advance(Duration::from_secs(30));
+    assert_eq!(s.sweep_expired().await.unwrap(), 1);
+    assert!(matches!(get_via(&s, &bucket, &parsed, None).await, Err(RuntimeStoreError::NotFound(_))));
+
+    // With no lifetime a project file lives until deleted, and a keep after
+    // the fact gives it one; KeepTtl::Never takes it away again.
+    let forever = put_via(&s, &bucket, &w, &StorageScope::Project, "b", "g", None, &big(), body(b"y"))
+        .await
+        .unwrap();
+    assert_eq!(forever.expires_at_unix, None);
+    let parsed = weft_core::storage::key::parse_key(&forever.key).unwrap();
+    let kept = s.keep(&parsed, KeepTtl::Secs { secs: 50 }).await.unwrap();
+    assert_eq!(kept.keep_ttl_secs, Some(50));
+    assert!(!kept.keep);
+    assert_eq!(kept.expires_at_unix, Some(clock.now_unix() + 50));
+    let cleared = s.keep(&parsed, KeepTtl::Never).await.unwrap();
+    assert_eq!((cleared.keep_ttl_secs, cleared.expires_at_unix), (None, None));
+}
+
+#[sqlx::test]
+async fn an_asset_takes_no_node_lifetime(pool: PgPool) {
+    let (s, _bucket, _c) = store(&pool).await;
+    let w = acting("t1");
+    let err = begin_via(&s, &w, &StorageScope::Asset, "b", "f", Some(KeepTtl::Default), &big(), Some(1))
         .await
         .unwrap_err();
     assert!(matches!(err, RuntimeStoreError::Invalid(_)), "{err:?}");
+}
+
+#[sqlx::test]
+async fn replace_overwrites_the_file_in_place(pool: PgPool) {
+    // Same key, name, type and lifetime; new content and size. The old
+    // bytes stay readable until the new ones land, the charge follows the
+    // new size, and no second file is left behind.
+    let (s, bucket, clock) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let f = put_via(&s, &bucket, &w, &StorageScope::Project, "application/json", "chat.json", Some(KeepTtl::Secs { secs: 100 }), &big(), body(b"[]"))
+        .await
+        .unwrap();
+    let parsed = weft_core::storage::key::parse_key(&f.key).unwrap();
+    clock.advance(Duration::from_secs(60));
+
+    assert_eq!(f.version, 1, "a file starts at its first version");
+    let (upload_key, part_size) = s.begin_replace(&w, &f.key, Some(10), Some(1), &big()).await.unwrap();
+    assert_ne!(upload_key, f.key, "the replacement uploads under a key of its own");
+    assert_eq!(s.tenant_usage("t1").await.unwrap(), (2, 2 + 10), "both versions count while it is in flight");
+    assert_eq!(get_via(&s, &bucket, &parsed, None).await.unwrap().1, body(b"[]"), "readers see the old bytes meanwhile");
+    assert_eq!(s.list("t1/project/p1/").await.unwrap().len(), 1, "the upload is not a file anyone lists");
+    upload_parts(&s, &bucket, &w, &upload_key, part_size, &body(b"[{\"a\": 1}]"), &big()).await.unwrap();
+    let replaced = s.complete_upload(&w, &upload_key).await.unwrap();
+
+    assert_eq!(replaced.key, f.key);
+    assert_eq!((replaced.filename.as_str(), replaced.mime_type.as_str()), ("chat.json", "application/json"));
+    assert_eq!(replaced.size_bytes, 10);
+    assert_eq!(replaced.version, 2, "one write, the next version");
+    assert_eq!(replaced.keep_ttl_secs, Some(100), "the lifetime is kept");
+    assert_eq!(replaced.expires_at_unix, Some(clock.now_unix() + 100), "a replace is an access");
+    assert_eq!(get_via(&s, &bucket, &parsed, None).await.unwrap().1, body(b"[{\"a\": 1}]"));
+    assert_eq!(s.tenant_usage("t1").await.unwrap(), (1, 10), "one file, charged at its new size");
+}
+
+#[sqlx::test]
+async fn a_retried_replacement_complete_answers_with_the_replaced_file(pool: PgPool) {
+    // The replacement's own row is gone once it folds, so the retry has
+    // to find the file it became, at the version it made.
+    let (s, bucket, _c) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let f = put_via(&s, &bucket, &w, &StorageScope::Project, "b", "f", None, &big(), body(b"old"))
+        .await
+        .unwrap();
+    let (upload_key, part_size) = s.begin_replace(&w, &f.key, Some(3), Some(1), &big()).await.unwrap();
+    upload_parts(&s, &bucket, &w, &upload_key, part_size, &body(b"new"), &big()).await.unwrap();
+    let first = s.complete_upload(&w, &upload_key).await.unwrap();
+    let retry = s.complete_upload(&w, &upload_key).await.unwrap();
+    assert_eq!((retry.key.as_str(), retry.version), (f.key.as_str(), 2));
+    assert_eq!(retry.version, first.version, "a retry moves nothing");
+}
+
+/// A file with `old` content and a replacement of it whose parts carrying
+/// `new` have all landed, ready to complete: (file, replacement key).
+async fn replacement_ready(
+    s: &RuntimeStore,
+    bucket: &FakeObjectStore,
+    w: &CallerAuth,
+    old: &[u8],
+    new: &[u8],
+) -> (StoredFileMeta, String) {
+    let f = put_via(s, bucket, w, &StorageScope::Project, "b", "f", None, &big(), body(old)).await.unwrap();
+    let (key, part_size) = s.begin_replace(w, &f.key, Some(new.len() as u64), Some(1), &big()).await.unwrap();
+    upload_parts(s, bucket, w, &key, part_size, &body(new), &big()).await.unwrap();
+    (f, key)
+}
+
+/// A new upload whose parts carrying `bytes` have all landed: its key.
+async fn upload_ready(s: &RuntimeStore, bucket: &FakeObjectStore, w: &CallerAuth, bytes: &[u8]) -> String {
+    let (key, part_size) =
+        begin_via(s, w, &StorageScope::Project, "b", "f", None, &big(), Some(bytes.len() as u64)).await.unwrap();
+    upload_parts(s, bucket, w, &key, part_size, &body(bytes), &big()).await.unwrap();
+    key
+}
+
+/// Start a completion and hold it after the bucket assembled the object,
+/// before it folds the rows: (the running completion, its release).
+async fn completion_held(
+    s: &Arc<RuntimeStore>,
+    bucket: &FakeObjectStore,
+    w: &CallerAuth,
+    key: &str,
+) -> (tokio::task::JoinHandle<Result<StoredFileMeta, RuntimeStoreError>>, tokio::sync::oneshot::Sender<()>) {
+    let (entered, release) = bucket.hold_next_complete();
+    let task = tokio::spawn({
+        let (s, w, k) = (s.clone(), w.clone(), key.to_string());
+        async move { s.complete_upload(&w, &k).await }
+    });
+    entered.await.unwrap();
+    (task, release)
+}
+
+async fn status_of(pool: &PgPool, key: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT status FROM runtime_file WHERE key = $1").bind(key).fetch_optional(pool).await.unwrap()
+}
+
+#[sqlx::test]
+async fn concurrent_completions_move_the_version_once(pool: PgPool) {
+    // The second complete arrives while the first is mid-way: it finds the
+    // upload already gone from the bucket, reads the object, and folds; the
+    // first then finds the fold done and answers with it.
+    let (s, bucket, _c) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let (f, key) = replacement_ready(&s, &bucket, &w, b"old", b"new").await;
+    let completes = || {
+        bucket.calls().iter().filter(|c| matches!(c, weft_platform_traits::object_store::fake::FakeCall::CompleteMultipart { .. })).count()
+    };
+    let before = completes();
+    let (first, release) = completion_held(&s, &bucket, &w, &key).await;
+    let second = s.complete_upload(&w, &key).await.unwrap();
+    release.send(()).unwrap();
+    let first = first.await.unwrap().unwrap();
+    assert_eq!((first.version, second.version), (2, 2));
+    let parsed = weft_core::storage::key::parse_key(&f.key).unwrap();
+    assert_eq!(s.meta(&parsed).await.unwrap().version, 2, "one replacement, one version");
+    assert_eq!(completes() - before, 1, "the bucket is never asked to complete an upload twice");
+}
+
+#[sqlx::test]
+async fn an_abort_during_a_completion_is_refused(pool: PgPool) {
+    // Once a completion has claimed the upload the bucket may already hold
+    // its object: an abort then is refused instead of removing the row.
+    let (s, bucket, _c) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let (f, replacement) = replacement_ready(&s, &bucket, &w, b"old", b"newer").await;
+    let fresh = upload_ready(&s, &bucket, &w, b"fresh").await;
+    for key in [&replacement, &fresh] {
+        let (task, release) = completion_held(&s, &bucket, &w, key).await;
+        assert!(matches!(s.abort_upload(&w, key).await, Err(RuntimeStoreError::Completing(_))));
+        release.send(()).unwrap();
+        task.await.unwrap().unwrap();
+    }
+    let parsed = weft_core::storage::key::parse_key(&f.key).unwrap();
+    let meta = s.meta(&parsed).await.unwrap();
+    assert_eq!((meta.version, meta.size_bytes), (2, 5), "the row matches the bytes, moved once");
+    assert_eq!(get_via(&s, &bucket, &parsed, None).await.unwrap().1, body(b"newer"));
+    let parsed = weft_core::storage::key::parse_key(&fresh).unwrap();
+    assert_eq!(get_via(&s, &bucket, &parsed, None).await.unwrap().1, body(b"fresh"));
+}
+
+#[sqlx::test]
+async fn a_delete_during_a_replacement_completion_is_refused(pool: PgPool) {
+    let (s, bucket, _c) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let (f, key) = replacement_ready(&s, &bucket, &w, b"old", b"new").await;
+    let parsed = weft_core::storage::key::parse_key(&f.key).unwrap();
+    let (task, release) = completion_held(&s, &bucket, &w, &key).await;
+    match s.delete(&parsed).await {
+        Err(RuntimeStoreError::Completing(msg)) => assert!(msg.contains(&key), "names the replacement: {msg}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    // A wipe of the scope leaves it too, and says so.
+    assert!(s.wipe_prefix("t1/").await.is_err());
+    release.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    s.delete(&parsed).await.unwrap();
+    assert!(bucket.get(&object_key(&f.key)).await.unwrap().is_none(), "no object outlives its row");
+}
+
+#[sqlx::test]
+async fn a_resumed_reserve_during_a_completion_is_refused_at_once(pool: PgPool) {
+    // The completion holds no lock across the bucket call, so the tenant's
+    // other uploads and this one's reservations never wait on it.
+    let (s, bucket, _c) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let key = upload_ready(&s, &bucket, &w, b"abc").await;
+    let other = begin_via(&s, &w, &StorageScope::Project, "b", "g", None, &big(), None).await.unwrap().0;
+    let (task, release) = completion_held(&s, &bucket, &w, &key).await;
+    let quick = Duration::from_secs(5);
+    let reserve = tokio::time::timeout(quick, s.reserve_parts(&w, &key, &[ask(1, 3)], &big(), WORKER)).await.unwrap();
+    assert!(matches!(reserve, Err(RuntimeStoreError::Completing(_))));
+    let report = tokio::time::timeout(quick, s.record_part(&w, &key, 1, "\"x\"")).await.unwrap();
+    assert!(matches!(report, Err(RuntimeStoreError::Completing(_))));
+    // The upload itself cannot be deleted either: it is no file yet, and
+    // the answer says why rather than "not found".
+    let parsed = weft_core::storage::key::parse_key(&key).unwrap();
+    assert!(matches!(s.delete(&parsed).await, Err(RuntimeStoreError::Completing(_))));
+    tokio::time::timeout(quick, s.reserve_parts(&w, &other, &[ask(1, 3)], &big(), WORKER)).await.unwrap().unwrap();
+    release.send(()).unwrap();
+    assert_eq!(task.await.unwrap().unwrap().size_bytes, 3);
+}
+
+#[sqlx::test]
+async fn a_dropped_completion_the_bucket_finished_is_recovered(pool: PgPool) {
+    let (s, bucket, clock) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let (f, key) = replacement_ready(&s, &bucket, &w, b"old", b"new").await;
+    let (task, _release) = completion_held(&s, &bucket, &w, &key).await;
+    task.abort();
+    let _ = task.await;
+    assert_eq!(status_of(&pool, &key).await.as_deref(), Some("completing"));
+    s.sweep_expired().await.unwrap();
+    assert_eq!(status_of(&pool, &key).await.as_deref(), Some("completing"), "a live claim is left alone");
+    clock.advance(Duration::from_secs(COMPLETING_LEASE_SECS as u64 + 1));
+    s.sweep_expired().await.unwrap();
+    assert_eq!(status_of(&pool, &key).await, None, "folded into the file");
+    let parsed = weft_core::storage::key::parse_key(&f.key).unwrap();
+    let meta = s.meta(&parsed).await.unwrap();
+    assert_eq!((meta.version, meta.size_bytes), (2, 3));
+    assert_eq!(get_via(&s, &bucket, &parsed, None).await.unwrap().1, body(b"new"));
+    // A retried complete from the caller that was cut off answers with it.
+    assert_eq!(s.complete_upload(&w, &key).await.unwrap().version, 2);
+}
+
+#[sqlx::test]
+async fn an_execution_upload_landing_after_its_run_ended_lingers(pool: PgPool) {
+    // The run ends while the upload is completing and the bucket is
+    // unreachable for it; it lands later, and it carries
+    // the same linger deadline as the run's other files.
+    let (s, bucket, clock) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let (key, part_size) =
+        begin_via(&s, &w, &StorageScope::Execution, "b", "f", None, &big(), Some(3)).await.unwrap();
+    upload_parts(&s, &bucket, &w, &key, part_size, &body(b"abc"), &big()).await.unwrap();
+    sqlx::query("UPDATE runtime_file SET status = 'completing', progressed_at_unix = $2 WHERE key = $1")
+        .bind(&key)
+        .bind(clock.now_unix())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let ended = clock.now_unix();
+    bucket.fail_next_complete();
+    s.sweep_exec("t1", "c1").await.unwrap();
+    assert_eq!(status_of(&pool, &key).await.as_deref(), Some("completing"), "not landed at the run's end");
+    // Landed afterwards (a retried complete; the stale-claim sweep folds
+    // the same way), it keeps the linger deadline the run's end stamped.
+    s.complete_upload(&w, &key).await.unwrap();
+    let expires: Option<i64> = sqlx::query_scalar("SELECT expires_at_unix FROM runtime_file WHERE key = $1 AND status = 'active'")
+        .bind(&key)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(expires, Some(ended + EXEC_LINGER_TTL_SECS));
+}
+
+#[sqlx::test]
+async fn a_dropped_completion_before_the_bucket_is_recovered(pool: PgPool) {
+    // Claimed, then the process died before asking the bucket: the sweep
+    // finds the multipart still open and completes it.
+    let (s, bucket, clock) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let key = upload_ready(&s, &bucket, &w, b"abc").await;
+    sqlx::query("UPDATE runtime_file SET status = 'completing', progressed_at_unix = $2 WHERE key = $1")
+        .bind(&key)
+        .bind(clock.now_unix())
+        .execute(&pool)
+        .await
+        .unwrap();
+    clock.advance(Duration::from_secs(COMPLETING_LEASE_SECS as u64 + 1));
+    s.sweep_expired().await.unwrap();
+    assert_eq!(status_of(&pool, &key).await.as_deref(), Some("active"));
+    let parsed = weft_core::storage::key::parse_key(&key).unwrap();
+    assert_eq!(get_via(&s, &bucket, &parsed, None).await.unwrap().1, body(b"abc"));
+}
+
+#[sqlx::test]
+async fn a_completion_the_bucket_cannot_account_for_is_ended(pool: PgPool) {
+    // The multipart is gone but no object of the right size is there (it
+    // was aborted outside weft): the verdict is final, the upload is
+    // reaped and its reservation freed. A replaced file whose object was
+    // never overwritten keeps its row and bytes.
+    let (s, bucket, clock) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let (f, replacement) = replacement_ready(&s, &bucket, &w, b"old", b"newer").await;
+    let fresh = upload_ready(&s, &bucket, &w, b"abc").await;
+    for key in [&replacement, &fresh] {
+        let upload_id: String = sqlx::query_scalar("SELECT upload_id FROM runtime_file WHERE key = $1")
+            .bind(key)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE runtime_file SET status = 'completing', progressed_at_unix = $2 WHERE key = $1")
+            .bind(key)
+            .bind(clock.now_unix())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let object = if key == &fresh { object_key(key) } else { object_key(&f.key) };
+        bucket.abort_multipart(&object, &upload_id).await.unwrap();
+        assert!(matches!(s.complete_upload(&w, key).await, Err(RuntimeStoreError::Lost(_))));
+        assert_eq!(status_of(&pool, key).await, None, "reaped");
+    }
+    let parsed = weft_core::storage::key::parse_key(&f.key).unwrap();
+    assert_eq!(get_via(&s, &bucket, &parsed, None).await.unwrap().1, body(b"old"));
+    assert_eq!(charged_bytes_for(&pool, "t1").await.unwrap(), 3, "only the old file is charged");
+}
+
+#[sqlx::test]
+async fn a_refused_completion_stays_completing_until_the_sweep_ends_it(pool: PgPool) {
+    // Never back to 'pending': another drive may be landing it. The live
+    // caller hears "completing"; the sweep past the lease gives the verdict.
+    let (s, bucket, clock) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let (key, _) = begin_via(&s, &w, &StorageScope::Project, "b", "f", None, &big(), Some(3)).await.unwrap();
+    let part = s.reserve_parts(&w, &key, &[ask(1, 3)], &big(), WORKER).await.unwrap().remove(0);
+    bucket.put_part(&part.url, body(b"abc")).unwrap();
+    s.record_part(&w, &key, 1, "\"not-the-etag\"").await.unwrap();
+    assert!(matches!(s.complete_upload(&w, &key).await, Err(RuntimeStoreError::Completing(_))));
+    assert_eq!(status_of(&pool, &key).await.as_deref(), Some("completing"));
+    assert!(matches!(s.abort_upload(&w, &key).await, Err(RuntimeStoreError::Completing(_))));
+    clock.advance(Duration::from_secs(COMPLETING_LEASE_SECS as u64 + 1));
+    s.sweep_expired().await.unwrap();
+    assert_eq!(status_of(&pool, &key).await, None, "ended and reaped");
+    assert!(bucket.in_progress_uploads().is_empty());
+    assert_eq!(charged_bytes_for(&pool, "t1").await.unwrap(), 0);
+}
+
+#[sqlx::test]
+async fn a_size_mismatched_completion_removes_rows_before_bytes(pool: PgPool) {
+    // A part whose bytes differ from its reservation (only a bucket anomaly
+    // could do it; here a direct part upload skips the signed length).
+    let (s, bucket, _c) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let (key, _) = begin_via(&s, &w, &StorageScope::Project, "b", "f", None, &big(), Some(3)).await.unwrap();
+    s.reserve_parts(&w, &key, &[ask(1, 3)], &big(), WORKER).await.unwrap();
+    let upload_id = bucket.in_progress_uploads().pop().unwrap();
+    let etag = bucket.upload_part(&object_key(&key), &upload_id, 1, body(b"abcd")).await.unwrap();
+    s.record_part(&w, &key, 1, &etag).await.unwrap();
+    assert!(matches!(s.complete_upload(&w, &key).await, Err(RuntimeStoreError::Lost(_))));
+    assert_eq!(status_of(&pool, &key).await, None);
+    assert!(bucket.get(&object_key(&key)).await.unwrap().is_none());
+    assert_eq!(charged_bytes_for(&pool, "t1").await.unwrap(), 0);
+}
+
+#[sqlx::test]
+async fn an_abandoned_replacement_leaves_the_file_untouched(pool: PgPool) {
+    // Aborted, or reaped by a sweep: the upload goes, the file it was
+    // replacing keeps its object and its bytes.
+    let (s, bucket, _c) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let f = put_via(&s, &bucket, &w, &StorageScope::Execution, "b", "f", None, &big(), body(b"old"))
+        .await
+        .unwrap();
+    let parsed = weft_core::storage::key::parse_key(&f.key).unwrap();
+    let (aborted, _) = s.begin_replace(&w, &f.key, Some(3), None, &big()).await.unwrap();
+    s.abort_upload(&w, &aborted).await.unwrap();
+    assert_eq!(get_via(&s, &bucket, &parsed, None).await.unwrap().1, body(b"old"));
+    // The bytes may have been swapped before an abort (a completion that
+    // failed after the bucket took them), so the file moves on anyway.
+    assert_eq!(s.meta(&parsed).await.unwrap().version, 2, "an ended replacement always moves the version");
+
+    let (swept, _) = s.begin_replace(&w, &f.key, Some(3), None, &big()).await.unwrap();
+    s.sweep_exec("t1", "c1").await.unwrap();
+    assert!(bucket.in_progress_uploads().is_empty(), "the replacement's multipart is aborted");
+    assert!(bucket.get(&object_key(&f.key)).await.unwrap().is_some(), "the file's object survives the reap");
+    assert!(matches!(s.complete_upload(&w, &swept).await, Err(RuntimeStoreError::NotFound(_))));
+}
+
+#[sqlx::test]
+async fn an_edit_from_an_old_version_is_refused_and_one_write_runs_at_a_time(pool: PgPool) {
+    let (s, bucket, _c) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    let f = put_via(&s, &bucket, &w, &StorageScope::Project, "application/json", "chat.json", None, &big(), body(b"[]"))
+        .await
+        .unwrap();
+    // A write in flight holds the file: a second one waits its turn.
+    let (first, part_size) = s.begin_replace(&w, &f.key, Some(3), Some(1), &big()).await.unwrap();
+    assert!(matches!(s.begin_replace(&w, &f.key, Some(2), Some(1), &big()).await, Err(RuntimeStoreError::Conflict(_))));
+    assert!(matches!(s.begin_replace(&w, &f.key, Some(2), None, &big()).await, Err(RuntimeStoreError::Conflict(_))));
+    upload_parts(&s, &bucket, &w, &first, part_size, &body(b"[1]"), &big()).await.unwrap();
+    assert_eq!(s.complete_upload(&w, &first).await.unwrap().version, 2);
+    // The second was made from version 1: the file has moved on.
+    assert!(matches!(s.begin_replace(&w, &f.key, Some(2), Some(1), &big()).await, Err(RuntimeStoreError::Stale(_))));
+    // Made from the version now there, it goes through.
+    let (second, part_size) = s.begin_replace(&w, &f.key, Some(5), Some(2), &big()).await.unwrap();
+    upload_parts(&s, &bucket, &w, &second, part_size, &body(b"[1,2]"), &big()).await.unwrap();
+    let after = s.complete_upload(&w, &second).await.unwrap();
+    assert_eq!((after.version, after.size_bytes), (3, 5));
+    let parsed = weft_core::storage::key::parse_key(&f.key).unwrap();
+    assert_eq!(get_via(&s, &bucket, &parsed, None).await.unwrap().1, body(b"[1,2]"), "both writes landed, in order");
+}
+
+#[sqlx::test]
+async fn replace_refuses_what_it_cannot_overwrite(pool: PgPool) {
+    let (s, bucket, _c) = store(&pool).await;
+    let w = worker("t1", "p1", Some("c1"));
+    // A file that is not there.
+    let missing = "t1/project/p1/00000000-0000-0000-0000-000000000000";
+    assert!(matches!(s.begin_replace(&w, missing, Some(1), None, &big()).await, Err(RuntimeStoreError::NotFound(_))));
+    // Another execution's file: the same wall as a read.
+    let f = put_via(&s, &bucket, &w, &StorageScope::Execution, "b", "f", None, &big(), body(b"x"))
+        .await
+        .unwrap();
+    let other = worker("t1", "p1", Some("c2"));
+    assert!(matches!(s.begin_replace(&other, &f.key, Some(1), None, &big()).await, Err(RuntimeStoreError::Denied(_))));
+    // A file deleted while its replacement was on the way: the new object
+    // is removed again and the caller hears the file is gone.
+    let (key, part_size) = s.begin_replace(&w, &f.key, Some(1), None, &big()).await.unwrap();
+    s.delete(&weft_core::storage::key::parse_key(&f.key).unwrap()).await.unwrap();
+    upload_parts(&s, &bucket, &w, &key, part_size, &body(b"y"), &big()).await.unwrap();
+    assert!(matches!(s.complete_upload(&w, &key).await, Err(RuntimeStoreError::NotFound(_))));
+    assert!(bucket.get(&object_key(&f.key)).await.unwrap().is_none(), "no object without a row");
+    assert_eq!(s.tenant_usage("t1").await.unwrap(), (0, 0), "nothing is left charged");
 }
 
 #[sqlx::test]

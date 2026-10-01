@@ -42,6 +42,21 @@
       "description": "How each message is framed on an HTTP body (ignored on a socket, where a message is a frame). `raw`: the payload as-is, no separator. `ndjson`: one JSON value per line. `sse`: server-sent events, `data:` lines and a blank line per message."
     },
     {
+      "name": "answerAs",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "",
+          "json",
+          "text",
+          "bytes"
+        ]
+      },
+      "label": "Answer as",
+      "description": "The shape of each `raw` message (and of the socket's frames). Empty (default) uses the trigger's own `dataType`. Set it when what goes out differs from what came in."
+    },
+    {
       "name": "status",
       "type": "Number",
       "widget": {
@@ -68,6 +83,9 @@
     }
   ],
   "requires_infra": false,
+  "features": {
+    "answersCaller": "stream"
+  },
   "validate": [
     {
       "when": {
@@ -75,16 +93,56 @@
         "of": {
           "kind": "run_reaches",
           "direction": "upstream",
-          "types": [
-            "Route",
-            "Socket"
-          ]
+          "with": {
+            "liveConnection": true
+          }
         }
       },
       "then": {
-        "message": "Stream '{id}' answers nobody: no Route or Socket starts a run that reaches it. Wire it from the trigger's run (through data, or `_should_flow`), or put it in a group the trigger's `_should_flow` runs.",
+        "message": "Stream '{id}' answers nobody: no trigger with a live caller (a Route, a Socket) starts a run that reaches it. Wire it from the trigger's run (through data, or `_should_flow`), or put it in a group the trigger's `_should_flow` runs.",
         "level": "structural",
         "severity": "warning"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "downstream_of",
+            "with": {
+              "answersCaller": [
+                "stream"
+              ]
+            }
+          },
+          {
+            "kind": "run_reaches",
+            "direction": "upstream",
+            "with": {
+              "liveConnection": [
+                "http"
+              ]
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "run_reaches",
+              "direction": "upstream",
+              "with": {
+                "liveConnection": [
+                  "websocket"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "Stream '{id}' runs after {with}, which already sent the response's head to the HTTP caller, so this stream can never go out. Send everything through one Stream, and end the exchange with a Close.",
+        "level": "structural",
+        "severity": "error"
       }
     }
   ]

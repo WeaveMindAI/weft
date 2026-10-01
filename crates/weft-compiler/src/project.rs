@@ -299,7 +299,11 @@ impl Project {
     }
 }
 
-/// `nodes/base_catalog/` under a project root.
+/// `nodes/base_catalog/` under a project root: the standard library, a
+/// folder of nodes like any other. Loading, validating, building and
+/// hashing treat it as any node folder, and a project may leave it out.
+/// The only thing particular to it is `weft catalog update` (which
+/// `weft new` runs to seed it), replacing it from the installation.
 #[cfg(feature = "build")]
 pub fn base_catalog_dir(project_root: &Path) -> PathBuf {
     project_root.join("nodes").join("base_catalog")
@@ -328,82 +332,6 @@ pub fn seed_base_catalog(project_root: &Path) -> CompileResult<()> {
     )
 }
 
-/// The manifest's pseudo-entry for the installed weft a project was
-/// built against: `weft:<version>:<catalog hash>`. It names the
-/// seeded base catalog instead of listing its files (it is the installed
-/// weft's, never the project's), so the CLI that records a version and
-/// the dispatcher that builds one compute it the same way, and a
-/// dispatcher whose own catalog is another one refuses the build.
-#[cfg(feature = "build")]
-pub fn weft_entry(project_root: &Path) -> CompileResult<String> {
-    Ok(format!(
-        "{}{}:{}",
-        weft_core::project::hash::WEFT_ENTRY_PREFIX,
-        env!("CARGO_PKG_VERSION"),
-        base_catalog_hash(project_root)?
-    ))
-}
-
-/// The content hash of the seeded base catalog: every file under
-/// `nodes/base_catalog/`, path and bytes, sorted.
-#[cfg(feature = "build")]
-pub fn base_catalog_hash(project_root: &Path) -> CompileResult<String> {
-    use sha2::Digest;
-    let dir = base_catalog_dir(project_root);
-    let mut files: Vec<PathBuf> = Vec::new();
-    if dir.is_dir() {
-        collect_catalog_files(&dir, &mut files)?;
-    }
-    files.sort();
-    let mut hasher = sha2::Sha256::new();
-    for f in files {
-        let rel = f.strip_prefix(&dir).expect("under the catalog").to_string_lossy().replace('\\', "/");
-        hasher.update(rel.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(std::fs::read(&f).map_err(CompileError::Io)?);
-        hasher.update(b"\n");
-    }
-    Ok(weft_core::project::hash::hex(&hasher.finalize()))
-}
-
-#[cfg(feature = "build")]
-fn collect_catalog_files(dir: &Path, out: &mut Vec<PathBuf>) -> CompileResult<()> {
-    for entry in std::fs::read_dir(dir).map_err(CompileError::Io)? {
-        let entry = entry.map_err(CompileError::Io)?;
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        // Installed dependencies and build output are not part of what
-        // weft is: they differ per machine and per install, and this hash
-        // ends up inside the manifest, which IS the version id (the
-        // catalog ships a pnpm package, and one `pnpm install` in there
-        // once folded thousands of local files into it). The SAME list
-        // the seed copies through (`weft_catalog::is_node_tree_excluded`), so
-        // the hash describes exactly the files the build stages.
-        if weft_catalog::is_node_tree_excluded(&name) {
-            continue;
-        }
-        // A symlink is refused rather than skipped: skipped, a catalog
-        // differing only by a link would hash like one without it, and
-        // followed, it would read something that is not a file of the
-        // catalog. The catalog is weft's own copy, so a link is weft's
-        // to fix.
-        if entry.file_type().map_err(CompileError::Io)?.is_symlink() {
-            return Err(CompileError::Project(format!(
-                "{} is a symlink, and the catalog's hash is taken over real files only, so \
-                 this project cannot be hashed. The catalog comes from the installed weft: \
-                 report this, and `weft catalog update` once it ships without the link",
-                path.display()
-            )));
-        }
-        if path.is_dir() {
-            collect_catalog_files(&path, out)?;
-        } else {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
 /// The source folder and the entry file inside it (`src/main.weft`).
 /// The editor host restates the pair to tell the entry file apart
 /// from a file opened on its own.
@@ -427,11 +355,9 @@ pub fn node_roots(project_root: &Path) -> [PathBuf; 2] {
 
 /// The canonical starter files of a brand-new project (`weft.toml` + `src/main.weft`),
 /// as `(relative-path, bytes)`. This is the ONE definition of "what a new project
-/// contains" (minus the seeded catalog, which `seed_catalog_into_upload` adds):
-/// `Project::init` writes these to disk for `weft new`; a caller that instead
-/// packs a project feeds them to `seed_catalog_into_upload` then packs the result,
-/// so a disk-created and a packed project are byte-identical. `id` is the project
-/// id stamped into the manifest (each caller mints its own).
+/// contains" (minus the seeded catalog, which `seed_base_catalog` adds), so
+/// every caller of `weft new` produces byte-identical projects. `id` is the
+/// project id stamped into the manifest (each caller mints its own).
 pub fn scaffold_files(name: &str, id: Uuid) -> CompileResult<Vec<(String, Vec<u8>)>> {
     let manifest = ProjectManifest {
         package: PackageSection {
@@ -460,82 +386,6 @@ pub fn scaffold_files(name: &str, id: Uuid) -> CompileResult<Vec<(String, Vec<u8
         ("weft.toml".to_string(), toml.into_bytes()),
         (format!("{SRC_DIR}/{ENTRY_FILE}"), main_weft.as_bytes().to_vec()),
     ])
-}
-
-/// Turn an uploaded file set (`(path, bytes)`) into the SELF-CONTAINED project
-/// folder (`path -> bytes`) that gets packed into a content tree: the upload PLUS
-/// the seeded `nodes/base_catalog/`, exactly the shape `weft new` writes to disk.
-/// Called before packing, so the stored tree carries its own node sources and the
-/// build compiles from the project's own `nodes/` with NOTHING injected
-/// out-of-folder (the same path the CLI runs).
-///
-/// Reuses `seed_base_catalog` verbatim by materializing to a temp dir; the read-back
-/// skips `is_node_tree_excluded` names so a seed source never drags build/cache dirs in.
-#[cfg(feature = "build")]
-pub fn seed_catalog_into_upload(
-    upload: &[(String, Vec<u8>)],
-) -> CompileResult<std::collections::BTreeMap<String, Vec<u8>>> {
-    let tmp = tempfile::tempdir().map_err(CompileError::Io)?;
-    for (path, bytes) in upload {
-        let dest = tmp.path().join(path);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).map_err(CompileError::Io)?;
-        }
-        std::fs::write(&dest, bytes).map_err(CompileError::Io)?;
-    }
-    seed_base_catalog(tmp.path())?;
-
-    let mut folder = std::collections::BTreeMap::new();
-    read_folder_into_map(tmp.path(), tmp.path(), &mut folder, &mut Default::default())?;
-    Ok(folder)
-}
-
-/// Recursively read every regular file under `dir` into `out` keyed by its path
-/// relative to `root` (`/`-separated), skipping `is_node_tree_excluded` names and
-/// following symlinks (their target bytes are packed, so a symlinked
-/// `nodes/base_catalog` uploads as real files), so the packed map matches what
-/// the build reads. A symlink cycle fails loudly via the descent chain.
-#[cfg(feature = "build")]
-fn read_folder_into_map(
-    root: &Path,
-    dir: &Path,
-    out: &mut std::collections::BTreeMap<String, Vec<u8>>,
-    chain: &mut Vec<PathBuf>,
-) -> CompileResult<()> {
-    let canon = weft_catalog::guard_node_tree_cycle(dir, chain).map_err(CompileError::Io)?;
-    chain.push(canon);
-    let result = read_folder_entries_into_map(root, dir, out, chain);
-    chain.pop();
-    result
-}
-
-#[cfg(feature = "build")]
-fn read_folder_entries_into_map(
-    root: &Path,
-    dir: &Path,
-    out: &mut std::collections::BTreeMap<String, Vec<u8>>,
-    chain: &mut Vec<PathBuf>,
-) -> CompileResult<()> {
-    for entry in std::fs::read_dir(dir).map_err(CompileError::Io)? {
-        let entry = entry.map_err(CompileError::Io)?;
-        let name = entry.file_name();
-        if weft_catalog::is_node_tree_excluded(&name.to_string_lossy()) {
-            continue;
-        }
-        let path = entry.path();
-        let kind = weft_catalog::node_tree_entry_kind(&path).map_err(CompileError::Io)?;
-        if kind == weft_catalog::NodeTreeEntryKind::Dir {
-            read_folder_into_map(root, &path, out, chain)?;
-        } else {
-            let rel = path
-                .strip_prefix(root)
-                .expect("walked path is under root")
-                .to_string_lossy()
-                .replace('\\', "/");
-            out.insert(rel, std::fs::read(&path).map_err(CompileError::Io)?);
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

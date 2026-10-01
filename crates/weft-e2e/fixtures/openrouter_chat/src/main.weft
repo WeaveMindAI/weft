@@ -1,10 +1,10 @@
-# A three-turn conversation through the typed ChatHistory value, with a
-# media attachment, against the real provider. What it proves that the
-# single-call fixture cannot: the history a call emits feeds the next
-# call (the model remembers turn one at turn three), a stored image
-# attached mid-conversation reaches the model (it names the color), and
-# the emitted history keeps media as stored-file values (the test
-# asserts no URL or base64 ever lands in it).
+# A three-turn conversation kept in one file, with a media attachment,
+# against the real provider. What it proves that the single-call
+# fixture cannot: the file a call adds its turn to feeds the next call
+# (the model remembers turn one at turn three), a stored image attached
+# mid-conversation reaches the model (it names the color), and the file
+# keeps media as stored-file values (the test asserts no URL or base64
+# ever lands in it).
 #
 # Needs OPENROUTER_API_KEY like the openrouter fixture; the cheapest
 # vision-capable model keeps the run nearly free.
@@ -34,7 +34,7 @@ turn1.params = params.params
 turn2 = LlmInference -> (response: String) {
   prompt: "What color is the attached square? One word."
 }
-turn2.history = turn1.history
+turn2.historyFile = turn1.historyFile
 turn2.media = @asset("assets/red.png", Image)
 turn2.provider = prov.provider
 turn2.params = params.params
@@ -42,7 +42,7 @@ turn2.params = params.params
 turn3 = LlmInference -> (response: String) {
   prompt: "What is my dog's name? One word."
 }
-turn3.history = turn2.history
+turn3.historyFile = turn2.historyFile
 turn3.provider = prov.provider
 turn3.params = params.params
 
@@ -50,4 +50,12 @@ out = Debug
 out.data = turn3.response
 
 hist = Debug
-hist.data = turn3.history
+hist.data = turn3.historyFile
+
+# The file after each earlier turn, so the test can see every turn
+# edit the same file one version at a time.
+hist1 = Debug
+hist1.data = turn1.historyFile
+
+hist2 = Debug
+hist2.data = turn2.historyFile

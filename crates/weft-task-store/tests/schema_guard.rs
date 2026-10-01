@@ -426,7 +426,7 @@ async fn the_plan_writes_sql_for_a_drop_a_type_change_and_a_new_column(pool: PgP
     let after = read_schema(&pool).await.unwrap();
 
     let sql: String =
-        plan_migration(&before, &after).into_iter().map(|p| p.stmt).collect::<Vec<_>>().join("\n");
+        plan_migration(&before, &after, &[]).unwrap().into_iter().map(|p| p.stmt).collect::<Vec<_>>().join("\n");
     assert!(sql.contains("ALTER TABLE probe DROP COLUMN doomed;"), "{sql}");
     assert!(sql.contains("ALTER TABLE probe ADD COLUMN added text;"), "{sql}");
     assert!(
@@ -462,7 +462,7 @@ async fn dropping_a_not_null_column_does_not_also_drop_its_constraint(pool: PgPo
     .unwrap();
     let after = read_schema(&pool).await.unwrap();
     let stmts: Vec<String> =
-        plan_migration(&before, &after).into_iter().map(|p| p.stmt).collect();
+        plan_migration(&before, &after, &[]).unwrap().into_iter().map(|p| p.stmt).collect();
     let sql = stmts.join("\n");
     assert!(sql.contains("DROP COLUMN big_key;"), "{sql}");
     assert!(!sql.contains("big_key_not_null"), "the column takes its NOT NULL constraint with it: {sql}");
@@ -505,7 +505,7 @@ async fn the_plan_renders_array_and_enum_types_as_runnable_sql(pool: PgPool) {
     let after = read_schema(&pool).await.unwrap();
 
     let stmts: Vec<String> =
-        plan_migration(&before, &after).into_iter().map(|p| p.stmt).collect();
+        plan_migration(&before, &after, &[]).unwrap().into_iter().map(|p| p.stmt).collect();
     let sql = stmts.join("\n");
     assert!(sql.contains("text[]"), "array type by its real name: {sql}");
     assert!(sql.contains("mood"), "enum type by its real name: {sql}");

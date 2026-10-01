@@ -31,8 +31,20 @@ pub async fn change(
     caller: CallerTenant,
     Path(id): Path<uuid::Uuid>,
     Json(body): Json<weft_core::picks::ChangePicks>,
-) -> Result<Json<weft_core::member_door::ValuesChanged>, (StatusCode, String)> {
+) -> Result<Json<weft_core::instance_door::ValuesChanged>, (StatusCode, String)> {
     authorize_project(&state, &caller.0, id).await?;
     let clear: Vec<(String, String)> = body.clear.into_iter().map(|f| (f.step, f.field)).collect();
     Ok(Json(crate::install_picks::change(&state, id, &body.set, &clear).await?))
+}
+
+/// `POST /projects/{id}/picks/move`: carry a place's picks and every
+/// instance's values to another place, after a node moved in the source.
+pub async fn move_picks(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path(id): Path<uuid::Uuid>,
+    Json(body): Json<weft_core::picks::MovePicks>,
+) -> Result<Json<weft_core::picks::PicksMoved>, (StatusCode, String)> {
+    authorize_project(&state, &caller.0, id).await?;
+    Ok(Json(crate::install_picks::move_picks(&state, id, &body).await?))
 }

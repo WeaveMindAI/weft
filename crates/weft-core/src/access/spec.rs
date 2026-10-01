@@ -1467,7 +1467,7 @@ impl AccessSpec {
         }
         if let Some(identity) = &self.identity {
             // The identity is shown wherever a connection is listed (the
-            // editor, `weft connect --list`, a member's settings page), so
+            // editor, `weft connect --list`, an instance's settings page), so
             // it may never be assembled from a secret.
             for name in identity.placeholders()? {
                 if SECRET_TOKEN_NAMES.contains(&name.as_str()) || secret_fields.contains(&name) {

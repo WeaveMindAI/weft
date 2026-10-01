@@ -35,7 +35,7 @@ fn task(target: TaskTarget, dedup: &str) -> tasks::NewTask {
         dedup_key: Some(dedup.to_string()),
         execution_id: None,
         tenant_id: "tenant-1".to_string(),
-        target_instance: None,
+        target_replica: None,
         binary_hash: None,
         payload: json!({}),
     }
@@ -131,7 +131,7 @@ fn cancel(execution_id: &str) -> tasks::NewTask {
         dedup_key: Some(format!("{execution_id}:cancel")),
         execution_id: Some(execution_id.to_string()),
         tenant_id: "tenant-1".to_string(),
-        target_instance: None,
+        target_replica: None,
         binary_hash: None,
         payload: json!({ "project_id": PROJECT, "execution_id": execution_id, "cause": { "kind": "user" } }),
     }

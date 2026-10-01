@@ -46,7 +46,7 @@ impl Node for FalUpscaleImageNode {
                 answer["images"].as_array().and_then(|a| a.first()).and_then(|i| i["url"].as_str())
             })
             .node_err("fal answered no image for this upscale")?;
-        let ty = ctx.output_type("image").node_err("the image port declares no type")?;
+        let ty = ctx.output_type("image")?;
         let stored = ctx
             .storage(StorageScope::Execution)
             // The upscaled image is the run's product: keep it past the

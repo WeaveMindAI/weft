@@ -1,0 +1,89 @@
+{
+  "type": "ListRuns",
+  "label": "List runs",
+  "description": "List this project's runs, newest first, narrowed by instance, status, the node that started them, a tag, or age, with how many match in all (`total`). At most `limit` come back; when `total` is larger, narrow the filters to reach the older ones. To only know how many, use `CountRuns`.",
+  "tags": [
+    "flow",
+    "runs",
+    "executions",
+    "tag",
+    "list"
+  ],
+  "icon": "ListChecks",
+  "color": "#6366f1",
+  "inputs": [
+    {
+      "name": "instance",
+      "type": "String",
+      "description": "Only the runs for this instance, by the id your program gives it (`user-42`)."
+    },
+    {
+      "name": "status",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": ["running", "waiting_for_input", "completed", "failed", "cancelled"]
+      },
+      "description": "Only the runs that ended this way (`completed`, `failed`, `cancelled`), `running` for the ones still going (a run parked on a wait included), or `waiting_for_input` for only the ones parked on a wait. Any other word is refused."
+    },
+    {
+      "name": "node",
+      "type": "String",
+      "description": "Only the runs this node started (the trigger that fired, or the node a run was started from), named the way the program writes it."
+    },
+    {
+      "name": "tag",
+      "type": "String",
+      "description": "Only the runs carrying this tag, given the way `TagRun` was given it: the same value finds the same runs."
+    },
+    {
+      "name": "olderThanSecs",
+      "type": "Number",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "step": 1
+      },
+      "description": "Only the runs started at least this many seconds ago, a whole number."
+    },
+    {
+      "name": "limit",
+      "type": "Number",
+      "default": 50,
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "max": 200,
+        "step": 1
+      },
+      "description": "How many runs to list at most, from 1 to 200."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "runs",
+      "type": "List[JsonDict]",
+      "description": "One entry per run, newest first: `{ execution_id, project_id, entry_node, status, phase, started_at, completed_at, tags, cancel_cause, error?, skipped_nodes, instance? }`. `status` is `running`, `waiting_for_input` (parked on a wait), `completed`, `failed` or `cancelled`; a `failed` run carries `error`, what failed it; times are unix seconds."
+    },
+    {
+      "name": "total",
+      "type": "Number",
+      "description": "How many runs match the filters, however many were listed."
+    }
+  ],
+  "requires_infra": false,
+  "validate": [
+    {
+      "when": {
+        "kind": "not",
+        "of": { "kind": "input_names", "port": "node", "names": { "node": {} } }
+      },
+      "then": {
+        "message": "ListRuns '{id}' names {names} in `node`, which is no node of this program. Name it the way the program writes it (`inbox`, or `one.inbox` inside an included file).",
+        "level": "structural",
+        "severity": "error",
+        "port": "node"
+      }
+    }
+  ]
+}

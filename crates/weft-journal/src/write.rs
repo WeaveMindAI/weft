@@ -43,9 +43,9 @@ pub enum RecordError {
 /// commits, which is what wakes the dispatcher's event bridge and a
 /// worker waiting on its run's journal.
 ///
-/// `instance` is the writing worker's instance id, stamped on the row.
+/// `replica` is the writing worker's replica id, stamped on the row.
 /// The fence is the broker's: it takes a worker's write only while that
-/// instance owns the execution's claim, so a worker that lost its claim
+/// replica owns the execution's claim, so a worker that lost its claim
 /// cannot pollute the journal. Listener-side and dispatcher-side writes
 /// pass `None`.
 pub async fn record_event(pool: &PgPool, event: &ExecEvent) -> Result<(), RecordError> {
@@ -53,13 +53,13 @@ pub async fn record_event(pool: &PgPool, event: &ExecEvent) -> Result<(), Record
 }
 
 /// Variant the worker's writes take (through the broker): stamps its
-/// instance id on the row.
-pub async fn record_event_from_instance(
+/// replica id on the row.
+pub async fn record_event_from_replica(
     pool: &PgPool,
     event: &ExecEvent,
-    instance: Option<&str>,
+    replica: Option<&str>,
 ) -> Result<(), RecordError> {
-    record_event_inner(pool, event, instance, None).await
+    record_event_inner(pool, event, replica, None).await
 }
 
 /// Idempotent variant: caller provides a stable dedup key. A retry
@@ -81,10 +81,10 @@ pub async fn record_event_dedup(
 pub async fn record_event_in<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
     event: &ExecEvent,
-    instance: Option<&str>,
+    replica: Option<&str>,
     dedup_key: Option<&str>,
 ) -> Result<(), RecordError> {
-    record_event_inner(executor, event, instance, dedup_key).await
+    record_event_inner(executor, event, replica, dedup_key).await
 }
 
 /// The advisory lock key of one execution's journal: the ONE definition,
@@ -117,7 +117,7 @@ pub async fn lock_execution_ids(
 async fn record_event_inner<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
     event: &ExecEvent,
-    instance: Option<&str>,
+    replica: Option<&str>,
     dedup_key: Option<&str>,
 ) -> Result<(), RecordError> {
     let payload = serde_json::to_string(event)?;
@@ -139,7 +139,7 @@ async fn record_event_inner<'e, E: sqlx::PgExecutor<'e>>(
         "WITH locked AS MATERIALIZED ( \
              SELECT pg_advisory_xact_lock(hashtextextended($7, 0)) \
          ) \
-         INSERT INTO exec_event (execution_id, kind, payload_json, created_at, instance, dedup_key) \
+         INSERT INTO exec_event (execution_id, kind, payload_json, created_at, replica, dedup_key) \
          SELECT $1, $2, $3, $4, $5, $6 FROM locked \
          ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING",
     )
@@ -147,7 +147,7 @@ async fn record_event_inner<'e, E: sqlx::PgExecutor<'e>>(
     .bind(event.kind_str())
     .bind(&payload)
     .bind(now)
-    .bind(instance)
+    .bind(replica)
     .bind(dedup_key)
     .bind(execution_id_lock_key(event.execution_id()))
     .execute(executor)

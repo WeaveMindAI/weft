@@ -7,7 +7,7 @@
 // WHERE the token goes (spans). The `@file` marker is reconstructed to its
 // `@file("path", Type)` source form (config never carries resolved content).
 
-import { installPicked, memberFilled, memberFilledValue, parseWeftType } from '../../protocol';
+import { installPicked, instanceFilled, instanceFilledValue, parseWeftType } from '../../protocol';
 
 /** Structural `@file` / `@asset` reference held in a config field. The value
  *  the field resolves to lives elsewhere (host-supplied file content, or the
@@ -151,11 +151,11 @@ export function formatConfigValue(value: unknown): string {
   if (installPicked(value)) {
     throw new Error('a connection picked on the install is never written in the source');
   }
-  // A field each member provides: the marker, with its fallback written
-  // the way any value is.
-  const filled = memberFilled(value);
+  // A field each instance gets its own value for: the marker, with its
+  // fallback written the way any value is.
+  const filled = instanceFilled(value);
   if (filled) {
-    return filled.fallback === undefined ? '@member_filled' : `@member_filled(${formatConfigValue(filled.fallback)})`;
+    return filled.fallback === undefined ? '@instance_filled' : `@instance_filled(${formatConfigValue(filled.fallback)})`;
   }
   // A port that holds several files: one marker per file, in order. A
   // marker is a value, so the list is written like any other list.
@@ -210,13 +210,13 @@ const JSON_COMPACT_MAX_CHARS = 60;
 export function parseConfigToken(token: string): unknown {
   const fileRef = fileRefFromToken(token);
   if (fileRef) return fileRef;
-  // SYNC: memberFilledValue <-> crates/weft-compiler/src/weft_compiler.rs member_filled_value
-  if (token === '@member_filled') return memberFilledValue();
-  if (token.startsWith('@member_filled(') && token.endsWith(')')) {
-    const inner = token.slice('@member_filled('.length, -1).trim();
+  // SYNC: instanceFilledValue <-> crates/weft-compiler/src/weft_compiler.rs instance_filled_value
+  if (token === '@instance_filled') return instanceFilledValue();
+  if (token.startsWith('@instance_filled(') && token.endsWith(')')) {
+    const inner = token.slice('@instance_filled('.length, -1).trim();
     // A fallback is a value or a file (`@file`/`@asset`), never another marker.
     if (inner === '' || (inner.startsWith('@') && !fileRefFromToken(inner))) throw new Error(`not a config value token: ${token.slice(0, 40)}`);
-    return memberFilledValue(parseConfigToken(inner));
+    return instanceFilledValue(parseConfigToken(inner));
   }
   // A list of markers: what a port holding several files writes.
   if (token.startsWith('[') && token.includes('@')) {

@@ -13,7 +13,7 @@ pub fn checked_id<'a>(id: &'a str, what: &str) -> WeftResult<&'a str> {
         && !id.contains(['/', '?', '#', '\\'])
         && !id.starts_with('.');
     if !clean {
-        weft::node_bail!("'{id}' is not a usable Airtable {what}");
+        return Err(weft::WeftError::Input(format!("'{id}' is not a usable Airtable {what}")));
     }
     Ok(id)
 }

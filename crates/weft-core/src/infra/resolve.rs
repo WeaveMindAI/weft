@@ -24,25 +24,25 @@ pub struct NodeRef {
     pub project: uuid::Uuid,
     /// The node as the program spells it (`db`, `one.db`).
     pub node: String,
-    /// Which copy this is, from [`NodeRef::copy_instance_id`]: the same
-    /// for the same (project, node, member) forever, so every apply of
+    /// Which copy this is, from [`NodeRef::copy_id`]: the same
+    /// for the same (project, node, instance) forever, so every apply of
     /// the copy, including the first one after a terminate, finds its
     /// disks under the same names.
-    pub instance: String,
+    pub copy_id: String,
 }
 
 impl NodeRef {
-    /// The id of the copy of `node` that `member` gets (`None`: the shared
+    /// The id of the copy of `node` that `instance` gets (`None`: the shared
     /// copy). Derived, never minted: a disk listed in `keepOnTerminate`
     /// outlives the copy's row, and the next apply can only find it again
     /// if it names the copy the same way. Two copies with one id never
     /// run side by side: an apply over a copy still being terminated
     /// finishes that terminate before it creates anything.
-    pub fn copy_instance_id(project: uuid::Uuid, node: &str, member: Option<&crate::member::MemberId>) -> String {
+    pub fn copy_id(project: uuid::Uuid, node: &str, instance: Option<&crate::instance::InstanceId>) -> String {
         let pid = super::name_segment(&project.to_string()).chars().take(8).collect::<String>();
         let nid = super::name_segment(node).chars().take(20).collect::<String>();
-        let key = format!("{project}|{node}|{}", member.map(|m| m.as_str()).unwrap_or(""));
-        // A member id is not name-safe and may be long, so it enters as
+        let key = format!("{project}|{node}|{}", instance.map(|m| m.as_str()).unwrap_or(""));
+        // An instance id is not name-safe and may be long, so it enters as
         // the digest only. 40 bits: no collision across one project's
         // copies of one node.
         let digest = Sha256::digest(key.as_bytes());
@@ -50,10 +50,10 @@ impl NodeRef {
         format!("wn-{pid}-{nid}-{hex}")
     }
 
-    /// Whether this is a member's copy rather than the shared one: the
-    /// shared copy's id is the one derived with no member.
-    pub fn is_member_copy(&self) -> bool {
-        self.instance != Self::copy_instance_id(self.project, &self.node, None)
+    /// Whether this is an instance's copy rather than the shared one: the
+    /// shared copy's id is the one derived with no instance.
+    pub fn is_instance_copy(&self) -> bool {
+        self.copy_id != Self::copy_id(self.project, &self.node, None)
     }
 
     /// A short name that is the same for the same copy and safe as a
@@ -61,7 +61,7 @@ impl NodeRef {
     /// starting with a letter, at most 40 characters, so a platform may
     /// add a unit or volume name after it and stay under 63.
     pub fn resource_base(&self) -> String {
-        let digest = Sha256::digest(format!("{}|{}|{}", self.project, self.node, self.instance).as_bytes());
+        let digest = Sha256::digest(format!("{}|{}|{}", self.project, self.node, self.copy_id).as_bytes());
         let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
         let mut readable: String = super::name_segment(&self.node).chars().take(20).collect();
         while readable.ends_with('-') {
@@ -123,7 +123,7 @@ pub enum ResolveError {
     /// filled by the version build, so on a project whose infra was never
     /// started it is empty whatever the node's metadata declares.
     #[error("infra node '{node}' has no image built yet for '{name}': run `weft infra start` \
-             (or, for a node marked `@per_member`, `weft activate`), which builds the node's \
+             (or, for a node marked `@per_instance`, `weft activate`), which builds the node's \
              images and registers them")]
     MissingLocalImage { node: String, name: String },
     #[error("infra node '{node}': {what} '{name}' is declared twice")]
@@ -355,10 +355,10 @@ fn canonical(value: &serde_json::Value) -> serde_json::Value {
 
 /// The front-door path of a public endpoint declaring `path` (no trailing
 /// slash; the prefix alone for a declared `/`). Under `/infra/<project>/
-/// <instance>`, so no endpoint can shadow a weft route or another node's.
+/// <copy_id>`, so no endpoint can shadow a weft route or another node's.
 // SYNC: public infra path <-> crates/weft-dispatcher/src/infra_door.rs (the route)
-pub fn public_path(project: uuid::Uuid, instance: &str, path: &str) -> String {
-    format!("/infra/{project}/{instance}{}", path.trim_end_matches('/'))
+pub fn public_path(project: uuid::Uuid, copy_id: &str, path: &str) -> String {
+    format!("/infra/{project}/{copy_id}{}", path.trim_end_matches('/'))
 }
 
 /// The full outside address of a public endpoint: the install's public
@@ -374,21 +374,21 @@ mod tests {
     use crate::infra::types::*;
 
     #[test]
-    fn a_copy_keeps_its_id_and_each_member_gets_its_own() {
+    fn a_copy_keeps_its_id_and_each_instance_gets_its_own() {
         let p = uuid::Uuid::from_u128(7);
-        let alice = crate::member::MemberId::new("alice").unwrap();
-        let bob = crate::member::MemberId::new("bob").unwrap();
-        let shared = NodeRef::copy_instance_id(p, "node_one", None);
-        assert_eq!(shared, NodeRef::copy_instance_id(p, "node_one", None));
-        assert_ne!(shared, NodeRef::copy_instance_id(p, "node_one", Some(&alice)));
-        assert_ne!(NodeRef::copy_instance_id(p, "node_one", Some(&alice)), NodeRef::copy_instance_id(p, "node_one", Some(&bob)));
-        assert_ne!(shared, NodeRef::copy_instance_id(uuid::Uuid::from_u128(8), "node_one", None));
+        let alice = crate::instance::InstanceId::new("alice").unwrap();
+        let bob = crate::instance::InstanceId::new("bob").unwrap();
+        let shared = NodeRef::copy_id(p, "node_one", None);
+        assert_eq!(shared, NodeRef::copy_id(p, "node_one", None));
+        assert_ne!(shared, NodeRef::copy_id(p, "node_one", Some(&alice)));
+        assert_ne!(NodeRef::copy_id(p, "node_one", Some(&alice)), NodeRef::copy_id(p, "node_one", Some(&bob)));
+        assert_ne!(shared, NodeRef::copy_id(uuid::Uuid::from_u128(8), "node_one", None));
         assert!(shared.starts_with("wn-") && shared.len() <= 50);
         assert!(shared.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
     }
 
     fn node() -> NodeRef {
-        NodeRef { tenant: "local".into(), project: uuid::Uuid::from_u128(1), node: "db".into(), instance: "i-1".into() }
+        NodeRef { tenant: "local".into(), project: uuid::Uuid::from_u128(1), node: "db".into(), copy_id: "i-1".into() }
     }
 
     fn spec() -> InfraSpec {
@@ -509,7 +509,7 @@ mod tests {
         assert!(base.starts_with("wi-db-"), "{base}");
         assert!(base.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
         let mut other = node();
-        other.instance = "i-2".into();
+        other.copy_id = "i-2".into();
         assert_ne!(base, other.resource_base());
     }
 }

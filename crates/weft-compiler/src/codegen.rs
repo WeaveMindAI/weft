@@ -48,6 +48,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use weft_catalog::FsCatalog;
+use weft_core::builds::NodeSet;
 use weft_core::ProjectDefinition;
 
 use crate::error::{CompileError, CompileResult};
@@ -225,33 +226,6 @@ fn sanitize_pkg_ident(raw: &str) -> String {
     // so a package's module ident, crate name, and staging paths can
     // never disagree or collide.
     format!("pkg_{}", crate::build::sanitize_crate_name(raw))
-}
-
-/// Which catalog node types a worker binary compiles in.
-///
-/// `Referenced` is the ordinary build: the types the program names, so
-/// the binary is as small as the program. `Full` compiles every node
-/// in the catalog, so a program edit that starts using a node the
-/// previous program did not never rebuilds the image: the build is
-/// content-addressed either way (`compute_binary_hash` folds the same
-/// set plus this choice), so a full image rebuilds only when a node
-/// source was added, removed, or edited. CLI builds default to `Full`;
-/// `--referenced` selects only the graph's types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NodeSet {
-    Referenced,
-    Full,
-}
-
-impl NodeSet {
-    /// The line the binary hash folds so a full image and a referenced
-    /// image of one program never share a tag.
-    pub fn hash_marker(self) -> &'static str {
-        match self {
-            NodeSet::Referenced => "referenced",
-            NodeSet::Full => "full",
-        }
-    }
 }
 
 /// The catalog node types a build under `node_set` compiles in, sorted:
@@ -1222,8 +1196,8 @@ async fn main() -> anyhow::Result<()> {{
     )
     .expect("first registry install in this process");
 
-    let instance = weft_engine::mint_instance_id("worker");
-    let token = TokenSource::worker(weft_engine::identity_from_env()?, instance.clone());
+    let replica = weft_engine::mint_replica_id("worker");
+    let token = TokenSource::worker(weft_engine::identity_from_env()?, replica.clone());
     // The engine composes its own client bundle from the broker address and
     // the worker's identity, so this generated binary never names the
     // bundle's fields.
@@ -1243,7 +1217,7 @@ async fn main() -> anyhow::Result<()> {{
     let config = weft_engine::WorkerConfig {{
         project_id: args.project_id,
         tenant_id: args.tenant_id,
-        instance,
+        replica,
         door: weft_engine::WorkerDoor::from_env()?,
         caller_token_secret,
         port: args.port,
@@ -1595,12 +1569,12 @@ mod tests {
             features: NodeFeatures::default(),
             scope: Vec::new(),
             group_boundary: None,
-            requires_infra: false, per_member: None,
+            requires_infra: false, per_instance: None,
             images: Vec::new(),
             fires_with: Default::default(),
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None,
             header_span: None,
             config_spans: Default::default(),

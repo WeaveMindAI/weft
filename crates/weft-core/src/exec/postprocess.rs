@@ -19,7 +19,7 @@ use crate::error::{WeftError, WeftResult};
 use crate::exec::emission::{pulse_id, PulseEmission};
 use crate::frames::LoopFrames;
 use crate::project::{Edge, EdgeIndex, ProjectDefinition};
-use crate::pulse::{Pulse, PulseTable};
+use crate::pulse::{Failure, Pulse, PulseTable};
 use crate::ExecutionId;
 
 
@@ -298,7 +298,7 @@ pub fn close_unmentioned_downstream(
     pulses: &mut PulseTable,
     edge_idx: &EdgeIndex,
     emissions: &mut Vec<PulseEmission>,
-    failure: Option<&str>,
+    failure: Option<&Failure>,
     closed: &HashSet<String>,
 ) -> WeftResult<()> {
     let Some(node) = project.nodes.iter().find(|n| n.id == node_id) else {
@@ -339,7 +339,7 @@ pub fn emit_port_closure(
     pulses: &mut PulseTable,
     edge_idx: &EdgeIndex,
     emissions: &mut Vec<PulseEmission>,
-    failure: Option<&str>,
+    failure: Option<&Failure>,
 ) -> WeftResult<()> {
     let declared = project
         .nodes
@@ -371,7 +371,7 @@ pub fn emit_port_closure(
 
 /// A boundary's closure sweep: first close, WITH its error, every
 /// output whose same-named input arrived as a failed closure
-/// (`closed_with_error`, from the firing input), then close everything
+/// (`closed_failures`, from the firing input), then close everything
 /// else the firing did not mention plainly. The one place a boundary
 /// forwards a failure as a failure, shared by the group passthrough and
 /// the loop's per-iteration launch so the two cannot drift: a port the
@@ -380,7 +380,7 @@ pub fn emit_port_closure(
 #[allow(clippy::too_many_arguments)]
 pub fn close_failed_then_unmentioned_downstream(
     node_id: &str,
-    closed_with_error: &std::collections::BTreeMap<String, String>,
+    closed_failures: &BTreeMap<String, Failure>,
     mentioned: &HashSet<String>,
     emission_id: Uuid,
     execution_id: ExecutionId,
@@ -397,13 +397,13 @@ pub fn close_failed_then_unmentioned_downstream(
         .map(|n| n.outputs.iter().map(|o| o.name.as_str()).collect())
         .unwrap_or_default();
     let mut closed = HashSet::new();
-    for (port, error) in closed_with_error {
+    for (port, failure) in closed_failures {
         if mentioned.contains(port) || !declared.contains(port.as_str()) {
             continue;
         }
         emit_port_closure(
             node_id, port, emission_id, execution_id, frames, project, pulses, edge_idx, emissions,
-            Some(error),
+            Some(failure),
         )?;
         closed.insert(port.clone());
     }
@@ -422,7 +422,7 @@ fn emit_closure_on_outgoing(
     emission_id: Uuid,
     execution_id: ExecutionId,
     frames: &LoopFrames,
-    close_error: Option<&str>,
+    failure: Option<&Failure>,
     outgoing: &[&Edge],
     pulses: &mut PulseTable,
     emissions: &mut Vec<PulseEmission>,
@@ -432,7 +432,7 @@ fn emit_closure_on_outgoing(
         .filter(|e| e.source_handle.as_deref() == Some(port_name))
     {
         emit_closure_on_edge(
-            project, node_id, edge, port_name, emission_id, execution_id, frames, close_error, pulses,
+            project, node_id, edge, port_name, emission_id, execution_id, frames, failure, pulses,
             emissions,
         );
     }
@@ -454,7 +454,7 @@ fn emit_closure_on_edge(
     emission_id: Uuid,
     execution_id: ExecutionId,
     frames: &LoopFrames,
-    close_error: Option<&str>,
+    failure: Option<&Failure>,
     pulses: &mut PulseTable,
     emissions: &mut Vec<PulseEmission>,
 ) {
@@ -479,13 +479,13 @@ fn emit_closure_on_edge(
         return;
     }
 
-    let pulse = Pulse::closure_with_error(
+    let pulse = Pulse::closure_with_failure(
         id,
         execution_id,
         frames.clone(),
         edge.target.clone(),
         target_handle.to_string(),
-        close_error.map(str::to_string),
+        failure.cloned(),
     );
     emissions.push(PulseEmission {
         pulse: pulse.clone(),
@@ -551,17 +551,18 @@ mod fan_in_tests {
         let mut project = direct_project();
         project.edges.push(edge("out", "consumer", "in"));
         let index = EdgeIndex::build(&project);
+        let refused = Failure { node: "src".into(), error: "refused output".into() };
         for explicit in [true, false] {
             let mut pulses = PulseTable::default();
             let mut emissions = Vec::new();
             if explicit {
                 emit_port_closure("src", "out", emission(), Uuid::nil(), &vec![], &project,
-                    &mut pulses, &index, &mut emissions, Some("refused output")).unwrap();
+                    &mut pulses, &index, &mut emissions, Some(&refused)).unwrap();
             } else {
                 close_unmentioned_downstream("src", &HashSet::new(), emission(), Uuid::nil(), &vec![], &project,
-                    &mut pulses, &index, &mut emissions, Some("refused output"), &HashSet::new()).unwrap();
+                    &mut pulses, &index, &mut emissions, Some(&refused), &HashSet::new()).unwrap();
             }
-            assert_eq!(pulses["consumer"][0].close_error.as_deref(), Some("refused output"));
+            assert_eq!(pulses["consumer"][0].failure.as_ref(), Some(&refused));
         }
     }
 
@@ -726,12 +727,12 @@ mod fan_in_tests {
             features: Default::default(),
             scope: Vec::new(),
             group_boundary: None,
-            requires_infra: false, per_member: None,
+            requires_infra: false, per_instance: None,
             fires_with: Default::default(),
             images: Vec::new(),
             published_service: None,
-            member_service: None,
-            member_rules: None,
+            instance_service: None,
+            instance_rules: None,
             span: None,
             header_span: None,
             config_spans: Default::default(),

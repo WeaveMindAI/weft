@@ -47,7 +47,29 @@ it needs (`machine`: `cpu`, `memory`, and `gpu` with a `kind` and a `count`)
 and what stop does to it (`onStop`: stop it, or keep it running until
 terminate). On a cloud install, weft picks a machine that fits those numbers.
 On your machine it only checks them, and refuses a unit that asks for a GPU
-you do not have.
+you do not have. On your machine weft cannot pick a GPU by kind, so a unit that
+asks for any GPU gets every GPU the machine has, and `weft infra start` and
+`weft infra status` warn you about it.
+
+A unit asking for one L4 GPU, with the CPUs and memory beside it:
+
+```rust
+Unit {
+    name: "model".into(),
+    machine: MachineShape {
+        cpu: Some("8".into()),
+        memory: Some("32Gi".into()),
+        gpu: Some(Gpu { kind: "nvidia-l4".into(), count: 1 }),
+    },
+    ..Default::default()
+}
+```
+
+The kinds a cloud install attaches are `nvidia-l4` (1, 2, 4 or 8 on one
+machine), `nvidia-tesla-t4` and `nvidia-tesla-p4` (1, 2 or 4), and
+`nvidia-tesla-v100` (1, 2, 4 or 8). Any other kind or count is refused when
+the machine is picked, and the refusal says what is allowed. The CPUs and
+memory you ask for must also fit a machine with that many GPUs.
 
 Each container also takes two probes: `readiness` says when it is up, and `liveness` restarts it after
 `failureThreshold` failures in a row.
@@ -115,7 +137,8 @@ set `expose`:
 
 The install serves every project at that address, so your `/hooks` lives
 under a prefix of its own: `public_url()` is
-`<address>/infra/<project>/<instance>/hooks`, and the install strips the
+`<address>/infra/<project>/<copy>/hooks` (`<copy>` names this copy of the
+node), and the install strips the
 prefix again, so your container still sees `/hooks`.
 `weft infra status` prints the same address under the node. On a cloud
 install it is the install's own address. On your machine it is the tunnel's
@@ -133,12 +156,13 @@ It works during provisioning after the apply, and in every later phase once the
 infrastructure is running. If the endpoint is not declared, or the
 infrastructure is down, the error says which and points at `weft infra status`.
 
-When a program marks your node `@per_member`, each member gets their own
-container, and `ctx.endpoint` answers with the copy of the member the run is
-for; your node's code does not change. Each copy has its own instance, so its
-`public_url()` is its own too. A connection your node publishes
-(`ctx.publish_access`) from a member's copy is recorded as that member's. For
-what a member is, go and read [programs with members](../running/members.md).
+When a program marks your node `@per_instance`, each instance of the program
+gets its own container, and `ctx.endpoint` answers with the copy of the
+instance the run is for; your node's code does not change. Each copy has its
+own address, so its `public_url()` is its own too. A connection your node
+publishes (`ctx.publish_access`) from an instance's copy is recorded as that
+instance's. For what an instance is, go and read
+[programs with instances](../running/instances.md).
 
 ## A live panel
 
@@ -176,20 +200,20 @@ money and weft will not spend it on a click that did not mention one.
 And `weft infra stop` keeps the disk while `weft infra terminate` deletes it.
 If your node has data worth keeping even through a terminate, name its disk in
 `keepOnTerminate`. The next `weft infra start` of the same node (the same
-member's copy, for a node marked `@per_member`) finds that disk and mounts it
+instance's copy, for a node marked `@per_instance`) finds that disk and mounts it
 again, data and all. If you want a kept disk gone, drop it from
 `keepOnTerminate`, start the node once so the copy knows about it, and
 terminate.
 
 A kept disk is deleted for you once its copy can never come back: when you
 remove the node from your program and run it again, when the node switches
-between shared and `@per_member` (which leaves the old side's copies behind), or
+between shared and `@per_instance` (which leaves the old side's copies behind), or
 when you remove the project with `weft rm`. This holds even if the copy was already terminated
 at the time. The supervisor sweeps for such copies on every ownership tick, so
 the disk goes within one tick of the change.
 
-If you wipe a member (the `WipeMember` node, or `ctx.infra(node).member(id).wipe(..)`
-from your own node), the kept disks of that member's copies go right away,
+If you wipe an instance (the `WipeInstance` node, or `ctx.infra(node).instance(id).wipe(..)`
+from your own node), the kept disks of that instance's copies go right away,
 including those of a copy that was already terminated.
 
 ## Testing one
@@ -200,10 +224,31 @@ let spec = outcome.infra_spec()?;
 assert_eq!(spec.units[0].name, "db");
 ```
 
-`fake` is the top tier here too, and the rig will answer or refuse an endpoint
-so you can test both roads:
+`fake` is the top tier here too. For a node that calls its own
+infrastructure, declare where each endpoint answers, then what each call gets:
 
 ```rust
-rig.declare_endpoint("sql", "http://localhost:5432");
-rig.answer_endpoint("sql", "/health", json!({ "ok": true }));
+rig.declare_endpoint("credential", "http://localhost:8080");
+rig.refuse_endpoint("credential", EndpointMethod::Get, "/password", 503, "starting");
+rig.answer_endpoint("credential", EndpointMethod::Get, "/password", json!({ "password": "minted" }));
+let outcome = rig.run(&DatabaseNode, json!({ "database": "app" })).await.ok()?;
+assert_eq!(rig.endpoint_calls().len(), 2, "asked twice: refused, then answered");
 ```
+
+| Call | What it does |
+|---|---|
+| `declare_endpoint(name, url)` | Says the endpoint `name` answers at `url`. Without it, `ctx.endpoint(name)` fails the way it does when the infrastructure is not running |
+| `declare_public_url(name, url)` | Makes a declared endpoint public: `ctx.endpoint(name)?.public_url()` answers `url` |
+| `answer_endpoint(endpoint, method, path, answer)` | The next call to `path` on that endpoint answers `answer` (JSON) |
+| `refuse_endpoint(endpoint, method, path, status, body)` | The next call to `path` on that endpoint is refused with `status` and `body`, the way a service that is still starting refuses one |
+| `endpoint_calls()` | Every call the node made to its endpoints, in order: `endpoint`, `method`, `path`, `body` |
+| `stop_after_calls(n)` | Presses stop, as `weft stop` would, once the node has made `n` calls (endpoint calls and web requests, counted together). The call that reaches `n` still gets its answer; `0` stops the run before it starts. This is how you test a node that polls a long job and must end cancelled when a person stops it |
+
+`method` is `EndpointMethod::Get` or `EndpointMethod::Post`.
+
+Each answer and each refusal is used by exactly one call, in the order you
+declared them, so declare one per call you expect. That is how a node that
+asks twice and acts on the answer changing (refused, then answered) gets
+tested. A call with nothing left to answer it fails the run and names
+`answer_endpoint`, so a question your node should not have needed to ask shows
+up instead of being quietly answered.

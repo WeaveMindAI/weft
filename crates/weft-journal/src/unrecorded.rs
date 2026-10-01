@@ -39,18 +39,17 @@ use crate::traits::{JournalClient, RawJournalRow};
 /// claim that lapsed is a worker that went away). Forgetting it ends that
 /// at once: the row goes, or, when its costs keep the row, `ended_at_unix`
 /// is stamped, both before its task is closed.
-// SYNC: terminal kind list <-> crates/weft-journal/src/events.rs ExecEvent::is_execution_terminal
-pub const LIVE_RUN_SQL: &str = "( \
+pub const LIVE_RUN_SQL: &str = concat!("( \
     (ec.kind = 'execution' AND NOT EXISTS ( \
         SELECT 1 FROM exec_event term WHERE term.execution_id = ec.execution_id \
-          AND term.kind IN ('execution_completed', 'execution_failed', 'execution_cancelled'))) \
+          AND term.kind IN ", crate::execution_terminal_kinds_sql!(), ")) \
     OR (ec.kind = 'unrecorded' AND ec.ended_at_unix IS NULL AND EXISTS ( \
         SELECT 1 FROM task run_task \
         WHERE run_task.execution_id = ec.execution_id AND run_task.kind = 'execute' \
           AND (run_task.status = 'pending' \
                OR (run_task.status = 'claimed' \
                    AND run_task.claimed_until_unix >= EXTRACT(EPOCH FROM NOW())::BIGINT)))) \
-)";
+)");
 
 /// The channel an unrecorded run's ending is announced on, at the commit
 /// of the transaction that forgot it, with an [`UnrecordedEnded`] as the
@@ -60,14 +59,16 @@ pub const LIVE_RUN_SQL: &str = "( \
 /// the run belonged to.
 pub const UNRECORDED_ENDED_CHANNEL: &str = "weft_unrecorded_ended";
 
-/// What the dispatcher needs to find the drain an ended unrecorded run
-/// may have been holding up. Its row can be gone by the time this is
-/// heard, so the ending carries it.
+/// What the dispatcher needs to finish an ended unrecorded run's
+/// bookkeeping: the entry slot it held, and the drain it may have been
+/// holding up. Its row can be gone by the time this is heard, so the
+/// ending carries it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UnrecordedEnded {
+    pub execution_id: ExecutionId,
     pub project_id: uuid::Uuid,
     pub fired_by: Option<String>,
-    pub member: Option<String>,
+    pub instance: Option<String>,
 }
 
 /// What an unrecorded run left behind once it ended.
@@ -141,7 +142,7 @@ impl UnrecordedJournal {
     /// ending at all, is written to the real journal in full (with a
     /// failure ending in the second case) as a recorded run. Anything
     /// else is forgotten.
-    pub async fn settle(&self, instance: Option<&str>) -> anyhow::Result<Settled> {
+    pub async fn settle(&self, replica: Option<&str>) -> anyhow::Result<Settled> {
         let events = {
             let mut held = self.held.lock().expect("unrecorded journal");
             anyhow::ensure!(!held.settled, "unrecorded run {} was already settled", self.execution_id);
@@ -163,11 +164,11 @@ impl UnrecordedJournal {
         };
         match events.iter().rev().find(|event| event.is_execution_terminal()) {
             Some(ExecEvent::ExecutionCompleted { .. } | ExecEvent::ExecutionCancelled { .. }) => {
-                self.real.forget_unrecorded(self.execution_id, instance).await?;
+                self.real.forget_unrecorded(self.execution_id, replica).await?;
                 Ok(Settled::Forgotten)
             }
             _ => {
-                self.real.record_retroactively(&as_recorded(events), instance).await?;
+                self.real.record_retroactively(&as_recorded(events), replica).await?;
                 Ok(Settled::Recorded)
             }
         }
@@ -192,7 +193,7 @@ pub fn as_recorded(events: Vec<ExecEvent>) -> Vec<ExecEvent> {
 
 #[async_trait]
 impl JournalClient for UnrecordedJournal {
-    async fn record_event(&self, event: &ExecEvent, instance: Option<&str>) -> anyhow::Result<()> {
+    async fn record_event(&self, event: &ExecEvent, replica: Option<&str>) -> anyhow::Result<()> {
         anyhow::ensure!(
             event.execution_id() == self.execution_id,
             "unrecorded run {} tried to write a row of run {}",
@@ -211,7 +212,7 @@ impl JournalClient for UnrecordedJournal {
         };
         anyhow::ensure!(!self.held.lock().expect("unrecorded journal").settled, refused());
         if matches!(event, ExecEvent::CostReported { .. }) {
-            self.real.record_event(event, instance).await?;
+            self.real.record_event(event, replica).await?;
         }
         let mut held = self.held.lock().expect("unrecorded journal");
         if held.settled {
@@ -267,7 +268,7 @@ impl JournalClient for UnrecordedJournal {
 pub async fn record_retroactively(
     pool: &sqlx::PgPool,
     events: &[ExecEvent],
-    instance: Option<&str>,
+    replica: Option<&str>,
 ) -> anyhow::Result<()> {
     let Some(first) = events.first() else {
         anyhow::bail!("an unrecorded run's record has at least its birth");
@@ -280,24 +281,24 @@ pub async fn record_retroactively(
     let mut tx = pool.begin().await?;
     crate::write::lock_execution_ids(&mut tx, &[execution_id]).await?;
     let row: Option<(uuid::Uuid, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT project_id, fired_by, member_id FROM execution WHERE execution_id = $1 AND kind = $2 FOR UPDATE",
+        "SELECT project_id, fired_by, instance_id FROM execution WHERE execution_id = $1 AND kind = $2 FOR UPDATE",
     )
     .bind(execution_id.to_string())
     .bind(RunKind::Unrecorded.as_str())
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((project_id, fired_by, member)) = row else {
+    let Some((project_id, fired_by, instance)) = row else {
         anyhow::bail!("run {execution_id} is not an unrecorded run, so its record cannot be written afterwards");
     };
     let rows: Vec<(String, Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT payload_json, instance, dedup_key FROM exec_event WHERE execution_id = $1 ORDER BY id")
+        sqlx::query_as("SELECT payload_json, replica, dedup_key FROM exec_event WHERE execution_id = $1 ORDER BY id")
             .bind(execution_id.to_string())
             .fetch_all(&mut *tx)
             .await?;
     sqlx::query("DELETE FROM exec_event WHERE execution_id = $1").bind(execution_id.to_string()).execute(&mut *tx).await?;
     let mut held: Vec<Option<HeldCost>> = rows
         .into_iter()
-        .map(|(payload, instance, dedup)| {
+        .map(|(payload, replica, dedup)| {
             let event = crate::decode_event(execution_id, &payload).map_err(|e| anyhow::anyhow!("{e}"))?;
             let ExecEvent::CostReported { cost_id, .. } = &event else {
                 anyhow::bail!(
@@ -305,7 +306,7 @@ pub async fn record_retroactively(
                     event.kind_str()
                 );
             };
-            Ok(Some(HeldCost { cost_id: cost_id.clone(), event, instance, dedup }))
+            Ok(Some(HeldCost { cost_id: cost_id.clone(), event, replica, dedup }))
         })
         .collect::<anyhow::Result<_>>()?;
     for event in events {
@@ -316,13 +317,13 @@ pub async fn record_retroactively(
             _ => None,
         };
         let (writer, dedup) = match &row {
-            Some(held) => (held.instance.as_deref(), held.dedup.as_deref()),
-            None => (instance, None),
+            Some(held) => (held.replica.as_deref(), held.dedup.as_deref()),
+            None => (replica, None),
         };
         crate::write::record_event_in(&mut *tx, event, writer, dedup).await.map_err(|e| anyhow::anyhow!("{e}"))?;
     }
-    for HeldCost { event, instance, dedup, .. } in held.into_iter().flatten() {
-        crate::write::record_event_in(&mut *tx, &event, instance.as_deref(), dedup.as_deref())
+    for HeldCost { event, replica, dedup, .. } in held.into_iter().flatten() {
+        crate::write::record_event_in(&mut *tx, &event, replica.as_deref(), dedup.as_deref())
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
@@ -331,7 +332,7 @@ pub async fn record_retroactively(
         .bind(RunKind::Execution.as_str())
         .execute(&mut *tx)
         .await?;
-    announce_ended(&mut tx, UnrecordedEnded { project_id, fired_by, member }).await?;
+    announce_ended(&mut tx, UnrecordedEnded { execution_id, project_id, fired_by, instance }).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -341,7 +342,7 @@ pub async fn record_retroactively(
 struct HeldCost {
     cost_id: String,
     event: ExecEvent,
-    instance: Option<String>,
+    replica: Option<String>,
     dedup: Option<String>,
 }
 
@@ -364,13 +365,13 @@ async fn announce_ended(tx: &mut sqlx::PgConnection, ended: UnrecordedEnded) -> 
 pub async fn forget_in(tx: &mut sqlx::PgConnection, execution_id: ExecutionId) -> anyhow::Result<bool> {
     crate::write::lock_execution_ids(&mut *tx, &[execution_id]).await?;
     let owner: Option<(uuid::Uuid, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT project_id, fired_by, member_id FROM execution WHERE execution_id = $1 AND kind = $2",
+        "SELECT project_id, fired_by, instance_id FROM execution WHERE execution_id = $1 AND kind = $2",
     )
     .bind(execution_id.to_string())
     .bind(RunKind::Unrecorded.as_str())
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((project_id, fired_by, member)) = owner else {
+    let Some((project_id, fired_by, instance)) = owner else {
         // Already forgotten (a cancel with no process, then the worker's own
         // settle, or the reverse): nothing ends twice.
         return Ok(false);
@@ -396,7 +397,7 @@ pub async fn forget_in(tx: &mut sqlx::PgConnection, execution_id: ExecutionId) -
             .execute(&mut *tx)
             .await?;
     }
-    announce_ended(tx, UnrecordedEnded { project_id, fired_by, member }).await?;
+    announce_ended(tx, UnrecordedEnded { execution_id, project_id, fired_by, instance }).await?;
     Ok(gone)
 }
 
@@ -447,8 +448,8 @@ mod tests {
                 run_kind: RunKind::Unrecorded,
                 subgraph: None,
                 seed: None,
-                member: None,
-                member_values: Default::default(), picks: Default::default(),
+                instance: None,
+                instance_values: Default::default(), picks: Default::default(),
                 fired_trigger: Some("route".into()),
                 run_class: weft_core::run_class::RunClass::Short,
                 at_unix: 1,

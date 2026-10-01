@@ -10,29 +10,12 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
-use serde::{Deserialize, Serialize};
-use weft_core::install::{Domain, DomainServes};
+use weft_core::install::{DnsRecord, Domain, DomainEntry, DomainServes};
 
 use crate::authenticator::{authorize_project, CallerTenant};
 use crate::state::DispatcherState;
 
 type ApiError = (StatusCode, String);
-
-/// The DNS record that points a domain at the install.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DnsRecord {
-    /// `A` for an IPv4 address, `AAAA` for an IPv6 one.
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub name: String,
-    pub value: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DomainEntry {
-    pub domain: Domain,
-    pub record: DnsRecord,
-}
 
 /// The record pointing `name` at `address`.
 pub fn record_for(name: &str, address: std::net::IpAddr) -> DnsRecord {

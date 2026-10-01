@@ -36,7 +36,7 @@ pub mod roles;
 pub mod runner;
 pub mod unit_agent;
 
-pub use alarm::{Alarm, Wake, WakeCall};
+pub use alarm::{Alarm, Wake, WakeCall, WakeRefusal};
 pub use clock::{Clock, SystemClock};
 pub use config::{InstallConfig, PlatformConfig};
 pub use drain::{drain_until_zero, DrainOutcome, DRAIN_POLL_INTERVAL};
@@ -48,7 +48,7 @@ pub use object_store::{
     S3ObjectStore, SharedObjectStore,
 };
 pub use roles::{CoreRole, Kick, Placement, RoleAddresses, RolePlacement, Vantage};
-pub use runner::{Patience, Runner, WorkerCall, WorkerEndpoint, WorkerOverrides, WorkerSettings, WorkerStarting, WorkerTarget, WORKER_ANSWER_HEADER, WORKER_AUTH_HEADER};
+pub use runner::{Patience, Runner, WorkerCall, WorkerEndpoint, WorkerOverrides, WorkerSettings, WorkerStarting, WorkerTarget, WorkersResponse, WORKER_ANSWER_HEADER, WORKER_AUTH_HEADER};
 #[cfg(any(test, feature = "test-helpers"))]
 pub use alarm::fake::FakeAlarm;
 #[cfg(any(test, feature = "test-helpers"))]

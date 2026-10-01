@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use sqlx::PgPool;
 
 use weft_core::storage::{
-    AdminUploadBeginRequest, ListFilesResponse, ListPrefixRequest, PartDoneRequest,
+    AssetUploadBeginRequest, AssetsHeldRequest, AssetsHeldResponse, ListFilesResponse, PartDoneRequest,
     PresignRequest, PresignResult,
     StoredFileMeta, SweepExecRequest, SweepExecResponse, Tenanted, TenantScopeRequest, TenantUsage,
     UploadAbortRequest, UploadBeginResponse, UploadCompleteRequest, UploadPartsRequest,
@@ -55,6 +55,10 @@ impl std::error::Error for StorageNotFound {}
 #[derive(Debug)]
 pub struct BrokerRejected {
     pub status: reqwest::StatusCode,
+    /// The broker marked the refusal "this upload is being completed right
+    /// now" ([`weft_core::storage::COMPLETING_HEADER`]); passed through so
+    /// the caller can ask again instead of giving up.
+    pub completing: bool,
 }
 
 impl std::fmt::Display for BrokerRejected {
@@ -71,6 +75,7 @@ async fn check(resp: reqwest::Response, what: &str) -> Result<reqwest::Response>
         return Ok(resp);
     }
     let status = resp.status();
+    let completing = resp.headers().contains_key(weft_core::storage::COMPLETING_HEADER);
     let body = resp.text().await.unwrap_or_default();
     if status == StatusCode::NOT_FOUND {
         // Preserve the 404 class through the anyhow chain: the api handler downcasts
@@ -100,7 +105,7 @@ async fn check(resp: reqwest::Response, what: &str) -> Result<reqwest::Response>
     );
     if terminal {
         // A refusal, not a fault: typed so retry loops can stop retrying it.
-        return Err(anyhow::Error::new(BrokerRejected { status })
+        return Err(anyhow::Error::new(BrokerRejected { status, completing })
             .context(format!("broker storage {what} returned {status}: {body}")));
     }
     // Everything else (401 auth-resolution fault, 429, 5xx, unexpected): transient,
@@ -348,54 +353,35 @@ async fn sweep_exec(state: &DispatcherState, tenant: &str, execution_id: &str) -
 // straight to the bucket.
 
 /// Begin an ASSET upload (content-addressed: `content_hash` becomes the key
-/// id); returns the minted key + part size.
+/// id) for `tenant`, the one the api layer resolved (never caller-claimed);
+/// returns the minted key + part size.
 pub async fn upload_begin(
     state: &DispatcherState,
     tenant: &str,
-    project: &str,
-    req: UploadBeginParams,
+    req: AssetUploadBeginRequest,
 ) -> Result<UploadBeginResponse> {
     post_admin(
         state,
         "/v1/storage/admin/upload/begin",
         "upload-begin",
-        &AdminUploadBeginRequest {
-            tenant: tenant.to_string(),
-            project: project.to_string(),
-            mime_type: req.mime_type,
-            filename: req.filename,
-            declared_size: req.declared_size,
-            content_hash: req.content_hash,
-        },
+        &Tenanted { tenant: tenant.to_string(), inner: req },
     )
     .await
 }
 
-/// The begin parameters the sync supplies (tenant/project are resolved by the
-/// api layer, not caller-claimed).
-pub struct UploadBeginParams {
-    pub mime_type: String,
-    pub filename: String,
-    pub declared_size: Option<u64>,
-    pub content_hash: String,
-}
-
-/// The files under one project's asset prefix: the sync's diff input.
-pub async fn asset_list(
+/// Which of the named contents `tenant` already stores: a publish's diff.
+pub async fn assets_held(
     state: &DispatcherState,
     tenant: &str,
-    project: &str,
-) -> Result<Vec<StoredFileMeta>> {
-    let prefix = weft_core::storage::key::ParsedKey::asset_prefix(tenant, project)
-        .map_err(|e| anyhow::anyhow!("asset prefix: {e}"))?;
-    let out: ListFilesResponse = post_admin(
+    req: AssetsHeldRequest,
+) -> Result<AssetsHeldResponse> {
+    post_admin(
         state,
-        "/v1/storage/admin/list-prefix",
-        "list-prefix",
-        &ListPrefixRequest { prefix },
+        "/v1/storage/admin/assets-held",
+        "assets-held",
+        &Tenanted { tenant: tenant.to_string(), inner: req },
     )
-    .await?;
-    Ok(out.files)
+    .await
 }
 
 /// Reserve + presign the next parts (browser-facing URLs).

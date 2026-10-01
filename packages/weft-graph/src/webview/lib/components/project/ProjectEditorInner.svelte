@@ -43,7 +43,7 @@
 	import { provideFieldEditorRegistry } from "./field-editor-registry";
 	import { extractInfraSubgraph } from "../../utils/infra-subgraph";
 	import { extractTriggerSubgraph } from "../../utils/trigger-subgraph";
-	import { canBePerMember, nodeHasDisplay, nodeIsTrigger, nodeRequiresInfra } from "../../utils/node-roles";
+	import { canBePerInstance, nodeHasDisplay, nodeIsTrigger, nodeRequiresInfra } from "../../utils/node-roles";
 	import { toast } from "svelte-sonner";
 
 	let {
@@ -163,7 +163,7 @@
 		onTerminateInfra?: () => void;
 		/// Per-node infra lifecycle. The graph's node context-menu
 		/// emits these when the user right-clicks an infra node, with
-		/// the instance's PLACE (`addressOf(callPath, id)`, so `one.db`
+		/// the node's PLACEMENT (`addressOf(callPath, id)`, so `one.db`
 		/// for the `db` of the call this view walked into). Routed
 		/// through the host's CLI verb path so the action bar's
 		/// `cli_running` overlay covers them.
@@ -181,7 +181,7 @@
 		// instance of the call it walked into. Used by the graph node
 		// decorations (badge under each infra node); independent of the
 		// action bar's infra rollup.
-		infraNodes?: import('../../../../protocol').InfraInstanceStatus[];
+		infraNodes?: import('../../../../protocol').InfraPlacementStatus[];
 		// Source-derived flags from the parsed project: does this
 		// graph DECLARE infra / trigger nodes. Drives bar-section
 		// visibility (don't show Infra section on a project with
@@ -1517,9 +1517,9 @@
 					// predicates read the instance before the catalog, the
 					// way the host does before it starts a poller.
 					requiresInfra: n.requiresInfra,
-					// Whether the node exists once per member (marked in the
+					// Whether the node exists once per instance (marked in the
 					// source, or reached from a marked one): drawn on the node.
-					perMember: n.perMember,
+					perInstance: n.perInstance,
 					// The unconnected-access pin (view state, never config):
 					// ProjectNode draws the body open and disables collapse.
 					pinnedOpen: pinnedIds.has(n.id),
@@ -2120,7 +2120,7 @@
 							fileContents: ctx.fileContents,
 							bodyFeed,
 							infraNodeStatus: backendNode?.status,
-							infraMemberCopies: backendNode?.memberCopies,
+							infraInstanceCopies: backendNode?.instanceCopyCount,
 							infraFailureStage: backendNode?.failureStage,
 							infraFailureMessage: backendNode?.failureMessage,
 						},
@@ -2324,9 +2324,9 @@
 		runTargetFactsLive.infraIds.every((id) => infraStatusOf(id)?.status === 'running'),
 	);
 
-	/// The infra instance behind a node on screen: the one at THIS view's
+	/// The infra placement behind a node on screen: the one at THIS view's
 	/// place (`addressOf(callPath, id)`), never another call's. A view
-	/// that is no place names no instance, whatever the status holds.
+	/// that is no place names no placement, whatever the status holds.
 	function infraStatusOf(nodeId: string) {
 		if (!interactive) return undefined;
 		const place = addressOf(callPath, nodeId);
@@ -3805,9 +3805,9 @@
 	 *  whether to open the menu in simplified view and to render the infra section. */
 	function nodeInfraActions(nodeId: string | null): { stop: boolean; terminate: boolean; has: boolean } {
 		const infra = nodeId ? infraStatusOf(nodeId) : undefined;
-		// A place with no shared copy (never started, or one per member)
+		// A place with no shared copy (never started, or one per instance)
 		// has nothing to stop or terminate here.
-		const hasCopy = !!infra && infra.status !== 'not_started' && infra.status !== 'per_member';
+		const hasCopy = !!infra && infra.status !== 'not_started' && infra.status !== 'per_instance';
 		const stop = hasCopy && (infra.status === 'running' || infra.status === 'flaky');
 		const terminate = hasCopy && infra.status !== 'terminating';
 		return { stop, terminate, has: stop || terminate };
@@ -4456,21 +4456,21 @@
 								<span class="text-muted-foreground text-xs">#</span>
 								<span>Tags…</span>
 							</button>
-							<!-- `@per_member`: only on a node that owns something per
-							     account (an infra container, a connection). A node the
+							<!-- `@per_instance`: only on a node that owns something per
+							     instance (an infra container, a connection). A node the
 							     compiler reached from a marked one follows it and has
 							     nothing of its own to toggle. -->
-							{#if canBePerMember({ nodeType: nodeToEdit.data.nodeType as string, requiresInfra: nodeToEdit.data.requiresInfra as boolean | undefined })}
-								{@const marked = nodeToEdit.data.perMember === 'marked'}
+							{#if canBePerInstance({ nodeType: nodeToEdit.data.nodeType as string, requiresInfra: nodeToEdit.data.requiresInfra as boolean | undefined })}
+								{@const marked = nodeToEdit.data.perInstance === 'marked'}
 								<button
 									class="w-full flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-muted text-sm text-left transition-colors"
 									title={marked
-										? 'Make this node one shared node again: every member uses the same one.'
-										: 'Give every member of the program their own copy of this node (its container, or the connection it uses).'}
-									onclick={() => { const id = contextMenu!.nodeId!; contextMenu = null; recordEdit([{ op: 'setPerMember', node: id, perMember: !marked }]); }}
+										? 'Make this node one shared node again: every instance uses the same one.'
+										: 'Give every instance of the program its own copy of this node (its container, or the connection it uses).'}
+									onclick={() => { const id = contextMenu!.nodeId!; contextMenu = null; recordEdit([{ op: 'setPerInstance', node: id, perInstance: !marked }]); }}
 								>
 									<span class="text-muted-foreground text-xs">@</span>
-									<span>{marked ? 'Share across members' : 'One per member'}</span>
+									<span>{marked ? 'Share across instances' : 'One per instance'}</span>
 								</button>
 							{/if}
 						{/if}

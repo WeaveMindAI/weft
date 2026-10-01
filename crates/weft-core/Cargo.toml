@@ -46,6 +46,8 @@ hmac = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 # OAuth 1.0a request signing (`access::client`): HMAC-SHA1 by spec.
 sha1 = { workspace = true, optional = true }
+# The readable diff a file edit records (`storage::diff`).
+similar = { workspace = true, optional = true }
 # Asymmetric push-verification schemes (`access::verify`): Ed25519
 # (Discord's scheme) and ECDSA P-256 (SendGrid's scheme).
 ed25519-dalek = { workspace = true, optional = true }
@@ -87,6 +89,7 @@ runtime = [
     "dep:hmac",
     "dep:base64",
     "dep:sha1",
+    "dep:similar",
     "dep:ed25519-dalek",
     "dep:p256",
     "dep:reqwest-middleware",

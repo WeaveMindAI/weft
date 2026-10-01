@@ -75,6 +75,9 @@
       "description": "The generated video."
     }
   ],
+  "features": {
+    "catchErrors": true
+  },
   "display": {
     "kind": "media",
     "output": "video"

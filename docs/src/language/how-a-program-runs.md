@@ -97,8 +97,10 @@ is coming", is what runs it.
 route = Route -> (photo: File) { path: "cards", method: "POST" }
 
 # A card sent with no picture: `photo` closes, so this runs.
-default_art = FetchToStorage { url: "https://example.com/blank.png" }
-default_art._should_not_flow = route.photo
+default_art = FetchToStorage {
+  url: "https://example.com/blank.png"
+  _should_not_flow: route.photo
+}
 ```
 
 This is the one port in weft that starts a step on a closure. Reach for it when
@@ -107,16 +109,20 @@ is a **decision your own step made**, have that step say so on a second output
 and gate on that, because the wire then reads forwards.
 
 A failure is not an absence. When the step it watches fails, its ports close
-too, but that closure carries the error and the gate reads it: the step stays
-off, skipped with the reason `the node its _should_not_flow watches did not
-finish (...)`, the error in the brackets, and the run reports the failure. So a
+too, but that closure carries which step broke and its error, and the gate
+reads it: the step stays off, skipped with the reason `what its
+_should_not_flow watches did not finish ('query' failed: the database is
+down)`, and the run reports the failure. So a
 "nothing there" branch never runs over a database that is down. The same holds
 through a group or a loop: a failure inside closes the scope's outputs with the
-failure on them, so a watcher outside reads it as one. And it holds through a
+failure on them, so a watcher outside reads it as one (and a loop whose
+carried value is lost to a failure stops and fails, see
+[loops](loops.md#when-an-iteration-fails)). And it holds through a
 skip: a step that skipped because its input closed on a failure did not decline
-either, so its own ports close with that failure on them (its skip reason ends
-in `: a node before it failed (...)`), and a watcher two steps down still reads
-a failure, not an absence.
+either, so its own ports close with that same failure on them (its skip reason
+ends in `because 'query' failed: ...`), and a watcher two steps down still
+reads a failure, not an absence, and still sees `query` named as the step that
+broke rather than the step that skipped.
 
 A step has one gate. Wiring both spellings is the `two-gates` error.
 
@@ -246,10 +252,10 @@ that work needs upstream, again stopping at other triggers. Only the trigger
 that fired gets the event; any others close. Two triggers can share the steps
 in the middle without becoming one run.
 
-In a program with members, a run is also for one member or for nobody
-(`weft run --member user-42` picks one). For what is checked before such a run
-starts, go and read
-[programs with members](../running/members.md#what-is-checked-before-a-run-starts).
+In a program with instances, a run is also for one instance or for none
+(`weft run --instance user-42` picks one). For what is checked before such a
+run starts, go and read
+[programs with instances](../running/instances.md#what-is-checked-before-a-run-starts).
 
 ## How a run ends
 
@@ -271,11 +277,9 @@ the journal. Those records are what the graph shows you, and they are what a
 replacement worker reads to rebuild a run that was interrupted. A step whose
 completion was safely written down does not run again.
 
-A step whose completion was not written down runs again from the top. `ctx.run`
-gives back a saved result rather than redoing the work, but an external action
-can still happen twice if the worker died before the result was recorded. Go
-and read [surviving a restart](../nodes/durable-execution.md) before you put
-side effects around a wait.
+If the worker goes away in the middle of a step, that step is failed, because
+it may have partly happened. Only a step waiting on an answer is replayed. Before you put side effects around a wait, go and read
+[surviving a restart](../nodes/durable-execution.md).
 
 ## What the build catches
 

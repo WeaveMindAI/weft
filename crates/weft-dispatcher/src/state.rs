@@ -11,10 +11,10 @@ use crate::tenant::TenantRouter;
 /// `axum::extract::State`. All fields are `Arc`-friendly.
 #[derive(Clone)]
 pub struct DispatcherState {
-    /// This process instance's id: the holder of the leases, claims and
-    /// builds it takes. Minted at boot; a sibling (another copy of the
-    /// dispatcher) has its own.
-    pub instance: String,
+    /// This process's replica id: the holder of the leases, claims and
+    /// builds it takes. Minted at boot; a sibling replica (another copy
+    /// of the dispatcher) has its own.
+    pub replica: String,
     pub journal: Arc<dyn Journal>,
     /// Direct Postgres pool handle. Owned here (not threaded through
     /// Journal) so lease management, EventBus pub/sub, and other

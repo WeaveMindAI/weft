@@ -40,5 +40,8 @@
       "type": "Boolean",
       "description": "True once the message is gone."
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

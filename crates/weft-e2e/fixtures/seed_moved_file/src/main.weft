@@ -1,0 +1,9 @@
+# A step that makes a file, and a later step that edits it in place.
+# `start` begins a conversation file; `more` adds a message to that same
+# file, so the file moves on from the version `start` handed out. A
+# seeded run that would reuse `start` is refused: its saved output names
+# the file at a version the file is no longer at.
+
+start = ChatHistoryAppend { role: "user", text: "one" }
+more = ChatHistoryAppend { role: "user", text: "two" }
+more.historyFile = start.historyFile

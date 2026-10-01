@@ -383,12 +383,7 @@ pub fn resolve_runtime_key_refs(
         else {
             continue;
         };
-        let file = weft_core::storage::StoredFile {
-            key: meta.key.clone(),
-            mime_type: meta.mime_type.clone(),
-            size_bytes: meta.size_bytes,
-            filename: meta.filename.clone(),
-        };
+        let file = weft_core::storage::StoredFile::from(meta);
         if let Some(declared) = r.ty.concrete_file_kind() {
             let stored = file.kind();
             if declared != weft_core::weft_type::FileKind::Blob && stored != declared {
@@ -554,10 +549,10 @@ pub(crate) fn resolve_project_file_refs(
         // every one of them resolves. Only a field that is ONE marker is
         // recorded as file-backed: that record drives editing the file
         // through the field, which is a thing you do to one file. A
-        // `@member_filled(@file(...))` fallback is one marker too, so the
+        // `@instance_filled(@file(...))` fallback is one marker too, so the
         // editor can put it back inside the marker.
         let single = value.as_str().is_some()
-            || weft_core::member::as_member_filled(value).and_then(|filled| filled.fallback).is_some_and(|f| f.is_string());
+            || weft_core::instance::as_instance_filled(value).and_then(|filled| filled.fallback).is_some_and(|f| f.is_string());
         each_value_mut(value, &mut |leaf| match resolve_leaf(leaf, root_fs, home.as_deref(), single) {
             Ok(Some(file_ref)) if single => {
                 node.file_refs.insert(key.clone(), file_ref);

@@ -12,9 +12,9 @@ Devin Desktop is what Windsurf became when Cognition renamed it in June 2026,
 which is why the paths are split: rules live under `.devin/`, while skills,
 workflows and hooks are still read from `.windsurf/`.
 
-The persona is split across `.devin/rules/tangle-1.md` through `tangle-4.md`,
+The persona is split across `.devin/rules/tangle-1.md` through `tangle-5.md`,
 each `trigger: always_on`. **That split is not cosmetic:** Devin caps a
-workspace rule file at 12,000 characters, and Tangle is about 30,000, so a
+workspace rule file at 12,000 characters, and Tangle is over 40,000, so a
 single file would be silently truncated. The split falls on section
 boundaries, so each file is whole ideas rather than a cut sentence.
 

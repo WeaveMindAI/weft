@@ -1,28 +1,62 @@
 //! Thin HTTP client against the dispatcher.
 
+use std::sync::{Arc, RwLock};
+
 use anyhow::Context;
+
+/// In an error's chain when the store refused because the upload is being
+/// completed by another caller right now
+/// ([`weft_core::storage::COMPLETING_HEADER`]): the file is about to land.
+#[derive(Debug)]
+pub struct StoreCompleting;
+
+impl std::fmt::Display for StoreCompleting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the upload is being completed by another caller")
+    }
+}
+
+impl std::error::Error for StoreCompleting {}
 
 #[derive(Clone)]
 pub struct DispatcherClient {
     base: String,
     /// The bearer every request carries: the operator key, when this
     /// person holds one for the install (see `crate::credentials`; the
-    /// local install needs none), or a member token (`with_bearer`).
-    operator_key: Option<String>,
+    /// local install needs none), or an instance token (`with_bearer`).
+    /// Shared by every clone, so `replace_bearer` reaches all of them:
+    /// that is how a command outlives one instance token.
+    bearer: Option<Arc<RwLock<String>>>,
     http: reqwest::Client,
 }
 
 impl DispatcherClient {
     pub fn new(base: impl Into<String>, operator_key: Option<String>) -> Self {
-        Self { base: base.into(), operator_key, http: reqwest::Client::new() }
+        Self { base: base.into(), bearer: operator_key.map(|key| Arc::new(RwLock::new(key))), http: reqwest::Client::new() }
     }
 
     /// The same dispatcher, with every request carrying `token` as its
     /// bearer in place of the operator key: how the CLI speaks at a door
-    /// that answers to a token rather than to the operator (the member
-    /// door).
+    /// that answers to a token rather than to the operator (the
+    /// instance door).
     pub fn with_bearer(&self, token: &str) -> Self {
         Self::new(self.base.clone(), Some(token.to_string()))
+    }
+
+    /// Swap the bearer this client and every clone of it carry from the
+    /// next request on (a renewed instance token). A client built with
+    /// no bearer has nothing to swap, which is a caller bug.
+    pub fn replace_bearer(&self, token: &str) -> anyhow::Result<()> {
+        let cell = self.bearer.as_ref().context("this client carries no bearer to replace")?;
+        *cell.write().map_err(|_| anyhow::anyhow!("the bearer lock was poisoned"))? = token.to_string();
+        Ok(())
+    }
+
+    fn current_bearer(&self) -> anyhow::Result<Option<String>> {
+        self.bearer
+            .as_ref()
+            .map(|cell| cell.read().map(|key| key.clone()).map_err(|_| anyhow::anyhow!("the bearer lock was poisoned")))
+            .transpose()
     }
 
     pub fn base(&self) -> &str {
@@ -36,7 +70,7 @@ impl DispatcherClient {
     pub fn event_stream(&self, path: &str) -> anyhow::Result<eventsource_client::ClientBuilder> {
         let url = format!("{}{}", self.base, path);
         let builder = eventsource_client::ClientBuilder::for_url(&url).context("build sse client")?;
-        match &self.operator_key {
+        match self.current_bearer()? {
             Some(key) => builder.header("Authorization", &format!("Bearer {key}")).context("build sse client"),
             None => Ok(builder),
         }
@@ -53,7 +87,7 @@ impl DispatcherClient {
     ) -> anyhow::Result<reqwest::Response> {
         let url = format!("{}{}", self.base, path);
         let mut builder = self.http.request(method.clone(), &url);
-        if let Some(key) = &self.operator_key {
+        if let Some(key) = self.current_bearer()? {
             builder = builder.bearer_auth(key);
         }
         if let Some(body) = body {
@@ -75,13 +109,15 @@ impl DispatcherClient {
         if status.is_success() {
             return Ok(resp);
         }
+        let completing = status == reqwest::StatusCode::CONFLICT
+            && resp.headers().contains_key(weft_core::storage::COMPLETING_HEADER);
         let body = resp.text().await.unwrap_or_default();
         let msg = body.trim();
-        anyhow::bail!(if msg.is_empty() {
-            format!("dispatcher returned {status}")
-        } else {
-            msg.to_string()
-        });
+        let msg = if msg.is_empty() { format!("dispatcher returned {status}") } else { msg.to_string() };
+        if completing {
+            return Err(anyhow::Error::new(StoreCompleting).context(msg));
+        }
+        anyhow::bail!(msg)
     }
 
     pub async fn get_json(&self, path: &str) -> anyhow::Result<serde_json::Value> {

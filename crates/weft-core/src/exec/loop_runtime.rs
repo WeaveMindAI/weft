@@ -8,8 +8,9 @@
 //!   gather output: `LoopWrite::Value(v)` for an iteration that wrote
 //!   the port, `LoopWrite::Closed` for one that closed it; the tagged
 //!   enum keeps "wrote JSON null" apart from "closed the port");
-//! - current carry values (each `LoopOut` firing may update them, or
-//!   keep the previous on closure);
+//! - current carry values (each `LoopOut` firing may update them, keep
+//!   the previous on a plain closure, or fail the loop on a closure
+//!   that carries a failure);
 //! - termination state (which condition fired, when to emit outwardly).
 //!
 //! Every value an instance holds is SHARED with the pulse it came
@@ -49,25 +50,37 @@ use crate::frames::{Frame, LoopFrames};
 use crate::generator::{StreamBuffer, StreamEnd};
 use crate::primitive::{LoopInstanceKey, LoopTerminationReason};
 use crate::project::{EdgeIndex, NodeDefinition, ProjectDefinition};
-use crate::pulse::PulseTable;
+use crate::pulse::{Failure, PulseTable};
 use crate::ExecutionId;
 
 /// One body-side write to a `LoopOut` inward-in port at a single
 /// iteration. The tag distinguishes "wrote a value (which MAY be JSON
-/// null)" from "closed the port". Carry semantics treat `Closed` as
-/// "keep previous"; gather semantics treat `Closed` as "null slot at
-/// index".
+/// null)" from "closed the port". A closure keeps WHY when the node
+/// that should have written the port broke (`failure`, the closure's
+/// own: which node broke and why): a failure is not an absence. Gather semantics treat any
+/// `Closed` as "null slot at index". Carry semantics treat a plain
+/// `Closed` (a branch not taken, a gate) as "keep previous", and a
+/// `Closed` with a failure as the loop's own failure: the next
+/// iteration would start from the same carry and meet the same break.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoopWrite {
     Value(Arc<Value>),
-    Closed,
+    Closed { failure: Option<Failure> },
 }
 
 impl LoopWrite {
     pub fn as_value(&self) -> Option<&Arc<Value>> {
         match self {
             LoopWrite::Value(v) => Some(v),
-            LoopWrite::Closed => None,
+            LoopWrite::Closed { .. } => None,
+        }
+    }
+
+    /// The failure this write's closure carries, if it is one.
+    pub fn failure(&self) -> Option<&Failure> {
+        match self {
+            LoopWrite::Closed { failure } => failure.as_ref(),
+            LoopWrite::Value(_) => None,
         }
     }
 }
@@ -251,11 +264,11 @@ pub struct LoopInstance {
     /// Parallel mode reads the same bag once at launch-all time.
     pub outer_input: HashMap<String, Arc<Value>>,
     /// Outer inputs that arrived as a FAILED closure (the producer
-    /// failed, error text attached), captured with `outer_input`. Each
-    /// iteration closes the same-named inside port WITH the error, so a
+    /// failed, its failure attached), captured with `outer_input`. Each
+    /// iteration closes the same-named inside port WITH the failure, so a
     /// body node watching it with `_should_not_flow` reads a failure as
     /// a failure, exactly as a node outside any loop would.
-    pub outer_closed_with_error: BTreeMap<String, String>,
+    pub outer_closed_failures: BTreeMap<String, Failure>,
     pub terminated: Option<LoopTerminationReason>,
 }
 
@@ -278,7 +291,7 @@ impl LoopInstance {
             gather_lists: HashMap::new(),
             carry_values: HashMap::new(),
             outer_input: HashMap::new(),
-            outer_closed_with_error: BTreeMap::new(),
+            outer_closed_failures: BTreeMap::new(),
             terminated: None,
         }
     }
@@ -426,7 +439,8 @@ impl LoopRuntime {
     /// - `gather_writes`: `Value(v)` for ports the body wrote, `Closed`
     ///   for ports the body closed.
     /// - `carry_writes`: `Value(v)` updates the carry; `Closed` keeps
-    ///   the previous value.
+    ///   the previous value (a failed closure fails the loop, which
+    ///   [`Self::record_loop_out`] decides; the value is kept here).
     pub fn apply_loop_out_writes(
         &mut self,
         key: &LoopInstanceKey,
@@ -470,12 +484,23 @@ impl LoopRuntime {
     /// state. A silent `LoopAdvance::Idle` would mask the bug.
     pub fn record_loop_out(
         &mut self,
+        project: &ProjectDefinition,
         key: &LoopInstanceKey,
         index: u32,
         gather_writes: HashMap<String, LoopWrite>,
         carry_writes: HashMap<String, LoopWrite>,
         done_vote: Option<bool>,
     ) -> Result<LoopAdvance, String> {
+        // A carried value that closed because a node before it broke:
+        // the next iteration would start from the same carry and meet
+        // the same break, every time up to `max_iters`, then hand the
+        // stale value on as if the loop had finished. Read before the
+        // writes are consumed; the smallest port name wins so the
+        // message is the same on every replay.
+        let carry_failure = carry_writes
+            .iter()
+            .filter_map(|(port, write)| write.failure().map(|failure| (port.clone(), failure.clone())))
+            .min_by(|(a, _), (b, _)| a.cmp(b));
         self.apply_loop_out_writes(key, index, gather_writes, carry_writes)?;
         let inst = self.instances.get_mut(key).expect("checked by apply_loop_out_writes");
         // A LoopOut firing arriving after termination (cancellation, a
@@ -485,6 +510,16 @@ impl LoopRuntime {
         // terminated loop, journaling a fresh LoopIterationLaunched.
         if inst.terminated.is_some() {
             return Ok(LoopAdvance::Idle);
+        }
+        // The error goes up as the LoopOut's own failure, which tears
+        // the loop down as `Failed` (the engine's boundary-failure path,
+        // the same one a failed `over` stream takes).
+        if let Some((port, failure)) = carry_failure {
+            return Err(format!(
+                "loop '{}' stopped at iteration {index}: its carried value '{port}' could not be \
+                 updated because {failure}",
+                loop_address(project, key),
+            ));
         }
 
         let done = done_vote.unwrap_or(false);
@@ -652,8 +687,8 @@ impl LoopRuntime {
             return Ok(LoopAdvance::LaunchNext { index: next_index, stream_item: Some(item) });
         }
         // `reinstate`, not `push`: an item CAN legitimately land after
-        // the recorded end here. The drive's at-least-once re-fold
-        // path re-routes buffered items (their pulses refold Pending)
+        // the recorded end here. The drive's re-fold path (a LoopIn
+        // re-fired by the next worker) re-routes buffered items (their pulses refold Pending)
         // into a fresh instance whose durable `stream_end` is already
         // seeded, so "after the end" is re-delivery order, not arrival
         // order. Arrival order is guarded where it exists: a producer
@@ -1127,11 +1162,7 @@ pub fn instantiate(
     if first_instantiation {
         let inst = loop_runtime.get_mut(&key).expect("just ensured");
         inst.outer_input = input.into_iter().collect();
-        inst.outer_closed_with_error = received
-            .closed_with_error
-            .iter()
-            .map(|(port, error)| (port.clone(), error.clone()))
-            .collect();
+        inst.outer_closed_failures = received.closed_failures.clone();
         for (port, v) in seed_carry {
             inst.carry_values.insert(port, v);
         }
@@ -1236,7 +1267,7 @@ pub fn launch_iteration(
     // as a FAILED closure closes inside with its error, first, so the
     // sweep leaves it alone: a failure reaches the body as a failure.
     crate::exec::postprocess::close_failed_then_unmentioned_downstream(
-        &loop_in_id, &inst.outer_closed_with_error, &mentioned, emission_id, key.execution_id,
+        &loop_in_id, &inst.outer_closed_failures, &mentioned, emission_id, key.execution_id,
         &body_frames, project, pulses, edge_idx, &mut emissions,
     )
     .map_err(|e| e.to_string())?;
@@ -1262,13 +1293,13 @@ pub struct LoopOutWrites {
 pub fn classify_loop_out(
     node_def: &NodeDefinition,
     config: &LoopConfig,
-    input: &InputBag,
-    closed_ports: &[String],
+    received: &FiringInput,
 ) -> Result<LoopOutWrites, String> {
+    let input = &received.input;
     let mut gather_writes: HashMap<String, LoopWrite> = HashMap::new();
     let mut carry_writes: HashMap<String, LoopWrite> = HashMap::new();
     let mut done_vote: Option<bool> = None;
-    let closed: std::collections::HashSet<&str> = closed_ports.iter().map(|s| s.as_str()).collect();
+    let closed: std::collections::HashSet<&str> = received.closed_ports.iter().map(|s| s.as_str()).collect();
     for port in &node_def.inputs {
         let name = &port.name;
         if name == "done" {
@@ -1302,15 +1333,15 @@ pub fn classify_loop_out(
             };
             continue;
         }
-        // `LoopWrite::Closed` for closure, `LoopWrite::Value(v)`
-        // for an actual write (including a real JSON null). The
+        // `LoopWrite::Closed` for closure (with the producer's error
+        // when it broke), `LoopWrite::Value(v)` for an actual write (including a real JSON null). The
         // dispatch invariant says every non-closed input port has a
         // pulse in the bag; if it's missing, that's corruption, not
         // "default to null" (which for carry ports would silently
         // overwrite the current value to null instead of keeping the
         // previous).
         let write = if closed.contains(name.as_str()) {
-            LoopWrite::Closed
+            LoopWrite::Closed { failure: received.closed_failures.get(name).cloned() }
         } else {
             let v = input.get(name).cloned().ok_or_else(|| format!(
                 "LoopOut '{}' input port '{}' is neither closed nor present in input bag; \
@@ -1402,7 +1433,7 @@ pub fn close_loop_outward(
         key.execution_id,
         &key.group_id,
         &key.parent_frames,
-        loop_end_failure(reason),
+        loop_end_failure(key, project, reason).as_ref(),
     )
 }
 
@@ -1412,13 +1443,22 @@ pub fn close_loop_outward(
 /// from the termination REASON, which is what the `LoopTerminated`
 /// row carries, so the live engine and the journal fold close the
 /// surface with the same words; the boundary's own `NodeFailed` row
-/// holds the detailed error.
-fn loop_end_failure(reason: LoopTerminationReason) -> Option<&'static str> {
-    match reason {
-        LoopTerminationReason::Failed => Some("the loop failed"),
-        LoopTerminationReason::Cancelled => Some("the loop was cancelled"),
-        _ => None,
-    }
+/// holds the detailed error. The node named is the loop itself.
+fn loop_end_failure(key: &LoopInstanceKey, project: &ProjectDefinition, reason: LoopTerminationReason) -> Option<Failure> {
+    let error = match reason {
+        LoopTerminationReason::Failed => "it stopped on an error inside",
+        LoopTerminationReason::Cancelled => "it was cancelled",
+        _ => return None,
+    };
+    Some(Failure { node: loop_address(project, key), error: error.into() })
+}
+
+/// The loop as the source reads it, spelled through the call sites
+/// its instance runs under (the way [`Failure::at`] spells a node).
+fn loop_address(project: &ProjectDefinition, key: &LoopInstanceKey) -> String {
+    let call_path: Vec<String> =
+        crate::frames::call_path(&key.parent_frames).into_iter().map(str::to_string).collect();
+    crate::project::group_address(project, &key.group_id, &call_path)
 }
 
 
@@ -1446,7 +1486,10 @@ mod tests {
     }
 
     fn val(v: serde_json::Value) -> LoopWrite { LoopWrite::Value(Arc::new(v)) }
-    fn closed() -> LoopWrite { LoopWrite::Closed }
+    fn closed() -> LoopWrite { LoopWrite::Closed { failure: None } }
+    fn failed(error: &str) -> LoopWrite {
+        LoopWrite::Closed { failure: Some(Failure { node: "ask".into(), error: error.to_string() }) }
+    }
 
     #[test]
     fn sequential_over_exhausted() {
@@ -1458,7 +1501,7 @@ mod tests {
             rt.record_launched(&k, i);
             let mut g = HashMap::new();
             g.insert("result".to_string(), val(serde_json::json!(i)));
-            let advance = rt.record_loop_out(&k, i, g, HashMap::new(), Some(false)).unwrap();
+            let advance = rt.record_loop_out(&loop_project(), &k, i, g, HashMap::new(), Some(false)).unwrap();
             match (i, &advance) {
                 (0 | 1, LoopAdvance::LaunchNext { index, stream_item: None }) => {
                     assert_eq!(*index, i + 1)
@@ -1481,9 +1524,9 @@ mod tests {
             rt.record_launched(&k, i);
         }
         // Fire LoopOut for each in random order.
-        let _ = rt.record_loop_out(&k, 2, HashMap::new(), HashMap::new(), None).unwrap();
-        let _ = rt.record_loop_out(&k, 0, HashMap::new(), HashMap::new(), None).unwrap();
-        let advance = rt.record_loop_out(&k, 1, HashMap::new(), HashMap::new(), None).unwrap();
+        let _ = rt.record_loop_out(&loop_project(), &k, 2, HashMap::new(), HashMap::new(), None).unwrap();
+        let _ = rt.record_loop_out(&loop_project(), &k, 0, HashMap::new(), HashMap::new(), None).unwrap();
+        let advance = rt.record_loop_out(&loop_project(), &k, 1, HashMap::new(), HashMap::new(), None).unwrap();
         match advance {
             LoopAdvance::EmitOutward { reason, .. } => {
                 assert_eq!(reason, LoopTerminationReason::OverExhausted);
@@ -1498,7 +1541,7 @@ mod tests {
         let k = key();
         rt.ensure(k.clone(), cfg(false, &[], &["acc"], Some(100)), LoopItemSource::DoneDriven, Some(100),vec![]);
         rt.record_launched(&k, 0);
-        let advance = rt.record_loop_out(&k, 0, HashMap::new(), HashMap::new(), Some(true)).unwrap();
+        let advance = rt.record_loop_out(&loop_project(), &k, 0, HashMap::new(), HashMap::new(), Some(true)).unwrap();
         match advance {
             LoopAdvance::EmitOutward { reason, .. } => {
                 assert_eq!(reason, LoopTerminationReason::DoneVoted);
@@ -1515,14 +1558,68 @@ mod tests {
         let mut carry = HashMap::new();
         carry.insert("acc".to_string(), val(serde_json::json!("first")));
         rt.record_launched(&k, 0);
-        let _ = rt.record_loop_out(&k, 0, HashMap::new(), carry, Some(false)).unwrap();
+        let _ = rt.record_loop_out(&loop_project(), &k, 0, HashMap::new(), carry, Some(false)).unwrap();
         // Second iteration: carry write is Closed.
         let mut carry = HashMap::new();
         carry.insert("acc".to_string(), closed());
         rt.record_launched(&k, 1);
-        let _ = rt.record_loop_out(&k, 1, HashMap::new(), carry, Some(false)).unwrap();
+        let _ = rt.record_loop_out(&loop_project(), &k, 1, HashMap::new(), carry, Some(false)).unwrap();
         let inst = rt.get(&k).expect("instance");
         assert_eq!(*inst.carry_values["acc"], serde_json::json!("first"));
+    }
+
+    /// A carried value that closed because a node inside the loop
+    /// broke stops the loop with an error naming the iteration, the
+    /// port and the failure, instead of re-running the same iteration
+    /// from the same carry up to `max_iters`. The firing's writes still
+    /// land (the fold applies the same row) and the carry keeps its
+    /// last good value.
+    #[test]
+    fn carry_closed_by_failure_fails_the_loop() {
+        let mut rt = LoopRuntime::new();
+        let k = key();
+        rt.ensure(k.clone(), cfg(false, &[], &["history"], Some(30)), LoopItemSource::DoneDriven, Some(30), vec![]);
+        rt.record_launched(&k, 0);
+        let mut carry = HashMap::new();
+        carry.insert("history".to_string(), val(serde_json::json!(["hi"])));
+        let _ = rt.record_loop_out(&loop_project(), &k, 0, HashMap::new(), carry, Some(false)).unwrap();
+        rt.record_launched(&k, 1);
+        let mut carry = HashMap::new();
+        carry.insert("history".to_string(), failed("the model answered 500"));
+        let err = rt.record_loop_out(&loop_project(), &k, 1, HashMap::new(), carry.clone(), Some(false)).unwrap_err();
+        assert!(err.contains("iteration 1"), "{err}");
+        assert!(err.contains("'history'"), "{err}");
+        assert!(err.contains("because 'ask' failed: the model answered 500"), "names the node that broke: {err}");
+        let inst = rt.get(&k).expect("instance");
+        assert_eq!(inst.out_fired, vec![0, 1], "the firing is recorded");
+        assert_eq!(inst.launched, vec![0, 1], "no next iteration launched");
+        assert_eq!(*inst.carry_values["history"], serde_json::json!(["hi"]));
+        // A crash-resume replay of the same firing decides the same way.
+        assert!(rt.record_loop_out(&loop_project(), &k, 1, HashMap::new(), carry, Some(false)).is_err());
+    }
+
+    /// Over a list, an iteration whose gathered output closed because a
+    /// node failed leaves a null slot and the loop carries on.
+    #[test]
+    fn gather_closed_by_failure_is_a_null_slot() {
+        let mut rt = LoopRuntime::new();
+        let k = key();
+        rt.ensure(k.clone(), cfg(false, &["items"], &[], None), LoopItemSource::Lists, Some(2), vec!["result".into()]);
+        rt.record_launched(&k, 0);
+        let mut g = HashMap::new();
+        g.insert("result".to_string(), failed("row 0 broke"));
+        let advance = rt.record_loop_out(&loop_project(), &k, 0, g, HashMap::new(), None).unwrap();
+        assert!(matches!(advance, LoopAdvance::LaunchNext { index: 1, .. }), "{advance:?}");
+        rt.record_launched(&k, 1);
+        let mut g = HashMap::new();
+        g.insert("result".to_string(), val(serde_json::json!("ok")));
+        match rt.record_loop_out(&loop_project(), &k, 1, g, HashMap::new(), None).unwrap() {
+            LoopAdvance::EmitOutward { reason, gather, .. } => {
+                assert_eq!(reason, LoopTerminationReason::OverExhausted);
+                assert_eq!(gather["result"], vec![None, Some(Arc::new(serde_json::json!("ok")))]);
+            }
+            other => panic!("expected emit, got {other:?}"),
+        }
     }
 
     /// A body that legitimately writes JSON null on a carry port must
@@ -1537,12 +1634,12 @@ mod tests {
         let mut carry = HashMap::new();
         carry.insert("acc".to_string(), val(serde_json::json!("first")));
         rt.record_launched(&k, 0);
-        let _ = rt.record_loop_out(&k, 0, HashMap::new(), carry, Some(false)).unwrap();
+        let _ = rt.record_loop_out(&loop_project(), &k, 0, HashMap::new(), carry, Some(false)).unwrap();
         // Second iteration: body wrote a real null.
         let mut carry = HashMap::new();
         carry.insert("acc".to_string(), val(serde_json::Value::Null));
         rt.record_launched(&k, 1);
-        let _ = rt.record_loop_out(&k, 1, HashMap::new(), carry, Some(false)).unwrap();
+        let _ = rt.record_loop_out(&loop_project(), &k, 1, HashMap::new(), carry, Some(false)).unwrap();
         let inst = rt.get(&k).expect("instance");
         assert_eq!(*inst.carry_values["acc"], serde_json::Value::Null);
     }
@@ -1568,7 +1665,7 @@ mod tests {
             // Only write to `result`, never to `errors`.
             let mut g = HashMap::new();
             g.insert("result".to_string(), val(serde_json::json!(i)));
-            last = Some(rt.record_loop_out(&k, i, g, HashMap::new(), Some(false)).unwrap());
+            last = Some(rt.record_loop_out(&loop_project(), &k, i, g, HashMap::new(), Some(false)).unwrap());
         }
         let LoopAdvance::EmitOutward { gather, .. } = last.expect("three firings") else {
             panic!("the third firing ends the loop")
@@ -1581,7 +1678,7 @@ mod tests {
             gather["result"].iter().map(|v| (**v.as_ref().unwrap()).clone()).collect();
         assert_eq!(result, vec![serde_json::json!(0), serde_json::json!(1), serde_json::json!(2)]);
         // A replayed firing after termination is idle.
-        let again = rt.record_loop_out(&k, 2, HashMap::new(), HashMap::new(), Some(true));
+        let again = rt.record_loop_out(&loop_project(), &k, 2, HashMap::new(), HashMap::new(), Some(true));
         assert!(matches!(again.unwrap(), LoopAdvance::Idle));
     }
 
@@ -1711,7 +1808,7 @@ mod tests {
         let b = rt.stream_push(&k, item(11)).unwrap();
         assert!(matches!(b, LoopAdvance::Idle), "{b:?}");
         // Iteration 0's LoopOut pops the buffered item as iteration 1.
-        let c = rt.record_loop_out(&k, 0, HashMap::new(), HashMap::new(), Some(false)).unwrap();
+        let c = rt.record_loop_out(&loop_project(), &k, 0, HashMap::new(), HashMap::new(), Some(false)).unwrap();
         match c {
             LoopAdvance::LaunchNext { index: 1, stream_item: Some(it) } => {
                 assert_eq!(*it.value, serde_json::json!(11));
@@ -1731,7 +1828,7 @@ mod tests {
         let a = rt.stream_close(&k, StreamEnd::Finished).unwrap();
         assert!(matches!(a, LoopAdvance::Idle), "{a:?}");
         // The last LoopOut sees the end and emits outward.
-        let b = rt.record_loop_out(&k, 0, HashMap::new(), HashMap::new(), Some(false)).unwrap();
+        let b = rt.record_loop_out(&loop_project(), &k, 0, HashMap::new(), HashMap::new(), Some(false)).unwrap();
         assert!(
             matches!(b, LoopAdvance::EmitOutward { reason: LoopTerminationReason::OverExhausted, .. }),
             "{b:?}"
@@ -1768,7 +1865,7 @@ mod tests {
             vec!["result".into()],
         );
         rt.record_launched(&k, 0);
-        let advance = rt.record_loop_out(&k, 0, HashMap::new(), HashMap::new(), Some(false)).unwrap();
+        let advance = rt.record_loop_out(&loop_project(), &k, 0, HashMap::new(), HashMap::new(), Some(false)).unwrap();
         assert!(
             matches!(advance, LoopAdvance::EmitOutward { reason: LoopTerminationReason::OverExhausted, .. }),
             "the seeded end terminates the resumed loop, got {advance:?}"
@@ -1795,7 +1892,7 @@ mod tests {
         // item re-routes now.
         let a = rt.stream_push(&k, item(11)).unwrap();
         assert!(matches!(a, LoopAdvance::Idle), "{a:?}");
-        let b = rt.record_loop_out(&k, 0, HashMap::new(), HashMap::new(), Some(false)).unwrap();
+        let b = rt.record_loop_out(&loop_project(), &k, 0, HashMap::new(), HashMap::new(), Some(false)).unwrap();
         match b {
             LoopAdvance::LaunchNext { index: 1, stream_item: Some(it) } => {
                 assert_eq!(*it.value, serde_json::json!(11), "the reinstated item launches");
@@ -1819,7 +1916,7 @@ mod tests {
         let mut rt = LoopRuntime::new();
         let k = key();
         let err = rt
-            .record_loop_out(&k, 0, HashMap::new(), HashMap::new(), Some(false))
+            .record_loop_out(&loop_project(), &k, 0, HashMap::new(), HashMap::new(), Some(false))
             .unwrap_err();
         assert!(
             err.contains("no LoopInstance exists"),
@@ -1845,7 +1942,7 @@ mod tests {
         rt.record_launched(&k, 0);
         for i in 0..2 {
             let advance = rt
-                .record_loop_out(&k, i, HashMap::new(), HashMap::new(), Some(false))
+                .record_loop_out(&loop_project(), &k, i, HashMap::new(), HashMap::new(), Some(false))
                 .unwrap();
             match advance {
                 LoopAdvance::LaunchNext { index, stream_item: None } => rt.record_launched(&k, index),
@@ -1853,7 +1950,7 @@ mod tests {
             }
         }
         let advance = rt
-            .record_loop_out(&k, 2, HashMap::new(), HashMap::new(), Some(false))
+            .record_loop_out(&loop_project(), &k, 2, HashMap::new(), HashMap::new(), Some(false))
             .unwrap();
         match advance {
             LoopAdvance::EmitOutward { reason, .. } => {
@@ -1876,7 +1973,7 @@ mod tests {
         rt.record_launched(&k, 0);
         // Live firing: LoopOut@0 dispatches LaunchNext(1).
         let advance = rt
-            .record_loop_out(&k, 0, HashMap::new(), HashMap::new(), Some(false))
+            .record_loop_out(&loop_project(), &k, 0, HashMap::new(), HashMap::new(), Some(false))
             .unwrap();
         match advance {
             LoopAdvance::LaunchNext { index, stream_item: None } => rt.record_launched(&k, index),
@@ -1885,7 +1982,7 @@ mod tests {
         // Crash-resume replay of the SAME LoopOut@0 firing: iteration
         // 1 is already launched, so the replay must be inert.
         let replay = rt
-            .record_loop_out(&k, 0, HashMap::new(), HashMap::new(), Some(false))
+            .record_loop_out(&loop_project(), &k, 0, HashMap::new(), HashMap::new(), Some(false))
             .unwrap();
         assert!(
             matches!(replay, LoopAdvance::Idle),
@@ -1912,10 +2009,10 @@ mod tests {
         }
         // Fire in deliberately-non-monotone order: 2 first, then 1,
         // then 0 (the completing firing has the LOWEST index).
-        let _ = rt.record_loop_out(&k, 2, HashMap::new(), HashMap::new(), None).unwrap();
-        let _ = rt.record_loop_out(&k, 1, HashMap::new(), HashMap::new(), None).unwrap();
+        let _ = rt.record_loop_out(&loop_project(), &k, 2, HashMap::new(), HashMap::new(), None).unwrap();
+        let _ = rt.record_loop_out(&loop_project(), &k, 1, HashMap::new(), HashMap::new(), None).unwrap();
         let advance = rt
-            .record_loop_out(&k, 0, HashMap::new(), HashMap::new(), None)
+            .record_loop_out(&loop_project(), &k, 0, HashMap::new(), HashMap::new(), None)
             .unwrap();
         match advance {
             LoopAdvance::EmitOutward { reason, .. } => {
@@ -1944,7 +2041,7 @@ mod tests {
         rt.cancel_inside(&Vec::new(), Uuid::nil());
         // A delayed LoopOut firing should NOT relaunch.
         let advance = rt
-            .record_loop_out(&k, 0, HashMap::new(), HashMap::new(), Some(false))
+            .record_loop_out(&loop_project(), &k, 0, HashMap::new(), HashMap::new(), Some(false))
             .unwrap();
         assert!(matches!(advance, LoopAdvance::Idle));
         let inst = rt.get(&k).expect("instance");
@@ -2069,17 +2166,26 @@ mod tests {
     fn classify_loop_out_splits_gather_from_carry_and_reads_the_vote() {
         let project = loop_project();
         let config = cfg(false, &["items"], &["acc"], None);
+        let received = |input: InputBag, closed: &[&str]| FiringInput {
+            input,
+            closed_ports: closed.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
         let input = bag(&[("acc", serde_json::json!(6)), ("res", serde_json::Value::Null), ("done", serde_json::json!(true))]);
-        let writes = classify_loop_out(def(&project, "lp__out"), &config, &input, &["res".to_string()]).unwrap();
+        let writes = classify_loop_out(def(&project, "lp__out"), &config, &received(input.clone(), &["res"])).unwrap();
         assert_eq!(writes.carry_writes["acc"], val(serde_json::json!(6)));
         assert_eq!(writes.gather_writes["res"], closed(), "a closed port is a closure, whatever the bag says");
         assert_eq!(writes.done_vote, Some(true));
-        let no_vote = classify_loop_out(def(&project, "lp__out"), &config, &bag(&[("acc", serde_json::json!(1)), ("res", serde_json::json!(2))]), &[]).unwrap();
+        let mut broke = received(bag(&[("res", serde_json::json!(2))]), &["acc"]);
+        broke.closed_failures.insert("acc".into(), Failure { node: "ask".into(), error: "the model answered 500".into() });
+        let writes = classify_loop_out(def(&project, "lp__out"), &config, &broke).unwrap();
+        assert_eq!(writes.carry_writes["acc"], failed("the model answered 500"), "the closure keeps why");
+        let no_vote = classify_loop_out(def(&project, "lp__out"), &config, &received(bag(&[("acc", serde_json::json!(1)), ("res", serde_json::json!(2))]), &[])).unwrap();
         assert_eq!(no_vote.done_vote, None);
         assert_eq!(no_vote.gather_writes["res"], val(serde_json::json!(2)));
         let parallel = cfg(true, &["items"], &["acc"], None);
-        assert!(classify_loop_out(def(&project, "lp__out"), &parallel, &input, &[]).is_err(), "a vote on a parallel loop is drift");
-        assert!(classify_loop_out(def(&project, "lp__out"), &config, &bag(&[("res", serde_json::json!(2))]), &[]).is_err(), "a port neither closed nor present is corruption");
+        assert!(classify_loop_out(def(&project, "lp__out"), &parallel, &received(input, &[])).is_err(), "a vote on a parallel loop is drift");
+        assert!(classify_loop_out(def(&project, "lp__out"), &config, &received(bag(&[("res", serde_json::json!(2))]), &[])).is_err(), "a port neither closed nor present is corruption");
     }
 
     #[test]
@@ -2102,11 +2208,11 @@ mod tests {
         close_loop_outward(&k, &project, &edge_idx, &mut closed_pulses, LoopTerminationReason::OverExhausted);
         let sink = pending_at(&closed_pulses, "sink");
         assert_eq!(sink.len(), 2);
-        assert!(sink.iter().all(|p| p.closed && p.close_error.is_none()), "a loop that ran out closes plainly");
+        assert!(sink.iter().all(|p| p.closed && p.failure.is_none()), "a loop that ran out closes plainly");
         let mut failed_pulses = PulseTable::default();
         close_loop_outward(&k, &project, &edge_idx, &mut failed_pulses, LoopTerminationReason::Failed);
         assert!(
-            pending_at(&failed_pulses, "sink").iter().all(|p| p.close_error.is_some()),
+            pending_at(&failed_pulses, "sink").iter().all(|p| p.failure.as_ref().is_some_and(|f| f.node == "lp")),
             "a loop that failed says so on every outward closure"
         );
         let mut twice = PulseTable::default();

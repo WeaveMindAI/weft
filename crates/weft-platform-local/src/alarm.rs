@@ -4,15 +4,19 @@
 //! The loop sleeps until the next wake is due (or until a new one is set),
 //! claims what is due, and posts each to its role the way a cloud's queue
 //! would: `WakeCall` as the body, the install's own identity as the
-//! bearer. A receiver that answers with an error gets the wake again
-//! later, backing off; a wake is never dropped for failing.
+//! bearer. A receiver that fails for now (a 5xx, 408, 429, an auth or
+//! routing 4xx such as 401, 403 or 404, or no answer) gets the wake again
+//! later, backing off. A receiver that rejects the request body (400, 413,
+//! 415, 422) would reject it forever, so that wake
+//! is dropped with one error naming its key, the status and the answer's
+//! body ([`WakeRefusal::of_status`]). Every failure logs the answer's body.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use sqlx::PgPool;
-use weft_platform_traits::{Alarm, CoreRole, IdentityTokens, RoleAddresses, Wake, WakeCall};
+use weft_platform_traits::{Alarm, CoreRole, IdentityTokens, RoleAddresses, Wake, WakeCall, WakeRefusal};
 
 /// How long a claimed wake is this loop's before it comes due again (a
 /// delivery that never finished, the process gone mid-call).
@@ -78,11 +82,19 @@ impl LocalAlarm {
                 let call = WakeCall { at_unix_ms: row.set_for_unix_ms, body: row.body.clone() };
                 match deliver.deliver(role, &row.path, call).await {
                     Ok(()) => weft_task_store::alarm::delete(&pool, &row.name).await,
-                    Err(e) => {
+                    Err(NotTaken { refusal: WakeRefusal::Permanent, detail }) => {
+                        tracing::error!(
+                            target: "weft_platform_local::alarm",
+                            wake = %row.name, key = %row.key, attempt = row.attempts, body = %row.body, error = %detail,
+                            "dropping a wake its receiver refused as malformed; the same call can never be taken"
+                        );
+                        weft_task_store::alarm::delete(&pool, &row.name).await
+                    }
+                    Err(NotTaken { refusal: WakeRefusal::Temporary, detail }) => {
                         let next = now_ms() + backoff_ms(row.attempts);
                         tracing::warn!(
                             target: "weft_platform_local::alarm",
-                            wake = %row.name, key = %row.key, attempt = row.attempts, error = %format!("{e:#}"),
+                            wake = %row.name, key = %row.key, attempt = row.attempts, error = %detail,
                             "a wake was not taken; trying again later"
                         );
                         weft_task_store::alarm::retry_at(&pool, &row.name, next).await
@@ -115,10 +127,26 @@ impl Alarm for LocalAlarm {
     }
 }
 
+/// Why a due wake was not taken, and whether it ever can be.
+#[derive(Debug)]
+pub struct NotTaken {
+    pub refusal: WakeRefusal,
+    /// What went wrong, with the receiver's answer body when it gave one.
+    pub detail: String,
+}
+
+impl NotTaken {
+    /// A failure with no answer to read (unreachable, no token, the
+    /// connection cut): always worth another try.
+    pub fn temporary(e: impl std::fmt::Display) -> Self {
+        Self { refusal: WakeRefusal::Temporary, detail: e.to_string() }
+    }
+}
+
 /// Hands a due wake to its role.
 #[async_trait]
 pub trait Deliver: Send + Sync {
-    async fn deliver(&self, role: CoreRole, path: &str, call: WakeCall<serde_json::Value>) -> anyhow::Result<()>;
+    async fn deliver(&self, role: CoreRole, path: &str, call: WakeCall<serde_json::Value>) -> Result<(), NotTaken>;
 }
 
 /// Posts the wake to the role's internal address with the install's own
@@ -137,17 +165,17 @@ impl HttpDeliver {
 
 #[async_trait]
 impl Deliver for HttpDeliver {
-    async fn deliver(&self, role: CoreRole, path: &str, call: WakeCall<serde_json::Value>) -> anyhow::Result<()> {
-        let base = self.roles.of(role)?;
-        let token = self.tokens.token_for(base).await?;
-        self.http
-            .post(format!("{base}{path}"))
-            .bearer_auth(token)
-            .json(&call)
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(())
+    async fn deliver(&self, role: CoreRole, path: &str, call: WakeCall<serde_json::Value>) -> Result<(), NotTaken> {
+        let base = self.roles.of(role).map_err(|e| NotTaken::temporary(format!("{e:#}")))?;
+        let token = self.tokens.token_for(base).await.map_err(|e| NotTaken::temporary(format!("{e:#}")))?;
+        let url = format!("{base}{path}");
+        let answer = self.http.post(&url).bearer_auth(token).json(&call).send().await.map_err(NotTaken::temporary)?;
+        let status = answer.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let body = answer.text().await.unwrap_or_else(|e| format!("<the answer's body could not be read: {e}>"));
+        Err(NotTaken { refusal: WakeRefusal::of_status(status.as_u16()), detail: format!("{url} answered {status}: {body}") })
     }
 }
 

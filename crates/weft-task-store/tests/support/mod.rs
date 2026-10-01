@@ -25,7 +25,7 @@ pub async fn setup(pool: &PgPool) {
         .await
         .expect("tasks schema");
     // `tasks::GROUP` creates a trigger ON `task` that stamps
-    // `execution.owner_instance` on claim (ownership-follows-claim).
+    // `execution.owner_replica` on claim (ownership-follows-claim).
     // Same situation as exec_event: the table is the dispatcher journal's,
     // created before task-store migrate in production. Stand up a minimal
     // `execution` so the trigger has a row to update; seed a row per
@@ -39,7 +39,7 @@ pub async fn setup(pool: &PgPool) {
             tenant_id TEXT NOT NULL,
             started_at_unix BIGINT NOT NULL,
             phase TEXT NOT NULL,
-            owner_instance TEXT
+            owner_replica TEXT
         )"#,
     )
     .execute(pool)

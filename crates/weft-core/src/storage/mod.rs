@@ -24,6 +24,8 @@ use crate::error::{WeftError, WeftResult};
 /// `StorageScope`/`StoredFile` contract it guards, in one dependency-free place.
 pub mod key;
 #[cfg(feature = "runtime")]
+pub mod diff;
+#[cfg(feature = "runtime")]
 pub mod media;
 
 /// The most one port value may weigh on a wire, as JSON. Bytes belong
@@ -32,6 +34,13 @@ pub mod media;
 /// broker's journal write bounds one recorded event with headroom over
 /// this, so the node's refusal is the one a user ever sees.
 pub const MAX_WIRE_VALUE_BYTES: usize = 100 * 1024;
+
+/// The response header marking a 409 that means "this upload is being
+/// completed by someone right now": any change to it is refused, and the
+/// file is about to land. The broker sets it on every such refusal and the
+/// dispatcher passes it through, so a client tells "ask again shortly"
+/// apart from a conflict that will not resolve on its own.
+pub const COMPLETING_HEADER: &str = "x-weft-completing";
 
 /// Whether `value` may travel a wire from port `port` of node `node`:
 /// the refusal names the port, the weight and where bytes belong.
@@ -259,44 +268,60 @@ pub enum StorageScope {
     /// default access-renewed TTL (content-hash ids). Workers READ this
     /// scope like project scope; the worker data path refuses writes to it.
     Asset,
-    /// `member/<project_id>/<member>/`: one member's files in this
-    /// project, living until deleted. `of` names the member; absent, the
-    /// run's own member (an error in a run for nobody). Any run of the
-    /// project may name any member (the program is the author's code);
-    /// another project never reaches them, even for the same member id.
-    Member {
+    /// `instance/<project_id>/<instance>/`: one instance's files in this
+    /// project, living until deleted. `of` names the instance; absent, the
+    /// run's own instance (an error in a run for no instance). Any run of
+    /// the project may name any instance (the program is the author's
+    /// code); another project never reaches them, even for the same
+    /// instance id.
+    Instance {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        of: Option<crate::member::MemberId>,
+        of: Option<crate::instance::InstanceId>,
     },
 }
 
 
 impl StorageScope {
-    /// The run's own member's files (`StorageScope::Member { of: None }`).
-    pub fn member() -> Self {
-        StorageScope::Member { of: None }
+    /// The run's own instance's files (`StorageScope::Instance { of: None }`).
+    pub fn instance() -> Self {
+        StorageScope::Instance { of: None }
     }
 
-    /// One member's files in this project, named by id.
-    pub fn member_of(member: crate::member::MemberId) -> Self {
-        StorageScope::Member { of: Some(member) }
+    /// One instance's files in this project, named by id.
+    pub fn instance_of(instance: crate::instance::InstanceId) -> Self {
+        StorageScope::Instance { of: Some(instance) }
     }
 }
 
-/// Lifetime of a KEPT execution-scoped file. Every access bumps the
-/// expiry back to now + TTL, so actively-used survivors never
-/// expire. `Default` resolves to the storage service's configured
-/// default (30 days); the number deliberately lives in one place
-/// (the service's config module), not here.
+/// How long a stored file lives, in any scope but the asset one. Every
+/// access bumps the expiry back to now + TTL, so actively-used files
+/// never expire. On an execution file, keeping it at all is also what
+/// makes it survive the end of its run. `Default` resolves to
+/// [`DEFAULT_KEEP_TTL_SECS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum KeepTtl {
-    /// Service default (30 days, access-bumped).
+    /// [`DEFAULT_KEEP_TTL_SECS`] (30 days), access-bumped.
     Default,
     /// now + this many seconds, access-bumped.
     Secs { secs: u64 },
     /// Never expires; explicit `weft files rm` / `weft clean` only.
     Never,
+}
+
+/// What [`KeepTtl::Default`] resolves to: 30 days, renewed by every
+/// access. Also the countdown a retired asset starts on.
+pub const DEFAULT_KEEP_TTL_SECS: u64 = 30 * 24 * 3600;
+
+impl KeepTtl {
+    /// The lifetime in seconds, `None` for [`KeepTtl::Never`].
+    pub fn secs(self) -> Option<u64> {
+        match self {
+            KeepTtl::Never => None,
+            KeepTtl::Default => Some(DEFAULT_KEEP_TTL_SECS),
+            KeepTtl::Secs { secs } => Some(secs),
+        }
+    }
 }
 
 /// Byte range for a partial `get`. `start` inclusive, `end`
@@ -320,12 +345,12 @@ pub struct StoredFileMeta {
     pub size_bytes: u64,
     pub filename: String,
     /// True iff this exec-scoped file is flagged to survive the
-    /// terminate sweep. Always false for project/shared files (they
-    /// are persistent without a flag).
+    /// terminate sweep. Always false in the other scopes, which outlive
+    /// runs without a flag (their lifetime is `keep_ttl_secs`).
     pub keep: bool,
-    /// Unix seconds at which this file expires. Kept execution files and
-    /// retired assets renew on access. `None` = no expiry (project/shared
-    /// files, current source assets, `KeepTtl::Never`).
+    /// Unix seconds at which this file expires, renewed on access. `None`
+    /// = no expiry (a file stored with no lifetime outside the execution
+    /// scope, a current source asset, `KeepTtl::Never`).
     #[serde(rename = "expiresAtUnix")]
     pub expires_at_unix: Option<i64>,
     /// The file's TTL in seconds, so an access can recompute
@@ -334,6 +359,18 @@ pub struct StoredFileMeta {
     pub keep_ttl_secs: Option<u64>,
     #[serde(rename = "createdAtUnix")]
     pub created_at_unix: i64,
+    /// Which write of the file's content this is: 1 when made, one more
+    /// after every replacement (see [`StoredFile::version`]).
+    pub version: u64,
+}
+
+/// The version a file starts at, and the one a stored-file value written
+/// before files carried versions stands for: every file stored then was
+/// given version 1 when the version column arrived.
+pub const FIRST_FILE_VERSION: u64 = 1;
+
+fn first_file_version() -> u64 {
+    FIRST_FILE_VERSION
 }
 
 /// The self-describing stored-file reference: the payload INSIDE a
@@ -352,6 +389,25 @@ pub struct StoredFile {
     #[serde(rename = "sizeBytes")]
     pub size_bytes: u64,
     pub filename: String,
+    /// Which write of the file's content this value names. A key is
+    /// never reused and every change of the bytes bumps the version, so
+    /// (key, version) is one exact content: what an edit compares
+    /// before it writes, and what a re-run that reuses a step's output
+    /// checks the file still holds.
+    #[serde(default = "first_file_version")]
+    pub version: u64,
+}
+
+impl From<&StoredFileMeta> for StoredFile {
+    fn from(meta: &StoredFileMeta) -> Self {
+        Self {
+            key: meta.key.clone(),
+            mime_type: meta.mime_type.clone(),
+            size_bytes: meta.size_bytes,
+            filename: meta.filename.clone(),
+            version: meta.version,
+        }
+    }
 }
 
 impl StoredFile {
@@ -399,6 +455,30 @@ impl StoredFile {
         })
     }
 
+}
+
+/// Every stored file a value names, however deep: a file value on its
+/// own, inside a list, or a field of a record. A url-backed file is not
+/// in storage and is left out.
+pub fn stored_files_within(value: &Value) -> Vec<StoredFile> {
+    let mut found = Vec::new();
+    let mut stack = vec![value];
+    while let Some(value) = stack.pop() {
+        match value {
+            Value::Array(items) => stack.extend(items.iter().rev()),
+            Value::Object(fields) => {
+                if crate::weft_type::FileKind::from_marker_obj(fields).is_some() {
+                    if let Ok(file) = StoredFile::from_value(value) {
+                        found.push(file);
+                    }
+                } else {
+                    stack.extend(fields.values().rev());
+                }
+            }
+            _ => {}
+        }
+    }
+    found
 }
 
 /// How to reach the bytes behind a file value: the marker payload's HANDLE.
@@ -573,6 +653,55 @@ pub struct UploadBeginRequest {
     pub identity: Option<String>,
 }
 
+/// `POST /v1/storage/upload/replace`: start overwriting the stored file at
+/// `key` with new bytes. Answers an [`UploadBeginResponse`] whose `key` is
+/// the REPLACEMENT's own upload key: the parts, resume, abort and complete
+/// verbs name that key exactly as for a new file, and complete answers the
+/// replaced file's value (its own key, its new size). The file keeps its
+/// key, scope, name, type and lifetime; only its content changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadReplaceRequest {
+    pub key: String,
+    #[serde(default)]
+    pub declared_size: Option<u64>,
+    /// The version the new content was made from (an edit read it
+    /// first); refused with 412 when the file has moved on since. `None`
+    /// overwrites whatever is there.
+    #[serde(default)]
+    pub expected_version: Option<u64>,
+}
+
+/// One change to a stored file's content, as the run's journal records
+/// it for the inspector: which file, from which version to which, and
+/// what changed in words a person reads ([`diff::edit_diff`]). Display
+/// only: nothing is ever rebuilt from it.
+// SYNC: FileEdit <-> packages/weft-graph/src/protocol.ts FileEditWire
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FileEdit {
+    pub key: String,
+    pub filename: String,
+    /// The version the change was made from; `None` for an overwrite
+    /// that never read the file.
+    #[serde(rename = "fromVersion")]
+    pub from_version: Option<u64>,
+    #[serde(rename = "toVersion")]
+    pub to_version: u64,
+    pub diff: String,
+}
+
+/// How one attempt at replacing a file's content ended. `Stale` and
+/// `Busy` change nothing: an edit re-reads on `Stale`, and every writer
+/// waits out `Busy` (another write of the same file in flight).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReplaceOutcome {
+    /// The file now holds the new content, at the version carried.
+    Replaced(StoredFile),
+    /// The file is not at the version the new content was made from.
+    Stale,
+    /// Another replacement of the file is in flight.
+    Busy,
+}
+
 /// Begin response: the minted key + the fixed part size for this upload.
 /// Every part the caller reserves must be exactly `part_size` bytes except
 /// the final one (which may be smaller and marks the end of the upload).
@@ -737,17 +866,24 @@ pub struct PresignRequest {
 /// different addresses: a provider on the open internet cannot open a
 /// loopback link, while the browser that just called a local install's
 /// route reached it at that very loopback address.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LinkReach {
     /// The open internet (a provider fetching media): only an address
     /// the internet resolves counts; a local install answers `None`.
     #[default]
     Internet,
-    /// A caller of this install (the browser a route answers): the
-    /// internet address when there is one, else the install's own
-    /// stable base, loopback included.
-    Caller,
+    /// A caller of this install (the browser a route answers). `base` is
+    /// the address that caller's request came in on
+    /// ([`crate::caller::LiveRequest::base_url`]): the link is built on
+    /// it, so a browser on the loopback port gets a loopback link and one
+    /// on the tunnel gets a tunnel link. `None` (a run no request
+    /// started) falls back to the install's configured address: the
+    /// internet one when there is one, else its own stable base.
+    Caller {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base: Option<String>,
+    },
 }
 
 /// `POST /v1/storage/public-link`: mint a temporary URL for the file
@@ -831,26 +967,13 @@ pub struct WipePrefixResponse {
 // carries only the acting tenant (the key itself names project + tenant, and
 // the broker re-checks they match).
 
-/// `POST /v1/storage/admin/upload/begin`: start an ASSET upload for
-/// `tenant`/`project` (the pre-build sync publishing a source-referenced
-/// media file). Same size semantics as `UploadBeginRequest`; `content_hash`
-/// is the sha256 that becomes the key id (content-addressed). The admin
-/// surface uploads ONLY the asset plane: every other scope is written by
-/// workers through the data path.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AdminUploadBeginRequest {
-    pub tenant: String,
-    pub project: String,
-    pub mime_type: String,
-    pub filename: String,
-    #[serde(default)]
-    pub declared_size: Option<u64>,
-    pub content_hash: String,
-}
-
-/// The key-addressed admin upload verbs (`parts`/`part-done`/`complete`/
-/// `resume`/`abort`): the acting tenant wrapping the same worker envelope the
-/// data path uses, so the two surfaces cannot drift.
+/// Every admin upload verb: the acting tenant wrapping the envelope the
+/// other surface uses, so the two cannot drift. `begin` wraps the
+/// dispatcher's own [`AssetUploadBeginRequest`] (`POST
+/// /v1/storage/admin/upload/begin`: the admin surface uploads ONLY the
+/// asset plane, every other scope is written by workers through the data
+/// path); the key-addressed verbs (`parts`/`part-done`/`complete`/
+/// `resume`/`abort`) wrap the worker envelope of the data path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tenanted<T> {
     pub tenant: String,
@@ -858,11 +981,12 @@ pub struct Tenanted<T> {
     pub inner: T,
 }
 
-/// Replace the current set of uploaded files used by one project's source.
-/// Only this project's asset keys are accepted. The dispatcher accepts bare
-/// scope keys and adds the authenticated tenant before forwarding to storage.
-/// An empty set retires every
-/// asset; retirement starts a TTL instead of deleting files old runs need.
+/// Replace the set of the tenant's assets one project references (its
+/// source's files and its versions' files). Only the acting tenant's asset
+/// keys are accepted. The dispatcher accepts bare scope keys and adds the
+/// authenticated tenant before forwarding to storage. An asset no project of
+/// the tenant references any more starts a TTL instead of being deleted, so
+/// old runs can still read it; an empty set drops this project's references.
 ///
 /// `keys` are this build's own files and must all be there (the build
 /// just uploaded them). `kept` are files an older version of the project
@@ -892,13 +1016,65 @@ pub struct AssetsPublished {
     pub warnings: Vec<String>,
 }
 
-/// `POST /v1/storage/admin/list-prefix`: the files under one scope-boundary
-/// prefix (the pre-build sync's asset diff over `<tenant>/asset/<project>/`).
-/// The broker validates the prefix with the same scope-boundary grammar as a
-/// wipe, so it can only ever range one owner's space.
+// The dispatcher's own `/storage/*` bodies, which the CLI sends. The
+// tenant is never in them: the dispatcher takes it from the caller's
+// credential.
+
+/// `POST /storage/upload/begin`: an ASSET upload (a version's file, or a
+/// media `@asset` the source references) into the caller's tenant.
+/// `content_hash` is the sha256 that becomes the key id, so content the
+/// tenant already stores, from whichever project, answers "already stored".
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ListPrefixRequest {
-    pub prefix: String,
+pub struct AssetUploadBeginRequest {
+    pub mime_type: String,
+    pub filename: String,
+    #[serde(default)]
+    pub declared_size: Option<u64>,
+    pub content_hash: String,
+}
+
+/// `POST /storage/assets/held`: which of these contents the caller's tenant
+/// already stores, so a publish uploads only the rest. Asked by hash rather
+/// than by listing, so the answer costs what the publish names, never what
+/// the tenant has accumulated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetsHeldRequest {
+    pub hashes: Vec<String>,
+}
+
+/// The answer to [`AssetsHeldRequest`]: `content hash -> stored key` for
+/// every named content the tenant stores whole (an upload still in flight
+/// is not held).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AssetsHeldResponse {
+    pub keys: std::collections::BTreeMap<String, String>,
+}
+
+/// `POST /storage/files/download`: a download link for one of the
+/// caller's files, answered as a [`PresignResult`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadRequest {
+    pub key: String,
+    /// Download-link lifetime; `None` is the broker's default (about 15
+    /// minutes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
+}
+
+/// `DELETE /storage/files`: exactly one of `key` (one file) or `prefix`
+/// (a whole space, e.g. `shared/team/` or `exec/<execution_id>/`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoveFilesRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+}
+
+/// What a `DELETE /storage/files` removed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilesRemoved {
+    pub removed: u64,
 }
 
 /// `POST /v1/storage/admin/sweep-exec`: terminate-sweep one execution's un-kept
@@ -1249,31 +1425,32 @@ mod tests {
         assert_eq!(back.inner.parts[1].part_number, 2);
         assert_eq!(back.inner.parts[1].size_bytes, 3);
 
-        let begin = AdminUploadBeginRequest {
+        let begin = Tenanted {
             tenant: "alice".into(),
-            project: "p1".into(),
-            mime_type: "image/png".into(),
-            filename: "x.png".into(),
-            declared_size: Some(8),
-            content_hash: "a".repeat(64),
+            inner: AssetUploadBeginRequest {
+                mime_type: "image/png".into(),
+                filename: "x.png".into(),
+                declared_size: Some(8),
+                content_hash: "a".repeat(64),
+            },
         };
         let v = serde_json::to_value(&begin).unwrap();
         assert_eq!(
             v,
-            json!({"tenant": "alice", "project": "p1", "mime_type": "image/png",
+            json!({"tenant": "alice", "mime_type": "image/png",
                    "filename": "x.png", "declared_size": 8,
                    "content_hash": "a".repeat(64)})
         );
-        let back: AdminUploadBeginRequest = serde_json::from_value(v).unwrap();
-        assert_eq!(back.project, "p1");
+        let back: Tenanted<AssetUploadBeginRequest> = serde_json::from_value(v).unwrap();
+        assert_eq!(back.inner.content_hash, "a".repeat(64));
         // declared_size is optional on the wire; content_hash is not (the
         // admin surface uploads only the content-addressed asset plane).
-        let min: AdminUploadBeginRequest = serde_json::from_value(json!({
-            "tenant": "t", "project": "p", "mime_type": "a/b", "filename": "f",
+        let min: Tenanted<AssetUploadBeginRequest> = serde_json::from_value(json!({
+            "tenant": "t", "mime_type": "a/b", "filename": "f",
             "content_hash": "b".repeat(64)
         }))
         .unwrap();
-        assert_eq!(min.declared_size, None);
+        assert_eq!(min.inner.declared_size, None);
     }
 
     #[test]
@@ -1283,6 +1460,7 @@ mod tests {
             mime_type: "audio/ogg".into(),
             size_bytes: 4_200_000,
             filename: "clip.ogg".into(),
+            version: 3,
         };
         let v = m.to_value();
         // Exact wire shape: the CONCRETE marker (audio/ogg -> __weft_audio__),
@@ -1294,15 +1472,22 @@ mod tests {
                 "mimeType": "audio/ogg",
                 "sizeBytes": 4_200_000u64,
                 "filename": "clip.ogg",
+                "version": 3,
             }})
         );
         assert_eq!(StoredFile::from_value(&v).unwrap(), m);
+        // A value written before files carried versions names the
+        // version every such file was given.
+        let mut older = v.clone();
+        older["__weft_audio__"].as_object_mut().unwrap().remove("version");
+        assert_eq!(StoredFile::from_value(&older).unwrap().version, FIRST_FILE_VERSION);
         // A non image/video/audio mime takes the Blob marker.
         let pdf = StoredFile {
             key: "exec/c/x".into(),
             mime_type: "application/pdf".into(),
             size_bytes: 10,
             filename: "x.pdf".into(),
+            version: FIRST_FILE_VERSION,
         };
         assert!(pdf.to_value().get("__weft_blob__").is_some());
         assert_eq!(StoredFile::from_value(&pdf.to_value()).unwrap(), pdf);
@@ -1315,6 +1500,7 @@ mod tests {
             mime_type: "audio/ogg".into(),
             size_bytes: 1,
             filename: "a.ogg".into(),
+            version: FIRST_FILE_VERSION,
         };
         let t = crate::weft_type::WeftType::infer(&m.to_value());
         assert_eq!(
@@ -1381,6 +1567,7 @@ mod tests {
             mime_type: "application/pdf".into(),
             size_bytes: 9,
             filename: "d.pdf".into(),
+            version: FIRST_FILE_VERSION,
         };
         assert_eq!(
             FileHandle::from_value(&key_file.to_value()).unwrap(),
@@ -1436,13 +1623,33 @@ mod tests {
         assert_eq!(back.key, keep.key);
         assert_eq!(back.ttl, keep.ttl);
 
-        let presign = PresignRequest { key: "t/project/p/1".into(), ttl_secs: Some(900), reach: LinkReach::Caller };
+        let reach = LinkReach::Caller { base: Some("http://127.0.0.1:14111".into()) };
+        let presign = PresignRequest { key: "t/project/p/1".into(), ttl_secs: Some(900), reach: reach.clone() };
         let v = serde_json::to_value(&presign).unwrap();
-        assert_eq!(v, json!({"key": "t/project/p/1", "ttl_secs": 900, "reach": "caller"}));
+        assert_eq!(
+            v,
+            json!({"key": "t/project/p/1", "ttl_secs": 900, "reach": {"caller": {"base": "http://127.0.0.1:14111"}}})
+        );
         let back: PresignRequest = serde_json::from_value(v).unwrap();
         assert_eq!(back.key, presign.key);
         assert_eq!(back.ttl_secs, presign.ttl_secs);
-        assert_eq!(back.reach, LinkReach::Caller);
+        assert_eq!(back.reach, reach);
+        // A caller no request stands behind names no base.
+        let unbased = serde_json::to_value(LinkReach::Caller { base: None }).unwrap();
+        assert_eq!(unbased, json!({"caller": {}}));
+        assert_eq!(serde_json::from_value::<LinkReach>(unbased).unwrap(), LinkReach::Caller { base: None });
+
+        let replace = UploadReplaceRequest { key: "t/project/p/1".into(), declared_size: Some(12), expected_version: Some(4) };
+        let v = serde_json::to_value(&replace).unwrap();
+        assert_eq!(v, json!({"key": "t/project/p/1", "declared_size": 12, "expected_version": 4}));
+        let back: UploadReplaceRequest = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            (back.key, back.declared_size, back.expected_version),
+            (replace.key, replace.declared_size, replace.expected_version)
+        );
+        // An overwrite names no version.
+        let blind: UploadReplaceRequest = serde_json::from_value(json!({"key": "t/project/p/1"})).unwrap();
+        assert_eq!(blind.expected_version, None);
         // An older asker sends no reach: the internet, the strict one.
         let bare: PresignRequest = serde_json::from_value(json!({"key": "t/project/p/1", "ttl_secs": null})).unwrap();
         assert_eq!(bare.reach, LinkReach::Internet);
@@ -1523,9 +1730,13 @@ mod tests {
             expires_at_unix: Some(1_700_000_000),
             keep_ttl_secs: Some(86_400),
             created_at_unix: 1_600_000_000,
+            version: 2,
         };
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["mimeType"], "video/mp4");
+        assert_eq!(v["version"], 2);
+        // The value the meta hands downstream carries the same version.
+        assert_eq!(StoredFile::from(&m).version, 2);
         assert_eq!(v["expiresAtUnix"], 1_700_000_000);
         let back: StoredFileMeta = serde_json::from_value(v).unwrap();
         assert_eq!(back, m);

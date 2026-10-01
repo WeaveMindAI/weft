@@ -220,9 +220,9 @@ impl ExecutionProjector {
                 })
                 .collect()
         } else { match ev {
-            ExecEvent::ExecutionStarted { entry_node, subgraph, seed, phase, member, .. } => {
+            ExecEvent::ExecutionStarted { entry_node, subgraph, seed, phase, instance, .. } => {
                 vec![DispatcherEvent::ExecutionStarted {
-                    execution_id, member: member.clone(), at_unix,
+                    execution_id, instance: instance.clone(), at_unix,
                     entry_node: entry_node.clone(),
                     phase: *phase,
                     subgraph: subgraph.as_ref().map(|s| s.nodes.iter().cloned().collect()),
@@ -361,6 +361,16 @@ impl ExecutionProjector {
                     service: service.clone(),
                     amount_usd: *amount_usd,
                     origin: origin.clone(),
+                }]
+            }
+            ExecEvent::FileEdited { node_id, frames, edit, .. } => {
+                vec![DispatcherEvent::FileEdited {
+                    execution_id, at_unix,
+                    inherited_from: None,
+                    project_id,
+                    node_id: node_id.clone(),
+                    frames: frames.clone(),
+                    edit: edit.clone(),
                 }]
             }
             // Bus events: surfaced so the inspector renders a live IRC-style
@@ -605,7 +615,8 @@ fn inherited_events(
                             *execution_id = child;
                             out.push(event);
                         }
-                        DispatcherEvent::CostReported { execution_id, node_id, frames, inherited_from, .. } => {
+                        DispatcherEvent::CostReported { execution_id, node_id, frames, inherited_from, .. }
+                        | DispatcherEvent::FileEdited { execution_id, node_id, frames, inherited_from, .. } => {
                             if seed.origins.get(&Located::at(node_id.as_str(), frames)) != Some(&ancestor.execution_id) { continue; }
                             *execution_id = child;
                             *inherited_from = Some(ancestor.execution_id);
@@ -631,6 +642,7 @@ fn needs_program(ev: &ExecEvent) -> bool {
             | ExecEvent::ExecutionCancelled { .. }
             | ExecEvent::ExecutionTagged { .. }
             | ExecEvent::CostReported { .. }
+            | ExecEvent::FileEdited { .. }
             | ExecEvent::LogLine { .. }
             | ExecEvent::BusJoined { .. }
             | ExecEvent::BusLeft { .. }
@@ -680,7 +692,7 @@ fn boundary_events(
             node,
             frames,
             closed_ports: closed_ports.clone(),
-            reason: skip_reason.clone(),
+            reason: skip_reason.as_deref().cloned(),
             inherited_from,
             project_id,
         },
@@ -1018,7 +1030,7 @@ mod tests {
                 program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
                 subgraph: None,
                 seed: None,
-                member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+                instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
                 run_class: weft_core::run_class::RunClass::Short,
             },
             ExecEvent::NodeKicked { execution_id: execution_id(), node_id: "src".into(), frames: vec![], firing: true, payload: None, port_snapshot: None, at_unix: 0 },
@@ -1246,7 +1258,7 @@ mod tests {
                 program: None, source_version: None, run_kind: weft_core::exec::RunKind::NodeTest,
                 subgraph: None,
                 seed: None,
-                member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+                instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
                 run_class: weft_core::run_class::RunClass::Short,
             },
             started("probe", 1),

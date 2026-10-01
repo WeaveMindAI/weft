@@ -153,7 +153,7 @@ impl ProtocolAction {
     pub fn unowned_scope(&self) -> BTreeSet<InfraCopy> {
         match self {
             Self::RestartUnit { node_id, .. } => {
-                BTreeSet::from([InfraCopy { node_id: node_id.clone(), member: None }])
+                BTreeSet::from([InfraCopy { node_id: node_id.clone(), instance: None }])
             }
             _ => BTreeSet::new(),
         }
@@ -240,7 +240,7 @@ pub fn default_protocols() -> HealthProtocols {
 pub struct UnitView {
     pub node_id: String,
     /// Whose copy: `None` for the shared one.
-    pub member: Option<weft_core::member::MemberId>,
+    pub instance: Option<weft_core::instance::InstanceId>,
     pub unit: String,
     /// The host reports it running and every readiness check passing.
     pub ready: bool,
@@ -250,7 +250,7 @@ pub struct UnitView {
 
 impl UnitView {
     pub(crate) fn copy(&self) -> InfraCopy {
-        InfraCopy { node_id: self.node_id.clone(), member: self.member.clone() }
+        InfraCopy { node_id: self.node_id.clone(), instance: self.instance.clone() }
     }
 
     /// Whether this unit satisfies the unit condition `cond`; `None`
@@ -354,11 +354,11 @@ pub fn broken_copies(cond: &HealthCondition, ctx: &ConditionContext<'_>) -> BTre
 mod tests {
     use super::*;
     use weft_broker_client::protocol::ProjectStatus;
-    use weft_core::member::MemberId;
+    use weft_core::instance::InstanceId;
 
     /// One seen unit of the shared copy of `node` (unit named after it).
     fn unit(node: &str, ready: bool, flaky: bool) -> UnitView {
-        UnitView { node_id: node.into(), member: None, unit: node.into(), ready, flaky }
+        UnitView { node_id: node.into(), instance: None, unit: node.into(), ready, flaky }
     }
 
     fn ctx(units: &[UnitView]) -> ConditionContext<'_> {
@@ -426,17 +426,17 @@ mod tests {
     /// one, not the shared db; nothing under a `not`.
     #[test]
     fn broken_copies_name_whose_copy_is_broken() {
-        let ada = MemberId::new("ada").unwrap();
+        let ada = InstanceId::new("ada").unwrap();
         let units = [
-            UnitView { member: Some(ada.clone()), ..unit("svc", false, true) },
-            UnitView { member: Some(MemberId::new("bob").unwrap()), ..unit("svc", true, false) },
+            UnitView { instance: Some(ada.clone()), ..unit("svc", false, true) },
+            UnitView { instance: Some(InstanceId::new("bob").unwrap()), ..unit("svc", true, false) },
             unit("db", true, false),
         ];
         let park = &default_protocols().protocols[0].when;
         assert!(ev(park, &units));
         assert_eq!(
             broken_copies(park, &ctx(&units)),
-            BTreeSet::from([InfraCopy { node_id: "svc".into(), member: Some(ada) }])
+            BTreeSet::from([InfraCopy { node_id: "svc".into(), instance: Some(ada) }])
         );
         let negated = HealthCondition::Not { cond: vec![not_ready("*")] };
         assert!(broken_copies(&negated, &ctx(&units)).is_empty());
@@ -447,10 +447,10 @@ mod tests {
     /// one are not; with nothing parked every copy fails it.
     #[test]
     fn still_broken_copies_are_read_copy_by_copy() {
-        let bob = MemberId::new("bob").unwrap();
+        let bob = InstanceId::new("bob").unwrap();
         let units = [
-            UnitView { member: Some(MemberId::new("ada").unwrap()), ..unit("svc", true, false) },
-            UnitView { member: Some(bob.clone()), ..unit("svc", false, true) },
+            UnitView { instance: Some(InstanceId::new("ada").unwrap()), ..unit("svc", true, false) },
+            UnitView { instance: Some(bob.clone()), ..unit("svc", false, true) },
             unit("db", true, false),
         ];
         let recover = &default_protocols().protocols[1].when;
@@ -458,7 +458,7 @@ mod tests {
         assert!(!evaluate_condition(recover, &parked), "read on the whole project, bob's copy holds it back");
         assert_eq!(
             still_broken_copies(recover, &parked),
-            BTreeSet::from([InfraCopy { node_id: "svc".into(), member: Some(bob) }])
+            BTreeSet::from([InfraCopy { node_id: "svc".into(), instance: Some(bob) }])
         );
         assert_eq!(still_broken_copies(recover, &ctx(&units)).len(), 3);
     }

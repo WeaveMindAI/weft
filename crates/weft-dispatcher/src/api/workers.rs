@@ -10,21 +10,10 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
-use serde::Serialize;
-use weft_platform_traits::{WorkerOverrides, WorkerSettings};
+use weft_platform_traits::{WorkerOverrides, WorkersResponse};
 
 use crate::authenticator::{authorize_project, CallerTenant};
 use crate::state::DispatcherState;
-
-#[derive(Debug, Serialize)]
-pub struct WorkersResponse {
-    /// What the install gives every project.
-    pub install: WorkerSettings,
-    /// What this project sets for itself.
-    pub project: WorkerOverrides,
-    /// What its workers run with.
-    pub effective: WorkerSettings,
-}
 
 fn internal(e: anyhow::Error) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))

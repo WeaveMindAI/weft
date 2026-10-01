@@ -24,7 +24,7 @@ pub mod test_rig;
 pub mod test_runner;
 
 pub use context::EngineClients;
-pub use weft_platform_traits::identity::mint_instance_id;
+pub use weft_platform_traits::identity::mint_replica_id;
 pub use worker::{identity_from_env, run_long, serve, RunAnswer, WorkerConfig, WorkerDoor};
 pub use storage::{WorkerStorage, WorkerStorageOps};
 

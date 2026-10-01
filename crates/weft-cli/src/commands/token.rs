@@ -27,56 +27,9 @@
 //! future Slack bot would pick its own kind. Same dispatcher surface
 //! either way.
 
-use serde::Deserialize;
+use weft_core::signal_token::{MintTokenRequest, MintedToken, TokenKind, TokenSummary};
 
 use super::Ctx;
-
-/// The mint response (`POST /signal-tokens`): the one time the full
-/// token is visible. Decoded strictly: a field this command cannot
-/// find is a token the user can never obtain, so the shape has to
-/// fail loudly rather than print a blank.
-#[derive(Deserialize)]
-struct Minted {
-    id: String,
-    kind: String,
-    token: String,
-    name: Option<String>,
-    url: String,
-    #[serde(rename = "allowedProjects")]
-    allowed_projects: Vec<String>,
-    #[serde(rename = "allowedTags")]
-    allowed_tags: Vec<String>,
-    #[serde(rename = "allowedDisplays")]
-    allowed_displays: Vec<String>,
-    #[serde(rename = "allDisplays")]
-    all_displays: bool,
-    #[serde(default)]
-    member: Option<weft_core::member::MemberId>,
-    #[serde(default, rename = "expiresAtUnix")]
-    expires_at_unix: Option<u64>,
-}
-
-/// One listed token (`GET /signal-tokens`): metadata and the
-/// recognizer prefix, never the secret.
-#[derive(Deserialize)]
-struct Listed {
-    id: String,
-    kind: String,
-    recognizer: String,
-    name: Option<String>,
-    #[serde(rename = "allowedProjects")]
-    allowed_projects: Vec<String>,
-    #[serde(rename = "allowedTags")]
-    allowed_tags: Vec<String>,
-    #[serde(rename = "allowedDisplays")]
-    allowed_displays: Vec<String>,
-    #[serde(rename = "allDisplays")]
-    all_displays: bool,
-    #[serde(default)]
-    member: Option<weft_core::member::MemberId>,
-    #[serde(default, rename = "expiresAtUnix")]
-    expires_at_unix: Option<u64>,
-}
 
 pub enum TokenAction {
     Mint {
@@ -87,8 +40,8 @@ pub enum TokenAction {
         displays: Vec<String>,
         /// Every display in the token's projects (`--displays`).
         all_displays: bool,
-        /// A member token for this member of the project in the folder.
-        member: Option<weft_core::member::MemberId>,
+        /// An instance token for this instance of the project in the folder.
+        instance: Option<weft_core::instance::InstanceId>,
         expires_in_secs: Option<u64>,
         /// An operator key rather than a caller token (`--operator`).
         operator: bool,
@@ -102,26 +55,33 @@ pub enum TokenAction {
 pub async fn run(ctx: Ctx, action: TokenAction) -> anyhow::Result<()> {
     let client = ctx.client()?;
     match action {
-        TokenAction::Mint { name, projects, tags, displays, all_displays, member, expires_in_secs, operator } => {
+        TokenAction::Mint { name, projects, tags, displays, all_displays, instance, expires_in_secs, operator } => {
             let displays = grants_for(&ctx, &displays)?;
-            let projects = member_projects(&ctx, member.as_ref(), projects)?;
-            let body = serde_json::json!({
-                "name": name,
-                "allowedProjects": projects,
-                "allowedTags": tags,
-                "allowedDisplays": displays,
-                "allDisplays": all_displays,
-                "member": member,
-                "expiresInSecs": expires_in_secs,
-                "kind": if operator { "operator" } else { "caller" },
-            });
-            let resp: serde_json::Value = client.post_json("/signal-tokens", &body).await?;
-            let minted: Minted = serde_json::from_value(resp.clone())
+            let projects = instance_projects(&ctx, instance.as_ref(), projects)?;
+            let allowed_projects = projects
+                .iter()
+                .map(|p| p.parse::<uuid::Uuid>().map_err(|_| anyhow::anyhow!("--projects takes project ids, and '{p}' is not one")))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let body = MintTokenRequest {
+                name,
+                allowed_projects,
+                allowed_tags: tags,
+                allowed_displays: displays,
+                all_displays,
+                instance,
+                expires_in_secs,
+                kind: if operator { TokenKind::Operator } else { TokenKind::Caller },
+            };
+            let resp: serde_json::Value = client.post_json("/signal-tokens", &serde_json::to_value(&body)?).await?;
+            // Decoded strictly: a field this command cannot find is a
+            // token the user can never obtain, so the shape has to fail
+            // loudly rather than print a blank.
+            let minted: MintedToken = serde_json::from_value(resp.clone())
                 .map_err(|e| anyhow::anyhow!("unexpected /signal-tokens mint response shape: {e}"))?;
             if ctx.json_out(&resp)? {
                 return Ok(());
             }
-            if minted.kind == "operator" {
+            if minted.kind == TokenKind::Operator {
                 // An operator key is a credential for the CLI, not a
                 // connect string: the bare key is all there is to copy.
                 println!("{}", minted.token);
@@ -150,12 +110,12 @@ pub async fn run(ctx: Ctx, action: TokenAction) -> anyhow::Result<()> {
                 &minted.allowed_displays,
                 minted.all_displays,
             );
-            print_member_summary(minted.member.as_ref(), minted.expires_at_unix);
+            print_instance_summary(minted.instance.as_ref(), minted.expires_at_unix);
             Ok(())
         }
         TokenAction::Ls => {
             let resp: serde_json::Value = client.get_json("/signal-tokens").await?;
-            let listed: Vec<Listed> = serde_json::from_value(resp.clone())
+            let listed: Vec<TokenSummary> = serde_json::from_value(resp.clone())
                 .map_err(|e| anyhow::anyhow!("unexpected /signal-tokens listing shape: {e}"))?;
             if ctx.json_out(&resp)? {
                 return Ok(());
@@ -171,7 +131,7 @@ pub async fn run(ctx: Ctx, action: TokenAction) -> anyhow::Result<()> {
                 let name = t.name.as_deref().filter(|n| !n.is_empty()).unwrap_or("(unnamed)");
                 println!("{}  {name}", t.recognizer);
                 println!("  id: {}", t.id);
-                if t.kind == "operator" {
+                if t.kind == TokenKind::Operator {
                     println!("  operator key: administers the whole install");
                     continue;
                 }
@@ -181,7 +141,7 @@ pub async fn run(ctx: Ctx, action: TokenAction) -> anyhow::Result<()> {
                     &t.allowed_displays,
                     t.all_displays,
                 );
-                print_member_summary(t.member.as_ref(), t.expires_at_unix);
+                print_instance_summary(t.instance.as_ref(), t.expires_at_unix);
             }
             Ok(())
         }
@@ -196,17 +156,17 @@ pub async fn run(ctx: Ctx, action: TokenAction) -> anyhow::Result<()> {
     }
 }
 
-/// The projects a token is scoped to. A member token acts in exactly
-/// one project, the one the person is standing in, so `--member` fills
-/// it from the folder (and a `--projects` naming anything else is
+/// The projects a token is scoped to. An instance token acts in exactly
+/// one project, the one the person is standing in, so `--instance`
+/// fills it from the folder (and a `--projects` naming anything else is
 /// refused rather than quietly replaced).
-fn member_projects(ctx: &Ctx, member: Option<&weft_core::member::MemberId>, projects: Vec<String>) -> anyhow::Result<Vec<String>> {
-    let Some(member) = member else { return Ok(projects) };
+fn instance_projects(ctx: &Ctx, instance: Option<&weft_core::instance::InstanceId>, projects: Vec<String>) -> anyhow::Result<Vec<String>> {
+    let Some(instance) = instance else { return Ok(projects) };
     let here = ctx
         .project()
         .map_err(|e| {
             anyhow::anyhow!(
-                "--member makes a token for a member of the project you are in, and there is none \
+                "--instance makes a token for an instance of the project you are in, and there is none \
                  here: {e}. Run this from the project's folder."
             )
         })?
@@ -214,17 +174,17 @@ fn member_projects(ctx: &Ctx, member: Option<&weft_core::member::MemberId>, proj
         .to_string();
     if projects.iter().any(|p| p != &here) {
         anyhow::bail!(
-            "a member token acts in exactly one project, the one you are in ({here}); drop --projects \
-             for member '{member}'"
+            "an instance token acts in exactly one project, the one you are in ({here}); drop --projects \
+             for instance '{instance}'"
         );
     }
     Ok(vec![here])
 }
 
-/// The member line of a token's summary, when it is a member token.
-fn print_member_summary(member: Option<&weft_core::member::MemberId>, expires_at_unix: Option<u64>) {
-    if let Some(member) = member {
-        eprintln!("    member:   {member}");
+/// The instance line of a token's summary, when it is an instance token.
+fn print_instance_summary(instance: Option<&weft_core::instance::InstanceId>, expires_at_unix: Option<u64>) {
+    if let Some(instance) = instance {
+        eprintln!("    instance: {instance}");
     }
     if let Some(at) = expires_at_unix {
         eprintln!("    expires:  unix {at}");
@@ -286,13 +246,13 @@ fn grant_node(grant: &str) -> String {
 /// render as "(any)"; displays are the other way round and render as
 /// "(none)", which is what a token that was never given one reads.
 fn print_scope_summary(
-    projects: &[String],
+    projects: &[uuid::Uuid],
     tags: &[String],
     displays: &[String],
     all_displays: bool,
 ) {
     eprintln!("  scope:");
-    eprintln!("    projects: {}", scope_or_any(projects));
+    eprintln!("    projects: {}", scope_or_any(&projects.iter().map(ToString::to_string).collect::<Vec<_>>()));
     eprintln!("    tags:     {}", scope_or_any(tags));
     eprintln!(
         "    displays: {}",

@@ -148,23 +148,14 @@ add, with the command you hand them (`weft connect --on prod --node <node>`).
 A run on prod that reaches a node with nothing picked there is refused
 before it starts, naming that command.
 
-A member's connection (a field written `@member_filled`) lives in the
-install the member made it on, so members connect on prod through the
+An instance's connection (a field written `@instance_filled`) lives in the
+install it was made on, so instances connect on prod through the
 site, as they do here.
 
 ## When a deploy fails
 
 - **A compile error**: printed before anything leaves this machine. The
   same fix as on `local`.
-- **"this version was written by weft X, and this install runs weft Y"**:
-  the CLI and the install are different weft versions. In CI the workflow
-  already builds the right CLI. On this machine, tell the user the two
-  ways out the error names: the CLI of the install's version (built from
-  the fork's commit the install ran), or updating the install (merging
-  upstream into the fork and running its install workflow again).
-- **"this version's `nodes/base_catalog/` is not the one weft X ships"**:
-  the catalog was edited in place or seeded by another build of weft. Run
-  `weft catalog update` in the project, then deploy again.
 - **An image build failed**: the install's builder log is quoted in the
   error, the `cargo` or `apt` line included. Fix the node it names; the
   next deploy rebuilds only what changed.

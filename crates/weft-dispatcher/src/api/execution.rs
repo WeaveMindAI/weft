@@ -9,14 +9,15 @@ use std::sync::Arc;
 use weft_core::ProjectDefinition;
 
 use axum::{extract::{Path, Query, State}, http::StatusCode, Json};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::Deserialize;
 
 use weft_core::exec::CancelCause;
+use weft_core::program::SummaryStatus;
 use weft_core::ExecutionId;
 
 use crate::authenticator::{authorize_execution, authorize_project, CallerTenant};
-use crate::journal::{ExecutionPage, ExecutionQuery};
+use crate::journal::ExecutionQuery;
+use weft_core::program::{DeletedExecution, ExecutionDetail, ExecutionPage, ParkedWait, ResolvedExecution};
 use crate::events::DispatcherEvent;
 use crate::state::DispatcherState;
 
@@ -32,7 +33,7 @@ pub async fn resolve_execution_id(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(prefix): Path<String>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> Result<Json<ResolvedExecution>, (StatusCode, String)> {
     let prefix = prefix.to_ascii_lowercase();
     if prefix.len() < 4 || !prefix.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
         return Err((
@@ -47,7 +48,7 @@ pub async fn resolve_execution_id(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("execution_ids_with_prefix: {e}")))?;
     match matches.as_slice() {
         [] => Err((StatusCode::NOT_FOUND, format!("no execution starts with '{prefix}'"))),
-        [one] => Ok(Json(serde_json::json!({ "execution_id": one.to_string() }))),
+        [one] => Ok(Json(ResolvedExecution { execution_id: *one })),
         // A count and a few short ids, never the whole list: an empty or
         // one-character prefix matches everything the project ever ran,
         // and printing a hundred full uuids buries the one sentence that
@@ -88,7 +89,7 @@ pub async fn cancel(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("execution summary: {e}")))?
     {
-        if let Some(refusal) = already_ended(&summary.status) {
+        if let Some(refusal) = already_ended(summary.status) {
             return Err((StatusCode::CONFLICT, format!("execution {execution_id} already ended ({refusal})")));
         }
     }
@@ -102,10 +103,11 @@ pub async fn cancel(
 /// The status word to answer a cancel of a run that is over with, or
 /// `None` while the run can still be cancelled (running, or a corrupt
 /// row whose terminal nobody can read: cancelling it is the safe side).
-fn already_ended(status: &str) -> Option<&str> {
+fn already_ended(status: SummaryStatus) -> Option<&'static str> {
+    use weft_core::program::RunStatus;
     match status {
-        "completed" | "failed" | "cancelled" => Some(status),
-        _ => None,
+        SummaryStatus::Run(RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled) => Some(status.as_str()),
+        SummaryStatus::Run(RunStatus::Running | RunStatus::WaitingForInput) | SummaryStatus::Corrupt => None,
     }
 }
 
@@ -343,13 +345,13 @@ pub(crate) async fn terminal_outcome(
     pool: &sqlx::PgPool,
     execution_id: ExecutionId,
 ) -> anyhow::Result<Option<TerminalOutcome>> {
-    // SYNC: terminal_outcome (SQL kind list) <-> crates/weft-journal/src/events.rs ExecEvent::is_execution_terminal, crates/weft-cli/src/commands/follow.rs is_terminal (SSE kind list)
-    let row: Option<(String,)> = sqlx::query_as(
+    let row: Option<(String,)> = sqlx::query_as(concat!(
         "SELECT kind FROM exec_event \
          WHERE execution_id = $1 \
-           AND kind IN ('execution_completed', 'execution_failed', 'execution_cancelled') \
-         LIMIT 1",
-    )
+           AND kind IN ",
+        weft_journal::execution_terminal_kinds_sql!(),
+        " LIMIT 1",
+    ))
     .bind(execution_id.to_string())
     .fetch_optional(pool)
     .await?;
@@ -381,12 +383,12 @@ pub(crate) enum TerminalOutcome {
 /// exactly as they did when it read `running`.
 async fn overlay_suspended(
     state: &DispatcherState,
-    summaries: &mut [crate::journal::ExecutionSummary],
+    summaries: &mut [weft_core::program::ExecutionSummary],
 ) -> Result<(), StatusCode> {
     use std::collections::HashMap;
     let mut sets: HashMap<uuid::Uuid, std::collections::HashSet<ExecutionId>> = HashMap::new();
     for s in summaries.iter_mut() {
-        if s.status != "running" {
+        if s.status != SummaryStatus::Run(weft_core::program::RunStatus::Running) {
             continue;
         }
         let set = match sets.entry(s.project_id) {
@@ -397,9 +399,7 @@ async fn overlay_suspended(
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
             ),
         };
-        if set.contains(&s.execution_id) {
-            s.status = "waiting_for_input".to_string();
-        }
+        s.status = s.status.parked(set.contains(&s.execution_id));
     }
     Ok(())
 }
@@ -408,7 +408,7 @@ pub async fn get(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(execution_id_str): Path<String>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<ExecutionDetail>, StatusCode> {
     let execution_id: ExecutionId = execution_id_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
     authorize_execution(&*state.journal, &caller.0, execution_id)
         .await
@@ -430,37 +430,12 @@ pub async fn get(
     // before the journal's `NodeSuspended` lands (the node registers
     // its wait, then returns), so a client that learns the run is
     // parked learns from the same read what it is parked on.
-    let waiting = if summary.status == "waiting_for_input" {
+    let waiting = if summary.status == SummaryStatus::Run(weft_core::program::RunStatus::WaitingForInput) {
         parked_waits(&state, execution_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     } else {
         Vec::new()
     };
-    Ok(Json(serde_json::json!({
-        "execution_id": summary.execution_id.to_string(),
-        "project_id": summary.project_id,
-        "entry_node": summary.entry_node,
-        "status": summary.status,
-        "phase": summary.phase,
-        "started_at": summary.started_at,
-        "completed_at": summary.completed_at,
-        "tags": summary.tags,
-        "waiting": waiting,
-    })))
-}
-
-/// One wait a parked run holds: the node, the token that answers it,
-/// and the signal kind (a `timer` is woken, anything else expects a
-/// value). Rides `GET /executions/{execution_id}` as `waiting`, which is what
-/// `wake` matches a `weft wake <execution_id> <node>` against.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ParkedWait {
-    /// The waiting node's place, spelled the way a person writes it
-    /// (`one.review` inside the file the site `one` includes): the
-    /// signal row's own key, so it is both what a reader is shown and
-    /// what `weft wake` names.
-    pub node: String,
-    pub token: String,
-    pub kind: String,
+    Ok(Json(ExecutionDetail { summary, waiting }))
 }
 
 /// The waits of `execution_id`, from the resume-signal rows that make it
@@ -481,22 +456,6 @@ fn waits_of(signals: &[crate::journal::SignalRegistration], execution_id: Execut
         .collect()
 }
 
-#[derive(Debug, Serialize)]
-pub struct LogLineOut {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inherited_from: Option<ExecutionId>,
-    pub at_unix: u64,
-    pub level: String,
-    /// The firing this line is about: the node, and the loop
-    /// iteration it was in. Absent on the wire for a run-level line
-    /// (the run itself failing or being cancelled).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub node: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub frames: weft_core::LoopFrames,
-    pub message: String,
-}
-
 /// How many log lines one read returns, and the ceiling on asking for
 /// more. The journal answers with the TAIL, so the default holds the
 /// end of a long run, which is where a run goes wrong. A `limit`
@@ -511,20 +470,13 @@ pub struct ListLogsParams {
     pub limit: Option<u32>,
 }
 
-/// A run's log: the tail, and the limit that cut it, so a reader who
-/// sent none still knows how long a full page is.
-#[derive(Debug, Serialize)]
-pub struct LogsOut {
-    pub limit: u32,
-    pub lines: Vec<LogLineOut>,
-}
 
 pub async fn list_logs(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(execution_id_str): Path<String>,
     Query(params): Query<ListLogsParams>,
-) -> Result<Json<LogsOut>, (StatusCode, String)> {
+) -> Result<Json<weft_core::program::ExecutionLogs>, (StatusCode, String)> {
     let execution_id: ExecutionId = execution_id_str
         .parse()
         .map_err(|_| (StatusCode::BAD_REQUEST, format!("'{execution_id_str}' is not an execution id (a uuid)")))?;
@@ -543,7 +495,7 @@ pub async fn list_logs(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let lines = entries
         .into_iter()
-        .map(|e| LogLineOut {
+        .map(|e| weft_core::program::ExecutionLogLine {
             inherited_from: e.inherited_from,
             at_unix: e.at_unix,
             level: e.level,
@@ -552,7 +504,7 @@ pub async fn list_logs(
             message: e.message,
         })
         .collect();
-    Ok(Json(LogsOut { limit, lines }))
+    Ok(Json(weft_core::program::ExecutionLogs { limit, lines }))
 }
 
 /// Complete ordered output evidence, including streams and inherited results.
@@ -693,17 +645,17 @@ pub struct ListExecutionsParams {
     pub phase: Option<weft_core::context::Phase>,
     /// Only runs started by this entry node.
     pub entry_node: Option<String>,
-    /// Only runs that ended this way (`completed`, `failed`,
-    /// `cancelled`, `running`).
-    pub status: Option<String>,
-    /// Only runs for this member.
-    pub member: Option<weft_core::member::MemberId>,
+    /// Only runs standing this way ([`weft_core::program::RunStatus`]);
+    /// any other word is a 400 before anything is read.
+    pub status: Option<weft_core::program::RunStatus>,
+    /// Only runs for this instance.
+    pub instance: Option<weft_core::instance::InstanceId>,
     /// Only runs carrying this tag.
     pub tag: Option<String>,
 }
 
 const DEFAULT_PAGE: u32 = 50;
-const MAX_PAGE: u32 = 200;
+const MAX_PAGE: u32 = weft_core::program::MAX_RUNS_PAGE;
 
 pub async fn list_executions(
     State(state): State<DispatcherState>,
@@ -719,7 +671,7 @@ pub async fn list_executions(
         phase: params.phase,
         entry_node: params.entry_node,
         status: params.status,
-        member: params.member,
+        instance: params.instance,
         tag: params.tag,
         below: None,
     };
@@ -739,7 +691,7 @@ pub async fn latest_for_project(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(id): Path<uuid::Uuid>,
-) -> Result<Json<crate::journal::ExecutionSummary>, StatusCode> {
+) -> Result<Json<weft_core::program::ExecutionSummary>, StatusCode> {
     authorize_project(&state, &caller.0, id)
         .await
         .map_err(|(s, _)| s)?;
@@ -754,7 +706,7 @@ pub async fn latest_for_project(
         phase: None,
         entry_node: None,
         status: None,
-        member: None,
+        instance: None,
         tag: None,
         below: None,
     };
@@ -829,29 +781,10 @@ pub async fn wake(
     crate::api::signal::fire_registered_signal(&state, &wait.token, payload).await
 }
 
-/// `POST /executions/clean`: delete every run the filter reaches. What
-/// `weft clean --project .. --member .. --status ..` sends; a program's
-/// `ctx.runs()..clean(..)` runs the same [`clean_runs`].
-#[derive(Debug, Deserialize)]
-pub struct CleanRequest {
-    /// Only this project's runs; every project of the caller's when absent.
-    #[serde(default)]
-    pub project: Option<uuid::Uuid>,
-    #[serde(default)]
-    pub filter: weft_core::program::RunFilter,
-    /// What happens to matching runs still going.
-    #[serde(default = "default_clean_running")]
-    pub running: weft_core::running_policy::RunningPolicy,
-}
-
-fn default_clean_running() -> weft_core::running_policy::RunningPolicy {
-    weft_core::running_policy::RunningPolicy::Wait
-}
-
 pub async fn clean(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    axum::Json(body): axum::Json<CleanRequest>,
+    axum::Json(body): axum::Json<weft_core::program::CleanRequest>,
 ) -> Result<axum::Json<weft_core::program::CleanOutcome>, (StatusCode, String)> {
     if let Some(project) = body.project {
         authorize_project(&state, &caller.0, project).await?;
@@ -876,27 +809,13 @@ pub(crate) async fn clean_runs(
     asked_by: Option<ExecutionId>,
 ) -> Result<weft_core::program::CleanOutcome, (StatusCode, String)> {
     let internal = |what: &str, e: anyhow::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e:#}"));
-    let now = crate::lease::now_unix() as u64;
-    let query = ExecutionQuery {
-        limit: MAX_PAGE,
-        offset: 0,
-        project_id: project,
-        started_after: None,
-        started_before: None,
-        phase: None,
-        entry_node: filter.node.clone(),
-        status: filter.status.clone(),
-        member: filter.member.clone(),
-        tag: filter.tag.clone(),
-        below: None,
-    };
+    let query = run_query(project, filter, MAX_PAGE, crate::lease::now_unix() as u64);
     let mut outcome = weft_core::program::CleanOutcome::default();
     // The pages walk back in time from a bound fixed now (a run that
     // starts while this cleans is never reached), each page starting
     // strictly after the last run the one before it listed. Whatever the
     // walk deletes, cancels or leaves behind itself, the next page is
     // exactly the runs it has not reached yet.
-    let before = filter.older_than_secs.map_or(now + 1, |secs| now.saturating_sub(secs));
     let mut below = None;
     let mut swept_projects: std::collections::BTreeSet<uuid::Uuid> = Default::default();
     loop {
@@ -904,7 +823,7 @@ pub(crate) async fn clean_runs(
             .journal
             .list_executions(
                 tenant.as_str(),
-                &ExecutionQuery { started_before: Some(before), below, ..query.clone() },
+                &ExecutionQuery { below, ..query.clone() },
             )
             .await
             .map_err(|e| internal("list runs", e))?;
@@ -916,7 +835,7 @@ pub(crate) async fn clean_runs(
             if Some(run.execution_id) == asked_by {
                 continue;
             }
-            if run.status == "running" {
+            if run.status == SummaryStatus::Run(weft_core::program::RunStatus::Running) {
                 match running {
                     weft_core::running_policy::RunningPolicy::Cancel => {
                         cancel_execution_id(state, run.execution_id, &weft_core::exec::CancelCause::User)
@@ -926,6 +845,13 @@ pub(crate) async fn clean_runs(
                     }
                     weft_core::running_policy::RunningPolicy::Wait => outcome.left_running += 1,
                 }
+                continue;
+            }
+            // The listing's status clause is SQL and cannot see a row
+            // that no longer decodes, so it lists one as `corrupt`; a
+            // filtered clean deletes only the runs the filter reaches,
+            // never those. An unfiltered clean still removes them.
+            if filter.status.is_some_and(|status| !status.reaches(run.status)) {
                 continue;
             }
             let project_id = clean_execution(state, tenant, run.execution_id)
@@ -947,6 +873,73 @@ pub(crate) async fn clean_runs(
     Ok(outcome)
 }
 
+/// THE reading of a [`weft_core::program::RunFilter`] as a journal query,
+/// shared by every door that takes one (clean, list, count), so they
+/// reach the same runs. Its upper start bound is fixed at `now`: a run
+/// that starts after the question is never part of the answer, and
+/// `older_than_secs` keeps runs started at least that long ago.
+pub(crate) fn run_query(
+    project: Option<uuid::Uuid>,
+    filter: &weft_core::program::RunFilter,
+    limit: u32,
+    now: u64,
+) -> ExecutionQuery {
+    ExecutionQuery {
+        limit,
+        offset: 0,
+        project_id: project,
+        started_after: None,
+        started_before: Some(now.saturating_sub(filter.older_than_secs.unwrap_or(0)) + 1),
+        phase: None,
+        entry_node: filter.node.clone(),
+        status: filter.status,
+        instance: filter.instance.clone(),
+        tag: filter.tag.clone(),
+        below: None,
+    }
+}
+
+/// The newest `limit` runs `filter` reaches in `project`, with how many it
+/// reaches in all; a run parked on a wait reads `waiting_for_input`, as
+/// in every other listing.
+pub(crate) async fn list_runs(
+    state: &DispatcherState,
+    tenant: &crate::tenant::TenantId,
+    project: uuid::Uuid,
+    filter: &weft_core::program::RunFilter,
+    limit: u32,
+) -> Result<ExecutionPage, (StatusCode, String)> {
+    if !(1..=MAX_PAGE).contains(&limit) {
+        return Err((StatusCode::BAD_REQUEST, format!("a runs listing takes 1 to {MAX_PAGE} runs, not {limit}")));
+    }
+    let query = run_query(Some(project), filter, limit, crate::lease::now_unix() as u64);
+    let mut page = state
+        .journal
+        .list_executions(tenant.as_str(), &query)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list runs: {e:#}")))?;
+    overlay_suspended(state, &mut page.executions)
+        .await
+        .map_err(|status| (status, "mark the runs parked on a wait".to_string()))?;
+    Ok(page)
+}
+
+/// How many runs `filter` reaches in `project`.
+pub(crate) async fn count_runs(
+    state: &DispatcherState,
+    tenant: &crate::tenant::TenantId,
+    project: uuid::Uuid,
+    filter: &weft_core::program::RunFilter,
+) -> Result<u64, (StatusCode, String)> {
+    let query = run_query(Some(project), filter, 0, crate::lease::now_unix() as u64);
+    let page = state
+        .journal
+        .list_executions(tenant.as_str(), &query)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("count runs: {e:#}")))?;
+    Ok(page.total)
+}
+
 /// Remove one run, and sweep the version its removal left bare.
 ///
 /// The sweep is HERE and not in whoever asked. Deleting the last run of
@@ -963,7 +956,7 @@ pub async fn delete_execution(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(execution_id_str): Path<String>,
-) -> Result<axum::Json<serde_json::Value>, StatusCode> {
+) -> Result<axum::Json<DeletedExecution>, StatusCode> {
     let execution_id: ExecutionId = execution_id_str.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
     let project_id = clean_execution(&state, &caller.0, execution_id).await?;
     // The run IS deleted, which is what was asked for, so a sweep that
@@ -977,7 +970,7 @@ pub async fn delete_execution(
         );
         Vec::new()
     });
-    Ok(axum::Json(serde_json::json!({ "project": project_id, "swept": swept })))
+    Ok(axum::Json(DeletedExecution { project: project_id, swept }))
 }
 
 /// THE removal of one execution (`weft clean <execution_id>`, and each run a
@@ -1068,7 +1061,7 @@ mod waits_tests {
 
     fn signal(token: &str, execution_id: Option<ExecutionId>, node: &str, is_resume: bool, kind: &str) -> crate::journal::SignalRegistration {
         crate::journal::SignalRegistration {
-            member: None,
+            instance: None,
             activation_trigger: None,
             source_version: None,
             setup_execution_id: None,

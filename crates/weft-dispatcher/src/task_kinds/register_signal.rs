@@ -252,9 +252,9 @@ impl RegisterSignalExecutor {
         // the project store: same answer while the project lives, and
         // still an answer once it does not.
         let tenant = owner.tenant;
-        // Whose signal: the run's member (a member's trigger setup arms
-        // that member's copy; a member's run waits as that member).
-        let member = owner.member;
+        // Whose signal: the run's instance (an instance's trigger setup arms
+        // that instance's copy; an instance's run waits as that instance).
+        let instance = owner.instance;
         let fired_by = owner.fired_by;
 
         // The place this registration is for, spelled: the row's key.
@@ -321,7 +321,7 @@ impl RegisterSignalExecutor {
             let (token, prior) = loop {
                 round += 1;
                 let (token, prior) =
-                    read_prior(state.journal.as_ref(), resume_token.as_deref(), project_id, &place, member.as_ref()).await?;
+                    read_prior(state.journal.as_ref(), resume_token.as_deref(), project_id, &place, instance.as_ref()).await?;
                 let prior_seq = prior.as_ref().map_or(0, |row| row.kind_state_seq);
                 // A resume starts its kind state afresh; an entry carries
                 // its row's forward (a feed cursor keeps its place).
@@ -341,12 +341,12 @@ impl RegisterSignalExecutor {
                         },
                     })
                     .await?;
-                refuse_unarmable_route(state, &prepared.routing.surface, member.as_ref(), tenant.as_str(), project_id, &place).await?;
+                refuse_unarmable_route(state, &prepared.routing.surface, instance.as_ref(), tenant.as_str(), project_id, &place).await?;
 
                 let written = state
                     .journal
                     .signal_insert(&crate::journal::SignalRegistration {
-                        member: member.clone(),
+                        instance: instance.clone(),
                         // An entry signal is its own trigger's; a wait is the
                         // activation's of the trigger that fired its run (none
                         // for a run started by hand).
@@ -556,12 +556,12 @@ async fn read_prior(
     resume_token: Option<&str>,
     project_id: uuid::Uuid,
     place: &str,
-    member: Option<&weft_core::member::MemberId>,
+    instance: Option<&weft_core::instance::InstanceId>,
 ) -> Result<(String, Option<crate::journal::SignalRegistration>)> {
     if let Some(token) = resume_token {
         return Ok((token.to_string(), journal.signal_get(token).await?));
     }
-    Ok(match journal.signal_entry_at(project_id, place, member).await? {
+    Ok(match journal.signal_entry_at(project_id, place, instance).await? {
         Some(row) => (row.token.clone(), Some(row)),
         None => (uuid::Uuid::new_v4().to_string(), None),
     })
@@ -629,7 +629,7 @@ async fn undo_registration(
 async fn refuse_unarmable_route(
     state: &DispatcherState,
     surface: &weft_core::primitive::SignalSurface,
-    member: Option<&weft_core::member::MemberId>,
+    instance: Option<&weft_core::instance::InstanceId>,
     tenant: &str,
     project_id: uuid::Uuid,
     place: &str,
@@ -637,16 +637,16 @@ async fn refuse_unarmable_route(
     let weft_core::primitive::SignalSurface::PublicEntry { path, methods } = surface else {
         return Ok(());
     };
-    // A public address is one per trigger: the member of a call to it is
-    // named per call (the `Weft-Member` header on a gated route, or a
-    // member token), never by giving each member a copy of the route.
-    if let Some(member) = member {
+    // A public address is one per trigger: the instance of a call to it is
+    // named per call (the `Weft-Instance` header on a gated route, or an
+    // instance token), never by giving each instance a copy of the route.
+    if let Some(instance) = instance {
         anyhow::bail!(
             "trigger '{place}' serves the public address '{path}', and an address is shared by \
-             every member, so it cannot be armed for member '{member}'. Keep the route shared \
-             and name the member per call: the {} header on a route gated by a connection, or \
-             a member token",
-            weft_core::member::MEMBER_HEADER,
+             every instance, so it cannot be armed for instance '{instance}'. Keep the route shared \
+             and name the instance per call: the {} header on a route gated by a connection, or \
+             an instance token",
+            weft_core::instance::INSTANCE_HEADER,
         );
     }
 

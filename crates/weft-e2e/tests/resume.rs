@@ -70,9 +70,9 @@ async fn worker_crash_resumes_on_fresh_worker() -> anyhow::Result<()> {
     // (before we sent the answer, so it provably had not finished), yet the
     // execution still completed with the correct approval. A dead worker cannot
     // finish a job; a fresh one re-seeded from the journal must have. We do NOT
-    // additionally fingerprint the new worker instance: a respawn reuses the
+    // additionally fingerprint the new worker replica: a respawn reuses the
     // worker's deterministic name and the dead row is GC'd within seconds, so
-    // any "a different instance did it" marker is timing-flaky (see platform.rs).
+    // any "a different replica did it" marker is timing-flaky (see platform.rs).
     let settled = SettledRun::observe(&disp, execution_id).await?;
     settled.completed()?;
     settled.assert_input("out", "data", &json!(true))?;

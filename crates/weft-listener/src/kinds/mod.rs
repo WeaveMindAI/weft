@@ -464,7 +464,7 @@ pub async fn bring_up(state: &crate::ListenerState, row: weft_broker_client::pro
             // after the new task subscribed it would drop the new one.
             stop_held(state, &row.token).await;
             let serving = Arc::new(Mutex::new(ServingState::default()));
-            let ctx = spawn_ctx(state, &row.token, &row.tenant_id, row.for_member.clone(), &spec, fresh, serving.clone());
+            let ctx = spawn_ctx(state, &row.token, &row.tenant_id, row.for_instance.clone(), &spec, fresh, serving.clone());
             let Some(task) = handler.spawn_task(&spec, &row.kind_state, ctx).await? else {
                 anyhow::bail!(
                     "the '{}' kind holds a connection but started no task; its `between_fires` \
@@ -546,7 +546,7 @@ fn spawn_ctx(
     state: &crate::ListenerState,
     token: &str,
     tenant_id: &str,
-    for_member: Option<weft_core::member::MemberScope>,
+    for_instance: Option<weft_core::instance::InstanceScope>,
     spec: &SignalSpec,
     fresh: bool,
     serving: Arc<Mutex<ServingState>>,
@@ -556,7 +556,7 @@ fn spawn_ctx(
             state.fire_sink.clone(),
             token.to_string(),
             tenant_id.to_string(),
-            for_member,
+            for_instance,
             spec.match_predicates.clone(),
         ),
         config: state.config.clone(),
@@ -645,7 +645,7 @@ pub async fn wake(state: &crate::ListenerState, body: WakeBody) -> Result<()> {
     // A `Wakes` kind keeps nothing in this process between calls (see
     // `bring_up`), so its serving slot lives for this one wake.
     let serving = Arc::new(Mutex::new(ServingState::default()));
-    let ctx = spawn_ctx(state, &row.token, &row.tenant_id, row.for_member.clone(), &spec, false, serving);
+    let ctx = spawn_ctx(state, &row.token, &row.tenant_id, row.for_instance.clone(), &spec, false, serving);
     let woken = Woken { aimed_at_ms, now_ms, state: row.kind_state.clone(), seq: row.kind_state_seq };
     let after = handler.on_wake(&spec, woken, ctx).await?;
     arm_next_wake(state, handler, &row.token, &spec, &after, WakeFrom::Woken { aimed_at_ms }).await

@@ -128,7 +128,7 @@
 		onUpgradeInfra?: () => void;
 		actionBarState: import('../../../../protocol').ActionBarState;
 		drift: import('../../../../protocol').ActionAvailability | undefined;
-		infraNodes?: import('../../../../protocol').InfraInstanceStatus[];
+		infraNodes?: import('../../../../protocol').InfraPlacementStatus[];
 		hasInfraInGraph?: boolean;
 		hasTriggersInGraph?: boolean;
 		executionState?: import('../../types').ExecutionState;

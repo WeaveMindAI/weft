@@ -73,7 +73,7 @@ pub async fn run(docker: &dyn Docker, args: Vec<String>) -> anyhow::Result<Strin
 /// containers and volumes again and never touches anything else.
 pub mod labels {
     /// On everything weft starts: which install it belongs to
-    /// (`weft_core::infra::Instance::label_value`), so one install never
+    /// (`weft_core::infra::Install::label_value`), so one install never
     /// touches another's on a machine that holds several.
     pub const INSTALL: &str = weft_core::infra::INSTALL_LABEL;
     pub const PROJECT: &str = "weft.project";
@@ -82,7 +82,8 @@ pub mod labels {
     pub const ROLE: &str = "weft.role";
     pub const IMAGE: &str = "weft.image";
     pub const NODE: &str = "weft.node";
-    pub const INSTANCE: &str = "weft.instance";
+    /// Which copy of an infra node (`NodeRef::copy_id`).
+    pub const COPY: &str = "weft.copy";
     pub const UNIT: &str = "weft.unit";
     pub const UNIT_HASH: &str = "weft.unit-hash";
 }

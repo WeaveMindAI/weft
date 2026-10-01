@@ -139,6 +139,11 @@ the node. A bake does not refuse; it brings the infrastructure up itself,
 which is right but takes as long as starting it would, so a bake that seems
 to hang on a program with infrastructure is usually provisioning.
 
+This is also how you test an infra node: live tests do not cover infra
+nodes for now, so you prove one inside a real program. Start its infra, then
+`--target` the node that reads it, with `--from` or `--emit` supplying the
+values upstream of it, so each run exercises the container and nothing else.
+
 A fire names exactly one trigger; its payload wakes that trigger, which
 runs and decides what to emit. An emit supplies the trigger's declared
 outputs directly. You choose one per trigger. Trigger ports receive their
@@ -170,7 +175,10 @@ checkpoint edits you want to keep.
 - `--seed --seed-until classify` also permits reusing `classify`.
 
 These flags limit reuse within the requested run; the [cut] limits
-execution itself. Changed implementations, inputs, dependencies, failed
+execution itself. A step whose saved output names a stored file that has
+been edited since, or is gone, cannot be reused: the run is refused before
+it starts, naming the step, the port and the file, and you either hand the
+file in with `--emit` or run the step again with `--seed-before` it. Changed implementations, inputs, dependencies, failed
 work, and live handles can prevent reuse. A loop is reused whole. An
 entirely reused run is valid and does no new node work. This applies
 inside a saved or carved run too: `--from` chooses its boundary, not a
@@ -214,7 +222,9 @@ it. Replaying the [frozen example] recomputes the selected work on current
 code; interior reused results do not become hidden fixed inputs.
 
 `expected` holds the output evidence `diff` uses, including finite streams
-and closures. You repeat `--expect node` to focus review on particular
+and closures. A closure a failure left reads `"closed": true` with
+`"failure": {"node": "query", "error": "..."}`, the node that broke and its
+message. You repeat `--expect node` to focus review on particular
 node outputs; focus changes comparison, not execution, and a focused
 output that disappeared remains visible as a difference. Stored media
 compares by its content hash.

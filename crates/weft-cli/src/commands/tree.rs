@@ -4,7 +4,8 @@
 
 use std::collections::BTreeMap;
 
-use super::versions::{fetch_tree_raw, short, RunSummary, Tree, VersionSummary};
+use super::versions::{fetch_tree_raw, short};
+use weft_core::versions::{RunSummary, VersionSummary, VersionTree};
 use super::Ctx;
 
 pub async fn run(ctx: Ctx) -> anyhow::Result<()> {
@@ -31,7 +32,7 @@ pub async fn run(ctx: Ctx) -> anyhow::Result<()> {
 
 /// The tree as lines. Pure (the clock formatter is passed in), so the
 /// layout is tested.
-pub fn render(tree: &Tree, when: &dyn Fn(u64) -> String) -> Vec<String> {
+pub fn render(tree: &VersionTree, when: &dyn Fn(u64) -> String) -> Vec<String> {
     if tree.versions.is_empty() {
         return vec!["no versions yet: `weft run` or `weft checkpoint` records one".to_string()];
     }
@@ -80,7 +81,7 @@ pub fn render(tree: &Tree, when: &dyn Fn(u64) -> String) -> Vec<String> {
 }
 
 fn render_version<'a>(
-    tree: &'a Tree,
+    tree: &'a VersionTree,
     v: &'a VersionSummary,
     depth: usize,
     children: &BTreeMap<Option<&str>, Vec<&'a VersionSummary>>,
@@ -123,8 +124,8 @@ fn render_version<'a>(
     };
     out.push(format!("{indent}{} {}{label}{change}{mark}", short(&v.id), when(v.created_at)));
     for r in runs.get(v.id.as_str()).cloned().unwrap_or_default() {
-        let head = if tree.head.head_run.as_deref() == Some(r.execution_id.as_str()) { " <- HEAD run" } else { "" };
-        let seed = r.seed_execution_id.as_deref().map(|s| format!(" seed {} ({} stale)", short(s), r.stale.len())).unwrap_or_default();
+        let head = if tree.head.head_run == Some(r.execution_id) { " <- HEAD run" } else { "" };
+        let seed = r.seed_execution_id.map(|s| format!(" seed {} ({} stale)", short(&s.to_string()), r.stale.len())).unwrap_or_default();
         let scope = r.spec.as_ref().map(|s| format!(" spec {}", s.name)).unwrap_or_default();
         let example = r.example.as_deref().map(|e| format!(" example {e}")).unwrap_or_default();
         let ended = r.completed_at.map(|t| format!(" -> {}", when(t))).unwrap_or_default();
@@ -146,7 +147,7 @@ fn render_version<'a>(
         } else {
             String::new()
         };
-        out.push(format!("{indent}  run {} {}{ended} {}{cause}{skipped}{seed}{scope}{example}{head}", short(&r.execution_id), when(r.started_at), r.status));
+        out.push(format!("{indent}  run {} {}{ended} {}{cause}{skipped}{seed}{scope}{example}{head}", short(&r.execution_id.to_string()), when(r.started_at), r.status.map_or("unknown", |s| s.as_str())));
     }
     for child in children.get(&Some(v.id.as_str())).cloned().unwrap_or_default() {
         render_version(tree, child, depth + 1, children, runs, when, shown, out);
@@ -156,7 +157,7 @@ fn render_version<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::versions::{Head, ManifestDiff};
+    use weft_core::versions::{Head, ManifestDiff};
 
     fn version(id: &str, parent: Option<&str>, label: Option<&str>, changed: &[&str]) -> VersionSummary {
         VersionSummary {
@@ -169,16 +170,22 @@ mod tests {
         }
     }
 
+    /// An execution id whose first eight characters are `prefix` padded
+    /// with zeros, which is what a line shows.
+    fn run_id(prefix: &str) -> uuid::Uuid {
+        format!("{prefix:0<8}-0000-0000-0000-000000000000").parse().expect("a uuid")
+    }
+
     fn run(execution_id: &str, version: &str, seed: Option<&str>, status: &str) -> RunSummary {
         RunSummary {
-            execution_id: format!("{execution_id}00000000"),
+            execution_id: run_id(execution_id),
             version_id: format!("{version}00000000"),
             definition_hash: "d".into(),
-            seed_execution_id: seed.map(|s| format!("{s}00000000")),
+            seed_execution_id: seed.map(run_id),
             stale: vec!["b".into()],
             spec: None,
             example: None,
-            status: status.into(),
+            status: weft_core::program::SummaryStatus::parse(status),
             started_at: 0,
             completed_at: if status == "completed" { Some(9) } else { None },
             // A cancelled run in this fixture says a person did it, so
@@ -190,8 +197,8 @@ mod tests {
 
     #[test]
     fn the_tree_indents_children_lists_runs_under_their_version_and_marks_head() {
-        let tree = Tree {
-            head: Head { head_version: Some("v200000000".into()), head_run: Some("c200000000".into()), activated_versions: vec![] },
+        let tree = VersionTree {
+            head: Head { head_version: Some("v200000000".into()), head_run: Some(run_id("c2")), activated_versions: vec![] },
             versions: vec![version("v1", None, Some("base"), &[]), version("v2", Some("v1"), None, &["main.weft"]), version("v3", Some("v1"), None, &["prompts/p.txt"])],
             runs: vec![run("c1", "v1", None, "completed"), run("c2", "v2", Some("c1"), "running")],
         };
@@ -210,7 +217,7 @@ mod tests {
 
     #[test]
     fn an_empty_tree_says_how_to_start_one() {
-        let tree = Tree { head: Head::default(), versions: vec![], runs: vec![] };
+        let tree = VersionTree { head: Head::default(), versions: vec![], runs: vec![] };
         assert!(render(&tree, &|t| t.to_string())[0].contains("weft checkpoint"));
     }
 }

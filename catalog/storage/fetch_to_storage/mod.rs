@@ -11,8 +11,10 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::storage::{KeepTtl, StorageScope, StoredFile};
+use weft::storage::StoredFile;
 use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+
+use super::lifetime;
 
 #[derive(NodeManifest)]
 pub struct FetchToStorageNode;
@@ -29,28 +31,14 @@ impl Node for FetchToStorageNode {
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let url: String = ctx.inputs.get("url")?;
-        // `keep` declares a metadata default, so the bag always holds a
-        // value; a required read keeps the default in ONE place.
-        let keep: bool = ctx.inputs.get("keep")?;
         let filename: Option<String> = ctx.inputs.opt("filename")?;
-        let scope_name: String = ctx.inputs.get("scope")?;
+        let scope = lifetime::scope_named(&ctx.inputs.get::<String>("scope")?)?;
         let identity: Option<String> = ctx.inputs.opt("identity")?.filter(|s: &String| !s.is_empty());
-        let scope = match scope_name.as_str() {
-            "execution" => StorageScope::Execution,
-            "project" => StorageScope::Project,
-            other => weft::node_bail!("`scope` is '{other}'; it is `execution` or `project`"),
-        };
-        // `keep` is a run-scoped file's way of outliving the run; a
-        // project file is persistent already, so the pair is a
-        // contradiction the author should see rather than a flag
-        // quietly dropped.
-        if keep && scope == StorageScope::Project {
-            weft::node_bail!(
-                "`keep` is on with `scope: project`; a project file already outlives the run, \
-                 so drop `keep` or use `scope: execution`"
-            );
-        }
-        let keep_ttl = keep.then_some(KeepTtl::Default);
+        // No default on purpose, as on every storage node: absent is the
+        // scope's own lifetime (an execution file goes with its run, a
+        // project file stays).
+        let ttl_days: Option<u64> = ctx.inputs.opt("ttl_days")?;
+        let keep_ttl = ttl_days.map(lifetime::ttl_of_days);
 
         // The whole fetch-stream-into-storage path is a language
         // capability: ctx GETs the URL, derives the mime, streams the
@@ -62,11 +50,6 @@ impl Node for FetchToStorageNode {
         }
         let file = storage.put_from_url(&url, filename.as_deref(), keep_ttl).await?;
 
-        let stored = StoredFile::from_value(&file)?;
-        let out = NodeOutput::new()
-            .set("file", file)
-            .set("sizeBytes", stored.size_bytes)
-            .set("mimeType", stored.mime_type);
-        ctx.pulse_downstream(out).await
+        ctx.pulse_downstream(NodeOutput::stored_file(StoredFile::from_value(&file)?)).await
     }
 }

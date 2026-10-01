@@ -223,6 +223,7 @@ fn resolve_runtime_key_refs_matches_listing_by_tenant_less_key() {
         expires_at_unix: None,
         keep_ttl_secs: None,
         created_at_unix: 0,
+        version: weft_core::storage::FIRST_FILE_VERSION,
     };
     let listing = vec![
         meta("t1/project/p1/f1", "pic.png"),
@@ -311,7 +312,7 @@ fn apply_asset_resolutions_substitutes_paths_and_urls() {
         "prompt": "plain value"
     }));
     let marker = serde_json::json!({"__weft_image__": {
-        "key": "t/asset/p/abc", "mimeType": "image/png", "sizeBytes": 4, "filename": "assets/pic.png"
+        "key": "t/asset/abc", "mimeType": "image/png", "sizeBytes": 4, "filename": "assets/pic.png"
     }});
     let map = std::collections::BTreeMap::from([(
         asset_ref("assets/pic.png", WeftType::Primitive(WeftPrimitive::Image)).resolution_key(),
@@ -778,10 +779,11 @@ mod run_values {
     #[test]
     fn a_file_on_a_port_that_takes_none_is_refused() {
         let file = weft_core::storage::StoredFile {
-            key: "t/asset/p/abc".into(),
+            key: "t/asset/abc".into(),
             mime_type: "audio/ogg".into(),
             size_bytes: 3,
             filename: "hello.ogg".into(),
+            version: weft_core::storage::FIRST_FILE_VERSION,
         };
         let audio = weft_core::storage::typed_file_value(&file, &WeftType::Primitive(WeftPrimitive::Audio));
         let takes_file = WeftType::parse("File").unwrap();

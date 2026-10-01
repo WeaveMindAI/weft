@@ -93,9 +93,9 @@ pub async fn tick(state: &SupervisorState, owned: &mut HashSet<Uuid>) -> Result<
     let mut held_projects: Vec<Uuid> = held.iter().flatten().map(|c| c.project).collect();
     held_projects.sort_unstable();
     held_projects.dedup();
-    let synced = state.broker.sync_ownership(&state.instance, &held_projects).await?;
+    let synced = state.broker.sync_ownership(&state.replica, &held_projects).await?;
     tracing::debug!(
-        instance = %state.instance,
+        replica = %state.replica,
         owned = synced.owned.len(),
         claimed = synced.claimed.len(),
         "ownership synced (renewed + claimed a batch)"
@@ -119,14 +119,14 @@ pub async fn tick(state: &SupervisorState, owned: &mut HashSet<Uuid>) -> Result<
 /// is right while the copy can come back, and a leak once it cannot:
 /// its project was removed (with `--force` not even waiting for the
 /// terminate), or the program no longer declares it (the node was
-/// removed, or changed sides between shared and per member), whether
+/// removed, or changed sides between shared and per instance), whether
 /// the orphan reap terminated it or it was already down with no row
 /// left to reap. The host is the only place such a copy still shows,
 /// so the sweep starts from the host's listing, and the broker judges
 /// which of those copies are gone. A copy still holding a row is never
 /// gone here: a user terminate or the reap owns it until the row goes.
 ///
-/// A copy's id is derived from (project, node, member), so a node added
+/// A copy's id is derived from (project, node, instance), so a node added
 /// back names the very copy a judgment called gone, and an apply
 /// adopting its kept disks must never overlap its deletion. Two guards,
 /// both held from the judgment through the deletion:
@@ -171,12 +171,12 @@ pub async fn sweep_gone_copies(state: &SupervisorState, copies: Vec<NodeRef>) {
 /// One project's sweep, under its lock: judge its copies, then delete
 /// each gone one after judging it again (the lease fence).
 async fn sweep_project(state: &SupervisorState, project: Uuid, copies: &[NodeRef]) -> Result<()> {
-    let Some(gone) = state.broker.gone_copies(&state.instance, project, copies).await? else {
+    let Some(gone) = state.broker.gone_copies(&state.replica, project, copies).await? else {
         tracing::debug!(project_id = %project, "another supervisor holds the project's lease; its copies are its to sweep");
         return Ok(());
     };
-    for copy in copies.iter().filter(|c| gone.contains(&c.instance)) {
-        match state.broker.gone_copies(&state.instance, project, std::slice::from_ref(copy)).await? {
+    for copy in copies.iter().filter(|c| gone.contains(&c.copy_id)) {
+        match state.broker.gone_copies(&state.replica, project, std::slice::from_ref(copy)).await? {
             None => {
                 tracing::info!(project_id = %project, "the project's lease moved mid-sweep; leaving its copies to the new owner");
                 return Ok(());
@@ -187,14 +187,14 @@ async fn sweep_project(state: &SupervisorState, project: Uuid, copies: &[NodeRef
         tracing::info!(
             project_id = %copy.project,
             node = %copy.node,
-            instance = %copy.instance,
+            copy_id = %copy.copy_id,
             "the copy is gone for good; deleting what the host still holds for it, kept disks included"
         );
         if let Err(e) = state.host.terminate(copy, &[]).await {
             tracing::warn!(
                 project_id = %copy.project,
                 node = %copy.node,
-                instance = %copy.instance,
+                copy_id = %copy.copy_id,
                 error = %format!("{e:#}"),
                 "deleting a gone copy failed; the next tick tries again"
             );

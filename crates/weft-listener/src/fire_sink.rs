@@ -81,7 +81,7 @@ impl FireSignalSink {
                 dedup_key: Some(dedup),
                 execution_id: None,
                 tenant_id: tenant_id.to_string(),
-                target_instance: None,
+                target_replica: None,
                 binary_hash: None,
                 payload: serde_json::json!({ "token": token, "payload": payload }),
             })

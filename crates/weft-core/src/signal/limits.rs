@@ -73,7 +73,7 @@ impl EntryLimits {
     pub const NODE_FIELDS: [&'static str; 3] = ["callsPerMinutePerCaller", "callsPerMinute", "callsAtOnce"];
 
     /// The inputs the language gives a trigger
-    /// ([`crate::node::NodeMetadata::add_language_inputs`]): the
+    /// ([`crate::node::NodeMetadata::add_language_ports`]): the
     /// per-minute and at-once limits on every trigger, and the
     /// per-caller one only when `has_caller` (somebody outside calls it,
     /// [`crate::node::NodeFeatures::has_outside_caller`]), since a

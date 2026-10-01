@@ -202,14 +202,13 @@ pub fn is_lowering_builtin(node_type: &str) -> bool {
     weft_core::project::boundary_types::is_boundary(node_type)
 }
 
-/// The message for a type the catalog does not serve: a node whose
-/// code is not written yet is named as such (the catalog saw its
-/// description), anything else is unknown.
+/// The message for a type the catalog does not serve: the catalog's own
+/// sentence when it saw the node (not ready yet, or failed to load),
+/// otherwise unknown.
 pub fn unknown_type_message(catalog: &dyn MetadataCatalog, node_type: &str) -> String {
-    match catalog.not_ready(node_type) {
-        Some(reason) => format!("node type '{node_type}' is not ready yet: {reason}"),
-        None => format!("unknown node type: '{node_type}'"),
-    }
+    catalog
+        .unavailable(node_type)
+        .unwrap_or_else(|| format!("unknown node type: '{node_type}'"))
 }
 
 pub fn enrich(project: &mut ProjectDefinition, catalog: &dyn MetadataCatalog) -> CompileResult<()> {
@@ -241,7 +240,7 @@ pub fn enrich_with_policy(
 /// changes; wired, a `false` or a closure skips the node.
 ///
 /// They sit with the catalog ports because the node type owns them, not
-/// the instance, and the node body never sees them (the input bag drops
+/// the node in the program, and the node body never sees them (the input bag drops
 /// them: the language's decision, not the node's data).
 ///
 /// One port each rather than one port with a flag: a wire names the
@@ -470,7 +469,7 @@ pub fn enrich_collecting(
 
         // An ACCESS NODE (metadata carries the `service` recipe):
         // stamp the service name onto its `access` widget, so the
-        // runtime bag and the editor read it off the instance. The
+        // runtime bag and the editor read it off the node. The
         // permissions are NOT materialized as an input: they are ticked
         // once at connect time and live on the stored connection, never
         // in source. The stamp itself is `AccessSpec::stamp_onto`, the
@@ -541,6 +540,24 @@ pub fn enrich_collecting(
             PortDirection::Input,
             &mut errors,
         );
+        // A node that catches its failures has an `error` output the
+        // language gave it and the runtime fills; a source port of that
+        // name would read as the author's own value on it. The declared
+        // port is dropped before the merge so this is the one error it
+        // earns, not this plus a type mismatch against the catalog's.
+        let mut weft_outputs = weft_outputs;
+        if meta.features.catch_errors {
+            let port = weft_core::node::ERROR_PORT;
+            if weft_outputs.iter().any(|p| p.name == port) {
+                weft_outputs.retain(|p| p.name != port);
+                errors.push(EnrichError { span: node_span, file: node.source_file.clone(), message: format!(
+                    "node '{}': '{port}' is the output this node type already has for its \
+                     failures (wire it to handle them); remove '{port}' from the node's \
+                     outputs, or give your own port another name",
+                    node.id,
+                )});
+            }
+        }
         let outputs = merge_ports(
             &catalog_outputs,
             &weft_outputs,
@@ -644,8 +661,8 @@ pub fn enrich_collecting(
         normalize_port_literals(node);
         // An access node's connection is picked on each install, never
         // written in the source (`weft_core::picks`): a field neither
-        // wired nor `@member_filled` is marked picked on the install, and
-        // a connection written there (a member's fallback included) is
+        // wired nor `@instance_filled` is marked picked on the install, and
+        // a connection written there (an instance's fallback included) is
         // the old way, refused naming the fix, since its id means nothing
         // on any other install.
         if let Some(input) = meta.access_input() {
@@ -656,10 +673,10 @@ pub fn enrich_collecting(
                 None if !wired => {
                     node.port_literals.insert(input.name.clone(), weft_core::picks::install_picked_literal());
                 }
-                // A member's fallback is a connection written in the
+                // An instance's fallback is a connection written in the
                 // source too, with the same id that means nothing elsewhere.
                 Some(value)
-                    if weft_core::member::as_member_filled(value).is_some_and(|filled| filled.fallback.is_some()) =>
+                    if weft_core::instance::as_instance_filled(value).is_some_and(|filled| filled.fallback.is_some()) =>
                 {
                     let span = node.written_span(&input.name).map(|s| s.span).unwrap_or(node_span);
                     errors.push(EnrichError {
@@ -668,7 +685,7 @@ pub fn enrich_collecting(
                         message: format!(
                             "'{id}.{field}' falls back to a connection written in the source. That was the \
                              old way: a connection lives in one install, so its id means nothing on any \
-                             other. Write `@member_filled` alone; a member who connected none is refused, \
+                             other. Write `@instance_filled` alone; an instance that connected none is refused, \
                              naming the field. See {doc}",
                             id = node.id,
                             field = input.name,
@@ -696,17 +713,17 @@ pub fn enrich_collecting(
                 _ => {}
             }
         }
-        // A node with a `@member_filled` field carries what checking a
-        // member's value needs (its rules) and, when the field is its
-        // connection, what the member's connect page needs (the
-        // service's recipe): the member door has only the program to read
-        // them from.
-        let filled: Vec<String> = weft_core::member::member_filled_fields(node).map(|(field, _)| field.to_string()).collect();
-        node.member_rules = (!filled.is_empty()).then(|| weft_core::project::MemberRules {
+        // A node with an `@instance_filled` field carries what checking an
+        // instance's value needs (its rules) and, when the field is its
+        // connection, what the instance's connect page needs (the
+        // service's recipe): the instance door has only the program to
+        // read them from.
+        let filled: Vec<String> = weft_core::instance::instance_filled_fields(node).map(|(field, _)| field.to_string()).collect();
+        node.instance_rules = (!filled.is_empty()).then(|| weft_core::project::InstanceRules {
             rules: crate::validate::node_rules(meta, node),
             custom_outputs: crate::validate::node_custom_outputs(node, meta),
         });
-        node.member_service = match (meta.access_input(), &meta.service) {
+        node.instance_service = match (meta.access_input(), &meta.service) {
             (Some(input), Some(spec)) if filled.contains(&input.name) => Some(spec.clone()),
             _ => None,
         };
@@ -737,31 +754,31 @@ pub fn enrich_collecting(
         }
         cast_literals(node);
     }
-    mark_per_member_slice(project);
+    mark_per_instance_slice(project);
     errors
 }
 
-/// Everything that reads a per-member value becomes per-member too.
+/// Everything that reads a per-instance value becomes per-instance too.
 ///
-/// The author writes only the starting points (`@per_member` on an infra
-/// node, `@member_filled` on a field); whatever sits downstream of one along the
-/// wires reads that member's value, so it exists per member as well: a
-/// trigger reading a member's bridge address is armed once per member,
-/// and a step reading a member's connection runs in that member's runs.
+/// The author writes only the starting points (`@per_instance` on an infra
+/// node, `@instance_filled` on a field); whatever sits downstream of one along the
+/// wires reads that instance's value, so it exists per instance as well: a
+/// trigger reading an instance's bridge address is armed once per instance,
+/// and a step reading an instance's connection runs in that instance's runs.
 /// Group, loop and include boundaries are ordinary nodes after
 /// flattening, so the walk crosses them without knowing they exist. A
 /// node an include's body shares between call sites is one node, so one
-/// per-member site makes it per-member for every site: the conservative
-/// answer, and the one that never lets a member's value reach a shared
+/// per-instance site makes it per-instance for every site: the conservative
+/// answer, and the one that never lets an instance's value reach a shared
 /// run unnoticed.
 ///
 /// Derived and filled marks are recomputed from scratch each time, so a
 /// stale one can never outlive what it came from.
-pub fn mark_per_member_slice(project: &mut ProjectDefinition) {
-    use weft_core::member::PerMember;
+pub fn mark_per_instance_slice(project: &mut ProjectDefinition) {
+    use weft_core::instance::PerInstance;
     for node in project.nodes.iter_mut() {
-        if matches!(node.per_member, Some(PerMember::Derived | PerMember::Filled)) {
-            node.per_member = None;
+        if matches!(node.per_instance, Some(PerInstance::Derived | PerInstance::Filled)) {
+            node.per_instance = None;
         }
     }
     let mut downstream: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
@@ -769,16 +786,16 @@ pub fn mark_per_member_slice(project: &mut ProjectDefinition) {
         downstream.entry(edge.source.as_str()).or_default().push(edge.target.as_str());
     }
     let mut reached: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    // The second starting point: a node with a field each member fills.
+    // The second starting point: a node with a field each instance fills.
     for node in project.nodes.iter_mut() {
-        if node.per_member.is_none() && weft_core::member::member_filled_fields(node).next().is_some() {
-            node.per_member = Some(PerMember::Filled);
+        if node.per_instance.is_none() && weft_core::instance::instance_filled_fields(node).next().is_some() {
+            node.per_instance = Some(PerInstance::Filled);
         }
     }
     let mut frontier: Vec<&str> = project
         .nodes
         .iter()
-        .filter(|n| matches!(n.per_member, Some(PerMember::Marked | PerMember::Filled)))
+        .filter(|n| matches!(n.per_instance, Some(PerInstance::Marked | PerInstance::Filled)))
         .map(|n| n.id.as_str())
         .collect();
     while let Some(id) = frontier.pop() {
@@ -789,8 +806,8 @@ pub fn mark_per_member_slice(project: &mut ProjectDefinition) {
         }
     }
     for node in project.nodes.iter_mut() {
-        if node.per_member.is_none() && reached.contains(&node.id) {
-            node.per_member = Some(PerMember::Derived);
+        if node.per_instance.is_none() && reached.contains(&node.id) {
+            node.per_instance = Some(PerInstance::Derived);
         }
     }
 }
@@ -813,15 +830,15 @@ fn cast_literals(node: &mut weft_core::project::NodeDefinition) {
             continue;
         }
         let Some(value) = node.port_literals.get(&input.name).cloned() else { continue };
-        // A `@member_filled` field casts its fallback, inside the marker;
+        // A `@instance_filled` field casts its fallback, inside the marker;
         // the marker itself is never a value to cast.
-        if let Some(filled) = weft_core::member::as_member_filled(&value) {
+        if let Some(filled) = weft_core::instance::as_instance_filled(&value) {
             let Some(fallback) = filled.fallback.cloned() else { continue };
             if WeftType::is_compatible(&crate::file_ref::literal_type(&fallback), &input.port_type) {
                 continue;
             }
             if let Ok(cast) = input.port_type.cast_value(&fallback) {
-                node.port_literals.insert(input.name.clone(), weft_core::member::member_filled_literal(Some(cast)));
+                node.port_literals.insert(input.name.clone(), weft_core::instance::instance_filled_literal(Some(cast)));
             }
             continue;
         }

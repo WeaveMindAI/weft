@@ -33,9 +33,9 @@ pub struct TaggedExecution {
 
 /// Journal `ExecutionTagged` and insert the tag rows, on the caller's
 /// transaction. Re-tagging an existing (execution, tag) keeps the original
-/// row (and its `seq`): a body re-run after a crash lands on the same
-/// state, and a tag's position in the order is the FIRST time the run
-/// claimed it. `instance` stamps the event with the writing instance,
+/// row (and its `seq`): a body replayed after a durable wait lands on
+/// the same state, and a tag's position in the order is the FIRST time the run
+/// claimed it. `replica` stamps the event with the writing replica,
 /// exactly like every other worker-originated write. The journal row
 /// is this function's first write; a caller that writes before it takes
 /// [`crate::lock_execution_ids`] first (the ordering invariant on `write`).
@@ -44,10 +44,10 @@ pub async fn tag_execution_in(
     execution_id: ExecutionId,
     tags: &[String],
     at_unix: u64,
-    instance: Option<&str>,
+    replica: Option<&str>,
 ) -> Result<(), RecordError> {
     let event = ExecEvent::ExecutionTagged { execution_id, tags: tags.to_vec(), at_unix };
-    record_event_in(&mut *tx, &event, instance, None).await?;
+    record_event_in(&mut *tx, &event, replica, None).await?;
     for tag in tags {
         sqlx::query(
             "INSERT INTO execution_tag (execution_id, tag, tagged_at_unix) VALUES ($1, $2, $3) \

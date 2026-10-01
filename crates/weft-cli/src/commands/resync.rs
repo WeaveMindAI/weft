@@ -2,7 +2,7 @@
 //! image, with the USER'S trigger-deactivation choice (mode + running
 //! policy + drain cap; same picker as `weft deactivate`). Used after
 //! editing the trigger or fire subgraph. Plain, it brings every trigger
-//! that is on up to date, the program's and each member's; the
+//! that is on up to date, the program's and each instance's; the
 //! dispatcher picks whose from its activation rows and answers with the
 //! list. Refuses on the dispatcher side if the infra those triggers read
 //! isn't running.
@@ -54,12 +54,10 @@ async fn run_inner(
             drain_timeout,
         )?
     };
-    let handle = super::ensure::ensure_registered(ctx, progress, weft_compiler::codegen::NodeSet::Full).await?;
+    let handle = super::ensure::ensure_registered(ctx, progress, weft_core::builds::NodeSet::Full).await?;
     let path = format!("/projects/{}/resync", handle.id);
-    let mut body = serde_json::Map::new();
-    handle.inject_hash_fields(&mut body);
-    body.insert("scope".into(), serde_json::to_value(&scope)?);
-    progress.drain_wait(&serde_json::json!({ "runningPolicy": running_policy.as_str() }), drain_timeout);
+    let body = weft_core::deactivation::ResyncRequest { target: handle.activation_target(), trigger_deactivation: None, scope };
+    progress.drain_wait(running_policy, drain_timeout);
     progress.trigger_register_start();
     progress.dispatcher_call_start(&path);
     let answer = super::deactivate::post_with_trigger_choice(
@@ -72,17 +70,14 @@ async fn run_inner(
         drain_timeout,
     )
     .await?;
-    let resynced: Vec<weft_core::member::Owner> = answer
-        .get("resynced")
-        .cloned()
-        .map(serde_json::from_value)
-        .transpose()?
-        .ok_or_else(|| {
+    let resynced = serde_json::from_value::<weft_core::activation::ResyncResponse>(answer)
+        .map_err(|e| {
             anyhow::anyhow!(
-                "resync: the dispatcher's answer does not say whose triggers it resynced; \
-                 upgrade the dispatcher or this CLI so the versions match"
+                "resync: the dispatcher's answer does not read as one ({e}); upgrade the dispatcher \
+                 or this CLI so the versions match"
             )
-        })?;
+        })?
+        .resynced;
     progress.dispatcher_call_done(serde_json::json!({ "project_id": handle.id, "resynced": resynced }));
     progress.trigger_register_done();
     let whom = resynced.iter().map(weft_core::deactivation::whose_triggers).collect::<Vec<_>>().join(", ");

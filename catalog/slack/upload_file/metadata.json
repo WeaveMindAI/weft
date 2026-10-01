@@ -82,5 +82,8 @@
       "type": "String",
       "description": "A link to the shared file."
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

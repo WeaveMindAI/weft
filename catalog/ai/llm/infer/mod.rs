@@ -10,13 +10,17 @@
 //! plumbing (generator, params, history assembly, the storage
 //! round-trip) lives in the package's `call.rs`.
 //!
-//! CONVERSATIONS ride the `history` input/output (`ChatHistory`, the
-//! typed minillmlib-shaped value whose media slots hold stored files).
+//! CONVERSATIONS live in a file: `historyFile` names a project file
+//! holding a `ChatHistory` (the typed minillmlib-shaped list whose
+//! media slots hold stored files). The call sends what the file holds
+//! plus this call's turn, then adds the turn and the reply to the end
+//! of that same file in place, and the file goes out on `historyFile`.
+//! With no file in, a wired `historyFile` output starts a new one.
 //! TOOLS: wired LlmTool declarations ride to the provider; the model's
-//! calls come out on `toolCalls` (and inside the emitted history), the
-//! graph runs each tool, and a Chat Message node (role: tool) appends
-//! the results for the next call, which is why `prompt` is optional
-//! once a history is wired.
+//! calls come out on `toolCalls` (and are saved in the file), the graph
+//! runs each tool, and a Chat Message node (role: tool) appends the
+//! results to the file for the next call, which is why `prompt` is
+//! optional once a file is wired.
 //!
 //! The call streams internally so a Stop lands mid-generation (and the
 //! metered client resolves the interrupted call's real cost on its

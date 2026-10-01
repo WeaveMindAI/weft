@@ -1,0 +1,30 @@
+{
+  "type": "InstanceProbe",
+  "label": "Instance Probe",
+  "description": "Report which instance a run is in: the connection the run got on `key`, and how many files that instance's own storage holds after this run writes `text` into it. Used by the e2e rig to prove a run lands on its instance's copy of everything.",
+  "tags": [
+    "instances",
+    "e2e"
+  ],
+  "icon": "User",
+  "color": "#0ea5e9",
+  "inputs": [
+    {
+      "name": "text",
+      "type": "String",
+      "required": true
+    },
+    {
+      "name": "key",
+      "type": "Access",
+      "accepts": ["wire"]
+    }
+  ],
+  "outputs": [
+    {
+      "name": "body",
+      "type": "JsonDict"
+    }
+  ],
+  "requires_infra": false
+}

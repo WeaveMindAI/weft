@@ -24,7 +24,7 @@ pub const KEPT_DIR_ENV: &str = "WEFT_E2E_KEPT_DIR";
 
 /// A grant `disp`'s install now holds for this test.
 pub(crate) fn grant_made(disp: &Dispatcher, grant_id: &str) -> Result<()> {
-    if disp.instance().name().is_some() {
+    if disp.install().name().is_some() {
         return Ok(());
     }
     default_install_grant_made(grant_id)

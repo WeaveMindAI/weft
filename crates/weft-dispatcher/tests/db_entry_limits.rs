@@ -202,3 +202,22 @@ async fn refusals_are_reported_for_two_minutes(pool: PgPool) {
     assert_eq!(recent, vec![(Limited::AtOnce, 2)]);
     assert!(entry_limits::recent_refusals(&pool, "tok", 300).await.unwrap().is_empty());
 }
+
+/// An unrecorded run whose costs kept its row is stamped ended rather
+/// than given a terminal event: its slot stops counting all the same, so
+/// a page polling an unrecorded route never fills the entry with runs
+/// that already finished.
+#[sqlx::test]
+async fn an_ended_unrecorded_run_stops_counting(pool: PgPool) {
+    setup(&pool).await;
+    sqlx::query(
+        "INSERT INTO execution (execution_id, project_id, tenant_id, started_at_unix, phase, kind, ended_at_unix) \
+         VALUES ('quiet', gen_random_uuid(), 't', 0, 'fire', 'unrecorded', 5)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    entry_limits::take_slot(&pool, "tok", "quiet", 1, 10_000, 0).await.unwrap().unwrap();
+    assert!(entry_limits::at_once_full(&pool, "tok", 1, 6).await.unwrap().is_none(), "it ended");
+    entry_limits::take_slot(&pool, "tok", "next", 1, 10_000, 6).await.unwrap().expect("its slot is free");
+}

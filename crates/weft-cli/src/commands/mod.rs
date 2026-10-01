@@ -30,7 +30,7 @@ pub mod status;
 pub mod test_node;
 pub mod tangle;
 pub mod connect_lib;
-pub mod member_values;
+pub mod instance_values;
 pub mod token;
 pub mod connect;
 pub mod options;
@@ -222,10 +222,10 @@ impl Ctx {
     /// request made to this verb (see [`Dispatcher`]).
     pub fn refuse_other_install(&self, verb: &str) -> anyhow::Result<()> {
         if let Some(on) = &self.on {
-            anyhow::bail!("{verb} reports on this machine's install; --on {on} names another one (drop it, or use WEFT_INSTANCE=<name> for a named local install)");
+            anyhow::bail!("{verb} reports on this machine's install; --on {on} names another one (drop it, or use WEFT_INSTALL=<name> for a named local install)");
         }
         if let Some(Dispatcher::Flag(_)) = &self.dispatcher {
-            anyhow::bail!("{verb} reports on this machine's install; --dispatcher names another one (drop it, or use WEFT_INSTANCE=<name> for a named local install)");
+            anyhow::bail!("{verb} reports on this machine's install; --dispatcher names another one (drop it, or use WEFT_INSTALL=<name> for a named local install)");
         }
         Ok(())
     }
@@ -359,15 +359,14 @@ pub async fn resolve_execution_id(ctx: &Ctx, input: &str) -> anyhow::Result<Stri
     if uuid::Uuid::parse_str(input).is_ok() {
         return Ok(input.to_string());
     }
-    let resp: serde_json::Value = ctx
+    let resp = ctx
         .client()?
         .get_json(&format!("/executions/resolve/{input}"))
         .await
         .map_err(|e| anyhow::anyhow!("'{input}' names no execution: {e}"))?;
-    resp.get("execution_id")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| anyhow::anyhow!("dispatcher response missing execution: {resp}"))
+    let resolved: weft_core::program::ResolvedExecution =
+        serde_json::from_value(resp).map_err(|e| anyhow::anyhow!("read the resolved execution: {e}"))?;
+    Ok(resolved.execution_id.to_string())
 }
 
 /// One node of the program, from the way a person spells it:
@@ -380,7 +379,7 @@ pub async fn resolve_execution_id(ctx: &Ctx, input: &str) -> anyhow::Result<Stri
 /// What comes back is the PLACE, spelled the one way the daemon keys a
 /// place by (`setup.store`, the person's own spelling written back
 /// canonical): a wait parked on a node inside an included file, and the
-/// infra instance of one, belong to one call of it, and the daemon
+/// infra of one, belong to one call of it, and the daemon
 /// holds both under that spelling.
 pub fn node_address_for(ctx: &Ctx, spelled: &str) -> anyhow::Result<String> {
     // Outside a project there is no program to check against, and the
@@ -594,7 +593,7 @@ mod tests {
     #[test]
     fn a_named_install_without_ports_fails_only_when_its_address_is_needed() {
         let name = format!("ctx{}", std::process::id());
-        std::env::set_var(weft_core::infra::INSTANCE_ENV, &name);
+        std::env::set_var(weft_core::infra::INSTALL_ENV, &name);
         let ctx = super::Ctx::new(None, None, false).expect("a Ctx needs no install address");
         let Err(error) = ctx.client() else { panic!("a named install with no ports has no address") };
         let error = error.to_string();
@@ -602,12 +601,12 @@ mod tests {
         assert!(ctx.install_access().is_err(), "the cached error answers every later use");
         // The install starts after this process did: a fresh resolution
         // sees it, the cached one keeps its answer.
-        let dir = weft_core::infra::Instance::from_env().unwrap().dir();
+        let dir = weft_core::infra::Install::from_env().unwrap().dir();
         weft_core::ports::InstallPorts::DEFAULT.save(&dir).expect("save ports");
         assert!(ctx.fresh_client(None).is_ok(), "a fresh resolution picks up the started install");
         assert!(ctx.client().is_err(), "the cached error is kept for a one-shot command");
         std::fs::remove_dir_all(&dir).unwrap();
-        std::env::remove_var(weft_core::infra::INSTANCE_ENV);
+        std::env::remove_var(weft_core::infra::INSTALL_ENV);
     }
 
     /// A verb bound to this machine refuses the `--dispatcher` flag but

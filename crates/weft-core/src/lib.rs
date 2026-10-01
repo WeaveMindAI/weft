@@ -1,3 +1,6 @@
+// First, so every module below can use the macros it exports.
+mod wire_enum;
+
 // Runtime modules: the execution context, buses, storage streaming, caller
 // connections, cancellation, timer signals, and signed routing tokens. Pull
 // tokio/futures/bytes (no wasm32 support), so they are gated behind the
@@ -9,6 +12,7 @@ pub mod bus;
 pub mod caller;
 pub mod access;
 pub mod activation;
+pub mod builds;
 #[cfg(feature = "runtime")]
 pub mod caller_token;
 #[cfg(feature = "runtime")]
@@ -24,14 +28,17 @@ pub mod frames;
 pub mod generator;
 #[cfg(feature = "runtime")]
 pub mod images;
+#[cfg(feature = "runtime")]
 pub mod in_flight;
 pub mod infra;
 pub mod install;
+pub mod instance;
+pub mod instance_door;
 pub mod live;
-pub mod member;
+#[cfg(feature = "runtime")]
+pub mod live_event;
 pub mod picks;
 pub mod ports;
-pub mod member_door;
 #[cfg(feature = "runtime")]
 pub mod liveness;
 #[cfg(feature = "runtime")]
@@ -42,6 +49,7 @@ pub mod node_test;
 pub mod primitive;
 pub mod program;
 pub mod project;
+pub mod projects;
 pub mod pulse;
 pub mod route;
 pub mod rules;
@@ -56,7 +64,7 @@ pub mod seeding;
 // gated inside the module.
 pub mod signal;
 // Signal-token values and their at-rest hash: minted by the dispatcher
-// (`weft token mint`) and the broker (a program's member token).
+// (`weft token mint`) and the broker (a program's instance token).
 pub mod signal_token;
 #[cfg(feature = "runtime")]
 pub mod signed_token;
@@ -70,8 +78,10 @@ pub mod storage;
 #[cfg(feature = "runtime")]
 pub mod stream_journal;
 pub mod tag;
+pub mod task;
 pub mod time_scale;
 pub mod wait;
+pub mod versions;
 pub mod weft_type;
 
 // Hosts the `stress_test!` macro (`#[macro_export]`). The macro is

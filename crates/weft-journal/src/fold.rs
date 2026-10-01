@@ -49,7 +49,7 @@ use weft_core::primitive::{
     LoopInstanceKey, LoopTerminationReason, SuspensionInfo,
 };
 use weft_core::project::{boundary_in_id, boundary_out_id, EdgeIndex, GroupBoundaryRole, NodeDefinition, ProjectDefinition};
-use weft_core::pulse::PulseStatus;
+use weft_core::pulse::{Failure, PulseStatus};
 use weft_core::ExecutionId;
 
 use crate::events::ExecEvent;
@@ -109,7 +109,7 @@ struct OutputEmission {
     frames: LoopFrames,
     port: String,
     value: Option<Arc<Value>>,
-    error: Option<String>,
+    error: Option<Failure>,
     provided: bool,
 }
 
@@ -169,7 +169,7 @@ impl Fold {
             let ordinal = ordinals.entry((output.node.clone(), output.frames.clone(), output.port.clone())).or_insert(0u64);
             let wire = weft_core::run_spec::OutputWire {
                 node: output.node.clone(), frames: output.frames.clone(), port: output.port.clone(),
-                ordinal: *ordinal, closed: output.value.is_none(), error: output.error.clone(),
+                ordinal: *ordinal, closed: output.value.is_none(), failure: output.error.clone(),
                 value: output.value.as_ref().map(|value| value.as_ref().clone()).unwrap_or(Value::Null),
             };
             *ordinal += 1;
@@ -269,7 +269,7 @@ impl Fold {
                 }
                 None => {
                     emit_port_closure(&output.node, &output.port, output.id, self.execution_id(), &output.frames,
-                        &self.project, &mut self.snap.pulses, &edge_idx, &mut effects.emissions, output.error.as_deref())?;
+                        &self.project, &mut self.snap.pulses, &edge_idx, &mut effects.emissions, output.error.as_ref())?;
                 }
             }
             for emission in &mut effects.emissions[start..] {
@@ -591,8 +591,8 @@ impl Fold {
                     }
                 }
                 // Only clear suspension state when this resume was
-                // suspension-driven (token present). Crashed-Running
-                // recovery has no token to remove.
+                // suspension-driven (token present). A group boundary
+                // re-fired after a refold has no token to remove.
                 if let Some(t) = token {
                     self.snap.suspensions.remove(t);
                     effects.resumed_value = self.snap.pending_deliveries.remove(t);
@@ -695,7 +695,7 @@ impl Fold {
                     self.report(CorruptionSite::LoopOutFired, format!("{}: no LoopOut firing at the iteration's frames", describe(ev)));
                     return effects;
                 };
-                match classify_loop_out(def, &config, &view.input, &view.closed_ports) {
+                match classify_loop_out(def, &config, &view) {
                     Ok(writes) => {
                         // The vote is an effect only once the firing's
                         // writes landed: a row the runtime refuses is
@@ -839,6 +839,7 @@ impl Fold {
             // design (a live connection dies with its worker), so they
             // never contribute to a resumed run's state.
             ExecEvent::LogLine { .. }
+            | ExecEvent::FileEdited { .. }
             | ExecEvent::TriggerCaptured { .. }
             | ExecEvent::ExecutionTagged { .. }
             | ExecEvent::ExecutionCompleted { .. }
@@ -929,7 +930,7 @@ impl Fold {
     /// scope down, or plain when it was gated off. The history is what a
     /// seeded run replays and what a frozen example expects, so a plain
     /// record here would launder the failure for both.
-    fn remember_scope_closures(&mut self, group: &str, frames: &LoopFrames, id: Uuid, failure: Option<&str>) {
+    fn remember_scope_closures(&mut self, group: &str, frames: &LoopFrames, id: Uuid, failure: Option<&Failure>) {
         if self.output_history.is_none() { return; }
         let node_id = boundary_out_id(group);
         if !self.edge_idx.admits(&node_id, frames) { return; }
@@ -938,7 +939,7 @@ impl Fold {
             .map(|port| port.name.clone()).collect();
         for port in ports {
             self.remember_output(OutputEmission { id, node: node_id.clone(), frames: frames.clone(), port,
-                value: None, error: failure.map(str::to_string), provided: false });
+                value: None, error: failure.cloned(), provided: false });
         }
     }
 
@@ -987,7 +988,7 @@ impl Fold {
                 {
                     let id = boundary_emission(&dispatch.node_id, &dispatch.frames, record.ordinal);
                     let provided_ports = record.received.provided_ports.clone();
-                    let closed_with_error = record.received.closed_with_error.clone();
+                    let closed_failures = record.received.closed_failures.clone();
                     let skipped = record.status == NodeExecutionStatus::Skipped;
                     let taken_down_above =
                         matches!(record.skip_reason, Some(SkipReason::ScopeSkipped { .. }));
@@ -1000,10 +1001,12 @@ impl Fold {
                     // on one), or plainly; a completed one forwarded each
                     // closed input with that input's own error. A type
                     // error recorded beside a skip never reached a wire.
-                    let own_failure: Option<String> =
-                        (record.status == NodeExecutionStatus::Failed).then(|| record.error.clone()).flatten();
-                    let inherited_failure: Option<String> = skipped
-                        .then(|| record.skip_reason.as_ref().and_then(|reason| reason.inherited_failure().map(str::to_string)))
+                    let own_failure: Option<Failure> = (record.status == NodeExecutionStatus::Failed)
+                        .then_some(record.error.as_deref())
+                        .flatten()
+                        .map(|error| Failure::at(&self.project, &dispatch.node_id, &dispatch.frames, error));
+                    let inherited_failure: Option<Failure> = skipped
+                        .then(|| record.skip_reason.as_ref().and_then(SkipReason::inherited_failure).cloned())
                         .flatten();
                     let values = output.clone().unwrap_or_default();
                     // A boundary inside a scope that was taken down from
@@ -1029,7 +1032,7 @@ impl Fold {
                         // the members' own exits carried.
                         let error = own_failure
                             .clone()
-                            .or_else(|| closed_with_error.get(&port).cloned())
+                            .or_else(|| closed_failures.get(&port).cloned())
                             .or_else(|| inherited_failure.clone());
                         self.remember_output(OutputEmission {
                             id, node: dispatch.node_id.clone(), frames: dispatch.frames.clone(),
@@ -1046,7 +1049,7 @@ impl Fold {
                         let group = self.project.nodes.iter().find(|node| node.id == dispatch.node_id)
                             .and_then(|node| node.group_boundary.as_ref()).filter(|boundary| boundary.role == GroupBoundaryRole::In)
                             .map(|boundary| boundary.group_id.clone());
-                        let failure = own_failure.as_deref().or(inherited_failure.as_deref());
+                        let failure = own_failure.as_ref().or(inherited_failure.as_ref());
                         if let Some(group) = group { self.remember_scope_closures(&group, &dispatch.frames, id, failure); }
                     }
                 }
@@ -1220,7 +1223,8 @@ impl Fold {
                 // inherited (an input that closed because its producer
                 // broke) rides its closures exactly as the live engine
                 // sends them.
-                let failure = error.or_else(|| skip_reason.and_then(SkipReason::inherited_failure));
+                let own = error.map(|error| Failure::at(&self.project, node_id, frames, error));
+                let failure = own.as_ref().or_else(|| skip_reason.and_then(SkipReason::inherited_failure));
                 if let Err(e) = close_unmentioned_downstream(
                     node_id, &mentioned, emission_id, execution_id, frames, &self.project,
                     &mut self.snap.pulses, &self.edge_idx, &mut effects.emissions, failure, &closed,
@@ -1234,7 +1238,7 @@ impl Fold {
                 for port in def.outputs.iter().filter(|port| !closed.contains(&port.name) && (!mentioned.contains(&port.name) || port.is_generator())) {
                     self.remember_output(OutputEmission {
                         id: emission_id, node: node_id.into(), frames: frames.clone(), port: port.name.clone(),
-                        value: None, error: failure.map(str::to_string), provided: false,
+                        value: None, error: failure.cloned(), provided: false,
                     });
                 }
             }
@@ -1466,7 +1470,7 @@ mod tests {
             program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
             subgraph: None,
             seed: None,
-            member: None, fired_trigger: None, run_class: weft_core::run_class::RunClass::Short, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+            instance: None, fired_trigger: None, run_class: weft_core::run_class::RunClass::Short, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
         }
     }
 
@@ -1830,8 +1834,8 @@ mod tests {
     }
 
     /// The crash window between an emission and the consumer's start:
-    /// the pulse refolds Pending, so the consumer is ready again
-    /// (at-least-once).
+    /// the pulse refolds Pending, so the consumer is ready (it never
+    /// started, so dispatching it is its first run, not a second).
     #[test]
     fn a_crash_between_emission_and_start_refolds_the_consumer_ready() {
         let project = fan_out_project();
@@ -1964,6 +1968,7 @@ mod tests {
     /// failure, and the frozen example (`output_wires`) records it so.
     #[test]
     fn a_skip_inherited_from_a_failure_is_remembered_with_it() {
+        let down = Failure { node: "src".into(), error: "the database is down".into() };
         let mut fold = Fold::new(execution_id(), fan_out_project()).with_output_history();
         for event in [
             started_execution(), kicked("src"), started("src", vec![], 0),
@@ -1971,14 +1976,14 @@ mod tests {
             started("a", vec![], 2),
             ExecEvent::NodeSkipped {
                 execution_id: execution_id(), node_id: "a".into(), frames: vec![],
-                reason: SkipReason::RequiredInputClosed { port: "in".into(), failure: Some("the database is down".into()) },
+                reason: SkipReason::RequiredInputClosed { port: "in".into(), failure: Some(down.clone()) },
                 at_unix: 2,
             },
         ] { assert!(!fold.apply(&event).rejected()); }
         let wires = fold.output_wires().unwrap();
         let a_out = wires.iter().find(|wire| wire.node == "a" && wire.port == "out").expect("a.out remembered");
         assert!(a_out.closed);
-        assert_eq!(a_out.error.as_deref(), Some("the database is down"), "the skip passes the failure on, in the history too");
+        assert_eq!(a_out.failure.as_ref(), Some(&down), "the skip passes the failure on, in the history too");
     }
 
     /// A scope gated off by a gate that closed on a failure closes
@@ -1992,11 +1997,14 @@ mod tests {
         ] { assert!(!fold.apply(&event).rejected()); }
         let snap = fold.snapshot();
         assert_eq!(snap.executions["g__in"][0].status, NodeExecutionStatus::Skipped);
-        assert_eq!(pending(snap, "sink")[0].close_error.as_deref(), Some("the database is down"), "the wire carries it");
+        // Two hops past the node that broke (the scope's In skipped, its
+        // Out closed outward), the closure still names `src`.
+        let down = Failure { node: "src".into(), error: "the database is down".into() };
+        assert_eq!(pending(snap, "sink")[0].failure.as_ref(), Some(&down), "the wire carries it");
         let wires = fold.output_wires().unwrap();
         let out = wires.iter().find(|wire| wire.node == "g__out" && wire.port == "y").expect("g__out.y remembered");
         assert!(out.closed);
-        assert_eq!(out.error.as_deref(), Some("the database is down"), "and so does the history");
+        assert_eq!(out.failure.as_ref(), Some(&down), "and so does the history");
     }
 
     /// An In boundary that refuses a value (a String on a Number port)
@@ -2015,13 +2023,15 @@ mod tests {
         let snap = fold.snapshot();
         assert_eq!(snap.executions["g__in"][0].status, NodeExecutionStatus::Failed);
         let refusal = snap.executions["g__in"][0].error.clone().expect("the refusal is the record's error");
-        assert_eq!(pending(snap, "sink")[0].close_error.as_deref(), Some(refusal.as_str()), "the wire carries it");
+        // The boundary is named the way the source reads it.
+        let refused = Failure::at(&nested_group_project(), "g__in", &vec![], refusal);
+        assert_eq!(pending(snap, "sink")[0].failure.as_ref(), Some(&refused), "the wire carries it");
         let wires = fold.output_wires().unwrap();
         for (node, port) in [("g__in", "x"), ("g__out", "y")] {
             let wire = wires.iter().find(|wire| wire.node == node && wire.port == port)
-                .unwrap_or_else(|| panic!("{node}.{port} remembered"));
+                .unwrap_or_else(|| panic!("{node}.{port} remembers the refusal"));
             assert!(wire.closed);
-            assert_eq!(wire.error.as_deref(), Some(refusal.as_str()), "{node}.{port} remembers the refusal");
+            assert_eq!(wire.failure.as_ref(), Some(&refused), "{node}.{port} remembers the refusal");
         }
     }
 

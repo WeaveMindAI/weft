@@ -138,7 +138,7 @@
             program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
             subgraph: Some(selection),
             seed,
-            member: None, fired_trigger: None, member_values: Default::default(), picks: Default::default(), at_unix: 0,
+            instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
             run_class: weft_core::run_class::RunClass::Short,
         }
     }

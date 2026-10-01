@@ -5,7 +5,8 @@
 //! - **apply**: resolve the InfraSpec (weft-core) for the copy, apply the
 //!   units that are down (or new) through the host, wait for them to be
 //!   ready, write the `infra_node` row via `set_applied`. The copy's
-//!   instance id is derived from (project, node, member), so every apply
+//!   id is derived from (project, node, instance),
+//!   so every apply
 //!   of it, the first after a terminate included, finds the copy's disks
 //!   again. (Upstream `Image::Upstream` references pass
 //!   through verbatim; mutable tags like `:latest` are NOT resolved to
@@ -197,7 +198,7 @@ async fn wait_for_drain(
     command_id: i64,
     drain_timeout_secs: u64,
     project_id: uuid::Uuid,
-    copies: &weft_core::member::Copies,
+    copies: &weft_core::instance::Copies,
 ) -> Result<()> {
     let outcome = weft_platform_traits::drain_until_zero(
         state.clock.as_ref(),
@@ -275,7 +276,7 @@ pub async fn run_loop(
                 });
             }
             claimed = state.broker.claim_command(
-                &state.instance,
+                &state.replica,
                 &busy_projects,
                 weft_broker_client::protocol::MAX_HOLD,
             ) => match claimed {
@@ -318,7 +319,7 @@ pub async fn run_loop(
 pub async fn tick(state: &SupervisorState, wait: Duration) -> Result<bool> {
     let SupervisorClaim::Command(cmd) = state
         .broker
-        .claim_command(&state.instance, &[], wait)
+        .claim_command(&state.replica, &[], wait)
         .await?
     else {
         return Ok(false);
@@ -359,7 +360,7 @@ async fn run_command(
     // a failure of this command's run.
     match state
         .broker
-        .command_complete(&state.instance, cmd.id, error.as_deref(), cancelled)
+        .command_complete(&state.replica, cmd.id, error.as_deref(), cancelled)
         .await?
     {
         weft_broker_client::WriteOutcome::Applied(_) => {}
@@ -391,18 +392,18 @@ async fn run_command(
 }
 
 /// Which copy a row of `project` names, as the host knows it.
-fn node_ref(project: &weft_broker_client::protocol::SupervisorProject, node_id: &str, instance_id: &str) -> NodeRef {
+fn node_ref(project: &weft_broker_client::protocol::SupervisorProject, node_id: &str, copy_id: &str) -> NodeRef {
     NodeRef {
         tenant: project.tenant_id.clone(),
         project: project.project_id,
         node: node_id.to_string(),
-        instance: instance_id.to_string(),
+        copy_id: copy_id.to_string(),
     }
 }
 
 /// The copies `cmd` names that the host still holds but no row does: what
 /// is left of a copy an earlier terminate took down keeping its listed
-/// disks. A copy's id is derived from its project, node and member, so
+/// disks. A copy's id is derived from its project, node and instance, so
 /// the ones `cmd.copies` admits are recognized by id. A copy with a row
 /// is never one of these: the command reaches it through its row.
 async fn rowless_copies(
@@ -410,12 +411,14 @@ async fn rowless_copies(
     cmd: &weft_broker_client::protocol::SupervisorCommandRow,
     rows: &[weft_broker_client::protocol::SupervisorInfraNode],
 ) -> Result<Vec<NodeRef>> {
-    use weft_core::member::Copies;
-    let with_row: std::collections::HashSet<&str> = rows.iter().map(|n| n.instance_id.as_str()).collect();
+    use weft_core::instance::Copies;
+    let with_row: std::collections::HashSet<&str> = rows.iter().map(|n| n.copy_id.as_str()).collect();
     let named = |copy: &NodeRef| match &cmd.copies {
         Copies::Every => true,
-        Copies::Shared => copy.instance == NodeRef::copy_instance_id(cmd.project_id, &copy.node, None),
-        Copies::Member(member) => copy.instance == NodeRef::copy_instance_id(cmd.project_id, &copy.node, Some(member)),
+        Copies::Shared => copy.copy_id == NodeRef::copy_id(cmd.project_id, &copy.node, None),
+        Copies::Instance(instance) => {
+            copy.copy_id == NodeRef::copy_id(cmd.project_id, &copy.node, Some(instance))
+        }
     };
     Ok(state
         .host
@@ -424,7 +427,7 @@ async fn rowless_copies(
         .into_iter()
         .filter(|c| c.project == cmd.project_id)
         .filter(|c| cmd.node_id.as_ref().is_none_or(|node| *node == c.node))
-        .filter(|c| !with_row.contains(c.instance.as_str()))
+        .filter(|c| !with_row.contains(c.copy_id.as_str()))
         .filter(named)
         .collect())
 }
@@ -438,7 +441,7 @@ async fn owned_project(
 ) -> Result<weft_broker_client::protocol::SupervisorProject> {
     state
         .broker
-        .owned_projects(&state.instance)
+        .owned_projects(&state.replica)
         .await?
         .into_iter()
         .find(|p| p.project_id == project_id)
@@ -477,7 +480,7 @@ async fn wait_for_readiness(
         let seen = state.host.observe(&node.tenant, node.project).await?;
         let mut waiting = Vec::new();
         for unit in units {
-            match seen.iter().find(|o| o.instance == node.instance && &o.unit == unit).map(|o| &o.state) {
+            match seen.iter().find(|o| o.copy_id == node.copy_id && &o.unit == unit).map(|o| &o.state) {
                 Some(UnitRunState::Ready) => {}
                 Some(UnitRunState::Failed { why }) => {
                     return Err(anyhow!("unit '{unit}' could not start: {why}"));
@@ -492,7 +495,7 @@ async fn wait_for_readiness(
         if state.clock.now() >= next_breadcrumb {
             tracing::info!(
                 target: "weft_infra_supervisor::lifecycle",
-                instance = %node.instance,
+                copy_id = %node.copy_id,
                 waiting = %waiting.join(", "),
                 "still waiting for infra units to be ready (cancel the apply to stop waiting)"
             );
@@ -521,8 +524,8 @@ async fn execute(
         wait_for_drain(state, cmd.id, cmd.drain_timeout_secs, cmd.project_id, &cmd.copies).await?;
     }
     // What a terminate does with the disks its nodes keep is the
-    // command's answer (a person's terminate keeps them, a member's wipe
-    // deletes them), read before anything is touched so a row without it
+    // command's answer (a person's terminate keeps them, an instance's
+    // wipe deletes them), read before anything is touched so a row without it
     // fails the command instead of guessing.
     let disks = match cmd.verb {
         InfraLifecycleVerb::Terminate => Some(cmd.terminate_work().map_err(|e| anyhow!(e))?.disks),
@@ -532,9 +535,9 @@ async fn execute(
     let targets: Vec<&weft_broker_client::protocol::SupervisorInfraNode> = match &cmd.node_id {
         Some(node_id) => nodes
             .iter()
-            .filter(|n| n.node_id == *node_id && cmd.copies.admits(n.member.as_ref()))
+            .filter(|n| n.node_id == *node_id && cmd.copies.admits(n.instance.as_ref()))
             .collect(),
-        None => nodes.iter().filter(|n| cmd.copies.admits(n.member.as_ref())).collect(),
+        None => nodes.iter().filter(|n| cmd.copies.admits(n.instance.as_ref())).collect(),
     };
     // A terminate that deletes every disk also reaches the copies with no
     // row left: ones an earlier terminate took down keeping their listed
@@ -568,14 +571,14 @@ async fn execute(
                 // stay stopped (halt, not rollback); the rest keep their
                 // prior status.
                 check_cancel(state, cmd.id, "stopping infra nodes").await?;
-                let copy = node_ref(&project, &n.node_id, &n.instance_id);
+                let copy = node_ref(&project, &n.node_id, &n.copy_id);
                 // A unit the host runs for this copy that the row's roster
                 // does not carry is an orphan: a unit dropped from the
                 // spec whose removal never landed. Stopping it regardless
                 // of `force` finishes that intent. Never STAMPED: the
                 // broker fences per-unit stamps on roster membership, and
                 // the honest record for an orphan is its absence.
-                for orphan in seen.iter().filter(|o| o.instance == n.instance_id && !n.units.contains_key(&o.unit)) {
+                for orphan in seen.iter().filter(|o| o.copy_id == n.copy_id && !n.units.contains_key(&o.unit)) {
                     tracing::warn!(
                         project_id = %cmd.project_id,
                         node_id = %n.node_id,
@@ -602,11 +605,11 @@ async fn execute(
                     if let Err(e) = state
                         .broker
                         .set_status(
-                            &state.instance,
+                            &state.replica,
                             Some(cmd.id),
                             cmd.project_id,
                             &n.node_id,
-                            n.member.as_ref(),
+                            n.instance.as_ref(),
                             Some(unit),
                             weft_broker_client::protocol::InfraNodeStatus::Stopping,
                             None,
@@ -626,11 +629,11 @@ async fn execute(
                     let outcome = state
                         .broker
                         .set_status(
-                            &state.instance,
+                            &state.replica,
                             Some(cmd.id),
                             cmd.project_id,
                             &n.node_id,
-                            n.member.as_ref(),
+                            n.instance.as_ref(),
                             Some(unit),
                             weft_broker_client::protocol::InfraNodeStatus::Stopped,
                             None,
@@ -676,7 +679,7 @@ async fn execute(
                         .event_record(
                             cmd.project_id,
                             Some(&n.node_id),
-                            n.member.as_ref(),
+                            n.instance.as_ref(),
                             weft_broker_client::protocol::InfraEvent::Stopped,
                         )
                         .await?;
@@ -710,11 +713,11 @@ async fn execute(
                 match state
                     .broker
                     .set_status(
-                        &state.instance,
+                        &state.replica,
                         Some(cmd.id),
                         cmd.project_id,
                         &n.node_id,
-                        n.member.as_ref(),
+                        n.instance.as_ref(),
                         None,
                         weft_broker_client::protocol::InfraNodeStatus::Terminating,
                         None,
@@ -742,10 +745,10 @@ async fn execute(
                 // supervisor has no spec at terminate time, but it has the
                 // row. Whether they stay is the command's answer.
                 let keep = disks.expect("a terminate read its disks above").kept(&n.keep_disks);
-                state.host.terminate(&node_ref(&project, &n.node_id, &n.instance_id), keep).await?;
+                state.host.terminate(&node_ref(&project, &n.node_id, &n.copy_id), keep).await?;
                 if !state
                     .broker
-                    .remove_node(&state.instance, cmd.project_id, &n.node_id, n.member.as_ref(), cmd.id)
+                    .remove_node(&state.replica, cmd.project_id, &n.node_id, n.instance.as_ref(), cmd.id)
                     .await?
                     .is_applied()
                 {
@@ -764,7 +767,7 @@ async fn execute(
                     .event_record(
                         cmd.project_id,
                         Some(&n.node_id),
-                        n.member.as_ref(),
+                        n.instance.as_ref(),
                         weft_broker_client::protocol::InfraEvent::Terminated,
                     )
                     .await?;
@@ -798,11 +801,12 @@ async fn execute_apply(
     cmd: &weft_broker_client::protocol::SupervisorCommandRow,
 ) -> Result<()> {
     let node_id = cmd.node_id.as_deref().ok_or_else(|| anyhow!("apply command missing node_id"))?;
-    // An apply builds exactly one copy: the shared one, or one member's.
-    let member = match &cmd.copies {
-        weft_core::member::Copies::Shared => None,
-        weft_core::member::Copies::Member(m) => Some(m),
-        weft_core::member::Copies::Every => {
+    // An apply builds exactly one copy: the shared one, or one
+    // instance's.
+    let instance = match &cmd.copies {
+        weft_core::instance::Copies::Shared => None,
+        weft_core::instance::Copies::Instance(i) => Some(i),
+        weft_core::instance::Copies::Every => {
             return Err(anyhow!("apply command names every copy; an apply builds exactly one"))
         }
     };
@@ -821,24 +825,28 @@ async fn execute_apply(
         .infra_nodes(cmd.project_id)
         .await?
         .into_iter()
-        .find(|n| n.node_id == node_id && n.member.as_ref() == member);
+        .find(|n| n.node_id == node_id && n.instance.as_ref() == instance);
 
     // The copy's id is derived from what it is a copy of, so it is the
     // same on every apply, a Fresh one after a terminate included: that
     // is how a disk kept through the terminate is found again. What the
     // prior row decides is only whether to work in place or to finish a
     // terminate that did not complete first.
-    let instance_id = NodeRef::copy_instance_id(cmd.project_id, node_id, member);
+    let copy_id = NodeRef::copy_id(cmd.project_id, node_id, instance);
     let mode = match prior.as_ref() {
         Some(p) if p.status.applies_in_place() => ApplyMode::ReplaceOrSkip,
         _ => ApplyMode::Fresh,
     };
-    let copy = node_ref(&project, node_id, &instance_id);
+    let copy = node_ref(&project, node_id, &copy_id);
 
     // Resolve, then refuse what this host cannot run (a GPU it lacks), at
     // the earliest point: before any row is written.
     let resolved = infra::resolve(&spec, &copy, &image_tags).map_err(|e| anyhow!("{e}"))?;
     state.host.check(&resolved).map_err(|why| anyhow!("{why}"))?;
+    // What the host runs differently from what was asked (a GPU kind it
+    // cannot choose): stamped on the row with the apply, where every
+    // status read shows it to the person who started the node.
+    let notes = state.host.notes(&resolved);
     let applied_spec_hash = resolved.hash();
 
     // Per-unit apply. Reconcile only the units that are DOWN (or new);
@@ -851,7 +859,7 @@ async fn execute_apply(
 
     // Full skip: every declared unit is already up and the hash matches.
     // The host already runs what we want; no host call. The row keeps
-    // its instance id, hash, endpoints.
+    // its copy id, hash, endpoints.
     let hash_matches = prior.as_ref().and_then(|p| p.applied_spec_hash.as_deref()) == Some(applied_spec_hash.as_str());
     if matches!(mode, ApplyMode::ReplaceOrSkip) && reconcile.is_empty() && hash_matches {
         // Re-fire `started` so the dispatcher's SSE bus wakes any
@@ -861,9 +869,9 @@ async fn execute_apply(
             .event_record(
                 cmd.project_id,
                 Some(node_id),
-                member,
+                instance,
                 weft_broker_client::protocol::InfraEvent::Started(weft_broker_client::protocol::StartedPayload {
-                    instance_id: instance_id.clone(),
+                    copy_id: copy_id.clone(),
                     mode: weft_broker_client::protocol::StartMode::Skip,
                 }),
             )
@@ -877,7 +885,7 @@ async fn execute_apply(
     // the PRIOR copy can still be running. Finish the terminate first,
     // with the keep list the row carries, and do it BEFORE the
     // provisioning stamp below overwrites that list: after that stamp
-    // the prior one lives nowhere durable. The copy has the same instance
+    // the prior one lives nowhere durable. The copy has the same copy
     // id either way, so the kept disks are the ones this apply adopts.
     // The ownership fence the provisioning stamp provides (a supervisor
     // that lost the project's lease must not touch its infra) is taken
@@ -889,11 +897,11 @@ async fn execute_apply(
         match state
             .broker
             .set_status(
-                &state.instance,
+                &state.replica,
                 Some(cmd.id),
                 cmd.project_id,
                 node_id,
-                member,
+                instance,
                 None,
                 weft_broker_client::protocol::InfraNodeStatus::Terminating,
                 None,
@@ -917,7 +925,7 @@ async fn execute_apply(
                 ));
             }
         }
-        state.host.terminate(&node_ref(&project, node_id, &p.instance_id), &p.keep_disks).await?;
+        state.host.terminate(&node_ref(&project, node_id, &p.copy_id), &p.keep_disks).await?;
     }
 
     // Pre-apply commitment: write the infra_node row before any host call
@@ -927,12 +935,12 @@ async fn execute_apply(
     let provision_outcome = state
         .broker
         .set_provisioning(
-            &state.instance,
+            &state.replica,
             cmd.id,
             cmd.project_id,
             node_id,
-            member,
-            &instance_id,
+            instance,
+            &copy_id,
             spec.keep_on_terminate.clone(),
             resolve_units(
                 &spec,
@@ -996,11 +1004,11 @@ async fn execute_apply(
             if let Err(status_err) = state
                 .broker
                 .set_status(
-                    &state.instance,
+                    &state.replica,
                     Some(cmd.id),
                     cmd.project_id,
                     node_id,
-                    member,
+                    instance,
                     None, // apply failure fails the whole node, all units
                     weft_broker_client::protocol::InfraNodeStatus::Failed,
                     Some(weft_broker_client::protocol::FailureStage::Apply),
@@ -1022,15 +1030,16 @@ async fn execute_apply(
     let outcome = state
         .broker
         .set_applied(
-            &state.instance,
+            &state.replica,
             cmd.id,
             cmd.project_id,
             node_id,
-            member,
-            &instance_id,
+            instance,
+            &copy_id,
             &applied_spec_hash,
             addresses,
             spec.keep_on_terminate.clone(),
+            notes,
             // `transitioning = false`: readiness waited, the reconciled
             // units' old copies are replaced, so their PRIOR image refs
             // leave the row here (the keep-set window closes with this
@@ -1064,9 +1073,9 @@ async fn execute_apply(
         .event_record(
             cmd.project_id,
             Some(node_id),
-            member,
+            instance,
             weft_broker_client::protocol::InfraEvent::Started(weft_broker_client::protocol::StartedPayload {
-                instance_id: instance_id.clone(),
+                copy_id: copy_id.clone(),
                 mode: start_mode,
             }),
         )
@@ -1102,7 +1111,7 @@ async fn endpoint_addresses(
             infra::Expose::Project => {}
             infra::Expose::Public { path } => {
                 out.public_paths
-                    .insert(ep.name.clone(), infra::public_path(resolved.node.project, &resolved.node.instance, path));
+                    .insert(ep.name.clone(), infra::public_path(resolved.node.project, &resolved.node.copy_id, path));
             }
             infra::Expose::SameNetwork => {
                 let door = at.same_network.ok_or_else(|| {

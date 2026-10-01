@@ -86,7 +86,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
         None => on.nest(role.internal_prefix().expect("the machine's process mounts only roles with internal routes"), routes),
     };
     let runs = |r: CoreRole| hosted.contains(&r);
-    let instance = weft_platform_traits::identity::mint_instance_id("runtime");
+    let replica = weft_platform_traits::identity::mint_replica_id("runtime");
     let addresses = config.role_addresses(here);
     let caller_token_secret = secret("WEFT_CALLER_TOKEN_SECRET")?;
     let caller_secret_bytes =
@@ -174,7 +174,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
         let state = weft_dispatcher::app::build_state(
             weft_dispatcher::app::DispatcherSettings {
                 config: &config,
-                instance: instance.clone(),
+                replica: replica.clone(),
                 pool: pool.clone(),
                 lock_pool,
                 signals: signals.clone().expect("the dispatcher's process listens"),
@@ -210,11 +210,11 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
     }
 
     if runs(CoreRole::Listener) {
-        let token = weft_broker_client::TokenSource::role(parts.tokens.clone(), instance.clone(), CoreRole::Listener);
+        let token = weft_broker_client::TokenSource::role(parts.tokens.clone(), replica.clone(), CoreRole::Listener);
         let tasks = weft_broker_client::BrokerTaskStoreClient::new(addresses.broker.clone(), token.clone());
         let state = weft_listener::ListenerState::new(
             weft_listener::ListenerConfig {
-                instance: instance.clone(),
+                replica: replica.clone(),
                 broker_url: addresses.broker.clone(),
                 placement: config.roles.listener,
             },
@@ -236,10 +236,10 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
     }
 
     if runs(CoreRole::Supervisor) {
-        let token = weft_broker_client::TokenSource::role(parts.tokens.clone(), instance.clone(), CoreRole::Supervisor);
+        let token = weft_broker_client::TokenSource::role(parts.tokens.clone(), replica.clone(), CoreRole::Supervisor);
         let state = weft_infra_supervisor::SupervisorState {
             broker: weft_broker_client::BrokerSupervisorClient::new(addresses.broker.clone(), token),
-            instance: instance.clone(),
+            replica: replica.clone(),
             host: parts.host.clone(),
             clock: Arc::new(weft_platform_traits::SystemClock),
             ownership_interval: weft_core::time_scale::scaled(SUPERVISOR_OWNERSHIP_EVERY),

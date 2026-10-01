@@ -56,5 +56,8 @@
       "name": "messageId",
       "type": "Number"
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

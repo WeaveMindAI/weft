@@ -38,14 +38,14 @@ pub struct InfraSpec {
     pub endpoints: Vec<Endpoint>,
 
     /// Disks (by volume name) terminate keeps. Usually empty.
-    #[serde(default, rename = "keepOnTerminate", alias = "keep_on_terminate", skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, rename = "keepOnTerminate", skip_serializing_if = "Vec::is_empty")]
     pub keep_on_terminate: Vec<String>,
 }
 
 /// What a terminate does with the disks the node lists in
 /// `keep_on_terminate`. A property of each terminate command, never of the
 /// copy: the same copy is terminated keeping them by a person's stop and
-/// wiping them when its member is wiped.
+/// wiping them when its instance is wiped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminateDisks {
@@ -513,7 +513,7 @@ pub enum Expose {
     #[default]
     Project,
     /// HTTP through the install's front door, at
-    /// `/infra/<project>/<instance>/<path>` (rewritten to `<path>` on the
+    /// `/infra/<project>/<copy_id>/<path>` (rewritten to `<path>` on the
     /// way in). Reachable from the internet.
     Public { path: String },
     /// The network the install runs on: the machine itself on a local

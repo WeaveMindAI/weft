@@ -17,6 +17,39 @@
 //! hold rather than rounding it.
 
 use serde_json::{json, Map, Value};
+
+/// Fail the node now for a mistake in the program itself: the SQL it
+/// wrote, a setting, a value of the wrong shape. Such a failure is an
+/// input error, so it fails the run even when the node's `error`
+/// output is wired: the fix is editing the program, and nothing a
+/// program does at run time can route around it. A refusal that
+/// depends on the database's data or state stays `node_bail!`, which
+/// `error` catches.
+macro_rules! mistake {
+    ($($arg:tt)*) => {
+        return Err(weft::WeftError::Input(format!($($arg)*)))
+    };
+}
+pub(crate) use mistake;
+
+/// A refusal from the server, as the error it is. A statement the
+/// server cannot even plan (SQLSTATE class 42: a syntax error, a
+/// table, column or function that does not exist, a parameter whose
+/// type it cannot infer) is a mistake in the program's SQL, so it is
+/// an input error that fails the run even with `error` wired. Anything
+/// else (a broken constraint, a `fail(..)` the SQL raised, a missing
+/// privilege, a dropped connection) is the database's answer to this
+/// run, which a program can handle.
+pub fn refusal(message: String, e: &tokio_postgres::Error) -> WeftError {
+    let in_the_sql = e.code().is_some_and(|state| {
+        state.code().starts_with("42") && *state != tokio_postgres::error::SqlState::INSUFFICIENT_PRIVILEGE
+    });
+    if in_the_sql {
+        WeftError::Input(message)
+    } else {
+        weft::error::node_error(message)
+    }
+}
 use tokio_postgres::config::SslMode;
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Config, Row};
@@ -405,7 +438,7 @@ pub fn params_of(values: &[Value]) -> Vec<Box<dyn ToSql + Sync + Send>> {
 /// empty one. Doubles embedded quotes, the standard escape.
 pub fn quote_ident(name: &str) -> WeftResult<String> {
     if name.trim().is_empty() {
-        weft::node_bail!("an empty identifier cannot name a table or column");
+        mistake!("an empty identifier cannot name a table or column");
     }
     Ok(format!("\"{}\"", name.replace('"', "\"\"")))
 }
@@ -475,7 +508,7 @@ fn cell_of(row: &Row, i: usize) -> WeftResult<Value> {
         Type::TIMESTAMP_ARRAY => array(row, i, |v: chrono::NaiveDateTime| json!(v.to_string())),
         Type::DATE_ARRAY => array(row, i, |v: chrono::NaiveDate| json!(v.to_string())),
         _ => {
-            weft::node_bail!(
+            mistake!(
                 "column '{name}' has type {ty}, which this node does not carry; cast it in \
                  the query (e.g. {name}::text)"
             );
@@ -530,7 +563,7 @@ pub fn refuse_shadowed_columns(first_row: &Value, own_ports: &[&str]) -> WeftRes
         if !row.contains_key(*port) {
             continue;
         }
-        weft::node_bail!(
+        mistake!(
             "this query answers a column called '{port}', which is also one of this node's own \
              output ports, so the column has nowhere to go: reading '{port}' gives you what the \
              node puts there, not your column. Alias it in the SQL (`... as {port}_value`), or \
@@ -571,7 +604,7 @@ pub fn refuse_unanswered_ports(
     }
     missing.sort_unstable();
     let answered: Vec<&str> = row.keys().map(String::as_str).collect();
-    weft::node_bail!(
+    mistake!(
         "this node declares the output port{} {}, and the query answers no column of that \
          name: the columns it answered are {}. A port filled from a column nobody selected \
          closes, and everything behind it skips. Select the column (or alias one to that \
@@ -666,10 +699,10 @@ pub async fn query_json(
     let refs: Vec<&(dyn ToSql + Sync)> =
         boxed.iter().map(|b| b.as_ref() as &(dyn ToSql + Sync)).collect();
     let rows = client.query(sql, &refs).await.map_err(|e| {
-        weft::error::node_error(format!(
-            "postgres: run the query: {}",
-            spell_parameters(&pg_detail(&e), names)
-        ))
+        refusal(
+            format!("postgres: run the query: {}", spell_parameters(&pg_detail(&e), names)),
+            &e,
+        )
     })?;
     rows_to_json(&rows)
 }
@@ -840,7 +873,7 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
                 let mut depth = 0usize;
                 loop {
                     if i >= chars.len() {
-                        weft::node_bail!("the SQL opens a /* comment it never closes");
+                        mistake!("the SQL opens a /* comment it never closes");
                     }
                     if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
                         depth += 1;
@@ -872,7 +905,7 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
                 i += 1;
                 loop {
                     let Some(&ch) = chars.get(i) else {
-                        weft::node_bail!("the SQL opens a {quote} quote it never closes");
+                        mistake!("the SQL opens a {quote} quote it never closes");
                     };
                     if ch == '\\' && escapes_with_backslash {
                         out.push(ch);
@@ -923,7 +956,7 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
                         k += 1;
                     }
                     let Some(end) = found else {
-                        weft::node_bail!("the SQL opens a ${tag}$ quote it never closes");
+                        mistake!("the SQL opens a ${tag}$ quote it never closes");
                     };
                     out.extend(&chars[i..end + close.len()]);
                     i = end + close.len();
@@ -986,7 +1019,7 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
         close_statement(&mut out, &mut names, &mut statements, &mut statement_start);
     }
     if statements.is_empty() {
-        weft::node_bail!(
+        mistake!(
             "the query is empty (nothing but whitespace or comments); write the SQL to run"
         );
     }
@@ -997,14 +1030,14 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
     if let Some(tag) = positional {
         let bound = parsed.names();
         if bound.is_empty() && parsed.statements.len() == 1 {
-            weft::node_bail!(
+            mistake!(
                 "the SQL uses `${tag}`, which is not a name this node can bind: parameters are \
                  the node's own input ports, read by name. Declare the port and name it: \
                  `PostgresExecuteQuery(user_id: String) {{ ... WHERE id = $user_id }}`"
             );
         }
         if !bound.is_empty() {
-            weft::node_bail!(
+            mistake!(
                 "the SQL mixes named parameters ({}) with `${tag}`, which is not a name this \
                  node can bind; name every parameter after the input port that carries it",
                 bound.join(", ")
@@ -1034,11 +1067,14 @@ pub async fn steps_json(
         let refs: Vec<&(dyn ToSql + Sync)> =
             boxed.iter().map(|b| b.as_ref() as &(dyn ToSql + Sync)).collect();
         let rows = tx.query(statement.sql.as_str(), &refs).await.map_err(|e| {
-            weft::error::node_error(format!(
-                "postgres: statement {} of the script: {} (the transaction was rolled back)",
-                index + 1,
-                spell_parameters(&pg_detail(&e), &statement.names)
-            ))
+            refusal(
+                format!(
+                    "postgres: statement {} of the script: {} (the transaction was rolled back)",
+                    index + 1,
+                    spell_parameters(&pg_detail(&e), &statement.names)
+                ),
+                &e,
+            )
         })?;
         last = rows_to_json(&rows)?;
     }
@@ -1069,13 +1105,16 @@ pub async fn script_json(
         run_script_head(client, &head.join(";\n")).await?;
     }
     let rows = client.query(last, &[]).await.map_err(|e| {
-        weft::error::node_error(format!(
-            "postgres: the last statement of the script: {}. Its rows are the ones this node \
-             answers, so it runs on its own and has to be one Postgres can prepare; a \
-             statement that cannot be (VACUUM, and the other utility commands) belongs \
-             before the last one",
-            pg_detail(&e)
-        ))
+        refusal(
+            format!(
+                "postgres: the last statement of the script: {}. Its rows are the ones this \
+                 node answers, so it runs on its own and has to be one Postgres can prepare; \
+                 a statement that cannot be (VACUUM, and the other utility commands) belongs \
+                 before the last one",
+                pg_detail(&e)
+            ),
+            &e,
+        )
     })?;
     rows_to_json(&rows)
 }
@@ -1086,6 +1125,6 @@ async fn run_script_head(client: &tokio_postgres::Client, sql: &str) -> WeftResu
     client
         .simple_query(sql)
         .await
-        .map_err(|e| weft::error::node_error(format!("postgres: run the script: {}", pg_detail(&e))))?;
+        .map_err(|e| refusal(format!("postgres: run the script: {}", pg_detail(&e)), &e))?;
     Ok(())
 }

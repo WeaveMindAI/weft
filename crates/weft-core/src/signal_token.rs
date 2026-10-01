@@ -132,7 +132,7 @@ pub const MAX_EXPIRY_SECS: u64 = 365 * 24 * 3600;
 /// When a token minted at `now_unix` to live `expires_in_secs` stops
 /// working, in unix seconds. Refuses 0 (a token that never works) and
 /// anything over [`MAX_EXPIRY_SECS`]. The one check every mint (the
-/// dispatcher's `weft token`, the broker's member tokens) makes.
+/// dispatcher's `weft token`, the broker's instance tokens) makes.
 pub fn expiry_at(now_unix: u64, expires_in_secs: u64) -> Result<u64, String> {
     if expires_in_secs == 0 || expires_in_secs > MAX_EXPIRY_SECS {
         return Err(format!(
@@ -144,9 +144,134 @@ pub fn expiry_at(now_unix: u64, expires_in_secs: u64) -> Result<u64, String> {
         .ok_or_else(|| format!("a clock at {now_unix} plus {expires_in_secs} seconds is past what a timestamp holds"))
 }
 
+crate::wire_enum! {
+    /// What a token may do. One table, one hash, one mint/list/revoke
+    /// surface for both, and the kind is checked at each door: a caller
+    /// token never opens the admin surface, and an operator key is never
+    /// taken on the outside-caller doors, so a frontend's leaked token can
+    /// never administer the install and an admin key is never pasted into
+    /// a frontend.
+    /// SYNC: kind column values <-> the CHECK on signal_token.kind in crates/weft-dispatcher/src/journal/postgres.rs GROUP
+    pub enum TokenKind {
+        /// An outside caller's scoped credential: signals, displays.
+        Caller = "caller",
+        /// Full admin of the tenant: every CLI and editor verb.
+        Operator = "operator",
+    }
+}
+
+/// A listed token (`GET /signal-tokens`): metadata + recognizer only,
+/// no secret. What the install answers and the CLI reads.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TokenSummary {
+    pub id: uuid::Uuid,
+    pub kind: TokenKind,
+    pub recognizer: String,
+    pub name: Option<String>,
+    #[serde(rename = "createdAtUnix")]
+    pub created_at_unix: u64,
+    #[serde(rename = "allowedProjects")]
+    pub allowed_projects: Vec<uuid::Uuid>,
+    #[serde(rename = "allowedTags")]
+    pub allowed_tags: Vec<String>,
+    #[serde(rename = "allowedDisplays")]
+    pub allowed_displays: Vec<String>,
+    #[serde(rename = "allDisplays")]
+    pub all_displays: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<crate::instance::InstanceId>,
+    #[serde(rename = "expiresAtUnix", default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix: Option<u64>,
+}
+
+/// `POST /signal-tokens`: mint a token.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MintTokenRequest {
+    /// The user-facing label (a display name), never part of the token value.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Scope vectors. Empty = wildcard. Each non-empty vector narrows
+    /// the signals this token can enumerate. Tags must pass the tag
+    /// charset (`[A-Za-z0-9_-]{1,64}`); rejected at parse time.
+    #[serde(default, rename = "allowedProjects")]
+    pub allowed_projects: Vec<uuid::Uuid>,
+    #[serde(default, rename = "allowedTags")]
+    pub allowed_tags: Vec<String>,
+    /// The display dimension, which does NOT take the wildcard-on-empty
+    /// rule: a token says which node displays it may read, or reads
+    /// none. `allDisplays` is the wildcard within the token's projects.
+    #[serde(default, rename = "allowedDisplays")]
+    pub allowed_displays: Vec<String>,
+    #[serde(default, rename = "allDisplays")]
+    pub all_displays: bool,
+    /// An instance token: acts inside this one instance of its one project
+    /// (`allowedProjects` names exactly that one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<crate::instance::InstanceId>,
+    /// How long the token works, in seconds from now. Required for an
+    /// instance token (it lives in a browser); optional otherwise.
+    #[serde(default, rename = "expiresInSecs", skip_serializing_if = "Option::is_none")]
+    pub expires_in_secs: Option<u64>,
+    /// What the token may do. Absent is a caller token, the scoped
+    /// credential; `operator` is an admin key and takes no scope.
+    #[serde(default = "caller_kind")]
+    pub kind: TokenKind,
+}
+
+impl MintTokenRequest {
+    /// A caller token named `name`, scoped to nothing yet.
+    pub fn caller(name: impl Into<String>) -> Self {
+        Self {
+            name: Some(name.into()),
+            allowed_projects: Vec::new(),
+            allowed_tags: Vec::new(),
+            allowed_displays: Vec::new(),
+            all_displays: false,
+            instance: None,
+            expires_in_secs: None,
+            kind: TokenKind::Caller,
+        }
+    }
+}
+
+fn caller_kind() -> TokenKind {
+    TokenKind::Caller
+}
+
+/// The mint answer: the ONLY place the full token value ever appears.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MintedToken {
+    pub id: uuid::Uuid,
+    pub kind: TokenKind,
+    /// The full secret, shown once. The client copies it now; the server
+    /// keeps only its hash and can never show it again.
+    pub token: String,
+    pub recognizer: String,
+    pub name: Option<String>,
+    /// The paste-able connect string for clients that take one URL
+    /// (`<public-base>/signal-token/<token>`): clients PARSE it into base +
+    /// token and present the token via `Authorization: Bearer`; the wire
+    /// requests never carry it in a path.
+    pub url: String,
+    #[serde(rename = "allowedProjects")]
+    pub allowed_projects: Vec<uuid::Uuid>,
+    #[serde(rename = "allowedTags")]
+    pub allowed_tags: Vec<String>,
+    #[serde(rename = "allowedDisplays")]
+    pub allowed_displays: Vec<String>,
+    #[serde(rename = "allDisplays")]
+    pub all_displays: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<crate::instance::InstanceId>,
+    #[serde(rename = "expiresAtUnix", default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix: Option<u64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    crate::wire_enum_roundtrip_tests!(TokenKind);
 
     #[test]
     fn an_expiry_is_between_a_second_and_a_year_from_now() {

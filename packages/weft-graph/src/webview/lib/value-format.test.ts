@@ -14,18 +14,18 @@ describe('formatConfigValue / parseConfigToken round-trip', () => {
     }
   });
 
-  it('round-trips a field each member fills, with and without a fallback', () => {
-    const bare = { __weft_member_filled__: {} };
-    expect(formatConfigValue(bare)).toBe('@member_filled');
+  it('round-trips a field each instance fills, with and without a fallback', () => {
+    const bare = { __weft_instance_filled__: {} };
+    expect(formatConfigValue(bare)).toBe('@instance_filled');
     expect(roundTrip(bare)).toEqual(bare);
-    const withFallback = { __weft_member_filled__: { fallback: '0 0 3 * * *' } };
-    expect(formatConfigValue(withFallback)).toBe('@member_filled("0 0 3 * * *")');
+    const withFallback = { __weft_instance_filled__: { fallback: '0 0 3 * * *' } };
+    expect(formatConfigValue(withFallback)).toBe('@instance_filled("0 0 3 * * *")');
     expect(roundTrip(withFallback)).toEqual(withFallback);
-    expect(() => parseConfigToken('@member_filled()')).toThrow();
-    const fromFile = { __weft_member_filled__: { fallback: { __weftFileRef: { path: 'prompts/default.md', type: 'String', marker: 'file' } } } };
-    expect(formatConfigValue(fromFile)).toBe('@member_filled(@file("prompts/default.md"))');
+    expect(() => parseConfigToken('@instance_filled()')).toThrow();
+    const fromFile = { __weft_instance_filled__: { fallback: { __weftFileRef: { path: 'prompts/default.md', type: 'String', marker: 'file' } } } };
+    expect(formatConfigValue(fromFile)).toBe('@instance_filled(@file("prompts/default.md"))');
     expect(roundTrip(fromFile)).toEqual(fromFile);
-    expect(() => parseConfigToken('@member_filled(@member_filled)')).toThrow();
+    expect(() => parseConfigToken('@instance_filled(@instance_filled)')).toThrow();
   });
 
   it('round-trips a multi-line string as a heredoc', () => {

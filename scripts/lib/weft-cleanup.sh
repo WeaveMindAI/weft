@@ -10,7 +10,7 @@
 # Every function assumes the docker daemon answers when it touches
 # docker; the callers check that once, up front.
 
-# SYNC: the install label <-> crates/weft-core/src/infra/instance.rs (INSTALL_LABEL)
+# SYNC: the install label <-> crates/weft-core/src/infra/install.rs (INSTALL_LABEL)
 weft_install_label=weft-install
 
 # The data directory every install lives under: the default install at
@@ -140,7 +140,7 @@ weft_old_install_present() {
 # The named installs on this machine (test cells, say), comma separated,
 # empty when there are none. A wipe takes them too, so its question
 # names them.
-# SYNC: installs/<name> <-> crates/weft-core/src/infra/instance.rs (Instance::dir)
+# SYNC: installs/<name> <-> crates/weft-core/src/infra/install.rs (Install::dir)
 weft_named_installs() {
   local d names=()
   for d in "${weft_state_dir}"/installs/*/; do

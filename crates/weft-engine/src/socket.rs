@@ -456,22 +456,22 @@ mod tests {
         }
         async fn claim_one(
             &self,
-            _instance: &str,
+            _replica: &str,
             _filter: weft_task_store::tasks::ClaimFilter,
             _wait: std::time::Duration,
         ) -> anyhow::Result<Option<weft_task_store::tasks::Task>> {
             Ok(None)
         }
-        async fn requeue(&self, _task_id: uuid::Uuid, _instance: &str) -> anyhow::Result<bool> {
+        async fn requeue(&self, _task_id: uuid::Uuid, _replica: &str) -> anyhow::Result<bool> {
             Ok(true)
         }
-        async fn heartbeat(&self, _task_id: uuid::Uuid, _instance: &str) -> anyhow::Result<bool> {
+        async fn heartbeat(&self, _task_id: uuid::Uuid, _replica: &str) -> anyhow::Result<bool> {
             Ok(true)
         }
         async fn complete(
             &self,
             _task_id: uuid::Uuid,
-            _instance: &str,
+            _replica: &str,
             _result: serde_json::Value,
         ) -> anyhow::Result<()> {
             Ok(())
@@ -479,7 +479,7 @@ mod tests {
         async fn fail(
             &self,
             _task_id: uuid::Uuid,
-            _instance: &str,
+            _replica: &str,
             _error: String,
         ) -> anyhow::Result<()> {
             Ok(())

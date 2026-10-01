@@ -17,6 +17,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_status_behind_a_socket_is_refused", socket_status_refused),
         NodeTest::fake("a_text_route_wants_a_string_body", text_shape),
         NodeTest::fake("a_bytes_route_sends_a_stored_file", bytes_shape),
+        NodeTest::fake("answer_as_bytes_answers_a_picture_from_a_json_route", answer_as_bytes),
         NodeTest::fake("a_stored_file_in_a_json_answer_goes_out_as_a_link", file_link),
         NodeTest::basic("a_head_carries_status_and_string_headers", head_shape),
     ]
@@ -81,8 +82,31 @@ async fn bytes_shape(rig: FakeRig) -> WeftResult<()> {
     let file = rig.store_file("out.bin", "application/octet-stream", vec![9, 9]);
     rig.run(&ReplyNode, json!({ "body": file })).await.ok()?;
     assert_eq!(conn.chunks(), vec![OutboundChunk::Bytes(vec![9, 9])]);
+    let head = &conn.heads()[0];
+    assert_eq!(head.header("content-type"), Some("application/octet-stream"), "the file's own type");
+    assert_eq!(head.header("content-disposition"), Some("inline; filename=\"out.bin\"; filename*=UTF-8''out.bin"));
     let err = rig.run(&ReplyNode, json!({ "body": "not a file" })).await.failure()?;
     assert!(err.contains("stored file"), "{err}");
+    Ok(())
+}
+
+/// A GET with no body still answers a picture as bytes: `answerAs` is
+/// the answer's shape, apart from the route's, and the file names its
+/// own type unless the program set one.
+async fn answer_as_bytes(rig: FakeRig) -> WeftResult<()> {
+    let conn = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    rig.attach_caller(conn.clone());
+    let file = rig.store_file("view.jpg", "image/jpeg", vec![1, 2]);
+    rig.run(&ReplyNode, json!({ "body": file.clone(), "answerAs": "bytes" })).await.ok()?;
+    assert_eq!(conn.chunks(), vec![OutboundChunk::Bytes(vec![1, 2])]);
+    assert_eq!(conn.heads()[0].header("content-type"), Some("image/jpeg"));
+    let set = http_caller(DataType::Json, LiveRequest::default(), InboundMessage::Json(json!(null)));
+    rig.attach_caller(set.clone());
+    let headers = json!({ "content-type": "image/x" });
+    rig.run(&ReplyNode, json!({ "body": file.clone(), "answerAs": "bytes", "headers": headers })).await.ok()?;
+    assert_eq!(set.heads()[0].header("content-type"), Some("image/x"), "the program's header wins");
+    let err = rig.run(&ReplyNode, json!({ "body": file, "answerAs": "xml" })).await.failure()?;
+    assert!(err.contains("answerAs must be json, text or bytes"), "{err}");
     Ok(())
 }
 

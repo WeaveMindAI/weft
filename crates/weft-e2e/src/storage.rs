@@ -2,8 +2,8 @@
 //!
 //! A program writes files through a storage node; the rig reads them back the
 //! way the CLI / web app does:
-//!   - list:     `GET /storage/files?project={id}` -> `{ files: [meta...] }`
-//!   - download: `POST /storage/files/download { key, project }` -> `{ url }`,
+//!   - list:     `GET /storage/files` -> `{ files: [meta...] }`
+//!   - download: `POST /storage/files/download { key }` -> `{ url }`,
 //!               then GET the bytes from that (box-public) URL.
 //!
 //! File keys are scoped: `exec/<execution_id>/<id>` (execution scratch, swept on
@@ -11,45 +11,16 @@
 
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
-use serde_json::{json, Value};
-use uuid::Uuid;
+use anyhow::{bail, Result};
+use weft_core::storage::{ListFilesResponse, StoredFileMeta};
 
 use crate::client::{poll_until_describing, Dispatcher};
 
-/// Metadata for one stored file (the fields the rig asserts on). Thin accessor
-/// over the JSON; SYNC by name with StoredFileMeta (camelCase on the wire).
-#[derive(Debug, Clone)]
-pub struct StoredFile(pub Value);
-
-impl StoredFile {
-    pub fn key(&self) -> Option<&str> {
-        self.0.get("key").and_then(Value::as_str)
-    }
-    pub fn filename(&self) -> Option<&str> {
-        self.0.get("filename").and_then(Value::as_str)
-    }
-    pub fn mime_type(&self) -> Option<&str> {
-        self.0.get("mimeType").and_then(Value::as_str)
-    }
-    pub fn size_bytes(&self) -> Option<u64> {
-        self.0.get("sizeBytes").and_then(Value::as_u64)
-    }
-    pub fn keep(&self) -> bool {
-        self.0.get("keep").and_then(Value::as_bool).unwrap_or(false)
-    }
-}
-
-/// List every stored file visible to `project_id`'s tenant.
-pub async fn list(disp: &Dispatcher, project_id: &Uuid) -> Result<Vec<StoredFile>> {
-    let path = format!("/storage/files?project={project_id}");
-    let resp: Value = disp.get_json(&path).await?;
-    let files = resp
-        .get("files")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    Ok(files.into_iter().map(StoredFile).collect())
+/// Every stored file of the caller's tenant (the dispatcher takes the
+/// tenant from the credential).
+pub async fn list(disp: &Dispatcher) -> Result<Vec<StoredFileMeta>> {
+    let listing: ListFilesResponse = disp.get_json("/storage/files").await?;
+    Ok(listing.files)
 }
 
 /// Find files under a SCOPE key prefix (e.g. `exec/<execution_id>/` for one run's
@@ -57,17 +28,13 @@ pub async fn list(disp: &Dispatcher, project_id: &Uuid) -> Result<Vec<StoredFile
 /// but tests think in the scope portion, so match the key with its leading
 /// `<tenant>/` segment stripped. Tenant-agnostic, so it works for any
 /// tenant, `local` included.
-pub async fn list_prefix(
-    disp: &Dispatcher,
-    project_id: &Uuid,
-    prefix: &str,
-) -> Result<Vec<StoredFile>> {
-    Ok(list(disp, project_id)
+pub async fn list_prefix(disp: &Dispatcher, prefix: &str) -> Result<Vec<StoredFileMeta>> {
+    Ok(list(disp)
         .await?
         .into_iter()
         .filter(|f| {
-            f.key()
-                .and_then(|k| k.split_once('/'))
+            f.key
+                .split_once('/')
                 .map(|(_tenant, scope_key)| scope_key.starts_with(prefix))
                 .unwrap_or(false)
         })
@@ -83,7 +50,7 @@ pub async fn list_prefix(
 /// not-ready state, not a download failure, so we poll through those codes +
 /// transport errors until the bucket is serving (bounded). Any OTHER non-success
 /// (403 denied/expired signature, 404 gone) fails fast.
-pub async fn download(disp: &Dispatcher, project_id: &Uuid, key: &str) -> Result<Vec<u8>> {
+pub async fn download(disp: &Dispatcher, key: &str) -> Result<Vec<u8>> {
     // Gateway "upstream not ready yet" codes: retry these, fail fast on the rest.
     const NOT_READY: [u16; 3] = [502, 503, 504];
     let deadline = Duration::from_secs(60);
@@ -94,17 +61,10 @@ pub async fn download(disp: &Dispatcher, project_id: &Uuid, key: &str) -> Result
     // up to ~120 times. A not-ready bucket response is independent of the URL,
     // so one mint suffices. Give it a TTL well above the poll deadline so the
     // signed URL cannot expire mid-wait.
-    let body = json!({
-        "key": key,
-        "project": project_id.to_string(),
-        "ttl_secs": deadline.as_secs() + 600,
-    });
-    let resp: Value = disp.post_json("/storage/files/download", &body).await?;
-    let url = resp
-        .get("url")
-        .and_then(Value::as_str)
-        .with_context(|| format!("download handshake for {key} missing `url`: {resp}"))?
-        .to_string();
+    let body = weft_core::storage::DownloadRequest { key: key.to_string(), ttl_secs: Some(deadline.as_secs() + 600) };
+    let handshake: weft_core::storage::PresignResult =
+        disp.post_json("/storage/files/download", &serde_json::to_value(&body)?).await?;
+    let url = handshake.url;
 
     // Poll the (single) URL through the box's cold-wake window; a timeout
     // names the LAST observation, turning a genuinely-down box from a vague
@@ -160,25 +120,23 @@ pub async fn download(disp: &Dispatcher, project_id: &Uuid, key: &str) -> Result
 /// matched file's key. The common storage check: "the program wrote this".
 pub async fn assert_file_contents(
     disp: &Dispatcher,
-    project_id: &Uuid,
     prefix: &str,
     expected: &[u8],
 ) -> Result<String> {
-    let files = list_prefix(disp, project_id, prefix).await?;
+    let files = list_prefix(disp, prefix).await?;
     if files.is_empty() {
-        bail!("no stored files under prefix '{prefix}' for project {project_id}");
+        bail!("no stored files under prefix '{prefix}'");
     }
     for f in &files {
-        let key = f.key().context("stored file missing key")?;
-        let bytes = download(disp, project_id, key).await?;
+        let bytes = download(disp, &f.key).await?;
         if bytes == expected {
-            return Ok(key.to_string());
+            return Ok(f.key.clone());
         }
     }
     bail!(
         "no file under '{prefix}' matched the expected {} bytes (found {} file(s): {:?})",
         expected.len(),
         files.len(),
-        files.iter().filter_map(StoredFile::key).collect::<Vec<_>>()
+        files.iter().map(|f| f.key.as_str()).collect::<Vec<_>>()
     )
 }

@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use serde_json::Value;
 use eventsource_client::Client;
 use futures::StreamExt;
+use weft_core::live_event::LiveEvent;
 
 use super::Ctx;
 
@@ -25,23 +26,31 @@ impl FollowTarget<'_> {
         }
     }
 
-    fn finished(self, event: &Value) -> bool {
-        matches!(self, Self::Execution(_)) && is_terminal(event)
+    fn finished(self, event: &LiveEvent) -> bool {
+        matches!(self, Self::Execution(_)) && event.event.is_execution_terminal()
     }
 }
 
 pub async fn run(ctx: Ctx, project: String) -> anyhow::Result<()> {
     let client = ctx.client()?;
-    follow_sse(&client, FollowTarget::Project(&project), print_event).await
+    follow_sse(&client, FollowTarget::Project(&project), |event| {
+        print_event(&serde_json::to_value(event)?);
+        Ok(())
+    })
+    .await
 }
 
 /// Follow one run to its end, each event printed the way the program
 /// reads (`one.strip`, `gate`) when the project's definition is at
 /// hand; ids otherwise.
 pub async fn follow_execution_id(client: &crate::client::DispatcherClient, execution_id: &str, definition: Option<&weft_core::ProjectDefinition>) -> anyhow::Result<()> {
-    follow_sse(client, FollowTarget::Execution(execution_id), |event| match definition {
-        Some(definition) => if let Some(spelled) = super::executions::spell_node(event.clone(), definition) { print_event(&spelled) },
-        None => print_event(event),
+    follow_sse(client, FollowTarget::Execution(execution_id), |event| {
+        let row = serde_json::to_value(event)?;
+        match definition {
+            Some(definition) => if let Some(spelled) = super::executions::spell_node(row, definition) { print_event(&spelled) },
+            None => print_event(&row),
+        }
+        Ok(())
     }).await
 }
 
@@ -52,7 +61,7 @@ fn print_event(event: &Value) {
 async fn follow_sse(
     client: &crate::client::DispatcherClient,
     target: FollowTarget<'_>,
-    mut emit: impl FnMut(&Value),
+    mut emit: impl FnMut(&LiveEvent) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let es = client
         .event_stream(&target.path())?
@@ -67,9 +76,9 @@ async fn follow_sse(
     while let Some(ev) = stream.next().await {
         match ev.context("live updates interrupted; the run may still be running. Inspect it with `weft executions` and `weft events <execution_id>`")? {
             eventsource_client::SSE::Event(event) => {
-                let event: Value = serde_json::from_str(&event.data).context("decode execution event")?;
+                let event: LiveEvent = serde_json::from_str(&event.data).context("decode execution event")?;
                 if history_ids.contains(event_identity(&event)?) { continue; }
-                emit(&event);
+                emit(&event)?;
                 if target.finished(&event) {
                     return Ok(());
                 }
@@ -80,12 +89,9 @@ async fn follow_sse(
                 // before attachment, including an already-finished run.
                 // New events remain buffered on the open stream meanwhile.
                 if let FollowTarget::Execution(execution_id) = target {
-                    let history: Vec<serde_json::Value> = serde_json::from_value(
-                        client.get_json(&format!("/executions/{execution_id}/replay")).await?
-                    ).context("read execution history")?;
-                    for event in history {
+                    for event in super::versions::replay_rows(client, execution_id).await? {
                         if !history_ids.insert(event_identity(&event)?.to_owned()) { continue; }
-                        emit(&event);
+                        emit(&event)?;
                         if target.finished(&event) {
                             return Ok(());
                         }
@@ -97,8 +103,8 @@ async fn follow_sse(
     anyhow::bail!("live updates ended before following was finished; inspect the run with `weft executions` and `weft events <execution_id>`")
 }
 
-fn event_identity(event: &Value) -> anyhow::Result<&str> {
-    event.get("event_id").and_then(Value::as_str).filter(|id| !id.is_empty())
+fn event_identity(event: &LiveEvent) -> anyhow::Result<&str> {
+    Some(event.event_id.as_str()).filter(|id| !id.is_empty())
         .context("execution event has no delivery identity")
 }
 
@@ -150,16 +156,6 @@ fn short(v: Option<&serde_json::Value>) -> String {
     }
 }
 
-/// Whether an SSE event ends the followed execution. A cancel is a
-/// terminal too. Project-wide follow keeps watching subsequent executions.
-// SYNC: is_terminal (SSE kind list) <-> crates/weft-journal/src/events.rs ExecEvent::is_execution_terminal
-fn is_terminal(value: &Value) -> bool {
-    matches!(
-        value.get("kind").and_then(|v| v.as_str()),
-        Some("execution_completed") | Some("execution_failed") | Some("execution_cancelled")
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,18 +203,41 @@ mod tests {
         Server { client, requests, task }
     }
 
+    /// One event as the dispatcher sends it: `kind`'s own fields, and the
+    /// ones every run event carries.
+    fn event(id: &str, kind: &str, run: u128) -> Value {
+        let mut fields = match kind {
+            "execution_started" => json!({ "entry_node": "n", "phase": "fire" }),
+            "execution_completed" => json!({ "outputs": {} }),
+            "execution_cancelled" => json!({ "reason": "stopped" }),
+            "node_started" => json!({ "node": "n", "frames": [], "input": {}, "closed_ports": [] }),
+            other => panic!("no fixture for {other}"),
+        };
+        let object = fields.as_object_mut().unwrap();
+        object.insert("event_id".into(), json!(id));
+        object.insert("kind".into(), json!(kind));
+        object.insert("execution_id".into(), json!(uuid::Uuid::from_u128(run)));
+        object.insert("project_id".into(), json!(uuid::Uuid::nil()));
+        object.insert("at_unix".into(), json!(1));
+        fields
+    }
+
+    fn ids(seen: &[LiveEvent]) -> Vec<String> {
+        seen.iter().map(|e| e.event_id.clone()).collect()
+    }
+
     weft_core::stress_test!(
         name: follow_recovers_a_run_that_finished_before_listening,
         runs: 32,
         worker_threads: 4,
         async fn body() {
-            let terminal = json!({ "event_id": "done", "kind": "execution_completed", "execution_id": "a" });
-            let server = server(vec![terminal.clone()], vec![], true).await;
+            let terminal = event("done", "execution_completed", 1);
+            let server = server(vec![terminal], vec![], true).await;
             let mut seen = Vec::new();
             tokio::time::timeout(Duration::from_secs(5), follow_sse(
-                &server.client, FollowTarget::Execution("a"), |raw| seen.push(raw.to_owned()),
+                &server.client, FollowTarget::Execution("a"), |raw| { seen.push(raw.clone()); Ok(()) },
             )).await.expect("completed history must finish follow").unwrap();
-            assert_eq!(seen, vec![terminal]);
+            assert_eq!(ids(&seen), vec!["done"]);
             assert_eq!(*server.requests.lock().unwrap(), vec!["subscribe", "history"]);
         }
     );
@@ -228,14 +247,14 @@ mod tests {
         runs: 32,
         worker_threads: 4,
         async fn body() {
-            let started = json!({ "event_id": "start", "kind": "execution_started", "execution_id": "a" });
-            let terminal = json!({ "event_id": "done", "kind": "execution_completed", "execution_id": "a" });
-            let server = server(vec![started.clone()], vec![terminal.clone()], true).await;
+            let started = event("start", "execution_started", 1);
+            let terminal = event("done", "execution_completed", 1);
+            let server = server(vec![started], vec![terminal], true).await;
             let mut seen = Vec::new();
             tokio::time::timeout(Duration::from_secs(5), follow_sse(
-                &server.client, FollowTarget::Execution("a"), |raw| seen.push(raw.to_owned()),
+                &server.client, FollowTarget::Execution("a"), |raw| { seen.push(raw.clone()); Ok(()) },
             )).await.expect("live completion must finish follow").unwrap();
-            assert_eq!(seen, vec![started, terminal]);
+            assert_eq!(ids(&seen), vec!["start", "done"]);
         }
     );
 
@@ -244,17 +263,14 @@ mod tests {
         runs: 32,
         worker_threads: 4,
         async fn body() {
-            let events = vec![
-                json!({ "event_id": "done:a", "kind": "execution_completed", "execution_id": "a" }),
-                json!({ "event_id": "done:b", "kind": "execution_cancelled", "execution_id": "b" }),
-            ];
-            let server = server(vec![], events.clone(), false).await;
+            let events = vec![event("done:a", "execution_completed", 1), event("done:b", "execution_cancelled", 2)];
+            let server = server(vec![], events, false).await;
             let mut seen = Vec::new();
             let err = tokio::time::timeout(Duration::from_secs(5), follow_sse(
-                &server.client, FollowTarget::Project("p"), |raw| seen.push(raw.to_owned()),
+                &server.client, FollowTarget::Project("p"), |raw| { seen.push(raw.clone()); Ok(()) },
             )).await.expect("a closed stream must stop following").unwrap_err();
             assert!(err.to_string().contains("live updates"), "{err}");
-            assert_eq!(seen, events);
+            assert_eq!(ids(&seen), vec!["done:a", "done:b"]);
             assert_eq!(*server.requests.lock().unwrap(), vec!["subscribe"]);
         }
     );
@@ -264,22 +280,24 @@ mod tests {
         runs: 32,
         worker_threads: 4,
         async fn body() {
-            let first = json!({ "event_id": "row:1", "kind": "node_started", "node": "n", "execution_id": "a" });
-            let second = json!({ "event_id": "row:2", "kind": "node_started", "node": "n", "execution_id": "a" });
-            let terminal = json!({ "event_id": "row:3", "kind": "execution_completed", "execution_id": "a" });
-            let server = server(vec![first.clone()], vec![first.clone(), second.clone(), terminal.clone()], true).await;
+            let first = event("row:1", "node_started", 1);
+            let second = event("row:2", "node_started", 1);
+            let terminal = event("row:3", "execution_completed", 1);
+            let server = server(vec![first.clone()], vec![first, second, terminal], true).await;
             let mut seen = Vec::new();
             tokio::time::timeout(Duration::from_secs(5), follow_sse(
-                &server.client, FollowTarget::Execution("a"), |event| seen.push(event.clone()),
+                &server.client, FollowTarget::Execution("a"), |event| { seen.push(event.clone()); Ok(()) },
             )).await.expect("completed follow must return").unwrap();
-            assert_eq!(seen, vec![first, second, terminal]);
+            assert_eq!(ids(&seen), vec!["row:1", "row:2", "row:3"]);
         }
     );
 
     #[test]
     fn events_without_identity_are_a_contract_error() {
-        assert!(event_identity(&json!({ "kind": "node_started" })).is_err());
-        assert!(event_identity(&json!({ "event_id": "" })).is_err());
+        let anonymous: LiveEvent = serde_json::from_value(event("", "node_started", 1)).unwrap();
+        assert!(event_identity(&anonymous).is_err());
+        let unmarked = { let mut e = event("x", "node_started", 1); e.as_object_mut().unwrap().remove("event_id"); e };
+        assert!(serde_json::from_value::<LiveEvent>(unmarked).is_err(), "an event without its identity does not decode");
     }
 
     #[test]

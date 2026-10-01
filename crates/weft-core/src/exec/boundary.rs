@@ -38,7 +38,7 @@ use crate::project::{
     boundary_in_id, boundary_out_id, scope_body_roots, scope_members, EdgeIndex, GroupBoundaryRole,
     NodeDefinition, ProjectDefinition,
 };
-use crate::pulse::{Pulse, PulseStatus, PulseTable};
+use crate::pulse::{Failure, Pulse, PulseStatus, PulseTable};
 use crate::ExecutionId;
 
 /// The compiler's node type for a group boundary.
@@ -134,7 +134,9 @@ pub enum BoundaryOutcome {
         input: InputBag,
         closed_ports: Vec<String>,
         output: Option<OutputBag>,
-        skip_reason: Option<SkipReason>,
+        /// Boxed: a skip reason can carry the failure that caused it,
+        /// which would make every outcome as large as the rarest one.
+        skip_reason: Option<Box<SkipReason>>,
         error: Option<String>,
     },
 }
@@ -223,7 +225,7 @@ fn settle_input_streams(
                 let bucket = pulses.entry(node.id.clone()).or_default();
                 let history: Vec<_> = bucket.iter().filter(|p|
                     p.execution_id == execution_id && p.frames == frames && p.target_port == *port).collect();
-                if history.iter().any(|p| p.backup || !p.closed || p.close_error.is_some()) { continue; }
+                if history.iter().any(|p| p.backup || !p.closed || p.failure.is_some()) { continue; }
                 let ended = history.iter().any(|p| p.closed);
                 if !ended && selection.has_supplier(project, &at, port) { continue; }
                 let backup = selection.input.get(&at).and_then(|values| values.get(*port));
@@ -466,7 +468,8 @@ fn dispatch_passthrough(
     } else if let Some(err) = &group.error {
         // A pre-dispatch failure (a port refused its value): nothing
         // was forwarded, so every output closes.
-        sweep_all_outputs(&node_id, emission_id, execution_id, &frames, project, edge_idx, pulses, &mut emissions, err);
+        let failure = Failure::at(project, &node_id, &frames, err.as_str());
+        sweep_all_outputs(&node_id, emission_id, execution_id, &frames, project, edge_idx, pulses, &mut emissions, &failure);
         // And the scope never starts, which the INSIDE has to be told
         // as well. Closing only the In boundary's own outputs left
         // every scope root (a member no wire feeds) never started,
@@ -476,7 +479,7 @@ fn dispatch_passthrough(
         // gated-off path does; only the reason differs.
         if let Some(group_id) = &in_scope {
             emissions.extend(tear_down_scope(
-                project, edge_idx, pulses, kicked, emission_id, execution_id, group_id, &frames, None, Some(err),
+                project, edge_idx, pulses, kicked, emission_id, execution_id, group_id, &frames, None, Some(&failure),
             ));
         }
         NodeExecutionStatus::Failed
@@ -500,7 +503,7 @@ fn dispatch_passthrough(
                 // never laundering it into a plain "nothing came" that a
                 // `_should_not_flow` outside the scope would run on.
                 if let Err(e) = close_failed_then_unmentioned_downstream(
-                    &node_id, &group.received.closed_with_error, &mentioned, emission_id, execution_id,
+                    &node_id, &group.received.closed_failures, &mentioned, emission_id, execution_id,
                     &frames, project, pulses, edge_idx, &mut emissions,
                 ) {
                     tracing::error!(
@@ -529,10 +532,11 @@ fn dispatch_passthrough(
                 // told, or its roots wait for ever and the run ends
                 // Stuck (the pre-dispatch branch above says why).
                 let err = e.to_string();
-                sweep_all_outputs(&node_id, emission_id, execution_id, &frames, project, edge_idx, pulses, &mut emissions, &err);
+                let failure = Failure::at(project, &node_id, &frames, err.as_str());
+                sweep_all_outputs(&node_id, emission_id, execution_id, &frames, project, edge_idx, pulses, &mut emissions, &failure);
                 if let Some(group_id) = &in_scope {
                     emissions.extend(tear_down_scope(
-                        project, edge_idx, pulses, kicked, emission_id, execution_id, group_id, &frames, None, Some(&err),
+                        project, edge_idx, pulses, kicked, emission_id, execution_id, group_id, &frames, None, Some(&failure),
                     ));
                 }
                 error = Some(err);
@@ -569,7 +573,7 @@ fn dispatch_passthrough(
             input: group.received.input,
             closed_ports: group.received.closed_ports,
             output,
-            skip_reason: group.skip,
+            skip_reason: group.skip.map(Box::new),
             error,
         },
     }
@@ -586,11 +590,11 @@ fn sweep_all_outputs(
     edge_idx: &EdgeIndex,
     pulses: &mut PulseTable,
     emissions: &mut Vec<PulseEmission>,
-    err: &str,
+    failure: &Failure,
 ) {
     if let Err(e) = close_unmentioned_downstream(
         node_id, &HashSet::new(), emission_id, execution_id, frames, project, pulses, edge_idx, emissions,
-        Some(err), &HashSet::new(),
+        Some(failure), &HashSet::new(),
     ) {
         tracing::error!(
             target: "weft_core::exec::boundary",
@@ -623,7 +627,7 @@ pub fn tear_down_scope(
     group_id: &str,
     frames: &LoopFrames,
     reason: Option<&SkipReason>,
-    failure: Option<&str>,
+    failure: Option<&Failure>,
 ) -> Vec<PulseEmission> {
     let refused = refused_scope(project, edge_idx, group_id, frames);
     if refused.owed_by_the_enclosing_pass(reason) {
@@ -650,7 +654,7 @@ pub fn tear_down_scope(
     // into that body looked like an exit, and the body's In woke up on
     // the closure and completed before the site's own skip took the
     // body down, leaving one node with two records.
-    let inside: HashSet<Located> = crate::project::selection::members_with_paths(project, &scope,
+    let inside: HashSet<Located> = crate::project::selection::members_in(&crate::project::graph::ProjectGraph::new(project), &scope,
         &crate::frames::call_path(frames).into_iter().map(str::to_string).collect::<Vec<_>>()).into_iter().collect();
     exits.edges.retain(|wire| crate::project::selection::wire_ends(project, wire).is_some_and(|(_, target)|
         target.id != boundary_out_id(&scope) && target.id != boundary_out_id(group_id) && !inside.contains(&target)));
@@ -766,7 +770,7 @@ pub fn close_scope_outward(
     execution_id: ExecutionId,
     group_id: &str,
     frames: &LoopFrames,
-    failure: Option<&str>,
+    failure: Option<&Failure>,
 ) -> Vec<PulseEmission> {
     let out_id = boundary_out_id(group_id);
     let Some(out_node) = project.nodes.iter().find(|n| n.id == out_id) else {
@@ -931,7 +935,8 @@ mod tests {
         for failed in [false, true] {
             let mut real = Pulse::new(Uuid::new_v4(), Uuid::nil(), vec![], "sink", "in", Arc::new(json!(9)));
             real.absorb();
-            let end = Pulse::closure_with_error(Uuid::new_v4(), Uuid::nil(), vec![], "sink", "in", failed.then(|| "producer failed".into()));
+            let end = Pulse::closure_with_failure(Uuid::new_v4(), Uuid::nil(), vec![], "sink", "in",
+                failed.then(|| Failure { node: "producer".into(), error: "producer failed".into() }));
             let mut history = if failed { vec![end] } else { vec![real, end] };
             pulses.insert("sink".into(), std::mem::take(&mut history));
             assert!(!settle_input_streams(&project, &index, Uuid::nil(), &mut pulses, &executions, &kicked));
@@ -1050,7 +1055,7 @@ mod tests {
             panic!("in scope")
         };
         assert_eq!(*status, NodeExecutionStatus::Skipped);
-        assert_eq!(*skip_reason, Some(SkipReason::DidNotFlow));
+        assert_eq!(skip_reason.as_deref(), Some(&SkipReason::DidNotFlow));
         assert!(output.is_none());
         assert!(pending(&pulses, "inner").is_empty(), "nothing is forwarded into a gated scope");
         let sink = pending(&pulses, "sink");
@@ -1430,7 +1435,7 @@ mod tests {
         assert!(output.is_none());
         let inner = pending(&pulses, "inner");
         assert_eq!(inner.len(), 1);
-        assert!(inner[0].closed && inner[0].close_error.is_some(), "closed with the failure: {:?}", inner[0]);
+        assert!(inner[0].closed && inner[0].failure.is_some(), "closed with the failure: {:?}", inner[0]);
         for member in ["lonely", "inner"] {
             assert!(kicked.keys().any(|loc| loc.node_id == member), "the failed forward tells {member}: {kicked:?}");
         }
@@ -1510,7 +1515,7 @@ mod tests {
         assert_eq!(ids, vec!["g__in", "h__in", "h__out"], "the outer skip kicks the nested boundaries, which fire in the same pass");
         for nested in &fired[1..] {
             let BoundaryOutcome::Fired { skip_reason, .. } = &nested.outcome else { panic!("in scope") };
-            assert_eq!(*skip_reason, Some(SkipReason::ScopeSkipped { scope: "g".into() }), "{}", nested.node_id);
+            assert_eq!(skip_reason.as_deref(), Some(&SkipReason::ScopeSkipped { scope: "g".into() }), "{}", nested.node_id);
             assert!(nested.emissions.is_empty(), "{} closes nothing more", nested.node_id);
         }
         assert_eq!(pending(&pulses, "sink").len(), 1, "the outer surface closed once");

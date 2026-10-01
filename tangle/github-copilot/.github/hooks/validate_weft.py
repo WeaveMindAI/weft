@@ -32,14 +32,23 @@ when the edit touched nothing weft-related, or when the toolchain needed to
 check is missing (a missing `weft` never blocks work).
 
 What it checks:
-  - an edit to any `.weft` file: that file, exactly as saved
+  - an edit to `src/main.weft`, or to a `.weft` file it includes (directly
+    or through other includes): `main.weft`, since an included file alone
+    reports false errors about what its includer wires into it
+  - an edit to any other `.weft` file: that file, exactly as saved
   - an edit anywhere under `nodes/` (metadata.json, mod.rs, deps.toml,
     package.toml, tests.rs): the project's entry `main.weft`, because a
-    catalog change can break the program that uses it
+    catalog change can break the program that uses it. Findings about node
+    types no folder under `nodes/` declares yet (`unknown node type`, and
+    what follows from it) are left out: they are another node's unwritten
+    work, not this edit's error. An edit to a `.weft` file reports them.
+
+The hook only reports: it never changes, reverts or undoes an edited file.
 """
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -59,8 +68,47 @@ def project_root(start: str):
         cur = parent
 
 
-def validate(root: str, target: str):
-    """Run the fast validate; return (blocking_text or None)."""
+INCLUDE = re.compile(r'@include\(\s*"([^"]+)"\s*\)')
+
+
+def entry_for(root: str, path: str) -> str:
+    """The file to validate for an edit to the `.weft` file `path`: the
+    project's entry `src/main.weft` when `path` is that file or is pulled
+    in by it, directly or through other includes (an included file
+    checked alone misses what its includer wires into it, and reports
+    false errors such as an unmet required port); `path` itself when
+    nothing includes it. An `@include` path is relative to the file that
+    writes it."""
+    entry = os.path.join(root, "src", "main.weft")
+    if not os.path.isfile(entry):
+        return path
+    want = os.path.realpath(path)
+    seen = set()
+    stack = [os.path.realpath(entry)]
+    while stack:
+        cur = stack.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        if cur == want:
+            return entry
+        try:
+            with open(cur, "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            for rel in INCLUDE.findall(line):
+                stack.append(os.path.realpath(os.path.join(os.path.dirname(cur), rel)))
+    return path
+
+
+def validate(root: str, target: str, node_edit: bool = False):
+    """Run the fast validate; return (blocking_text or None). `node_edit`:
+    the edit was under `nodes/`, so findings about node types nobody has
+    written yet are left out (`_drop_unwritten`)."""
     weft = shutil.which("weft")
     if weft is None:
         return None
@@ -103,6 +151,8 @@ def validate(root: str, target: str):
         d for d in diags
         if d.get("severity") == "error" and d.get("code") != "rule-runtime"
     ]
+    if node_edit:
+        errors = _drop_unwritten(root, target, errors)
     # The one warning worth the model's attention mid-build: a level of
     # the graph past fifteen items. Everything else at severity warning
     # (orphan-outputs, no-required-skip) is normal half-built noise and
@@ -125,6 +175,83 @@ def validate(root: str, target: str):
         for d in level_warnings:
             lines.append(_format_finding(d, target))
     return "\n".join(lines)
+
+
+UNWRITTEN = (
+    re.compile(r"unknown node type:? '([^']+)'"),
+    re.compile(r"node type '([^']+)' is not ready yet"),
+    re.compile(r"node '([^']+)' failed to load"),
+)
+DECLARED = re.compile(r'"type"\s*:\s*"([^"]+)"')
+NODE_LINE = re.compile(r"^\s*([A-Za-z_]\w*)\s*=\s*([A-Z]\w*)\b", re.M)
+
+
+def _types_with_a_folder(root: str):
+    """Every node type some `metadata.json` under `nodes/` declares. Read
+    with a regex, not a JSON parse, so a half-written file still names its
+    type."""
+    found = set()
+    for dirpath, _dirs, names in os.walk(os.path.join(root, "nodes")):
+        if "metadata.json" not in names:
+            continue
+        try:
+            with open(os.path.join(dirpath, "metadata.json"), "r", encoding="utf-8") as f:
+                m = DECLARED.search(f.read())
+        except OSError:
+            continue
+        if m:
+            found.add(m.group(1))
+    return found
+
+
+def _unwritten_type(d):
+    """The node type a finding says the catalog does not serve, or None."""
+    for pattern in UNWRITTEN:
+        m = pattern.search(d.get("message") or "")
+        if m:
+            return m.group(1)
+    return None
+
+
+def _drop_unwritten(root: str, target: str, findings):
+    """For an edit under `nodes/`: drop the findings about node types no
+    folder declares yet. The program uses them, but they are another
+    node's unwritten work, not the edit's error. Findings that follow from
+    them go too: any finding on the line of such a node, or naming a node
+    declared with such a type. Everything else, the edited node's own type
+    and package included, is kept."""
+    unwritten = {t for t in map(_unwritten_type, findings) if t}
+    if not unwritten:
+        return findings
+    unwritten -= _types_with_a_folder(root)
+    if not unwritten:
+        return findings
+    ids = set()
+    for dirpath, _dirs, names in os.walk(os.path.dirname(target)):
+        for name in names:
+            if not name.endswith(".weft"):
+                continue
+            try:
+                with open(os.path.join(dirpath, name), "r", encoding="utf-8") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            ids.update(i for i, t in NODE_LINE.findall(text) if t in unwritten)
+    lines = {
+        (d.get("file"), d.get("line"))
+        for d in findings if _unwritten_type(d) in unwritten
+    }
+    names = [re.compile(r"['.]" + re.escape(i) + r"'") for i in ids]
+
+    def unwritten_work(d):
+        if _unwritten_type(d) in unwritten:
+            return True
+        if (d.get("file"), d.get("line")) in lines:
+            return True
+        message = d.get("message") or ""
+        return any(n.search(message) for n in names)
+
+    return [d for d in findings if not unwritten_work(d)]
 
 
 def _format_finding(d, target):
@@ -172,7 +299,7 @@ def main() -> int:
         return 0
 
     if path.endswith(".weft"):
-        target = path
+        target = entry_for(root, path)
     elif ("{}nodes{}".format(os.sep, os.sep)) in path:
         # A catalog change: check the program that consumes it.
         target = os.path.join(root, "src", "main.weft")
@@ -181,7 +308,7 @@ def main() -> int:
     else:
         return 0
 
-    blocking = validate(root, target)
+    blocking = validate(root, target, node_edit=not path.endswith(".weft"))
     if blocking:
         print(json.dumps({"additionalContext": blocking}))
     return 0

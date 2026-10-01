@@ -31,20 +31,20 @@ async fn schema(pool: &PgPool) {
 }
 
 /// `process` holds the project's `infra_owner` lease for the next hour.
-async fn lease(pool: &PgPool, instance: &str) {
-    lease_of(pool, PROJECT, instance).await
+async fn lease(pool: &PgPool, replica: &str) {
+    lease_of(pool, PROJECT, replica).await
 }
 
 /// `process` holds `project`'s `infra_owner` lease for the next hour.
-async fn lease_of(pool: &PgPool, project: uuid::Uuid, instance: &str) {
+async fn lease_of(pool: &PgPool, project: uuid::Uuid, replica: &str) {
     sqlx::query(
-        "INSERT INTO infra_owner (project_id, supervisor_instance, tenant_id, leased_until_unix) \
+        "INSERT INTO infra_owner (project_id, supervisor_replica, tenant_id, leased_until_unix) \
          VALUES ($1, $2, $3, EXTRACT(EPOCH FROM NOW())::BIGINT + 3600) \
-         ON CONFLICT (project_id) DO UPDATE SET supervisor_instance = EXCLUDED.supervisor_instance, \
+         ON CONFLICT (project_id) DO UPDATE SET supervisor_replica = EXCLUDED.supervisor_replica, \
          leased_until_unix = EXCLUDED.leased_until_unix",
     )
     .bind(project)
-    .bind(instance)
+    .bind(replica)
     .bind(TENANT)
     .execute(pool)
     .await
@@ -60,7 +60,7 @@ async fn command(pool: &PgPool) -> i64 {
 async fn command_of(pool: &PgPool, project: uuid::Uuid) -> i64 {
     let (id,): (i64,) = sqlx::query_as(
         "INSERT INTO infra_lifecycle_command \
-         (tenant_id, project_id, node_id, verb, issued_by_instance, issued_at_unix) \
+         (tenant_id, project_id, node_id, verb, issued_by_replica, issued_at_unix) \
          VALUES ($1, $2, $3, 'stop', 'dispatcher', EXTRACT(EPOCH FROM NOW())::BIGINT) \
          RETURNING id",
     )
@@ -98,7 +98,7 @@ fn unit(status: &str) -> serde_json::Value {
 
 async fn node_row(pool: &PgPool, status: &str, units: serde_json::Value) {
     sqlx::query(
-        "INSERT INTO infra_node (project_id, node_id, instance_id, status, units_json) \
+        "INSERT INTO infra_node (project_id, node_id, copy_id, status, units_json) \
          VALUES ($1, $2, 'inst1', $3, $4)",
     )
     .bind(PROJECT)
@@ -119,9 +119,9 @@ async fn row(pool: &PgPool) -> (String, serde_json::Value) {
         .expect("row")
 }
 
-fn stamp(instance: &str, command_id: Option<i64>, unit: Option<&str>, status: Status) -> SupervisorSetStatusRequest {
+fn stamp(replica: &str, command_id: Option<i64>, unit: Option<&str>, status: Status) -> SupervisorSetStatusRequest {
     SupervisorSetStatusRequest {
-        instance: instance.into(),
+        replica: replica.into(),
         command_id,
         project_id: PROJECT,
         node_id: NODE.into(),
@@ -129,7 +129,7 @@ fn stamp(instance: &str, command_id: Option<i64>, unit: Option<&str>, status: St
         status,
         failure_stage: None,
         failure_message: None,
-        member: None,
+        instance: None,
     }
 }
 
@@ -177,7 +177,7 @@ async fn per_unit_stamp_on_a_missing_unit_is_gone_and_writes_nothing(pool: PgPoo
 /// Gone: the target is there, the writer is not the owner), and the
 /// row is untouched.
 #[sqlx::test]
-async fn stamp_by_a_displaced_instance_is_displaced(pool: PgPool) {
+async fn stamp_by_a_displaced_replica_is_displaced(pool: PgPool) {
     schema(&pool).await;
     lease(&pool, OWNER).await;
     let cmd = command(&pool).await;
@@ -195,7 +195,7 @@ async fn stamp_by_a_displaced_instance_is_displaced(pool: PgPool) {
 /// The autonomous (health) stamp is fenced by ownership too: a process that
 /// lost the project cannot stamp it while no command is in flight.
 #[sqlx::test]
-async fn autonomous_stamp_by_a_displaced_instance_is_displaced(pool: PgPool) {
+async fn autonomous_stamp_by_a_displaced_replica_is_displaced(pool: PgPool) {
     schema(&pool).await;
     lease(&pool, OWNER).await;
     node_row(&pool, "running", serde_json::json!({ "a": unit("running") })).await;
@@ -239,7 +239,7 @@ async fn node_wide_stamp_sets_every_unit_and_the_node_even_with_no_units(pool: P
     // Completed command: the fence no longer matches, owner still owns.
     complete_command(
         &pool,
-        &SupervisorCommandCompleteRequest { instance: OWNER.into(), command_id: cmd, error: None, cancelled: false },
+        &SupervisorCommandCompleteRequest { replica: OWNER.into(), command_id: cmd, error: None, cancelled: false },
     )
     .await
     .unwrap();
@@ -266,7 +266,7 @@ async fn autonomous_stamp_is_fenced_by_an_in_flight_command(pool: PgPool) {
     assert_eq!(row(&pool).await.0, "running");
     complete_command(
         &pool,
-        &SupervisorCommandCompleteRequest { instance: OWNER.into(), command_id: cmd, error: None, cancelled: false },
+        &SupervisorCommandCompleteRequest { replica: OWNER.into(), command_id: cmd, error: None, cancelled: false },
     )
     .await
     .unwrap();
@@ -285,8 +285,8 @@ async fn command_completion_is_once_and_owner_only(pool: PgPool) {
     schema(&pool).await;
     lease(&pool, OWNER).await;
     let cmd = command(&pool).await;
-    let req = |instance: &str, id: i64, error: Option<&str>| SupervisorCommandCompleteRequest {
-        instance: instance.into(),
+    let req = |replica: &str, id: i64, error: Option<&str>| SupervisorCommandCompleteRequest {
+        replica: replica.into(),
         command_id: id,
         error: error.map(String::from),
         cancelled: false,
@@ -338,7 +338,7 @@ async fn next_command_skips_busy_and_foreign_projects(pool: PgPool) {
     complete_command(
         &pool,
         &SupervisorCommandCompleteRequest {
-            instance: OWNER.into(),
+            replica: OWNER.into(),
             command_id: first_a,
             error: None,
             cancelled: false,
@@ -421,7 +421,7 @@ async fn a_pending_command_alone_makes_a_project_owned(pool: PgPool) {
 
     complete_command(
         &pool,
-        &SupervisorCommandCompleteRequest { instance: OWNER.into(), command_id: cmd, error: None, cancelled: false },
+        &SupervisorCommandCompleteRequest { replica: OWNER.into(), command_id: cmd, error: None, cancelled: false },
     )
     .await
     .unwrap();
@@ -440,11 +440,11 @@ async fn nothing_is_issued_or_recorded_for_a_deleted_project(pool: PgPool) {
         tenant_id: TENANT,
         project_id,
         node_id: Some(NODE),
-        copies: &weft_core::member::Copies::Shared,
+        copies: &weft_core::instance::Copies::Shared,
         verb: InfraLifecycleVerb::Apply,
         running_policy: None,
         spec_json: Some(&spec),
-        issued_by_instance: "worker-1",
+        issued_by_replica: "worker-1",
     };
     let gone = uuid::Uuid::from_u128(9);
     assert_eq!(issue_command(&pool, &apply(gone)).await.unwrap(), None);
@@ -488,19 +488,19 @@ async fn repair_sql_drops_status_only_stubs(pool: PgPool) {
     assert_eq!(decoded["a"].status, Status::Running);
 }
 
-/// A member's copy is its own row: a stamp naming the member moves only
-/// that copy, and a command naming copies hands the same copies back to
-/// the supervisor that claims it.
+/// An instance's copy is its own row: a stamp naming the instance moves
+/// only that copy, and a command naming copies hands the same copies
+/// back to the supervisor that claims it.
 #[sqlx::test]
-async fn a_members_copy_is_stamped_and_commanded_on_its_own(pool: PgPool) {
-    use weft_core::member::{Copies, MemberId};
+async fn an_instances_copy_is_stamped_and_commanded_on_its_own(pool: PgPool) {
+    use weft_core::instance::{Copies, InstanceId};
     schema(&pool).await;
     project_row(&pool, PROJECT, true).await;
     lease(&pool, OWNER).await;
-    let ada = MemberId::new("ada").unwrap();
+    let ada = InstanceId::new("ada").unwrap();
     node_row(&pool, "running", serde_json::json!({ "a": unit("running") })).await;
     sqlx::query(
-        "INSERT INTO infra_node (project_id, node_id, instance_id, status, units_json, member_id) \
+        "INSERT INTO infra_node (project_id, node_id, copy_id, status, units_json, instance_id) \
          VALUES ($1, $2, 'inst-ada', 'running', $3, 'ada')",
     )
     .bind(PROJECT)
@@ -510,28 +510,28 @@ async fn a_members_copy_is_stamped_and_commanded_on_its_own(pool: PgPool) {
     .await
     .expect("ada's copy");
     let duplicate = sqlx::query(
-        "INSERT INTO infra_node (project_id, node_id, status, member_id) VALUES ($1, $2, 'running', 'ada')",
+        "INSERT INTO infra_node (project_id, node_id, status, instance_id) VALUES ($1, $2, 'running', 'ada')",
     )
     .bind(PROJECT)
     .bind(NODE)
     .execute(&pool)
     .await;
-    assert!(duplicate.is_err(), "one copy per member");
+    assert!(duplicate.is_err(), "one copy per instance");
 
-    let stamp_ada = SupervisorSetStatusRequest { member: Some(ada.clone()), ..stamp(OWNER, None, Some("a"), Status::Flaky) };
+    let stamp_ada = SupervisorSetStatusRequest { instance: Some(ada.clone()), ..stamp(OWNER, None, Some("a"), Status::Flaky) };
     assert_eq!(set_status(&pool, &stamp_ada).await.unwrap(), FencedWrite::Applied);
     let statuses: Vec<(Option<String>, String)> =
-        sqlx::query_as("SELECT member_id, status FROM infra_node WHERE project_id = $1 ORDER BY member_id NULLS FIRST")
+        sqlx::query_as("SELECT instance_id, status FROM infra_node WHERE project_id = $1 ORDER BY instance_id NULLS FIRST")
             .bind(PROJECT)
             .fetch_all(&pool)
             .await
             .unwrap();
     assert_eq!(statuses, vec![(None, "running".to_string()), (Some("ada".to_string()), "flaky".to_string())]);
-    let stamp_bob = SupervisorSetStatusRequest { member: Some(MemberId::new("bob").unwrap()), ..stamp_ada.clone() };
+    let stamp_bob = SupervisorSetStatusRequest { instance: Some(InstanceId::new("bob").unwrap()), ..stamp_ada.clone() };
     assert_eq!(set_status(&pool, &stamp_bob).await.unwrap(), FencedWrite::Gone, "bob has no copy");
 
     let spec = serde_json::json!({ "units": [] });
-    let copies = Copies::Member(ada.clone());
+    let copies = Copies::Instance(ada.clone());
     let apply = IssuedCommand {
         tenant_id: TENANT,
         project_id: PROJECT,
@@ -540,34 +540,34 @@ async fn a_members_copy_is_stamped_and_commanded_on_its_own(pool: PgPool) {
         verb: InfraLifecycleVerb::Apply,
         running_policy: None,
         spec_json: Some(&spec),
-        issued_by_instance: "worker-1",
+        issued_by_replica: "worker-1",
     };
     let id = issue_command(&pool, &apply).await.unwrap().expect("issued");
     let shared = IssuedCommand { copies: &Copies::Shared, ..apply };
     assert_ne!(issue_command(&pool, &shared).await.unwrap(), Some(id), "the shared copy's apply is another command");
     let claimed = next_command(&pool, OWNER, &[]).await.unwrap().expect("a command");
-    assert_eq!((claimed.id, claimed.copies), (id, Copies::Member(ada)));
+    assert_eq!((claimed.id, claimed.copies), (id, Copies::Instance(ada)));
 }
 
 
 /// What `running_policy=wait` waits on: the live runs a copy serves. A
-/// finished run and a run parked on a resume hold nothing; a member's
-/// copy counts only that member's runs, the shared copy every run.
+/// finished run and a run parked on a resume hold nothing; an instance's
+/// copy counts only that instance's runs, the shared copy every run.
 #[sqlx::test]
 async fn the_running_count_is_the_live_runs_a_copy_serves(pool: PgPool) {
-    use weft_core::member::{Copies, MemberId};
+    use weft_core::instance::{Copies, InstanceId};
     schema(&pool).await;
-    let run = |execution_id: &'static str, member: Option<&'static str>| {
+    let run = |execution_id: &'static str, instance: Option<&'static str>| {
         let pool = pool.clone();
         async move {
             sqlx::query(
-                "INSERT INTO execution (execution_id, project_id, tenant_id, started_at_unix, phase, member_id) \
+                "INSERT INTO execution (execution_id, project_id, tenant_id, started_at_unix, phase, instance_id) \
                  VALUES ($1, $2, $3, 0, 'fire', $4)",
             )
             .bind(execution_id)
             .bind(PROJECT)
             .bind(TENANT)
-            .bind(member)
+            .bind(instance)
             .execute(&pool)
             .await
             .unwrap();
@@ -581,7 +581,7 @@ async fn the_running_count_is_the_live_runs_a_copy_serves(pool: PgPool) {
         async move { weft_broker::lifecycle_writes::live_run_count(&pool, PROJECT, &copies).await.unwrap() }
     };
     assert_eq!(count(Copies::Shared).await, 3);
-    assert_eq!(count(Copies::Member(MemberId::new("ada").unwrap())).await, 2);
+    assert_eq!(count(Copies::Instance(InstanceId::new("ada").unwrap())).await, 2);
 
     // One of ada's runs ends, the other parks on a form.
     sqlx::query(
@@ -600,6 +600,6 @@ async fn the_running_count_is_the_live_runs_a_copy_serves(pool: PgPool) {
     .execute(&pool)
     .await
     .unwrap();
-    assert_eq!(count(Copies::Member(MemberId::new("ada").unwrap())).await, 0);
+    assert_eq!(count(Copies::Instance(InstanceId::new("ada").unwrap())).await, 0);
     assert_eq!(count(Copies::Every).await, 1, "the shared copy's run is still live");
 }

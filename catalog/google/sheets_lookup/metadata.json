@@ -123,5 +123,8 @@
       "type": "Boolean",
       "description": "Whether at least one row matched."
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

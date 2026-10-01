@@ -45,5 +45,8 @@
       "type": "List[JsonDict]",
       "description": "The listed files: {id, name, mimeType} each."
     }
-  ]
+  ],
+  "features": {
+    "catchErrors": true
+  }
 }

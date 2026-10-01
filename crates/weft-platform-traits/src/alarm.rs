@@ -20,6 +20,13 @@
 //! - **Same key and time, same wake.** Setting a wake whose key and time
 //!   are already set does not add a second one where the platform can
 //!   tell (every platform here can).
+//! - **The answer's status says whether to try again.** A receiver that
+//!   fails for now (5xx, an auth or routing 4xx such as 401, 403 or 404,
+//!   or no answer at all) gets the wake again later. Only an answer that
+//!   says the request body itself is wrong (400, 413, 415, 422: a body
+//!   from an older build the receiver no longer reads) means the same call
+//!   can never succeed: an alarm that can tell drops it, loudly
+//!   ([`WakeRefusal::of_status`]).
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -48,6 +55,31 @@ pub struct Wake {
 pub struct WakeCall<B> {
     pub at_unix_ms: i64,
     pub body: B,
+}
+
+/// Whether a wake the receiver did not take can ever be taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakeRefusal {
+    /// The receiver failed for now: try again later.
+    Temporary,
+    /// The request itself is wrong: the same call will be refused forever.
+    Permanent,
+}
+
+impl WakeRefusal {
+    /// Read the status of an answer that was not a success. Only the
+    /// statuses that judge the request body (400 bad request, 413 too
+    /// large, 415 unsupported type, 422 unprocessable) are permanent.
+    /// Everything else is temporary: a 5xx, a 408 or 429, and also a 401,
+    /// 403 or 404, which say the caller's credentials or the receiver's
+    /// routes are not right YET (a rotating key, a role mid-deploy), and
+    /// would delete a good wake if read as final.
+    pub fn of_status(status: u16) -> Self {
+        match status {
+            400 | 413 | 415 | 422 => WakeRefusal::Permanent,
+            _ => WakeRefusal::Temporary,
+        }
+    }
 }
 
 impl Wake {
@@ -104,6 +136,25 @@ pub mod fake {
         async fn set(&self, wake: Wake) -> anyhow::Result<()> {
             self.set.lock().push(wake);
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::WakeRefusal;
+
+    #[test]
+    fn a_server_error_throttle_or_auth_failure_is_tried_again() {
+        for status in [500, 502, 503, 599, 408, 429, 401, 403, 404, 405, 409, 499, 302] {
+            assert_eq!(WakeRefusal::of_status(status), WakeRefusal::Temporary, "{status}");
+        }
+    }
+
+    #[test]
+    fn only_a_rejected_body_is_permanent() {
+        for status in [400, 413, 415, 422] {
+            assert_eq!(WakeRefusal::of_status(status), WakeRefusal::Permanent, "{status}");
         }
     }
 }

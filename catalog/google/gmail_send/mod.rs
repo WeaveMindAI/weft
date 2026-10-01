@@ -38,7 +38,9 @@ impl Node for GmailSendNode {
         let handles: Vec<Value> = ctx.inputs.list("attachments")?;
 
         if to.is_empty() && cc.is_empty() && bcc.is_empty() {
-            weft::node_bail!("no recipient: provide to, cc, or bcc");
+            return Err(weft::WeftError::Input(
+                "no recipient: provide to, cc, or bcc".to_string(),
+            ));
         }
         let http = ctx.client(&account).await?;
 

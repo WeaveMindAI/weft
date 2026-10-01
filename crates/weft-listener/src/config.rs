@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListenerConfig {
-    /// This process instance's id: what its broker calls are made as, and
+    /// This process's replica id: what its broker calls are made as, and
     /// what keeps its shared provider sockets apart from another
     /// in-process listener's (tests).
-    pub instance: String,
+    pub replica: String,
     /// Broker base URL: the listener's only door to the durable `signal`
     /// table (loading a signal, writing its kind state) and to the task
     /// queue its fires ride.

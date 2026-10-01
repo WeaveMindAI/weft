@@ -42,9 +42,9 @@ pub struct Subscription {
     pub access_id: uuid::Uuid,
     /// The registered signal this subscription feeds.
     pub signal_token: String,
-    /// The member whose signal it is (the connection is theirs); `None`
+    /// The instance whose signal it is (the connection is its own); `None`
     /// for a shared signal.
-    pub for_member: Option<weft_core::member::MemberScope>,
+    pub for_instance: Option<weft_core::instance::InstanceScope>,
     /// The secret weft minted; what a token-echo verification
     /// compares against.
     pub token: String,
@@ -59,10 +59,10 @@ pub struct Subscription {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct EnsureSubscription {
     pub tenant: String,
-    /// The member whose signal this serves (their trigger reading
+    /// The instance whose signal this serves (its trigger reading
     /// through their own connection); `None`: a shared signal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub for_member: Option<weft_core::member::MemberScope>,
+    pub for_instance: Option<weft_core::instance::InstanceScope>,
     pub service: String,
     /// Which of the service's event topics to subscribe on.
     pub topic: String,
@@ -102,7 +102,7 @@ pub async fn ensure_subscription(
     pool: &PgPool,
     req: &EnsureSubscription,
 ) -> anyhow::Result<EnsuredSubscription> {
-    let source = resolve_event_source(pool, &req.tenant, crate::GrantUser::of(req.for_member.as_ref()), req.access_id, &req.service, &[]).await?;
+    let source = resolve_event_source(pool, &req.tenant, crate::GrantUser::of(req.for_instance.as_ref()), req.access_id, &req.service, &[]).await?;
     let Some(topic) = source.events.get(&req.topic) else {
         return Err(AccessError::Invalid(format!(
             "'{}' declares no event topic named '{}'",
@@ -175,7 +175,7 @@ pub async fn ensure_subscription(
     sqlx::query(
         "INSERT INTO signal_subscription
            (id, tenant_id, service, topic, access_id, signal_token, token_sealed,
-            captures_json, expires_at, project_id, member_id)
+            captures_json, expires_at, project_id, instance_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(&minted_id)
@@ -187,8 +187,8 @@ pub async fn ensure_subscription(
     .bind(crate::seal_str(&minted_token))
     .bind(serde_json::to_value(&captures)?)
     .bind(expires_at)
-    .bind(req.for_member.as_ref().map(|m| m.project_id))
-    .bind(req.for_member.as_ref().map(|m| m.member.as_str()))
+    .bind(req.for_instance.as_ref().map(|m| m.project_id))
+    .bind(req.for_instance.as_ref().map(|m| m.instance.as_str()))
     .execute(pool)
     .await?;
 
@@ -230,7 +230,7 @@ pub async fn drop_subscriptions_for_signal(
     for sub in rows {
         let stopped = async {
             let source =
-                resolve_event_source(pool, &sub.tenant_id, crate::GrantUser::of(sub.for_member.as_ref()), sub.access_id, &sub.service, &[])
+                resolve_event_source(pool, &sub.tenant_id, crate::GrantUser::of(sub.for_instance.as_ref()), sub.access_id, &sub.service, &[])
                     .await?;
             let calls = source
                 .events
@@ -270,7 +270,7 @@ pub async fn subscription_by_id(
 ) -> anyhow::Result<Option<Subscription>> {
     let row: Option<SubscriptionRow> = sqlx::query_as(
         "SELECT id, tenant_id, service, topic, access_id, signal_token, token_sealed, captures_json,
-                expires_at, project_id, member_id
+                expires_at, project_id, instance_id
          FROM signal_subscription WHERE id = $1 AND service = $2 AND topic = $3",
     )
     .bind(minted_id)
@@ -323,7 +323,7 @@ async fn list_for_signal(
 ) -> anyhow::Result<Vec<Subscription>> {
     let rows: Vec<SubscriptionRow> = sqlx::query_as(
         "SELECT id, tenant_id, service, topic, access_id, signal_token, token_sealed, captures_json,
-                expires_at, project_id, member_id
+                expires_at, project_id, instance_id
          FROM signal_subscription WHERE tenant_id = $1 AND signal_token = $2
          ORDER BY created_at DESC",
     )
@@ -350,18 +350,18 @@ type SubscriptionRow = (
 );
 
 fn row_to_subscription(
-    (id, tenant_id, service, topic, access_id, signal_token, token_sealed, captures_json, expires_at, project_id, member_id):
+    (id, tenant_id, service, topic, access_id, signal_token, token_sealed, captures_json, expires_at, project_id, instance_id):
         SubscriptionRow,
 ) -> anyhow::Result<Subscription> {
-    let for_member = match (project_id, member_id) {
-        (Some(project_id), Some(member)) => Some(weft_core::member::MemberScope {
+    let for_instance = match (project_id, instance_id) {
+        (Some(project_id), Some(instance)) => Some(weft_core::instance::InstanceScope {
             project_id,
-            member: weft_core::member::MemberId::new(member).map_err(anyhow::Error::msg)?,
+            instance: weft_core::instance::InstanceId::new(instance).map_err(anyhow::Error::msg)?,
         }),
         _ => None,
     };
     Ok(Subscription {
-        for_member,
+        for_instance,
         id,
         tenant_id,
         service,

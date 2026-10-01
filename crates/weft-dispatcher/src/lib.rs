@@ -37,7 +37,7 @@ pub mod lifecycle_claimer;
 pub mod listener;
 pub mod live_relay;
 pub mod proxy;
-pub mod member_values;
+pub mod instance_values;
 pub mod install_picks;
 pub mod projection;
 pub mod project_store;

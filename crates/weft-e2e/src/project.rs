@@ -437,9 +437,9 @@ impl Project {
 
     /// Whether the dispatcher holds this project.
     async fn registered_on_dispatcher(&self) -> Result<bool> {
-        let projects: Vec<serde_json::Value> = self.disp.get_json("/projects").await?;
+        let projects: Vec<weft_core::projects::ProjectSummary> = self.disp.get_json("/projects").await?;
         let id = self.id.to_string();
-        Ok(projects.iter().any(|p| p.get("id").and_then(|v| v.as_str()) == Some(id.as_str())))
+        Ok(projects.iter().any(|p| p.id == id))
     }
 }
 

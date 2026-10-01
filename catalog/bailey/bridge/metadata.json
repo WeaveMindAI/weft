@@ -1,7 +1,7 @@
 {
   "type": "BaileyBridge",
   "label": "WhatsApp Bridge (Baileys)",
-  "description": "Provision a per-project WhatsApp bridge (Baileys + WhatsApp Web). Connect with a phone via QR code on first start; the bridge persists its auth state in a PVC so subsequent starts reuse the session.",
+  "description": "Provision a per-project WhatsApp bridge (Baileys + WhatsApp Web). Connect with a phone via QR code on first start; the bridge persists its auth state on a disk so subsequent starts reuse the session.",
   "tags": [
     "whatsapp",
     "baileys",

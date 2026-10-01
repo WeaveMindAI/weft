@@ -153,7 +153,7 @@ automatically, follow the manual instructions the installer prints.
 git clone https://github.com/WeaveMindAI/weft.git
 cd weft
 ./setup.sh
-weft new hello --assistant claude-code
+weft new hello --assistant claude-code --remember
 cd hello
 weft run
 ```
@@ -161,7 +161,7 @@ weft run
 Open `hello/main.weft` in VS Code to see the program as a graph. Open the
 same project in your coding assistant and tell Tangle what you want to build.
 Claude Code is the example here; you pick your assistant with `--assistant`, and
-weft remembers it for your next project.
+`--remember` makes it the default, so your next `weft new` needs no flag.
 
 If the installer reports a missing tool, it prints where to get it. If your
 shell cannot find `weft`, use the PATH line it printed. For installation

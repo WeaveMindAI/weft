@@ -65,23 +65,23 @@ async fn a_token_reads_an_infra_display_and_presses_its_button() -> anyhow::Resu
     project.finish().await
 }
 
-/// A member's display says where their copy stands: the listing a member
-/// token reads gives the copy's `status`, and once the copy is stopped the
+/// An instance's display says where its copy stands: the listing an
+/// instance token reads gives the copy's `status`, and once the copy is stopped the
 /// read door answers 404 naming it, instead of a connection error from a
 /// copy scaled to nothing.
 #[tokio::test]
-async fn a_members_display_says_where_their_copy_stands() -> anyhow::Result<()> {
+async fn an_instances_display_says_where_its_copy_stands() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let project = Project::prepare("infra_display", disp.clone()).await?;
-    project.set_main("panel = DisplayService {\n  @per_member\n}\n")?;
+    project.set_main("panel = DisplayService {\n  @per_instance\n}\n")?;
     let pid = project.id();
     let status_of = |listed: &[serde_json::Value]| {
         listed.iter().find(|d| d["node"] == "panel").and_then(|d| d["status"].as_str().map(str::to_string))
     };
 
-    project.weft(&["infra", "start", "--member", "ada"]).await?;
+    project.weft(&["infra", "start", "--instance", "ada"]).await?;
     let minted: serde_json::Value = serde_json::from_str(
-        project.weft(&["token", "mint", "--member", "ada", "--expires", "1d", "--display", "panel", "--json"]).await?.trim(),
+        project.weft(&["token", "mint", "--instance", "ada", "--expires", "1d", "--display", "panel", "--json"]).await?.trim(),
     )?;
     let token = minted["token"].as_str().expect("a token").to_string();
     let read = format!("/signal-token/displays/{pid}/panel");
@@ -96,7 +96,7 @@ async fn a_members_display_says_where_their_copy_stands() -> anyhow::Result<()> 
     })
     .await?;
 
-    project.weft(&["infra", "node-stop", "panel", "--force", "--member", "ada"]).await?;
+    project.weft(&["infra", "node-stop", "panel", "--force", "--instance", "ada"]).await?;
     poll_until("ada's copy to stop", Duration::from_secs(300), Duration::from_millis(750), || async {
         Ok((status_of(&display::list_for_token(&disp, &token).await?).as_deref() == Some("stopped")).then_some(()))
     })
@@ -107,9 +107,9 @@ async fn a_members_display_says_where_their_copy_stands() -> anyhow::Result<()> 
         "a stopped copy's display is a 404 naming its state: {status} {body}"
     );
 
-    project.weft(&["infra", "node-terminate", "panel", "--member", "ada"]).await?;
+    project.weft(&["infra", "node-terminate", "panel", "--instance", "ada", "--yes"]).await?;
     poll_until("ada's copy to go", Duration::from_secs(300), Duration::from_millis(750), || async {
-        Ok((status_of(&display::list_for_token(&disp, &token).await?).as_deref() == Some("absent")).then_some(()))
+        Ok((status_of(&display::list_for_token(&disp, &token).await?).as_deref() == Some("none")).then_some(()))
     })
     .await?;
     project.finish().await

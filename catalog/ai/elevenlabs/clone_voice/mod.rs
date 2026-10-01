@@ -33,7 +33,9 @@ impl Node for ElevenLabsCloneVoiceNode {
         let remove_noise: bool = ctx.inputs.get("removeBackgroundNoise")?;
 
         if samples.is_empty() {
-            weft::node_bail!("cloning a voice needs at least one sample recording");
+            return Err(weft::WeftError::Input(
+                "cloning a voice needs at least one sample recording".into(),
+            ));
         }
 
         let storage = ctx.storage(StorageScope::Execution);

@@ -13,6 +13,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use weft_compiler::project::LOCAL_TARGET;
+use weft_core::signal_token::{MintTokenRequest, MintedToken, TokenKind, TokenSummary};
 
 use super::Ctx;
 use crate::credentials;
@@ -339,28 +340,16 @@ impl ExportLabels {
     /// minted for exactly that project); a legacy operator key carries
     /// nothing but its name, so one minted by an older export of another
     /// project with the same name matches too.
-    fn minted(&self, token: &ListedToken) -> bool {
+    fn minted(&self, token: &TokenSummary) -> bool {
         let name = token.name.as_deref();
-        match token.kind.as_str() {
-            "operator" => name == Some(self.operator.as_str()) || name == Some(self.legacy_operator.as_str()),
-            "caller" => {
+        match token.kind {
+            TokenKind::Operator => name == Some(self.operator.as_str()) || name == Some(self.legacy_operator.as_str()),
+            TokenKind::Caller => {
                 name == Some(self.frontend.as_str())
                     || (name == Some(self.legacy_frontend.as_str()) && token.allowed_projects == [self.id])
             }
-            _ => false,
         }
     }
-}
-
-/// The part of a `GET /signal-tokens` entry export reads.
-// SYNC: fields <-> crates/weft-dispatcher/src/api/signal_token.rs TokenSummary
-#[derive(serde::Deserialize)]
-struct ListedToken {
-    id: String,
-    kind: String,
-    name: Option<String>,
-    #[serde(rename = "allowedProjects")]
-    allowed_projects: Vec<uuid::Uuid>,
 }
 
 /// Mint the workflow's two keys, answering them with their ids. A failure
@@ -372,31 +361,15 @@ async fn mint_ci_keys(
     labels: &ExportLabels,
     front_env: Option<String>,
 ) -> Result<(CiKeys, Vec<String>)> {
-    async fn mint(client: &crate::client::DispatcherClient, body: serde_json::Value) -> Result<(String, String)> {
-        let minted = client.post_json("/signal-tokens", &body).await?;
-        let token = minted["token"].as_str().context("the install minted no token")?;
-        let id = minted["id"].as_str().context("the install minted a token with no id")?;
-        Ok((token.to_string(), id.to_string()))
+    async fn mint(client: &crate::client::DispatcherClient, body: MintTokenRequest) -> Result<(String, String)> {
+        let minted: MintedToken = serde_json::from_value(client.post_json("/signal-tokens", &serde_json::to_value(&body)?).await?)
+            .context("read the token the install minted")?;
+        Ok((minted.token, minted.id.to_string()))
     }
-    let (operator_key, operator_id) = mint(
-        client,
-        serde_json::json!({
-            "name": labels.operator,
-            "kind": "operator",
-            "allowedProjects": [], "allowedTags": [], "allowedDisplays": [], "allDisplays": false,
-        }),
-    )
-    .await?;
-    let frontend = mint(
-        client,
-        serde_json::json!({
-            "name": labels.frontend,
-            "kind": "caller",
-            "allowedProjects": [project.id().to_string()],
-            "allowedTags": [], "allowedDisplays": [], "allDisplays": false,
-        }),
-    )
-    .await;
+    let operator = MintTokenRequest { kind: TokenKind::Operator, ..MintTokenRequest::caller(labels.operator.clone()) };
+    let (operator_key, operator_id) = mint(client, operator).await?;
+    let frontend = MintTokenRequest { allowed_projects: vec![project.id()], ..MintTokenRequest::caller(labels.frontend.clone()) };
+    let frontend = mint(client, frontend).await;
     let (frontend_token, frontend_id) = match frontend {
         Ok(minted) => minted,
         Err(e) => return Err(take_back(client, std::slice::from_ref(&operator_id), e, target).await),
@@ -406,13 +379,13 @@ async fn mint_ci_keys(
 
 /// The keys an earlier export of this project left on the install.
 async fn stale_exports(client: &crate::client::DispatcherClient, labels: &ExportLabels, fresh: &[String]) -> Result<Vec<String>> {
-    let listed: Vec<ListedToken> = serde_json::from_value(client.get_json("/signal-tokens").await?)
+    let listed: Vec<TokenSummary> = serde_json::from_value(client.get_json("/signal-tokens").await?)
         .context("unexpected /signal-tokens listing shape")?;
     Ok(stale_ids(labels, listed, fresh))
 }
 
-fn stale_ids(labels: &ExportLabels, listed: Vec<ListedToken>, fresh: &[String]) -> Vec<String> {
-    listed.into_iter().filter(|t| labels.minted(t) && !fresh.contains(&t.id)).map(|t| t.id).collect()
+fn stale_ids(labels: &ExportLabels, listed: Vec<TokenSummary>, fresh: &[String]) -> Vec<String> {
+    listed.into_iter().map(|t| (t.id.to_string(), t)).filter(|(id, t)| labels.minted(t) && !fresh.contains(id)).map(|(id, _)| id).collect()
 }
 
 /// Revoke every id, trying all of them; the error names each one that
@@ -420,7 +393,7 @@ fn stale_ids(labels: &ExportLabels, listed: Vec<ListedToken>, fresh: &[String]) 
 async fn revoke_all(client: &crate::client::DispatcherClient, ids: &[String]) -> Result<()> {
     let mut failed = Vec::new();
     for id in ids {
-        if let Err(e) = client.delete(&format!("/signal-tokens/{id}")).await {
+        if let Err(e) = client.delete_idempotent(&format!("/signal-tokens/{id}")).await {
             failed.push(format!("{id} ({e:#})"));
         }
     }
@@ -590,27 +563,41 @@ mod tests {
         };
         let labels = ExportLabels::of(&project);
         let other: uuid::Uuid = "00000000-0000-0000-0000-000000000002".parse().unwrap();
-        let scoped = |id: &str, kind: &str, name: &str, allowed_projects: Vec<uuid::Uuid>| ListedToken {
-            id: id.into(),
-            kind: kind.into(),
-            name: Some(name.into()),
-            allowed_projects,
+        // Token ids are uuids; each named one here is a uuid whose last
+        // digits count up, so the expected list reads by name.
+        let names = ["old-op", "old-front", "new-op", "a-person", "wrong-kind", "other-project", "legacy-op", "legacy-front", "legacy-other-front"];
+        let id_of = |name: &str| -> uuid::Uuid {
+            let n = names.iter().position(|n| *n == name).expect("a named token");
+            format!("00000000-0000-0000-0000-{n:012}").parse().expect("a uuid")
         };
-        let token = |id: &str, kind: &str, name: &str| scoped(id, kind, name, vec![]);
+        let scoped = |id: &str, kind: TokenKind, name: &str, allowed_projects: Vec<uuid::Uuid>| TokenSummary {
+            id: id_of(id),
+            kind,
+            recognizer: "wft-x-...".into(),
+            name: Some(name.into()),
+            created_at_unix: 0,
+            allowed_projects,
+            allowed_tags: vec![],
+            allowed_displays: vec![],
+            all_displays: false,
+            instance: None,
+            expires_at_unix: None,
+        };
+        let token = |id: &str, kind: TokenKind, name: &str| scoped(id, kind, name, vec![]);
         let listed = vec![
-            token("old-op", "operator", &labels.operator),
-            token("old-front", "caller", &labels.frontend),
-            token("new-op", "operator", &labels.operator),
-            token("a-person", "operator", "laptop"),
-            token("wrong-kind", "caller", &labels.operator),
-            token("other-project", "caller", "frontend: p (00000000-0000-0000-0000-000000000002)"),
-            token("legacy-op", "operator", "ci: p"),
-            scoped("legacy-front", "caller", "frontend: p", vec![project.id()]),
-            scoped("legacy-other-front", "caller", "frontend: p", vec![other]),
+            token("old-op", TokenKind::Operator, &labels.operator),
+            token("old-front", TokenKind::Caller, &labels.frontend),
+            token("new-op", TokenKind::Operator, &labels.operator),
+            token("a-person", TokenKind::Operator, "laptop"),
+            token("wrong-kind", TokenKind::Caller, &labels.operator),
+            token("other-project", TokenKind::Caller, "frontend: p (00000000-0000-0000-0000-000000000002)"),
+            token("legacy-op", TokenKind::Operator, "ci: p"),
+            scoped("legacy-front", TokenKind::Caller, "frontend: p", vec![project.id()]),
+            scoped("legacy-other-front", TokenKind::Caller, "frontend: p", vec![other]),
         ];
         assert_eq!(
-            stale_ids(&labels, listed, &["new-op".into()]),
-            vec!["old-op", "old-front", "legacy-op", "legacy-front"]
+            stale_ids(&labels, listed, &[id_of("new-op").to_string()]),
+            ["old-op", "old-front", "legacy-op", "legacy-front"].map(|name| id_of(name).to_string())
         );
     }
 

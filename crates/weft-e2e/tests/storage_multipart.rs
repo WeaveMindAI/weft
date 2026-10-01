@@ -45,7 +45,6 @@ async fn fetch_and_verify(
     label: &str,
 ) -> anyhow::Result<()> {
     let mut project = Project::prepare("storage_file", disp.clone()).await?;
-    let pid = project.id();
     let fake = BytesFake::start(content.clone()).await?;
     project.substitute_in_main("__E2E_FAKE_URL__", &fake.url())?;
 
@@ -53,7 +52,7 @@ async fn fetch_and_verify(
     settled.completed()?;
 
     let prefix = format!("exec/{}/", settled.execution_id);
-    let key = storage::assert_file_contents(disp, &pid, &prefix, &content).await?;
+    let key = storage::assert_file_contents(disp, &prefix, &content).await?;
     eprintln!("[{label}] {} bytes round-tripped at {key}", content.len());
     project.finish().await
 }
@@ -93,7 +92,6 @@ async fn an_interrupted_upload_leaves_no_leftover() -> anyhow::Result<()> {
     let platform = Platform::connect(&disp).await?;
 
     let mut project = Project::prepare("storage_file", disp.clone()).await?;
-    let pid = project.id();
 
     // Advertise 3 parts, deliver ~1.5 parts then break: at least one full part
     // has landed (and its bytes are reserved) when the stream errors.
@@ -131,12 +129,12 @@ async fn an_interrupted_upload_leaves_no_leftover() -> anyhow::Result<()> {
 
     // Nothing became downloadable under the run's scope.
     let prefix = format!("exec/{}/", execution_id);
-    let files = storage::list_prefix(&disp, &pid, &prefix).await?;
+    let files = storage::list_prefix(&disp, &prefix).await?;
     anyhow::ensure!(
         files.is_empty(),
         "interrupted upload left {} visible file(s) under {prefix}: {:?}",
         files.len(),
-        files.iter().filter_map(weft_e2e::storage::StoredFile::key).collect::<Vec<_>>()
+        files.iter().map(|f| f.key.as_str()).collect::<Vec<_>>()
     );
 
     project.finish().await
@@ -154,7 +152,6 @@ async fn concurrent_uploads_stay_isolated_and_consistent() -> anyhow::Result<()>
     let platform = Platform::connect(&disp).await?;
 
     let mut project = Project::prepare("storage_concurrent", disp.clone()).await?;
-    let pid = project.id();
 
     // Distinct multi-part payloads of DIFFERENT sizes, so a cross-over is caught
     // by both the bytes AND the per-file size, and the sizes don't coincide.
@@ -175,7 +172,7 @@ async fn concurrent_uploads_stay_isolated_and_consistent() -> anyhow::Result<()>
     // and each is a different size, so a mixed-up part would fail the match.
     let prefix = format!("exec/{}/", settled.execution_id);
     for (payload, label) in [(&a, "a"), (&b, "b"), (&c, "c")] {
-        let key = storage::assert_file_contents(&disp, &pid, &prefix, payload)
+        let key = storage::assert_file_contents(&disp, &prefix, payload)
             .await
             .map_err(|e| anyhow::anyhow!("concurrent file {label} did not round-trip: {e}"))?;
         eprintln!("[concurrent] file {label} ({} bytes) at {key}", payload.len());

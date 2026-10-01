@@ -59,7 +59,28 @@ place, and each place gets its own pick.
 
 If you run a program with a step nobody connected on this install, the run
 is refused before it starts, naming the step and the `weft connect` that
-fixes it. Forgetting a stored connection takes every pick of it with it.
+fixes it. `weft activate` and `weft resync` check every step of the program
+the same way before any trigger moves, so a missing pick is caught there and
+not at the first call. Forgetting a stored connection takes every pick of it
+with it.
+
+A pick is kept under the step's full address, and the file a step is written
+in is part of that address. So if you move `chat.weft` into a `studio/`
+folder, the step that was `chat.send.agent` is now `studio.chat.send.agent`,
+and its pick stays behind under the old name. weft never guesses where a step
+went. When a step of the same kind now has no pick, activating refuses and
+names both addresses:
+
+```
+'chat.send.agent' has connections or values stored on this install and is no
+longer in the program; did you move it to 'studio.chat.send.agent'?
+`weft connect --move chat.send.agent studio.chat.send.agent` carries them across
+```
+
+`weft connect --move <old> <new>` carries the program's pick and every
+instance's values for that step across in one go. It refuses if the new step
+already has some, or if it takes different connections, since then it is not
+the same kind of step.
 
 If a build refuses a line like `account: {"id": "...", "identity": "..."}`
 with "that was the old way of connecting a node", the connection was written

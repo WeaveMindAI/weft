@@ -38,7 +38,7 @@ pub struct KeyRequest {
     /// The calling process, taken from the caller's verified token (not from the
     /// request body). A policy that resolves the running binary uses this;
     /// `None` means the token was not process-bound.
-    pub instance: Option<String>,
+    pub replica: Option<String>,
     /// How long the caller declared its provider work may take. A source
     /// that hands out time-bounded credentials bounds them by this (the
     /// crash backstop; the runtime normally releases first).
@@ -116,7 +116,7 @@ pub trait CredentialSource: Send + Sync {
 
 /// Default source: the shared-credentials file's `api_key` entries.
 /// Self-hosting means the configured key is the operator's own, every
-/// node of every tenant on this instance may use it (a single operator
+/// node of every tenant on this install may use it (a single operator
 /// has no policy to enforce), and calls go straight to the service.
 /// Holds ONE file provider, so lookups share its mtime-keyed snapshot
 /// (same freshness contract as the OAuth apps: an edit takes effect

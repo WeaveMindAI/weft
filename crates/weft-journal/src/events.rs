@@ -22,27 +22,15 @@
 //! older shape does not decode, the read that hits it fails naming
 //! the execution, and `weft clean` removes the execution.
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use weft_core::frames::{Located, LoopFrames};
+use weft_core::frames::LoopFrames;
 use weft_core::primitive::{LoopTerminationReason, SignalSpec};
 use weft_core::ExecutionId;
 
-/// The chosen origin of each reused result, independent of which nodes
-/// execute in the child. Readers reconstruct each origin under its own
-/// birth context and import history without replaying its scheduling.
-// SYNC: Seed <-> packages/weft-graph/src/protocol.ts Seed
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Seed {
-    pub parent: ExecutionId,
-    /// Per place (a node under the calls that reach it): the run whose
-    /// result it keeps.
-    pub origins: BTreeMap<Located, ExecutionId>,
-}
+/// A run's seed: weft-core's, since the live events carry it too.
+pub use weft_core::run_spec::Seed;
 
 /// One event in the execution log. Append-only; events are never
 /// edited or deleted by the dispatcher. User-initiated cleanup
@@ -99,38 +87,38 @@ pub enum ExecEvent {
         /// execution: they are read off the seed's journal at fold time.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seed: Option<Seed>,
-        /// Who the run is for: the member whatever started it named (a
-        /// `--member`, a member token, the `Weft-Member` header on a gated
-        /// route, a firing through a member's copy). `None` for a run for
-        /// nobody in particular. Written ONCE here, at birth; the
-        /// `execution` row copies it in the same transaction so the
-        /// member filters read a column, and the engine folds it into
-        /// `ctx.member()`.
+        /// Which instance the run belongs to: the one whatever started it
+        /// named (an `--instance`, an instance token, the `Weft-Instance`
+        /// header on a gated route, a firing through an instance's copy).
+        /// `None` for a run of no instance in particular. Written ONCE
+        /// here, at birth; the `execution` row copies it in the same
+        /// transaction so the instance filters read a column, and the
+        /// engine folds it into `ctx.instance()`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        member: Option<weft_core::member::MemberId>,
-        /// What that member provides for the run's `@member_filled`
+        instance: Option<weft_core::instance::InstanceId>,
+        /// What that instance provides for the run's `@instance_filled`
         /// fields, by place and field, read and checked ONCE here, at
-        /// birth (`weft_core::run_spec::member_run_values`). Every firing
+        /// birth (`weft_core::run_spec::instance_run_values`). Every firing
         /// reads these, never the live store, so a replay sees the values
         /// the run was born with and a value changed meanwhile reaches the
         /// next run.
         /// Boxed: most runs carry none, and the birth event is the
         /// enum's largest variant already.
-        #[serde(default, skip_serializing_if = "no_member_values")]
-        member_values: Box<weft_core::member::MemberValues>,
+        #[serde(default, skip_serializing_if = "no_instance_values")]
+        instance_values: Box<weft_core::instance::InstanceValues>,
         /// The install's picks for the run's access nodes whose
         /// connection is picked on the install (`weft_core::picks`), by
         /// place and field, read and checked ONCE here, at birth
-        /// (`weft_core::picks::run_picks`), like the member's values
+        /// (`weft_core::picks::run_picks`), like the instance's values
         /// above: every firing reads these, so a pick changed meanwhile
         /// reaches the next run.
-        #[serde(default, skip_serializing_if = "no_member_values")]
+        #[serde(default, skip_serializing_if = "no_instance_values")]
         picks: Box<weft_core::picks::Picks>,
         /// The trigger whose firing started this run, spelled the way the
         /// program reads it (`door`, `one.door`): a listener fire, a
         /// route call, a replayed parked fire, or `weft run --fire`.
         /// `None` for a run started by hand and for every setup run. The
-        /// run belongs to that trigger's activation (for the member
+        /// run belongs to that trigger's activation (for the instance
         /// above): taking the activation down takes the run's waits with
         /// it, and `execution.fired_by` copies it for that join.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -234,16 +222,18 @@ pub enum ExecEvent {
         ///   `SuspensionResolved` for `token` arrived (its value is on
         ///   that row). The fold clears the `suspensions` and
         ///   `pending_deliveries` entries for `token`.
-        /// - `None`: crashed-Running recovery (the firing was
-        ///   Running when the worker crashed; a fresh worker is
-        ///   re-driving it). No suspension token to clear.
+        /// - `None`: a group boundary the worker was firing when it
+        ///   went away, re-fired by the next worker (its state is all
+        ///   journaled, so the re-fire is safe; a STEP a dead worker
+        ///   left running is failed, never re-run). No suspension
+        ///   token to clear.
         /// Either way the fold absorbs every pulse pending at the
         /// location, as it does for a `NodeStarted`: a resume can
         /// absorb fresh pulses that arrived while the firing was
-        /// waiting, and the un-absorb path on a later crashed-Running
-        /// recovery needs every absorbed pulse, not just the original
-        /// dispatch's. Always written (`null` for a crash recovery): a
-        /// missing field is a truncated row and fails to decode.
+        /// waiting, and the un-absorb path on a later re-fire needs
+        /// every absorbed pulse, not just the original dispatch's.
+        /// Always written (`null` for a re-fire): a missing field is a
+        /// truncated row and fails to decode.
         #[serde(deserialize_with = "present")]
         token: Option<String>,
         at_unix: u64,
@@ -482,6 +472,19 @@ pub enum ExecEvent {
         at_unix: u64,
     },
 
+    /// A node changed a stored file's content in place
+    /// (`ctx.storage().edit` / `replace`): which file, from which version
+    /// to which, and a readable diff cut to a readable size. For the
+    /// inspector's card on that firing; not folded, since nothing a
+    /// resume needs depends on it.
+    FileEdited {
+        execution_id: ExecutionId,
+        node_id: String,
+        frames: LoopFrames,
+        edit: weft_core::storage::FileEdit,
+        at_unix: u64,
+    },
+
     /// A node tagged its own execution (`ctx.tag_execution`). The
     /// record of the act, for the inspector; the SELECTABLE copy a
     /// sibling's `ctx.stop_tagged` reads lives beside the execution row
@@ -544,7 +547,7 @@ pub enum ExecEvent {
     /// `messages` are empty and the `totals` rollup is the whole
     /// journaled story. A quiet bus degenerates to one message per
     /// window, so slow traffic reads exactly as before.
-    // SYNC: BusWindow <-> crates/weft-dispatcher/src/events.rs BusWindow, packages/weft-graph/src/protocol.ts BusInspectorEvent 'window', extension-vscode/src/execFollower.ts DispatcherEvent 'bus_window'
+    // SYNC: BusWindow <-> crates/weft-core/src/live_event.rs BusWindow, packages/weft-graph/src/protocol.ts BusInspectorEvent 'window', extension-vscode/src/execFollower.ts DispatcherEvent 'bus_window'
     BusWindow {
         execution_id: ExecutionId,
         bus_id: String,
@@ -598,7 +601,7 @@ pub enum ExecEvent {
     /// even when it does not say what it was. What decides that lives
     /// in one place for every channel in the language
     /// ([`weft_core::stream_journal`]).
-    // SYNC: CallerWindow <-> crates/weft-dispatcher/src/events.rs CallerWindow, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'window', extension-vscode/src/execFollower.ts DispatcherEvent 'caller_window'
+    // SYNC: CallerWindow <-> crates/weft-core/src/live_event.rs CallerWindow, packages/weft-graph/src/protocol.ts CallerInspectorEvent 'window', extension-vscode/src/execFollower.ts DispatcherEvent 'caller_window'
     CallerWindow {
         execution_id: ExecutionId,
         first_offset: u64,
@@ -639,13 +642,43 @@ where
     Option::<T>::deserialize(deserializer)
 }
 
+/// The terminal event kinds as a SQL list, `('a', 'b', 'c')`, for a
+/// `kind IN` filter on `exec_event`. A macro so a query written as one
+/// string literal can take it through `concat!`; a query built with
+/// `format!` uses [`EXECUTION_TERMINAL_KINDS_SQL`]. Every SQL filter on
+/// the terminal set goes through one of the two, and a test pins it to
+/// [`ExecEvent::is_execution_terminal`].
+// SYNC: EXECUTION_TERMINAL_KINDS_SQL <-> crates/weft-journal/src/events.rs ExecEvent::is_execution_terminal, crates/weft-core/src/live_event.rs DispatcherEvent::is_execution_terminal
+#[macro_export]
+macro_rules! execution_terminal_kinds_sql {
+    () => {
+        "('execution_completed', 'execution_failed', 'execution_cancelled')"
+    };
+}
+
+/// See [`execution_terminal_kinds_sql!`].
+pub const EXECUTION_TERMINAL_KINDS_SQL: &str = execution_terminal_kinds_sql!();
+
+/// THE rule for "this run is parked on a wait", as a SQL predicate over
+/// an `execution` row aliased `ec`: a resume signal is registered for it.
+/// A macro so a query written as one string literal can take it through
+/// `concat!`; a query built with `format!` uses [`RUN_PARKED_SQL`].
+// SYNC: run_parked_sql <-> crates/weft-core/src/program.rs SummaryStatus::parked
+#[macro_export]
+macro_rules! run_parked_sql {
+    () => {
+        "EXISTS (SELECT 1 FROM signal parked WHERE parked.execution_id = ec.execution_id AND parked.is_resume)"
+    };
+}
+
+/// See [`run_parked_sql!`].
+pub const RUN_PARKED_SQL: &str = run_parked_sql!();
+
 impl ExecEvent {
     /// Whether this event ends the execution: completed, failed, or
-    /// cancelled. The ONE definition of the terminal set in Rust; the
-    /// SQL that filters on it lives in
-    /// `weft-dispatcher/src/api/execution.rs` (`terminal_outcome`) and
-    /// carries a marker back here.
-    // SYNC: ExecEvent::is_execution_terminal <-> crates/weft-dispatcher/src/api/execution.rs terminal_outcome (SQL kind list), crates/weft-cli/src/commands/follow.rs is_terminal (SSE kind list), crates/weft-journal/src/tags.rs live_tagged_executions (SQL kind list)
+    /// cancelled. The ONE definition of the terminal set in Rust; every
+    /// SQL filter on it uses [`EXECUTION_TERMINAL_KINDS_SQL`].
+    // SYNC: ExecEvent::is_execution_terminal <-> crates/weft-core/src/live_event.rs DispatcherEvent::is_execution_terminal, crates/weft-journal/src/events.rs EXECUTION_TERMINAL_KINDS_SQL
     pub fn is_execution_terminal(&self) -> bool {
         matches!(
             self,
@@ -680,6 +713,7 @@ impl ExecEvent {
             | Self::RunOutput { execution_id, .. }
             | Self::CostReported { execution_id, .. }
             | Self::LogLine { execution_id, .. }
+            | Self::FileEdited { execution_id, .. }
             | Self::ExecutionTagged { execution_id, .. }
             | Self::ExecutionCompleted { execution_id, .. }
             | Self::ExecutionFailed { execution_id, .. }
@@ -721,6 +755,7 @@ impl ExecEvent {
             | Self::RunOutput { at_unix, .. }
             | Self::CostReported { at_unix, .. }
             | Self::LogLine { at_unix, .. }
+            | Self::FileEdited { at_unix, .. }
             | Self::ExecutionTagged { at_unix, .. }
             | Self::ExecutionCompleted { at_unix, .. }
             | Self::ExecutionFailed { at_unix, .. }
@@ -761,6 +796,7 @@ impl ExecEvent {
             Self::RunOutput { .. } => "run_output",
             Self::CostReported { .. } => "cost_reported",
             Self::LogLine { .. } => "log_line",
+            Self::FileEdited { .. } => "file_edited",
             Self::ExecutionTagged { .. } => "execution_tagged",
             Self::ExecutionCompleted { .. } => "execution_completed",
             Self::ExecutionFailed { .. } => "execution_failed",
@@ -778,8 +814,8 @@ impl ExecEvent {
 }
 
 
-/// Whether a birth carries no member values (then the field is left out).
-fn no_member_values(values: &weft_core::member::MemberValues) -> bool {
+/// Whether a birth carries no instance values (then the field is left out).
+fn no_instance_values(values: &weft_core::instance::InstanceValues) -> bool {
     values.is_empty()
 }
 
@@ -787,6 +823,8 @@ fn no_member_values(values: &weft_core::member::MemberValues) -> bool {
 mod wire_tests {
     use super::*;
     use serde_json::json;
+    use std::collections::BTreeMap;
+    use weft_core::frames::Located;
     use uuid::Uuid;
 
     fn execution_id() -> ExecutionId {
@@ -799,6 +837,20 @@ mod wire_tests {
         let again = serde_json::to_string(&back).expect("re-serialize");
         assert_eq!(s, again, "round trip is stable");
         serde_json::from_str(&s).expect("json")
+    }
+
+    /// The SQL terminal list names exactly the kinds
+    /// `is_execution_terminal` accepts.
+    #[test]
+    fn terminal_kinds_sql_names_the_terminal_events() {
+        let terminal = [
+            ExecEvent::ExecutionCompleted { execution_id: execution_id(), at_unix: 0 },
+            ExecEvent::ExecutionFailed { execution_id: execution_id(), error: String::new(), at_unix: 0 },
+            ExecEvent::ExecutionCancelled { execution_id: execution_id(), reason: String::new(), cause: None, at_unix: 0 },
+        ];
+        assert!(terminal.iter().all(ExecEvent::is_execution_terminal));
+        let listed = terminal.iter().map(|e| format!("'{}'", e.kind_str())).collect::<Vec<_>>().join(", ");
+        assert_eq!(EXECUTION_TERMINAL_KINDS_SQL, format!("({listed})"));
     }
 
     /// Every reshaped row round-trips, and its kind tag is what the
@@ -859,8 +911,8 @@ mod wire_tests {
     }
 
     /// A resume row always carries its token field (`null` for a
-    /// crash re-run), so a row that lacks it is a truncated row and
-    /// fails to decode instead of reading as a crash re-run.
+    /// boundary re-fire), so a row that lacks it is a truncated row and
+    /// fails to decode instead of reading as a re-fire.
     #[test]
     fn a_resume_row_always_carries_its_token_field() {
         let row = ExecEvent::NodeResumed { execution_id: execution_id(), node_id: "n".into(), frames: vec![], token: None, at_unix: 1 };
@@ -950,8 +1002,8 @@ mod wire_tests {
                     ..Default::default()
                 }),
                 seed: Some(Seed { parent: execution_id(), origins: BTreeMap::from([(Located::top("source"), execution_id())]) }),
-                member: Some(weft_core::member::MemberId::new("user-42").unwrap()),
-                fired_trigger: Some("trigger".into()), member_values: Default::default(), picks: Default::default(),
+                instance: Some(weft_core::instance::InstanceId::new("user-42").unwrap()),
+                fired_trigger: Some("trigger".into()), instance_values: Default::default(), picks: Default::default(),
                 run_class: weft_core::run_class::RunClass::Short,
                 at_unix: 7,
             },
@@ -964,7 +1016,7 @@ mod wire_tests {
                 program: None, source_version: None, run_kind: weft_core::exec::RunKind::NodeTest,
                 subgraph: None,
                 seed: None,
-                member: None, fired_trigger: None, run_class: weft_core::run_class::RunClass::Short, member_values: Default::default(), picks: Default::default(), at_unix: 7,
+                instance: None, fired_trigger: None, run_class: weft_core::run_class::RunClass::Short, instance_values: Default::default(), picks: Default::default(), at_unix: 7,
             },
             ExecEvent::ExecutionStarted {
                 execution_id: execution_id(),
@@ -975,13 +1027,15 @@ mod wire_tests {
                 program: None, source_version: None, run_kind: weft_core::exec::RunKind::Unrecorded,
                 subgraph: None,
                 seed: None,
-                member: None, fired_trigger: None, run_class: weft_core::run_class::RunClass::Short, member_values: Default::default(), picks: Default::default(), at_unix: 7,
+                instance: None, fired_trigger: None, run_class: weft_core::run_class::RunClass::Short, instance_values: Default::default(), picks: Default::default(), at_unix: 7,
             },
             ExecEvent::NodeKicked { execution_id: execution_id(), node_id: "sock".into(), frames: vec![], firing: true, payload: Some(json!({"body": "late"})), port_snapshot: Some(json!({"url": "u"})), at_unix: 0 },
             ExecEvent::NodeStarted { execution_id: execution_id(), node_id: "n".into(), frames: vec![weft_core::frames::Frame::Loop { index: 2 }], at_unix: 1 },
             ExecEvent::NodeCompleted { execution_id: execution_id(), node_id: "n".into(), frames: vec![], at_unix: 1 },
             ExecEvent::NodeFailed { execution_id: execution_id(), node_id: "n".into(), frames: vec![], error: "boom".into(), at_unix: 1 },
             ExecEvent::NodeSkipped { execution_id: execution_id(), node_id: "n".into(), frames: vec![], reason: weft_core::exec::skip::SkipReason::RequiredInputClosed { port: "in".into(), failure: None }, at_unix: 1 },
+            ExecEvent::NodeSkipped { execution_id: execution_id(), node_id: "n".into(), frames: vec![], reason: weft_core::exec::skip::SkipReason::RequiredInputClosed { port: "in".into(), failure: Some(weft_core::pulse::Failure { node: "auth.query".into(), error: "down".into() }) }, at_unix: 1 },
+            ExecEvent::NodeSkipped { execution_id: execution_id(), node_id: "n".into(), frames: vec![], reason: weft_core::exec::skip::SkipReason::WatchedNodeFailed { failure: weft_core::pulse::Failure { node: "q".into(), error: "down".into() } }, at_unix: 1 },
             ExecEvent::NodeSuspended { execution_id: execution_id(), node_id: "n".into(), frames: vec![], token: "t".into(), at_unix: 1 },
             ExecEvent::NodeResumed { execution_id: execution_id(), node_id: "n".into(), frames: vec![], token: Some("t".into()), at_unix: 1 },
             ExecEvent::NodeResumed { execution_id: execution_id(), node_id: "n".into(), frames: vec![], token: None, at_unix: 1 },
@@ -1013,6 +1067,19 @@ mod wire_tests {
                 at_unix: 1,
             },
             ExecEvent::LogLine { execution_id: execution_id(), node_id: "n".into(), frames: vec![], level: "info".into(), message: "hi".into(), at_unix_ms: None, seq: None, at_unix: 1 },
+            ExecEvent::FileEdited {
+                execution_id: execution_id(),
+                node_id: "n".into(),
+                frames: vec![weft_core::frames::Frame::Loop { index: 1 }],
+                edit: weft_core::storage::FileEdit {
+                    key: "t/project/p/f".into(),
+                    filename: "chat.jsonl".into(),
+                    from_version: Some(4),
+                    to_version: 5,
+                    diff: "@@ -1,1 +1,2 @@\n a\n+b\n".into(),
+                },
+                at_unix: 1,
+            },
             ExecEvent::ExecutionTagged { execution_id: execution_id(), tags: vec!["user_1".into()], at_unix: 3 },
             ExecEvent::ExecutionFailed { execution_id: execution_id(), error: "boom".into(), at_unix: 1 },
             ExecEvent::ExecutionCancelled { execution_id: execution_id(), reason: "stopped".into(), cause: Some(weft_core::exec::CancelCause::User), at_unix: 1 },
@@ -1095,7 +1162,7 @@ mod wire_tests {
         let mut kinds: Vec<&'static str> = rows.iter().map(|r| r.kind_str()).collect();
         kinds.sort_unstable();
         kinds.dedup();
-        assert_eq!(kinds.len(), 34, "a variant has no row above: {kinds:?}");
+        assert_eq!(kinds.len(), 35, "a variant has no row above: {kinds:?}");
         for row in rows {
             let kind = row.kind_str();
             let json = round_trip(row);

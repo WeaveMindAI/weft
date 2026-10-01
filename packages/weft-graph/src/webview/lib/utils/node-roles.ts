@@ -13,7 +13,7 @@
 // SYNC: role precedence <-> extension-vscode/src/graphView.ts syncDisplayPollers
 
 import { NODE_TYPE_CONFIG } from '../nodes';
-import type { IncludedContents, PerMember } from '../../../protocol';
+import type { IncludedContents, PerInstance } from '../../../protocol';
 
 /// Minimal NodeInstance shape this module reads. Avoids importing
 /// the full type from `../types` so this file stays focused.
@@ -35,11 +35,11 @@ export function nodeIsTrigger(node: RoleNodeShape): boolean {
   return node.features?.isTrigger ?? !!NODE_TYPE_CONFIG[node.nodeType]?.features?.isTrigger;
 }
 
-/// May this node carry `@per_member`? It must run a container of its
-/// own, which each member then gets. What a member provides (their
-/// connection, their sheet) is a field written `@member_filled` instead.
-// SYNC: canBePerMember <-> crates/weft-core/src/node.rs NodeMetadata::per_member_eligible
-export function canBePerMember(node: RoleNodeShape): boolean {
+/// May this node carry `@per_instance`? It must run a container of its
+/// own, which each instance then gets. A value each instance has its own
+/// of (a connection, a sheet) is a field written `@instance_filled` instead.
+// SYNC: canBePerInstance <-> crates/weft-core/src/node.rs NodeMetadata::per_instance_eligible
+export function canBePerInstance(node: RoleNodeShape): boolean {
   return nodeRequiresInfra(node);
 }
 
@@ -52,26 +52,26 @@ export function canBePerMember(node: RoleNodeShape): boolean {
 /// what `includeContents` is for. Get this wrong and a project whose only
 /// trigger sits in an included file shows no Activate button.
 ///
-/// Only SHARED nodes count: a `@per_member` node's copies are each
-/// member's, armed and started by the program for that member, so the
+/// Only SHARED nodes count: a `@per_instance` node's copies each belong
+/// to one instance, armed and started by the program for it, so the
 /// action bar's Activate and Start infra have nothing to act on for it
 /// (an included file's contents already leave such nodes out).
 type ProjectRoleNode = RoleNodeShape & {
   requiresInfra?: boolean;
-  perMember?: PerMember;
+  perInstance?: PerInstance;
   includeContents?: IncludedContents | undefined;
 };
 
 /// True iff the project declares any shared infra, an included file's included.
 // SYNC: shared roles <-> crates/weft-dispatcher/src/api/project.rs gather_action_snapshot (source_infra)
 export function projectHasInfra(nodes: readonly ProjectRoleNode[]): boolean {
-  return nodes.some((n) => (!n.perMember && nodeRequiresInfra(n)) || !!n.includeContents?.requiresInfra);
+  return nodes.some((n) => (!n.perInstance && nodeRequiresInfra(n)) || !!n.includeContents?.requiresInfra);
 }
 
 /// True iff the project declares any shared trigger, an included file's included.
 // SYNC: shared roles <-> crates/weft-dispatcher/src/api/project.rs gather_action_snapshot (shared_triggers)
 export function projectHasTriggers(nodes: readonly ProjectRoleNode[]): boolean {
-  return nodes.some((n) => (!n.perMember && nodeIsTrigger(n)) || !!n.includeContents?.hasTrigger);
+  return nodes.some((n) => (!n.perInstance && nodeIsTrigger(n)) || !!n.includeContents?.hasTrigger);
 }
 
 /// Does this node show a display on its body?
