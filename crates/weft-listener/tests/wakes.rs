@@ -589,10 +589,21 @@ async fn a_row_marked_down_again_keeps_one_retry_loop() {
 // ---------- Replacing a held connection ----------
 
 /// A held kind that records, in order, each task it starts (by the spec's
-/// `n`) and each outside teardown it is asked for.
+/// `n`) and each outside teardown it is asked for, under the spec's
+/// `test`: the tests of this binary share one process under `cargo test`,
+/// so one log per test keeps them from reading each other's entries.
 struct RecordingHold;
 
-static RECORDED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static RECORDED: Mutex<std::collections::BTreeMap<String, Vec<String>>> = Mutex::new(std::collections::BTreeMap::new());
+
+fn recorded(test: &str) -> Vec<String> {
+    RECORDED.lock().unwrap().get(test).cloned().unwrap_or_default()
+}
+
+fn record(spec: &weft_core::primitive::SignalSpec, entry: String) {
+    let test = spec.config["test"].as_str().expect("a recording spec names its test").to_string();
+    RECORDED.lock().unwrap().entry(test).or_default().push(entry);
+}
 const RECORDING_TAG: &str = "test_recording_hold";
 
 #[async_trait::async_trait]
@@ -615,7 +626,7 @@ impl weft_listener::kinds::KindHandler for RecordingHold {
         _kind_state: &Value,
         _ctx: weft_listener::kinds::SpawnCtx,
     ) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
-        RECORDED.lock().unwrap().push(format!("spawn {}", spec.config["n"]));
+        record(spec, format!("spawn {}", spec.config["n"]));
         Ok(Some(tokio::spawn(std::future::pending())))
     }
 
@@ -640,16 +651,16 @@ impl weft_listener::kinds::KindHandler for RecordingHold {
         sig: &weft_listener::registry::RegisteredSignal,
         _events_broker: &Arc<weft_broker_client::BrokerEventsClient>,
     ) {
-        RECORDED.lock().unwrap().push(format!("unregister {}", sig.spec.config["n"]));
+        record(&sig.spec, format!("unregister {}", sig.spec.config["n"]));
     }
 }
 
 inventory::submit!(&RecordingHold as &dyn weft_listener::kinds::KindHandler);
 
-fn recording_spec(n: u32) -> weft_core::primitive::SignalSpec {
+fn recording_spec(test: &str, n: u32) -> weft_core::primitive::SignalSpec {
     weft_core::primitive::SignalSpec {
         kind: RECORDING_TAG.into(),
-        config: json!({ "n": n }),
+        config: json!({ "n": n, "test": test }),
         consumer_kind: None,
         access: None,
         match_predicates: Vec::new(),
@@ -666,17 +677,17 @@ fn recording_spec(n: u32) -> weft_core::primitive::SignalSpec {
 async fn replacing_a_held_connection_tears_the_displaced_one_down_first() {
     let rig = rig(Placement::Machine).await;
     for n in 1..=2 {
-        let written = row("rec", &recording_spec(n), json!({}), n.into());
+        let written = row("rec", &recording_spec("replacing", n), json!({}), n.into());
         rig.rows.lock().unwrap().insert("rec".into(), written.clone());
         weft_listener::registry::hold(&rig.state, serde_json::from_value(written).unwrap(), weft_core::signal::listener_protocol::StartMode::New)
             .await
             .unwrap();
     }
-    assert_eq!(*RECORDED.lock().unwrap(), ["spawn 1", "unregister 1", "spawn 2"]);
+    assert_eq!(recorded("replacing"), ["spawn 1", "unregister 1", "spawn 2"]);
 
     weft_listener::kinds::forget(&rig.state, "rec");
-    wait_for(|| RECORDED.lock().unwrap().len() == 4).await;
-    assert_eq!(RECORDED.lock().unwrap()[3], "unregister 2");
+    wait_for(|| recorded("replacing").len() == 4).await;
+    assert_eq!(recorded("replacing")[3], "unregister 2");
     assert!(rig.state.registry.get("rec").is_none());
 }
 
@@ -687,19 +698,19 @@ async fn replacing_a_held_connection_tears_the_displaced_one_down_first() {
 #[tokio::test]
 async fn a_bring_up_right_after_forget_waits_for_the_old_teardown() {
     let rig = rig(Placement::Machine).await;
-    let first = row("rec", &recording_spec(1), json!({}), 1);
+    let first = row("rec", &recording_spec("bring_up", 1), json!({}), 1);
     rig.rows.lock().unwrap().insert("rec".into(), first.clone());
     weft_listener::registry::hold(&rig.state, serde_json::from_value(first).unwrap(), weft_core::signal::listener_protocol::StartMode::New)
         .await
         .unwrap();
 
     weft_listener::kinds::forget(&rig.state, "rec");
-    let second = row("rec", &recording_spec(2), json!({}), 2);
+    let second = row("rec", &recording_spec("bring_up", 2), json!({}), 2);
     rig.rows.lock().unwrap().insert("rec".into(), second.clone());
     weft_listener::registry::hold(&rig.state, serde_json::from_value(second).unwrap(), weft_core::signal::listener_protocol::StartMode::New)
         .await
         .unwrap();
-    assert_eq!(*RECORDED.lock().unwrap(), ["spawn 1", "unregister 1", "spawn 2"]);
+    assert_eq!(recorded("bring_up"), ["spawn 1", "unregister 1", "spawn 2"]);
     assert!(rig.state.registry.get("rec").is_some(), "the new connection runs");
 }
 
