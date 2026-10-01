@@ -33,6 +33,7 @@ impl RoleClient {
     /// identity: every role's internal surface answers weft's own roles
     /// only.
     pub async fn request(&self, method: reqwest::Method, path: &str) -> Result<reqwest::RequestBuilder> {
+        let url = self.url_for(path)?;
         let bearer = self
             .tokens
             .token_for(&self.base_url)
@@ -40,8 +41,45 @@ impl RoleClient {
             .with_context(|| format!("get an identity token for the {}", self.role.as_str()))?;
         Ok(self
             .http
-            .request(method, format!("{}{path}", self.base_url))
+            .request(method, url)
             .bearer_auth(bearer)
             .header(ROLE_HEADER, CoreRole::Dispatcher.as_str()))
+    }
+
+    /// The role's URL for `path`. Paths carry values from requests (a
+    /// file key, a token), so a path that does not start at the role's
+    /// root, climbs out with `..`, or would land on another origin is
+    /// refused instead of sent with the dispatcher's identity.
+    fn url_for(&self, path: &str) -> Result<reqwest::Url> {
+        anyhow::ensure!(path.starts_with('/'), "a role path starts with '/': {path:?}");
+        anyhow::ensure!(
+            !path.split(['/', '?', '#']).any(|seg| seg == ".." || seg == "."),
+            "a role path may not climb out of its route: {path:?}"
+        );
+        let base = reqwest::Url::parse(&self.base_url).with_context(|| format!("the {} address {}", self.role.as_str(), self.base_url))?;
+        let url = reqwest::Url::parse(&format!("{}{path}", self.base_url)).with_context(|| format!("a role path {path:?}"))?;
+        anyhow::ensure!(url.origin() == base.origin(), "a role path may not change the address it is sent to: {path:?}");
+        Ok(url)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client() -> RoleClient {
+        let tokens: Arc<dyn IdentityTokens> = Arc::new(weft_platform_traits::FixedToken("t".into()));
+        RoleClient::new(CoreRole::Broker, "http://127.0.0.1:9000/".into(), tokens, reqwest::Client::new())
+    }
+
+    /// A path built from a request's values reaches only the role's own
+    /// routes: it cannot name another host or climb out of its route.
+    #[test]
+    fn a_role_path_stays_on_the_role() {
+        let role = client();
+        assert_eq!(role.url_for("/v1/storage/admin/meta/t/asset/x").unwrap().as_str(), "http://127.0.0.1:9000/v1/storage/admin/meta/t/asset/x");
+        for bad in ["@evil.example/x", "v1/x", "/v1/storage/../admin", "/v1/./x"] {
+            assert!(role.url_for(bad).is_err(), "{bad} is refused");
+        }
     }
 }

@@ -150,6 +150,24 @@ pub async fn logout(ctx: Ctx, name: String) -> Result<()> {
     Ok(())
 }
 
+/// Write `secrets` as `KEY=value` lines to a file only this user can read,
+/// under the install's own folder, and answer its path.
+fn write_secrets_file(target: &str, secrets: &[(&'static str, String)]) -> Result<std::path::PathBuf> {
+    use std::io::Write;
+    let dir = weft_core::infra::Install::from_env().map_err(anyhow::Error::msg)?.dir().join("exports");
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join(format!("{target}.secrets.env"));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&path).with_context(|| format!("open {}", path.display()))?;
+    for (k, v) in secrets {
+        writeln!(file, "{k}={v}").with_context(|| format!("write {}", path.display()))?;
+    }
+    Ok(path)
+}
+
 /// What `weft target export` hands the repository: variables anybody
 /// with access may read, and secrets nobody can read back.
 #[derive(Debug, PartialEq, Eq)]
@@ -265,10 +283,14 @@ async fn export(
         for (k, v) in &settings.variables {
             println!("  {k}={v}");
         }
-        println!("repository secrets (shown once; the install keeps only a hash):");
-        for (k, v) in &settings.secrets {
-            println!("  {k}={v}");
-        }
+        // Secrets never go to the terminal, where scrollback and logs keep
+        // them: they go to a file only this user can read.
+        let file = write_secrets_file(name, &settings.secrets)?;
+        println!(
+            "repository secrets: written to {} (readable by you only; the install keeps only a hash). \
+             Copy each into the repository's secrets, then delete the file.",
+            file.display()
+        );
         // Nothing here knows when the new values are in place, so the
         // older ones stay usable until the person retires them.
         for id in &stale {
@@ -279,11 +301,7 @@ async fn export(
     if let Err(e) = set_repository_values(&project.root, &settings) {
         return Err(take_back(&client, &fresh, e, name).await);
     }
-    println!(
-        "set {} variables and {} secrets on the repository; run its deploy workflow from the Actions tab",
-        settings.variables.len(),
-        settings.secrets.len()
-    );
+    println!("set the repository's variables and secrets; run its deploy workflow from the Actions tab");
     // The repository now holds the new keys, so an earlier export's are
     // held by nobody.
     revoke_all(&client, &stale).await.with_context(|| {

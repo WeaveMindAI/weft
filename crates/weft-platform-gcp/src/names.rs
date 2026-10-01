@@ -62,7 +62,7 @@ mod tests {
     fn a_project_account_leads_back_to_its_project() {
         let p = uuid::Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0);
         let id = project_account_id(p);
-        assert!(id.len() <= 30, "{id}");
+        assert!(id.len() <= 30, "a project account id fits GCP's 30 characters");
         let email = project_account_email(p, "acme");
         let prefix = project_prefix_of(&email, "acme").unwrap();
         assert!(p.simple().to_string().starts_with(&prefix));

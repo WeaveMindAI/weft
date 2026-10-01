@@ -48,7 +48,8 @@ pub async fn materialize(
     root: &Path,
 ) -> Result<()> {
     let scope = weft_core::storage::key::KeyScope::Asset;
-    let mut files = Vec::with_capacity(manifest.len());
+    // Grown as each path is checked, never sized from the client's count.
+    let mut files = Vec::new();
     for (path, hash) in manifest {
         let rel = safe_relative_path(path)?;
         if !weft_core::storage::is_content_hash(hash) {

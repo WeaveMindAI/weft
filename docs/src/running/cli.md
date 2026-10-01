@@ -193,7 +193,7 @@ all take `--instance <id>`.
 | `weft logout <name>` | Forgets your key for it |
 | `weft running-source <folder>` | Writes the program an install is running into a new folder, without touching your own files. Add `--on <target>` to get what a cloud install runs |
 | `weft ci add --cloud gcp` | Writes `.github/workflows/deploy.yml`. Refuses to replace one somebody edited |
-| `weft target export <name> [--github]` | Mints a CI operator key and a frontend token on the install. With `--github` it sets them, and the workflow's other settings, on the repository through `gh`; without it, it prints them |
+| `weft target export <name> [--github]` | Mints a CI operator key and a frontend token on the install. With `--github` it sets them, and the workflow's other settings, on the repository through `gh`; without it, it prints the variables and writes the secrets to a file only you can read, under the install's `exports/` folder |
 | `weft domain add <name>` | Makes the install answer at a domain you own: prints the DNS record to set and waits until it points here. `--for api` serves the project's routes there instead, `--for frontend --to <address>` its frontend. `--no-wait` returns after printing the record |
 | `weft domain list` | Every domain, with its DNS record |
 | `weft domain rm <name>` | Stops answering at it |
