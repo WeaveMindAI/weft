@@ -1,7 +1,7 @@
 {
   "type": "AnthropicProvider",
   "label": "Anthropic",
-  "description": "Serve LLM calls directly on Anthropic's API with your own API key: pick the connection and the model, and wire the provider output into any LLM node. Model names are Anthropic's own (claude-sonnet-5, ...).",
+  "description": "Serve LLM calls directly on Anthropic's API with your own API key; wire the provider output into any LLM node. Model names are Anthropic's own (claude-sonnet-5, ...).",
   "tags": [
     "ai",
     "provider",
@@ -89,7 +89,7 @@
     {
       "name": "provider",
       "type": "LlmProvider",
-      "description": "The provider value: wire it into an LLM node's provider input."
+      "description": "Wire it into an LLM node's provider input."
     }
   ],
   "validate": [
@@ -107,6 +107,5 @@
         "field": "model"
       }
     }
-  ],
-  "requires_infra": false
+  ]
 }

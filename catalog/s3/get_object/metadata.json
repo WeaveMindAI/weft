@@ -1,7 +1,7 @@
 {
   "type": "S3GetObject",
   "label": "S3: Get Object",
-  "description": "Read an object into storage and emit the file reference (streamed, so large objects stay in bounded memory). The file belongs to this run and is swept when it ends; wire it through KeepFile to keep it longer or share it with later runs.",
+  "description": "Read an object from an S3-compatible bucket into storage and emit its stored-file reference (streamed, so large objects are fine). The file is execution-scoped; wire it through KeepFile to keep it for later runs.",
   "tags": [
     "s3",
     "storage",

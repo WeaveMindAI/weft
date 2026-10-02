@@ -211,3 +211,29 @@ out.data = svc.status
     infra::terminate_and_wait_gone(&project, "svc").await?;
     project.finish().await
 }
+
+/// A node waits on a long job in its own container without holding a
+/// worker: it starts the job, parks on a poll of the job's status route
+/// at the endpoint's worker address, and the listener does the polling.
+/// The container says "running" twice before "done", so the result
+/// reaching Debug proves the listener reached the unit (through the
+/// address weft's own roles use, which on a local install is a loopback
+/// port rather than the Docker name the workers use) and resumed the run
+/// on the answer that passed the filter.
+#[tokio::test]
+async fn a_node_parks_on_a_long_job_in_its_own_infra() -> anyhow::Result<()> {
+    let disp = ensure::up().await?;
+    let mut project = Project::prepare("infra_job", disp).await?;
+    infra::start_and_wait_running(&mut project, "svc").await?;
+
+    let settled = run::run_and_settle(&mut project).await?;
+    settled.completed()?;
+    let result = settled.input_of("out").and_then(|i| i.get("data").cloned());
+    anyhow::ensure!(
+        result.as_ref().and_then(|v| v.as_str()).is_some_and(|s| s.starts_with("rendered ")),
+        "the finished job's result reached Debug, got {result:?}"
+    );
+
+    infra::terminate_and_wait_gone(&project, "svc").await?;
+    project.finish().await
+}

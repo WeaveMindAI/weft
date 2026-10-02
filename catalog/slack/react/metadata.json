@@ -1,7 +1,7 @@
 {
   "type": "SlackReact",
   "label": "Slack: React",
-  "description": "Add (or remove) an emoji reaction on a message, addressed by channel + ts. The usual acknowledgement pattern: react to the message a workflow just handled.",
+  "description": "Adds or removes an emoji reaction on a Slack message, addressed by channel + ts (e.g. to acknowledge a message a workflow handled).",
   "tags": [
     "slack",
     "reaction"
@@ -16,14 +16,38 @@
       "requiresScopes": [
         "reactions:write"
       ],
-      "description": "The Slack access (wire a SlackAccess node). Needs the reactions:write scope."
+      "description": "Needs reactions:write."
     },
     {
       "name": "channel",
       "type": "String",
       "required": true,
       "label": "Channel",
-      "placeholder": "The channel id the message lives in"
+      "placeholder": "The channel id the message lives in",
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "sources": [
+          {
+            "kind": "list",
+            "requires": [
+              "channels:read"
+            ],
+            "get": "https://slack.com/api/conversations.list?limit=200&exclude_archived=true",
+            "items": "channels",
+            "label": "name",
+            "value": "id",
+            "page": {
+              "cursor_param": "cursor",
+              "cursor_path": "response_metadata.next_cursor"
+            }
+          },
+          {
+            "kind": "from_url",
+            "pattern": "/archives/([A-Z0-9]+)"
+          }
+        ]
+      }
     },
     {
       "name": "ts",
@@ -43,18 +67,15 @@
       "name": "remove",
       "type": "Boolean",
       "default": false,
-      "widget": {
-        "kind": "checkbox"
-      },
       "label": "Remove instead of add",
-      "description": "Take the reaction off instead of adding it."
+      "description": "Remove the reaction instead of adding it."
     }
   ],
   "outputs": [
     {
       "name": "done",
       "type": "Boolean",
-      "description": "True once the reaction change landed."
+      "description": "True once the change landed."
     }
   ],
   "features": {

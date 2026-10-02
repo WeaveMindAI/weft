@@ -433,12 +433,17 @@ export interface InputDefinition extends PortDefinition {
 // sources-less remote_select cannot typecheck (Rust already refuses
 // them at metadata load), and adding a Rust variant without a member
 // here breaks every exhaustive switch instead of shipping unhandled.
+// The languages a code widget can highlight: the one list on the TS
+// side. Metadata naming any other word is refused at load by Rust.
+// SYNC: CodeLanguage <-> crates/weft-core/src/node.rs CodeLanguage
+export type CodeLanguage = 'python' | 'javascript' | 'sql' | 'json';
+
 // SYNC: Widget <-> crates/weft-core/src/node.rs Widget
 export type Widget =
   | { kind: 'text' }
   | { kind: 'textarea' }
-  /// Syntax highlighting language ("python", "javascript", ...).
-  | { kind: 'code'; language: string }
+  /// Syntax highlighting language, one of `CodeLanguage`.
+  | { kind: 'code'; language: CodeLanguage }
   /// `step` is the input's granularity (arrow/slider increment).
   | { kind: 'number'; min?: number | null; max?: number | null; step?: number | null }
   | { kind: 'checkbox' }

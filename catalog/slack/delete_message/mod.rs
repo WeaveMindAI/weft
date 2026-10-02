@@ -26,8 +26,9 @@ impl Node for SlackDeleteMessageNode {
         let access: Access = ctx.inputs.get("account")?;
         let channel: String = ctx.inputs.get("channel")?;
         let ts: String = ctx.inputs.get("ts")?;
+        let client = ctx.client(&access).await?;
 
-        api::call(&ctx, &access, "chat.delete", json!({ "channel": channel, "ts": ts })).await?;
+        api::call(&client, "chat.delete", json!({ "channel": channel, "ts": ts })).await?;
         ctx.pulse_downstream(NodeOutput::new().set("done", true)).await
     }
 }

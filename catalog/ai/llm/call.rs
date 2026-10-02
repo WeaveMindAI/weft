@@ -382,8 +382,7 @@ pub async fn finish(
     }
     if let Some(calls) = &response.tool_calls {
         if !calls.is_empty() {
-            let calls = serde_json::to_value(calls).node_err("serializing tool calls")?;
-            output = output.set("toolCalls", calls);
+            output = output.set_serialized("toolCalls", calls)?;
         }
     }
     Ok(output)

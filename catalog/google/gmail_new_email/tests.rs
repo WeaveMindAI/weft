@@ -29,7 +29,7 @@ async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
     let registered = rig.registered_signals();
     assert_eq!(registered.len(), 1);
     let spec = serde_json::to_value(&registered[0].0).expect("spec serializes").to_string();
-    assert!(spec.contains("/messages?maxResults=25&q=is%3Aunread"), "query rides the url: {spec}");
+    assert!(spec.contains("/messages?maxResults=500&q=is%3Aunread"), "query rides the url: {spec}");
     assert!(spec.contains("\"set\""), "seen-set delta mode: {spec}");
     Ok(())
 }

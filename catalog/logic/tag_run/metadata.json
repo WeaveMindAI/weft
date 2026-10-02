@@ -1,7 +1,7 @@
 {
   "type": "TagRun",
   "label": "Tag run",
-  "description": "Put tags on this run so a later run can stop it. Every input wired onto the node is a tag, and a `tags` list works too; the two add up. Any string works as a tag: unsafe characters are replaced and a short fingerprint is added, so two different values never share a tag. Pair with `StopTagged` when a new event should stop the work already in flight.",
+  "description": "Tag this run so a later run can stop it with StopTagged (e.g. a new message stops the reply still in flight). Each wired input is a tag, plus the `tags` list. Any string works: unsafe characters are replaced and a fingerprint added, so two different values never share a tag.",
   "tags": [
     "flow",
     "tag",
@@ -15,19 +15,18 @@
     {
       "name": "tags",
       "type": "List[String]",
-      "description": "Tags as one list, for when they come from a node that already built the list. Wired inputs of your own are tags too; the two add up."
+      "description": "Tags as one list; added to the wired inputs."
     }
   ],
   "outputs": [
     {
       "name": "done",
       "type": "Boolean",
-      "description": "True once the tags are on the run. Wire it into the `_should_flow` of what must happen only after tagging, `StopTagged` first."
+      "description": "True once the tags are on; gate StopTagged on it."
     }
   ],
   "features": {
     "canAddInputPorts": true,
     "customInputType": "String"
-  },
-  "requires_infra": false
+  }
 }

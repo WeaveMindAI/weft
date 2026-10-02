@@ -4,8 +4,7 @@ import { extractTextContent } from './message-store.js';
 /**
  * Action dispatch router for the standard POST /action contract.
  * 
- * Each action maps to a Baileys socket method. The bridge provides the
- * live socket, and the webhook manager handles webhook registration.
+ * Each action maps to a Baileys socket method on the bridge's live socket.
  */
 /** The WhatsApp media kind a mime maps to. */
 function mediaTypeOf(mime) {
@@ -48,16 +47,8 @@ function mimeFromUrl(url) {
   }
 }
 
-export function createActionRouter(bridge, webhookManager, messageStore) {
+export function createActionRouter(bridge, messageStore) {
   const handlers = {
-    async ping() {
-      // "ready" means the server can process actions, NOT that the bridge
-      // is connected to WhatsApp. The WhatsApp connection is user-initiated
-      // (QR scan) and happens after provisioning. As long as the Express
-      // server is up and the action router can dispatch, we're ready.
-      return { ready: true };
-    },
-
     // The button on `/live`: detach the phone and show a new QR code,
     // from any state (paired and running, or stuck after a pairing
     // that died half way). Nothing else resets a bridge short of
@@ -80,23 +71,26 @@ export function createActionRouter(bridge, webhookManager, messageStore) {
     // `ptt` marks audio as a voice note (WhatsApp renders it as a
     // playable bubble instead of an audio file); ignored for any other
     // media type.
-    async sendMedia({ to, mediaUrl, mediaBase64, caption, mimetype, filename, ptt }) {
+    async sendMedia({ to, mediaUrl, caption, mimetype, filename, ptt }) {
+      if (typeof mediaUrl !== 'string' || mediaUrl === '') {
+        return { error: 'sendMedia needs a mediaUrl (a link or a data: URL) to send' };
+      }
       const sock = bridge.getSocket();
       if (!sock || !bridge.isConnected()) {
         return { error: 'WhatsApp not connected' };
       }
 
       // Inline content (weft's storage has no public link to hand out
-      // in every install, so the node ships the bytes base64-inline).
-      // A data: URL is normalized into the same inline path.
-      if (!mediaBase64 && mediaUrl && mediaUrl.startsWith('data:')) {
+      // in every install, so the node ships the bytes as a data: URL):
+      // decoded here and sent as bytes.
+      let buffer;
+      if (mediaUrl.startsWith('data:')) {
         const m = mediaUrl.match(/^data:([^;]*);base64,(.*)$/s);
         if (!m) return { error: 'data: URL without a base64 payload' };
         mimetype = mimetype || m[1];
-        mediaBase64 = m[2];
+        buffer = Buffer.from(m[2], 'base64');
         mediaUrl = undefined;
       }
-      let buffer = mediaBase64 ? Buffer.from(mediaBase64, 'base64') : undefined;
       const resolvedMime = whatsappMime(mimetype || (buffer ? '' : mimeFromUrl(mediaUrl)));
       const mediaType = mediaTypeOf(resolvedMime);
       const voiceNote = mediaType === 'audio' && ptt === true;
@@ -254,7 +248,10 @@ export function createActionRouter(bridge, webhookManager, messageStore) {
         return { error: 'WhatsApp not connected' };
       }
       // presence: 'composing', 'recording', 'paused', 'available', 'unavailable'
-      await sock.sendPresenceUpdate(presence || 'composing', chatId);
+      if (!chatId || !presence) {
+        return { error: 'chatId and presence are required' };
+      }
+      await sock.sendPresenceUpdate(presence, chatId);
       return { success: true };
     },
 
@@ -287,31 +284,14 @@ export function createActionRouter(bridge, webhookManager, messageStore) {
       return { chats: chatList };
     },
 
-    async registerWebhook({ callbackUrl, events }) {
-      if (!callbackUrl) {
-        return { error: 'callbackUrl is required' };
-      }
-      const webhookId = webhookManager.register(callbackUrl, events || ['message.received']);
-      return { webhookId };
-    },
-
-    async unregisterWebhook({ webhookId }) {
-      if (!webhookId) {
-        return { error: 'webhookId is required' };
-      }
-      const success = webhookManager.unregister(webhookId);
-      return { success };
-    },
-
-    async listWebhooks() {
-      return { webhooks: webhookManager.list() };
-    },
-
     async fetchMessages({ chatId, count }) {
       if (!chatId) {
         return { error: 'chatId is required' };
       }
-      const requested = count || 20;
+      if (!Number.isInteger(count) || count < 1) {
+        return { error: `count must be a whole number of at least 1, got ${JSON.stringify(count)}` };
+      }
+      const requested = count;
 
       // If the store has no messages for this chat, wait for the initial
       // history sync to arrive (with timeout). This handles the case where

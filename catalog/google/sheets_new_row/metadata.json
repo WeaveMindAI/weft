@@ -1,7 +1,7 @@
 {
   "type": "GoogleSheetsNewRow",
   "label": "Google Sheets: On New Row",
-  "description": "Fires once per row added to a tab. Activation starts from the sheet's current end (history never replays), the position survives restarts, and each new row fires with its cells, the header-keyed object, and its sheet row number.",
+  "description": "Fires once per row added to a Google Sheets tab, polling on an interval. Starts from the sheet's end at activation (old rows never replay) and keeps its position across restarts.",
   "tags": [
     "google",
     "sheets",
@@ -17,7 +17,7 @@
       "requiresScopes": [
         "https://www.googleapis.com/auth/drive.file"
       ],
-      "description": "A Google account with write access to the sheet (the picker grant covers the file it picked)."
+      "description": "The picker grant covers the file it picked."
     },
     {
       "name": "spreadsheet",
@@ -64,7 +64,6 @@
     {
       "name": "tab",
       "type": "String",
-      "default": "0",
       "widget": {
         "kind": "remote_select",
         "access": "account",
@@ -89,17 +88,18 @@
         ]
       },
       "label": "Tab",
-      "placeholder": "Pick a tab, or paste a link with #gid="
+      "placeholder": "Pick a tab, or paste a link with #gid=",
+      "description": "The tab to use. Empty: the first tab, whatever its id."
     },
     {
       "name": "intervalSecs",
       "type": "Number",
       "default": 30,
       "label": "Check every (seconds)",
-      "description": "How often the sheet is checked for new rows.",
+      "description": "How often the sheet is checked.",
       "widget": {
         "kind": "number",
-        "min": 1,
+        "min": 5,
         "step": 1
       }
     },
@@ -107,9 +107,6 @@
       "name": "hasHeader",
       "type": "Boolean",
       "default": true,
-      "widget": {
-        "kind": "checkbox"
-      },
       "label": "First row is a header",
       "description": "Needed to order an object row's columns."
     }
@@ -118,17 +115,17 @@
     {
       "name": "row",
       "type": "JsonDict",
-      "description": "The new row keyed by the header (positional c0, c1, ... without one)."
+      "description": "Keyed by the header (c0, c1, ... without one)."
     },
     {
       "name": "cells",
       "type": "List[String]",
-      "description": "The new row's raw cells in order."
+      "description": "Raw cells in order."
     },
     {
       "name": "rowNumber",
       "type": "Number",
-      "description": "The new row's 1-based sheet row number."
+      "description": "1-based sheet row number."
     }
   ],
   "firesWith": {

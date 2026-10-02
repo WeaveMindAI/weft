@@ -13,7 +13,8 @@ pub async fn append_text(http: &ClientWithMiddleware,
 ) -> WeftResult<()> {
     weft::access::client::json_call(
         http.post(format!(
-            "https://docs.googleapis.com/v1/documents/{doc_id}:batchUpdate"
+            "https://docs.googleapis.com/v1/documents/{}:batchUpdate",
+            super::api::segment(doc_id)
         ))
         .json(&json!({
             "requests": [{

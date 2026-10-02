@@ -25,6 +25,28 @@ let reply = client.post("https://slack.com/api/chat.postMessage")
 
 That client already has the authentication, the routing and the metering on it.
 
+## Sending the call and reading the answer
+
+Every API node does the same three things after building a request: send it,
+fail with the provider's own words when the status is not a success, and read
+the body. `weft::access::client` has that once, so your node does not write it
+again:
+
+| Call | Use it when |
+|---|---|
+| `get_json(&client, url, what)` / `post_json(&client, url, &body, what)` | A plain GET, or a POST of a JSON body, that answers JSON |
+| `json_call(request, what)` | The request needs its own preparation (a content type, a multipart body) but answers JSON |
+| `checked_send(request, what)` | The answer is not JSON (a download, raw text). You get the response back unread |
+| `require_ok_flag(answer, "ok", "error", what)` | The service answers 200 to everything and says inside the body whether it worked (Slack's `ok`, Telegram's `ok` and `description`) |
+| `cursor_paged(paging, what, request, check, visit)` | A list that comes a page at a time with a cursor. `CursorPaging` says where the items and the next cursor sit and which query parameter carries it back; `past_cap_hint` is what the user is told to narrow when the list runs past the page cap |
+| `required_str(&answer, what, "id")` | A field the rest of the node cannot do without, failing by name when it is missing |
+
+`what` names the attempt, so a failure reads "the service answered 403 trying
+to post the message" instead of a bare status code.
+
+If your node waits on a job the provider runs, go and read
+[waiting on a job a service runs](../nodes/durable-execution.md#waiting-on-a-job-a-service-runs).
+
 ## The one rule about HTTP
 
 A call **on a connection** goes through `ctx.open` or `ctx.client`. Everything

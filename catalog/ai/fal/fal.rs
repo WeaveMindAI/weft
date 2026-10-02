@@ -1,21 +1,19 @@
 //! Shared fal plumbing: the queue dance (submit, wait on the status,
-//! fetch the result) and the media-in/media-out conversions every fal
+//! fetch the result) and the answer-reading helpers every fal
 //! node repeats.
 //!
 //! fal serves every model through one queue API: POST the payload to
-//! the model's route, poll the request's status until COMPLETED, then
-//! read the response. A generation the user asked for takes as long
-//! as it takes (no deadline here; cancelling the execution cancels
-//! the wait).
+//! the model's route, wait until the request's status says COMPLETED,
+//! then read the response. The wait is a parked poll, so no worker is
+//! held while fal generates, and there is no deadline: a generation the
+//! user asked for takes as long as it takes, and cancelling the
+//! execution cancels the wait.
 
-use std::time::Duration;
-
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use weft::access::client::{get_json, post_json};
-use weft::context::LogLevel;
-use weft::storage::{FileHandle, StorageScope};
-use weft::{ExecutionContext, NodeErrExt, WeftResult};
+use weft::signal::{PollEndpoint, Predicate};
+use weft::{Access, ExecutionContext, NodeErrExt, WeftResult};
 
 pub const API: &str = "https://queue.fal.run";
 
@@ -40,18 +38,24 @@ pub fn checked_model(model: &str) -> WeftResult<&str> {
 }
 
 /// Submit `payload` to `model`'s queue, wait on the request, and hand
-/// back the completed response. `what` names the attempt in errors
-/// and log breadcrumbs.
+/// back the completed response. `what` names the attempt in errors.
 pub async fn run_queued(
     ctx: &ExecutionContext,
+    account: &Access,
     http: &weft::reqwest_middleware::ClientWithMiddleware,
     model: &str,
     payload: &Value,
     what: &str,
 ) -> WeftResult<Value> {
     let model = checked_model(model)?;
-    let submitted =
-        post_json(http, &format!("{API}/{model}"), payload, what).await?;
+    // The submit is the paid call, and the body replays from the top
+    // when the wait resumes: journaled, the replay reads this request id
+    // back instead of queueing a second generation.
+    let submitted = ctx
+        .run("fal_submit", || async {
+            post_json(http, &format!("{API}/{model}"), payload, what).await
+        })
+        .await?;
     let request_id = submitted["request_id"]
         .as_str()
         .node_err("fal: the submit answered no request_id")?
@@ -62,24 +66,24 @@ pub async fn run_queued(
     // `fal-ai/flux/requests/...` (the full path answers 405).
     let app: String =
         model.split('/').take(2).collect::<Vec<_>>().join("/");
-    let status_url = format!("{API}/{app}/requests/{request_id}/status");
-    let mut polls: u64 = 0;
-    loop {
-        let status = get_json(http, &status_url, "fal: read the request status").await?;
-        match status["status"].as_str().unwrap_or_default() {
-            "COMPLETED" => break,
-            "IN_QUEUE" | "IN_PROGRESS" => {
-                polls += 1;
-                if polls % 20 == 0 {
-                    ctx.log(LogLevel::Info, format!("{what}: still running on {model}"))
-                        .await?;
-                }
-                tokio::time::sleep(Duration::from_secs(3)).await;
-            }
-            other => {
-                weft::node_bail!("fal answered an unexpected status '{other}' for {what}")
-            }
-        }
+    // Resume on any status that is not in flight, so a status this node
+    // does not know ends the wait and is refused below instead of
+    // being waited on forever.
+    let status = ctx
+        .await_signal(PollEndpoint {
+            url: format!("{API}/{app}/requests/{request_id}/status"),
+            interval_secs: 5,
+            access: Some(weft::primitive::AccessRef::from(account)),
+            filters: vec![
+                Predicate::neq("status", "IN_QUEUE"),
+                Predicate::neq("status", "IN_PROGRESS"),
+            ],
+            ..Default::default()
+        })
+        .await?;
+    match status["status"].as_str().unwrap_or_default() {
+        "COMPLETED" => {}
+        other => weft::node_bail!("fal answered an unexpected status '{other}' for {what}"),
     }
 
     // A failed generation still COMPLETES (the queue has no failed
@@ -91,17 +95,6 @@ pub async fn run_queued(
         weft::node_bail!("fal failed {what} on {model}: {error} ({kind})");
     }
     Ok(answer)
-}
-
-/// A stored file as something fal can read: its public link when the
-/// install serves one, else an inline data: URL (fal accepts both).
-pub async fn media_url(ctx: &ExecutionContext, file: &FileHandle) -> WeftResult<String> {
-    let storage = ctx.storage(StorageScope::Execution);
-    if let Some(url) = storage.public_link(file, None).await? {
-        return Ok(url);
-    }
-    let (meta, bytes) = storage.get_bytes(file).await?;
-    Ok(weft::storage::media::data_url(&meta.mime_type, &bytes))
 }
 
 /// The answered video's URL, wherever the model family put it
@@ -122,13 +115,8 @@ pub fn video_url(answer: &Value) -> Option<&str> {
 /// extra whose value is `null` removes that key from the request, which
 /// is how a caller drops a field the node sends for another model family's
 /// sake.
-pub fn merge_params(payload: &mut Value, params: Option<&Value>) -> WeftResult<()> {
-    let Some(params) = params else { return Ok(()) };
-    let Some(extra) = params.as_object() else {
-        return Err(weft::WeftError::Input(
-            "params must be an object of model parameters".into(),
-        ));
-    };
+pub fn merge_params(payload: &mut Value, params: Option<&Map<String, Value>>) {
+    let Some(extra) = params else { return };
     let base = payload.as_object_mut().expect("payloads are objects");
     for (k, v) in extra {
         // A declared knob still wins over an extra of the same name, which
@@ -144,5 +132,4 @@ pub fn merge_params(payload: &mut Value, params: Option<&Value>) -> WeftResult<(
             base.insert(k.clone(), v.clone());
         }
     }
-    Ok(())
 }

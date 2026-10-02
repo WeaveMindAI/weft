@@ -94,7 +94,7 @@ impl Node for RouteNode {
                         "this route's body lands key by key on its declared ports, so it has \
                          to be a json object; the caller sent {}. Either send an object, or \
                          set the body shape to `text` and read it whole",
-                        shape_of_json(&body)
+                        wire::kind_of(&body)
                     );
                 }
                 // Top-level keys onto same-named declared ports. The fixed
@@ -182,11 +182,8 @@ fn declared_body_ports(ctx: &ExecutionContext, captures: &std::collections::BTre
 ///
 /// A string is a text body, an object is a json one. Anything else is
 /// refused by the fire payload contract before this runs, against the
-/// type the metadata declares.
-// TODO: once weft types have a `Bytes` primitive, the declaration
-// becomes `body?: JsonDict | String | Bytes` and a fired run can carry
-// a binary body. Until then a bytes route is not fireable, which the
-// contract says by refusing the value rather than by a check here.
+/// type the metadata declares, so a bytes route is not fireable: its
+/// body has no declared type a fire payload can carry.
 fn fired_body(ctx: &ExecutionContext) -> WeftResult<InboundMessage> {
     let Some(body) = ctx.wake.opt::<Value>("body")? else {
         return Ok(InboundMessage::Json(Value::Null));
@@ -195,20 +192,6 @@ fn fired_body(ctx: &ExecutionContext) -> WeftResult<InboundMessage> {
         Value::String(text) => InboundMessage::Text(text),
         other => InboundMessage::Json(other),
     })
-}
-
-/// What a json body turned out to be, for the refusal above. Named for
-/// the caller's benefit, not serde's: they sent it and have to recognise
-/// it in the message.
-fn shape_of_json(value: &serde_json::Value) -> &'static str {
-    match value {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "true or false",
-        serde_json::Value::Number(_) => "a number",
-        serde_json::Value::String(_) => "a string",
-        serde_json::Value::Array(_) => "a list",
-        serde_json::Value::Object(_) => "an object",
-    }
 }
 
 fn shape_of(message: &InboundMessage) -> &'static str {

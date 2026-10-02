@@ -27,8 +27,8 @@
       ],
       "outputs": [
         {
-          "name": "endpointUrl",
-          "portType": "String",
+          "name": "bridge",
+          "portType": "Infra",
           "required": false
         },
         {
@@ -85,10 +85,10 @@
       "groupBoundary": null,
       "inputs": [
         {
-          "name": "endpointUrl",
-          "portType": "String",
+          "name": "bridge",
+          "portType": "Infra",
           "required": true,
-          "description": "Output of a BaileyBridge node. The listener subscribes to <endpointUrl without /action>/events.",
+          "description": "The `bridge` output of the BaileyBridge node to talk through.",
           "exposure": "all",
           "widget": {
             "kind": "text"
@@ -700,8 +700,8 @@
       "groupBoundary": null,
       "inputs": [
         {
-          "name": "endpointUrl",
-          "portType": "String",
+          "name": "bridge",
+          "portType": "Infra",
           "required": true,
           "exposure": "all",
           "widget": {
@@ -1126,11 +1126,11 @@
   ],
   "edges": [
     {
-      "id": "e-whatsapp-endpointUrl-ask-endpointUrl",
+      "id": "e-whatsapp-bridge-ask-bridge",
       "source": "whatsapp",
       "target": "ask",
-      "sourceHandle": "endpointUrl",
-      "targetHandle": "endpointUrl",
+      "sourceHandle": "bridge",
+      "targetHandle": "bridge",
       "span": {
         "startLine": 9,
         "startColumn": 22,
@@ -1282,11 +1282,11 @@
       }
     },
     {
-      "id": "e-whatsapp-endpointUrl-reply-endpointUrl",
+      "id": "e-whatsapp-bridge-reply-bridge",
       "source": "whatsapp",
       "target": "reply",
-      "sourceHandle": "endpointUrl",
-      "targetHandle": "endpointUrl",
+      "sourceHandle": "bridge",
+      "targetHandle": "bridge",
       "span": {
         "startLine": 49,
         "startColumn": 2,

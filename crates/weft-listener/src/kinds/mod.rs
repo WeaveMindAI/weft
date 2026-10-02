@@ -130,6 +130,9 @@ pub struct Woken {
     /// version it is at.
     pub state: Value,
     pub seq: i64,
+    /// True when the signal is a parked run's wait (`await_signal`)
+    /// rather than an entry trigger, read off the row like the state.
+    pub is_resume: bool,
 }
 
 /// Per-kind handler. One unit struct per kind, registered with the
@@ -211,9 +214,23 @@ pub trait KindHandler: Send + Sync {
     ///
     /// `asked_at_unix_ms` is when the registration was asked for (the
     /// node's `await_signal`, or the activation), for a kind whose state
-    /// counts from that moment.
-    fn compute_initial_state(&self, _spec: &SignalSpec, _prior: Option<&Value>, _asked_at_unix_ms: i64) -> Result<Value> {
+    /// counts from that moment. `is_resume` says which of the two it is,
+    /// for a kind that behaves differently while a run waits on it.
+    fn compute_initial_state(
+        &self,
+        _spec: &SignalSpec,
+        _prior: Option<&Value>,
+        _asked_at_unix_ms: i64,
+        _is_resume: bool,
+    ) -> Result<Value> {
         Ok(Value::Object(serde_json::Map::new()))
+    }
+
+    /// Refuse a spec this kind cannot serve as a parked run's wait
+    /// (`await_signal`), naming why. Called at registration, only for a
+    /// resume. Default: every spec the kind validates can be awaited.
+    fn check_resume(&self, _spec: &SignalSpec) -> Result<()> {
+        Ok(())
     }
 
     /// For a `Holds` kind: spawn the task that holds its connection
@@ -408,8 +425,11 @@ pub fn prepare_signal(
             spec.kind,
         );
     }
+    if is_resume {
+        handler.check_resume(&spec)?;
+    }
     let routing = handler.compute_routing(&spec)?;
-    let kind_state = handler.compute_initial_state(&spec, prior_kind_state, asked_at_unix_ms)?;
+    let kind_state = handler.compute_initial_state(&spec, prior_kind_state, asked_at_unix_ms, is_resume)?;
     let signal = RegisteredSignal {
         spec,
         node_id,
@@ -646,7 +666,7 @@ pub async fn wake(state: &crate::ListenerState, body: WakeBody) -> Result<()> {
     // `bring_up`), so its serving slot lives for this one wake.
     let serving = Arc::new(Mutex::new(ServingState::default()));
     let ctx = spawn_ctx(state, &row.token, &row.tenant_id, row.for_instance.clone(), &spec, false, serving);
-    let woken = Woken { aimed_at_ms, now_ms, state: row.kind_state.clone(), seq: row.kind_state_seq };
+    let woken = Woken { aimed_at_ms, now_ms, state: row.kind_state.clone(), seq: row.kind_state_seq, is_resume: row.is_resume };
     let after = handler.on_wake(&spec, woken, ctx).await?;
     arm_next_wake(state, handler, &row.token, &spec, &after, WakeFrom::Woken { aimed_at_ms }).await
 }

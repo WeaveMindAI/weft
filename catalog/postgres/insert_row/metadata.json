@@ -1,7 +1,7 @@
 {
   "type": "PostgresInsertRow",
   "label": "Postgres: Insert Row",
-  "description": "Insert one row into a table, columns from a JSON object, and get the inserted row back (defaults and generated ids filled in). A database that cannot be reached or refuses the row (a broken constraint, a duplicate key) is a failure `error` catches when wired; a mistake in the program (a table or column that does not exist, `values` that is not an object) always fails the run.",
+  "description": "Insert one row into a table from a JSON object of column values, and get the stored row back (defaults and generated ids filled in). Unreachable database or a refused row (constraint, duplicate key): catchable by `error`. Unknown table or column, or `values` not an object: always fails the run.",
   "tags": [
     "postgres",
     "database",
@@ -20,26 +20,26 @@
         "user",
         "password"
       ],
-      "description": "The database's connection (wire a PostgresAccess node, or a PostgresDatabase's access output)."
+      "description": "Wire a PostgresAccess, or a PostgresDatabase's access output."
     },
     {
       "name": "table",
       "type": "String",
       "required": true,
-      "description": "The table to insert into."
+      "description": "Target table."
     },
     {
       "name": "values",
       "type": "JsonDict",
       "required": true,
-      "description": "The row as column: value pairs, e.g. { \"email\": \"a@b.c\", \"age\": 30 }."
+      "description": "Column to value, e.g. { \"email\": \"a@b.c\", \"age\": 30 }."
     }
   ],
   "outputs": [
     {
       "name": "row",
       "type": "JsonDict",
-      "description": "The inserted row as the database stored it. The node fails rather than emitting nothing: if the table has a rule or trigger that discards the insert, no row was stored and there is nothing to pass on."
+      "description": "The row as stored. If a rule or trigger discards the insert, the node fails instead of emitting nothing."
     }
   ],
   "features": {

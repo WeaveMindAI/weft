@@ -51,7 +51,7 @@ A trigger reading an instance's container, or a trigger with an
 bridge = BaileyBridge {
   @per_instance
 }
-receive = BaileyReceive { endpointUrl: bridge.endpointUrl }
+receive = BaileyReceive { bridge: bridge.bridge }
 
 openrouter = OpenRouterProvider {
   connection: @instance_filled
@@ -153,18 +153,18 @@ live = Group(keys: Access) {
   shoot = Route -> (id: String) { path: "sessions/{id}/render", method: "POST", auth: self.keys }
 
   agent = @include("live/agent.weft")
-  agent.endpoint = blender.endpointUrl
+  agent.workstation = blender.workstation
   agent.text = say.text
 
-  viewport = Group(endpoint: String, view: String) {
-    frame = BlenderPreview { endpointUrl: self.endpoint, view: self.view }
+  viewport = Group(workstation: Infra, view: String) {
+    frame = BlenderPreview { workstation: self.workstation, view: self.view }
     show = Reply { answerAs: "bytes", body: frame.image }
   }
-  viewport.endpoint = blender.endpointUrl
+  viewport.workstation = blender.workstation
   viewport.view = look.view
 
   output = @include("live/output.weft")
-  output.endpoint = blender.endpointUrl
+  output.workstation = blender.workstation
   output.session = shoot.id
 }
 ```

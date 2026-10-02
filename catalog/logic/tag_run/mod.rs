@@ -3,7 +3,7 @@
 //! The tags are whatever the user wired onto the node (each created
 //! input is one tag) plus the optional `tags` list, so a program says
 //! `TagRun(sender: String)` and wires the sender in; nothing is
-//! assembled by hand, and any string works (see `steering::safe_tag`).
+//! assembled by hand, and any string works (`ctx.tag_execution` normalises it, see `weft::tag::normalize_tag`).
 //! The node exists so the debounce shape (a new message stops the
 //! answer to the previous one) is two catalog nodes and no Rust: this
 //! one, then `StopTagged`.

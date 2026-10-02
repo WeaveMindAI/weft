@@ -1,7 +1,7 @@
 {
   "type": "GoogleSheetsRead",
   "label": "Google Sheets: Read",
-  "description": "Read a spreadsheet's rows. Works signed in (pick a sheet, or let the picker grant one) and with nothing but a share link: leave the account unconnected and paste the link of a sheet shared with 'anyone with the link'.",
+  "description": "Reads a Google Sheets tab's rows, signed in or (account left unconnected) from the share link of a sheet shared with 'anyone with the link'.",
   "tags": [
     "google",
     "sheets",
@@ -14,7 +14,7 @@
     {
       "name": "account",
       "type": "Access", "accepts": ["wire"],
-      "description": "A Google account. Leave it unconnected to read sheets shared by link."
+      "description": "Leave unconnected to read a sheet shared by link."
     },
     {
       "name": "spreadsheet",
@@ -61,7 +61,6 @@
     {
       "name": "tab",
       "type": "String",
-      "default": "0",
       "widget": {
         "kind": "remote_select",
         "access": "account",
@@ -86,15 +85,13 @@
         ]
       },
       "label": "Tab",
-      "placeholder": "Pick a tab, or paste a link with #gid="
+      "placeholder": "Pick a tab, or paste a link with #gid=",
+      "description": "The tab to use. Empty: the first tab, whatever its id."
     },
     {
       "name": "hasHeader",
       "type": "Boolean",
       "default": true,
-      "widget": {
-        "kind": "checkbox"
-      },
       "label": "First row is a header"
     }
   ],
@@ -102,7 +99,7 @@
     {
       "name": "rows",
       "type": "List[JsonDict]",
-      "description": "The sheet's rows. With a header, each row is {column: value}; without one, {c0, c1, ...}."
+      "description": "With a header, {column: value} each; without, {c0, c1, ...}."
     }
   ],
   "features": {

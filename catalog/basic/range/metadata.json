@@ -1,7 +1,7 @@
 {
   "type": "Range",
   "label": "Range",
-  "description": "Yield the numbers between `from` (inclusive) and `to` (exclusive) one at a time, stepping by `step`. Commonly used to drive `Loop(over: [\"values\"])` for count-based iteration; the loop pulls one number per iteration, so large ranges never sit in memory.",
+  "description": "Generate the numbers from `from` (inclusive) to `to` (exclusive) by `step`, to drive a count-based `Loop(over: [\"values\"])`; the loop pulls one per iteration, so a large range is never held in memory.",
   "tags": ["number", "stream", "range", "loop"],
   "icon": "Hash",
   "color": "#64748b",
@@ -13,5 +13,29 @@
   "outputs": [
     { "name": "values", "type": "Generator[Number]" }
   ],
-  "requires_infra": false
+  "validate": [
+    {
+      "when": {
+        "kind": "any",
+        "of": [
+          {
+            "kind": "config_equals",
+            "field": "step",
+            "equals": 0
+          },
+          {
+            "kind": "config_equals",
+            "field": "step",
+            "equals": 0.0
+          }
+        ]
+      },
+      "then": {
+        "message": "Range '{id}' has a `step` of zero, which never reaches `to`. Use a positive step to count up or a negative one to count down.",
+        "level": "structural",
+        "severity": "error",
+        "port": "step"
+      }
+    }
+  ]
 }

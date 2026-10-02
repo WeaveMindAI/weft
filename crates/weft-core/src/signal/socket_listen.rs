@@ -39,6 +39,122 @@ pub enum SocketFrame {
     Binary { base64: String },
 }
 
+/// How a `{name|escape}` placeholder writes its value into a text
+/// frame. A bare `{name}` writes the value as it is, which is right for
+/// a token in a JSON frame the connection minted, and wrong for a value
+/// a person typed into a line protocol: a password holding `"` ends the
+/// quoted string early, and one holding a line break sends a second
+/// command. The escape is data in the frame, so the node never ships
+/// code to the listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameEscape {
+    /// `{name|quoted}`: an IMAP quoted string (RFC 3501): the value
+    /// wrapped in `"`, with `\` and `"` escaped by a `\`. A value
+    /// holding CR, LF or NUL cannot be quoted (the protocol needs a
+    /// literal for those) and is refused.
+    Quoted,
+}
+
+impl FrameEscape {
+    fn parse(name: &str) -> Result<Self, String> {
+        match name {
+            "quoted" => Ok(FrameEscape::Quoted),
+            other => Err(format!("unknown frame escape '{other}'; the known one is 'quoted'")),
+        }
+    }
+
+    /// Write `value` (the value of placeholder `name`) the way this
+    /// escape says. The error names the placeholder, never the value,
+    /// since the value is usually a credential.
+    fn apply(self, name: &str, value: &str) -> Result<String, String> {
+        match self {
+            FrameEscape::Quoted => {
+                if value.contains(['\r', '\n', '\0']) {
+                    return Err(format!(
+                        "the value for '{{{name}|quoted}}' holds a line break or a NUL byte, which \
+                         a quoted string cannot carry; it would end the line and send the rest as \
+                         a command of its own"
+                    ));
+                }
+                let mut out = String::with_capacity(value.len() + 2);
+                out.push('"');
+                for c in value.chars() {
+                    if c == '\\' || c == '"' {
+                        out.push('\\');
+                    }
+                    out.push(c);
+                }
+                out.push('"');
+                Ok(out)
+            }
+        }
+    }
+}
+
+/// A placeholder in a text frame: `{name}` or `{name|escape}`.
+fn frame_placeholder() -> &'static regex::Regex {
+    static PLACEHOLDER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\{([a-z0-9_]+)(?:\|([a-z0-9_]+))?\}").expect("static regex")
+    });
+    &PLACEHOLDER
+}
+
+/// Refuse a text frame naming an escape that does not exist, at
+/// registration rather than at the first connect. `field` names the
+/// frame in the error.
+pub fn check_frame_text(body: &str, field: &str) -> Result<(), String> {
+    for caps in frame_placeholder().captures_iter(body) {
+        if let Some(escape) = caps.get(2) {
+            FrameEscape::parse(escape.as_str()).map_err(|e| format!("{field}: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// [`check_frame_text`] for a frame of either encoding (a binary frame
+/// interpolates nothing).
+pub fn check_frame(frame: &SocketFrame, field: &str) -> Result<(), String> {
+    match frame {
+        SocketFrame::Text { body } => check_frame_text(body, field),
+        SocketFrame::Binary { .. } => Ok(()),
+    }
+}
+
+/// Interpolate `{name}` and `{name|escape}` placeholders into a frame's
+/// text from the connection's resolved `values`. Unlike the strict
+/// template grammar, everything that is not a well-formed placeholder
+/// stays literal (a JSON frame is full of braces that mean JSON). A
+/// placeholder naming a value nobody resolved is a loud error: a
+/// handshake going out with a literal `{token}` is a silent
+/// authentication failure. So is a value its escape cannot write.
+pub fn interpolate_frame(
+    body: &str,
+    values: &std::collections::BTreeMap<String, String>,
+) -> Result<String, String> {
+    let mut err = None;
+    let out = frame_placeholder().replace_all(body, |caps: &regex::Captures<'_>| {
+        let name = &caps[1];
+        let written = match values.get(name) {
+            None => Err(format!(
+                "the frame interpolates '{{{name}}}' but the connection resolves no value \
+                 named '{name}'"
+            )),
+            Some(v) => match caps.get(2) {
+                None => Ok(v.clone()),
+                Some(escape) => FrameEscape::parse(escape.as_str()).and_then(|e| e.apply(name, v)),
+            },
+        };
+        written.unwrap_or_else(|e| {
+            err.get_or_insert(e);
+            String::new()
+        })
+    });
+    match err {
+        Some(e) => Err(e),
+        None => Ok(out.into_owned()),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SocketListen {
     /// The `ws://`/`wss://` gateway URL to connect to. May be empty
@@ -105,6 +221,12 @@ impl Signal for SocketListen {
             }
         }
         self.minted.validate("socket_listen")?;
+        if let Some(frame) = &self.handshake {
+            check_frame(frame, "socket_listen.handshake")?;
+        }
+        if let Some(frame) = &self.heartbeat {
+            check_frame(frame, "socket_listen.heartbeat")?;
+        }
         if self.heartbeat.is_some() && self.heartbeat_secs == 0 {
             return Err(
                 "socket_listen.heartbeat_secs must be > 0 when a heartbeat frame is set: \
@@ -121,6 +243,58 @@ crate::register_signal_kind!(SocketListen);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn values(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    /// A bare placeholder writes its value as it is, and everything that
+    /// is not a placeholder (JSON braces) stays literal.
+    #[test]
+    fn bare_placeholders_write_the_value_verbatim() {
+        let out = interpolate_frame(r#"{"auth":"{token}"}"#, &values(&[("token", "xo\"xb")])).unwrap();
+        assert_eq!(out, r#"{"auth":"xo"xb"}"#);
+        let err = interpolate_frame("{missing}", &values(&[])).unwrap_err();
+        assert!(err.contains("'missing'"), "{err}");
+    }
+
+    /// `|quoted` writes an IMAP quoted string: `\` and `"` escaped, the
+    /// whole wrapped in quotes, so a password holding them still signs in.
+    #[test]
+    fn quoted_placeholders_escape_backslash_and_quote() {
+        let out = interpolate_frame(
+            "a1 LOGIN {user|quoted} {password|quoted}\r\n",
+            &values(&[("user", "me@example.com"), ("password", r#"p"a\ss"#)]),
+        )
+        .unwrap();
+        assert_eq!(out, "a1 LOGIN \"me@example.com\" \"p\\\"a\\\\ss\"\r\n");
+        assert_eq!(interpolate_frame("{p|quoted}", &values(&[("p", "")])).unwrap(), "\"\"");
+    }
+
+    /// A value holding a line break would end the command and send the
+    /// rest as a command of its own: refused, naming the placeholder and
+    /// never the value.
+    #[test]
+    fn quoted_placeholders_refuse_line_breaks_without_echoing_the_value() {
+        for bad in ["x\r\na2 LOGOUT", "x\ny", "x\ry", "x\0y"] {
+            let err = interpolate_frame("{password|quoted}", &values(&[("password", bad)])).unwrap_err();
+            assert!(err.contains("{password|quoted}"), "{err}");
+            assert!(!err.contains("LOGOUT") && !err.contains("x\n"), "the value is not echoed: {err}");
+        }
+    }
+
+    /// An escape nobody defined is refused at registration and at
+    /// interpolation alike, never sent as a literal.
+    #[test]
+    fn unknown_escapes_are_refused() {
+        let err = interpolate_frame("{password|shell}", &values(&[("password", "x")])).unwrap_err();
+        assert!(err.contains("'shell'"), "{err}");
+        let mut s = base("wss://gw.example");
+        s.handshake = Some(SocketFrame::Text { body: "{token|shell}".into() });
+        assert!(s.validate().unwrap_err().contains("socket_listen.handshake"));
+        s.handshake = Some(SocketFrame::Text { body: "{token|quoted}".into() });
+        s.validate().unwrap();
+    }
     use crate::access::spec::{Capture, ConnectCall, ReplyRule, Template};
 
     fn base(url: &str) -> SocketListen {

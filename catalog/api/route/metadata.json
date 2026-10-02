@@ -1,7 +1,7 @@
 {
   "type": "Route",
   "label": "Route",
-  "description": "Turn this program into an HTTP route. A call to the route's path (and method) starts a fresh execution: the request's method, path, parameters, query and headers come out on the fixed ports, and the body's top-level keys come out on the output ports you declare in the source (`-> (user_id: String, text: String)`), exactly like an LLM call with Parse JSON on. Declare every field you read; there is no port for the whole body (a field that is itself an object is `-> (meta: JsonDict)`). A declared port named like a path capture reads the capture (`-> (id: String)` on `cards/{id}`). A port declared as a file kind (`photo: Image`) takes a picture the body carries as a `data:` URL or base64: it is stored on the way in and the stored-file value flows, never the bytes (a value on a wire is at most 100 KB). The whole request body is capped at 16 MB unless `Largest request body` says otherwise, and a `data:` URL inflates what it carries by about a third, so roughly 12 MB of picture at the default: a caller sending more is answered 413. Answer with a Reply, Stream or Close node downstream, or read the caller through the ctx in a custom node.",
+  "description": "An HTTP endpoint: each call to its path (and method) starts a fresh run carrying the request. The fixed ports carry method, path, captures, query and headers; the body arrives on the ports you declare on the arrow (`-> (user_id: String)`), one per top-level key, with no port for the whole body. A declared port named like a path capture reads the capture; one declared as a file kind (`photo: Image`) takes a `data:` URL or base64 and receives the stored file. Answer with Reply, Stream or Close downstream.",
   "tags": [
     "api",
     "http",
@@ -15,11 +15,8 @@
     {
       "name": "path",
       "type": "String",
-      "widget": {
-        "kind": "text"
-      },
       "label": "Path",
-      "description": "The route under the project's live URL: literal segments and `{name}` captures (`users/{id}`, `chat/{room}/messages`). Required, and never empty: a trigger with no address would answer at the project's own address, where every other one that forgot would answer too. Must not start with '/'. Two routes of one account may share a call when one spells out what the other captures (`cards/count` beside `cards/{id}`); a pair where neither is the more specific is refused at activation."
+      "description": "Path under the project's live URL: literal segments and `{name}` captures (`users/{id}`), or empty for the root address. No leading '/'. Two routes may overlap only when one is strictly more specific (`cards/count` beside `cards/{id}`); otherwise activation refuses the pair."
     },
     {
       "name": "method",
@@ -38,7 +35,7 @@
         ]
       },
       "label": "Method",
-      "description": "The HTTP method this route serves. Empty serves every method; a call with another method on a served path is answered 405 by the gateway."
+      "description": "HTTP method served. Empty serves every method; another method on a served path gets 405."
     },
     {
       "name": "dataType",
@@ -53,7 +50,7 @@
       },
       "default": "json",
       "label": "Body shape",
-      "description": "What the body is. `json`: the body parses as JSON and its top-level keys land on the ports you declare, one port per key you want; there is no port for the whole object, so a caller sending anything but an object (a bare list or string) is refused by name. `text`: the whole body is a String on the one port you declare (a port named like a path capture reads the capture and does not count). `bytes`: the whole body is stored as a file and its stored-file value lands on the one port you declare, captures aside (declare it `File`, or the kind you expect: `Image` for an image upload, which is checked against the file's own bytes and refused if they are something else). Reply and Stream answer in the same shape unless their own `Answer as` says otherwise, so a GET with no body can still answer bytes."
+      "description": "Body shape. `json`: top-level keys land on declared ports; a non-object body is refused. `text`: the whole body is a String on the one declared port. `bytes`: the body is stored and its stored-file value lands on the one declared port (declare `File`, or `Image`, which is checked against the bytes). Capture-named ports never count as that one port. Reply and Stream answer in this shape unless their `answerAs` says otherwise."
     },
     {
       "name": "auth",
@@ -61,13 +58,13 @@
       "accepts": [
         "wire"
       ],
-      "description": "Who may call this route: wire an auth access node (ApiKeyAuth, JwtAuth, HmacAuth). Unwired, the route is open to anyone with the URL. With one wired, the gateway checks the caller before a run starts and the established identity comes out on `caller`."
+      "description": "Auth access node (ApiKeyAuth, JwtAuth, HmacAuth). Unwired, anyone with the URL may call. The established identity comes out on `caller`."
     },
     {
       "name": "outlivesCaller",
       "type": "Boolean",
       "label": "May outlive the caller",
-      "description": "Who owns the run, which decides what a caller leaving means. Off (default): the run is the caller's, so their leaving cancels it, and a node that hits a long durable wait holds the worker briefly and is then killed rather than parked. On: the run is its own, so the caller leaving does not touch it and a long wait parks properly and resumes later, making it a background job. Turn it on to answer early and keep working afterwards. Be deliberate about it: the caller leaving is what ends a tied run, so switching this on removes that ending and the work behind the answer must end by itself. Work that finishes on its own (a call, a query, a script) is fine; anything that watches, subscribes or loops until something changes is not, and then you say what ends it, with `maxSessionSecs` here or a TagRun and StopTagged pair in the graph."
+      "description": "Off (default): the caller leaving cancels the run, and a long durable wait is killed instead of parked. On: the run is its own (answer early, keep working), so whatever runs after the answer must end by itself; anything that watches or loops needs `maxSessionSecs` or a TagRun/StopTagged pair."
     },
     {
       "name": "defaultHoldSecs",
@@ -78,7 +75,7 @@
         "step": 1
       },
       "label": "Hold seconds before giving up on a wait",
-      "description": "For a caller-tied run: how long a node's wait holds the worker (keeping the connection alive) before giving up. Per-wait overrides win over this. Never unbounded."
+      "description": "Caller-tied run only: how long a node's wait holds the worker (and the connection) before giving up. Per-wait overrides win. Never unbounded."
     },
     {
       "name": "maxSessionSecs",
@@ -89,7 +86,7 @@
         "step": 1
       },
       "label": "Give up on one connection after this long",
-      "description": "A hard ceiling on one whole connection, off by default and with no default on purpose: it ends the connection on the clock whatever the caller is doing, so it would cut a healthy live feed short. You rarely want it. A caller who vanishes is already found by `Call the caller gone after this much silence`, whatever the answer is framed as, and that ends the run when the run is the caller's. Reach for this only when it is not: with `May outlive the caller` on, the caller going away no longer ends anything, so a run that would otherwise never finish needs something of its own, and this is the bluntest version of that (stopping older runs by tag is usually the better one)."
+      "description": "Hard ceiling on one connection, no default: it cuts a healthy feed on the clock. Only for an `outlivesCaller` run that has nothing else ending it (TagRun/StopTagged is usually better)."
     },
     {
       "name": "callerSilenceSecs",
@@ -101,7 +98,7 @@
         "step": 1
       },
       "label": "Call the caller gone after this much silence",
-      "description": "How long the caller's machine may leave what the worker sent it unacknowledged before the connection is called dead, in seconds. This is NOT a ceiling on the call: a machine that is still there acknowledges every packet by itself, whatever the person is doing, so a caller who stays resets this constantly and a run that legitimately lasts hours is never touched. It bounds SILENCE, which is the only way to tell a caller who vanished (a closed laptop, a dropped network) from one who is simply quiet. Raise it for a client on a link that genuinely goes silent for longer, like a device that sleeps its radio between messages; lower it to notice a departure sooner. `0` leaves the machine's own default, which is about fifteen minutes."
+      "description": "Seconds the caller's machine may leave sent data unacknowledged before the caller counts as gone. Bounds silence, not call length: a present caller acks automatically, so hours-long feeds are untouched. Raise for clients whose link sleeps. `0` uses the OS default (about fifteen minutes)."
     },
     {
       "name": "maxInboundMb",
@@ -113,27 +110,27 @@
         "step": 1
       },
       "label": "Largest request body, in MB",
-      "description": "The biggest body a caller may send, in whole megabytes; a bigger one is answered 413. 16 by default, which fits a few photos sent as `data:` URLs. Raise it for a route that takes larger uploads, lower it to refuse oversized calls early."
+      "description": "Largest request body in MB; bigger is answered 413. A `data:` URL inflates its bytes by about a third, so the default 16 fits roughly 12 MB of picture."
     },
     {
       "name": "journalEphemeral",
       "type": "Boolean",
       "label": "Keep the exchange out of the journal",
-      "description": "What the journal keeps of what was said. Off (default): the request and the answer are recorded, so the inspector replays the exchange and you can see what a caller actually sent. Anything over 100 KB is recorded trimmed, and raw bytes are never recorded whatever this says, so the journal holds what a person would read rather than a copy of the traffic. On: only the sizes and the count are kept, never the content. Turn it on for a route carrying something you would rather not have written down for every run, remembering that you are also giving up seeing it when you debug."
+      "description": "On: the journal keeps only sizes and counts, never the request or answer content (also hidden from you when debugging). Off (default): both are recorded, trimmed above 100 KB; raw bytes are never recorded."
     },
     {
       "name": "recorded",
       "type": "Boolean",
       "default": true,
       "label": "Record each run",
-      "description": "Whether each call leaves a run in `weft executions`. On (default): every call is a recorded run you can list and inspect. Off: a run that succeeds or is cancelled leaves nothing behind but what it cost, and a run that fails is written down whole after the fact, so you can still inspect it like any other. Turn it off for a route called often for cheap reads, like a page asking for a status every few seconds, which would otherwise pile up hundreds of runs. An unrecorded run keeps its steps in the worker's memory, so it cannot wait (a timer, a form, anything that parks the run fails at the call), cannot outlive its caller, and is lost if the worker dies mid-call."
+      "description": "Off: a successful or cancelled run leaves nothing in `weft executions` but its cost; a failed one is still written down whole. For cheap, frequently polled routes. An unrecorded run cannot wait (timer, form), cannot outlive its caller, and is lost if the worker dies."
     }
   ],
   "outputs": [
     {
       "name": "fired",
       "type": "Boolean",
-      "description": "Always true when the route is called. Wire it to gate work on \"the route was called\" without reading any request part."
+      "description": "Always true on a call; gate work on \"the route was called\"."
     },
     {
       "name": "method",
@@ -143,30 +140,29 @@
     {
       "name": "path",
       "type": "String",
-      "description": "The path as called under the project (no leading slash), for example `users/42`."
+      "description": "Path as called, no leading slash (`users/42`)."
     },
     {
       "name": "params",
       "type": "Dict[String, String]",
-      "description": "The `{name}` captures of the route's path, by name."
+      "description": "The path's `{name}` captures."
     },
     {
       "name": "query",
       "type": "Dict[String, String]",
-      "description": "The query string's parameters, by name."
+      "description": "Query string parameters."
     },
     {
       "name": "headers",
       "type": "Dict[String, String]",
-      "description": "The request headers, by lowercase name."
+      "description": "Request headers, lowercase names."
     },
     {
       "name": "caller",
       "type": "JsonDict | Null",
-      "description": "Who the auth gate established: a JWT's claims, `{\"key\": <index>}` for an API key, `{}` for an HMAC. Null when the route has no `auth`."
+      "description": "What the auth gate established: JWT claims, `{\"key\": <index>}` for an API key, `{}` for HMAC. Null with no `auth`."
     }
   ],
-  "requires_infra": false,
   "claimsRoute": {
     "pathField": "path",
     "methodField": "method"

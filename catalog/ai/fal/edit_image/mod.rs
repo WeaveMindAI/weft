@@ -4,13 +4,13 @@
 //! model-specific extras.
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use weft::node::NodeOutput;
 use weft::storage::{FileHandle, KeepTtl, StorageScope};
 use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
-use super::fal::{media_url, merge_params, run_queued};
+use super::fal::{merge_params, run_queued};
 
 #[derive(NodeManifest)]
 pub struct FalEditImageNode;
@@ -31,7 +31,7 @@ impl Node for FalEditImageNode {
         let prompt: String = ctx.inputs.get("prompt")?;
         let image: FileHandle = ctx.inputs.get("image")?;
         let mask: Option<FileHandle> = ctx.inputs.opt("mask")?;
-        let params = ctx.inputs.raw("params").cloned();
+        let params = ctx.inputs.opt::<Map<String, Value>>("params")?;
 
         // Two families, two spellings of the same argument: the flux
         // kontext line takes `image_url` (one string), OpenAI's edit
@@ -40,19 +40,21 @@ impl Node for FalEditImageNode {
         // the other. A model that refuses the one it does not know is not
         // a dead end: `params: { "image_urls": null }` takes it back off,
         // which is what a null extra means.
-        let image_url = media_url(&ctx, &image).await?;
+        let storage = ctx.storage(StorageScope::Execution);
+        let image_url = storage.external_url(&image).await?;
         let mut payload = json!({
             "prompt": prompt,
             "image_url": image_url.clone(),
             "image_urls": [image_url],
         });
         if let Some(mask) = &mask {
-            payload["mask_url"] = json!(media_url(&ctx, mask).await?);
+            payload["mask_url"] = json!(storage.external_url(mask).await?);
         }
-        merge_params(&mut payload, params.as_ref())?;
+        merge_params(&mut payload, params.as_ref());
 
         let http = ctx.client(&account).await?;
-        let answer = run_queued(&ctx, &http, &model, &payload, "fal: edit the image").await?;
+        let answer =
+            run_queued(&ctx, &account, &http, &model, &payload, "fal: edit the image").await?;
 
         // Edit models answer `images`; a single-image model answers
         // `image`. Take whichever arrived.

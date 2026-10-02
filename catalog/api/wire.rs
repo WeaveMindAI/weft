@@ -335,14 +335,18 @@ pub fn head_for(status: u16, headers: Option<&Value>) -> WeftResult<ResponseHead
 /// the node's default (200) and `headers` absent or empty when nothing
 /// was set; anything else is the program's bug, said loud.
 pub fn refuse_head_on_socket(node: &str, status: u16, headers: Option<&Value>) -> WeftResult<()> {
-    let has_headers = headers.is_some_and(|h| !h.as_object().is_some_and(|m| m.is_empty()));
-    if status != 200 || has_headers {
+    if status != 200 || has_headers(headers) {
         weft::node_bail!(
             "{node} behind a Socket sends messages; a status ({status}) or headers have no \
              meaning on a socket. Drop them, or put the {node} behind a Route"
         );
     }
     Ok(())
+}
+
+/// Whether a program set headers: present and not an empty object.
+pub fn has_headers(headers: Option<&Value>) -> bool {
+    headers.is_some_and(|h| !h.as_object().is_some_and(|m| m.is_empty()))
 }
 
 /// A one-word description of a value's shape, for error messages.

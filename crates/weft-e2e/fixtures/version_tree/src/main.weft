@@ -23,7 +23,7 @@ stamp = Debug
 stamp.data = tick.scheduledTime
 
 # A trigger whose own input comes off a wire, the shape a bridge feeds
-# (`ask = BaileyReceive { endpointUrl: bridge.endpointUrl }`). Bake captures
+# (`ask = BaileyReceive { bridge: whatsapp.bridge }`). Bake captures
 # these inputs without listening. Activation also arms the schedule.
 # Emit supplies outputs without running the trigger body.
 sched = Text { value: "0 0 * * * *" }

@@ -74,7 +74,7 @@ pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>, caller_t
             let cache_docker = docker.clone();
             Ok(Parts {
                 runner,
-                images: Arc::new(weft_platform_local::DockerImageBuilder::new(docker)),
+                images: Arc::new(weft_platform_local::DockerImageBuilder::new(docker, config.install.clone())),
                 host,
                 alarm,
                 identity: identity.clone(),

@@ -1,7 +1,7 @@
 {
   "type": "AirtableCreateRecord",
   "label": "Airtable: Create Record",
-  "description": "Add a record to a table. Fields are keyed by column name; turn on typecast to let Airtable coerce strings into selects, dates, and links.",
+  "description": "Add a record to an Airtable table, fields keyed by column name; `typecast` lets Airtable coerce strings into selects, dates and links.",
   "tags": [
     "airtable",
     "record",
@@ -90,9 +90,6 @@
       "name": "typecast",
       "type": "Boolean",
       "default": true,
-      "widget": {
-        "kind": "checkbox"
-      },
       "label": "Typecast values",
       "description": "Let Airtable coerce strings into selects, dates, collaborators, and links."
     }

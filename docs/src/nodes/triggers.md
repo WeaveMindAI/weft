@@ -6,8 +6,9 @@ A trigger starts runs from outside. It has two bodies instead of one.
 #[async_trait]
 impl Node for CronNode {
     async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let spec: String = ctx.inputs.get("schedule")?;
-        ctx.register_signal(Timer::cron(spec)).await
+        let expression: String = ctx.inputs.get("cron")?;
+        let timezone: String = ctx.inputs.get("timezone")?;
+        ctx.register_signal(Timer { spec: TimerSpec::Cron { expression, timezone } }).await
     }
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
@@ -92,8 +93,17 @@ before it fails.
 | `SocketListen` | A socket weft dials out to and holds |
 | `StreamListen` | A TCP or TLS stream |
 | `SseSubscribe` | A server-sent-event stream weft subscribes to |
-| `PollEndpoint` | An address weft checks on a timer |
+| `PollEndpoint` | An address weft checks on a timer. If your node started an outside job and waits on its status address with `await_signal`, the first check runs at once, and the first answer that passes the filters (`status` matching `COMPLETED\|FAILED`, say) is what `await_signal` returns |
 | `ProviderEvents` | A service's own events, by topic, through its recipe |
+
+If your node registers a `SocketListen` or `StreamListen` with a connection,
+the text frames it sends (and a stream's address) can name the connection's
+stored values as `{name}`, and the value goes in as it is. When the value is
+something a person typed into a line protocol, like a password in an IMAP
+`LOGIN`, write `{name|quoted}` instead: weft wraps it in `"` and escapes `\`
+and `"`, so `a1 LOGIN {user|quoted} {password|quoted}` signs in whatever the
+password holds. A value with a line break in it cannot be quoted and is
+refused rather than sent as a second command.
 
 `ProviderEvents` is the one to reach for when the service has a recipe, because
 it takes care of both roads: a provider that pushes to you, and one you have to
@@ -111,10 +121,10 @@ per-iteration one is not a thing.
 ## Testing one
 
 ```rust
-rig.run_setup_trigger(&CronNode, json!({ "schedule": "0 9 * * *" })).await.ok()?;
+rig.run_setup_trigger(&CronNode, json!({ "cron": "0 0 9 * * *" })).await.ok()?;
 assert_eq!(rig.registered_signals().len(), 1);
 
-let outcome = rig.wake(json!({ "firedAt": 1700000000 }))
+let outcome = rig.wake(json!({ "scheduledTime": "2026-01-05T09:00:00Z", "actualTime": "2026-01-05T09:00:01Z" }))
     .run(&CronNode, json!({})).await.ok()?;
 ```
 

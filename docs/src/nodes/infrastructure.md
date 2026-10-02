@@ -164,6 +164,68 @@ publishes (`ctx.publish_access`) from an instance's copy is recorded as that
 instance's. For what an instance is, go and read
 [programs with instances](../running/instances.md).
 
+## Letting other nodes reach it
+
+If other nodes need to talk to your service (say, a WhatsApp bridge that
+every send node goes through), pass them a handle instead of `url()`. The
+address changes every time your service is set up again. The handle names
+your node, as it is named in the program, and its endpoint, so it still
+finds the service after that.
+
+Declare an output typed `Infra` and set it to the endpoint's handle:
+
+```json
+{ "name": "bridge", "type": "Infra" }
+```
+
+```rust
+let api = ctx.endpoint("api").await?;
+ctx.pulse_downstream(NodeOutput::new().set("bridge", api.infra_handle())).await
+```
+
+A node that uses it declares an input typed `Infra` and resolves it:
+
+```rust
+let bridge: InfraHandle = ctx.inputs.get("bridge")?;
+let bridge = ctx.endpoint_of(&bridge).await?;
+let sent = bridge.action("sendMessage", json!({ "to": to, "text": text })).await?;
+```
+
+`ctx.endpoint_of` gives back the same handle `ctx.endpoint` does, so `url()`
+and `call(..)` work on it as well. `action(name, payload)` posts
+`{"action": name, "payload": payload}` to the service's `/action` and gives
+you the `result` of its answer. Your service answers `{"result": ...}`. If
+`result` carries an `error`, the node fails with that message, the same as
+on a non-2xx. If `result` is missing, the node fails too. The buttons
+of [a live panel](#a-live-panel) post to the same `/action`, so one handler in
+your container serves both.
+
+An `Infra` input only takes a handle from an `Infra` output. The compiler
+refuses a `String` wired into it, and it refuses a value typed into it by
+hand. A handle only works inside its own project. It only reaches
+infrastructure the program still declares. For a node marked `@per_instance`,
+it reaches the copy that belongs to the run's instance.
+
+## A long job in your container
+
+If your service runs something long (a render, a training run), have it answer
+`POST /jobs` with an id at once and a status route like `GET /jobs/<id>`, then
+wait on that route the way a node waits on a provider's job: start it inside
+`ctx.run` and park with `PollEndpoint` on `format!("{}/jobs/{id}", api.url())`.
+For the whole pattern, go and read
+[waiting on a job a service runs](durable-execution.md#waiting-on-a-job-a-service-runs).
+
+`api.url()` is the address your workers reach, and the checks are made by the
+listener, which on a local install sits on the machine rather than in Docker's
+network. Before every check it asks for the same endpoint's address as weft's
+own roles reach it, looked up in this project's infra only, so the address you
+pass works as it is.
+
+If somebody stops the run while it waits, none of your code runs: the run ends
+cancelled and the checks stop, but the job in your container carries on. If it
+should stop too, have the container give up on a job whose status nobody has
+asked for in a few intervals; terminating the infra stops it as well.
+
 ## A live panel
 
 If your container serves `/live`, name that endpoint and the editor shows the
@@ -241,8 +303,10 @@ assert_eq!(rig.endpoint_calls().len(), 2, "asked twice: refused, then answered")
 | `declare_public_url(name, url)` | Makes a declared endpoint public: `ctx.endpoint(name)?.public_url()` answers `url` |
 | `answer_endpoint(endpoint, method, path, answer)` | The next call to `path` on that endpoint answers `answer` (JSON) |
 | `refuse_endpoint(endpoint, method, path, status, body)` | The next call to `path` on that endpoint is refused with `status` and `body`, the way a service that is still starting refuses one |
-| `endpoint_calls()` | Every call the node made to its endpoints, in order: `endpoint`, `method`, `path`, `body` |
-| `stop_after_calls(n)` | Presses stop, as `weft stop` would, once the node has made `n` calls (endpoint calls and web requests, counted together). The call that reaches `n` still gets its answer; `0` stops the run before it starts. This is how you test a node that polls a long job and must end cancelled when a person stops it |
+| `declare_infra(place, endpoint, url)` | Use this when your node reads an `Infra` input. It pretends the infrastructure node `place` shares `endpoint` at `url`, and returns the handle to set on that input |
+| `answer_infra(place, endpoint, method, path, answer)` | Queues the answer to the next call to `path` on that shared endpoint, one per call, the same way `answer_endpoint` does |
+| `endpoint_calls()` | Every call the node made to an endpoint, its own or a shared one, in order: `place`, `endpoint`, `method`, `path`, `body` |
+| `stop_after_calls(n)` | Presses stop, as `weft stop` would, once the node has made `n` calls (endpoint calls and web requests, counted together). The call that reaches `n` still gets its answer; `0` stops the run before it starts. This is how you test a node that loops on calls and must end cancelled when a person stops it |
 
 `method` is `EndpointMethod::Get` or `EndpointMethod::Post`.
 

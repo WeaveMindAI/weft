@@ -1,7 +1,7 @@
 {
   "type": "ElevenLabsTranscribe",
   "label": "ElevenLabs Transcribe (Realtime)",
-  "description": "Realtime speech-to-text over a live audio stream (Scribe v2 realtime). Wire an audio Bus in (16-bit PCM chunks), and the transcript flows out on a text Bus as it is spoken, with the full transcript emitted at the end. The credential decision comes from a wired ElevenLabsAccess node. A failure after the stream has opened fails the run, so a reader never mistakes a cut-off stream for a finished one.",
+  "description": "Realtime speech-to-text over a live audio bus (Scribe v2 realtime): 16-bit PCM in, each committed segment out on a text bus as it is spoken, the full transcript at the end. A failure after the stream has opened fails the run, so a cut-off stream is never mistaken for a finished one.",
   "tags": [
     "ai",
     "audio",
@@ -23,7 +23,7 @@
       "name": "account",
       "type": "Access", "accepts": ["wire"],
       "required": true,
-      "description": "The ElevenLabs access (wire an ElevenLabsAccess node's output): whose key the session spends."
+      "description": "The ElevenLabs access (wire an ElevenLabsAccess node)."
     },
     {
       "name": "language",
@@ -44,6 +44,5 @@
       "type": "String",
       "description": "The full transcript, once the audio stream has ended."
     }
-  ],
-  "requires_infra": false
+  ]
 }

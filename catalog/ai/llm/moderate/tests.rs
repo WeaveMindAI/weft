@@ -1,5 +1,5 @@
-//! LlmModerate self-tests: the moderation call, the model swap, and
-//! the flagged-category extraction.
+//! LlmModerate self-tests: the moderation call, a chat-model provider
+//! lending only its connection, and the flagged-category extraction.
 
 use serde_json::json;
 
@@ -10,7 +10,7 @@ use super::LlmModerateNode;
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("flags_and_extracts_the_flagged_categories", flags),
-        NodeTest::fake("a_chat_model_swaps_to_the_moderation_default", model_swap),
+        NodeTest::fake("a_chat_model_provider_lends_only_its_connection", chat_model_provider),
         NodeTest::fake("a_non_openai_provider_is_refused", wrong_kind),
         NodeTest::fake("a_result_without_a_verdict_never_passes_as_safe", missing_verdict),
         NodeTest::live("one_real_moderation_verdict", "openai", live_moderation),
@@ -65,21 +65,26 @@ async fn flags(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-async fn model_swap(rig: FakeRig) -> WeftResult<()> {
+async fn chat_model_provider(rig: FakeRig) -> WeftResult<()> {
     rig.respond(
         "POST",
         "/v1/moderations",
         json!({ "results": [{ "flagged": false, "categories": {}, "category_scores": {} }]}),
     );
-    rig.run(&LlmModerateNode, json!({ "provider": provider(&rig, "gpt-4o-mini"), "text": "hi" }))
-        .await
-        .ok()?;
-    let body = rig.requests()[0].body.clone().expect("call body");
-    assert_eq!(
-        body["model"],
-        json!("omni-moderation-latest"),
-        "a chat model on the provider swaps to the moderation default"
-    );
+    rig.run(
+        &LlmModerateNode,
+        json!({
+            "provider": provider(&rig, "gpt-4o-mini"),
+            "model": "text-moderation-latest",
+            "text": "hi",
+        }),
+    )
+    .await
+    .ok()?;
+    let requests = rig.requests();
+    assert_eq!(requests.len(), 1);
+    let body = requests[0].body.clone().expect("json payload");
+    assert_eq!(body["model"], json!("text-moderation-latest"));
     Ok(())
 }
 

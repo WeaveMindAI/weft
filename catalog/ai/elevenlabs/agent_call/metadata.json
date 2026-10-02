@@ -96,5 +96,32 @@
   ],
   "features": {
     "catchErrors": true
-  }
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_present",
+            "field": "toNumber"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_matches",
+              "field": "toNumber",
+              "regex": "^\\+[1-9][0-9]{1,14}$"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ElevenLabsAgentCall '{id}' has a `toNumber` that is not in E.164 form. Write it as + then the country code and number, with no spaces (+15551234567).",
+        "level": "structural",
+        "severity": "error",
+        "port": "toNumber"
+      }
+    }
+  ]
 }

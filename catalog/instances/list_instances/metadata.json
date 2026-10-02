@@ -1,7 +1,7 @@
 {
   "type": "ListInstances",
   "label": "List instances",
-  "description": "List every instance weft holds anything for in this project: saved values, connections, infra copies, instance tokens, trigger activations. One entry per instance with what it has (counts and states, never a value or a secret), including fires of its triggers that wait because a field is not filled yet, with the reason. For an admin overview, or a website that shows what is still missing.",
+  "description": "List every instance this project holds anything for (values, connections, infra copies, tokens, trigger activations), as counts and states (never a value or secret), including trigger fires waiting on an unfilled field. For an admin overview or a page showing what is still missing.",
   "tags": [
     "instances",
     "status"
@@ -23,8 +23,7 @@
     {
       "name": "waiting",
       "type": "List[String]",
-      "description": "The instances with fires waiting on a value not given yet."
+      "description": "Instances with fires waiting on a value not given yet."
     }
-  ],
-  "requires_infra": false
+  ]
 }

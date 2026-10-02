@@ -1,7 +1,7 @@
 {
   "type": "ElevenLabsSpeakFile",
   "label": "Speak to File",
-  "description": "Turn text into one spoken audio file with an ElevenLabs voice. The batch route: whole text in, whole file out. For a live token-stream voice, use the streaming speak node instead.",
+  "description": "Turn text into one spoken audio file with an ElevenLabs voice: whole text in, whole file out. For live streaming speech use the streaming speak node.",
   "tags": [
     "ai",
     "audio",

@@ -39,8 +39,7 @@ pub enum StopSelf {
     Include,
 }
 
-/// The most characters a tag may have. A node that turns arbitrary
-/// text into a tag (`catalog/logic/steering.rs`) cuts to this.
+/// The most characters a tag may have.
 pub const MAX_LEN: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +94,38 @@ pub fn validate_tags(tags: &[String]) -> Result<(), TagError> {
     Ok(())
 }
 
+/// Hex characters of the fingerprint [`normalize_tag`] appends to a
+/// value it had to change: sixty-four bits of the value's sha256, so two
+/// values that only differ in the replaced characters do not meet on one
+/// tag, while the readable part keeps most of the room.
+const FINGERPRINT_LEN: usize = 16;
+
+/// Any string as a valid tag, the one rule every execution-tag call
+/// (`ctx.tag_execution`, `ctx.stop_tagged`, a runs query's tag filter)
+/// applies to what it is handed. A value that already is a tag is kept
+/// as it is, so a chat id stays readable and the same clean value is
+/// the same tag. Anything else is rewritten: every other character
+/// becomes `_`, the readable part is cut to leave room, and a short
+/// fingerprint of the ORIGINAL value is appended
+/// (`49151@s.whatsapp.net` becomes `49151_s_whatsapp_net-3f7a92c14b0e6d18`),
+/// so two different values never share a tag however alike they look
+/// once cleaned. An empty value fails: there is nothing to tag with.
+pub fn normalize_tag(value: &str) -> Result<String, TagError> {
+    if value.is_empty() {
+        return Err(TagError::Empty);
+    }
+    if validate_tag(value).is_ok() {
+        return Ok(value.to_string());
+    }
+    let readable: String = value
+        .chars()
+        .map(|c| if is_allowed_char(c) { c } else { '_' })
+        .take(MAX_LEN - FINGERPRINT_LEN - 1)
+        .collect();
+    let digest = crate::project::hash::sha256_hex(value.as_bytes());
+    Ok(format!("{readable}-{}", &digest[..FINGERPRINT_LEN]))
+}
+
 fn is_allowed_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-'
 }
@@ -121,5 +152,27 @@ mod tests {
         assert!(validate_tag("co'mma").is_err());
         assert!(validate_tag("dot.tag").is_err());
         assert!(validate_tag("café").is_err());
+    }
+
+    /// A valid tag is kept; anything else is cleaned, fingerprinted by
+    /// the original value (so two values that clean alike stay apart),
+    /// cut to fit, and stable when normalized again. Empty fails.
+    #[test]
+    fn normalize_tag_keeps_valid_tags_and_fingerprints_the_rest() {
+        assert_eq!(normalize_tag("user_7").unwrap(), "user_7");
+        let max = "x".repeat(MAX_LEN);
+        assert_eq!(normalize_tag(&max).unwrap(), max);
+        let tag = normalize_tag("49151@s.whatsapp.net").unwrap();
+        assert!(tag.starts_with("49151_s_whatsapp_net-"), "{tag}");
+        assert_eq!(tag.len(), "49151_s_whatsapp_net-".len() + FINGERPRINT_LEN);
+        assert!(validate_tag(&tag).is_ok());
+        assert_eq!(normalize_tag("49151@s.whatsapp.net").unwrap(), tag, "deterministic");
+        assert_ne!(normalize_tag("+33 6 12").unwrap(), normalize_tag("+33.6.12").unwrap());
+        let long = "y".repeat(MAX_LEN + 1);
+        let cut = normalize_tag(&long).unwrap();
+        assert_eq!(cut.len(), MAX_LEN);
+        assert_ne!(cut, normalize_tag(&format!("{long}y")).unwrap());
+        assert_eq!(normalize_tag(&cut).unwrap(), cut, "normalizing twice changes nothing");
+        assert_eq!(normalize_tag(""), Err(TagError::Empty));
     }
 }

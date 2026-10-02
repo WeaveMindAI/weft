@@ -1,5 +1,5 @@
-//! Shared Gmail plumbing: the API base, base64url codecs, RFC 2822
-//! message assembly (with attachments), and message-part walking.
+//! Shared Gmail plumbing: the API base, base64url codecs, message
+//! assembly (lettre, with attachments), and message-part walking.
 //! Every gmail node speaks through these so the two directions
 //! (build-and-send, fetch-and-decompose) stay exact inverses.
 
@@ -23,8 +23,10 @@ pub fn b64url_decode(data: &str) -> WeftResult<Vec<u8>> {
         .map_err(|e| weft::node_error(format!("gmail: a body part is not base64url: {e}")))
 }
 
-/// A one-or-many recipient/label input, read and blank-filtered: an
-/// unfilled text input arrives as "" and means "none given".
+/// A one-or-many label input, read and blank-filtered: an unfilled
+/// text input arrives as "" and means "none given". Never split on
+/// commas, since a Gmail label name may contain one (recipients go
+/// through `weft::comma_list` instead).
 pub fn non_blank_list(inputs: &weft::ValueBag, name: &str) -> WeftResult<Vec<String>> {
     Ok(inputs
         .list::<String>(name)?
@@ -40,131 +42,99 @@ pub struct OutAttachment {
     pub bytes: Vec<u8>,
 }
 
-/// Assemble the RFC 2822 message. Text and/or html become the body
-/// (both = multipart/alternative); attachments wrap everything in
-/// multipart/mixed. Header VALUES are sanitized against CRLF
-/// injection (a subject with a newline must not smuggle headers).
-pub fn build_mime(
-    to: &[String],
-    cc: &[String],
-    bcc: &[String],
-    subject: &str,
-    reply_headers: &[(String, String)],
-    text: Option<&str>,
-    html: Option<&str>,
-    attachments: &[OutAttachment],
-) -> WeftResult<Vec<u8>> {
-    fn header_value(v: &str) -> String {
-        v.replace(['\r', '\n'], " ")
-    }
-    if text.is_none() && html.is_none() {
-        return Err(weft::WeftError::Input(
-            "nothing to send: provide text, html, or both".to_string(),
-        ));
-    }
-    let mut head = String::new();
-    if !to.is_empty() {
-        head.push_str(&format!("To: {}\r\n", header_value(&to.join(", "))));
-    }
-    if !cc.is_empty() {
-        head.push_str(&format!("Cc: {}\r\n", header_value(&cc.join(", "))));
-    }
-    if !bcc.is_empty() {
-        head.push_str(&format!("Bcc: {}\r\n", header_value(&bcc.join(", "))));
-    }
-    head.push_str(&format!("Subject: {}\r\n", header_value(subject)));
-    for (name, value) in reply_headers {
-        head.push_str(&format!("{}: {}\r\n", header_value(name), header_value(value)));
-    }
-    head.push_str("MIME-Version: 1.0\r\n");
+/// What one outgoing message carries, before assembly.
+pub struct OutMessage<'a> {
+    /// The account's own address: Gmail sends as the signed-in
+    /// account, and an RFC 5322 message must name its sender.
+    pub from: &'a str,
+    pub to: &'a [String],
+    pub cc: &'a [String],
+    pub bcc: &'a [String],
+    pub subject: &'a str,
+    /// The replied-to message's Message-ID, stamped as In-Reply-To
+    /// and References so mail clients thread the reply.
+    pub in_reply_to: Option<&'a str>,
+    pub text: Option<&'a str>,
+    pub html: Option<&'a str>,
+    pub attachments: &'a [OutAttachment],
+}
 
-    // The body block: one part, or multipart/alternative for both.
-    // Boundaries are minted per message and collision-scanned against
-    // the exact content they will delimit: a body that happens to
-    // contain the boundary marker would otherwise truncate the MIME
-    // structure at that point (the recipient sees a mangled mail and
-    // everything after the marker vanishes).
-    let body_block = match (text, html) {
-        (Some(t), None) => part("text/plain; charset=\"UTF-8\"", t),
-        (None, Some(h)) => part("text/html; charset=\"UTF-8\"", h),
+/// Assemble the RFC 5322 message through lettre's builder, which
+/// encodes non-ASCII headers and filenames (RFC 2047 / 2231), picks
+/// each body's transfer encoding, mints collision-free multipart
+/// boundaries, and refuses CRLF in header values. Text and/or html
+/// become the body (both = multipart/alternative); attachments wrap
+/// everything in multipart/mixed. Bcc is KEPT in the raw message:
+/// Gmail reads it to deliver, then strips it from what recipients see.
+pub fn build_mime(m: &OutMessage<'_>) -> WeftResult<Vec<u8>> {
+    use lettre::message::header::ContentType;
+    use lettre::message::{Attachment, Mailbox, MultiPart, SinglePart};
+
+    fn mailbox(addr: &str, what: &str) -> WeftResult<Mailbox> {
+        addr.parse().map_err(|e| {
+            weft::WeftError::Input(format!("{what} ('{addr}') is not a valid email address: {e}"))
+        })
+    }
+
+    let mut builder = lettre::Message::builder()
+        .from(mailbox(m.from, "the account's own address")?)
+        .subject(m.subject)
+        .keep_bcc();
+    for addr in m.to {
+        builder = builder.to(mailbox(addr, "a To address")?);
+    }
+    for addr in m.cc {
+        builder = builder.cc(mailbox(addr, "a Cc address")?);
+    }
+    for addr in m.bcc {
+        builder = builder.bcc(mailbox(addr, "a Bcc address")?);
+    }
+    if let Some(id) = m.in_reply_to {
+        builder = builder.in_reply_to(id.to_string()).references(id.to_string());
+    }
+
+    // The body: one part, or a plain/html alternative pair.
+    enum Body {
+        One(SinglePart),
+        Alternative(MultiPart),
+    }
+    let body = match (m.text, m.html) {
+        (Some(t), None) => Body::One(SinglePart::plain(t.to_string())),
+        (None, Some(h)) => Body::One(SinglePart::html(h.to_string())),
         (Some(t), Some(h)) => {
-            let boundary = mint_boundary("weft-alt", &[t.as_bytes(), h.as_bytes()]);
-            let mut b = format!(
-                "Content-Type: multipart/alternative; boundary=\"{boundary}\"\r\n\r\n"
-            );
-            for (ct, body) in [
-                ("text/plain; charset=\"UTF-8\"", t),
-                ("text/html; charset=\"UTF-8\"", h),
-            ] {
-                b.push_str(&format!("--{boundary}\r\n"));
-                b.push_str(&part(ct, body));
-            }
-            b.push_str(&format!("--{boundary}--\r\n"));
-            b
+            Body::Alternative(MultiPart::alternative_plain_html(t.to_string(), h.to_string()))
         }
-        (None, None) => unreachable!("checked above"),
+        (None, None) => {
+            return Err(weft::WeftError::Input(
+                "nothing to send: provide text, html, or both".to_string(),
+            ))
+        }
     };
-
-    let message = if attachments.is_empty() {
-        format!("{head}{body_block}")
+    let message = if m.attachments.is_empty() {
+        match body {
+            Body::One(part) => builder.singlepart(part),
+            Body::Alternative(parts) => builder.multipart(parts),
+        }
     } else {
-        // Scan the assembled body block plus every attachment header
-        // string; the base64 payload cannot collide (its alphabet has
-        // no `-`), so it stays out of the haystack.
-        let mut hay: Vec<&[u8]> = vec![body_block.as_bytes()];
-        for a in attachments {
-            hay.push(a.filename.as_bytes());
-            hay.push(a.mime_type.as_bytes());
+        let mut mixed = match body {
+            Body::One(part) => MultiPart::mixed().singlepart(part),
+            Body::Alternative(parts) => MultiPart::mixed().multipart(parts),
+        };
+        for a in m.attachments {
+            let content_type = ContentType::parse(&a.mime_type).map_err(|e| {
+                weft::WeftError::Input(format!(
+                    "attachment '{}' has an unusable content type '{}': {e}",
+                    a.filename, a.mime_type
+                ))
+            })?;
+            mixed = mixed.singlepart(
+                Attachment::new(a.filename.clone()).body(a.bytes.clone(), content_type),
+            );
         }
-        let boundary = mint_boundary("weft-mixed", &hay);
-        let mut m = format!(
-            "{head}Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n\
-             --{boundary}\r\n{body_block}"
-        );
-        for a in attachments {
-            m.push_str(&format!("--{boundary}\r\n"));
-            let name = header_value(&a.filename).replace('"', "'");
-            m.push_str(&format!(
-                "Content-Type: {}; name=\"{name}\"\r\n\
-                 Content-Disposition: attachment; filename=\"{name}\"\r\n\
-                 Content-Transfer-Encoding: base64\r\n\r\n",
-                header_value(&a.mime_type),
-            ));
-            // 76-char lines per RFC 2045.
-            let encoded = base64::engine::general_purpose::STANDARD.encode(&a.bytes);
-            for chunk in encoded.as_bytes().chunks(76) {
-                m.push_str(std::str::from_utf8(chunk).expect("base64 is ascii"));
-                m.push_str("\r\n");
-            }
-        }
-        m.push_str(&format!("--{boundary}--\r\n"));
-        m
-    };
-    Ok(message.into_bytes())
-}
-
-/// A fresh multipart boundary whose bare `--<boundary>` marker appears
-/// in none of `hay`. A v4 uuid collides only by deliberate
-/// construction, and the scan makes even that exact rather than
-/// probabilistic (a hit re-mints).
-fn mint_boundary(prefix: &str, hay: &[&[u8]]) -> String {
-    loop {
-        let boundary = format!("{prefix}-{}", uuid::Uuid::new_v4().simple());
-        let marker = format!("--{boundary}");
-        let clash = hay
-            .iter()
-            .any(|h| h.windows(marker.len()).any(|w| w == marker.as_bytes()));
-        if !clash {
-            return boundary;
-        }
+        builder.multipart(mixed)
     }
-}
-
-/// One simple MIME part (headers + a plain text body). Attachments
-/// base64 their bytes inline at their own call site; they never come
-/// through here.
-fn part(content_type: &str, body: &str) -> String {
-    format!("Content-Type: {content_type}\r\n\r\n{body}\r\n")
+    .map_err(|e| weft::WeftError::Input(format!("building the email: {e}")))?;
+    Ok(message.formatted())
 }
 
 /// A named header out of a message's payload (case-insensitive).
@@ -193,10 +163,9 @@ pub fn walk_parts<'a>(payload: &'a Value, visit: &mut dyn FnMut(&'a Value)) {
     }
 }
 
-/// The message's best-effort text body: the first text/plain leaf,
-/// else the first text/html leaf (returned as-is; the caller knows
-/// which it got from the `html` flag).
-pub fn body_of(payload: &Value) -> WeftResult<(String, bool)> {
+/// The message's best-effort text body leaf: the first text/plain
+/// leaf, else the first text/html leaf, with whether it is html.
+pub fn body_leaf(payload: &Value) -> Option<(&Value, bool)> {
     let mut plain: Option<&Value> = None;
     let mut html: Option<&Value> = None;
     walk_parts(payload, &mut |leaf| {
@@ -208,14 +177,51 @@ pub fn body_of(payload: &Value) -> WeftResult<(String, bool)> {
             html = Some(leaf);
         }
     });
-    let (leaf, is_html) = match (plain, html) {
-        (Some(p), _) => (p, false),
-        (None, Some(h)) => (h, true),
-        (None, None) => return Ok((String::new(), false)),
-    };
-    let data = leaf.pointer("/body/data").and_then(Value::as_str).unwrap_or_default();
-    let bytes = b64url_decode(data)?;
-    Ok((String::from_utf8_lossy(&bytes).into_owned(), is_html))
+    match (plain, html) {
+        (Some(p), _) => Some((p, false)),
+        (None, Some(h)) => Some((h, true)),
+        (None, None) => None,
+    }
+}
+
+/// One leaf part's bytes. A small part carries them inline as
+/// `body.data`; a large one (a big body or an attachment) carries an
+/// `attachmentId` instead, fetched through the attachments endpoint.
+/// `None` when the part has neither: Gmail sends that only for an
+/// empty part.
+async fn part_bytes(
+    http: &weft::reqwest_middleware::ClientWithMiddleware,
+    message_id: &str,
+    leaf: &Value,
+    what: &str,
+) -> WeftResult<Option<Vec<u8>>> {
+    use weft::access::client::get_json;
+    match (
+        leaf.pointer("/body/data").and_then(Value::as_str),
+        leaf.pointer("/body/attachmentId").and_then(Value::as_str),
+    ) {
+        (Some(data), _) => Ok(Some(b64url_decode(data)?)),
+        (None, Some(att_id)) => {
+            let att: Value = get_json(
+                http,
+                &format!(
+                    "{API}/messages/{}/attachments/{}",
+                    super::api::segment(message_id),
+                    super::api::segment(att_id)
+                ),
+                &format!("gmail: read {what}"),
+            )
+            .await?;
+            let Some(data) = att["data"].as_str() else {
+                weft::node_bail!(
+                    "gmail: {what} of message {message_id} came back with no data \
+                     (attachment {att_id})"
+                )
+            };
+            Ok(Some(b64url_decode(data)?))
+        }
+        (None, None) => Ok(None),
+    }
 }
 
 /// A fetched message, decomposed for node outputs.
@@ -260,12 +266,19 @@ pub async fn read_message(
     use weft::access::client::get_json;
     let msg: Value = get_json(
         http,
-        &format!("{API}/messages/{id}?format=full"),
+        &format!("{API}/messages/{}?format=full", super::api::segment(id)),
         "gmail: read the message",
     )
     .await?;
     let payload = &msg["payload"];
-    let (body, body_is_html) = body_of(payload)?;
+    let (body, body_is_html) = match body_leaf(payload) {
+        Some((leaf, is_html)) => {
+            // No bytes at all is Gmail's shape for an empty part.
+            let bytes = part_bytes(http, id, leaf, "the message body").await?.unwrap_or_default();
+            (String::from_utf8_lossy(&bytes).into_owned(), is_html)
+        }
+        None => (String::new(), false),
+    };
 
     let mut files = Vec::new();
     if include_attachments {
@@ -280,21 +293,9 @@ pub async fn read_message(
                 continue;
             }
             let mime = leaf["mimeType"].as_str().unwrap_or("application/octet-stream");
-            let bytes = match (
-                leaf.pointer("/body/data").and_then(Value::as_str),
-                leaf.pointer("/body/attachmentId").and_then(Value::as_str),
-            ) {
-                (Some(data), _) => b64url_decode(data)?,
-                (None, Some(att_id)) => {
-                    let att: Value = get_json(
-                        http,
-                        &format!("{API}/messages/{id}/attachments/{att_id}"),
-                        "gmail: read an attachment",
-                    )
-                    .await?;
-                    b64url_decode(att["data"].as_str().unwrap_or_default())?
-                }
-                (None, None) => continue,
+            let Some(bytes) = part_bytes(http, id, &leaf, &format!("attachment '{filename}'")).await?
+            else {
+                continue;
             };
             // Attachments are content the workflow acts on and the
             // editor previews after the run: keep them past the run
@@ -317,51 +318,94 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn message<'a>(
+        to: &'a [String],
+        subject: &'a str,
+        text: Option<&'a str>,
+        html: Option<&'a str>,
+        attachments: &'a [OutAttachment],
+    ) -> OutMessage<'a> {
+        OutMessage {
+            from: "me@x.com",
+            to,
+            cc: &[],
+            bcc: &[],
+            subject,
+            in_reply_to: None,
+            text,
+            html,
+            attachments,
+        }
+    }
+
     #[test]
-    fn mime_round_trips_the_essentials() {
-        let msg = build_mime(
-            &["a@x.com".into()],
-            &[],
-            &[],
-            "Hi\r\nX-Evil: injected",
-            &[("In-Reply-To".into(), "<m1@x>".into())],
-            Some("hello"),
-            None,
-            &[],
-        )
-        .unwrap();
-        let text = String::from_utf8(msg).unwrap();
+    fn mime_carries_the_essentials() {
+        let to = ["a@x.com".to_string()];
+        let mut m = message(&to, "Hi", Some("hello"), None, &[]);
+        m.in_reply_to = Some("<m1@x>");
+        let text = String::from_utf8(build_mime(&m).unwrap()).unwrap();
+        assert!(text.contains("From: me@x.com\r\n"), "{text}");
         assert!(text.contains("To: a@x.com\r\n"), "{text}");
-        assert!(text.contains("Subject: Hi  X-Evil: injected\r\n"), "header injection folded");
-        assert!(text.contains("In-Reply-To: <m1@x>\r\n"));
-        assert!(text.ends_with("hello\r\n"));
+        assert!(text.contains("Subject: Hi\r\n"), "{text}");
+        assert!(text.contains("In-Reply-To: <m1@x>\r\n"), "{text}");
+        assert!(text.contains("References: <m1@x>\r\n"), "{text}");
+        assert!(text.contains("hello"), "{text}");
+    }
+
+    /// A non-ASCII subject is RFC 2047 encoded, so no raw UTF-8 lands
+    /// in the header block.
+    #[test]
+    fn a_non_ascii_subject_is_encoded() {
+        let to = ["a@x.com".to_string()];
+        let m = message(&to, "Café déjà vu", Some("hello"), None, &[]);
+        let text = String::from_utf8(build_mime(&m).unwrap()).unwrap();
+        let subject = text.lines().find(|l| l.starts_with("Subject: ")).expect("subject");
+        assert!(subject.is_ascii(), "{subject}");
+        assert!(subject.contains("=?utf-8?"), "{subject}");
+    }
+
+    /// Bcc stays in the raw message: Gmail delivers from it.
+    #[test]
+    fn bcc_is_kept_for_gmail_to_deliver() {
+        let to = ["a@x.com".to_string()];
+        let bcc = ["hidden@x.com".to_string()];
+        let mut m = message(&to, "s", Some("t"), None, &[]);
+        m.bcc = &bcc;
+        let text = String::from_utf8(build_mime(&m).unwrap()).unwrap();
+        assert!(text.contains("Bcc: hidden@x.com\r\n"), "{text}");
+    }
+
+    #[test]
+    fn an_invalid_address_is_refused() {
+        let to = ["not an address".to_string()];
+        let err = build_mime(&message(&to, "s", Some("t"), None, &[])).unwrap_err().to_string();
+        assert!(err.contains("not an address"), "{err}");
+    }
+
+    #[test]
+    fn nothing_to_send_is_refused() {
+        let to = ["a@x.com".to_string()];
+        let err = build_mime(&message(&to, "s", None, None, &[])).unwrap_err().to_string();
+        assert!(err.contains("nothing to send"), "{err}");
     }
 
     #[test]
     fn attachments_wrap_in_multipart_mixed() {
-        let msg = build_mime(
-            &["a@x.com".into()],
-            &[],
-            &[],
-            "s",
-            &[],
-            Some("body"),
-            None,
-            &[OutAttachment {
-                filename: "a.txt".into(),
-                mime_type: "text/plain".into(),
-                bytes: b"data".to_vec(),
-            }],
-        )
-        .unwrap();
-        let text = String::from_utf8(msg).unwrap();
-        assert!(text.contains("multipart/mixed"));
-        assert!(text.contains("filename=\"a.txt\""));
-        assert!(text.contains(&base64::engine::general_purpose::STANDARD.encode("data")));
+        let to = ["a@x.com".to_string()];
+        let attachments = [OutAttachment {
+            filename: "a.txt".into(),
+            mime_type: "text/plain".into(),
+            bytes: b"data".to_vec(),
+        }];
+        let m = message(&to, "s", Some("body"), Some("<b>body</b>"), &attachments);
+        let text = String::from_utf8(build_mime(&m).unwrap()).unwrap();
+        assert!(text.contains("multipart/mixed"), "{text}");
+        assert!(text.contains("multipart/alternative"), "{text}");
+        assert!(text.contains("a.txt"), "{text}");
     }
 
     #[test]
-    fn body_extraction_prefers_plain_and_decodes() {
+    fn body_extraction_prefers_plain() {
         let payload = json!({
             "mimeType": "multipart/alternative",
             "parts": [
@@ -371,43 +415,9 @@ mod tests {
                   "body": { "data": b64url(b"hi") } }
             ]
         });
-        let (text, is_html) = body_of(&payload).unwrap();
-        assert_eq!(text, "hi");
+        let (leaf, is_html) = body_leaf(&payload).expect("a body leaf");
         assert!(!is_html);
-    }
-
-    /// A body that contains a plausible boundary literal never breaks
-    /// the MIME structure: the minted boundary is scanned against the
-    /// content and re-minted on a hit, so the assembled message's
-    /// boundary appears only where the structure puts it.
-    #[test]
-    fn boundaries_never_collide_with_the_content() {
-        let b = mint_boundary("weft-alt", &[b"innocent"]);
-        assert!(b.starts_with("weft-alt-"));
-
-        let msg = build_mime(
-            &["a@x.com".into()],
-            &[],
-            &[],
-            "s",
-            &[],
-            Some("text with --weft-mixed-8d1e4b and --weft-alt-3f9c2a inside"),
-            Some("<b>html</b>"),
-            &[OutAttachment {
-                filename: "a.txt".into(),
-                mime_type: "text/plain".into(),
-                bytes: b"data".to_vec(),
-            }],
-        )
-        .unwrap();
-        let text = String::from_utf8(msg).unwrap();
-        let boundary = text
-            .split("multipart/mixed; boundary=\"")
-            .nth(1)
-            .and_then(|r| r.split('"').next())
-            .expect("mixed boundary");
-        // The marker appears exactly where the structure uses it: two
-        // part openers + one terminator, never inside the body text.
-        assert_eq!(text.matches(&format!("--{boundary}")).count(), 3, "{text}");
+        let data = leaf.pointer("/body/data").and_then(Value::as_str).unwrap();
+        assert_eq!(b64url_decode(data).unwrap(), b"hi");
     }
 }

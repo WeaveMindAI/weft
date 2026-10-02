@@ -62,6 +62,13 @@ How a request gets signed, applied in order:
 Every value is a template interpolating stored values by name, like
 `"Bearer {token}"`.
 
+A `header` step's `name` can be a template too, for a connection where the
+person types which header their key goes in (a generic API key):
+`{ "kind": "header", "name": "{header}", "value": "{key}" }`. It may only name
+a declared field that is not `secret`, and if what the person typed is not a
+legal header name, the call is refused before anything is sent, telling them
+to reconnect.
+
 ## Permissions
 
 ```json

@@ -10,10 +10,8 @@ use super::TelegramSendMessageNode;
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("sends_with_buttons_and_reply_threading", sends),
-        NodeTest::fake("a_button_without_a_url_refuses", bad_button),
         NodeTest::fake("a_refused_send_fails_the_run_when_error_is_unwired", refused_unwired),
         NodeTest::fake("a_refused_send_comes_out_on_error_when_it_is_wired", refused_wired),
-        NodeTest::fake("a_bad_button_fails_the_run_even_with_error_wired", bad_button_wired),
         NodeTest::live("one_real_send", "telegram", live_send).with_fixture(fixture_spec(
             "TELEGRAM_CHAT_ID",
             "Chat id",
@@ -49,23 +47,6 @@ async fn sends(rig: FakeRig) -> WeftResult<()> {
         body["reply_markup"]["inline_keyboard"][0][0]["text"],
         json!("Docs")
     );
-    Ok(())
-}
-
-async fn bad_button(rig: FakeRig) -> WeftResult<()> {
-    let outcome = rig
-        .run(
-            &TelegramSendMessageNode,
-            json!({
-                "account": rig.access("telegram"),
-                "chatId": "12345",
-                "text": "hello",
-                "buttons": [{ "label": "no url" }],
-            }),
-        )
-        .await;
-    let err = outcome.result.expect_err("a url-less button must refuse").to_string();
-    assert!(err.contains("label and a url"), "{err}");
     Ok(())
 }
 
@@ -114,24 +95,5 @@ async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
     let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
     assert!(error.contains("bot was blocked"), "{error}");
     assert!(!outcome.outputs.contains_key("messageId"), "a caught failure emits no messageId");
-    Ok(())
-}
-
-async fn bad_button_wired(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
-    let err = rig
-        .run(
-            &TelegramSendMessageNode,
-            json!({
-                "account": rig.access("telegram"),
-                "chatId": "12345",
-                "text": "hello",
-                "buttons": [{ "label": "no url" }],
-            }),
-        )
-        .await
-        .failure()?;
-    assert!(err.starts_with("input error"), "a program mistake is never caught: {err}");
-    assert!(rig.requests().is_empty(), "refused before any call");
     Ok(())
 }

@@ -9,7 +9,7 @@
 use serde_json::{json, Value};
 
 use weft::access::client::get_json;
-use weft::WeftResult;
+use weft::{NodeErrExt, WeftResult};
 
 pub const API: &str = "https://api.notion.com/v1";
 
@@ -35,7 +35,11 @@ pub async fn data_source_id(
         db["data_sources"].as_array().into_iter().flatten().collect();
     match sources.as_slice() {
         [] => weft::node_bail!("notion database {database} has no data source"),
-        [one] => Ok(one["id"].as_str().unwrap_or_default().to_string()),
+        [one] => Ok(one["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .node_err("notion: the database's only data source carries no id")?
+            .to_string()),
         several => {
             let names: Vec<&str> =
                 several.iter().filter_map(|s| s["name"].as_str()).collect();
@@ -67,7 +71,8 @@ pub fn paragraph_blocks(content: &str) -> Vec<Value> {
 
 /// The children a writing node sends: the raw `blocks` list when one
 /// was wired (full Notion block objects, power path), else `content`
-/// as paragraphs. Nothing to write is a loud error, not an empty call.
+/// as paragraphs. Empty when neither holds anything: a new page may
+/// have no body, and a node for which that is a mistake says so itself.
 pub fn children_of(content: Option<&str>, blocks: Option<&Value>) -> WeftResult<Vec<Value>> {
     if let Some(blocks) = blocks {
         let Some(list) = blocks.as_array() else {
@@ -79,11 +84,5 @@ pub fn children_of(content: Option<&str>, blocks: Option<&Value>) -> WeftResult<
             return Ok(list.clone());
         }
     }
-    let paragraphs = content.map(paragraph_blocks).unwrap_or_default();
-    if paragraphs.is_empty() {
-        return Err(weft::WeftError::Input(
-            "nothing to write: set content (plain text) or blocks".to_string(),
-        ));
-    }
-    Ok(paragraphs)
+    Ok(content.map(paragraph_blocks).unwrap_or_default())
 }

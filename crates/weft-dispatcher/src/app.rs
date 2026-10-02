@@ -296,7 +296,22 @@ pub fn spawn_relays(state: &DispatcherState) {
     spawn_supervised("unrecorded_endings", async move {
         crate::journal_bridge::run_unrecorded_endings(endings).await;
     });
+    // Builds and removals ask for a reclaim of the images nothing uses,
+    // but one a container still ran from, or one a process died before
+    // reclaiming, would wait for the next build. So the reclaim also runs
+    // at every start and on a timer.
+    let images = state.clone();
+    spawn_supervised("image_reclaim", async move {
+        loop {
+            images.builder.prunes.request(&images, None);
+            tokio::time::sleep(IMAGE_RECLAIM_EVERY).await;
+        }
+    });
 }
+
+/// How often the dispatcher reclaims the images nothing uses
+/// (`crate::build::prune::AfterBuildPrunes`) without a build asking.
+const IMAGE_RECLAIM_EVERY: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
 
 /// Spawn a background task under supervision: one that is only ever
 /// meant to run for the process's whole life, so the wrapped future NEVER

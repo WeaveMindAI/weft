@@ -39,9 +39,6 @@
       "name": "loop",
       "type": "Boolean",
       "default": false,
-      "widget": {
-        "kind": "checkbox"
-      },
       "label": "Seamless loop",
       "description": "Generate audio that loops cleanly."
     },

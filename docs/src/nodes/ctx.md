@@ -96,6 +96,7 @@ you like until you close it.
 |---|---|
 | `NodeOutput::new()` | An empty one |
 | `.set("port", value)` | Sets one port |
+| `.set_serialized("port", &value)?` | Sets one port to any `Serialize` value (a struct, a list of them). Fails naming the port when the value has no JSON form |
 | `.extend_from_object(&value)` | Fans every top-level key onto a same-named port. Last write wins |
 | `NodeOutput::stored_file(stored)` | The four ports a stored file travels as: `file`, `filename`, `mimeType`, `sizeBytes` |
 | `.get("port")` | Reads back what you already set |
@@ -207,8 +208,8 @@ Read a stream input like any other value: `ctx.inputs.get::<Generator<Row>>("row
 | Call | What it does | It fails when |
 |---|---|---|
 | `log(level, message).await` | Writes a line into the run's log. `Trace`, `Debug`, `Info`, `Warn`, `Error` | The write fails |
-| `tag_execution(["user_7"]).await` | Tags this run. Additive and safe to repeat | The list is empty, or a tag is not `[A-Za-z0-9_-]`, 1 to 64 characters |
-| `stop_tagged("user_7", StopSelf::Keep).await` | Queues a stop for every live run of this project carrying that tag | The tag is invalid |
+| `tag_execution(["user_7"]).await` | Tags this run. Additive and safe to repeat. Any string works: one that is not already a tag is turned into one (see below) | The list is empty, or a tag is empty |
+| `stop_tagged("user_7", StopSelf::Keep).await` | Queues a stop for every live run of this project carrying that tag, turned into a tag the same way | The tag is empty |
 | `is_cancelled()` | Whether this run was cancelled. Cheap enough to poll | never |
 | `cancellation()` | The flag itself, to `select!` against your own work | never |
 

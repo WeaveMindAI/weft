@@ -4,6 +4,7 @@
 
 use async_trait::async_trait;
 
+use weft::infra::InfraHandle;
 use weft::node::NodeOutput;
 use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
 
@@ -21,17 +22,14 @@ impl Node for BaileyDeleteMessageNode {
     }
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let endpoint_url: String = ctx.inputs.get("endpointUrl")?;
+        let bridge: InfraHandle = ctx.inputs.get("bridge")?;
         let chat_id: String = ctx.inputs.get("chatId")?;
         let message_id: String = ctx.inputs.get("messageId")?;
 
-        super::bridge_api::action(
-            &ctx,
-            &endpoint_url,
-            "deleteMessage",
-            serde_json::json!({ "chatId": chat_id, "messageId": message_id }),
-        )
-        .await?;
+        ctx.endpoint_of(&bridge)
+            .await?
+            .action("deleteMessage", serde_json::json!({ "chatId": chat_id, "messageId": message_id }))
+            .await?;
         ctx.pulse_downstream(NodeOutput::new().set("done", true)).await
     }
 }

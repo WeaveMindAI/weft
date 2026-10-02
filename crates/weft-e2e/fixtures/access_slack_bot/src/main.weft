@@ -4,7 +4,7 @@
 # trusted and Slack's own error is the runtime backstop).
 
 ws = SlackAccess
-send = SlackSendMessage { text: "weft e2e: access proof" }
+send = SlackSendMessage { channel: "C000", text: "weft e2e: access proof" }
 send.account = ws.access
 
 out = Debug

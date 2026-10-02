@@ -18,7 +18,7 @@ export interface Span {
 // The input vocabulary (ports, their drivers, the control an input draws)
 // lives in the connect library, whose instance page draws a program's inputs
 // too; the graph protocol names it from there.
-export type { AcceptedForm, Accepts, PortDefinition, InputDefinition, Widget } from '../../weft-connect/src/core/wire';
+export type { AcceptedForm, Accepts, CodeLanguage, PortDefinition, InputDefinition, Widget } from '../../weft-connect/src/core/wire';
 import type { Accepts, PortDefinition, InputDefinition, Widget } from '../../weft-connect/src/core/wire';
 
 /// Source span of one config field plus how it was written. `origin` tells
@@ -103,6 +103,11 @@ export type WeftType =
   // to Access; the grant itself is opaque to the type system.
   // SYNC: access <-> crates/weft-core/src/weft_type.rs WeftType::Access
   | { kind: 'access' }
+  // A handle on one endpoint of an infra node, the value an infra node
+  // emits so other nodes reach it. Infra connects only to Infra. Wires
+  // only (minted by an infra node, never typed as a literal).
+  // SYNC: infra <-> crates/weft-core/src/weft_type.rs WeftType::Infra
+  | { kind: 'infra' }
   // A typed, one-directional, terminating stream: `Generator[T]`. The
   // port accepts being emitted into repeatedly (each emission one item
   // of T); exactly one producer feeds exactly one consumer. Wires only.
@@ -240,7 +245,7 @@ function parseSingleType(s: string): WeftType | null {
     if (!/^[A-Z][A-Za-z0-9_]*$/.test(name)) return null;
     if (
       (ALL_PRIMITIVE_TYPES as string[]).includes(name)
-      || ['List', 'Dict', 'JsonDict', 'Bus', 'Access', 'Generator', 'MustOverride'].includes(name)
+      || ['List', 'Dict', 'JsonDict', 'Bus', 'Access', 'Infra', 'Generator', 'MustOverride'].includes(name)
       || NAMED_UNIONS.has(name)
       || isTypeVarName(name)
     ) return null;
@@ -275,6 +280,7 @@ function parseSingleType(s: string): WeftType | null {
   if (s === 'JsonDict') return { kind: 'json_dict' };
   if (s === 'Bus') return { kind: 'bus' };
   if (s === 'Access') return { kind: 'access' };
+  if (s === 'Infra') return { kind: 'infra' };
   if (s === 'MustOverride') return { kind: 'must_override' };
 
   // Parameterized: List[...], Dict[...]
@@ -387,7 +393,7 @@ export function weftTypesEqual(a: WeftType, b: WeftType): boolean {
     case 'typevar':
       return b.kind === 'typevar' && a.name === (b as Extract<WeftType, { kind: 'typevar' }>).name;
     default:
-      // json_dict / bus / access / must_override carry no payload.
+      // json_dict / bus / access / infra / must_override carry no payload.
       return true;
   }
 }
@@ -735,6 +741,10 @@ export { credentialOwnerKind } from '../../weft-connect/src/core/wire';
 /** The on-wire sentinel key tagging an Access value. */
 // SYNC: ACCESS_MARKER_KEY <-> crates/weft-core/src/access/value.rs ACCESS_MARKER_KEY
 export const ACCESS_MARKER_KEY = '__weft_access__';
+
+/** The on-wire sentinel key tagging an Infra handle value. */
+// SYNC: INFRA_MARKER_KEY <-> crates/weft-core/src/infra/handle.rs INFRA_MARKER_KEY
+export const INFRA_MARKER_KEY = '__weft_infra__';
 
 /** Render hint for one form field. Opaque to the host; the
  *  consumer (browser extension, dashboard) reads `component` to

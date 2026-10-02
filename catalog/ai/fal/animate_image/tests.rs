@@ -41,11 +41,7 @@ async fn animates(rig: FakeRig) -> WeftResult<()> {
     let model = "fal-ai/kling-video/v2.1/standard/image-to-video";
     rig.respond("POST", &format!("/{model}"), json!({ "request_id": "req-5" }));
     // The request routes address the app (`owner/name`), variant dropped.
-    rig.respond(
-        "GET",
-        "/fal-ai/kling-video/requests/req-5/status",
-        json!({ "status": "COMPLETED" }),
-    );
+    rig.signal(json!({ "status": "COMPLETED" }));
     rig.respond(
         "GET",
         "/fal-ai/kling-video/requests/req-5",

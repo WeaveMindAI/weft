@@ -293,7 +293,8 @@ scripts/run-db-tests.sh weft-broker        # just one
 ```
 
 It starts a throwaway Postgres in Docker, runs the four crates whose tests need
-one, and takes the container away afterwards. Point it at a server of your own
+one, and takes the container away afterwards. If an earlier run was killed
+before it could clean up, the next run removes that run's container too. Point it at a server of your own
 by setting `DATABASE_URL`, which is what CI does. Not the one your weft runs
 on, though: these tests create and drop databases on whatever server they are
 given.

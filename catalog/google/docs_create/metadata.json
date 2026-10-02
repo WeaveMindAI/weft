@@ -1,7 +1,7 @@
 {
   "type": "GoogleDocsCreate",
   "label": "Google Docs: Create",
-  "description": "Create a Google Doc with a title and optional initial text. The report sink: an LLM writes, the doc lands in Drive.",
+  "description": "Creates a Google Doc with a title and optional initial text, for example to land an LLM-written report in Drive.",
   "tags": [
     "google",
     "docs",
@@ -16,8 +16,7 @@
       "required": true,
       "requiresScopes": [
         "https://www.googleapis.com/auth/documents"
-      ],
-      "description": "A Google account with the documents permission."
+      ]
     },
     {
       "name": "title",

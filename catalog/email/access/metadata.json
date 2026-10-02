@@ -1,7 +1,7 @@
 {
   "type": "EmailAccess",
   "label": "Email Access",
-  "description": "Sign in to a mailbox with its address and password. Mail uses two separate protocols, one per direction: IMAP reads what arrives, SMTP sends. Fill the half you need (both, to receive and send through one connection). Works with every provider that serves them, which is essentially all of them: Gmail (imap.gmail.com / smtp.gmail.com, with an app password), Outlook, Fastmail, iCloud, a company server, a self-hosted box.",
+  "description": "Connects a mailbox by address and password over IMAP (receive) and SMTP (send), for any provider; fill the server half you need, or both. Gmail and Outlook need an app password (Gmail: imap.gmail.com / smtp.gmail.com).",
   "tags": [
     "email",
     "imap",
@@ -96,7 +96,7 @@
     {
       "name": "access",
       "type": "Access",
-      "description": "The mailbox's access: wire it into the email trigger and action nodes."
+      "description": "Wire into the email trigger and SendEmail."
     }
   ]
 }

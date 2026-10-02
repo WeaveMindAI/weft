@@ -1286,6 +1286,9 @@ pub struct RunnerHandle {
     /// Whether this node exists once per instance: its infra is then the
     /// run instance's own copy, never the shared one.
     per_instance: Option<weft_core::instance::PerInstance>,
+    /// Which copies of its infra the run's program declares: an `Infra`
+    /// handle another node shared resolves only to one of these.
+    declared_infra: Arc<weft_core::project::DeclaredInfra>,
     /// The node declares `features.catchErrors`, so its `error` output
     /// is the runtime's to fill (`ContextHandle::catches_errors`).
     catch_errors: bool,
@@ -1473,6 +1476,7 @@ impl RunnerHandle {
             execution_id,
             run_kind: weft_core::exec::RunKind::Execution,
             per_instance: None,
+            declared_infra: Arc::new(weft_core::project::DeclaredInfra::default()),
             catch_errors: false,
             place,
             node_id,
@@ -1610,6 +1614,14 @@ impl RunnerHandle {
     /// reads it off the run's own execution row.
     pub fn with_per_instance(mut self, per_instance: Option<weft_core::instance::PerInstance>) -> Self {
         self.per_instance = per_instance;
+        self
+    }
+
+    /// Which copies of its infra the run's program declares, computed
+    /// once per run. Without it the handle resolves only the node's own
+    /// infra, never one another node shared.
+    pub fn with_declared_infra(mut self, declared_infra: Arc<weft_core::project::DeclaredInfra>) -> Self {
+        self.declared_infra = declared_infra;
         self
     }
 
@@ -2408,24 +2420,59 @@ impl ContextHandle for RunnerHandle {
         self.clients.storage.public_link(self.execution_id, key, ttl_secs, reach).await
     }
 
-    async fn endpoint_address(&self, name: &str) -> WeftResult<weft_core::infra::EndpointAddress> {
-        // By place (see `name`): the placement provisioned for THIS call
-        // of the file, never another call's.
+    fn own_infra(
+        &self,
+        name: &str,
+        instance: Option<&weft_core::instance::InstanceId>,
+    ) -> WeftResult<weft_core::infra::InfraHandle> {
+        // By place (see `place`): the placement provisioned for THIS call
+        // of the file, never another call's. A node that exists once per
+        // instance reaches the run instance's copy, so a run for no
+        // instance has no copy to reach.
+        let instance = match (self.per_instance, instance) {
+            (None, _) => None,
+            (Some(_), Some(instance)) => Some(instance.clone()),
+            (Some(_), None) => {
+                return Err(WeftError::Config(format!(
+                    "'{}' exists once per instance, but this run is for no instance; \
+                     start it from an instance's door",
+                    self.place
+                )))
+            }
+        };
+        Ok(weft_core::infra::InfraHandle::new(self.place.clone(), name, instance))
+    }
+
+    async fn endpoint_address(
+        &self,
+        infra: &weft_core::infra::InfraHandle,
+    ) -> WeftResult<weft_core::infra::EndpointAddress> {
+        // A handle names a copy the program must still declare: a removed
+        // node's infra may still be running, and a handle minted before a
+        // node changed sides (shared vs per instance) names a copy it no
+        // longer has. Reaching either would act on something the program
+        // no longer has, so the node's own place is checked too.
+        if !self.declared_infra.declares(infra.place(), infra.instance().is_some()) {
+            return Err(WeftError::Config(format!(
+                "{infra} is not infra this program declares{}; wire the input to an infra \
+                 node's handle output in this program",
+                if infra.instance().is_some() { " once per instance" } else { " with one shared copy" },
+            )));
+        }
         let endpoint = self
             .clients
             .infra
-            .endpoint_address(self.execution_id, &self.place, self.per_instance.is_some(), name)
+            .endpoint_address(self.execution_id, infra)
             .await
             .map_err(|e| WeftError::Config(format!("infra_node lookup: {e}")))?;
         let address = endpoint.ok_or_else(|| {
             WeftError::Config(format!(
-                "endpoint '{}' for node '{}' is not available; either the infra isn't running \
-                 or the endpoint name is not declared. Check `weft infra status` and the node's \
-                 InfraSpec.endpoints list.",
-                name, self.place
+                "{infra} is not available; either the infra isn't running or the endpoint \
+                 name is not declared. Check `weft infra status` and the node's \
+                 InfraSpec.endpoints list."
             ))
         })?;
-        self.wait_until_routable_logging(&address.url, &format!("endpoint '{name}'")).await?;
+        self.wait_until_routable_logging(&address.url, &infra.to_string()).await?;
         Ok(address)
     }
 
@@ -2467,7 +2514,7 @@ impl ContextHandle for RunnerHandle {
             // timeout, a TLS failure: those are ANSWERS, and they
             // surface immediately.
             Err(e) if e.is_connect() => {
-                self.wait_until_routable_logging(base, "this node's own service").await?;
+                self.wait_until_routable_logging(base, "the endpoint's service").await?;
                 req.send().await.map_err(|e| {
                     WeftError::Runtime(anyhow::anyhow!("endpoint_call {url}: {e}"))
                 })?
@@ -3948,9 +3995,7 @@ mod replay_tests {
         async fn endpoint_address(
             &self,
             _execution_id: weft_core::ExecutionId,
-            _node_id: &str,
-            _per_instance: bool,
-            _endpoint_name: &str,
+            _infra: &weft_core::infra::InfraHandle,
         ) -> anyhow::Result<Option<weft_core::infra::EndpointAddress>> {
             Ok(None)
         }
@@ -4220,6 +4265,39 @@ mod replay_tests {
             matches!(err, WeftError::Suspended { ref token } if token == "tok-pending"),
             "tied-run await must suspend at the call, not fail; got: {err:?}"
         );
+    }
+
+    /// A program where `node-x` has infra once per instance.
+    fn declared_per_instance_node_x() -> Arc<weft_core::project::DeclaredInfra> {
+        let project: weft_core::ProjectDefinition = serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::nil(),
+            "nodes": [{
+                "id": "node-x", "nodeType": "TestNode", "label": null,
+                "config": null, "position": { "x": 0.0, "y": 0.0 },
+                "inputs": [], "outputs": [], "scope": [], "groupBoundary": null,
+                "requiresInfra": true, "perInstance": "marked", "images": []
+            }],
+            "edges": [],
+            "groups": []
+        }))
+        .expect("project");
+        Arc::new(weft_core::project::DeclaredInfra::of(&project))
+    }
+
+    /// A handle naming the node's OWN place on the side the program no
+    /// longer has (minted before the node turned per instance) is refused
+    /// before any lookup, like a handle another node shared.
+    #[tokio::test]
+    async fn endpoint_address_refuses_own_place_on_a_side_the_program_does_not_declare() {
+        let handle = handle_with_sequence(Vec::new()).with_declared_infra(declared_per_instance_node_x());
+        let shared = weft_core::infra::InfraHandle::new("node-x", "api", None);
+        let err = handle.endpoint_address(&shared).await.expect_err("the shared copy is gone").to_string();
+        assert!(err.contains("is not infra this program declares with one shared copy"), "{err}");
+
+        let alice = weft_core::instance::InstanceId::new("alice").unwrap();
+        let mine = weft_core::infra::InfraHandle::new("node-x", "api", Some(alice));
+        let err = handle.endpoint_address(&mine).await.expect_err("no row behind the fake").to_string();
+        assert!(err.contains("is not available"), "a declared copy reaches the lookup: {err}");
     }
 }
 

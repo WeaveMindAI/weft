@@ -54,6 +54,12 @@
     }
   ],
   "features": {
-    "catchErrors": true
+    "catchErrors": true,
+    "oneOfRequired": [
+      [
+        "content",
+        "blocks"
+      ]
+    ]
   }
 }

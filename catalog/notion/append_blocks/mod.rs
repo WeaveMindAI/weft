@@ -30,6 +30,13 @@ impl Node for NotionAppendBlocksNode {
         let blocks = ctx.inputs.raw("blocks").cloned();
 
         let children = children_of(content.as_deref(), blocks.as_ref())?;
+        // Appending nothing is a mistake in the program, never a value
+        // for `error`.
+        if children.is_empty() {
+            return Err(weft::WeftError::Input(
+                "nothing to write: set content (plain text) or blocks".to_string(),
+            ));
+        }
         let count = children.len() as f64;
         let http = ctx.client(&account).await?;
         json_call(

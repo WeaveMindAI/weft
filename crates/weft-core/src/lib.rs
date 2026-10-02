@@ -15,6 +15,7 @@ pub mod activation;
 pub mod builds;
 #[cfg(feature = "runtime")]
 pub mod caller_token;
+pub mod comma_list;
 #[cfg(feature = "runtime")]
 pub mod cancellation;
 #[cfg(feature = "runtime")]
@@ -175,10 +176,11 @@ pub use context::{
 };
 pub use access::spec::{AccessSpec, AppRegistration};
 pub use access::{Access, CredentialOwner};
+pub use comma_list::comma_list;
 pub use error::{node_error, NodeErrExt, WeftError, WeftResult};
 pub use infra::{
     Container, ContainerPort, Endpoint, EndpointTarget, EnvEntry, Expose, Gpu, Image,
-    InfraProvisionContext, InfraSpec, Limits, MachineShape, Mount, Probe, ProbeKind, Protocol,
+    InfraHandle, InfraProvisionContext, InfraSpec, Limits, MachineShape, Mount, Probe, ProbeKind, Protocol,
     ProvisionContextError, StopBehavior, Unit, UnitHealth, Volume, VolumeKind,
 };
 pub use frames::{Frame, LoopFrames};

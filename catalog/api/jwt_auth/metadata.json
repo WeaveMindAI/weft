@@ -1,7 +1,7 @@
 {
   "type": "JwtAuth",
   "label": "JWT Auth",
-  "description": "Gate a Route or Socket with signed identity tokens from an issuer that publishes its keys (a frontend's BetterAuth, Clerk, Auth0, Firebase, or any OIDC provider). Store the issuer and its JWKS address on the connection; a caller presents `Authorization: Bearer <jwt>`, the gateway verifies the signature, issuer and expiry (and the audience, when you set one) before a run starts, and the trigger's `caller` port carries the token's claims (`sub`, `email`, whatever the issuer put there). Wire the access output into the trigger's `auth` input.",
+  "description": "Gate a Route or Socket with signed identity tokens from an issuer that publishes a JWKS (BetterAuth, Clerk, Auth0, Firebase, any OIDC provider). The connection holds the issuer and JWKS address; a caller sends `Authorization: Bearer <jwt>`, signature, issuer, expiry (and audience, when set) are checked, and `caller` carries the token's claims.",
   "tags": [
     "api",
     "auth",
@@ -59,8 +59,7 @@
     {
       "name": "access",
       "type": "Access",
-      "description": "The issuer: wire it into a Route or Socket's `auth` input."
+      "description": "Wire into a Route or Socket's `auth`."
     }
-  ],
-  "requires_infra": false
+  ]
 }

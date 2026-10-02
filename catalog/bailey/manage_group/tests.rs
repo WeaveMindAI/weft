@@ -4,7 +4,7 @@
 
 use serde_json::json;
 
-use weft::{FakeRig, NodeTest, WeftResult};
+use weft::{EndpointMethod, FakeRig, NodeTest, WeftResult};
 
 use super::{bridge_call, BaileyManageGroupNode};
 
@@ -21,13 +21,14 @@ pub fn tests() -> Vec<NodeTest> {
 }
 
 async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
-    rig.respond("POST", "/action", json!({ "result": { "error": "WhatsApp not connected" } }));
+    let bridge = rig.declare_infra("bridge", "api", "http://bridge.example:8090");
+    rig.answer_infra("bridge", "api", EndpointMethod::Post, "/action", json!({ "result": { "error": "WhatsApp not connected" } }));
     rig.wire_output("error");
     let outcome = rig
         .run(
             &BaileyManageGroupNode,
             json!({
-                "endpointUrl": "http://b:1",
+                "bridge": bridge,
                 "action": "add",
                 "groupId": "123@g.us",
                 "participants": ["49@s.whatsapp.net"],
@@ -42,16 +43,17 @@ async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn mistake_wired(rig: FakeRig) -> WeftResult<()> {
+    let bridge = rig.declare_infra("bridge", "api", "http://bridge.example:8090");
     rig.wire_output("error");
     let err = rig
         .run(
             &BaileyManageGroupNode,
-            json!({ "endpointUrl": "http://b:1", "action": "add", "participants": ["49@s.whatsapp.net"] }),
+            json!({ "bridge": bridge, "action": "add", "participants": ["49@s.whatsapp.net"] }),
         )
         .await
         .failure()?;
     assert!(err.starts_with("input error") && err.contains("needs groupId"), "{err}");
-    assert!(rig.requests().is_empty(), "a program mistake refuses before anything is sent");
+    assert!(rig.endpoint_calls().is_empty(), "a program mistake refuses before anything is sent");
     Ok(())
 }
 
@@ -93,12 +95,13 @@ fn requirements() -> WeftResult<()> {
 }
 
 async fn creates(rig: FakeRig) -> WeftResult<()> {
-    rig.respond("POST", "/action", json!({ "result": { "groupId": "123@g.us" } }));
+    let bridge = rig.declare_infra("bridge", "api", "http://bridge.example:8090");
+    rig.answer_infra("bridge", "api", EndpointMethod::Post, "/action", json!({ "result": { "groupId": "123@g.us" } }));
     let outcome = rig
         .run(
             &BaileyManageGroupNode,
             json!({
-                "endpointUrl": "http://bridge.example:8090",
+                "bridge": bridge,
                 "action": "create",
                 "name": "Team",
                 "participants": ["49151@s.whatsapp.net"],
@@ -107,19 +110,20 @@ async fn creates(rig: FakeRig) -> WeftResult<()> {
         .await
         .ok()?;
     assert_eq!(outcome.outputs["groupId"], json!("123@g.us"));
-    let body = rig.requests()[0].body.clone().expect("action body");
+    let body = rig.endpoint_calls()[0].body.clone().expect("action body");
     assert_eq!(body["action"], json!("createGroup"));
     assert_eq!(body["payload"]["name"], json!("Team"));
     Ok(())
 }
 
 async fn edits(rig: FakeRig) -> WeftResult<()> {
-    rig.respond("POST", "/action", json!({ "result": { "success": true } }));
+    let bridge = rig.declare_infra("bridge", "api", "http://bridge.example:8090");
+    rig.answer_infra("bridge", "api", EndpointMethod::Post, "/action", json!({ "result": { "success": true } }));
     let outcome = rig
         .run(
             &BaileyManageGroupNode,
             json!({
-                "endpointUrl": "http://bridge.example:8090",
+                "bridge": bridge,
                 "action": "rename",
                 "groupId": "123@g.us",
                 "name": "New Name",
@@ -128,23 +132,20 @@ async fn edits(rig: FakeRig) -> WeftResult<()> {
         .await
         .ok()?;
     assert_eq!(outcome.outputs["groupId"], json!("123@g.us"));
-    let body = rig.requests()[0].body.clone().expect("action body");
+    let body = rig.endpoint_calls()[0].body.clone().expect("action body");
     assert_eq!(body["action"], json!("groupUpdateSubject"));
     assert_eq!(body["payload"]["subject"], json!("New Name"));
     Ok(())
 }
 
 async fn soft_error(rig: FakeRig) -> WeftResult<()> {
-    rig.respond(
-        "POST",
-        "/action",
-        json!({ "result": { "error": "WhatsApp not connected" } }),
-    );
+    let bridge = rig.declare_infra("bridge", "api", "http://bridge.example:8090");
+    rig.answer_infra("bridge", "api", EndpointMethod::Post, "/action", json!({ "result": { "error": "WhatsApp not connected" } }));
     let outcome = rig
         .run(
             &BaileyManageGroupNode,
             json!({
-                "endpointUrl": "http://b:1",
+                "bridge": bridge,
                 "action": "add",
                 "groupId": "123@g.us",
                 "participants": ["49@s.whatsapp.net"],

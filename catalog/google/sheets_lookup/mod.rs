@@ -26,12 +26,12 @@ impl Node for GoogleSheetsLookupNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let id: String = ctx.inputs.get("spreadsheet")?;
-        let gid: String = ctx.inputs.get("tab")?;
+        let gid: Option<String> = ctx.inputs.opt("tab")?;
         let column: String = ctx.inputs.get("column")?;
         let value: String = ctx.inputs.get("value")?;
 
         let http = ctx.client(&account).await?;
-        let title = tab_title(&http, &id, &gid).await?;
+        let title = tab_title(&http, &id, gid.as_deref()).await?;
         let mut cells = read_cells(&http, &id, &title).await?.into_iter();
         let Some(headers) = cells.next() else {
             weft::node_bail!("the tab is empty; a lookup needs a header row");

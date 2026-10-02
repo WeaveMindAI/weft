@@ -1,6 +1,5 @@
-//! TextToFile: store a string as a file and emit its reference. The
-//! way text too big for a wire (100 KB) moves between nodes, and the way
-//! a node that takes a file gets one made of text.
+//! TextToFile: store a string as a file and emit its reference: how a
+//! node that takes a file gets one made of text.
 
 use async_trait::async_trait;
 

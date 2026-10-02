@@ -1,7 +1,7 @@
 {
   "type": "All",
   "label": "All of these",
-  "description": "Say yes only when every input agreed: `yes` carries true when all the inputs wired onto it arrived and none of them is `false`, and nothing at all otherwise. Its inputs are the ones you wire onto it, so `rude: judge.rude` beside `sure: judge.sure` is the two-part permission a gate takes one wire for. A branch that closed never arrives, so it is a no as well, which makes this the AND of both a decision and an absence. Reads a value exactly the way a gate does: only `false` is a no, anything else is a yes.",
+  "description": "AND for gates: `yes` is true when every wired input arrived and none is `false` (any other value counts as yes); otherwise it stays closed. Combines several conditions into the one wire a gate takes: `rude: judge.rude` beside `sure: judge.sure`.",
   "tags": [
     "flow",
     "logic",
@@ -21,6 +21,5 @@
   ],
   "features": {
     "canAddInputPorts": true
-  },
-  "requires_infra": false
+  }
 }

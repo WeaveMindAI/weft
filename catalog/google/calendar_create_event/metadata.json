@@ -15,15 +15,21 @@
       "required": true,
       "requiresScopes": [
         "https://www.googleapis.com/auth/calendar.events"
-      ],
-      "description": "A Google account with the calendar permission."
+      ]
     },
     {
       "name": "calendar",
       "type": "String",
       "default": "primary",
       "label": "Calendar",
-      "description": "The calendar id. 'primary' is the account's main calendar."
+      "description": "Calendar id; 'primary' is the account's main calendar.",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "primary"
+        ],
+        "free_text": true
+      }
     },
     {
       "name": "summary",
@@ -35,13 +41,15 @@
       "name": "start",
       "type": "String",
       "required": true,
-      "label": "Start"
+      "label": "Start",
+      "placeholder": "2026-09-03T11:00:00+02:00, or 2026-09-03 for all day"
     },
     {
       "name": "end",
       "type": "String",
       "required": true,
-      "label": "End"
+      "label": "End",
+      "placeholder": "2026-09-03T12:00:00+02:00, or 2026-09-04 for all day"
     },
     {
       "name": "description",
@@ -57,7 +65,7 @@
     {
       "name": "attendees",
       "type": "List[String]",
-      "description": "Attendee email addresses; they receive invitations."
+      "description": "Email addresses; each gets an invitation."
     }
   ],
   "outputs": [

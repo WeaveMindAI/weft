@@ -8,3 +8,6 @@ csv = "1"
 urlencoding = "2"
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
+# Gmail's send takes a whole RFC 5322 message; lettre's builder
+# assembles it (header encoding, multipart, transfer encodings).
+lettre = { version = "0.11", default-features = false, features = ["builder"] }

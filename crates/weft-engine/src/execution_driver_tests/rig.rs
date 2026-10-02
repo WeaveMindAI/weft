@@ -157,7 +157,7 @@
     pub(super) struct NoopInfra;
     #[async_trait]
     impl InfraReader for NoopInfra {
-        async fn endpoint_address(&self, _c: weft_core::ExecutionId, _n: &str, _p: bool, _e: &str) -> anyhow::Result<Option<weft_core::infra::EndpointAddress>> { Ok(None) }
+        async fn endpoint_address(&self, _c: weft_core::ExecutionId, _i: &weft_core::infra::InfraHandle) -> anyhow::Result<Option<weft_core::infra::EndpointAddress>> { Ok(None) }
     }
     pub(super) struct NoopInfraState;
     #[async_trait]

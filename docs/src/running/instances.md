@@ -29,10 +29,10 @@ instance:
 bridge = BaileyBridge {
   @per_instance
 }
-receive = BaileyReceive { endpointUrl: bridge.endpointUrl }
+receive = BaileyReceive { bridge: bridge.bridge }
 # a real assistant wires an LLM's answer into `message`
 reply = BaileySend {
-  endpointUrl: bridge.endpointUrl
+  bridge: bridge.bridge
   to: receive.from
   message: "hi"
 }

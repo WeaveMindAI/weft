@@ -52,9 +52,6 @@
       "name": "dropBackgroundAudio",
       "type": "Boolean",
       "default": false,
-      "widget": {
-        "kind": "checkbox"
-      },
       "label": "Drop background audio",
       "description": "Keep only the dubbed voices, discarding music and effects."
     }

@@ -30,14 +30,15 @@ impl Node for TelegramEditMessageNode {
         let text: String = ctx.inputs.get("text")?;
 
         api::call(
-            &ctx,
-            &access,
+            &ctx.client(&access).await?,
             "editMessageText",
-            serde_json::json!({
-                "chat_id": chat_id,
-                "message_id": message_id,
-                "text": text,
-            }),
+            |req| {
+                req.json(&serde_json::json!({
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": text,
+                }))
+            },
         )
         .await?;
         ctx.pulse_downstream(NodeOutput::new().set("done", true)).await

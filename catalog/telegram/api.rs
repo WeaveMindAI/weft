@@ -1,63 +1,32 @@
 //! Shared Telegram Bot API plumbing for every node in this package.
 //!
-//! One helper, one contract: `call` POSTs a method with a JSON body on
-//! the connection's authenticated client (whose PathPrefix step aims
-//! the generic URL at `/bot<token>/<method>`), checks Telegram's `ok`
-//! envelope, and returns the parsed body; `send_raw` does the same for
-//! a pre-framed body (the multipart media upload). Both fail loudly
-//! with Telegram's own `description` so the user sees the API's exact
-//! refusal, not a generic failure.
+//! One helper, one contract: `call` POSTs a method on the connection's
+//! authenticated client (opened once per run by the node and passed
+//! in; its PathPrefix step aims the generic URL at
+//! `/bot<token>/<method>`), with the body the caller's `prepare` puts
+//! on the request (a JSON payload, or the pre-framed multipart media
+//! upload). The transport (send, refuse a non-success status, parse) is
+//! the core `json_call`, and Telegram's `ok` envelope is checked through
+//! the core `require_ok_flag`, so a refusal fails loudly with
+//! Telegram's own `description`, the API's exact words.
 
 use serde_json::Value;
 
-use weft::{Access, ExecutionContext, NodeErrExt, WeftResult};
+use weft::access::client::{json_call, require_ok_flag};
+use weft::reqwest_middleware::{ClientWithMiddleware, RequestBuilder};
+use weft::{NodeErrExt, WeftResult};
 
-/// POST a Bot API method with a JSON payload.
+/// POST a Bot API method, its body set by `prepare`
+/// (`|req| req.json(&payload)`, or a raw multipart body with its
+/// content type).
 pub async fn call(
-    ctx: &ExecutionContext,
-    access: &Access,
+    client: &ClientWithMiddleware,
     method: &str,
-    payload: Value,
+    prepare: impl FnOnce(RequestBuilder) -> RequestBuilder,
 ) -> WeftResult<Value> {
-    let client = ctx.client(access).await?;
-    let resp = client
-        .post(format!("https://api.telegram.org/{method}"))
-        .json(&payload)
-        .send()
-        .await
-        .node_err(format!("telegram: call {method}"))?;
-    check(method, resp.json().await.node_err(format!("telegram: read {method} response"))?)
-}
-
-/// POST a Bot API method with a pre-framed raw body (multipart media).
-pub async fn send_raw(
-    ctx: &ExecutionContext,
-    access: &Access,
-    method: &str,
-    content_type: &str,
-    body: Vec<u8>,
-) -> WeftResult<Value> {
-    let client = ctx.client(access).await?;
-    let resp = client
-        .post(format!("https://api.telegram.org/{method}"))
-        .header("content-type", content_type)
-        .body(body)
-        .send()
-        .await
-        .node_err(format!("telegram: call {method}"))?;
-    check(method, resp.json().await.node_err(format!("telegram: read {method} response"))?)
-}
-
-/// Telegram's `ok` envelope check: every Bot API response says
-/// `ok: true` or carries a `description` naming what was refused.
-fn check(method: &str, answer: Value) -> WeftResult<Value> {
-    if answer.get("ok").and_then(Value::as_bool) == Some(true) {
-        return Ok(answer);
-    }
-    Err(weft::node_error(format!(
-        "telegram refused {method}: {}",
-        answer.get("description").and_then(Value::as_str).unwrap_or("no detail")
-    )))
+    let req = prepare(client.post(format!("https://api.telegram.org/{method}")));
+    let what = format!("call telegram's {method}");
+    require_ok_flag(json_call(req, &what).await?, "ok", "description", &what)
 }
 
 /// A REQUIRED i64 field of a checked response's `result`.

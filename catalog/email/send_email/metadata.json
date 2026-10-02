@@ -1,7 +1,7 @@
 {
   "type": "SendEmail",
   "label": "Send Email",
-  "description": "Send an email as the connected mailbox, over SMTP (the standard sending protocol every mail provider serves). Set replyToMessageId to answer inside an existing conversation.",
+  "description": "Sends an email from a mailbox over SMTP, works with any mail provider; set replyToMessageId to reply inside an existing thread.",
   "tags": [
     "email",
     "smtp"
@@ -17,11 +17,11 @@
         "smtp_host",
         "smtp_port"
       ],
-      "description": "The mailbox's access (wire an EmailAccess node). Needs the connection's outgoing (SMTP) server, which is what sending mail uses."
+      "description": "Needs the connection's SMTP server filled."
     },
     {
       "name": "to",
-      "type": "String",
+      "type": "String | List[String]",
       "required": true,
       "label": "To"
     },
@@ -40,25 +40,25 @@
     },
     {
       "name": "cc",
-      "type": "String",
+      "type": "String | List[String]",
       "label": "Cc"
     },
     {
       "name": "bcc",
-      "type": "String",
+      "type": "String | List[String]",
       "label": "Bcc"
     },
     {
       "name": "replyToMessageId",
       "type": "String",
-      "description": "The Message-ID being answered (from ReceiveEmail's messageId output); sets the reply headers so mail clients thread it."
+      "description": "Message-ID being answered (e.g. ReceiveEmail's messageId); sets the reply headers so clients thread it."
     }
   ],
   "outputs": [
     {
       "name": "messageId",
       "type": "String",
-      "description": "The sent message's Message-ID header."
+      "description": "Message-ID header of the sent mail."
     }
   ],
   "features": {

@@ -4,7 +4,7 @@
 //! model family).
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use weft::node::NodeOutput;
 use weft::storage::{KeepTtl, StorageScope};
@@ -30,13 +30,14 @@ impl Node for FalGenerateVideoNode {
         let model: String = ctx.inputs.get("model")?;
         let prompt: String = ctx.inputs.get("prompt")?;
         let aspect: String = ctx.inputs.get("aspectRatio")?;
-        let params = ctx.inputs.raw("params").cloned();
+        let params = ctx.inputs.opt::<Map<String, Value>>("params")?;
 
         let mut payload = json!({ "prompt": prompt, "aspect_ratio": aspect });
-        merge_params(&mut payload, params.as_ref())?;
+        merge_params(&mut payload, params.as_ref());
 
         let http = ctx.client(&account).await?;
-        let answer = run_queued(&ctx, &http, &model, &payload, "fal: generate the video").await?;
+        let answer =
+            run_queued(&ctx, &account, &http, &model, &payload, "fal: generate the video").await?;
 
         let url = video_url(&answer).node_err("fal answered no video for this generation")?;
         let ty = ctx.output_type("video")?;

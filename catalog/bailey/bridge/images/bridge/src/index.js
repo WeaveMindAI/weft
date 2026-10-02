@@ -2,7 +2,7 @@ import { pipeline } from 'node:stream';
 import express from 'express';
 import { createBridge } from './bridge.js';
 import { createActionRouter } from './actions.js';
-import { WebhookManager } from './webhooks.js';
+import { EventHub } from './events.js';
 import { MessageStore, contentDisposition } from './message-store.js';
 
 const PORT = parseInt(process.env.PORT || '8090', 10);
@@ -11,10 +11,9 @@ const AUTH_DIR = process.env.AUTH_DIR || '/data/auth';
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
-const webhookManager = new WebhookManager();
-const MESSAGES_PATH = `${AUTH_DIR}/messages.json`;
-const messageStore = new MessageStore(500, MESSAGES_PATH);
-const bridge = await createBridge(AUTH_DIR, webhookManager, messageStore);
+const eventHub = new EventHub();
+const messageStore = new MessageStore(500, AUTH_DIR);
+const bridge = await createBridge(AUTH_DIR, eventHub, messageStore);
 
 // Flush message store to disk on shutdown
 for (const sig of ['SIGINT', 'SIGTERM']) {
@@ -38,17 +37,6 @@ app.get('/outputs', (_req, res) => {
     jid: state.jid || null,
     pushName: state.pushName || null,
   });
-});
-
-// WhatsApp-specific endpoints
-app.get('/qr', (_req, res) => {
-  const qr = bridge.getQr();
-  res.json({ qr });
-});
-
-app.get('/status', (_req, res) => {
-  const state = bridge.getState();
-  res.json({ status: state.status });
 });
 
 // Live data endpoint (generic pattern for dashboard rendering)
@@ -108,7 +96,7 @@ app.get('/events', (req, res) => {
     ? req.query.events.split(',')
     : ['message.received'];
 
-  webhookManager.addSseClient(res, events);
+  eventHub.addSseClient(res, events);
 });
 
 // Media download endpoint, serves media from stored Baileys WAMessage protobufs.
@@ -174,7 +162,7 @@ app.get('/media/:messageId', async (req, res) => {
 });
 
 // Action dispatch (standard endpoint contract)
-const actionRouter = createActionRouter(bridge, webhookManager, messageStore);
+const actionRouter = createActionRouter(bridge, messageStore);
 app.post('/action', actionRouter);
 
 app.listen(PORT, '0.0.0.0', () => {

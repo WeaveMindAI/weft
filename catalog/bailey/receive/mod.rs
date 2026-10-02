@@ -1,8 +1,8 @@
 //! BaileyReceive: fires when a WhatsApp message lands at the
 //! project's bridge.
 //!
-//!   - `setup_trigger`: read the upstream bridge's `endpointUrl`,
-//!     compute the `/events` SSE URL, register an SSE signal. The
+//!   - `setup_trigger`: resolve the upstream bridge's handle, register
+//!     an SSE signal on its `/events` stream. The
 //!     listener subscribes; the dispatcher receives `message.received`
 //!     events and fires fresh executions. The node's filter settings
 //!     become predicates on the signal, so a message they exclude is
@@ -14,6 +14,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
+use weft::infra::InfraHandle;
 use weft::signal::{Predicate, SseSubscribe};
 use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
@@ -32,7 +33,7 @@ impl Node for BaileyReceiveNode {
 
     // Registers the SSE signal; setup emits nothing downstream.
     async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let bridge: String = ctx.inputs.get("endpointUrl")?;
+        let bridge: InfraHandle = ctx.inputs.get("bridge")?;
         let ignore_groups: bool = ctx.inputs.get("ignoreGroups")?;
         let message_types: Option<Vec<String>> = ctx.inputs.opt("messageTypes")?;
 
@@ -44,15 +45,9 @@ impl Node for BaileyReceiveNode {
             filters.push(Predicate::neq("isGroup", "true"));
         }
         if let Some(types) = message_types.filter(|t| !t.is_empty()) {
-            for t in &types {
-                if !MESSAGE_TYPES.contains(&t.as_str()) {
-                    weft::node_bail!(
-                        "messageTypes has {t:?}, which the bridge never sends; pick from {}",
-                        MESSAGE_TYPES.join(", ")
-                    );
-                }
-            }
-            // Every entry is one of the plain words above, so the
+            // The `multiselect` widget's options bind every entry (the
+            // compiler refuses a written one, the runtime a wired one),
+            // so each is one of the bridge's plain words and the
             // alternation needs no escaping.
             filters.push(Predicate::regex("messageType", format!("^({})$", types.join("|"))));
         } else {
@@ -62,8 +57,9 @@ impl Node for BaileyReceiveNode {
             filters.push(Predicate::neq("messageType", "unknown"));
         }
 
+        let bridge = ctx.endpoint_of(&bridge).await?;
         ctx.register_signal(SseSubscribe {
-            url: super::bridge_api::route(&bridge, "/events"),
+            url: format!("{}/events", bridge.url().trim_end_matches('/')),
             event_name: "message.received".into(),
             filters,
         })
@@ -94,7 +90,7 @@ impl Node for BaileyReceiveNode {
 
         // Media messages: stream the bytes from the bridge's media
         // endpoint straight into PROJECT storage under the message's
-        // identity (see `bridge_api::fetch_media`) and emit the
+        // identity (see `media::fetch_media`) and emit the
         // self-describing stored-file reference on `file`. Bytes never ride
         // the pulse path; downstream nodes get/stream/presign via the
         // reference.
@@ -103,25 +99,18 @@ impl Node for BaileyReceiveNode {
             .and_then(|v| v.as_str())
             .node_err("message event without a messageType; the bridge always sends one")?;
         if MEDIA_TYPES.contains(&message_type) {
-            let bridge: String = ctx.inputs.get("endpointUrl")?;
+            let bridge: InfraHandle = ctx.inputs.get("bridge")?;
             let message_id = data
                 .get("messageId")
                 .and_then(|v| v.as_str())
                 .node_err("media message without a messageId; cannot fetch its bytes")?;
-            let file = super::bridge_api::fetch_media(&ctx, &bridge, message_id).await?;
+            let bridge = ctx.endpoint_of(&bridge).await?;
+            let file = super::media::fetch_media(&ctx, &bridge, message_id).await?;
             out = out.set("file", file);
         }
         ctx.pulse_downstream(out).await
     }
 }
-
-/// Every `messageType` the bridge emits.
-// SYNC: MESSAGE_TYPES <-> `extractTextContent` in
-// catalog/bailey/bridge/images/bridge/src/message-store.js and the
-// `messageTypes` description in metadata.json.
-const MESSAGE_TYPES: [&str; 9] = [
-    "text", "image", "video", "audio", "document", "sticker", "contact", "location", "unknown",
-];
 
 /// Message types whose bytes the bridge can serve via
 /// `/media/<messageId>`.

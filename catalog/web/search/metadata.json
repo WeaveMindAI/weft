@@ -1,7 +1,7 @@
 {
   "type": "WebSearch",
   "label": "Web Search",
-  "description": "Search the web (semantic + keyword, auto-picked per query) and get results with their page text, ready for an LLM step. Powered by Exa.",
+  "description": "Search the web (semantic or keyword, picked per query) and get results with their page text, ready for an LLM step. Uses Exa.",
   "tags": [
     "web",
     "search"
@@ -25,6 +25,12 @@
       "name": "numResults",
       "type": "Number",
       "default": 10,
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "max": 100,
+        "step": 1
+      },
       "label": "Results",
       "description": "How many results (1-100)."
     },
@@ -32,17 +38,19 @@
       "name": "includeText",
       "type": "Boolean",
       "default": true,
-      "widget": {
-        "kind": "checkbox"
-      },
       "label": "Include page text"
     },
     {
       "name": "maxTextChars",
       "type": "Number",
       "default": 4000,
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "step": 1
+      },
       "label": "Text per result",
-      "description": "The most characters of page text one result carries; Exa cuts each page there. A wire carries at most 100 KB, so `numResults` times this (plus titles and URLs) has to stay under it: the default keeps ten results near 40 KB. Ignored when `includeText` is off."
+      "description": "Max page-text characters per result. `numResults` times this (plus titles and URLs) must stay under the 100 KB wire limit; the default keeps ten results near 40 KB. Ignored when `includeText` is off."
     },
     {
       "name": "includeDomains",

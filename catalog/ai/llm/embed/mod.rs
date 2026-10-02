@@ -40,7 +40,7 @@ impl Node for LlmEmbedNode {
         let http = ctx.client(&account).await?;
         let answer = weft::access::client::post_json(
             &http,
-            "https://openrouter.ai/api/v1/embeddings",
+            &format!("{}/embeddings", super::provider::OPENROUTER_API),
             &body,
             "openrouter: embeddings",
         )

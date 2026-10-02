@@ -1,7 +1,7 @@
 {
   "type": "Debug",
   "label": "Debug",
-  "description": "Display incoming data for debugging. Connect any output to the data port to inspect its value after execution.",
+  "description": "Show whatever value is wired into `data`, for inspecting it after a run.",
   "tags": [
     "debug",
     "inspect",
@@ -18,7 +18,6 @@
     }
   ],
   "outputs": [],
-  "requires_infra": false,
   "features": {
     "showDebugPreview": true
   }

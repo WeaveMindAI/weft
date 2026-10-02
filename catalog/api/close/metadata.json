@@ -1,7 +1,7 @@
 {
   "type": "Close",
   "label": "Close",
-  "description": "End the exchange with the caller of this run, and say why. Behind a Socket it sends the close frame with `code` and `reason`. Behind a Route, `reason` is the response body under `status` (a String, sent the way Reply sends one), and with no reason it is a bodiless response (`status` defaults to 204; after a Stream only the end of the response is left). Close needs nothing from upstream to work, so the `_should_flow` gate is usually its whole wiring: prefill `reason` and `status`, then wire any output port of the branch that should end here into `_should_flow`, whatever that port's type (the value is never read, only a `false` says no). Every field takes a wire as well as a literal, so a `reason` a node computed can be wired in like any other input. The shape for \"do this, and if it did not work, stop here\" is a Switch on the outcome whose failing case gates this node and whose passing case gates the rest. A branch that skipped closes its ports, so the Close behind it skips too.",
+  "description": "End the exchange with this run's caller, saying why: a close frame (`code`, `reason`) behind a Socket, a response (`status`, `reason` as the String body) behind a Route. It needs no data from upstream, so `_should_flow` is usually its whole wiring: prefill `reason` and `status` and gate it on the branch that should end here (a Switch's failing case, say).",
   "tags": [
     "api",
     "http",
@@ -22,12 +22,12 @@
         "step": 1
       },
       "label": "Close code (Socket, empty = 1000)",
-      "description": "The WebSocket close code, Socket only: empty is 1000 (a normal closure), 4000 to 4999 are yours to define. Refused behind a Route."
+      "description": "WebSocket close code, Socket only: empty is 1000, 4000 to 4999 are yours."
     },
     {
       "name": "reason",
       "type": "String",
-      "description": "Why the exchange ended, a short sentence for the caller: the close frame's reason behind a Socket, the response body behind a Route (refused after a Stream, which already sent the response)."
+      "description": "Short sentence for the caller: the close frame's reason, or the response body. Refused after a Stream."
     },
     {
       "name": "status",
@@ -39,23 +39,22 @@
         "step": 1
       },
       "label": "Status (Route, empty = 204, or 200 with a reason)",
-      "description": "The HTTP status, Route only: empty is 204 with no reason and 200 with one; 204 with a reason is refused (a 204 carries no body). After a Stream the status already went out. Refused behind a Socket."
+      "description": "HTTP status, Route only: empty is 204 without a reason, 200 with one; 204 with a reason is refused. Ignored after a Stream (the status already went out)."
     },
     {
       "name": "headers",
       "type": "Dict[String, String]",
       "label": "Headers (Route)",
-      "description": "Extra response headers by name (Route only), so an ending carries its own: a 304 with its `etag`, a 429 with its `retry-after`. A content-type here overrides the one a reason's shape implies. After a Stream they are refused (that head already went out), and refused behind a Socket."
+      "description": "Extra response headers, Route only (a 304's `etag`, a 429's `retry-after`); a content-type overrides the reason's. Refused after a Stream."
     }
   ],
   "outputs": [
     {
       "name": "done",
       "type": "Boolean",
-      "description": "Fires true once the exchange has been ended."
+      "description": "True once the exchange has ended."
     }
   ],
-  "requires_infra": false,
   "features": {
     "answersCaller": "end"
   },

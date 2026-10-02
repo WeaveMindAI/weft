@@ -44,7 +44,7 @@ impl Node for HumanTriggerNode {
         // an approve/reject field, a synthesized `rejected: true` pulse).
         let submission = ctx.wake.record()?;
         let specs = form_specs(self.manifest())?;
-        let raw_fields = parse_form_fields(ctx.inputs.object()?);
+        let raw_fields = parse_form_fields(ctx.inputs.object()?)?;
         ctx.pulse_downstream(map_response_to_ports(&submission, &raw_fields, specs)?).await
     }
 }

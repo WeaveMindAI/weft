@@ -9,6 +9,13 @@ use weft::{fixture_spec, FakeRig, LiveRig, NodeTest, WeftResult};
 
 use super::GmailSendNode;
 
+/// A fake Google connection that recorded its account address, as
+/// every real one does (the connect test captures it): the send
+/// names it as the sender.
+fn google_account() -> serde_json::Value {
+    weft::Access::new("fake-connection", "google", Some("me@example.com".to_string())).to_value()
+}
+
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("sends_the_assembled_raw_message", sends),
@@ -46,7 +53,7 @@ async fn attachments_and_reply(rig: FakeRig) -> WeftResult<()> {
     rig.run(
         &GmailSendNode,
         json!({
-            "account": rig.access("google"),
+            "account": google_account(),
             "to": "ada@example.com",
             "cc": "bob@example.com",
             "subject": "re: hello",
@@ -72,9 +79,10 @@ async fn attachments_and_reply(rig: FakeRig) -> WeftResult<()> {
         mime.contains("Content-Type: application/pdf") && mime.contains("report.pdf"),
         "attachment part missing:\n{mime}"
     );
-    // The attachment's bytes ride base64-encoded inside the multipart.
+    // The attachment's bytes ride inside the multipart, in the transfer
+    // encoding the builder picks for them (plain ASCII stays 7bit).
     let b64 = base64::engine::general_purpose::STANDARD.encode(b"PDFDATA");
-    assert!(mime.contains(&b64), "attachment bytes missing:\n{mime}");
+    assert!(mime.contains("PDFDATA") || mime.contains(&b64), "attachment bytes missing:\n{mime}");
     Ok(())
 }
 
@@ -88,7 +96,7 @@ async fn sends(rig: FakeRig) -> WeftResult<()> {
         .run(
             &GmailSendNode,
             json!({
-                "account": rig.access("google"),
+                "account": google_account(),
                 "to": "ada@example.com",
                 "subject": "hello",
                 "text": "body text",
@@ -115,7 +123,7 @@ async fn no_recipient(rig: FakeRig) -> WeftResult<()> {
     let outcome = rig
         .run(
             &GmailSendNode,
-            json!({ "account": rig.access("google"), "subject": "s", "text": "t" }),
+            json!({ "account": google_account(), "subject": "s", "text": "t" }),
         )
         .await;
     let err = outcome.result.expect_err("no recipient must refuse").to_string();
@@ -136,7 +144,7 @@ fn refuse_the_send(rig: &FakeRig) {
 
 fn a_mail(rig: &FakeRig) -> serde_json::Value {
     json!({
-        "account": rig.access("google"),
+        "account": google_account(),
         "to": "ada@example.com",
         "subject": "hello",
         "text": "body text",
@@ -167,7 +175,7 @@ async fn mistake_not_caught(rig: FakeRig) -> WeftResult<()> {
     let err = rig
         .run(
             &GmailSendNode,
-            json!({ "account": rig.access("google"), "subject": "s", "text": "t" }),
+            json!({ "account": google_account(), "subject": "s", "text": "t" }),
         )
         .await
         .failure()?;

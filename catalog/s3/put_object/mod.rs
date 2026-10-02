@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 
+use weft::access::client::checked_send;
 use weft::node::NodeOutput;
 use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
@@ -30,13 +31,9 @@ impl Node for S3PutObjectNode {
         let content: String = ctx.inputs.get("content")?;
 
         let s3 = ctx.client(&access).await?;
-        let resp = s3
-            .put(s3::object_url(&bucket, &key)?)
-            .body(content)
-            .send()
-            .await
-            .node_err("s3: put object")?;
-        let resp = s3::ok_or_bail(resp, "the upload").await?;
+        let resp =
+            checked_send(s3.put(s3::object_url(&bucket, &key)?).body(content), "upload the object")
+                .await?;
         let etag = resp
             .headers()
             .get("etag")

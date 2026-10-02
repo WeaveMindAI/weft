@@ -46,8 +46,8 @@ what earlier failed runs kept (cells, projects and connections the suite
 made, marked as e2e), then runs `weft clean --images --all`. That last step is
 machine-wide and reaches past the suite: it removes every worker image no
 project on the default install references (yours too, once nothing runs them),
-infra images no project references, every builder base and runtime image
-but the current one, the worker compile cache this checkout
+infra images no project references, every builder base, runtime image and
+standard worker image but the current one, the worker compile cache this checkout
 moved off (every lane, at once), and compile caches of another retired key that
 sat unused. `--clean` does only this, without bringing the install to
 current code first, so a failure's runtime is still the one that failed.

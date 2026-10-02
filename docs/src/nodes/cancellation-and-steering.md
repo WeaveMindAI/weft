@@ -74,9 +74,15 @@ not in the order yet.
 `stop_tagged` returns when the request is durably queued, not when the other
 runs are gone. Do not write a node whose next line assumes they stopped.
 
-Tags are `[A-Za-z0-9_-]`, one to sixty-four characters, checked before anything
-is written, naming the character that was wrong. Tagging twice with the same
-tag does nothing, which is what makes it safe to replay.
+A tag is `[A-Za-z0-9_-]`, one to sixty-four characters, but you can hand
+either call any string that is not empty. If you pass a chat id or an email
+address, weft keeps the readable part, swaps every other character for `_`,
+and adds a short fingerprint of the original, so `49151@s.whatsapp.net`
+becomes `49151_s_whatsapp_net-` followed by sixteen hex characters. Both calls
+and the runs list's tag filter do this the same way, so the same value always
+lands on the same tag, and two values that only differ in the swapped
+characters never share one. Tagging twice with the same tag does nothing,
+which is what makes it safe to replay.
 
 ## In a test
 

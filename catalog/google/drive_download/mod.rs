@@ -65,15 +65,16 @@ impl Node for GoogleDriveDownloadNode {
             };
             (
                 format!(
-                    "{}/files/{file_id}/export?mimeType={}",
+                    "{}/files/{}/export?mimeType={}",
                     drive::API,
+                    super::api::segment(&file_id),
                     urlencoding::encode(&mime)
                 ),
                 mime,
                 format!("{name}.{ext}"),
             )
         } else {
-            (format!("{}/files/{file_id}?alt=media", drive::API), native_mime, name)
+            (format!("{}/files/{}?alt=media", drive::API, super::api::segment(&file_id)), native_mime, name)
         };
 
         let resp = http.get(&url).send().await.node_err("google drive: download")?;

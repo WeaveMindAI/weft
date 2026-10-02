@@ -31,6 +31,8 @@ use weft::bus::BusOptions;
 use weft::{node_error, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 use weft::node::NodeOutput;
 
+use super::elevenlabs::WS_API;
+
 #[derive(NodeManifest)]
 pub struct ElevenLabsTranscribeNode;
 
@@ -144,7 +146,7 @@ impl Node for ElevenLabsTranscribeNode {
 
         let conn = ctx.open(&account).await?;
         let mut url = format!(
-            "wss://api.elevenlabs.io/v1/speech-to-text/realtime\
+            "{WS_API}/speech-to-text/realtime\
              ?model_id=scribe_v2_realtime&audio_format=pcm_{rate}&commit_strategy=vad"
         );
         if let Some(language) = &language {

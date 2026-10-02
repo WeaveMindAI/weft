@@ -1,0 +1,11 @@
+# A node that started an outside job waits for it without holding a worker:
+# AwaitJob parks on a poll of the job's status address, the listener polls it,
+# and the run resumes with the first answer whose status says done. Debug
+# receives the job's result.
+#
+# __E2E_FAKE_URL__ is substituted by the test with the job fake's status URL.
+
+job = AwaitJob { url: "__E2E_FAKE_URL__" }
+
+out = Debug
+out.data = job.result

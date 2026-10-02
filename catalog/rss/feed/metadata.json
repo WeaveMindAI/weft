@@ -1,7 +1,7 @@
 {
   "type": "RssFeed",
   "label": "RSS: On New Entry",
-  "description": "Fires once per new entry in an RSS or Atom feed. No account needed; activation starts from now (history never replays) and the position survives restarts.",
+  "description": "Fires once per new entry in an RSS or Atom feed. No account needed; only entries after activation fire, and the position survives restarts.",
   "tags": [
     "rss",
     "atom",
@@ -26,7 +26,7 @@
       "description": "How often the feed is checked.",
       "widget": {
         "kind": "number",
-        "min": 1,
+        "min": 5,
         "step": 1
       }
     }
@@ -63,5 +63,32 @@
   },
   "features": {
     "isTrigger": true
-  }
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_present",
+            "field": "feedUrl"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_matches",
+              "field": "feedUrl",
+              "regex": "(?i)^https?://"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "RssFeed '{id}' has a `feedUrl` that is not a web address. Start it with http:// or https://.",
+        "level": "structural",
+        "severity": "error",
+        "port": "feedUrl"
+      }
+    }
+  ]
 }

@@ -13,10 +13,9 @@ use super::NotionCreatePageNode;
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("creates_the_page_from_plain_text", creates),
-        NodeTest::fake("nothing_to_write_refuses", empty),
+        NodeTest::fake("a_title_only_page_has_no_body", title_only),
         NodeTest::fake("a_refused_page_fails_the_run_when_error_is_unwired", refused_unwired),
         NodeTest::fake("a_refused_page_comes_out_on_error_when_it_is_wired", refused_wired),
-        NodeTest::fake("nothing_to_write_still_fails_the_run_when_error_is_wired", empty_wired),
         NodeTest::live("one_real_page_created_and_archived", "notion", live_create).with_fixture(
             fixture_spec(PARENT_PAGE_FIXTURE, PARENT_PAGE_LABEL.0, PARENT_PAGE_LABEL.1),
         ),
@@ -81,7 +80,12 @@ async fn creates(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-async fn empty(rig: FakeRig) -> WeftResult<()> {
+async fn title_only(rig: FakeRig) -> WeftResult<()> {
+    rig.respond(
+        "POST",
+        "/v1/pages",
+        json!({ "id": "page-2", "url": "https://notion.so/page-2" }),
+    );
     let outcome = rig
         .run(
             &NotionCreatePageNode,
@@ -91,9 +95,12 @@ async fn empty(rig: FakeRig) -> WeftResult<()> {
                 "title": "Empty",
             }),
         )
-        .await;
-    let err = outcome.result.expect_err("an empty body must refuse").to_string();
-    assert!(err.contains("nothing to write"), "{err}");
+        .await
+        .ok()?;
+    assert_eq!(outcome.outputs["pageId"], json!("page-2"));
+    let body = rig.requests()[0].body.clone().expect("json payload");
+    assert_eq!(body["properties"]["title"]["title"][0]["text"]["content"], json!("Empty"));
+    assert!(body.get("children").is_none(), "a title-only page sends no body: {body}");
     Ok(())
 }
 
@@ -133,24 +140,5 @@ async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
     for port in ["pageId", "url"] {
         assert!(!outcome.outputs.contains_key(port), "a caught failure emits nothing on {port}");
     }
-    Ok(())
-}
-
-/// An empty body is a mistake in the program, never a value for `error`.
-async fn empty_wired(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
-    let err = rig
-        .run(
-            &NotionCreatePageNode,
-            json!({
-                "account": rig.access("notion"),
-                "parentPage": "a".repeat(32),
-                "title": "Empty",
-            }),
-        )
-        .await
-        .failure()?;
-    assert!(err.starts_with("input error"), "{err}");
-    assert!(rig.requests().is_empty(), "nothing was sent");
     Ok(())
 }

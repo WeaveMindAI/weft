@@ -1,7 +1,7 @@
 {
   "type": "GmailSend",
   "label": "Gmail: Send",
-  "description": "Send mail as the connected Google account: to/cc/bcc, plain text and/or HTML, file attachments, and reply-in-thread (pass the original message's id and clients thread it correctly).",
+  "description": "Sends mail as a Google account through Gmail: to/cc/bcc, text and/or HTML, attachments, and replies threaded onto an original message.",
   "tags": [
     "google",
     "gmail",
@@ -17,7 +17,7 @@
       "requiresScopes": [
         "https://www.googleapis.com/auth/gmail.send"
       ],
-      "description": "A Google account with the send-mail permission, and the read-headers permission a reply needs to thread onto the original."
+      "description": "Needs send-mail; a reply also needs read-headers to thread onto the original."
     },
     {
       "name": "to",
@@ -56,12 +56,11 @@
       "name": "replyTo",
       "type": "String",
       "label": "Reply to message id",
-      "description": "Send as a reply in this message's thread (the id a Gmail trigger or Get emits)."
+      "description": "Gmail message id to reply to in its thread (as a Gmail trigger or Get emits)."
     },
     {
       "name": "attachments",
-      "type": "File | List[File]",
-      "description": "Stored files to attach."
+      "type": "File | List[File]"
     }
   ],
   "outputs": [
@@ -76,6 +75,17 @@
     }
   ],
   "features": {
-    "catchErrors": true
+    "catchErrors": true,
+    "oneOfRequired": [
+      [
+        "to",
+        "cc",
+        "bcc"
+      ],
+      [
+        "text",
+        "html"
+      ]
+    ]
   }
 }

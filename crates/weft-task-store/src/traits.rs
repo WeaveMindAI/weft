@@ -150,18 +150,17 @@ impl TaskStoreClient for PostgresTaskStoreClient {
 /// provisions infrastructure.
 #[async_trait]
 pub trait InfraReader: Send + Sync {
-    /// Where one declared endpoint of an infra node answers, for the
-    /// run `execution_id`. `None` when the node is not Running or declares no
-    /// endpoint by that name. Backs `ctx.endpoint(name)` in node code.
-    /// The run names only itself: its project, and its instance when the
-    /// node exists once per instance (`per_instance`), are the broker's to
-    /// resolve, so a run can never reach another instance's copy.
+    /// Where the endpoint `infra` names answers, for the run
+    /// `execution_id`. `None` when the node is not Running or declares no
+    /// endpoint by that name. Backs `ctx.endpoint(name)` and
+    /// `ctx.endpoint_of(&handle)` in node code. The project is the
+    /// broker's to resolve from the run, and a handle naming an instance
+    /// other than the run's is refused there, so a run can never reach
+    /// another project's or another instance's copy.
     async fn endpoint_address(
         &self,
         execution_id: weft_core::ExecutionId,
-        node_id: &str,
-        per_instance: bool,
-        endpoint_name: &str,
+        infra: &weft_core::infra::InfraHandle,
     ) -> Result<Option<weft_core::infra::EndpointAddress>>;
 }
 

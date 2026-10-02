@@ -16,8 +16,8 @@ const STORAGE_BASE: &str = "https://storage";
 /// The addressable URL of one bucket, with a percent-encoded query
 /// (the list door). Owns the query assembly so no node hand-rolls
 /// `push_str` + encode pairs.
-pub fn bucket_url(bucket: &str, query: &[(&str, &str)]) -> String {
-    let mut url = format!("{STORAGE_BASE}/{bucket}");
+pub fn bucket_url(bucket: &str, query: &[(&str, &str)]) -> weft::WeftResult<String> {
+    let mut url = format!("{STORAGE_BASE}/{}", checked_bucket(bucket)?);
     for (i, (name, value)) in query.iter().enumerate() {
         let sep = if i == 0 { '?' } else { '&' };
         url.push(sep);
@@ -25,28 +25,21 @@ pub fn bucket_url(bucket: &str, query: &[(&str, &str)]) -> String {
         url.push('=');
         url.push_str(&urlencoding::encode(value));
     }
-    url
+    Ok(url)
 }
 
-/// Refuse a non-success answer loudly, quoting the store's (XML) body
-/// truncated; hand the response back untouched otherwise, so a caller
-/// that needs the success body (the list) reads it after. `what` names
-/// the verb ("the delete", "the read", ...). The one status-and-bail
-/// shape every S3 node shares (S3 answers XML, so the JSON helpers
-/// don't apply).
-pub async fn ok_or_bail(
-    resp: weft::reqwest::Response,
-    what: &str,
-) -> weft::WeftResult<weft::reqwest::Response> {
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(weft::node_error(format!(
-            "the store answered {status} on {what}: {}",
-            weft::truncate_user_string(&body, 300)
-        )));
+/// Refuse a bucket name that would change the path it is spliced into:
+/// empty, or carrying a `/`, `?`, `#`, `\` or `..` (S3 bucket names
+/// are lowercase letters, digits, dots and hyphens, so none of these is
+/// ever a real bucket).
+fn checked_bucket(bucket: &str) -> weft::WeftResult<&str> {
+    let clean = !bucket.is_empty()
+        && !bucket.contains(['/', '?', '#', '\\'])
+        && !bucket.contains("..");
+    if !clean {
+        return Err(weft::WeftError::Input(format!("'{bucket}' is not a usable S3 bucket name")));
     }
-    Ok(resp)
+    Ok(bucket)
 }
 
 /// The addressable URL of one object: base + bucket + the key with
@@ -55,23 +48,6 @@ pub async fn ok_or_bail(
 /// segment is refused loudly: URL path normalization collapses those
 /// segments (percent-encoding the dots does not survive it either),
 /// so the request would silently address a DIFFERENT object.
-// This file is a package-level SHARED helper, not a node, so its unit
-// tests stay an ordinary `#[cfg(test)]` block (node self-tests in a
-// `tests.rs` belong to nodes; see docs/src/nodes/testing.md).
-#[cfg(test)]
-mod url_tests {
-    use super::*;
-
-    #[test]
-    fn bucket_url_percent_encodes_the_query() {
-        assert_eq!(bucket_url("b", &[]), "https://storage/b");
-        assert_eq!(
-            bucket_url("b", &[("list-type", "2"), ("prefix", "a b/c")]),
-            "https://storage/b?list-type=2&prefix=a%20b%2Fc"
-        );
-    }
-}
-
 pub fn object_url(bucket: &str, key: &str) -> weft::WeftResult<String> {
     let mut encoded_key: Vec<String> = Vec::new();
     for segment in key.split('/') {
@@ -83,5 +59,31 @@ pub fn object_url(bucket: &str, key: &str) -> weft::WeftResult<String> {
         }
         encoded_key.push(urlencoding::encode(segment).into_owned());
     }
-    Ok(format!("{STORAGE_BASE}/{bucket}/{}", encoded_key.join("/")))
+    Ok(format!("{STORAGE_BASE}/{}/{}", checked_bucket(bucket)?, encoded_key.join("/")))
+}
+
+// This file is a package-level SHARED helper, not a node, so its unit
+// tests stay an ordinary `#[cfg(test)]` block (node self-tests in a
+// `tests.rs` belong to nodes; see docs/src/nodes/testing.md).
+#[cfg(test)]
+mod url_tests {
+    use super::*;
+
+    #[test]
+    fn bucket_url_percent_encodes_the_query() {
+        assert_eq!(bucket_url("b", &[]).unwrap(), "https://storage/b");
+        assert_eq!(
+            bucket_url("b", &[("list-type", "2"), ("prefix", "a b/c")]).unwrap(),
+            "https://storage/b?list-type=2&prefix=a%20b%2Fc"
+        );
+    }
+
+    #[test]
+    fn a_bucket_that_would_reshape_the_path_is_refused() {
+        for bad in ["", "a/b", "a?b", "a#b", "a..b", "..", "a\\b"] {
+            assert!(bucket_url(bad, &[]).is_err(), "{bad:?} was accepted");
+            assert!(object_url(bad, "k").is_err(), "{bad:?} was accepted");
+        }
+        assert!(object_url("my.bucket-1", "k").is_ok());
+    }
 }

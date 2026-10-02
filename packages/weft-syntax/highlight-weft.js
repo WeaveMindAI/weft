@@ -75,7 +75,7 @@
           className: 'type',
           begin:
             '\\b(String|Number|Boolean|Null|Image|Video|Audio|Blob|Empty|Media|File' +
-            '|List|Dict|JsonDict|Bus|Access|Generator|MustOverride)\\b',
+            '|List|Dict|JsonDict|Bus|Access|Infra|Generator|MustOverride)\\b',
         },
 
         { className: 'literal', begin: '\\b(true|false)\\b' },

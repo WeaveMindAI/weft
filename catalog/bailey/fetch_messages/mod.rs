@@ -4,6 +4,7 @@
 
 use async_trait::async_trait;
 
+use weft::infra::InfraHandle;
 use weft::node::NodeOutput;
 use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
@@ -21,17 +22,14 @@ impl Node for BaileyFetchMessagesNode {
     }
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let endpoint_url: String = ctx.inputs.get("endpointUrl")?;
+        let bridge: InfraHandle = ctx.inputs.get("bridge")?;
         let chat_id: String = ctx.inputs.get("chatId")?;
         let count: f64 = ctx.inputs.get("count")?;
 
-        let result = super::bridge_api::action(
-            &ctx,
-            &endpoint_url,
-            "fetchMessages",
-            serde_json::json!({ "chatId": chat_id, "count": count }),
-        )
-        .await?;
+        let result = ctx.endpoint_of(&bridge)
+            .await?
+            .action("fetchMessages", serde_json::json!({ "chatId": chat_id, "count": count }))
+            .await?;
         let messages = result["messages"]
             .as_array()
             .node_err(format!("bridge fetchMessages response missing result.messages: {result}"))?

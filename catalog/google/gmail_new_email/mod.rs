@@ -31,7 +31,11 @@ impl Node for GmailNewEmailNode {
         let query: String = ctx.inputs.get_or("query", String::new())?;
         let interval: f64 = ctx.inputs.get("intervalSecs")?;
 
-        let mut url = format!("{API}/messages?maxResults=25");
+        // The poll reads one page (the poll primitive does not follow
+        // `nextPageToken`), so it asks for Gmail's largest page: more
+        // than 500 matching messages arriving within one interval
+        // fire only the newest 500.
+        let mut url = format!("{API}/messages?maxResults=500");
         if !query.trim().is_empty() {
             url.push_str(&format!("&q={}", urlencoding::encode(query.trim())));
         }

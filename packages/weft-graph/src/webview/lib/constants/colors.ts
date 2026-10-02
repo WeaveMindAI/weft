@@ -15,6 +15,7 @@ export const PORT_TYPE_COLORS: Record<string, string> = {
 	MustOverride: '#ef4444', // Red (needs attention)
 	Bus: '#d97706',      // Amber-600 (live-channel signal)
 	Access: '#0d9488',   // Teal-600 (credential grant)
+	Infra: '#2563eb',    // Blue-600 (handle on a running service)
 };
 
 const FALLBACK_COLOR = '#52525b'; // Dark gray
@@ -46,6 +47,7 @@ function colorForParsed(t: WeftType): string {
 		case 'must_override': return PORT_TYPE_COLORS.MustOverride;
 		case 'bus': return PORT_TYPE_COLORS.Bus;
 		case 'access': return PORT_TYPE_COLORS.Access;
+		case 'infra': return PORT_TYPE_COLORS.Infra;
 		// A stream colors as its element: the wire carries items of T.
 		case 'generator': return colorForParsed(t.inner);
 	}

@@ -1,0 +1,4 @@
+[package]
+name = "e2e_await_poll"
+id = "00000000-0000-0000-0000-000000000089"
+version = "0.1.0"

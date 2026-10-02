@@ -38,11 +38,7 @@ async fn live_upscale(rig: LiveRig) -> WeftResult<()> {
 
 async fn upscales(rig: FakeRig) -> WeftResult<()> {
     rig.respond("POST", "/fal-ai/esrgan", json!({ "request_id": "req-3" }));
-    rig.respond(
-        "GET",
-        "/fal-ai/esrgan/requests/req-3/status",
-        json!({ "status": "COMPLETED" }),
-    );
+    rig.signal(json!({ "status": "COMPLETED" }));
     rig.respond(
         "GET",
         "/fal-ai/esrgan/requests/req-3",

@@ -1,0 +1,30 @@
+{
+  "type": "AwaitJob",
+  "label": "Await Job",
+  "description": "Wait for an outside job to finish by parking on a poll of its status address, then emit its result. The e2e rig's proof that a node can wait on a job without holding a worker.",
+  "tags": [
+    "e2e",
+    "poll",
+    "await"
+  ],
+  "icon": "Hourglass",
+  "color": "#0ea5e9",
+  "inputs": [
+    {
+      "name": "url",
+      "type": "String",
+      "required": true,
+      "widget": {
+        "kind": "text"
+      },
+      "label": "Status URL"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "result",
+      "type": "String"
+    }
+  ],
+  "requires_infra": false
+}

@@ -33,6 +33,13 @@ pub fn is_text_mime(mime: &str) -> bool {
                 | "application/csv"
                 | "application/yaml"
                 | "application/x-yaml"
+                | "application/toml"
+                | "application/javascript"
+                | "application/x-javascript"
+                | "application/ecmascript"
+                | "application/x-www-form-urlencoded"
+                | "application/graphql"
+                | "application/sql"
         )
 }
 
@@ -231,9 +238,23 @@ mod tests {
 
     #[test]
     fn text_types_are_recognized() {
-        for mime in ["text/csv", "application/json; charset=utf-8", "application/ld+json", "application/xml"] {
+        for mime in [
+            "text/csv",
+            "TEXT/HTML",
+            "application/json; charset=utf-8",
+            "application/ld+json",
+            "application/problem+json",
+            "application/xml",
+            "application/atom+xml",
+            "image/svg+xml",
+            "application/javascript",
+            "application/x-www-form-urlencoded",
+            "application/yaml",
+        ] {
             assert!(is_text_mime(mime), "{mime}");
         }
-        assert!(!is_text_mime("application/octet-stream"));
+        for mime in ["application/octet-stream", "application/pdf", "image/png", "application/zip", ""] {
+            assert!(!is_text_mime(mime), "{mime}");
+        }
     }
 }

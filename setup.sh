@@ -391,8 +391,7 @@ remove_dir_reporting() { # path label [ok_note] [fail_note]
 # and roughly four minutes of an install that has about one minute of
 # real work in it. The 20 GB LRU bound the CLI section applies is what
 # keeps the dead layers from accumulating, and being least recently
-# used (none of them in the last day) is exactly what makes them the
-# ones it drops.
+# used is exactly what makes them the ones it drops.
 #
 # Worker images are deliberately NOT this sweep's to take:
 # a running project keeps using its old-engine image until the user
@@ -1552,15 +1551,16 @@ if [[ $build_cli -eq 1 ]]; then
   # on a machine whose docker isn't running must still produce a
   # binary. With a live daemon, a failed prune fails loud; with none,
   # SAY the bound was skipped instead of letting silence read as done.
-  # Only what nothing used in the last day is eligible: the bound counts
-  # the image layers in use too, which it can never free, so on a busy
-  # machine it went on to take every reclaimable record, the compile
-  # caches every build of the day had just used included.
-  # SYNC: 20GB and until=24h <-> crates/weft-platform-local/src/images.rs
-  #       (BUILD_CACHE_CAP, BUILD_CACHE_SPARE)
+  # --all and no age filter: without --all BuildKit leaves most records
+  # out of the prune, and an `until` filter makes everything used inside
+  # its window untouchable whatever the cap says; both let the cache grow
+  # far past the cap (once to 293GB). Least recently used goes first, so
+  # what the last builds used is the last to go.
+  # SYNC: 20GB and the flags <-> crates/weft-platform-local/src/images.rs
+  #       (BUILD_CACHE_CAP, build_cache_bound_args)
   if docker_reachable; then
-    spin "bound BuildKit cache to 20GB (LRU, sparing what was used in the last day)" \
-      docker builder prune --force --max-used-space 20GB --filter until=24h
+    spin "bound BuildKit cache to 20GB (least recently used first)" \
+      docker builder prune --force --all --max-used-space 20GB
   else
     warn "docker unreachable; the BuildKit cache bound is skipped this install"
   fi

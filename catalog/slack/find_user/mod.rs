@@ -27,27 +27,24 @@ impl Node for SlackFindUserNode {
         let access: Access = ctx.inputs.get("account")?;
         let email: Option<String> = ctx.inputs.opt("email")?;
         let id: Option<String> = ctx.inputs.opt("id")?;
+        let client = ctx.client(&access).await?;
 
         // Which key to look up by is the program's choice, so a wrong
         // pair is an input mistake, never a caught failure.
         let user: Value = match (email, id) {
             (Some(e), None) => {
                 let answer =
-                    api::get(&ctx, &access, "users.lookupByEmail", &[("email", e)]).await?;
+                    api::get(&client, "users.lookupByEmail", &[("email", e)]).await?;
                 answer["user"].clone()
             }
             (None, Some(u)) => {
-                let answer = api::get(&ctx, &access, "users.info", &[("user", u)]).await?;
+                let answer = api::get(&client, "users.info", &[("user", u)]).await?;
                 answer["user"].clone()
             }
-            (Some(_), Some(_)) => {
+            // Neither one never reaches here: `oneOfRequired` skips the node.
+            _ => {
                 return Err(weft::WeftError::Input(
                     "pick ONE lookup key: an email or a user id, not both".to_string(),
-                ));
-            }
-            (None, None) => {
-                return Err(weft::WeftError::Input(
-                    "pick a lookup key: an email or a user id".to_string(),
                 ));
             }
         };

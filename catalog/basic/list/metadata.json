@@ -1,7 +1,7 @@
 {
   "type": "List",
   "label": "Build a list",
-  "description": "Put values together into one list. Declare one input port per item and wire each one: `List(first: String, second: String) -> (list: List[String])` gives `[first, second]`, in the order the ports are written. Declare the list's type on the `list` output, since the items can be of any type. Every port is required like any other, so a branch that closed skips this node instead of handing on a short list. An item that is genuinely optional is written `name?:`, and when nothing arrives on it, it is left out and the items after it move up, so the list never holds a gap or a null that nobody sent.",
+  "description": "Build one list from wired values, one input port per item: `List(first: String, second: String) -> (list: List[String])` gives `[first, second]`, in the order the ports are written. Declare the type on the `list` output. Ports are required, so a closed branch skips the node; an item written `name?:` is left out when nothing arrives (no gap, no null).",
   "tags": [
     "list",
     "array",
@@ -16,11 +16,10 @@
     {
       "name": "list",
       "type": "MustOverride",
-      "description": "The values of the input ports, in the order the ports are written, leaving out any optional port that received nothing. Declare its type in the source: `-> (list: List[String])`."
+      "description": "The items in written order. Declare its type: `-> (list: List[String])`."
     }
   ],
   "features": {
     "canAddInputPorts": true
-  },
-  "requires_infra": false
+  }
 }

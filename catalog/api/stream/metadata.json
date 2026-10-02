@@ -1,7 +1,7 @@
 {
   "type": "Stream",
   "label": "Stream",
-  "description": "Stream a bus to the caller of this run, one chunk per message, until the bus closes. Behind a Route the response body streams as the bus flows (`sse` for a browser's EventSource and LLM-style clients, `ndjson` for a script reading lines, `raw` for the payloads as they are) and ends when the bus closes. Behind a Socket each message is one socket message and the socket stays open. Wire an LLM Stream's bus in to stream a reply as it is generated, or a Postgres: Watch query's to keep a page live. A stored file inside a message goes out as `{ url, mimeType, filename, sizeBytes }`, a link the caller can fetch.",
+  "description": "Stream a bus to the caller of this run, one chunk per message, until the bus closes: an LLM's reply as it is generated, a watched query keeping a page live. Behind a Route the response body streams; behind a Socket each message is one frame and the socket stays open. Stored files inside messages go out as `{ url, mimeType, filename, sizeBytes }`.",
   "tags": [
     "api",
     "http",
@@ -19,12 +19,12 @@
       "accepts": [
         "wire"
       ],
-      "description": "The live bus to stream: every message on it, in order, from the earliest still buffered; the bus closing ends the stream."
+      "description": "The bus to stream, from the earliest message still buffered; its closing ends the stream."
     },
     {
       "name": "first",
       "type": "T",
-      "description": "A value sent ahead of the bus, framed exactly like the messages behind it. This is the header every streaming API has: an id, the row that was just created, a session token, and then the feed. Leave it off and the response is the bus alone."
+      "description": "One value sent ahead of the bus, framed like the messages (an id, a created row, a session token)."
     },
     {
       "name": "format",
@@ -39,7 +39,7 @@
       },
       "default": "raw",
       "label": "Format",
-      "description": "How each message is framed on an HTTP body (ignored on a socket, where a message is a frame). `raw`: the payload as-is, no separator. `ndjson`: one JSON value per line. `sse`: server-sent events, `data:` lines and a blank line per message."
+      "description": "HTTP framing (ignored on a socket). `ndjson`: one JSON value per line, payloads exact. `sse`: `data:` lines and a blank line per message; readers must strip exactly one space after the colon. `raw`: payloads as-is, no separator."
     },
     {
       "name": "answerAs",
@@ -54,7 +54,7 @@
         ]
       },
       "label": "Answer as",
-      "description": "The shape of each `raw` message (and of the socket's frames). Empty (default) uses the trigger's own `dataType`. Set it when what goes out differs from what came in."
+      "description": "Shape of each `raw` message and of socket frames; empty follows the trigger's `dataType`."
     },
     {
       "name": "status",
@@ -67,22 +67,21 @@
       },
       "default": 200,
       "label": "Status",
-      "description": "The HTTP status of the response (Route only)."
+      "description": "HTTP status (Route only), sent with the first chunk."
     },
     {
       "name": "headers",
       "type": "Dict[String, String]",
-      "description": "Extra response headers by name (Route only). A content-type here overrides the one the format implies."
+      "description": "Extra response headers (Route only); a content-type here overrides the format's."
     }
   ],
   "outputs": [
     {
       "name": "done",
       "type": "Boolean",
-      "description": "Fires true once the bus closed and the last chunk was handed to the caller."
+      "description": "True once the bus closed and the last chunk was handed over."
     }
   ],
-  "requires_infra": false,
   "features": {
     "answersCaller": "stream"
   },

@@ -33,6 +33,7 @@ pub fn tests() -> Vec<NodeTest> {
             Ok(())
         }),
         NodeTest::fake("signed_in_read_emits_header_keyed_rows", signed_in_read),
+        NodeTest::fake("no_tab_reads_the_first_tab_whatever_its_id", first_tab),
         NodeTest::live("one_real_signed_in_read", "google", live_read).with_fixture(
             // The node's own spreadsheet input, picker widget and all.
             fixture_spec_like(GoogleSheetsReadNode.manifest(), "spreadsheet", "GOOGLE_SHEET_ID"),
@@ -72,6 +73,38 @@ async fn signed_in_read(rig: FakeRig) -> WeftResult<()> {
         .await
         .ok()?;
     assert_eq!(outcome.outputs["rows"], json!([{ "name": "ada", "age": "36" }]));
+    Ok(())
+}
+
+/// An unset tab is the first one in the spreadsheet, even when its id
+/// is not 0 (the original first tab was deleted, or tabs were reordered).
+async fn first_tab(rig: FakeRig) -> WeftResult<()> {
+    rig.respond(
+        "GET",
+        "/v4/spreadsheets/sheet-1?fields=sheets.properties",
+        json!({ "sheets": [
+            { "properties": { "sheetId": 1234, "title": "Front" } },
+            { "properties": { "sheetId": 0, "title": "Back" } },
+        ]}),
+    );
+    rig.respond(
+        "GET",
+        "/v4/spreadsheets/sheet-1/values/%27Front%27",
+        json!({ "values": [["name"], ["ada"]] }),
+    );
+
+    let outcome = rig
+        .run(
+            &GoogleSheetsReadNode,
+            json!({
+                "account": rig.access("google"),
+                "spreadsheet": "sheet-1",
+                "hasHeader": true,
+            }),
+        )
+        .await
+        .ok()?;
+    assert_eq!(outcome.outputs["rows"], json!([{ "name": "ada" }]));
     Ok(())
 }
 

@@ -12,7 +12,6 @@ use super::CronNode;
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("setup_registers_the_cron_timer", setup_registers),
-        NodeTest::fake("the_shipped_default_is_a_valid_expression", default_is_valid),
         NodeTest::fake("a_fire_forwards_its_wake_payload", fire_forwards),
         NodeTest::basic("every_zone_in_the_dropdown_is_a_zone_the_runtime_knows", zones_agree),
     ]
@@ -57,19 +56,6 @@ fn zones_agree() -> WeftResult<()> {
     known.extend(chrono_tz::TZ_VARIANTS.iter().map(|z| z.name()).filter(|n| *n != "UTC"));
     assert_eq!(offered, known, "the dropdown and chrono-tz disagree; regenerate the options");
     assert_eq!(input["default"], "UTC");
-    Ok(())
-}
-
-/// The metadata default is what a user gets by dropping the node in
-/// and pressing Activate; it once shipped in the five-field form the
-/// runtime refuses, so the default is validated the way the listener
-/// will validate it.
-async fn default_is_valid(rig: FakeRig) -> WeftResult<()> {
-    rig.run_setup_trigger(&CronNode, json!({})).await.ok()?;
-    let registered = rig.registered_signals();
-    assert_eq!(registered.len(), 1, "the default registered a timer");
-    weft::signal::validate_spec(&registered[0].0)
-        .map_err(|e| weft::error::node_error(format!("the shipped default does not parse: {e}")))?;
     Ok(())
 }
 

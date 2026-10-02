@@ -10,28 +10,32 @@ use weft::reqwest_middleware::ClientWithMiddleware;
 use weft::{node_bail, WeftResult};
 
 /// Resolve a tab's gid to its title (the only addressing
-/// `values.get` / `values.append` accept). Fails loudly on an
-/// unknown gid: the tab was deleted or the wrong sheet is picked.
+/// `values.get` / `values.append` accept). No gid is the spreadsheet's
+/// first tab, whatever its id. Fails loudly on an unknown gid: the tab
+/// was deleted or the wrong sheet is picked.
 pub async fn tab_title(http: &ClientWithMiddleware,
     id: &str,
-    gid: &str,
+    gid: Option<&str>,
 ) -> WeftResult<String> {
     let meta: Value = get_json(
         http,
-        &format!("https://sheets.googleapis.com/v4/spreadsheets/{id}?fields=sheets.properties"),
+        &format!(
+            "https://sheets.googleapis.com/v4/spreadsheets/{}?fields=sheets.properties",
+            super::api::segment(id)
+        ),
         "list the sheet's tabs",
     )
     .await?;
-    let title = meta["sheets"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|s| &s["properties"])
-        .find(|p| p["sheetId"].as_i64().map(|g| g.to_string()).as_deref() == Some(gid))
-        .and_then(|p| p["title"].as_str().map(str::to_string));
-    match title {
-        Some(t) => Ok(t),
-        None => node_bail!("the spreadsheet has no tab with gid {gid}; pick the tab again"),
+    // `sheets` lists the tabs in their order in the spreadsheet.
+    let mut tabs = meta["sheets"].as_array().into_iter().flatten().map(|s| &s["properties"]);
+    let found = match gid {
+        Some(gid) => tabs.find(|p| p["sheetId"].as_i64().map(|g| g.to_string()).as_deref() == Some(gid)),
+        None => tabs.next(),
+    };
+    match (found.and_then(|p| p["title"].as_str()), gid) {
+        (Some(t), _) => Ok(t.to_string()),
+        (None, Some(gid)) => node_bail!("the spreadsheet has no tab with gid {gid}; pick the tab again"),
+        (None, None) => node_bail!("the spreadsheet lists no tab to use"),
     }
 }
 
@@ -47,7 +51,8 @@ pub fn values_url(id: &str, title: &str, range: Option<&str>) -> String {
         None => quoted_title,
     };
     format!(
-        "https://sheets.googleapis.com/v4/spreadsheets/{id}/values/{}",
+        "https://sheets.googleapis.com/v4/spreadsheets/{}/values/{}",
+        super::api::segment(id),
         urlencoding::encode(&addr)
     )
 }
@@ -73,13 +78,24 @@ pub async fn header_for_row(http: &ClientWithMiddleware,
                 .to_string(),
         ));
     }
-    let cells = read_cells(http, id, title).await?;
-    match cells.into_iter().next() {
+    match header_row(http, id, title).await? {
         Some(h) => Ok(Some(h)),
         None => node_bail!(
             "the tab is empty: there is no header row to order the keyed row by"
         ),
     }
+}
+
+/// The tab's first row (its header, when it has one), read alone
+/// through the `1:1` range instead of the whole tab. `None` when the
+/// row is empty.
+pub async fn header_row(http: &ClientWithMiddleware,
+    id: &str,
+    title: &str,
+) -> WeftResult<Option<Vec<String>>> {
+    let values: Value =
+        get_json(http, &values_url(id, title, Some("1:1")), "read the tab's header row").await?;
+    Ok(values["values"].as_array().and_then(|rows| rows.first()).map(row_to_strings))
 }
 
 /// Read a tab's cells as a string grid via the Sheets API.

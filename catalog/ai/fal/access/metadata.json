@@ -1,7 +1,7 @@
 {
   "type": "FalAccess",
   "label": "fal Access",
-  "description": "Sign in to fal.ai, the image and video generation API the media nodes speak. Pick an existing connection or paste an API key.",
+  "description": "Connect fal.ai, the image and video generation API the fal media nodes call, with the built-in connection or your own API key.",
   "tags": [
     "ai",
     "media",
@@ -66,7 +66,7 @@
     {
       "name": "access",
       "type": "Access",
-      "description": "The fal access: wire it into the media nodes."
+      "description": "Wire into the fal media nodes' account input."
     }
   ]
 }

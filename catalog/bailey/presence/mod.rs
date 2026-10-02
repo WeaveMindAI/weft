@@ -4,6 +4,7 @@
 
 use async_trait::async_trait;
 
+use weft::infra::InfraHandle;
 use weft::node::NodeOutput;
 use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
 
@@ -21,17 +22,14 @@ impl Node for BaileyPresenceNode {
     }
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let endpoint_url: String = ctx.inputs.get("endpointUrl")?;
+        let bridge: InfraHandle = ctx.inputs.get("bridge")?;
         let chat_id: String = ctx.inputs.get("chatId")?;
         let presence: String = ctx.inputs.get("presence")?;
 
-        super::bridge_api::action(
-            &ctx,
-            &endpoint_url,
-            "sendPresenceUpdate",
-            serde_json::json!({ "chatId": chat_id, "presence": presence }),
-        )
-        .await?;
+        ctx.endpoint_of(&bridge)
+            .await?
+            .action("sendPresenceUpdate", serde_json::json!({ "chatId": chat_id, "presence": presence }))
+            .await?;
         ctx.pulse_downstream(NodeOutput::new().set("done", true)).await
     }
 }

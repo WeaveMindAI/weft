@@ -1,7 +1,7 @@
 {
   "type": "ElevenLabsAccess",
   "label": "ElevenLabs Access",
-  "description": "Connect ElevenLabs for the project's audio AI calls: pick the built-in connection, or bring your own ElevenLabs API key. Wire the access output into every ElevenLabs node; one connection, picked once, however many calls consume it.",
+  "description": "Connect ElevenLabs for the project's audio AI calls, with the built-in connection or your own API key; wire the access output into every ElevenLabs node.",
   "tags": [
     "ai",
     "audio",
@@ -102,8 +102,7 @@
     {
       "name": "access",
       "type": "Access",
-      "description": "The ElevenLabs access: wire it into an ElevenLabs node's account input."
+      "description": "Wire into an ElevenLabs node's account input."
     }
-  ],
-  "requires_infra": false
+  ]
 }

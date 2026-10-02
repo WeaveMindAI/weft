@@ -1,7 +1,7 @@
 {
   "type": "SlackGetThread",
   "label": "Slack: Get Thread",
-  "description": "Read a whole thread: the parent message and every reply, in order, paging until exhausted (capped at 10000 messages; a larger thread fails loudly). Address it by channel + the parent message's ts.",
+  "description": "Reads a whole Slack thread, parent first then every reply, addressed by channel + the parent's ts. Over 10000 messages fails loudly.",
   "tags": [
     "slack",
     "message",
@@ -17,14 +17,38 @@
       "requiresScopes": [
         "channels:history"
       ],
-      "description": "The Slack access (wire a SlackAccess node). Reading needs the channels:history scope (groups:history for private channels) and channel membership."
+      "description": "Needs channels:history (groups:history for private channels), and the app must be in the channel."
     },
     {
       "name": "channel",
       "type": "String",
       "required": true,
       "label": "Channel",
-      "placeholder": "The channel id the thread lives in"
+      "placeholder": "The channel id the thread lives in",
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "sources": [
+          {
+            "kind": "list",
+            "requires": [
+              "channels:read"
+            ],
+            "get": "https://slack.com/api/conversations.list?limit=200&exclude_archived=true",
+            "items": "channels",
+            "label": "name",
+            "value": "id",
+            "page": {
+              "cursor_param": "cursor",
+              "cursor_path": "response_metadata.next_cursor"
+            }
+          },
+          {
+            "kind": "from_url",
+            "pattern": "/archives/([A-Z0-9]+)"
+          }
+        ]
+      }
     },
     {
       "name": "ts",
@@ -38,12 +62,12 @@
     {
       "name": "messages",
       "type": "List[JsonDict]",
-      "description": "Every message in the thread (parent first), as Slack returns them: text, user, ts, reactions, ..."
+      "description": "As Slack returns them: text, user, ts, reactions, ..."
     },
     {
       "name": "count",
       "type": "Number",
-      "description": "How many messages the thread holds (parent included)."
+      "description": "Messages in the thread, parent included."
     }
   ],
   "features": {

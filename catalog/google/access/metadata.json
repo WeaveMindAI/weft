@@ -1,7 +1,7 @@
 {
   "type": "GoogleAccess",
   "label": "Google Access",
-  "description": "Sign in to a Google account, once, for everything Google. Pick an existing connection or add one; what a connection can DO is the permissions it was granted, shown in the list. The permission list grows with the nodes that need more.",
+  "description": "Connects a Google account for every Google node (Drive, Sheets, Docs, Gmail, Calendar). One connection serves them all; each consumer checks the permission it needs.",
   "tags": [
     "google",
     "drive",
@@ -199,7 +199,7 @@
     {
       "name": "access",
       "type": "Access",
-      "description": "The Google access: wire it into Google action nodes."
+      "description": "Wire into Google nodes."
     }
   ]
 }

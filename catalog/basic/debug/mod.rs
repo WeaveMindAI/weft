@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use weft::bus::BusEntryKind;
 use weft::context::LogLevel;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{ExecutionContext, Node, NodeManifest, WeftResult, WeftType};
 
 #[derive(NodeManifest)]
 pub struct DebugNode;
@@ -35,7 +35,7 @@ impl Node for DebugNode {
 
         // A bus marker is a CHANNEL, not a value: follow it live instead
         // of printing the marker.
-        if data.get("__weft_bus__").is_some() {
+        if WeftType::bus_marker_id(&data).is_some() {
             let bus = ctx.bus_from_input("data")?;
             let mut cursor = bus.cursor_from_start();
             let mut seen: Vec<Value> = Vec::new();

@@ -1,7 +1,7 @@
 {
   "type": "LlmRerank",
   "label": "Rerank",
-  "description": "Reorder documents by relevance to a query through the wired OpenRouter connection: pick the rerank model on the provider node (cohere/rerank-4-pro, ...). Emits the documents best-first plus each one's score.",
+  "description": "Reorder documents by relevance to a query through a wired OpenRouter provider, whose model names a rerank model (cohere/rerank-4-pro, ...). Emits the documents best-first plus each one's score.",
   "tags": [
     "ai",
     "rerank",
@@ -31,7 +31,12 @@
       "name": "topN",
       "type": "Number",
       "label": "Top N",
-      "description": "Only return the best N. Empty = all, reordered."
+      "description": "Only return the best N. Empty = all, reordered.",
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "step": 1
+      }
     }
   ],
   "outputs": [

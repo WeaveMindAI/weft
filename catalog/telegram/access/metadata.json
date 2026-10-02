@@ -1,7 +1,7 @@
 {
   "type": "TelegramAccess",
   "label": "Telegram Access",
-  "description": "Sign in as a Telegram bot: paste the token BotFather gave you. Wire the access output into Telegram action nodes; the token lives in the runtime's access store, never in the project file.",
+  "description": "Connect a Telegram bot with the token BotFather gave you.",
   "tags": [
     "telegram",
     "access",
@@ -53,7 +53,7 @@
     {
       "name": "access",
       "type": "Access",
-      "description": "The bot's access: wire it into Telegram action nodes."
+      "description": "Wire into the Telegram nodes."
     }
   ]
 }

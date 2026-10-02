@@ -1,7 +1,7 @@
 {
   "type": "GoogleSheetsAppend",
   "label": "Google Sheets: Append Row",
-  "description": "Append one row to a tab: pass an object keyed by the header's column names, or a plain list of cells. Emits the appended row's sheet row number.",
+  "description": "Appends one row to a Google Sheets tab, given as an object keyed by header column names or a plain list of cells; emits the new row's number.",
   "tags": [
     "google",
     "sheets",
@@ -17,7 +17,7 @@
       "requiresScopes": [
         "https://www.googleapis.com/auth/drive.file"
       ],
-      "description": "A Google account with write access to the sheet (the picker grant covers the file it picked)."
+      "description": "Needs write access to the sheet; the picker grant covers the file it picked."
     },
     {
       "name": "spreadsheet",
@@ -64,7 +64,6 @@
     {
       "name": "tab",
       "type": "String",
-      "default": "0",
       "widget": {
         "kind": "remote_select",
         "access": "account",
@@ -89,21 +88,19 @@
         ]
       },
       "label": "Tab",
-      "placeholder": "Pick a tab, or paste a link with #gid="
+      "placeholder": "Pick a tab, or paste a link with #gid=",
+      "description": "The tab to use. Empty: the first tab, whatever its id."
     },
     {
       "name": "row",
       "type": "JsonDict | List[String]",
       "required": true,
-      "description": "The row to append: an object keyed by header column names ({\"name\": \"ada\", \"age\": \"36\"}), or a plain list of cells in order."
+      "description": "An object keyed by header column names ({\"name\": \"ada\", \"age\": \"36\"}), or a list of cells in order."
     },
     {
       "name": "hasHeader",
       "type": "Boolean",
       "default": true,
-      "widget": {
-        "kind": "checkbox"
-      },
       "label": "First row is a header",
       "description": "Needed to order an object row's columns."
     }
@@ -112,7 +109,7 @@
     {
       "name": "rowNumber",
       "type": "Number",
-      "description": "The appended row's 1-based sheet row number."
+      "description": "1-based sheet row number."
     },
     {
       "name": "done",

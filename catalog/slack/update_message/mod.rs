@@ -5,6 +5,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
+use weft::access::client::required_str;
 use weft::node::NodeOutput;
 use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
 
@@ -31,10 +32,11 @@ impl Node for SlackUpdateMessageNode {
         let blocks: Option<Value> = ctx.inputs.opt("blocks")?;
 
         let mut payload = serde_json::json!({ "channel": channel, "ts": ts });
-        api::set_content(&mut payload, text, blocks, "update with")?;
+        api::set_content(&mut payload, text, blocks);
+        let client = ctx.client(&access).await?;
 
-        let answer = api::call(&ctx, &access, "chat.update", payload).await?;
-        let ts = api::required_str(&answer, "chat.update", "ts")?.to_string();
+        let answer = api::call(&client, "chat.update", payload).await?;
+        let ts = required_str(&answer, "chat.update", "ts")?.to_string();
         ctx.pulse_downstream(NodeOutput::new().set("ts", ts)).await
     }
 }

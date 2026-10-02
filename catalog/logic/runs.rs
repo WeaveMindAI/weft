@@ -5,8 +5,6 @@
 use weft::context::RunQuery;
 use weft::{ExecutionContext, WeftError, WeftResult};
 
-use super::steering::safe_tag;
-
 /// `ctx.runs()` narrowed by every filter input the node was given. An
 /// empty text input narrows nothing. The tag is read the way `TagRun`
 /// writes it, so the same value finds the runs `TagRun` tagged with it.
@@ -25,7 +23,7 @@ pub fn runs_from_inputs(ctx: &ExecutionContext) -> WeftResult<RunQuery<'_>> {
         query = query.node(node);
     }
     if let Some(tag) = text("tag")? {
-        query = query.tag(safe_tag(&tag)?);
+        query = query.tag(&tag)?;
     }
     if let Some(secs) = ctx.inputs.opt::<f64>("olderThanSecs")? {
         if !(secs >= 0.0) || secs.fract() != 0.0 {

@@ -1,7 +1,7 @@
 {
   "type": "ChatHistoryAppend",
   "label": "Chat Message",
-  "description": "Append one message to a conversation kept in a file (`historyFile`), in place: the same file an LLM node reads and adds its turns to, so a conversation is built by chaining this node and the AI calls on one file. With no file in, the message starts a new conversation file, kept past the run. Media attachments ride inside messages as stored files. Role 'tool' feeds a tool call's result back: in an agent's tool loop, set `role: \"tool\"`, wire the tool's result to `text`, the call's `id` to `toolCallId` and the loop's carried file to `historyFile`; this node's `historyFile` output is the loop's next carry.",
+  "description": "Append one message to a conversation file (`historyFile`), in place: the same file LLM nodes read and add their turns to, so a conversation is built by chaining this node and LLM calls on one file. With no file in, it starts a new conversation file, kept past the run. For a tool result in an agent's tool loop: `role: \"tool\"`, the result on `text`, the call's `id` on `toolCallId`, the loop's carried file on `historyFile`; this node's `historyFile` output is the loop's next carry.",
   "tags": [
     "ai",
     "chat",
@@ -18,7 +18,7 @@
       "accepts": [
         "wire"
       ],
-      "description": "The conversation so far, kept in a stored file (an LLM node's or another Chat Message's `historyFile` output, or a file holding `[]`). The message is added to this same file, in place. Unwired, the message starts a new conversation file."
+      "description": "The conversation so far (an LLM node's or another Chat Message's `historyFile` output, or a stored file holding `[]`). The message is added to this file in place. Unwired, a new conversation file is started."
     },
     {
       "name": "role",
@@ -49,21 +49,96 @@
     {
       "name": "cacheBreakpoint",
       "type": "Boolean",
-      "widget": { "kind": "checkbox" },
       "default": false,
       "label": "Cache up to here",
-      "description": "Mark this message as a prompt-cache breakpoint: everything up to and including it is cached by providers that support it, and the next call reuses it. Put the stable part of a conversation (persona, reference material) before the mark and the volatile part after. A conversation carrying any mark of its own turns the LLM node's automatic marks off."
+      "description": "Prompt-cache everything up to and including this message. Any mark in a conversation turns the LLM node's automatic marks off."
     }
   ],
   "outputs": [
     {
       "name": "historyFile",
       "type": "File",
-      "description": "The conversation including this message: the file that came in (next version), or the new one this message started. Wire it into the next node's `historyFile`."
+      "description": "The file that came in (next version), or the new one this message started."
     }
   ],
   "features": {
     "oneOfRequired": [["text", "media"]]
   },
-  "requires_infra": false
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_equals",
+            "field": "role",
+            "equals": "tool"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "toolCallId"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ChatHistoryAppend '{id}' is a tool message with no `toolCallId`. Wire the id of the tool call it answers (an LLM node's toolCalls output) to `toolCallId`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "toolCallId"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_satisfied",
+            "port": "toolCallId"
+          },
+          {
+            "kind": "any",
+            "of": [
+              {
+                "kind": "config_in_set",
+                "field": "role",
+                "values": [
+                  "user",
+                  "assistant",
+                  "system"
+                ]
+              },
+              {
+                "kind": "all",
+                "of": [
+                  {
+                    "kind": "not",
+                    "of": {
+                      "kind": "config_present",
+                      "field": "role"
+                    }
+                  },
+                  {
+                    "kind": "not",
+                    "of": {
+                      "kind": "input_wired",
+                      "port": "role"
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "then": {
+        "message": "ChatHistoryAppend '{id}' has a `toolCallId` but is not a tool message. Set `role` to tool, or remove `toolCallId`.",
+        "level": "structural",
+        "severity": "error",
+        "port": "toolCallId"
+      }
+    }
+  ]
 }

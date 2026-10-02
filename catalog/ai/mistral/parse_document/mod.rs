@@ -89,8 +89,7 @@ impl Node for MistralParseDocumentNode {
                          OCR; remove it from the account's file list by hand"
                     ),
                 )
-                .await
-                .ok();
+                .await?;
             }
             Err(e) => {
                 ctx.log(
@@ -100,8 +99,7 @@ impl Node for MistralParseDocumentNode {
                          it from the account's file list by hand"
                     ),
                 )
-                .await
-                .ok();
+                .await?;
             }
         }
         let answer = ocr?;

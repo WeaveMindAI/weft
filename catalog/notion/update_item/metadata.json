@@ -56,6 +56,12 @@
     }
   ],
   "features": {
-    "catchErrors": true
+    "catchErrors": true,
+    "oneOfRequired": [
+      [
+        "properties",
+        "archived"
+      ]
+    ]
   }
 }

@@ -39,11 +39,7 @@ async fn live_edit(rig: LiveRig) -> WeftResult<()> {
 
 async fn edits(rig: FakeRig) -> WeftResult<()> {
     rig.respond("POST", "/fal-ai/flux-pro/kontext", json!({ "request_id": "req-2" }));
-    rig.respond(
-        "GET",
-        "/fal-ai/flux-pro/requests/req-2/status",
-        json!({ "status": "COMPLETED" }),
-    );
+    rig.signal(json!({ "status": "COMPLETED" }));
     rig.respond(
         "GET",
         "/fal-ai/flux-pro/requests/req-2",
@@ -88,11 +84,7 @@ async fn edits(rig: FakeRig) -> WeftResult<()> {
 /// naming the key `null` in `params` takes it off the request.
 async fn params_null_drops_a_key(rig: FakeRig) -> WeftResult<()> {
     rig.respond("POST", "/fal-ai/flux-pro/kontext", json!({ "request_id": "req-3" }));
-    rig.respond(
-        "GET",
-        "/fal-ai/flux-pro/requests/req-3/status",
-        json!({ "status": "COMPLETED" }),
-    );
+    rig.signal(json!({ "status": "COMPLETED" }));
     rig.respond(
         "GET",
         "/fal-ai/flux-pro/requests/req-3",

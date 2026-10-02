@@ -1,7 +1,7 @@
 {
   "type": "Not",
   "label": "Not",
-  "description": "Flips a yes/no answer: `value` comes out `false` when `true` went in, and `true` when `false` went in. Wire it into `_should_flow` when a step should run on a `false`. Only a Boolean fits the input, so a string or a number is refused when the program is checked, never guessed at. When nothing arrives (the branch feeding it closed), nothing comes out either.",
+  "description": "Flip a Boolean, e.g. to run a step on `false` through `_should_flow`. Only a Boolean is accepted (checked at compile time); a closed input gives a closed output.",
   "tags": [
     "flow",
     "logic",
@@ -16,15 +16,14 @@
       "name": "value",
       "type": "Boolean",
       "required": true,
-      "description": "The answer to flip."
+      "description": "The Boolean to flip."
     }
   ],
   "outputs": [
     {
       "name": "value",
       "type": "Boolean",
-      "description": "The opposite of the input."
+      "description": "The opposite."
     }
-  ],
-  "requires_infra": false
+  ]
 }

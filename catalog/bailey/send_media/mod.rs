@@ -5,8 +5,9 @@
 
 use async_trait::async_trait;
 
+use weft::infra::InfraHandle;
 use weft::node::NodeOutput;
-use weft::storage::FileHandle;
+use weft::storage::{FileHandle, StorageScope};
 use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
@@ -23,13 +24,13 @@ impl Node for BaileySendMediaNode {
     }
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let endpoint_url: String = ctx.inputs.get("endpointUrl")?;
+        let bridge: InfraHandle = ctx.inputs.get("bridge")?;
         let to: String = ctx.inputs.get("to")?;
         let file: FileHandle = ctx.inputs.get("file")?;
         let caption: Option<String> = ctx.inputs.opt("caption")?;
         let voice_note: bool = ctx.inputs.get("voiceNote")?;
 
-        let media = super::bridge_api::bridge_media(&ctx, &file).await?;
+        let media = ctx.storage(StorageScope::Execution).external_file(&file).await?;
         // A voice note is an audio message and nothing else. The bridge
         // picks the media kind from the mime and would quietly drop the
         // flag on anything else, so a file that is not audio is refused
@@ -55,8 +56,7 @@ impl Node for BaileySendMediaNode {
             payload["caption"] = serde_json::json!(caption);
         }
 
-        let result =
-            super::bridge_api::action(&ctx, &endpoint_url, "sendMedia", payload).await?;
+        let result = ctx.endpoint_of(&bridge).await?.action("sendMedia", payload).await?;
         let message_id = result["messageId"]
             .as_str()
             .node_err(format!("bridge send response missing result.messageId: {result}"))?;

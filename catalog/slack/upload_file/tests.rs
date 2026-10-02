@@ -62,7 +62,7 @@ async fn live_upload(rig: LiveRig) -> WeftResult<()> {
             Ok(())
         },
         || async {
-            crate::api::call_on(conn.client(), "files.delete", json!({ "file": file_id.clone() }))
+            crate::api::call(conn.client(), "files.delete", json!({ "file": file_id.clone() }))
                 .await
                 .map(|_| ())
         },

@@ -27,8 +27,9 @@ impl Node for ListInstancesNode {
             .filter(|i| i.triggers.iter().any(|t| t.waiting.is_some()))
             .map(|i| i.instance.as_str().to_string())
             .collect();
-        let instances =
-            serde_json::to_value(&instances).map_err(|e| weft::WeftError::NodeExecution(format!("instances: {e}")))?;
-        ctx.pulse_downstream(NodeOutput::new().set("instances", instances).set("ids", ids).set("waiting", waiting)).await
+        ctx.pulse_downstream(
+            NodeOutput::new().set_serialized("instances", &instances)?.set("ids", ids).set("waiting", waiting),
+        )
+        .await
     }
 }

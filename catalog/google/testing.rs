@@ -4,21 +4,13 @@
 #![cfg(feature = "node-tests")]
 
 use weft::access::OpenedConnection;
-use weft::{NodeErrExt, WeftResult};
+use weft::WeftResult;
 
 /// DELETE `url` through the test's own connection, loud on refusal.
 /// Google's delete endpoints answer an empty 204, so this checks the
 /// status and never parses a body.
 pub async fn delete(conn: &OpenedConnection, url: &str, what: &str) -> WeftResult<()> {
-    let resp = conn.client().delete(url).send().await.node_err(what)?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        weft::node_bail!(
-            "the service answered {status} trying to {what}: {}",
-            body.chars().take(500).collect::<String>()
-        );
-    }
+    weft::access::client::checked_send(conn.client().delete(url), what).await?;
     Ok(())
 }
 
@@ -26,7 +18,7 @@ pub async fn delete(conn: &OpenedConnection, url: &str, what: &str) -> WeftResul
 pub async fn drive_delete(conn: &OpenedConnection, id: &str) -> WeftResult<()> {
     delete(
         conn,
-        &format!("{}/files/{id}", super::drive::API),
+        &format!("{}/files/{}", super::drive::API, super::api::segment(id)),
         "delete the test file from Drive",
     )
     .await

@@ -3,7 +3,7 @@
 
 use serde_json::json;
 
-use weft::{FakeRig, NodeTest, WeftResult};
+use weft::{EndpointMethod, FakeRig, NodeTest, WeftResult};
 
 use super::BaileyPresenceNode;
 
@@ -15,12 +15,13 @@ pub fn tests() -> Vec<NodeTest> {
 }
 
 async fn posts(rig: FakeRig) -> WeftResult<()> {
-    rig.respond("POST", "/action", json!({ "result": { "success": true } }));
+    let bridge = rig.declare_infra("bridge", "api", "http://bridge.example:8090");
+    rig.answer_infra("bridge", "api", EndpointMethod::Post, "/action", json!({ "result": { "success": true } }));
     let outcome = rig
         .run(
             &BaileyPresenceNode,
             json!({
-                "endpointUrl": "http://bridge.example:8090",
+                "bridge": bridge,
                 "chatId": "49151@s.whatsapp.net",
                 "presence": "composing",
             }),
@@ -28,22 +29,19 @@ async fn posts(rig: FakeRig) -> WeftResult<()> {
         .await
         .ok()?;
     assert_eq!(outcome.outputs["done"], json!(true));
-    let body = rig.requests()[0].body.clone().expect("action body");
+    let body = rig.endpoint_calls()[0].body.clone().expect("action body");
     assert_eq!(body["action"], json!("sendPresenceUpdate"));
     assert_eq!(body["payload"]["presence"], json!("composing"));
     Ok(())
 }
 
 async fn soft_error(rig: FakeRig) -> WeftResult<()> {
-    rig.respond(
-        "POST",
-        "/action",
-        json!({ "result": { "error": "WhatsApp not connected" } }),
-    );
+    let bridge = rig.declare_infra("bridge", "api", "http://bridge.example:8090");
+    rig.answer_infra("bridge", "api", EndpointMethod::Post, "/action", json!({ "result": { "error": "WhatsApp not connected" } }));
     let outcome = rig
         .run(
             &BaileyPresenceNode,
-            json!({ "endpointUrl": "http://b:1", "chatId": "c", "presence": "composing" }),
+            json!({ "bridge": bridge, "chatId": "c", "presence": "composing" }),
         )
         .await;
     let err = outcome.result.expect_err("a soft error must refuse").to_string();

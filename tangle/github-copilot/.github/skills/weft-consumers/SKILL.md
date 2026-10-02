@@ -219,7 +219,7 @@ A form's payload is `formSchema.fields`, each field:
 |---|---|---|---|
 | `display` | `readonly`: show the value, no input | the wired value (a string, or any JSON to pretty-print) | nothing |
 | `display_image` | `image` | a file (below) | nothing |
-| `approve_reject` | `buttons`, labels from `config.approveLabel` / `rejectLabel` | none | `true` or `false` |
+| `approve_reject` | `buttons`, labels from `config.approveLabel` / `rejectLabel` | none | `true` or `false` (`"approve"` and `"reject"` also work; anything else, null included, fails the form's node) |
 | `select` / `multi_select` | `select`, options from `config.options`; `render.multiple` for several | none | one option string, or an array of them |
 | `select_input` / `multi_select_input` | `select`, options from the wired `value` (a list of strings) | the option list | as above |
 | `text_input` / `textarea` | `text` / `textarea`, `config.placeholder` when set | none | a string |

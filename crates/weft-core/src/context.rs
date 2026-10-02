@@ -247,10 +247,15 @@ impl ExecutionContext {
     /// Stop executing this firing until the given wake signal fires.
     ///
     /// Use when the node needs an answer mid-flow that comes from
-    /// outside (a HumanQuery form, a timer, a webhook callback). The
+    /// outside (a HumanQuery form, a timer, a webhook callback, a
+    /// `PollEndpoint` on an outside job's status address). The
     /// node's execute body parks here and the engine releases the
     /// worker; when the fire arrives, a fresh worker spawns, folds
     /// the journal, and this call returns the fire's payload.
+    ///
+    /// The body replays from the top when the fire arrives, so a side
+    /// effect before this call (the submit that started the job) goes
+    /// through [`Self::run`].
     ///
     /// This is the resume path; pair with `register_signal`
     /// (entry-trigger, persistent) for the other case. Lifecycle
@@ -611,10 +616,27 @@ impl ExecutionContext {
     /// Returns an error if the endpoint doesn't exist or the infra
     /// isn't applied. The dispatcher resolves the URL from the
     /// `infra_node` row so node code never touches the platform.
+    ///
+    /// To let OTHER nodes reach the endpoint, emit
+    /// [`EndpointHandle::infra_handle`] on an output port typed `Infra`.
     pub async fn endpoint(&self, name: &str) -> WeftResult<EndpointHandle> {
-        let address = self.handle.endpoint_address(name).await?;
+        let own = self.handle.own_infra(name, self.instance.as_ref())?;
+        self.endpoint_of(&own).await
+    }
+
+    /// Resolve an endpoint some infra node shared with this one: the
+    /// `Infra` handle it emitted, read off an input. The same lookup as
+    /// [`Self::endpoint`] and the same handle back, so `.url()`,
+    /// `.call(..)` and `.action(..)` work the same on either.
+    ///
+    /// Refused when the handle names an infra place this program does
+    /// not declare, or another instance's copy than the run's own. A
+    /// handle never reaches outside the project of the run holding it.
+    pub async fn endpoint_of(&self, infra: &crate::infra::InfraHandle) -> WeftResult<EndpointHandle> {
+        let address = self.handle.endpoint_address(infra).await?;
         Ok(EndpointHandle {
             handle: self.handle.clone(),
+            infra: infra.clone(),
             url: address.url,
             public_url: address.public_url,
         })
@@ -757,8 +779,11 @@ impl ExecutionContext {
     /// run's [`Self::stop_tagged`] selects on, and they show on the
     /// run in the inspector.
     ///
-    /// Tag grammar is [`crate::tag`]'s: `[A-Za-z0-9_-]{1,64}`. A bad
-    /// tag fails here, before anything is written, naming the character.
+    /// Any non-empty string works: each is turned into a valid tag by
+    /// [`crate::tag::normalize_tag`] (kept as it is when it already is
+    /// one), the same rule [`Self::stop_tagged`] and a runs query's tag
+    /// filter apply, so the same value always meets the same tag. An
+    /// empty tag fails here, before anything is written.
     pub async fn tag_execution<I, S>(&self, tags: I) -> WeftResult<()>
     where
         I: IntoIterator<Item = S>,
@@ -768,8 +793,14 @@ impl ExecutionContext {
         if tags.is_empty() {
             return Err(WeftError::Input("tag_execution needs at least one tag".into()));
         }
-        crate::tag::validate_tags(&tags).map_err(|e| WeftError::Input(e.to_string()))?;
-        self.handle.tag_execution(tags).await
+        let mut normalized: Vec<String> = Vec::with_capacity(tags.len());
+        for tag in &tags {
+            let tag = crate::tag::normalize_tag(tag).map_err(|e| WeftError::Input(e.to_string()))?;
+            if !normalized.contains(&tag) {
+                normalized.push(tag);
+            }
+        }
+        self.handle.tag_execution(normalized).await
     }
 
     /// Stop every live execution of this project carrying `tag`, right
@@ -796,11 +827,13 @@ impl ExecutionContext {
     /// needs the siblings gone before its next step has no such
     /// guarantee and should not be written to depend on one.
     ///
+    /// `tag` is normalized the way [`Self::tag_execution`] normalizes,
+    /// so the value a run tagged itself with reaches it.
+    ///
     /// Never crosses a project: a tag is scoped to the project the
     /// caller runs in, and the broker refuses anything else.
     pub async fn stop_tagged(&self, tag: impl Into<String>, stop_self: StopSelf) -> WeftResult<()> {
-        let tag = tag.into();
-        crate::tag::validate_tag(&tag).map_err(|e| WeftError::Input(e.to_string()))?;
+        let tag = crate::tag::normalize_tag(&tag.into()).map_err(|e| WeftError::Input(e.to_string()))?;
         self.handle.stop_tagged(tag, stop_self).await
     }
 
@@ -1034,6 +1067,46 @@ impl AccessPort {
     }
 }
 
+/// `v` with every integral float (`2.0`) turned into the integer it
+/// exactly equals, at any depth; `None` when there was none to turn. A
+/// float with a fractional part, or past what an `i64`/`u64` holds,
+/// stays a float, so the typed read still refuses it.
+fn integral_floats_as_integers(v: &Value) -> Option<Value> {
+    // 2^63 and 2^64: an f64 strictly below them fits, and an integral
+    // f64 IS an exact integer, so the conversion loses nothing.
+    const I64_END: f64 = 9_223_372_036_854_775_808.0;
+    const U64_END: f64 = 18_446_744_073_709_551_616.0;
+    match v {
+        Value::Number(n) if n.is_f64() => {
+            let f = n.as_f64()?;
+            if f.fract() != 0.0 || !f.is_finite() {
+                None
+            } else if (-I64_END..I64_END).contains(&f) {
+                Some(Value::from(f as i64))
+            } else if (0.0..U64_END).contains(&f) {
+                Some(Value::from(f as u64))
+            } else {
+                None
+            }
+        }
+        Value::Array(items) => {
+            let turned: Vec<Option<Value>> = items.iter().map(integral_floats_as_integers).collect();
+            turned.iter().any(Option::is_some).then(|| {
+                Value::Array(items.iter().zip(turned).map(|(item, t)| t.unwrap_or_else(|| item.clone())).collect())
+            })
+        }
+        Value::Object(fields) => {
+            let turned: Vec<Option<Value>> = fields.values().map(integral_floats_as_integers).collect();
+            turned.iter().any(Option::is_some).then(|| {
+                Value::Object(
+                    fields.iter().zip(turned).map(|((k, item), t)| (k.clone(), t.unwrap_or_else(|| item.clone()))).collect(),
+                )
+            })
+        }
+        _ => None,
+    }
+}
+
 impl ValueBag {
     pub fn inputs(
         values: serde_json::Map<String, Value>,
@@ -1112,8 +1185,22 @@ impl ValueBag {
             .values
             .get(name)
             .ok_or_else(|| self.err(format!("missing required {} '{name}'", self.noun())))?;
-        serde_json::from_value(v.clone())
-            .map_err(|e| self.err(format!("{} '{name}': {e}", self.noun())))
+        self.read(name, v)
+    }
+
+    /// Deserialize one value of `name` into `T`. A number is a number:
+    /// a wire carries `2.0` where a whole-number widget's input held
+    /// `2`, so when the value as it stands does not read, it is read
+    /// again with every integral float as the integer it exactly is. A
+    /// reader that takes floats (or the raw value) gets the value
+    /// untouched, and a fractional or out-of-range number still fails
+    /// with serde's message naming it.
+    fn read<T: DeserializeOwned>(&self, name: &str, v: &Value) -> WeftResult<T> {
+        serde_json::from_value(v.clone()).or_else(|e| {
+            integral_floats_as_integers(v)
+                .and_then(|whole| serde_json::from_value(whole).ok())
+                .ok_or_else(|| self.err(format!("{} '{name}': {e}", self.noun())))
+        })
     }
 
     /// Read the optional value `name`, typed. Absent or explicitly null
@@ -1123,9 +1210,7 @@ impl ValueBag {
         match self.values.get(name) {
             None => Ok(None),
             Some(v) if v.is_null() => Ok(None),
-            Some(v) => serde_json::from_value(v.clone())
-                .map(Some)
-                .map_err(|e| self.err(format!("{} '{name}': {e}", self.noun()))),
+            Some(v) => self.read(name, v).map(Some),
         }
     }
 
@@ -1151,10 +1236,7 @@ impl ValueBag {
         };
         elems
             .into_iter()
-            .map(|v| {
-                serde_json::from_value(v)
-                    .map_err(|e| self.err(format!("{} '{name}': {e}", self.noun())))
-            })
+            .map(|v| self.read(name, &v))
             .collect()
     }
 
@@ -1543,20 +1625,25 @@ pub enum EndpointMethod {
     Post,
 }
 
-/// Resolved handle for one of a node's declared endpoints.
-/// Obtained via `ctx.endpoint(name)`: one broker round-trip
-/// resolves the URL, the handle caches it. After that:
+/// Resolved handle for one infra endpoint: one of the node's own
+/// (`ctx.endpoint(name)`) or one another infra node shared
+/// (`ctx.endpoint_of(&handle)`). One broker round-trip resolves the
+/// URL, the handle caches it. After that:
 ///
 ///   - `.url()` is a sync getter for the bare install-internal URL
-///     (e.g. to forward as a NodeOutput port value);
+///     (e.g. for a signal that subscribes to the service);
 ///   - `.call(method, path, body)` issues an HTTP request to the
-///     cached URL + `path` and returns the JSON response.
+///     cached URL + `path` and returns the JSON response;
+///   - `.action(name, payload)` speaks the infra action envelope;
+///   - `.infra_handle()` is the value to emit so other nodes reach it.
 ///
 /// One handle, one round-trip. No duplicate `endpoint_url`+`endpoint_call`
 /// pattern.
 #[derive(Clone)]
 pub struct EndpointHandle {
     handle: Arc<dyn ContextHandle>,
+    /// Which endpoint this is, by name: what other nodes resolve.
+    infra: crate::infra::InfraHandle,
     url: String,
     public_url: Option<String>,
 }
@@ -1622,7 +1709,11 @@ impl EndpointHandle {
     }
 
     /// The address the project's own workers reach this endpoint at. No
-    /// broker call; the URL was resolved by `ctx.endpoint(name)`.
+    /// broker call; the URL was resolved by `ctx.endpoint(name)`. A
+    /// signal given this address (a `PollEndpoint` a run parks on, an
+    /// `SseSubscribe`) works too: the listener asks the broker for the
+    /// same endpoint's address as weft's own roles reach it before every
+    /// connect (`weft_listener::infra_address`).
     pub fn url(&self) -> &str {
         &self.url
     }
@@ -1654,6 +1745,28 @@ impl EndpointHandle {
             )));
         }
         self.handle.endpoint_call(&self.url, method, path, body).await
+    }
+
+    /// Ask the service to run one action, through the action envelope
+    /// every infra endpoint with actions speaks (`POST /action`, see
+    /// [`crate::infra::action`]), and hand back its `result`. A refusal
+    /// the service answers with a 200 (`result.error`) fails just as
+    /// loudly as a non-2xx.
+    pub async fn action(&self, name: &str, payload: Value) -> WeftResult<Value> {
+        use crate::infra::action::{action_request, action_result, ACTION_PATH};
+        let answer = self
+            .call(EndpointMethod::Post, ACTION_PATH, Some(action_request(name, payload)))
+            .await?;
+        action_result(name, answer).map_err(crate::error::node_error)
+    }
+
+    /// The value that lets another node reach this endpoint: emit it on
+    /// an output port typed `Infra`, and a node wired to that port
+    /// resolves it with `ctx.endpoint_of(&handle)`. It names the
+    /// endpoint, never the address, so it survives a redeploy that
+    /// moves the service.
+    pub fn infra_handle(&self) -> &crate::infra::InfraHandle {
+        &self.infra
     }
 }
 
@@ -2110,6 +2223,51 @@ impl StorageHandle {
         }
     }
 
+    /// One file as something the open internet can read: its public
+    /// link when this storage can serve one, else an inline `data:` URL.
+    /// A link only helps a consumer that can fetch it, so the fallback
+    /// hands out the bytes (read only on that path) when the store is
+    /// private and no public relay is up.
+    pub async fn external_url(&self, file: &crate::storage::FileHandle) -> WeftResult<String> {
+        if let Some(url) = self.public_link(file, None).await? {
+            return Ok(url);
+        }
+        let (meta, bytes) = self.get_bytes(file).await?;
+        Ok(crate::storage::media::data_url(&meta.mime_type, &bytes))
+    }
+
+    /// [`Self::external_url`] plus the file's mime type and filename,
+    /// for a send that names them beside the link. The bytes are read
+    /// only for the inline fallback. With a public link, a url-backed
+    /// file answers from its own value with no fetch at all, and a
+    /// stored file's metadata comes from opening its read, whose byte
+    /// stream is then dropped unread.
+    pub async fn external_file(
+        &self,
+        file: &crate::storage::FileHandle,
+    ) -> WeftResult<crate::storage::media::ExternalFile> {
+        use crate::storage::media::{data_url, ExternalFile};
+        let Some(url) = self.public_link(file, None).await? else {
+            let (meta, bytes) = self.get_bytes(file).await?;
+            return Ok(ExternalFile {
+                url: data_url(&meta.mime_type, &bytes),
+                mime_type: meta.mime_type,
+                filename: meta.filename,
+            });
+        };
+        let (mime_type, filename) = match file {
+            crate::storage::FileHandle::Url { mime_type, filename, .. } => {
+                (mime_type.clone(), filename.clone())
+            }
+            crate::storage::FileHandle::Key(_) => {
+                let (meta, unread) = self.get(file).await?;
+                drop(unread);
+                (meta.mime_type, meta.filename)
+            }
+        };
+        Ok(ExternalFile { url, mime_type, filename })
+    }
+
     /// Convert every MEDIA SLOT of a typed value into a form an
     /// external consumer can use, per the value's declared type: a slot
     /// is any position `ty` declares as a stored-file type, anywhere
@@ -2140,13 +2298,7 @@ impl StorageHandle {
                 // when the open internet can fetch it, so the slot
                 // falls back to inline bytes when no public link can
                 // be served (private store, no relay).
-                MediaForm::Url => match self.public_link(&handle, None).await? {
-                    Some(url) => url,
-                    None => {
-                        let (meta, bytes) = self.get_bytes(&handle).await?;
-                        crate::storage::media::data_url(&meta.mime_type, &bytes)
-                    }
-                },
+                MediaForm::Url => self.external_url(&handle).await?,
                 MediaForm::Inline => {
                     let (meta, bytes) = self.get_bytes(&handle).await?;
                     crate::storage::media::data_url(&meta.mime_type, &bytes)
@@ -2261,10 +2413,23 @@ pub trait ContextHandle: Send + Sync {
     /// dispatcher stores it with the signal and replays it onto the
     /// trigger's ports at every fire.
     async fn register_signal(&self, spec: SignalSpec, port_snapshot: Value) -> WeftResult<()>;
-    /// Resolve where a declared endpoint of the current node answers.
-    /// Used internally by [`ExecutionContext::endpoint`] to build an
-    /// `EndpointHandle`; nodes shouldn't call this directly.
-    async fn endpoint_address(&self, name: &str) -> WeftResult<crate::infra::EndpointAddress>;
+    /// The handle naming the endpoint `name` of the current node's own
+    /// infra: its place, and `instance` (the run's) when the node exists
+    /// once per instance. Refused for a per-instance node in a run for
+    /// no instance. Used internally by [`ExecutionContext::endpoint`].
+    fn own_infra(
+        &self,
+        name: &str,
+        instance: Option<&crate::instance::InstanceId>,
+    ) -> WeftResult<crate::infra::InfraHandle>;
+    /// Resolve where the endpoint a handle names answers: the current
+    /// node's own, or one another infra node shared. Used internally by
+    /// [`ExecutionContext::endpoint_of`] to build an `EndpointHandle`;
+    /// nodes shouldn't call this directly.
+    async fn endpoint_address(
+        &self,
+        infra: &crate::infra::InfraHandle,
+    ) -> WeftResult<crate::infra::EndpointAddress>;
     /// HTTP call against a pre-resolved endpoint URL. Used
     /// internally by [`EndpointHandle::call`]; nodes shouldn't
     /// call this directly. Takes the URL the handle cached at
@@ -2647,6 +2812,48 @@ mod value_bag_tests {
         ValueBag::inputs(values.as_object().unwrap().clone(), Default::default(), order)
     }
 
+    /// A wired `2.0` (what a whole-number widget accepts) reads into an
+    /// integer type; a float reader and a raw reader still see `2.0`,
+    /// and a fractional or out-of-range number is refused naming it.
+    #[test]
+    fn an_integral_float_reads_as_an_integer() {
+        let bag = ValueBag::inputs(
+            json!({
+                "rows": 2.0, "neg": -3.0, "big": 1e19, "huge": 1e20, "half": 2.5,
+                "list": [1.0, 2.0], "nested": {"n": 4.0, "s": "x"}
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            Default::default(),
+            vec![],
+        );
+        assert_eq!(bag.get::<u64>("rows").unwrap(), 2);
+        assert_eq!(bag.get::<i64>("neg").unwrap(), -3);
+        assert_eq!(bag.get::<u64>("big").unwrap(), 10_000_000_000_000_000_000);
+        assert_eq!(bag.opt::<u32>("rows").unwrap(), Some(2));
+        assert_eq!(bag.list::<u8>("list").unwrap(), vec![1, 2]);
+        #[derive(serde::Deserialize)]
+        struct Nested {
+            n: u64,
+            s: String,
+        }
+        let nested: Nested = bag.get("nested").unwrap();
+        assert_eq!((nested.n, nested.s.as_str()), (4, "x"));
+
+        assert_eq!(bag.get::<f64>("rows").unwrap(), 2.0);
+        assert_eq!(bag.get::<Value>("rows").unwrap(), json!(2.0), "a raw reader gets the value untouched");
+
+        let err = bag.get::<u64>("half").unwrap_err().to_string();
+        assert!(err.contains("input 'half'") && err.contains("2.5"), "{err}");
+        let err = bag.get::<u64>("huge").unwrap_err().to_string();
+        assert!(err.contains("input 'huge'") && err.contains("floating point"), "{err}");
+        let err = bag.get::<i64>("big").unwrap_err().to_string();
+        assert!(err.contains("input 'big'"), "past i64 is refused, never wrapped: {err}");
+        let err = bag.get::<u64>("neg").unwrap_err().to_string();
+        assert!(err.contains("input 'neg'"), "a negative never reads as unsigned: {err}");
+    }
+
     /// A hole naming a port the node declared, which stayed silent this
     /// firing, reads null: `photo?: File` on a card sent with no
     /// picture. A hole naming no port at all still names the author's
@@ -2752,7 +2959,8 @@ mod value_bag_tests {
     impl ContextHandle for DeadHandle {
         async fn await_signal(&self, _: SignalSpec) -> WeftResult<Value> { unreachable!() }
         async fn register_signal(&self, _: SignalSpec, _: Value) -> WeftResult<()> { unreachable!() }
-        async fn endpoint_address(&self, _: &str) -> WeftResult<crate::infra::EndpointAddress> { unreachable!() }
+        fn own_infra(&self, _: &str, _: Option<&crate::instance::InstanceId>) -> WeftResult<crate::infra::InfraHandle> { unreachable!() }
+        async fn endpoint_address(&self, _: &crate::infra::InfraHandle) -> WeftResult<crate::infra::EndpointAddress> { unreachable!() }
         async fn endpoint_call(&self, _: &str, _: EndpointMethod, _: &str, _: Option<Value>) -> WeftResult<Value> { unreachable!() }
         async fn run_step(&self, _: &str) -> WeftResult<(u32, Option<Value>)> { unreachable!() }
         async fn run_record(&self, _: &str, _: u32, _: &Value) -> WeftResult<()> { unreachable!() }
@@ -2814,7 +3022,8 @@ mod value_bag_tests {
     impl ContextHandle for StorageProbeHandle {
         async fn await_signal(&self, _: SignalSpec) -> WeftResult<Value> { unreachable!() }
         async fn register_signal(&self, _: SignalSpec, _: Value) -> WeftResult<()> { unreachable!() }
-        async fn endpoint_address(&self, _: &str) -> WeftResult<crate::infra::EndpointAddress> { unreachable!() }
+        fn own_infra(&self, _: &str, _: Option<&crate::instance::InstanceId>) -> WeftResult<crate::infra::InfraHandle> { unreachable!() }
+        async fn endpoint_address(&self, _: &crate::infra::InfraHandle) -> WeftResult<crate::infra::EndpointAddress> { unreachable!() }
         async fn endpoint_call(&self, _: &str, _: EndpointMethod, _: &str, _: Option<Value>) -> WeftResult<Value> { unreachable!() }
         async fn run_step(&self, _: &str) -> WeftResult<(u32, Option<Value>)> { unreachable!() }
         async fn run_record(&self, _: &str, _: u32, _: &Value) -> WeftResult<()> { unreachable!() }
@@ -2888,8 +3097,6 @@ mod value_bag_tests {
         fn caller_connection(&self) -> Option<Arc<dyn crate::caller::CallerConnection>> { None }
     }
 
-    /// `MediaForm::Url` is a preference: the slot takes the storage's
-    /// public link when one exists and falls back to inline bytes when
     /// A link the storage cannot mint is the firing's error, not a
     /// marker quietly handed over without one: the body would fetch a
     /// URL that is not there. A text input needs no signer at all.
@@ -2963,7 +3170,8 @@ mod value_bag_tests {
         assert_eq!(&put.bytes[..], b"png");
     }
 
-    /// it does not; `Inline` always embeds.
+    /// A file input's marker carries a link minted for this firing,
+    /// and what leaves the node is the stored form again.
     #[tokio::test]
     async fn file_inputs_get_a_firing_link_that_every_exit_strips() {
         let file = crate::storage::StoredFile {
@@ -3003,7 +3211,10 @@ mod value_bag_tests {
         assert_eq!(out.outputs["photo"], file.to_value());
     }
 
-#[tokio::test]
+    /// `MediaForm::Url` is a preference: the slot takes the storage's
+    /// public link when one exists and falls back to inline bytes when
+    /// it does not.
+    #[tokio::test]
     async fn externalize_url_form_falls_back_to_inline_without_a_public_link() {
         use crate::storage::media::ExternalizePolicy;
         let file = crate::storage::StoredFile {
@@ -3046,6 +3257,50 @@ mod value_bag_tests {
             .unwrap();
         let s = out.as_str().unwrap();
         assert!(s.starts_with("data:image/png;base64,"), "{s}");
+    }
+
+    /// `external_file` answers the link, mime and filename together: a
+    /// public link with the stored meta, else the inline bytes; a
+    /// url-backed file with a link answers from its own value.
+    #[tokio::test]
+    async fn external_file_carries_the_link_or_the_bytes_with_the_meta() {
+        let with_link = |link: Option<&str>| {
+            ExecutionContext::new(
+                uuid::Uuid::nil(),
+                "node-1".into(),
+                "TestNode".into(),
+                None,
+                crate::ExecutionId::nil(),
+                LoopFrames::default(),
+                None,
+                inputs_bag(json!({})),
+                Arc::new(StorageProbeHandle { public_link: link.map(str::to_string), presign_fails: false, puts: Default::default() }),
+            )
+        };
+        let stored = crate::storage::FileHandle::Key("project/p1/img1".into());
+
+        let ctx = with_link(Some("https://pub.example/files/tok1"));
+        let storage = ctx.storage(crate::storage::StorageScope::Project);
+        let out = storage.external_file(&stored).await.unwrap();
+        assert_eq!(out.url, "https://pub.example/files/tok1");
+        assert_eq!((out.mime_type.as_str(), out.filename.as_str()), ("image/png", "p.png"));
+        // The probe's url read is unreachable!(), so this proves no fetch.
+        let external = crate::storage::FileHandle::Url {
+            url: "https://cdn.example/a.mp3".into(),
+            mime_type: "audio/mpeg".into(),
+            filename: "a.mp3".into(),
+            size_bytes: 9,
+        };
+        let out = storage.external_file(&external).await.unwrap();
+        assert_eq!(out.url, "https://cdn.example/a.mp3");
+        assert_eq!((out.mime_type.as_str(), out.filename.as_str()), ("audio/mpeg", "a.mp3"));
+
+        let ctx = with_link(None);
+        let storage = ctx.storage(crate::storage::StorageScope::Project);
+        let out = storage.external_file(&stored).await.unwrap();
+        assert_eq!(out.url, crate::storage::media::data_url("image/png", b"png"));
+        assert_eq!(out.filename, "p.png");
+        assert_eq!(storage.external_url(&stored).await.unwrap(), out.url);
     }
 
     fn ctx(inputs_json: serde_json::Value) -> ExecutionContext {

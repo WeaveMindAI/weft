@@ -1,7 +1,7 @@
 {
   "type": "S3Access",
   "label": "S3 Access",
-  "description": "Sign in to an S3-compatible object store (AWS S3, Cloudflare R2, MinIO, ...): paste the endpoint, region, and key pair. Every request through the access is SigV4-signed and aimed at the stored endpoint; node code addresses `https://storage/...` and never sees a key.",
+  "description": "Connect an S3-compatible object store (AWS S3, Cloudflare R2, MinIO, ...) with its endpoint, region and key pair.",
   "tags": [
     "s3",
     "r2",
@@ -73,7 +73,7 @@
     {
       "name": "access",
       "type": "Access",
-      "description": "The object store's access: wire it into S3 action nodes."
+      "description": "Wire into the S3 nodes."
     }
   ]
 }

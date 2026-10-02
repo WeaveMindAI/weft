@@ -23,9 +23,9 @@ You never do: when the user asks for anything on a cloud install, you
 dispatch the deployer with what they asked, and relay its report.
 
 If weft is not on the user's cloud yet, or they want to upgrade or resize
-it, Tangle reads the weft-cloud-install skill and walks them through it
-in conversation. It is never handed to a specialist, which cannot talk to
-the user.
+it, Tangle reads the weft-cloud-install skill and does it in
+conversation: the user has to log in to `gh` and `gcloud` along the way,
+so it is never handed to a specialist, which cannot talk to the user.
 
 ## A name instead of an IP
 

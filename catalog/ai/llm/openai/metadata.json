@@ -1,7 +1,7 @@
 {
   "type": "OpenAIProvider",
   "label": "OpenAI",
-  "description": "Serve LLM calls directly on OpenAI's API with your own API key: pick the connection and the model, and wire the provider output into any LLM node.",
+  "description": "Serve LLM calls directly on OpenAI's API with your own API key; wire the provider output into any LLM node.",
   "tags": [
     "ai",
     "provider",
@@ -84,7 +84,7 @@
     {
       "name": "provider",
       "type": "LlmProvider",
-      "description": "The provider value: wire it into an LLM node's provider input."
+      "description": "Wire it into an LLM node's provider input."
     }
   ],
   "validate": [
@@ -102,6 +102,5 @@
         "field": "model"
       }
     }
-  ],
-  "requires_infra": false
+  ]
 }

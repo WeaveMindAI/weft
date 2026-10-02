@@ -671,8 +671,8 @@ pub async fn clean(
 ///      built (`weft test-node`), which the install never saw: those
 ///      carrying the cwd project's `weft.dev/project` label, or any value
 ///      with `--all`.
-///   3. With `--all` only: builder-base and runtime tags other than the
-///      current ones (each engine change mints fresh ones, and both are
+///   3. With `--all` only: builder-base, runtime and registry-named
+///      standard worker tags other than the current ones (each engine change mints fresh ones, and both are
 ///      shared across every project). Needs the weft repo root to compute
 ///      the current refs.
 ///   4. With `--all` only: compile caches under a retired key.
@@ -706,6 +706,7 @@ async fn clean_build_images(ctx: &Ctx, all: bool) -> anyhow::Result<()> {
     if all {
         layer("builder-base images", current_only_sweep(crate::images::builder_base_ref()?, "builder-base").await);
         layer("runtime images", current_only_sweep(crate::images::runtime_image_ref()?, "runtime").await);
+        layer("standard worker images", stale_standard_worker_sweep().await);
         layer("retired compile caches", retired_compile_cache_sweep().await);
     }
     // The compile cache every worker build shares is not an image, but it
@@ -791,6 +792,18 @@ async fn current_only_sweep(current: String, what: &str) -> anyhow::Result<()> {
         return Ok(());
     }
     println!("{}", reclaim_host_images(&stale).await?.report(&format!("stale {what} image(s)")));
+    Ok(())
+}
+
+/// Layer 3 too: the standard workers of earlier weft versions, which are
+/// tagged under a registry name and so are not in the install's ledger.
+async fn stale_standard_worker_sweep() -> anyhow::Result<()> {
+    let stale = crate::images::stale_standard_workers(&host_image_listing().await?, &crate::images::standard_worker_ref()?)?;
+    if stale.is_empty() {
+        println!("no stale standard worker images");
+        return Ok(());
+    }
+    println!("{}", reclaim_host_images(&stale).await?.report("stale standard worker image(s)"));
     Ok(())
 }
 

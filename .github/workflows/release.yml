@@ -52,7 +52,13 @@ jobs:
   # store uploads. Whoever pulls such a commit builds from source and
   # hits the same loud local failure the dev did; their data is safe
   # either way (the boot refuses on schema drift instead of guessing).
+  #
+  # Only on weft's own repository: a fork that turns its workflows on (to
+  # run "install on GCP") must never publish images, binaries or store
+  # versions. Every job below waits on this one, so skipping it skips
+  # the whole release.
   ci:
+    if: github.repository == 'WeaveMindAI/weft'
     uses: ./.github/workflows/ci.yml
 
   # ---- shared images -> ghcr ------------------------------------------

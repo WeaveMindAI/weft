@@ -344,17 +344,14 @@ pub struct TaskWaitCancelsResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfraEndpointUrlRequest {
-    /// The asking run. The broker resolves its project and instance from
-    /// it, so a run reaches only its own instance's copy.
+    /// The asking run. The broker resolves its project from it, so a
+    /// handle never reaches outside the run's project, and checks the
+    /// handle's instance against the run's.
     pub execution_id: weft_core::ExecutionId,
-    /// The node's placement spelling (see `InfraEnqueueApplyRequest`):
-    /// the asking node's own place, so a node inside a file included
-    /// twice reaches the placement of its own call.
-    pub node_id: String,
-    /// Whether the node exists once per instance: then the copy is the
-    /// run's instance's, else the shared one.
-    pub per_instance: bool,
-    pub endpoint_name: String,
+    /// The endpoint asked for: an infra node's place (see
+    /// `InfraEnqueueApplyRequest`), the endpoint's name, and the instance
+    /// whose copy it is (absent for a shared copy).
+    pub infra: weft_core::infra::InfraHandle,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2641,15 +2638,14 @@ mod supervisor_protocol_tests {
     }
 
     #[test]
-    fn endpoint_url_request_carries_endpoint_name() {
+    fn endpoint_url_request_carries_the_handle() {
         let v = json!({
             "execution_id": "00000000-0000-0000-0000-0000000000a1",
-            "node_id": "n",
-            "per_instance": false,
-            "endpoint_name": "api"
+            "infra": { "__weft_infra__": { "place": "n", "endpoint": "api", "instance": "ada" } }
         });
         let r: InfraEndpointUrlRequest = serde_json::from_value(v).unwrap();
-        assert_eq!(r.endpoint_name, "api");
+        assert_eq!((r.infra.place(), r.infra.endpoint()), ("n", "api"));
+        assert_eq!(r.infra.instance().map(|i| i.as_str()), Some("ada"));
     }
 
     fn make_row(

@@ -60,7 +60,10 @@ impl Node for TelegramSendMediaNode {
             .file(field, &meta.filename, &meta.mime_type, bytes)
             .build();
 
-        let answer = api::send_raw(&ctx, &access, method, &content_type, body).await?;
+        let answer = api::call(&ctx.client(&access).await?, method, |req| {
+            req.header("content-type", content_type).body(body)
+        })
+        .await?;
         let message_id = api::result_message_id(&answer, method)?;
         ctx.pulse_downstream(NodeOutput::new().set("messageId", message_id)).await
     }

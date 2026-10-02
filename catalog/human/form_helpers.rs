@@ -50,7 +50,7 @@ pub fn build_form(
     form_type: &str,
     prefill: &Value,
 ) -> WeftResult<Form> {
-    let raw_fields = parse_form_fields(inputs.object()?);
+    let raw_fields = parse_form_fields(inputs.object()?)?;
     let title: String = inputs.get_or("title", String::new())?;
     let description: Option<String> = inputs.opt("description")?;
     let schema = FormSchema {
@@ -68,11 +68,16 @@ pub fn build_form(
 }
 
 /// Pull the `fields` array off a node's config. The canonical shape is a
-/// JSON array (what the compiler produces); anything else means no fields.
-pub fn parse_form_fields(config: &serde_json::Map<String, Value>) -> Vec<Value> {
+/// JSON array (what the compiler produces). An absent `fields` is a form
+/// with no fields; any other shape is a broken config and fails loudly
+/// instead of silently becoming an empty form.
+pub fn parse_form_fields(config: &serde_json::Map<String, Value>) -> WeftResult<Vec<Value>> {
     match config.get("fields") {
-        Some(Value::Array(arr)) => arr.clone(),
-        _ => Vec::new(),
+        Some(Value::Array(arr)) => Ok(arr.clone()),
+        None => Ok(Vec::new()),
+        Some(other) => weft::node_bail!(
+            "the form's `fields` must be a list of field entries, and it is {other}"
+        ),
     }
 }
 
@@ -183,26 +188,19 @@ fn render_needs_input(render: &FormFieldRender) -> bool {
 }
 
 /// Map the form response onto output ports declared by the node's
-/// specs. Driven entirely by `adds_outputs` in the spec; no
-/// per-field-type knowledge here.
+/// specs, dispatched on each field's `kind`:
+///   * `approve_reject`: the response is the decision (`true` or
+///     `"approve"`, `false` or `"reject"`). The chosen side's port
+///     (`{key}_approved` or `{key}_rejected`) gets `true`; the other is
+///     OMITTED so the engine emits a structural closure on it at
+///     termination (the losing branch is cut by the closure marker,
+///     not a `false` data pulse).
+///   * Display-only kinds (no outputs): nothing is emitted.
+///   * Every other kind declares the single `{key}` port, which gets
+///     `response[key]` as-is.
 ///
-/// Conventions a spec author should follow:
-///   * Single-port outputs (`adds_outputs.len() == 1`,
-///     `name_template = "{key}"`): the port value is `response[key]`.
-///   * `approve_reject`-style: two boolean ports
-///     (`{key}_approved`, `{key}_rejected`). The user response is
-///     `{ key: bool }`; we set the active port `true` and OMIT the
-///     inactive port so the engine emits a structural closure on it
-///     at termination (the inactive branch is cut by the closure
-///     marker, not a `null` data pulse). See `emit_outputs_for_field`.
-///   * Display-only fields (no outputs): no-op; the port set is
-///     empty so nothing is emitted.
-///   * Anything else with a single output: `response[key]` mapped
-///     verbatim.
-///
-/// If a spec uses templates we don't know how to fill (e.g. a
-/// future "{key}.something"), we still emit it as-is and pass
-/// `response[key]` so the node author's contract works.
+/// A spec whose outputs fit none of these shapes fails loudly naming
+/// its kind: guessing would hand downstream a value nobody defined.
 pub fn map_response_to_ports(
     response: &Value,
     raw_fields: &[Value],
@@ -218,93 +216,57 @@ pub fn map_response_to_ports(
         // downstream a closure instead of an error (a trigger's build
         // and wake are two different firings, so a schema saved before a
         // metadata change can reach this side alone).
-        let (key, _, spec) = resolve_field(field, &spec_map)?;
+        let (key, kind, spec) = resolve_field(field, &spec_map)?;
         if spec.adds_outputs.is_empty() {
             continue;
         }
         let raw_value = response.get(key).cloned().unwrap_or(Value::Null);
-        emit_outputs_for_field(&mut output, &spec.adds_outputs, key, &raw_value);
+        emit_outputs_for_field(&mut output, kind, &spec.adds_outputs, key, raw_value)?;
     }
     Ok(output)
 }
 
-/// For one field, set every output port the spec declares. The
-/// port-name template (`{key}_approved`, `{key}_rejected`,
-/// `{key}`) drives both the port name and the value picker:
-///   * Plain `{key}` ports get the raw response value.
-///   * `{key}_<suffix>` ports interpret a boolean response: the
-///     active-side port (the one whose suffix matches the response's
-///     truthiness) gets `true`; the inactive-side port is OMITTED
-///     from the output entirely so the engine emits a structural
-///     closure on it at termination. A consumer wired to the
-///     inactive port sees "this branch is structurally dead" via the
-///     closure marker, not a `null` data pulse.
+/// The kind whose response is a decision split across two ports.
+const APPROVE_REJECT: &str = "approve_reject";
+
+/// For one field, set the output ports its kind defines (see
+/// [`map_response_to_ports`] for the shapes).
 fn emit_outputs_for_field(
     output: &mut NodeOutput,
+    kind: &str,
     ports: &[PortTemplate],
     key: &str,
-    raw_value: &Value,
-) {
-    // Single port keyed exactly to `{key}`: pass through.
-    if ports.len() == 1 && ports[0].name_template == "{key}" {
-        output.outputs.insert(ports[0].resolve_name(key), raw_value.clone());
-        return;
-    }
-
-    // Multi-port pattern: split a single response value across
-    // suffix-tagged ports. Boolean-style splits (approve/reject,
-    // yes/no, on/off) are covered; for unknown suffixes we copy
-    // the raw value to every port and let the node author tune
-    // the spec.
-    let truthy_suffixes: &[&str] = &["approved", "yes", "on", "true"];
-    let falsy_suffixes: &[&str] = &["rejected", "no", "off", "false"];
-
-    let response_truthy = match raw_value {
-        Value::Bool(b) => *b,
-        Value::String(s) => {
-            let lc = s.to_ascii_lowercase();
-            ["approve", "approved", "true", "yes", "on"].contains(&lc.as_str())
+    raw_value: Value,
+) -> WeftResult<()> {
+    let templates: Vec<&str> = ports.iter().map(|p| p.name_template.as_str()).collect();
+    if kind == APPROVE_REJECT {
+        if templates != ["{key}_approved", "{key}_rejected"] {
+            weft::node_bail!(
+                "form kind '{kind}' declares outputs {templates:?}; its response maps \
+                 only onto [\"{{key}}_approved\", \"{{key}}_rejected\"]"
+            );
         }
-        Value::Null => false,
-        _ => true,
-    };
-
-    let mut handled_split = false;
-    for port in ports {
-        let resolved = port.resolve_name(key);
-        let suffix = resolved
-            .strip_prefix(key)
-            .and_then(|rest| rest.strip_prefix('_'));
-        if let Some(suffix) = suffix {
-            if truthy_suffixes.contains(&suffix) {
-                handled_split = true;
-                if response_truthy {
-                    output.outputs.insert(resolved, Value::Bool(true));
-                }
-                // Else: omit. The engine emits a closure at termination,
-                // signaling "this branch is structurally dead" to the
-                // downstream consumer.
-                continue;
-            }
-            if falsy_suffixes.contains(&suffix) {
-                handled_split = true;
-                if !response_truthy {
-                    output.outputs.insert(resolved, Value::Bool(true));
-                }
-                // Else: omit, see above.
-                continue;
-            }
-        }
+        let approved = match &raw_value {
+            Value::Bool(b) => *b,
+            Value::String(s) if s == "approve" => true,
+            Value::String(s) if s == "reject" => false,
+            other => weft::node_bail!(
+                "form field '{key}' ({kind}) needs a decision (true or \"approve\", false \
+                 or \"reject\"), and the response carried {other}"
+            ),
+        };
+        // The losing side is omitted: the engine closes it at
+        // termination, which tells its consumer the branch is dead.
+        let chosen = if approved { &ports[0] } else { &ports[1] };
+        output.outputs.insert(chosen.resolve_name(key), Value::Bool(true));
+        return Ok(());
     }
-
-    if handled_split {
-        return;
+    if templates != ["{key}"] {
+        weft::node_bail!(
+            "form kind '{kind}' declares outputs {templates:?}; a kind other than \
+             '{APPROVE_REJECT}' maps its response only onto the single \"{{key}}\" port"
+        );
     }
-
-    // Fallback: catalog declared multiple outputs we don't
-    // recognize. Emit the raw response on each so the node author
-    // can iterate without losing data.
-    for port in ports {
-        output.outputs.insert(port.resolve_name(key), raw_value.clone());
-    }
+    output.outputs.insert(ports[0].resolve_name(key), raw_value);
+    Ok(())
 }

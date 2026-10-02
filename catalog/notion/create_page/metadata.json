@@ -1,7 +1,7 @@
 {
   "type": "NotionCreatePage",
   "label": "Notion: Create Page",
-  "description": "Create a page under a parent page, with plain text (one paragraph per line) or raw Notion blocks as its body. Emits the new page's id and link.",
+  "description": "Create a page under a parent page, with plain text (one paragraph per line) or raw Notion blocks as its body, or with only a title when both are left empty. Emits the new page's id and link.",
   "tags": [
     "notion",
     "page"

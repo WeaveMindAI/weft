@@ -1,7 +1,8 @@
 //! LlmModerate: content-safety classification through OpenAI's
 //! moderation endpoint (free, no usage caps). The provider must be an
-//! OpenAIProvider; its model is ignored here (moderation has its own
-//! model family) unless it names a moderation model explicitly.
+//! OpenAIProvider, and only its connection is used: moderation has its
+//! own model family, picked on this node's `model`, so the same provider
+//! can feed chat nodes and this one.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -23,17 +24,11 @@ impl Node for LlmModerateNode {
     }
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let (model, account) = super::provider::read_for(&ctx, "openai", "moderation")?;
+        // The provider's own model is a chat model in the usual setup
+        // (one OpenAIProvider for everything); moderation names its own.
+        let (_, account) = super::provider::read_for(&ctx, "openai", "moderation")?;
+        let model: String = ctx.inputs.get("model")?;
         let text: String = ctx.inputs.get("text")?;
-
-        // A chat model on the provider is the normal case (the same
-        // provider node often feeds an inference step); moderation
-        // then uses its own current default.
-        let model = if model.contains("moderation") {
-            model
-        } else {
-            "omni-moderation-latest".to_string()
-        };
 
         let http = ctx.client(&account).await?;
         let answer = weft::access::client::post_json(

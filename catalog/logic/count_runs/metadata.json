@@ -1,7 +1,7 @@
 {
   "type": "CountRuns",
   "label": "Count runs",
-  "description": "Count this project's runs, narrowed by instance, status, the node that started them, a tag, or age. To see the runs themselves, use `ListRuns`.",
+  "description": "Count this project's runs, filtered by instance, status, starting node, tag or age. To list them, use ListRuns.",
   "tags": [
     "flow",
     "runs",
@@ -54,7 +54,6 @@
       "description": "How many runs match. This run counts too when it matches."
     }
   ],
-  "requires_infra": false,
   "validate": [
     {
       "when": {
@@ -62,7 +61,7 @@
         "of": { "kind": "input_names", "port": "node", "names": { "node": {} } }
       },
       "then": {
-        "message": "CountRuns '{id}' names {names} in `node`, which is no node of this program. Name it the way the program writes it (`inbox`, or `one.inbox` inside an included file).",
+        "message": "CountRuns '{id}' names {names} in `node`, which is no node of this program. Name it the way the program writes it (`inbox`, `work.inbox` inside a group, or `one.inbox` inside an included file).",
         "level": "structural",
         "severity": "error",
         "port": "node"

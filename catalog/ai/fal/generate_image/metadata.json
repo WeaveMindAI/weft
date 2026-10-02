@@ -82,7 +82,13 @@
     {
       "name": "seed",
       "type": "Number",
-      "description": "Fixed seed for reproducible output."
+      "description": "Fixed seed for reproducible output.",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "max": 9007199254740992,
+        "step": 1
+      }
     },
     {
       "name": "params",

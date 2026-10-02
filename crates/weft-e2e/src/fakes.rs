@@ -118,6 +118,60 @@ async fn poll_handler(State(body): State<Arc<Mutex<String>>>) -> impl IntoRespon
     ([(axum::http::header::CONTENT_TYPE, "application/json")], b)
 }
 
+/// A fake outside job's status address, the shape of a queue provider's
+/// "is it done yet" endpoint: the first `pending` reads answer
+/// `{"status": "IN_PROGRESS"}`, every read after them answers
+/// `{"status": "COMPLETED", "result": <result>}`. Counts the reads, so a
+/// test can see the job was polled until done and not after.
+pub struct JobFake {
+    base_url: String,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+    _server: AbortOnDrop,
+}
+
+#[derive(Clone)]
+struct JobState {
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+    pending: usize,
+    result: Arc<String>,
+}
+
+impl JobFake {
+    /// Bind the fake: `pending` reads say "still running", then the job
+    /// is done with `result`.
+    pub async fn start(pending: usize, result: &str) -> Result<Self> {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (gateway, listener, port) = bind_host("job").await?;
+        let app = Router::new()
+            .route("/status", get(job_status))
+            .with_state(JobState { reads: reads.clone(), pending, result: Arc::new(result.to_string()) });
+        Ok(Self {
+            base_url: format!("http://{gateway}:{port}"),
+            reads,
+            _server: serve_axum(listener, app),
+        })
+    }
+
+    /// The reachable URL of the status address (`<base>/status`).
+    pub fn url(&self) -> String {
+        format!("{}/status", self.base_url)
+    }
+
+    /// How many times the status was read so far.
+    pub fn reads(&self) -> usize {
+        self.reads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+async fn job_status(State(state): State<JobState>) -> impl IntoResponse {
+    let seen = state.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if seen < state.pending {
+        axum::Json(serde_json::json!({ "status": "IN_PROGRESS" }))
+    } else {
+        axum::Json(serde_json::json!({ "status": "COMPLETED", "result": *state.result }))
+    }
+}
+
 /// A fake HTTP server that serves fixed bytes at `/bytes`. Used by the storage
 /// fixture: a FetchToStorage node fetches FROM here, so the rig controls the
 /// exact content it can then download back and assert. Reachable like

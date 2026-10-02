@@ -1,7 +1,7 @@
 {
   "type": "ApiKeyAuth",
   "label": "API Key Auth",
-  "description": "Gate a Route or Socket with a set of API keys you hand out. Store the accepted keys on the connection (comma-separated); a caller presents one as `X-Api-Key: <key>` or `Authorization: Bearer <key>`, the gateway checks it before a run starts, and the trigger's `caller` port says which key matched (`{\"key\": 0}` for the first). Wire the access output into the trigger's `auth` input.",
+  "description": "Gate a Route or Socket with API keys you hand out. The connection holds the accepted keys, comma-separated; a caller sends `X-Api-Key: <key>` or `Authorization: Bearer <key>`, and the trigger's `caller` says which matched (`{\"key\": 0}` for the first).",
   "tags": [
     "api",
     "auth",
@@ -43,8 +43,7 @@
     {
       "name": "access",
       "type": "Access",
-      "description": "The key set: wire it into a Route or Socket's `auth` input."
+      "description": "Wire into a Route or Socket's `auth`."
     }
-  ],
-  "requires_infra": false
+  ]
 }

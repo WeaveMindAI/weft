@@ -1,7 +1,7 @@
 {
   "type": "SlackUploadFile",
   "label": "Slack: Upload File",
-  "description": "Share a stored file into a channel (optionally inside a thread), with an optional title and comment. Uses Slack's external-upload flow, the only upload path Slack still supports.",
+  "description": "Shares a stored file into a Slack channel (optionally in a thread) with an optional title and comment, through Slack's external-upload flow.",
   "tags": [
     "slack",
     "file"
@@ -16,13 +16,12 @@
       "requiresScopes": [
         "files:write"
       ],
-      "description": "The Slack access (wire a SlackAccess node). Needs the files:write scope."
+      "description": "Needs files:write."
     },
     {
       "name": "file",
       "type": "File",
-      "required": true,
-      "description": "The stored file to share (from FetchToStorage, a trigger's attachment, any node emitting a file)."
+      "required": true
     },
     {
       "name": "channel",
@@ -45,6 +44,10 @@
               "cursor_param": "cursor",
               "cursor_path": "response_metadata.next_cursor"
             }
+          },
+          {
+            "kind": "from_url",
+            "pattern": "/archives/([A-Z0-9]+)"
           }
         ]
       },
@@ -68,14 +71,14 @@
       "type": "String",
       "widget": { "kind": "textarea" },
       "label": "Comment",
-      "description": "A message posted alongside the file."
+      "description": "Message posted alongside the file."
     }
   ],
   "outputs": [
     {
       "name": "fileId",
       "type": "String",
-      "description": "The shared file's Slack id (F...)."
+      "description": "Slack file id (F...)."
     },
     {
       "name": "permalink",

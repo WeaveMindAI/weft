@@ -1,7 +1,7 @@
 {
   "type": "SlackUpdateMessage",
   "label": "Slack: Update Message",
-  "description": "Rewrite a message this app posted earlier (Slack only lets an app edit its own messages). Address it by channel + ts, replace text and/or blocks.",
+  "description": "Rewrites the text and/or blocks of a Slack message this app posted, addressed by channel + ts (Slack lets an app edit only its own messages).",
   "tags": [
     "slack",
     "message",
@@ -17,14 +17,38 @@
       "requiresScopes": [
         "chat:write"
       ],
-      "description": "The Slack access (wire a SlackAccess node). Needs the chat:write scope."
+      "description": "Needs chat:write."
     },
     {
       "name": "channel",
       "type": "String",
       "required": true,
       "label": "Channel",
-      "placeholder": "The channel id the message lives in"
+      "placeholder": "The channel id the message lives in",
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "sources": [
+          {
+            "kind": "list",
+            "requires": [
+              "channels:read"
+            ],
+            "get": "https://slack.com/api/conversations.list?limit=200&exclude_archived=true",
+            "items": "channels",
+            "label": "name",
+            "value": "id",
+            "page": {
+              "cursor_param": "cursor",
+              "cursor_path": "response_metadata.next_cursor"
+            }
+          },
+          {
+            "kind": "from_url",
+            "pattern": "/archives/([A-Z0-9]+)"
+          }
+        ]
+      }
     },
     {
       "name": "ts",
@@ -43,7 +67,7 @@
       "name": "blocks",
       "type": "List[JsonDict]",
       "label": "New blocks",
-      "description": "Replacement Block Kit blocks. Text and/or blocks must be provided."
+      "description": "Replacement Block Kit blocks. Give text and/or blocks."
     }
   ],
   "outputs": [
@@ -54,6 +78,12 @@
     }
   ],
   "features": {
-    "catchErrors": true
+    "catchErrors": true,
+    "oneOfRequired": [
+      [
+        "text",
+        "blocks"
+      ]
+    ]
   }
 }

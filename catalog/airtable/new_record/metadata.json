@@ -1,7 +1,7 @@
 {
   "type": "AirtableNewRecord",
   "label": "Airtable: On New Record",
-  "description": "Fires once per record added to a table. The table needs a Created time column to sort on (add one if it has none); activation starts from now and the position survives restarts.",
+  "description": "Fires once per record added to an Airtable table. The table needs a Created time column to sort on; starts from activation and keeps its position across restarts.",
   "tags": [
     "airtable",
     "record",
@@ -95,7 +95,7 @@
       "description": "How often the table is checked for new records.",
       "widget": {
         "kind": "number",
-        "min": 1,
+        "min": 5,
         "step": 1
       }
     }

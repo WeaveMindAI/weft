@@ -1215,7 +1215,7 @@ pub fn infra_place_spellings(project: &ProjectDefinition) -> std::collections::B
 /// from the program for good: the node was removed, or it changed sides
 /// (a node no longer per instance leaves its instances' copies behind, a
 /// node now per instance leaves its shared one).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeclaredInfra {
     /// Place -> whether it is per instance.
     places: std::collections::BTreeMap<String, bool>,

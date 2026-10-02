@@ -80,7 +80,7 @@ impl Node for GmailLabelNode {
         }
 
         let answer = weft::access::client::json_call(
-            http.post(format!("{API}/messages/{id}/modify"))
+            http.post(format!("{API}/messages/{}/modify", super::api::segment(&id)))
                 .json(&json!({ "addLabelIds": add_ids, "removeLabelIds": remove_ids })),
             "modify the labels",
         )

@@ -1,7 +1,7 @@
 {
   "type": "BaileyListChats",
   "label": "WhatsApp List Chats (Baileys)",
-  "description": "List the group chats the connected account participates in, via the project's bridge. Each entry carries `id`, `name`, and `participantCount`.",
+  "description": "List the WhatsApp group chats the connected account is in, each `{ id, name, participantCount }`.",
   "tags": [
     "whatsapp",
     "baileys",
@@ -11,9 +11,10 @@
   "color": "#25D366",
   "inputs": [
     {
-      "name": "endpointUrl",
-      "type": "String",
-      "required": true
+      "name": "bridge",
+      "type": "Infra",
+      "required": true,
+      "description": "The `bridge` output of the BaileyBridge node to talk through."
     }
   ],
   "outputs": [
@@ -28,6 +29,5 @@
   ],
   "features": {
     "catchErrors": true
-  },
-  "requires_infra": false
+  }
 }

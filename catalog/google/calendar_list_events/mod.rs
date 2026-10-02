@@ -29,7 +29,7 @@ impl Node for GoogleCalendarListEventsNode {
 
         let mut base = format!(
             "https://www.googleapis.com/calendar/v3/calendars/{}/events?singleEvents=true&orderBy=startTime&maxResults=250&timeMin={}&timeMax={}",
-            urlencoding::encode(&calendar),
+            super::api::segment(&calendar),
             urlencoding::encode(&time_min),
             urlencoding::encode(&time_max),
         );
@@ -41,22 +41,32 @@ impl Node for GoogleCalendarListEventsNode {
         // Page until the window is exhausted: a `count` that silently
         // stopped at one page would be a wrong number the workflow
         // trusts.
-        let events: Vec<Value> =
-            super::api::paged(&http, &base, "items", "google calendar: list events", |_| false)
-                .await?
-                .iter()
-                .map(|e| {
-                    json!({
-                        "id": e["id"],
-                        "summary": e["summary"],
-                        "start": e["start"]["dateTime"].as_str().or(e["start"]["date"].as_str()),
-                        "end": e["end"]["dateTime"].as_str().or(e["end"]["date"].as_str()),
-                        "location": e["location"],
-                        "description": e["description"],
-                        "link": e["htmlLink"],
-                    })
+        let mut items: Vec<Value> = Vec::new();
+        weft::access::client::cursor_paged::<()>(
+            super::api::paging("/items", "narrow `timeMin`..`timeMax`, or add a `query`"),
+            "google calendar: list events",
+            || http.get(&base),
+            Ok,
+            |page| {
+                items.extend_from_slice(page);
+                Ok(None)
+            },
+        )
+        .await?;
+        let events: Vec<Value> = items
+            .iter()
+            .map(|e| {
+                json!({
+                    "id": e["id"],
+                    "summary": e["summary"],
+                    "start": e["start"]["dateTime"].as_str().or(e["start"]["date"].as_str()),
+                    "end": e["end"]["dateTime"].as_str().or(e["end"]["date"].as_str()),
+                    "location": e["location"],
+                    "description": e["description"],
+                    "link": e["htmlLink"],
                 })
-                .collect();
+            })
+            .collect();
         let count = events.len() as f64;
         ctx.pulse_downstream(
             NodeOutput::new().set("events", json!(events)).set("count", count),

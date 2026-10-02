@@ -1,7 +1,7 @@
 {
   "type": "BaileyFetchMedia",
   "label": "WhatsApp Fetch Media (Baileys)",
-  "description": "Pull one message's media (a voice note, a picture, a document) out of the project's WhatsApp bridge into storage, by its `messageId`. The message has to be one the bridge still holds: a live message BaileyReceive already stores for you; this is for one out of BaileyFetchMessages history, whose entries carry the id but not the bytes.",
+  "description": "Download one WhatsApp message's media (voice note, picture, document) into storage by `messageId`, for entries from BaileyFetchMessages, which carry the id but not the bytes (BaileyReceive already stores live media). The bridge must still hold the message.",
   "tags": [
     "whatsapp",
     "baileys",
@@ -13,15 +13,16 @@
   "color": "#25D366",
   "inputs": [
     {
-      "name": "endpointUrl",
-      "type": "String",
-      "required": true
+      "name": "bridge",
+      "type": "Infra",
+      "required": true,
+      "description": "The `bridge` output of the BaileyBridge node to talk through."
     },
     {
       "name": "messageId",
       "type": "String",
       "required": true,
-      "description": "The `messageId` of a media message, as a BaileyFetchMessages entry or a BaileyReceive fire carries it."
+      "description": "A media message's `messageId`."
     }
   ],
   "outputs": [
@@ -49,6 +50,5 @@
   "display": {
     "kind": "media",
     "output": "file"
-  },
-  "requires_infra": false
+  }
 }

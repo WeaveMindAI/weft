@@ -47,8 +47,10 @@ A claim lasts 60 seconds and the holder renews it every 15. Claiming is
 `FOR UPDATE SKIP LOCKED`, so two workers never take the same run.
 Every queued run also carries a key that turns a duplicate into a no-op, so work
 queued twice runs once. A run whose claim ran out may be half done, and the next worker may redo
-part of it. That is why every step the runtime takes has to be safe to run
-twice.
+part of the runtime's own bookkeeping for it, which is why every step the
+runtime takes has to be safe to run twice. Your nodes are different: a node
+that was running when its worker died is failed, never run again (go and read
+[surviving a restart](../nodes/durable-execution.md#when-the-worker-dies-mid-step)).
 
 ## What happens when an event arrives
 

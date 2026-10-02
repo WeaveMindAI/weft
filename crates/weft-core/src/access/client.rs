@@ -133,45 +133,174 @@ pub async fn post_json(
     json_call(client.post(url).json(body), what).await
 }
 
-/// Send a prepared request expecting a JSON answer: refuse a
-/// non-success status quoting the provider's own words, then parse.
-/// The one status-and-bail shape behind [`get_json`] / [`post_json`];
-/// public for callers whose request needs its own preparation (a
-/// custom content type, a raw multipart body) but the same contract.
-///
-/// The error text quotes the provider's own message when the failure
-/// body carries one of the common JSON error envelopes:
-/// `{"error": {"message": ...}}` / `{"error": "..."}` (Google, and most
-/// JSON APIs), top-level `{"message": ...}` (GitHub), or top-level
-/// `{"detail": ...}` (FastAPI services). Otherwise it quotes the raw
-/// body (truncated), so an HTML 502 from a proxy is still legible.
+/// Send a prepared request and refuse a non-success status, quoting
+/// the provider's own words (see [`error_detail`]). The success
+/// response comes back unread, for callers whose answer is not JSON (a
+/// download, a raw text body); [`json_call`] is this plus the parse.
 #[cfg(feature = "runtime")]
-pub async fn json_call(
+pub async fn checked_send(
     req: reqwest_middleware::RequestBuilder,
     what: &str,
-) -> crate::WeftResult<serde_json::Value> {
+) -> crate::WeftResult<reqwest::Response> {
     use crate::error::{node_error, NodeErrExt};
     let resp = req
         .send()
         .await
         .map_err(|e| node_error(format!("{what}: {}", send_error(e))))?;
     let status = resp.status();
-    let body = resp.text().await.node_err(what)?;
-    if !status.is_success() {
-        let nested = serde_json::from_str::<serde_json::Value>(&body).ok().and_then(|v| {
-            v["error"]["message"]
-                .as_str()
-                .or_else(|| v["error"].as_str())
-                .or_else(|| v["message"].as_str())
-                .or_else(|| v["detail"].as_str())
-                .map(str::to_string)
-        });
-        let detail = nested.unwrap_or_else(|| body.chars().take(500).collect::<String>());
-        return Err(node_error(format!(
-            "the service answered {status} trying to {what}: {detail}"
-        )));
+    if status.is_success() {
+        return Ok(resp);
     }
+    let body = resp.text().await.node_err(what)?;
+    Err(node_error(format!(
+        "the service answered {status} trying to {what}: {}",
+        error_detail(&body)
+    )))
+}
+
+/// The provider's own words in a failure body, when it carries one of
+/// the common JSON error envelopes: `{"error": {"message": ...}}` /
+/// `{"error": "..."}` (Google, and most JSON APIs), top-level
+/// `{"message": ...}` (GitHub), top-level `{"detail": ...}` (FastAPI
+/// services) or top-level `{"description": ...}` (Telegram).
+/// Otherwise the raw body (truncated), so an HTML 502 from a proxy is
+/// still legible.
+#[cfg(feature = "runtime")]
+fn error_detail(body: &str) -> String {
+    let nested = serde_json::from_str::<serde_json::Value>(body).ok().and_then(|v| {
+        v["error"]["message"]
+            .as_str()
+            .or_else(|| v["error"].as_str())
+            .or_else(|| v["message"].as_str())
+            .or_else(|| v["detail"].as_str())
+            .or_else(|| v["description"].as_str())
+            .map(str::to_string)
+    });
+    nested.unwrap_or_else(|| body.chars().take(500).collect::<String>())
+}
+
+/// Send a prepared request expecting a JSON answer: refuse a
+/// non-success status quoting the provider's own words (through
+/// [`checked_send`]), then parse. The one status-and-bail shape behind
+/// [`get_json`] / [`post_json`]; public for callers whose request
+/// needs its own preparation (a custom content type, a raw multipart
+/// body) but the same contract.
+#[cfg(feature = "runtime")]
+pub async fn json_call(
+    req: reqwest_middleware::RequestBuilder,
+    what: &str,
+) -> crate::WeftResult<serde_json::Value> {
+    use crate::error::NodeErrExt;
+    let body = checked_send(req, what).await?.text().await.node_err(what)?;
     serde_json::from_str(&body).node_err(what)
+}
+
+/// Refuse a JSON answer whose success flag is not `true`. Some services
+/// answer every call 200 and say whether it worked inside the body
+/// (Slack: `ok` / `error`, Telegram: `ok` / `description`): `ok_field`
+/// names the flag, `detail_field` the string naming what went wrong.
+/// A missing or non-`true` flag fails loudly with that detail (or the
+/// whole answer, truncated, when the detail is absent too); a passing
+/// answer comes back for the caller to read.
+#[cfg(feature = "runtime")]
+pub fn require_ok_flag(
+    answer: serde_json::Value,
+    ok_field: &str,
+    detail_field: &str,
+    what: &str,
+) -> crate::WeftResult<serde_json::Value> {
+    if answer.get(ok_field).and_then(serde_json::Value::as_bool) == Some(true) {
+        return Ok(answer);
+    }
+    let detail = answer
+        .get(detail_field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| answer.to_string().chars().take(500).collect());
+    Err(crate::error::node_error(format!("the service refused to {what}: {detail}")))
+}
+
+/// The most pages [`cursor_paged`] follows before failing: a bound on a
+/// degenerate query or a cursor that loops, so a node fails loudly
+/// instead of growing without bound or draining a rate budget.
+pub const MAX_PAGES: usize = 50;
+
+/// How a cursor-paged list endpoint speaks: where each page's items
+/// sit, where the next cursor sits, and which query parameter carries
+/// it back. Both locations are JSON pointers (`/files`,
+/// `/response_metadata/next_cursor`). A cursor that is absent, not a
+/// string, or empty ends the listing.
+#[derive(Debug, Clone, Copy)]
+pub struct CursorPaging<'a> {
+    /// Pointer to the page's items array.
+    pub items: &'a str,
+    /// Pointer to the next page's cursor.
+    pub next: &'a str,
+    /// The query parameter the cursor is sent back in.
+    pub param: &'a str,
+    /// Whether a page may leave the items array out. Some services drop
+    /// an empty array from the answer (a Google list with no hits);
+    /// for the others a missing array is a malformed answer and fails.
+    pub items_may_be_absent: bool,
+    /// What the user should do instead when the listing runs past
+    /// [`MAX_PAGES`], said to them in the failure ("narrow `query`",
+    /// "paste the channel id instead of its name"). Each caller words
+    /// it, because only the node knows which of its inputs shrinks the
+    /// listing, or that none does.
+    pub past_cap_hint: &'a str,
+}
+
+/// Page a cursor-paged endpoint: `request` builds the page's request
+/// (called once per page, so nothing is cloned), the cursor rides as
+/// `paging.param` from the second page on, `check` vets each parsed
+/// answer (pass `Ok` when the status code says it all, or a closure
+/// over [`require_ok_flag`] for a service that answers 200 with an
+/// `ok` flag), and `visit` sees each page's items. `visit` returns
+/// `Some(t)` to stop early with that answer; a listing that ends
+/// without one returns `Ok(None)`. Past [`MAX_PAGES`] pages it fails
+/// loudly, telling the user `paging.past_cap_hint`.
+#[cfg(feature = "runtime")]
+pub async fn cursor_paged<T>(
+    paging: CursorPaging<'_>,
+    what: &str,
+    mut request: impl FnMut() -> reqwest_middleware::RequestBuilder,
+    check: impl Fn(serde_json::Value) -> crate::WeftResult<serde_json::Value>,
+    mut visit: impl FnMut(&[serde_json::Value]) -> crate::WeftResult<Option<T>>,
+) -> crate::WeftResult<Option<T>> {
+    use crate::error::node_error;
+    let mut cursor: Option<String> = None;
+    for _page in 0..MAX_PAGES {
+        let mut req = request();
+        if let Some(c) = &cursor {
+            req = req.query(&[(paging.param, c.as_str())]);
+        }
+        let answer = check(json_call(req, what).await?)?;
+        let page: &[serde_json::Value] = match answer.pointer(paging.items) {
+            Some(serde_json::Value::Array(items)) => items,
+            None if paging.items_may_be_absent => &[],
+            _ => {
+                return Err(node_error(format!(
+                    "{what}: the answer carries no {} array",
+                    paging.items
+                )))
+            }
+        };
+        if let Some(found) = visit(page)? {
+            return Ok(Some(found));
+        }
+        cursor = answer
+            .pointer(paging.next)
+            .and_then(serde_json::Value::as_str)
+            .filter(|c| !c.is_empty())
+            .map(str::to_string);
+        if cursor.is_none() {
+            return Ok(None);
+        }
+    }
+    Err(node_error(format!(
+        "{what}: more than {MAX_PAGES} pages of results; {}",
+        paging.past_cap_hint
+    )))
 }
 
 /// A REQUIRED string field of a JSON answer: absent or non-string fails
@@ -352,7 +481,14 @@ pub fn resolve_steps(
         .map(|step| {
             Ok(match step {
                 AuthStep::Header { name, value } => {
-                    AppliedStep::Header { name: name.clone(), value: r(value)? }
+                    let name = r(name)?;
+                    if !super::spec::is_header_name(&name) {
+                        return Err(format!(
+                            "the connection's header name '{name}' is not a legal HTTP header \
+                             name; reconnect with a valid one"
+                        ));
+                    }
+                    AppliedStep::Header { name, value: r(value)? }
                 }
                 AuthStep::Query { name, value } => {
                     AppliedStep::Query { name: name.clone(), value: r(value)? }
@@ -1039,6 +1175,185 @@ mod tests {
         assert!(text.contains("Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n42\r\n"), "{text}");
     }
 
+    /// A one-route loopback HTTP server for the paging and status
+    /// tests: every request's target (path and query) is recorded, and
+    /// `answer` maps it to a status and a body.
+    #[cfg(feature = "runtime")]
+    async fn serve(
+        answer: impl Fn(&str) -> (u16, String) + Send + Sync + 'static,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let answer = std::sync::Arc::new(answer);
+        let log = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap();
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let target = head.split(' ').nth(1).unwrap_or("").to_string();
+                log.lock().unwrap().push(target.clone());
+                let (status, body) = answer(&target);
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                sock.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        (base, seen)
+    }
+
+    /// A query parameter of a recorded request target.
+    #[cfg(feature = "runtime")]
+    fn query_param(target: &str, name: &str) -> Option<String> {
+        url::Url::parse(&format!("http://x{target}"))
+            .unwrap()
+            .query_pairs()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.into_owned())
+    }
+
+    /// The Google shape: the token sits top-level as `nextPageToken`,
+    /// goes back as `pageToken`, the base URL's own query survives, and
+    /// a page with no items array is an empty page.
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn cursor_paged_follows_a_top_level_token_back_as_a_query_param() {
+        let (base, seen) = serve(|target| {
+            let body = match query_param(target, "pageToken").as_deref() {
+                None => r#"{"files":[1,2],"nextPageToken":"p2"}"#,
+                Some("p2") => r#"{"nextPageToken":"p3"}"#,
+                Some(_) => r#"{"files":[3]}"#,
+            };
+            (200, body.to_string())
+        })
+        .await;
+        let http = plain_client();
+        let paging = CursorPaging {
+            items: "/files",
+            next: "/nextPageToken",
+            param: "pageToken",
+            items_may_be_absent: true,
+            past_cap_hint: "narrow the query",
+        };
+        let mut all = Vec::new();
+        let none: Option<()> = cursor_paged(
+            paging,
+            "list files",
+            || http.get(format!("{base}/list?pageSize=2")),
+            Ok,
+            |page| {
+                all.extend(page.iter().cloned());
+                Ok(None)
+            },
+        )
+        .await
+        .unwrap();
+        assert!(none.is_none());
+        assert_eq!(all, vec![serde_json::json!(1), serde_json::json!(2), serde_json::json!(3)]);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert!(seen.iter().all(|t| query_param(t, "pageSize").as_deref() == Some("2")), "{seen:?}");
+        assert_eq!(query_param(&seen[2], "pageToken").as_deref(), Some("p3"));
+    }
+
+    /// The Slack shape: the cursor is nested, goes back as `cursor`, an
+    /// empty cursor ends the listing, `visit` stops early, the ok flag
+    /// is checked per page, and a missing items array fails loudly.
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn cursor_paged_follows_a_nested_cursor_and_stops_early() {
+        let (base, seen) = serve(|target| {
+            let body = match query_param(target, "cursor").as_deref() {
+                None => r#"{"ok":true,"channels":["a"],"response_metadata":{"next_cursor":"c2"}}"#,
+                Some(_) => r#"{"ok":true,"channels":["b","c"],"response_metadata":{"next_cursor":"c3"}}"#,
+            };
+            (200, body.to_string())
+        })
+        .await;
+        let http = plain_client();
+        let paging = CursorPaging {
+            items: "/channels",
+            next: "/response_metadata/next_cursor",
+            param: "cursor",
+            items_may_be_absent: false,
+            past_cap_hint: "paste the channel id instead of its name",
+        };
+        let found = cursor_paged(
+            paging,
+            "list channels",
+            || http.get(format!("{base}/conversations.list")),
+            |a| require_ok_flag(a, "ok", "error", "list channels"),
+            |page| Ok(page.iter().find(|c| *c == "c").cloned()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found, Some(serde_json::json!("c")));
+        assert_eq!(seen.lock().unwrap().len(), 2, "stopped once found");
+
+        let (base, _) = serve(|_| (200, r#"{"ok":true}"#.to_string())).await;
+        let err = cursor_paged::<()>(paging, "list channels", || http.get(&base), Ok, |_| Ok(None))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("/channels"), "{err}");
+    }
+
+    /// A cursor that never ends fails loudly past the page cap.
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn cursor_paged_fails_loudly_past_the_page_cap() {
+        let (base, seen) = serve(|_| (200, r#"{"items":[],"next":"again"}"#.to_string())).await;
+        let http = plain_client();
+        let paging = CursorPaging {
+            items: "/items",
+            next: "/next",
+            param: "c",
+            items_may_be_absent: false,
+            past_cap_hint: "pick one folder",
+        };
+        let err = cursor_paged::<()>(paging, "list things", || http.get(&base), Ok, |_| Ok(None))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("more than 50 pages") && err.contains("list things"), "{err}");
+        assert!(err.ends_with("; pick one folder"), "the caller's hint is the advice: {err}");
+        assert_eq!(seen.lock().unwrap().len(), MAX_PAGES);
+    }
+
+    /// `require_ok_flag` passes `ok: true`, and otherwise fails quoting
+    /// the named detail field, or the answer itself when it has none.
+    #[cfg(feature = "runtime")]
+    #[test]
+    fn require_ok_flag_names_the_refusal() {
+        let ok = serde_json::json!({ "ok": true, "x": 1 });
+        assert_eq!(require_ok_flag(ok.clone(), "ok", "error", "post").unwrap(), ok);
+        let err = require_ok_flag(serde_json::json!({ "ok": false, "description": "chat not found" }), "ok", "description", "send")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("send") && err.contains("chat not found"), "{err}");
+        let err = require_ok_flag(serde_json::json!({ "weird": 1 }), "ok", "error", "post").unwrap_err().to_string();
+        assert!(err.contains("weird"), "{err}");
+    }
+
+    /// A non-success status is refused through `checked_send` with the
+    /// provider's words, Telegram's `description` included.
+    #[cfg(feature = "runtime")]
+    #[tokio::test]
+    async fn checked_send_quotes_the_failure_detail() {
+        let (base, _) = serve(|_| (400, r#"{"ok":false,"description":"Bad Request: chat not found"}"#.to_string())).await;
+        let http = plain_client();
+        let err = json_call(http.get(&base), "send a message").await.unwrap_err().to_string();
+        assert!(err.contains("400") && err.contains("send a message") && err.contains("chat not found"), "{err}");
+        let (base, _) = serve(|_| (200, "plain".to_string())).await;
+        let resp = checked_send(http.get(&base), "fetch").await.unwrap();
+        assert_eq!(resp.text().await.unwrap(), "plain");
+    }
+
     /// `required_str` hands back a present string field and fails loud
     /// (naming the call and the field) on absence or a non-string.
     #[cfg(feature = "runtime")]
@@ -1059,6 +1374,19 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("'nope'"), "{e}");
+    }
+
+    /// A templated header name resolves from the stored values, and a
+    /// resolved name that is no header name is refused before any
+    /// request is built.
+    #[test]
+    fn resolve_steps_fills_a_templated_header_name() {
+        let step = [AuthStep::Header { name: "{header}".into(), value: Template::new("{value}") }];
+        let steps =
+            resolve_steps(&step, &values(&[("header", "X-Api-Key"), ("value", "k")])).unwrap();
+        assert!(steps == [AppliedStep::Header { name: "X-Api-Key".into(), value: "k".into() }]);
+        let e = resolve_steps(&step, &values(&[("header", "X Api"), ("value", "k")])).unwrap_err();
+        assert!(e.contains("'X Api'"), "{e}");
     }
 
     /// The official AWS documentation vector (GET iam ListUsers,
