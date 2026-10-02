@@ -1,0 +1,5 @@
+# A test that runs past five minutes is stuck, not slow: nextest stops it
+# and reports it failed, so a hang shows up as a failure naming the test
+# instead of a run that never ends.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 5 }
