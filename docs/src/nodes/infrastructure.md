@@ -45,9 +45,17 @@ A unit is a group of containers that run side by side, with optional init
 containers that run one after another before them. It also says what machine
 it needs (`machine`: `cpu`, `memory`, and `gpu` with a `kind` and a `count`)
 and what stop does to it (`onStop`: stop it, or keep it running until
-terminate). On a cloud install, weft picks a machine that fits those numbers.
-On your machine it only checks them, and refuses a unit that asks for a GPU
-you do not have. On your machine weft cannot pick a GPU by kind, so a unit that
+terminate). On a cloud install, weft picks the cheapest machine that holds
+those numbers, shared-core ones included: a quarter CPU with `1Gi` is
+Compute Engine's `e2-micro`. A number left unset is the sum of the
+containers' own limits. If you need one machine type in particular,
+`machine.kind` names it (`n2-highmem-8`) and skips the pick. On your machine
+weft caps each container that has no limits of its own at the unit's numbers,
+and refuses a unit that asks for a GPU you do not have.
+
+Whoever uses your node pays for that machine, so if the right size depends on
+their load, give the node inputs for it and read them into `machine`: the
+Postgres node takes `cpu`, `memory` and `machineType`. On your machine weft cannot pick a GPU by kind, so a unit that
 asks for any GPU gets every GPU the machine has, and `weft infra start` and
 `weft infra status` warn you about it.
 

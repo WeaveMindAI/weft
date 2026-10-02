@@ -12,7 +12,7 @@
 use async_trait::async_trait;
 
 use weft::infra::{
-    Container, ContainerPort, Endpoint, EndpointTarget, EnvEntry, Expose, Image, InfraSpec, Limits, Mount, Probe,
+    Container, ContainerPort, Endpoint, EndpointTarget, EnvEntry, Expose, Image, InfraSpec, MachineShape, Mount, Probe,
     Protocol, Unit, Volume, VolumeKind,
 };
 use weft::{ExecutionContext, InfraProvisionContext, Node, NodeManifest, ValueBag, WeftResult};
@@ -33,9 +33,11 @@ impl Node for BaileyBridgeNode {
     async fn provision_infra(
         &self,
         _ctx: InfraProvisionContext,
-        _input: ValueBag,
+        input: ValueBag,
     ) -> WeftResult<InfraSpec> {
-        // No programmatic inputs; the bridge is parameterless.
+        // The machine, as the node's settings size it; the cloud picks
+        // its cheapest that holds it.
+        let machine = MachineShape { cpu: input.opt("cpu")?, memory: input.opt("memory")?, kind: input.opt::<String>("machineType")?.filter(|t| !t.trim().is_empty()), gpu: None };
         // One unit, one copy: WhatsApp's session cannot tolerate two
         // bridges at once, and a unit never runs beside its own next
         // version.
@@ -49,9 +51,9 @@ impl Node for BaileyBridgeNode {
                         EnvEntry::new("AUTH_DIR", "/data/auth"),
                     ])
                     .with_ports(vec![ContainerPort { name: "http".into(), port: BRIDGE_PORT, protocol: Protocol::Tcp }])
-                    .with_limits(Limits { cpu: Some("0.5".into()), memory: Some("512Mi".into()) })
                     .with_mounts(vec![Mount::new("auth", "/data/auth")])
                     .with_readiness(Probe::http("/health", BRIDGE_PORT).with_initial_delay(5))],
+                machine,
                 ..Default::default()
             }],
             volumes: vec![Volume { name: "auth".into(), kind: VolumeKind::Disk { size: "100Mi".into(), class: None } }],

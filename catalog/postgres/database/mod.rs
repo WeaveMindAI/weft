@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use std::collections::BTreeMap;
 
 use weft::infra::{
-    Container, ContainerPort, Endpoint, EndpointTarget, EnvEntry, Expose, Image, InfraSpec, Limits, Mount, Probe,
+    Container, ContainerPort, Endpoint, EndpointTarget, EnvEntry, Expose, Image, InfraSpec, Limits, MachineShape, Mount, Probe,
     Protocol, Unit, Volume, VolumeKind,
 };
 use weft::node::NodeOutput;
@@ -141,6 +141,9 @@ impl Node for PostgresDatabaseNode {
         // a person reading this node sees what is reachable, and
         // nothing after the fact can change it.
         let reachable: bool = input.get("reachable")?;
+        // The machine, as the node's settings size it; the cloud picks
+        // its cheapest that holds it.
+        let machine = MachineShape { cpu: input.opt("cpu")?, memory: input.opt("memory")?, kind: input.opt::<String>("machineType")?.filter(|t| !t.trim().is_empty()), gpu: None };
 
         let credential = Image::Local { name: "credential".into() };
         Ok(InfraSpec {
@@ -173,7 +176,6 @@ impl Node for PostgresDatabaseNode {
                         port: SQL_PORT,
                         protocol: Protocol::Tcp,
                     }])
-                    .with_limits(Limits { cpu: Some("2".into()), memory: Some("2Gi".into()) })
                     .with_mounts(vec![store_mount(), socket_mount()])
                     // Postgres accepts TCP while it is still starting up
                     // and refuses every connection, so the port being
@@ -208,6 +210,7 @@ impl Node for PostgresDatabaseNode {
                         ),
                 ],
                 fs_group: Some(POSTGRES_GID),
+                machine,
                 ..Default::default()
             }],
             volumes: vec![

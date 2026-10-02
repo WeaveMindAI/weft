@@ -518,9 +518,19 @@ async fn provision_infra(&self, _ctx: InfraProvisionContext, _input: ValueBag) -
 
 | Field | Type | Example | Unset |
 |---|---|---|---|
-| `cpu` | `Option<String>` | `"2"`, `"0.5"` | the smallest machine that fits the containers' own limits |
-| `memory` | `Option<String>` | `"4Gi"`, `"512Mi"` | same |
+| `cpu` | `Option<String>` | `"0.25"`, `"2"`, `"500m"` | the sum of the containers' own limits |
+| `memory` | `Option<String>` | `"1Gi"`, `"512Mi"` | same |
 | `gpu` | `Option<Gpu { kind: String, count: u32 }>` | `nvidia-l4`, 1 | no GPU |
+| `kind` | `Option<String>` | `"n2-highmem-8"` | picked from the numbers above |
+
+A cloud install picks its cheapest machine that holds `cpu` and `memory`,
+shared-core ones included (a quarter CPU with `1Gi` is Compute Engine's
+`e2-micro`, about $6 a month). `kind` names the cloud's own machine type and
+skips the pick; keep it a last resort. A local install caps each container
+without limits of its own at `cpu` and `memory`. Whoever uses your node pays
+for that machine, so if the right size depends on their load, give the node
+inputs for it and read them into `machine` (the Postgres node takes `cpu`,
+`memory` and `machineType`).
 
 If you need a GPU on a cloud install, the kinds weft attaches are
 `nvidia-l4` (1, 2, 4 or 8), `nvidia-tesla-t4` and `nvidia-tesla-p4` (1, 2
