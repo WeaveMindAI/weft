@@ -112,8 +112,10 @@ pub struct Unit {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MachineShape {
-    /// CPUs, as a number (`"2"`, `"0.5"`). Unset: the platform's
-    /// smallest that fits the containers' own limits.
+    /// CPUs, as a number (`"2"`, `"0.5"`, `"250m"`). Unset: the sum of
+    /// the containers' own limits. A cloud picks the cheapest machine
+    /// that holds both numbers, shared-core ones included (a quarter of
+    /// a CPU with 1 GB is Compute Engine's `e2-micro`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu: Option<String>,
     /// Memory (`"4Gi"`, `"512Mi"`). Unset: as for `cpu`.
@@ -122,6 +124,11 @@ pub struct MachineShape {
     /// GPUs attached to the unit's machine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu: Option<Gpu>,
+    /// The platform's own machine type, used as is (`e2-micro`,
+    /// `n2-highmem-8` on Compute Engine): a cloud then skips picking
+    /// one from `cpu` and `memory`. A local install ignores it.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 /// GPUs for a unit: which kind and how many. The kind is the platform's

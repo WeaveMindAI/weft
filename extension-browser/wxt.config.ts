@@ -24,7 +24,7 @@ export default defineConfig({
     artifactTemplate: '{{name}}-{{browser}}.zip',
     sourcesTemplate: '{{name}}-sources.zip',
   },
-  runner: {
+  webExt: {
     startUrls: [],
     openDevtools: false,
   },

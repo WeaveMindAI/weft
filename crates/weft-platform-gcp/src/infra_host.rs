@@ -21,7 +21,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use weft_core::infra::wire::{LogStream, LogsFrom};
-use weft_core::infra::{EndpointTarget, Expose, NodeRef, ResolvedNode, ResolvedUnit, VolumeKind};
+use weft_core::infra::{Container, EndpointTarget, Expose, Limits, NodeRef, ResolvedNode, ResolvedUnit, VolumeKind};
 use weft_platform_traits::config::GcpPlatform;
 use weft_platform_traits::unit_agent::{UnitAssignment, HOST_APPLY, HOST_LOGS, HOST_OBSERVE, HOST_RESTART};
 use weft_core::ports::UNIT_AGENT;
@@ -275,24 +275,48 @@ pub struct Shape {
     pub gpus: u32,
 }
 
-/// The machine for `unit`: an E2 machine sized to its CPUs and memory
-/// (E2 custom shapes: an even number of CPUs from 2, memory in 256 MB
-/// steps between half a GB and 8 GB per CPU), or for GPUs the family the
-/// accelerator attaches to (N1 for the `nvidia-tesla-*` kinds, G2 for
-/// `nvidia-l4`), at the cheapest type that holds its CPUs and memory.
+/// The machine for `unit`. A `machine.type` is used as is. Otherwise the
+/// numbers are `machine.cpu` and `machine.memory`, each unset one being
+/// the sum of the containers' own limits (or the largest init
+/// container's, which runs alone), and the machine is the cheapest that
+/// holds them: one of the shared-core E2 types, or an E2 custom shape
+/// (an even number of CPUs from 2, memory in 256 MB steps between half a
+/// GB and 8 GB per CPU). For GPUs it is the family the accelerator
+/// attaches to (N1 for the `nvidia-tesla-*` kinds, G2 for `nvidia-l4`),
+/// at the cheapest type that holds its CPUs and memory.
 pub fn machine_shape(_zone: &str, unit: &ResolvedUnit) -> anyhow::Result<Shape> {
     let m = &unit.unit.machine;
+    if let Some(kind) = &m.kind {
+        anyhow::ensure!(
+            !kind.is_empty() && kind.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "unit '{}' asks for machine type '{kind}'; a Compute Engine machine type is lowercase letters, digits and dashes (e2-micro, n2-standard-8)",
+            unit.unit.name
+        );
+        let gpus = m.gpu.as_ref().map_or(0, |g| g.count);
+        // These families come with their GPUs; any other takes them
+        // attached.
+        let built_in = ["a2-", "a3-", "a4-", "g2-", "g4-"].iter().any(|f| kind.starts_with(f));
+        let accelerator = m.gpu.as_ref().filter(|_| !built_in).map(|g| g.kind.clone());
+        return Ok(Shape { machine_type: kind.clone(), accelerator, gpus });
+    }
     let cpus = match &m.cpu {
         Some(c) => parse_cpus(c)?,
-        None => 2.0,
+        None => containers_need(unit, |l| l.cpu.as_deref(), parse_cpus)?,
     };
     let memory_mb = match &m.memory {
         Some(mem) => parse_mb(mem)?,
-        None => 0,
+        None => containers_need(unit, |l| l.memory.as_deref(), |raw| parse_mb(raw).map(f64::from))?.ceil() as u32,
     };
     if let Some(gpu) = &m.gpu {
         anyhow::ensure!(gpu.count >= 1, "unit '{}' asks for 0 GPUs", unit.unit.name);
         return gpu_shape(&unit.unit.name, &gpu.kind, gpu.count, cpus, memory_mb);
+    }
+    // The shared-core types: the share of a CPU each sustains, and its
+    // memory in MB. Each is cheaper than any custom shape that holds as
+    // much.
+    const SHARED: [(&str, f64, u32); 3] = [("e2-micro", 0.25, 1024), ("e2-small", 0.5, 2048), ("e2-medium", 1.0, 4096)];
+    if let Some((name, ..)) = SHARED.iter().find(|&&(_, c, mb)| cpus <= c && memory_mb <= mb) {
+        return Ok(Shape { machine_type: (*name).into(), accelerator: None, gpus: 0 });
     }
     let cpus = (cpus.ceil() as u32).max(2).div_ceil(2) * 2;
     let floor = cpus * 512;
@@ -305,6 +329,17 @@ pub fn machine_shape(_zone: &str, unit: &ResolvedUnit) -> anyhow::Result<Shape> 
         memory_mb
     );
     Ok(Shape { machine_type: format!("e2-custom-{cpus}-{mb}"), accelerator: None, gpus: 0 })
+}
+
+/// What `unit`'s containers' own limits add up to, read by `pick` and
+/// `parse`: the containers run side by side, so theirs are summed, and
+/// an init container runs alone, so only the largest counts. A
+/// container with no limit adds nothing.
+fn containers_need(unit: &ResolvedUnit, pick: fn(&Limits) -> Option<&str>, parse: fn(&str) -> anyhow::Result<f64>) -> anyhow::Result<f64> {
+    let each = |cs: &[Container]| cs.iter().filter_map(|c| pick(&c.limits)).map(parse).collect::<anyhow::Result<Vec<f64>>>();
+    let side_by_side: f64 = each(&unit.unit.containers)?.into_iter().sum();
+    let alone = each(&unit.unit.init_containers)?.into_iter().fold(0.0, f64::max);
+    Ok(side_by_side.max(alone))
 }
 
 // The GPU machines Compute Engine offers, as its GPU machine types page
@@ -685,17 +720,25 @@ mod tests {
     }
 
     #[test]
-    fn a_unit_gets_the_smallest_e2_shape_that_holds_it() {
-        assert_eq!(machine_shape("z", &unit(MachineShape::default())).unwrap().machine_type, "e2-custom-2-1024");
-        let s = machine_shape("z", &unit(MachineShape { cpu: Some("3".into()), memory: Some("6Gi".into()), gpu: None })).unwrap();
-        assert_eq!(s.machine_type, "e2-custom-4-6144");
-        let err = machine_shape("z", &unit(MachineShape { cpu: Some("2".into()), memory: Some("64Gi".into()), gpu: None })).unwrap_err();
+    fn a_unit_gets_the_cheapest_e2_machine_that_holds_it() {
+        let sized = |cpu: &str, memory: &str| {
+            machine_shape("z", &unit(MachineShape { cpu: Some(cpu.into()), memory: Some(memory.into()), ..Default::default() }))
+                .unwrap()
+                .machine_type
+        };
+        assert_eq!(machine_shape("z", &unit(MachineShape::default())).unwrap().machine_type, "e2-micro");
+        assert_eq!(sized("0.25", "1Gi"), "e2-micro");
+        assert_eq!(sized("250m", "1536Mi"), "e2-small");
+        assert_eq!(sized("1", "4Gi"), "e2-medium");
+        assert_eq!(sized("1", "5Gi"), "e2-custom-2-5120");
+        assert_eq!(sized("3", "6Gi"), "e2-custom-4-6144");
+        let err = machine_shape("z", &unit(MachineShape { cpu: Some("2".into()), memory: Some("64Gi".into()), ..Default::default() })).unwrap_err();
         assert!(format!("{err}").contains("machine.cpu"));
     }
 
     #[test]
     fn a_gpu_unit_gets_the_family_its_accelerator_attaches_to() {
-        let t4 = machine_shape("z", &unit(MachineShape { cpu: Some("4".into()), memory: None, gpu: Some(Gpu { kind: "nvidia-tesla-t4".into(), count: 1 }) })).unwrap();
+        let t4 = machine_shape("z", &unit(MachineShape { cpu: Some("4".into()), gpu: Some(Gpu { kind: "nvidia-tesla-t4".into(), count: 1 }), ..Default::default() })).unwrap();
         assert_eq!(t4, Shape { machine_type: "n1-standard-4".into(), accelerator: Some("nvidia-tesla-t4".into()), gpus: 1 });
         let l4 = machine_shape("z", &unit(MachineShape { gpu: Some(Gpu { kind: "nvidia-l4".into(), count: 2 }), ..Default::default() })).unwrap();
         assert_eq!(l4.machine_type, "g2-standard-24");
@@ -707,7 +750,7 @@ mod tests {
         let gpu = |kind: &str, count: u32, cpu: &str, memory: &str| {
             machine_shape(
                 "z",
-                &unit(MachineShape { cpu: Some(cpu.into()), memory: Some(memory.into()), gpu: Some(Gpu { kind: kind.into(), count }) }),
+                &unit(MachineShape { cpu: Some(cpu.into()), memory: Some(memory.into()), gpu: Some(Gpu { kind: kind.into(), count }), kind: None }),
             )
         };
         assert_eq!(gpu("nvidia-tesla-t4", 1, "2", "32Gi").unwrap().machine_type, "n1-highmem-8", "32 GB on a T4 is not a 7.5 GB n1-standard-2");
@@ -722,6 +765,37 @@ mod tests {
         assert_eq!(gpu("nvidia-l4", 1, "2", "40Gi").unwrap().machine_type, "g2-standard-12");
         assert_eq!(gpu("nvidia-l4", 1, "20", "1Gi").unwrap().machine_type, "g2-standard-32");
         assert!(gpu("nvidia-l4", 2, "32", "1Gi").is_err());
+    }
+
+    #[test]
+    fn unset_numbers_are_the_containers_own_limits() {
+        use weft_core::infra::Image;
+        let c = |cpu: &str, memory: &str| {
+            Container::new("c", Image::Local { name: "c".into() })
+                .with_limits(Limits { cpu: Some(cpu.into()), memory: Some(memory.into()) })
+        };
+        let u = |containers, init_containers, machine| ResolvedUnit {
+            unit: Unit { name: "main".into(), containers, init_containers, machine, ..Default::default() },
+            hash: "h".into(),
+        };
+        let two = vec![c("0.2", "512Mi"), c("0.1", "64Mi")];
+        assert_eq!(machine_shape("z", &u(two.clone(), vec![], MachineShape::default())).unwrap().machine_type, "e2-small");
+        // An init container runs alone, so it counts against the sum, not into it.
+        assert_eq!(machine_shape("z", &u(two.clone(), vec![c("0.1", "3Gi")], MachineShape::default())).unwrap().machine_type, "e2-medium");
+        // The unit's own numbers win over its containers'.
+        let set = MachineShape { cpu: Some("0.25".into()), memory: Some("1Gi".into()), ..Default::default() };
+        assert_eq!(machine_shape("z", &u(vec![c("2", "2Gi")], vec![], set)).unwrap().machine_type, "e2-micro");
+    }
+
+    #[test]
+    fn a_named_machine_type_is_used_as_is() {
+        let named = |kind: &str, gpu: Option<Gpu>| machine_shape("z", &unit(MachineShape { kind: Some(kind.into()), gpu, ..Default::default() }));
+        assert_eq!(named("n2-highmem-8", None).unwrap(), Shape { machine_type: "n2-highmem-8".into(), accelerator: None, gpus: 0 });
+        let t4 = named("n1-standard-8", Some(Gpu { kind: "nvidia-tesla-t4".into(), count: 2 })).unwrap();
+        assert_eq!((t4.accelerator.as_deref(), t4.gpus), (Some("nvidia-tesla-t4"), 2));
+        let g2 = named("g2-standard-8", Some(Gpu { kind: "nvidia-l4".into(), count: 1 })).unwrap();
+        assert_eq!((g2.accelerator, g2.gpus), (None, 1));
+        assert!(named("N2 Standard", None).is_err());
     }
 
     #[test]

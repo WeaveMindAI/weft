@@ -17,6 +17,7 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("declares_a_database_that_reads_its_password_from_a_file", declares),
         NodeTest::fake("describes_itself_identically_every_time", stable),
+        NodeTest::fake("its_machine_is_what_its_settings_say", sized),
         NodeTest::fake("keeps_the_credential_endpoint_to_the_project", internal),
         NodeTest::fake("waits_for_postgres_to_answer_for_itself", ready),
         NodeTest::fake("the_first_run_reads_the_password_and_retires_it", first_run),
@@ -28,7 +29,7 @@ pub fn tests() -> Vec<NodeTest> {
 }
 
 fn config() -> serde_json::Value {
-    json!({ "database": "app", "storage": "10Gi", "version": "17", "reachable": false })
+    json!({ "database": "app", "storage": "10Gi", "version": "17", "reachable": false, "cpu": "0.25", "memory": "1Gi" })
 }
 
 /// The same database, with the author saying something outside the
@@ -103,6 +104,19 @@ async fn declares(rig: FakeRig) -> WeftResult<()> {
             "the credential server is told {name} by the node"
         );
     }
+    Ok(())
+}
+
+/// The machine follows the node's settings, and an emptied machine
+/// type leaves the pick to the cloud.
+async fn sized(rig: FakeRig) -> WeftResult<()> {
+    let mut settings = config();
+    settings["cpu"] = json!("2");
+    settings["memory"] = json!("8Gi");
+    settings["machineType"] = json!("");
+    let outcome = rig.run_provision_infra(&PostgresDatabaseNode, settings).await.ok()?;
+    let machine = &outcome.infra_spec()?.units[0].machine;
+    assert_eq!((machine.cpu.as_deref(), machine.memory.as_deref(), machine.kind.as_deref()), (Some("2"), Some("8Gi"), None));
     Ok(())
 }
 

@@ -208,9 +208,11 @@ async fn every_waiter_on_one_build_gets_its_end(pool: PgPool) {
         first.ensure_images(&wanted, uuid::Uuid::new_v4(), "local", &first_gate, &first_hold),
         second.ensure_images(&wanted, uuid::Uuid::new_v4(), "local", &second_gate, &second_hold),
     );
-    done.await.unwrap();
+    // The verbs first: when both fail before starting anything, `done`
+    // never sees a build and would wait forever, hiding why.
     a.unwrap();
     b.unwrap();
+    done.await.unwrap();
     assert_eq!(fake.starts().len(), 1, "one build for both");
     assert!(!fake.releases().is_empty(), "the build is freed once the end is recorded");
 }

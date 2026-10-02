@@ -50,9 +50,53 @@ to do before anything that creates or costs something:
 2. **The fork.** `gh repo fork WeaveMindAI/weft --clone=false`. A new fork
    has its workflows turned off: turn them on with
    `gh api -X PUT repos/<fork>/actions/permissions -F enabled=true`.
-3. **The `gcloud` block** from the guide, as written, with the values filled
-   in; never invent a flag. Its pool step retries on its own while IAM catches
-   up on a brand new project.
+3. **The `gcloud` block** below, as written, with the three values on its
+   first line filled in (`FORK` is the fork's `owner/repo`, with GitHub's
+   capitals, because Google compares it letter for letter); never invent a
+   flag. Its IAM steps retry on their own while IAM catches up on a
+   brand new project, so a few "waiting for IAM" lines are normal.
+
+   ```bash
+   PROJECT=my-project REGION=us-central1 FORK=me/weft
+   NUMBER=$(gcloud projects describe $PROJECT --format='value(projectNumber)')
+
+   gcloud services enable --project $PROJECT \
+     iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com \
+     cloudresourcemanager.googleapis.com serviceusage.googleapis.com
+
+   gcloud storage buckets create gs://$PROJECT-weft-state --project $PROJECT \
+     --location $REGION --uniform-bucket-level-access
+
+   gcloud iam service-accounts create weft-installer --project $PROJECT
+   gcloud projects add-iam-policy-binding $PROJECT --role roles/owner \
+     --member serviceAccount:weft-installer@$PROJECT.iam.gserviceaccount.com
+
+   # On a new project IAM can take a minute to catch up with the services
+   # just enabled, so each IAM step below is retried until it holds.
+   retry() { until "$@"; do echo "waiting for IAM to catch up, trying again in 10 seconds"; sleep 10; done; }
+   pool() {
+     gcloud iam workload-identity-pools describe weft-install --project $PROJECT \
+       --location global >/dev/null 2>&1 \
+     || gcloud iam workload-identity-pools create weft-install --project $PROJECT \
+       --location global
+   }
+   provider() {
+     gcloud iam workload-identity-pools providers describe github --project $PROJECT \
+       --location global --workload-identity-pool weft-install >/dev/null 2>&1 \
+     || gcloud iam workload-identity-pools providers create-oidc github \
+       --project $PROJECT --location global --workload-identity-pool weft-install \
+       --issuer-uri https://token.actions.githubusercontent.com \
+       --attribute-mapping google.subject=assertion.sub,attribute.repository=assertion.repository \
+       --attribute-condition "assertion.repository=='$FORK'"
+   }
+   retry pool
+   retry provider
+   retry gcloud iam service-accounts add-iam-policy-binding \
+     weft-installer@$PROJECT.iam.gserviceaccount.com --project $PROJECT \
+     --role roles/iam.workloadIdentityUser \
+     --member principalSet://iam.googleapis.com/projects/$NUMBER/locations/global/workloadIdentityPools/weft-install/attribute.repository/$FORK
+   ```
+
 4. **The fork's variables**, with `gh variable set <NAME> --repo <fork>
    --body <value>`: `GCP_PROJECT_ID`, `GCP_REGION`, `GCP_ZONE`,
    `TF_STATE_BUCKET`, `GCP_WORKLOAD_IDENTITY_PROVIDER`,

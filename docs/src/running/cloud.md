@@ -60,19 +60,26 @@ gcloud projects add-iam-policy-binding $PROJECT --role roles/owner \
   --member serviceAccount:weft-installer@$PROJECT.iam.gserviceaccount.com
 
 # On a new project IAM can take a minute to catch up with the services
-# just enabled, so the pool is retried until it exists.
-until gcloud iam workload-identity-pools describe weft-install --project $PROJECT \
+# just enabled, so each IAM step below is retried until it holds.
+retry() { until "$@"; do echo "waiting for IAM to catch up, trying again in 10 seconds"; sleep 10; done; }
+pool() {
+  gcloud iam workload-identity-pools describe weft-install --project $PROJECT \
     --location global >/dev/null 2>&1 \
   || gcloud iam workload-identity-pools create weft-install --project $PROJECT \
-    --location global; do
-  echo "waiting for IAM to catch up, trying again in 10 seconds"; sleep 10
-done
-gcloud iam workload-identity-pools providers create-oidc github \
-  --project $PROJECT --location global --workload-identity-pool weft-install \
-  --issuer-uri https://token.actions.githubusercontent.com \
-  --attribute-mapping google.subject=assertion.sub,attribute.repository=assertion.repository \
-  --attribute-condition "assertion.repository=='$FORK'"
-gcloud iam service-accounts add-iam-policy-binding \
+    --location global
+}
+provider() {
+  gcloud iam workload-identity-pools providers describe github --project $PROJECT \
+    --location global --workload-identity-pool weft-install >/dev/null 2>&1 \
+  || gcloud iam workload-identity-pools providers create-oidc github \
+    --project $PROJECT --location global --workload-identity-pool weft-install \
+    --issuer-uri https://token.actions.githubusercontent.com \
+    --attribute-mapping google.subject=assertion.sub,attribute.repository=assertion.repository \
+    --attribute-condition "assertion.repository=='$FORK'"
+}
+retry pool
+retry provider
+retry gcloud iam service-accounts add-iam-policy-binding \
   weft-installer@$PROJECT.iam.gserviceaccount.com --project $PROJECT \
   --role roles/iam.workloadIdentityUser \
   --member principalSet://iam.googleapis.com/projects/$NUMBER/locations/global/workloadIdentityPools/weft-install/attribute.repository/$FORK
