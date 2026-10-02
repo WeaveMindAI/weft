@@ -175,7 +175,8 @@
     // every index after it. A target that WAS the flushed task comes
     // back -1, and the drop's own advance already focused its
     // neighbour, so nothing more to do.
-    const target = allTasks[idx].token;
+    const target = allTasks[idx]?.token;
+    if (target === undefined) return;
     flushAdvance();
     const at = allTasks.findIndex((t) => t.token === target);
     if (at < 0) return;
@@ -184,7 +185,7 @@
     error = null;
     staleTaskRequested = false;
     writeHashToken(target);
-    initFormState(allTasks[at]);
+    initFormState(allTasks[at]!);
   }
 
   function initFormState(t: PendingTask) {
@@ -317,7 +318,7 @@
     if (settlingToken === token) settlingToken = undefined;
     const idx = allTasks.findIndex((t) => t.token === token);
     if (idx < 0) return;
-    const task = allTasks[idx];
+    const task = allTasks[idx]!;
     if (isTrigger(task)) {
       if (currentIndex === idx) initFormState(task);
       return;

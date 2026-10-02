@@ -251,8 +251,9 @@
         dispatcherUrl = `${url.protocol}//${url.host}`;
         const pathParts = url.pathname.split('/').filter(Boolean);
         const idx = pathParts.indexOf('signal-token');
-        if (idx >= 0 && pathParts[idx + 1]) {
-          token = pathParts[idx + 1];
+        const found = idx >= 0 ? pathParts[idx + 1] : undefined;
+        if (found) {
+          token = found;
         } else {
           throw new Error(`Invalid URL format. Expected: ${LOCAL_INSTALL_URL}/signal-token/TOKEN`);
         }

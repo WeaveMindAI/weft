@@ -137,7 +137,7 @@ export function ownRegistration(
 		}
 		const reg: AppRegistration = {
 			label: ownName.trim() || displayLabel(spec),
-			client_id: formValues['client_id'].trim(),
+			client_id: formValues['client_id']!.trim(),
 		};
 		for (const f of fields) {
 			const value = formValues[f.name]?.trim();

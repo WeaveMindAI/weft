@@ -341,7 +341,7 @@ export async function fetchPendingTasks(
       }
     } else {
       const detail = res.reason instanceof Error ? res.reason.message : String(res.reason);
-      failures.push({ token: tokens[i], detail });
+      failures.push({ token: tokens[i]!, detail });
     }
   });
   return {
