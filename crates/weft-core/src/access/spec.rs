@@ -699,8 +699,11 @@ impl TestMethod {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AuthStep {
     /// `Authorization: Bearer {token}`, `X-Shopify-Access-Token:
-    /// {token}`, `Bot {token}` ... any header.
-    Header { name: String, value: Template },
+    /// {token}`, `Bot {token}` ... any header. The name is a template
+    /// too, so a recipe whose header name is itself something the user
+    /// types (a generic API key connection) writes `"name": "{header}"`;
+    /// it may only name a declared, non-secret field.
+    Header { name: Template, value: Template },
     /// `?key={token}` style query parameter.
     Query { name: String, value: Template },
     /// HTTP Basic in its four survey flavors (Stripe `key:`, Twilio
@@ -960,6 +963,12 @@ pub struct Template(pub String);
 /// recipe declares: the tokens and the app's own secret.
 const SECRET_TOKEN_NAMES: &[&str] = &["access_token", "refresh_token", "client_secret"];
 
+impl From<&str> for Template {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
 impl Template {
     pub fn new(s: impl Into<String>) -> Self {
         Self(s.into())
@@ -1054,7 +1063,11 @@ fn auth_templates_of(steps: &[AuthStep]) -> Vec<&Template> {
     let mut ts = Vec::new();
     for step in steps {
         match step {
-            AuthStep::Header { value, .. } | AuthStep::Query { value, .. } => ts.push(value),
+            AuthStep::Header { name, value } => {
+                ts.push(name);
+                ts.push(value);
+            }
+            AuthStep::Query { value, .. } => ts.push(value),
             AuthStep::Basic { username, password } => {
                 ts.push(username);
                 ts.push(password);
@@ -1077,6 +1090,33 @@ fn auth_templates_of(steps: &[AuthStep]) -> Vec<&Template> {
         }
     }
     ts
+}
+
+/// RFC 7230 token charset, what `HeaderName` accepts: the one test for
+/// an auth header name, run on a literal at load and on a templated
+/// one once resolved.
+pub fn is_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 /// The ONE credential string behind a set of resolved auth steps, when
@@ -1326,36 +1366,17 @@ impl AccessSpec {
         for t in self.auth_templates() {
             t.placeholders()?;
         }
-        // Header and query names are static spec data, so a malformed
-        // one is refused here, at load, rather than on every request.
+        // A literal header or query name is static spec data, so a
+        // malformed one is refused here, at load, rather than on every
+        // request. A templated header name is checked against the
+        // declared fields below, and its resolved value when applied.
         for step in &self.auth {
             match step {
                 AuthStep::Header { name, .. } => {
-                    // RFC 7230 token charset, what HeaderName accepts.
-                    let legal = !name.is_empty()
-                        && name.bytes().all(|b| {
-                            b.is_ascii_alphanumeric()
-                                || matches!(
-                                    b,
-                                    b'!' | b'#'
-                                        | b'$'
-                                        | b'%'
-                                        | b'&'
-                                        | b'\''
-                                        | b'*'
-                                        | b'+'
-                                        | b'-'
-                                        | b'.'
-                                        | b'^'
-                                        | b'_'
-                                        | b'`'
-                                        | b'|'
-                                        | b'~'
-                                )
-                        });
-                    if !legal {
+                    if name.placeholders()?.is_empty() && !is_header_name(&name.0) {
                         return Err(format!(
-                            "auth header name '{name}' is not a legal HTTP header name"
+                            "auth header name '{}' is not a legal HTTP header name",
+                            name.0
                         ));
                     }
                 }
@@ -1445,6 +1466,34 @@ impl AccessSpec {
             .filter(|f| f.secret)
             .map(|f| f.name.clone())
             .collect();
+        // A templated header name is filled from what the user typed at
+        // connect, so it must name a field they are asked for, and a
+        // non-secret one: a header name travels and prints in the clear.
+        for step in &self.auth {
+            let AuthStep::Header { name, .. } = step else { continue };
+            for field in name.placeholders()? {
+                let declared =
+                    field_lists.iter().flat_map(|fs| fs.iter()).find(|f| f.name == field);
+                match declared {
+                    None => {
+                        return Err(format!(
+                            "auth header name '{}' names the field '{field}', which this \
+                             service does not declare",
+                            name.0
+                        ))
+                    }
+                    Some(f) if f.secret => {
+                        return Err(format!(
+                            "auth header name '{}' names '{field}', a secret field: a header \
+                             name is sent and shown in the clear, so build it from a \
+                             non-secret field",
+                            name.0
+                        ))
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
         for fields in field_lists {
             let mut seen = std::collections::HashSet::new();
             for f in fields {
@@ -2306,6 +2355,31 @@ mod tests {
             vec![AuthStep::Header { name: "X Bad Name".into(), value: Template::new("{token}") }];
         let err = bad_header.validate().unwrap_err();
         assert!(err.contains("'X Bad Name'"), "{err}");
+
+        // A templated header name must name a declared, non-secret
+        // field; a literal one is checked as a header name.
+        let header_key = |fields: serde_json::Value, name: &str| -> Result<(), String> {
+            let spec: AccessSpec = serde_json::from_value(json!({
+                "service": "x",
+                "label": "X",
+                "doors": ["own"],
+                "acquisition": { "kind": "static", "fields": fields },
+                "auth": [{ "kind": "header", "name": name, "value": "{value}" }]
+            }))
+            .unwrap();
+            spec.validate()
+        };
+        let fields = json!([
+            { "name": "header", "label": "Header", "secret": false },
+            { "name": "value", "label": "Value" }
+        ]);
+        header_key(fields.clone(), "{header}").unwrap();
+        let err = header_key(fields.clone(), "{nope}").unwrap_err();
+        assert!(err.contains("'nope'") && err.contains("does not declare"), "{err}");
+        let err = header_key(fields.clone(), "{value}").unwrap_err();
+        assert!(err.contains("secret"), "{err}");
+        let err = header_key(fields, "X Bad").unwrap_err();
+        assert!(err.contains("'X Bad'"), "{err}");
 
         let mut bad_query = slack_spec();
         bad_query.auth =

@@ -53,9 +53,6 @@
       "name": "forceInstrumental",
       "type": "Boolean",
       "default": false,
-      "widget": {
-        "kind": "checkbox"
-      },
       "label": "Instrumental only",
       "description": "Never generate vocals."
     }

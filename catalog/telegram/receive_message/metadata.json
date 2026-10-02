@@ -1,7 +1,7 @@
 {
   "type": "TelegramReceiveMessage",
   "label": "Telegram: Receive Message",
-  "description": "Fires once per message sent to the bot, optionally filtered to one chat and a contained keyword. Activation starts from now; restarts never re-fire history.",
+  "description": "Fires once per message sent to the Telegram bot, optionally only in one chat or only when the text contains a keyword. Starts from activation; restarts never re-fire history.",
   "tags": [
     "telegram",
     "message",
@@ -20,7 +20,7 @@
       "name": "chatId",
       "type": "String",
       "label": "Chat id",
-      "description": "Only fire on messages in this chat. Empty = every chat the bot is in."
+      "description": "Only this chat; empty means every chat the bot is in."
     },
     {
       "name": "keyword",
@@ -35,7 +35,7 @@
       "label": "Check every (seconds)",
       "widget": {
         "kind": "number",
-        "min": 1,
+        "min": 5,
         "step": 1
       }
     }

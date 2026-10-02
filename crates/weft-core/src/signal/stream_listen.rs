@@ -18,7 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::socket_listen::SocketFrame;
+use super::socket_listen::{check_frame, check_frame_text, SocketFrame};
 use super::Signal;
 use crate::primitive::AccessRef;
 use crate::signal::Predicate;
@@ -326,11 +326,17 @@ impl Signal for StreamListen {
             _ => {}
         }
         compiled(&self.fire, "fire")?;
+        check_frame_text(&self.address, "stream_listen.address")?;
         for (i, step) in self.script.iter().enumerate() {
             compiled(&step.until, &format!("script[{i}].until"))?;
+            check_frame(&step.send, &format!("stream_listen.script[{i}].send"))?;
         }
         for (i, reply) in self.replies.iter().enumerate() {
             compiled(&reply.when, &format!("replies[{i}].when"))?;
+            check_frame(&reply.frame, &format!("stream_listen.replies[{i}].frame"))?;
+        }
+        if let Some(frame) = &self.heartbeat {
+            check_frame(frame, "stream_listen.heartbeat")?;
         }
         if self.heartbeat.is_some() && self.heartbeat_secs == 0 {
             return Err(

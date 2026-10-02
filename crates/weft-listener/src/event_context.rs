@@ -96,8 +96,25 @@ impl FireContext {
         self.fire_keyed(payload, target, crate::fire_sink::FireIdentity::Named(name)).await
     }
 
+    /// [`Self::fire`] for a payload cut down from what was observed (a
+    /// poll that carries only some fields): the filter reads `judged`,
+    /// the whole observation, and `payload` is what goes out.
+    pub async fn fire_judged(&self, judged: &Value, payload: Value, target: &str) -> FireOutcome {
+        self.fire_filtered(Some(judged), payload, target, crate::fire_sink::FireIdentity::Payload).await
+    }
+
     async fn fire_keyed(&self, payload: Value, target: &str, identity: crate::fire_sink::FireIdentity<'_>) -> FireOutcome {
-        if !matches(&self.predicates, &payload) {
+        self.fire_filtered(None, payload, target, identity).await
+    }
+
+    async fn fire_filtered(
+        &self,
+        judged: Option<&Value>,
+        payload: Value,
+        target: &str,
+        identity: crate::fire_sink::FireIdentity<'_>,
+    ) -> FireOutcome {
+        if !matches(&self.predicates, judged.unwrap_or(&payload)) {
             debug!(
                 target: "weft_listener::event_context",
                 kind = target, token = %self.token,

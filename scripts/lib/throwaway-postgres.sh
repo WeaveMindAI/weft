@@ -27,10 +27,30 @@ start_throwaway_postgres() {
     echo "docker is not on PATH, so no throwaway postgres can be started" >&2
     return 1
   fi
+  # Every container made here carries the uid of the user who made it,
+  # and only this user's are ever removed: the docker daemon is the
+  # machine's, and another user's run is none of ours.
+  local owner
+  owner="weft.throwaway-owner=$(id -u)"
   # A leftover same-name container from a run whose trap never fired
-  # (SIGKILL, crashed caller, pre-helper leftover): remove it WITH its
-  # anonymous volume (-v), the same volume this would otherwise strand.
-  docker rm -f -v "$container" >/dev/null 2>&1 || true
+  # (SIGKILL, crashed caller): remove it WITH its anonymous volume (-v),
+  # the same volume this would otherwise strand. Its pid is ours now, so
+  # the run that made it is gone.
+  if [ -n "$(docker ps -aq --filter "name=^$container\$" --filter "label=$owner")" ]; then
+    docker rm -f -v "$container" >/dev/null 2>&1 || true
+  fi
+  # The same for every earlier run of this prefix whose process is gone
+  # (killed before its trap ran): each is named after its runner's pid,
+  # so a gone pid is a container nothing will ever remove. `ps -p` sees
+  # every user's processes; `kill -0` fails on a live process of another
+  # user too, which would read as gone.
+  local leftover pid
+  for leftover in $(docker ps -a --format '{{.Names}}' --filter "name=^$1-[0-9]+\$" --filter "label=$owner"); do
+    pid="${leftover##*-}"
+    if ! ps -p "$pid" >/dev/null 2>&1; then
+      docker rm -f -v "$leftover" >/dev/null 2>&1 || true
+    fi
+  done
   # Exported BEFORE the container runs, so a Ctrl-C anywhere in the
   # readiness wait still leaves the caller's trap pointing at the right
   # container instead of an unset variable and an orphan.
@@ -40,7 +60,7 @@ start_throwaway_postgres() {
   # SYNC: postgres image tag <-> setup.sh (--purge --postgres, which
   #       reclaims exactly this image),
   #       crates/weft-cli/src/commands/daemon.rs (POSTGRES_IMAGE, 18-alpine)
-  if ! docker run -d --name "$container" -p 127.0.0.1:0:5432 \
+  if ! docker run -d --name "$container" --label "$owner" -p 127.0.0.1:0:5432 \
        -e POSTGRES_PASSWORD=postgres postgres:18 >/dev/null; then
     echo "could not start the throwaway postgres container '$container'" >&2
     return 1

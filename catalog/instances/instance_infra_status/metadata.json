@@ -1,7 +1,7 @@
 {
   "type": "InstanceInfraStatus",
   "label": "Instance infra status",
-  "description": "Read the state of one instance's copy of an infra node: `none` when it was never started (or was terminated), else provisioning, running, flaky, stopping, stopped, terminating or failed. A start or stop on its way reads provisioning or stopping at once, the same answer `weft status` gives.",
+  "description": "Read the state of one instance's copy of a `@per_instance` infra node: `none` (never started, or terminated), provisioning, running, flaky, stopping, stopped, terminating or failed. A start or stop just requested already reads provisioning or stopping, as `weft status` does.",
   "tags": [
     "instances",
     "infra",
@@ -14,28 +14,27 @@
       "name": "node",
       "type": "String",
       "required": true,
-      "description": "The infra node marked `@per_instance`, named the way the program writes it (`bridge`, or `one.bridge` inside an included file)."
+      "description": "The `@per_instance` infra node, named as the program writes it (`bridge`, `work.bridge` inside a group, or `one.bridge` inside an included file)."
     },
     {
       "name": "instance",
       "type": "String",
       "required": true,
-      "description": "The instance, by the id your program gives it (`user-42`)."
+      "description": "The instance id your program gives it (`user-42`)."
     }
   ],
   "outputs": [
     {
       "name": "status",
       "type": "String",
-      "description": "The copy's state, `none` when there is no copy."
+      "description": "The copy's state, `none` when there is none."
     },
     {
       "name": "running",
       "type": "Boolean",
-      "description": "True when the copy answers now."
+      "description": "True when the copy is answering now."
     }
   ],
-  "requires_infra": false,
   "validate": [
     {
       "when": {
@@ -43,7 +42,7 @@
         "of": { "kind": "input_names", "port": "node", "names": { "node": { "role": "infra", "per_instance": true } } }
       },
       "then": {
-        "message": "InstanceInfraStatus '{id}' names {names} in `node`, which is no infra node of this program marked `@per_instance`. Name one the way the program writes it (`bridge`, or `one.bridge` inside an included file).",
+        "message": "InstanceInfraStatus '{id}' names {names} in `node`, which is no infra node of this program marked `@per_instance`. Name one the way the program writes it (`bridge`, `work.bridge` inside a group, or `one.bridge` inside an included file).",
         "level": "structural",
         "severity": "error",
         "port": "node"

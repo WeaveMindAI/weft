@@ -29,14 +29,14 @@ impl Node for SlackReactNode {
         let ts: String = ctx.inputs.get("ts")?;
         let emoji: String = ctx.inputs.get("emoji")?;
         let remove: bool = ctx.inputs.get("remove")?;
+        let client = ctx.client(&access).await?;
 
         // Slack wants the bare emoji name; strip the :colons: people
         // naturally paste so both spellings work.
         let name = emoji.trim_matches(':').to_string();
         let method = if remove { "reactions.remove" } else { "reactions.add" };
         api::call(
-            &ctx,
-            &access,
+            &client,
             method,
             json!({ "channel": channel, "timestamp": ts, "name": name }),
         )

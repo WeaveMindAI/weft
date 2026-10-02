@@ -7,16 +7,21 @@
 //! - `status`: the lifecycle state of one infra node copy.
 //! - `install`: which install a process belongs to.
 //! - `wire`: what the install's infra endpoints answer (doors, logs).
+//! - `handle`: the value an infra node emits so other nodes reach it.
+//! - `action`: the action envelope an infra endpoint speaks.
 //!
 //! The dispatcher never runs infra: it routes lifecycle commands, and the
 //! project's supervisor applies them through the platform's `InfraHost`.
 
+pub mod action;
+mod handle;
 mod install;
 pub mod resolve;
 mod status;
 pub mod types;
 pub mod wire;
 
+pub use handle::{InfraHandle, INFRA_MARKER_KEY};
 pub use install::{data_dir, Install, INSTALL_ENV, INSTALL_LABEL, MAX_INSTALL_NAME};
 pub use resolve::{
     public_path, public_url, resolve, resolve_image, unit_image_refs, NodeRef, ResolveError, ResolvedNode,

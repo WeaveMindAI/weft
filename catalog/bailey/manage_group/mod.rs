@@ -9,6 +9,7 @@
 use async_trait::async_trait;
 use serde_json::json;
 
+use weft::infra::InfraHandle;
 use weft::node::NodeOutput;
 use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftError, WeftResult};
 
@@ -73,7 +74,7 @@ impl Node for BaileyManageGroupNode {
     }
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let endpoint_url: String = ctx.inputs.get("endpointUrl")?;
+        let bridge: InfraHandle = ctx.inputs.get("bridge")?;
         let action: String = ctx.inputs.get("action")?;
         let group_id: Option<String> = ctx.inputs.opt("groupId")?;
         let name: Option<String> = ctx.inputs.opt("name")?;
@@ -87,8 +88,7 @@ impl Node for BaileyManageGroupNode {
             description.as_deref(),
             &participants,
         )?;
-        let result =
-            super::bridge_api::action(&ctx, &endpoint_url, bridge_action, payload).await?;
+        let result = ctx.endpoint_of(&bridge).await?.action(bridge_action, payload).await?;
         // `create` answers the minted id; every other action passes the
         // addressed group through.
         let out_group = result["groupId"]

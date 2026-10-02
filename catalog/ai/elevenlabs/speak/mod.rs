@@ -29,7 +29,7 @@ use weft::node::NodeOutput;
 use weft::storage::{KeepTtl, StorageScope};
 use weft::{node_error, Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
-use super::elevenlabs::audio_file_type;
+use super::elevenlabs::{audio_file_type, WS_API};
 
 #[derive(NodeManifest)]
 pub struct ElevenLabsSpeakNode;
@@ -98,7 +98,7 @@ impl Node for ElevenLabsSpeakNode {
 
         let conn = ctx.open(&account).await?;
         let url = format!(
-            "wss://api.elevenlabs.io/v1/text-to-speech/{voice}/stream-input\
+            "{WS_API}/text-to-speech/{voice}/stream-input\
              ?model_id={}&output_format={}&auto_mode=true&inactivity_timeout=180",
             urlencoding::encode(&model),
             urlencoding::encode(&output_format),

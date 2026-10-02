@@ -1,7 +1,7 @@
 {
   "type": "HumanQuery",
   "label": "Human",
-  "description": "Pause execution and wait for a human to submit a form. Uses the await_form language primitive. Form fields determine the visible inputs/outputs.",
+  "description": "Pauses the run until a person submits a form, then continues with their answers; use it for review or approval mid-run. Each form field adds input and/or output ports by its kind.",
   "tags": [
     "human",
     "form",
@@ -15,12 +15,9 @@
     {
       "name": "title",
       "type": "String",
-      "widget": {
-        "kind": "text"
-      },
       "label": "Title",
       "placeholder": "Review request",
-      "description": "Title the reviewer sees at the top of the form."
+      "description": "Shown at the top of the form."
     },
     {
       "name": "description",
@@ -28,7 +25,7 @@
       "widget": { "kind": "textarea" },
       "label": "Description",
       "placeholder": "What you want the reviewer to do.",
-      "description": "Description shown under the title."
+      "description": "Shown under the title."
     },
     {
       "name": "fields",
@@ -38,11 +35,10 @@
         "kind": "entry_list"
       },
       "label": "Form fields",
-      "description": "Each field contributes inputs/outputs per its kind (see the node's portsFromConfig)."
+      "description": "Each field adds ports by its kind (see portsFromConfig)."
     }
   ],
   "outputs": [],
-  "requires_infra": false,
   "validate": [
     {
       "when": {

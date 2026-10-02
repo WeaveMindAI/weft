@@ -1,7 +1,7 @@
 {
   "type": "LlmEmbed",
   "label": "Embed",
-  "description": "Texts to embedding vectors through the wired OpenRouter connection: pick the embedding model on the provider node (voyageai/voyage-4, openai/text-embedding-3-small, ...).",
+  "description": "Turn texts into embedding vectors through a wired OpenRouter provider, whose model names the embedding model (voyageai/voyage-4, openai/text-embedding-3-small, ...).",
   "tags": [
     "ai",
     "embedding",
@@ -25,7 +25,12 @@
     {
       "name": "dimensions",
       "type": "Number",
-      "description": "Shrink vectors to this many dimensions (models supporting matryoshka sizing only)."
+      "description": "Shrink vectors to this many dimensions (models supporting matryoshka sizing only).",
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "step": 1
+      }
     }
   ],
   "outputs": [

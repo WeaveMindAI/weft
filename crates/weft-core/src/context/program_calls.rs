@@ -491,10 +491,13 @@ impl RunQuery<'_> {
         self
     }
 
-    /// Runs carrying this tag (`ctx.tag_execution`).
-    pub fn tag(mut self, tag: impl Into<String>) -> Self {
-        self.filter.tag = Some(tag.into());
-        self
+    /// Runs carrying this tag (`ctx.tag_execution`), normalized the
+    /// same way, so the value a run tagged itself with finds it. An
+    /// empty tag is refused.
+    pub fn tag(mut self, tag: &str) -> WeftResult<Self> {
+        let tag = crate::tag::normalize_tag(tag).map_err(|e| WeftError::Input(format!("runs: {e}")))?;
+        self.filter.tag = Some(tag);
+        Ok(self)
     }
 
     /// Runs started at least this long ago.
@@ -553,6 +556,13 @@ impl<'a> TokenCalls<'a> {
     /// the old value stops working), never left beside a second one.
     pub async fn mint_for_instance(self, instance: impl Into<String>, expires_in: std::time::Duration) -> WeftResult<MintedInstanceToken> {
         let instance = required_instance(&instance.into())?;
+        // The expiry is refused before the id is journaled, so a refused
+        // mint leaves no record of a token that never existed.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| WeftError::NodeExecution(format!("the clock is before 1970: {e}")))?
+            .as_secs();
+        crate::signal_token::expiry_at(now, expires_in.as_secs()).map_err(WeftError::Input)?;
         let (call_index, replayed) = self.ctx.handle.run_step(MINT_JOURNAL_NAME).await?;
         let id = match replayed {
             Some(recorded) => recorded

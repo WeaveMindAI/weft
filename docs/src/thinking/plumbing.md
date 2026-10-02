@@ -38,7 +38,8 @@ one node's body where nobody can.
 
 No file on the side, no table of your own, no "I'll just keep this in memory
 between runs". If the worker dies, a fresh one rebuilds the execution from the
-journal and keeps going, and `ctx.run` is how a step that waited reuses its
+journal and keeps going (a step that was half way through is failed, since it
+may have partly happened), and `ctx.run` is how a step that waited reuses its
 recorded results when it picks back up.
 
 **VI. Thou shalt not carry files around.**

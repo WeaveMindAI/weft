@@ -1,4 +1,17 @@
 import { readFileSync, writeFileSync, renameSync, existsSync } from 'fs';
+import { join } from 'path';
+
+// The store's files in its directory, named here and nowhere else: the
+// message history, the ids it has seen, and the temporary each flush
+// writes before renaming it into place.
+const MESSAGES_FILE = 'messages.json';
+const SEEN_FILE = `${MESSAGES_FILE}.seen`;
+
+/** Whether a file in the store's directory is one the store writes. */
+export function ownsFile(name) {
+  return [MESSAGES_FILE, SEEN_FILE].some((file) => name === file || name === `${file}.tmp`);
+}
+
 
 /**
  * In-memory message store, keyed by chatId, with optional disk persistence.
@@ -27,18 +40,19 @@ import { readFileSync, writeFileSync, renameSync, existsSync } from 'fs';
  * message never fires the trigger again. The seen ids are bounded too
  * (`maxSeen`, oldest forgotten first), far above what the chats hold.
  *
- * If `persistPath` is provided, the messages are loaded from it on
- * construction and flushed to it (debounced) after mutations, and the seen
- * ids the same way from `<persistPath>.seen`.
+ * If `persistDir` is provided, the messages are loaded from its
+ * `messages.json` on construction and flushed to it (debounced) after
+ * mutations, and the seen ids the same way from `messages.json.seen`.
  */
 export class MessageStore {
-  constructor(maxPerChat = 500, persistPath = null, maxSeen = 200_000) {
+  constructor(maxPerChat = 500, persistDir = null, maxSeen = 200_000) {
     // Eviction keeps the message just added, so a chat holds at least one.
     if (!(maxPerChat >= 1)) throw new RangeError(`maxPerChat must be at least 1, got ${maxPerChat}`);
     if (!(maxSeen >= maxPerChat)) throw new RangeError(`maxSeen must be at least maxPerChat (${maxPerChat}), got ${maxSeen}`);
     this.maxPerChat = maxPerChat;
     this.maxSeen = maxSeen;
-    this.persistPath = persistPath;
+    this.persistDir = persistDir;
+    this.persistPath = persistDir ? join(persistDir, MESSAGES_FILE) : null;
     /** @type {Map<string, Array<Object>>} chatId -> sorted array of raw WAMessages */
     this.chats = new Map();
     /** @type {Set<string>} every messageId ever added, oldest first, never pruned by eviction */
@@ -50,7 +64,7 @@ export class MessageStore {
     this._resolveHistoryReady = null;
 
     // Load persisted messages from disk if available
-    if (persistPath) {
+    if (persistDir) {
       this._loadFromDisk();
     }
   }
@@ -119,7 +133,7 @@ export class MessageStore {
   /**
    * Get the last `count` raw WAMessages for a chat, oldest first.
    */
-  getRawMessages(chatId, count = 20) {
+  getRawMessages(chatId, count) {
     const list = this.chats.get(chatId);
     if (!list || list.length === 0) return [];
     return list.slice(-count);
@@ -219,7 +233,7 @@ export class MessageStore {
   }
 
   _seenPath() {
-    return `${this.persistPath}.seen`;
+    return join(this.persistDir, SEEN_FILE);
   }
 
   _markDirty() {
@@ -333,8 +347,8 @@ export function toNumber(ts) {
  * content, never an empty text a program would run on as if a person
  * sent it.
  */
-// SYNC: the messageTypes returned here <-> MESSAGE_TYPES in
-// catalog/bailey/receive/mod.rs.
+// SYNC: the messageTypes returned here <-> the `messageTypes` widget
+// options in catalog/bailey/receive/metadata.json.
 export function extractTextContent(msg) {
   const m = msg.message;
   if (!m) return { content: null, messageType: 'unknown' };

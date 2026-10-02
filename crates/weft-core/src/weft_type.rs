@@ -58,14 +58,14 @@ macro_rules! define_primitives {
 }
 
 /// The type names that are not primitives but still mean something to
-/// the type language: the two containers, the opaque dict, the two
+/// the type language: the two containers, the opaque dict, the
 /// wired-only handles, and the two declaration markers. A node author
 /// cannot name a type after any of them.
 // SYNC: the type vocabulary (this list + define_primitives! below) <->
 // packages/weft-syntax/weft.tmLanguage.json, packages/weft-syntax/highlight-weft.js,
 // crates/weft-compiler/tests/highlighting_vocabulary.rs (the word-list alarm)
 pub const CONTAINER_AND_SPECIAL_TYPES: &[&str] =
-    &["List", "Dict", "JsonDict", "Bus", "Access", "Generator", "MustOverride"];
+    &["List", "Dict", "JsonDict", "Bus", "Access", "Infra", "Generator", "MustOverride"];
 
 define_primitives!(
     String,
@@ -519,6 +519,14 @@ pub enum WeftType {
     /// service wiring fails loud at runtime). Wired-only: the marker is
     /// minted by an access node, never typed as a literal.
     Access,
+    /// A handle on one endpoint of an infra node: the value an infra
+    /// node emits (`{"__weft_infra__": {...}}`, see
+    /// `crate::infra::InfraHandle`) so other nodes reach that endpoint.
+    /// One general type for every infra node; which node and endpoint it
+    /// names is the value's, checked when it resolves. Wired-only: the
+    /// marker is minted by an infra node, never typed as a literal.
+    // SYNC: WeftType::Infra <-> packages/weft-graph/src/protocol.ts WeftType 'infra'
+    Infra,
     /// A typed, one-directional, terminating stream: `Generator[T]`.
     /// The port itself accepts being emitted into multiple times; every
     /// item is checked against the element type `T`, the consumer pulls
@@ -578,6 +586,7 @@ impl PartialEq for WeftType {
             (WeftType::JsonDict, WeftType::JsonDict) => true,
             (WeftType::Bus, WeftType::Bus) => true,
             (WeftType::Access, WeftType::Access) => true,
+            (WeftType::Infra, WeftType::Infra) => true,
             (WeftType::Generator(a), WeftType::Generator(b)) => a == b,
             (WeftType::Record(a), WeftType::Record(b)) => {
                 a.len() == b.len()
@@ -843,6 +852,7 @@ impl WeftType {
             WeftType::JsonDict
             | WeftType::Bus
             | WeftType::Access
+            | WeftType::Infra
             | WeftType::Generator(_)
             | WeftType::TypeVar(_)
             | WeftType::MustOverride => false,
@@ -959,6 +969,7 @@ impl WeftType {
             WeftType::Named { body, .. } => body.zero_value(),
             WeftType::Bus
             | WeftType::Access
+            | WeftType::Infra
             | WeftType::Generator(_)
             | WeftType::TypeVar(_)
             | WeftType::MustOverride => Value::Null,
@@ -1005,6 +1016,9 @@ impl WeftType {
             // An access connects only to an access; the KIND/service is
             // checked at runtime resolution, not by the type system.
             (WeftType::Access, WeftType::Access) => true,
+            // An infra handle connects only to an infra handle; which
+            // node it names is checked when it resolves.
+            (WeftType::Infra, WeftType::Infra) => true,
             // A generator connects only to a same-element generator
             // (invariant in T, checked both ways): the stream contract
             // is one type end to end, so no variance-driven surprise
@@ -1103,6 +1117,9 @@ impl WeftType {
                 }
                 if obj.contains_key(crate::access::ACCESS_MARKER_KEY) {
                     return WeftType::Access;
+                }
+                if obj.contains_key(crate::infra::INFRA_MARKER_KEY) {
+                    return WeftType::Infra;
                 }
                 if obj.is_empty() {
                     return WeftType::Dict(
@@ -1257,7 +1274,7 @@ impl WeftType {
             });
         }
         if self.is_unresolved()
-            || matches!(self, WeftType::Bus | WeftType::Access | WeftType::Generator(_))
+            || matches!(self, WeftType::Bus | WeftType::Access | WeftType::Infra | WeftType::Generator(_))
         {
             return Err(format!("no cast into {self}"));
         }
@@ -1466,7 +1483,7 @@ impl WeftType {
         }
         let text_serializable = |t: &WeftType| {
             !t.references_file()
-                && !matches!(t, WeftType::Bus | WeftType::Access | WeftType::Generator(_))
+                && !matches!(t, WeftType::Bus | WeftType::Access | WeftType::Infra | WeftType::Generator(_))
         };
         let object_shaped = |t: &WeftType| {
             matches!(
@@ -1651,6 +1668,13 @@ impl WeftType {
                     mismatch(path)
                 }
             }
+            WeftType::Infra => {
+                if crate::infra::InfraHandle::from_value(value).is_ok() {
+                    Ok(())
+                } else {
+                    mismatch(path)
+                }
+            }
             // A generator PORT value is the live-handle marker; the
             // items themselves are validated per emission against the
             // element type, never through this whole-value gate.
@@ -1734,6 +1758,7 @@ impl WeftType {
             | WeftType::Record(_)
             | WeftType::Bus
             | WeftType::Access
+            | WeftType::Infra
             | WeftType::Generator(_) => value.is_object(),
             WeftType::Union(members) => members.iter().any(|m| m.shallow_matches(value)),
             WeftType::Named { body, .. } => body.shallow_matches(value),
@@ -1945,6 +1970,10 @@ fn parse_single_type(s: &str) -> Option<WeftType> {
         return Some(WeftType::Access);
     }
 
+    if s == "Infra" {
+        return Some(WeftType::Infra);
+    }
+
     if s == "MustOverride" {
         return Some(WeftType::MustOverride);
     }
@@ -2117,6 +2146,7 @@ impl WeftType {
             WeftType::JsonDict => out.push_str("JsonDict"),
             WeftType::Bus => out.push_str("Bus"),
             WeftType::Access => out.push_str("Access"),
+            WeftType::Infra => out.push_str("Infra"),
             WeftType::Generator(inner) => {
                 out.push_str("Generator[");
                 inner.fmt_with(out, wire);

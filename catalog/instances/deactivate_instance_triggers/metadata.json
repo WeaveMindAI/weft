@@ -1,7 +1,7 @@
 {
   "type": "DeactivateInstanceTriggers",
   "label": "Deactivate instance triggers",
-  "description": "Turn off one instance's own triggers, the way `triggers` says (park, hibernate or wipe), with their runs still going following `running`.",
+  "description": "Turn off one instance's per-instance triggers (park, hibernate or wipe), with `running` deciding what happens to its runs in flight.",
   "tags": [
     "instances",
     "triggers",
@@ -14,12 +14,12 @@
       "name": "instance",
       "type": "String",
       "required": true,
-      "description": "The instance, by the id your program gives it (`user-42`)."
+      "description": "The instance id your program gives it (`user-42`)."
     },
     {
       "name": "only",
       "type": "List[String]",
-      "description": "Only these triggers. Every per-instance trigger when not wired."
+      "description": "Only these triggers. Unwired: every per-instance trigger."
     },
     {
       "name": "triggers",
@@ -34,7 +34,7 @@
       },
       "default": "park",
       "label": "Triggers",
-      "description": "What happens to the instance's triggers: park keeps what arrives for later, hibernate keeps it for a grace window, wipe drops it."
+      "description": "park queues what arrives, hibernate keeps accepting for `graceMinutes`, wipe drops it."
     },
     {
       "name": "running",
@@ -48,45 +48,88 @@
       },
       "default": "wait",
       "label": "Running work",
-      "description": "What happens to the instance's runs still going: wait lets them finish, cancel stops them now. Wipe needs cancel."
+      "description": "The instance's runs still going: wait lets them finish, cancel stops them. `wipe` needs cancel."
     },
     {
       "name": "graceMinutes",
       "type": "Number",
       "default": 15,
       "label": "Grace minutes",
-      "description": "How long hibernate keeps accepting what arrives. Ignored by park and wipe."
+      "description": "Hibernate only: how long it keeps accepting.",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "step": 1
+      }
     },
     {
       "name": "includeSelf",
       "type": "Boolean",
-      "widget": {
-        "kind": "checkbox"
-      },
       "default": false,
       "label": "Stop this run too",
-      "description": "Off: this run keeps going even when it is one of the runs reached. On: this run ends with them, cancelled."
+      "description": "On: this run is cancelled too when it is one of the runs reached."
     }
   ],
   "outputs": [
     {
       "name": "done",
       "type": "Boolean",
-      "description": "True once the triggers are down (under `running: wait`, once they are draining: the runs they fired may still be finishing). Wire it into the `_should_flow` of what must happen after."
+      "description": "True once the triggers are down; under `running: wait` their runs may still be finishing."
     }
   ],
-  "requires_infra": false,
   "validate": [
     {
       "when": {
         "kind": "not",
-        "of": { "kind": "input_names", "port": "only", "names": { "node": { "role": "trigger", "per_instance": true } } }
+        "of": {
+          "kind": "input_names",
+          "port": "only",
+          "names": {
+            "node": {
+              "role": "trigger",
+              "per_instance": true
+            }
+          }
+        }
       },
       "then": {
-        "message": "DeactivateInstanceTriggers '{id}' names {names} in `only`, which is no per-instance trigger of this program. Name each the way the program writes it (`inbox`, or `one.inbox` inside an included file).",
+        "message": "DeactivateInstanceTriggers '{id}' names {names} in `only`, which is no per-instance trigger of this program. Name each the way the program writes it (`inbox`, `work.inbox` inside a group, or `one.inbox` inside an included file).",
         "level": "structural",
         "severity": "error",
         "port": "only"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_equals",
+            "field": "triggers",
+            "equals": "wipe"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_equals",
+              "field": "running",
+              "equals": "cancel"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "running"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "DeactivateInstanceTriggers '{id}' wipes the triggers but lets running work finish. Wiping drops what the runs still need, so set `running` to cancel, or pick park or hibernate for `triggers`.",
+        "level": "structural",
+        "severity": "error",
+        "field": "running"
       }
     }
   ]

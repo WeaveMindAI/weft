@@ -1,7 +1,7 @@
 {
   "type": "SlackAccess",
   "label": "Slack Access",
-  "description": "Sign in to a Slack workspace. Pick an existing connection or add one: one click on the built-in app, through your own Slack app, or by pasting a bot token (xoxb-...) you made yourself. Slack has ONE grant per app + workspace, so reconnecting or upgrading permissions rotates the shared connection every project follows. Event triggers (a message arriving) work through your own app's Socket Mode token, or through pushes to a weft that is reachable from the internet.",
+  "description": "Connects a Slack workspace for every Slack node, through the built-in app, your own Slack app, or a pasted bot token (xoxb-...). Slack allows one grant per app and workspace, so reconnecting or upgrading permissions changes the connection for every project using it. Event triggers need your own app's Socket Mode token (xapp-...) on the connection, or a weft reachable from the internet.",
   "tags": [
     "slack",
     "access",
@@ -405,7 +405,7 @@
     {
       "name": "access",
       "type": "Access",
-      "description": "The workspace's access: wire it into Slack action nodes."
+      "description": "Wire into Slack nodes."
     }
   ]
 }

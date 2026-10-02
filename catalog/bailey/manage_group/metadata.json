@@ -1,7 +1,7 @@
 {
   "type": "BaileyManageGroup",
   "label": "WhatsApp Manage Group (Baileys)",
-  "description": "Manage a WhatsApp group via the project's bridge: create one, add/kick/promote/demote participants, or set its name/description. `create` needs `name` + `participants` and emits the new `groupId`; every other action needs `groupId` (participant actions also need `participants`, `rename` needs `name`, `describe` needs `description`).",
+  "description": "Create a WhatsApp group, add/kick/promote/demote participants, or rename/describe it. `create` needs `name` and `participants` and outputs the new `groupId`; every other action needs `groupId`, plus `participants` for participant actions, `name` for `rename`, `description` for `describe`.",
   "tags": [
     "whatsapp",
     "baileys",
@@ -11,9 +11,10 @@
   "color": "#25D366",
   "inputs": [
     {
-      "name": "endpointUrl",
-      "type": "String",
-      "required": true
+      "name": "bridge",
+      "type": "Infra",
+      "required": true,
+      "description": "The `bridge` output of the BaileyBridge node to talk through."
     },
     {
       "name": "action",
@@ -59,5 +60,161 @@
   "features": {
     "catchErrors": true
   },
-  "requires_infra": false
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_in_set",
+            "field": "action",
+            "values": [
+              "add",
+              "kick",
+              "promote",
+              "demote",
+              "rename",
+              "describe"
+            ]
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "groupId"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "BaileyManageGroup '{id}' acts on an existing group but has no `groupId`. Give the id of the group to change.",
+        "level": "structural",
+        "severity": "error",
+        "port": "groupId"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "any",
+            "of": [
+              {
+                "kind": "any",
+                "of": [
+                  {
+                    "kind": "config_equals",
+                    "field": "action",
+                    "equals": "create"
+                  },
+                  {
+                    "kind": "all",
+                    "of": [
+                      {
+                        "kind": "not",
+                        "of": {
+                          "kind": "config_present",
+                          "field": "action"
+                        }
+                      },
+                      {
+                        "kind": "not",
+                        "of": {
+                          "kind": "input_wired",
+                          "port": "action"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "kind": "config_equals",
+                "field": "action",
+                "equals": "rename"
+              }
+            ]
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "name"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "BaileyManageGroup '{id}' creates or renames a group but has no `name`. Give the group's name.",
+        "level": "structural",
+        "severity": "error",
+        "port": "name"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "any",
+            "of": [
+              {
+                "kind": "any",
+                "of": [
+                  {
+                    "kind": "config_equals",
+                    "field": "action",
+                    "equals": "create"
+                  },
+                  {
+                    "kind": "all",
+                    "of": [
+                      {
+                        "kind": "not",
+                        "of": {
+                          "kind": "config_present",
+                          "field": "action"
+                        }
+                      },
+                      {
+                        "kind": "not",
+                        "of": {
+                          "kind": "input_wired",
+                          "port": "action"
+                        }
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "kind": "config_in_set",
+                "field": "action",
+                "values": [
+                  "add",
+                  "kick",
+                  "promote",
+                  "demote"
+                ]
+              }
+            ]
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "participants"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "BaileyManageGroup '{id}' needs `participants` for this action. List the people it applies to.",
+        "level": "structural",
+        "severity": "error",
+        "port": "participants"
+      }
+    }
+  ]
 }

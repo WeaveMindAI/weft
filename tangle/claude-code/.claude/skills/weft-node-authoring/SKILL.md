@@ -136,6 +136,11 @@ writing anything else fails with `literal-not-an-option`. Keep it closed when
 your code matches on the value. When the list is only the ones you know of
 and a provider can add more (model ids, voices), add `"free_text": true` to
 the widget, and the options become suggestions.
+A `code` widget's `language` is one of `python`, `javascript`, `sql`, `json`;
+any other word fails to load. `json` also fits a `JsonDict` input
+(edited as JSON text); the others edit a `String`. A `number` widget with a whole `step`
+(`"step": 1`) takes whole numbers only: the compiler checks a written value
+and the runtime a wired one, so your body can cast it to an integer.
 Output entry: `name`, `type`, `description` (an output has no optionality).
 
 A `validate` rule's `when` is a closed set of conditions, combined with
@@ -267,6 +272,48 @@ template) has nothing outside to fail on and does not set the flag.
 `fake` test of the caught path calls `rig.wire_output("error")` first; a rig
 wires nothing by default, so without it the failure fails the test run.
 
+**Calling a service.** `weft::access::client` already holds what every API
+node repeats, so you never write it again: `get_json` / `post_json` (send,
+refuse a non-success status quoting the provider's own words, parse),
+`json_call` for a request you prepared yourself, `checked_send` when the
+answer is not JSON, `require_ok_flag` for a service that answers 200 and says
+`ok: false` in the body, `cursor_paged` with a `CursorPaging` (its
+`past_cap_hint` tells the user what to narrow when the list runs past the page
+cap) for a cursor-paged list, and `required_str` for a field you cannot do
+without. To hand a stored file to a provider, `ctx.storage(scope).external_url(&file)`
+gives its public link or a `data:` URL (`external_file` adds the mime type
+and filename); never write that fallback yourself. To emit a struct, use
+`NodeOutput::new().set_serialized(port, &value)?`.
+
+**Waiting on a provider's job** (a render, a dub, a crawl) is
+`ctx.await_signal(PollEndpoint { .. })`, never a sleep loop in the body,
+which holds a worker for the whole job. Submit inside `ctx.run`, then wait:
+
+```rust
+use weft::signal::{PollEndpoint, Predicate};
+
+let submitted = ctx.run("submit", || async {
+    post_json(&http, &submit_url, &payload, "submitting the render").await
+}).await?;
+let id = submitted["request_id"].as_str().node_err("the submit answered no request_id")?;
+let status = ctx.await_signal(PollEndpoint {
+    url: format!("{API}/requests/{id}/status"),
+    interval_secs: 5,
+    access: Some(weft::primitive::AccessRef::from(&account)),
+    filters: vec![Predicate::neq("status", "IN_QUEUE"), Predicate::neq("status", "IN_PROGRESS")],
+    ..Default::default()
+}).await?;
+```
+
+The worker goes away while it waits. The first check runs at once, then
+every `interval_secs` (under 5 is refused); the first answer passing every
+filter is what `await_signal` returns, and checking stops. A failed check is
+tried again at the next one. The body then replays from the top, which is why
+the submit sits in `ctx.run`: without it the replay starts and pays for a
+second job. Filter on "not in flight" as above, so an unknown status ends the
+wait and your code can fail on it. `delta` is refused here. Read the
+stdlib's `nodes/base_catalog/ai/fal/fal.rs` (`run_queued`) for a whole worked case.
+
 You emit only through `ctx.pulse_downstream(NodeOutput::new().set(port, value))`;
 ports you did not emit are closed, which is the skip signal downstream. For
 user-added output ports use `ctx.fan_declared(...)`. A step never runs twice
@@ -308,10 +355,13 @@ every older run of the project carrying the tag, waiting ones included (a
 run parked on a person or a timer never wakes); `StopSelf::Include` stops
 this run too. Tag first, then stop: a stop only reaches runs that put the
 tag on before this one did, so when two runs race, the later one survives.
-Both calls are safe to re-run after a crash (a repeated tag keeps its place
-in the order, a repeated stop finds its targets already ended), so neither
-goes through `ctx.run`. A tag is `[A-Za-z0-9_-]{1,64}`; the ctx refuses
-anything else before writing. In the `fake` tier nothing is stopped:
+Both calls are safe to repeat when the body replays after a wait (a
+repeated tag keeps its place in the order, a repeated stop finds its targets
+already ended), so neither goes through `ctx.run`. Pass any non-empty string
+as a tag, a chat id or an email included: the ctx keeps a valid tag
+(`[A-Za-z0-9_-]{1,64}`) as it is and turns anything else into one (other
+characters become `_`, plus a short fingerprint of the original), the same
+way in both calls, so never clean a tag yourself. Only an empty tag fails. In the `fake` tier nothing is stopped:
 `rig.execution_tags()` and `rig.stops()` record what the node asked for, so
 you assert on those.
 
@@ -536,46 +586,73 @@ network error or a body that is not JSON is an error. The call has no
 timeout of its own, so a call that waits on slow work never returns while a
 person presses stop: that is what the shape below is for.
 
+**If other nodes need your service** (a bridge every send node talks
+through), pass them `api.infra_handle()` instead of `api.url()`, because the address
+changes each time the service is set up again. Declare an
+output `{ "name": "bridge", "type": "Infra" }` and set it to
+`api.infra_handle()`. The handle names your node's place and the endpoint,
+plus the instance for a node marked `@per_instance`. A node that uses it
+declares an input typed `Infra` and resolves it:
+
+```rust
+use weft::infra::InfraHandle;
+
+let bridge: InfraHandle = ctx.inputs.get("bridge")?;
+let bridge = ctx.endpoint_of(&bridge).await?;
+let sent = bridge.action("sendMessage", json!({ "to": to, "text": text })).await?;
+```
+
+It returns the same kind of handle as `ctx.endpoint`. `action(name, payload)` posts
+`{"action": name, "payload": payload}` to the container's `/action` and
+answers its `result`; a `result.error`, or no `result` at all, fails the
+node, like a non-2xx. The compiler refuses a `String` wired into an `Infra` input
+and a written value, and a handle resolves only in its own project, to
+infra the program declares, for the run's own instance.
+
 **A long job** (a render, a training run, a batch on the GPU) never sits in
-one `call`. The container answers at once with a job id, runs the work in its
-own background thread, shows progress on its display (the `progress` item
-under [The display](#the-display)), and answers a status route. The node
-polls that route and watches cancellation between looks:
+one `call`, and never in a loop that sleeps in the body either: that holds a
+worker for the whole job. The container answers at once with a job id, runs
+the work in its own background thread, shows progress on its display (the
+`progress` item under [The display](#the-display)), and answers a status
+route. The node starts the job inside `ctx.run` and parks on that route:
 
 ```rust
 use weft::EndpointMethod;
+use weft::signal::{PollEndpoint, Predicate};
 
 let api = ctx.endpoint("api").await?;
-let job = api.call(EndpointMethod::Post, "/jobs", Some(json!({ "prompt": prompt }))).await?;
-let id = job["id"].as_str().ok_or_else(|| weft::node_error("the service answered no job id"))?.to_string();
-let cancel = ctx.cancellation();
-let result = loop {
-    let state = api.call(EndpointMethod::Get, &format!("/jobs/{id}"), None).await?;
-    match state["status"].as_str() {
-        Some("done") => break state["result"].clone(),
-        Some("failed") => return Err(weft::node_error(format!("job {id} failed: {}", state["error"]))),
-        _ => {}
-    }
-    tokio::select! {
-        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
-        err = cancel.cancelled_err() => {
-            api.call(EndpointMethod::Post, &format!("/jobs/{id}/cancel"), None).await?;
-            return Err(err);
-        }
-    }
-};
+let job = ctx.run("start the job", || async {
+    api.call(EndpointMethod::Post, "/jobs", Some(json!({ "prompt": prompt }))).await
+}).await?;
+let id = job["id"].as_str().ok_or_else(|| weft::node_error("the service answered no job id"))?;
+let state = ctx.await_signal(PollEndpoint {
+    url: format!("{}/jobs/{id}", api.url()),
+    interval_secs: 5,
+    filters: vec![Predicate::neq("status", "running")],
+    ..Default::default()
+}).await?;
+if state["status"] != "done" {
+    return Err(weft::node_error(format!("job {id} ended {state}")));
+}
 ```
 
-The routes (`/jobs`, `/jobs/<id>`, `/jobs/<id>/cancel`) are your image's own
-API; weft only carries the calls. `ctx.cancellation()` is an
-`Arc<CancellationFlag>`: `cancel.cancelled().await` resolves once the run is
-stopped, `cancel.cancelled_err().await` resolves to the error that ends the
-body as cancelled rather than failed, and `ctx.is_cancelled()` is a cheap
-check for a loop that does not wait. Once tripped it stays tripped.
-To test this path, have the rig press stop partway through the job:
-`rig.stop_after_calls(2)` stops the run once the node has made two calls (web
-requests and endpoint calls, counted together), and the run should then end
-in `WeftError::Cancelled` with no outputs.
+The run parks and the worker goes away. The listener checks the route straight
+away, then every `interval_secs` (5 is the floor), and the first answer
+that passes the filters is what `await_signal` returns. The body then replays
+from the top, which is why the start is inside `ctx.run`: without it the
+replay would start a second job. `api.url()` is the address the workers
+reach; the listener sits elsewhere on a local install, so before every check
+it asks for the same endpoint's address as weft's own roles reach it, and
+only this project's infra is looked up. The routes (`/jobs`, `/jobs/<id>`)
+are your image's own API.
+
+Stopping a parked run runs none of your code: the run ends cancelled, its
+wait is removed, and the checks stop. The job in the container carries on.
+If it should stop too, the container has to notice on its own, for example
+by giving up on a job whose status nobody has asked for in a few intervals
+(the listener asks every `interval_secs` for as long as the run waits);
+terminating the infra stops it with everything else. To test the node, queue
+the answer with `rig.signal(json!({ "status": "done", "result": ... }))`.
 
 **Keeping a file past the run**: a file stored in `StorageScope::Execution`
 with no keep is swept shortly after the run ends. If the file is what the
@@ -612,7 +689,12 @@ a `Disk` volume instead.
   polling test queues one answer per look; a call with none left fails.
   `rig.refuse_endpoint(endpoint, method, path, status, body)` refuses one.
 - `rig.endpoint_calls()` is every call the node made, each an `EndpointCall
-  { endpoint, method, path, body }`.
+  { place, endpoint, method, path, body }` (`place` is the infra node the
+  call went to).
+- `let bridge = rig.declare_infra("bridge", "api", "http://bridge:8090")`
+  declares an endpoint another infra node shares and hands back its `Infra`
+  handle, to put on the input; `rig.answer_infra("bridge", "api", method,
+  path, answer)` queues its answers the way `answer_endpoint` does.
 - `rig.logs()` is every `ctx.log` line as `(LogLevel, String)`.
 - `rig.stored_meta(key)?.keep` and `.keep_ttl_secs` say whether a stored
   file was kept, and `rig.stored_files(&scope)?` lists them.

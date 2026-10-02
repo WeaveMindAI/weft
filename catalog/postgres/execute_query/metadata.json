@@ -1,7 +1,7 @@
 {
   "type": "PostgresExecuteQuery",
   "label": "Postgres: Query",
-  "description": "Run SQL against a Postgres database and get the rows back. The query's parameters are the node's own input ports, declared inline and read by name in the SQL: `PostgresExecuteQuery(user_id: String) { query: \"SELECT * FROM users WHERE id = $user_id\" }`. A string binds as the text of whatever the placeholder's type is (a text column as is; `$when::timestamptz`, a uuid column or `$amount::numeric` parse it like a quoted literal), a boolean as bool, a number to whichever numeric column it meets, null to any column, an object or list as jsonb (read a key with `$params::jsonb->>'id'`). Postgres works out each parameter's type from where it sits in the SQL, whatever value arrives: where it cannot (inside `jsonb_build_object(...)`, in `$x IS NULL`, a bare `SELECT $x`), the query is refused with \"could not determine data type of parameter\", so cast it there (`$x::text`, `$x::jsonb`). Several statements are a script: with `$name` parameters each statement runs with the ports it names, in one transaction; without any, the statements before the last go whole (so transaction control and the utility statements work) and the last runs on its own. Either way the rows of the last statement come back, typed the same as a one-statement query. Declare output ports (`-> (name: String)`) to read the first row's columns by name. A column that can be NULL is declared `T | Null` where the rows are typed (`List[Dict[String, JsonDict | Null]]`, or the field of a named record): a null arrives as data, and `JsonDict` alone refuses it. Plain SQL cannot raise an error of its own, and a `$port` inside a dollar-quoted `DO` body is text to Postgres, not a parameter; so define once, in your schema, `CREATE FUNCTION fail(msg text) RETURNS void LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION '%', msg; END $$;` and call it where the statement should fail: `SELECT fail('the publication has no row') WHERE NOT EXISTS (SELECT 1 FROM publication WHERE id = $id)` fails the node with that text. A port used in the message and in a comparison is ONE parameter with one inferred type, and `'...' || $id` makes it text, so a uuid or integer `id` column then refuses the comparison; carry the message on its own port instead. A data-modifying CTE (`WITH ins AS (INSERT ... RETURNING *) SELECT ...`) is invisible to the rest of its own statement, so read what it wrote from `ins`, never from the table. A database that cannot be reached or refuses what the query does (a broken constraint, a `fail(..)` it raised, a missing privilege) is a failure `error` catches when wired; a mistake in the SQL itself (a syntax error, a table or column that does not exist, a positional `$1`) always fails the run, wired or not: the fix is editing the query.",
+  "description": "Run SQL against Postgres and get the rows back. Parameters are the node's own inline-declared input ports, read by name: `PostgresExecuteQuery(user_id: String) { query: \"SELECT * FROM users WHERE id = $user_id\" }`. Binding: a string as the text of the placeholder's type (so `$when::timestamptz`, a uuid column or `$amount::numeric` parse it like a quoted literal), a boolean as bool, a number to whatever numeric column it meets, null anywhere, an object or list as jsonb (`$params::jsonb->>'id'`). Where Postgres cannot infer a parameter's type (inside `jsonb_build_object(...)`, `$x IS NULL`, bare `SELECT $x`) it refuses with \"could not determine data type of parameter\": cast it (`$x::text`). A port used twice is ONE parameter with one type, so `'...' || $id` makes `id` text and a uuid or integer comparison on it then fails; use a separate port. Several statements form a script: with `$name` parameters they run in one transaction, each with the ports it names; without any, all but the last run whole (transaction control and utility statements work) and the last runs alone. The last statement's rows come back. Declare output ports (`-> (name: String)`) to read the first row's columns; a nullable column is typed `T | Null` (`List[Dict[String, JsonDict | Null]]`), since `JsonDict` alone refuses null. To fail on purpose, define once in the schema `CREATE FUNCTION fail(msg text) RETURNS void LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION '%', msg; END $$;` and call `SELECT fail('no such publication') WHERE NOT EXISTS (...)` (a `$port` inside a `DO` body is plain text, not a parameter). A data-modifying CTE (`WITH ins AS (INSERT ... RETURNING *) SELECT ...`) is invisible to the rest of its statement: read from `ins`, not the table. Unreachable database, broken constraint, `fail(..)` or missing privilege: catchable by `error`. An SQL mistake (syntax, unknown table or column, positional `$1`): always fails the run.",
   "tags": [
     "postgres",
     "database",
@@ -23,7 +23,7 @@
         "user",
         "password"
       ],
-      "description": "The database's connection (wire a PostgresAccess node, or a PostgresDatabase's access output)."
+      "description": "Wire a PostgresAccess, or a PostgresDatabase's access output."
     },
     {
       "name": "query",
@@ -35,19 +35,19 @@
       },
       "label": "SQL",
       "placeholder": "SELECT * FROM users WHERE email = $email",
-      "description": "The SQL. Each `$name` reads the input port of that name; declare the ports inline on the node and wire them."
+      "description": "The SQL; each `$name` reads the inline-declared input port of that name."
     }
   ],
   "outputs": [
     {
       "name": "rows",
       "type": "List[JsonDict]",
-      "description": "The answered rows keyed by column name (the last statement's, for a script)."
+      "description": "Answered rows keyed by column (the last statement's, for a script)."
     },
     {
       "name": "count",
       "type": "Number",
-      "description": "The number of rows the query RETURNED (the length of `rows`), never the number of rows a write changed. An `insert`, `update` or `delete` returns no rows unless it has a `RETURNING` clause, so on a plain write `count` is 0 even when the write worked. If you want how many rows a write touched, add `RETURNING id` and `count` becomes that number. This is the node's own port, so a column called `count` cannot use it; alias such a column in the SQL (`count(*) as total`) and declare a port for that name."
+      "description": "Rows RETURNED (length of `rows`), not rows changed: a plain INSERT/UPDATE/DELETE gives 0; add `RETURNING id` to count them. A column named `count` cannot use this port: alias it (`count(*) as total`) and declare that port."
     }
   ],
   "features": {

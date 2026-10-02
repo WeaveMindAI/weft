@@ -4,7 +4,7 @@
 //! through the same node.
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use weft::node::NodeOutput;
 use weft::storage::{KeepTtl, StorageScope};
@@ -32,29 +32,23 @@ impl Node for FalGenerateImageNode {
         let size: String = ctx.inputs.get("imageSize")?;
         let count: f64 = ctx.inputs.get("count")?;
         let seed: Option<f64> = ctx.inputs.opt("seed")?;
-        let params = ctx.inputs.raw("params").cloned();
+        let params = ctx.inputs.opt::<Map<String, Value>>("params")?;
 
-        // `count` is bound to [1, 8] whole by its widget, wired or written.
+        // `count` is bound to [1, 8] whole and `seed` to [0, 2^53] whole by
+        // their widgets, wired or written, so both casts below are exact.
         let mut payload = json!({
             "prompt": prompt,
             "image_size": size,
             "num_images": count as u64,
         });
         if let Some(s) = seed {
-            // Bounded on both ends: the cast below saturates, so a huge
-            // seed would silently become u64::MAX, and past 2^53 the
-            // number the author typed is not the number that arrived.
-            if s.fract() != 0.0 || s < 0.0 || s > 9_007_199_254_740_992.0 {
-                return Err(weft::WeftError::Input(format!(
-                    "seed must be a whole number between 0 and 9007199254740992, got {s}"
-                )));
-            }
             payload["seed"] = json!(s as u64);
         }
-        merge_params(&mut payload, params.as_ref())?;
+        merge_params(&mut payload, params.as_ref());
 
         let http = ctx.client(&account).await?;
-        let answer = run_queued(&ctx, &http, &model, &payload, "fal: generate the image").await?;
+        let answer =
+            run_queued(&ctx, &account, &http, &model, &payload, "fal: generate the image").await?;
 
         let urls: Vec<Value> = answer["images"]
             .as_array()

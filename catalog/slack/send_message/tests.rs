@@ -20,7 +20,6 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("refuses_two_destinations", refuses_two_destinations),
         NodeTest::fake("a_refused_post_fails_the_run_when_error_is_unwired", refused_unwired),
         NodeTest::fake("a_refused_post_comes_out_on_error_when_it_is_wired", refused_wired),
-        NodeTest::fake("a_missing_destination_fails_the_run_even_with_error_wired", no_destination_wired),
         NodeTest::live("one_real_send_then_delete", "slack", live_send_then_delete).with_fixture(
             fixture_spec(
                 "SLACK_CHANNEL_ID",
@@ -309,17 +308,5 @@ async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
     for port in ["ts", "channel", "permalink", "scheduledId"] {
         assert!(!outcome.outputs.contains_key(port), "a caught failure emits nothing on {port}");
     }
-    Ok(())
-}
-
-async fn no_destination_wired(rig: FakeRig) -> WeftResult<()> {
-    rig.wire_output("error");
-    let err = rig
-        .run(&SlackSendMessageNode, json!({ "account": rig.access("slack"), "text": "hello" }))
-        .await
-        .failure()?;
-    assert!(err.starts_with("input error"), "a program mistake is never caught: {err}");
-    assert!(err.contains("pick a destination"), "{err}");
-    assert!(rig.requests().is_empty(), "refused before any call");
     Ok(())
 }

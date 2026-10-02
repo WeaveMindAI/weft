@@ -4,6 +4,7 @@
 
 use async_trait::async_trait;
 
+use weft::access::client::required_str;
 use weft::node::NodeOutput;
 use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
 
@@ -26,31 +27,26 @@ impl Node for SlackFindChannelNode {
         let access: Access = ctx.inputs.get("account")?;
         let name: String = ctx.inputs.get("name")?;
         let wanted = name.trim_start_matches('#').to_string();
+        let client = ctx.client(&access).await?;
 
         // Slack has no name-lookup endpoint, so resolving a name means
-        // scanning the listing (bounded by the shared paging cap; past
-        // it the node fails loudly naming the recovery: paste the id).
+        // scanning the listing (bounded by the shared paging cap, past
+        // which the node fails loudly).
         let query = [
             ("exclude_archived", "true".to_string()),
             ("types", "public_channel,private_channel".to_string()),
         ];
         let hit = api::paged(
-            &ctx,
-            &access,
+            &client,
             "conversations.list",
             &query,
-            "channels",
+            "/channels",
+            "paste the channel id (`C0123ABCD`) instead of its name",
             |channels| {
                 Ok(channels
                     .iter()
                     .find(|c| c["name"].as_str() == Some(wanted.as_str()))
                     .cloned())
-            },
-            |scanned| {
-                format!(
-                    "scanned {scanned} channels without finding '{wanted}'; paste the \
-                     channel id directly instead of the name"
-                )
             },
         )
         .await?;
@@ -60,7 +56,7 @@ impl Node for SlackFindChannelNode {
                  only appear once the app is invited into them)"
             );
         };
-        let id = api::required_str(&hit, "conversations.list", "id")?.to_string();
+        let id = required_str(&hit, "conversations.list", "id")?.to_string();
         let is_private = hit["is_private"].as_bool().unwrap_or(false);
         ctx.pulse_downstream(
             NodeOutput::new().set("id", id).set("name", wanted).set("private", is_private),

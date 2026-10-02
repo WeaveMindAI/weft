@@ -46,8 +46,8 @@ async fn fire_emits_row(rig: FakeRig) -> WeftResult<()> {
     canned_tab(&rig);
     rig.respond(
         "GET",
-        &path(&values_url("s1", "Leads", None)),
-        json!({ "values": [["name", "email"], ["ada", "ada@example.com"]] }),
+        &path(&values_url("s1", "Leads", Some("1:1"))),
+        json!({ "values": [["name", "email"]] }),
     );
     rig.wake(json!({ "item": ["ada", "ada@example.com"], "index": 1 }));
     let outcome = rig

@@ -1,0 +1,8 @@
+# A long job inside the program's own infra: JobService starts a job in its
+# container, parks on a poll of the job's status route at the endpoint's
+# worker address, and emits the result once the container says done. The
+# listener does the polling, so it has to reach that address too.
+
+svc = JobService
+out = Debug
+out.data = svc.result

@@ -26,6 +26,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::context::LogLevel;
+use weft::access::client::required_str;
 use weft::node::NodeOutput;
 use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
 
@@ -54,6 +55,7 @@ impl Node for SlackSendMessageNode {
         // Read as an integer directly: a fractional schedule time is a
         // loud type error, never a silent truncation.
         let post_at: Option<i64> = ctx.inputs.opt("postAt")?;
+        let client = ctx.client(&access).await?;
 
         let destination = match (channel, user) {
             (Some(c), None) => c,
@@ -61,41 +63,37 @@ impl Node for SlackSendMessageNode {
                 // A user destination is a DM: open (or reuse) the
                 // conversation with them and post into its channel id.
                 let opened =
-                    api::call(&ctx, &access, "conversations.open", json!({ "users": u })).await?;
-                api::required_str(&opened["channel"], "conversations.open", "id")?.to_string()
+                    api::call(&client, "conversations.open", json!({ "users": u })).await?;
+                required_str(&opened["channel"], "conversations.open", "id")?.to_string()
             }
             // The destination is the program's choice, so a wrong pair
-            // is an input mistake, never a caught failure.
-            (Some(_), Some(_)) => {
+            // is an input mistake, never a caught failure. Neither one
+            // never reaches here: `oneOfRequired` skips the node.
+            _ => {
                 return Err(weft::WeftError::Input(
                     "pick ONE destination: a channel or a user, not both".to_string(),
-                ));
-            }
-            (None, None) => {
-                return Err(weft::WeftError::Input(
-                    "pick a destination: a channel or a user".to_string(),
                 ));
             }
         };
 
         let mut payload = json!({ "channel": destination });
-        api::set_content(&mut payload, text, blocks, "send")?;
+        api::set_content(&mut payload, text, blocks);
         if let Some(t) = thread_ts {
             payload["thread_ts"] = json!(t);
         }
 
         if let Some(at) = post_at {
             payload["post_at"] = json!(at);
-            let answer = api::call(&ctx, &access, "chat.scheduleMessage", payload).await?;
-            let id = api::required_str(&answer, "chat.scheduleMessage", "scheduled_message_id")?;
+            let answer = api::call(&client, "chat.scheduleMessage", payload).await?;
+            let id = required_str(&answer, "chat.scheduleMessage", "scheduled_message_id")?;
             return ctx
                 .pulse_downstream(NodeOutput::new().set("scheduledId", id.to_string()))
                 .await;
         }
 
-        let answer = api::call(&ctx, &access, "chat.postMessage", payload).await?;
-        let ts = api::required_str(&answer, "chat.postMessage", "ts")?.to_string();
-        let posted_channel = api::required_str(&answer, "chat.postMessage", "channel")?.to_string();
+        let answer = api::call(&client, "chat.postMessage", payload).await?;
+        let ts = required_str(&answer, "chat.postMessage", "ts")?.to_string();
+        let posted_channel = required_str(&answer, "chat.postMessage", "channel")?.to_string();
         // The permalink is a separate read; `chat.getPermalink` sits in
         // Slack's most generous rate tier (Tier 4), so fetching it on
         // every post never throttles ahead of the posting itself. The
@@ -105,14 +103,13 @@ impl Node for SlackSendMessageNode {
         // (the engine closes it at termination; downstream reads
         // absence).
         let permalink = api::get(
-            &ctx,
-            &access,
+            &client,
             "chat.getPermalink",
             &[("channel", posted_channel.clone()), ("message_ts", ts.clone())],
         )
         .await
         .and_then(|link| {
-            api::required_str(&link, "chat.getPermalink", "permalink").map(str::to_string)
+            required_str(&link, "chat.getPermalink", "permalink").map(str::to_string)
         });
 
         let mut out = NodeOutput::new().set("ts", ts).set("channel", posted_channel);

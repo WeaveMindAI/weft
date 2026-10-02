@@ -1,7 +1,7 @@
 {
   "type": "ExaAccess",
   "label": "Exa Access",
-  "description": "Sign in to Exa, the web-search API the Web Search node speaks. Pick an existing connection or paste an API key.",
+  "description": "Connect Exa, the web-search API behind Web Search, with an API key.",
   "tags": [
     "web",
     "search",
@@ -67,7 +67,7 @@
     {
       "name": "access",
       "type": "Access",
-      "description": "The Exa access: wire it into Web Search."
+      "description": "Wire into Web Search."
     }
   ]
 }

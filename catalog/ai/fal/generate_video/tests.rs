@@ -8,7 +8,7 @@ use super::FalGenerateVideoNode;
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
-        NodeTest::fake("queues_polls_and_stores_the_video", generates),
+        NodeTest::fake("queues_waits_and_stores_the_video", generates),
         NodeTest::live("one_real_short_video", "fal", live_generate),
     ]
 }
@@ -35,11 +35,7 @@ async fn live_generate(rig: LiveRig) -> WeftResult<()> {
 
 async fn generates(rig: FakeRig) -> WeftResult<()> {
     rig.respond("POST", "/fal-ai/veo3/fast", json!({ "request_id": "req-4" }));
-    rig.respond(
-        "GET",
-        "/fal-ai/veo3/requests/req-4/status",
-        json!({ "status": "COMPLETED" }),
-    );
+    rig.signal(json!({ "status": "COMPLETED" }));
     rig.respond(
         "GET",
         "/fal-ai/veo3/requests/req-4",

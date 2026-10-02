@@ -30,13 +30,17 @@ impl Node for NotionCreatePageNode {
         let content: Option<String> = ctx.inputs.opt("content")?;
         let blocks = ctx.inputs.raw("blocks").cloned();
 
-        let body = json!({
+        let mut body = json!({
             "parent": { "page_id": parent },
             "properties": {
                 "title": { "title": [{ "type": "text", "text": { "content": title } }] },
             },
-            "children": children_of(content.as_deref(), blocks.as_ref())?,
         });
+        // A page with only a title is a page: no body, no `children`.
+        let children = children_of(content.as_deref(), blocks.as_ref())?;
+        if !children.is_empty() {
+            body["children"] = json!(children);
+        }
 
         let http = ctx.client(&account).await?;
         let page =

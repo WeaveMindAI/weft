@@ -1,7 +1,7 @@
 {
   "type": "OpenRouterProvider",
   "label": "OpenRouter",
-  "description": "Serve LLM calls through OpenRouter: pick the connection (the built-in credits connection, or your own OpenRouter API key) and the model, and wire the provider output into any LLM node. One provider node, picked once, however many calls consume it.",
+  "description": "Serve LLM calls through OpenRouter, with the built-in credits connection or your own OpenRouter API key; wire the provider output into any LLM node, one provider node for however many calls.",
   "tags": [
     "ai",
     "provider",
@@ -90,9 +90,6 @@
     {
       "name": "servingProvider",
       "type": "String",
-      "widget": {
-        "kind": "text"
-      },
       "label": "Serving provider",
       "placeholder": "(any)",
       "description": "Serve the model from one specific OpenRouter provider (anthropic, fireworks, amazon-bedrock, ...). Leave empty to let OpenRouter route. Providers charge different rates for the same model, so pinning one also pins the price."
@@ -101,14 +98,14 @@
       "name": "providerFallbacks",
       "type": "Boolean",
       "label": "Allow provider fallbacks",
-      "description": "Fall back to other serving providers when the preferred one (the pin above, or OpenRouter's top-ranked choice) is unavailable. On by default. Turning it off makes the call fail rather than be served (and billed) by someone else."
+      "description": "Fall back to other serving providers when the preferred one (the pin above, or OpenRouter's top choice) is unavailable. Off makes the call fail rather than be served and billed by someone else."
     }
   ],
   "outputs": [
     {
       "name": "provider",
       "type": "LlmProvider",
-      "description": "The provider value: wire it into an LLM node's provider input."
+      "description": "Wire it into an LLM node's provider input."
     }
   ],
   "validate": [
@@ -126,6 +123,5 @@
         "field": "model"
       }
     }
-  ],
-  "requires_infra": false
+  ]
 }

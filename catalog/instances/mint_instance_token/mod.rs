@@ -5,9 +5,7 @@
 use async_trait::async_trait;
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
-
-use weft::node_bail;
+use weft::{node_bail, ExecutionContext, Node, NodeManifest, WeftResult};
 
 use super::lifecycle::instance;
 
@@ -26,18 +24,16 @@ impl Node for MintInstanceTokenNode {
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let hours: f64 = ctx.inputs.get("expiresInHours")?;
-        // A year at most (a token that outlives that is not one that
-        // expires), and a second at least (a shorter one is dead before
-        // anybody can use it). The bounds also keep the duration finite.
-        const MAX_HOURS: f64 = 365.0 * 24.0;
-        const MIN_HOURS: f64 = 1.0 / 3600.0;
-        if !(MIN_HOURS..=MAX_HOURS).contains(&hours) {
-            node_bail!(
-                "expiresInHours must be from {MIN_HOURS} (one second) to {MAX_HOURS} (a year), got {hours}: \
-                 an instance token always expires"
-            );
+        // The token's life is counted in whole seconds, so the hours
+        // round to the nearest one (1.1 hours is 3960.0000000000005
+        // seconds in floating point, and means 3960). The bounds (at
+        // least a second, at most a year) are the core's, checked at the
+        // mint, so anything rounding to 0 is refused there.
+        let secs = (hours * 3600.0).round();
+        if !(secs.is_finite() && secs >= 0.0) {
+            node_bail!("expiresInHours must be a finite, non-negative number of hours, got {hours}");
         }
-        let expires_in = std::time::Duration::from_secs_f64(hours * 3600.0);
+        let expires_in = std::time::Duration::from_secs(secs as u64);
         let minted = ctx.tokens().mint_for_instance(instance(&ctx)?, expires_in).await?;
         ctx.pulse_downstream(
             NodeOutput::new().set("token", minted.token).set("expiresAt", minted.expires_at_unix),

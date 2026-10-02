@@ -152,16 +152,18 @@ Name the source, like `<service>:<id>`, not the content.
 
 ## Handing a file out
 
-Three ways, for three audiences.
-
 | Call | The link reaches |
 |---|---|
 | `presign(&file, ttl)` | Whoever you give it to, for about 15 minutes by default |
 | `public_link(&file, ttl)` | The open internet, or `None` when this install serves no public address |
 | `caller_link(&file, ttl)` | The caller of this run, on the address its request came in on. This is what a route's answer carries in place of a file |
+| `external_url(&file)` | An outside service you are sending the file to: the public link when there is one, else a `data:` URL carrying the bytes |
+| `external_file(&file)` | The same, plus the file's mime type and filename, for an API that wants them beside the link |
 
 `public_link` returning `None` is not a failure. It means the store is private
-and nothing is relaying it, so hand out the bytes instead.
+and nothing is relaying it. If you are handing a file to a provider's API (an
+image to edit, a video to dub), call `external_url` instead of writing that
+fallback yourself.
 
 If your install answers on more than one address (the loopback port, a tunnel,
 a domain), `caller_link` builds the link on the one the caller used, so a

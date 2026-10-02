@@ -1,7 +1,7 @@
 {
   "type": "TelegramEditMessage",
   "label": "Telegram: Edit Message",
-  "description": "Rewrite a message the bot sent earlier, addressed by chat + message id (both from Send Message).",
+  "description": "Rewrite a message the bot sent earlier, addressed by chat id and message id (both from Send Message).",
   "tags": [
     "telegram",
     "message",
@@ -21,13 +21,17 @@
       "type": "String",
       "required": true,
       "label": "Chat id",
-      "description": "The chat to address (a user's or group's id; the receive trigger emits it)."
+      "description": "User or group chat id (Receive Message emits it)."
     },
     {
       "name": "messageId",
       "type": "Number",
       "required": true,
-      "label": "Message id"
+      "label": "Message id",
+      "widget": {
+        "kind": "number",
+        "step": 1
+      }
     },
     {
       "name": "text",

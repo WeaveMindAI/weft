@@ -6,6 +6,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use weft::access::client::checked_send;
 use weft::node::NodeOutput;
 use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
@@ -36,10 +37,12 @@ impl Node for S3ListObjectsNode {
             if let Some(t) = &token {
                 query.push(("continuation-token", t.as_str()));
             }
-            let url = super::s3::bucket_url(&bucket, &query);
-            let resp = s3.get(&url).send().await.node_err("s3: list objects")?;
-            let resp = super::s3::ok_or_bail(resp, "the list").await?;
-            let body = resp.text().await.node_err("s3: read list response")?;
+            let url = super::s3::bucket_url(&bucket, &query)?;
+            let body = checked_send(s3.get(&url), "list the bucket's objects")
+                .await?
+                .text()
+                .await
+                .node_err("s3: read list response")?;
             // S3 always sends Key, Size, and LastModified on a
             // Contents element; an absence means the response is not
             // the listing shape we think it is, and a silently-zero
@@ -93,13 +96,55 @@ fn tag_bodies(xml: &str, tag: &str) -> Vec<String> {
 
 /// The first `<tag>` body, XML-entity-decoded (keys may contain `&`).
 fn first_tag(xml: &str, tag: &str) -> Option<String> {
-    tag_bodies(xml, tag).into_iter().next().map(|s| {
-        s.replace("&amp;", "&")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", "\"")
-            .replace("&apos;", "'")
-    })
+    tag_bodies(xml, tag).into_iter().next().map(|s| decode_entities(&s))
+}
+
+/// Decode XML character references in one left-to-right scan, so a
+/// decoded `&` never starts a second reference (`&amp;lt;` is `&lt;`):
+/// the five named entities plus decimal (`&#13;`) and hex (`&#x0D;`)
+/// numeric references. Anything else is kept verbatim.
+fn decode_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp..];
+        let decoded = tail.find(';').and_then(|semi| {
+            let name = &tail[1..semi];
+            let ch = match name {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                _ => {
+                    let code = if let Some(hex) =
+                        name.strip_prefix("#x").or_else(|| name.strip_prefix("#X"))
+                    {
+                        u32::from_str_radix(hex, 16).ok()
+                    } else if let Some(dec) = name.strip_prefix('#') {
+                        dec.parse::<u32>().ok()
+                    } else {
+                        None
+                    };
+                    code.and_then(char::from_u32)
+                }
+            };
+            ch.map(|c| (c, semi))
+        });
+        match decoded {
+            Some((c, semi)) => {
+                out.push(c);
+                rest = &tail[semi + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(feature = "node-tests")]

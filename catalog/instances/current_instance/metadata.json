@@ -1,7 +1,7 @@
 {
   "type": "CurrentInstance",
   "label": "Current instance",
-  "description": "Say which instance this run is for. A run started for an instance (through its own trigger copy, its instance token, or the `Weft-Instance` header on a gated route) fires `instance` with its id; a run for no instance (a cron, a manager route) fires `nobody` instead. Exactly one of the two fires, so each is a branch.",
+  "description": "Branch on which instance this run is for: `instance` fires with its id when the run was started for one (its own trigger copy, its instance token, or the `Weft-Instance` header on a gated route), `nobody` fires otherwise (a cron, a manager route). Exactly one fires.",
   "tags": [
     "instances",
     "identity"
@@ -13,13 +13,12 @@
     {
       "name": "instance",
       "type": "String",
-      "description": "The instance's id, the one your program gives it (`user-42`). Fires only when the run is for an instance."
+      "description": "The instance id (`user-42`)."
     },
     {
       "name": "nobody",
       "type": "Boolean",
-      "description": "True, and fires only when the run is for no instance."
+      "description": "True when the run is for no instance."
     }
-  ],
-  "requires_infra": false
+  ]
 }

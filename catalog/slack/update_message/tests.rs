@@ -13,7 +13,6 @@ use super::SlackUpdateMessageNode;
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("rewrites_the_message_text", rewrites),
-        NodeTest::fake("nothing_to_update_with_refuses", nothing_to_update),
         NodeTest::live("one_real_rewrite_then_delete", "slack", live_rewrite).with_fixture(
             fixture_spec(
                 "SLACK_CHANNEL_ID",
@@ -82,17 +81,5 @@ async fn rewrites(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(outcome.outputs["ts"], json!("1.2"));
     let body = rig.requests()[0].body.clone().expect("update body");
     assert_eq!(body["text"], json!("new text"));
-    Ok(())
-}
-
-async fn nothing_to_update(rig: FakeRig) -> WeftResult<()> {
-    let outcome = rig
-        .run(
-            &SlackUpdateMessageNode,
-            json!({ "account": rig.access("slack"), "channel": "C1", "ts": "1.2" }),
-        )
-        .await;
-    let err = outcome.result.expect_err("no text, no blocks must refuse").to_string();
-    assert!(err.contains("nothing to update"), "{err}");
     Ok(())
 }

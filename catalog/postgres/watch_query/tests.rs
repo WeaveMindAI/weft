@@ -14,7 +14,7 @@ use super::{cadence, changed, watched, PostgresWatchQueryNode};
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::basic("only_one_statement_can_be_watched", one_statement),
-        NodeTest::basic("the_cadence_is_at_least_a_second", cadence_floor),
+        NodeTest::basic("the_cadence_is_at_least_the_poll_floor", cadence_floor),
         NodeTest::basic("the_first_result_and_every_move_count_as_a_change", changes),
         NodeTest::fake("a_script_refuses_before_dialing", script_refused),
         NodeTest::fake("a_placeholder_without_a_port_refuses_before_dialing", missing_port),
@@ -55,7 +55,8 @@ fn one_statement() -> WeftResult<()> {
 
 fn cadence_floor() -> WeftResult<()> {
     assert_eq!(cadence(5.0)?, std::time::Duration::from_secs(5));
-    assert_eq!(cadence(1.5)?, std::time::Duration::from_millis(1500));
+    assert_eq!(cadence(7.5)?, std::time::Duration::from_millis(7500));
+    assert!(cadence(4.9).is_err());
     assert!(cadence(0.2).is_err());
     assert!(cadence(f64::NAN).is_err());
     Ok(())
@@ -117,8 +118,8 @@ async fn bad_cadence(rig: FakeRig) -> WeftResult<()> {
         )
         .await
         .result
-        .expect_err("a cadence under a second refuses")
+        .expect_err("a cadence under the poll floor refuses")
         .to_string();
-    assert!(err.contains("intervalSecs must be at least 1"), "{err}");
+    assert!(err.contains("intervalSecs must be at least 5"), "{err}");
     Ok(())
 }

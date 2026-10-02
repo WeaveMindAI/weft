@@ -1,7 +1,7 @@
 {
   "type": "GmailLabel",
   "label": "Gmail: Label",
-  "description": "Add and/or remove labels on a message, by name. A new add-label is created on the fly; removing a label that does not exist fails loudly (the name is wrong).",
+  "description": "Adds and/or removes Gmail labels on a message, by name. A missing add-label is created; a missing remove-label fails loudly.",
   "tags": [
     "google",
     "gmail",
@@ -16,8 +16,7 @@
       "required": true,
       "requiresScopes": [
         "https://www.googleapis.com/auth/gmail.modify"
-      ],
-      "description": "A Google account with the modify-mail permission."
+      ]
     },
     {
       "name": "id",
@@ -44,6 +43,12 @@
     }
   ],
   "features": {
-    "catchErrors": true
+    "catchErrors": true,
+    "oneOfRequired": [
+      [
+        "add",
+        "remove"
+      ]
+    ]
   }
 }

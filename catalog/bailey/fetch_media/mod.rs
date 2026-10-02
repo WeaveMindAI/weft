@@ -6,6 +6,7 @@
 
 use async_trait::async_trait;
 
+use weft::infra::InfraHandle;
 use weft::node::NodeOutput;
 use weft::storage::StoredFile;
 use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
@@ -24,9 +25,10 @@ impl Node for BaileyFetchMediaNode {
     }
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let endpoint_url: String = ctx.inputs.get("endpointUrl")?;
+        let bridge: InfraHandle = ctx.inputs.get("bridge")?;
         let message_id: String = ctx.inputs.get("messageId")?;
-        let stored = super::bridge_api::fetch_media(&ctx, &endpoint_url, &message_id).await?;
+        let bridge = ctx.endpoint_of(&bridge).await?;
+        let stored = super::media::fetch_media(&ctx, &bridge, &message_id).await?;
         ctx.pulse_downstream(NodeOutput::stored_file(StoredFile::from_value(&stored)?)).await
     }
 }

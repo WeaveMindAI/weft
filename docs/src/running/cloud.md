@@ -15,6 +15,11 @@ You do two jobs, from two repositories:
 
 ## Install weft on GCP
 
+If you work with Tangle, it can do this whole section for you. It first gets
+`gh` and `gcloud` installed and logged in on your machine (the sign-ups, the
+billing card and the two logins are the parts only you can do, in your
+browser), then runs every step below itself.
+
 ### Once, by hand
 
 Before the install workflow can create anything, it needs permission to act
@@ -54,8 +59,14 @@ gcloud iam service-accounts create weft-installer --project $PROJECT
 gcloud projects add-iam-policy-binding $PROJECT --role roles/owner \
   --member serviceAccount:weft-installer@$PROJECT.iam.gserviceaccount.com
 
-gcloud iam workload-identity-pools create weft-install --project $PROJECT \
-  --location global
+# On a new project IAM can take a minute to catch up with the services
+# just enabled, so the pool is retried until it exists.
+until gcloud iam workload-identity-pools describe weft-install --project $PROJECT \
+    --location global >/dev/null 2>&1 \
+  || gcloud iam workload-identity-pools create weft-install --project $PROJECT \
+    --location global; do
+  echo "waiting for IAM to catch up, trying again in 10 seconds"; sleep 10
+done
 gcloud iam workload-identity-pools providers create-oidc github \
   --project $PROJECT --location global --workload-identity-pool weft-install \
   --issuer-uri https://token.actions.githubusercontent.com \
@@ -92,8 +103,9 @@ in a repository secret named `WEFT_ACCESS_APPS`. Otherwise skip it.
 
 ### Run the workflow
 
-Open the Actions tab of your fork, pick **install on GCP**, and run it. It
-builds weft from your fork, pushes its images to your project, and creates
+Open the Actions tab of your fork. GitHub turns workflows off in a new fork, so if the tab asks, enable them first. Then pick **install on GCP** and run it. It
+takes weft's images from the release when your fork matches it (and
+builds the ones it changed), pushes them to your project, and creates
 everything listed under [what you get](#what-you-get).
 
 When it finishes, the run's summary gives you the install's address,
@@ -156,6 +168,11 @@ in the Terraform state, in the `$PROJECT-weft-state` bucket, and copied
 into Secret Manager, which is where the machine reads it. If it is ever
 lost or replaced, every saved connection stops working and has to be made again, so keep the
 bucket and never run `terraform destroy`.
+
+A cloud install belongs to one person. Every project on it shares one
+private network, so a project's code can reach another project's
+infrastructure there; keep projects you would not trust with each other on
+installs of their own.
 
 ### Your own domain
 

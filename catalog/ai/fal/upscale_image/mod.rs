@@ -3,13 +3,13 @@
 //! extras.
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use weft::node::NodeOutput;
 use weft::storage::{FileHandle, KeepTtl, StorageScope};
 use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
-use super::fal::{media_url, merge_params, run_queued};
+use super::fal::{merge_params, run_queued};
 
 #[derive(NodeManifest)]
 pub struct FalUpscaleImageNode;
@@ -29,16 +29,17 @@ impl Node for FalUpscaleImageNode {
         let model: String = ctx.inputs.get("model")?;
         let image: FileHandle = ctx.inputs.get("image")?;
         let scale: f64 = ctx.inputs.get("scale")?;
-        let params = ctx.inputs.raw("params").cloned();
+        let params = ctx.inputs.opt::<Map<String, Value>>("params")?;
 
         let mut payload = json!({
-            "image_url": media_url(&ctx, &image).await?,
+            "image_url": ctx.storage(StorageScope::Execution).external_url(&image).await?,
             "scale": scale,
         });
-        merge_params(&mut payload, params.as_ref())?;
+        merge_params(&mut payload, params.as_ref());
 
         let http = ctx.client(&account).await?;
-        let answer = run_queued(&ctx, &http, &model, &payload, "fal: upscale the image").await?;
+        let answer =
+            run_queued(&ctx, &account, &http, &model, &payload, "fal: upscale the image").await?;
 
         let url = answer["image"]["url"]
             .as_str()

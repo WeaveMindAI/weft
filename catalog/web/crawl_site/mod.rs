@@ -1,17 +1,15 @@
 //! CrawlSite: crawl a site through Firecrawl and emit every page as
-//! clean markdown. Submits the crawl job, then waits ON THE RESULT
-//! (polling the job until it reaches a terminal state; a crawl the
-//! user asked for takes as long as it takes, so there is no deadline
-//! here; cancelling the execution cancels the wait).
-
-use std::time::Duration;
+//! clean markdown. Submits the crawl job, then parks on the job without
+//! holding a worker until it reaches a terminal state (a crawl the user
+//! asked for takes as long as it takes, so there is no deadline here;
+//! cancelling the execution cancels the wait).
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use weft::context::LogLevel;
-use weft::node::NodeOutput;
 use weft::access::client::get_json;
+use weft::node::NodeOutput;
+use weft::signal::{PollEndpoint, Predicate};
 use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 #[cfg(feature = "node-tests")]
@@ -35,61 +33,56 @@ impl Node for CrawlSiteNode {
         let http = ctx.client(&access).await?;
         let body = json!({
             "url": url,
-            "limit": (limit as u64).clamp(1, 1000),
+            "limit": limit as u64,
             "scrapeOptions": { "formats": ["markdown"] },
         });
-        let started =
-            super::firecrawl::call(&http, "crawl", &body, "firecrawl: start the crawl").await?;
+        // Starting the crawl is the paid call, and the body replays from
+        // the top when the wait resumes: journaled, the replay reads this
+        // job id back instead of starting a second crawl.
+        let started = ctx
+            .run("firecrawl_start_crawl", || async {
+                super::firecrawl::call(&http, "crawl", &body, "firecrawl: start the crawl").await
+            })
+            .await?;
         let job = started["id"].as_str().node_err("firecrawl: crawl carries no id")?.to_string();
 
-        // Wait on the job. Pages accumulate across status reads (the
-        // completed answer pages through `next` links).
+        // "scraping" is the one status Firecrawl documents for a crawl
+        // still in flight; any other ends the wait, so a status this node
+        // does not know is refused below instead of being waited on
+        // forever.
+        // The finished answer embeds the first page of crawled data, which
+        // can weigh megabytes: the wait carries only the status, and the
+        // pages are read once it has ended.
+        let status_url = format!("{}/crawl/{job}", super::firecrawl::API);
+        let answer = ctx
+            .await_signal(PollEndpoint {
+                url: status_url.clone(),
+                interval_secs: 5,
+                access: Some(weft::primitive::AccessRef::from(&access)),
+                filters: vec![Predicate::neq("status", "scraping")],
+                carry: vec!["status".into(), "error".into()],
+                ..Default::default()
+            })
+            .await?;
+        match answer["status"].as_str().unwrap_or_default() {
+            "completed" => {}
+            state @ ("failed" | "cancelled") => weft::node_bail!(
+                "the crawl ended {state}: {}",
+                answer["error"].as_str().unwrap_or("no detail")
+            ),
+            other => weft::node_bail!(
+                "firecrawl answered an unexpected status '{other}' for crawl {job}"
+            ),
+        }
+
+        // The completed answer pages through `next` links; pages
+        // accumulate across them.
         let mut pages: Vec<Value> = Vec::new();
-        let mut next = format!("{}/crawl/{job}", super::firecrawl::API);
-        let mut polls: u64 = 0;
+        let mut answer = get_json(&http, &status_url, "firecrawl: read the finished crawl").await?;
         loop {
-            let answer: Value = get_json(&http, &next, "firecrawl: read crawl status").await?;
-            let state = answer["status"].as_str().unwrap_or_default();
-            match state {
-                "completed" => {
-                    collect_pages(&answer, &mut pages);
-                    match answer["next"].as_str() {
-                        Some(n) => next = n.to_string(),
-                        None => break,
-                    }
-                }
-                "failed" | "cancelled" => {
-                    weft::node_bail!(
-                        "the crawl ended {state}: {}",
-                        answer["error"].as_str().unwrap_or("no detail")
-                    );
-                }
-                // "scraping" is the one status Firecrawl documents for a
-                // crawl still in flight. A breadcrumb every ~10 polls
-                // keeps a long crawl legible in the logs.
-                "scraping" => {
-                    polls += 1;
-                    if polls % 10 == 0 {
-                        ctx.log(
-                            LogLevel::Info,
-                            format!(
-                                "crawl {job} still running: {}/{} pages scraped",
-                                answer["completed"].as_u64().unwrap_or(0),
-                                answer["total"].as_u64().unwrap_or(0)
-                            ),
-                        )
-                        .await?;
-                    }
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                }
-                // Anything else (a missing status included) is an answer
-                // this node does not understand; spinning on it forever
-                // would hide the problem behind an execution that never
-                // ends.
-                other => weft::node_bail!(
-                    "firecrawl answered an unexpected status '{other}' for crawl {job}"
-                ),
-            }
+            collect_pages(&answer, &mut pages)?;
+            let Some(next) = answer["next"].as_str().map(str::to_string) else { break };
+            answer = get_json(&http, &next, "firecrawl: read the crawl's next page").await?;
         }
 
         let count = pages.len() as f64;
@@ -100,12 +93,18 @@ impl Node for CrawlSiteNode {
     }
 }
 
-fn collect_pages(answer: &Value, pages: &mut Vec<Value>) {
+/// Each scraped page of one status answer. The markdown IS the node's
+/// product, so a page without it is refused, as FetchPage refuses it.
+fn collect_pages(answer: &Value, pages: &mut Vec<Value>) -> WeftResult<()> {
     for d in answer["data"].as_array().into_iter().flatten() {
+        let markdown = d["markdown"].as_str().node_err(
+            "firecrawl: the crawl completed but one of its pages carries no markdown",
+        )?;
         pages.push(json!({
             "url": d.pointer("/metadata/sourceURL").cloned(),
             "title": d.pointer("/metadata/title").cloned(),
-            "markdown": d["markdown"],
+            "markdown": markdown,
         }));
     }
+    Ok(())
 }

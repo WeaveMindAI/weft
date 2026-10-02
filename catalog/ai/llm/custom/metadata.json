@@ -1,7 +1,7 @@
 {
   "type": "CustomProvider",
   "label": "Custom Provider",
-  "description": "Serve LLM calls on any OpenAI-compatible endpoint (a self-hosted vLLM or Ollama, an enterprise gateway, a niche vendor): base URL, model, and optionally a pasted API key. Wire the provider output into any LLM node.",
+  "description": "Serve LLM calls on any OpenAI-compatible endpoint (self-hosted vLLM or Ollama, an enterprise gateway, a niche vendor): base URL, model, and an optional API key.",
   "tags": [
     "ai",
     "provider",
@@ -60,29 +60,20 @@
       "name": "baseUrl",
       "type": "String",
       "required": true,
-      "widget": {
-        "kind": "text"
-      },
       "label": "Base URL",
       "placeholder": "http://localhost:11434/v1",
-      "description": "The endpoint's base address; the OpenAI-compatible chat-completions path is derived from it."
+      "description": "The endpoint's base address; the chat-completions path is derived from it."
     },
     {
       "name": "model",
       "type": "String",
       "required": true,
-      "widget": {
-        "kind": "text"
-      },
       "label": "Model",
       "placeholder": "tangle-v2"
     },
     {
       "name": "name",
       "type": "String",
-      "widget": {
-        "kind": "text"
-      },
       "label": "Name",
       "placeholder": "Custom",
       "description": "A display name for this endpoint, used in error messages."
@@ -92,7 +83,7 @@
     {
       "name": "provider",
       "type": "LlmProvider",
-      "description": "The provider value: wire it into an LLM node's provider input."
+      "description": "Wire it into an LLM node's provider input."
     }
   ],
   "validate": [
@@ -100,8 +91,20 @@
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "not", "of": { "kind": "input_wired", "port": "baseUrl" } },
-          { "kind": "not", "of": { "kind": "config_nonempty", "field": "baseUrl" } }
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "baseUrl"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_nonempty",
+              "field": "baseUrl"
+            }
+          }
         ]
       },
       "then": {
@@ -114,8 +117,20 @@
       "when": {
         "kind": "all",
         "of": [
-          { "kind": "not", "of": { "kind": "input_wired", "port": "model" } },
-          { "kind": "not", "of": { "kind": "config_nonempty", "field": "model" } }
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "model"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_nonempty",
+              "field": "model"
+            }
+          }
         ]
       },
       "then": {
@@ -123,7 +138,31 @@
         "level": "runtime",
         "field": "model"
       }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_present",
+            "field": "baseUrl"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_matches",
+              "field": "baseUrl",
+              "regex": "(?i)^https?://"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "CustomProvider '{id}' has a `baseUrl` that is not a web address. Start it with http:// or https://.",
+        "level": "structural",
+        "severity": "error",
+        "port": "baseUrl"
+      }
     }
-  ],
-  "requires_infra": false
+  ]
 }

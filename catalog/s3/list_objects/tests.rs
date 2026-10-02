@@ -6,7 +6,7 @@ use serde_json::json;
 
 use weft::{FakeRig, NodeTest, WeftResult};
 
-use super::{first_tag, tag_bodies, S3ListObjectsNode};
+use super::{decode_entities, first_tag, tag_bodies, S3ListObjectsNode};
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
@@ -21,6 +21,13 @@ pub fn tests() -> Vec<NodeTest> {
             assert_eq!(first_tag(&bodies[1], "Size").unwrap(), "3");
             assert_eq!(first_tag(xml, "NextContinuationToken").unwrap(), "tok==");
             assert!(first_tag(xml, "Missing").is_none());
+            Ok(())
+        }),
+        NodeTest::basic("entities_decode_once_left_to_right", || {
+            assert_eq!(decode_entities("&amp;lt;"), "&lt;");
+            assert_eq!(decode_entities("a&#13;b&#x0D;c&#X41;"), "a\rb\rcA");
+            assert_eq!(decode_entities("&quot;&apos;&gt;"), "\"'>");
+            assert_eq!(decode_entities("a & b &bogus; &#xZZ;"), "a & b &bogus; &#xZZ;");
             Ok(())
         }),
         NodeTest::fake("lists_across_pages_and_emits_the_objects", paginated_listing),

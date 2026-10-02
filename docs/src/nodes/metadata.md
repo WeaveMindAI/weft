@@ -99,8 +99,8 @@ Every widget, by its `kind`:
 |---|---|---|
 | `text` | | One line of text. The default for `String` |
 | `textarea` | | A wrapping box. The default for anything JSON-shaped |
-| `code` | `language` | A code box with highlighting |
-| `number` | `min`, `max`, `step` | A number box. `min` and `max` are real rules the runtime enforces, and a whole-number `step` means the input takes whole numbers |
+| `code` | `language` | A code box with highlighting. `language` is one of `python`, `javascript`, `sql`, `json`, and any other word fails to load. `json` also fits a structured input (`JsonDict`, a list), edited as JSON text; the others edit a `String` |
+| `number` | `min`, `max`, `step` | A number box. `min` and `max` are real rules the runtime enforces, and a whole-number `step` (`"step": 1`) means the input takes whole numbers: a written value is checked when the program compiles, a wired one when it arrives. A fractional `step` is only the arrow keys' increment |
 | `checkbox` | | A tick box. The default for `Boolean` |
 | `datetime` | | A date and time picker, stored as ISO 8601 |
 | `select` | `options`, `free_text` | A dropdown. `options` cannot be empty, and they are a real rule: a written, wired or instance-provided value outside them is refused, and so is a default. If the list is only suggestions (model ids, voices, anything the provider adds to), set `"free_text": true`: the editor still offers the list, lets the user type anything else, and nothing is refused |

@@ -70,6 +70,13 @@ describe('parseWeftType', () => {
 		expect(parseWeftType('Access')?.kind).toBe('access');
 	});
 
+	it('parses Infra, and only an Infra handle connects to it', () => {
+		const infra = parseWeftType('Infra')!;
+		expect(infra.kind).toBe('infra');
+		expect(isCompatible(infra, infra)).toBe(true);
+		expect(isCompatible(parseWeftType('String')!, infra)).toBe(false);
+	});
+
 	it('parses a record with optional fields', () => {
 		const t = parseWeftType('{ name: String, age: Number, nickname?: String }');
 		expect(t).toEqual({
@@ -732,6 +739,7 @@ describe('runtime handle inference', () => {
 	it('infers Bus and Access from their sentinel markers', () => {
 		expect(inferTypeFromValue({ __weft_bus__: { id: 'a', mode: 'journaled' } })).toEqual({ kind: 'bus' });
 		expect(inferTypeFromValue({ __weft_access__: {} })).toEqual({ kind: 'access' });
+		expect(inferTypeFromValue({ __weft_infra__: { place: 'bridge', endpoint: 'api' } })).toEqual({ kind: 'infra' });
 	});
 });
 

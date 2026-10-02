@@ -229,3 +229,22 @@ fn all_and_any_settle_on_the_deciding_part() {
     assert_eq!(eval(json!({ "kind": "any", "of": [no.clone(), unknown] })), None);
     assert_eq!(eval(json!({ "kind": "any", "of": [no.clone(), no] })), Some(false));
 }
+
+/// A node inside a group written by its short name is refused with the
+/// full spelling it most likely meant.
+#[test]
+fn a_short_name_is_refused_with_the_spelling_it_meant() {
+    let mut p = program(Some(json!("box")));
+    let mut boxed = p.nodes[0].clone();
+    boxed.id = "work.box".into();
+    boxed.scope = vec!["work".into()];
+    boxed.port_literals.clear();
+    p.nodes.push(boxed);
+    let named: ValidationRule = serde_json::from_value(json!({
+        "when": { "kind": "not", "of": { "kind": "input_names", "port": "cron", "names": { "node": {} } } },
+        "then": { "message": "{names}" }
+    }))
+    .unwrap();
+    assert!(fires_on(&p, &named));
+    assert_eq!(message(&named, &p.nodes[0], &RuleContext::new(&p), &[]), "'box' (did you mean 'work.box'?)");
+}

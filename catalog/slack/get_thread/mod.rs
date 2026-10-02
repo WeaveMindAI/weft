@@ -27,26 +27,21 @@ impl Node for SlackGetThreadNode {
         let access: Access = ctx.inputs.get("account")?;
         let channel: String = ctx.inputs.get("channel")?;
         let ts: String = ctx.inputs.get("ts")?;
+        let client = ctx.client(&access).await?;
 
         // Whole-thread accumulation, bounded by the shared paging cap:
         // past it the node fails loudly instead of consuming the whole
         // rate budget on a degenerate thread.
         let mut messages: Vec<Value> = Vec::new();
         api::paged::<()>(
-            &ctx,
-            &access,
+            &client,
             "conversations.replies",
             &[("channel", channel.clone()), ("ts", ts.clone())],
-            "messages",
+            "/messages",
+            "this node reads a thread whole, and this one is too long for that",
             |page| {
                 messages.extend(page.iter().cloned());
                 Ok(None)
-            },
-            |cap| {
-                format!(
-                    "the thread exceeds {cap} messages; this node reads whole threads \
-                     and one this size is out of its scope"
-                )
             },
         )
         .await?;

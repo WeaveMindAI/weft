@@ -104,7 +104,7 @@ impl KindHandler for TimerHandler {
     /// cron's first is its next occurrence after the asking.
     // `_prior` is deliberately ignored: reactivate IS a fresh schedule
     // (an after-timer restarts its countdown from the activation).
-    fn compute_initial_state(&self, spec: &SignalSpec, _prior: Option<&Value>, asked_at_unix_ms: i64) -> Result<Value> {
+    fn compute_initial_state(&self, spec: &SignalSpec, _prior: Option<&Value>, asked_at_unix_ms: i64, _is_resume: bool) -> Result<Value> {
         let timer: Timer = serde_json::from_value(spec.config.clone())
             .map_err(|e| anyhow::anyhow!("malformed timer spec: {e}"))?;
         let next = match &timer.spec {
@@ -241,7 +241,7 @@ mod schedule_tests {
     fn an_after_timer_counts_from_when_it_was_asked_for() {
         let spec = weft_core::signal::to_spec(Timer { spec: TimerSpec::After { duration_ms: 3_000 } });
         let asked = 1_700_000_000_000;
-        let state = TimerHandler.compute_initial_state(&spec, None, asked).unwrap();
+        let state = TimerHandler.compute_initial_state(&spec, None, asked, false).unwrap();
         assert_eq!(state["next_fire_at_unix_ms"], asked + 3_000);
     }
 
@@ -297,7 +297,7 @@ mod tests {
     fn the_first_moment_is_pinned_and_is_the_wake() {
         let asked = 1_700_000_000_000;
         let after = spec(TimerSpec::After { duration_ms: 3_000 });
-        let state = TimerHandler.compute_initial_state(&after, None, asked).unwrap();
+        let state = TimerHandler.compute_initial_state(&after, None, asked, false).unwrap();
         assert_eq!(next_of(&state), Some(asked + 3_000));
         for from in [WakeFrom::Armed, WakeFrom::Woken { aimed_at_ms: asked }] {
             assert_eq!(TimerHandler.next_wake(&after, &state, from, asked + 99).unwrap(), Some(asked + 3_000));
@@ -305,8 +305,8 @@ mod tests {
 
         let when = DateTime::from_timestamp_millis(asked + 60_000).unwrap();
         let at = spec(TimerSpec::At { when });
-        assert_eq!(next_of(&TimerHandler.compute_initial_state(&at, None, asked).unwrap()), Some(asked + 60_000));
-        let past = TimerHandler.compute_initial_state(&at, None, asked + 120_000).unwrap();
+        assert_eq!(next_of(&TimerHandler.compute_initial_state(&at, None, asked, false).unwrap()), Some(asked + 60_000));
+        let past = TimerHandler.compute_initial_state(&at, None, asked + 120_000, false).unwrap();
         assert_eq!(next_of(&past), None, "an `at` already past when armed never fires");
         assert_eq!(TimerHandler.next_wake(&at, &past, WakeFrom::Armed, asked).unwrap(), None);
     }

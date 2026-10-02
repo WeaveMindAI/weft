@@ -24,6 +24,8 @@ async fn custom_node_compiles_and_runs() -> anyhow::Result<()> {
 async fn a_projects_older_worker_images_are_reclaimed_after_each_build() -> anyhow::Result<()> {
     let started = std::time::Instant::now();
     let disp = ensure::up().await?;
+    // The repo this install's worker images are named under.
+    let repo = disp.install().local_image_ref("weft-worker:x").trim_end_matches(":x").to_string();
     let mut project = Project::prepare("custom_node", disp).await?;
     let node = project.dir().join("nodes/multiply/mod.rs");
     let original = std::fs::read_to_string(&node)?;
@@ -41,7 +43,7 @@ async fn a_projects_older_worker_images_are_reclaimed_after_each_build() -> anyh
     }
     anyhow::ensure!(builds[0] != builds[1] && builds[1] != builds[2], "each edit builds a new image: {builds:?}");
     let tags = || async {
-        let out = tokio::process::Command::new("docker").args(["images", "weft-worker", "--format", "{{.Tag}}"]).output().await?;
+        let out = tokio::process::Command::new("docker").args(["images", &repo, "--format", "{{.Tag}}"]).output().await?;
         anyhow::Ok(String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect::<Vec<_>>())
     };
     let has = |tags: &[String], short: &str| tags.iter().any(|t| t.starts_with(short));

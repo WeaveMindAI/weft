@@ -1,7 +1,7 @@
 {
   "type": "PostgresUpdateRows",
   "label": "Postgres: Update Rows",
-  "description": "Update matching rows: SET columns from a JSON object, WHERE from a SQL condition (its $1-style placeholders read from whereParams). Emits the changed rows. A database that cannot be reached or refuses the update (a broken constraint) is a failure `error` catches when wired; a mistake in the program (a syntax error in `where`, a column that does not exist, a `whereParams` count that does not match) always fails the run.",
+  "description": "Update the rows matching a SQL condition, setting columns from a JSON object, and emit the changed rows. The condition's parameters are the node's own inline-declared input ports, read by name, as in Postgres: Query: `PostgresUpdateRows(email: String) { where: \"email = $email\" }`. Unreachable database or a broken constraint: catchable by `error`. A syntax error in `where`, an unknown column, or a `$name` with no port of that name: always fails the run.",
   "tags": [
     "postgres",
     "database",
@@ -20,39 +20,34 @@
         "user",
         "password"
       ],
-      "description": "The database's connection (wire a PostgresAccess node, or a PostgresDatabase's access output)."
+      "description": "Wire a PostgresAccess, or a PostgresDatabase's access output."
     },
     {
       "name": "table",
       "type": "String",
       "required": true,
-      "description": "The table to update."
+      "description": "Target table."
     },
     {
       "name": "set",
       "type": "JsonDict",
       "required": true,
-      "description": "The columns to change, e.g. { \"stage\": \"won\" }."
+      "description": "Columns to change, e.g. { \"stage\": \"won\" }."
     },
     {
       "name": "where",
       "type": "String",
       "required": true,
       "label": "Where",
-      "placeholder": "email = $1",
-      "description": "SQL condition the rows must match; write `true` to update every row."
-    },
-    {
-      "name": "whereParams",
-      "type": "List[String | Number | Boolean | Null | JsonDict]",
-      "description": "Values for the condition's $1, $2, ..."
+      "placeholder": "email = $email",
+      "description": "SQL condition; each `$name` reads the inline-declared input port of that name. `true` updates every row."
     }
   ],
   "outputs": [
     {
       "name": "rows",
       "type": "List[JsonDict]",
-      "description": "The changed rows as the database stored them."
+      "description": "Changed rows as stored."
     },
     {
       "name": "count",
@@ -60,6 +55,7 @@
     }
   ],
   "features": {
-    "catchErrors": true
+    "catchErrors": true,
+    "canAddInputPorts": true
   }
 }

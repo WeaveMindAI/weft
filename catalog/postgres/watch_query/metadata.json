@@ -1,7 +1,7 @@
 {
   "type": "PostgresWatchQuery",
   "label": "Postgres: Watch query",
-  "description": "Keep a query's result live: run it now and again on a cadence, and each time the rows differ from the last time, send them as one message on the `rows` bus. A live counter, list or dashboard pipes that bus into a Stream behind a Route (`format: \"sse\"`) and the browser sees every change. The query's parameters are the node's own input ports, read by name in the SQL like Postgres: Query (`$user_id`). Give `channel` a name and the node also LISTENs on it: a `NOTIFY channel` from a trigger in the database re-runs the query the moment a row changes, instead of at the next tick. One statement only; a script cannot be watched. Declare an output port named after a column (`-> (count: Bus)`) and that column of the first row gets its own bus, so a live counter over `select count(*)` sends `7` instead of `[{\"count\": 7}]` for every consumer to unwrap. A tick whose query answered no rows says nothing on those ports and does not close them, because the next tick may well answer one. The node runs until the run ends (a caller leaving ends a route's run), and the bus closes with it.",
+  "description": "Keep a query's result live: run it now and on a cadence, and send the rows on the `rows` bus each time they differ from last time (pipe it into a Stream behind a Route for a live page). Parameters are inline-declared input ports read by name (`$user_id`), as in Postgres: Query; one statement only. With `channel` set it also LISTENs, so a `NOTIFY` from the database re-runs the query at once. A declared output port named after a column (`-> (count: Bus)`) gets that column of the first row as its own bus, so `select count(*)` sends `7` rather than `[{\"count\": 7}]`. A tick with no rows sends nothing on those ports and leaves them open. Runs until the run ends, then the buses close.",
   "tags": [
     "postgres",
     "database",
@@ -26,7 +26,7 @@
         "user",
         "password"
       ],
-      "description": "The database's connection (wire a PostgresAccess node, or a PostgresDatabase's access output)."
+      "description": "Wire a PostgresAccess, or a PostgresDatabase's access output."
     },
     {
       "name": "query",
@@ -38,28 +38,33 @@
       },
       "label": "SQL",
       "placeholder": "SELECT id, caption FROM cards ORDER BY created_at DESC LIMIT 50",
-      "description": "The one statement to keep live. Each `$name` reads the input port of that name; declare the ports inline on the node and wire them."
+      "description": "The one statement to keep live; each `$name` reads the input port of that name."
     },
     {
       "name": "intervalSecs",
       "type": "Number",
       "default": 5,
       "label": "Every (seconds)",
-      "description": "How often the query runs again, in seconds (at least 1). With `channel` set this is the backstop; without it, the whole cadence."
+      "description": "Seconds between re-runs (at least 5): the whole cadence, or the backstop when `channel` is set.",
+      "widget": {
+        "kind": "number",
+        "min": 5,
+        "step": 1
+      }
     },
     {
       "name": "channel",
       "type": "String",
       "label": "Notify channel",
       "placeholder": "cards_changed",
-      "description": "A Postgres NOTIFY channel to LISTEN on: every notification re-runs the query at once. Leave empty to poll on the cadence alone. Raise it from the database side, for example `CREATE TRIGGER ... EXECUTE FUNCTION pg_notify('cards_changed', '')`."
+      "description": "NOTIFY channel to LISTEN on; each notification re-runs the query. Empty polls only. Raise it from a database trigger whose function calls `pg_notify('cards_changed', '')`."
     }
   ],
   "outputs": [
     {
       "name": "rows",
       "type": "Bus",
-      "description": "The live result: one `rows` message per change, carrying the whole answered list keyed by column name (the first one right after the node starts). Closes when the run ends."
+      "description": "One message per change carrying the whole row list (the first right after start)."
     }
   ],
   "features": {

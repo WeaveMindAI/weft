@@ -17,7 +17,7 @@ use weft::node::NodeOutput;
 use weft::signal::{PollDelta, PollEndpoint};
 use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
-use super::sheets::{read_cells, row_object, row_to_strings, tab_title, values_url};
+use super::sheets::{header_row, row_object, row_to_strings, tab_title, values_url};
 
 #[derive(NodeManifest)]
 pub struct GoogleSheetsNewRowNode;
@@ -35,11 +35,11 @@ impl Node for GoogleSheetsNewRowNode {
     async fn setup_trigger(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let id: String = ctx.inputs.get("spreadsheet")?;
-        let gid: String = ctx.inputs.get("tab")?;
+        let gid: Option<String> = ctx.inputs.opt("tab")?;
         let interval: f64 = ctx.inputs.get("intervalSecs")?;
 
         let http = ctx.client(&account).await?;
-        let title = tab_title(&http, &id, &gid).await?;
+        let title = tab_title(&http, &id, gid.as_deref()).await?;
 
         ctx.register_signal(PollEndpoint {
             url: values_url(&id, &title, None),
@@ -59,7 +59,7 @@ impl Node for GoogleSheetsNewRowNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let id: String = ctx.inputs.get("spreadsheet")?;
-        let gid: String = ctx.inputs.get("tab")?;
+        let gid: Option<String> = ctx.inputs.opt("tab")?;
         let has_header: bool = ctx.inputs.get("hasHeader")?;
 
         let wake = ctx.wake.record()?;
@@ -80,12 +80,15 @@ impl Node for GoogleSheetsNewRowNode {
             // whatever reads it skips (the cells still fire).
             if index > 0 {
                 let http = ctx.client(&account).await?;
-                let title = tab_title(&http, &id, &gid).await?;
-                let headers = read_cells(&http, &id, &title)
-                    .await?
-                    .into_iter()
-                    .next()
-                    .unwrap_or_default();
+                let title = tab_title(&http, &id, gid.as_deref()).await?;
+                // A data row (index > 0) exists, so the header row is
+                // above it; finding none means row 1 was cleared since.
+                let Some(headers) = header_row(&http, &id, &title).await? else {
+                    weft::node_bail!(
+                        "the tab's first row is empty, so the new row has no header to be \
+                         keyed by; restore the header, or turn 'First row is a header' off"
+                    )
+                };
                 out = out.set("row", Value::Object(row_object(cells, Some(&headers))));
             }
         } else {

@@ -13,6 +13,10 @@ use serde_json::{json, Map, Value};
 use weft::node::NodeOutput;
 use weft::{Access, ExecutionContext, WeftError, WeftResult};
 
+/// OpenRouter's API base, for the single-service nodes (embeddings,
+/// rerank) that call it directly.
+pub const OPENROUTER_API: &str = "https://openrouter.ai/api/v1";
+
 /// Emit the `LlmProvider` object: `kind` + `model` + the picked
 /// connection + every OTHER declared input that holds a value,
 /// forwarded verbatim under its own name. Reading the declared inputs

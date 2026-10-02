@@ -36,6 +36,55 @@ ctx.pulse_downstream(NodeOutput::new().set("approved", answer)).await
 Without `ctx.run`, that fetch happens again every time somebody takes a day to
 answer.
 
+## Waiting on a job a service runs
+
+If your node starts something slow on a provider (a video render, a dubbing
+job, a site crawl) and the provider hands back a status address, do not loop
+and sleep in your body: that holds a worker for the whole job. Submit the job
+inside `ctx.run`, then wait on the status address with `PollEndpoint`:
+
+```rust
+use weft::signal::{PollEndpoint, Predicate};
+
+let submitted = ctx.run("submit", || async {
+    post_json(&http, &submit_url, &payload, "submitting the render").await
+}).await?;
+let id = submitted["request_id"].as_str().node_err("the submit answered no request_id")?;
+
+let status = ctx.await_signal(PollEndpoint {
+    url: format!("{API}/requests/{id}/status"),
+    interval_secs: 5,
+    access: Some(weft::primitive::AccessRef::from(&account)),
+    filters: vec![
+        Predicate::neq("status", "IN_QUEUE"),
+        Predicate::neq("status", "IN_PROGRESS"),
+    ],
+    ..Default::default()
+}).await?;
+```
+
+The run parks and the worker goes away. Weft checks the address once straight
+away (a job that is already done resumes at once), then every `interval_secs`,
+and an interval under 5 seconds is refused. The first answer that passes every filter is what
+`await_signal` returns, and the checking stops. With no filters, the first
+successful answer is the one. An error status or a failed request is not an
+answer: it is tried again at the next check and shown on the node. `access`
+signs each check with that connection.
+
+If the finished answer is heavy (a crawl's status that embeds its first page
+of results), list the fields your node reads next in `carry`, like
+`carry: vec!["status".into(), "error".into()]`. The filters still read the
+whole answer, but only those fields are handed back, so megabytes of data
+never sit in the run's history; read the rest yourself once the wait is over.
+
+When that answer comes, your body replays from the top, so the submit has to
+be inside `ctx.run`. Without it the replay would start a second job, and pay
+for it.
+
+Write the filters as "not one of the in-flight statuses" rather than "one of
+the finished ones", the way the example does. A status you did not expect then
+ends the wait, and your code can fail on it, instead of waiting for ever.
+
 ## Two things weft refuses
 
 **Emitting, then awaiting.** A replay would emit again, and the value already

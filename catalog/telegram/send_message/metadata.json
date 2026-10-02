@@ -1,7 +1,7 @@
 {
   "type": "TelegramSendMessage",
   "label": "Telegram: Send Message",
-  "description": "Send a text message to a chat through the connected bot.",
+  "description": "Send a text message to a Telegram chat through the connected bot.",
   "tags": [
     "telegram",
     "message",
@@ -22,7 +22,7 @@
       "required": true,
       "label": "Chat ID",
       "placeholder": "123456789 or @channelname",
-      "description": "The chat/channel to send to (the bot must be a member)."
+      "description": "Chat or channel id; the bot must be a member."
     },
     {
       "name": "text",
@@ -48,14 +48,18 @@
     },
     {
       "name": "buttons",
-      "type": "List[JsonDict]",
+      "type": "List[{ label: String, url: String }]",
       "label": "Link buttons",
       "description": "Link buttons under the message: [{\"label\": \"Open\", \"url\": \"https://...\"}]."
     },
     {
       "name": "replyTo",
       "type": "Number",
-      "label": "Reply to message id"
+      "label": "Reply to message id",
+      "widget": {
+        "kind": "number",
+        "step": 1
+      }
     }
   ],
   "outputs": [

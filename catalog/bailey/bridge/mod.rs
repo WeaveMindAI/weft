@@ -6,8 +6,8 @@
 //!   runs it and writes the `infra_node` row, then `run` forwards the
 //!   bridge's `/outputs` to the node's pulse output ports.
 //! - On later invocations (trigger setup, a normal firing) provisioning
-//!   is skipped (infra is already up) and `run` queries
-//!   `endpoint_url("api")` and forwards `/outputs` as before.
+//!   is skipped (infra is already up) and `run` resolves
+//!   `ctx.endpoint("api")` and forwards `/outputs` as before.
 
 use async_trait::async_trait;
 
@@ -70,11 +70,11 @@ impl Node for BaileyBridgeNode {
         // fire-time data reads) all need the URL.
         //
         // One broker round-trip resolves the endpoint; the handle
-        // caches the URL so `.url()` and `.call(...)` don't repeat
-        // the lookup. Output ports: `endpointUrl` (the bare URL, so
-        // downstream nodes like BaileySend can target the bridge
-        // from outside the declared-endpoint graph) plus the bridge's
-        // `/outputs` keys (status, phoneNumber, jid, pushName). The
+        // caches the URL so `.call(...)` doesn't repeat the lookup.
+        // Output ports: `bridge` (the `Infra` handle on the `api`
+        // endpoint, which every other WhatsApp node resolves to reach
+        // the bridge) plus the bridge's `/outputs` keys (status,
+        // phoneNumber, jid, pushName). The
         // fan takes the declared ports and nothing else, so a key the
         // container grows does not have to be added here first, and it
         // skips the nulls an unpaired bridge reports (no phone number
@@ -83,10 +83,10 @@ impl Node for BaileyBridgeNode {
         let bridge_outputs = api
             .call(weft::EndpointMethod::Get, "/outputs", None)
             .await?;
-        // `endpointUrl` is our locally-known truth (the resolved
-        // EndpointHandle URL). Set AFTER the fan (set-after-fan wins) so a
-        // misbehaving container can't shadow it with its own value.
-        let out = ctx.fan_declared(&bridge_outputs).set("endpointUrl", api.url());
+        // `bridge` is our own truth (the endpoint's handle). Set AFTER
+        // the fan (set-after-fan wins) so a misbehaving container can't
+        // shadow it with its own value.
+        let out = ctx.fan_declared(&bridge_outputs).set("bridge", api.infra_handle());
         ctx.pulse_downstream(out).await
     }
 }

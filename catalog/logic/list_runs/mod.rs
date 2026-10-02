@@ -29,7 +29,6 @@ impl Node for ListRunsNode {
             return Err(WeftError::Input(format!("limit is how many runs to list, a whole number, so it cannot be {limit}")));
         }
         let page = runs_from_inputs(&ctx)?.list(limit as u32).await?;
-        let runs = serde_json::to_value(&page.executions).map_err(|e| WeftError::NodeExecution(format!("runs: {e}")))?;
-        ctx.pulse_downstream(NodeOutput::new().set("runs", runs).set("total", page.total)).await
+        ctx.pulse_downstream(NodeOutput::new().set_serialized("runs", &page.executions)?.set("total", page.total)).await
     }
 }

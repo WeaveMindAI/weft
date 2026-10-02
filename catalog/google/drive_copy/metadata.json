@@ -1,7 +1,7 @@
 {
   "type": "GoogleDriveCopy",
   "label": "Google Drive: Copy",
-  "description": "Copy a file, optionally into a folder and under a new name. The template pattern: keep a template, copy it per run, fill the copy.",
+  "description": "Copies a Drive file, optionally into a folder and under a new name (for example, copy a template per run, then fill the copy).",
   "tags": [
     "google",
     "drive",
@@ -16,14 +16,47 @@
       "required": true,
       "requiresScopes": [
         "https://www.googleapis.com/auth/drive.file"
-      ],
-      "description": "A Google account that can read the file."
+      ]
     },
     {
       "name": "fileId",
       "type": "String",
       "required": true,
-      "label": "File id"
+      "label": "File id",
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "sources": [
+          {
+            "kind": "list",
+            "requires": [
+              "https://www.googleapis.com/auth/drive.readonly"
+            ],
+            "get": "https://www.googleapis.com/drive/v3/files?pageSize=100",
+            "items": "files",
+            "label": "name",
+            "value": "id",
+            "page": {
+              "cursor_param": "pageToken",
+              "cursor_path": "nextPageToken"
+            }
+          },
+          {
+            "kind": "picker",
+            "script": "https://apis.google.com/js/api.js",
+            "code": "await new Promise((resolve) => gapi.load('picker', resolve));\nif (!weft.clientId) throw new Error('this connection has no OAuth app; the Google picker only grants files to an app');\nlet view = new google.picker.DocsView();\nif (weft.mimeTypes.length > 0) view = view.setMimeTypes(weft.mimeTypes.join(','));\nnew google.picker.PickerBuilder()\n  .setOAuthToken(weft.token)\n  .setAppId(weft.clientId.split('-')[0])\n  .addView(view)\n  .setCallback((data) => {\n    const action = data[google.picker.Response.ACTION];\n    if (action === google.picker.Action.PICKED) {\n      const doc = data[google.picker.Response.DOCUMENTS][0];\n      weft.done({ id: doc.id, label: doc.name || doc.id });\n    } else if (action === google.picker.Action.CANCEL) {\n      weft.cancel();\n    }\n  })\n  .build()\n  .setVisible(true);",
+            "grants": [
+              "https://www.googleapis.com/auth/drive.file"
+            ],
+            "mime_types": []
+          },
+          {
+            "kind": "from_url",
+            "pattern": "/d/([a-zA-Z0-9_-]+)"
+          }
+        ]
+      },
+      "placeholder": "Pick a file, or paste its link"
     },
     {
       "name": "name",
@@ -34,7 +67,43 @@
       "name": "folder",
       "type": "String",
       "label": "Folder id",
-      "description": "The destination Drive folder's id (from its URL). Empty = My Drive root."
+      "description": "Destination folder id (from its URL). Empty = My Drive root.",
+      "widget": {
+        "kind": "remote_select",
+        "access": "account",
+        "sources": [
+          {
+            "kind": "list",
+            "requires": [
+              "https://www.googleapis.com/auth/drive.readonly"
+            ],
+            "get": "https://www.googleapis.com/drive/v3/files?q=mimeType%3D'application%2Fvnd.google-apps.folder'&pageSize=100",
+            "items": "files",
+            "label": "name",
+            "value": "id",
+            "page": {
+              "cursor_param": "pageToken",
+              "cursor_path": "nextPageToken"
+            }
+          },
+          {
+            "kind": "picker",
+            "script": "https://apis.google.com/js/api.js",
+            "code": "await new Promise((resolve) => gapi.load('picker', resolve));\nif (!weft.clientId) throw new Error('this connection has no OAuth app; the Google picker only grants files to an app');\nlet view = new google.picker.DocsView().setIncludeFolders(true).setSelectFolderEnabled(true);\nif (weft.mimeTypes.length > 0) view = view.setMimeTypes(weft.mimeTypes.join(','));\nnew google.picker.PickerBuilder()\n  .setOAuthToken(weft.token)\n  .setAppId(weft.clientId.split('-')[0])\n  .addView(view)\n  .setCallback((data) => {\n    const action = data[google.picker.Response.ACTION];\n    if (action === google.picker.Action.PICKED) {\n      const doc = data[google.picker.Response.DOCUMENTS][0];\n      weft.done({ id: doc.id, label: doc.name || doc.id });\n    } else if (action === google.picker.Action.CANCEL) {\n      weft.cancel();\n    }\n  })\n  .build()\n  .setVisible(true);",
+            "grants": [
+              "https://www.googleapis.com/auth/drive.file"
+            ],
+            "mime_types": [
+              "application/vnd.google-apps.folder"
+            ]
+          },
+          {
+            "kind": "from_url",
+            "pattern": "/folders/([a-zA-Z0-9_-]+)"
+          }
+        ]
+      },
+      "placeholder": "Pick a folder, or paste its link"
     }
   ],
   "outputs": [

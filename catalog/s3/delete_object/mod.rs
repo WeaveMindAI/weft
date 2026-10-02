@@ -2,8 +2,9 @@
 
 use async_trait::async_trait;
 
+use weft::access::client::checked_send;
 use weft::node::NodeOutput;
-use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
 
 use super::s3;
 
@@ -26,12 +27,7 @@ impl Node for S3DeleteObjectNode {
         let key: String = ctx.inputs.get("key")?;
 
         let s3 = ctx.client(&access).await?;
-        let resp = s3
-            .delete(s3::object_url(&bucket, &key)?)
-            .send()
-            .await
-            .node_err("s3: delete object")?;
-        s3::ok_or_bail(resp, "the delete").await?;
+        checked_send(s3.delete(s3::object_url(&bucket, &key)?), "delete the object").await?;
         ctx.pulse_downstream(NodeOutput::new().set("done", true)).await
     }
 }

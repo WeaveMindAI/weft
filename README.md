@@ -67,7 +67,7 @@ it writes, the container it needs, the person it asks: each are fast to produce 
 ```weft
 whatsapp = BaileyBridge
 
-ask = BaileyReceive { endpointUrl: whatsapp.endpointUrl }
+ask = BaileyReceive { bridge: whatsapp.bridge }
 
 draft = LlmInference -> (answer: String, sensitivity: String) {
   parseJson: true
@@ -106,7 +106,7 @@ allowed = FirstInOrder {
 
 reply = BaileySend {
   _should_flow: allowed.value
-  endpointUrl: whatsapp.endpointUrl
+  bridge: whatsapp.bridge
   to: ask.chatId
   message: draft.answer
 }

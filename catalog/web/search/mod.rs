@@ -32,7 +32,7 @@ impl Node for WebSearchNode {
         let mut body = json!({
             "query": query,
             "type": "auto",
-            "numResults": (num_results as u64).clamp(1, 100),
+            "numResults": num_results as u64,
         });
         if include_text {
             // Exa cuts each page's text at `maxCharacters`, so the
@@ -40,7 +40,7 @@ impl Node for WebSearchNode {
             // the pages weigh: a wire carries at most 100 KB, and ten
             // long articles uncapped would fail the run on a day the
             // news happened to be long.
-            body["contents"] = json!({ "text": { "maxCharacters": (max_text_chars as u64).max(1) } });
+            body["contents"] = json!({ "text": { "maxCharacters": max_text_chars as u64 } });
         }
         if !domains.is_empty() {
             body["includeDomains"] = json!(domains);

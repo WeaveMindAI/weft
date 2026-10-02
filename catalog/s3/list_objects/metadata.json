@@ -1,7 +1,7 @@
 {
   "type": "S3ListObjects",
   "label": "S3: List Objects",
-  "description": "List a bucket's objects under a prefix (paging until exhausted): keys, sizes, and last-modified times.",
+  "description": "List an S3-compatible bucket's objects under a prefix (all pages): keys, sizes, last-modified times.",
   "tags": [
     "s3",
     "storage",
@@ -26,7 +26,7 @@
       "name": "prefix",
       "type": "String",
       "label": "Prefix",
-      "description": "Only keys starting with this. Empty = the whole bucket."
+      "description": "Only keys starting with this; empty lists the whole bucket."
     }
   ],
   "outputs": [

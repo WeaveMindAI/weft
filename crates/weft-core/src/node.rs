@@ -1030,6 +1030,10 @@ impl NodeMetadata {
             let widget_value_type = match input.effective_widget() {
                 Widget::Number { .. } => Some(WeftType::primitive(WeftPrimitive::Number)),
                 Widget::Checkbox => Some(WeftType::primitive(WeftPrimitive::Boolean)),
+                // A JSON code editor edits a structured value as JSON text,
+                // the same way textarea does, so it suits any structural
+                // type; every other language edits a string.
+                Widget::Code { language: CodeLanguage::Json } => None,
                 Widget::Text
                 | Widget::Password
                 | Widget::Code { .. }
@@ -2664,7 +2668,8 @@ impl Accepts {
     }
 
     /// What a type takes when nobody says otherwise: a live handle (a
-    /// `Bus`, a `Generator`) exists only while something runs, so no
+    /// `Bus`, a `Generator`) exists only while something runs, and an
+    /// `Infra` handle only once its infra node has emitted it, so no
     /// human can write one; everything else takes both.
     pub fn for_type(ty: &WeftType) -> Self {
         if Self::type_is_handle(ty) { Self::wire_only() } else { Self::both() }
@@ -2672,7 +2677,7 @@ impl Accepts {
 
     /// A type whose values are live runtime handles, wire-only by nature.
     pub fn type_is_handle(ty: &WeftType) -> bool {
-        matches!(ty.structural(), WeftType::Bus | WeftType::Generator(_))
+        matches!(ty.structural(), WeftType::Bus | WeftType::Infra | WeftType::Generator(_))
     }
 
     /// The list as an error message reads it back: `literal, wire`.
@@ -2842,6 +2847,19 @@ pub struct OutputSpec {
     pub description: Option<String>,
 }
 
+/// The languages a code widget can highlight. Closed: a metadata file
+/// naming any other word fails to load, instead of the editor quietly
+/// rendering plain text.
+// SYNC: CodeLanguage <-> packages/weft-connect/src/core/wire.ts CodeLanguage
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CodeLanguage {
+    Python,
+    Javascript,
+    Sql,
+    Json,
+}
+
 /// The editor control an input renders. The vocabulary of the node
 /// inspector: every input has exactly one effective widget (declared, or
 /// derived from the type via [`Widget::default_for_type`]).
@@ -2855,9 +2873,8 @@ pub struct OutputSpec {
 pub enum Widget {
     Text,
     Textarea,
-    /// `language` picks the syntax highlighting in the editor's code box
-    /// (e.g. "python", "javascript").
-    Code { language: String },
+    /// `language` picks the syntax highlighting in the editor's code box.
+    Code { language: CodeLanguage },
     /// `step` is the input's granularity (the arrow/slider increment), the
     /// third knob of a number input alongside `min`/`max`.
     Number { min: Option<f64>, max: Option<f64>, step: Option<f64> },
@@ -3287,6 +3304,17 @@ impl NodeOutput {
         self
     }
 
+    /// Set `port` to any serializable value (a struct, a list of
+    /// them). A value that cannot become JSON (a map with non-string
+    /// keys, a failing custom `Serialize`) fails the node naming the
+    /// port.
+    pub fn set_serialized(self, port: &str, value: &impl Serialize) -> crate::WeftResult<Self> {
+        let value = serde_json::to_value(value).map_err(|e| {
+            crate::WeftError::NodeExecution(format!("output '{port}' cannot be serialized: {e}"))
+        })?;
+        Ok(self.set(port, value))
+    }
+
     /// The standard stored-file output quartet: `file` (the stored-file
     /// value), `filename`, `mimeType`, `sizeBytes`. Every node whose
     /// job is "put bytes in storage and hand the file downstream" emits
@@ -3396,6 +3424,21 @@ mod node_output_tests {
         assert!(!out.outputs.contains_key("content"), "a null on a String port never fires");
         assert_eq!(out.outputs["maybe"], serde_json::Value::Null, "a nullable port takes it");
         assert!(!out.outputs.contains_key("undeclared"));
+    }
+
+    /// `set_serialized` stores a struct as its JSON, and a value with no
+    /// JSON form fails naming the port.
+    #[test]
+    fn set_serialized_sets_the_json_or_names_the_port() {
+        #[derive(serde::Serialize)]
+        struct Run {
+            id: u32,
+        }
+        let out = NodeOutput::new().set_serialized("runs", &vec![Run { id: 7 }]).unwrap();
+        assert_eq!(out.outputs["runs"], serde_json::json!([{ "id": 7 }]));
+        let bad: std::collections::HashMap<(u8, u8), u8> = [((1, 2), 3)].into_iter().collect();
+        let err = NodeOutput::new().set_serialized("pairs", &bad).unwrap_err().to_string();
+        assert!(err.contains("'pairs'"), "{err}");
     }
 
     use super::*;
@@ -4489,6 +4532,46 @@ mod input_semantics_tests {
         }
     }
 
+    /// A code widget's language is a closed set spelled in lowercase: the
+    /// shipped words load, anything else fails the metadata load loudly.
+    #[test]
+    fn code_widget_language_is_a_closed_lowercase_set() {
+        for (word, lang) in [
+            ("python", CodeLanguage::Python),
+            ("javascript", CodeLanguage::Javascript),
+            ("sql", CodeLanguage::Sql),
+            ("json", CodeLanguage::Json),
+        ] {
+            let raw = serde_json::json!({ "kind": "code", "language": word });
+            let w: Widget = serde_json::from_value(raw.clone()).unwrap();
+            assert_eq!(w, Widget::Code { language: lang });
+            assert_eq!(serde_json::to_value(&w).unwrap(), raw);
+        }
+        for bad in ["rust", "Python", ""] {
+            let raw = serde_json::json!({ "kind": "code", "language": bad });
+            let err = serde_json::from_value::<Widget>(raw).unwrap_err().to_string();
+            assert!(err.contains("unknown variant"), "{bad}: {err}");
+        }
+        let missing = serde_json::json!({ "kind": "code" });
+        assert!(serde_json::from_value::<Widget>(missing).is_err());
+    }
+
+    /// A JSON code editor edits a structured value as JSON text, so it
+    /// fits a JsonDict input; the other languages edit text and stay on
+    /// String inputs.
+    #[test]
+    fn a_json_code_widget_fits_a_structured_input() {
+        let with = |ty: WeftType, language: CodeLanguage| {
+            let mut n = input("schema", ty);
+            n.widget = Some(Widget::Code { language });
+            metadata_with(vec![n]).validate_semantics()
+        };
+        assert!(with(WeftType::JsonDict, CodeLanguage::Json).is_ok());
+        assert!(with(WeftType::primitive(WeftPrimitive::String), CodeLanguage::Python).is_ok());
+        let e = with(WeftType::JsonDict, CodeLanguage::Python).unwrap_err();
+        assert!(e.contains("code widget edits"), "{e}");
+    }
+
     /// `kind_name` hands back exactly the serde `kind` tag for every
     /// variant: the tag is the one source of truth and this pins the
     /// convenience match to it.
@@ -4497,7 +4580,7 @@ mod input_semantics_tests {
         let all = [
             Widget::Text,
             Widget::Textarea,
-            Widget::Code { language: "python".into() },
+            Widget::Code { language: CodeLanguage::Python },
             Widget::Number { min: None, max: None, step: None },
             Widget::Checkbox,
             Widget::Datetime,
@@ -5369,3 +5452,4 @@ mod compact_view_tests {
         );
     }
 }
+

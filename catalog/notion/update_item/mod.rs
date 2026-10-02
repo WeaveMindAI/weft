@@ -36,11 +36,6 @@ impl Node for NotionUpdateItemNode {
         if let Some(a) = archived {
             body["archived"] = json!(a);
         }
-        if body.as_object().expect("object").is_empty() {
-            return Err(weft::WeftError::Input(
-                "nothing to update: set properties or archived".to_string(),
-            ));
-        }
 
         let http = ctx.client(&account).await?;
         let page = json_call(

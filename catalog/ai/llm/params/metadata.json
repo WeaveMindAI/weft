@@ -1,7 +1,7 @@
 {
   "type": "LlmParams",
   "label": "LLM Params",
-  "description": "Completion parameters for LLM nodes (system prompt, sampling knobs, reasoning). Provider-agnostic: the same params drive any wired provider. When multiple LLM nodes share the same settings, point them at one LlmParams node; only use multiple when you truly need different settings.",
+  "description": "Completion parameters for LLM nodes (system prompt, sampling, reasoning, max tokens), the same for any provider. LLM nodes that share settings share one LlmParams node.",
   "tags": [
     "config",
     "ai",
@@ -17,7 +17,7 @@
       "widget": { "kind": "textarea" },
       "label": "System Prompt",
       "placeholder": "You are a helpful assistant.",
-      "description": "System prompt for every LLM node wired to these params. Seeds the conversation as its first (role: system) message and rides the history from then on; a history already opening with a system message keeps it, so to switch instructions mid-chain append a system message with the Chat Message node."
+      "description": "Seeds the conversation as its first (role system) message and rides the history from then on. A history already opening with a system message keeps its own, so to switch instructions mid-chain append a system message with Chat Message."
     },
     {
       "name": "maxTokens",
@@ -100,10 +100,9 @@
     {
       "name": "reasoning",
       "type": "Boolean",
-      "widget": { "kind": "checkbox" },
       "default": false,
       "label": "Enable Reasoning",
-      "description": "Off by default: the call sends no reasoning request. A model that cannot switch reasoning off refuses on providers that spell the off position, and the error says to set this on; on the others it reasons at its own default and bills the thinking. A model with no reasoning fails with its provider's own error: set this off. On: reasoning at `reasoningEffort` (`low` when none is picked, raise it for one hard step). A reasoning model that answered nothing usually spent `maxTokens` thinking: raise it."
+      "description": "Off (default) sends no reasoning request; on reasons at `reasoningEffort`. A model that cannot switch reasoning off fails with an error saying to set this on; a model with no reasoning fails with its provider's error: set this off."
     },
     {
       "name": "reasoningEffort",
@@ -118,7 +117,7 @@
         ]
       },
       "label": "Reasoning Effort",
-      "description": "Only used when reasoning is enabled. Unpicked means `low`."
+      "description": "Only used when reasoning is on. Unpicked means `low`."
     },
     {
       "name": "forcePrepend",
@@ -132,15 +131,18 @@
       "type": "Number",
       "label": "Seed",
       "placeholder": "Leave empty for random",
-      "description": "For reproducible outputs"
+      "description": "For reproducible outputs",
+      "widget": {
+        "kind": "number",
+        "step": 1
+      }
     }
   ],
   "outputs": [
     {
       "name": "params",
       "type": "Dict[String, String | Number | Boolean | List[String]]",
-      "description": "The parameters object, fed into one or more LLM nodes."
+      "description": "Wire into one or more LLM nodes' params input."
     }
-  ],
-  "requires_infra": false
+  ]
 }

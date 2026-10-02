@@ -1,7 +1,7 @@
 {
   "type": "CrawlSite",
   "label": "Crawl Site",
-  "description": "Crawl a site from a starting URL and emit every reached page as clean markdown. Runs as long as the crawl takes; the page limit bounds cost.",
+  "description": "Crawl a site from a starting URL and emit every reached page as clean markdown, using Firecrawl. Runs as long as the crawl takes; `limit` bounds the per-page cost.",
   "tags": [
     "web",
     "scrape",
@@ -26,6 +26,12 @@
       "name": "limit",
       "type": "Number",
       "default": 25,
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "max": 1000,
+        "step": 1
+      },
       "label": "Max pages",
       "description": "Upper bound on crawled pages (1-1000); the crawl bills per page."
     }
@@ -43,5 +49,32 @@
   ],
   "features": {
     "catchErrors": true
-  }
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_present",
+            "field": "url"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_matches",
+              "field": "url",
+              "regex": "(?i)^https?://"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "CrawlSite '{id}' has a `url` that is not a web address. Start it with http:// or https://.",
+        "level": "structural",
+        "severity": "error",
+        "port": "url"
+      }
+    }
+  ]
 }

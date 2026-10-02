@@ -20,7 +20,7 @@ pub fn tests() -> Vec<NodeTest> {
 /// nothing created, nothing billed.
 async fn live_lookup(rig: LiveRig) -> WeftResult<()> {
     let conn = rig.connect().await?;
-    let me = crate::api::call_on(conn.client(), "auth.test", json!({})).await?;
+    let me = crate::api::call(conn.client(), "auth.test", json!({})).await?;
     let bot_user = me["user_id"].as_str().node_err("auth.test answered no user_id")?;
     let outcome = rig
         .run(

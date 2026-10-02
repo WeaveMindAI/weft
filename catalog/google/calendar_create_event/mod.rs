@@ -63,7 +63,7 @@ impl Node for GoogleCalendarCreateEventNode {
         let answer = weft::access::client::json_call(
             http.post(format!(
                 "https://www.googleapis.com/calendar/v3/calendars/{}/events",
-                urlencoding::encode(&calendar)
+                super::api::segment(&calendar)
             ))
             .json(&body),
             "create the event",

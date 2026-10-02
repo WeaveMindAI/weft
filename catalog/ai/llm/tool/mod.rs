@@ -8,10 +8,10 @@
 // SYNC: emitted object <-> MiniLLMLibRS/src/tools/mod.rs ToolDefinition
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use weft::node::NodeOutput;
-use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
+use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
 
 #[derive(NodeManifest)]
 pub struct LlmToolNode;
@@ -29,14 +29,12 @@ impl Node for LlmToolNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let name: String = ctx.inputs.get("name")?;
         let description: Option<String> = ctx.inputs.opt("description")?;
-        // The schema arrives as JSON text (the code widget edits a
-        // String); malformed JSON fails loudly here, at declaration
-        // time, not at the provider. A tool with no arguments is
-        // legitimate (a "get the time" tool); the empty schema is the
-        // declared way to say so.
-        let parameters: Value = match ctx.inputs.opt::<String>("parameters")? {
-            Some(text) if !text.trim().is_empty() => serde_json::from_str(&text)
-                .node_err("the arguments schema is not valid JSON")?,
+        // The schema arrives as a JSON object (the port's type holds it
+        // to one, written or wired). A tool with no arguments is
+        // legitimate (a "get the time" tool); leaving the schema out, or
+        // writing `{}`, is the declared way to say so.
+        let parameters: Value = match ctx.inputs.opt::<Map<String, Value>>("parameters")? {
+            Some(schema) if !schema.is_empty() => Value::Object(schema),
             _ => json!({ "type": "object", "properties": {} }),
         };
 

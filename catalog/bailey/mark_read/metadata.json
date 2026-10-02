@@ -1,7 +1,7 @@
 {
   "type": "BaileyMarkRead",
   "label": "WhatsApp Mark Read (Baileys)",
-  "description": "Mark a WhatsApp message as read via the project's bridge, so the sender sees the blue ticks. Wire `endpointUrl` from a BaileyBridge; `chatId` and `messageId` usually come from a WhatsApp Receive fire.",
+  "description": "Mark a WhatsApp message read (the sender sees blue ticks). `chatId` and `messageId` usually come from a BaileyReceive fire.",
   "tags": [
     "whatsapp",
     "baileys",
@@ -12,9 +12,10 @@
   "color": "#25D366",
   "inputs": [
     {
-      "name": "endpointUrl",
-      "type": "String",
-      "required": true
+      "name": "bridge",
+      "type": "Infra",
+      "required": true,
+      "description": "The `bridge` output of the BaileyBridge node to talk through."
     },
     {
       "name": "chatId",
@@ -35,6 +36,5 @@
   ],
   "features": {
     "catchErrors": true
-  },
-  "requires_infra": false
+  }
 }

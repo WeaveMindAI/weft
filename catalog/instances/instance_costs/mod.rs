@@ -30,13 +30,10 @@ impl Node for InstanceCostsNode {
         if let Some(node) = ctx.inputs.opt::<String>("node")?.filter(|s| !s.trim().is_empty()) {
             query = query.node(node);
         }
-        if let Some(paid_by) = ctx.inputs.opt::<String>("paidBy")?.filter(|s| !s.trim().is_empty()) {
-            query = query.paid_by(match paid_by.as_str() {
-                "platform" => PaidBy::Platform,
-                "author" => PaidBy::Author,
-                "instance" => PaidBy::Instance,
-                other => node_bail!("paidBy must be platform, author or instance, got '{other}'"),
-            });
+        // Read typed: a word outside the enum fails naming the input, the
+        // word, and the words it takes.
+        if let Some(paid_by) = ctx.inputs.opt::<PaidBy>("paidBy")? {
+            query = query.paid_by(paid_by);
         }
         if let Some(since) = ctx.inputs.opt::<f64>("since")? {
             if !(since >= 0.0) {
@@ -48,7 +45,6 @@ impl Node for InstanceCostsNode {
         // Folded from 0.0: `Sum` for f64 starts at -0.0, so an instance
         // with no records would read a total of -0.
         let total: f64 = records.iter().filter_map(|r| r.amount_usd).fold(0.0, |sum, amount| sum + amount);
-        let records = serde_json::to_value(&records).map_err(|e| weft::WeftError::NodeExecution(format!("costs: {e}")))?;
-        ctx.pulse_downstream(NodeOutput::new().set("records", records).set("totalUsd", total)).await
+        ctx.pulse_downstream(NodeOutput::new().set_serialized("records", &records)?.set("totalUsd", total)).await
     }
 }

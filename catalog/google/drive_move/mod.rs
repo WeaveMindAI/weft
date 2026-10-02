@@ -40,8 +40,9 @@ impl Node for GoogleDriveMoveNode {
             .collect();
 
         let mut url = format!(
-            "{}/files/{file_id}?addParents={}&fields=id",
+            "{}/files/{}?addParents={}&fields=id",
             drive::API,
+            super::api::segment(&file_id),
             urlencoding::encode(&folder),
         );
         if !old_parents.is_empty() {

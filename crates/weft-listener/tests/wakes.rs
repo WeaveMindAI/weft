@@ -427,6 +427,158 @@ async fn a_poll_failure_streak_survives_fresh_listeners_and_priming_is_explicit(
     assert!(shown(&copy, "poll").await.contains("polling"));
 }
 
+// ---------- A run waiting on a poll ----------
+
+/// A job status endpoint answering each GET with the next of `script`
+/// (status code, body), then repeating the last; counts the GETs.
+async fn spawn_status(script: Vec<(u16, Value)>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = hits.clone();
+    let script = Arc::new(script);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = axum::Router::new().route(
+        "/status",
+        axum::routing::get(move || {
+            let hits = counted.clone();
+            let script = script.clone();
+            async move {
+                let n = hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (code, body) = script[n.min(script.len() - 1)].clone();
+                (axum::http::StatusCode::from_u16(code).unwrap(), axum::Json(body))
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}/status"), hits)
+}
+
+/// A wait on a job: resumes on the first answer whose `status` says done.
+fn job_wait(url: &str) -> weft_core::primitive::SignalSpec {
+    to_spec(weft_core::signal::PollEndpoint {
+        url: url.into(),
+        interval_secs: 60,
+        filters: vec![weft_core::signal::Predicate::regex("status", "COMPLETED|FAILED")],
+        ..Default::default()
+    })
+}
+
+/// Register a parked run's wait the way the dispatcher does.
+async fn register_wait(rig: &Rig, token: &str, spec: &weft_core::primitive::SignalSpec, asked_at_unix_ms: i64) -> anyhow::Result<()> {
+    let mut who = identity(token, spec.clone());
+    who.is_resume = true;
+    who.execution_id = Some("exec-1".into());
+    let prepared = prepare_signal(&rig.state, who, None, asked_at_unix_ms)?;
+    let mut written = row(token, spec, prepared.kind_state, 1);
+    written["is_resume"] = json!(true);
+    written["execution_id"] = json!("exec-1");
+    rig.rows.lock().unwrap().insert(token.into(), written.clone());
+    weft_listener::registry::hold(&rig.state, serde_json::from_value(written)?, StartMode::New).await
+}
+
+/// A job that is already done when the run starts waiting resumes it on
+/// the first wake, which is pinned at the moment the wait was asked for
+/// rather than an interval later. The answer is the response itself, it
+/// routes to the parked run, and nothing polls after it.
+#[tokio::test]
+async fn a_wait_on_a_job_already_done_resumes_at_once() {
+    let rig = rig(Placement::Serverless).await;
+    let (url, hits) = spawn_status(vec![(200, json!({ "status": "COMPLETED", "url": "https://cdn/x.mp4" }))]).await;
+    let asked = now_ms();
+    register_wait(&rig, "wait", &job_wait(&url), asked).await.unwrap();
+    let armed = rig.alarm.wakes_for("signal:wait");
+    assert_eq!(armed.len(), 1);
+    assert_eq!(armed[0].at_unix_ms, asked, "the first poll is the moment the wait was asked for");
+
+    wake(&rig.state, WakeBody { token: "wait".into(), due_at_ms: asked }).await.unwrap();
+    {
+        let fires = rig.tasks.enqueued.lock().unwrap();
+        assert_eq!(fires.len(), 1);
+        assert_eq!(fires[0].payload["payload"]["url"], "https://cdn/x.mp4");
+    }
+    assert_eq!(rig.alarm.wakes_for("signal:wait").len(), 1, "answered: no further poll is set");
+    assert!(shown(&rig.state, "wait").await.contains("answered"));
+
+    let outcome = weft_listener::kinds::process(&rig.state, "wait", json!({ "status": "COMPLETED" })).await.unwrap();
+    assert!(
+        matches!(&outcome.target, weft_core::signal::listener_protocol::ProcessTarget::Resume { execution_id } if execution_id == "exec-1"),
+        "the fire resumes the parked run: {:?}",
+        outcome.target
+    );
+
+    // A wake that was already set when the answer went out polls nothing.
+    wake(&rig.state, WakeBody { token: "wait".into(), due_at_ms: now_ms() }).await.unwrap();
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(rig.tasks.enqueued.lock().unwrap().len(), 1);
+}
+
+/// A job still running is not an answer: the filter drops it and the wait
+/// keeps polling on its interval. A non-2xx answer is a failed poll,
+/// counted on the row and retried. The first answer that passes the
+/// filter resumes the run, once.
+#[tokio::test]
+async fn a_wait_polls_until_the_job_is_done_and_resumes_once() {
+    let rig = rig(Placement::Serverless).await;
+    let (url, hits) = spawn_status(vec![
+        (200, json!({ "status": "IN_PROGRESS" })),
+        (503, json!({ "error": "busy" })),
+        (200, json!({ "status": "IN_PROGRESS" })),
+        (200, json!({ "status": "FAILED", "error": "nsfw" })),
+    ])
+    .await;
+    let asked = now_ms();
+    register_wait(&rig, "wait", &job_wait(&url), asked).await.unwrap();
+
+    for _ in 0..3 {
+        wake(&rig.state, WakeBody { token: "wait".into(), due_at_ms: now_ms() }).await.unwrap();
+        assert!(rig.tasks.enqueued.lock().unwrap().is_empty(), "not done yet: nothing fires");
+    }
+    let stored = rig.rows.lock().unwrap()["wait"]["kind_state"].clone();
+    assert_eq!(stored, json!({}), "the failure streak cleared on the good poll after it");
+    let wakes = rig.alarm.wakes_for("signal:wait");
+    assert_eq!(wakes.len(), 4, "armed, then one more per poll");
+    assert!(wakes[1].at_unix_ms > asked, "after the first poll, the interval sets the pace");
+
+    wake(&rig.state, WakeBody { token: "wait".into(), due_at_ms: now_ms() }).await.unwrap();
+    {
+        let fires = rig.tasks.enqueued.lock().unwrap();
+        assert_eq!(fires.len(), 1);
+        assert_eq!(fires[0].payload["payload"], json!({ "status": "FAILED", "error": "nsfw" }));
+    }
+    assert_eq!(rig.alarm.wakes_for("signal:wait").len(), 4, "answered: no further poll is set");
+    assert_eq!(rig.rows.lock().unwrap()["wait"]["kind_state"], json!({ "resumed": true }));
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 4);
+}
+
+/// A non-2xx answer is shown on the node as a failed poll while the
+/// wait goes on.
+#[tokio::test]
+async fn a_wait_whose_status_endpoint_fails_keeps_polling_and_says_so() {
+    let rig = rig(Placement::Serverless).await;
+    let (url, _) = spawn_status(vec![(404, json!({ "error": "no such job" }))]).await;
+    register_wait(&rig, "wait", &job_wait(&url), now_ms()).await.unwrap();
+    wake(&rig.state, WakeBody { token: "wait".into(), due_at_ms: now_ms() }).await.unwrap();
+    assert!(rig.tasks.enqueued.lock().unwrap().is_empty());
+    assert!(shown(&rig.state, "wait").await.contains("404"), "{}", shown(&rig.state, "wait").await);
+    assert_eq!(rig.alarm.wakes_for("signal:wait").len(), 2, "it polls again");
+}
+
+/// Delta mode cannot serve a run's wait (its first poll primes
+/// silently), so the registration is refused, naming why.
+#[tokio::test]
+async fn a_wait_in_delta_mode_is_refused() {
+    let rig = rig(Placement::Serverless).await;
+    let spec = to_spec(
+        serde_json::from_value::<weft_core::signal::PollEndpoint>(json!({
+            "url": "https://example.com/jobs",
+            "delta": { "items": "items", "cursor_field": "id" },
+        }))
+        .unwrap(),
+    );
+    let err = register_wait(&rig, "wait", &spec, now_ms()).await.expect_err("refused");
+    assert!(format!("{err:#}").contains("delta"), "{err:#}");
+}
+
 // ---------- Held connections: one bring-up path ----------
 
 /// A held-connection spec whose loop only ever retries (nothing listens

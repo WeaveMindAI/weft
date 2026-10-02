@@ -1,7 +1,7 @@
 {
   "type": "HttpRequest",
   "label": "HTTP Request",
-  "description": "Make an outbound HTTP request. Supports GET/POST/PUT/PATCH/DELETE with JSON body and custom headers. A request that gets no answer at all (an unreachable host, a dropped connection, a body that cannot be read) is a failure, which `error` catches when it is wired. An answer with an error status (404, 500) is not a failure: `status` and `ok` carry it.",
+  "description": "Make an outbound HTTP request (GET/POST/PUT/PATCH/DELETE, JSON body, custom headers). Only no answer (unreachable host, dropped connection, unreadable body) is a failure; an error status (404, 500) succeeds with `status` and `ok` carrying it. A text response comes out on `body`: a JSON object as a dict, anything else (array, scalar, non-JSON text) as its raw text. A response whose type is not text (an image, a PDF, a zip) comes out whole on `file` instead. For an API key, pick a `connection` rather than writing it in `headers`.",
   "tags": [
     "http",
     "api",
@@ -10,7 +10,55 @@
   ],
   "icon": "Send",
   "color": "#06b6d4",
+  "service": {
+    "service": "http_header_key",
+    "label": "HTTP header key",
+    "connection_optional": true,
+    "doors": [
+      "own"
+    ],
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "header",
+          "label": "Header name",
+          "secret": false,
+          "placeholder": "Authorization, or X-Api-Key"
+        },
+        {
+          "name": "value",
+          "label": "Header value",
+          "placeholder": "Bearer sk-..., or the bare key"
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "{header}",
+        "value": "{value}"
+      }
+    ],
+    "own_page": {
+      "guide": {
+        "steps": [
+          "Name the header the API reads its key from (`Authorization` for most, `X-Api-Key` for some).",
+          "Paste the header's whole value, with its prefix when the API wants one (`Bearer sk-...`)."
+        ]
+      }
+    }
+  },
   "inputs": [
+    {
+      "name": "connection",
+      "type": "Access",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Connection",
+      "description": "Optional: a key the request carries in the header the connection names. Leave unpicked for an API that takes bare calls."
+    },
     {
       "name": "url",
       "type": "String",
@@ -51,7 +99,13 @@
     },
     {
       "name": "body",
-      "type": "JsonDict | String"
+      "type": "JsonDict | String",
+      "description": "A text response: a JSON object as a dict, anything else as its raw text. Absent when the response came out on `file`."
+    },
+    {
+      "name": "file",
+      "type": "File",
+      "description": "A response whose type is not text (or that names no type and does not read as text), stored whole. Absent for a text response."
     },
     {
       "name": "ok",
@@ -61,5 +115,31 @@
   "features": {
     "catchErrors": true
   },
-  "requires_infra": false
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_present",
+            "field": "url"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_matches",
+              "field": "url",
+              "regex": "(?i)^https?://"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "HttpRequest '{id}' has a `url` that is not a web address. Start it with http:// or https://.",
+        "level": "structural",
+        "severity": "error",
+        "port": "url"
+      }
+    }
+  ]
 }

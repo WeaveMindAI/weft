@@ -64,7 +64,7 @@
       "description": "How often the database is checked for new rows.",
       "widget": {
         "kind": "number",
-        "min": 1,
+        "min": 5,
         "step": 1
       }
     }

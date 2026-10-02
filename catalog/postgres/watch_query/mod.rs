@@ -26,6 +26,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::bus::BusOptions;
+use weft::signal::poll_endpoint::MIN_POLL_INTERVAL_SECS;
 use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::postgres::{
@@ -51,10 +52,11 @@ pub fn watched(query: &str) -> WeftResult<(String, Vec<String>)> {
     }
 }
 
-/// The cadence as a duration, refusing what would hammer the database.
+/// The cadence as a duration, refusing what would hammer the database:
+/// the same floor every polling signal has.
 pub fn cadence(interval_secs: f64) -> WeftResult<std::time::Duration> {
-    if !interval_secs.is_finite() || interval_secs < 1.0 {
-        mistake!("intervalSecs must be at least 1, got {interval_secs}");
+    if !interval_secs.is_finite() || interval_secs < MIN_POLL_INTERVAL_SECS as f64 {
+        mistake!("intervalSecs must be at least {MIN_POLL_INTERVAL_SECS}, got {interval_secs}");
     }
     Ok(std::time::Duration::from_secs_f64(interval_secs))
 }
@@ -113,7 +115,7 @@ impl Node for PostgresWatchQueryNode {
             // already rides on, so it would never reach a reader.
             if let Some(first) = rows.first() {
                 refuse_shadowed_columns(first, &["rows"])?;
-                refuse_unanswered_ports(first, ctx.declared_outputs(), &["rows"])?;
+                refuse_unanswered_ports(first, &ctx.data_outputs(), &["rows"])?;
             }
             if changed(last.as_deref(), &rows) {
                 bus.send("rows", json!(rows)).node_err("sending the rows on the bus")?;
@@ -174,7 +176,7 @@ fn first_row_columns(rows: &[Value], columns: &[String]) -> Vec<(String, Value)>
 /// column of the watched query, and each becomes its own bus.
 fn declared_columns(ctx: &ExecutionContext) -> Vec<String> {
     let mut columns: Vec<String> =
-        ctx.declared_outputs().keys().filter(|name| *name != "rows").cloned().collect();
+        ctx.data_outputs().into_keys().filter(|name| name != "rows").collect();
     // The declared map has no order of its own; a stable one keeps the
     // bus markers going out the same way on every run, which the
     // journal compares across runs.

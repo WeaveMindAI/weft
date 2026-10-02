@@ -1,7 +1,7 @@
 {
   "type": "FetchToStorage",
   "label": "Fetch to Storage",
-  "description": "Download a file from a URL straight into storage and emit a file reference. The bytes stream directly into storage (never buffered whole), so it handles large files. Wire `file` into MediaDisplay, DownloadLink, KeepFile, or any node that takes a stored file. To fetch a thing ONCE per project however many runs ask for it, set `scope` to `project` and give it an `identity` (a label for the source, such as `docs:invoice-42`): a second fetch of the same identity answers the file already stored and downloads nothing. This node downloads; for a file the run already holds in storage (an upload, a generated image) that later runs need to read, use KeepFile with `scope: project` instead.",
+  "description": "Download a file from a URL into storage and emit its stored-file reference; bytes stream straight to storage, so large files are fine. With `scope: project` and an `identity` (a source label like `docs:invoice-42`), a later fetch of the same identity answers the stored file and downloads nothing. For a file the run already holds in storage, use KeepFile instead.",
   "tags": [
     "storage",
     "fetch",
@@ -15,12 +15,12 @@
       "name": "url",
       "type": "String",
       "required": true,
-      "description": "URL of the file to fetch."
+      "description": "URL to fetch."
     },
     {
       "name": "filename",
       "type": "String",
-      "description": "Override the stored filename. Defaults to the URL's last path segment."
+      "description": "Stored filename; defaults to the URL's last path segment."
     },
     {
       "name": "scope",
@@ -34,49 +34,76 @@
         ]
       },
       "label": "Store in",
-      "description": "`execution`: the file belongs to this run, and only this run can read it. `project`: it belongs to the project, and every later run can read it."
+      "description": "`execution`: only this run can read it. `project`: every later run can."
     },
     {
       "name": "ttl_days",
       "type": "Number",
       "widget": {
         "kind": "number",
-        "min": 0
+        "min": 0,
+        "step": 1
       },
       "label": "Keep for (days, 0 = forever)",
-      "description": "How long the file lives once nobody touches it: any access (read, download, presign) resets the clock, and 0 means never expire. Empty means an execution file is swept shortly after its run ends, and a project file lives until deleted."
+      "description": "Lifetime since last access (any read, download or presign resets it); 0 never expires. Empty: an execution file is swept soon after its run, a project file lives until deleted."
     },
     {
       "name": "identity",
       "type": "String",
       "label": "Identity",
-      "description": "What the file is a copy of, as a stable label (`<source>:<id>`). A fetch whose identity is already stored in the chosen scope answers that file and downloads nothing, so the same document asked for by many runs is one file. Leave empty for a file that is its own thing."
+      "description": "Stable `<source>:<id>` label of what this is a copy of; a fetch whose identity is already stored in the scope reuses that file. Empty for a one-off."
     }
   ],
   "outputs": [
     {
       "name": "file",
       "type": "File",
-      "description": "The stored file's reference."
+      "description": "The stored file."
     },
     {
       "name": "filename",
       "type": "String",
-      "description": "The name the file is stored under."
+      "description": "Stored filename."
     },
     {
       "name": "mimeType",
       "type": "String",
-      "description": "The file's media type."
+      "description": "Media type."
     },
     {
       "name": "sizeBytes",
       "type": "Number",
-      "description": "The file's size in bytes."
+      "description": "Size in bytes."
     }
   ],
   "features": {
     "catchErrors": true
   },
-  "requires_infra": false
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_present",
+            "field": "url"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_matches",
+              "field": "url",
+              "regex": "(?i)^https?://"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "FetchToStorage '{id}' has a `url` that is not a web address. Start it with http:// or https://.",
+        "level": "structural",
+        "severity": "error",
+        "port": "url"
+      }
+    }
+  ]
 }

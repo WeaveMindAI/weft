@@ -1,7 +1,7 @@
 {
   "type": "GmailGet",
   "label": "Gmail: Get Message",
-  "description": "Fetch one message by id and decompose it: subject/from/to/date, the text body, labels, and every attachment pulled into storage as file references.",
+  "description": "Fetches one Gmail message by id: subject/from/to/date, text body, labels, and every attachment pulled into storage.",
   "tags": [
     "google",
     "gmail",
@@ -16,8 +16,7 @@
       "required": true,
       "requiresScopes": [
         "https://www.googleapis.com/auth/gmail.readonly"
-      ],
-      "description": "A Google account with the read-mail permission."
+      ]
     },
     {
       "name": "id",
@@ -29,9 +28,6 @@
       "name": "includeAttachments",
       "type": "Boolean",
       "default": true,
-      "widget": {
-        "kind": "checkbox"
-      },
       "label": "Download attachments"
     }
   ],
@@ -55,7 +51,7 @@
     {
       "name": "body",
       "type": "String",
-      "description": "The message text (plain when available, else the HTML)."
+      "description": "Plain text when available, else the HTML."
     },
     {
       "name": "bodyIsHtml",

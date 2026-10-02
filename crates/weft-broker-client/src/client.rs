@@ -567,16 +567,9 @@ impl InfraReader for BrokerInfraClient {
     async fn endpoint_address(
         &self,
         execution_id: weft_core::ExecutionId,
-        node_id: &str,
-        per_instance: bool,
-        endpoint_name: &str,
+        infra: &weft_core::infra::InfraHandle,
     ) -> Result<Option<weft_core::infra::EndpointAddress>> {
-        let req = InfraEndpointUrlRequest {
-            execution_id,
-            node_id: node_id.to_string(),
-            per_instance,
-            endpoint_name: endpoint_name.to_string(),
-        };
+        let req = InfraEndpointUrlRequest { execution_id, infra: infra.clone() };
         let resp: InfraEndpointUrlResponse =
             self.http.post("/v1/infra/endpoint_url", &req).await?;
         Ok(resp.address)

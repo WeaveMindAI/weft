@@ -4627,3 +4627,39 @@ fn a_crowded_included_file_warns_on_its_first_item() {
     assert_eq!(warned.len(), 1, "{d:?}");
     assert!(warned[0].message.contains("this included file holds 16 items"), "{}", warned[0].message);
 }
+
+/// An `Infra` input takes only the handle an infra node emits: the
+/// bridge's own handle wires clean, a URL string off a wire is a type
+/// error, and a written URL is refused because no person can write a
+/// handle.
+#[test]
+fn an_infra_input_takes_only_an_infra_handle() {
+    let project = parse_enrich(
+        r#"
+whatsapp = BaileyBridge
+send = BaileySend { to: "49151", message: "hi" }
+send.bridge = whatsapp.bridge
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(errors(&d).is_empty(), "the bridge's handle wires clean, got {:?}", errors(&d));
+
+    let project = parse_enrich(
+        r#"
+url = Text { value: "http://bridge:8090" }
+send = BaileySend { to: "49151", message: "hi" }
+send.bridge = url.value
+"#,
+    );
+    let d = validate(&project, &catalog());
+    assert!(codes(&d).contains(&"type-mismatch"), "a String into an Infra input must be refused: {d:?}");
+
+    let project = parse_enrich(
+        r#"
+send = BaileySend { bridge: "http://bridge:8090", to: "49151", message: "hi" }
+"#,
+    );
+    let d = validate(&project, &catalog());
+    let hit = d.iter().find(|e| e.code.as_deref() == Some("input-accepts"));
+    assert!(hit.is_some_and(|e| e.message.contains("`bridge` accepts: wire")), "a written URL must be refused: {d:?}");
+}

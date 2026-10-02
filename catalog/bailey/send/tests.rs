@@ -3,7 +3,7 @@
 
 use serde_json::json;
 
-use weft::{FakeRig, NodeTest, WeftResult};
+use weft::{EndpointMethod, FakeRig, NodeTest, WeftResult};
 
 use super::BaileySendNode;
 
@@ -15,16 +15,13 @@ pub fn tests() -> Vec<NodeTest> {
 }
 
 async fn sends(rig: FakeRig) -> WeftResult<()> {
-    rig.respond(
-        "POST",
-        "/action",
-        json!({ "result": { "messageId": "wa-1" } }),
-    );
+    let bridge = rig.declare_infra("bridge", "api", "http://bridge.example:8090");
+    rig.answer_infra("bridge", "api", EndpointMethod::Post, "/action", json!({ "result": { "messageId": "wa-1" } }));
     let outcome = rig
         .run(
             &BaileySendNode,
             json!({
-                "endpointUrl": "http://bridge.example:8090",
+                "bridge": bridge,
                 "to": "4915112345678",
                 "message": "hello",
             }),
@@ -32,23 +29,20 @@ async fn sends(rig: FakeRig) -> WeftResult<()> {
         .await
         .ok()?;
     assert_eq!(outcome.outputs["messageId"], json!("wa-1"));
-    let body = rig.requests()[0].body.clone().expect("action body");
+    let body = rig.endpoint_calls()[0].body.clone().expect("action body");
     assert_eq!(body["action"], json!("sendMessage"));
     assert_eq!(body["payload"]["to"], json!("4915112345678"));
     Ok(())
 }
 
 async fn soft_error(rig: FakeRig) -> WeftResult<()> {
+    let bridge = rig.declare_infra("bridge", "api", "http://bridge.example:8090");
     // Soft failures ride a 200 with result.error.
-    rig.respond(
-        "POST",
-        "/action",
-        json!({ "result": { "error": "WhatsApp not connected" } }),
-    );
+    rig.answer_infra("bridge", "api", EndpointMethod::Post, "/action", json!({ "result": { "error": "WhatsApp not connected" } }));
     let outcome = rig
         .run(
             &BaileySendNode,
-            json!({ "endpointUrl": "http://bridge.example:8090", "to": "49151", "message": "x" }),
+            json!({ "bridge": bridge, "to": "49151", "message": "x" }),
         )
         .await;
     let err = outcome.result.expect_err("a soft error must refuse").to_string();

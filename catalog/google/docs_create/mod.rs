@@ -45,7 +45,7 @@ impl Node for GoogleDocsCreateNode {
         ctx.pulse_downstream(
             NodeOutput::new()
                 .set("documentId", doc_id.clone())
-                .set("link", format!("https://docs.google.com/document/d/{doc_id}/edit")),
+                .set("link", format!("https://docs.google.com/document/d/{}/edit", super::api::segment(&doc_id))),
         )
         .await
     }

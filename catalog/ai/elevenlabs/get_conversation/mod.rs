@@ -1,16 +1,15 @@
 //! ElevenLabsGetConversation: read an agent conversation: waits for
-//! it to finish by default (a call takes as long as it takes; no
-//! deadline, cancelling the execution cancels the wait), then emits
-//! the transcript, the analysis, and optionally the call audio.
-
-use std::time::Duration;
+//! it to finish by default, parked without holding a worker (a call
+//! takes as long as it takes; no deadline, cancelling the execution
+//! cancels the wait), then emits the transcript, the analysis, and
+//! optionally the call audio.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use weft::access::client::get_json;
-use weft::context::LogLevel;
 use weft::node::NodeOutput;
+use weft::signal::{PollEndpoint, Predicate};
 use weft::storage::{KeepTtl, StorageScope};
 use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
@@ -37,36 +36,38 @@ impl Node for ElevenLabsGetConversationNode {
 
         let http = ctx.client(&account).await?;
         let url = format!("{API}/convai/conversations/{conversation}");
-        let mut polls: u64 = 0;
-        let (status, answer): (String, Value) = loop {
-            let answer =
-                get_json(&http, &url, "elevenlabs: read the conversation").await?;
-            let status = answer["status"]
-                .as_str()
-                .node_err("elevenlabs: the conversation answered no status")?
-                .to_string();
-            match status.as_str() {
-                "done" | "failed" => break (status, answer),
-                "initiated" | "in-progress" | "processing" if !wait => break (status, answer),
-                // Still ringing, talking, or post-processing. A
-                // breadcrumb every ~12 polls keeps a long call legible.
-                "initiated" | "in-progress" | "processing" => {
-                    polls += 1;
-                    if polls % 12 == 0 {
-                        ctx.log(
-                            LogLevel::Info,
-                            format!("conversation {conversation} still {status}"),
-                        )
-                        .await?;
-                    }
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
-                other => weft::node_bail!(
-                    "elevenlabs answered an unexpected status '{other}' for conversation \
-                     {conversation}"
-                ),
-            }
+        // Waiting parks on the conversation and resumes on any status
+        // that is not in flight (still ringing, talking, or
+        // post-processing), so a status this node does not know ends the
+        // wait and is refused below instead of being waited on forever.
+        let answer = if wait {
+            ctx.await_signal(PollEndpoint {
+                url: url.clone(),
+                interval_secs: 5,
+                access: Some(weft::primitive::AccessRef::from(&account)),
+                filters: vec![
+                    Predicate::neq("status", "initiated"),
+                    Predicate::neq("status", "in-progress"),
+                    Predicate::neq("status", "processing"),
+                ],
+                ..Default::default()
+            })
+            .await?
+        } else {
+            get_json(&http, &url, "elevenlabs: read the conversation").await?
         };
+        let status = answer["status"]
+            .as_str()
+            .node_err("elevenlabs: the conversation answered no status")?
+            .to_string();
+        match status.as_str() {
+            "done" | "failed" => {}
+            "initiated" | "in-progress" | "processing" if !wait => {}
+            other => weft::node_bail!(
+                "elevenlabs answered an unexpected status '{other}' for conversation \
+                 {conversation}"
+            ),
+        }
 
         let transcript: Vec<Value> = answer["transcript"]
             .as_array()

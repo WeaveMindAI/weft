@@ -1032,8 +1032,8 @@ pub fn placeholders(sql: &str) -> WeftResult<PlaceholderSql> {
         if bound.is_empty() && parsed.statements.len() == 1 {
             mistake!(
                 "the SQL uses `${tag}`, which is not a name this node can bind: parameters are \
-                 the node's own input ports, read by name. Declare the port and name it: \
-                 `PostgresExecuteQuery(user_id: String) {{ ... WHERE id = $user_id }}`"
+                 the node's own input ports, read by name. Declare the port on the node, \
+                 `(user_id: String)`, and write `$user_id` where its value goes"
             );
         }
         if !bound.is_empty() {

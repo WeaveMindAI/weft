@@ -1,7 +1,7 @@
 {
   "type": "TextToFile",
   "label": "Text to File",
-  "description": "Store a piece of text as a file and emit the file reference. For text that is too big to travel between nodes as a value (a wire carries at most 100 KB), or that a node wants as a file (an upload, an attachment, a conversation an LLM node keeps in a file). The file is plain text unless `mimeType` says otherwise (`application/json` for a JSON document). To read a text file back, use FileToText.",
+  "description": "Store text as a file and emit its reference, for a node that takes a file (an upload, an attachment, an LLM conversation file) or to move text on as a file instead of a value. Plain text unless `mimeType` says otherwise. FileToText reads it back.",
   "tags": [
     "storage",
     "text",
@@ -17,21 +17,21 @@
       "type": "String",
       "required": true,
       "widget": { "kind": "textarea" },
-      "description": "The text to store, saved as UTF-8."
+      "description": "Text to store, as UTF-8."
     },
     {
       "name": "filename",
       "type": "String",
       "default": "text.txt",
       "label": "Filename",
-      "description": "The name the file is stored under (what a download calls it)."
+      "description": "Stored filename (what a download calls it)."
     },
     {
       "name": "mimeType",
       "type": "String",
       "default": "text/plain",
       "label": "Media type",
-      "description": "The file's media type: `text/plain`, `text/markdown`, `text/csv`, `application/json`, and so on."
+      "description": "Media type: `text/plain`, `text/markdown`, `text/csv`, `application/json`, ..."
     },
     {
       "name": "scope",
@@ -45,40 +45,40 @@
         ]
       },
       "label": "Store in",
-      "description": "`execution`: the file belongs to this run, and only this run can read it. `project`: it belongs to the project, and every later run can read it."
+      "description": "`execution`: only this run can read it. `project`: every later run can."
     },
     {
       "name": "ttl_days",
       "type": "Number",
       "widget": {
         "kind": "number",
-        "min": 0
+        "min": 0,
+        "step": 1
       },
       "label": "Keep for (days, 0 = forever)",
-      "description": "How long the file lives once nobody touches it: any access (read, download, presign) resets the clock, and 0 means never expire. Empty means an execution file is swept shortly after its run ends, and a project file lives until deleted."
+      "description": "Lifetime since last access (any read, download or presign resets it); 0 never expires. Empty: an execution file is swept soon after its run, a project file lives until deleted."
     }
   ],
   "outputs": [
     {
       "name": "file",
       "type": "File",
-      "description": "The stored file's reference."
+      "description": "The stored file."
     },
     {
       "name": "filename",
       "type": "String",
-      "description": "The name the file is stored under."
+      "description": "Stored filename."
     },
     {
       "name": "mimeType",
       "type": "String",
-      "description": "The file's media type."
+      "description": "Media type."
     },
     {
       "name": "sizeBytes",
       "type": "Number",
-      "description": "The file's size in bytes."
+      "description": "Size in bytes."
     }
-  ],
-  "requires_infra": false
+  ]
 }

@@ -4,6 +4,7 @@
 
 use async_trait::async_trait;
 
+use weft::infra::InfraHandle;
 use weft::node::NodeOutput;
 use weft::{ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
@@ -21,26 +22,17 @@ impl Node for BaileySendNode {
     }
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
-        let endpoint_url: String = ctx.inputs.get("endpointUrl")?;
+        let bridge: InfraHandle = ctx.inputs.get("bridge")?;
         let to: String = ctx.inputs.get("to")?;
         let message: String = ctx.inputs.get("message")?;
 
-        let result = super::bridge_api::action(
-            &ctx,
-            &endpoint_url,
-            "sendMessage",
-            serde_json::json!({ "to": to, "text": message }),
-        )
-        .await?;
+        let result = ctx.endpoint_of(&bridge)
+            .await?
+            .action("sendMessage", serde_json::json!({ "to": to, "text": message }))
+            .await?;
         let message_id = result["messageId"]
             .as_str()
             .node_err(format!("bridge send response missing result.messageId: {result}"))?;
-        // Only emit `messageId`. The previous `success: true` port was
-        // an always-true constant (every failure path errors above), so
-        // its mere presence on the wire was the meaningful signal. The
-        // `messageId` emission already conveys "send succeeded"; if a
-        // user wires a downstream `success` consumer they wire it
-        // against `messageId` instead.
         ctx.pulse_downstream(NodeOutput::new().set("messageId", message_id)).await
     }
 }

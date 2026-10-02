@@ -21,7 +21,7 @@ use crate::registry::RegisteredSignal;
 use crate::socket_engine::PrepareError;
 use crate::stream_engine::{self, PlanReply, PlanStep, StreamPlan};
 
-use super::socket_listen::interpolate_frame;
+use weft_core::signal::socket_listen::interpolate_frame;
 use super::{BetweenFires, KindHandler, LiveCtx, SpawnCtx};
 use weft_core::live::{LiveFeed, LiveItem};
 

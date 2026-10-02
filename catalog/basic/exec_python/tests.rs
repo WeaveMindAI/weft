@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 
 use weft::{FakeRig, NodeTest, WeftError, WeftResult, WeftType};
 
-use super::{run_python, ExecPythonNode};
+use super::{run_python, ExecPythonNode, Interrupt};
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
@@ -14,6 +14,7 @@ pub fn tests() -> Vec<NodeTest> {
             let out = run_python(
                 "return {'sum': a + b, 'label': f'{a}+{b}'}",
                 vec![("a".into(), json!(2)), ("b".into(), json!(3))],
+                &Interrupt::default(),
             )?;
             assert_eq!(
                 out,
@@ -25,44 +26,63 @@ pub fn tests() -> Vec<NodeTest> {
             Ok(())
         }),
         NodeTest::basic("an_empty_dict_yields_no_pulses", || {
-            let out = run_python("return {}", Vec::new())?;
+            let out = run_python("return {}", Vec::new(), &Interrupt::default())?;
             assert!(out.is_empty());
             Ok(())
         }),
         NodeTest::basic("a_missing_return_is_a_type_error", || {
             for code in ["x = 1", "return", "return None"] {
-                let err = run_python(code, Vec::new()).expect_err("no dict, no answer");
+                let err = run_python(code, Vec::new(), &Interrupt::default()).expect_err("no dict, no answer");
                 assert!(matches!(&err, WeftError::Type(m) if m.contains("without returning a dict")), "{code}: {err}");
             }
             Ok(())
         }),
         NodeTest::basic("an_exception_is_a_node_failure_carrying_the_traceback", || {
-            let err = run_python("raise ValueError('boom')", Vec::new()).expect_err("a raise must fail the run");
+            let err = run_python("raise ValueError('boom')", Vec::new(), &Interrupt::default()).expect_err("a raise must fail the run");
             let WeftError::NodeExecution(message) = &err else { panic!("a raise is catchable: {err}") };
             assert!(message.contains("ValueError: boom"), "{message}");
             assert!(message.contains("Traceback"), "{message}");
             Ok(())
         }),
         NodeTest::basic("a_syntax_error_is_an_input_error", || {
-            let err = run_python("return {'a': 1", Vec::new()).expect_err("code that does not compile");
+            let err = run_python("return {'a': 1", Vec::new(), &Interrupt::default()).expect_err("code that does not compile");
             assert!(matches!(&err, WeftError::Input(m) if m.contains("does not compile") && m.contains("SyntaxError")), "{err}");
             Ok(())
         }),
         NodeTest::basic("a_non_dict_return_is_a_type_error", || {
-            let err = run_python("return 3", Vec::new()).expect_err("a scalar return must fail");
+            let err = run_python("return 3", Vec::new(), &Interrupt::default()).expect_err("a scalar return must fail");
             assert!(matches!(&err, WeftError::Type(m) if m.contains("must return a dict")), "{err}");
             Ok(())
         }),
         NodeTest::basic("a_value_with_no_json_form_is_a_type_error", || {
-            let err = run_python("return {'s': {1, 2}}", Vec::new()).expect_err("a set has no port value");
+            let err = run_python("return {'s': {1, 2}}", Vec::new(), &Interrupt::default()).expect_err("a set has no port value");
             assert!(matches!(&err, WeftError::Type(m) if m.contains("'s'") && m.contains("set")), "{err}");
             Ok(())
         }),
         NodeTest::basic("json_round_trips_through_python", || {
             let value = json!({ "s": "x", "n": 1.5, "b": true, "z": Value::Null,
                                 "l": [1, 2], "o": { "k": "v" } });
-            let out = run_python("return {'echo': data}", vec![("data".into(), value.clone())])?;
+            let out = run_python("return {'echo': data}", vec![("data".into(), value.clone())], &Interrupt::default())?;
             assert_eq!(out, vec![("echo".to_string(), value)]);
+            Ok(())
+        }),
+        NodeTest::basic("a_stop_interrupts_a_running_script", || {
+            let interrupt = std::sync::Arc::new(Interrupt::default());
+            let running = interrupt.clone();
+            let script = std::thread::spawn(move || run_python("while True:\n    pass", Vec::new(), &running));
+            while interrupt.thread.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            interrupt.stop_now();
+            let result = script.join().expect("the script thread does not panic");
+            assert!(matches!(result, Err(WeftError::Cancelled)), "{result:?}");
+            Ok(())
+        }),
+        NodeTest::basic("a_stopped_script_never_starts", || {
+            let interrupt = Interrupt::default();
+            interrupt.stop_now();
+            let result = run_python("return {'ran': True}", Vec::new(), &interrupt);
+            assert!(matches!(result, Err(WeftError::Cancelled)), "{result:?}");
             Ok(())
         }),
         NodeTest::fake("custom_ports_bind_in_and_pulse_out", custom_ports),

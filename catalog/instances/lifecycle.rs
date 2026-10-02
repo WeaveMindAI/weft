@@ -21,17 +21,10 @@ pub fn instance(ctx: &ExecutionContext) -> WeftResult<InstanceId> {
 /// hibernate or wipe) and to the runs they fired (`running`: wait or
 /// cancel). Waiting before a wipe is refused, as everywhere else.
 pub fn take_down_spec(ctx: &ExecutionContext) -> WeftResult<DeactivateSpec> {
-    let mode = match ctx.inputs.get::<String>("triggers")?.as_str() {
-        "park" => DeactivationMode::Park,
-        "hibernate" => DeactivationMode::Hibernate,
-        "wipe" => DeactivationMode::Wipe,
-        other => node_bail!("triggers must be park, hibernate or wipe, got '{other}'"),
-    };
-    let running_policy = match ctx.inputs.get::<String>("running")?.as_str() {
-        "wait" => RunningPolicy::Wait,
-        "cancel" => RunningPolicy::Cancel,
-        other => node_bail!("running must be wait or cancel, got '{other}'"),
-    };
+    // Read typed: a word outside the enum fails naming the input, the
+    // word, and the words it takes.
+    let mode: DeactivationMode = ctx.inputs.get("triggers")?;
+    let running_policy: RunningPolicy = ctx.inputs.get("running")?;
     let grace: f64 = ctx.inputs.get("graceMinutes")?;
     if grace < 0.0 || grace.fract() != 0.0 || grace > f64::from(u32::MAX) {
         node_bail!("graceMinutes must be a whole number of minutes from 0 to {}, got {grace}", u32::MAX);

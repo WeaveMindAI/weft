@@ -22,7 +22,6 @@
     }
   ],
   "outputs": [],
-  "requires_infra": false,
   "features": {
     "catchErrors": true,
     "canAddInputPorts": true,

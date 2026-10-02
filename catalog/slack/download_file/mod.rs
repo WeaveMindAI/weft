@@ -29,8 +29,9 @@ impl Node for SlackDownloadFileNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let access: Access = ctx.inputs.get("account")?;
         let file_id: String = ctx.inputs.get("fileId")?;
+        let client = ctx.client(&access).await?;
 
-        let info = api::get(&ctx, &access, "files.info", &[("file", file_id.clone())]).await?;
+        let info = api::get(&client, "files.info", &[("file", file_id.clone())]).await?;
         let url = info
             .pointer("/file/url_private")
             .and_then(Value::as_str)
@@ -50,7 +51,6 @@ impl Node for SlackDownloadFileNode {
         // url_private only answers with the workspace bearer, so this
         // fetch runs on the connection's client and streams into
         // storage (bounded memory, whatever the file size).
-        let client = ctx.client(&access).await?;
         let resp = client.get(&url).send().await.node_err("slack: fetch file bytes")?;
         let stored = ctx
             .storage(StorageScope::Execution)

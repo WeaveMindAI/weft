@@ -1,7 +1,7 @@
 {
   "type": "GoogleSheetsLookup",
   "label": "Google Sheets: Lookup Rows",
-  "description": "Find the rows where a column holds a value: resolve an id to its record, check whether a key is already logged. Needs a header row. Emits the matching rows, their sheet row numbers, and whether anything matched.",
+  "description": "Finds the rows of a Google Sheets tab whose given header column holds an exact value (resolve an id to its record, check a key is already logged); emits the rows, their row numbers, and whether any matched.",
   "tags": [
     "google",
     "sheets",
@@ -17,7 +17,7 @@
       "requiresScopes": [
         "https://www.googleapis.com/auth/drive.file"
       ],
-      "description": "A Google account with write access to the sheet (the picker grant covers the file it picked)."
+      "description": "The picker grant covers the file it picked."
     },
     {
       "name": "spreadsheet",
@@ -64,7 +64,6 @@
     {
       "name": "tab",
       "type": "String",
-      "default": "0",
       "widget": {
         "kind": "remote_select",
         "access": "account",
@@ -89,7 +88,8 @@
         ]
       },
       "label": "Tab",
-      "placeholder": "Pick a tab, or paste a link with #gid="
+      "placeholder": "Pick a tab, or paste a link with #gid=",
+      "description": "The tab to use. Empty: the first tab, whatever its id."
     },
     {
       "name": "column",
@@ -97,21 +97,21 @@
       "required": true,
       "label": "Column",
       "placeholder": "email",
-      "description": "The header column to match on."
+      "description": "Header column to match on (a header row is required)."
     },
     {
       "name": "value",
       "type": "String",
       "required": true,
       "label": "Value",
-      "description": "The exact cell value to match."
+      "description": "Exact cell value to match."
     }
   ],
   "outputs": [
     {
       "name": "rows",
       "type": "List[JsonDict]",
-      "description": "The matching rows, keyed by the header."
+      "description": "Matching rows, keyed by the header."
     },
     {
       "name": "rowNumbers",

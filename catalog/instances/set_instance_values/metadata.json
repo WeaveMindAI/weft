@@ -1,7 +1,7 @@
 {
   "type": "SetInstanceValues",
   "label": "Set instance values",
-  "description": "Give one instance values for the fields the program writes `@instance_filled` (its sheet, its schedule, its connection), and clear others, all at once. Each value is checked against its field and the node's rules first, and nothing is stored if one is refused. A live trigger of the instance that reads a changed value is set up again with it before `rearmed` fires, so the new schedule or connection takes effect without anyone re-arming by hand.",
+  "description": "Set and clear one instance's values for the program's `@instance_filled` fields in one go. Every value is checked against its field and node rules first; one refusal stores nothing. The instance's active triggers reading a changed value are re-armed with it before `rearmed` fires.",
   "tags": [
     "instances",
     "values",
@@ -14,27 +14,26 @@
       "name": "instance",
       "type": "String",
       "required": true,
-      "description": "The instance, by the id your program gives it (`user-42`)."
+      "description": "The instance id your program gives it (`user-42`)."
     },
     {
       "name": "values",
       "type": "JsonDict",
-      "description": "The values to give, by `node.field` the way the program writes it: `{\"read.spreadsheet\": \"1AbC...\", \"digest.cron\": \"0 0 7 * * *\"}`. A connection field takes one of the instance's connections: `{\"slack.account\": {\"id\": \"<connection id>\"}}`."
+      "description": "Keyed by `node.field`: `{\"read.spreadsheet\": \"1AbC...\", \"digest.cron\": \"0 0 7 * * *\"}`. A connection field takes one of the instance's connections: `{\"slack.account\": {\"id\": \"<connection id>\"}}`."
     },
     {
       "name": "clear",
       "type": "List[String]",
-      "description": "The fields to clear, as `node.field`: each then falls back as if never given."
+      "description": "Fields to clear, as `node.field`; each falls back as if never given."
     }
   ],
   "outputs": [
     {
       "name": "rearmed",
       "type": "List[String]",
-      "description": "The instance's triggers that were set up again because they read a changed value."
+      "description": "The instance's triggers re-armed because they read a changed value."
     }
   ],
-  "requires_infra": false,
   "validate": [
     {
       "when": {
@@ -60,5 +59,13 @@
         "port": "clear"
       }
     }
-  ]
+  ],
+  "features": {
+    "oneOfRequired": [
+      [
+        "values",
+        "clear"
+      ]
+    ]
+  }
 }

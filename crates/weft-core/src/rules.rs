@@ -90,7 +90,9 @@ pub fn fires(rule: &ValidationRule, node: &NodeDefinition, cx: &RuleContext, cus
 /// `{custom_outputs}` replaced from the node; `{per_instance_reason}`
 /// with why it is per instance ("it reads 'blender'", "it sits inside
 /// group 'work', which receives 'blender'"); `{names}` with the names
-/// its `input_names` conditions refuse; `{with}` with the nodes its
+/// its `input_names` conditions refuse, each with the full spelling it
+/// most likely meant when one exists (`'box' (did you mean
+/// 'work.box'?)`); `{with}` with the nodes its
 /// `downstream_of` conditions found.
 pub fn message(rule: &ValidationRule, node: &NodeDefinition, cx: &RuleContext, custom_outputs: &[String]) -> String {
     let mut s = rule.then.message.replace("{id}", &node.id);
@@ -116,7 +118,7 @@ pub fn message(rule: &ValidationRule, node: &NodeDefinition, cx: &RuleContext, c
         names.dedup();
         with_found.sort();
         with_found.dedup();
-        s = s.replace("{names}", &quoted(&names)).replace("{with}", &quoted(&with_found));
+        s = s.replace("{names}", &names.join(", ")).replace("{with}", &quoted(&with_found));
     }
     s
 }
@@ -367,6 +369,38 @@ fn misnamed(value: Option<&Value>, project: &ProjectDefinition, named: Named) ->
     names.into_iter().filter(|name| !fits(name)).map(str::to_string).collect()
 }
 
+/// One refused name, quoted, with the spellings it most likely meant:
+/// the places that fit and end in it, which is what a node inside a
+/// group or an included file is called when written by its short name
+/// (`box` for `work.box`). A field name is matched on its node part.
+fn refused_name(name: &str, cx: &RuleContext, named: Named) -> String {
+    let project = cx.project();
+    let (step, field) = match named {
+        Named::Field { .. } => match name.rsplit_once('.') {
+            Some((step, field)) => (step, Some(field)),
+            None => return format!("'{name}'"),
+        },
+        Named::Node { .. } => (name, None),
+    };
+    let suffix = format!(".{step}");
+    let meant: BTreeSet<String> = cx
+        .places()
+        .iter()
+        .map(|place| crate::project::address_of(project, &place.id, &place.path))
+        .filter(|spelled| spelled.ends_with(&suffix))
+        .map(|spelled| match field {
+            Some(field) => format!("{spelled}.{field}"),
+            None => spelled,
+        })
+        .filter(|candidate| misnamed(Some(&Value::String(candidate.clone())), project, named).is_empty())
+        .collect();
+    if meant.is_empty() {
+        format!("'{name}'")
+    } else {
+        format!("'{name}' (did you mean {}?)", meant.iter().map(|m| format!("'{m}'")).collect::<Vec<_>>().join(" or "))
+    }
+}
+
 /// Every name the rule's `input_names` conditions refuse on `node`
 /// (`{names}`), and every node its `downstream_of` conditions found
 /// (`{with}`), walked through the combinators.
@@ -374,7 +408,7 @@ fn collect_from_condition(cond: &Condition, node: &NodeDefinition, cx: &RuleCont
     match cond {
         Condition::InputNames { port, names: named } => {
             if let Written::Known(value) = written(node, port) {
-                names.extend(misnamed(value, cx.project(), *named));
+                names.extend(misnamed(value, cx.project(), *named).iter().map(|name| refused_name(name, cx, *named)));
             }
         }
         Condition::DownstreamOf { with } => with_found.extend(upstream_with(node, cx, with)),

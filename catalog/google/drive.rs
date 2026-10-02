@@ -25,7 +25,10 @@ pub async fn file_meta(
 ) -> WeftResult<Value> {
     get_json(
         http,
-        &format!("{API}/files/{file_id}?fields={fields}&supportsAllDrives=true"),
+        &format!(
+            "{API}/files/{}?fields={fields}&supportsAllDrives=true",
+            super::api::segment(file_id)
+        ),
         what,
     )
     .await

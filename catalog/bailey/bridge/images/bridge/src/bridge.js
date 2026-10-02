@@ -11,7 +11,7 @@ import {
   DisconnectReason,
   proto,
 } from 'baileys';
-import { extractTextContent, mediaFacts, toNumber } from './message-store.js';
+import { extractTextContent, mediaFacts, ownsFile, toNumber } from './message-store.js';
 
 // Resolve enum values once at module load. If Baileys ever
 // renames or moves these (it has done so between major versions),
@@ -43,7 +43,7 @@ if (HISTORY_SYNC_ON_DEMAND === undefined) {
  *   - getMessage callback (placeholder; required for retransmit logic)
  *   - sock.ev.process(events => ...) batched event handler
  */
-export async function createBridge(authDir, webhookManager, messageStore) {
+export async function createBridge(authDir, eventHub, messageStore) {
   mkdirSync(authDir, { recursive: true });
 
   // `warn` and up reach the container log: Baileys swallows a failed media
@@ -145,7 +145,7 @@ export async function createBridge(authDir, webhookManager, messageStore) {
       }
       if (events['groups.update']) {
         for (const update of events['groups.update']) {
-          webhookManager.emit('group.update', update);
+          eventHub.emit('group.update', update);
         }
       }
     });
@@ -184,7 +184,7 @@ export async function createBridge(authDir, webhookManager, messageStore) {
         state.pushName = me.name || null;
       }
       console.log(`[bridge] Connected as ${state.pushName} (${state.phoneNumber})`);
-      webhookManager.emit('connection.update', {
+      eventHub.emit('connection.update', {
         status: 'connected',
         phoneNumber: state.phoneNumber,
       });
@@ -278,7 +278,7 @@ export async function createBridge(authDir, webhookManager, messageStore) {
         state.jid = null;
         state.pushName = null;
         console.log('[bridge] Logged out; dropping the pairing and dialling for a new QR code');
-        webhookManager.emit('connection.update', { status: 'logged_out' });
+        eventHub.emit('connection.update', { status: 'logged_out' });
         forgetPairing();
         state.status = 'connecting';
         connect().catch((err) => {
@@ -292,11 +292,11 @@ export async function createBridge(authDir, webhookManager, messageStore) {
    * Delete the pairing WhatsApp issued (creds.json plus every Signal
    * key file `useMultiFileAuthState` writes) so the next dial starts
    * from nothing and gets a QR code. The message store lives in the
-   * same directory and is kept.
+   * same directory and keeps every file it names as its own.
    */
   function forgetPairing() {
     for (const name of readdirSync(authDir)) {
-      if (name === 'messages.json') continue;
+      if (ownsFile(name)) continue;
       rmSync(join(authDir, name), { recursive: true, force: true });
     }
     console.log('[bridge] pairing files removed');
@@ -325,7 +325,7 @@ export async function createBridge(authDir, webhookManager, messageStore) {
       const from = msg.key.remoteJid;
       const isGroup = from?.endsWith('@g.us') || false;
 
-      webhookManager.emit('message.received', {
+      eventHub.emit('message.received', {
         from,
         pushName: msg.pushName || null,
         content,

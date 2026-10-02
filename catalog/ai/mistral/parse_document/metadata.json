@@ -1,7 +1,7 @@
 {
   "type": "MistralParseDocument",
   "label": "Parse Document",
-  "description": "A PDF, scan, or image to clean markdown through Mistral's OCR: tables, layout, and 100+ languages. Emits the whole document's markdown and the per-page breakdown.",
+  "description": "Turn a PDF, scan, or image into clean markdown through Mistral's OCR (tables, layout, 100+ languages). Emits the whole document's markdown and a per-page breakdown.",
   "tags": [
     "ai",
     "document",

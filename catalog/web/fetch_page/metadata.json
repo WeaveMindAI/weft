@@ -1,7 +1,7 @@
 {
   "type": "FetchPage",
   "label": "Fetch Page",
-  "description": "One URL to clean markdown (JavaScript rendered, boilerplate stripped), ready for an LLM step. Powered by Firecrawl.",
+  "description": "Fetch one URL as clean markdown (JavaScript rendered, boilerplate stripped), ready for an LLM step. Uses Firecrawl.",
   "tags": [
     "web",
     "scrape"
@@ -25,9 +25,6 @@
       "name": "onlyMainContent",
       "type": "Boolean",
       "default": true,
-      "widget": {
-        "kind": "checkbox"
-      },
       "label": "Main content only",
       "description": "Strip navigation, footers, and boilerplate."
     }
@@ -44,5 +41,32 @@
   ],
   "features": {
     "catchErrors": true
-  }
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_present",
+            "field": "url"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_matches",
+              "field": "url",
+              "regex": "(?i)^https?://"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "FetchPage '{id}' has a `url` that is not a web address. Start it with http:// or https://.",
+        "level": "structural",
+        "severity": "error",
+        "port": "url"
+      }
+    }
+  ]
 }

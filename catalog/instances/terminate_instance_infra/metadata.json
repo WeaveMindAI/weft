@@ -1,7 +1,7 @@
 {
   "type": "TerminateInstanceInfra",
   "label": "Terminate instance infra",
-  "description": "Delete one instance's copy of an infra node and its disk. The instance's triggers reading it go down with it, the way `triggers` says; the instance's runs using it follow `running`.",
+  "description": "Delete one instance's copy of a `@per_instance` infra node and its disk. The instance's triggers reading it go down per `triggers`; its runs follow `running`.",
   "tags": [
     "instances",
     "infra",
@@ -15,13 +15,13 @@
       "name": "node",
       "type": "String",
       "required": true,
-      "description": "The infra node marked `@per_instance`, named the way the program writes it (`bridge`, or `one.bridge` inside an included file)."
+      "description": "The `@per_instance` infra node, named as the program writes it (`bridge`, `work.bridge` inside a group, or `one.bridge` inside an included file)."
     },
     {
       "name": "instance",
       "type": "String",
       "required": true,
-      "description": "The instance, by the id your program gives it (`user-42`)."
+      "description": "The instance id your program gives it (`user-42`)."
     },
     {
       "name": "triggers",
@@ -36,7 +36,7 @@
       },
       "default": "park",
       "label": "Triggers",
-      "description": "What happens to the instance's triggers reading it: park keeps what arrives for later, hibernate keeps it for a grace window, wipe drops it."
+      "description": "The instance's triggers reading it: park queues what arrives, hibernate keeps accepting for `graceMinutes`, wipe drops it."
     },
     {
       "name": "running",
@@ -50,45 +50,88 @@
       },
       "default": "wait",
       "label": "Running work",
-      "description": "What happens to the instance's runs still going: wait lets them finish, cancel stops them now. Wipe needs cancel."
+      "description": "The instance's runs still going: wait lets them finish, cancel stops them. `wipe` needs cancel."
     },
     {
       "name": "graceMinutes",
       "type": "Number",
       "default": 15,
       "label": "Grace minutes",
-      "description": "How long hibernate keeps accepting what arrives. Ignored by park and wipe."
+      "description": "Hibernate only: how long it keeps accepting.",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "step": 1
+      }
     },
     {
       "name": "includeSelf",
       "type": "Boolean",
-      "widget": {
-        "kind": "checkbox"
-      },
       "default": false,
       "label": "Stop this run too",
-      "description": "Off: this run keeps going even when it is one of the runs reached. On: this run ends with them, cancelled."
+      "description": "On: this run is cancelled too when it is one of the runs reached."
     }
   ],
   "outputs": [
     {
       "name": "done",
       "type": "Boolean",
-      "description": "True once the instance's triggers reading the copy are down and the terminate is handed to the supervisor, which deletes the copy on its own time. Wire it into the `_should_flow` of what must happen after."
+      "description": "True once the triggers reading the copy are down and the delete is handed off; the copy is deleted afterwards."
     }
   ],
-  "requires_infra": false,
   "validate": [
     {
       "when": {
         "kind": "not",
-        "of": { "kind": "input_names", "port": "node", "names": { "node": { "role": "infra", "per_instance": true } } }
+        "of": {
+          "kind": "input_names",
+          "port": "node",
+          "names": {
+            "node": {
+              "role": "infra",
+              "per_instance": true
+            }
+          }
+        }
       },
       "then": {
-        "message": "TerminateInstanceInfra '{id}' names {names} in `node`, which is no infra node of this program marked `@per_instance`. Name one the way the program writes it (`bridge`, or `one.bridge` inside an included file).",
+        "message": "TerminateInstanceInfra '{id}' names {names} in `node`, which is no infra node of this program marked `@per_instance`. Name one the way the program writes it (`bridge`, `work.bridge` inside a group, or `one.bridge` inside an included file).",
         "level": "structural",
         "severity": "error",
         "port": "node"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_equals",
+            "field": "triggers",
+            "equals": "wipe"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_equals",
+              "field": "running",
+              "equals": "cancel"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "running"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "TerminateInstanceInfra '{id}' wipes the triggers but lets running work finish. Wiping drops what the runs still need, so set `running` to cancel, or pick park or hibernate for `triggers`.",
+        "level": "structural",
+        "severity": "error",
+        "field": "running"
       }
     }
   ]

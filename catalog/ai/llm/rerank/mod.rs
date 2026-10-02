@@ -43,7 +43,7 @@ impl Node for LlmRerankNode {
         let http = ctx.client(&account).await?;
         let answer = weft::access::client::post_json(
             &http,
-            "https://openrouter.ai/api/v1/rerank",
+            &format!("{}/rerank", super::provider::OPENROUTER_API),
             &body,
             "openrouter: rerank",
         )

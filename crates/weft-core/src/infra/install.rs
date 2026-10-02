@@ -85,7 +85,44 @@ impl Install {
     pub fn label_value(&self) -> &str {
         self.name.as_deref().unwrap_or("default")
     }
+
+    /// The name this install gives an image it keeps on the local Docker
+    /// daemon, from its content-addressed `tag` (`weft-worker:<hash>`):
+    /// the tag itself for the default install,
+    /// `localhost/weft-<name>/<tag>` for a named one.
+    ///
+    /// Each install holds its images under names of its own, so two
+    /// installs that built the same content each hold a name on one
+    /// image, and an install removing its name never takes the image from
+    /// another (Docker deletes an image with its last name). `localhost/`
+    /// keeps Docker from ever pulling such a name from Docker Hub.
+    pub fn local_image_ref(&self, tag: &str) -> String {
+        match &self.name {
+            None => tag.to_string(),
+            Some(n) => format!("{LOCAL_IMAGE_REGISTRY}/weft-{n}/{tag}"),
+        }
+    }
+
+    /// The tag an install's local image name carries (`weft-worker:<hash>`),
+    /// when `image_ref` is one of any install's local image names
+    /// ([`Self::local_image_ref`]); `None` for any other image.
+    pub fn tag_of_local_image(image_ref: &str) -> Option<&str> {
+        let tag = match image_ref.strip_prefix(LOCAL_IMAGE_REGISTRY).and_then(|r| r.strip_prefix("/weft-")) {
+            Some(rest) => {
+                let (name, tag) = rest.split_once('/')?;
+                Self::named(name).ok()?;
+                tag
+            }
+            None => image_ref,
+        };
+        (!tag.contains('/') && tag.contains(':')).then_some(tag)
+    }
 }
+
+/// The registry part of a named install's local image names: one Docker
+/// resolves to this machine, so a missing image is never pulled from
+/// anywhere else.
+const LOCAL_IMAGE_REGISTRY: &str = "localhost";
 
 /// The root of weft's files on this machine.
 // SYNC: data_dir <-> setup.sh (~/.local/share/weft), scripts/lib/weft-cleanup.sh
@@ -120,6 +157,19 @@ mod tests {
         assert_eq!(c.resource_prefix(), "weft-cell7");
         assert_eq!(d.label_value(), "default");
         assert_eq!(c.label_value(), "cell7");
+    }
+
+    #[test]
+    fn each_install_names_its_local_images_apart() {
+        let d = Install::default_install();
+        let c = Install::named("cell7").unwrap();
+        assert_eq!(d.local_image_ref("weft-worker:ab"), "weft-worker:ab");
+        assert_eq!(c.local_image_ref("weft-worker:ab"), "localhost/weft-cell7/weft-worker:ab");
+        assert_eq!(Install::tag_of_local_image("weft-worker:ab"), Some("weft-worker:ab"));
+        assert_eq!(Install::tag_of_local_image("localhost/weft-cell7/weft-worker:ab"), Some("weft-worker:ab"));
+        for other in ["localhost/other/weft-worker:ab", "ghcr.io/x/weft-worker:ab", "evil/weft-worker:ab", "weft-worker", "localhost/weft-Bad/weft-worker:ab"] {
+            assert_eq!(Install::tag_of_local_image(other), None, "{other}");
+        }
     }
 
     #[test]

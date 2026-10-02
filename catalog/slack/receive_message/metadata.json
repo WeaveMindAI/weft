@@ -1,7 +1,7 @@
 {
   "type": "SlackReceiveMessage",
   "label": "Slack Receive Message",
-  "description": "Fires an execution when a message lands in a Slack channel. Works through your own Slack app's Socket Mode token (paste it on the connection), or through Slack pushing events to a weft that is reachable from the internet. Filters run before anything fires, so only matching messages cost an execution. For 'every workspace that installed my app', use Slack App Messages instead.",
+  "description": "Fires when a message lands in a Slack channel of your workspace; for every workspace that installed your app, use Slack App Messages. Needs your own app's Socket Mode token on the connection, or a weft reachable from the internet. Filters run before firing, so only matching messages cost an execution.",
   "tags": [
     "slack",
     "trigger",
@@ -30,7 +30,7 @@
       "requiresScopes": [
         "channels:history"
       ],
-      "description": "The Slack access (wire a SlackAccess node). Reading messages needs the channels:history scope, and the app must be a member of the channel."
+      "description": "Needs channels:history, and the app must be in the channel."
     },
     {
       "name": "channel",
@@ -68,31 +68,28 @@
       "type": "String",
       "label": "Contains",
       "placeholder": "Only fire when the text contains this",
-      "description": "Only fire on messages whose text contains this. Leave empty for every message."
+      "description": "Only fire when the text contains this. Empty = every message."
     },
     {
       "name": "pattern",
       "type": "String",
       "label": "Matches pattern",
       "placeholder": "A regular expression the text must match",
-      "description": "Only fire on messages whose text matches this regular expression. Leave empty for no pattern filter."
+      "description": "Only fire when the text matches this regular expression."
     },
     {
       "name": "fromUser",
       "type": "String",
       "label": "From user",
       "placeholder": "A Slack user id (U...)",
-      "description": "Only fire on messages sent by this user id. Leave empty for anyone."
+      "description": "Only fire on this user id's messages. Empty = anyone."
     },
     {
       "name": "includeBots",
       "type": "Boolean",
       "default": false,
-      "widget": {
-        "kind": "checkbox"
-      },
       "label": "Include bot messages",
-      "description": "Also fire on messages posted by bots (including this app's own). Off by default so a workflow that posts into its own channel cannot trigger itself."
+      "description": "Also fire on bot messages, this app's own included. Off so a workflow posting into its channel cannot trigger itself."
     },
     {
       "name": "replies",
@@ -107,7 +104,7 @@
         ]
       },
       "label": "Thread scope",
-      "description": "Which messages fire: every message, only top-level channel messages, or only replies inside threads."
+      "description": "Every message, only top-level, or only thread replies."
     }
   ],
   "outputs": [

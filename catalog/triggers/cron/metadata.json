@@ -1,7 +1,7 @@
 {
   "type": "Cron",
   "label": "Cron Schedule",
-  "description": "Fire on a schedule. The `cron` expression has SIX fields with seconds first (`sec min hour day month weekday`): `0 */5 * * * *` is every five minutes, `0 0 9 * * MON-FRI` is nine every weekday. `timezone` says whose nine: UTC unless you pick a zone (`Europe/Paris`), and a zone keeps the schedule on local time across daylight-saving changes.",
+  "description": "Fire on a schedule. `cron` has SIX fields, seconds first (`0 0 9 * * MON-FRI` is nine every weekday), counted in `timezone`, which keeps local time across daylight-saving changes.",
   "tags": [
     "cron",
     "schedule",
@@ -15,12 +15,8 @@
       "name": "cron",
       "type": "String",
       "required": true,
-      "widget": {
-        "kind": "text"
-      },
-      "default": "0 */5 * * * *",
       "label": "Cron",
-      "description": "Six fields, seconds first: `sec min hour day month weekday`. The default fires every five minutes. A five-field (minute-first) expression is refused as you type it.",
+      "description": "`sec min hour day month weekday`. A five-field (minute-first) expression is refused.",
       "placeholder": "0 */5 * * * *"
     },
     {
@@ -630,19 +626,19 @@
       },
       "default": "UTC",
       "label": "Time zone",
-      "description": "The IANA zone the expression counts in. UTC by default; pick `Europe/Paris` and `0 0 9 * * *` fires at nine Paris time, summer and winter."
+      "description": "IANA zone the expression counts in."
     }
   ],
   "outputs": [
     {
       "name": "scheduledTime",
       "type": "String",
-      "description": "ISO-8601 timestamp of the scheduled fire time"
+      "description": "ISO-8601 scheduled fire time"
     },
     {
       "name": "actualTime",
       "type": "String",
-      "description": "ISO-8601 timestamp of when the firing actually happened"
+      "description": "ISO-8601 time it actually fired"
     }
   ],
   "validate": [
@@ -660,7 +656,6 @@
       }
     }
   ],
-  "requires_infra": false,
   "firesWith": {
     "scheduledTime": "String",
     "actualTime": "String"

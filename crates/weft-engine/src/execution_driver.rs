@@ -1166,6 +1166,9 @@ async fn drive(
 ) -> anyhow::Result<ExecutionOutcome> {
     let project: &ProjectDefinition = project_arc;
     let journal = clients.journal.as_ref();
+    // What infra the program declares, read once per drive: every
+    // firing's handle checks a shared `Infra` handle against it.
+    let declared_infra = Arc::new(weft_core::project::DeclaredInfra::of(project));
     // ONE ordered channel from node tasks to the loop. A node sends
     // `TaskMsg::Emission` zero or more times while it runs (each
     // `pulse_downstream` / `close_port`, applied without closing the
@@ -1989,6 +1992,7 @@ async fn drive(
             .with_emit_channel(task_tx.clone())
             .with_caller_connection(caller.cloned())
             .with_per_instance(node_def.per_instance)
+            .with_declared_infra(declared_infra.clone())
             .with_catch_errors(node_def.features.catch_errors)
             .with_run_kind(run_kind);
             // What a trigger wakes with is a declared contract

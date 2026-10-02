@@ -1,10 +1,23 @@
 //! Outbound event source (2 of 3): periodic HTTP poll. The listener hits
-//! `url` every `interval_secs` and fires a fresh execution carrying the
-//! response body. No persistent connection: this is the right shape for
-//! APIs that only offer a "give me what's new" endpoint (long-poll or plain
-//! poll), e.g. a bot getUpdates loop. The polling node owns any cursor/offset
-//! bookkeeping by varying the URL it registers; the language only owns the
-//! timer + fire + the listener keep-alive across worker stalls.
+//! `url` every `interval_secs` and fires with the response body. No
+//! persistent connection: this is the right shape for APIs that only offer
+//! a "give me what's new" endpoint (long-poll or plain poll), e.g. a bot
+//! getUpdates loop. The polling node owns any cursor/offset bookkeeping by
+//! varying the URL it registers; the language only owns the timer + fire +
+//! the listener keep-alive across worker stalls.
+//!
+//! Two ways to use it:
+//!   - `ctx.register_signal(PollEndpoint { .. })`: an entry trigger, each
+//!     fire starts a fresh execution.
+//!   - `ctx.await_signal(PollEndpoint { .. })`: a node that started an
+//!     outside job waits for it without holding a worker. The first poll
+//!     runs at once (a job already done resumes straight away), and the
+//!     first response that passes `filters` resumes the run, as the value
+//!     `await_signal` returns; then the polling stops. With no filters the
+//!     first successful response resumes it. A non-2xx answer or a failed
+//!     request is not an answer: it is retried at the next poll and shown
+//!     on the node. `delta` is refused here, since its first poll primes
+//!     silently and would swallow the answer.
 //!
 //! For a held read-only stream see [`super::SseSubscribe`]; for a
 //! bidirectional socket with a heartbeat see [`super::SocketListen`].
@@ -55,6 +68,15 @@ pub struct PollEndpoint {
     /// "from now on", never "replay all history".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delta: Option<PollDelta>,
+    /// The fields of the response a fire carries, as dotted paths
+    /// (`status`, `error.message`); empty carries the whole response.
+    /// The filters still read the whole response, so a wait can say
+    /// "done" on a field and carry only what the node reads next. For an
+    /// answer that is mostly data the node fetches again anyway (a job
+    /// status that embeds its first page of results), this keeps that
+    /// data out of the queued fire and the run's journal. Plain mode only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carry: Vec<String>,
     /// The connection whose credential signs each poll (a provider
     /// API the anonymous client cannot read). Lifted onto the spec by
     /// [`super::to_spec`]; not part of the kind's own config blob
@@ -64,7 +86,8 @@ pub struct PollEndpoint {
     pub access: Option<AccessRef>,
     /// The pre-fire filter, over the fire payload (a delta fire is
     /// `{ item }`, positional mode also carrying `index`, so item
-    /// fields address as `item.<path>`).
+    /// fields address as `item.<path>`; a plain fire is the response
+    /// itself). For `await_signal` this is what says the job is done.
     /// Lifted onto the spec like `access`; the shared fire plumbing
     /// evaluates it, so a filtered-out item costs no execution.
     #[serde(skip)]
@@ -135,6 +158,7 @@ impl Default for PollEndpoint {
             format: PollFormat::Json,
             interval_secs: DEFAULT_POLL_INTERVAL_SECS,
             delta: None,
+            carry: Vec::new(),
             access: None,
             filters: Vec::new(),
         }
@@ -187,6 +211,12 @@ impl Signal for PollEndpoint {
                 self.interval_secs
             ));
         }
+        if !self.carry.is_empty() && self.delta.is_some() {
+            return Err("poll_endpoint.carry trims a plain poll's answer; a delta poll fires one item at a time, so drop one of the two".into());
+        }
+        if let Some(empty) = self.carry.iter().find(|path| path.trim().is_empty()) {
+            return Err(format!("poll_endpoint.carry names an empty path ({empty:?}); list the fields the fire keeps, like `status`"));
+        }
         if self.body.is_some() && self.method != PollMethod::Post {
             return Err(
                 "poll_endpoint.body only rides a `post` poll; set method: Post or drop the \
@@ -227,11 +257,51 @@ impl Signal for PollEndpoint {
     }
 }
 
+/// What a fire carries of `response`: the fields `carry` names, each
+/// at its own path, or the whole response when `carry` is empty. A
+/// named field the response lacks is left out, so the node reads it as
+/// absent, the way the filters do.
+pub fn carried(response: &serde_json::Value, carry: &[String]) -> serde_json::Value {
+    if carry.is_empty() {
+        return response.clone();
+    }
+    let mut out = serde_json::Value::Object(serde_json::Map::new());
+    for path in carry {
+        let Some(found) = crate::access::spec::lookup_path(response, path) else { continue };
+        let mut at = &mut out;
+        let mut segments = path.split('.').peekable();
+        while let Some(segment) = segments.next() {
+            let serde_json::Value::Object(map) = at else { break };
+            if segments.peek().is_none() {
+                map.insert(segment.to_string(), found.clone());
+                break;
+            }
+            at = map.entry(segment.to_string()).or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        }
+    }
+    out
+}
+
 crate::register_signal_kind!(PollEndpoint);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fire carries only the named fields, each at its own path; an
+    /// empty list carries the whole answer, and a missing field is left out.
+    #[test]
+    fn a_fire_carries_only_the_named_fields() {
+        let answer = serde_json::json!({"status": "completed", "error": {"code": 3, "message": "x"}, "data": [1, 2, 3]});
+        assert_eq!(carried(&answer, &[]), answer);
+        assert_eq!(
+            carried(&answer, &["status".into(), "error.message".into(), "missing".into()]),
+            serde_json::json!({"status": "completed", "error": {"message": "x"}})
+        );
+        let mut delta = PollEndpoint { url: "https://example.com/x".into(), carry: vec!["status".into()], ..Default::default() };
+        delta.delta = Some(PollDelta { items: String::new(), cursor_field: None, mode: DeltaMode::default(), cursor_param: None });
+        assert!(delta.validate().unwrap_err().contains("carry"));
+    }
 
     #[test]
     fn default_interval_is_stable() {

@@ -124,6 +124,38 @@ async fn docker_pull(image_ref: &str) -> Result<bool> {
     if !image_ref.contains('/') {
         return Ok(false);
     }
+    let Err(reason) = pull_one(image_ref).await? else {
+        return Ok(true);
+    };
+    // Tags are a hash of the image's contents, so the same repo and tag
+    // in the published registry is the same image. A registry of one's
+    // own (an install's Artifact Registry) starts empty: when the release
+    // already published this exact image, copy it instead of building.
+    if let Some(published) = published_copy(image_ref)? {
+        if pull_one(&published).await?.is_ok() {
+            let status = docker().args(["tag", &published, image_ref]).status().await?;
+            anyhow::ensure!(status.success(), "docker tag {published} {image_ref} failed with {status}");
+            eprintln!("using the published {published} as {image_ref}");
+            return Ok(true);
+        }
+    }
+    eprintln!("pull {image_ref} unavailable ({reason}); building locally");
+    Ok(false)
+}
+
+/// The same image in the registry the release publishes to, when
+/// `image_ref` names another registry; `None` when it already is that one.
+fn published_copy(image_ref: &str) -> Result<Option<String>> {
+    if image_ref.starts_with(&format!("{DEFAULT_IMAGE_REGISTRY}/")) {
+        return Ok(None);
+    }
+    let (repo, tag) = ref_repo_tag(image_ref)?;
+    Ok(Some(qualified_ref_with(Some(DEFAULT_IMAGE_REGISTRY), repo, tag)))
+}
+
+/// One `docker pull`: `Err` carries docker's reason when the image is
+/// not there.
+async fn pull_one(image_ref: &str) -> Result<std::result::Result<(), String>> {
     eprintln!("pulling {image_ref}");
     let mut cmd = docker();
     cmd.arg("pull");
@@ -136,12 +168,10 @@ async fn docker_pull(image_ref: &str) -> Result<bool> {
         .await
         .map_err(|e| anyhow::anyhow!("docker not reachable on PATH: {e}"))?;
     if out.status.success() {
-        return Ok(true);
+        return Ok(Ok(()));
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let reason = stderr.lines().last().unwrap_or("unknown error").trim();
-    eprintln!("pull {image_ref} unavailable ({reason}); building locally");
-    Ok(false)
+    Ok(Err(stderr.lines().last().unwrap_or("unknown error").trim().to_string()))
 }
 
 /// `docker push`, loud on failure. Used by `weft build-images` (the
@@ -384,10 +414,8 @@ pub fn standard_worker_ref() -> Result<String> {
 }
 
 /// Make the standard worker exist under its ref (present, else pulled,
-/// else built FROM `base`, the builder base this process just ensured),
-/// and under its bare name too (`weft-worker:<hash>`), which is the name a
-/// local install's own builds look for, so a stock project's build finds
-/// it and compiles nothing.
+/// else built FROM `base`, the builder base this process just ensured).
+/// An install holds it under a name of its own ([`hold_standard_worker`]).
 async fn ensure_standard_worker(base: &str, rebuild: bool, suffix: Option<&str>) -> Result<String> {
     let image = standard_worker_ref()?;
     let target = suffixed_ref(&image, suffix);
@@ -406,15 +434,22 @@ async fn ensure_standard_worker(base: &str, rebuild: bool, suffix: Option<&str>)
         )?;
         docker_build_worker(&target, &build.build_context.join("Dockerfile"), &build.build_context, &[]).await?;
     }
-    if suffix.is_none() {
-        let (repo, tag) = ref_repo_tag(&image)?;
-        let bare = format!("{repo}:{tag}");
-        if bare != image && !image_present(&bare).await? {
-            let out = docker().args(["tag", &image, &bare]).output().await?;
-            anyhow::ensure!(out.status.success(), "docker tag {image} {bare}: {}", String::from_utf8_lossy(&out.stderr).trim());
-        }
-    }
     Ok(image)
+}
+
+/// Give `install` its own name for the standard worker `image`
+/// (`Install::local_image_ref`), the name its builds look for, so a stock
+/// project's build finds it and compiles nothing. The install records it
+/// and removes that name once a newer weft names another standard worker;
+/// the image goes with its last name.
+pub async fn hold_standard_worker(install: &weft_core::infra::Install, image: &str) -> Result<()> {
+    let (repo, tag) = ref_repo_tag(image)?;
+    let held = install.local_image_ref(&format!("{repo}:{tag}"));
+    if held != image && !image_present(&held).await? {
+        let out = docker().args(["tag", image, &held]).output().await?;
+        anyhow::ensure!(out.status.success(), "docker tag {image} {held}: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
 }
 
 /// One BuildKit record of a worker compile cache mount, as `docker
@@ -699,6 +734,33 @@ pub fn outside_current(current_ref: &str) -> Result<impl Fn(&str, &str) -> bool 
     Ok(move |r: &str, t: &str| r == repo && t != current)
 }
 
+/// The standard workers in `listing` other than the current one
+/// (`current_ref`). The standard worker is the one worker this host pulls
+/// or builds under a registry name, and each weft version names a new one,
+/// so every older one is dead. Only weft's own registry names go: the
+/// current ref's registry and the one the release publishes to (the copy
+/// it may have been tagged from), never another repository that happens to
+/// be called `weft-worker`. The current hash is current under any suffix
+/// (`<hash>-amd64`, the release's per-architecture halves): content hashes
+/// have one length, so no other hash starts with it. An install's own name
+/// for a worker (`Install::local_image_ref`) carries no registry, and that
+/// install reclaims it.
+pub fn stale_standard_workers(listing: &str, current_ref: &str) -> Result<Vec<String>> {
+    let (_, current) = ref_repo_tag(current_ref)?;
+    // With the registry disabled the current ref is bare, the default
+    // install's own name, and only the published registry is left to sweep.
+    let registry = current_ref.rsplit_once('/').map_or(DEFAULT_IMAGE_REGISTRY, |(registry, _)| registry);
+    let repos = [registry, DEFAULT_IMAGE_REGISTRY].map(|r| format!("{r}/{}:", weft_compiler::build::WORKER_IMAGE_REPO));
+    Ok(listing
+        .lines()
+        .map(str::trim)
+        .filter(|full| {
+            repos.iter().any(|repo| full.strip_prefix(repo.as_str()).is_some_and(|tag| !tag.is_empty() && !tag.starts_with(current)))
+        })
+        .map(str::to_string)
+        .collect())
+}
+
 /// Host `docker images` lines (one `repo:tag` per line) that a sweep
 /// may delete: those whose prefix-stripped `(repo, tag)` parse and
 /// satisfy `condemn`. THE host-side matcher (the runtime image, builder
@@ -761,6 +823,17 @@ mod tests {
         );
     }
 
+    /// An image wanted in another registry is looked for under the same
+    /// repo and tag in the published one.
+    #[test]
+    fn the_published_copy_is_the_same_repo_and_tag() {
+        assert_eq!(
+            published_copy("us-central1-docker.pkg.dev/p/weft/weft-runtime:abc").unwrap().as_deref(),
+            Some("ghcr.io/weavemindai/weft-runtime:abc")
+        );
+        assert_eq!(published_copy("ghcr.io/weavemindai/weft-runtime:abc").unwrap(), None);
+    }
+
     /// Unset means the default registry, blank means disabled, and a
     /// value is trimmed of whitespace and a trailing slash.
     #[test]
@@ -791,6 +864,35 @@ mod tests {
         // A digest-pinned ref would split into a "tag" no listing line
         // ever equals, condemning the whole repo; refused instead.
         assert!(ref_repo_tag("ghcr.io/weavemindai/weft-dispatcher@sha256:0011").is_err());
+    }
+
+    /// Only weft's registry names of older standard workers go: never the
+    /// current one under any suffix, never an install's own name, never
+    /// another repository called `weft-worker`.
+    #[test]
+    fn only_older_standard_workers_are_stale() {
+        let listing = "ghcr.io/weavemindai/weft-worker:now\nghcr.io/weavemindai/weft-worker:now-amd64\n\
+                       ghcr.io/weavemindai/weft-worker:old\nghcr.io/weavemindai/weft-worker:old-arm64\n\
+                       eu.gcr.io/p/weft-worker:older\neu.gcr.io/p/weft-worker:now\nweft-worker:project\n\
+                       localhost/weft-cell7/weft-worker:old\nsomeone/weft-worker:old\nghcr.io/other/weft-worker:old\n\
+                       ghcr.io/weavemindai/weft-runtime:old\n<none>:<none>\n";
+        assert_eq!(
+            stale_standard_workers(listing, "ghcr.io/weavemindai/weft-worker:now").unwrap(),
+            vec!["ghcr.io/weavemindai/weft-worker:old".to_string(), "ghcr.io/weavemindai/weft-worker:old-arm64".to_string()]
+        );
+        assert_eq!(
+            stale_standard_workers(listing, "eu.gcr.io/p/weft-worker:now").unwrap(),
+            vec![
+                "ghcr.io/weavemindai/weft-worker:old".to_string(),
+                "ghcr.io/weavemindai/weft-worker:old-arm64".to_string(),
+                "eu.gcr.io/p/weft-worker:older".to_string()
+            ]
+        );
+        assert_eq!(
+            stale_standard_workers(listing, "weft-worker:now").unwrap(),
+            vec!["ghcr.io/weavemindai/weft-worker:old".to_string(), "ghcr.io/weavemindai/weft-worker:old-arm64".to_string()],
+            "with the registry disabled, the published registry is the only one swept"
+        );
     }
 
     /// The host sweep must remove every other tag of a system repo

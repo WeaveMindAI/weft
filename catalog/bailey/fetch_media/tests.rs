@@ -4,7 +4,7 @@
 
 use serde_json::json;
 
-use weft::{FakeRig, NodeTest, WeftResult};
+use weft::{EndpointMethod, FakeRig, NodeTest, WeftResult};
 
 use super::BaileyFetchMediaNode;
 
@@ -16,13 +16,31 @@ pub fn tests() -> Vec<NodeTest> {
     ]
 }
 
+/// The bridge every case wires in: its `Infra` handle, declared on the
+/// rig so the node can resolve it.
+fn bridge(rig: &FakeRig) -> serde_json::Value {
+    rig.declare_infra("bridge", "api", "http://bridge.example:8090")
+}
+
+/// The bridge's next `/outputs` answer: the paired account media is
+/// stored under.
+fn answer_outputs(rig: &FakeRig) {
+    rig.answer_infra(
+        "bridge",
+        "api",
+        EndpointMethod::Get,
+        "/outputs",
+        json!({ "jid": "4915100000000@s.whatsapp.net", "status": "connected" }),
+    );
+}
+
 async fn pulls(rig: FakeRig) -> WeftResult<()> {
-    rig.respond("GET", "/outputs", json!({ "jid": "4915100000000@s.whatsapp.net", "status": "connected" }));
+    answer_outputs(&rig);
     rig.respond_raw("GET", "/media/wa-42", 200, "audio/ogg", b"OggS".to_vec());
     let outcome = rig
         .run(
             &BaileyFetchMediaNode,
-            json!({ "endpointUrl": "http://bridge.example:8090", "messageId": "wa-42" }),
+            json!({ "bridge": bridge(&rig), "messageId": "wa-42" }),
         )
         .await
         .ok()?;
@@ -40,9 +58,12 @@ async fn pulls(rig: FakeRig) -> WeftResult<()> {
 /// that wants the same voice note gets the file the first one stored:
 /// same key, and the bridge is not asked again.
 async fn once(rig: FakeRig) -> WeftResult<()> {
-    rig.respond("GET", "/outputs", json!({ "jid": "4915100000000@s.whatsapp.net", "status": "connected" }));
+    // Each run asks the bridge which account it holds; only the first
+    // pulls the bytes.
+    answer_outputs(&rig);
+    answer_outputs(&rig);
     rig.respond_raw("GET", "/media/wa-7", 200, "audio/ogg", b"OggS".to_vec());
-    let input = json!({ "endpointUrl": "http://bridge.example:8090", "messageId": "wa-7" });
+    let input = json!({ "bridge": bridge(&rig), "messageId": "wa-7" });
     let first = rig.run(&BaileyFetchMediaNode, input.clone()).await.ok()?;
     let second = rig.run(&BaileyFetchMediaNode, input).await.ok()?;
     assert_eq!(first.outputs["file"], second.outputs["file"], "one file, whichever run asked");
@@ -52,12 +73,12 @@ async fn once(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn gone(rig: FakeRig) -> WeftResult<()> {
-    rig.respond("GET", "/outputs", json!({ "jid": "4915100000000@s.whatsapp.net", "status": "connected" }));
+    answer_outputs(&rig);
     rig.respond_raw("GET", "/media/wa-0", 404, "text/plain", b"no such message".to_vec());
     let err = rig
         .run(
             &BaileyFetchMediaNode,
-            json!({ "endpointUrl": "http://bridge.example:8090", "messageId": "wa-0" }),
+            json!({ "bridge": bridge(&rig), "messageId": "wa-0" }),
         )
         .await
         .result

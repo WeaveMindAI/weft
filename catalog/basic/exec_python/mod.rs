@@ -58,6 +58,17 @@
 //!   keys, a string on a number port). `error` is weft's, so a script
 //!   that wants to fail on purpose raises.
 //!
+//! - A cancelled run stops its script. Python offers one way to stop
+//!   code running on another thread: `PyThreadState_SetAsyncExc`
+//!   raises an exception in that thread at its next bytecode. The
+//!   script's thread records its id in an [`Interrupt`] while it runs,
+//!   and the guard the node body holds raises `KeyboardInterrupt` there
+//!   when the body ends early (the run was cancelled, or the engine
+//!   dropped the body). A script inside one long C call (a `time.sleep`,
+//!   a blocking socket read) stops when that call returns, the earliest
+//!   moment Python checks. `KeyboardInterrupt` is outside `Exception`,
+//!   so a script's `except Exception` does not swallow it.
+//!
 //! Isolation: the worker the node runs in IS the isolation boundary;
 //! the Python executes there with the same access that worker already
 //! has, and is not sandboxed further. Running a project therefore runs
@@ -70,6 +81,8 @@ use pyo3::types::{PyBool, PyDict, PyFloat, PyList, PyString};
 use pyo3::ToPyObject;
 use serde_json::{Map, Number, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use weft::node::NodeOutput;
 use weft::storage::media::{media_slots, substitute_media};
@@ -124,9 +137,16 @@ impl Node for ExecPythonNode {
         // PyO3 needs the GIL which it acquires on whatever sync
         // thread we call from. Hop off the async executor for the
         // blocking call so we don't stall other node invocations.
-        let result = tokio::task::spawn_blocking(move || run_python(&code, inputs))
-            .await
-            .node_err("ExecPython blocking task panicked")??;
+        // `_stop` interrupts the script when this body ends before it
+        // does (see the module doc).
+        let interrupt = Arc::new(Interrupt::default());
+        let _stop = StopOnDrop(interrupt.clone());
+        let task = tokio::task::spawn_blocking(move || run_python(&code, inputs, &interrupt));
+        let cancel = ctx.cancellation();
+        let result = tokio::select! {
+            err = cancel.cancelled_err() => return Err(err),
+            joined = task => joined.node_err("ExecPython blocking task panicked")??,
+        };
 
         // Check the whole answer before anything goes out, so a wrong
         // key or type refuses the firing as the program mistake it is
@@ -250,7 +270,7 @@ fn wrap_files(value: &Value, ty: &WeftType) -> WeftResult<Value> {
 /// answer that is not a dict of plain values is a type error (both are
 /// the program's own mistakes), and an exception the script raises while
 /// it runs is a node failure, the one kind `error` catches.
-fn run_python(code: &str, inputs: Vec<(String, Value)>) -> WeftResult<Vec<(String, Value)>> {
+fn run_python(code: &str, inputs: Vec<(String, Value)>, interrupt: &Interrupt) -> WeftResult<Vec<(String, Value)>> {
     Python::with_gil(|py| -> WeftResult<Vec<(String, Value)>> {
         // Build the wrapper source once per call. Wrapping in a
         // function lets the user write `return {...}` naturally.
@@ -283,8 +303,8 @@ fn run_python(code: &str, inputs: Vec<(String, Value)>) -> WeftResult<Vec<(Strin
             args.append(py_val)
                 .map_err(|err| node_error(format!("building the argument list: {}", python_error(py, &err))))?;
         }
-        let ret = user_fn
-            .call1(args.to_tuple())
+        let ret = interrupt
+            .run(py, || user_fn.call1(args.to_tuple()))?
             .map_err(|err| node_error(format!("the script raised {}", python_error(py, &err))))?;
 
         // Falling off the end, a bare `return` and `return None` are one
@@ -319,6 +339,85 @@ fn run_python(code: &str, inputs: Vec<(String, Value)>) -> WeftResult<Vec<(Strin
         }
         Ok(out)
     })
+}
+
+/// The thread a script runs on, for stopping it from another thread
+/// (see the module doc). `thread` is the Python thread id while the
+/// script runs and 0 otherwise; it is only written with the GIL held,
+/// so a reader holding the GIL sees the script either running or done.
+#[derive(Default)]
+struct Interrupt {
+    thread: AtomicU64,
+    stopped: AtomicBool,
+}
+
+impl Interrupt {
+    /// Run the script's call on this thread, stoppable by [`Self::stop_now`].
+    /// `Err(Cancelled)` when the stop came first or interrupted it.
+    fn run<T>(&self, py: Python<'_>, call: impl FnOnce() -> PyResult<T>) -> WeftResult<PyResult<T>> {
+        let ident: u64 = py
+            .import_bound("threading")
+            .and_then(|threading| threading.call_method0("get_ident"))
+            .and_then(|ident| ident.extract())
+            .map_err(|err| node_error(format!("reading the script's thread id: {}", python_error(py, &err))))?;
+        // Written before `stopped` is read (see `StopOnDrop`).
+        self.thread.store(ident, Ordering::SeqCst);
+        if self.stopped.load(Ordering::SeqCst) {
+            self.thread.store(0, Ordering::SeqCst);
+            return Err(WeftError::Cancelled);
+        }
+        let out = call();
+        self.thread.store(0, Ordering::SeqCst);
+        // A stop that landed after the script's last bytecode is still
+        // pending on this thread's state, and the next script this
+        // pooled thread runs would raise it: clear it.
+        // SAFETY: the GIL is held (`py`); a null exception clears.
+        unsafe { pyo3::ffi::PyThreadState_SetAsyncExc(ident as std::os::raw::c_long, std::ptr::null_mut()) };
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(WeftError::Cancelled);
+        }
+        Ok(out)
+    }
+
+    /// Stop the script: one that has not started never starts, one that
+    /// runs raises `KeyboardInterrupt` at its next bytecode. Takes the
+    /// GIL, so it waits for the script's thread to hand it over (Python
+    /// does every few milliseconds): never call it on the async executor.
+    fn stop_now(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        Python::with_gil(|_py| {
+            let ident = self.thread.load(Ordering::SeqCst);
+            if ident != 0 {
+                // SAFETY: the GIL is held, and `PyExc_KeyboardInterrupt`
+                // is a static the interpreter owns. The id is Python's
+                // unsigned thread id, which this binding takes as signed.
+                unsafe {
+                    pyo3::ffi::PyThreadState_SetAsyncExc(
+                        ident as std::os::raw::c_long,
+                        pyo3::ffi::PyExc_KeyboardInterrupt,
+                    )
+                };
+            }
+        });
+    }
+}
+
+/// Stops the script when the node body ends, whichever way it ends: a
+/// script that already finished is untouched.
+struct StopOnDrop(Arc<Interrupt>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        // Written before `thread` is read, and the script's thread writes
+        // `thread` before reading this: whichever runs second sees the
+        // other, so a script that has not started yet never starts.
+        self.0.stopped.store(true, Ordering::SeqCst);
+        if self.0.thread.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        let interrupt = self.0.clone();
+        tokio::task::spawn_blocking(move || interrupt.stop_now());
+    }
 }
 
 /// A Python object's type name, for a message.

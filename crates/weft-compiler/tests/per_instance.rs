@@ -31,9 +31,9 @@ bridge = BaileyBridge {
   @per_instance
 }
 receive = BaileyReceive
-receive.endpointUrl = bridge.endpointUrl
+receive.bridge = bridge.bridge
 reply = BaileySend { message: "hi" }
-reply.endpointUrl = bridge.endpointUrl
+reply.bridge = bridge.bridge
 reply.to = receive.from
 log = Debug
 log.data = receive.content

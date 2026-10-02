@@ -1,7 +1,7 @@
 {
   "type": "AirtableUpdateRecord",
   "label": "Airtable: Update Record",
-  "description": "Change some of a record's fields; fields you don't name keep their values.",
+  "description": "Change some fields of an Airtable record; unnamed fields keep their values.",
   "tags": [
     "airtable",
     "record",
@@ -96,9 +96,6 @@
       "name": "typecast",
       "type": "Boolean",
       "default": true,
-      "widget": {
-        "kind": "checkbox"
-      },
       "label": "Typecast values",
       "description": "Let Airtable coerce strings into selects, dates, collaborators, and links."
     }

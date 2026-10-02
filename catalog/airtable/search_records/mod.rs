@@ -30,8 +30,7 @@ impl Node for AirtableSearchRecordsNode {
         let table: String = ctx.inputs.get("table")?;
         let formula: Option<String> = ctx.inputs.opt("filterByFormula")?;
         let view: Option<String> = ctx.inputs.opt("view")?;
-        let max: f64 = ctx.inputs.get("maxRecords")?;
-        let max = (max as usize).clamp(1, 1000);
+        let max = ctx.inputs.get::<f64>("maxRecords")? as usize;
 
         let base = checked_id(&base, "base id")?;
         let table = checked_id(&table, "table")?;

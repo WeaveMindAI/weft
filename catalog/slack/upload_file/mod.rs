@@ -13,6 +13,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use weft::access::client::{checked_send, required_str};
 use weft::node::NodeOutput;
 use weft::storage::{FileHandle, StorageScope};
 use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
@@ -49,10 +50,10 @@ impl Node for SlackUploadFileNode {
         // stored file's real name; `title` is only the display name on
         // the finished share.
         let display_title = title.clone().unwrap_or_else(|| meta.filename.clone());
+        let client = ctx.client(&access).await?;
 
         let minted = api::get(
-            &ctx,
-            &access,
+            &client,
             "files.getUploadURLExternal",
             &[
                 ("filename", meta.filename.clone()),
@@ -60,19 +61,10 @@ impl Node for SlackUploadFileNode {
             ],
         )
         .await?;
-        let upload_url = api::required_str(&minted, "files.getUploadURLExternal", "upload_url")?;
-        let file_id = api::required_str(&minted, "files.getUploadURLExternal", "file_id")?.to_string();
+        let upload_url = required_str(&minted, "files.getUploadURLExternal", "upload_url")?;
+        let file_id = required_str(&minted, "files.getUploadURLExternal", "file_id")?.to_string();
 
-        let resp = ctx
-            .http()
-            .post(upload_url)
-            .body(bytes)
-            .send()
-            .await
-            .node_err("slack: upload bytes")?;
-        if !resp.status().is_success() {
-            weft::node_bail!("slack's upload endpoint answered {}", resp.status());
-        }
+        checked_send(ctx.http().post(upload_url).body(bytes), "upload the bytes to slack").await?;
 
         let mut complete = json!({
             "files": [{ "id": file_id, "title": display_title }],
@@ -85,7 +77,7 @@ impl Node for SlackUploadFileNode {
             complete["initial_comment"] = json!(c);
         }
         let answer =
-            api::call(&ctx, &access, "files.completeUploadExternal", complete).await?;
+            api::call(&client, "files.completeUploadExternal", complete).await?;
         // The metadata promises "a link to the shared file": a
         // completed share answering without one is a broken contract,
         // not an empty string downstream posts as a dead link.

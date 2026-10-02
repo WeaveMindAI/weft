@@ -1,7 +1,7 @@
 {
   "type": "NotionAccess",
   "label": "Notion Access",
-  "description": "Connect a Notion workspace: sign in through Notion's consent page (picking which pages the connection can see), or paste an internal integration token. Wire the access output into every Notion node.",
+  "description": "Connect a Notion workspace, through Notion's consent page (choosing which pages it can see) or an internal integration token.",
   "tags": [
     "notion",
     "access"
@@ -97,7 +97,7 @@
     {
       "name": "access",
       "type": "Access",
-      "description": "The Notion access: wire it into the Notion nodes."
+      "description": "Wire into the Notion nodes."
     }
   ]
 }

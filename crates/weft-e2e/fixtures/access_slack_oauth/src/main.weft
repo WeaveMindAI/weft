@@ -4,7 +4,7 @@
 # before any Slack call is made.
 
 ws = SlackAccess
-send = SlackSendMessage { text: "never sent" }
+send = SlackSendMessage { channel: "C000", text: "never sent" }
 send.account = ws.access
 
 out = Debug

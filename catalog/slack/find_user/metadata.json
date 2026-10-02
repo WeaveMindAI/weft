@@ -1,7 +1,7 @@
 {
   "type": "SlackFindUser",
   "label": "Slack: Find User",
-  "description": "Resolve a person to their Slack identity: by email (bridge a CRM/ticket contact to a Slack user for DMs) or by user id (turn an event's bare U... into a name and profile). Exactly one of the two keys.",
+  "description": "Looks up a Slack user by email (e.g. a CRM contact to DM) or by user id (turn an event's U... into a name and profile); give exactly one.",
   "tags": [
     "slack",
     "user",
@@ -17,7 +17,7 @@
       "requiresScopes": [
         "users:read"
       ],
-      "description": "The Slack access (wire a SlackAccess node). Needs users:read; email lookup also needs users:read.email."
+      "description": "Needs users:read; email lookup also needs users:read.email."
     },
     {
       "name": "email",
@@ -36,22 +36,22 @@
     {
       "name": "id",
       "type": "String",
-      "description": "The user's Slack id (U...)."
+      "description": "Slack user id (U...)."
     },
     {
       "name": "name",
       "type": "String",
-      "description": "Display name (falls back to real name)."
+      "description": "Display name, else real name."
     },
     {
       "name": "email",
       "type": "String",
-      "description": "The profile email (empty without users:read.email)."
+      "description": "Profile email (empty without users:read.email)."
     },
     {
       "name": "timezone",
       "type": "String",
-      "description": "The user's timezone, e.g. Europe/Paris."
+      "description": "E.g. Europe/Paris."
     },
     {
       "name": "user",
@@ -60,6 +60,35 @@
     }
   ],
   "features": {
-    "catchErrors": true
-  }
+    "catchErrors": true,
+    "oneOfRequired": [
+      [
+        "email",
+        "id"
+      ]
+    ]
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_satisfied",
+            "port": "email"
+          },
+          {
+            "kind": "input_satisfied",
+            "port": "id"
+          }
+        ]
+      },
+      "then": {
+        "message": "SlackFindUser '{id}' has both `email` and `id`. Keep the one you want to look the user up by and remove the other.",
+        "level": "structural",
+        "severity": "error",
+        "field": "id"
+      }
+    }
+  ]
 }

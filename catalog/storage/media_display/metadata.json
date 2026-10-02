@@ -1,7 +1,7 @@
 {
   "type": "MediaDisplay",
   "label": "Media Display",
-  "description": "Show a stored image, audio clip, or video inline in the graph: images render in place, audio and video get a real player, and a save button sits below. A display sink; it emits nothing.",
+  "description": "Show a stored image, audio clip or video inline in the graph editor, with a player for audio and video and a save button. Emits nothing.",
   "tags": [
     "storage",
     "media",
@@ -18,11 +18,10 @@
       "name": "media",
       "type": "Image | Audio | Video",
       "required": true,
-      "description": "The stored media to show inline."
+      "description": "Stored media to show."
     }
   ],
   "outputs": [],
-  "requires_infra": false,
   "display": {
     "kind": "media",
     "input": "media"

@@ -1,7 +1,7 @@
 {
   "type": "AirtableAccess",
   "label": "Airtable Access",
-  "description": "Connect an Airtable account: sign in through Airtable's consent page (picking which bases the connection can reach), or paste a personal access token. Wire the access output into every Airtable node.",
+  "description": "Connect an Airtable account, through Airtable's consent page (choosing which bases it can reach) or a personal access token.",
   "tags": [
     "airtable",
     "access"
@@ -103,7 +103,7 @@
     {
       "name": "access",
       "type": "Access",
-      "description": "The Airtable access: wire it into the Airtable nodes."
+      "description": "Wire into the Airtable nodes."
     }
   ]
 }

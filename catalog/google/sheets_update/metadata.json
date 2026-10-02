@@ -1,7 +1,7 @@
 {
   "type": "GoogleSheetsUpdate",
   "label": "Google Sheets: Update Row",
-  "description": "Overwrite one row, addressed by its sheet row number (from Append Row, Lookup, or the New Row trigger) or by an explicit A1 range. Pass an object keyed by header column names or a plain list of cells.",
+  "description": "Overwrites one row of a Google Sheets tab, addressed by row number (from Append, Lookup or the New Row trigger) or an A1 range, with an object keyed by header names or a list of cells.",
   "tags": [
     "google",
     "sheets",
@@ -17,7 +17,7 @@
       "requiresScopes": [
         "https://www.googleapis.com/auth/drive.file"
       ],
-      "description": "A Google account with write access to the sheet (the picker grant covers the file it picked)."
+      "description": "Needs write access to the sheet; the picker grant covers the file it picked."
     },
     {
       "name": "spreadsheet",
@@ -64,7 +64,6 @@
     {
       "name": "tab",
       "type": "String",
-      "default": "0",
       "widget": {
         "kind": "remote_select",
         "access": "account",
@@ -89,19 +88,20 @@
         ]
       },
       "label": "Tab",
-      "placeholder": "Pick a tab, or paste a link with #gid="
+      "placeholder": "Pick a tab, or paste a link with #gid=",
+      "description": "The tab to use. Empty: the first tab, whatever its id."
     },
     {
       "name": "row",
       "type": "JsonDict | List[String]",
       "required": true,
-      "description": "The replacement row: an object keyed by header column names, or a plain list of cells in order."
+      "description": "An object keyed by header column names, or a list of cells in order."
     },
     {
       "name": "rowNumber",
       "type": "Number",
       "label": "Row number",
-      "description": "The 1-based sheet row to overwrite (exactly one of rowNumber / range).",
+      "description": "1-based sheet row (exactly one of rowNumber / range).",
       "widget": {
         "kind": "number",
         "min": 1,
@@ -113,15 +113,12 @@
       "type": "String",
       "label": "Range",
       "placeholder": "B2:D2",
-      "description": "An A1 range inside the tab to write instead of a whole row (exactly one of rowNumber / range)."
+      "description": "A1 range inside the tab (exactly one of rowNumber / range)."
     },
     {
       "name": "hasHeader",
       "type": "Boolean",
       "default": true,
-      "widget": {
-        "kind": "checkbox"
-      },
       "label": "First row is a header",
       "description": "Needed to order an object row's columns."
     }
@@ -133,6 +130,35 @@
     }
   ],
   "features": {
-    "catchErrors": true
-  }
+    "catchErrors": true,
+    "oneOfRequired": [
+      [
+        "rowNumber",
+        "range"
+      ]
+    ]
+  },
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_satisfied",
+            "port": "rowNumber"
+          },
+          {
+            "kind": "input_satisfied",
+            "port": "range"
+          }
+        ]
+      },
+      "then": {
+        "message": "GoogleSheetsUpdate '{id}' has both `rowNumber` and `range`. Keep `rowNumber` to write one row, or `range` to write at an A1 address, and remove the other.",
+        "level": "structural",
+        "severity": "error",
+        "field": "range"
+      }
+    }
+  ]
 }

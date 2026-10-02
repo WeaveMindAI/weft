@@ -1,7 +1,7 @@
 {
   "type": "BaileyPresence",
   "label": "WhatsApp Presence (Baileys)",
-  "description": "Show a presence state in a chat (typing, recording, online, offline) via the project's bridge. Send `composing` before a long-running reply so the other side sees typing dots.",
+  "description": "Show a WhatsApp presence state in a chat (typing, recording, online, offline). Send `composing` before a slow reply so the other side sees typing dots.",
   "tags": [
     "whatsapp",
     "baileys",
@@ -12,9 +12,10 @@
   "color": "#25D366",
   "inputs": [
     {
-      "name": "endpointUrl",
-      "type": "String",
-      "required": true
+      "name": "bridge",
+      "type": "Infra",
+      "required": true,
+      "description": "The `bridge` output of the BaileyBridge node to talk through."
     },
     {
       "name": "chatId",
@@ -45,6 +46,5 @@
   ],
   "features": {
     "catchErrors": true
-  },
-  "requires_infra": false
+  }
 }

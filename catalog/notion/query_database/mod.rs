@@ -29,8 +29,7 @@ impl Node for NotionQueryDatabaseNode {
         let source: Option<String> = ctx.inputs.opt("source")?;
         let filter = ctx.inputs.raw("filter").cloned();
         let sorts = ctx.inputs.raw("sorts").cloned();
-        let limit: f64 = ctx.inputs.get("limit")?;
-        let limit = (limit as usize).clamp(1, 1000);
+        let limit = ctx.inputs.get::<f64>("limit")? as usize;
 
         let http = ctx.client(&account).await?;
         let source = data_source_id(&http, &database, source.as_deref()).await?;

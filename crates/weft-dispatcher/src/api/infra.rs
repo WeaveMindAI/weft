@@ -137,7 +137,15 @@ pub(crate) fn resolve_infra_nodes(
     let mut out = std::collections::BTreeSet::new();
     for node in nodes {
         if !declared.contains(node) {
-            return Err((StatusCode::NOT_FOUND, format!("'{node}' is no infra node of this program")));
+            // A node inside a group or an included file written by its
+            // short name: name the full spelling it most likely meant.
+            let suffix = format!(".{node}");
+            let meant: Vec<String> = declared.iter().filter(|d| d.ends_with(&suffix)).map(|d| format!("'{d}'")).collect();
+            let hint = if meant.is_empty() { String::new() } else { format!(" (did you mean {}?)", meant.join(" or ")) };
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("'{node}' is no infra node of this program{hint}; name it the way the program writes it (`work.{node}` inside a group, `one.{node}` inside an included file)"),
+            ));
         }
         match (per_instance_of(node), instance) {
             (true, None) => {
@@ -1264,11 +1272,12 @@ pub(crate) async fn press_live(
     payload: &serde_json::Value,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     let endpoint_url = live_endpoint_url(state, id, node, instance).await?;
-    let action_url = format!("{}/action", endpoint_url.trim_end_matches('/'));
+    use weft_core::infra::action::{action_request, ACTION_PATH};
+    let action_url = format!("{}{ACTION_PATH}", endpoint_url.trim_end_matches('/'));
     let resp = state
         .http
         .post(&action_url)
-        .json(&serde_json::json!({ "action": kind, "payload": payload }))
+        .json(&action_request(kind, payload.clone()))
         .send()
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("action send: {e}")))?;
@@ -1304,28 +1313,23 @@ pub(crate) async fn press_live(
     .await;
     let answer = serde_json::from_str::<serde_json::Value>(&text)
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("action parse: {e}")))?;
-    infra_action_result(kind, answer)
+    press_answer(kind, answer)
 }
 
-/// The `result` of a container's `/action` answer, or the refusal it
-/// carried (`result.error`) as a 400 naming the action. An answer with
-/// no `result` at all is not the envelope: a container that answered
-/// 200 with something else is reported as such (502), never read as an
-/// action that succeeded with nothing to say.
-fn infra_action_result(
-    kind: &str,
-    answer: serde_json::Value,
-) -> Result<serde_json::Value, (StatusCode, String)> {
-    let Some(result) = answer.get("result").cloned() else {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            format!("{kind}: the container answered without a `result` envelope: {answer}"),
-        ));
-    };
-    if let Some(err) = result.get("error").and_then(|e| e.as_str()) {
-        return Err((StatusCode::BAD_REQUEST, format!("{kind}: {err}")));
-    }
-    Ok(result)
+/// The `result` of a container's action answer, read by the one reader
+/// every action goes through (`weft_core::infra::action`), with the
+/// failure as the editor's answer: the refusal the container carried
+/// (`result.error`) is the caller's, a 400 naming the action; an answer
+/// that is not the envelope at all is the container's fault, a 502.
+fn press_answer(kind: &str, answer: serde_json::Value) -> Result<serde_json::Value, (StatusCode, String)> {
+    use weft_core::infra::action::{action_result, ActionFailure};
+    action_result(kind, answer).map_err(|failure| {
+        let code = match failure {
+            ActionFailure::Refused { .. } => StatusCode::BAD_REQUEST,
+            ActionFailure::NotEnvelope { .. } => StatusCode::BAD_GATEWAY,
+        };
+        (code, failure.to_string())
+    })
 }
 
 /// The URL of the endpoint an infra node names as serving `/live` (and
@@ -1941,11 +1945,11 @@ mod tests {
     }
 
     #[test]
-    fn an_action_answer_is_its_result_or_the_refusal_it_carried() {
-        use super::infra_action_result;
-        let ok = infra_action_result("logout", serde_json::json!({ "result": { "success": true } })).unwrap();
+    fn a_pressed_actions_failure_is_the_callers_or_the_containers() {
+        use super::press_answer;
+        let ok = press_answer("logout", serde_json::json!({ "result": { "success": true } })).unwrap();
         assert_eq!(ok, serde_json::json!({ "success": true }));
-        let (status, msg) = infra_action_result(
+        let (status, msg) = press_answer(
             "logout",
             serde_json::json!({ "result": { "error": "WhatsApp not connected" } }),
         )
@@ -1953,7 +1957,7 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(msg, "logout: WhatsApp not connected");
         // No `result` at all is not the envelope: reported, never read as success.
-        let (status, msg) = infra_action_result("x", serde_json::json!({ "ok": true })).unwrap_err();
+        let (status, msg) = press_answer("x", serde_json::json!({ "ok": true })).unwrap_err();
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(msg.contains("without a `result` envelope"), "{msg}");
     }

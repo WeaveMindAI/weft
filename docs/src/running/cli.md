@@ -314,4 +314,10 @@ when needed and ignored otherwise.
 | `weft connect --forget <id>` | A stored connection. Other projects using it then fail at run time asking for a reconnect |
 
 Worker images are shared between projects, so no level of `weft rm` reclaims
-them. `weft clean --images` is what does.
+them. `weft clean --images` is what does, and `weft clean --images --all` also
+removes every older builder base, runtime and standard worker image left by
+earlier weft versions. You only need it by hand for those: the runtime already
+reclaims the images no project uses when it starts and every six hours. A
+local install also holds the docker build cache to 20 GB at the same times
+(and `./setup.sh` does on every install), dropping what was used least
+recently first.

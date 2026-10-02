@@ -26,11 +26,11 @@ impl Node for SendEmailNode {
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
-        let to: String = ctx.inputs.get("to")?;
+        let to = weft::comma_list(ctx.inputs.list::<String>("to")?);
         let subject: String = ctx.inputs.get("subject")?;
         let body: String = ctx.inputs.get("body")?;
-        let cc: Option<String> = ctx.inputs.opt("cc")?;
-        let bcc: Option<String> = ctx.inputs.opt("bcc")?;
+        let cc = weft::comma_list(ctx.inputs.list::<String>("cc")?);
+        let bcc = weft::comma_list(ctx.inputs.list::<String>("bcc")?);
         let reply_to: Option<String> = ctx.inputs.opt("replyToMessageId")?;
 
         let conn = ctx.open(&account).await?;
@@ -39,13 +39,13 @@ impl Node for SendEmailNode {
         let mut builder = Message::builder()
             .from(mailbox(&server.sender, "the connection's send-as address")?)
             .subject(subject);
-        for addr in list(&to) {
+        for addr in &to {
             builder = builder.to(mailbox(addr, "a To address")?);
         }
-        for addr in cc.as_deref().map(list).unwrap_or_default() {
+        for addr in &cc {
             builder = builder.cc(mailbox(addr, "a Cc address")?);
         }
-        for addr in bcc.as_deref().map(list).unwrap_or_default() {
+        for addr in &bcc {
             builder = builder.bcc(mailbox(addr, "a Bcc address")?);
         }
         if let Some(id) = reply_to.filter(|s| !s.trim().is_empty()) {
@@ -63,12 +63,15 @@ impl Node for SendEmailNode {
             .unwrap_or_default()
             .to_string();
 
-        // 587 is the STARTTLS submission port; everything else
-        // (465, a custom port) speaks TLS from the first byte.
-        let transport = if server.port == 587 {
-            AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&server.host)
-        } else {
+        // 465 is the one implicit-TLS port (RFC 8314): TLS from the
+        // first byte. Every other port (587 submission, 25 relay, 2525
+        // and other custom ones) opens in plain text and upgrades with
+        // STARTTLS, which lettre requires, so the session is never
+        // left unencrypted.
+        let transport = if server.port == IMPLICIT_TLS_PORT {
             AsyncSmtpTransport::<Tokio1Executor>::relay(&server.host)
+        } else {
+            AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&server.host)
         }
         .map_err(|e| weft::WeftError::NodeExecution(format!("the SMTP server address is unusable: {e}")))?
         .port(server.port)
@@ -84,10 +87,8 @@ impl Node for SendEmailNode {
     }
 }
 
-/// A comma-separated address list's non-empty entries.
-fn list(s: &str) -> Vec<&str> {
-    s.split(',').map(str::trim).filter(|a| !a.is_empty()).collect()
-}
+/// The SMTP port that speaks TLS from the first byte (RFC 8314).
+const IMPLICIT_TLS_PORT: u16 = 465;
 
 fn mailbox(addr: &str, what: &str) -> WeftResult<Mailbox> {
     addr.parse()

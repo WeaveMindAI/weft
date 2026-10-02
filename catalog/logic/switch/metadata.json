@@ -1,7 +1,7 @@
 {
   "type": "Switch",
   "label": "Switch",
-  "description": "Pick a branch by testing a value: each case names an output port and the test the value has to pass, and exactly one of them emits true while the rest close. Wire the port a case names into the `_should_flow` of whatever that branch runs. A case's kind IS its test: `equals`, `in`, `contains`, `matches` (a regular expression), `gt` / `gte` / `lt` / `lte`, `between` for a range, and `otherwise` for everything the cases above did not catch, which goes last.",
+  "description": "Pick one branch by testing a value: each case names an output port and a test; exactly one port emits true, the rest close. Wire each port into its branch's `_should_flow`. Test kinds: `equals`, `in`, `contains`, `matches` (a regular expression), `gt` / `gte` / `lt` / `lte`, `between` for a range, and `otherwise` for everything the cases above did not catch, which goes last.",
   "tags": [
     "flow",
     "switch",
@@ -240,6 +240,5 @@
         "field": "cases"
       }
     }
-  ],
-  "requires_infra": false
+  ]
 }

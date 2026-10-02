@@ -1,7 +1,7 @@
 {
   "type": "BaileyBridge",
   "label": "WhatsApp Bridge (Baileys)",
-  "description": "Provision a per-project WhatsApp bridge (Baileys + WhatsApp Web). Connect with a phone via QR code on first start; the bridge persists its auth state on a disk so subsequent starts reuse the session.",
+  "description": "WhatsApp bridge (Baileys over WhatsApp Web) that every other WhatsApp node talks to through its `bridge` output. Pair a phone by QR code on first start; the session is kept on disk, so later starts reuse it.",
   "tags": [
     "whatsapp",
     "baileys",
@@ -13,8 +13,9 @@
   "inputs": [],
   "outputs": [
     {
-      "name": "endpointUrl",
-      "type": "String"
+      "name": "bridge",
+      "type": "Infra",
+      "description": "The bridge's handle. Wire it into the `bridge` input of every other WhatsApp node."
     },
     {
       "name": "status",

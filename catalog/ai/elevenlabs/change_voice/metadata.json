@@ -83,9 +83,6 @@
       "name": "removeBackgroundNoise",
       "type": "Boolean",
       "default": false,
-      "widget": {
-        "kind": "checkbox"
-      },
       "label": "Remove background noise",
       "description": "Clean the recording before re-voicing."
     }

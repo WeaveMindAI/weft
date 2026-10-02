@@ -1,7 +1,7 @@
 {
   "type": "HmacAuth",
   "label": "HMAC Auth",
-  "description": "Gate a Route with a shared secret the caller signs each request with. Store the secret on the connection; the caller sends `X-Timestamp: <unix seconds>` and `X-Signature: <hex hmac-sha256 of \"<timestamp>.<raw body>\" under the secret>`, the gateway recomputes it before a run starts (a timestamp more than five minutes off is refused as a replay). The trigger's `caller` port is `{}`: the scheme proves the secret, not a person. A different signing scheme is a new access node with its own `verify` block. Wire the access output into the trigger's `auth` input.",
+  "description": "Gate a Route with a shared secret the caller signs each request with, typical for webhooks. The caller sends `X-Timestamp: <unix seconds>` and `X-Signature: <hex HMAC-SHA256 of \"<timestamp>.<raw body>\" under the secret>`; a timestamp more than five minutes off is refused as a replay. `caller` is `{}`. Another signing scheme needs its own access node with its own `verify` block.",
   "tags": [
     "api",
     "auth",
@@ -47,8 +47,7 @@
     {
       "name": "access",
       "type": "Access",
-      "description": "The signing secret: wire it into a Route's `auth` input."
+      "description": "Wire into a Route's `auth`."
     }
-  ],
-  "requires_infra": false
+  ]
 }

@@ -27,12 +27,12 @@ impl Node for GoogleSheetsAppendNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
         let id: String = ctx.inputs.get("spreadsheet")?;
-        let gid: String = ctx.inputs.get("tab")?;
+        let gid: Option<String> = ctx.inputs.opt("tab")?;
         let row: Value = ctx.inputs.get("row")?;
         let has_header: bool = ctx.inputs.get("hasHeader")?;
 
         let http = ctx.client(&account).await?;
-        let title = tab_title(&http, &id, &gid).await?;
+        let title = tab_title(&http, &id, gid.as_deref()).await?;
         let headers = header_for_row(&http, &id, &title, &row, has_header).await?;
         let cells = row_to_cells(&row, headers.as_deref())?;
 

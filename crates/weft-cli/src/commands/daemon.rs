@@ -433,6 +433,11 @@ async fn remove_container(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether `docker start`'s error says the container's network is gone.
+fn stale_network(stderr: &str) -> bool {
+    stderr.contains("network") && stderr.contains("not found")
+}
+
 async fn ensure_network() -> Result<()> {
     if images::docker().args(["network", "inspect", NETWORK]).output().await?.status.success() {
         return Ok(());
@@ -462,8 +467,19 @@ async fn ensure_container(name: &str, args: &[String], stamp_dir: &Path, publish
         Some(s) if current && s == "running" => return Ok(()),
         Some(_) if current => {
             refuse_taken_ports(published.as_slice()).await?;
-            docker_ok(&["start", name], &format!("docker start {name}")).await?;
-            return Ok(());
+            let out = images::docker().args(["start", name]).output().await?;
+            if out.status.success() {
+                return Ok(());
+            }
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // A stopped container keeps the id of the network it was
+            // attached to; when Docker's networks are made again (a Docker
+            // or WSL reset, a moved disk) that id is gone and the container
+            // can never start. Its state lives in named volumes and bind
+            // mounts, so it is made again from the same arguments.
+            anyhow::ensure!(stale_network(&stderr), "docker start {name} failed: {}", stderr.trim());
+            eprintln!("{name} was attached to a network Docker no longer has; making it again (its data is kept)");
+            remove_container(name).await?;
         }
         Some(_) => remove_container(name).await?,
         None => {}
@@ -1196,6 +1212,7 @@ async fn start(install: &Install, rebuild: bool) -> Result<()> {
     let ports = ports(install)?;
 
     let shared = images::ensure_all_shared_images(rebuild, None).await?;
+    images::hold_standard_worker(&install.id, &shared.worker).await?;
     ensure_network().await?;
     ensure_postgres(install, ports.postgres).await?;
     ensure_object_store(object_store_port()?).await?;
@@ -1347,6 +1364,16 @@ async fn logs(install: &Install, tail: usize, follow: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Docker's refusal for a container whose network was made again is
+    /// told apart from every other start failure.
+    #[test]
+    fn a_vanished_network_is_told_apart() {
+        assert!(stale_network(
+            "Error response from daemon: failed to set up container networking: network cfc1be309d69 not found"
+        ));
+        assert!(!stale_network("Error response from daemon: driver failed programming external connectivity: port is already allocated"));
+    }
 
     fn install(name: Option<&str>) -> Install {
         let id = match name {

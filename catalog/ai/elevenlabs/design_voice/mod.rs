@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use weft::access::client::post_json;
 use weft::node::NodeOutput;
 use weft::storage::{KeepTtl, StorageScope};
-use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
+use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::elevenlabs::API;
 
@@ -55,16 +55,28 @@ impl Node for ElevenLabsDesignVoiceNode {
             .into_iter()
             .flatten()
             .map(|p| {
-                let mime = p["media_type"].as_str().unwrap_or("audio/mpeg");
-                let b64 = p["audio_base_64"].as_str().unwrap_or_default();
-                json!({
-                    "voiceId": p["generated_voice_id"],
+                // A preview without its audio or its voice id is no
+                // preview: emitting it would hand on an empty clip, or
+                // one Create Voice cannot mint.
+                let voice_id = p["generated_voice_id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .node_err("elevenlabs answered a preview with no generated_voice_id")?;
+                let b64 = p["audio_base_64"]
+                    .as_str()
+                    .filter(|a| !a.is_empty())
+                    .node_err("elevenlabs answered a preview with no audio_base_64")?;
+                let mime = p["media_type"]
+                    .as_str()
+                    .node_err("elevenlabs answered a preview with no media_type")?;
+                Ok(json!({
+                    "voiceId": voice_id,
                     "audio": format!("data:{mime};base64,{b64}"),
                     "durationSecs": p["duration_secs"],
                     "language": p["language"],
-                })
+                }))
             })
-            .collect();
+            .collect::<WeftResult<_>>()?;
         if previews.is_empty() {
             weft::node_bail!("elevenlabs answered no previews for this description");
         }

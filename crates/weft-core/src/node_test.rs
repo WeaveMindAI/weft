@@ -839,14 +839,16 @@ struct FakeState {
     program_answers: Mutex<HashMap<String, VecDeque<Value>>>,
     /// Every instance token the node minted: the instance and its life.
     minted_tokens: Mutex<Vec<MintedToken>>,
-    /// The infra endpoints this node's own infrastructure answers on,
-    /// by endpoint name. Declared by `endpoint`; an undeclared name
-    /// fails the way an unprovisioned one does in a real run.
-    endpoints: Mutex<BTreeMap<String, String>>,
-    /// The outside address of a declared endpoint, by endpoint name.
+    /// The infra endpoints the node can reach, by (place, endpoint
+    /// name): its own (at `NODE_UNDER_TEST_ID`, declared by
+    /// `declare_endpoint`) and the ones other infra nodes shared with it
+    /// (declared by `declare_infra`). An undeclared one fails the way an
+    /// unprovisioned one does in a real run.
+    endpoints: Mutex<BTreeMap<EndpointKey, String>>,
+    /// The outside address of a declared endpoint of the node's own.
     /// Declared by `declare_public_url`; absent reads as an endpoint
     /// that is not public.
-    public_urls: Mutex<BTreeMap<String, String>>,
+    public_urls: Mutex<BTreeMap<EndpointKey, String>>,
     /// Canned answers, keyed by WHICH endpoint was called as well as
     /// the method and path, and popped in order.
     ///
@@ -856,7 +858,7 @@ struct FakeState {
     /// the endpoint because a node with two of them calling the wrong
     /// one is a real bug, and a fake that answered either identically
     /// would pass it.
-    endpoint_answers: Mutex<BTreeMap<(String, EndpointMethod, String), VecDeque<CannedAnswer>>>,
+    endpoint_answers: Mutex<BTreeMap<(EndpointKey, EndpointMethod, String), VecDeque<CannedAnswer>>>,
     /// Every endpoint call the node made, in order.
     endpoint_calls: Mutex<Vec<EndpointCall>>,
     /// The fake's journal of each body's replayable calls: every
@@ -880,10 +882,21 @@ struct FakeState {
     stop_after_calls: Mutex<Option<usize>>,
 }
 
-/// One call a node made to its own infrastructure, as the fake
-/// recorded it.
+/// An infra endpoint in the fake: the infra node's place, and the
+/// endpoint's name.
+type EndpointKey = (String, String);
+
+/// The fake's key for an endpoint of the node's OWN infra.
+fn own_endpoint(name: &str) -> EndpointKey {
+    (NODE_UNDER_TEST_ID.to_string(), name.to_string())
+}
+
+/// One call a node made to an infra endpoint, as the fake recorded it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EndpointCall {
+    /// The infra node the call went to: `NODE_UNDER_TEST_ID` for the
+    /// node's own, else the place given to `declare_infra`.
+    pub place: String,
     /// The endpoint the call went to, by the name the node resolved.
     pub endpoint: String,
     pub method: EndpointMethod,
@@ -1255,17 +1268,34 @@ impl FakeRig {
     /// at `url`. Without this, `ctx.endpoint(name)` fails the way it
     /// does when the infra is not running.
     pub fn declare_endpoint(&self, name: &str, url: &str) {
+        self.declare_at(own_endpoint(name), url);
+    }
+
+    /// Declare that the infra node at `place` shares its endpoint
+    /// `endpoint`, answering at `url`, and get the `Infra` handle it
+    /// would emit, to place on the input the node reads it from. Answer
+    /// its calls with [`Self::answer_infra`].
+    pub fn declare_infra(&self, place: &str, endpoint: &str, url: &str) -> Value {
+        assert_ne!(
+            place, NODE_UNDER_TEST_ID,
+            "'{place}' is the node under test; declare its own endpoints with declare_endpoint"
+        );
+        self.declare_at((place.to_string(), endpoint.to_string()), url);
+        crate::infra::InfraHandle::new(place, endpoint, None).to_value()
+    }
+
+    fn declare_at(&self, key: EndpointKey, url: &str) {
         let mut endpoints = self.state.endpoints.lock().unwrap();
         // Two endpoints on one address would make a call ambiguous,
         // and the fake would answer the wrong one's canned reply
         // while the test went green. In a real project two endpoints
         // never share an address either.
-        if let Some((taken, _)) =
-            endpoints.iter().find(|(taken, declared)| *taken != name && *declared == url)
+        if let Some(((place, taken), _)) =
+            endpoints.iter().find(|(taken, declared)| **taken != key && *declared == url)
         {
-            panic!("endpoint '{taken}' is already declared at {url}; give '{name}' its own");
+            panic!("endpoint '{taken}' of '{place}' is already declared at {url}; give '{}' its own", key.1);
         }
-        endpoints.insert(name.to_string(), url.to_string());
+        endpoints.insert(key, url.to_string());
     }
 
     /// Declare that the endpoint `name` (already declared with
@@ -1273,10 +1303,10 @@ impl FakeRig {
     /// what `ctx.endpoint(name)?.public_url()` answers.
     pub fn declare_public_url(&self, name: &str, url: &str) {
         assert!(
-            self.state.endpoints.lock().unwrap().contains_key(name),
+            self.state.endpoints.lock().unwrap().contains_key(&own_endpoint(name)),
             "declare endpoint '{name}' with declare_endpoint before giving it a public url"
         );
-        self.state.public_urls.lock().unwrap().insert(name.to_string(), url.to_string());
+        self.state.public_urls.lock().unwrap().insert(own_endpoint(name), url.to_string());
     }
 
     /// Declare what the NEXT call to `path` on the `endpoint` endpoint
@@ -1293,7 +1323,21 @@ impl FakeRig {
         path: &str,
         answer: Value,
     ) {
-        self.queue_answer(endpoint, method, path, CannedAnswer::Body(answer));
+        self.queue_answer(own_endpoint(endpoint), method, path, CannedAnswer::Body(answer));
+    }
+
+    /// Declare what the NEXT call to `path` on the endpoint `endpoint`
+    /// another infra node shared (see [`Self::declare_infra`]) answers.
+    /// Call it once per expected call, in order, like `answer_endpoint`.
+    pub fn answer_infra(
+        &self,
+        place: &str,
+        endpoint: &str,
+        method: EndpointMethod,
+        path: &str,
+        answer: Value,
+    ) {
+        self.queue_answer((place.to_string(), endpoint.to_string()), method, path, CannedAnswer::Body(answer));
     }
 
     /// Declare that the next call to `path` on `endpoint` is REFUSED
@@ -1308,7 +1352,7 @@ impl FakeRig {
         body: &str,
     ) {
         self.queue_answer(
-            endpoint,
+            own_endpoint(endpoint),
             method,
             path,
             CannedAnswer::Refusal { status, body: body.to_string() },
@@ -1317,7 +1361,7 @@ impl FakeRig {
 
     fn queue_answer(
         &self,
-        endpoint: &str,
+        endpoint: EndpointKey,
         method: EndpointMethod,
         path: &str,
         answer: CannedAnswer,
@@ -1326,7 +1370,7 @@ impl FakeRig {
             .endpoint_answers
             .lock()
             .unwrap()
-            .entry((endpoint.to_string(), method, path.to_string()))
+            .entry((endpoint, method, path.to_string()))
             .or_default()
             .push_back(answer);
     }
@@ -1344,7 +1388,8 @@ impl FakeRig {
         self.state.press_stop_if_due();
     }
 
-    /// Every call the node made to its own infrastructure, in order.
+    /// Every call the node made to an infra endpoint, its own or a
+    /// shared one, in order.
     pub fn endpoint_calls(&self) -> Vec<EndpointCall> {
         self.state.endpoint_calls.lock().unwrap().clone()
     }
@@ -2218,15 +2263,37 @@ impl ContextHandle for TestHandle {
         Ok(())
     }
 
-    async fn endpoint_address(&self, name: &str) -> WeftResult<crate::infra::EndpointAddress> {
-        let url = self.state.endpoints.lock().unwrap().get(name).cloned().ok_or_else(|| {
-            WeftError::Config(format!(
-                "the node asked for its '{name}' endpoint but the test declared no address \
-                 for it; declare one with rig.declare_endpoint(\"{name}\", \"http://..\") \
-                 before rig.run(..)"
-            ))
+    fn own_infra(
+        &self,
+        name: &str,
+        _instance: Option<&crate::instance::InstanceId>,
+    ) -> WeftResult<crate::infra::InfraHandle> {
+        // The node under test has one shared copy of its infra here.
+        Ok(crate::infra::InfraHandle::new(NODE_UNDER_TEST_ID, name, None))
+    }
+
+    async fn endpoint_address(
+        &self,
+        infra: &crate::infra::InfraHandle,
+    ) -> WeftResult<crate::infra::EndpointAddress> {
+        let key = (infra.place().to_string(), infra.endpoint().to_string());
+        let url = self.state.endpoints.lock().unwrap().get(&key).cloned().ok_or_else(|| {
+            let (place, name) = &key;
+            WeftError::Config(if place == NODE_UNDER_TEST_ID {
+                format!(
+                    "the node asked for its '{name}' endpoint but the test declared no address \
+                     for it; declare one with rig.declare_endpoint(\"{name}\", \"http://..\") \
+                     before rig.run(..)"
+                )
+            } else {
+                format!(
+                    "the node asked for the '{name}' endpoint of '{place}' but the test declared \
+                     no address for it; declare one with rig.declare_infra(\"{place}\", \"{name}\", \
+                     \"http://..\") before rig.run(..)"
+                )
+            })
         })?;
-        let public_url = self.state.public_urls.lock().unwrap().get(name).cloned();
+        let public_url = self.state.public_urls.lock().unwrap().get(&key).cloned();
         Ok(crate::infra::EndpointAddress { url, public_url })
     }
 
@@ -2241,16 +2308,18 @@ impl ContextHandle for TestHandle {
         // request from the base address, so a node calling the wrong
         // one of its endpoints reaches a different service; recording
         // the name is what lets a test see that.
-        let endpoint = self
+        let key = self
             .state
             .endpoints
             .lock()
             .unwrap()
             .iter()
             .find(|(_, declared)| declared.as_str() == url)
-            .map(|(name, _)| name.clone())
-            .unwrap_or_else(|| url.to_string());
+            .map(|(key, _)| key.clone())
+            .unwrap_or_else(|| (url.to_string(), url.to_string()));
+        let (place, endpoint) = key.clone();
         self.state.endpoint_calls.lock().unwrap().push(EndpointCall {
+            place: place.clone(),
             endpoint: endpoint.clone(),
             method,
             path: path.to_string(),
@@ -2262,7 +2331,7 @@ impl ContextHandle for TestHandle {
             .endpoint_answers
             .lock()
             .unwrap()
-            .get_mut(&(endpoint.clone(), method, path.to_string()))
+            .get_mut(&(key, method, path.to_string()))
             .and_then(VecDeque::pop_front);
         match answer {
             Some(CannedAnswer::Body(v)) => Ok(v),
@@ -2272,9 +2341,14 @@ impl ContextHandle for TestHandle {
             Some(CannedAnswer::Refusal { status, body }) => Err(WeftError::Runtime(
                 anyhow::anyhow!("endpoint_call {url}{path} returned {status}: {body}"),
             )),
-            None => Err(WeftError::Config(format!(
+            None if place == NODE_UNDER_TEST_ID => Err(WeftError::Config(format!(
                 "the node called {method:?} {path} on its '{endpoint}' endpoint but the \
                  test has no answer left for it; declare one with rig.answer_endpoint(..) \
+                 per expected call, before rig.run(..)"
+            ))),
+            None => Err(WeftError::Config(format!(
+                "the node called {method:?} {path} on the '{endpoint}' endpoint of '{place}' \
+                 but the test has no answer left for it; declare one with rig.answer_infra(..) \
                  per expected call, before rig.run(..)"
             ))),
         }
@@ -3136,8 +3210,19 @@ impl ContextHandle for CapturingHandle {
         self.inner.register_signal(spec, port_snapshot).await
     }
 
-    async fn endpoint_address(&self, name: &str) -> WeftResult<crate::infra::EndpointAddress> {
-        self.inner.endpoint_address(name).await
+    fn own_infra(
+        &self,
+        name: &str,
+        instance: Option<&crate::instance::InstanceId>,
+    ) -> WeftResult<crate::infra::InfraHandle> {
+        self.inner.own_infra(name, instance)
+    }
+
+    async fn endpoint_address(
+        &self,
+        infra: &crate::infra::InfraHandle,
+    ) -> WeftResult<crate::infra::EndpointAddress> {
+        self.inner.endpoint_address(infra).await
     }
 
     async fn endpoint_call(
@@ -3505,11 +3590,11 @@ mod tests {
             ctx.tag_execution([text.as_str(), "batch_a"]).await?;
             ctx.stop_tagged(text.as_str(), crate::tag::StopSelf::Keep).await?;
             ctx.stop_tagged("batch_a", crate::tag::StopSelf::Include).await?;
-            // A tag outside the grammar is refused at the ctx, before
-            // the handle sees it. So is an empty tag list: "at least
-            // one tag" is part of the ctx contract, not only the
-            // broker's.
-            let bad = ctx.tag_execution(["has space"]).await;
+            // An empty tag is refused at the ctx, before the handle
+            // sees it (any other string is normalized into a tag). So
+            // is an empty tag list: "at least one tag" is part of the
+            // ctx contract, not only the broker's.
+            let bad = ctx.tag_execution([""]).await;
             assert!(matches!(bad, Err(WeftError::Input(_))), "{bad:?}");
             let empty = ctx.tag_execution(Vec::<String>::new()).await;
             assert!(matches!(empty, Err(WeftError::Input(_))), "{empty:?}");
@@ -4412,5 +4497,68 @@ mod tests {
         let outcome = rig.run(&PlainHttpNode, json!({})).await;
         let err = outcome.result.expect_err("no route, no network").to_string();
         assert!(err.contains("no canned response for GET /feed"), "{err}");
+    }
+
+    /// A node that reaches an endpoint another infra node shared: the
+    /// `Infra` handle on its `service` input, one action through it.
+    struct SharedInfraNode;
+    impl crate::node::NodeManifest for SharedInfraNode {
+        fn manifest(&self) -> &'static NodeMetadata {
+            static MANIFEST: std::sync::OnceLock<NodeMetadata> = std::sync::OnceLock::new();
+            MANIFEST.get_or_init(|| {
+                serde_json::from_value(json!({
+                    "type": "SharedInfraProbe",
+                    "label": "Shared infra probe",
+                    "description": "test-only node",
+                    "inputs": [{"name": "service", "type": "Infra", "required": true}],
+                    "outputs": [{"name": "reply", "type": "JsonDict"}]
+                }))
+                .expect("shared infra manifest")
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl Node for SharedInfraNode {
+        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            let service: crate::infra::InfraHandle = ctx.inputs.get("service")?;
+            let reply = ctx.endpoint_of(&service).await?.action("ping", json!({"n": 1})).await?;
+            ctx.pulse_downstream(NodeOutput::new().set("reply", reply)).await
+        }
+    }
+
+    /// Another node's endpoint resolves through the same seam as the
+    /// node's own, an action speaks the envelope, and the refusal a
+    /// service answers with a 200 fails the node naming the action.
+    #[tokio::test]
+    async fn a_shared_infra_handle_resolves_and_speaks_the_action_envelope() {
+        let rig = FakeRig::new();
+        let service = rig.declare_infra("whatsapp", "api", "http://whatsapp:8090");
+        rig.answer_infra("whatsapp", "api", EndpointMethod::Post, "/action", json!({"result": {"pong": 1}}));
+        let outcome = rig.run(&SharedInfraNode, json!({"service": service.clone()})).await.ok().expect("resolves");
+        assert_eq!(outcome.outputs["reply"], json!({"pong": 1}));
+        let calls = rig.endpoint_calls();
+        assert_eq!((calls[0].place.as_str(), calls[0].endpoint.as_str()), ("whatsapp", "api"));
+        assert_eq!(calls[0].body, Some(json!({"action": "ping", "payload": {"n": 1}})));
+
+        rig.answer_infra("whatsapp", "api", EndpointMethod::Post, "/action", json!({"result": {"error": "not paired"}}));
+        let err = rig.run(&SharedInfraNode, json!({"service": service})).await.result.expect_err("refused");
+        assert!(err.to_string().contains("ping: not paired"), "{err}");
+    }
+
+    /// A handle naming infra nobody declared fails the way an
+    /// unprovisioned endpoint does, and a URL is not a handle at all.
+    #[tokio::test]
+    async fn an_unknown_handle_or_a_url_is_refused() {
+        let rig = FakeRig::new();
+        let stray = crate::infra::InfraHandle::new("elsewhere", "api", None).to_value();
+        let err = rig.run(&SharedInfraNode, json!({"service": stray})).await.result.expect_err("unknown");
+        assert!(err.to_string().contains("rig.declare_infra(\"elsewhere\""), "{err}");
+
+        let err = rig
+            .run(&SharedInfraNode, json!({"service": "http://whatsapp:8090"}))
+            .await
+            .result
+            .expect_err("a url is not a handle");
+        assert!(err.to_string().contains("infra"), "{err}");
     }
 }

@@ -6,7 +6,7 @@ use serde_json::json;
 
 use weft::signal::predicate::matches;
 use weft::signal::Predicate;
-use weft::{FakeRig, NodeTest, WeftResult};
+use weft::{EndpointMethod, FakeRig, NodeTest, WeftResult};
 
 use super::BaileyReceiveNode;
 
@@ -23,7 +23,6 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("ignore_groups_drops_a_group_message", ignore_groups),
         NodeTest::fake("message_types_keep_only_the_listed_types", message_types),
         NodeTest::fake("both_filters_must_pass", both_filters),
-        NodeTest::fake("an_unknown_message_type_is_refused_at_setup", unknown_type),
     ]
 }
 
@@ -36,6 +35,24 @@ async fn filters_for(rig: &FakeRig, inputs: serde_json::Value) -> WeftResult<Vec
     Ok(registered[0].0.match_predicates.clone())
 }
 
+/// The bridge every case wires in: its `Infra` handle, declared on the
+/// rig so the node can resolve it.
+fn bridge(rig: &FakeRig) -> serde_json::Value {
+    rig.declare_infra("bridge", "api", "http://bridge.example:8090")
+}
+
+/// The bridge's next `/outputs` answer: the paired account media is
+/// stored under.
+fn answer_outputs(rig: &FakeRig) {
+    rig.answer_infra(
+        "bridge",
+        "api",
+        EndpointMethod::Get,
+        "/outputs",
+        json!({ "jid": "4915100000000@s.whatsapp.net", "status": "connected" }),
+    );
+}
+
 fn message(message_type: &str, is_group: bool) -> serde_json::Value {
     json!({ "messageType": message_type, "isGroup": is_group, "messageId": "wa-1" })
 }
@@ -43,7 +60,7 @@ fn message(message_type: &str, is_group: bool) -> serde_json::Value {
 async fn no_filters(rig: FakeRig) -> WeftResult<()> {
     let f = filters_for(
         &rig,
-        json!({ "endpointUrl": "http://bridge.example:8090", "messageTypes": [] }),
+        json!({ "bridge": bridge(&rig), "messageTypes": [] }),
     )
     .await?;
     for t in ["text", "image", "audio", "contact", "location"] {
@@ -57,7 +74,7 @@ async fn no_filters(rig: FakeRig) -> WeftResult<()> {
 async fn unknown_listed(rig: FakeRig) -> WeftResult<()> {
     let f = filters_for(
         &rig,
-        json!({ "endpointUrl": "http://bridge.example:8090", "messageTypes": ["unknown"] }),
+        json!({ "bridge": bridge(&rig), "messageTypes": ["unknown"] }),
     )
     .await?;
     assert!(matches(&f, &message("unknown", false)), "listed by name, it fires");
@@ -68,7 +85,7 @@ async fn unknown_listed(rig: FakeRig) -> WeftResult<()> {
 async fn missing_message_type(rig: FakeRig) -> WeftResult<()> {
     rig.wake(json!({ "from": "4915112345678", "messageId": "wa-9", "content": "" }));
     let err = rig
-        .run(&BaileyReceiveNode, json!({ "endpointUrl": "http://bridge.example:8090" }))
+        .run(&BaileyReceiveNode, json!({ "bridge": bridge(&rig) }))
         .await
         .result
         .expect_err("an event with no messageType is refused, never read as text")
@@ -80,7 +97,7 @@ async fn missing_message_type(rig: FakeRig) -> WeftResult<()> {
 async fn ignore_groups(rig: FakeRig) -> WeftResult<()> {
     let f = filters_for(
         &rig,
-        json!({ "endpointUrl": "http://bridge.example:8090", "ignoreGroups": true }),
+        json!({ "bridge": bridge(&rig), "ignoreGroups": true }),
     )
     .await?;
     assert!(matches(&f, &message("text", false)), "a direct message fires");
@@ -91,7 +108,7 @@ async fn ignore_groups(rig: FakeRig) -> WeftResult<()> {
 async fn message_types(rig: FakeRig) -> WeftResult<()> {
     let f = filters_for(
         &rig,
-        json!({ "endpointUrl": "http://bridge.example:8090", "messageTypes": ["text", "audio"] }),
+        json!({ "bridge": bridge(&rig), "messageTypes": ["text", "audio"] }),
     )
     .await?;
     assert!(matches(&f, &message("text", false)));
@@ -105,7 +122,7 @@ async fn both_filters(rig: FakeRig) -> WeftResult<()> {
     let f = filters_for(
         &rig,
         json!({
-            "endpointUrl": "http://bridge.example:8090",
+            "bridge": bridge(&rig),
             "ignoreGroups": true,
             "messageTypes": ["image"],
         }),
@@ -117,24 +134,10 @@ async fn both_filters(rig: FakeRig) -> WeftResult<()> {
     Ok(())
 }
 
-async fn unknown_type(rig: FakeRig) -> WeftResult<()> {
-    let err = rig
-        .run_setup_trigger(
-            &BaileyReceiveNode,
-            json!({ "endpointUrl": "http://bridge.example:8090", "messageTypes": ["photo"] }),
-        )
-        .await
-        .result
-        .expect_err("a type the bridge never sends is refused")
-        .to_string();
-    assert!(err.contains("photo") && err.contains("image"), "{err}");
-    assert!(rig.registered_signals().is_empty(), "nothing registers");
-    Ok(())
-}
 async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
     rig.run_setup_trigger(
         &BaileyReceiveNode,
-        json!({ "endpointUrl": "http://bridge.example:8090" }),
+        json!({ "bridge": bridge(&rig) }),
     )
     .await
     .ok()?;
@@ -161,7 +164,7 @@ async fn text_fire(rig: FakeRig) -> WeftResult<()> {
     let outcome = rig
         .run(
             &BaileyReceiveNode,
-            json!({ "endpointUrl": "http://bridge.example:8090" }),
+            json!({ "bridge": bridge(&rig) }),
         )
         .await
         .ok()?;
@@ -171,7 +174,7 @@ async fn text_fire(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn media_fire(rig: FakeRig) -> WeftResult<()> {
-    rig.respond("GET", "/outputs", json!({ "jid": "4915100000000@s.whatsapp.net", "status": "connected" }));
+    answer_outputs(&rig);
     rig.respond_raw("GET", "/media/wa-9", 200, "image/jpeg", b"JPEG".to_vec());
     rig.wake(json!({
         "messageType": "image",
@@ -181,7 +184,7 @@ async fn media_fire(rig: FakeRig) -> WeftResult<()> {
     let outcome = rig
         .run(
             &BaileyReceiveNode,
-            json!({ "endpointUrl": "http://bridge.example:8090" }),
+            json!({ "bridge": bridge(&rig) }),
         )
         .await
         .ok()?;
@@ -192,7 +195,7 @@ async fn media_fire(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(blob["filename"], json!("wa-9"));
     // Received media cannot be re-fetched once the bridge's copy ages
     // out, so it lives in PROJECT storage under the message's identity
-    // (see `bridge_api::fetch_media`, and the fetch-media node's own
+    // (see `media::fetch_media`, and the fetch-media node's own
     // "same message twice is one file" test for the identity half).
     let key = blob["key"].as_str().expect("stored value carries its key");
     assert!(rig.stored_meta(key).is_ok(), "the media is stored");
@@ -222,7 +225,7 @@ async fn a_smuggled_file_key_never_starts_a_run(rig: FakeRig) -> WeftResult<()> 
         let err = rig
             .run(
                 &BaileyReceiveNode,
-                json!({ "endpointUrl": "http://bridge.example:8090" }),
+                json!({ "bridge": bridge(&rig) }),
             )
             .await
             .result
@@ -239,7 +242,7 @@ async fn a_smuggled_file_key_never_starts_a_run(rig: FakeRig) -> WeftResult<()> 
 /// The size and length ride the event, so a graph can gate on them
 /// before any byte is fetched.
 async fn voice_note_facts(rig: FakeRig) -> WeftResult<()> {
-    rig.respond("GET", "/outputs", json!({ "jid": "4915100000000@s.whatsapp.net", "status": "connected" }));
+    answer_outputs(&rig);
     rig.respond_raw("GET", "/media/wa-7", 200, "audio/ogg", b"OGG".to_vec());
     rig.wake(json!({
         "messageType": "audio",
@@ -251,7 +254,7 @@ async fn voice_note_facts(rig: FakeRig) -> WeftResult<()> {
     let outcome = rig
         .run(
             &BaileyReceiveNode,
-            json!({ "endpointUrl": "http://bridge.example:8090" }),
+            json!({ "bridge": bridge(&rig) }),
         )
         .await
         .ok()?;

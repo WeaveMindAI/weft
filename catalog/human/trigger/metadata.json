@@ -1,7 +1,7 @@
 {
   "type": "HumanTrigger",
   "label": "Human Trigger",
-  "description": "Start an execution when a human submits a form. Form fields determine the output ports.",
+  "description": "Starts a run when a person submits a form; each form field becomes an output port.",
   "tags": [
     "human",
     "form",
@@ -14,19 +14,16 @@
     {
       "name": "title",
       "type": "String",
-      "widget": {
-        "kind": "text"
-      },
       "label": "Title",
       "placeholder": "Submit",
-      "description": "Title the user sees at the top of the form."
+      "description": "Shown at the top of the form."
     },
     {
       "name": "description",
       "type": "String",
       "widget": { "kind": "textarea" },
       "label": "Description",
-      "description": "Description shown under the title."
+      "description": "Shown under the title."
     },
     {
       "name": "fields",
@@ -36,11 +33,10 @@
         "kind": "entry_list"
       },
       "label": "Form fields",
-      "description": "Each field contributes an output port per its kind (see the node's portsFromConfig)."
+      "description": "Each field adds an output port by its kind (see portsFromConfig)."
     }
   ],
   "outputs": [],
-  "requires_infra": false,
   "features": {
     "isTrigger": true,
     "calledFromOutside": true

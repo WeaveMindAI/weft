@@ -1,7 +1,7 @@
 {
   "type": "ListRuns",
   "label": "List runs",
-  "description": "List this project's runs, newest first, narrowed by instance, status, the node that started them, a tag, or age, with how many match in all (`total`). At most `limit` come back; when `total` is larger, narrow the filters to reach the older ones. To only know how many, use `CountRuns`.",
+  "description": "List this project's runs, newest first, filtered by instance, status, starting node, tag or age, with `total` matching. At most `limit` come back; narrow the filters to reach older ones. For just a count, use CountRuns.",
   "tags": [
     "flow",
     "runs",
@@ -71,7 +71,6 @@
       "description": "How many runs match the filters, however many were listed."
     }
   ],
-  "requires_infra": false,
   "validate": [
     {
       "when": {
@@ -79,7 +78,7 @@
         "of": { "kind": "input_names", "port": "node", "names": { "node": {} } }
       },
       "then": {
-        "message": "ListRuns '{id}' names {names} in `node`, which is no node of this program. Name it the way the program writes it (`inbox`, or `one.inbox` inside an included file).",
+        "message": "ListRuns '{id}' names {names} in `node`, which is no node of this program. Name it the way the program writes it (`inbox`, `work.inbox` inside a group, or `one.inbox` inside an included file).",
         "level": "structural",
         "severity": "error",
         "port": "node"

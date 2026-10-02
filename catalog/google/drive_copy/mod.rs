@@ -30,8 +30,12 @@ impl Node for GoogleDriveCopyNode {
         let body = drive::file_metadata(name, folder);
         let http = ctx.client(&account).await?;
         let answer = weft::access::client::json_call(
-            http.post(format!("{}/files/{file_id}/copy?fields=id,webViewLink", drive::API))
-                .json(&body),
+            http.post(format!(
+                "{}/files/{}/copy?fields=id,webViewLink",
+                drive::API,
+                super::api::segment(&file_id)
+            ))
+            .json(&body),
             "copy the file",
         )
         .await?;

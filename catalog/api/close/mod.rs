@@ -57,7 +57,7 @@ impl Node for CloseNode {
                     // carrying these went out with the stream's first
                     // chunk, so a header set here would silently never
                     // reach the caller.
-                    if headers.as_ref().is_some_and(|h| !h.as_object().is_some_and(|m| m.is_empty())) {
+                    if wire::has_headers(headers.as_ref()) {
                         weft::node_bail!(
                             "`headers` cannot reach this caller: a Stream already sent the \
                              response head, so only its end is left. Set them on the Stream, \

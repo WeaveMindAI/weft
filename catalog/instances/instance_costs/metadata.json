@@ -1,7 +1,7 @@
 {
   "type": "InstanceCosts",
   "label": "Instance costs",
-  "description": "Read what one instance's runs cost: every call that booked a price, each saying whose credential paid (the runtime's credit, your own connection, or the instance's own), plus the total. Narrow by service, node, who paid, or a start time. Weft reports what it measured; what you bill for it is your program's to decide.",
+  "description": "Read what one instance's runs cost, per priced call with whose credential paid, plus the total; narrow by service, node, payer, or start time. Weft only reports; billing is up to the program.",
   "tags": [
     "instances",
     "costs",
@@ -14,7 +14,7 @@
       "name": "instance",
       "type": "String",
       "required": true,
-      "description": "The instance, by the id your program gives it (`user-42`)."
+      "description": "The instance id your program gives it (`user-42`)."
     },
     {
       "name": "service",
@@ -24,7 +24,7 @@
     {
       "name": "node",
       "type": "String",
-      "description": "Only the costs this node booked, named the way the program writes it."
+      "description": "Only costs this node booked, named as the program writes it."
     },
     {
       "name": "paidBy",
@@ -33,12 +33,17 @@
         "kind": "select",
         "options": ["platform", "author", "instance"]
       },
-      "description": "Only the costs paid from this kind of credential: `platform` (the runtime's credit), `author` (your own connection) or `instance` (the instance's own)."
+      "description": "`platform` (the runtime's credit), `author` (the program author's connection) or `instance` (the instance's own connection)."
     },
     {
       "name": "since",
       "type": "Number",
-      "description": "Only the costs booked at or after this moment, in unix seconds."
+      "description": "Only costs booked at or after this unix time (seconds).",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "step": 1
+      }
     }
   ],
   "outputs": [
@@ -50,10 +55,9 @@
     {
       "name": "totalUsd",
       "type": "Number",
-      "description": "The sum of every measured `amount_usd`, in US dollars."
+      "description": "Sum of every non-null `amount_usd`."
     }
   ],
-  "requires_infra": false,
   "validate": [
     {
       "when": {
@@ -61,7 +65,7 @@
         "of": { "kind": "input_names", "port": "node", "names": { "node": {} } }
       },
       "then": {
-        "message": "InstanceCosts '{id}' names {names} in `node`, which is no node of this program. Name it the way the program writes it (`draft`, or `one.draft` inside an included file).",
+        "message": "InstanceCosts '{id}' names {names} in `node`, which is no node of this program. Name it the way the program writes it (`draft`, `work.draft` inside a group, or `one.draft` inside an included file).",
         "level": "structural",
         "severity": "error",
         "port": "node"

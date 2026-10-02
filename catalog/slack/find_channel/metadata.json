@@ -1,7 +1,7 @@
 {
   "type": "SlackFindChannel",
   "label": "Slack: Find Channel",
-  "description": "Resolve a channel name (with or without the #) to its id, searching public and private channels the app can see (scanning up to 10000 channels). Fails loudly when no visible channel matches, or when the workspace exceeds the scan cap (paste the id directly then).",
+  "description": "Resolves a Slack channel name (with or without #) to its id, among the public and private channels the app can see. Fails loudly when nothing matches or the workspace has over 10000 channels (paste the id then).",
   "tags": [
     "slack",
     "channel",
@@ -17,7 +17,7 @@
       "requiresScopes": [
         "channels:read"
       ],
-      "description": "The Slack access (wire a SlackAccess node). Needs channels:read (groups:read to also see private channels the app is in)."
+      "description": "Needs channels:read (groups:read to also see private channels the app is in)."
     },
     {
       "name": "name",
@@ -31,12 +31,12 @@
     {
       "name": "id",
       "type": "String",
-      "description": "The channel's id (C...)."
+      "description": "Channel id (C...)."
     },
     {
       "name": "name",
       "type": "String",
-      "description": "The matched name, # stripped."
+      "description": "Matched name, # stripped."
     },
     {
       "name": "private",

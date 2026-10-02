@@ -1,5 +1,5 @@
-//! ElevenLabsDub self-tests: the submit -> poll -> download dance
-//! against canned answers.
+//! ElevenLabsDub self-tests: the submit -> parked wait -> download
+//! dance against canned answers.
 
 use serde_json::json;
 
@@ -68,7 +68,7 @@ async fn live_dub(rig: LiveRig) -> WeftResult<()> {
 
 async fn dubs(rig: FakeRig) -> WeftResult<()> {
     rig.respond("POST", "/v1/dubbing", json!({ "dubbing_id": "dub-1" }));
-    rig.respond("GET", "/v1/dubbing/dub-1", json!({ "status": "dubbed" }));
+    rig.signal(json!({ "status": "dubbed" }));
     rig.respond_raw(
         "GET",
         "/v1/dubbing/dub-1/audio/fr",
@@ -91,16 +91,34 @@ async fn dubs(rig: FakeRig) -> WeftResult<()> {
         .ok()?;
     assert_eq!(outcome.outputs["filename"], json!("dubbed_fr_talk.mp3"));
     assert_eq!(outcome.outputs["sizeBytes"], json!(6));
+
+    let awaited = rig.awaited_signals();
+    assert_eq!(awaited.len(), 1, "one wait");
+    assert_eq!(awaited[0].kind, "poll_endpoint");
+    assert_eq!(awaited[0].config["url"], json!("https://api.elevenlabs.io/v1/dubbing/dub-1"));
+    assert!(awaited[0].access.is_some(), "each poll is signed by the elevenlabs connection");
+
+    // The body replays from the top on resume: the journaled start is
+    // read back, so the dub is started (and paid for) once.
+    rig.run(
+        &ElevenLabsDubNode,
+        json!({
+            "account": rig.access("elevenlabs"),
+            "file": file,
+            "targetLang": "fr",
+            "dropBackgroundAudio": false,
+        }),
+    )
+    .await
+    .ok()?;
+    let starts = rig.requests().iter().filter(|r| r.method == "POST").count();
+    assert_eq!(starts, 1, "the replay never starts a second dub");
     Ok(())
 }
 
 async fn failed(rig: FakeRig) -> WeftResult<()> {
     rig.respond("POST", "/v1/dubbing", json!({ "dubbing_id": "dub-2" }));
-    rig.respond(
-        "GET",
-        "/v1/dubbing/dub-2",
-        json!({ "status": "failed", "error": "unsupported language" }),
-    );
+    rig.signal(json!({ "status": "failed", "error": "unsupported language" }));
     let file = rig.store_file("talk.mp3", "audio/mpeg", b"english".to_vec());
     let outcome = rig
         .run(

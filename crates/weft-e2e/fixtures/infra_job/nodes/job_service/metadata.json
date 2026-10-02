@@ -1,0 +1,23 @@
+{
+  "type": "JobService",
+  "label": "Job Service",
+  "description": "An infra node that runs a fake long job in its container: it starts the job, waits for it by parking on a poll of the job's status route, and emits the result. The e2e rig's proof that the listener reaches a program's own infra for a parked wait.",
+  "tags": [
+    "infra",
+    "e2e"
+  ],
+  "icon": "Server",
+  "color": "#22c55e",
+  "inputs": [],
+  "outputs": [
+    {
+      "name": "result",
+      "type": "String"
+    }
+  ],
+  "requires_infra": true,
+  "images": [
+    "images/job_service"
+  ],
+  "features": {}
+}

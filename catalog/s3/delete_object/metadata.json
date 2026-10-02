@@ -1,7 +1,7 @@
 {
   "type": "S3DeleteObject",
   "label": "S3: Delete Object",
-  "description": "Delete one object.",
+  "description": "Delete one object from an S3-compatible bucket.",
   "tags": [
     "s3",
     "storage",

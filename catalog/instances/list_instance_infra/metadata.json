@@ -1,7 +1,7 @@
 {
   "type": "ListInstanceInfra",
   "label": "List instance infra",
-  "description": "List every copy of one infra node that exists: the shared one, if the node has one, and each instance's copy of a node marked `@per_instance`, each with its state. For an overview of which instance has what running, or to find the copies to stop.",
+  "description": "List every existing copy of one infra node (the shared one, and each instance's copy of a `@per_instance` node) with its state, to see which instance has what running or find copies to stop.",
   "tags": [
     "instances",
     "infra",
@@ -14,14 +14,14 @@
       "name": "node",
       "type": "String",
       "required": true,
-      "description": "The infra node, named the way the program writes it (`bridge`, or `one.bridge` inside an included file)."
+      "description": "The infra node, named as the program writes it (`bridge`, `work.bridge` inside a group, or `one.bridge` inside an included file)."
     }
   ],
   "outputs": [
     {
       "name": "copies",
       "type": "List[JsonDict]",
-      "description": "One entry per copy: `{ node, instance?, status, failure? }`. `instance` is missing on the shared copy; `status` is provisioning, running, flaky, stopping, stopped, terminating or failed, and `failure` says why when it failed."
+      "description": "One entry per copy: `{ node, instance?, status, failure? }`. `instance` is absent on the shared copy; `status` as in InstanceInfraStatus (never `none`); `failure` says why it failed."
     },
     {
       "name": "instances",
@@ -29,7 +29,6 @@
       "description": "The instances that have a copy, whatever its state."
     }
   ],
-  "requires_infra": false,
   "validate": [
     {
       "when": {
@@ -37,7 +36,7 @@
         "of": { "kind": "input_names", "port": "node", "names": { "node": { "role": "infra" } } }
       },
       "then": {
-        "message": "ListInstanceInfra '{id}' names {names} in `node`, which is no infra node of this program. Name one the way the program writes it (`bridge`, or `one.bridge` inside an included file).",
+        "message": "ListInstanceInfra '{id}' names {names} in `node`, which is no infra node of this program. Name one the way the program writes it (`bridge`, `work.bridge` inside a group, or `one.bridge` inside an included file).",
         "level": "structural",
         "severity": "error",
         "port": "node"

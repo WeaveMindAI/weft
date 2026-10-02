@@ -108,7 +108,7 @@ fn placeholder_statements() -> WeftResult<()> {
     assert_eq!(script.statements.len(), 2, "a trailing `;` counts no empty statement");
     assert_eq!(placeholders("DO $$ BEGIN NULL; END $$;")?.statements.len(), 1);
     let err = placeholders("SELECT * FROM t WHERE id = $1").expect_err("positions are gone").to_string();
-    assert!(err.contains("$1") && err.contains("name it"), "{err}");
+    assert!(err.contains("$1") && err.contains("Declare the port"), "{err}");
     // A name that could never be a port is the same refusal.
     let err = placeholders("SELECT * FROM t WHERE id = $1st").expect_err("not a port name").to_string();
     assert!(err.contains("$1st"), "{err}");

@@ -1,7 +1,7 @@
 {
   "type": "AirtableSearchRecords",
   "label": "Airtable: Search Records",
-  "description": "Read records out of a table, optionally narrowed by an Airtable formula (e.g. {Stage} = 'Lead') and a view.",
+  "description": "Read records from an Airtable table, optionally narrowed by a formula (`{Stage} = 'Lead'`) and a view.",
   "tags": [
     "airtable",
     "record",

@@ -1,7 +1,7 @@
 {
   "type": "Reply",
   "label": "Reply",
-  "description": "Answer the caller of this run with one message. Behind a Route it is the response: status, headers and body, and the exchange ends. Behind a Socket it is one message and the socket stays open (status and headers have no meaning there and are refused if set). The body's shape follows `Answer as`, or the trigger's dataType when it is unset: any value for json, a String for text, a stored file for bytes. A stored file sent as bytes goes out under its own content type and filename unless `headers` sets them. On a json route a stored file anywhere in the body (a picture kept at project scope, say) goes out as `{ url, mimeType, filename, sizeBytes }`, the url being a link the caller can fetch straight into an `<img>`.",
+  "description": "Answer the caller of this run with one message: behind a Route, the whole response (status, headers, body) and the exchange ends; behind a Socket, one message and the socket stays open (status and headers refused). A stored file anywhere in a json body goes out as `{ url, mimeType, filename, sizeBytes }`; sent as bytes it goes out under its own content type and filename unless `headers` sets them.",
   "tags": [
     "api",
     "http",
@@ -16,7 +16,7 @@
       "name": "body",
       "type": "T",
       "required": true,
-      "description": "What to send: any value on a json route (an object, a list, a string), a String on a text route, a stored file on a bytes route."
+      "description": "Any value on json, a String on text, a stored file on bytes."
     },
     {
       "name": "answerAs",
@@ -31,7 +31,7 @@
         ]
       },
       "label": "Answer as",
-      "description": "The shape of the answer. Empty (default) answers in the trigger's own `dataType`. Set it when the answer differs from what came in: a GET with no body that answers a picture sets `bytes` and sends a stored file."
+      "description": "`json`, `text` or `bytes`; empty follows the trigger's `dataType`. A GET answering a picture sets `bytes`."
     },
     {
       "name": "status",
@@ -44,22 +44,21 @@
       },
       "default": 200,
       "label": "Status",
-      "description": "The HTTP status of the response (Route only)."
+      "description": "HTTP status (Route only)."
     },
     {
       "name": "headers",
       "type": "Dict[String, String]",
-      "description": "Extra response headers by name (Route only). A content-type here overrides the one the body's shape implies."
+      "description": "Extra response headers (Route only); a content-type here overrides the body's."
     }
   ],
   "outputs": [
     {
       "name": "done",
       "type": "Boolean",
-      "description": "Fires true once the message has been handed to the caller."
+      "description": "True once the message was handed to the caller."
     }
   ],
-  "requires_infra": false,
   "features": {
     "answersCaller": "whole"
   },

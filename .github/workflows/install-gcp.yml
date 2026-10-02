@@ -83,15 +83,33 @@ jobs:
           terraform apply -input=false -auto-approve \
             -target=google_project_service.apis -target=google_artifact_registry_repository.images
 
-      - run: rustup toolchain install
-
-      - name: build the weft CLI from this checkout
-        run: cargo build --release --locked -p weft-cli
+      # The CLI the release published for this exact commit, checked
+      # against its sha256, when the fork sits on that commit (the same
+      # match setup.sh makes); otherwise built from this checkout.
+      # SYNC: release tag + asset name + manifest.json keys <-> .github/workflows/release.yml (the release job), setup.sh (prebuilt artifacts block)
+      - name: the weft CLI for this checkout
+        run: |
+          base=https://github.com/WeaveMindAI/weft/releases/download/latest
+          manifest=$(curl -fsSL --max-time 10 "$base/manifest.json" || true)
+          commit=$(sed -n 's/.*"commit": *"\([^"]*\)".*/\1/p' <<<"$manifest")
+          sha=$(sed -n 's/.*"sha256_weft-x86_64-linux": *"\([^"]*\)".*/\1/p' <<<"$manifest")
+          mkdir -p target/release
+          if [ "$commit" = "$GITHUB_SHA" ] && [ -n "$sha" ]; then
+            curl -fsSL "$base/weft-x86_64-linux" -o target/release/weft
+            echo "$sha  target/release/weft" | sha256sum -c -
+            chmod +x target/release/weft
+            echo "using the CLI the release built from $commit"
+          else
+            echo "this commit has no published CLI; building it"
+            rustup toolchain install
+            cargo build --release --locked -p weft-cli
+          fi
 
       # The runtime image and the worker builder base this checkout names,
-      # built here and pushed to the install's registry (an image already
-      # there is not built again). A fork carrying its own changes gets
-      # exactly its own runtime.
+      # pushed to the install's registry. Each is taken from the install's
+      # registry if there, else copied from the release's (the same tag is
+      # the same contents), else built. A fork carrying its own changes
+      # hashes to new tags and gets exactly its own runtime.
       - name: build the runtime's images
         run: |
           registry=$(terraform -chdir=deploy/terraform/gcp output -raw registry)

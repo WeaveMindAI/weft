@@ -4,13 +4,13 @@
 //! model-specific extras.
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use weft::node::NodeOutput;
 use weft::storage::{FileHandle, KeepTtl, StorageScope};
 use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
-use super::fal::{media_url, merge_params, run_queued, video_url};
+use super::fal::{merge_params, run_queued, video_url};
 
 #[derive(NodeManifest)]
 pub struct FalAnimateImageNode;
@@ -31,19 +31,21 @@ impl Node for FalAnimateImageNode {
         let image: FileHandle = ctx.inputs.get("image")?;
         let prompt: String = ctx.inputs.get("prompt")?;
         let tail: Option<FileHandle> = ctx.inputs.opt("tailImage")?;
-        let params = ctx.inputs.raw("params").cloned();
+        let params = ctx.inputs.opt::<Map<String, Value>>("params")?;
 
+        let storage = ctx.storage(StorageScope::Execution);
         let mut payload = json!({
             "prompt": prompt,
-            "image_url": media_url(&ctx, &image).await?,
+            "image_url": storage.external_url(&image).await?,
         });
         if let Some(tail) = &tail {
-            payload["tail_image_url"] = json!(media_url(&ctx, tail).await?);
+            payload["tail_image_url"] = json!(storage.external_url(tail).await?);
         }
-        merge_params(&mut payload, params.as_ref())?;
+        merge_params(&mut payload, params.as_ref());
 
         let http = ctx.client(&account).await?;
-        let answer = run_queued(&ctx, &http, &model, &payload, "fal: animate the image").await?;
+        let answer =
+            run_queued(&ctx, &account, &http, &model, &payload, "fal: animate the image").await?;
 
         let url = video_url(&answer).node_err("fal answered no video for this animation")?;
         let ty = ctx.output_type("video")?;

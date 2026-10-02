@@ -5,10 +5,13 @@
 	import type { Extension } from '@codemirror/state';
 	import { python } from '@codemirror/lang-python';
 	import { javascript } from '@codemirror/lang-javascript';
+	import { sql } from '@codemirror/lang-sql';
+	import { json } from '@codemirror/lang-json';
 	import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 	import { syntaxHighlighting, defaultHighlightStyle } from '@codemirror/language';
 	import { githubLight } from '@uiw/codemirror-theme-github';
 	import { minimalChange } from '../minimal-change';
+	import type { CodeLanguage } from '../../../protocol';
 
 	let {
 		value = '',
@@ -26,7 +29,7 @@
 		/// The code widget's declared syntax (metadata `language`). The
 		/// Rust widget always carries one; absence is a malformed state
 		/// and surfaces loudly, never a silent default language.
-		language?: string;
+		language?: CodeLanguage;
 		/// True when `value` is a LIVE external document (a file-backed
 		/// field's file content): its changes apply to the editor even
 		/// while focused, so what's on disk is what's on screen. False
@@ -38,25 +41,30 @@
 		onchange?: (value: string) => void;
 	} = $props();
 
-	/// The one language -> CodeMirror-extension table. An unknown or
-	/// missing language is a LOUD console error and renders as plain
+	/// The one language -> CodeMirror-extension table. Keyed by the
+	/// closed `CodeLanguage` union, so a language added there without an
+	/// entry here fails the typecheck. A missing or unknown language
+	/// (malformed data) is a LOUD console error and renders as plain
 	/// text; it is never silently highlighted as some other language.
-	function languageExtensions(lang: string | undefined): Extension[] {
+	const LANGUAGE_EXTENSIONS: Record<CodeLanguage, () => Extension> = {
+		python: () => python(),
+		javascript: () => javascript(),
+		sql: () => sql(),
+		json: () => json(),
+	};
+
+	function languageExtensions(lang: CodeLanguage | undefined): Extension[] {
 		if (lang === undefined) {
 			console.error('CodeEditor: code widget carries no language; rendering plain text');
 			return [];
 		}
-		switch (lang) {
-			case 'python':
-				return [python()];
-			case 'javascript':
-				return [javascript()];
-			default:
-				console.error(
-					`CodeEditor: no syntax support for language '${lang}' (known: python, javascript); rendering plain text`,
-				);
-				return [];
+		if (!Object.hasOwn(LANGUAGE_EXTENSIONS, lang)) {
+			console.error(
+				`CodeEditor: no syntax support for language '${lang}' (known: ${Object.keys(LANGUAGE_EXTENSIONS).join(', ')}); rendering plain text`,
+			);
+			return [];
 		}
+		return [LANGUAGE_EXTENSIONS[lang]()];
 	}
 
 	let container: HTMLDivElement;

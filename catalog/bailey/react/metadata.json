@@ -1,7 +1,7 @@
 {
   "type": "BaileyReact",
   "label": "WhatsApp React (Baileys)",
-  "description": "React to a WhatsApp message with an emoji via the project's bridge. An empty emoji removes the reaction. Wire `endpointUrl` from a BaileyBridge; `chatId` and `messageId` usually come from a WhatsApp Receive fire.",
+  "description": "React to a WhatsApp message with an emoji; an empty emoji removes the reaction. `chatId` and `messageId` usually come from a BaileyReceive fire.",
   "tags": [
     "whatsapp",
     "baileys",
@@ -11,9 +11,10 @@
   "color": "#25D366",
   "inputs": [
     {
-      "name": "endpointUrl",
-      "type": "String",
-      "required": true
+      "name": "bridge",
+      "type": "Infra",
+      "required": true,
+      "description": "The `bridge` output of the BaileyBridge node to talk through."
     },
     {
       "name": "chatId",
@@ -39,6 +40,5 @@
   ],
   "features": {
     "catchErrors": true
-  },
-  "requires_infra": false
+  }
 }

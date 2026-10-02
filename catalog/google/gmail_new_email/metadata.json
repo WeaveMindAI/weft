@@ -1,7 +1,7 @@
 {
   "type": "GmailNewEmail",
   "label": "Gmail: On New Email",
-  "description": "Fires once per new message matching a Gmail search query (e.g. 'label:inbox -from:me', 'has:attachment invoice'). Activation starts from the current mailbox (history never replays); each fire carries the decomposed message, attachments included.",
+  "description": "Fires once per new Gmail message matching a search query (e.g. 'label:inbox -from:me', 'has:attachment invoice'), carrying the decomposed message with attachments. Starts from the mailbox as it is at activation; older mail never replays. Each poll reads up to 500 messages, so a burst larger than that within one interval fires only its newest 500.",
   "tags": [
     "google",
     "gmail",
@@ -16,15 +16,14 @@
       "required": true,
       "requiresScopes": [
         "https://www.googleapis.com/auth/gmail.readonly"
-      ],
-      "description": "A Google account with the read-mail permission."
+      ]
     },
     {
       "name": "query",
       "type": "String",
       "label": "Search query",
       "placeholder": "label:inbox",
-      "description": "A Gmail search query filtering which messages fire. Empty = every new message."
+      "description": "Gmail search query. Empty = every new message."
     },
     {
       "name": "intervalSecs",
@@ -33,7 +32,7 @@
       "label": "Check every (seconds)",
       "widget": {
         "kind": "number",
-        "min": 1,
+        "min": 5,
         "step": 1
       }
     },
@@ -41,9 +40,6 @@
       "name": "includeAttachments",
       "type": "Boolean",
       "default": true,
-      "widget": {
-        "kind": "checkbox"
-      },
       "label": "Download attachments"
     }
   ],

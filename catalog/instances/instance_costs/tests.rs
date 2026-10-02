@@ -54,7 +54,7 @@ async fn no_costs(rig: FakeRig) -> WeftResult<()> {
 
 async fn a_bad_paid_by(rig: FakeRig) -> WeftResult<()> {
     let err = rig.run(&InstanceCostsNode, json!({ "instance": "ada", "paidBy": "someone" })).await.failure()?;
-    assert!(err.contains("platform, author or instance"), "{err}");
+    assert!(err.contains("paidBy") && err.contains("someone") && err.contains("`instance`"), "{err}");
     assert!(rig.program_calls().is_empty());
     Ok(())
 }

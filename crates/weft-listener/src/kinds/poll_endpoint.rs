@@ -1,8 +1,16 @@
 //! Periodic HTTP poll handler. Hits the configured URL once per wake,
-//! every `interval_secs`, and fires a fresh execution carrying the
-//! response body (JSON if it parses, else a JSON string), or, in delta
-//! mode, one per new item past the cursor kept on the signal row. Nothing
-//! runs between polls: each wake polls once and sets the next.
+//! every `interval_secs`, and fires the response body (JSON if it
+//! parses, else a JSON string), or, in delta mode, one fire per new item
+//! past the cursor kept on the signal row. Nothing runs between polls:
+//! each wake polls once and sets the next.
+//!
+//! As an entry trigger every fire starts a fresh execution. As a parked
+//! run's wait (`await_signal`, a node waiting for an outside job to
+//! finish) the first poll runs at once, so a job already done resumes
+//! the run without waiting an interval, and the first answer that passes
+//! the signal's filter resumes it; after that the signal polls no more.
+//! Delta mode is refused there: its first poll primes silently, which
+//! would swallow the very answer the run waits for.
 
 
 use anyhow::Result;
@@ -45,8 +53,27 @@ impl KindHandler for PollEndpointHandler {
     /// queued while the project was inactive (and on an
     /// acknowledged-cursor feed like Telegram, actively tell the
     /// provider to drop it).
-    fn compute_initial_state(&self, _spec: &SignalSpec, prior: Option<&Value>, _asked_at_unix_ms: i64) -> Result<Value> {
+    ///
+    /// A run's wait starts from nothing and pins its first poll at the
+    /// moment it was asked for, so the job it waits on is checked at once.
+    fn compute_initial_state(&self, _spec: &SignalSpec, prior: Option<&Value>, asked_at_unix_ms: i64, is_resume: bool) -> Result<Value> {
+        if is_resume {
+            return Ok(PollState { first_poll_at_ms: Some(asked_at_unix_ms), ..PollState::default() }.to_value());
+        }
         Ok(prior.cloned().unwrap_or_else(|| Value::Object(serde_json::Map::new())))
+    }
+
+    fn check_resume(&self, spec: &SignalSpec) -> Result<()> {
+        let poll: PollEndpoint = serde_json::from_value(spec.config.clone())
+            .map_err(|e| anyhow::anyhow!("malformed poll_endpoint spec: {e}"))?;
+        anyhow::ensure!(
+            poll.delta.is_none(),
+            "a run waiting on a poll_endpoint cannot use delta mode: its first poll primes the \
+             cursor silently, which would swallow the answer the run waits for. Drop `delta` and \
+             say when the answer is the one to resume on with filters (for example `status` \
+             matching `COMPLETED|FAILED`)"
+        );
+        Ok(())
     }
 
     /// The next point on the poll's grid: every `interval_secs` counted
@@ -55,16 +82,32 @@ impl KindHandler for PollEndpointHandler {
     /// listener) names the same moment and sets one wake. A slow poll
     /// or a late wake skips the points it missed rather than polling in
     /// a burst to catch up.
-    fn next_wake(&self, spec: &SignalSpec, _state: &Value, _from: WakeFrom, now_ms: i64) -> Result<Option<i64>> {
+    ///
+    /// A run's wait first polls at its pinned moment (when it was asked
+    /// for), and stops for good once it delivered its answer.
+    fn next_wake(&self, spec: &SignalSpec, state: &Value, _from: WakeFrom, now_ms: i64) -> Result<Option<i64>> {
         let poll: PollEndpoint = serde_json::from_value(spec.config.clone())
             .map_err(|e| anyhow::anyhow!("malformed poll_endpoint spec: {e}"))?;
+        let state = PollState::read(state)?;
+        if state.resumed {
+            return Ok(None);
+        }
+        if let Some(first) = state.first_poll_at_ms {
+            return Ok(Some(first));
+        }
         Ok(Some(next_grid_point(now_ms, poll.interval_secs)))
     }
 
     async fn on_wake(&self, spec: &SignalSpec, woken: Woken, ctx: SpawnCtx) -> Result<Value> {
         let poll: PollEndpoint = serde_json::from_value(spec.config.clone())
             .map_err(|e| anyhow::anyhow!("malformed poll_endpoint spec: {e}"))?;
-        poll_once(&poll, &spec.access, woken.state, woken.seq, &ctx).await
+        // Registration refuses this (`check_resume`); a row that holds it
+        // anyway was written past that check and is refused here too.
+        anyhow::ensure!(
+            !(woken.is_resume && poll.delta.is_some()),
+            "a run waiting on a poll_endpoint cannot use delta mode"
+        );
+        poll_once(&poll, &spec.access, woken.state, woken.seq, woken.is_resume, &ctx).await
     }
 
     fn process_entry(&self, _sig: &RegisteredSignal, payload: Value) -> ProcessOutcome {
@@ -125,6 +168,14 @@ struct PollState {
     /// Why the last of them failed. Absent once a poll went through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_failure: Option<String>,
+    /// A run's wait only: the moment its first poll is pinned at (when
+    /// the wait was asked for). Gone once a poll ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    first_poll_at_ms: Option<i64>,
+    /// A run's wait only: an answer passed the filter and was handed to
+    /// the run, so there is nothing left to poll for.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    resumed: bool,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -144,6 +195,7 @@ impl PollState {
     fn status_line(&self) -> String {
         match (&self.last_failure, self.consecutive_failures) {
             (Some(why), n) if n > 0 => format!("{why} (failed {n} in a row)"),
+            _ if self.resumed => "answered".to_string(),
             _ => "polling".to_string(),
         }
     }
@@ -171,6 +223,9 @@ async fn store(ctx: &SpawnCtx, seq: i64, next: &PollState) {
 }
 
 /// One poll: fetch, fire what is new, persist the advanced cursor.
+/// For a run's wait (`is_resume`), a fire that went out is the answer:
+/// the state records it and no further poll is set. A filtered answer
+/// (the job is not done yet) keeps polling.
 /// Answers the state the signal now stands at. A failed poll fires
 /// nothing and moves no cursor; it counts the streak on the row, where
 /// the node's display reads it, and a streak that keeps growing
@@ -181,10 +236,15 @@ async fn poll_once(
     access: &Option<weft_core::primitive::AccessRef>,
     kind_state: Value,
     seq: i64,
+    is_resume: bool,
     ctx: &SpawnCtx,
 ) -> Result<Value> {
     let url = poll.url.as_str();
     let before = PollState::read(&kind_state)?;
+    if before.resumed {
+        // A wake that was already set when the answer went out.
+        return Ok(kind_state);
+    }
     let state = before.delta.clone();
     let failed = |what: &str, detail: String| {
         let streak = before.consecutive_failures + 1;
@@ -198,7 +258,12 @@ async fn poll_once(
         } else {
             warn!(target: "weft_listener::poll_endpoint", %url, error = %detail, "{what}; will retry next poll");
         }
-        PollState { delta: before.delta.clone(), consecutive_failures: streak, last_failure: Some(format!("{what}: {detail}")) }
+        PollState {
+            delta: before.delta.clone(),
+            consecutive_failures: streak,
+            last_failure: Some(format!("{what}: {detail}")),
+            ..PollState::default()
+        }
     };
     let next = 'poll: {
         // Signed-in polls resolve the connection PER POLL: the credential
@@ -244,9 +309,13 @@ async fn poll_once(
         let Some(delta) = &poll.delta else {
             // Plain mode: every poll fires the whole response. It has no
             // replay cursor; the delivery outcome is already logged by
-            // the fire path.
-            let _ = ctx.fire.fire(super::event_source::coerce_text_payload(body), "poll_endpoint").await;
-            break 'poll PollState { delta: None, consecutive_failures: 0, last_failure: None };
+            // the fire path. A run's wait is answered by the first fire
+            // that went out; one that did not keeps it polling.
+            let answer = super::event_source::coerce_text_payload(body);
+            let carried = weft_core::signal::poll_endpoint::carried(&answer, &poll.carry);
+            let outcome = ctx.fire.fire_judged(&answer, carried, "poll_endpoint").await;
+            let resumed = is_resume && outcome == crate::event_context::FireOutcome::Fired;
+            break 'poll PollState { resumed, ..PollState::default() };
         };
 
         // Delta mode: fire once per NEW item, then persist the advanced
@@ -293,7 +362,7 @@ async fn poll_once(
             }
             advanced
         };
-        PollState { delta: advanced, consecutive_failures: 0, last_failure: None }
+        PollState { delta: advanced, ..PollState::default() }
     };
     if next != before {
         store(ctx, seq, &next).await;

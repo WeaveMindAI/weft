@@ -1,7 +1,7 @@
 {
   "type": "SlackOnFileShared",
   "label": "Slack: On File Shared",
-  "description": "Fires when a file is shared in a channel, optionally filtered to one channel. The event carries the file's id and where it landed, never the bytes; wire Slack: Download File downstream to pull the content.",
+  "description": "Fires when a file is shared in a Slack channel, optionally only in one channel. Carries the file id and where it landed, never the bytes; wire Slack Download File to get the content.",
   "tags": [
     "slack",
     "trigger",
@@ -26,7 +26,7 @@
       "requiresScopes": [
         "files:read"
       ],
-      "description": "The Slack access (wire a SlackAccess node). Needs the files:read scope."
+      "description": "Needs files:read."
     },
     {
       "name": "channel",
@@ -48,23 +48,27 @@
               "cursor_param": "cursor",
               "cursor_path": "response_metadata.next_cursor"
             }
+          },
+          {
+            "kind": "from_url",
+            "pattern": "/archives/([A-Z0-9]+)"
           }
         ]
       },
       "label": "Channel",
-      "description": "Only fire on files shared in this channel. Leave empty for the whole workspace."
+      "description": "Only this channel. Empty = whole workspace."
     }
   ],
   "outputs": [
     {
       "name": "fileId",
       "type": "String",
-      "description": "The shared file's id (F...)."
+      "description": "File id (F...)."
     },
     {
       "name": "channel",
       "type": "String",
-      "description": "The channel it was shared into."
+      "description": "Channel it was shared into."
     },
     {
       "name": "user",

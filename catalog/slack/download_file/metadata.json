@@ -1,7 +1,7 @@
 {
   "type": "SlackDownloadFile",
   "label": "Slack: Download File",
-  "description": "Pull a Slack-hosted file (an F... id, e.g. from the file-shared trigger) into storage and emit the stored-file reference for downstream nodes. The file belongs to this run and is swept when it ends; wire it through KeepFile to keep it longer or share it with later runs.",
+  "description": "Downloads a Slack-hosted file (an F... id, e.g. from the file-shared trigger) into storage. The file is swept when the run ends; wire it through KeepFile to keep it.",
   "tags": [
     "slack",
     "file"
@@ -16,7 +16,7 @@
       "requiresScopes": [
         "files:read"
       ],
-      "description": "The Slack access (wire a SlackAccess node). Needs the files:read scope."
+      "description": "Needs files:read."
     },
     {
       "name": "fileId",
@@ -29,8 +29,7 @@
   "outputs": [
     {
       "name": "file",
-      "type": "File",
-      "description": "The stored file reference."
+      "type": "File"
     },
     {
       "name": "filename",

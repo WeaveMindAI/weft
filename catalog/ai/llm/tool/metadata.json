@@ -1,7 +1,7 @@
 {
   "type": "LlmTool",
   "label": "LLM Tool",
-  "description": "Declare one tool the model may call: a name, what it does, and a JSON Schema for its arguments. Wire it (or a list of them) into an LLM node's tools input; the model's calls come out on that node's toolCalls output, and a Chat Message node (role: tool) feeds each result back into the history.",
+  "description": "Declare one tool the model may call: a name, what it does, and a JSON Schema for its arguments. The model's calls come out on the LLM node's toolCalls output, and a Chat Message (role tool) feeds each result back.",
   "tags": [
     "ai",
     "tool",
@@ -15,9 +15,6 @@
       "name": "name",
       "type": "String",
       "required": true,
-      "widget": {
-        "kind": "text"
-      },
       "label": "Name",
       "placeholder": "get_weather"
     },
@@ -31,22 +28,21 @@
     },
     {
       "name": "parameters",
-      "type": "String",
+      "type": "JsonDict",
       "widget": {
         "kind": "code",
         "language": "json"
       },
       "label": "Arguments schema",
       "placeholder": "{ \"type\": \"object\", \"properties\": { \"city\": { \"type\": \"string\" } }, \"required\": [\"city\"] }",
-      "description": "JSON Schema for the tool's arguments. Leave empty for a tool that takes none."
+      "description": "JSON Schema for the tool's arguments, as an object. Leave empty for a tool that takes none."
     }
   ],
   "outputs": [
     {
       "name": "tool",
       "type": "JsonDict",
-      "description": "The tool declaration: wire it into an LLM node's tools input."
+      "description": "Wire into an LLM node's tools input (alone or in a list)."
     }
-  ],
-  "requires_infra": false
+  ]
 }

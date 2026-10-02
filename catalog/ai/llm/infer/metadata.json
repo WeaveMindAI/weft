@@ -1,7 +1,7 @@
 {
   "type": "LlmInference",
   "label": "LLM",
-  "description": "AI language model completion. Which service serves it comes from a wired provider node (OpenRouter, Anthropic, OpenAI, or a custom endpoint); sampling parameters come from a wired LlmParams node, and without one the defaults apply. A conversation is kept in a file that each call adds its turn to (`historyFile`); wired LLM Tool declarations turn on tool calling. For an agent that calls tools until it is done: run turns in a sequential Loop carrying the conversation file. Each turn takes the file on `historyFile` and the LLM Tools on `tools` (several through a List). When the model asks for tools, `toolCalls` pulses a List[ToolCall], each `{ id, name, arguments }` with `arguments` as raw JSON text; run them in a sequential Loop over `toolCalls` that carries the file, a Switch on the call's `name` (one `equals` case per tool) gating each tool's node, and add each result to the file with a Chat Message node (see its description). The file that loop hands back feeds the next turn, and the turns stop when one answers with no `toolCalls` pulse.",
+  "description": "AI language model completion: one call to a model, served by a wired provider node, with optional tool calling and a conversation kept in a file. For an agent that calls tools until it is done: run turns in a sequential Loop carrying the conversation file. Each turn takes the file on `historyFile` and the LLM Tools on `tools` (several through a List). When the model asks for tools, `toolCalls` pulses a List[ToolCall], each `{ id, name, arguments }` with `arguments` as raw JSON text; run them in a sequential Loop over `toolCalls` that carries the file, a Switch on the call's `name` (one `equals` case per tool) gating each tool's node, and add each result to the file with a Chat Message node (role tool). The file that loop hands back feeds the next turn, and the turns stop when one answers with no `toolCalls` pulse.",
   "tags": [
     "ai",
     "gpt",
@@ -17,31 +17,31 @@
       "name": "prompt",
       "type": "String",
       "widget": { "kind": "textarea" },
-      "description": "The prompt to send, appended as the newest user message. Optional when a `historyFile` is wired (a tool-result round re-enters with the conversation alone)."
+      "description": "Appended as the newest user message. Optional when `historyFile` is wired (a tool-result round re-enters with the conversation alone)."
     },
     {
       "name": "historyFile",
       "type": "File",
       "accepts": ["wire"],
-      "description": "The conversation so far, kept in a stored file (a previous call's or a Chat Message node's `historyFile` output, or a file holding `[]` to start one that later runs will continue: store it in the project scope). This call's turn is added to this same file, in place, and the file comes out on `historyFile`. Unwired, the call starts from no conversation."
+      "description": "The conversation so far, in a stored file (a previous call's or a Chat Message's `historyFile` output, or a file holding `[]` stored in the project scope to start one later runs continue). This call's turn is added to the same file, in place. Unwired, the call starts from no conversation."
     },
     {
       "name": "media",
       "type": "Media | List[Media]",
-      "description": "Media attached to this prompt: one stored image, audio clip, or video, or a list of them."
+      "description": "One stored image, audio clip, or video attached to this prompt, or a list of them."
     },
     {
       "name": "provider",
       "type": "LlmProvider",
       "required": true,
       "accepts": ["wire"],
-      "description": "The provider (wire an OpenRouter, Anthropic, OpenAI, or Custom Provider node's output): which service, which model, whose credential the call spends. Always wire one of those nodes; never build this value by hand or pass it through a port typed JsonDict (a group that carries it declares the port as LlmProvider). The provider node holds the connection, so the credential never appears in the program."
+      "description": "Which service, model, and credential: wire an OpenRouter, Anthropic, OpenAI, or Custom Provider node's output. Never build this value by hand or pass it through a port typed JsonDict (a group that carries it declares the port as LlmProvider)."
     },
     {
       "name": "params",
       "type": "Dict[String, String | Number | Boolean | List[String]]",
       "accepts": ["wire"],
-      "description": "Optional LlmParams node carrying the sampling settings (system prompt, temperature, ...). Unwired, the defaults apply."
+      "description": "Optional LlmParams node (system prompt, temperature, ...). Unwired, the defaults apply."
     },
     {
       "name": "tools",
@@ -65,32 +65,31 @@
       "type": "Boolean",
       "default": false,
       "label": "Parse JSON",
-      "description": "Parse and repair JSON from the response (changes output to Dict). With it on, declare output ports named after the JSON's keys (`-> (verdict: String, score: Number)`) and each key comes out as its own port; `response` then only matters when something reads the whole object."
+      "description": "Parse and repair JSON from the reply (output becomes a Dict). Declare output ports named after the JSON's keys (`-> (verdict: String, score: Number)`) and each key comes out on its own port."
     },
     {
       "name": "autoCache",
       "type": "Boolean",
-      "widget": { "kind": "checkbox" },
       "default": true,
       "label": "Automatic prompt caching",
-      "description": "On: when the conversation carries no cache mark, the request marks the system message and the last message before this call's new turn, so a chain of calls reuses its stable prefix. The marks live on the request alone: the `historyFile` keeps the conversation as written, so the next call in the chain places its own. A conversation that already carries marks (Chat Message's `cacheBreakpoint`) is sent as placed."
+      "description": "On: when the conversation carries no cache mark of its own, the request marks the system message and the last message before this turn. The marks are sent only, never written into `historyFile`."
     }
   ],
   "outputs": [
     {
       "name": "response",
       "type": "MustOverride",
-      "description": "The reply. Declare its type in the source: `String` without parseJson; with parseJson, prefer one output port per JSON key (`-> (verdict: String)`) and read `response` only when something needs the whole object (then `JsonDict` or a record type)."
+      "description": "The reply. Declare its type: `String` without parseJson; with parseJson read it only when something needs the whole object (`JsonDict` or a record type), and prefer one port per key."
     },
     {
       "name": "historyFile",
       "type": "File",
-      "description": "The conversation including this call, kept in a file: the `historyFile` that came in, with this call's user message and reply added to it in place (same file, next version), or, when none came in, a new file holding this turn, kept past the run. Wire it into the next call's or Chat Message node's `historyFile`. Left unwired with no file in, the call is a one-shot and keeps nothing."
+      "description": "The `historyFile` that came in with this call's user message and reply added (same file, next version), or, when none came in, a new file holding this turn, kept past the run. Unwired with no file in, the call keeps nothing."
     },
     {
       "name": "toolCalls",
       "type": "List[ToolCall]",
-      "description": "The tool calls the model made, if any (each with the raw JSON text of its arguments). Pulses only when the model called tools; append each result with a Chat Message node (role: tool) and wire the `historyFile` back into the next LLM call. A call left without an answer (the run stopped before its result was appended) is answered `cancelled` by the next call on its own, so the conversation keeps working."
+      "description": "Pulses only when the model called tools. Append each result with a Chat Message (role tool) and wire its `historyFile` into the next call. A call left unanswered (the run stopped before its result was appended) is answered `cancelled` by the next call."
     }
   ],
   "validate": [
@@ -110,7 +109,6 @@
       }
     }
   ],
-  "requires_infra": false,
   "features": {
     "catchErrors": true,
     "canAddOutputPorts": true,

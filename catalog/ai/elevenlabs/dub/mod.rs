@@ -1,16 +1,16 @@
 //! ElevenLabsDub: dub a recording into another language (translated,
 //! re-voiced to match the original speakers). Long-running: submit
-//! the dubbing job, wait on its status (a dub the user asked for
-//! takes as long as it takes, no deadline; cancelling the execution
-//! cancels the wait), then download and store the dubbed audio.
-
-use std::time::Duration;
+//! the dubbing job, park on its status without holding a worker (a dub
+//! the user asked for takes as long as it takes, no deadline;
+//! cancelling the execution cancels the wait), then download and store
+//! the dubbed audio.
 
 use async_trait::async_trait;
+use serde_json::json;
 
-use weft::access::client::{get_json, json_call, Multipart};
-use weft::context::LogLevel;
+use weft::access::client::{json_call, Multipart};
 use weft::node::NodeOutput;
+use weft::signal::{PollEndpoint, Predicate};
 use weft::storage::{FileHandle, KeepTtl, StorageScope};
 use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
@@ -37,61 +37,72 @@ impl Node for ElevenLabsDubNode {
         let num_speakers: Option<f64> = ctx.inputs.opt("numSpeakers")?;
         let drop_background: bool = ctx.inputs.get("dropBackgroundAudio")?;
 
-        let (meta, bytes) = ctx.storage(StorageScope::Execution).get_bytes(&file).await?;
-        let mut form = Multipart::form_data()
-            .text("target_lang", &target_lang)
-            .file("file", &meta.filename, &meta.mime_type, bytes);
-        if let Some(lang) = &source_lang {
-            form = form.text("source_lang", lang);
-        }
-        if let Some(n) = num_speakers {
-            form = form.text("num_speakers", &(n as u64).to_string());
-        }
-        if drop_background {
-            form = form.text("drop_background_audio", "true");
-        }
-        let (content_type, body) = form.build();
-
         let http = ctx.client(&account).await?;
-        let started = json_call(
-            http.post(format!("{API}/dubbing"))
-                .header("content-type", content_type)
-                .body(body),
-            "elevenlabs: start the dub",
-        )
-        .await?;
-        let job = started["dubbing_id"]
-            .as_str()
-            .node_err("elevenlabs: the dub start carries no dubbing_id")?
-            .to_string();
-
-        // Wait on the job. A breadcrumb every ~12 polls keeps a long
-        // dub legible in the logs.
-        let mut polls: u64 = 0;
-        loop {
-            let status = get_json(
-                &http,
-                &format!("{API}/dubbing/{job}"),
-                "elevenlabs: read the dub status",
-            )
-            .await?;
-            match status["status"].as_str().unwrap_or_default() {
-                "dubbed" => break,
-                "failed" => weft::node_bail!(
-                    "the dub failed: {}",
-                    status["error"].as_str().unwrap_or("no detail")
-                ),
-                "preparing" | "dubbing" => {
-                    polls += 1;
-                    if polls % 12 == 0 {
-                        ctx.log(LogLevel::Info, format!("dub {job} still running")).await?;
-                    }
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+        // Starting the dub is the paid call, and the body replays from
+        // the top when the wait resumes: journaled, the replay reads the
+        // dubbing id back instead of starting a second dub (and never
+        // reads the recording again).
+        let started = ctx
+            .run("elevenlabs_start_dub", || async {
+                let (meta, bytes) =
+                    ctx.storage(StorageScope::Execution).get_bytes(&file).await?;
+                let mut form = Multipart::form_data()
+                    .text("target_lang", &target_lang)
+                    .file("file", &meta.filename, &meta.mime_type, bytes);
+                if let Some(lang) = &source_lang {
+                    form = form.text("source_lang", lang);
                 }
-                other => weft::node_bail!(
-                    "elevenlabs answered an unexpected status '{other}' for dub {job}"
-                ),
-            }
+                if let Some(n) = num_speakers {
+                    form = form.text("num_speakers", &(n as u64).to_string());
+                }
+                if drop_background {
+                    form = form.text("drop_background_audio", "true");
+                }
+                let (content_type, body) = form.build();
+                let answer = json_call(
+                    http.post(format!("{API}/dubbing"))
+                        .header("content-type", content_type)
+                        .body(body),
+                    "elevenlabs: start the dub",
+                )
+                .await?;
+                let job = answer["dubbing_id"]
+                    .as_str()
+                    .node_err("elevenlabs: the dub start carries no dubbing_id")?;
+                Ok(json!({ "job": job, "filename": meta.filename }))
+            })
+            .await?;
+        let job = started["job"]
+            .as_str()
+            .node_err("the journaled dub start has no job")?
+            .to_string();
+        let filename =
+            started["filename"].as_str().node_err("the journaled dub start has no filename")?;
+
+        // Resume on any status that is not in flight, so a status this
+        // node does not know ends the wait and is refused below instead
+        // of being waited on forever.
+        let status = ctx
+            .await_signal(PollEndpoint {
+                url: format!("{API}/dubbing/{job}"),
+                interval_secs: 5,
+                access: Some(weft::primitive::AccessRef::from(&account)),
+                filters: vec![
+                    Predicate::neq("status", "preparing"),
+                    Predicate::neq("status", "dubbing"),
+                ],
+                ..Default::default()
+            })
+            .await?;
+        match status["status"].as_str().unwrap_or_default() {
+            "dubbed" => {}
+            "failed" => weft::node_bail!(
+                "the dub failed: {}",
+                status["error"].as_str().unwrap_or("no detail")
+            ),
+            other => weft::node_bail!(
+                "elevenlabs answered an unexpected status '{other}' for dub {job}"
+            ),
         }
 
         let resp = http
@@ -105,7 +116,7 @@ impl Node for ElevenLabsDubNode {
                 resp,
                 "elevenlabs: download the dubbed audio",
                 None,
-                &format!("dubbed_{target_lang}_{}", meta.filename),
+                &format!("dubbed_{target_lang}_{filename}"),
                 // The dubbed audio is the run's product: keep it past
                 // the run (default 30-day access-bumped TTL).
                 Some(KeepTtl::Default),

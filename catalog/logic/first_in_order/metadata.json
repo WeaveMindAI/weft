@@ -1,7 +1,7 @@
 {
   "type": "FirstInOrder",
   "label": "First in order",
-  "description": "Take whichever branch spoke, in the order the inputs are written: the first input that carried a value is the one emitted, and nothing is emitted when they all stayed quiet. Its inputs are the ones you wire onto it, so `checked: review.answer` above `quick: draft.answer` prefers the checked one whenever both arrive.",
+  "description": "Emit the first wired input, in written order, that carried a value; nothing if none did. `checked: review.answer` above `quick: draft.answer` prefers the checked one when both arrive.",
   "tags": [
     "flow",
     "join",
@@ -16,13 +16,12 @@
     {
       "name": "value",
       "type": "T",
-      "description": "The first input that spoke, in written order. Closed when none did."
+      "description": "The first input that carried a value. Closed when none did."
     }
   ],
   "features": {
     "canAddInputPorts": true,
     "optionalCustomInputs": true,
     "customInputType": "T"
-  },
-  "requires_infra": false
+  }
 }

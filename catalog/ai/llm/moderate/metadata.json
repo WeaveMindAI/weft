@@ -1,7 +1,7 @@
 {
   "type": "LlmModerate",
   "label": "Moderate",
-  "description": "Content-safety classification through OpenAI's moderation endpoint (free, no usage caps): wire an OpenAIProvider. Emits whether the text flags, which categories, and the per-category scores.",
+  "description": "Classify text for content safety through OpenAI's moderation endpoint (free, no usage caps); wire an OpenAIProvider. Emits whether the text flags, which categories, and per-category scores.",
   "tags": [
     "ai",
     "moderation",
@@ -14,7 +14,21 @@
       "name": "provider",
       "type": "LlmProvider",
       "required": true,
-      "description": "Wire an OpenAIProvider (moderation is an OpenAI endpoint; the provider's chat model is ignored)."
+      "description": "Wire an OpenAIProvider; only its connection is used, so the one feeding your chat nodes works here too."
+    },
+    {
+      "name": "model",
+      "type": "String",
+      "default": "omni-moderation-latest",
+      "description": "The OpenAI moderation model.",
+      "widget": {
+        "kind": "select",
+        "free_text": true,
+        "options": [
+          "omni-moderation-latest",
+          "text-moderation-latest"
+        ]
+      }
     },
     {
       "name": "text",

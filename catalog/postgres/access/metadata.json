@@ -1,7 +1,7 @@
 {
   "type": "PostgresAccess",
   "label": "Postgres Access",
-  "description": "Connect to a Postgres database with its host, port, database name, user and password. Works with any Postgres: a managed one (Neon, Supabase, RDS, Cloud SQL), a server you run, or one on your own machine. The password is stored sealed and never travels on a wire between nodes.",
+  "description": "Connect to an existing Postgres database (managed like Neon, Supabase, RDS, Cloud SQL, or self-hosted) by host, port, database, user and password.",
   "tags": [
     "postgres",
     "database",
@@ -24,7 +24,7 @@
     {
       "name": "access",
       "type": "Access",
-      "description": "The database's access: wire it into the Postgres query and write nodes."
+      "description": "Wire into the Postgres query and write nodes."
     }
   ],
   "service": {

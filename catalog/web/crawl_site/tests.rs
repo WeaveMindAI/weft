@@ -1,5 +1,5 @@
-//! CrawlSite self-tests: submit, poll to completion, accumulate pages
-//! across `next` links, and the loud failed-crawl path.
+//! CrawlSite self-tests: submit, park until the crawl ends, accumulate
+//! pages across `next` links, and the loud failed-crawl path.
 
 use serde_json::json;
 
@@ -44,7 +44,9 @@ async fn live_crawl(rig: LiveRig) -> WeftResult<()> {
 
 async fn crawl_accumulates(rig: FakeRig) -> WeftResult<()> {
     rig.respond("POST", "/v2/crawl", json!({ "success": true, "id": "job-1" }));
-    // First status read: completed with one page and a `next` link.
+    // The wait carries only the status; the pages are read after it,
+    // starting with the finished answer: one page and a `next` link.
+    rig.signal(json!({ "status": "completed" }));
     rig.respond(
         "GET",
         "/v2/crawl/job-1",
@@ -94,16 +96,23 @@ async fn crawl_accumulates(rig: FakeRig) -> WeftResult<()> {
         json!(10),
         "the price-bounding page limit always goes out"
     );
+
+    let awaited = rig.awaited_signals();
+    assert_eq!(awaited.len(), 1, "one wait");
+    assert_eq!(awaited[0].kind, "poll_endpoint");
+    assert_eq!(awaited[0].config["url"], json!("https://api.firecrawl.dev/v2/crawl/job-1"));
+    assert!(awaited[0].access.is_some(), "each poll is signed by the firecrawl connection");
+    assert_eq!(
+        awaited[0].match_predicates,
+        vec![weft::signal::Predicate::neq("status", "scraping")]
+    );
+    assert_eq!(awaited[0].config["carry"], json!(["status", "error"]), "the wait carries the status, never the pages");
     Ok(())
 }
 
 async fn failed_crawl(rig: FakeRig) -> WeftResult<()> {
     rig.respond("POST", "/v2/crawl", json!({ "success": true, "id": "job-2" }));
-    rig.respond(
-        "GET",
-        "/v2/crawl/job-2",
-        json!({ "status": "failed", "error": "robots.txt forbids crawling" }),
-    );
+    rig.signal(json!({ "status": "failed", "error": "robots.txt forbids crawling" }));
     let outcome = rig
         .run(
             &CrawlSiteNode,
@@ -121,11 +130,7 @@ async fn failed_crawl(rig: FakeRig) -> WeftResult<()> {
 
 async fn failed_crawl_wired(rig: FakeRig) -> WeftResult<()> {
     rig.respond("POST", "/v2/crawl", json!({ "success": true, "id": "job-4" }));
-    rig.respond(
-        "GET",
-        "/v2/crawl/job-4",
-        json!({ "status": "failed", "error": "robots.txt forbids crawling" }),
-    );
+    rig.signal(json!({ "status": "failed", "error": "robots.txt forbids crawling" }));
     rig.wire_output("error");
     let outcome = rig
         .run(
@@ -149,8 +154,8 @@ async fn failed_crawl_wired(rig: FakeRig) -> WeftResult<()> {
 async fn unknown_status(rig: FakeRig) -> WeftResult<()> {
     rig.respond("POST", "/v2/crawl", json!({ "success": true, "id": "job-3" }));
     // A status outside Firecrawl's documented set must refuse loudly,
-    // never poll forever on an answer the node does not understand.
-    rig.respond("GET", "/v2/crawl/job-3", json!({ "status": "paused" }));
+    // never wait forever on an answer the node does not understand.
+    rig.signal(json!({ "status": "paused" }));
     let outcome = rig
         .run(
             &CrawlSiteNode,

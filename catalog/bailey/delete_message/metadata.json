@@ -1,7 +1,7 @@
 {
   "type": "BaileyDeleteMessage",
   "label": "WhatsApp Delete Message (Baileys)",
-  "description": "Delete (revoke for everyone) a message the connected account sent, via the project's bridge. Wire `endpointUrl` from a BaileyBridge; `chatId` and `messageId` usually come from a send node or a WhatsApp Receive fire.",
+  "description": "Delete for everyone a WhatsApp message the connected account sent. `bridge` comes from a BaileyBridge; `chatId` and `messageId` from a send node or a BaileyReceive fire.",
   "tags": [
     "whatsapp",
     "baileys",
@@ -11,9 +11,10 @@
   "color": "#25D366",
   "inputs": [
     {
-      "name": "endpointUrl",
-      "type": "String",
-      "required": true
+      "name": "bridge",
+      "type": "Infra",
+      "required": true,
+      "description": "The `bridge` output of the BaileyBridge node to talk through."
     },
     {
       "name": "chatId",
@@ -34,6 +35,5 @@
   ],
   "features": {
     "catchErrors": true
-  },
-  "requires_infra": false
+  }
 }

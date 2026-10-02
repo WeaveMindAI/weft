@@ -11,7 +11,7 @@ use weft::access::client::{get_json, required_str};
 use weft::storage::{FileHandle, StorageScope};
 use weft::{Access, ExecutionContext, Node, NodeManifest, WeftResult};
 
-use super::gmail::{b64url, build_mime, header, non_blank_list, OutAttachment, API};
+use super::gmail::{b64url, build_mime, header, OutAttachment, OutMessage, API};
 
 #[derive(NodeManifest)]
 pub struct GmailSendNode;
@@ -28,9 +28,9 @@ impl Node for GmailSendNode {
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let account: Access = ctx.inputs.get("account")?;
-        let to = non_blank_list(&ctx.inputs, "to")?;
-        let cc = non_blank_list(&ctx.inputs, "cc")?;
-        let bcc = non_blank_list(&ctx.inputs, "bcc")?;
+        let to = weft::comma_list(ctx.inputs.list::<String>("to")?);
+        let cc = weft::comma_list(ctx.inputs.list::<String>("cc")?);
+        let bcc = weft::comma_list(ctx.inputs.list::<String>("bcc")?);
         let subject: String = ctx.inputs.get_or("subject", String::new())?;
         let text: Option<String> = ctx.inputs.opt("text")?;
         let html: Option<String> = ctx.inputs.opt("html")?;
@@ -42,16 +42,25 @@ impl Node for GmailSendNode {
                 "no recipient: provide to, cc, or bcc".to_string(),
             ));
         }
+        // Gmail sends as the signed-in account; its address is the
+        // connection's recorded identity, and the message must name it.
+        let Some(from) = account.identity().map(str::to_string) else {
+            weft::node_bail!(
+                "gmail: the Google connection recorded no account address to send from; \
+                 reconnect it on the access node"
+            )
+        };
         let http = ctx.client(&account).await?;
 
         // Reply threading: the original's Message-ID header + thread.
-        let mut reply_headers = Vec::new();
+        let mut in_reply_to = None;
         let mut thread_id = None;
         if let Some(orig_id) = reply_to.filter(|r| !r.trim().is_empty()) {
             let orig: Value = get_json(
                 &http,
                 &format!(
-                    "{API}/messages/{orig_id}?format=metadata&metadataHeaders=Message-ID"
+                    "{API}/messages/{}?format=metadata&metadataHeaders=Message-ID",
+                    super::api::segment(&orig_id)
                 ),
                 "gmail: read the replied-to message",
             )
@@ -68,8 +77,7 @@ impl Node for GmailSendNode {
                      a reply."
                 ))
             })?;
-            reply_headers.push(("In-Reply-To".to_string(), mid.to_string()));
-            reply_headers.push(("References".to_string(), mid.to_string()));
+            in_reply_to = Some(mid.to_string());
             thread_id = orig["threadId"].as_str().map(str::to_string);
         }
 
@@ -86,16 +94,17 @@ impl Node for GmailSendNode {
             });
         }
 
-        let mime = build_mime(
-            &to,
-            &cc,
-            &bcc,
-            &subject,
-            &reply_headers,
-            text.as_deref(),
-            html.as_deref(),
-            &attachments,
-        )?;
+        let mime = build_mime(&OutMessage {
+            from: &from,
+            to: &to,
+            cc: &cc,
+            bcc: &bcc,
+            subject: &subject,
+            in_reply_to: in_reply_to.as_deref(),
+            text: text.as_deref(),
+            html: html.as_deref(),
+            attachments: &attachments,
+        })?;
         let mut body = json!({ "raw": b64url(&mime) });
         if let Some(t) = thread_id {
             body["threadId"] = json!(t);

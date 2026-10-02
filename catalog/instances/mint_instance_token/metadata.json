@@ -1,7 +1,7 @@
 {
   "type": "MintInstanceToken",
   "label": "Mint instance token",
-  "description": "Hand a browser or extension a token that acts inside one instance of this program, and nothing else: it starts that instance's runs (in the `Weft-Instance-Token` header on a live route), answers its waits, shows its displays and connects its accounts. It always expires. The value comes out once; keep it only where whoever uses the instance can reach it.",
+  "description": "Mint a token a browser or extension uses to act inside one instance only: start its runs (`Weft-Instance-Token` header on a live route), answer its waits, show its displays, connect its accounts. It always expires, and its value is output once.",
   "tags": [
     "instances",
     "token",
@@ -14,13 +14,17 @@
       "name": "instance",
       "type": "String",
       "required": true,
-      "description": "The instance, by the id your program gives it (`user-42`)."
+      "description": "The instance id your program gives it (`user-42`)."
     },
     {
       "name": "expiresInHours",
       "type": "Number",
       "required": true,
-      "description": "How long the token works, in hours (a year at most)."
+      "description": "Lifetime in hours, from one second to a year, rounded to the nearest second.",
+      "widget": {
+        "kind": "number",
+        "max": 8760
+      }
     }
   ],
   "outputs": [
@@ -32,8 +36,7 @@
     {
       "name": "expiresAt",
       "type": "Number",
-      "description": "When it stops working, in unix seconds."
+      "description": "Expiry, unix seconds."
     }
-  ],
-  "requires_infra": false
+  ]
 }

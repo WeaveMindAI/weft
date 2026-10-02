@@ -1,7 +1,7 @@
 {
   "type": "FirecrawlAccess",
   "label": "Firecrawl Access",
-  "description": "Sign in to Firecrawl, the page-fetching and crawling API the Fetch Page and Crawl Site nodes speak. Pick an existing connection or paste an API key.",
+  "description": "Connect Firecrawl, the page-fetching API behind Fetch Page and Crawl Site, with an API key.",
   "tags": [
     "web",
     "scrape",
@@ -65,7 +65,7 @@
     {
       "name": "access",
       "type": "Access",
-      "description": "The Firecrawl access: wire it into Fetch Page / Crawl Site."
+      "description": "Wire into Fetch Page or Crawl Site."
     }
   ]
 }

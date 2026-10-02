@@ -24,7 +24,6 @@ impl Node for ListInstanceInfraNode {
         let copies = ctx.infra(node).copies().await?;
         let instances: Vec<String> =
             copies.iter().filter_map(|c| c.instance.as_ref().map(|i| i.as_str().to_string())).collect();
-        let copies = serde_json::to_value(&copies).map_err(|e| weft::WeftError::NodeExecution(format!("copies: {e}")))?;
-        ctx.pulse_downstream(NodeOutput::new().set("copies", copies).set("instances", instances)).await
+        ctx.pulse_downstream(NodeOutput::new().set_serialized("copies", &copies)?.set("instances", instances)).await
     }
 }

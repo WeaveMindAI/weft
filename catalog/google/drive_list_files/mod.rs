@@ -41,11 +41,18 @@ impl Node for GoogleDriveListFilesNode {
         if !query.trim().is_empty() {
             base.push_str(&format!("&q={}", urlencoding::encode(query.trim())));
         }
-        let mut files =
-            super::api::paged(&drive, &base, "files", "list the files", |got| {
-                got.len() >= wanted
-            })
-            .await?;
+        let mut files: Vec<Value> = Vec::new();
+        weft::access::client::cursor_paged(
+            super::api::paging("/files", "narrow `query`, or lower `pageSize`"),
+            "list the files",
+            || drive.get(&base),
+            Ok,
+            |page| {
+                files.extend_from_slice(page);
+                Ok((files.len() >= wanted).then_some(()))
+            },
+        )
+        .await?;
         files.truncate(wanted);
         ctx.pulse_downstream(NodeOutput::new().set("files", Value::Array(files))).await
     }

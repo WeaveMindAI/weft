@@ -17,6 +17,7 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 use weft_core::primitive::{AccessRef, SignalAuth, SignalRouting, SignalSpec, SignalSurface};
+use weft_core::signal::socket_listen::interpolate_frame;
 use weft_core::signal::{Signal, SocketFrame, SocketListen};
 
 use weft_core::signal::listener_protocol::{ProcessOutcome, ProcessTarget};
@@ -172,40 +173,6 @@ fn prepare_frame(
             Message::Binary(bytes)
         }
     }))
-}
-
-/// Interpolate `{name}` placeholders into a frame's text. Unlike the
-/// strict [`Template`] grammar, everything that is not a well-formed
-/// `{[a-z0-9_]+}` placeholder stays literal (a JSON frame is full of
-/// braces that mean JSON). A placeholder naming a value nobody
-/// resolved is a loud error: a handshake going out with a literal
-/// `{token}` is a silent authentication failure.
-pub(crate) fn interpolate_frame(
-    body: &str,
-    values: &BTreeMap<String, String>,
-) -> Result<String, String> {
-    static PLACEHOLDER: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"\{([a-z0-9_]+)\}").expect("static regex"));
-    let mut err = None;
-    let out = PLACEHOLDER.replace_all(body, |caps: &regex::Captures<'_>| {
-        let name = &caps[1];
-        match values.get(name) {
-            Some(v) => v.clone(),
-            None => {
-                err.get_or_insert_with(|| {
-                    format!(
-                        "the frame interpolates '{{{name}}}' but the connection resolves \
-                         no value named '{name}'"
-                    )
-                });
-                String::new()
-            }
-        }
-    });
-    match err {
-        Some(e) => Err(e),
-        None => Ok(out.into_owned()),
-    }
 }
 
 inventory::submit!(&SocketListenHandler as &dyn KindHandler);

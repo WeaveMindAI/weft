@@ -22,7 +22,7 @@ export type { NodeExecutionStatus };
 export type { NodeFeaturesWire as NodeFeatures } from '../../../protocol';
 // The accepts/widget vocabulary IS the wire type, re-exported for the
 // same one-definition reason.
-import { ACCESS_MARKER_KEY, type Accepts, type InputDefinition, type Widget, type WidgetKind } from '../../../protocol';
+import { ACCESS_MARKER_KEY, INFRA_MARKER_KEY, type Accepts, type CodeLanguage, type InputDefinition, type Widget, type WidgetKind } from '../../../protocol';
 export type { Accepts, Widget, WidgetKind };
 
 // =============================================================================
@@ -152,6 +152,7 @@ function renderType(t: WeftType, wire: boolean): string {
 		case 'json_dict': return 'JsonDict';
 		case 'bus': return 'Bus';
 		case 'access': return 'Access';
+		case 'infra': return 'Infra';
 		case 'generator': return `Generator[${renderType(t.inner, wire)}]`;
 		case 'union': return unionAliasName(t.types) ?? t.types.map(m => renderType(m, wire)).join(' | ');
 		case 'record':
@@ -178,6 +179,7 @@ export function extractPrimitives(t: WeftType): WeftPrimitive[] {
 		case 'json_dict': return [];
 		case 'bus': return [];
 		case 'access': return [];
+		case 'infra': return [];
 		// A stream reads as its element for color/leaf purposes.
 		case 'generator': return extractPrimitives(t.inner);
 		case 'union': return t.types.flatMap(extractPrimitives);
@@ -223,6 +225,7 @@ export function isCompatible(source: WeftType, target: WeftType): boolean {
 	// A bus connects only to a bus; payloads are not type-checked.
 	if (source.kind === 'bus' && target.kind === 'bus') return true;
 	if (source.kind === 'access' && target.kind === 'access') return true;
+	if (source.kind === 'infra' && target.kind === 'infra') return true;
 	// A generator connects only to a same-element generator (invariant
 	// in T, checked both ways). A plain T never accepts a Generator[T].
 	// SYNC: generator compatibility <-> crates/weft-core/src/weft_type.rs WeftType::is_compatible
@@ -322,6 +325,7 @@ export function inferTypeFromValue(value: unknown): WeftType {
 			return { kind: 'bus' };
 		}
 		if (ACCESS_MARKER_KEY in obj) return { kind: 'access' };
+		if (INFRA_MARKER_KEY in obj) return { kind: 'infra' };
 		const values = Object.values(obj);
 		if (values.length === 0) {
 			return { kind: 'dict', key: { kind: 'primitive', value: 'String' }, value: { kind: 'primitive', value: 'Empty' } };
@@ -394,7 +398,7 @@ export interface FieldDefinition {
 	accept?: string; // For file_drop fields: narrows the type-derived HTML-accept filter
 	fileType?: string; // For file_drop fields: the declared weft file type (Image/Audio/.../File)
 	multiple?: boolean; // For file_drop fields: the port holds several files, so the control keeps a list
-	language?: string; // For code fields: the CodeMirror syntax ("python", "javascript", ...)
+	language?: CodeLanguage; // For code fields: the CodeMirror syntax
 	min?: number; // For number fields: minimum allowed value (clamped on blur)
 	max?: number; // For number fields: maximum allowed value (clamped on blur)
 	step?: number; // For number fields: granularity of the input (used by slider/number)

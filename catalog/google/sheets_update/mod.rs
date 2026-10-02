@@ -31,14 +31,14 @@ impl Node for GoogleSheetsUpdateNode {
 
         let account: Access = ctx.inputs.get("account")?;
         let id: String = ctx.inputs.get("spreadsheet")?;
-        let gid: String = ctx.inputs.get("tab")?;
+        let gid: Option<String> = ctx.inputs.opt("tab")?;
         let row: Value = ctx.inputs.get("row")?;
         let row_number: Option<f64> = ctx.inputs.opt("rowNumber")?;
         let range: Option<String> = ctx.inputs.opt("range")?;
         let has_header: bool = ctx.inputs.get("hasHeader")?;
 
         let http = ctx.client(&account).await?;
-        let title = tab_title(&http, &id, &gid).await?;
+        let title = tab_title(&http, &id, gid.as_deref()).await?;
 
         let headers = header_for_row(&http, &id, &title, &row, has_header).await?;
         let cells = row_to_cells(&row, headers.as_deref())?;
@@ -57,14 +57,10 @@ impl Node for GoogleSheetsUpdateNode {
                 )))
             }
             (None, Some(r)) => r,
-            (Some(_), Some(_)) => {
+            // Neither one never reaches here: `oneOfRequired` skips the node.
+            _ => {
                 return Err(weft::WeftError::Input(
                     "pick ONE addressing: rowNumber or range, not both".to_string(),
-                ))
-            }
-            (None, None) => {
-                return Err(weft::WeftError::Input(
-                    "pick an addressing: rowNumber or range".to_string(),
                 ))
             }
         };

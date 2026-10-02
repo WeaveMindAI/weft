@@ -45,7 +45,7 @@ impl Node for ReceiveEmailNode {
         )
         .with_access(&account)
         .step(
-            SocketFrame::Text { body: "a1 LOGIN \"{user}\" \"{password}\"\r\n".into() },
+            SocketFrame::Text { body: "a1 LOGIN {user|quoted} {password|quoted}\r\n".into() },
             "^a1 OK",
         )
         .step(SocketFrame::Text { body: "a2 SELECT INBOX\r\n".into() }, "^a2 OK")
@@ -61,17 +61,31 @@ impl Node for ReceiveEmailNode {
         let account: Access = ctx.inputs.get("account")?;
         let from_contains: Option<String> = ctx.inputs.opt("fromContains")?;
         let subject_contains: Option<String> = ctx.inputs.opt("subjectContains")?;
-        let conn = ctx.open(&account).await?;
-
-        let imap = super::mailbox::imap(&conn)?;
-        let raw_messages = fetch_unseen(&imap.address, &imap.user, &imap.password)
-            .await
-            .map_err(|e| weft::WeftError::NodeExecution(format!("reading the inbox over IMAP: {e}")))?;
+        // Fetching marks the messages seen on the server, so it is
+        // journaled: a replay after a resume reads the same parsed
+        // messages back (opening nothing) instead of asking the server
+        // again, where they are no longer unseen and would be lost.
+        let fetched = {
+            let ctx = &ctx;
+            let account = &account;
+            ctx.run("fetch_unseen", move || async move {
+                let conn = ctx.open(account).await?;
+                let imap = super::mailbox::imap(&conn)?;
+                let raw = fetch_unseen(&imap.address, &imap.user, &imap.password)
+                    .await
+                    .map_err(|e| weft::WeftError::NodeExecution(format!("reading the inbox over IMAP: {e}")))?;
+                Ok(Value::Array(raw.iter().map(|m| parse_message(m)).collect()))
+            })
+            .await?
+        };
+        let parsed_messages = match fetched {
+            Value::Array(messages) => messages,
+            other => weft::node_bail!("the journaled inbox fetch is not a list of messages: {other}"),
+        };
 
         // Keep the ones passing the filters, oldest first.
         let mut messages: Vec<Value> = Vec::new();
-        for raw in &raw_messages {
-            let parsed = parse_message(raw);
+        for parsed in parsed_messages {
             let from_ok = from_contains
                 .as_deref()
                 .filter(|f| !f.trim().is_empty())

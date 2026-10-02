@@ -739,22 +739,71 @@ fn instance_copy(
     }
 }
 
+/// Refuse a handle naming a copy the program (its stored definition)
+/// does not declare: a place that is not infra, or the side it no
+/// longer has. The message names the handle, never an address.
+fn require_declared_infra(
+    project_json: &str,
+    infra: &weft_core::infra::InfraHandle,
+) -> Result<(), (StatusCode, String)> {
+    let definition: weft_core::project::ProjectDefinition = serde_json::from_str(project_json)
+        .map_err(|e| internal(anyhow::anyhow!("{infra}: project definition: {e}")))?;
+    let instance_copy = infra.instance().is_some();
+    if weft_core::project::DeclaredInfra::of(&definition).declares(infra.place(), instance_copy) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        format!(
+            "{infra} is not infra this program declares{}; wire the input to an infra \
+             node's handle output in this program",
+            if instance_copy { " once per instance" } else { " with one shared copy" },
+        ),
+    ))
+}
+
 pub async fn infra_endpoint_url(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
     Json(req): Json<InfraEndpointUrlRequest>,
 ) -> Resp<InfraEndpointUrlResponse> {
-    // A worker's run asks, at fire time, for an endpoint of its node's
-    // infra. The copy is resolved from the run itself: its project, and
-    // its instance when the node exists once per instance. Nothing in the
-    // request names an instance, so a run cannot reach another's copy.
+    // A worker's run asks, at fire time, for an endpoint of an infra
+    // node: its node's own, or one another infra node shared with it.
+    // The project is the run's, so a handle never reaches outside it. A
+    // handle naming an instance names that instance's copy, which only
+    // that instance's runs may reach; one naming none is the shared copy,
+    // and a per-instance node has no shared row to find.
     require_worker(&caller)?;
     let run = scope::require_execution_id_scope(&state.scope_cache, &state.pool, &caller, &req.execution_id.to_string())
         .await?;
-    let instance = instance_copy(run.instance.as_ref(), req.per_instance)?;
+    let instance = req.infra.instance();
+    if instance.is_some() && instance != run.instance.as_ref() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "{} belongs to another instance than the run asking for it ({}); \
+                 a run reaches only its own instance's infra",
+                req.infra,
+                run.instance.as_ref().map_or("no instance", |i| i.as_str()),
+            ),
+        ));
+    }
+    // The handle may have been minted against an older program: a node
+    // since removed, or one that changed sides (shared vs per instance),
+    // can leave its old copy running. Only a copy the project's program
+    // declares is reachable.
+    let project_json: Option<String> = sqlx::query_scalar("SELECT project_json FROM project WHERE id = $1")
+        .bind(run.project)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("project definition")))?;
+    let project_json = project_json.ok_or_else(|| {
+        (StatusCode::NOT_FOUND, format!("{}: the run's project is no longer registered", req.infra))
+    })?;
+    require_declared_infra(&project_json, &req.infra)?;
     let address = state
         .infra
-        .endpoint_address(run.project, &req.node_id, instance, &req.endpoint_name)
+        .endpoint_address(run.project, req.infra.place(), instance, req.infra.endpoint())
         .await
         .map_err(internal)?;
     Ok(Json(InfraEndpointUrlResponse { address }))
@@ -2337,5 +2386,50 @@ mod tests {
         let mut anchor = Some("acme".to_string());
         let err = merge_anchor_tenant(&mut anchor, "globex".into()).unwrap_err();
         assert_eq!(err.0, StatusCode::CONFLICT);
+    }
+
+    /// A program with `shared` (one copy), `mine` (one per instance)
+    /// and `plain` (no infra).
+    fn program_json() -> String {
+        let node = |id: &str, infra: bool, per_instance: bool| {
+            let mut n = serde_json::json!({
+                "id": id, "nodeType": "Any", "label": null,
+                "config": null, "position": { "x": 0.0, "y": 0.0 },
+                "inputs": [], "outputs": [], "scope": [], "groupBoundary": null,
+                "requiresInfra": infra, "images": []
+            });
+            if per_instance {
+                n["perInstance"] = serde_json::json!("marked");
+            }
+            n
+        };
+        serde_json::json!({
+            "id": uuid::Uuid::nil(),
+            "nodes": [node("shared", true, false), node("mine", true, true), node("plain", false, false)],
+            "edges": [],
+            "groups": []
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_handle_reaches_only_a_copy_the_program_declares() {
+        use weft_core::infra::InfraHandle;
+        let json = program_json();
+        let alice = || Some(weft_core::instance::InstanceId::new("alice").unwrap());
+        require_declared_infra(&json, &InfraHandle::new("shared", "api", None)).expect("the shared copy");
+        require_declared_infra(&json, &InfraHandle::new("mine", "api", alice())).expect("an instance's copy");
+
+        for (handle, side) in [
+            (InfraHandle::new("mine", "api", None), "with one shared copy"),
+            (InfraHandle::new("shared", "api", alice()), "once per instance"),
+            (InfraHandle::new("plain", "api", None), "with one shared copy"),
+            (InfraHandle::new("gone", "api", None), "with one shared copy"),
+        ] {
+            let (status, why) = require_declared_infra(&json, &handle).unwrap_err();
+            assert_eq!(status, StatusCode::FORBIDDEN, "{why}");
+            assert!(why.starts_with(&handle.to_string()), "it names the handle: {why}");
+            assert!(why.contains(&format!("is not infra this program declares {side}")), "{why}");
+        }
     }
 }

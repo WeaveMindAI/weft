@@ -21,12 +21,21 @@
 //!      pulse who clicked what.
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::json;
 
+use weft::access::client::required_str;
 use weft::signal::{Predicate, ProviderEvents};
 use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::api;
+
+/// One approval button, as the `buttons` port's type declares it.
+#[derive(serde::Deserialize)]
+struct ActionButton {
+    id: String,
+    label: String,
+    style: Option<String>,
+}
 
 #[derive(NodeManifest)]
 pub struct SlackAwaitActionNode;
@@ -45,28 +54,26 @@ impl Node for SlackAwaitActionNode {
         let access: Access = ctx.inputs.get("account")?;
         let channel: String = ctx.inputs.get("channel")?;
         let text: String = ctx.inputs.get("text")?;
-        let buttons: Value = ctx.inputs.get("buttons")?;
+        let buttons: Vec<ActionButton> = ctx.inputs.get("buttons")?;
         let confirmed_text: Option<String> = ctx.inputs.opt("confirmedText")?;
 
-        let entries = buttons
-            .as_array()
-            .filter(|b| !b.is_empty())
-            .ok_or_else(|| bad_buttons("buttons must be a non-empty list of { id, label } objects"))?;
+        // The port's type holds each button to {id, label, style?}; what
+        // it cannot say is that the list has one.
+        if buttons.is_empty() {
+            return Err(bad_buttons("buttons must be a non-empty list of { id, label } objects"));
+        }
         let mut elements = Vec::new();
-        for b in entries {
-            let id = b["id"].as_str().ok_or_else(|| bad_buttons("every button needs an id"))?;
-            let label =
-                b["label"].as_str().ok_or_else(|| bad_buttons("every button needs a label"))?;
+        for b in &buttons {
             let mut button = json!({
                 "type": "button",
-                "text": { "type": "plain_text", "text": label },
-                "action_id": id,
-                "value": id,
+                "text": { "type": "plain_text", "text": b.label },
+                "action_id": b.id,
+                "value": b.id,
             });
             // Slack styles: "primary" (green) / "danger" (red); absent
             // = default grey. Passed through verbatim so Slack's own
             // error names an invalid style.
-            if let Some(style) = b.get("style").and_then(Value::as_str) {
+            if let Some(style) = &b.style {
                 button["style"] = json!(style);
             }
             elements.push(button);
@@ -93,10 +100,12 @@ impl Node for SlackAwaitActionNode {
         let posted = {
             let ctx = &ctx;
             let access = &access;
+            // The connection opens inside the journaled step, so a
+            // replay that reads the journaled answer opens nothing.
             ctx.run("post_message", move || async move {
+                let client = ctx.client(access).await?;
                 api::call(
-                    ctx,
-                    access,
+                    &client,
                     "chat.postMessage",
                     json!({
                         "channel": channel,
@@ -112,8 +121,8 @@ impl Node for SlackAwaitActionNode {
             })
             .await?
         };
-        let posted_ts = api::required_str(&posted, "chat.postMessage", "ts")?.to_string();
-        let posted_channel = api::required_str(&posted, "chat.postMessage", "channel")?.to_string();
+        let posted_ts = required_str(&posted, "chat.postMessage", "ts")?.to_string();
+        let posted_channel = required_str(&posted, "chat.postMessage", "channel")?.to_string();
 
         let click = ctx
             .await_signal(ProviderEvents::new(
@@ -145,11 +154,10 @@ impl Node for SlackAwaitActionNode {
         // deleted) logs loudly and still delivers the decision: a
         // stale button is recoverable, a discarded approval is not.
         // Journaled via ctx.run so a replay never re-updates.
-        let label = entries
+        let label = buttons
             .iter()
-            .find(|b| b["id"].as_str() == Some(action.as_str()))
-            .and_then(|b| b["label"].as_str())
-            .unwrap_or(action.as_str());
+            .find(|b| b.id == action)
+            .map_or(action.as_str(), |b| b.label.as_str());
         let final_text = confirmed_text
             .clone()
             .unwrap_or_else(|| format!("{text}\n> *{label}* chosen by <@{user}>"));
@@ -158,10 +166,12 @@ impl Node for SlackAwaitActionNode {
             let access = &access;
             let posted_channel = &posted_channel;
             let posted_ts = &posted_ts;
+            // Opened after the park, not before it: the click may come
+            // days later, and this call needs a fresh sign-in then.
             ctx.run("retire_buttons", move || async move {
+                let client = ctx.client(access).await?;
                 api::call(
-                    ctx,
-                    access,
+                    &client,
                     "chat.update",
                     json!({
                         "channel": posted_channel,

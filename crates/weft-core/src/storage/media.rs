@@ -304,6 +304,20 @@ pub fn data_url(mime: &str, bytes: &[u8]) -> String {
     )
 }
 
+/// One stored file in the form an outside service can read, with what
+/// a send to that service usually needs beside it. What
+/// [`StorageHandle::external_file`] answers.
+///
+/// [`StorageHandle::external_file`]: crate::context::StorageHandle::external_file
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalFile {
+    /// A public link when the install serves one, else an inline
+    /// `data:` URL carrying the bytes.
+    pub url: String,
+    pub mime_type: String,
+    pub filename: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

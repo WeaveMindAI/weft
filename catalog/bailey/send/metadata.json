@@ -1,7 +1,7 @@
 {
   "type": "BaileySend",
   "label": "WhatsApp Send (Baileys)",
-  "description": "Send a text message via the project's WhatsApp bridge. Wire `endpointUrl` from a BaileyBridge; set `to` to a jid (e.g. `1234567890@s.whatsapp.net`) and `message` to the text body.",
+  "description": "Send a WhatsApp text message. `to` is a jid (`1234567890@s.whatsapp.net`).",
   "tags": [
     "whatsapp",
     "baileys",
@@ -12,9 +12,10 @@
   "color": "#25D366",
   "inputs": [
     {
-      "name": "endpointUrl",
-      "type": "String",
-      "required": true
+      "name": "bridge",
+      "type": "Infra",
+      "required": true,
+      "description": "The `bridge` output of the BaileyBridge node to talk through."
     },
     {
       "name": "to",
@@ -36,6 +37,5 @@
   ],
   "features": {
     "catchErrors": true
-  },
-  "requires_infra": false
+  }
 }

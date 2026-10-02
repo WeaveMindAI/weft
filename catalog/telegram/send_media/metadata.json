@@ -1,7 +1,7 @@
 {
   "type": "TelegramSendMedia",
   "label": "Telegram: Send Media",
-  "description": "Send a stored file to a chat as a photo, document, voice note, video, or audio, with an optional caption.",
+  "description": "Send a stored file to a Telegram chat as a photo, document, voice note, video or audio, with an optional caption.",
   "tags": [
     "telegram",
     "message",
@@ -21,7 +21,7 @@
       "type": "String",
       "required": true,
       "label": "Chat id",
-      "description": "The chat to address (a user's or group's id; the receive trigger emits it)."
+      "description": "User or group chat id (Receive Message emits it)."
     },
     {
       "name": "file",

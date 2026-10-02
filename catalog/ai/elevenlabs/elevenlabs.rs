@@ -7,6 +7,8 @@ use weft::storage::{KeepTtl, StorageScope};
 use weft::{ExecutionContext, NodeErrExt, WeftResult};
 
 pub const API: &str = "https://api.elevenlabs.io/v1";
+/// The same API over a websocket, for the live (streaming) nodes.
+pub const WS_API: &str = "wss://api.elevenlabs.io/v1";
 
 /// The stored file's extension and mime for a declared
 /// `output_format` (`mp3_44100_128` -> `("mp3", "audio/mpeg")`).

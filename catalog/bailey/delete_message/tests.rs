@@ -3,7 +3,7 @@
 
 use serde_json::json;
 
-use weft::{FakeRig, NodeTest, WeftResult};
+use weft::{EndpointMethod, FakeRig, NodeTest, WeftResult};
 
 use super::BaileyDeleteMessageNode;
 
@@ -15,12 +15,13 @@ pub fn tests() -> Vec<NodeTest> {
 }
 
 async fn deletes(rig: FakeRig) -> WeftResult<()> {
-    rig.respond("POST", "/action", json!({ "result": { "success": true } }));
+    let bridge = rig.declare_infra("bridge", "api", "http://bridge.example:8090");
+    rig.answer_infra("bridge", "api", EndpointMethod::Post, "/action", json!({ "result": { "success": true } }));
     let outcome = rig
         .run(
             &BaileyDeleteMessageNode,
             json!({
-                "endpointUrl": "http://bridge.example:8090",
+                "bridge": bridge,
                 "chatId": "49151@s.whatsapp.net",
                 "messageId": "wa-3",
             }),
@@ -28,7 +29,7 @@ async fn deletes(rig: FakeRig) -> WeftResult<()> {
         .await
         .ok()?;
     assert_eq!(outcome.outputs["done"], json!(true));
-    let body = rig.requests()[0].body.clone().expect("action body");
+    let body = rig.endpoint_calls()[0].body.clone().expect("action body");
     assert_eq!(body["action"], json!("deleteMessage"));
     assert_eq!(body["payload"]["chatId"], json!("49151@s.whatsapp.net"));
     assert_eq!(body["payload"]["messageId"], json!("wa-3"));
@@ -36,15 +37,12 @@ async fn deletes(rig: FakeRig) -> WeftResult<()> {
 }
 
 async fn soft_error(rig: FakeRig) -> WeftResult<()> {
-    rig.respond(
-        "POST",
-        "/action",
-        json!({ "result": { "error": "WhatsApp not connected" } }),
-    );
+    let bridge = rig.declare_infra("bridge", "api", "http://bridge.example:8090");
+    rig.answer_infra("bridge", "api", EndpointMethod::Post, "/action", json!({ "result": { "error": "WhatsApp not connected" } }));
     let outcome = rig
         .run(
             &BaileyDeleteMessageNode,
-            json!({ "endpointUrl": "http://b:1", "chatId": "c", "messageId": "m" }),
+            json!({ "bridge": bridge, "chatId": "c", "messageId": "m" }),
         )
         .await;
     let err = outcome.result.expect_err("a soft error must refuse").to_string();

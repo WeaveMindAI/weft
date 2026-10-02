@@ -1,7 +1,7 @@
 {
   "type": "BaileyReceive",
   "label": "WhatsApp Receive (Baileys)",
-  "description": "Fires an execution when a WhatsApp message arrives at the project's WhatsApp bridge. Wire this node's `endpointUrl` input from a BaileyBridge node; the listener subscribes to the bridge's SSE events stream and fires on every `message.received` event that passes the filter settings.",
+  "description": "Fires on each incoming WhatsApp message that passes the filters, from a BaileyBridge's `bridge` (it follows the bridge's `message.received` events).",
   "tags": [
     "whatsapp",
     "baileys",
@@ -12,33 +12,34 @@
   "color": "#25D366",
   "inputs": [
     {
-      "name": "endpointUrl",
-      "type": "String",
+      "name": "bridge",
+      "type": "Infra",
       "required": true,
-      "description": "Output of a BaileyBridge node. The listener subscribes to <endpointUrl without /action>/events."
+      "description": "The `bridge` output of the BaileyBridge node to talk through."
     },
     {
       "name": "ignoreGroups",
       "type": "Boolean",
       "default": false,
-      "widget": {
-        "kind": "checkbox"
-      },
       "label": "Ignore group chats",
-      "description": "Only fire on direct messages. A message posted in a group chat is dropped as it arrives and never starts a run."
+      "description": "Only fire on direct messages; group messages are dropped."
     },
     {
       "name": "messageTypes",
       "type": "List[String]",
       "label": "Only these message types",
-      "description": "Only fire on messages of these types: text, image, video, audio, document, sticker, contact, location, unknown. Leave empty to fire on every type except unknown. A message of an unlisted type is dropped as it arrives and never starts a run. unknown is anything else WhatsApp sends (a reaction, a poll, a protocol message): it has no content, and fires only when you list it."
+      "widget": {
+        "kind": "multiselect",
+        "options": ["text", "image", "video", "audio", "document", "sticker", "contact", "location", "unknown"]
+      },
+      "description": "Only fire on these types: text, image, video, audio, document, sticker, contact, location, unknown. Empty: every type except unknown. Unlisted types are dropped. unknown is anything else (a reaction, a poll, a protocol message), has no content, and fires only when listed."
     }
   ],
   "outputs": [
     {
       "name": "content",
       "type": "String",
-      "description": "The message's text, or the caption of a picture, video or document. Absent for a voice note, for a picture, video or document sent without a caption, and for a sticker, contact, location or unknown message. FirstInOrder over a voice note's transcript and content picks whichever exists."
+      "description": "The message's text, or the caption of a picture, video or document. Absent for a voice note, for a picture, video or document sent without a caption, and for a sticker, contact, location or unknown message. FirstInOrder over a voice note's transcript and `content` picks whichever exists."
     },
     {
       "name": "from",
@@ -71,20 +72,19 @@
     {
       "name": "file",
       "type": "File",
-      "description": "Stored-file reference for image/video/audio/document/sticker messages; absent for text."
+      "description": "The stored media for image, video, audio, document and sticker messages; absent otherwise."
     },
     {
       "name": "fileSize",
       "type": "Number",
-      "description": "The media's size in bytes, as WhatsApp reports it before anything is downloaded; absent for text. Gate on it to refuse a file too large to process."
+      "description": "Media size in bytes as WhatsApp reports it before download; absent for text. Gate on it to refuse oversized files."
     },
     {
       "name": "seconds",
       "type": "Number",
-      "description": "The length of a voice note or a video, in seconds; absent for anything else. Gate on it to refuse an hour-long voice note before paying to transcribe it."
+      "description": "Length of a voice note or video in seconds; absent otherwise. Gate on it before paying to transcribe a long one."
     }
   ],
-  "requires_infra": false,
   "firesWith": {
     "content?": "String",
     "from?": "String",
