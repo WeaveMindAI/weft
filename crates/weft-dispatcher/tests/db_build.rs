@@ -307,6 +307,27 @@ async fn a_joiner_never_calls_a_build_still_being_made_gone(pool: PgPool) {
     joiner.await.unwrap().unwrap();
 }
 
+/// A verb that found the image missing while another verb's build of it
+/// was running, and claims it only once that build succeeded, builds
+/// nothing: the image is there. (Building it again started a build
+/// nothing ever finished, which hung the two-waiter test under load.)
+#[sqlx::test]
+async fn a_claim_after_the_build_succeeded_builds_nothing(pool: PgPool) {
+    setup(&pool).await;
+    let Claim::Start { name, .. } = ledger::claim(&pool, "reg:5000/weft-worker:k", uuid::Uuid::new_v4(), "local", "d-0", 2, crate_now()).await.unwrap() else {
+        panic!("the first claim starts")
+    };
+    ledger::finish(&pool, "reg:5000/weft-worker:k", &name, ledger::Outcome::Succeeded, crate_now()).await.unwrap();
+    let late = ledger::claim(&pool, "reg:5000/weft-worker:k", uuid::Uuid::new_v4(), "local", "d-1", 2, crate_now()).await.unwrap();
+    assert!(matches!(late, Claim::Built), "{late:?}");
+    let fake = Arc::new(FakeImageBuilder::new());
+    builder(&pool, fake.clone(), "d-1")
+        .ensure_images(&[image(ImageKind::Worker, "reg:5000/weft-worker:k")], uuid::Uuid::new_v4(), "local", &Gate::default(), &ImageHold::new(&pool))
+        .await
+        .unwrap();
+    assert!(fake.starts().is_empty(), "nothing is built again");
+}
+
 /// Racing claims of one ref start it exactly once.
 #[sqlx::test]
 async fn racing_claims_start_one_build(pool: PgPool) {

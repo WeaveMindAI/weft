@@ -94,6 +94,12 @@ pub enum Claim {
     /// builds it again as `name` in `lane` (`take_over`). `ours` as for
     /// `Join`.
     Adopt { gone: String, name: String, lane: u32, ours: bool },
+    /// A build of it already succeeded: the image is in the registry (a
+    /// prune forgets the row in the same transaction that deletes the
+    /// image), so there is nothing to build. A verb that found the image
+    /// missing a moment before, while another verb's build was still
+    /// running, lands here instead of building it again.
+    Built,
 }
 
 impl Claim {
@@ -102,6 +108,7 @@ impl Claim {
         match self {
             Claim::Start { .. } => true,
             Claim::Join { ours, .. } | Claim::Adopt { ours, .. } => *ours,
+            Claim::Built => false,
         }
     }
 }
@@ -120,14 +127,17 @@ pub async fn claim(
 ) -> Result<Claim> {
     let mut tx = pool.begin().await.context("begin the build claim")?;
     lock_image(&mut tx, image_ref).await?;
-    let running: Option<(String, String, i64, uuid::Uuid)> = sqlx::query_as(
-        "SELECT build_name, driver_replica, driver_until, project_id FROM image_build \
-         WHERE image_ref = $1 AND status = 'running'",
+    let row: Option<(String, String, String, i64, uuid::Uuid)> = sqlx::query_as(
+        "SELECT status, build_name, driver_replica, driver_until, project_id FROM image_build WHERE image_ref = $1",
     )
     .bind(image_ref)
     .fetch_optional(&mut *tx)
     .await?;
-    if let Some((name, driver, driver_until, builds_for)) = running {
+    if row.as_ref().is_some_and(|(status, ..)| status == "succeeded") {
+        tx.commit().await.context("commit the build claim")?;
+        return Ok(Claim::Built);
+    }
+    if let Some((_, name, driver, driver_until, builds_for)) = row.filter(|(status, ..)| status == "running") {
         let ours = builds_for == project_id;
         // A lapsed hold is taken over even when it names this process: a
         // dispatcher restarted under the same name lost track of its

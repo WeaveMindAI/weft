@@ -306,6 +306,7 @@ impl VersionBuilder {
                 self.took_over(image, &gone, &name).await;
                 self.start(image, project_id, tenant, &name, lane, &mut follow).await?;
             }
+            ledger::Claim::Built => return Ok(()),
         }
         match self.follow(image, project_id, tenant, &mut follow, stoppable, Some(&cancelled)).await {
             Ok(Followed::Ended(outcome)) => ended(&image.image_ref, outcome),
