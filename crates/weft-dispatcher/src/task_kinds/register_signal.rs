@@ -306,9 +306,10 @@ impl RegisterSignalExecutor {
         // rows the insert writes, so two routes registering at once would
         // each pass the check before the other's row existed and both arm
         // (`chat/{a}` next to `chat/{b}`). The lock comes from the lock
-        // pool, so a waiter pins no work connection.
+        // pool, so it pins no work connection.
         let mount_key = crate::lease::advisory_key(crate::lease::SIGNAL_MOUNT_DOMAIN, tenant.as_str());
-        crate::lease::with_advisory_lock_blocking(&state.lock_pool, mount_key, || async move {
+        let waiting_for = format!("tenant {tenant}'s route registrations");
+        weft_task_store::locks::with_lock_waiting(&state.lock_pool, mount_key, &waiting_for, || async move {
             // The row's kind state is computed from the state it replaces,
             // and written only while the row is still at the version that
             // state was read at (`signal_insert` is a compare-and-set). A
@@ -318,7 +319,7 @@ impl RegisterSignalExecutor {
             // signal's wakes never stop claiming, which is a bug to see.
             const ROUNDS: usize = 5;
             let mut round = 0;
-            let (token, prior) = loop {
+            let (token, prior, holds) = loop {
                 round += 1;
                 let (token, prior) =
                     read_prior(state.journal.as_ref(), resume_token.as_deref(), project_id, &place, instance.as_ref()).await?;
@@ -339,10 +340,14 @@ impl RegisterSignalExecutor {
                             prior_kind_state,
                             asked_at_unix_ms: payload.asked_at_unix_ms,
                         },
+                        for_instance: instance
+                            .clone()
+                            .map(|instance| weft_core::instance::InstanceScope { project_id, instance }),
                     })
                     .await?;
                 refuse_unarmable_route(state, &prepared.routing.surface, instance.as_ref(), tenant.as_str(), project_id, &place).await?;
 
+                let holds = prepared.holds;
                 let written = state
                     .journal
                     .signal_insert(&crate::journal::SignalRegistration {
@@ -373,10 +378,11 @@ impl RegisterSignalExecutor {
                         auth_config: (!prepared.routing.auth_config.is_null()).then_some(prepared.routing.auth_config),
                         kind_state: prepared.kind_state,
                         kind_state_seq: prior_seq,
+                        holds,
                     })
                     .await?;
                 match written {
-                    crate::journal::SignalWrite::Written => break (token, prior),
+                    crate::journal::SignalWrite::Written => break (token, prior, holds),
                     crate::journal::SignalWrite::StateMoved if round < ROUNDS => continue,
                     crate::journal::SignalWrite::StateMoved => anyhow::bail!(
                         "signal {token}'s state moved under each of {ROUNDS} registrations in a row: \
@@ -394,12 +400,43 @@ impl RegisterSignalExecutor {
                 None => ArmUndo::Created,
                 Some(prior) => ArmUndo::Replaced(Box::new(prior)),
             };
-            if let Err(e) = state.listener.start(&token, StartMode::New).await {
+            // A replaced row served the other way round (held where the
+            // new one is not, or the reverse) is unregistered first, from
+            // its own spec and state: bringing the new row up never reaches
+            // the old serving, so nothing else would tear down what it
+            // arranged outside (a wake's provider subscription). A held
+            // connection in this process stops here; one a holder elsewhere
+            // runs lost its claim when the row was written, so the broker
+            // refuses its fires from then on and it stops at its next look.
+            let served_otherwise = matches!(&undo, ArmUndo::Replaced(prior) if prior.holds != holds);
+            let stopped = match &undo {
+                ArmUndo::Replaced(prior) if served_otherwise => state.listener.unregister_replaced(prior).await,
+                _ => Ok(false),
+            };
+            // Whether the replaced row may have been stopped, so an undo
+            // brings it back up (harmless when it was not: a put-back
+            // re-arms a wake that subscribes only when nothing is live, or
+            // retakes a held row). Only a row the listener could not read,
+            // or whose kind it does not know, was surely left untouched.
+            let untouched = match &stopped {
+                Ok(stopped) => !stopped,
+                Err(e) => e
+                    .downcast_ref::<crate::listener::ListenerRefused>()
+                    .is_some_and(|r| r.status == reqwest::StatusCode::SERVICE_UNAVAILABLE),
+            };
+            let replaced_stopped = served_otherwise && !untouched;
+            let started = match stopped {
+                Ok(_) => state.listener.start(&token, StartMode::New).await,
+                Err(e) => Err(e.context("stopping the row it replaces, which was served the other way")),
+            };
+            if let Err(e) = started {
                 // A start that failed left the listener on what it ran
                 // before, so a replaced row goes back without a restart
                 // (unless a wake ran the new row meanwhile, see
-                // `undo_registration`).
-                undo_arm(state.journal.as_ref(), &state.listener, &token, undo, Restart::No).await.map_err(|undo_err| {
+                // `undo_registration`). A replaced row it was told to stop
+                // is brought back up.
+                let restart = if replaced_stopped { Restart::Yes } else { Restart::No };
+                undo_arm(state.journal.as_ref(), &state.listener, &token, undo, restart).await.map_err(|undo_err| {
                     anyhow::anyhow!(
                         "signal {token} could not start ({e:#}), and undoing its registration failed too, \
                          so its row may not match what the listener runs until the trigger is \

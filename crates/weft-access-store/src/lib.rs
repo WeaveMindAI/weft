@@ -65,12 +65,17 @@ pub enum AccessError {
     /// will ever land under it, so a poll must stop.
     #[error("{0}")]
     Gone(String),
+    /// A provider that was not reached, or did not answer in time:
+    /// nothing is wrong with the request, and trying again is the fix.
+    #[error("{0}")]
+    Unreached(String),
 }
 
 /// Map a store error to an HTTP status at an API edge: missing/foreign
 /// rows are 404 (one answer, no existence leak), caller-fixable input
 /// is 400, a dead grant is 409 (the fix is a reconnect, not a retry),
-/// a browser flow that is gone is 410 (the fix is starting it again).
+/// a browser flow that is gone is 410 (the fix is starting it again), a
+/// provider not reached is 502 (the fix is trying again).
 /// `None` = internal: the edge logs the chain itself and answers 500
 /// without echoing detail. ONE mapping so every surface fronting the
 /// store (dispatcher and broker) answers identically.
@@ -80,8 +85,24 @@ fn client_status(e: &anyhow::Error) -> Option<(u16, String)> {
         Some(AccessError::Invalid(_)) => Some((400, format!("{e}"))),
         Some(AccessError::NeedsReconnect { .. }) => Some((409, format!("{e}"))),
         Some(AccessError::Gone(_)) => Some((410, format!("{e}"))),
+        Some(AccessError::Unreached(_)) => Some((502, format!("{e}"))),
         None => None,
     }
+}
+
+/// A provider's answer as text: one that stops arriving is a provider not
+/// reached, never an empty answer.
+pub(crate) async fn read_answer(resp: reqwest::Response, shown: &str) -> anyhow::Result<String> {
+    Ok(resp
+        .text()
+        .await
+        .map_err(|e| AccessError::Unreached(format!("the answer from {shown} did not arrive: {}", e.without_url())))?)
+}
+
+/// [`read_answer`] as JSON: an empty or unparsable one is `Null` (the
+/// status and the fields read next say what is wrong).
+pub(crate) async fn read_json_answer(resp: reqwest::Response, shown: &str) -> anyhow::Result<serde_json::Value> {
+    Ok(serde_json::from_str(&read_answer(resp, shown).await?).unwrap_or(serde_json::Value::Null))
 }
 
 /// A store error as a surface should ANSWER it: the client-fixable

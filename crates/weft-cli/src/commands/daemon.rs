@@ -23,7 +23,7 @@ use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use tokio::process::Command;
 use weft_platform_traits::config::{
-    AuthMode, BuildConfig, EdgeConfig, InstallConfig, Listen, LocalPlatform, ObjectStoreSettings, PlatformConfig, ProxyHops,
+    AuthMode, BuildConfig, EdgeConfig, InstallConfig, Listen, LocalPlatform, ObjectStoreSettings, PlatformConfig, S3StoreSettings, ProxyHops,
 };
 
 use super::Ctx;
@@ -751,12 +751,12 @@ fn internal_listen(ports: Ports) -> std::net::SocketAddr {
 
 /// The edge settings: an environment variable when one is set, what the
 /// install already had otherwise, the defaults on a new install.
-fn edge_config(kept: Option<EdgeConfig>) -> Result<EdgeConfig> {
+fn edge_config(kept: Option<KeptEdge>) -> Result<EdgeConfig> {
     // The public port is reached straight from this machine; the outside
     // port through cloudflared, which reaches it from loopback and appends
     // the internet caller to `X-Forwarded-For`, so one hop is trusted
     // there or every internet caller would count as 127.0.0.1.
-    let kept = kept.unwrap_or(EdgeConfig { trusted_proxy_hops: ProxyHops { public: 0, outside: 1 }, invalid_tokens_per_minute: Some(30) });
+    let kept = kept.unwrap_or(KeptEdge { trusted_proxy_hops: KeptHops { public: 0, outside: 1 }, invalid_tokens_per_minute: Some(30) });
     let hops = std::env::var("WEFT_TRUSTED_PROXY_HOPS").ok().filter(|v| !v.trim().is_empty());
     let invalid = std::env::var("WEFT_INVALID_TOKENS_PER_MINUTE").ok().filter(|v| !v.trim().is_empty());
     Ok(EdgeConfig {
@@ -766,6 +766,8 @@ fn edge_config(kept: Option<EdgeConfig>) -> Result<EdgeConfig> {
                 None => kept.trusted_proxy_hops.public,
             },
             outside: kept.trusted_proxy_hops.outside,
+            // A local install has no domains of its own.
+            domains: 0,
         },
         invalid_tokens_per_minute: match invalid.as_deref() {
             Some("off") => None,
@@ -775,25 +777,71 @@ fn edge_config(kept: Option<EdgeConfig>) -> Result<EdgeConfig> {
     })
 }
 
+/// The levers a person sets in `config.json`, as the last start left
+/// them: the worker defaults, the edge, how long idle workers stay up.
+/// Only these are read from the file, each where it sits: the rest of it
+/// is weft's own and written afresh every start, so a shape a newer weft
+/// writes differently never stops the start that rewrites it.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Levers {
+    worker_idle_stop_seconds: Option<u64>,
+    workers: Option<weft_platform_traits::WorkerSettings>,
+    edge: Option<KeptEdge>,
+}
+
+/// The edge settings a person may change, as kept from the last start's
+/// file: the rest of `edge` is weft's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+struct KeptEdge {
+    #[serde(rename = "trustedProxyHops")]
+    trusted_proxy_hops: KeptHops,
+    #[serde(rename = "invalidTokensPerMinute", deserialize_with = "Option::deserialize")]
+    invalid_tokens_per_minute: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+struct KeptHops {
+    public: usize,
+    outside: usize,
+}
+
+impl Levers {
+    fn read(path: &Path) -> Result<Self> {
+        let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let file: serde_json::Value =
+            serde_json::from_str(&raw).with_context(|| format!("{} is not JSON", path.display()))?;
+        fn lever<T: serde::de::DeserializeOwned>(file: &serde_json::Value, path: &Path, at: &str) -> Result<Option<T>> {
+            file.pointer(at)
+                .filter(|v| !v.is_null())
+                .map(|v| serde_json::from_value(v.clone()).with_context(|| format!("{} at {at} is not valid", path.display())))
+                .transpose()
+        }
+        Ok(Self {
+            worker_idle_stop_seconds: lever(&file, path, "/platform/workerIdleStopSeconds")?,
+            workers: lever(&file, path, "/workers")?,
+            edge: lever(&file, path, "/edge")?,
+        })
+    }
+}
+
 /// The install's config. Everything that follows from this machine is
-/// set here; the levers a person sets in `config.json` (the worker
-/// defaults, the edge, how long idle workers stay up) are kept from
-/// `previous`, the config the last start wrote.
+/// set here; the levers a person sets in `config.json` are kept from
+/// `previous`, what the last start wrote.
 fn install_config(
     install: &Install,
     ports: Ports,
     runtime_image: String,
     builder_base: String,
     internet_url: Option<String>,
-    previous: Option<InstallConfig>,
+    previous: Levers,
 ) -> Result<InstallConfig> {
-    let idle_stop = match (&previous, std::env::var("WEFT_WORKER_IDLE_STOP_SECONDS").ok().filter(|v| !v.trim().is_empty())) {
+    let idle_stop = match (previous.worker_idle_stop_seconds, std::env::var("WEFT_WORKER_IDLE_STOP_SECONDS").ok().filter(|v| !v.trim().is_empty())) {
         (_, Some(v)) => v.trim().parse().map_err(|_| anyhow::anyhow!("WEFT_WORKER_IDLE_STOP_SECONDS='{v}' is not a whole number"))?,
-        (Some(InstallConfig { platform: PlatformConfig::Local(l), .. }), None) => l.worker_idle_stop_seconds,
-        _ => 300,
+        (Some(kept), None) => kept,
+        (None, None) => 300,
     };
-    let workers = previous.as_ref().map(|p| p.workers.clone()).unwrap_or_default();
-    let edge = edge_config(previous.as_ref().map(|p| p.edge))?;
+    let workers = previous.workers.unwrap_or_default();
+    let edge = edge_config(previous.edge)?;
     let config = InstallConfig {
         install: install.id.clone(),
         platform: PlatformConfig::Local(LocalPlatform {
@@ -801,29 +849,30 @@ fn install_config(
             container_internal_url: container_internal_url(ports),
             runtime_image,
             worker_idle_stop_seconds: idle_stop,
+            listen: Listen {
+                public: ([127, 0, 0, 1], ports.public).into(),
+                internal: internal_listen(ports),
+                // Served whether or not a tunnel carries it: on loopback it
+                // answers a subset of what the public port does, and a
+                // tunnel opened later finds it already there.
+                outside: Some(([127, 0, 0, 1], ports.outside).into()),
+            },
+            internal_url: format!("http://127.0.0.1:{}", ports.internal),
         }),
         auth: AuthMode::Local,
         public_url: format!("http://127.0.0.1:{}", ports.public),
-        listen: Listen {
-            public: ([127, 0, 0, 1], ports.public).into(),
-            internal: internal_listen(ports),
-            // Served whether or not a tunnel carries it: on loopback it
-            // answers a subset of what the public port does, and a tunnel
-            // opened later finds it already there.
-            outside: Some(([127, 0, 0, 1], ports.outside).into()),
-        },
         internet_url,
-        internal_url: format!("http://127.0.0.1:{}", ports.internal),
         roles: Default::default(),
         role_urls: Default::default(),
         workers,
+        holders: Default::default(),
         build: BuildConfig {
             compile_lanes: images::compile_lanes()?,
             builder_base_image: builder_base,
             runtime_base_image: weft_compiler::worker_image::DEFAULT_BASE_IMAGE.to_string(),
         },
         edge,
-        object_store: ObjectStoreSettings {
+        object_store: ObjectStoreSettings::S3(S3StoreSettings {
             endpoint: format!("http://127.0.0.1:{}", object_store_port()?),
             bucket: install.bucket(),
             region: "us-east-1".into(),
@@ -831,12 +880,19 @@ fn install_config(
             public_endpoint: None,
             worker_endpoint: Some(format!("http://{OBJECT_STORE_CONTAINER}:8333")),
             public_internet: false,
-        },
-        front_door: None,
+        }),
         source: None,
     };
     config.validate().map_err(|e| anyhow::anyhow!("the install config weft made is not valid: {e}"))?;
     Ok(config)
+}
+
+/// The ports a local install's one process serves.
+fn listen_of(config: &InstallConfig) -> &Listen {
+    match &config.platform {
+        PlatformConfig::Local(local) => &local.listen,
+        PlatformConfig::Gcp(_) => unreachable!("the daemon only ever writes a local install's config"),
+    }
 }
 
 // ----- the tunnel --------------------------------------------------------
@@ -1218,7 +1274,10 @@ async fn start(install: &Install, rebuild: bool) -> Result<()> {
     ensure_object_store(object_store_port()?).await?;
     let tunnel = reconcile_tunnel(install, ports).await?;
 
-    let previous = install.config_path().exists().then(|| InstallConfig::load(&install.config_path())).transpose()?;
+    let previous = match install.config_path().exists() {
+        true => Levers::read(&install.config_path())?,
+        false => Levers::default(),
+    };
     let config = install_config(install, ports, shared.runtime, shared.builder_base, tunnel.as_ref().map(|(u, _)| u.clone()), previous)?;
     std::fs::write(install.config_path(), serde_json::to_vec_pretty(&config)?)?;
     let env = secrets(install, ports, &repo_root)?;
@@ -1229,11 +1288,12 @@ async fn start(install: &Install, rebuild: bool) -> Result<()> {
     // anything still listening there is another program, and the new
     // runtime would never come up.
     stop_runtime(install).await?;
+    let listen = listen_of(&config);
     let mut uses = vec![
-        PortUse::of(install, config.listen.public, "its API and dashboard", "WEFT_PUBLIC_PORT"),
-        PortUse::of(install, config.listen.internal, "the calls its own containers make to it", "WEFT_INTERNAL_PORT"),
+        PortUse::of(install, listen.public, "its API and dashboard", "WEFT_PUBLIC_PORT"),
+        PortUse::of(install, listen.internal, "the calls its own containers make to it", "WEFT_INTERNAL_PORT"),
     ];
-    if let Some(outside) = config.listen.outside {
+    if let Some(outside) = listen.outside {
         uses.push(PortUse::of(install, outside, "the doors outside callers use (the tunnel's target)", "WEFT_OUTSIDE_PORT"));
     }
     refuse_taken_ports(&uses).await?;
@@ -1395,24 +1455,31 @@ mod tests {
     #[test]
     fn the_config_a_start_writes_is_valid_and_keeps_the_management_api_off_the_tunnel() {
         let ports = Ports { public: 14111, internal: 14113, outside: 14112, postgres: 14114 };
-        let closed = install_config(&install(None), ports, "weft-runtime:x".into(), "b".into(), None, None).unwrap();
-        assert_eq!(closed.listen.outside, Some(([127, 0, 0, 1], 14112).into()), "the outside port is served without a tunnel too");
+        let closed = install_config(&install(None), ports, "weft-runtime:x".into(), "b".into(), None, Levers::default()).unwrap();
+        assert_eq!(listen_of(&closed).outside, Some(([127, 0, 0, 1], 14112).into()), "the outside port is served without a tunnel too");
         assert_eq!(closed.public_url, "http://127.0.0.1:14111");
-        assert_eq!(closed.object_store.worker_endpoint.as_deref(), Some("http://weft-object-store:8333"));
-        let open = install_config(&install(None), ports, "weft-runtime:x".into(), "b".into(), Some("https://a.trycloudflare.com".into()), None).unwrap();
-        assert_eq!(open.listen.outside, Some(([127, 0, 0, 1], 14112).into()));
-        assert_eq!(open.listen.public.ip(), std::net::IpAddr::from([127, 0, 0, 1]), "the management API stays on loopback");
+        let ObjectStoreSettings::S3(store) = &closed.object_store else { panic!("a local install's store is S3-compatible") };
+        assert_eq!(store.worker_endpoint.as_deref(), Some("http://weft-object-store:8333"));
+        let open = install_config(&install(None), ports, "weft-runtime:x".into(), "b".into(), Some("https://a.trycloudflare.com".into()), Levers::default()).unwrap();
+        assert_eq!(listen_of(&open).outside, Some(([127, 0, 0, 1], 14112).into()));
+        assert_eq!(listen_of(&open).public.ip(), std::net::IpAddr::from([127, 0, 0, 1]), "the management API stays on loopback");
         let v = serde_json::to_value(&open).unwrap();
         assert_eq!(serde_json::from_value::<InstallConfig>(v).unwrap(), open);
 
-        // A lever a person set in the file survives the next start.
-        let mut edited = closed.clone();
-        edited.workers.min_instances = 1;
-        assert_eq!(closed.edge.trusted_proxy_hops, ProxyHops { public: 0, outside: 1 }, "cloudflared is one hop in front of the outside port");
-        edited.edge.trusted_proxy_hops.public = 2;
-        let again = install_config(&install(None), ports, "weft-runtime:y".into(), "b".into(), None, Some(edited)).unwrap();
+        // A lever a person set in the file survives the next start, read
+        // from the file even when the rest of it is a shape this weft no
+        // longer writes (an object store from before it named its kind).
+        let mut edited = serde_json::to_value(&closed).unwrap();
+        edited["workers"]["min_instances"] = serde_json::json!(1);
+        assert_eq!(closed.edge.trusted_proxy_hops, ProxyHops { public: 0, outside: 1, domains: 0 }, "cloudflared is one hop in front of the outside port");
+        edited["edge"]["trustedProxyHops"]["public"] = serde_json::json!(2);
+        edited["objectStore"] = serde_json::json!({ "endpoint": "http://127.0.0.1:8333", "bucket": "weft" });
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.json");
+        std::fs::write(&file, serde_json::to_vec(&edited).unwrap()).unwrap();
+        let again = install_config(&install(None), ports, "weft-runtime:y".into(), "b".into(), None, Levers::read(&file).unwrap()).unwrap();
         assert_eq!(again.workers.min_instances, 1);
-        assert_eq!(again.edge.trusted_proxy_hops, ProxyHops { public: 2, outside: 1 });
+        assert_eq!(again.edge.trusted_proxy_hops, ProxyHops { public: 2, outside: 1, domains: 0 });
         assert_eq!(again.platform, PlatformConfig::Local(LocalPlatform { runtime_image: "weft-runtime:y".into(), ..match closed.platform { PlatformConfig::Local(l) => l, _ => unreachable!() } }));
     }
 

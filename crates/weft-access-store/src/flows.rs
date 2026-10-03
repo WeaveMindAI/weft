@@ -1259,7 +1259,7 @@ async fn finish_connect(
     if let Some(verifier) = verifier {
         params.push(("code_verifier".into(), verifier));
     }
-    let resp = token_request(token_url, &params, basic).await?;
+    let resp = token_request(token_url, &params, basic).await.map_err(sign_in_spent)?;
 
     let mut values: BTreeMap<String, String> = BTreeMap::new();
     let token = resp
@@ -1297,7 +1297,7 @@ async fn finish_connect(
         recorded_permissions(spec.verification.rung, echo, ticked.clone());
 
     if spec.verification.cost.may_auto_run() {
-        run_test_call(spec.test.as_ref(), &spec.auth, &mut values).await?;
+        run_test_call(spec.test.as_ref(), &spec.auth, &mut values).await.map_err(sign_in_spent)?;
     }
     let identity = resolve_identity(&spec, &values)?;
     let label = Some(registration.label.clone());
@@ -1490,6 +1490,16 @@ pub(crate) fn place_client_auth(
     }
 }
 
+/// A provider not reached while finishing a sign-in, which was claimed
+/// (its row is gone) and whose code is single-use: trying again cannot
+/// help, and the only way on is a new sign-in.
+fn sign_in_spent(e: anyhow::Error) -> anyhow::Error {
+    match e.downcast_ref::<AccessError>() {
+        Some(AccessError::Unreached(_)) => AccessError::Gone(format!("{e}; the sign-in cannot be finished, start the connect again")).into(),
+        _ => e,
+    }
+}
+
 pub(crate) async fn token_request(
     token_url: &str,
     params: &[(String, String)],
@@ -1505,9 +1515,9 @@ pub(crate) async fn token_request(
     let resp = req
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("token endpoint unreachable: {e}"))?;
+        .map_err(|e| AccessError::Unreached(format!("token endpoint unreachable: {}", e.without_url())))?;
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
+    let body = crate::read_answer(resp, "the token endpoint").await?;
     if !status.is_success() {
         return Err(AccessError::Invalid(format!(
             "token endpoint answered {status}: {}",
@@ -1591,14 +1601,10 @@ pub(crate) async fn run_test_call(
             // The template, never the resolved URL: it may interpolate a
             // secret, and the send error's own URL carries the applied
             // auth (a query token, a path-prefix token).
-            anyhow::anyhow!(
-                "test call to {} failed: {}",
-                test.url.0,
-                weft_core::access::client::send_error(e)
-            )
+            AccessError::Unreached(format!("test call to {} failed: {}", test.url.0, weft_core::access::client::send_error(e)))
         })?;
     let status = resp.status().as_u16();
-    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    let body: Value = crate::read_json_answer(resp, &test.url.0).await?;
     if status != test.expect_status {
         return Err(AccessError::Invalid(format!(
             "the credential did not pass the service's test call ({} answered {status}, \

@@ -395,6 +395,7 @@ fn resume_signal(token: &str, project_id: Uuid, execution_id: weft_core::Executi
         kind_state_seq: 0,
         access_id: None,
         port_snapshot: None,
+        holds: false,
     }
 }
 

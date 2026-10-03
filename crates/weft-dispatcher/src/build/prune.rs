@@ -2,7 +2,10 @@
 //! store (`weft clean --images`). Every build adds one image per content, and
 //! nothing else ever removes one.
 //!
-//! Only images this install built (its `image_build` ledger) are touched,
+//! Only images this install built or tried to build (its `image_build`
+//! ledger, any build that ended: a failed one may have pushed before it
+//! failed, and deleting an image that is not there is not an error, so
+//! such a row is simply forgotten) are touched,
 //! and only those outside the referenced set: what a project's running
 //! build names, what a live worker or a queued task was stamped
 //! with, and every infra image a project's build or a running unit
@@ -35,24 +38,26 @@ use weft_core::images::PruneReport;
 
 /// One build request's claim on the images it relies on, from its first
 /// look at the registry until its registration commits. Renewed in the
-/// background while the request lives, like a build driver's hold
-/// (`ledger::DRIVER_LEASE_SECS`): a dispatcher that dies stops renewing
+/// background while the request lives (`ledger::CLAIM_LEASE_SECS`): a
+/// dispatcher that dies stops renewing
 /// and its claim stops protecting anything, with no connection held open
 /// and nothing to wait out.
 pub struct ImageHold {
     pool: sqlx::PgPool,
     id: uuid::Uuid,
+    /// The project whose build request this is.
+    project: uuid::Uuid,
     /// The images the claim covers, to check none lapsed.
     held: std::sync::Mutex<BTreeSet<String>>,
     renewer: tokio::task::JoinHandle<()>,
 }
 
 impl ImageHold {
-    pub fn new(pool: &sqlx::PgPool) -> Self {
+    pub fn new(pool: &sqlx::PgPool, project: uuid::Uuid) -> Self {
         let id = uuid::Uuid::new_v4();
         let renew_pool = pool.clone();
         let renewer = tokio::spawn(async move {
-            let every = std::time::Duration::from_secs((super::ledger::DRIVER_LEASE_SECS / 3) as u64);
+            let every = std::time::Duration::from_secs((super::ledger::CLAIM_LEASE_SECS / 3) as u64);
             loop {
                 tokio::time::sleep(every).await;
                 if let Err(e) = super::ledger::renew_claim(&renew_pool, id, crate::lease::now_unix()).await {
@@ -60,12 +65,12 @@ impl ImageHold {
                 }
             }
         });
-        Self { pool: pool.clone(), id, held: Default::default(), renewer }
+        Self { pool: pool.clone(), id, project, held: Default::default(), renewer }
     }
 
     /// Claim `images` before the build looks for any of them.
     pub async fn claim(&self, images: &[String]) -> Result<()> {
-        super::ledger::claim_images(&self.pool, self.id, images, crate::lease::now_unix()).await?;
+        super::ledger::claim_images(&self.pool, self.id, self.project, images, crate::lease::now_unix()).await?;
         self.held.lock().expect("the claim's image set is never poisoned").extend(images.iter().cloned());
         Ok(())
     }
@@ -348,7 +353,7 @@ impl AfterBuildPrunes {
 /// Reclaim each of `projects`' images older than its newest `1 +
 /// PREVIOUS_BUILDS_KEPT` builds, and every image no project uses at all
 /// (`ledger::unused_images`: a removed project's, a build's that never
-/// registered, a standard worker a newer weft replaced), sparing whatever
+/// registered or failed, a standard worker a newer weft replaced), sparing whatever
 /// still runs or a build in progress claims. Every pass takes the unused
 /// ones, so one a container still ran from last time goes on a later one.
 async fn reclaim(state: &crate::state::DispatcherState, projects: &BTreeSet<uuid::Uuid>) -> Result<PruneReport> {
@@ -410,16 +415,25 @@ pub async fn prune(
             Err(e) => Err(e),
         };
         match deleted {
-            Ok(weft_platform_traits::ImageDeleted::Deleted) => {
+            // Not there to delete (a build that failed before its push):
+            // only its row goes, and nothing is reported removed.
+            Ok(gone @ (weft_platform_traits::ImageDeleted::Deleted | weft_platform_traits::ImageDeleted::Absent)) => {
                 let forgotten = match super::ledger::forget(&mut tx, &image_ref).await {
                     Ok(()) => tx.commit().await.context("commit forgetting a deleted image"),
                     Err(e) => Err(e),
                 };
                 match forgotten {
+                    Ok(()) if gone == weft_platform_traits::ImageDeleted::Absent => {}
                     Ok(()) => report.removed.push(image_ref),
                     // Gone from the store but still in the ledger: the
                     // next prune finds it again and forgets it then.
-                    Err(e) => report.failed.push((image_ref, format!("deleted, but forgetting it failed: {e:#}"))),
+                    Err(e) => {
+                        let done = match gone {
+                            weft_platform_traits::ImageDeleted::Absent => "not in the store",
+                            _ => "deleted",
+                        };
+                        report.failed.push((image_ref, format!("{done}, but forgetting it failed: {e:#}")))
+                    }
                 }
             }
             Ok(weft_platform_traits::ImageDeleted::InUse) => report.in_use.push(image_ref),

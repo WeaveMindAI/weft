@@ -35,8 +35,8 @@ impl KindHandler for PollEndpointHandler {
         PollEndpoint::TAG
     }
 
-    fn between_fires(&self) -> BetweenFires {
-        BetweenFires::Wakes
+    fn between_fires(&self, _spec: &SignalSpec, _kind_state: &Value) -> Result<BetweenFires> {
+        Ok(BetweenFires::Wakes)
     }
 
     fn compute_routing(&self, _spec: &SignalSpec) -> Result<SignalRouting> {
@@ -98,7 +98,7 @@ impl KindHandler for PollEndpointHandler {
         Ok(Some(next_grid_point(now_ms, poll.interval_secs)))
     }
 
-    async fn on_wake(&self, spec: &SignalSpec, woken: Woken, ctx: SpawnCtx) -> Result<Value> {
+    async fn on_wake(&self, spec: &SignalSpec, woken: Woken, ctx: SpawnCtx) -> Result<Option<Value>> {
         let poll: PollEndpoint = serde_json::from_value(spec.config.clone())
             .map_err(|e| anyhow::anyhow!("malformed poll_endpoint spec: {e}"))?;
         // Registration refuses this (`check_resume`); a row that holds it
@@ -107,7 +107,9 @@ impl KindHandler for PollEndpointHandler {
             !(woken.is_resume && poll.delta.is_some()),
             "a run waiting on a poll_endpoint cannot use delta mode"
         );
-        poll_once(&poll, &spec.access, woken.state, woken.seq, woken.is_resume, &ctx).await
+        // A poll whose write lost still answers its own state: of two copies
+        // that polled at one state either answer stands (see `store`).
+        poll_once(&poll, &spec.access, woken.state, woken.seq, woken.is_resume, &ctx).await.map(Some)
     }
 
     fn process_entry(&self, _sig: &RegisteredSignal, payload: Value) -> ProcessOutcome {
@@ -354,7 +356,8 @@ async fn poll_once(
                     // broker does not know): hold the cursor so the item
                     // is re-offered.
                     crate::event_context::FireOutcome::EnqueueFailed
-                    | crate::event_context::FireOutcome::UnknownSignal => break,
+                    | crate::event_context::FireOutcome::UnknownSignal
+                    | crate::event_context::FireOutcome::NotHeld => break,
                     crate::event_context::FireOutcome::Fired | crate::event_context::FireOutcome::Filtered => {
                         advanced = Some(state_after);
                     }

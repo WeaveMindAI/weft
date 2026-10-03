@@ -12,6 +12,7 @@
 
 use anyhow::{Context, Result};
 use sqlx::PgPool;
+use weft_task_store::drain::{DrainStep, SAFETY_POLL_INTERVAL};
 
 use weft_core::storage::{
     AssetUploadBeginRequest, AssetsHeldRequest, AssetsHeldResponse, ListFilesResponse, PartDoneRequest,
@@ -516,17 +517,19 @@ pub async fn enqueue_sweep_in(conn: &mut sqlx::PgConnection, tenant: &str, execu
 
 /// Sweep-queue reaper: ask the broker to sweep each pending execution's un-kept
 /// exec files. A row is removed only after the broker confirmed; a TRANSIENT
-/// broker error (unreachable, 5xx) leaves the row for the next tick (the sweep
-/// is idempotent). A TERMINAL refusal (a 4xx: the broker understood and
+/// broker error (unreachable, 5xx) leaves the row, and the answer asks for
+/// another look after `SAFETY_POLL_INTERVAL` rather than waiting for the next
+/// write (the sweep is idempotent). A TERMINAL refusal (a 4xx: the broker understood and
 /// rejected the request) is loud + dead-lettered: retrying the identical
 /// request every tick forever would be a silent infinite loop over a row the
 /// user can neither see nor clear, so the row is dropped with an error log
 /// naming the execution (the files, if any, remain reclaimable via `weft files`).
-pub async fn process_sweep_queue(state: DispatcherState) -> Result<()> {
+pub async fn process_sweep_queue(state: DispatcherState) -> Result<DrainStep> {
     let rows: Vec<(String, String)> =
         sqlx::query_as("SELECT execution_id, tenant_id FROM storage_sweep ORDER BY enqueued_at_unix")
             .fetch_all(&state.pg_pool)
             .await?;
+    let mut deferred = false;
     for (execution_id, tenant) in rows {
         match sweep_exec(&state, &tenant, &execution_id).await {
             Ok(out) => {
@@ -577,16 +580,17 @@ pub async fn process_sweep_queue(state: DispatcherState) -> Result<()> {
             }
             Err(e) => {
                 // Transient (broker unreachable, apiserver blip surfaced as 401,
-                // 5xx): keep the row and retry next tick.
+                // 5xx): keep the row and look again soon.
                 tracing::warn!(
                     target: "weft_dispatcher::storage",
                     %execution_id, tenant = %tenant, error = %e,
                     "terminate sweep deferred (transient broker/control-plane fault); will retry"
                 );
+                deferred = true;
             }
         }
     }
-    Ok(())
+    Ok(if deferred { DrainStep::RetryIn(SAFETY_POLL_INTERVAL) } else { DrainStep::Done })
 }
 
 #[cfg(test)]

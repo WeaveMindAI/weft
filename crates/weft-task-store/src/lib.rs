@@ -4,6 +4,7 @@
 //! over each module's `GROUP`.
 //!
 //! Modules:
+//!   - `db`: connecting to the database; every pool comes from here.
 //!   - `alarm`: the wakes a local install has set and not yet
 //!     delivered.
 //!   - `tasks`: the `task` table (enqueue, claim, heartbeat,
@@ -23,9 +24,11 @@
 //!     group's migration files.
 
 pub mod alarm;
+pub mod db;
 pub mod drain;
 pub mod executor;
 pub mod kinds;
+pub mod locks;
 pub mod pg_signal;
 pub mod schema_guard;
 pub mod tasks;

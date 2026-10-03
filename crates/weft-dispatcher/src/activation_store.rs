@@ -274,6 +274,23 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
              ON trigger_activation (activating_execution_id) WHERE activating_execution_id IS NOT NULL"#,
         r#"CREATE INDEX IF NOT EXISTS trigger_activation_transitional
              ON trigger_activation (status) WHERE status IN ('activating', 'deactivating')"#,
+        // An activation changing status, coming or going can start or stop
+        // the holding of its held signals without any signal row changing
+        // (a parked or hibernated trigger woken, a wiped instance's row
+        // forgotten, which a signal with no activation reads as active), so
+        // each wakes the holder sizing too. The function is the journal
+        // group's, which applies first.
+        r#"DROP TRIGGER IF EXISTS trigger_activation_held_on_status ON trigger_activation"#,
+        r#"CREATE TRIGGER trigger_activation_held_on_status
+            AFTER UPDATE OF status ON trigger_activation
+            FOR EACH ROW
+            WHEN (NEW.status IS DISTINCT FROM OLD.status)
+            EXECUTE FUNCTION signal_held_notify()"#,
+        r#"DROP TRIGGER IF EXISTS trigger_activation_held_on_row ON trigger_activation"#,
+        r#"CREATE TRIGGER trigger_activation_held_on_row
+            AFTER INSERT OR DELETE ON trigger_activation
+            FOR EACH ROW
+            EXECUTE FUNCTION signal_held_notify()"#,
     ],
     seed: &[],
 };

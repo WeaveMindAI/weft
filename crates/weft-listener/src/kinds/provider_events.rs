@@ -1,27 +1,28 @@
 //! The transport-neutral event subscription, served. A registered
 //! `provider_events` signal names a connection, a topic and a filter;
-//! this handler decides which transport the environment can serve and
-//! runs it:
+//! this handler decides which transport serves it and runs it:
 //!
+//!   - **dial-in**: the service pushes to the install's public events
+//!     surface. This side's job is only the provider subscription
+//!     (subscribe, renew before expiry, unsubscribe at unregister),
+//!     driven through the broker on the signal's wakes; the fires arrive
+//!     through the receiver. Nothing stays up for it, so a cloud install,
+//!     where a held connection costs money, chooses it whenever the service
+//!     offers it for a subscription of one account.
 //!   - **dial-out**: the service declares a socket recipe and the
-//!     connection holds every value its mint call needs. ONE shared
-//!     socket per (connection, topic) on this process, fanning every
-//!     inbound event to all of that pair's subscriptions; the engine
-//!     re-resolves the connection and re-mints the address on every
-//!     reconnect.
-//!   - **dial-in**: the service pushes to the public events surface.
-//!     This side's job is only the provider subscription (subscribe,
-//!     renew before expiry, unsubscribe at unregister), driven
-//!     through the broker; the fires arrive through the receiver.
+//!     connection holds every value its mint call needs. A holder keeps
+//!     ONE shared socket per (connection, topic), fanning every inbound
+//!     event to all of that pair's subscriptions; the engine re-resolves
+//!     the connection and re-mints the address on every reconnect.
 //!
-//! A FRESH registration makes the transport decision (and, dial-in,
-//! the first subscribe) BEFORE answering, so activating a trigger
-//! that cannot be served fails loudly right there, naming what is
-//! missing; it never mints a silently-dead trigger. The serving task
-//! then serves exactly what activation decided, so the two can never
-//! diverge. A rehydrate decides for itself in the background,
-//! retrying resolution until it can (one unreachable broker at boot
-//! must not fail the whole rebuild).
+//! The registration settles the transport ([`KindHandler::settle`]) and
+//! records it on the row, so activating a trigger that cannot be served
+//! fails loudly right there, naming what is missing, and the row says
+//! where the signal runs: dial-in wakes, dial-out is held. A fresh
+//! dial-in subscribes at once, so a provider refusal is that
+//! activation's error. A row registered before its transport was
+//! settled is held, and its holder decides on the way up, retrying
+//! resolution until it can.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
@@ -45,7 +46,7 @@ use weft_core::signal::listener_protocol::{ProcessOutcome, ProcessTarget, PushEv
 use crate::registry::{RegisteredSignal, ServingState, TaskGuard, Transport};
 use crate::socket_engine::{self, CyclePlan, PrepareError};
 
-use super::{BetweenFires, KindHandler, LiveCtx, SpawnCtx};
+use super::{BetweenFires, KindHandler, LiveCtx, SpawnCtx, WakeFrom, Woken};
 use weft_core::live::{LiveFeed, LiveItem};
 
 pub struct ProviderEventsHandler;
@@ -56,8 +57,79 @@ impl KindHandler for ProviderEventsHandler {
         ProviderEvents::TAG
     }
 
-    fn between_fires(&self) -> BetweenFires {
-        BetweenFires::Holds
+    fn between_fires(&self, _spec: &SignalSpec, kind_state: &Value) -> Result<BetweenFires> {
+        Ok(match Settled::read(kind_state)?.transport {
+            Some(SettledTransport::Webhook) => BetweenFires::Wakes,
+            Some(SettledTransport::Socket) | None => BetweenFires::Holds,
+        })
+    }
+
+    /// Resolve the connection and decide the transport, refusing a
+    /// subscription no transport can serve.
+    async fn settle(&self, spec: &SignalSpec, kind_state: Value, ctx: &SpawnCtx) -> Result<Value> {
+        let (cfg, access) = parse_spec(spec)?;
+        let decided = resolve_and_decide(&cfg, &access, None, ctx).await?;
+        let settled = match decided.transport {
+            Transport::Socket => Settled { transport: Some(SettledTransport::Socket), ..Settled::default() },
+            Transport::Webhook => Settled {
+                transport: Some(SettledTransport::Webhook),
+                renew_margin_secs: renew_margin_secs(&decided.topic),
+                ..Settled::default()
+            },
+            Transport::Unservable(reason) => {
+                anyhow::bail!("this trigger cannot be served on the '{}' connection: {reason}", access.service)
+            }
+        };
+        settled.into_state(kind_state)
+    }
+
+    fn wakes_at_once_when_fresh(&self) -> bool {
+        // The first subscribe: a provider refusal fails the activation.
+        true
+    }
+
+    /// A dial-in subscription wakes to subscribe as it comes up (at the
+    /// next whole second, so every arming within one second sets one
+    /// wake), then before each expiry to renew.
+    fn next_wake(&self, _spec: &SignalSpec, state: &Value, from: WakeFrom, now_ms: i64) -> Result<Option<i64>> {
+        let settled = Settled::read(state)?;
+        if settled.transport != Some(SettledTransport::Webhook) {
+            return Ok(None);
+        }
+        Ok(match from {
+            WakeFrom::Armed => Some(next_whole_second(now_ms)),
+            WakeFrom::Woken { .. } => settled.renew_at_ms,
+        })
+    }
+
+    /// Subscribe (or renew) through the broker, then claim the moment,
+    /// recording when it was subscribed and when to renew.
+    ///
+    /// The ensure comes before the claim, and it is idempotent with the
+    /// provider: it makes sure one live subscription serves this token,
+    /// subscribing only when none does and renewing only inside the renewal
+    /// margin. So two copies woken for one moment both ensure and still end
+    /// on one subscription, and a copy that dies between the ensure and the
+    /// claim leaves the row unclaimed for the alarm's retry, which ensures
+    /// again. The claim has one winner, which records the subscription and
+    /// sets the next wake; a copy whose claim lost ends quietly.
+    async fn on_wake(&self, spec: &SignalSpec, woken: Woken, ctx: SpawnCtx) -> Result<Option<Value>> {
+        let (cfg, access) = parse_spec(spec)?;
+        let ensured = ensure_via_broker(&ctx, &access, &cfg).await?;
+        let mut settled = Settled::read(&woken.state)?;
+        let margin_secs = settled.renew_margin_secs.unwrap_or(0);
+        settled.renew_at_ms = ensured.expires_at_unix.map(|at| renew_at_ms(&ctx, &cfg, at, margin_secs, woken.now_ms));
+        settled.subscribed = true;
+        let after = settled.into_state(woken.state)?;
+        if !ctx.fire.claim_kind_state(after.clone(), woken.seq).await? {
+            tracing::debug!(
+                target: "weft_listener::provider_events",
+                token = %ctx.fire.token(), topic = %cfg.topic,
+                "another copy claimed this subscription's moment first; its write and its next wake stand"
+            );
+            return Ok(None);
+        }
+        Ok(Some(after))
     }
 
     fn broad_push_routed(&self) -> bool {
@@ -87,7 +159,13 @@ impl KindHandler for ProviderEventsHandler {
     /// is the topic's declared fields, which is exactly what the trigger
     /// declared it wakes with.
     fn match_push(&self, sig: &RegisteredSignal, push: &PushEvent) -> Option<Value> {
-        let cfg: ProviderEvents = serde_json::from_value(sig.spec.config.clone()).ok()?;
+        let cfg = match parse_config(&sig.spec) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                tracing::warn!(target: "weft_listener::provider_events", error = %format!("{e:#}"), "a held subscription's spec cannot be read; no push feeds it");
+                return None;
+            }
+        };
         if cfg.topic != push.topic {
             return None;
         }
@@ -111,65 +189,16 @@ impl KindHandler for ProviderEventsHandler {
     async fn spawn_task(
         &self,
         spec: &SignalSpec,
-        _kind_state: &Value,
+        kind_state: &Value,
         ctx: SpawnCtx,
     ) -> Result<Option<JoinHandle<()>>> {
-        let cfg: ProviderEvents = serde_json::from_value(spec.config.clone())
-            .map_err(|e| anyhow::anyhow!("malformed provider_events spec: {e}"))?;
-        let access = spec
-            .access
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("provider_events signal has no connection"))?;
+        let (cfg, access) = parse_spec(spec)?;
         set_status(&ctx, "starting");
-
-        let decided = if ctx.fresh {
-            // Decide (and for dial-in, subscribe) NOW, so activation
-            // fails loudly on an unservable trigger instead of
-            // minting a dead one. The decision travels into the
-            // serving task, which serves exactly what was reported.
-            let source = crate::listener_access::resolve(&access, &ctx).await?;
-            let topic = source
-                .events
-                .get(&cfg.topic)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "'{}' declares no event topic named '{}'; reconnect the account (an \
-                         older connection may predate the topic)",
-                        access.service,
-                        cfg.topic
-                    )
-                })?
-                .clone();
-            let mut available = source.values.clone();
-            available.extend(source.recipe_values.clone());
-            let transport = decide_transport(&topic, cfg.scope, &available);
-            match &transport {
-                Transport::Socket => {}
-                Transport::Webhook => {
-                    // The first subscribe runs here so a missing
-                    // public address (or a provider refusal) is THIS
-                    // activation's error.
-                    ensure_via_broker(&ctx, &access, &cfg)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("{e:#}"))?;
-                }
-                Transport::Unservable(reason) => {
-                    return Err(anyhow::anyhow!(
-                        "this trigger cannot be served on the '{}' connection: {reason}",
-                        access.service
-                    ));
-                }
-            }
-            Some(DecidedServing {
-                transport,
-                topic,
-                provider_account: source.provider_account.clone(),
-            })
-        } else {
-            None
-        };
-
-        Ok(Some(serve_subscription(cfg, access, decided, ctx)))
+        let settled = Settled::read(kind_state)?.transport.map(|t| match t {
+            SettledTransport::Socket => Transport::Socket,
+            SettledTransport::Webhook => Transport::Webhook,
+        });
+        Ok(Some(serve_subscription(cfg, access, settled, ctx)))
     }
 
     fn process_entry(&self, _sig: &RegisteredSignal, payload: Value) -> ProcessOutcome {
@@ -192,7 +221,16 @@ impl KindHandler for ProviderEventsHandler {
         // A topic is a provider's own word ("messages", "files"), never
         // a credential, so it is shown plainly.
         let mut items = vec![LiveItem::text("Topic", cfg.topic)];
-        items.extend(super::serving_item(sig));
+        // A dial-in subscription is read off its row, which says whether
+        // it is subscribed and when it renews; a held one says what its
+        // holder's task is doing.
+        match sig.kind_state.as_ref().map(Settled::read) {
+            Some(Ok(settled @ Settled { transport: Some(SettledTransport::Webhook), .. })) => {
+                items.push(LiveItem::text("State", webhook_state(&settled)))
+            }
+            Some(Err(e)) => items.push(LiveItem::text("State", format!("{e:#}"))),
+            _ => items.extend(super::serving_item(sig)),
+        }
         LiveFeed::new(items)
     }
 
@@ -202,17 +240,19 @@ impl KindHandler for ProviderEventsHandler {
 
     /// A dial-in subscription holds provider-side state (the provider
     /// keeps posting to a channel weft asked for); drop it at the
-    /// provider too. A socket-served signal never subscribed, and one
-    /// whose transport was never recorded holds nothing this process
-    /// arranged; either way there is nothing to drop, and a provider
-    /// channel that outlives its signal lapses on its own expiry.
+    /// provider too. A socket-served signal never subscribed, so there is
+    /// nothing to drop. A signal that carries its state here is one served
+    /// by wakes, which for this kind is the dial-in one (a held one's task
+    /// owns its state and carries none); a held one that fell back to a
+    /// webhook says so on its serving slot.
     async fn on_unregister(
         &self,
         token: &str,
         sig: &RegisteredSignal,
         events_broker: &Arc<weft_broker_client::BrokerEventsClient>,
     ) {
-        if sig.serving.lock().transport != Some(Transport::Webhook) {
+        let pushed = sig.serving.lock().transport == Some(Transport::Webhook) || sig.kind_state.is_some();
+        if !pushed {
             return;
         }
         if let Err(e) = events_broker
@@ -240,18 +280,26 @@ fn set_status(ctx: &SpawnCtx, status: impl Into<String>) {
 }
 
 /// Which transport serves a subscription, decided from the recipe,
-/// the subscription's SCOPE, and what the connection actually holds.
-/// Pure. Dial-out wins when the connection can run the mint call (it
-/// needs no public address and its socket is single-owner by
-/// construction); otherwise dial-in; otherwise a reason naming
-/// exactly what is missing. An APP-wide subscription is socket-only:
-/// the push receiver routes each event to ONE account's connections,
-/// so it can never deliver "every install of your app".
+/// the subscription's SCOPE, what the connection actually holds, and
+/// whether this install takes a push over a held connection
+/// (`ListenerConfig::prefer_push`). Pure. Dial-in wins there when the
+/// service pushes this topic for one account: it keeps nothing up between
+/// events. Otherwise dial-out
+/// when the connection can run the mint call (it needs no public address
+/// and its socket is single-owner by construction); otherwise dial-in;
+/// otherwise a reason naming exactly what is missing. An APP-wide
+/// subscription is socket-only: the push receiver routes each event to
+/// ONE account's connections, so it can never deliver "every install of
+/// your app".
 pub fn decide_transport(
     topic: &EventsSpec,
     scope: EventScope,
     available: &BTreeMap<String, String>,
+    prefer_push: bool,
 ) -> Transport {
+    if prefer_push && scope == EventScope::Account && topic.webhook.is_some() {
+        return Transport::Webhook;
+    }
     if let Some(socket) = &topic.socket {
         let Some(connect) = &socket.minted.connect else {
             return Transport::Unservable("its socket recipe declares no connect call".into());
@@ -296,6 +344,43 @@ pub fn decide_transport(
     Transport::Unservable("the service declares no transport for this topic".into())
 }
 
+/// What a `provider_events` spec subscribes to, and through which
+/// connection.
+fn parse_spec(spec: &SignalSpec) -> Result<(ProviderEvents, AccessRef)> {
+    let cfg = parse_config(spec)?;
+    let access = spec.access.clone().ok_or_else(|| anyhow::anyhow!("provider_events signal has no connection"))?;
+    Ok((cfg, access))
+}
+
+/// What the signal subscribes to, without the connection it reads it
+/// through (a push already arrived on one).
+fn parse_config(spec: &SignalSpec) -> Result<ProviderEvents> {
+    serde_json::from_value(spec.config.clone()).map_err(|e| anyhow::anyhow!("malformed provider_events spec: {e}"))
+}
+
+/// One topic of a resolved connection: its recipe, every value the
+/// connection holds (its stored ones and its recipe's), and the
+/// connection's own provider account.
+struct ResolvedTopic {
+    topic: EventsSpec,
+    values: BTreeMap<String, String>,
+    provider_account: Option<String>,
+}
+
+/// Resolve `access` through the broker and read its `topic`.
+async fn resolve_topic(access: &AccessRef, topic: &str, ctx: &SpawnCtx) -> Result<ResolvedTopic> {
+    let source = crate::listener_access::resolve(access, ctx).await?;
+    let spec = source.events.get(topic).cloned().ok_or_else(|| {
+        anyhow::anyhow!(
+            "'{}' declares no event topic named '{topic}'; reconnect the account (an older connection may predate the topic)",
+            access.service
+        )
+    })?;
+    let mut values = source.values;
+    values.extend(source.recipe_values);
+    Ok(ResolvedTopic { topic: spec, values, provider_account: source.provider_account })
+}
+
 /// The transport decision plus everything it was decided FROM that
 /// the serving task needs: the topic recipe and the connection's own
 /// provider account.
@@ -305,53 +390,46 @@ struct DecidedServing {
     provider_account: Option<String>,
 }
 
-/// The long-running per-signal task: serve the decided transport
-/// until the signal unregisters (its abort drops the membership
-/// guard). A FRESH registration hands its decision in, so what runs
-/// here is exactly what activation reported; a rehydrate decides for
-/// itself, retrying resolution on the ladder until it can (one
-/// unreachable broker at boot must not fail the whole rebuild). An
+/// Resolve the subscription's connection and the transport that serves
+/// it: `settled` when the registration recorded one, otherwise decided
+/// from what the connection holds ([`decide_transport`]).
+async fn resolve_and_decide(
+    cfg: &ProviderEvents,
+    access: &AccessRef,
+    settled: Option<Transport>,
+    ctx: &SpawnCtx,
+) -> Result<DecidedServing> {
+    let resolved = resolve_topic(access, &cfg.topic, ctx).await?;
+    let transport =
+        settled.unwrap_or_else(|| decide_transport(&resolved.topic, cfg.scope, &resolved.values, ctx.config.prefer_push));
+    Ok(DecidedServing { transport, topic: resolved.topic, provider_account: resolved.provider_account })
+}
+
+/// The long-running per-signal task: serve the transport until the
+/// signal stops (its abort drops the membership guard). It resolves the
+/// connection (the topic and its own provider account), retrying on the
+/// ladder until it can (one unreachable broker must not keep it down
+/// for good), and serves the transport the registration `settled`; a row
+/// registered before its transport was settled decides it here. An
 /// unservable decision is TERMINAL: retrying would re-derive the same
 /// facts, and a reconnect of the account re-registers the signal and
 /// re-runs the decision.
 fn serve_subscription(
     cfg: ProviderEvents,
     access: AccessRef,
-    decided: Option<DecidedServing>,
+    settled: Option<Transport>,
     ctx: SpawnCtx,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let decided = match decided {
-            Some(d) => d,
-            None => {
-                let mut backoff = crate::kinds::event_source::Backoff::new();
-                loop {
-                    let source = match crate::listener_access::resolve(&access, &ctx).await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            set_status(&ctx, format!("cannot resolve the connection: {e:#}"));
-                            backoff.wait_then_climb().await;
-                            continue;
-                        }
-                    };
-                    let Some(topic) = source.events.get(&cfg.topic).cloned() else {
-                        set_status(
-                            &ctx,
-                            format!(
-                                "the connection declares no '{}' topic; reconnect the account",
-                                cfg.topic
-                            ),
-                        );
+        let decided = {
+            let mut backoff = crate::kinds::event_source::Backoff::new();
+            loop {
+                match resolve_and_decide(&cfg, &access, settled.clone(), &ctx).await {
+                    Ok(decided) => break decided,
+                    Err(e) => {
+                        set_status(&ctx, format!("{e:#}"));
                         backoff.wait_then_climb().await;
-                        continue;
-                    };
-                    let mut available = source.values.clone();
-                    available.extend(source.recipe_values.clone());
-                    break DecidedServing {
-                        transport: decide_transport(&topic, cfg.scope, &available),
-                        topic,
-                        provider_account: source.provider_account,
-                    };
+                    }
                 }
             }
         };
@@ -515,27 +593,14 @@ fn spawn_shared_engine(
         let topic_name = prepare_topic.clone();
         let recipe = recipe.clone();
         async move {
-            let source = crate::listener_access::resolve(&access, &ctx)
-                .await
-                .map_err(PrepareError::Transient)?;
-            let topic = source
-                .events
-                .get(&topic_name)
-                .cloned()
-                .ok_or_else(|| {
-                    PrepareError::Transient(anyhow::anyhow!(
-                        "the connection declares no '{topic_name}' topic"
-                    ))
-                })?;
-            let socket = topic.socket.clone().ok_or_else(|| {
+            let resolved = resolve_topic(&access, &topic_name, &ctx).await.map_err(PrepareError::Transient)?;
+            let socket = resolved.topic.socket.clone().ok_or_else(|| {
                 PrepareError::Transient(anyhow::anyhow!(
                     "the '{topic_name}' topic declares no socket recipe"
                 ))
             })?;
-            let mut values = source.values;
-            values.extend(source.recipe_values);
-            let url = socket_engine::mint_socket_url(&socket.minted, &values).await?;
-            *recipe.lock() = Some(topic.clone());
+            let url = socket_engine::mint_socket_url(&socket.minted, &resolved.values).await?;
+            *recipe.lock() = Some(resolved.topic);
             Ok(CyclePlan {
                 url,
                 handshake: None,
@@ -612,6 +677,123 @@ fn spawn_shared_engine(
 
 // ---------- Dial-in: the provider subscription lifecycle ----------
 
+/// The least time between two renewals, whatever expiry the provider
+/// answers, so the wakes never spin.
+const RENEW_FLOOR_MS: i64 = 60_000;
+
+/// How long before an expiry the topic's subscription renews, when its
+/// recipe says.
+fn renew_margin_secs(topic: &EventsSpec) -> Option<u64> {
+    topic.webhook.as_ref().and_then(|w| w.subscribe.as_ref()).and_then(|s| s.renew_margin_secs)
+}
+
+/// When a subscription that expires at `expires_at_unix` (unix seconds)
+/// renews, in unix ms: half its `margin_secs` before the expiry, and never
+/// sooner than [`RENEW_FLOOR_MS`] after `now_ms`. The broker renews
+/// anything within the whole margin of its expiry, so aiming at the
+/// middle of it leaves room for a wake that arrives early and for the
+/// broker's clock running behind this one; aimed at the margin's edge, a
+/// wake a moment early renews nothing. `floored` when the floor decided
+/// it: the provider answered an expiry too close to renew before.
+#[derive(Debug, PartialEq, Eq)]
+struct Renewal {
+    at_ms: i64,
+    floored: bool,
+}
+
+fn renewal(expires_at_unix: i64, margin_secs: u64, now_ms: i64) -> Renewal {
+    let wanted = expires_at_unix * 1000 - i64::try_from(margin_secs).unwrap_or(i64::MAX / 2_000) * 500;
+    let floor = now_ms + RENEW_FLOOR_MS;
+    Renewal { at_ms: wanted.max(floor), floored: wanted < floor }
+}
+
+/// [`renewal`]'s moment for one subscription, saying so when the floor
+/// decided it.
+fn renew_at_ms(ctx: &SpawnCtx, cfg: &ProviderEvents, expires_at_unix: i64, margin_secs: u64, now_ms: i64) -> i64 {
+    let renewal = renewal(expires_at_unix, margin_secs, now_ms);
+    if renewal.floored {
+        tracing::warn!(
+            target: "weft_listener::provider_events",
+            token = %ctx.fire.token(), topic = %cfg.topic, expires_at_unix,
+            "the provider answered an expiry too close to renew before it; renewing on the floor"
+        );
+    }
+    renewal.at_ms
+}
+
+/// `ms` rounded up to a whole second.
+fn next_whole_second(ms: i64) -> i64 {
+    (ms + 999).div_euclid(1000) * 1000
+}
+
+/// What the registration settled about how a subscription is served,
+/// kept in its kind state.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Settled {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transport: Option<SettledTransport>,
+    /// For dial-in: how long before an expiry the topic renews.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    renew_margin_secs: Option<u64>,
+    /// For dial-in: when the subscription next renews (unix ms), `None`
+    /// before the first subscribe and for one that never expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    renew_at_ms: Option<i64>,
+    /// For dial-in: whether a subscription was made, which is what tells
+    /// one that never expires from one not made yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    subscribed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SettledTransport {
+    Socket,
+    Webhook,
+}
+
+impl Settled {
+    /// From a signal's state; a state that says nothing (a row
+    /// registered before transports were settled) is an empty one, and
+    /// one this kind did not write is an error.
+    fn read(state: &Value) -> Result<Self> {
+        if state.is_null() {
+            return Ok(Self::default());
+        }
+        serde_json::from_value(state.clone()).map_err(|e| anyhow::anyhow!("this subscription's recorded state cannot be read: {e}"))
+    }
+
+    /// Written into `state`, alongside whatever else it holds.
+    fn into_state(self, state: Value) -> Result<Value> {
+        let mut state = match state {
+            Value::Object(map) => map,
+            Value::Null => serde_json::Map::new(),
+            other => anyhow::bail!("a provider_events state is an object, not {other}"),
+        };
+        for key in ["transport", "renew_margin_secs", "renew_at_ms", "subscribed"] {
+            state.remove(key);
+        }
+        if let Value::Object(settled) = serde_json::to_value(self)? {
+            state.extend(settled);
+        }
+        Ok(Value::Object(state))
+    }
+}
+
+/// What a dial-in subscription shows on its node, from its row.
+fn webhook_state(settled: &Settled) -> String {
+    match (settled.renew_at_ms, settled.subscribed) {
+        (Some(at), _) => format!("subscribed, events arrive by push (webhook); renews at {}", unix_ms_text(at)),
+        (None, true) => "subscribed, events arrive by push (webhook); the subscription does not expire".to_string(),
+        (None, false) => "subscribing (webhook)".to_string(),
+    }
+}
+
+/// A unix-ms moment as a person reads it.
+fn unix_ms_text(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms).map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_else(|| ms.to_string())
+}
+
 async fn ensure_via_broker(
     ctx: &SpawnCtx,
     access: &AccessRef,
@@ -640,12 +822,7 @@ async fn serve_webhook(
     topic: &EventsSpec,
     ctx: &SpawnCtx,
 ) {
-    let margin_secs = topic
-        .webhook
-        .as_ref()
-        .and_then(|w| w.subscribe.as_ref())
-        .and_then(|s| s.renew_margin_secs)
-        .unwrap_or(0);
+    let margin_secs = renew_margin_secs(topic).unwrap_or(0);
     let mut backoff = crate::kinds::event_source::Backoff::new();
     loop {
         match ensure_via_broker(ctx, access, cfg).await {
@@ -654,24 +831,10 @@ async fn serve_webhook(
                 match ensured.expires_at_unix {
                     None => std::future::pending::<()>().await,
                     Some(at) => {
-                        let wake = at - margin_secs as i64;
-                        let now = chrono::Utc::now().timestamp();
-                        if wake <= now {
-                            // A renewal point already behind now
-                            // means the provider answered a stale (or
-                            // absurdly short) expiry; keep the 60s
-                            // floor so the loop never spins, and say
-                            // so.
-                            tracing::warn!(
-                                target: "weft_listener::provider_events",
-                                token = %ctx.fire.token(), topic = %cfg.topic,
-                                expires_at_unix = at,
-                                "the provider answered an expiry already behind the \
-                                 renewal point; renewing on the 60s floor"
-                            );
-                        }
-                        let sleep_secs = (wake - now).max(60) as u64;
-                        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+                        let now_ms = chrono::Utc::now().timestamp_millis();
+                        let wake_ms = renew_at_ms(ctx, cfg, at, margin_secs, now_ms);
+                        // At least the floor ahead of now, so positive.
+                        tokio::time::sleep(std::time::Duration::from_millis((wake_ms - now_ms) as u64)).await;
                     }
                 }
             }
@@ -725,21 +888,21 @@ mod tests {
         let with_token =
             BTreeMap::from([("app_token".to_string(), "xapp-1".to_string())]);
         assert_eq!(
-            decide_transport(&both, EventScope::Account, &with_token),
+            decide_transport(&both, EventScope::Account, &with_token, false),
             Transport::Socket
         );
         assert_eq!(
-            decide_transport(&both, EventScope::Account, &BTreeMap::new()),
+            decide_transport(&both, EventScope::Account, &BTreeMap::new(), false),
             Transport::Webhook
         );
         // An APP-wide subscription never falls to the push transport
         // (it routes per account, which can never mean "every
         // install"); without the dial-out value it refuses, naming it.
         assert_eq!(
-            decide_transport(&both, EventScope::App, &with_token),
+            decide_transport(&both, EventScope::App, &with_token, false),
             Transport::Socket
         );
-        match decide_transport(&both, EventScope::App, &BTreeMap::new()) {
+        match decide_transport(&both, EventScope::App, &BTreeMap::new(), false) {
             Transport::Unservable(reason) => {
                 assert!(reason.contains("app-wide"), "{reason}");
                 assert!(reason.contains("app_token"), "{reason}");
@@ -759,11 +922,114 @@ mod tests {
                 }
             }
         }));
-        match decide_transport(&socket_only, EventScope::Account, &BTreeMap::new()) {
+        match decide_transport(&socket_only, EventScope::Account, &BTreeMap::new(), false) {
             Transport::Unservable(reason) => {
                 assert!(reason.contains("app_token"), "{reason}")
             }
             other => panic!("expected unservable, got {other:?}"),
         }
+    }
+
+    /// On an install that prefers the push, a subscription of one account
+    /// that the service pushes rides it, even when the connection could
+    /// dial out: nothing has to stay up for it. An app-wide one still dials
+    /// out.
+    #[test]
+    fn an_install_that_prefers_the_push_takes_it() {
+        let both = slack_topic();
+        let with_token = BTreeMap::from([("app_token".to_string(), "xapp-1".to_string())]);
+        assert_eq!(decide_transport(&both, EventScope::Account, &with_token, true), Transport::Webhook);
+        assert_eq!(decide_transport(&both, EventScope::App, &with_token, true), Transport::Socket);
+    }
+
+    /// A pushed subscription wakes (to subscribe, then to renew) and is
+    /// never held; a dialed one, or one whose transport was never settled,
+    /// is held.
+    #[test]
+    fn the_settled_transport_decides_where_a_subscription_runs() {
+        let spec: SignalSpec = serde_json::from_value(serde_json::json!({
+            "kind": "provider_events", "config": { "topic": "messages" }
+        }))
+        .unwrap();
+        let handler = ProviderEventsHandler;
+        let webhook = Settled {
+            transport: Some(SettledTransport::Webhook),
+            renew_margin_secs: Some(60),
+            renew_at_ms: Some(5_000),
+            subscribed: true,
+        }
+        .into_state(serde_json::json!({ "other": 1 }))
+        .unwrap();
+        assert_eq!(webhook["other"], 1, "the rest of the state stays");
+        assert_eq!(handler.between_fires(&spec, &webhook).unwrap(), BetweenFires::Wakes);
+        assert_eq!(handler.next_wake(&spec, &webhook, WakeFrom::Armed, 1_000).unwrap(), Some(1_000), "subscribe as it comes up");
+        assert_eq!(handler.next_wake(&spec, &webhook, WakeFrom::Woken { aimed_at_ms: 1_000 }, 1_200).unwrap(), Some(5_000));
+        let socket = Settled { transport: Some(SettledTransport::Socket), ..Settled::default() }.into_state(Value::Null).unwrap();
+        assert_eq!(handler.between_fires(&spec, &socket).unwrap(), BetweenFires::Holds);
+        assert_eq!(handler.next_wake(&spec, &socket, WakeFrom::Armed, 1_000).unwrap(), None);
+        assert_eq!(handler.between_fires(&spec, &serde_json::json!({})).unwrap(), BetweenFires::Holds, "unsettled: decided on the way up");
+        assert!(handler.between_fires(&spec, &serde_json::json!({ "transport": "carrier_pigeon" })).is_err(), "a state it did not write is an error");
+    }
+
+    /// Two armings within one second set one wake: the first subscribe is
+    /// aimed at the next whole second.
+    #[test]
+    fn arming_a_subscription_aims_at_the_next_whole_second() {
+        let spec: SignalSpec = serde_json::from_value(serde_json::json!({
+            "kind": "provider_events", "config": { "topic": "messages" }
+        }))
+        .unwrap();
+        let webhook = Settled { transport: Some(SettledTransport::Webhook), ..Settled::default() }.into_state(Value::Null).unwrap();
+        let armed = |now_ms| ProviderEventsHandler.next_wake(&spec, &webhook, WakeFrom::Armed, now_ms).unwrap();
+        assert_eq!((armed(1_001), armed(1_999), armed(2_000)), (Some(2_000), Some(2_000), Some(2_000)));
+        assert_eq!(next_whole_second(-1), 0);
+    }
+
+    /// A subscription renews its margin before the expiry, and never
+    /// sooner than the floor after now, saying when the floor decided it.
+    #[test]
+    fn a_subscription_renews_its_margin_before_expiry_on_a_floor() {
+        let now_ms = 1_000_000;
+        assert_eq!(renewal(10_000, 600, now_ms), Renewal { at_ms: 9_700_000, floored: false }, "in the middle of the margin");
+        assert_eq!(renewal(10_000, 0, now_ms), Renewal { at_ms: 10_000_000, floored: false });
+        assert_eq!(renewal(1_030, 0, now_ms), Renewal { at_ms: now_ms + RENEW_FLOOR_MS, floored: true }, "too close");
+        assert_eq!(renewal(500, 0, now_ms), Renewal { at_ms: now_ms + RENEW_FLOOR_MS, floored: true }, "already past");
+    }
+
+    /// The display tells a subscription being made from one made that
+    /// never expires, and from one that renews.
+    #[test]
+    fn a_dial_in_subscription_says_whether_it_is_subscribed() {
+        let mut settled = Settled { transport: Some(SettledTransport::Webhook), ..Settled::default() };
+        assert_eq!(webhook_state(&settled), "subscribing (webhook)");
+        settled.subscribed = true;
+        assert!(webhook_state(&settled).ends_with("does not expire"), "{}", webhook_state(&settled));
+        settled.renew_at_ms = Some(0);
+        assert!(webhook_state(&settled).ends_with("renews at 1970-01-01 00:00 UTC"), "{}", webhook_state(&settled));
+    }
+
+    /// A spec names its topic and its connection; one missing either is
+    /// refused naming what is wrong.
+    #[test]
+    fn a_spec_names_its_topic_and_its_connection() {
+        let whole: SignalSpec = serde_json::from_value(serde_json::json!({
+            "kind": "provider_events", "config": { "topic": "messages" },
+            "access": { "id": "a-1", "service": "slack" }
+        }))
+        .unwrap();
+        let (cfg, access) = parse_spec(&whole).unwrap();
+        assert_eq!((cfg.topic.as_str(), cfg.scope, access.id.as_str()), ("messages", EventScope::Account, "a-1"));
+        let without_access: SignalSpec = serde_json::from_value(serde_json::json!({
+            "kind": "provider_events", "config": { "topic": "messages" }
+        }))
+        .unwrap();
+        let e = parse_spec(&without_access).unwrap_err().to_string();
+        assert!(e.contains("no connection"), "{e}");
+        let malformed: SignalSpec = serde_json::from_value(serde_json::json!({
+            "kind": "provider_events", "config": { "topic": 5 }
+        }))
+        .unwrap();
+        let e = parse_spec(&malformed).unwrap_err().to_string();
+        assert!(e.contains("malformed provider_events spec"), "{e}");
     }
 }

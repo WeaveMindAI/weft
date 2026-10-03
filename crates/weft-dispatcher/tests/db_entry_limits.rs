@@ -179,7 +179,7 @@ async fn the_sweep_frees_the_slot_of_a_run_that_ended(pool: PgPool) {
 #[sqlx::test]
 async fn token_guessing_blocks_the_address_for_the_minute(pool: PgPool) {
     setup(&pool).await;
-    let edge = entry_limits::EdgeConfig { trusted_proxy_hops: weft_platform_traits::config::ProxyHops { public: 1, outside: 1 }, invalid_tokens_per_minute: Some(3) };
+    let edge = entry_limits::EdgeConfig { trusted_proxy_hops: weft_platform_traits::config::ProxyHops { public: 1, outside: 1, domains: 2 }, invalid_tokens_per_minute: Some(3) };
     let addr: std::net::IpAddr = "203.0.113.9".parse().unwrap();
     for _ in 0..3 {
         assert!(entry_limits::token_guessing_blocked(&pool, &edge, addr, 120).await.unwrap().is_none());
@@ -188,7 +188,7 @@ async fn token_guessing_blocks_the_address_for_the_minute(pool: PgPool) {
     let blocked = entry_limits::token_guessing_blocked(&pool, &edge, addr, 150).await.unwrap().expect("blocked");
     assert_eq!(blocked.retry_after_secs, 30);
     assert!(entry_limits::token_guessing_blocked(&pool, &edge, addr, 180).await.unwrap().is_none());
-    let off = entry_limits::EdgeConfig { trusted_proxy_hops: weft_platform_traits::config::ProxyHops { public: 1, outside: 1 }, invalid_tokens_per_minute: None };
+    let off = entry_limits::EdgeConfig { trusted_proxy_hops: weft_platform_traits::config::ProxyHops { public: 1, outside: 1, domains: 2 }, invalid_tokens_per_minute: None };
     assert!(entry_limits::token_guessing_blocked(&pool, &off, addr, 150).await.unwrap().is_none());
 }
 

@@ -43,10 +43,22 @@ pub struct CallerAddress(pub std::net::IpAddr);
 
 /// How many proxies in front of the listener a request came in on append
 /// to `X-Forwarded-For` (the install's `edge.trustedProxyHops` for that
-/// listener). Each listener's router puts it on every request, so the
-/// same door reads its caller right whichever port it was reached on.
+/// listener). Each listener's router puts it on every request that does
+/// not carry one yet (the door puts its own on a request that came by one
+/// of the install's domains, through the load balancer in front of them),
+/// so the same door reads its caller right whichever way it was reached.
 #[derive(Debug, Clone, Copy)]
-struct TrustedHops(usize);
+pub(crate) struct TrustedHops(pub(crate) usize);
+
+/// Put `hops` on every request that carries none yet.
+fn with_hops(router: Router<DispatcherState>, hops: TrustedHops) -> Router<DispatcherState> {
+    router.layer(axum::middleware::from_fn(move |mut request: axum::extract::Request, next: axum::middleware::Next| async move {
+        if request.extensions().get::<TrustedHops>().is_none() {
+            request.extensions_mut().insert(hops);
+        }
+        next.run(request).await
+    }))
+}
 
 impl CallerAddress {
     /// The key a per-caller count is kept under.
@@ -148,7 +160,7 @@ pub mod domains;
 pub mod execution;
 mod events;
 mod provider_events;
-mod signal_token;
+pub(crate) mod signal_token;
 pub(crate) mod infra;
 mod display;
 // `pub` (not `pub(crate)`) like `project` above: the parked-fire queue
@@ -185,6 +197,11 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         .route("/install", get(project::install))
         .route("/install/domains", get(domains::list).post(domains::add))
         .route("/install/domains/{name}", axum::routing::delete(domains::remove))
+        .route("/projects/{id}/frontends", get(crate::frontends::list_route).post(crate::frontends::add))
+        .route("/projects/{id}/frontends/{name}", axum::routing::delete(crate::frontends::remove))
+        .route("/projects/{id}/frontends/{name}/token", post(crate::frontends::new_token))
+        .route("/projects/{id}/frontends/{name}/token/{token}/done", post(crate::frontends::token_done))
+        .route("/projects/{id}/frontends/{name}/token/{token}", axum::routing::delete(crate::frontends::drop_token))
         .route("/projects", get(project::list).post(project::declare))
         // Build one version inside the install and register it: the one
         // way a project's program and images come to exist.
@@ -491,7 +508,7 @@ pub fn permissive_cors() -> CorsLayer {
 /// surface (see [`core_routes`]).
 pub fn router(state: DispatcherState, cors: CorsLayer) -> Router {
     let hops = TrustedHops(state.edge.trusted_proxy_hops.public);
-    core_routes(cors, state.clone()).layer(axum::Extension(hops)).with_state(state)
+    with_hops(core_routes(cors, state.clone()), hops).with_state(state)
 }
 
 /// Only the doors outside callers use (the public trigger surface, the
@@ -500,7 +517,7 @@ pub fn router(state: DispatcherState, cors: CorsLayer) -> Router {
 /// install's tunnel).
 pub fn outside_router(state: DispatcherState) -> Router {
     let hops = TrustedHops(state.edge.trusted_proxy_hops.outside);
-    outside_caller_routes(state.clone()).layer(axum::Extension(hops)).with_state(state)
+    with_hops(outside_caller_routes(state.clone()), hops).with_state(state)
 }
 
 #[cfg(test)]

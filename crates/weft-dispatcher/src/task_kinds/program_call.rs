@@ -314,7 +314,7 @@ async fn infra_down(
     )
     .await?;
     let drain = spec.drain_timeout_secs.unwrap_or(weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS);
-    let command_id = crate::api::infra::issue_lifecycle_kicking_supervisor(
+    let command_id = crate::api::infra::issue_lifecycle_for(
         state,
         project_id,
         Some(node),
@@ -554,10 +554,9 @@ fn internal<E: std::fmt::Display>(what: &'static str) -> impl Fn(E) -> CallError
     move |e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{what}: {e:#}"))
 }
 
+/// A store error as the store answers it on every surface
+/// (`weft_access_store::client_error`).
 fn access_error(e: anyhow::Error) -> CallError {
-    match e.downcast_ref::<weft_access_store::AccessError>() {
-        Some(weft_access_store::AccessError::NotFound) => (StatusCode::NOT_FOUND, format!("{e}")),
-        Some(_) => (StatusCode::BAD_REQUEST, format!("{e}")),
-        None => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")),
-    }
+    let (status, message) = weft_access_store::client_error(e);
+    (StatusCode::from_u16(status).expect("store status codes are valid"), message)
 }

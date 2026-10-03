@@ -9,6 +9,7 @@ import type {
   ActionAvailability,
   ActionBarState,
   ActionVerb,
+  ApplyProgress,
   BackendSnapshot,
   ExecutionPhase,
   ProjectTransition,
@@ -27,6 +28,7 @@ export interface RawStatusPayload {
   orphaned_infra?: boolean;
   infra_rollup?: string;
   infra_busy?: boolean;
+  builds?: Array<{ image: string; build: string; startedAtUnix: number; logUrl?: string }>;
   infra?: Array<{
     node?: string;
     node_type?: string;
@@ -34,6 +36,7 @@ export interface RawStatusPayload {
     failureStage?: string;
     failureMessage?: string;
     instance_copy_count?: number;
+    progress?: ApplyProgress;
   }>;
   drift?: {
     binary_drift?: boolean;
@@ -132,6 +135,7 @@ export function parseStatusPayload(raw: RawStatusPayload): ActionAvailability {
     ...(n.failureStage !== undefined ? { failureStage: n.failureStage } : {}),
     ...(n.failureMessage !== undefined ? { failureMessage: n.failureMessage } : {}),
     ...(n.instance_copy_count !== undefined ? { instanceCopyCount: n.instance_copy_count } : {}),
+    ...(n.progress !== undefined ? { progress: n.progress } : {}),
   }));
   return {
     availableActions: (Array.isArray(raw.available_actions)
@@ -202,4 +206,13 @@ export function backendFromSnapshot(snapshot: ActionAvailability): BackendSnapsh
       ? { firesDeadlineUnix: snapshot.firesDeadlineUnix }
       : {}),
   };
+}
+
+/** How far a start of an infra copy got, as a person reads it: "for
+ *  3m12s, waiting on: ...". */
+// SYNC: describeProgress <-> crates/weft-core/src/infra/wire.rs ApplyProgress::describe
+export function describeProgress(progress: ApplyProgress, nowUnix: number): string {
+  const secs = Math.max(0, Math.floor(nowUnix - progress.sinceUnix));
+  const elapsed = secs >= 60 ? `${Math.floor(secs / 60)}m${String(secs % 60).padStart(2, '0')}s` : `${secs}s`;
+  return progress.waiting ? `for ${elapsed}, waiting on: ${progress.waiting}` : `for ${elapsed}`;
 }

@@ -1,15 +1,18 @@
 //! `weft domain add|list|rm`: the domains the install answers at.
 //!
-//! A domain is bought anywhere. Adding one here stores it and prints the
-//! DNS record to set at the registrar; the command then waits until the
-//! name points at the install, after which the install's front door gets
-//! its certificate on its own.
+//! A domain is bought anywhere. The install answers at its own address
+//! without one; a domain needs a door in front of the install, which the
+//! first domain makes (on GCP a load balancer, which costs money while it
+//! stands, so the first add needs `--accept-cost`) and the last one takes
+//! down. Adding one stores it and prints the DNS record to set at the
+//! registrar; the command then waits until the name points at the door,
+//! which then gets the name's certificate on its own.
 
 use std::net::IpAddr;
 use std::time::Duration;
 
 use anyhow::Context;
-use weft_core::install::{Domain, DomainEntry, DomainServes};
+use weft_core::install::{AddDomain, Domain, DomainAdded, DomainList, DomainServes};
 
 use super::Ctx;
 
@@ -25,7 +28,7 @@ pub enum Serves {
 }
 
 pub enum DomainAction {
-    Add { name: String, serves: Serves, to: Option<String>, no_wait: bool },
+    Add { name: String, serves: Serves, to: Option<String>, no_wait: bool, accept_cost: bool },
     List,
     Rm { name: String },
 }
@@ -41,12 +44,15 @@ pub async fn run(ctx: Ctx, action: DomainAction) -> anyhow::Result<()> {
             if ctx.json_out(&entries)? {
                 return Ok(());
             }
-            let entries: Vec<DomainEntry> = serde_json::from_value(entries).context("read the install's domains")?;
-            if entries.is_empty() {
+            let DomainList { domains, door_refused } = serde_json::from_value(entries).context("read the install's domains")?;
+            if let Some(why) = door_refused {
+                eprintln!("the door in front of the install's domains refuses to follow them, and the install keeps trying: {why}");
+            }
+            if domains.is_empty() {
                 println!("no domains; the install answers at its own address only (add one with `weft domain add <name>`)");
                 return Ok(());
             }
-            for e in entries {
+            for e in domains {
                 let what = match &e.domain.serves {
                     DomainServes::Frontend { project, upstream } => format!("frontend of {project} ({upstream})"),
                     DomainServes::Api { project } => format!("API of {project}"),
@@ -59,10 +65,10 @@ pub async fn run(ctx: Ctx, action: DomainAction) -> anyhow::Result<()> {
         }
         DomainAction::Rm { name } => {
             client.delete(&format!("/install/domains/{name}")).await?;
-            println!("removed {name}; you can delete its DNS record at your registrar");
+            println!("removed {name}; you can delete its DNS record at your registrar (the door in front of the domains goes with the last one)");
             Ok(())
         }
-        DomainAction::Add { name, serves, to, no_wait } => {
+        DomainAction::Add { name, serves, to, no_wait, accept_cost } => {
             let name = weft_core::install::normalize_domain_name(&name).map_err(anyhow::Error::msg)?;
             let project = || -> anyhow::Result<uuid::Uuid> { Ok(ctx.project()?.id()) };
             let serves = match (serves, to) {
@@ -75,15 +81,18 @@ pub async fn run(ctx: Ctx, action: DomainAction) -> anyhow::Result<()> {
                 (_, Some(_)) => anyhow::bail!("--to is only for a frontend domain"),
             };
             let domain = Domain { name: name.clone(), serves };
-            let answer = client.post_json("/install/domains", &serde_json::to_value(&domain)?).await?;
+            let answer = client.post_json("/install/domains", &serde_json::to_value(AddDomain { domain, accept_cost })?).await?;
             if ctx.json_out(&answer)? {
                 return Ok(());
             }
-            let entry: DomainEntry = serde_json::from_value(answer).context("read the stored domain")?;
+            let entry: DomainAdded = serde_json::from_value(answer).context("read the stored domain")?;
             println!("added {name}. At your domain's registrar, set this DNS record:");
             println!("  {}", entry.record);
+            if let Some(cost) = &entry.cost {
+                println!("the door in front of the install's domains is {cost}; removing the last domain takes it down");
+            }
             if no_wait {
-                println!("the install gets the domain's certificate once the record is in place (`weft domain list` shows it again)");
+                println!("the door gets the domain's certificate once the record is in place (`weft domain list` shows it again)");
                 return Ok(());
             }
             let address: IpAddr = entry
@@ -92,7 +101,7 @@ pub async fn run(ctx: Ctx, action: DomainAction) -> anyhow::Result<()> {
                 .parse()
                 .map_err(|_| anyhow::anyhow!("the install answered '{}' as the record's address", entry.record.value))?;
             wait_for_dns(&name, address).await;
-            println!("{name} points at the install; its certificate follows within a minute, then https://{name} works");
+            println!("{name} points at the install; https://{name} works once the door has its certificate, which is issued on its own once the record is seen, and can take a while (`weft domain list` shows the record again)");
             Ok(())
         }
     }

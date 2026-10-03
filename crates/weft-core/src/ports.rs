@@ -11,8 +11,7 @@
 //! `WEFT_SEAWEED_PORT` moves the object store, which all installs share.
 //!
 //! SYNC: these numbers <-> setup.sh (weft_local_url, the summary),
-//! deploy/terraform/gcp/network.tf (local.public_port, local.internal_port,
-//! local.agent_port), extension-vscode/src/localInstall.ts
+//! extension-vscode/src/localInstall.ts
 //! (DEFAULT_LOCAL_URL),
 //! extension-browser/src/entrypoints/popup/App.svelte (the bare-token
 //! default), and the prose that names them: docs/src/**,

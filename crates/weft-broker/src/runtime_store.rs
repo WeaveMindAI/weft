@@ -48,9 +48,7 @@ pub const EXEC_LINGER_TTL_SECS: i64 = 5 * 60;
 /// Default lifetime of a presigned URL when the caller doesn't choose one.
 pub const DEFAULT_PRESIGN_TTL_SECS: u64 = 15 * 60;
 
-/// Hard ceiling on a requested presign lifetime. A presign is an explicit,
-/// EXPIRING artifact; a year-long one would be a durable public link.
-pub const MAX_PRESIGN_TTL_SECS: u64 = 7 * 24 * 3600;
+pub use weft_platform_traits::object_store::MAX_PRESIGN_TTL_SECS;
 
 /// How long a 'pending' upload may sit with NO progress (no new part reserved)
 /// before the sweep reaps it as abandoned: aborts its multipart upload, deletes

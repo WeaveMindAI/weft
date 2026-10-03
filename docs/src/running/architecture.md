@@ -11,10 +11,11 @@ The runtime has four roles, each with one job.
 
 The dispatcher, listener and supervisor, together with the broker, are parts of one
 binary, `weft-runtime`, and on your machine one `weft-runtime` process runs
-all of them. On a cloud install the dispatcher, the broker and the
-supervisor are Cloud Run services of their own, each scaling on its own
-load, and the listener shares one small machine with Postgres
-([deploying to your cloud](cloud.md#what-you-get)). Workers are always
+all of them. On a cloud install each is a Cloud Run service of its own,
+which scales with its own load and down to zero between calls. Triggers that
+keep a connection open run separately, on holders: for how they work, see
+[the listener](#the-listener), and for what they cost, see
+[what you get](cloud.md#what-you-get). Workers are always
 separate: one per program, started by the runtime.
 
 Anything that has to survive a crash goes into Postgres, and every role reads
@@ -104,8 +105,20 @@ what it needs between two events, and the listener does exactly that:
 - **A schedule, a delay or a poll** needs a timer. It asks for its next wake,
   and the install's alarm delivers it (a table in Postgres on your machine,
   Cloud Tasks on a cloud install), even across a restart of the runtime.
-- **A stream or a socket** needs an open connection. The listener keeps it
-  open, and a restarted listener opens it again.
+- **A stream or a socket** needs an open connection, so it needs a process
+  that stays up between events. weft calls that process a holder, and it runs
+  the listener's code. On
+  your machine that is the runtime's one process. On a cloud install the
+  holders run in a pool, as many as those connections need and none when
+  there are none. Each holder claims the triggers it holds, so no two
+  holders hold the same one, and it renews those claims every 10 seconds. If a holder crashes, its claims run
+  out after 30 seconds and another holder takes its triggers. A holder that
+  is shut down gives them up at once.
+- **An event subscription** needs a holder only when it dials out to the
+  service. On a cloud install, when the service can push the subscribed events
+  for one account, weft subscribes with the service instead and renews that
+  on a timer, so nothing stays open for it. A subscription to every account
+  of your app always dials out.
 
 If you want a new kind of trigger, you only write listener code: the listener
 is the only role that tells kinds apart.
@@ -161,7 +174,7 @@ whose result never got written down. For that boundary, go and read
 
 ## Running it somewhere new
 
-If you want weft on another platform, write a crate that implements the six traits below, from
+If you want weft on another platform, write a crate that implements the traits below, from
 `crates/weft-platform-traits`: everything that depends on where weft
 runs sits behind one of them.
 
@@ -173,11 +186,16 @@ runs sits behind one of them.
 | `Alarm` | How a wake set for later is delivered |
 | `CallerIdentity` | Who is calling an internal endpoint |
 | `IdentityTokens` | How a role proves who it is to another |
+| `FrontendHosting` | Where a project's frontend runs, when the install hosts it |
+| `DomainHosting` | What stands in front of the install's own domains and holds their certificates |
+| `HolderPool` | How many holders run, for the triggers that keep a connection open |
 
-Files are the one thing a new platform does not implement: every platform keeps them through the same S3
-client (`ObjectStore`, built by `object_store_for`), pointed at whatever
-S3-compatible store the install config names: SeaweedFS on your machine, Cloud
-Storage on GCP. A new platform only names its store.
+Files go through one more trait, `ObjectStore`. If your platform's store
+speaks S3 and you can hand it a key pair, you implement nothing: the S3
+client (`object_store_for`) talks to it, the way it talks to SeaweedFS on your
+machine. GCP has its own (`GcsObjectStore`), because it reaches Cloud Storage
+as the runtime's own service account and has Google sign the links, so no key
+exists for an organization's policy to forbid.
 
 Two platforms exist: `weft-platform-local` (Docker on your machine) and
 `weft-platform-gcp` (Cloud Run, Compute Engine, Cloud Build, Cloud Tasks). The

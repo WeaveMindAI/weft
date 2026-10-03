@@ -30,6 +30,9 @@ pub const BROKER_CHANNELS: &[&str] = &[
 
 pub struct BrokerState {
     pub pool: PgPool,
+    /// A pool for locks held across a slow call (a provider round trip),
+    /// whose connections do no work while they hold one.
+    pub lock_pool: PgPool,
     /// The process's one Postgres `LISTEN` connection, on (at least)
     /// [`BROKER_CHANNELS`]; every held request sleeps on it.
     pub signals: Arc<PgSignalWatch>,
@@ -71,8 +74,6 @@ pub struct BrokerState {
     /// relay and point straight at the bucket. A local install never
     /// sets it.
     pub object_store_public_internet: bool,
-    /// Tells a role that may be scaled to zero that work waits for it.
-    pub kick: Arc<dyn weft_platform_traits::Kick>,
 }
 
 /// What the broker is built from, besides the pool and the signal watch
@@ -87,7 +88,6 @@ pub struct BrokerSettings {
     pub public_base_url: String,
     pub internet_url: Option<String>,
     pub object_store_public_internet: bool,
-    pub kick: Arc<dyn weft_platform_traits::Kick>,
 }
 
 impl BrokerState {
@@ -103,7 +103,7 @@ impl BrokerState {
 
     /// Build the broker state over the process's pool and signal watch,
     /// applying the broker's own schema group (the runtime-file table).
-    pub async fn new(pool: PgPool, signals: Arc<PgSignalWatch>, settings: BrokerSettings) -> anyhow::Result<Arc<Self>> {
+    pub async fn new(pool: PgPool, lock_pool: PgPool, signals: Arc<PgSignalWatch>, settings: BrokerSettings) -> anyhow::Result<Arc<Self>> {
         for channel in BROKER_CHANNELS {
             signals.require(channel)?;
         }
@@ -124,6 +124,7 @@ impl BrokerState {
         ));
         Ok(Arc::new(Self {
             pool,
+            lock_pool,
             signals,
             journal,
             tasks,
@@ -140,7 +141,6 @@ impl BrokerState {
             public_base_url: settings.public_base_url,
             internet_url: settings.internet_url,
             object_store_public_internet: settings.object_store_public_internet,
-            kick: settings.kick,
         }))
     }
 }

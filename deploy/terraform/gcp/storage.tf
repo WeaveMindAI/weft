@@ -1,5 +1,7 @@
-# The object store: one bucket, reached over GCS's S3-compatible API
-# with an HMAC key pair of a service account that may use only it.
+# The object store: one bucket, reached as the core account itself. No
+# key is made for it: links are signed by Google for that account
+# (identity.tf), so an organization that forbids service-account keys
+# runs this as is.
 
 resource "google_storage_bucket" "files" {
   name                        = "${var.project_id}-${var.name}-files"
@@ -27,25 +29,18 @@ resource "google_storage_bucket" "files" {
   }
 }
 
-resource "google_service_account" "object_store" {
-  account_id   = "${var.name}-object-store"
-  display_name = "weft object store (HMAC key holder)"
-}
-
-resource "google_storage_bucket_iam_member" "object_store" {
+resource "google_storage_bucket_iam_member" "core_files" {
   bucket = google_storage_bucket.files.name
   role   = "roles/storage.objectAdmin"
-  member = "serviceAccount:${google_service_account.object_store.email}"
+  member = local.core
 }
 
-resource "google_storage_bucket_iam_member" "object_store_bucket_read" {
+# Reads the bucket itself, which the runtime does at boot to check it
+# reaches the store.
+resource "google_storage_bucket_iam_member" "core_files_bucket_read" {
   bucket = google_storage_bucket.files.name
   role   = "roles/storage.legacyBucketReader"
-  member = "serviceAccount:${google_service_account.object_store.email}"
-}
-
-resource "google_storage_hmac_key" "object_store" {
-  service_account_email = google_service_account.object_store.email
+  member = local.core
 }
 
 # Where a project build's context is staged for Cloud Build. A staged

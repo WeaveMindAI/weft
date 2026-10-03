@@ -9,7 +9,7 @@ import * as path from 'node:path';
 
 // The default install's address before its first start.
 // SYNC: 14111 <-> crates/weft-core/src/ports.rs (PUBLIC, LOCAL_PUBLIC_URL),
-// setup.sh (weft_local_url), deploy/terraform/gcp/network.tf,
+// setup.sh (weft_local_url),
 // extension-browser/src/entrypoints/popup/App.svelte
 export const DEFAULT_LOCAL_URL = 'http://127.0.0.1:14111';
 

@@ -121,7 +121,7 @@ impl ImageBuilder for DockerImageBuilder {
             }
         });
         table.insert(name.clone(), Build::Running(task.abort_handle()));
-        Ok(BuildHandle { external_build_id: name })
+        Ok(BuildHandle::named(name))
     }
 
     async fn poll(&self, handle: &BuildHandle) -> anyhow::Result<BuildStatus> {
@@ -149,8 +149,10 @@ impl ImageBuilder for DockerImageBuilder {
     async fn delete_image(&self, image_ref: &str) -> anyhow::Result<ImageDeleted> {
         let args = vec!["image".to_string(), "rm".into(), image_ref.into()];
         let out = self.docker.exec(&args).await?;
-        if out.success() || out.stderr.contains("No such image") {
+        if out.success() {
             Ok(ImageDeleted::Deleted)
+        } else if out.stderr.contains("No such image") {
+            Ok(ImageDeleted::Absent)
         } else if out.stderr.contains("is using its referenced image") {
             Ok(ImageDeleted::InUse)
         } else {
@@ -228,7 +230,7 @@ mod tests {
 
         b.release(&h).await;
         assert_eq!(b.poll(&h).await.unwrap(), BuildStatus::Gone, "a released build is gone");
-        assert_eq!(b.poll(&BuildHandle { external_build_id: "never".into() }).await.unwrap(), BuildStatus::Gone);
+        assert_eq!(b.poll(&BuildHandle::named("never")).await.unwrap(), BuildStatus::Gone);
     }
 
     /// A content another install already holds is given this install's
@@ -269,7 +271,7 @@ mod tests {
         let docker = Arc::new(FakeDocker::new());
         docker.fail(&["image", "rm"], "Error: No such image: x");
         let b = DockerImageBuilder::new(docker.clone(), weft_core::infra::Install::default_install());
-        assert_eq!(b.delete_image("x").await.unwrap(), ImageDeleted::Deleted);
+        assert_eq!(b.delete_image("x").await.unwrap(), ImageDeleted::Absent);
         docker.fail(&["image", "inspect"], "Error: No such image: x");
         assert!(!b.image_exists("x").await.unwrap());
     }

@@ -66,13 +66,13 @@ pub async fn forward(http: &reqwest::Client, upstream: Upstream, path_and_query:
 }
 
 /// What the upstream is told about the caller. A host and scheme an
-/// earlier door set are kept (the front door, which terminated TLS, says
-/// `https`); otherwise they are this hop's own: the `Host` the caller
+/// earlier door set are kept (Cloud Run's front end, which terminated
+/// TLS, says `https`); otherwise they are this hop's own: the `Host` the caller
 /// sent, over plain HTTP, which is all weft's own ports speak. The peer is
 /// appended to the address chain, which is read from the right, so
 /// whatever a caller wrote to its left never counts.
 fn forwarded_headers(headers: &HeaderMap, peer: IpAddr) -> Result<Vec<(HeaderName, HeaderValue)>, axum::http::header::InvalidHeaderValue> {
-    let mut out = Vec::with_capacity(3);
+    let mut out = Vec::with_capacity(4);
     let chain = match headers.get(X_FORWARDED_FOR).and_then(|v| v.to_str().ok()).map(str::trim).filter(|v| !v.is_empty()) {
         Some(earlier) => format!("{earlier}, {peer}"),
         None => peer.to_string(),
@@ -81,8 +81,17 @@ fn forwarded_headers(headers: &HeaderMap, peer: IpAddr) -> Result<Vec<(HeaderNam
     if let Some(host) = headers.get(X_FORWARDED_HOST).or_else(|| headers.get(axum::http::header::HOST)) {
         out.push((HeaderName::from_static(X_FORWARDED_HOST), host.clone()));
     }
-    let proto = headers.get(X_FORWARDED_PROTO).cloned().unwrap_or_else(|| HeaderValue::from_static("http"));
-    out.push((HeaderName::from_static(X_FORWARDED_PROTO), proto));
+    let proto = headers
+        .get(weft_core::net::WEFT_FORWARDED_PROTO)
+        .or_else(|| headers.get(X_FORWARDED_PROTO))
+        .cloned()
+        .unwrap_or_else(|| HeaderValue::from_static("http"));
+    out.push((HeaderName::from_static(X_FORWARDED_PROTO), proto.clone()));
+    // The scheme again under weft's own name: Cloud Run's front end
+    // overwrites `X-Forwarded-Proto` with the https it was reached on,
+    // so a caller on the machine's plain-http private port would be
+    // handed https links to that port.
+    out.push((HeaderName::from_static(weft_core::net::WEFT_FORWARDED_PROTO), proto));
     Ok(out)
 }
 
@@ -107,6 +116,7 @@ fn is_hop_header(name: &HeaderName) -> bool {
             | X_FORWARDED_FOR
             | X_FORWARDED_HOST
             | X_FORWARDED_PROTO
+            | weft_core::net::WEFT_FORWARDED_PROTO
     ) || name.as_str() == weft_platform_traits::WORKER_AUTH_HEADER
 }
 
@@ -329,6 +339,7 @@ mod tests {
                 ("x-forwarded-for".into(), "203.0.113.9".into()),
                 ("x-forwarded-host".into(), "10.10.0.2:14113".into()),
                 ("x-forwarded-proto".into(), "http".into()),
+                ("x-weft-forwarded-proto".into(), "http".into()),
             ]
         );
         assert_eq!(
@@ -337,7 +348,22 @@ mod tests {
                 ("x-forwarded-for".into(), "198.51.100.1, 203.0.113.9".into()),
                 ("x-forwarded-host".into(), "weft.example.com".into()),
                 ("x-forwarded-proto".into(), "https".into()),
+                ("x-weft-forwarded-proto".into(), "https".into()),
             ]
         );
+    }
+
+    /// Cloud Run's front end, between a door and the dispatcher, says
+    /// https whatever the caller used; the scheme weft's door passed
+    /// under its own name is the one that holds.
+    #[test]
+    fn the_scheme_a_door_passed_survives_a_front_end_that_rewrites_it() {
+        let told = told(&[("host", "dispatcher.run.app"), ("x-forwarded-proto", "https"), ("x-weft-forwarded-proto", "http")]);
+        assert!(told.contains(&("x-forwarded-proto".into(), "http".into())), "{told:?}");
+        let mut map = HeaderMap::new();
+        map.insert("x-forwarded-host", HeaderValue::from_static("10.10.0.2:14113"));
+        map.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        map.insert("x-weft-forwarded-proto", HeaderValue::from_static("http"));
+        assert_eq!(weft_core::net::request_base_url(&map).as_deref(), Some("http://10.10.0.2:14113"));
     }
 }

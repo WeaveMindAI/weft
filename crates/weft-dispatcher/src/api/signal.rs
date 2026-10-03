@@ -1842,11 +1842,11 @@ fn live_token_ttl_secs() -> i64 {
 /// the execution is born when the caller actually arrives at a worker
 /// (`birth_on_arrival`), on that worker, so a caller who never follows
 /// the redirect leaves nothing behind.
-/// Set by the install's front door on a request that came for one
-/// project's API domain: the handshake then matches only that project's
-/// routes. The front door drops any copy a caller sent; one that reaches
-/// the handshake some other way can only narrow what matches.
-// SYNC: API_PROJECT_HEADER <-> crates/weft-runtime/src/front_door.rs (route)
+/// Set by the install's door on a request that came for one project's API
+/// domain: the handshake then matches only that project's routes. The
+/// door drops any copy a caller sent; one that reaches the handshake some
+/// other way can only narrow what matches.
+// SYNC: API_PROJECT_HEADER <-> crates/weft-dispatcher/src/door.rs (route)
 pub const API_PROJECT_HEADER: &str = "x-weft-api-project";
 
 pub async fn connect_live(
@@ -1858,14 +1858,6 @@ pub async fn connect_live(
     RawQuery(raw_query): RawQuery,
     body: axum::body::Body,
 ) -> Result<Response, (StatusCode, String)> {
-    if state.caller_token_secret.is_empty() {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "live caller connections are not provisioned on this dispatcher \
-             (WEFT_CALLER_TOKEN_SECRET unset)"
-                .into(),
-        ));
-    }
     let (tenant_segment, path) = split_tenant(&called_path)?;
     let (tenant_segment, path) = (tenant_segment.to_string(), path.to_string());
     let method_name = method.as_str().to_string();
@@ -2259,16 +2251,16 @@ fn row_err(e: sqlx::Error) -> (StatusCode, String) {
 }
 
 /// Which door the caller should be sent back through for the live hop.
-/// A request that passed a door carries `X-Forwarded-Proto` (a cloud
-/// machine's front door, which terminated TLS; the machine's pass to a
-/// dispatcher of its own; a local install's tunnel) and is answered at
-/// the address the caller used, so a caller on the internet is never sent
-/// to a loopback address and a local one never to the tunnel. A request
-/// that reached the dispatcher's own port directly (tooling on the
-/// machine, a frontend on the private network) passed no door, and is
-/// sent to the install's configured base, which is one.
+/// A request that passed a door carries `X-Forwarded-Proto` (Cloud Run's
+/// front end, or the load balancer in front of the install's domains,
+/// which terminated TLS; a local install's tunnel) and is answered at the
+/// address the caller used, so a caller on the internet is never sent to
+/// a loopback address and a local one never to the tunnel. A request that
+/// reached the dispatcher's own port directly (tooling on the machine)
+/// passed no door, and is sent to the install's configured base, which is
+/// one.
 fn live_door(headers: &HeaderMap, configured: &str) -> String {
-    let through_door = headers.contains_key("x-forwarded-proto");
+    let through_door = headers.contains_key("x-forwarded-proto") || headers.contains_key(weft_core::net::WEFT_FORWARDED_PROTO);
     match weft_core::net::request_base_url(headers).filter(|_| through_door) {
         Some(base) => base,
         None => configured.trim_end_matches('/').to_string(),
@@ -2436,6 +2428,7 @@ mod public_url_tests {
             auth_config: None,
             kind_state: serde_json::Value::Object(Default::default()),
             kind_state_seq: 0,
+            holds: false,
         }
     }
 
@@ -2608,6 +2601,7 @@ mod can_cancel_tests {
             auth_config: None,
             kind_state: serde_json::Value::Object(Default::default()),
             kind_state_seq: 0,
+            holds: false,
         }
     }
 
@@ -2723,6 +2717,7 @@ mod signal_file_scope_tests {
             auth_config: None,
             kind_state: serde_json::Value::Object(Default::default()),
             kind_state_seq: 0,
+            holds: false,
         }
     }
 

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use weft_platform_traits::config::{InstallConfig, PlatformConfig};
+use weft_platform_traits::config::{InstallConfig, ObjectStoreSettings, PlatformConfig};
 use weft_platform_traits::{Alarm, CallerIdentity, IdentityTokens, ImageBuilder, InfraHost, Runner, Vantage};
 
 /// What every role of this process takes from the platform.
@@ -16,10 +16,19 @@ pub struct Parts {
     pub images: Arc<dyn ImageBuilder>,
     pub host: Arc<dyn InfraHost>,
     pub alarm: Arc<dyn Alarm>,
+    /// Where a project's frontend runs, when the install hosts it.
+    pub frontends: Arc<dyn weft_platform_traits::FrontendHosting>,
+    /// The door in front of the install's domains.
+    pub domains: Arc<dyn weft_platform_traits::DomainHosting>,
+    /// How many holders run.
+    pub holder_pool: Arc<dyn weft_platform_traits::HolderPool>,
     /// Who is calling, for the internal endpoints this process serves.
     pub identity: Arc<dyn CallerIdentity>,
     /// This process's own identity, for its calls to other roles.
     pub tokens: Arc<dyn IdentityTokens>,
+    /// The Google API client and its token cache, on GCP: one per process,
+    /// shared by everything that calls Google (the object store too).
+    pub google: Option<weft_platform_gcp::Google>,
     /// Work the platform itself needs done for as long as the process
     /// lives (delivering local wakes, stopping idle local workers).
     pub background: Vec<(&'static str, futures::future::BoxFuture<'static, anyhow::Result<()>>)>,
@@ -32,7 +41,7 @@ const IDLE_SWEEP: Duration = Duration::from_secs(30);
 /// (`weft_platform_local::bound_build_cache`).
 const BUILD_CACHE_BOUND: Duration = Duration::from_secs(6 * 3600);
 
-pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>, caller_token_secret: &str) -> anyhow::Result<Parts> {
+pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>) -> anyhow::Result<Parts> {
     match &config.platform {
         PlatformConfig::Local(local) => {
             let pool = pool.context("a local install's process runs every role, so it holds the database")?;
@@ -45,7 +54,9 @@ pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>, caller_t
                 Arc::new(weft_platform_traits::SystemClock),
                 weft_platform_local::LocalRunnerConfig {
                     broker_url: config.role_addresses(Vantage::Private).broker,
-                    caller_token_secret: Some(caller_token_secret.to_string()),
+                    // A local worker gets the ticket secret from the runner
+                    // that starts it; a GCP one reads it from Secret Manager.
+                    caller_token_secret: crate::secret("WEFT_CALLER_TOKEN_SECRET")?,
                     idle_stop: Duration::from_secs(local.worker_idle_stop_seconds),
                     scratch_dir: scratch.clone(),
                     install: config.install.clone(),
@@ -65,8 +76,7 @@ pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>, caller_t
                 },
             ));
             let alarm = Arc::new(weft_platform_local::LocalAlarm::new(pool.clone()));
-            // A local install's one process is the machine's, which delivers
-            // its wakes.
+            // A local install's one process delivers its wakes.
             let deliver: Arc<dyn weft_platform_local::Deliver> =
                 Arc::new(weft_platform_local::HttpDeliver::new(config.role_addresses(Vantage::Machine), identity.clone()));
             let wakes = alarm.clone();
@@ -77,8 +87,12 @@ pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>, caller_t
                 images: Arc::new(weft_platform_local::DockerImageBuilder::new(docker, config.install.clone())),
                 host,
                 alarm,
+                frontends: Arc::new(weft_platform_local::NoFrontendHosting),
+                domains: Arc::new(weft_platform_local::NoDomains),
+                holder_pool: Arc::new(weft_platform_local::OneProcessHolds),
                 identity: identity.clone(),
                 tokens: identity,
+                google: None,
                 background: vec![
                     ("local_alarm", Box::pin(async move { wakes.run(deliver).await })),
                     (
@@ -114,7 +128,11 @@ pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>, caller_t
                 runner: Arc::new(weft_platform_gcp::CloudRunRunner::new(google.clone(), gcp.clone(), config.role_addresses(Vantage::Private).broker, config.install.clone())),
                 images: Arc::new(weft_platform_gcp::CloudBuildImages::new(google.clone(), gcp.clone())?),
                 host: Arc::new(weft_platform_gcp::ComputeInfraHost::new(google.clone(), gcp.clone(), config.install.clone())),
-                alarm: Arc::new(weft_platform_gcp::CloudTasksAlarm::new(google, gcp.clone(), config.role_addresses(Vantage::Public))),
+                alarm: Arc::new(weft_platform_gcp::CloudTasksAlarm::new(google.clone(), gcp.clone(), config.role_addresses(Vantage::Public))),
+                frontends: Arc::new(weft_platform_gcp::CloudRunFrontends::new(google.clone(), gcp.clone())),
+                domains: Arc::new(weft_platform_gcp::LoadBalancerDomains::new(google.clone(), gcp.clone())),
+                holder_pool: Arc::new(weft_platform_gcp::WorkerPoolHolders::new(google.clone(), gcp.holder_pool.clone())),
+                google: Some(google),
                 identity: Arc::new(weft_platform_gcp::GoogleIdentity::new(
                     gcp.project.clone(),
                     gcp.core_service_account.clone(),
@@ -125,4 +143,19 @@ pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>, caller_t
             })
         }
     }
+}
+
+/// The object store the install config names. A Cloud Storage bucket is
+/// reached through the platform's own Google client, so only on GCP.
+pub async fn object_store(settings: &ObjectStoreSettings, parts: &Parts) -> anyhow::Result<weft_platform_traits::SharedObjectStore> {
+    Ok(match settings {
+        ObjectStoreSettings::S3(s3) => weft_platform_traits::object_store_for(s3).await?,
+        ObjectStoreSettings::Gcs(gcs) => {
+            let google = parts
+                .google
+                .clone()
+                .context("objectStore is a Cloud Storage bucket (`kind: gcs`), which an install off GCP cannot reach")?;
+            Arc::new(weft_platform_gcp::GcsObjectStore::new(google, gcs.bucket.clone()).await?)
+        }
+    })
 }

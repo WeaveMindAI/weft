@@ -101,7 +101,7 @@ impl Cursor {
     }
 }
 
-const ON_EXEC_EVENT: &[WakeOn] = &[WakeOn::any(weft_journal::EXEC_EVENT_CHANNEL)];
+pub(crate) static ON_EXEC_EVENT: &[WakeOn] = &[WakeOn::any(weft_journal::EXEC_EVENT_CHANNEL)];
 
 /// Long-running task. Spawn one per dispatcher. Sleeps until a
 /// journal row is announced on `EXEC_EVENT_CHANNEL`, then publishes

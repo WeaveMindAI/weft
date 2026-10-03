@@ -1,16 +1,18 @@
+# SYNC: the variables the install workflow sets (project_id, region, zone, database_url, database_listen_url, runtime_image, builder_base_image, weft_repository, weft_commit, access_apps_json) <-> .github/workflows/install-gcp.yml (the TF_VAR_* names)
+
 variable "project_id" {
   description = "The GCP project the install lives in."
   type        = string
 }
 
 variable "region" {
-  description = "Where everything lives. The free e2-micro machine is free only in us-west1, us-central1 and us-east1."
+  description = "Where everything lives."
   type        = string
   default     = "us-central1"
 }
 
 variable "zone" {
-  description = "The zone the machine and infra machines run in, inside `region`."
+  description = "The zone infra machines run in, inside `region`."
   type        = string
   default     = "us-central1-a"
 }
@@ -21,55 +23,45 @@ variable "name" {
   default     = "weft"
 }
 
-variable "machine_type" {
-  description = "The machine running Postgres, the front door and the listener (unless listener_machine gives it a machine of its own). e2-micro is in the free tier; grow it (e2-small, e2-medium, ...) when the install outgrows 1 GB of memory."
+variable "database_url" {
+  description = "The Postgres the install keeps everything in, as a connection URL (postgres://user:password@host/db?sslmode=require). Any Postgres works; one that scales to zero costs nothing while the install is idle. A pooled address is fine."
   type        = string
-  default     = "e2-micro"
+  sensitive   = true
 }
 
-variable "listener_machine" {
-  description = "Give the listener a machine of its own that stays up, instead of sharing the machine with Postgres. Reach for it when the triggers that hold a connection open (sockets, streams, SSE subscriptions) load the machine."
-  type        = bool
-  default     = false
-}
-
-variable "listener_machine_type" {
-  description = "The listener's own machine, when listener_machine is on."
+variable "database_listen_url" {
+  description = "A direct (session) address of the same database, when database_url goes through a pooler that hands out a connection per transaction: a LISTEN needs a session of its own (the runtime refuses to start, naming this, when it cannot listen). Empty when database_url is already one."
   type        = string
-  default     = "e2-small"
+  default     = ""
+  sensitive   = true
 }
 
-variable "data_disk_gb" {
-  description = "The size of the disk holding the database and the front door's certificates. It can grow later (never shrink); the free tier covers 30 GB of standard disk, boot disk included."
+variable "signals_per_holder" {
+  description = "The most held signals (sockets, streams, subscriptions kept open) one holder takes; weft runs one more holder per this many."
   type        = number
-  default     = 20
+  default     = 200
 }
 
-variable "data_disk_type" {
-  description = "The data disk's type: pd-standard (free tier, slow), pd-balanced or pd-ssd."
+variable "holder_cpu" {
+  description = "The CPU of each holder."
   type        = string
-  default     = "pd-standard"
+  default     = "1"
+}
+
+variable "holder_memory" {
+  description = "The memory of each holder."
+  type        = string
+  default     = "512Mi"
 }
 
 variable "runtime_image" {
-  description = "The weft-runtime image the machine and any serverless role run (the install workflow builds it and passes its ref)."
+  description = "The weft-runtime image every role runs (the install workflow builds it and passes its ref)."
   type        = string
 }
 
 variable "builder_base_image" {
   description = "The image a project's worker compiles in (the install workflow builds it and passes its ref)."
   type        = string
-}
-
-variable "serverless_roles" {
-  description = "Roles run as Cloud Run services of their own, each scaling to zero and out on its own load (any of dispatcher, broker, listener, supervisor). A role left out runs on the machine. The listener stays on a machine by default: a trigger that holds a connection open needs it up between events."
-  type        = list(string)
-  default     = ["dispatcher", "broker", "supervisor"]
-
-  validation {
-    condition     = alltrue([for r in var.serverless_roles : contains(["dispatcher", "broker", "listener", "supervisor"], r)])
-    error_message = "serverless_roles holds only dispatcher, broker, listener and supervisor."
-  }
 }
 
 variable "compile_lanes" {
@@ -82,12 +74,6 @@ variable "invalid_tokens_per_minute" {
   description = "Refused tokens one address may present per minute on the token doors before every token door refuses it for the rest of the minute. 0 turns the block off."
   type        = number
   default     = 30
-}
-
-variable "frontend_repos" {
-  description = "GitHub repositories (owner/name) whose Actions may deploy a frontend beside the install."
-  type        = list(string)
-  default     = []
 }
 
 variable "weft_repository" {

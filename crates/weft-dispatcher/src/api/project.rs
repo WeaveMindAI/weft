@@ -310,7 +310,7 @@ pub async fn build(
     // registry until the registration commits, so no prune deletes an
     // image this build found or built before anything references it
     // (`crate::build::prune::ImageHold`).
-    let hold = crate::build::prune::ImageHold::new(&state.pg_pool);
+    let hold = crate::build::prune::ImageHold::new(&state.pg_pool, id);
     let crate::build::Build { program: mut built, images } =
         crate::transition::build_version_gated(&state, id, &caller.0, &req, &hold).await?;
     hold.confirm().await.map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
@@ -403,7 +403,7 @@ pub async fn remove(
     caller: CallerTenant,
     Path(id): Path<uuid::Uuid>,
     axum::extract::Query(query): axum::extract::Query<RemoveQuery>,
-) -> Result<StatusCode, StatusError> {
+) -> Result<Json<weft_core::projects::ProjectRemoved>, StatusError> {
     // Marked gate, not `authorize_project`: rm is a delete, so the CLI
     // retries it idempotently and needs the `x-weft-not-found` marker
     // to treat "already gone" as the desired end state instead of an
@@ -434,6 +434,12 @@ pub async fn remove(
         // The row vanished mid-remove (a concurrent rm won): that IS
         // rm's desired end state, so it gets the marker too.
         .ok_or(StatusError::NotMyProject)?;
+    // Its frontends first: one whose service cannot be removed stops the
+    // removal with everything else still whole (`--force` forgets it, and
+    // the answer names what stays on the cloud).
+    let left = crate::frontends::remove_project(&state, &tenant, id, query.force).await.map_err(|e| {
+        (StatusCode::BAD_GATEWAY, format!("remove the project's frontends: {e:#}; retry `weft rm`, or `weft rm --force`"))
+    })?;
     // Tear down infra: issues a supervisor terminate command, waits
     // up to 120s for completion (unless --force), then drops all
     // infra_* rows. MUST succeed: if any of the DB cascade writes fail,
@@ -467,6 +473,8 @@ pub async fn remove(
                 format!("could not reclaim the project's stored data: {e:#}; retry `weft rm`"),
             )
         })?;
+    // Its domains go with the row, and the platform's door follows the
+    // rows on its own (`crate::domains::drain_loop`).
     let removed = state
         .projects
         .remove(id)
@@ -520,7 +528,7 @@ pub async fn remove(
                 "could not retire what the removed project left behind; the reaper will retry"
             );
         }
-        Ok(StatusCode::NO_CONTENT)
+        Ok(Json(weft_core::projects::ProjectRemoved { left }))
     } else {
         // A concurrent rm dropped the row after our gate: still rm's
         // desired end state, so it gets the marker.
@@ -1301,7 +1309,7 @@ pub(crate) async fn await_infra_setup(
     // user code may legitimately be slow; a hard cap would refuse
     // legitimate provisioning. Instead, a periodic breadcrumb keeps
     // the stuck-state legible in the dispatcher logs, and the user
-    // can always cancel the execution (`weft stop`) to unblock.
+    // can always cancel it (`weft infra cancel`) to unblock.
     let started = std::time::Instant::now();
     let mut breadcrumb = tokio::time::interval(std::time::Duration::from_secs(30));
     breadcrumb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1341,7 +1349,7 @@ pub(crate) async fn await_infra_setup(
                     execution_id = %execution_id,
                     elapsed_secs = started.elapsed().as_secs(),
                     "infra setup still running; waiting on the InfraSetup execution \
-                     (cancel it with `weft stop` to unblock)"
+                     (cancel it with `weft infra cancel` to unblock)"
                 );
             }
             res = events.recv() => {
@@ -1726,6 +1734,21 @@ pub async fn status(
         infra,
         executions,
         has_infra,
+        built: binary_hash.is_some(),
+        builds: crate::build::ledger::running(&state.pg_pool, Some(id))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("running builds: {e:#}")))?
+            .into_iter()
+            // A build not made on the builder yet has no id there to name.
+            .filter_map(|b| {
+                Some(weft_core::projects::BuildInFlight {
+                    image: b.image_ref,
+                    build: b.builder_id?,
+                    started_at_unix: b.started_at,
+                    log_url: b.log_url,
+                })
+            })
+            .collect(),
         orphaned_infra: snapshot.orphaned_infra,
         infra_rollup,
         infra_busy: snapshot.infra_busy,
@@ -1765,11 +1788,22 @@ fn infra_entries(
     let mut instance_infra: Vec<InstanceInfraEntry> = copies
         .rows
         .iter()
-        .filter_map(|row| Some((row.node_id.clone(), row.instance.clone()?, row.status)))
+        .filter_map(|row| {
+            Some(InstanceInfraEntry {
+                node: row.node_id.clone(),
+                instance: row.instance.clone()?,
+                status: row.status.as_str().to_string(),
+                progress: crate::api::infra::provisioning_progress(row.status, row.provisioning_since_unix, row.waiting.clone()),
+            })
+        })
         .chain(copies.starting.iter().filter_map(|(node, instance)| {
-            Some((node.clone(), instance.clone()?, crate::infra_node::InfraNodeStatus::Provisioning))
+            Some(InstanceInfraEntry {
+                node: node.clone(),
+                instance: instance.clone()?,
+                status: crate::infra_node::InfraNodeStatus::Provisioning.as_str().to_string(),
+                progress: None,
+            })
         }))
-        .map(|(node, instance, status)| InstanceInfraEntry { node, instance, status: status.as_str().to_string() })
         .collect();
     instance_infra.sort_by(|a, b| (&a.node, &a.instance).cmp(&(&b.node, &b.instance)));
     let mut infra = Vec::new();
@@ -1786,6 +1820,7 @@ fn infra_entries(
             failure_stage: None,
             failure_message: None,
             instance_copy_count: None,
+            progress: None,
         };
         if node.per_instance.is_some() {
             infra.push(ProjectInfraEntry {
@@ -1800,6 +1835,11 @@ fn infra_entries(
                 endpoint_url: row.install_endpoints.values().next().cloned(),
                 failure_stage: row.failure_stage.map(|f| f.as_str().to_string()),
                 failure_message: row.failure_message.clone(),
+                progress: crate::api::infra::provisioning_progress(
+                    row.status,
+                    row.provisioning_since_unix,
+                    row.waiting.clone(),
+                ),
                 ..entry(row.status.as_str().to_string())
             }),
             None => infra.push(entry(match copies.status_of(&spelled, None) {
@@ -2090,15 +2130,20 @@ fn unavailable_action(
     allowed: &[String],
 ) -> String {
     if verb == "activate" && status == crate::project_store::ProjectStatus::Active {
-        return "these triggers are already on. If you changed the source, run `weft resync` to put the \
-                change live (`weft deactivate` turns them off instead)"
+        return "these triggers are already on. If you changed the source, run `weft resync --mode <park|hibernate|wipe>` \
+                to put the change live (park and hibernate keep the work waiting on them, wipe drops it); \
+                `weft deactivate` turns them off instead"
             .into();
     }
+    // A build in flight blocks every verb but its cancel, so it is named
+    // as the blocker rather than buried in the triggers' state.
+    if let Some(why) = transition.refusal() {
+        return format!("'{verb}' is not available right now: {why}");
+    }
     format!(
-        "'{verb}' is not available right now: the triggers it names are {} (transition {}, infra {infra_rollup}); \
+        "'{verb}' is not available right now: the triggers it names are {} (infra {infra_rollup}); \
          allowed actions: [{}]",
         status.as_str(),
-        transition.as_str(),
         allowed.join(", "),
     )
 }
@@ -2860,7 +2905,7 @@ impl From<ActivateError> for (StatusCode, String) {
             ActivateError::Refused(refused) => (
                 StatusCode::CONFLICT,
                 match refused {
-                    ClaimRefused::Building => "the project is building; wait for it to finish or cancel it",
+                    ClaimRefused::Building => "the project is building; wait for it to finish or cancel it with `weft cancel-build`",
                     ClaimRefused::Claimed => "these triggers are already activating; wait for it to finish or cancel it",
                     ClaimRefused::NotExpected => "a trigger this re-arm read as on was taken down meanwhile",
                 }
@@ -5433,6 +5478,8 @@ mod trigger_infra_ready_tests {
             keep_disks: Vec::new(),
             units: Default::default(),
             notes: Vec::new(),
+            waiting: None,
+            provisioning_since_unix: None,
         }
     }
 
@@ -5930,6 +5977,8 @@ mod infra_entries_tests {
             keep_disks: Vec::new(),
             units: Default::default(),
             notes: Vec::new(),
+            waiting: None,
+            provisioning_since_unix: None,
         }
     }
 
@@ -5989,5 +6038,14 @@ mod unavailable_action_tests {
         assert!(message.contains("already on") && message.contains("weft resync"), "{message}");
         let other = unavailable_action("run", ProjectStatus::Active, ProjectTransition::None, "stopped", &allowed);
         assert!(other.contains("allowed actions: [run, deactivate, resync]"), "{other}");
+    }
+
+    #[test]
+    fn a_build_in_flight_is_named_as_the_blocker() {
+        let allowed = vec!["cancel_build".to_string()];
+        let message = unavailable_action("activate", ProjectStatus::Registered, ProjectTransition::Building, "none", &allowed);
+        assert!(message.contains("the project is building") && message.contains("weft cancel-build"), "{message}");
+        let cancelling = unavailable_action("activate", ProjectStatus::Registered, ProjectTransition::CancellingBuild, "none", &allowed);
+        assert!(cancelling.contains("being cancelled") && !cancelling.contains("weft cancel-build"), "{cancelling}");
     }
 }

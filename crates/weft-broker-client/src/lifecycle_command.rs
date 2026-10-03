@@ -156,13 +156,26 @@ pub fn live_lease_exists(replica_param: Option<&str>, project_col: &str) -> Stri
 ///     mid-command.
 pub fn ownable_project(project_alias: &str, held_param: &str) -> String {
     format!(
-        "({p}.has_infra \
-          OR EXISTS (SELECT 1 FROM infra_node ownable_n WHERE ownable_n.project_id = {p}.id) \
-          OR {p}.id = ANY({held_param}) \
-          OR EXISTS (SELECT 1 FROM infra_lifecycle_command ownable_c \
-                     WHERE ownable_c.project_id = {p}.id AND {pending}))",
+        "({p}.has_infra OR {p}.id = ANY({held_param}) OR {work})",
         p = project_alias,
-        pending = pending_supervisor_command("ownable_c"),
+        work = supervisor_work(project_alias)
+    )
+}
+
+/// SQL condition that is true iff the `project` row aliased
+/// `project_alias` gives its owner something to look at now: infra
+/// nodes whose health it watches, or a supervisor command waiting. A
+/// project that only declares infra, or whose host holds only kept disks
+/// of it, is ownable ([`ownable_project`]) but gives its owner nothing to
+/// do until a command is issued, which wakes it, so a supervisor that
+/// scales to zero sleeps over it.
+pub fn supervisor_work(project_alias: &str) -> String {
+    format!(
+        "(EXISTS (SELECT 1 FROM infra_node work_n WHERE work_n.project_id = {p}.id) \
+          OR EXISTS (SELECT 1 FROM infra_lifecycle_command work_c \
+                     WHERE work_c.project_id = {p}.id AND {pending}))",
+        p = project_alias,
+        pending = pending_supervisor_command("work_c"),
     )
 }
 
@@ -255,6 +268,16 @@ impl<'a> InfraCommandSignal<'a> {
         payload.strip_prefix("done:")?.parse().ok().map(|id| Self::Done { id })
     }
 }
+
+/// What wakes whoever claims lifecycle commands (a supervisor, the
+/// dispatcher's claimer): a command being issued anywhere. A command's end
+/// concerns only whoever waits on that one command. The broker's held
+/// claim, the dispatcher's claimer and the waker that rings a sleeping
+/// supervisor all wait on this.
+pub const ISSUED_WAKE: weft_task_store::drain::WakeOn = weft_task_store::drain::WakeOn {
+    channel: INFRA_COMMAND_CHANNEL,
+    concerns: |payload| matches!(InfraCommandSignal::parse(payload), Some(InfraCommandSignal::Issued { .. })),
+};
 
 #[cfg(test)]
 mod verb_tests {

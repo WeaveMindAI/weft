@@ -44,9 +44,13 @@ const PASSED_RESPONSE_HEADERS = ['content-type', 'content-length', 'cache-contro
 // The headers that tell the dispatcher which address the BROWSER used, so a
 // link it hands back (an instance's file chooser page) points at the site, not
 // at the site server's own view of the dispatcher.
-// SYNC: the forwarded headers <-> crates/weft-core/src/net.rs request_base_url
+// The scheme goes twice: Cloud Run's front end, between this server and a
+// dispatcher on Cloud Run, replaces `x-forwarded-proto` with its own https,
+// and weft's own name for it is the one that survives.
+// SYNC: the forwarded headers <-> crates/weft-core/src/net.rs request_base_url, WEFT_FORWARDED_PROTO
 const FORWARDED_HOST = 'x-forwarded-host';
 const FORWARDED_PROTO = 'x-forwarded-proto';
+const WEFT_FORWARDED_PROTO = 'x-weft-forwarded-proto';
 const FORWARDED_PREFIX = 'x-forwarded-prefix';
 
 export interface PassThroughOptions {
@@ -88,6 +92,7 @@ export function weftPassThrough(options: PassThroughOptions): (request: Request,
 		// browser's `X-Forwarded-*` would let it choose the links it is given.
 		headers.set(FORWARDED_HOST, url.host);
 		headers.set(FORWARDED_PROTO, url.protocol.replace(/:$/, ''));
+		headers.set(WEFT_FORWARDED_PROTO, url.protocol.replace(/:$/, ''));
 		headers.set(FORWARDED_PREFIX, mountOf(url.pathname, segments.length));
 		const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
 		const route = segments[0] === ROUTE_DOOR;
@@ -107,7 +112,7 @@ export function weftPassThrough(options: PassThroughOptions): (request: Request,
 			} as RequestInit);
 		} catch (e) {
 			return new Response(
-				`weft pass-through: the dispatcher at ${base} did not answer (${e instanceof Error ? e.message : String(e)})`,
+				`weft pass-through: the dispatcher at ${base} did not answer (${failureOf(e)})`,
 				{ status: 502 },
 			);
 		}
@@ -118,6 +123,25 @@ export function weftPassThrough(options: PassThroughOptions): (request: Request,
 		}
 		return new Response(answer.body, { status: answer.status, statusText: answer.statusText, headers: out });
 	};
+}
+
+/** What a failed fetch says, with every cause beneath it: Node's fetch
+ *  says only "fetch failed", and the reason (a refused connection, a
+ *  certificate, a name that does not resolve) is on its `cause`. */
+export function failureOf(e: unknown): string {
+	const parts: string[] = [];
+	let at: unknown = e;
+	for (let depth = 0; at !== undefined && at !== null && depth < 5; depth++) {
+		if (at instanceof Error) {
+			const code = (at as { code?: unknown }).code;
+			parts.push(typeof code === 'string' && !at.message.includes(code) ? `${at.message} (${code})` : at.message);
+			at = (at as { cause?: unknown }).cause;
+		} else {
+			parts.push(String(at));
+			break;
+		}
+	}
+	return parts.join(': ');
 }
 
 /** Where the pass-through is mounted (`/weft`), read off the request's

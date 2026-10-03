@@ -700,8 +700,13 @@ async fn refresh(
                 for (k, v) in reg {
                     inputs.entry(k).or_insert(v);
                 }
-                let resp = run_connect_call(call, &inputs).await.map_err(|e| {
-                    anyhow::Error::from(reconnect(format!("the renewal was refused ({e:#})")))
+                let resp = run_connect_call(call, &inputs).await.map_err(|e| match e {
+                    // Not reached: the account may be fine, so this is
+                    // retried rather than sent to a reconnect.
+                    weft_core::access::client::ConnectCallError::Unreached(why) => anyhow::Error::from(AccessError::Unreached(why)),
+                    weft_core::access::client::ConnectCallError::Unbuildable(why) | weft_core::access::client::ConnectCallError::Refused(why) => {
+                        anyhow::Error::from(reconnect(format!("the renewal was refused ({why})")))
+                    }
                 })?;
                 apply_captures(&call.captures, &resp, values)?;
                 return Ok(expires_at_of(&resp));
@@ -725,8 +730,11 @@ async fn refresh(
                     ];
                     let basic =
                         crate::flows::place_client_auth(*token_auth, &reg, &mut params);
-                    let resp = token_request(token_url, &params, basic).await.map_err(|e| {
-                        anyhow::Error::from(reconnect(format!("the refresh was refused ({e})")))
+                    let resp = token_request(token_url, &params, basic).await.map_err(|e| match e.downcast_ref::<AccessError>() {
+                        // Not reached: the account may be fine, so this is
+                        // retried rather than sent to a reconnect.
+                        Some(AccessError::Unreached(_)) => e,
+                        _ => anyhow::Error::from(reconnect(format!("the refresh was refused ({e})"))),
                     })?;
                     let token = resp
                         .get("access_token")
@@ -842,14 +850,10 @@ pub(crate) async fn mint_and_exchange(
             // The template, never the resolved URL: a recipe may
             // interpolate a secret into it, and reqwest's error text
             // would echo the URL whole.
-            anyhow::anyhow!(
-                "token exchange at {} failed: {}",
-                exchange.url.0,
-                e.without_url()
-            )
+            AccessError::Unreached(format!("token exchange at {} failed: {}", exchange.url.0, e.without_url()))
         })?;
     let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    let body: Value = crate::read_json_answer(resp, &exchange.url.0).await?;
     if !status.is_success() {
         return Err(AccessError::NeedsReconnect {
             service: spec.service.clone(),
@@ -1018,13 +1022,10 @@ pub async fn lookup(
         .map_err(|e| {
             // The send error's own URL carries the applied auth (a query
             // token, a path-prefix token); `url` here is pre-auth and safe.
-            anyhow::anyhow!(
-                "lookup call to {url} failed: {}",
-                weft_core::access::client::send_error(e)
-            )
+            AccessError::Unreached(format!("lookup call to {url} failed: {}", weft_core::access::client::send_error(e)))
         })?;
     let status = resp.status();
-    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    let body: Value = crate::read_json_answer(resp, url).await?;
     if !status.is_success() {
         return Err(AccessError::Invalid(format!(
             "the service answered {status} to the lookup; the access may need reconnecting"
@@ -1071,6 +1072,7 @@ fn display_of(v: &Value) -> String {
         other => other.to_string(),
     }
 }
+
 
 #[cfg(test)]
 mod tests {

@@ -112,11 +112,20 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
         // Idempotent: a marker-404 ("no such project") on a delete means the
         // project is already gone, which is rm's desired end state (a retry
         // after a lost success response must not fail).
-        client
-            .delete_idempotent(&unregister_path)
+        let removed = client
+            .delete_idempotent_json(&unregister_path)
             .await
-            .context("dispatcher unregister")?;
+            .context("dispatcher unregister")?
+            .map(serde_json::from_value::<weft_core::projects::ProjectRemoved>)
+            .transpose()
+            .context("read what the removal left")?
+            .unwrap_or_default();
         progress.dispatcher_call_done(serde_json::json!({ "step": "unregister" }));
+        // What a forced removal could not take off the cloud: the person
+        // has to know, it may still run and cost.
+        for leftover in &removed.left {
+            progress.warn(leftover);
+        }
 
         if local {
             wipe_local_artifacts(&ctx, &progress)?;

@@ -1163,7 +1163,7 @@ async fn subscriptions_subscribe_once_and_stop_at_the_provider(pool: PgPool) {
         params: [("target".to_string(), "file-9".to_string())].into_iter().collect(),
         receiver_url: Some("https://public.example/events/fakeoauth/things".into()),
     };
-    let ensured = weft_access_store::ensure_subscription(&pool, &req).await.unwrap();
+    let ensured = weft_access_store::ensure_subscription(&pool, &pool, &req).await.unwrap();
     assert!(ensured.expires_at.is_some(), "the recipe declares an expiring channel");
 
     // The provider saw ONE subscribe, at the templated target, with
@@ -1204,7 +1204,7 @@ async fn subscriptions_subscribe_once_and_stop_at_the_provider(pool: PgPool) {
     assert!(watch_calls[0].contains(&sub.token), "the minted token traveled to the provider");
 
     // A healthy subscription is idempotent: no second provider call.
-    weft_access_store::ensure_subscription(&pool, &req).await.unwrap();
+    weft_access_store::ensure_subscription(&pool, &pool, &req).await.unwrap();
     let watch_count =
         fake.calls.lock().unwrap().iter().filter(|c| c.starts_with("/watch/")).count();
     assert_eq!(watch_count, 1, "far from expiry, ensure re-subscribes nothing");
@@ -1212,7 +1212,7 @@ async fn subscriptions_subscribe_once_and_stop_at_the_provider(pool: PgPool) {
     // Dropping stops the channel at the provider (with the captured
     // resource id) and forgets the row.
     let dropped =
-        weft_access_store::drop_subscriptions_for_signal(&pool, TENANT_A, "sig-1").await.unwrap();
+        weft_access_store::drop_subscriptions_for_signal(&pool, &pool, TENANT_A, "sig-1").await.unwrap();
     assert_eq!(dropped, 1);
     let stops: Vec<String> = fake
         .calls
@@ -1245,6 +1245,7 @@ async fn a_subscribe_topic_without_a_public_address_teaches_the_fix(pool: PgPool
     let spec = events_spec(&base);
     let grant = full_consent(&pool, TENANT_A, &spec, &["read"], None).await.unwrap();
     let err = weft_access_store::ensure_subscription(
+        &pool,
         &pool,
         &weft_access_store::EnsureSubscription {
             tenant: TENANT_A.into(),

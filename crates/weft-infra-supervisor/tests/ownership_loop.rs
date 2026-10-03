@@ -39,6 +39,30 @@ async fn ownership_tick_syncs_under_this_supervisors_identity() {
     assert!(synced, "ownership tick must sync_ownership(test-supervisor)");
 }
 
+/// A pass answers when it next has something to look at: soon while a
+/// project it owns has infra running, when a sibling's lease over one
+/// lapses while it owns none of them, and never while nothing anywhere
+/// has anything to do (a declared infra alone included).
+#[tokio::test]
+async fn a_pass_looks_again_only_while_there_is_something_to_look_at() {
+    use weft_broker_client::protocol::InfraNodeStatus;
+    let running = SupervisorTestRig::with_tenant("alice");
+    running.broker.add_project(P1);
+    running.broker.add_infra_node(P1, "db", "i-1", InfraNodeStatus::Running);
+    assert_eq!(weft_infra_supervisor::tick(&running.state).await.unwrap(), Some(running.state.health_interval));
+
+    let sibling = SupervisorTestRig::with_tenant("alice");
+    sibling.broker.add_project(P1);
+    sibling.broker.add_infra_node(P1, "db", "i-1", InfraNodeStatus::Running);
+    sibling.broker.set_project_owned(P1, false);
+    let next = weft_infra_supervisor::tick(&sibling.state).await.unwrap().expect("a sibling's lease may lapse");
+    assert!(next > std::time::Duration::from_secs(1), "at the lapse, not now: {next:?}");
+
+    let declared = SupervisorTestRig::with_tenant("alice");
+    declared.broker.add_project(P1);
+    assert_eq!(weft_infra_supervisor::tick(&declared.state).await.unwrap(), None, "declared infra alone gives nothing to look at");
+}
+
 #[tokio::test]
 async fn work_loops_read_owned_projects_not_a_global_list() {
     // Both work loops must scope their work to the owned set (via

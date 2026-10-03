@@ -318,7 +318,7 @@ impl CloudRunRunner {
     }
 
     async fn ensure_account(&self, project: uuid::Uuid) -> anyhow::Result<String> {
-        crate::accounts::ensure_project_account(&self.google, &self.gcp, project, Access::CallerTokenSecret).await
+        crate::accounts::ensure_project_account(&self.google, &self.gcp, project, &[Access::CallerTokenSecret]).await
     }
 
     /// Create or update the service or job at `url` to `body`, whole
@@ -680,6 +680,7 @@ mod tests {
 
     fn gcp() -> GcpPlatform {
         GcpPlatform {
+            name: "weft".into(),
             project: "acme".into(),
             region: "us-central1".into(),
             zone: "us-central1-a".into(),
@@ -690,7 +691,8 @@ mod tests {
             builder_service_account: "weft-builder@acme.iam.gserviceaccount.com".into(),
             tasks_queue: "weft-wakes".into(),
             core_service_account: "weft-core@acme.iam.gserviceaccount.com".into(),
-            machine_internal_url: "http://10.10.0.2:14113".into(),
+            holder_pool: "projects/acme/locations/us-central1/workerPools/weft-holder".into(),
+            dispatcher_service: "weft-role-dispatcher".into(),
             runtime_image: "r".into(),
             deployer_service_account: "d".into(),
             frontend_service_account: "f".into(),

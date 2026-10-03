@@ -100,6 +100,7 @@ pub struct EnsuredSubscription {
 /// which case it is in.
 pub async fn ensure_subscription(
     pool: &PgPool,
+    locks: &PgPool,
     req: &EnsureSubscription,
 ) -> anyhow::Result<EnsuredSubscription> {
     let source = resolve_event_source(pool, &req.tenant, crate::GrantUser::of(req.for_instance.as_ref()), req.access_id, &req.service, &[]).await?;
@@ -127,91 +128,116 @@ pub async fn ensure_subscription(
         return Err(AccessError::Invalid(no_public_url_error(&req.service)).into());
     };
 
-    // Every row already serving this signal, newest first. The newest
-    // decides whether anything needs doing; the REST are strays a
-    // crash between insert and cleanup left behind, and the renewal
-    // below stops all of them, not just the one it replaces.
-    let existing = list_for_signal(pool, &req.tenant, &req.signal_token).await?;
-    if let Some(sub) = existing.first() {
-        if !needs_renewal(sub.expires_at, calls.renew_margin_secs, chrono::Utc::now()) {
-            return Ok(EnsuredSubscription { expires_at: sub.expires_at });
+    // One change to this signal's subscriptions at a time, held to the
+    // end: two copies woken for one renewal would otherwise both read the
+    // same rows, both subscribe, and leave two live channels firing every
+    // event twice; and a drop running meanwhile could take the channel
+    // this one just decided to keep.
+    with_signal_locked(locks, &req.tenant, &req.signal_token, || async {
+        // Every row already serving this signal, newest first. The newest
+        // decides whether anything needs doing; the REST are strays a
+        // crash between insert and cleanup left behind, and the renewal
+        // below stops all of them, not just the one it replaces.
+        let existing = list_for_signal(pool, &req.tenant, &req.signal_token).await?;
+        if let Some(sub) = existing.first() {
+            if !needs_renewal(sub.expires_at, calls.renew_margin_secs, chrono::Utc::now()) {
+                return Ok(EnsuredSubscription { expires_at: sub.expires_at });
+            }
         }
-    }
 
-    // Subscribe fresh: a new id + token every time, because a renewal
-    // is a NEW provider-side channel (the surveyed providers have no
-    // extend verb), and reusing the token would make the old channel
-    // and the new one indistinguishable.
-    let minted_id = uuid::Uuid::new_v4().to_string();
-    let minted_token = mint_token();
-    let mut values = call_values(&source.values, &source.recipe_values, &req.params)?;
-    values.insert(MINTED_ID.to_string(), minted_id.clone());
-    values.insert(MINTED_TOKEN.to_string(), minted_token.clone());
-    values.insert(RECEIVER_URL.to_string(), receiver_url.to_string());
+        // Subscribe fresh: a new id + token every time, because a renewal
+        // is a NEW provider-side channel (the surveyed providers have no
+        // extend verb), and reusing the token would make the old channel
+        // and the new one indistinguishable.
+        let minted_id = uuid::Uuid::new_v4().to_string();
+        let minted_token = mint_token();
+        let mut values = call_values(&source.values, &source.recipe_values, &req.params)?;
+        values.insert(MINTED_ID.to_string(), minted_id.clone());
+        values.insert(MINTED_TOKEN.to_string(), minted_token.clone());
+        values.insert(RECEIVER_URL.to_string(), receiver_url.to_string());
 
-    let resp = run_connect_call(&calls.subscribe, &values).await?;
-    apply_captures(&calls.subscribe.captures, &resp, &mut values)?;
-    let expires_at = match calls.renew_margin_secs {
-        None => None,
-        Some(_) => Some(parse_expiry(values.get(EXPIRES_AT).map(String::as_str).ok_or_else(
-            || {
-                AccessError::Invalid(format!(
-                    "the '{}' subscribe answered without the expiry its recipe captures",
-                    req.service
-                ))
-            },
-        )?)?),
-    };
+        let resp = run_connect_call(&calls.subscribe, &values).await?;
+        apply_captures(&calls.subscribe.captures, &resp, &mut values)?;
+        let expires_at = match calls.renew_margin_secs {
+            None => None,
+            Some(_) => Some(parse_expiry(values.get(EXPIRES_AT).map(String::as_str).ok_or_else(
+                || {
+                    AccessError::Invalid(format!(
+                        "the '{}' subscribe answered without the expiry its recipe captures",
+                        req.service
+                    ))
+                },
+            )?)?),
+        };
 
-    // Record the new channel FIRST, so a crash between here and the
-    // old channel's stop leaves both routable (the overlap window)
-    // rather than a live provider channel no row knows about.
-    let captures: BTreeMap<String, String> = calls
-        .subscribe
-        .captures
-        .iter()
-        .filter_map(|c| values.get(&c.name).map(|v| (c.name.clone(), v.clone())))
-        .collect();
-    sqlx::query(
-        "INSERT INTO signal_subscription
-           (id, tenant_id, service, topic, access_id, signal_token, token_sealed,
-            captures_json, expires_at, project_id, instance_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-    )
-    .bind(&minted_id)
-    .bind(&req.tenant)
-    .bind(&req.service)
-    .bind(&req.topic)
-    .bind(req.access_id)
-    .bind(&req.signal_token)
-    .bind(crate::seal_str(&minted_token))
-    .bind(serde_json::to_value(&captures)?)
-    .bind(expires_at)
-    .bind(req.for_instance.as_ref().map(|m| m.project_id))
-    .bind(req.for_instance.as_ref().map(|m| m.instance.as_str()))
-    .execute(pool)
-    .await?;
+        // Record the new channel FIRST, so a crash between here and the
+        // old channel's stop leaves both routable (the overlap window)
+        // rather than a live provider channel no row knows about.
+        let captures: BTreeMap<String, String> = calls
+            .subscribe
+            .captures
+            .iter()
+            .filter_map(|c| values.get(&c.name).map(|v| (c.name.clone(), v.clone())))
+            .collect();
+        sqlx::query(
+            "INSERT INTO signal_subscription
+               (id, tenant_id, service, topic, access_id, signal_token, token_sealed,
+                captures_json, expires_at, project_id, instance_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+        )
+        .bind(&minted_id)
+        .bind(&req.tenant)
+        .bind(&req.service)
+        .bind(&req.topic)
+        .bind(req.access_id)
+        .bind(&req.signal_token)
+        .bind(crate::seal_str(&minted_token))
+        .bind(serde_json::to_value(&captures)?)
+        .bind(expires_at)
+        .bind(req.for_instance.as_ref().map(|m| m.project_id))
+        .bind(req.for_instance.as_ref().map(|m| m.instance.as_str()))
+        .execute(pool)
+        .await?;
 
-    // Now stop EVERY channel this one replaces: the newest, and any
-    // stray an earlier crash between insert and cleanup left behind.
-    // Best-effort by design: the old channels expire on their own
-    // shortly (that is why we are renewing), so a provider refusal
-    // here must not fail a renewal that already succeeded.
-    for old in existing {
-        if let Err(e) = stop_subscription(pool, &source, calls, &old, &req.params).await {
-            tracing::warn!(
-                target: "weft_access_store::subscriptions",
-                service = %req.service, old_id = %old.id, error = %format!("{e:#}"),
-                "stopping the replaced subscription failed; it will lapse on its own expiry"
-            );
-            // The row still dies: the provider channel outlives it
-            // briefly, and a push on it simply finds no row (dropped,
-            // logged), which is the overlap window's normal shape.
-            delete_row(pool, &old.id).await?;
+        // Now stop EVERY channel this one replaces: the newest, and any
+        // stray an earlier crash between insert and cleanup left behind.
+        // Best-effort by design: the old channels expire on their own
+        // shortly (that is why we are renewing), so a provider refusal
+        // here must not fail a renewal that already succeeded.
+        for old in existing {
+            if let Err(e) = stop_subscription(pool, &source, calls, &old, &req.params).await {
+                tracing::warn!(
+                    target: "weft_access_store::subscriptions",
+                    service = %req.service, old_id = %old.id, error = %format!("{e:#}"),
+                    "stopping the replaced subscription failed; it will lapse on its own expiry"
+                );
+                // The row still dies: the provider channel outlives it
+                // briefly, and a push on it simply finds no row (dropped,
+                // logged), which is the overlap window's normal shape.
+                delete_row(pool, &old.id).await?;
+            }
         }
-    }
 
-    Ok(EnsuredSubscription { expires_at })
+        Ok(EnsuredSubscription { expires_at })
+    })
+    .await
+}
+
+/// Run `body` while no other change to `signal_token`'s subscriptions
+/// runs, install-wide. The lock is held on `locks`, a pool of its own:
+/// its connection does no work for as long as the change waits on the
+/// provider, and taken from the pool the change writes through, enough
+/// changes at once would hold every connection and wait for one more. A
+/// waiter holds no connection while it waits
+/// (`weft_task_store::locks::with_lock_waiting`).
+async fn with_signal_locked<T, F, Fut>(locks: &PgPool, tenant: &str, signal_token: &str, body: F) -> anyhow::Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let key = weft_task_store::locks::advisory_key("weft_signal_subscription", &format!("{tenant}/{signal_token}"));
+    let waiting_for = format!("another change to signal {signal_token}'s provider subscriptions");
+    weft_task_store::locks::with_lock_waiting(locks, key, &waiting_for, body).await
 }
 
 /// Stop and forget every subscription serving `signal_token`: the
@@ -222,39 +248,43 @@ pub async fn ensure_subscription(
 /// logged loudly.
 pub async fn drop_subscriptions_for_signal(
     pool: &PgPool,
+    locks: &PgPool,
     tenant: &str,
     signal_token: &str,
 ) -> anyhow::Result<u64> {
-    let rows: Vec<Subscription> = list_for_signal(pool, tenant, signal_token).await?;
-    let count = rows.len() as u64;
-    for sub in rows {
-        let stopped = async {
-            let source =
-                resolve_event_source(pool, &sub.tenant_id, crate::GrantUser::of(sub.for_instance.as_ref()), sub.access_id, &sub.service, &[])
-                    .await?;
-            let calls = source
-                .events
-                .get(&sub.topic)
-                .and_then(|t| t.webhook.as_ref())
-                .and_then(|w| w.subscribe.as_ref())
-                .ok_or_else(|| {
-                    anyhow::anyhow!("the service no longer declares subscribe calls")
-                })?
-                .clone();
-            stop_subscription(pool, &source, &calls, &sub, &BTreeMap::new()).await
+    with_signal_locked(locks, tenant, signal_token, || async {
+        let rows: Vec<Subscription> = list_for_signal(pool, tenant, signal_token).await?;
+        let count = rows.len() as u64;
+        for sub in rows {
+            let stopped = async {
+                let source =
+                    resolve_event_source(pool, &sub.tenant_id, crate::GrantUser::of(sub.for_instance.as_ref()), sub.access_id, &sub.service, &[])
+                        .await?;
+                let calls = source
+                    .events
+                    .get(&sub.topic)
+                    .and_then(|t| t.webhook.as_ref())
+                    .and_then(|w| w.subscribe.as_ref())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("the service no longer declares subscribe calls")
+                    })?
+                    .clone();
+                stop_subscription(pool, &source, &calls, &sub, &BTreeMap::new()).await
+            }
+            .await;
+            if let Err(e) = stopped {
+                tracing::warn!(
+                    target: "weft_access_store::subscriptions",
+                    service = %sub.service, id = %sub.id, error = %format!("{e:#}"),
+                    "provider unsubscribe failed while unregistering; the channel will lapse \
+                     on its own expiry"
+                );
+                delete_row(pool, &sub.id).await?;
+            }
         }
-        .await;
-        if let Err(e) = stopped {
-            tracing::warn!(
-                target: "weft_access_store::subscriptions",
-                service = %sub.service, id = %sub.id, error = %format!("{e:#}"),
-                "provider unsubscribe failed while unregistering; the channel will lapse \
-                 on its own expiry"
-            );
-            delete_row(pool, &sub.id).await?;
-        }
-    }
-    Ok(count)
+        Ok(count)
+    })
+    .await
 }
 
 /// The subscription a push names, for `route_by: subscription`
@@ -410,13 +440,19 @@ pub fn needs_renewal(
 }
 
 /// One declared authenticated call, executed through the shared core
-/// executor, with its failure carried as the store's caller-fixable
-/// error class (the provider's refusal is the caller's to read).
+/// executor, with its failure carried as the store's error class: a
+/// provider not reached is one to retry, and its refusal is the
+/// caller's to read.
 pub async fn run_connect_call(
     call: &ConnectCall,
     values: &BTreeMap<String, String>,
 ) -> anyhow::Result<Value> {
-    core_run_connect_call(call, values).await.map_err(|e| AccessError::Invalid(e).into())
+    core_run_connect_call(call, values).await.map_err(|e| match e {
+        weft_core::access::client::ConnectCallError::Unreached(why) => AccessError::Unreached(why).into(),
+        weft_core::access::client::ConnectCallError::Unbuildable(why) | weft_core::access::client::ConnectCallError::Refused(why) => {
+            AccessError::Invalid(why).into()
+        }
+    })
 }
 
 /// The value map a recipe call resolves against: the caller's

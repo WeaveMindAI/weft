@@ -124,10 +124,27 @@ pub async fn run_loops(state: SupervisorState) -> anyhow::Result<()> {
 
 /// One pass of every loop, for a supervisor that scales to zero: renew
 /// and claim, run every waiting command of what it owns, look at their
-/// health. Each command runs to its end inside the pass.
-pub async fn tick(state: &SupervisorState) -> anyhow::Result<()> {
+/// health. Each command runs to its end inside the pass. Answers when to
+/// look again: at the health interval while a project it owns has
+/// something to look at (infra nodes, a command), or while the host
+/// listing or the gone-copy sweep left something; otherwise when the
+/// soonest lease a sibling holds over such a project, or over one the
+/// host holds copies of, lapses (the sibling may be gone, and only a
+/// lapsed lease is taken over), and the moment after. `None` when there
+/// is nothing to look at anywhere: a command being issued wakes it.
+pub async fn tick(state: &SupervisorState) -> anyhow::Result<Option<Duration>> {
     let mut owned = std::collections::HashSet::new();
-    ownership::tick(state, &mut owned).await?;
+    let synced = ownership::tick(state, &mut owned).await?;
     while lifecycle::tick(state, Duration::ZERO).await? {}
-    health::tick(state).await
+    health::tick(state).await?;
+    Ok(next_look(&synced, state.health_interval))
+}
+
+/// When a supervisor that scales to zero looks again after a pass that
+/// found `synced`.
+fn next_look(synced: &ownership::Synced, health_interval: Duration) -> Option<Duration> {
+    if synced.owns_work {
+        return Some(health_interval);
+    }
+    synced.others_lapse_in.map(|lapse| lapse + Duration::from_secs(1))
 }

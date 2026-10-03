@@ -8,8 +8,8 @@
 //! service pushing to its registry.
 //!
 //! Building is split in two so a build outlives whoever started it:
-//! `start` launches it under a name the caller minted (and recorded before
-//! starting), `poll` asks about it by that name alone.
+//! `start` launches it and answers the builder's own id for it (which the
+//! builder may choose), and `poll` asks about it by that id alone.
 
 use std::path::PathBuf;
 
@@ -19,8 +19,11 @@ use serde::{Deserialize, Serialize};
 /// What deleting an image did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageDeleted {
-    /// It is gone (or was never there).
+    /// It was there and is gone.
     Deleted,
+    /// It was not there to delete (a build that failed before its push,
+    /// or an image somebody already removed).
+    Absent,
     /// A container still runs from it (a unit a removed project left
     /// behind while its teardown finishes), so it stays for now.
     InUse,
@@ -70,10 +73,23 @@ pub struct BuildRequest {
 }
 
 /// The builder's own id for a build, persisted on the `image_build` row
-/// so a poll survives a restart.
+/// so a poll survives a restart. The builder may choose it (Cloud Build
+/// names its builds itself), so it is the one [`ImageBuilder::start`]
+/// answers, never the name the caller minted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildHandle {
     pub external_build_id: String,
+    /// Where a person reads the build's log, when the builder keeps one
+    /// at an address (Cloud Build's console page).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_url: Option<String>,
+}
+
+impl BuildHandle {
+    /// A build known by its id alone.
+    pub fn named(external_build_id: impl Into<String>) -> Self {
+        Self { external_build_id: external_build_id.into(), log_url: None }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +124,14 @@ struct FakeImageBuilderInner {
     exists_checks: Vec<String>,
     releases: Vec<String>,
     deletes: Vec<String>,
+    /// Name each build `<name>-id` instead of the caller's name, the way
+    /// Cloud Build names its own.
+    names_its_own: bool,
+    /// Builds a poll of answers an error (the builder unreachable).
+    unanswered: std::collections::HashSet<String>,
+    /// The image each started build pushes, by its id: a poll answering
+    /// `Succeeded` puts it in `existing`, as a real push does.
+    pushes: std::collections::HashMap<String, String>,
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -118,6 +142,17 @@ impl FakeImageBuilder {
 
     pub fn set_image_exists(&self, image_ref: &str) {
         self.inner.lock().unwrap().existing.insert(image_ref.to_string());
+    }
+
+    /// Make every poll of `external_build_id` fail, as an unreachable
+    /// builder does.
+    pub fn fail_polls(&self, external_build_id: &str) {
+        self.inner.lock().unwrap().unanswered.insert(external_build_id.to_string());
+    }
+
+    /// Give each build an id of the builder's own, as Cloud Build does.
+    pub fn name_builds_itself(&self) {
+        self.inner.lock().unwrap().names_its_own = true;
     }
 
     pub fn set_poll_result(&self, external_build_id: &str, status: BuildStatus) {
@@ -154,15 +189,25 @@ impl ImageBuilder for FakeImageBuilder {
 
     async fn start(&self, req: BuildRequest) -> anyhow::Result<BuildHandle> {
         let mut inner = self.inner.lock().unwrap();
-        let id = req.name.clone();
+        let id = if inner.names_its_own { format!("{}-id", req.name) } else { req.name.clone() };
+        inner.pushes.insert(id.clone(), req.image_ref.clone());
         inner.starts.push(req);
-        Ok(BuildHandle { external_build_id: id })
+        Ok(BuildHandle::named(id))
     }
 
     async fn poll(&self, handle: &BuildHandle) -> anyhow::Result<BuildStatus> {
         let mut inner = self.inner.lock().unwrap();
         inner.polls.push(handle.external_build_id.clone());
-        Ok(inner.poll_results.get(&handle.external_build_id).cloned().unwrap_or(BuildStatus::Pending))
+        if inner.unanswered.contains(&handle.external_build_id) {
+            anyhow::bail!("the builder did not answer");
+        }
+        let status = inner.poll_results.get(&handle.external_build_id).cloned().unwrap_or(BuildStatus::Pending);
+        if status == BuildStatus::Succeeded {
+            if let Some(image_ref) = inner.pushes.get(&handle.external_build_id).cloned() {
+                inner.existing.insert(image_ref);
+            }
+        }
+        Ok(status)
     }
 
     async fn image_exists(&self, image_ref: &str) -> anyhow::Result<bool> {
@@ -180,8 +225,10 @@ impl ImageBuilder for FakeImageBuilder {
     async fn delete_image(&self, image_ref: &str) -> anyhow::Result<ImageDeleted> {
         let mut inner = self.inner.lock().unwrap();
         inner.deletes.push(image_ref.to_string());
-        inner.existing.remove(image_ref);
-        Ok(ImageDeleted::Deleted)
+        Ok(match inner.existing.remove(image_ref) {
+            true => ImageDeleted::Deleted,
+            false => ImageDeleted::Absent,
+        })
     }
 }
 
@@ -191,7 +238,7 @@ mod tests {
 
     #[test]
     fn build_handle_wire_round_trips() {
-        let h = BuildHandle { external_build_id: "build-op-42".into() };
+        let h = BuildHandle::named("build-op-42");
         let v = serde_json::to_value(&h).unwrap();
         assert_eq!(v["external_build_id"], "build-op-42");
         let back: BuildHandle = serde_json::from_value(v).unwrap();

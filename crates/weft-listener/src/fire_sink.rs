@@ -44,6 +44,8 @@ impl FireSignalSink {
 
     /// Enqueue a FireSignal task for this fire. `tenant_id` is the firing
     /// signal's tenant; the broker checks it against the signal's real one.
+    /// `held_by` names the holder a held connection fires under; the
+    /// broker refuses the fire (409) once the row is not held under it.
     ///
     /// The dedup key is derived from `(token, identity)`, so a retry of the
     /// SAME event collapses onto its task row while it is still queued,
@@ -52,6 +54,7 @@ impl FireSignalSink {
         &self,
         token: &str,
         tenant_id: &str,
+        held_by: Option<&str>,
         payload: Value,
         identity: FireIdentity<'_>,
     ) -> Result<weft_task_store::tasks::DedupOutcome> {
@@ -83,7 +86,11 @@ impl FireSignalSink {
                 tenant_id: tenant_id.to_string(),
                 target_replica: None,
                 binary_hash: None,
-                payload: serde_json::json!({ "token": token, "payload": payload }),
+                payload: serde_json::to_value(weft_task_store::kinds::FireSignalPayload {
+                    token: token.to_string(),
+                    payload,
+                    held_by: held_by.map(str::to_string),
+                })?,
             })
             .await
     }

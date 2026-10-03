@@ -641,6 +641,17 @@ pub struct SupervisorSyncOwnershipResponse {
     /// on one of them while nobody held it woke none of this replica's
     /// claims, so it asks again at once when this is not empty.
     pub claimed: Vec<Uuid>,
+    /// Whether a project this replica owns gives it something to look at
+    /// now (`lifecycle_command::supervisor_work`): its health is looked at
+    /// again soon while this is true.
+    pub owns_work: bool,
+    /// In how many seconds (on the database's clock, 0 when already) the
+    /// soonest lease this replica does not hold lapses, over the projects
+    /// that give their owner something to do; a project of those nobody
+    /// holds counts as lapsed. A replica looks again then: the sibling
+    /// holding it may be gone, and only a lapsed lease is taken over.
+    /// `None` when there is no such project.
+    pub others_lapse_in_secs: Option<i64>,
 }
 
 /// Pure read of the projects a supervisor process currently owns (no claim,
@@ -1040,6 +1051,21 @@ pub struct SupervisorSetStatusRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorSetStatusResponse {}
+
+/// What an apply waits on for one copy, in the host's words, so `weft
+/// status` can say it. Written under the apply's command.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorSetWaitingRequest {
+    pub replica: String,
+    pub command_id: i64,
+    pub project_id: Uuid,
+    pub node_id: String,
+    pub instance: Option<weft_core::instance::InstanceId>,
+    pub waiting: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisorSetWaitingResponse {}
 
 /// Atomic post-apply state write: status, copy_id, applied spec
 /// hash, endpoints map. Supervisor calls this on successful apply.
@@ -1602,6 +1628,14 @@ pub const SIGNAL_ACTIVATION_JOIN: &str = "LEFT JOIN trigger_activation a \
     ON a.project_id = s.project_id AND a.trigger = s.activation_trigger \
     AND a.instance_id IS NOT DISTINCT FROM s.instance_id";
 
+/// Whether signal `$1` is still held under the claim of holder `$2`: what
+/// a held connection's fire must find as it arrives. A lapsed lease nobody
+/// took over still counts, since no other copy serves the row. An event
+/// that arrived while its holder held the row is delivered even if
+/// another holder takes the row a moment later: that one's connection
+/// only hears what comes after it took it.
+pub const STILL_HELD_BY: &str = "SELECT EXISTS (SELECT 1 FROM signal WHERE token = $1 AND holds AND held_by = $2)";
+
 /// Every signal the listener must hold: the rows whose governing
 /// activation's status is one of [`LISTENER_HELD_STATUSES`], of one
 /// project when `project` names it (an activation's rehydrate), of every
@@ -1760,6 +1794,99 @@ pub struct SignalRowWire {
     /// its durable cursor writes at `seq + 1` so a restart can never
     /// regress the fence.
     pub kind_state_seq: i64,
+    /// Whether the signal keeps a connection open between fires, which a
+    /// holder holds (the `signal.holds` column).
+    pub holds: bool,
+    /// For a held signal: what its holder says the connection is doing,
+    /// while a holder holds it; `None` while none does.
+    pub serving: Option<HeldServing>,
+}
+
+/// What a holder says one held connection is doing, for its node's
+/// display (the `signal.serving` column).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldServing {
+    /// The serving task's own words ("connecting", "listening").
+    pub status: String,
+    /// Which transport serves it, once the task decided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<HeldTransport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HeldTransport {
+    Socket,
+    Webhook,
+    Unservable { reason: String },
+}
+
+/// How long a holder's claim on a signal lasts unless it renews it: three
+/// of its looks (`weft_listener::hold`), so one slow look never drops a
+/// connection it still holds, and one that died hands its signals on
+/// within this. 30 seconds in real time, at this install's pace.
+pub fn hold_lease_secs() -> i64 {
+    weft_core::time_scale::scaled_secs(30)
+}
+
+/// One look of a holder (`signal/hold`): renew the claims on what it
+/// holds, report what each connection is doing, take more when it has
+/// room. Of the signals that need a holder, only those no live holder
+/// claims are taken, so holders share them and take over from one that
+/// went.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalHoldRequest {
+    /// The holder; the call must come from this replica.
+    pub replica: String,
+    /// Every signal it holds now, with what its connection is doing when
+    /// that changed since the last look.
+    pub holding: Vec<HeldNow>,
+    /// How many more it may take; `None` takes every one there is (a
+    /// local install's one process holds them all).
+    pub room: Option<u32>,
+    /// Signals to take ahead of any other, when free: one a local install
+    /// brings up the moment it is registered.
+    #[serde(default)]
+    pub want: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeldNow {
+    pub token: String,
+    #[serde(default)]
+    pub serving: Option<HeldServing>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalHoldResponse {
+    /// Of what it holds, what is still its own. The rest it stops.
+    pub kept: Vec<String>,
+    /// Of what it holds, what has ended: the row is gone, or its
+    /// activation is no longer held. Its holder stops it and tears down
+    /// what it arranged outside. One neither kept nor ended went to
+    /// another holder (or its row was rewritten and is taken afresh), so
+    /// its holder only stops it here: a teardown would undo what the new
+    /// holder arranged under the same token.
+    pub ended: Vec<String>,
+    /// What it took on this look, to bring up.
+    pub taken: Vec<SignalRowWire>,
+}
+
+/// Record whether a signal keeps a connection open (`signal.holds`): what
+/// its kind decides for it now, for a row that says otherwise (one
+/// registered under a weft whose kind decided differently).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalSetHoldsRequest {
+    pub token: String,
+    pub holds: bool,
+}
+
+/// Give up every claim `replica` holds (a holder stopping): another
+/// holder takes them at its next look instead of waiting for the claims
+/// to lapse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalLetGoRequest {
+    pub replica: String,
 }
 
 // ---------- Provider-event serving (listener <-> broker) ----------
@@ -2052,12 +2179,16 @@ mod supervisor_protocol_tests {
                 }
             ],
             "claimed": ["00000000-0000-0000-0000-0000000000a1"],
+            "owns_work": true,
+            "others_lapse_in_secs": 12,
         }))
         .unwrap();
         assert_eq!(resp.owned.len(), 1);
         assert_eq!(resp.owned[0].project_id.to_string(), "00000000-0000-0000-0000-0000000000a1");
         assert_eq!(resp.owned[0].status, ProjectStatus::Active);
         assert_eq!(resp.claimed, vec![resp.owned[0].project_id]);
+        assert!(resp.owns_work);
+        assert_eq!(resp.others_lapse_in_secs, Some(12));
     }
 
     #[test]
@@ -2669,6 +2800,8 @@ mod supervisor_protocol_tests {
             auth_kind,
             auth_config,
             kind_state: Value::Null,
+            holds: false,
+            serving: None,
         }
     }
 
@@ -2882,6 +3015,38 @@ mod supervisor_protocol_tests {
             let back: SubscriptionEnsureResponse = serde_json::from_value(v).unwrap();
             assert_eq!(back.expires_at_unix, expiry);
         }
+    }
+
+    #[test]
+    fn signal_hold_round_trip() {
+        let req = SignalHoldRequest {
+            replica: "holder-1".into(),
+            holding: vec![HeldNow {
+                token: "a".into(),
+                serving: Some(HeldServing { status: "listening".into(), transport: Some(HeldTransport::Socket) }),
+            }],
+            room: Some(4),
+            want: vec!["b".into()],
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "replica": "holder-1",
+                "holding": [{ "token": "a", "serving": { "status": "listening", "transport": { "kind": "socket" } } }],
+                "room": 4, "want": ["b"]
+            })
+        );
+        let back: SignalHoldRequest = serde_json::from_value(v).unwrap();
+        assert_eq!((back.holding[0].token.as_str(), back.room, back.want), ("a", Some(4), vec!["b".to_string()]));
+
+        let mut taken = make_row(SignalSurfaceKind::Internal, None, SignalAuthKind::None, None);
+        taken.holds = true;
+        let resp = SignalHoldResponse { kept: vec!["a".into()], ended: vec!["c".into()], taken: vec![taken] };
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!((&v["kept"], &v["ended"], &v["taken"][0]["holds"]), (&json!(["a"]), &json!(["c"]), &json!(true)));
+        let back: SignalHoldResponse = serde_json::from_value(v).unwrap();
+        assert_eq!((back.kept, back.ended, back.taken.len()), (vec!["a".to_string()], vec!["c".to_string()], 1));
     }
 
     #[test]

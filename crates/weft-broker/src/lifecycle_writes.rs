@@ -12,13 +12,13 @@ use anyhow::Context as _;
 use sqlx::PgPool;
 
 use weft_broker_client::lifecycle_command::{
-    command_reaches_copy, live_lease_exists, ownable_project, owns_project_predicate,
+    command_reaches_copy, live_lease_exists, ownable_project, owns_project_predicate, supervisor_work,
     pending_supervisor_command,
 };
 use weft_broker_client::protocol::{
     InfraLifecycleVerb, LifecycleOutcome, ProjectStatus, RunningPolicy,
     SupervisorCommandCompleteRequest, SupervisorCommandRow, SupervisorProject,
-    SupervisorSetStatusRequest, SupervisorSyncOwnershipResponse,
+    SupervisorSetStatusRequest, SupervisorSetWaitingRequest, SupervisorSyncOwnershipResponse,
 };
 
 /// One supervisor ownership tick, atomically, so two supervisors never
@@ -110,13 +110,35 @@ pub async fn sync_ownership(
         .context("claim infra_owner rows")?;
     claimed.extend(taken);
 
-    // 3. Return the full owned set (joined to current project state).
+    // 3. When this supervisor next has something to look at: now, while a
+    //    project it owns gives it work; or when the soonest lease a
+    //    sibling holds over such a project, or over one the host holds
+    //    copies of (which a sibling's gone-copy sweep may have left
+    //    half done), lapses: the sibling may be gone, and only a lapsed
+    //    lease is taken over. One of those that nobody holds (past this
+    //    tick's batch) counts as lapsed.
+    let (owns_work, others_lapse_in_secs): (bool, Option<i64>) = sqlx::query_as(&format!(
+        "SELECT \
+           EXISTS (SELECT 1 FROM project p JOIN infra_owner io ON io.project_id = p.id \
+                   WHERE io.supervisor_replica = $1 AND {work}), \
+           (SELECT MIN(GREATEST(COALESCE(io.leased_until_unix, 0) - EXTRACT(EPOCH FROM NOW())::BIGINT, 0)) \
+              FROM project p LEFT JOIN infra_owner io ON io.project_id = p.id \
+             WHERE io.supervisor_replica IS DISTINCT FROM $1 AND ({work} OR p.id = ANY($2)))",
+        work = supervisor_work("p"),
+    ))
+    .bind(replica)
+    .bind(held_projects)
+    .fetch_one(&mut *tx)
+    .await
+    .context("look for what the supervisors have to do")?;
+
+    // 4. Return the full owned set (joined to current project state).
     let owned = owned_projects(&mut *tx, replica).await?;
     tx.commit().await.context("commit sync_ownership tx")?;
     claimed.retain(|id| owned.iter().any(|p| p.project_id == *id));
     claimed.sort_unstable();
     claimed.dedup();
-    Ok(SupervisorSyncOwnershipResponse { owned, claimed })
+    Ok(SupervisorSyncOwnershipResponse { owned, claimed, owns_work, others_lapse_in_secs })
 }
 
 /// The projects a supervisor owns (every live `infra_owner` lease it
@@ -472,13 +494,23 @@ fn rollup_sql(units_expr: &str) -> String {
 /// EXISTS is evaluated atomically with the write so a command that
 /// appeared after the supervisor's tick-level gate still blocks here.
 pub async fn set_status(pool: &PgPool, req: &SupervisorSetStatusRequest) -> anyhow::Result<FencedWrite> {
+    // An apply's progress (what it waits on, since when) belongs to the
+    // copy while it provisions: a status that leaves provisioning clears
+    // it, so a later start never shows an earlier one's.
+    let progress = |new_status: &str| {
+        format!(
+            ", waiting_on = CASE WHEN {new_status} = 'provisioning' THEN waiting_on END, \
+             provisioning_since_unix = CASE WHEN {new_status} = 'provisioning' THEN provisioning_since_unix END"
+        )
+    };
     let (set_clause, unit_fence) = if req.unit.is_some() {
         let new_units = "jsonb_set(units_json, ARRAY[$1], \
              (units_json->$1) || jsonb_build_object('status', $2::text))";
+        let rollup = rollup_sql(new_units);
         (
             format!(
-                "units_json = {new_units}, status = {rollup}, failure_stage = $3, failure_message = $4",
-                rollup = rollup_sql(new_units),
+                "units_json = {new_units}, status = {rollup}, failure_stage = $3, failure_message = $4{}",
+                progress(&rollup),
             ),
             " AND units_json ? $1",
         )
@@ -493,7 +525,8 @@ pub async fn set_status(pool: &PgPool, req: &SupervisorSetStatusRequest) -> anyh
             FROM jsonb_each(units_json) AS e(k, v))";
         (
             format!(
-                "units_json = {new_units}, status = $2::text, failure_stage = $3, failure_message = $4"
+                "units_json = {new_units}, status = $2::text, failure_stage = $3, failure_message = $4{}",
+                progress("$2::text"),
             ),
             "",
         )
@@ -550,6 +583,38 @@ pub async fn set_status(pool: &PgPool, req: &SupervisorSetStatusRequest) -> anyh
         .execute(pool)
         .await?
     };
+    if res.rows_affected() > 0 {
+        return Ok(FencedWrite::Applied);
+    }
+    stale_answer(pool, &req.replica, req.project_id).await
+}
+
+/// Record what the apply `req.command_id` waits on for its copy. The
+/// command must still be an uncompleted apply that reaches the copy, and `replica`
+/// must still own the project, all in the UPDATE's own WHERE.
+pub async fn set_waiting(pool: &PgPool, req: &SupervisorSetWaitingRequest) -> anyhow::Result<FencedWrite> {
+    let res = sqlx::query(&format!(
+        "UPDATE infra_node SET waiting_on = $1 \
+         WHERE project_id = $2 AND node_id = $3 \
+           AND instance_id IS NOT DISTINCT FROM $4 AND EXISTS ( \
+           SELECT 1 FROM infra_lifecycle_command c \
+           WHERE c.id = $5 \
+             AND c.project_id = $2 \
+             AND c.verb = 'apply' \
+             AND {reaches} \
+             AND c.completed_at_unix IS NULL \
+         ) AND {owns}",
+        reaches = command_reaches_copy("c", "$3", "$4"),
+        owns = owns_project_predicate("$6", "$2"),
+    ))
+    .bind(&req.waiting)
+    .bind(req.project_id)
+    .bind(&req.node_id)
+    .bind(req.instance.as_ref().map(|m| m.as_str()))
+    .bind(req.command_id)
+    .bind(&req.replica)
+    .execute(pool)
+    .await?;
     if res.rows_affected() > 0 {
         return Ok(FencedWrite::Applied);
     }

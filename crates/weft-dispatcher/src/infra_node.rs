@@ -81,6 +81,11 @@ pub struct InfraNodeRow {
     /// it cannot choose), one plain sentence each; empty when it runs the
     /// copy as asked. Stamped at apply, in the `notes_json` column.
     pub notes: Vec<String>,
+    /// While an apply is under way: what it waits on, in the host's words
+    /// ("its machine's agent does not answer yet: ..."), and when the
+    /// apply began. Both cleared when it lands.
+    pub waiting: Option<String>,
+    pub provisioning_since_unix: Option<i64>,
 }
 
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
@@ -120,7 +125,11 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- What the host runs differently from what was asked (a
             -- GPU kind it cannot choose), one sentence each. JSON
             -- array. Stamped at apply.
-            notes_json          JSONB NOT NULL DEFAULT '[]'::jsonb
+            notes_json          JSONB NOT NULL DEFAULT '[]'::jsonb,
+            -- While an apply is under way: what it waits on, in the
+            -- host's words, and when it began. Cleared when it lands.
+            waiting_on          TEXT,
+            provisioning_since_unix BIGINT
         )"#,
         r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_infra_node_copy
              ON infra_node(project_id, node_id, instance_id) NULLS NOT DISTINCT"#,
@@ -155,7 +164,8 @@ pub async fn set_status(
 /// The columns every read decodes (`parse_row`).
 const ROW_COLUMNS: &str = "project_id, node_id, instance_id, copy_id, status, \
      failure_stage, failure_message, applied_spec_hash, \
-     applied_at_unix, endpoints_json, install_endpoints_json, public_paths_json, doors_json, keep_disks_json, units_json, notes_json";
+     applied_at_unix, endpoints_json, install_endpoints_json, public_paths_json, doors_json, keep_disks_json, units_json, notes_json, \
+     waiting_on, provisioning_since_unix";
 
 /// Read one copy's row. Returns None when the row doesn't exist (no
 /// infra was ever applied for this copy).
@@ -566,6 +576,8 @@ fn parse_row(row: sqlx::postgres::PgRow) -> anyhow::Result<InfraNodeRow> {
         keep_disks,
         units,
         notes,
+        waiting: row.try_get("waiting_on")?,
+        provisioning_since_unix: row.try_get("provisioning_since_unix")?,
     })
 }
 

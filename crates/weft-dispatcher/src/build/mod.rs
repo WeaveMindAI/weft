@@ -20,6 +20,7 @@
 //! resolution is program data, the same as the source it came with.
 
 pub mod blob_cache;
+pub mod follow;
 pub mod ledger;
 pub mod prune;
 pub mod source;
@@ -29,7 +30,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use weft_platform_traits::{BuildHandle, BuildRequest, BuildStatus, ImageBuilder};
+use weft_platform_traits::{BuildHandle, BuildRequest, ImageBuilder};
 
 /// The control point the version builder (`crate::build`) calls around REAL build work, so the
 /// dispatcher's `building` transition only engages when something actually
@@ -118,8 +119,6 @@ pub struct VersionBuilder {
     pub bases: weft_compiler::worker_image::BaseImages,
     pub images: Arc<dyn ImageBuilder>,
     pub pool: sqlx::PgPool,
-    /// This dispatcher replica: the owner of the builds it drives.
-    pub replica: String,
     /// How many worker builds compile side by side, each in a compile
     /// cache of its own (`weft_compiler::worker_image::COMPILE_LANE_ARG`).
     pub compile_lanes: u32,
@@ -204,12 +203,12 @@ impl VersionBuilder {
     /// before the first build, whether this process starts it or joins one
     /// already running.
     ///
-    /// Each image is driven by a task of its own that always sees its
-    /// build to an end (or, for a build another project started, stops
-    /// waiting on it): a sibling image failing, or the request that asked
-    /// being dropped, never leaves a build this process drives without a
-    /// driver. The verb waits for every driver and reports every failure,
-    /// the first one first.
+    /// Each image is waited on by a task of its own. A build never depends
+    /// on this verb to be seen through: its row is moved forward by
+    /// whoever looks (`follow::advance`), this verb while it waits and the
+    /// build loop otherwise, so a sibling image failing, or the request
+    /// that asked being dropped, leaves nothing stuck. The verb waits for
+    /// every image and reports every failure, the first one first.
     pub async fn ensure_images(
         &self,
         images: &[weft_compiler::build_plan::PlannedImage],
@@ -235,16 +234,16 @@ impl VersionBuilder {
         }
         gate.begin().await?;
         let (cancel, cancelled) = tokio::sync::watch::channel(false);
-        let drivers: Vec<(String, tokio::task::JoinHandle<Result<()>>)> = stale
+        let waiters: Vec<(String, tokio::task::JoinHandle<Result<()>>)> = stale
             .into_iter()
             .map(|image| {
-                let driver = self.clone();
+                let builder = self.clone();
                 let (tenant, cancelled) = (tenant.to_string(), cancelled.clone());
                 let image_ref = image.image_ref.clone();
-                (image_ref, tokio::spawn(async move { driver.drive(&image, project_id, &tenant, cancelled).await }))
+                (image_ref, tokio::spawn(async move { builder.build_one(&image, project_id, &tenant, cancelled).await }))
             })
             .collect();
-        let (refs, handles): (Vec<String>, Vec<_>) = drivers.into_iter().unzip();
+        let (refs, handles): (Vec<String>, Vec<_>) = waiters.into_iter().unzip();
         let mut all = std::pin::pin!(futures::future::join_all(handles));
         let joined = loop {
             tokio::select! {
@@ -262,7 +261,7 @@ impl VersionBuilder {
             match joined {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => failures.push(e),
-                Err(e) => failures.push(anyhow!("the driver of the build of {image_ref} panicked: {e}")),
+                Err(e) => failures.push(anyhow!("the wait on the build of {image_ref} panicked: {e}")),
             }
         }
         let mut failures = failures.into_iter();
@@ -274,17 +273,15 @@ impl VersionBuilder {
         bail!("{first:#}\n\n{} other image(s) failed too:\n{}", others.len(), others.join("\n\n"))
     }
 
-    /// Drive one image to a pushed image: start its build, join the one
+    /// See one image to a pushed image: start its build, or join the one
     /// already running for the same ref (another project with the same
-    /// content), or take over one whose driver died, then follow it to its
-    /// end.
+    /// content), then wait for its row to end, moving it forward while
+    /// waiting.
     ///
-    /// A cancel of this project stops a build it may stop (`stoppable`).
-    /// A build it may not stop but drives (it took it over, or started it
-    /// for another project first) is never left without a driver: the
-    /// verb stops waiting, and a detached task keeps driving it to its
-    /// end. A build it neither may stop nor drives is left to its driver.
-    async fn drive(
+    /// A cancel of this project stops a build it may stop (`stoppable`):
+    /// the end is recorded, then the build is freed. A build it may not
+    /// stop goes on; the verb only stops waiting on it.
+    async fn build_one(
         &self,
         image: &weft_compiler::build_plan::PlannedImage,
         project_id: uuid::Uuid,
@@ -292,59 +289,55 @@ impl VersionBuilder {
         cancelled: tokio::sync::watch::Receiver<bool>,
     ) -> Result<()> {
         let now = crate::lease::now_unix();
-        let claim = ledger::claim(&self.pool, &image.image_ref, project_id, tenant, &self.replica, self.compile_lanes, now)
-            .await?;
+        let lanes = (image.kind == weft_compiler::build_plan::ImageKind::Worker).then_some(self.compile_lanes);
+        let claim = ledger::claim(&self.pool, self.images.as_ref(), &image.image_ref, project_id, tenant, lanes, now).await?;
         let stoppable = claim.stoppable();
-        let mut follow = Follow { name: String::new(), driving: true, started: Vec::new() };
-        match claim {
-            ledger::Claim::Start { name, lane } => self.start(image, project_id, tenant, &name, lane, &mut follow).await?,
-            ledger::Claim::Join { name, driving, .. } => {
-                follow.name = name;
-                follow.driving = driving;
+        // The build this verb waits on: a cancel stops that one, never a
+        // later build of the same ref the row may run by then.
+        let name = match claim {
+            ledger::Claim::Start { name, lane } => {
+                self.start(image, project_id, tenant, &name, lane).await?;
+                name
             }
-            ledger::Claim::Adopt { gone, name, lane, .. } => {
-                self.took_over(image, &gone, &name).await;
-                self.start(image, project_id, tenant, &name, lane, &mut follow).await?;
-            }
+            ledger::Claim::Join { name, .. } => name,
             ledger::Claim::Built => return Ok(()),
-        }
-        match self.follow(image, project_id, tenant, &mut follow, stoppable, Some(&cancelled)).await {
-            Ok(Followed::Ended(outcome)) => ended(&image.image_ref, outcome),
-            Ok(Followed::StoppedWaiting) => {
-                if follow.driving {
-                    let (driver, image, tenant) = (self.clone(), image.clone(), tenant.to_string());
-                    tokio::spawn(async move {
-                        if let Err(e) = driver.follow(&image, project_id, &tenant, &mut follow, false, None).await {
-                            tracing::warn!(
-                                target: "weft_dispatcher::build",
-                                image = %image.image_ref, error = %format!("{e:#}"),
-                                "driving a build this project stopped waiting on failed"
-                            );
-                        }
-                    });
+        };
+        loop {
+            if *cancelled.borrow() {
+                if !stoppable {
+                    bail!("the build of {} was cancelled", image.image_ref);
                 }
-                bail!("the build of {} was cancelled", image.image_ref)
+                // Recorded before anything is freed, like any end. A build
+                // not made on the builder yet is freed by its starter, which
+                // finds the row no longer its own.
+                if let Some(Some(builder_id)) = ledger::cancel(&self.pool, &image.image_ref, &name, crate::lease::now_unix()).await? {
+                    self.images.release(&BuildHandle::named(builder_id)).await;
+                }
             }
-            Err(e) => Err(e),
+            follow::advance(&self.pool, self.images.as_ref(), &image.image_ref).await?;
+            if let ledger::Seen::Ended(outcome) = ledger::look(&self.pool, &image.image_ref).await? {
+                return ended(&image.image_ref, outcome);
+            }
+            tokio::time::sleep(self.poll_every).await;
         }
     }
 
-    /// Start the build `name` of `image` in `lane`, whose row the ledger
-    /// already holds, and follow it from now on. A start that fails is
-    /// recorded as the build's end.
+    /// Start the build `name` of `image` (in `lane`, for a worker), whose
+    /// row the ledger already holds, and record the builder's id for it. A
+    /// start that fails is recorded as the build's end; a build made whose
+    /// id cannot be recorded is stopped.
     async fn start(
         &self,
         image: &weft_compiler::build_plan::PlannedImage,
         project_id: uuid::Uuid,
         tenant: &str,
         name: &str,
-        lane: u32,
-        follow: &mut Follow,
+        lane: Option<u32>,
     ) -> Result<()> {
-        let mut build_args = Vec::new();
-        if image.kind == weft_compiler::build_plan::ImageKind::Worker {
-            build_args.push((weft_compiler::worker_image::COMPILE_LANE_ARG.to_string(), lane.to_string()));
-        }
+        let build_args = match lane {
+            Some(lane) => vec![(weft_compiler::worker_image::COMPILE_LANE_ARG.to_string(), lane.to_string())],
+            None => Vec::new(),
+        };
         let request = BuildRequest {
             name: name.to_string(),
             project_id,
@@ -353,13 +346,8 @@ impl VersionBuilder {
             image_ref: image.image_ref.clone(),
             build_args,
         };
-        match self.images.start(request).await {
-            Ok(handle) => {
-                follow.started.push(handle.clone());
-                follow.name = handle.external_build_id;
-                follow.driving = true;
-                Ok(())
-            }
+        let handle = match self.images.start(request).await {
+            Ok(handle) => handle,
             Err(e) => {
                 let e = e.context(format!("start the build of {}", image.image_ref));
                 let recorded = ledger::finish(
@@ -369,164 +357,35 @@ impl VersionBuilder {
                     ledger::Outcome::Failed(format!("{e:#}")),
                     crate::lease::now_unix(),
                 )
-                .await;
-                Err(with_secondary(e, recorded))
+                .await
+                .map(|_| ());
+                return Err(with_secondary(e, recorded));
             }
-        }
-    }
-
-    /// Follow the row of `image` until its build ends, or, with a cancel
-    /// channel, until this verb stops waiting on a build it may not stop.
-    /// Whoever drives records the end, and every end frees what this task
-    /// started (`ImageBuilder::release`).
-    async fn follow(
-        &self,
-        image: &weft_compiler::build_plan::PlannedImage,
-        project_id: uuid::Uuid,
-        tenant: &str,
-        follow: &mut Follow,
-        stoppable: bool,
-        cancelled: Option<&tokio::sync::watch::Receiver<bool>>,
-    ) -> Result<Followed> {
-        let result = self.follow_to_end(image, project_id, tenant, follow, stoppable, cancelled).await;
-        let result = match result {
-            Err(e) if follow.driving => {
-                // A driver never walks away from a build it drives: an
-                // error is recorded as its end, so nobody waits forever.
+        };
+        match ledger::started(&self.pool, &image.image_ref, name, &handle).await {
+            Ok(true) => Ok(()),
+            // Cancelled, or given up on, while it was being made: nobody
+            // will ask about it, so it is freed here. The row's end is the
+            // answer the wait reads.
+            Ok(false) => {
+                self.images.release(&handle).await;
+                Ok(())
+            }
+            Err(e) => {
+                self.images.release(&handle).await;
                 let recorded = ledger::finish(
                     &self.pool,
                     &image.image_ref,
-                    &follow.name,
-                    ledger::Outcome::Failed(format!("the dispatcher driving it failed: {e:#}")),
+                    name,
+                    ledger::Outcome::Failed(format!("its id on the builder could not be recorded, so it was stopped: {e:#}")),
                     crate::lease::now_unix(),
                 )
-                .await;
+                .await
+                .map(|_| ());
                 Err(with_secondary(e, recorded))
             }
-            other => other,
-        };
-        // Everything this task started is freed once the build ended. When
-        // the verb only stopped waiting, the build it still drives goes on
-        // (the detached task in `drive` frees it at its end); anything else
-        // it started, taken over by another process since, is freed now.
-        let keep = match &result {
-            Ok(Followed::StoppedWaiting) if follow.driving => Some(follow.name.clone()),
-            _ => None,
-        };
-        let (kept, freed): (Vec<_>, Vec<_>) =
-            follow.started.drain(..).partition(|h| keep.as_deref() == Some(h.external_build_id.as_str()));
-        follow.started = kept;
-        for handle in freed {
-            self.images.release(&handle).await;
-        }
-        result
-    }
-
-    /// This process took over `gone`, whose driver stopped renewing its hold,
-    /// as `name`: the process `gone` ran in is nobody's any more, so it goes.
-    async fn took_over(&self, image: &weft_compiler::build_plan::PlannedImage, gone: &str, name: &str) {
-        tracing::info!(
-            target: "weft_dispatcher::build",
-            image = %image.image_ref, gone = %gone, build = %name,
-            "took over a build whose driving dispatcher is gone; building it again"
-        );
-        self.images.release(&BuildHandle { external_build_id: gone.to_string() }).await;
-    }
-
-    async fn follow_to_end(
-        &self,
-        image: &weft_compiler::build_plan::PlannedImage,
-        project_id: uuid::Uuid,
-        tenant: &str,
-        follow: &mut Follow,
-        stoppable: bool,
-        cancelled: Option<&tokio::sync::watch::Receiver<bool>>,
-    ) -> Result<Followed> {
-        loop {
-            if cancelled.is_some_and(|c| *c.borrow()) {
-                if !stoppable {
-                    return Ok(Followed::StoppedWaiting);
-                }
-                // Recorded before anything is freed, like any end. The
-                // build's driver, here or on another process, reads it next.
-                ledger::finish(&self.pool, &image.image_ref, &follow.name, ledger::Outcome::Cancelled, crate::lease::now_unix())
-                    .await?;
-            }
-            // The ledger first: a build ends once, whoever waits on it,
-            // and whoever saw it end recorded that before freeing its process.
-            let now = crate::lease::now_unix();
-            match ledger::look(&self.pool, &image.image_ref, &follow.name).await? {
-                ledger::Seen::Ended(outcome) => return Ok(Followed::Ended(outcome)),
-                ledger::Seen::Running { name, driver, driver_until } => {
-                    if name != follow.name {
-                        // Taken over under another name (the ledger doc).
-                        follow.name = name;
-                    }
-                    follow.driving = driver == self.replica;
-                    if !follow.driving && driver_until < now {
-                        if let Some((name, lane)) = ledger::take_over(
-                            &self.pool,
-                            &image.image_ref,
-                            &follow.name,
-                            &self.replica,
-                            self.compile_lanes,
-                            now,
-                        )
-                        .await?
-                        {
-                            let gone = follow.name.clone();
-                            self.took_over(image, &gone, &name).await;
-                            self.start(image, project_id, tenant, &name, lane, follow).await?;
-                        }
-                        continue;
-                    }
-                }
-            }
-            let handle = BuildHandle { external_build_id: follow.name.clone() };
-            let outcome = match self.images.poll(&handle).await? {
-                BuildStatus::Pending => {
-                    if follow.driving {
-                        ledger::renew(&self.pool, &image.image_ref, &follow.name, &self.replica, now).await?;
-                    }
-                    tokio::time::sleep(self.poll_every).await;
-                    continue;
-                }
-                // Only the task that started the process may call it gone: any
-                // other waiter (on another process, or on this one, joining a
-                // build whose process is still being created) waits for that
-                // task to record the end, or takes the build over once its
-                // driver's hold lapses.
-                BuildStatus::Gone if !follow.started.iter().any(|h| h.external_build_id == follow.name) => {
-                    tokio::time::sleep(self.poll_every).await;
-                    continue;
-                }
-                BuildStatus::Gone => ledger::Outcome::Failed(format!(
-                    "the build {} is gone (deleted before it finished)",
-                    follow.name
-                )),
-                BuildStatus::Succeeded => ledger::Outcome::Succeeded,
-                BuildStatus::Failed { reason } => ledger::Outcome::Failed(reason),
-            };
-            // Whoever sees the end records it; the next look reads the
-            // record back, so every waiter reports the same end.
-            ledger::finish(&self.pool, &image.image_ref, &follow.name, outcome, crate::lease::now_unix()).await?;
         }
     }
-}
-
-/// The build a driver task follows: the row's current build, whether this
-/// process drives it, and every build this task started (freed at the end).
-struct Follow {
-    name: String,
-    driving: bool,
-    started: Vec<BuildHandle>,
-}
-
-/// How following one build stopped.
-enum Followed {
-    Ended(ledger::Outcome),
-    /// A build this project may not stop: this verb stopped waiting on it.
-    StoppedWaiting,
 }
 
 /// `primary` as the error to report, with a failure to record it beneath:

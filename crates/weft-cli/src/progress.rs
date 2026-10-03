@@ -79,6 +79,10 @@ pub enum Phase {
     /// The install finished building the project. Detail carries
     /// `{ "project": <name> }`.
     BuildDone,
+    /// One image of the build is building on the install's builder.
+    /// Detail carries `{ "image", "build", "logUrl"? }`: the image ref,
+    /// the builder's id for the build, and where its log is read.
+    BuildImage,
     /// HTTP request to the dispatcher started.
     DispatcherCallStart,
     /// HTTP request to the dispatcher finished. Body in `detail`
@@ -285,6 +289,14 @@ impl Progress {
         self.emit(Phase::BuildStart, Some(serde_json::json!({ "project": project })));
     }
 
+    /// An image of the build started building on the install's builder.
+    pub fn build_image(&self, build: &weft_core::projects::BuildInFlight) {
+        self.emit(
+            Phase::BuildImage,
+            Some(serde_json::json!({ "image": build.image, "build": build.build, "logUrl": build.log_url })),
+        );
+    }
+
     /// `built`: the image refs the install had to build (empty when every
     /// image was already there).
     pub fn build_done(&self, project: &str, built: &[String]) {
@@ -416,6 +428,15 @@ fn human_line(ev: &Event<'_>) -> Option<String> {
                 .and_then(|v| v.as_str())
                 .expect("build_start always names the project")
         ),
+        Phase::BuildImage => {
+            let field = |k: &str| ev.detail.and_then(|d| d.get(k)).and_then(|v| v.as_str());
+            let image = field("image").unwrap_or("an image");
+            let build = field("build").unwrap_or("?");
+            match field("logUrl") {
+                Some(log) => format!("  building {image} as {build}; its log: {log}"),
+                None => format!("  building {image} as {build}"),
+            }
+        }
         Phase::InfraProvisionStart => "provisioning infra".to_string(),
         Phase::DrainWait => {
             let cap = match ev.detail.and_then(|d| d.get("capSeconds")).and_then(|v| v.as_u64()) {

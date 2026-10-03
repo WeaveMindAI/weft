@@ -1,14 +1,16 @@
 # Deploys this project onto its weft install on GCP: the program first
-# (`weft activate`), then, when the project has one (front/Dockerfile),
-# the frontend in front/ to Cloud Run, which
-# reaches the install privately through Direct VPC egress. Run it by
-# hand from the Actions tab.
+# (`weft activate`, or `weft resync` when it is already on), then, when
+# the install hosts a frontend for this repository (`weft frontend add`),
+# the frontend in front/ to its Cloud Run service. It calls the install
+# at its public address with its token, and reaches the program's own
+# infrastructure (a database) privately through Direct VPC egress. Run it
+# by hand from the Actions tab.
 #
 # Its repository variables and secrets come from
 # `weft target export <target> --github`.
 #
 # The frontend contract: front/Dockerfile builds a server that listens on
-# $PORT and reads WEFT_DISPATCHER_URL (the install, private), WEFT_TOKEN (a
+# $PORT and reads WEFT_DISPATCHER_URL (the install), WEFT_TOKEN (a
 # caller token, never sent to a browser) and WEFT_PUBLIC_URL (for links a
 # browser follows), plus whatever else the WEFT_FRONT_ENV secret holds (the
 # program's database address and credentials, its sign-in secret), in the
@@ -38,17 +40,46 @@ jobs:
       # SYNC: the frontend repository <-> deploy/terraform/gcp/registry.tf (frontends)
       FRONT_IMAGE: ${{ vars.GCP_ARTIFACT_REGISTRY }}-frontends/{{SERVICE}}-front:${{ github.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      # The CLI of the exact weft the install runs: a project compiled by
-      # another weft is refused there.
-      - uses: actions/checkout@v4
+      # The source of the exact weft the install runs (the CLI compiles the
+      # project against its nodes), and its CLI: a project compiled by
+      # another weft is refused there. The release's own CLI when the
+      # release was built from that commit (checked against its sha256),
+      # otherwise built from the source and cached for the next run.
+      # SYNC: release tag + asset name + manifest.json keys <-> .github/workflows/release.yml (the release job), .github/workflows/install-gcp.yml (the weft CLI for this checkout)
+      - uses: actions/checkout@v7
         with:
           repository: ${{ vars.WEFT_SOURCE_REPOSITORY }}
           ref: ${{ vars.WEFT_SOURCE_COMMIT }}
           path: .weft
 
-      - uses: actions/cache@v4
+      - name: download the weft CLI
+        id: download
+        run: |
+          base=https://github.com/WeaveMindAI/weft/releases/download/latest
+          manifest=$(curl -fsSL --max-time 10 "$base/manifest.json" || true)
+          commit=$(sed -n 's/.*"commit": *"\([^"]*\)".*/\1/p' <<<"$manifest")
+          sha=$(sed -n 's/.*"sha256_weft-x86_64-linux": *"\([^"]*\)".*/\1/p' <<<"$manifest")
+          mkdir -p "$RUNNER_TEMP/weft"
+          # A release being replaced can serve a binary its manifest does
+          # not vouch for yet: the checksum then fails, and the CLI is built.
+          if [ "$commit" = "${{ vars.WEFT_SOURCE_COMMIT }}" ] && [ -n "$sha" ] \
+            && curl -fsSL "$base/weft-x86_64-linux" -o "$RUNNER_TEMP/weft/weft" \
+            && echo "$sha  $RUNNER_TEMP/weft/weft" | sha256sum -c -; then
+            chmod +x "$RUNNER_TEMP/weft/weft"
+            echo "$RUNNER_TEMP/weft" >> "$GITHUB_PATH"
+            echo "using the CLI the release built from $commit"
+            echo "found=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "the release has no CLI built from ${{ vars.WEFT_SOURCE_COMMIT }} that checks out; building it"
+          fi
+
+      # Restored and saved as two steps, so a run that fails after the
+      # build still keeps it for the next one.
+      - uses: actions/cache/restore@v6
+        if: steps.download.outputs.found != 'yes'
+        id: cache
         with:
           path: |
             ~/.cargo/registry
@@ -57,39 +88,61 @@ jobs:
           key: weft-cli-${{ runner.os }}-${{ vars.WEFT_SOURCE_COMMIT }}
 
       - name: build the weft CLI
+        id: build
+        if: steps.download.outputs.found != 'yes'
         working-directory: .weft
         run: |
           rustup toolchain install
           cargo build --release --locked -p weft-cli
           echo "$WEFT_REPO_ROOT/target/release" >> "$GITHUB_PATH"
 
-      - name: deploy the program
-        run: weft activate --on ${{ vars.WEFT_TARGET }}
+      - uses: actions/cache/save@v6
+        if: always() && steps.build.outcome == 'success' && steps.cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            .weft/target
+          key: weft-cli-${{ runner.os }}-${{ vars.WEFT_SOURCE_COMMIT }}
 
-      # Everything below is the frontend's, and runs only when the project
-      # has one (front/Dockerfile): a project without a frontend deploys
-      # its program and stops, and needs no GCP access at all.
-      - uses: google-github-actions/auth@v2
-        if: hashFiles('front/Dockerfile') != ''
+      # A program that is off is switched on; one whose triggers are on is
+      # brought up to date. `--mode park` holds the calls that arrive while
+      # its triggers come down and back up, and runs them once they are
+      # back; change it to `hibernate` or `wipe` if that suits this program.
+      - name: deploy the program
+        run: |
+          status=$(weft status --on ${{ vars.WEFT_TARGET }} --json | jq -r '.status // "registered"')
+          if [ "$status" = "active" ]; then
+            weft resync --on ${{ vars.WEFT_TARGET }} --mode park
+          else
+            weft activate --on ${{ vars.WEFT_TARGET }}
+          fi
+
+      # Everything below is the frontend's, and runs only when the install
+      # hosts one for this repository (`weft frontend add <name> --repo
+      # <this repository>`, then `weft target export`): a project without
+      # one deploys its program and stops, and needs no GCP access at all.
+      - uses: google-github-actions/auth@v3
+        if: vars.WEFT_FRONTEND_SERVICE != ''
         with:
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_DEPLOYER_SERVICE_ACCOUNT }}
 
-      - uses: google-github-actions/setup-gcloud@v2
-        if: hashFiles('front/Dockerfile') != ''
+      - uses: google-github-actions/setup-gcloud@v3
+        if: vars.WEFT_FRONTEND_SERVICE != ''
 
       - name: build the frontend
-        if: hashFiles('front/Dockerfile') != ''
+        if: vars.WEFT_FRONTEND_SERVICE != ''
         run: |
           gcloud auth configure-docker "${{ vars.GCP_REGION }}-docker.pkg.dev" --quiet
           docker build -t "$FRONT_IMAGE" front
           docker push "$FRONT_IMAGE"
 
       - name: deploy the frontend
-        if: hashFiles('front/Dockerfile') != ''
+        if: vars.WEFT_FRONTEND_SERVICE != ''
         env:
           WEFT_FRONT_ENV: ${{ secrets.WEFT_FRONT_ENV }}
-          WEFT_DISPATCHER_URL: ${{ vars.WEFT_INTERNAL_URL }}
+          WEFT_DISPATCHER_URL: ${{ vars.WEFT_PUBLIC_URL }}
           WEFT_PUBLIC_URL: ${{ vars.WEFT_PUBLIC_URL }}
           WEFT_TOKEN: ${{ secrets.WEFT_FRONTEND_TOKEN }}
         run: |
@@ -113,13 +166,9 @@ jobs:
           for name, value in env.items():
               print(f"{name}: {json.dumps(value)}")
           PY
-          # The install made this repository's own service, already public,
-          # and it is the only one this workflow may change: its name is the
-          # install's name, "-front-", and the first 12 hex of the sha256 of
-          # this repository's owner/name.
-          # SYNC: FRONT_SERVICE <-> deploy/terraform/gcp/identity.tf (local.frontend_services)
-          install="${{ vars.GCP_ARTIFACT_REGISTRY }}"
-          service="${install##*/}-front-$(printf '%s' "$GITHUB_REPOSITORY" | sha256sum | cut -c1-12)"
+          # The install made this frontend's own service, already public,
+          # and it is the only one this workflow may change.
+          service="${{ vars.WEFT_FRONTEND_SERVICE }}"
           gcloud run deploy "$service" \
             --project "${{ vars.GCP_PROJECT_ID }}" \
             --region "${{ vars.GCP_REGION }}" \
@@ -132,3 +181,10 @@ jobs:
           rm "$RUNNER_TEMP/front-env.yaml"
           url=$(gcloud run services describe "$service" --project "${{ vars.GCP_PROJECT_ID }}" --region "${{ vars.GCP_REGION }}" --format 'value(status.url)')
           echo "frontend: $url" >> "$GITHUB_STEP_SUMMARY"
+
+      # The frontend now calls with the token this deploy gave it (named by
+      # its id, so a token made since and not deployed is never put in its
+      # place), and every other token of it is retired.
+      - name: retire the frontend's old token
+        if: vars.WEFT_FRONTEND_SERVICE != ''
+        run: weft frontend token "${{ vars.WEFT_FRONTEND_NAME }}" --done "${{ vars.WEFT_FRONTEND_TOKEN_ID }}" --on ${{ vars.WEFT_TARGET }}

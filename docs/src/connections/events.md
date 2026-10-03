@@ -15,8 +15,10 @@ needs [a public address](../build/public-address.md), and it is the only road a
 shared application can use, and the only road most services offer at all.
 
 You never choose. You name a connection and a filter, and the transport follows
-from what the service declares and what your environment can serve. Dial out
-wins when it is available, because it needs nothing from you.
+from what the service declares and what your environment can serve. On a cloud
+install, if the service can push these events for your account, weft
+takes the push, so nothing has to stay running between events. Otherwise weft
+dials out when it can, because that needs nothing from you.
 
 ## What a topic declares
 

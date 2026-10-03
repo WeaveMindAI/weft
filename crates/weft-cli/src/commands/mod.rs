@@ -48,6 +48,7 @@ pub mod prune;
 pub mod wake;
 pub mod workers;
 pub mod domain;
+pub mod frontend;
 pub mod target;
 pub mod ci;
 

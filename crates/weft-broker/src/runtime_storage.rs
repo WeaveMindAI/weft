@@ -567,8 +567,8 @@ async fn public_link(
 
 /// Mint the link for a file, or `None` when the asker has no address
 /// to be given. Three configurations, one rule each:
-/// - the bucket's public endpoint is a declared internet host
-///   (`WEFT_OBJECT_STORE_PUBLIC_INTERNET`): the bucket's own presigned
+/// - the open internet reaches the store's presigned URLs
+///   (`ObjectStoreSettings::public_internet`): the bucket's own presigned
 ///   URL, zero relay hops;
 /// - a base exists for the asker ([`relay_base`]): a relay link under
 ///   it, resolved by the public `/public/files/{token}` route;

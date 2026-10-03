@@ -83,6 +83,13 @@ pub enum BrokerCall {
         failure_stage: Option<weft_broker_client::protocol::FailureStage>,
         failure_message: Option<String>,
     },
+    SetWaiting {
+        command_id: i64,
+        project_id: uuid::Uuid,
+        node_id: String,
+        instance: Option<weft_core::instance::InstanceId>,
+        waiting: String,
+    },
     RemoveNode {
         project_id: uuid::Uuid,
         node_id: String,
@@ -270,8 +277,14 @@ impl Inner {
     /// `ownable_project` answers it: infra to manage, copies on the host
     /// (`held`), or an uncompleted command waiting on it.
     fn ownable(&self, project_id: uuid::Uuid, held: &[uuid::Uuid]) -> bool {
-        !self.infraless.contains(&project_id)
-            || held.contains(&project_id)
+        !self.infraless.contains(&project_id) || held.contains(&project_id) || self.has_work(project_id)
+    }
+
+    /// Whether `project_id` gives its owner something to look at now, as
+    /// the broker's `supervisor_work` answers it: infra nodes, or an
+    /// uncompleted command.
+    fn has_work(&self, project_id: uuid::Uuid) -> bool {
+        self.infra_nodes.keys().any(|k| k.0 == project_id)
             || self.commands.iter().any(|c| c.project_id == project_id && !self.completed(c.id))
     }
 
@@ -715,7 +728,23 @@ impl BrokerSupervisorOps for FakeBroker {
         }
         let claimed = taken.into_iter().filter(|id| inner.projects.contains_key(id)).collect();
         let owned = inner.projects.values().filter(|p| inner.owns(p.project_id)).cloned().collect();
-        Ok(SupervisorSyncOwnershipResponse { owned, claimed })
+        // Every project row, whoever holds its lease, as the broker reads
+        // its `project` table. The fake keeps no lease times: a sibling's
+        // lease lapses a whole lease from now, and one nobody holds has
+        // lapsed.
+        let with_work: Vec<uuid::Uuid> = inner.projects.keys().copied().filter(|id| inner.has_work(*id)).collect();
+        let owns_work = with_work.iter().any(|id| inner.owns(*id));
+        let others_lapse_in_secs = inner
+            .projects
+            .keys()
+            .filter(|id| inner.has_work(**id) || held_projects.contains(id))
+            .filter_map(|id| match inner.owners.get(id) {
+                Some(Owner::Other) => Some(weft_broker_client::lifecycle_command::infra_owner_lease_secs()),
+                Some(Owner::Nobody) => Some(0),
+                Some(Owner::Us) | None => None,
+            })
+            .min();
+        Ok(SupervisorSyncOwnershipResponse { owned, claimed, owns_work, others_lapse_in_secs })
     }
 
     async fn owned_projects(&self, replica: &str) -> Result<Vec<SupervisorProject>> {
@@ -916,6 +945,29 @@ impl BrokerSupervisorOps for FakeBroker {
             // No row to update while still owning the project: Gone.
             Ok(weft_broker_client::WriteOutcome::Gone)
         }
+    }
+
+    async fn set_waiting(
+        &self,
+        _replica: &str,
+        command_id: i64,
+        project_id: uuid::Uuid,
+        node_id: &str,
+        instance: Option<&weft_core::instance::InstanceId>,
+        waiting: &str,
+    ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetWaitingResponse>> {
+        let mut inner = self.inner.lock();
+        inner.calls.push(BrokerCall::SetWaiting {
+            command_id,
+            project_id,
+            node_id: node_id.to_string(),
+            instance: instance.cloned(),
+            waiting: waiting.to_string(),
+        });
+        if !inner.owns(project_id) {
+            return Ok(weft_broker_client::WriteOutcome::Displaced);
+        }
+        Ok(weft_broker_client::WriteOutcome::Applied(weft_broker_client::protocol::SupervisorSetWaitingResponse {}))
     }
 
     async fn remove_node(
@@ -1179,6 +1231,7 @@ mod tests {
         let synced = b.sync_ownership("sup-1", &[]).await.unwrap();
         assert_eq!(synced.owned.len(), 1);
         assert!(synced.claimed.is_empty(), "a seeded project is already owned");
+        assert!(!synced.owns_work, "a project with no node, copy or command gives nothing to look at");
         assert!(b.calls().iter().any(|c| matches!(c, BrokerCall::SyncOwnership { replica, .. } if replica == "sup-1")));
     }
 

@@ -35,6 +35,7 @@ describe('the pass-through', () => {
 		// The dispatcher learns the address the browser used, mount included.
 		expect(seen[0].headers.get('x-forwarded-host')).toBe('site.example');
 		expect(seen[0].headers.get('x-forwarded-proto')).toBe('https');
+		expect(seen[0].headers.get('x-weft-forwarded-proto')).toBe('https');
 		expect(seen[0].headers.get('x-forwarded-prefix')).toBe('/weft');
 	});
 
@@ -155,5 +156,17 @@ describe('the pass-through', () => {
 		);
 		expect(res.status).toBe(502);
 		expect(await res.text()).toContain('http://127.0.0.1:14111');
+	});
+
+	it('names the cause beneath a failed fetch', async () => {
+		const fetcher = (async () => {
+			const refused = Object.assign(new Error('connect ECONNREFUSED 10.10.0.2:14113'), { code: 'ECONNREFUSED' });
+			throw new TypeError('fetch failed', { cause: refused });
+		}) as unknown as typeof fetch;
+		const res = await weftPassThrough({ dispatcher: 'http://10.10.0.2:14113', fetcher })(
+			new Request(`${site}/instance/fields`),
+			'instance/fields',
+		);
+		expect(await res.text()).toContain('fetch failed: connect ECONNREFUSED 10.10.0.2:14113');
 	});
 });

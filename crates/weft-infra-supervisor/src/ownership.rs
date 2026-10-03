@@ -52,12 +52,25 @@ impl OwnershipChange {
     }
 }
 
+/// What one ownership tick found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Synced {
+    /// What the tick changed for this supervisor, if anything.
+    pub change: Option<OwnershipChange>,
+    /// Whether it has something to look at now: a project it owns gives
+    /// it work, or the host listing or the gone-copy sweep left some.
+    pub owns_work: bool,
+    /// When the soonest lease it does not hold, over a project with
+    /// something to do, lapses (see `SupervisorSyncOwnershipResponse`).
+    pub others_lapse_in: Option<std::time::Duration>,
+}
+
 /// Tick for as long as the process lives, handing every change to each work
 /// loop in `changes` (lifecycle and health).
 pub async fn run_loop(state: SupervisorState, changes: Vec<UnboundedSender<OwnershipChange>>) -> Result<()> {
     let mut owned = HashSet::new();
     loop {
-        match tick(&state, &mut owned).await {
+        match tick(&state, &mut owned).await.map(|synced| synced.change) {
             Ok(Some(change)) => {
                 for loop_changes in &changes {
                     loop_changes
@@ -78,9 +91,10 @@ pub async fn run_loop(state: SupervisorState, changes: Vec<UnboundedSender<Owner
 /// One ownership tick: list what the host holds, renew + claim (the
 /// held projects included), sweep the gone copies under the leases just
 /// renewed, update `owned` (what this supervisor owned after the previous
-/// tick) and hand back what changed, if anything. Exposed so integration
-/// tests can step it one tick at a time.
-pub async fn tick(state: &SupervisorState, owned: &mut HashSet<Uuid>) -> Result<Option<OwnershipChange>> {
+/// tick) and hand back what changed, if anything, and when there is next
+/// something to look at. Exposed so integration tests can step it one
+/// tick at a time.
+pub async fn tick(state: &SupervisorState, owned: &mut HashSet<Uuid>) -> Result<Synced> {
     // A failed listing skips this tick's sweep but never the renewal:
     // losing every lease over a host hiccup would hand the projects over.
     let held = match state.host.copies().await {
@@ -100,15 +114,22 @@ pub async fn tick(state: &SupervisorState, owned: &mut HashSet<Uuid>) -> Result<
         claimed = synced.claimed.len(),
         "ownership synced (renewed + claimed a batch)"
     );
-    if let Some(copies) = held {
-        sweep_gone_copies(state, copies).await;
-    }
+    // A listing that failed, or a sweep that left gone copies behind,
+    // is looked at again soon: what it leaves may be billed.
+    let sweep_left = match held {
+        Some(copies) => sweep_gone_copies(state, copies).await,
+        None => true,
+    };
     let now: HashSet<Uuid> = synced.owned.iter().map(|p| p.project_id).collect();
     let mut lost: Vec<Uuid> = owned.difference(&now).copied().collect();
     lost.sort_unstable();
     *owned = now;
     let change = OwnershipChange { claimed: synced.claimed, lost };
-    Ok((!change.is_empty()).then_some(change))
+    Ok(Synced {
+        change: (!change.is_empty()).then_some(change),
+        owns_work: synced.owns_work || sweep_left,
+        others_lapse_in: synced.others_lapse_in_secs.map(|s| std::time::Duration::from_secs(u64::try_from(s).unwrap_or(0))),
+    })
 }
 
 /// Delete everything the host holds (`copies`, its listing) for a copy
@@ -152,34 +173,43 @@ pub async fn tick(state: &SupervisorState, owned: &mut HashSet<Uuid>) -> Result<
 /// One project or copy failing is logged and the rest still go.
 /// Idempotent: a copy another supervisor deleted first is simply gone
 /// from the next listing.
-pub async fn sweep_gone_copies(state: &SupervisorState, copies: Vec<NodeRef>) {
+pub async fn sweep_gone_copies(state: &SupervisorState, copies: Vec<NodeRef>) -> bool {
     let mut by_project: BTreeMap<Uuid, Vec<NodeRef>> = BTreeMap::new();
     for copy in copies {
         by_project.entry(copy.project).or_default().push(copy);
     }
+    let mut left = false;
     for (project, copies) in by_project {
         let Some(_project) = state.project_locks.try_lock(project) else {
             tracing::debug!(project_id = %project, "a lifecycle command holds the project; its gone copies wait for the next tick");
+            left = true;
             continue;
         };
-        if let Err(e) = sweep_project(state, project, &copies).await {
-            tracing::warn!(project_id = %project, error = %format!("{e:#}"), "sweeping the project's gone copies failed; the next tick tries again");
+        match sweep_project(state, project, &copies).await {
+            Ok(project_left) => left |= project_left,
+            Err(e) => {
+                tracing::warn!(project_id = %project, error = %format!("{e:#}"), "sweeping the project's gone copies failed; the next tick tries again");
+                left = true;
+            }
         }
     }
+    left
 }
 
 /// One project's sweep, under its lock: judge its copies, then delete
-/// each gone one after judging it again (the lease fence).
-async fn sweep_project(state: &SupervisorState, project: Uuid, copies: &[NodeRef]) -> Result<()> {
+/// each gone one after judging it again (the lease fence). Answers
+/// whether it left a gone copy standing (a delete that failed).
+async fn sweep_project(state: &SupervisorState, project: Uuid, copies: &[NodeRef]) -> Result<bool> {
     let Some(gone) = state.broker.gone_copies(&state.replica, project, copies).await? else {
         tracing::debug!(project_id = %project, "another supervisor holds the project's lease; its copies are its to sweep");
-        return Ok(());
+        return Ok(false);
     };
+    let mut left = false;
     for copy in copies.iter().filter(|c| gone.contains(&c.copy_id)) {
         match state.broker.gone_copies(&state.replica, project, std::slice::from_ref(copy)).await? {
             None => {
                 tracing::info!(project_id = %project, "the project's lease moved mid-sweep; leaving its copies to the new owner");
-                return Ok(());
+                return Ok(left);
             }
             Some(still) if still.is_empty() => continue,
             Some(_) => {}
@@ -198,7 +228,8 @@ async fn sweep_project(state: &SupervisorState, project: Uuid, copies: &[NodeRef
                 error = %format!("{e:#}"),
                 "deleting a gone copy failed; the next tick tries again"
             );
+            left = true;
         }
     }
-    Ok(())
+    Ok(left)
 }

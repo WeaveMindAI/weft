@@ -55,7 +55,6 @@ pub async fn run(
     )
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("enqueue node test: {e}")))?;
-    state.kick.kick(weft_platform_traits::CoreRole::Dispatcher);
 
     Ok(Json(RunNodeTestResponse { task_id: task_id.to_string() }))
 }

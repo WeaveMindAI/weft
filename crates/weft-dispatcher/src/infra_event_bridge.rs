@@ -11,14 +11,15 @@
 //!
 //! Multi-process concurrency: a drain holds a session advisory lock on its
 //! own connection, taken with `pg_try_advisory_lock`, so only one
-//! dispatcher drains at a time and the others skip rather than wait
-//! (the holder's own wake covers whatever they heard). No transaction
+//! dispatcher drains at a time and the others skip rather than wait,
+//! looking again shortly (the holder may have read before the write they
+//! heard about). No transaction
 //! stays open across the publishes: an open one would hold back the
 //! settled horizon every cursor reads against (`crate::settled`).
 
 use crate::events::DispatcherEvent;
 use crate::infra_event::{self, InfraEvent};
-use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn, SAFETY_POLL_INTERVAL};
+use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn, LOCK_HELD_RETRY, SAFETY_POLL_INTERVAL};
 use crate::settled::{Position, SettledReader};
 use crate::state::DispatcherState;
 
@@ -50,7 +51,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     ],
 };
 
-const ON_INFRA_EVENT: &[WakeOn] = &[WakeOn::any(INFRA_EVENT_CHANNEL)];
+pub(crate) static ON_INFRA_EVENT: &[WakeOn] = &[WakeOn::any(INFRA_EVENT_CHANNEL)];
 
 /// The advisory lock key only one process's drain holds at a time.
 // SYNC: 'infra_event_bridge' <-> CURSOR_KEY (the lock is keyed like the cursor row)
@@ -71,8 +72,9 @@ async fn drain(state: &DispatcherState, reader: &mut SettledReader) -> anyhow::R
         .fetch_one(&mut *conn)
         .await?;
     if !locked {
-        // A sibling is draining; its own wake covers what this one heard.
-        return Ok(DrainStep::Done);
+        // A sibling is draining, but it may have read before the write
+        // this wake is for, so look again shortly.
+        return Ok(DrainStep::RetryIn(LOCK_HELD_RETRY));
     }
     let step = drain_locked(state, reader, &mut conn).await;
     let unlocked = sqlx::query(&format!("SELECT pg_advisory_unlock({DRAIN_LOCK_SQL})"))

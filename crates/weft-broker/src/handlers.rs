@@ -15,7 +15,7 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use weft_broker_client::lifecycle_command::{InfraCommandSignal, INFRA_COMMAND_CHANNEL};
+use weft_broker_client::lifecycle_command::{InfraCommandSignal, INFRA_COMMAND_CHANNEL, ISSUED_WAKE};
 use weft_broker_client::protocol::*;
 use weft_task_store::tasks::{ClaimFilter, DedupOutcome, TaskTarget};
 use weft_task_store::TaskKind;
@@ -480,14 +480,27 @@ pub async fn task_enqueue_dedup(
     if kind == TaskKind::FireSignal.as_str() {
         // Listener held-event fire: the signal token is the tenant
         // anchor. Pull it from the payload and resolve.
-        let token = req
-            .spec
-            .payload
-            .get("token")
-            .and_then(|v| v.as_str())
-            .ok_or((StatusCode::BAD_REQUEST, "fire_signal payload missing token".into()))?;
-        let t = scope::require_signal_owned_by(&state.scope_cache, &state.pool, &caller, token).await?;
+        let fire: weft_task_store::kinds::FireSignalPayload = serde_json::from_value(req.spec.payload.clone())
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("malformed fire_signal payload: {e}")))?;
+        let t = scope::require_signal_owned_by(&state.scope_cache, &state.pool, &caller, &fire.token).await?;
         merge_anchor_tenant(&mut anchor_tenant, t)?;
+        // A held connection fires under its holder's claim: only the
+        // holder itself may name it, and only while the row is still held
+        // under it (another holder took it, or it was registered again to
+        // be served another way, and the copy that lost it has not looked
+        // yet).
+        match crate::held_signals::judge_held_fire(&state.pool, caller.replica.as_deref(), &fire)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+        {
+            crate::held_signals::HeldFire::Taken => {}
+            crate::held_signals::HeldFire::NotItsSender => {
+                return Err((StatusCode::FORBIDDEN, "a held fire names the holder that sends it".into()));
+            }
+            crate::held_signals::HeldFire::NoLongerHeld => {
+                return Err((StatusCode::CONFLICT, format!("signal {} is no longer held by its sender", fire.token)));
+            }
+        }
     }
 
     // These kinds act on the run their PAYLOAD names (the dispatcher's
@@ -570,17 +583,11 @@ pub async fn task_enqueue_dedup(
     // never the wire value and never the caller identity.
     let mut new_task = req.spec;
     new_task.tenant_id = resolved_tenant;
-    let for_dispatcher = new_task.target == TaskTarget::Dispatcher;
     let outcome = state.tasks.enqueue_dedup(new_task).await.map_err(internal)?;
     let (id, inserted) = match outcome {
         DedupOutcome::Inserted(id) => (id, true),
         DedupOutcome::AlreadyLive(id) => (id, false),
     };
-    // The dispatcher may be scaled to zero, and then it hears no
-    // notification of the row: tell it work waits.
-    if for_dispatcher && inserted {
-        state.kick.kick(weft_platform_traits::CoreRole::Dispatcher);
-    }
     Ok(Json(TaskEnqueueDedupResponse { id, inserted }))
 }
 
@@ -916,15 +923,12 @@ pub async fn resolve_connection(
     )
     .await
     .map_err(|e| match e.downcast_ref::<weft_access_store::AccessError>() {
+        // The store's own words name no place to fix it from; a node does.
         Some(weft_access_store::AccessError::NotFound) => (
             StatusCode::NOT_FOUND,
             "this connection does not exist here; pick one on the access node".into(),
         ),
-        Some(weft_access_store::AccessError::Invalid(_))
-        | Some(weft_access_store::AccessError::NeedsReconnect { .. }) => {
-            (StatusCode::CONFLICT, format!("{e}"))
-        }
-        Some(weft_access_store::AccessError::Gone(_)) | None => internal(e),
+        _ => store_err(e),
     })?;
 
     let response = match resolved.owner {
@@ -1338,10 +1342,7 @@ pub async fn supervisor_claim_command(
             return Ok(Json(SupervisorClaim::UnownedWork));
         }
         let woken = heard
-            .woken_before(deadline, |channel, payload| {
-                channel == INFRA_COMMAND_CHANNEL
-                    && matches!(InfraCommandSignal::parse(payload), Some(InfraCommandSignal::Issued { .. }))
-            })
+            .woken_before(deadline, |channel, payload| ISSUED_WAKE.hears(channel, payload))
             .await
             .map_err(internal)?;
         if !woken {
@@ -1423,6 +1424,27 @@ pub async fn supervisor_set_status(
     Ok(Json(SupervisorSetStatusResponse {}))
 }
 
+/// Record what an apply waits on, for `weft status`: the supervisor
+/// writes it as its units come up. Fenced like `set_status` under a
+/// command.
+pub async fn supervisor_set_waiting(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(mut req): Json<SupervisorSetWaitingRequest>,
+) -> Resp<SupervisorSetWaitingResponse> {
+    require_supervisor(&caller)?;
+    require_node_id(&mut req.node_id)?;
+    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
+        .await?;
+    let outcome = crate::lifecycle_writes::set_waiting(&state.pool, &req)
+        .await
+        .map_err(internal)?;
+    fenced_to_http(outcome, || {
+        format!("set_waiting(project={}, node={}, cmd={})", req.project_id, req.node_id, req.command_id)
+    })?;
+    Ok(Json(SupervisorSetWaitingResponse {}))
+}
+
 /// Write the `infra_node` row for an apply command, gated on the
 /// caller still owning the command's claim. Shared by
 /// `set_applied` (Running + hash/endpoints) and
@@ -1445,8 +1467,9 @@ struct ApplyRowState {
     /// `Some` for set_applied; `None` for set_provisioning (the
     /// row hasn't successfully applied yet).
     applied_spec_hash: Option<String>,
-    /// True for set_applied (stamps `applied_at_unix = NOW()`),
-    /// false for provisioning (leaves it NULL).
+    /// True for set_applied (stamps `applied_at_unix = NOW()`, clears
+    /// `provisioning_since_unix`), false for provisioning (the other way
+    /// round). Either way `waiting_on` starts empty.
     stamp_applied_at: bool,
     /// Where the endpoints answer; empty until the apply succeeds.
     addresses: weft_broker_client::protocol::AppliedEndpoints,
@@ -1490,10 +1513,11 @@ async fn write_apply_row(
          (project_id, node_id, instance_id, copy_id, status, \
           failure_stage, failure_message, applied_spec_hash, \
           applied_at_unix, endpoints_json, public_paths_json, doors_json, keep_disks_json, units_json, \
-          install_endpoints_json, notes_json) \
+          install_endpoints_json, notes_json, waiting_on, provisioning_since_unix) \
          SELECT $1, $2, $13, $3, $4, NULL, NULL, $5, \
                 CASE WHEN $6 THEN EXTRACT(EPOCH FROM NOW())::BIGINT ELSE NULL END, \
-                $7, $12, $14, $8, $9, $15, $16 \
+                $7, $12, $14, $8, $9, $15, $16, NULL, \
+                CASE WHEN $6 THEN NULL ELSE EXTRACT(EPOCH FROM NOW())::BIGINT END \
          FROM infra_lifecycle_command \
          WHERE id = $10 \
            AND project_id = $1 \
@@ -1515,7 +1539,9 @@ async fn write_apply_row(
             install_endpoints_json = EXCLUDED.install_endpoints_json, \
             notes_json         = EXCLUDED.notes_json, \
             keep_disks_json = EXCLUDED.keep_disks_json, \
-            units_json         = EXCLUDED.units_json",
+            units_json         = EXCLUDED.units_json, \
+            waiting_on         = NULL, \
+            provisioning_since_unix = EXCLUDED.provisioning_since_unix",
         owns = weft_broker_client::lifecycle_command::owns_project_predicate("$11", "$1"),
     ),
     )
@@ -2240,6 +2266,59 @@ pub async fn signal_write_kind_state(
         .await
         .map_err(internal)?;
     Ok(Json(SignalWriteKindStateResponse { written }))
+}
+
+/// One look of a holder: renew, report, take (see
+/// `SignalHoldRequest`). Bound to the calling replica, so a holder only
+/// ever renews or takes in its own name.
+pub async fn signal_hold(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<SignalHoldRequest>,
+) -> Resp<SignalHoldResponse> {
+    if caller.role != Role::Listener {
+        return Err((StatusCode::FORBIDDEN, "listener only".into()));
+    }
+    require_replica_matches(&caller, &req.replica)?;
+    let out = crate::held_signals::hold(
+        &state.pool,
+        &req.replica,
+        &req.holding,
+        req.room,
+        &req.want,
+        weft_broker_client::protocol::hold_lease_secs(),
+    )
+    .await
+    .map_err(internal)?;
+    Ok(Json(out))
+}
+
+/// What a signal's kind decides about holding it, for a row that said
+/// otherwise.
+pub async fn signal_set_holds(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<SignalSetHoldsRequest>,
+) -> Resp<serde_json::Value> {
+    if caller.role != Role::Listener {
+        return Err((StatusCode::FORBIDDEN, "listener only".into()));
+    }
+    crate::held_signals::set_holds(&state.pool, &req.token, req.holds).await.map_err(internal)?;
+    Ok(Json(serde_json::json!({})))
+}
+
+/// A holder giving up its claims (it is stopping).
+pub async fn signal_let_go(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<SignalLetGoRequest>,
+) -> Resp<serde_json::Value> {
+    if caller.role != Role::Listener {
+        return Err((StatusCode::FORBIDDEN, "listener only".into()));
+    }
+    require_replica_matches(&caller, &req.replica)?;
+    crate::held_signals::let_go(&state.pool, &req.replica).await.map_err(internal)?;
+    Ok(Json(serde_json::json!({})))
 }
 
 // ---------- helpers ----------

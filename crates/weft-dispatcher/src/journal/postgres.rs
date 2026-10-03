@@ -8,7 +8,7 @@
 
 use anyhow::Context;
 use async_trait::async_trait;
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::postgres::PgPool;
 
 use weft_core::ExecutionId;
 
@@ -245,52 +245,6 @@ fn decode_all(execution_id: ExecutionId, rows: Vec<(i64, String)>) -> anyhow::Re
 }
 
 impl PostgresJournal {
-    /// A connected pool for `database_url`
-    /// (`postgres://user:pass@host:port/db`). Retries the initial
-    /// connection for up to 60s so a process that boots before Postgres is
-    /// ready doesn't crash-loop. Applies NO schema: the boot applies
-    /// every group in one pass ([`crate::app::apply_core_schema`]), so
-    /// every pending migration across every group runs in one global id
-    /// order rather than this crate's group jumping the queue.
-    pub async fn connect_pool(database_url: &str) -> anyhow::Result<PgPool> {
-        Self::connect_pool_sized(database_url, 16, std::time::Duration::from_secs(5)).await
-    }
-
-    /// The same, with the pool's own size and acquire timeout.
-    ///
-    /// The work pool and the LOCK pool want different numbers. A lock is
-    /// held for the length of an operation and its connection does no
-    /// work, so a lock taken from the work pool is a connection the
-    /// operation itself then has to wait for; the two are separated so
-    /// that cannot happen (see `lease::with_project_transition_lock`).
-    pub async fn connect_pool_sized(
-        database_url: &str,
-        max_connections: u32,
-        acquire_timeout: std::time::Duration,
-    ) -> anyhow::Result<PgPool> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let pool = loop {
-            match PgPoolOptions::new()
-                .max_connections(max_connections)
-                .acquire_timeout(acquire_timeout)
-                .connect(database_url)
-                .await
-            {
-                Ok(p) => break p,
-                Err(e) if std::time::Instant::now() < deadline => {
-                    tracing::warn!(
-                        target: "weft_dispatcher::journal",
-                        error = %e,
-                        "postgres not ready yet; retrying"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
-                Err(e) => return Err(e.into()),
-            }
-        };
-        Ok(pool)
-    }
-
     /// Wrap an EXISTING pool. Pure: the schema (this crate's [`GROUP`]
     /// included) is applied once, before construction, by
     /// [`crate::app::apply_core_schema`]; a second application here
@@ -694,7 +648,24 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- started by hand, which no activation governs.
             activation_trigger TEXT,
             auth_kind TEXT NOT NULL DEFAULT 'none',
-            auth_config JSONB
+            auth_config JSONB,
+            -- Whether the signal keeps a connection to the outside open
+            -- between fires (its kind's decision for it, from the
+            -- listener's `/prepare`): a holder holds it, and the number
+            -- of holders is counted from these rows.
+            holds BOOLEAN NOT NULL DEFAULT FALSE,
+            -- The holder holding its connection now (its replica id) and
+            -- until when (unix seconds): a lease it renews while it lives
+            -- and another holder takes once it lapses. NULL while nobody
+            -- holds it. A registration that rewrites the row clears both,
+            -- so whoever held the old one lets go and the new one comes up
+            -- fresh.
+            held_by TEXT,
+            held_until BIGINT,
+            -- What its holder says the connection is doing
+            -- (`{"status", "transport"}`), for the node's display, which
+            -- another process renders. NULL while nobody holds it.
+            serving JSONB
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_signal_tenant ON signal(tenant_id)"#,
         r#"CREATE INDEX IF NOT EXISTS idx_signal_project ON signal(project_id)"#,
@@ -704,6 +675,37 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
            WHERE access_id IS NOT NULL"#,
         r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_signal_mount_path
              ON signal(mount_path, mount_methods) WHERE mount_path IS NOT NULL"#,
+        // What a holder claims from: the held signals, by when their
+        // lease ends.
+        r#"CREATE INDEX IF NOT EXISTS idx_signal_held ON signal(held_until) WHERE holds"#,
+        // Wake the holder sizing when a held signal comes or goes, so the
+        // holders start as the first one is registered and stop with the
+        // last.
+        // SYNC: 'weft_held_signals' <-> crate::holders::HELD_SIGNALS_CHANNEL
+        r#"CREATE OR REPLACE FUNCTION signal_held_notify() RETURNS trigger AS $$
+            BEGIN
+                PERFORM pg_notify('weft_held_signals', '');
+                RETURN NULL;
+            END;
+            $$ LANGUAGE plpgsql"#,
+        r#"DROP TRIGGER IF EXISTS signal_held_on_insert ON signal"#,
+        r#"CREATE TRIGGER signal_held_on_insert
+            AFTER INSERT ON signal
+            FOR EACH ROW
+            WHEN (NEW.holds)
+            EXECUTE FUNCTION signal_held_notify()"#,
+        r#"DROP TRIGGER IF EXISTS signal_held_on_delete ON signal"#,
+        r#"CREATE TRIGGER signal_held_on_delete
+            AFTER DELETE ON signal
+            FOR EACH ROW
+            WHEN (OLD.holds)
+            EXECUTE FUNCTION signal_held_notify()"#,
+        r#"DROP TRIGGER IF EXISTS signal_held_on_change ON signal"#,
+        r#"CREATE TRIGGER signal_held_on_change
+            AFTER UPDATE OF holds ON signal
+            FOR EACH ROW
+            WHEN (NEW.holds IS DISTINCT FROM OLD.holds)
+            EXECUTE FUNCTION signal_held_notify()"#,
         // Entry rows are keyed by (project_id, node_id), `node_id`
         // being the trigger's place spelled the way a person writes
         // it (`one.door`), so a file called from two places holds two
@@ -1945,7 +1947,7 @@ macro_rules! signal_columns {
             $p, "consumer_payload, ", $p, "surface_kind, ", $p, "mount_path, ",
             $p, "auth_kind, ", $p, "auth_config, ", $p, "kind_state, ",
             $p, "kind_state_seq, ", $p, "program_json, ", $p, "setup_execution_id, ", $p, "source_version, ",
-            $p, "mount_methods, ", $p, "instance_id, ", $p, "activation_trigger"
+            $p, "mount_methods, ", $p, "instance_id, ", $p, "activation_trigger, ", $p, "holds"
         )
     };
 }
@@ -1980,7 +1982,7 @@ const SIGNAL_SELECT_ENTRY_AT_PLACE: &str = concat!(
 /// parked fires are never among them.
 // SYNC: SIGNAL_REFRESHED_COLUMNS <-> bind_signal_refreshed (same order)
 //       <-> journal/fake.rs `copy_refreshed`
-const SIGNAL_REFRESHED_COLUMNS: [&str; 15] = [
+const SIGNAL_REFRESHED_COLUMNS: [&str; 16] = [
     "spec_json",
     "program_json",
     "setup_execution_id",
@@ -1996,6 +1998,7 @@ const SIGNAL_REFRESHED_COLUMNS: [&str; 15] = [
     "auth_kind",
     "auth_config",
     "kind_state",
+    "holds",
 ];
 
 /// Bind a registration's [`SIGNAL_REFRESHED_COLUMNS`] values, in order.
@@ -2018,13 +2021,15 @@ fn bind_signal_refreshed<'q>(
         .bind(&sig.mount_methods)
         .bind(&sig.auth_kind)
         .bind(sig.auth_config.as_ref())
-        .bind(&sig.kind_state))
+        .bind(&sig.kind_state)
+        .bind(sig.holds))
 }
 
 /// `signal_insert`: the nine identity columns ($1..$9), the refreshed
 /// ones, then the version the registration read (the row lands one past
 /// it). On a token conflict only the refreshed columns change, and only
-/// while the row is still at that version.
+/// while the row is still at that version; the row's holder lets go
+/// ([`LET_GO`]), so the rewritten signal comes up fresh.
 static SIGNAL_INSERT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     const IDENTITY: [&str; 9] = [
         "token", "tenant_id", "project_id", "execution_id", "node_id", "is_resume", "created_at", "instance_id",
@@ -2037,10 +2042,15 @@ static SIGNAL_INSERT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| 
     let set = refreshed.iter().map(|c| format!("{c} = EXCLUDED.{c}")).collect::<Vec<_>>().join(", ");
     format!(
         "INSERT INTO signal ({columns}, kind_state_seq) VALUES ({values}, ${seq} + 1) \
-         ON CONFLICT (token) DO UPDATE SET {set}, kind_state_seq = EXCLUDED.kind_state_seq \
+         ON CONFLICT (token) DO UPDATE SET {set}, kind_state_seq = EXCLUDED.kind_state_seq, {LET_GO} \
          WHERE signal.kind_state_seq = EXCLUDED.kind_state_seq - 1"
     )
 });
+
+/// What a rewrite of a signal row does to its holder: its lease goes, so
+/// the holder running the old row stops it at its next look, and the row
+/// is claimed and brought up again as it now reads.
+const LET_GO: &str = "held_by = NULL, held_until = NULL, serving = NULL";
 
 /// `signal_restore`: the token ($1), the refreshed columns, then the
 /// version the row must still be at (it moves one past).
@@ -2048,7 +2058,7 @@ static SIGNAL_RESTORE: std::sync::LazyLock<String> = std::sync::LazyLock::new(||
     let refreshed = SIGNAL_REFRESHED_COLUMNS;
     let seq = refreshed.len() + 2;
     let set = refreshed.iter().enumerate().map(|(i, c)| format!("{c} = ${}", i + 2)).collect::<Vec<_>>().join(", ");
-    format!("UPDATE signal SET {set}, kind_state_seq = ${seq} + 1 WHERE token = $1 AND kind_state_seq = ${seq}")
+    format!("UPDATE signal SET {set}, kind_state_seq = ${seq} + 1, {LET_GO} WHERE token = $1 AND kind_state_seq = ${seq}")
 });
 
 const SIGNAL_DELETE_BY_EXECUTION_ID_RETURNING: &str =
@@ -2124,6 +2134,7 @@ pub(crate) struct SignalRow {
     pub(crate) auth_config: Option<serde_json::Value>,
     pub(crate) kind_state: serde_json::Value,
     pub(crate) kind_state_seq: i64,
+    pub(crate) holds: bool,
 }
 
 pub(crate) fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration> {
@@ -2193,6 +2204,7 @@ pub(crate) fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration
         auth_config: row.auth_config,
         kind_state: row.kind_state,
         kind_state_seq: row.kind_state_seq,
+        holds: row.holds,
     })
 }
 

@@ -40,14 +40,14 @@ impl ListenerClient {
         Ok(resp)
     }
 
-    /// Bail with `<route> returned <status>: <body>` unless 2xx.
+    /// Fail with [`ListenerRefused`] unless 2xx.
     async fn ok(resp: reqwest::Response, route: &str) -> Result<reqwest::Response> {
         if resp.status().is_success() {
             return Ok(resp);
         }
         let status = resp.status();
         let body = resp.text().await.unwrap_or_else(|e| format!("<body read failed: {e}>"));
-        anyhow::bail!("listener {route} returned {status}: {body}")
+        Err(ListenerRefused { route: route.to_string(), status, body }.into())
     }
 
     /// What the row of a new signal holds, as its kind computes it
@@ -139,9 +139,49 @@ impl ListenerClient {
         Ok(())
     }
 
-    pub async fn unregister(&self, token: &str) -> Result<()> {
-        Self::ok(self.post("/unregister", &serde_json::json!({ "token": token })).await?, "/unregister").await?;
+    /// Tell the listener `sig`'s row is gone, with what it needs to tear
+    /// down what the signal arranged outside.
+    pub async fn unregister(&self, sig: &crate::journal::SignalRegistration) -> Result<()> {
+        Self::ok(self.post("/unregister", &Self::unregister_request(sig, false)?).await?, "/unregister").await?;
         Ok(())
+    }
+
+    /// [`Self::unregister`] for a row replaced by one under the same token
+    /// that is brought up next: answered once the teardown is over, so it
+    /// never reaches what the new row arranges. A row the listener can
+    /// never tear down (it cannot read it, and says so with a 422) is
+    /// logged and passed: refusing would keep the token from ever being
+    /// registered again, and nothing would tear it down later either.
+    /// Answers whether the row was stopped (`false` for one passed). On an
+    /// error the listener may have stopped it before the answer was lost,
+    /// unless it answered that it does not know the row's kind (503),
+    /// which it says before touching anything.
+    pub async fn unregister_replaced(&self, sig: &crate::journal::SignalRegistration) -> Result<bool> {
+        let resp = self.post("/unregister", &Self::unregister_request(sig, true)?).await?;
+        if resp.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            let why = resp.text().await.unwrap_or_else(|e| format!("<body read failed: {e}>"));
+            tracing::error!(
+                target: "weft_dispatcher::listener",
+                token = %sig.token, %why,
+                "the row being replaced cannot be torn down; what it arranged outside stays until it lapses"
+            );
+            return Ok(false);
+        }
+        Self::ok(resp, "/unregister").await?;
+        Ok(true)
+    }
+
+    fn unregister_request(
+        sig: &crate::journal::SignalRegistration,
+        reused: bool,
+    ) -> Result<weft_core::signal::listener_protocol::UnregisterRequest> {
+        Ok(weft_core::signal::listener_protocol::UnregisterRequest {
+            token: sig.token.clone(),
+            tenant_id: sig.tenant_id.clone(),
+            spec: sig.spec()?,
+            kind_state: sig.kind_state.clone(),
+            reused,
+        })
     }
 
     /// Tell the listener to forget each of `signals`, best effort. Does
@@ -152,7 +192,7 @@ impl ListenerClient {
     /// finds the row gone the next time it is asked about the token.
     pub async fn unregister_many(&self, signals: &[crate::journal::SignalRegistration]) {
         for sig in signals {
-            if let Err(e) = self.unregister(&sig.token).await {
+            if let Err(e) = self.unregister(sig).await {
                 tracing::warn!(
                     target: "weft_dispatcher::listener",
                     token = %sig.token,
@@ -163,6 +203,22 @@ impl ListenerClient {
         }
     }
 }
+
+/// A listener's answer that was not a success.
+#[derive(Debug)]
+pub struct ListenerRefused {
+    pub route: String,
+    pub status: reqwest::StatusCode,
+    pub body: String,
+}
+
+impl std::fmt::Display for ListenerRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "listener {} returned {}: {}", self.route, self.status, self.body)
+    }
+}
+
+impl std::error::Error for ListenerRefused {}
 
 /// Whether the listener is listening for `project`: it holds every signal
 /// the durable table has, so that is whether the project has an armed

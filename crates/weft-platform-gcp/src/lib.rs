@@ -6,7 +6,10 @@
 //!   for it: workers on Cloud Run (`runner`), infra on Compute Engine
 //!   (`infra_host`), images on Cloud Build and Artifact Registry
 //!   (`images`), wakes on Cloud Tasks (`alarm`), and caller identities
-//!   verified against Google's keys (`identity`). `api` is the one REST
+//!   verified against Google's keys (`identity`), the object store on
+//!   Cloud Storage (`storage`), frontends on Cloud Run (`frontends`), the
+//!   door in front of the install's domains on a load balancer
+//!   (`domains`), the holders on a worker pool (`holders`). `api` is the one REST
 //!   client they share, `names` what they call things, `accounts` the
 //!   project's own service account.
 
@@ -19,6 +22,12 @@ pub mod alarm;
 #[cfg(feature = "control")]
 pub mod api;
 #[cfg(feature = "control")]
+pub mod domains;
+#[cfg(feature = "control")]
+pub mod frontends;
+#[cfg(feature = "control")]
+pub mod holders;
+#[cfg(feature = "control")]
 pub mod identity;
 #[cfg(feature = "control")]
 pub mod images;
@@ -28,10 +37,13 @@ pub mod infra_host;
 pub mod names;
 #[cfg(feature = "control")]
 pub mod runner;
+#[cfg(feature = "control")]
+pub mod storage;
 
 pub use metadata::MetadataTokens;
 #[cfg(feature = "control")]
 pub use {
-    alarm::CloudTasksAlarm, api::Google, identity::GoogleIdentity, images::CloudBuildImages,
-    infra_host::ComputeInfraHost, runner::CloudRunRunner,
+    alarm::CloudTasksAlarm, api::Google, domains::LoadBalancerDomains, frontends::CloudRunFrontends, holders::WorkerPoolHolders,
+    identity::GoogleIdentity, images::CloudBuildImages, infra_host::ComputeInfraHost, runner::CloudRunRunner,
+    storage::GcsObjectStore,
 };

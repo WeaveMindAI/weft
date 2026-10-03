@@ -1,4 +1,4 @@
-//! `weft target add|list|remove` and `weft login|logout`: the installs a
+//! `weft target add|list|show|remove` and `weft login|logout`: the installs a
 //! project deploys to, and this person's key for each.
 //!
 //! A target is a name in the project's `weft.toml` (`[targets.prod] url
@@ -21,8 +21,9 @@ use crate::credentials;
 pub enum TargetAction {
     Add { name: String, url: String },
     List,
+    Show { name: String },
     Remove { name: String },
-    Export { name: String, github: bool, front_env: Option<std::path::PathBuf> },
+    Export { name: String, github: bool, front_env: Option<std::path::PathBuf>, frontend: Option<String> },
 }
 
 pub async fn run(ctx: Ctx, action: TargetAction) -> Result<()> {
@@ -47,7 +48,22 @@ pub async fn run(ctx: Ctx, action: TargetAction) -> Result<()> {
             anyhow::ensure!(removed, "no target '{name}' in {}", manifest.display());
             println!("target '{name}' removed (any key you stored for it stays until `weft logout`)");
         }
-        TargetAction::Export { name, github, front_env } => export(project, &name, github, front_env.as_deref()).await?,
+        TargetAction::Export { name, github, front_env, frontend } => {
+            export(project, &name, github, front_env.as_deref(), frontend.as_deref()).await?
+        }
+        TargetAction::Show { name } => {
+            let url = project.target_url(&name).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let key = credentials::operator_key_for(&url, Some(&name))?;
+            let info = crate::client::DispatcherClient::new(url.clone(), key).get_json("/install").await?;
+            if ctx.json_out(&info)? {
+                return Ok(());
+            }
+            let info: weft_core::install::InstallInfo = serde_json::from_value(info)
+                .with_context(|| format!("{url} answered /install with something that is not an install description"))?;
+            for line in describe_install(&name, &info) {
+                println!("{line}");
+            }
+        }
         TargetAction::List => {
             let stored = credentials::load()?;
             let env = std::env::var(credentials::OPERATOR_KEY_ENV).ok();
@@ -126,7 +142,7 @@ pub async fn login(ctx: Ctx, name: String, key_stdin: bool) -> Result<()> {
     anyhow::ensure!(!key.is_empty(), "no key given; nothing was stored");
     // Proven before it is stored, so a typo fails here with the install's
     // own answer rather than on the next deploy.
-    crate::client::DispatcherClient::new(url.clone(), Some(key.clone()))
+    let info = crate::client::DispatcherClient::new(url.clone(), Some(key.clone()))
         .get_json("/install")
         .await
         .with_context(|| format!("{url} refused this key; nothing was stored"))?;
@@ -134,7 +150,28 @@ pub async fn login(ctx: Ctx, name: String, key_stdin: bool) -> Result<()> {
     stored.set(&url, key)?;
     credentials::save(&stored)?;
     println!("logged in to {name} ({url}); act on it with `--on {name}`");
+    if let Ok(info) = serde_json::from_value::<weft_core::install::InstallInfo>(info) {
+        for line in describe_install(&name, &info).into_iter().skip(1) {
+            println!("{line}");
+        }
+    }
     Ok(())
+}
+
+/// Where an install lives, a line each: its address, and on a cloud its
+/// project and region, which nothing else on this machine records.
+fn describe_install(name: &str, info: &weft_core::install::InstallInfo) -> Vec<String> {
+    let mut lines = vec![format!("{name}: {}", info.public_url)];
+    match &info.cloud {
+        Some(weft_core::install::CloudInstall::Gcp(gcp)) => {
+            lines.push(format!("  on GCP: project {}, region {}", gcp.project, gcp.region));
+        }
+        None => lines.push("  on this machine".to_string()),
+    }
+    if let Some(source) = &info.source {
+        lines.push(format!("  runs weft {} at {}", source.repository, source.commit));
+    }
+    lines
 }
 
 pub async fn logout(ctx: Ctx, name: String) -> Result<()> {
@@ -152,7 +189,7 @@ pub async fn logout(ctx: Ctx, name: String) -> Result<()> {
 
 /// Write `secrets` as `KEY=value` lines to a file only this user can read,
 /// under the install's own folder, and answer its path.
-fn write_secrets_file(target: &str, secrets: &[(&'static str, String)]) -> Result<std::path::PathBuf> {
+pub(crate) fn write_secrets_file(target: &str, secrets: &[(&'static str, String)]) -> Result<std::path::PathBuf> {
     use std::io::Write;
     let dir = weft_core::infra::Install::from_env().map_err(anyhow::Error::msg)?.dir().join("exports");
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
@@ -176,12 +213,14 @@ struct RepositorySettings {
     secrets: Vec<(&'static str, String)>,
 }
 
-/// The two credentials the workflow uses: an operator key to deploy the
-/// program, and a caller token the frontend's server calls with; and the
-/// frontend's own environment, when one was handed over.
+/// The credentials the workflow uses: an operator key to deploy the
+/// program, and, when the install hosts a frontend for it, where that
+/// frontend runs and the token its server calls with; and the frontend's
+/// own environment, when one was handed over.
 struct CiKeys {
     operator_key: String,
-    frontend_token: String,
+    /// The frontend the install hosts for this repository, when it has one.
+    frontend: Option<HandedFrontend>,
     /// A dotenv file's contents (`weft infra env --into` writes them):
     /// the program's database address and credentials, a sign-in secret.
     front_env: Option<String>,
@@ -199,9 +238,6 @@ fn repository_settings(
             info.public_url
         );
     };
-    let internal = info.internal_url.clone().with_context(|| {
-        format!("{} does not say where a frontend beside it reaches it", info.public_url)
-    })?;
     let source = info.source.as_ref().with_context(|| {
         format!(
             "{} does not say which weft it runs; run its install workflow again",
@@ -213,7 +249,6 @@ fn repository_settings(
             ("WEFT_TARGET", target.to_string()),
             ("WEFT_SOURCE_REPOSITORY", source.repository.clone()),
             ("WEFT_SOURCE_COMMIT", source.commit.clone()),
-            ("WEFT_INTERNAL_URL", internal),
             ("WEFT_PUBLIC_URL", info.public_url.clone()),
             ("GCP_PROJECT_ID", gcp.project.clone()),
             ("GCP_REGION", gcp.region.clone()),
@@ -223,10 +258,19 @@ fn repository_settings(
             ("GCP_DEPLOYER_SERVICE_ACCOUNT", gcp.deployer_service_account.clone()),
             ("GCP_FRONTEND_SERVICE_ACCOUNT", gcp.frontend_service_account.clone()),
             ("GCP_WORKLOAD_IDENTITY_PROVIDER", gcp.workload_identity_provider.clone()),
-        ],
+        ]
+        .into_iter()
+        .chain(keys.frontend.iter().flat_map(|f| {
+            [
+                ("WEFT_FRONTEND_NAME", f.name.clone()),
+                ("WEFT_FRONTEND_SERVICE", f.service.clone()),
+                ("WEFT_FRONTEND_TOKEN_ID", f.token_id.to_string()),
+            ]
+        }))
+        .collect(),
         secrets: [
             Some(("WEFT_OPERATOR_KEY", keys.operator_key)),
-            Some(("WEFT_FRONTEND_TOKEN", keys.frontend_token)),
+            keys.frontend.map(|f| ("WEFT_FRONTEND_TOKEN", f.token)),
             keys.front_env.map(|env| ("WEFT_FRONT_ENV", env)),
         ]
         .into_iter()
@@ -240,6 +284,7 @@ async fn export(
     name: &str,
     github: bool,
     front_env: Option<&Path>,
+    frontend: Option<&str>,
 ) -> Result<()> {
     // Read before anything is minted, so a wrong path leaves no stray keys.
     let front_env = front_env
@@ -253,30 +298,39 @@ async fn export(
         .with_context(|| format!("{url} answered /install with something that is not an install description"))?;
     // Checked before anything is minted, so a missing `gh` leaves no
     // stray keys on the install.
-    if github {
-        let status = std::process::Command::new("gh")
-            .args(["repo", "view", "--json", "nameWithOwner"])
+    let repo = if github {
+        let out = std::process::Command::new("gh")
+            .args(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"])
             .current_dir(&project.root)
-            .stdout(std::process::Stdio::null())
-            .status()
+            .output()
             .context("run gh (the GitHub CLI); install it, or leave out --github to print the settings")?;
         anyhow::ensure!(
-            status.success(),
+            out.status.success(),
             "gh cannot see this project's GitHub repository (not logged in, or no remote yet); \
              fix that, or leave out --github to print the settings"
         );
-    }
+        Some(super::frontend::repository(String::from_utf8_lossy(&out.stdout).trim())?)
+    } else {
+        None
+    };
+    // Which frontend this repository's workflow deploys, decided before
+    // anything is minted, so a refusal leaves no stray key.
+    let frontends: Vec<weft_core::frontend::Frontend> =
+        serde_json::from_value(client.get_json(&format!("/projects/{}/frontends", project.id())).await?)
+            .context("read the project's frontends")?;
+    let frontend = hosted_frontend(&frontends, frontend, repo.as_ref())?;
+
     let labels = ExportLabels::of(project);
-    let (keys, fresh) = mint_ci_keys(&client, name, project, &labels, front_env).await?;
+    let (keys, minted) = mint_ci_keys(&client, name, project, &labels, front_env, frontend).await?;
     let prepared = async {
         let settings = repository_settings(name, &info, keys)?;
-        let stale = stale_exports(&client, &labels, &fresh).await?;
+        let stale = stale_exports(&client, &labels, &minted.keys).await?;
         anyhow::Ok((settings, stale))
     }
     .await;
     let (settings, stale) = match prepared {
         Ok(prepared) => prepared,
-        Err(e) => return Err(take_back(&client, &fresh, e, name).await),
+        Err(e) => return Err(take_back(&client, &minted, e, name).await),
     };
     if !github {
         println!("repository variables:");
@@ -296,12 +350,27 @@ async fn export(
         for id in &stale {
             println!("an earlier export's key {id} still works; once these are in place: weft token revoke {id} --on {name}");
         }
+        if let Some((_, frontend, _)) = &minted.frontend {
+            println!(
+                "frontend '{frontend}' keeps its old token working until the deploy workflow puts the new one in place and retires it"
+            );
+        }
         return Ok(());
     }
     if let Err(e) = set_repository_values(&project.root, &settings) {
-        return Err(take_back(&client, &fresh, e, name).await);
+        return Err(take_back(&client, &minted, e, name).await);
     }
-    println!("set the repository's variables and secrets; run its deploy workflow from the Actions tab");
+    println!("set on the repository:");
+    for (k, v) in &settings.variables {
+        println!("  variable {k}={v}");
+    }
+    for (k, _) in &settings.secrets {
+        println!("  secret   {k}");
+    }
+    println!("run its deploy workflow from the Actions tab");
+    if let Some((_, frontend, _)) = &minted.frontend {
+        println!("frontend '{frontend}' keeps its old token working until that run deploys the new one and retires it");
+    }
     // The repository now holds the new keys, so an earlier export's are
     // held by nobody.
     revoke_all(&client, &stale).await.with_context(|| {
@@ -314,22 +383,32 @@ async fn export(
 }
 
 /// An export that failed after minting: nobody holds the keys it minted,
-/// so they are revoked. The export's own failure stays the message, and
-/// what became of its keys goes on a line beneath it.
-async fn take_back(client: &crate::client::DispatcherClient, fresh: &[String], e: anyhow::Error, target: &str) -> anyhow::Error {
-    let keys = match revoke_all(client, fresh).await {
+/// so they are revoked, and the frontend's new token is dropped (it keeps
+/// the one it has). The export's own failure stays the message, and what
+/// became of its keys goes on a line beneath it.
+async fn take_back(client: &crate::client::DispatcherClient, minted: &Minted, e: anyhow::Error, target: &str) -> anyhow::Error {
+    let keys = match revoke_all(client, &minted.keys).await {
         Ok(()) => "the keys this export minted were revoked".to_string(),
         Err(revoke) => format!(
             "revoking the keys this export minted failed ({revoke:#}); revoke them with `weft token revoke <id> --on {target}`"
         ),
     };
-    anyhow::anyhow!("{e:#}\n{keys}")
+    let front = match &minted.frontend {
+        None => String::new(),
+        Some((path, name, token)) => match client.delete(&format!("{path}/token/{token}")).await {
+            Ok(()) => format!("; frontend '{name}' keeps the token it had"),
+            Err(drop) => format!("; dropping frontend '{name}''s new token failed ({drop:#}), the one it had still works"),
+        },
+    };
+    anyhow::anyhow!("{e:#}\n{keys}{front}")
 }
 
 /// The name and kind each key `weft target export` mints carries, so a
 /// later export finds the ones an earlier one left: exact labels, with
 /// the project's id, so two projects of one name never touch each
-/// other's keys.
+/// other's keys. `frontend` is what exports named the frontend's token
+/// before each frontend kept a token of its own (`weft frontend`): such a
+/// key is retired like any other an export left.
 struct ExportLabels {
     id: uuid::Uuid,
     operator: String,
@@ -370,29 +449,99 @@ impl ExportLabels {
     }
 }
 
-/// Mint the workflow's two keys, answering them with their ids. A failure
-/// minting the second revokes the first.
+/// The frontend the install hosts that this export hands its repository:
+/// the one named (`--frontend`), else the one that deploys from this
+/// repository, else the only one the install hosts for the project. None
+/// when it hosts none: the workflow then deploys the program alone.
+fn hosted_frontend<'a>(
+    frontends: &'a [weft_core::frontend::Frontend],
+    named: Option<&str>,
+    repo: Option<&weft_core::frontend::Repository>,
+) -> Result<Option<&'a weft_core::frontend::Frontend>> {
+    let hosted: Vec<&weft_core::frontend::Frontend> =
+        frontends.iter().filter(|f| f.host == weft_core::frontend::FrontendHost::CloudRun).collect();
+    if let Some(name) = named {
+        return hosted
+            .iter()
+            .find(|f| f.name == name)
+            .copied()
+            .map(Some)
+            .with_context(|| format!("the install hosts no frontend named '{name}' for this project (`weft frontend ls` lists them)"));
+    }
+    let candidates: Vec<&weft_core::frontend::Frontend> = match repo {
+        // By id: a repository renamed since keeps deploying its frontend.
+        Some(repo) => hosted.iter().filter(|f| f.repo.as_ref().is_some_and(|r| r.id == repo.id)).copied().collect(),
+        None => hosted,
+    };
+    match candidates.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some(one)),
+        many => anyhow::bail!(
+            "the install hosts several frontends this repository could deploy ({}); name one with --frontend",
+            many.iter().map(|f| f.name.as_str()).collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
+/// Mint the workflow's operator key, and a new token for the frontend it
+/// deploys (beside the one it has, which keeps working until the new one is
+/// in place), answering what was minted. A failure on the second takes back
+/// the first.
 async fn mint_ci_keys(
     client: &crate::client::DispatcherClient,
     target: &str,
     project: &weft_compiler::project::Project,
     labels: &ExportLabels,
     front_env: Option<String>,
-) -> Result<(CiKeys, Vec<String>)> {
-    async fn mint(client: &crate::client::DispatcherClient, body: MintTokenRequest) -> Result<(String, String)> {
-        let minted: MintedToken = serde_json::from_value(client.post_json("/signal-tokens", &serde_json::to_value(&body)?).await?)
-            .context("read the token the install minted")?;
-        Ok((minted.token, minted.id.to_string()))
-    }
+    frontend: Option<&weft_core::frontend::Frontend>,
+) -> Result<(CiKeys, Minted)> {
     let operator = MintTokenRequest { kind: TokenKind::Operator, ..MintTokenRequest::caller(labels.operator.clone()) };
-    let (operator_key, operator_id) = mint(client, operator).await?;
-    let frontend = MintTokenRequest { allowed_projects: vec![project.id()], ..MintTokenRequest::caller(labels.frontend.clone()) };
-    let frontend = mint(client, frontend).await;
-    let (frontend_token, frontend_id) = match frontend {
-        Ok(minted) => minted,
-        Err(e) => return Err(take_back(client, std::slice::from_ref(&operator_id), e, target).await),
+    let minted: MintedToken = serde_json::from_value(client.post_json("/signal-tokens", &serde_json::to_value(&operator)?).await?)
+        .context("read the token the install minted")?;
+    let mut made = Minted { keys: vec![minted.id.to_string()], frontend: None };
+    let operator_key = minted.token;
+    let frontend = match frontend {
+        None => None,
+        Some(f) => {
+            let path = format!("/projects/{}/frontends/{}", project.id(), f.name);
+            let renewed = async {
+                let answer = client.post_json(&format!("{path}/token"), &serde_json::json!({})).await?;
+                let renewed: weft_core::frontend::FrontendWithToken =
+                    serde_json::from_value(answer).context("read the frontend's new token")?;
+                let service = renewed
+                    .frontend
+                    .service
+                    .with_context(|| format!("the install names no service for frontend '{}'", f.name))?;
+                anyhow::Ok(HandedFrontend { name: f.name.clone(), service, token: renewed.token, token_id: renewed.token_id })
+            }
+            .await;
+            match renewed {
+                Ok(handed) => {
+                    made.frontend = Some((path, f.name.clone(), handed.token_id));
+                    Some(handed)
+                }
+                Err(e) => return Err(take_back(client, &made, e, target).await),
+            }
+        }
     };
-    Ok((CiKeys { operator_key, frontend_token, front_env }, vec![operator_id, frontend_id]))
+    Ok((CiKeys { operator_key, frontend, front_env }, made))
+}
+
+/// The frontend an export hands the workflow: its name, its service, and
+/// its new token.
+struct HandedFrontend {
+    name: String,
+    service: String,
+    token: String,
+    /// The token's id: what the workflow names to put it in place.
+    token_id: uuid::Uuid,
+}
+
+/// What an export minted: its keys' ids, and the frontend it made a new
+/// token for (its path on the install, its name, the token's id).
+struct Minted {
+    keys: Vec<String>,
+    frontend: Option<(String, String, uuid::Uuid)>,
 }
 
 /// The keys an earlier export of this project left on the install.
@@ -507,10 +656,13 @@ mod tests {
     #[test]
     fn a_cloud_install_becomes_the_workflows_settings() {
         use weft_core::install::{CloudInstall, GcpInstall, InstallInfo, WeftSource};
-        let keys = || CiKeys { operator_key: "op".into(), frontend_token: "fr".into(), front_env: None };
+        let keys = || CiKeys {
+            operator_key: "op".into(),
+            frontend: Some(HandedFrontend { name: "front".into(), service: "fe-svc".into(), token: "fr".into(), token_id: uuid::Uuid::nil() }),
+            front_env: None,
+        };
         let mut info = InstallInfo {
             public_url: "https://w.example.com".into(),
-            internal_url: Some("http://10.10.0.100".into()),
             cloud: Some(CloudInstall::Gcp(GcpInstall {
                 project: "p".into(),
                 region: "us-central1".into(),
@@ -522,12 +674,14 @@ mod tests {
                 workload_identity_provider: "wip".into(),
             })),
             source: Some(WeftSource { repository: "me/weft".into(), commit: "abc".into() }),
-            address: None,
         };
         let settings = repository_settings("prod", &info, keys()).unwrap();
         assert!(settings.variables.contains(&("WEFT_TARGET", "prod".into())));
         assert!(settings.variables.contains(&("WEFT_SOURCE_COMMIT", "abc".into())));
         assert!(settings.secrets.contains(&("WEFT_FRONTEND_TOKEN", "fr".into())));
+        assert!(settings.variables.contains(&("WEFT_FRONTEND_SERVICE", "fe-svc".into())));
+        let alone = repository_settings("prod", &info, CiKeys { frontend: None, ..keys() }).unwrap();
+        assert!(!alone.secrets.iter().any(|(k, _)| *k == "WEFT_FRONTEND_TOKEN"), "no hosted frontend, no frontend settings");
         info.source = None;
         assert!(repository_settings("prod", &info, keys()).unwrap_err().to_string().contains("install workflow"));
         info.cloud = None;
@@ -551,7 +705,6 @@ mod tests {
         read.sort();
         let info = weft_core::install::InstallInfo {
             public_url: "https://w".into(),
-            internal_url: Some("http://i".into()),
             cloud: Some(weft_core::install::CloudInstall::Gcp(weft_core::install::GcpInstall {
                 project: String::new(),
                 region: String::new(),
@@ -563,14 +716,48 @@ mod tests {
                 workload_identity_provider: String::new(),
             })),
             source: Some(weft_core::install::WeftSource { repository: String::new(), commit: String::new() }),
-            address: None,
         };
         let settings =
-            repository_settings("t", &info, CiKeys { operator_key: String::new(), frontend_token: String::new(), front_env: Some(String::new()) }).unwrap();
+            repository_settings(
+                "t",
+                &info,
+                CiKeys {
+                    operator_key: String::new(),
+                    frontend: Some(HandedFrontend { name: String::new(), service: String::new(), token: String::new(), token_id: uuid::Uuid::nil() }),
+                    front_env: Some(String::new()),
+                },
+            )
+            .unwrap();
         let mut set: Vec<String> =
             settings.variables.iter().chain(&settings.secrets).map(|(k, _)| k.to_string()).collect();
         set.sort();
         assert_eq!(read, set);
+    }
+
+    #[test]
+    fn the_frontend_an_export_hands_over_is_the_named_one_or_this_repositorys() {
+        use weft_core::frontend::{Frontend, FrontendHost};
+        let f = |name: &str, host: FrontendHost, repo: Option<&str>| Frontend {
+            name: name.into(),
+            project: uuid::Uuid::nil(),
+            host,
+            repo: repo.map(|r| weft_core::frontend::Repository { name: r.into(), id: if r == "me/shop" { 1 } else { 2 } }),
+            service: Some(format!("fe-{name}")),
+            url: None,
+            token_id: uuid::Uuid::nil(),
+            pending_token_ids: Vec::new(),
+        };
+        let all = [
+            f("shop", FrontendHost::CloudRun, Some("me/shop")),
+            f("admin", FrontendHost::CloudRun, Some("me/admin")),
+            f("app", FrontendHost::External, None),
+        ];
+        let repo = |name: &str, id| weft_core::frontend::Repository { name: name.into(), id };
+        assert_eq!(hosted_frontend(&all, None, Some(&repo("me/renamed-shop", 1))).unwrap().unwrap().name, "shop", "by id");
+        assert_eq!(hosted_frontend(&all, Some("admin"), Some(&repo("me/shop", 1))).unwrap().unwrap().name, "admin");
+        assert!(hosted_frontend(&all, None, Some(&repo("me/other", 9))).unwrap().is_none(), "nothing hosted for this repository");
+        assert!(hosted_frontend(&all, None, None).unwrap_err().to_string().contains("--frontend"));
+        assert!(hosted_frontend(&all, Some("app"), None).is_err(), "an outside frontend is deployed by nobody here");
     }
 
     #[test]

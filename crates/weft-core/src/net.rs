@@ -103,6 +103,12 @@ pub fn tls_config() -> Result<Arc<rustls::ClientConfig>, String> {
         .clone()
 }
 
+/// The scheme a caller used, as weft's own doors pass it on. It wins over
+/// `X-Forwarded-Proto`, which Cloud Run's front end replaces with the
+/// https it was itself reached on, whatever the caller used before it.
+// SYNC: WEFT_FORWARDED_PROTO <-> packages/weft-connect/src/server/passthrough.ts WEFT_FORWARDED_PROTO
+pub const WEFT_FORWARDED_PROTO: &str = "x-weft-forwarded-proto";
+
 /// The absolute base URL a client used to reach this service, from the
 /// request's own `Host` (and `X-Forwarded-Proto` when a proxy fronted
 /// it), or `None` when the request carries no usable host.
@@ -136,7 +142,7 @@ pub fn tls_config() -> Result<Arc<rustls::ClientConfig>, String> {
 /// the links this builds are only ever capability URLs whose token is
 /// the credential. A forged host redirects the forger to their own
 /// server with a token they already had, which grants them nothing new.
-// SYNC: the forwarded headers <-> packages/weft-connect/src/server/passthrough.ts FORWARDED_HOST, FORWARDED_PROTO, FORWARDED_PREFIX
+// SYNC: the forwarded headers <-> packages/weft-connect/src/server/passthrough.ts FORWARDED_HOST, FORWARDED_PROTO, WEFT_FORWARDED_PROTO, FORWARDED_PREFIX
 pub fn request_base_url(headers: &http::HeaderMap) -> Option<String> {
     let host = match headers.get("x-forwarded-host") {
         Some(forwarded) => first_hop(forwarded)?,
@@ -152,7 +158,8 @@ pub fn request_base_url(headers: &http::HeaderMap) -> Option<String> {
     // A proxy that terminated TLS says so; otherwise the scheme is
     // whatever this listener speaks, which is plain http.
     let scheme = headers
-        .get("x-forwarded-proto")
+        .get(WEFT_FORWARDED_PROTO)
+        .or_else(|| headers.get("x-forwarded-proto"))
         .and_then(first_hop)
         .map(|v| v.to_ascii_lowercase())
         .filter(|v| v == "http" || v == "https")

@@ -116,8 +116,10 @@ fn status_of(build: &Value) -> BuildStatus {
     };
     match status {
         "SUCCESS" => BuildStatus::Succeeded,
-        "FAILURE" | "INTERNAL_ERROR" | "TIMEOUT" => BuildStatus::Failed { reason: detail() },
-        "CANCELLED" | "EXPIRED" => BuildStatus::Gone,
+        // Cancelled (by weft's own release, after the end was recorded, or
+        // by somebody in the console) and expired (queued too long) are
+        // ends Cloud Build knows and words: its words are the reason.
+        "FAILURE" | "INTERNAL_ERROR" | "TIMEOUT" | "CANCELLED" | "EXPIRED" => BuildStatus::Failed { reason: detail() },
         _ => BuildStatus::Pending,
     }
 }
@@ -156,7 +158,8 @@ impl ImageBuilder for CloudBuildImages {
             .pointer("/metadata/build/id")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("Cloud Build started a build without an id: {op}"))?;
-        Ok(BuildHandle { external_build_id: id.to_string() })
+        let log_url = op.pointer("/metadata/build/logUrl").and_then(Value::as_str).map(str::to_string);
+        Ok(BuildHandle { external_build_id: id.to_string(), log_url })
     }
 
     async fn poll(&self, handle: &BuildHandle) -> anyhow::Result<BuildStatus> {
@@ -214,7 +217,7 @@ impl ImageBuilder for CloudBuildImages {
             repo.repo,
             package.replace('/', "%2F")
         );
-        let Some(found) = self.google.get_opt(&tag_url).await? else { return Ok(ImageDeleted::Deleted) };
+        let Some(found) = self.google.get_opt(&tag_url).await? else { return Ok(ImageDeleted::Absent) };
         let version = found
             .get("version")
             .and_then(Value::as_str)
@@ -263,7 +266,7 @@ mod tests {
     fn a_build_status_is_read_as_weft_reads_builds() {
         assert_eq!(status_of(&json!({ "status": "WORKING" })), BuildStatus::Pending);
         assert_eq!(status_of(&json!({ "status": "SUCCESS" })), BuildStatus::Succeeded);
-        assert_eq!(status_of(&json!({ "status": "CANCELLED" })), BuildStatus::Gone);
+        assert_eq!(status_of(&json!({ "status": "CANCELLED" })), BuildStatus::Failed { reason: "CANCELLED".into() }, "an end Cloud Build words itself");
         let BuildStatus::Failed { reason } = status_of(&json!({ "status": "FAILURE", "statusDetail": "step 0 failed", "logUrl": "https://log" })) else {
             panic!()
         };

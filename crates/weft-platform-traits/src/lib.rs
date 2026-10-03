@@ -16,6 +16,9 @@
 //!   - `roles`: weft's own roles and where each one runs.
 //!   - `config`: the install's one config file.
 //!   - `object_store`: files.
+//!   - `frontends`: hosting a project's frontend on the install's cloud.
+//!   - `domains`: the door in front of the install's own domains.
+//!   - `holder_pool`: how many holders keep held connections open.
 //!   - `clock`: time, abstracted so tests advance it deterministically.
 //!   - `drain`: waiting for a project's running executions to finish
 //!     before a disruptive lifecycle step.
@@ -27,7 +30,10 @@
 pub mod alarm;
 pub mod clock;
 pub mod config;
+pub mod domains;
 pub mod drain;
+pub mod frontends;
+pub mod holder_pool;
 pub mod identity;
 pub mod images;
 pub mod infra_host;
@@ -41,25 +47,32 @@ pub use clock::{Clock, SystemClock};
 pub use config::{InstallConfig, PlatformConfig};
 pub use drain::{drain_until_zero, DrainOutcome, DRAIN_POLL_INTERVAL};
 pub use identity::{CallerIdentity, FixedToken, IdentityRefused, IdentityTokens, Principal};
+pub use domains::DomainHosting;
+pub use frontends::{FrontendHosting, FrontendSite, HostedFrontend};
+pub use holder_pool::HolderPool;
 pub use images::{BuildHandle, BuildRequest, BuildStatus, ImageBuilder, ImageDeleted};
 pub use infra_host::{EndpointAt, InfraHost, UnitObservation, UnitRunState};
 pub use object_store::{
     object_store_for, ObjectEntry, ObjectStore, ObjectStoreConfig, PresignAudience,
     S3ObjectStore, SharedObjectStore,
 };
-pub use roles::{CoreRole, Kick, Placement, RoleAddresses, RolePlacement, Vantage};
+pub use roles::{CoreRole, Placement, RoleAddresses, RolePlacement, Vantage};
 pub use runner::{Patience, Runner, WorkerCall, WorkerEndpoint, WorkerOverrides, WorkerSettings, WorkerStarting, WorkerTarget, WorkersResponse, WORKER_ANSWER_HEADER, WORKER_AUTH_HEADER};
 #[cfg(any(test, feature = "test-helpers"))]
 pub use alarm::fake::FakeAlarm;
 #[cfg(any(test, feature = "test-helpers"))]
 pub use clock::FakeClock;
 #[cfg(any(test, feature = "test-helpers"))]
+pub use domains::fake::FakeDomainHosting;
+#[cfg(any(test, feature = "test-helpers"))]
+pub use frontends::fake::{FakeFrontendHosting, FrontendCall};
+#[cfg(any(test, feature = "test-helpers"))]
+pub use holder_pool::fake::FakeHolderPool;
+#[cfg(any(test, feature = "test-helpers"))]
 pub use images::FakeImageBuilder;
 #[cfg(any(test, feature = "test-helpers"))]
 pub use object_store::fake::{FakeCall as ObjectStoreFakeCall, FakeObjectStore};
 #[cfg(any(test, feature = "test-helpers"))]
 pub use runner::fake::{FakeRunner, RunnerCall};
-#[cfg(any(test, feature = "test-helpers"))]
-pub use roles::fake::FakeKick;
 #[cfg(any(test, feature = "test-helpers"))]
 pub use infra_host::fake::{FakeInfraHost, HostCall};

@@ -3,8 +3,9 @@
 //!
 //! The runtime runs the schema, builds the state from the install config
 //! and the platform's implementations, registers the task executors, runs
-//! the background loops (on the machine, or once per tick when the
-//! dispatcher is a service of its own), and serves the router. Each
+//! the background loops (in a local install's one process, or once per
+//! tick when the dispatcher is a service of its own), and serves the
+//! router behind the door that routes by name (`crate::door`). Each
 //! building block takes what it needs as plain construction input.
 
 use std::sync::Arc;
@@ -13,7 +14,7 @@ use anyhow::Context;
 use tracing::info;
 use weft_platform_traits::config::{AuthMode, InstallConfig};
 use weft_platform_traits::CoreRole;
-use weft_task_store::drain::DrainLoop;
+use weft_task_store::drain::{DrainLoop, WakeOn};
 
 use crate::authenticator::local_authenticator;
 use crate::journal::postgres::PostgresJournal;
@@ -65,6 +66,8 @@ pub static ALL_GROUPS: &[&weft_task_store::SchemaGroup] = &[
     &crate::project_store::GROUP,
     // The install's domains; a project's go with it.
     &crate::domains::GROUP,
+    // A project's frontends; they go with it.
+    &crate::frontends::GROUP,
     // Hangs off `project` (its rows cascade with the project).
     &crate::activation_store::GROUP,
     // The version tree hangs off `project` (its foreign keys and the head
@@ -78,6 +81,9 @@ pub static ALL_GROUPS: &[&weft_task_store::SchemaGroup] = &[
     // The wakes a local install has set and not yet delivered (a cloud
     // keeps them in its own queue; the table stays empty there).
     &weft_task_store::alarm::GROUP,
+    // When each loop of a role that scales to zero next wants a look
+    // (`weft_task_store::drain`); empty on a local install.
+    &weft_task_store::drain::GROUP,
 ];
 
 /// The construction-time policies threaded into `build_state`: who a
@@ -120,6 +126,8 @@ pub const DISPATCHER_CHANNELS: &[&str] = &[
     crate::reaper::PARKED_FIRE_CHANNEL,
     crate::reaper::STORAGE_SWEEP_CHANNEL,
     crate::display_feeds::LOOK_NOW_CHANNEL,
+    crate::holders::HELD_SIGNALS_CHANNEL,
+    crate::domains::DOMAINS_CHANNEL,
 ];
 
 /// What the dispatcher is built from: the install's config and what the
@@ -138,9 +146,11 @@ pub struct DispatcherSettings<'a> {
     pub runner: Arc<dyn weft_platform_traits::Runner>,
     pub host: Arc<dyn weft_platform_traits::InfraHost>,
     pub images: Arc<dyn weft_platform_traits::ImageBuilder>,
+    pub frontends: Arc<dyn weft_platform_traits::FrontendHosting>,
+    pub domains: Arc<dyn weft_platform_traits::DomainHosting>,
+    pub holder_pool: Arc<dyn weft_platform_traits::HolderPool>,
     /// The dispatcher's identity for its calls to the other roles.
     pub tokens: Arc<dyn weft_platform_traits::IdentityTokens>,
-    pub kick: Arc<dyn weft_platform_traits::Kick>,
     /// Signs live-caller routing tickets (`WEFT_CALLER_TOKEN_SECRET`).
     pub caller_token_secret: Vec<u8>,
 }
@@ -148,8 +158,21 @@ pub struct DispatcherSettings<'a> {
 /// Build the dispatcher state.
 pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -> anyhow::Result<DispatcherState> {
     let Defaults { authenticator, tenant_router, project_reclaimer } = defaults;
-    let DispatcherSettings { config, replica, pool, lock_pool, signals, runner, host, images, tokens, kick, caller_token_secret } =
-        settings;
+    let DispatcherSettings {
+        config,
+        replica,
+        pool,
+        lock_pool,
+        signals,
+        runner,
+        host,
+        images,
+        frontends,
+        domains,
+        holder_pool,
+        tokens,
+        caller_token_secret,
+    } = settings;
     for channel in DISPATCHER_CHANNELS {
         signals.require(channel)?;
     }
@@ -166,8 +189,8 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
     let event_bus = crate::EventBus::with_notify(pool.clone(), &signals)?;
     let displays = crate::display_feeds::DisplayFeeds::with_look_now(&signals)?;
     // The other roles as this dispatcher reaches them, from where its
-    // own placement puts it (the machine's loopback is only the
-    // machine's).
+    // own placement puts it (a local install's loopback is only its own
+    // process's).
     let addresses = config.role_addresses(config.roles.of(CoreRole::Dispatcher).vantage());
     let builder = Arc::new(crate::build::VersionBuilder {
         bases: weft_compiler::worker_image::BaseImages {
@@ -176,7 +199,6 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         },
         images,
         pool: pool.clone(),
-        replica: replica.clone(),
         compile_lanes: config.build.compile_lanes,
         poll_every: weft_core::time_scale::scaled(std::time::Duration::from_secs(2)),
         prunes: Default::default(),
@@ -199,6 +221,10 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         displays,
         runner,
         host,
+        frontends,
+        domains,
+        holder_pool,
+        holder_settings: config.holders,
         worker_defaults: config.workers.clone(),
         builder,
         install_info: install_info(config),
@@ -216,7 +242,6 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         broker: RoleClient::new(CoreRole::Broker, addresses.broker.clone(), tokens, http.clone()),
         http,
         caller_token_secret: Arc::new(caller_token_secret),
-        kick,
     })
 }
 
@@ -225,10 +250,6 @@ pub fn install_info(config: &InstallConfig) -> weft_core::install::InstallInfo {
     use weft_platform_traits::config::PlatformConfig;
     weft_core::install::InstallInfo {
         public_url: config.public_url.clone(),
-        internal_url: match &config.platform {
-            PlatformConfig::Local(_) => None,
-            PlatformConfig::Gcp(g) => Some(g.machine_internal_url.clone()),
-        },
         cloud: match &config.platform {
             PlatformConfig::Local(_) => None,
             PlatformConfig::Gcp(g) => Some(weft_core::install::CloudInstall::Gcp(weft_core::install::GcpInstall {
@@ -243,7 +264,6 @@ pub fn install_info(config: &InstallConfig) -> weft_core::install::InstallInfo {
             })),
         },
         source: config.source.clone(),
-        address: config.front_door.as_ref().map(|door| door.address),
     }
 }
 
@@ -276,15 +296,56 @@ pub fn drain_loops(state: &DispatcherState, registry: crate::task_executor::Task
         weft_task_store::PostgresTaskStoreClient::new(state.pg_pool.clone(), state.signals.clone())
             .context("the dispatcher's signal watch listens on every task channel")?,
     );
+    // The picker, the delivery and the claimer also rescue a claim whose
+    // holder died, which nothing announces: they look again while
+    // anything is in motion.
+    let in_motion = |l| crate::reaper::while_in_motion(state, l);
     let mut loops = vec![
-        weft_task_store::dispatcher_picker_loop(picker_store, state.clone(), registry, state.replica.clone()),
-        crate::delivery::drain_loop(state.clone()),
-        crate::lifecycle_claimer::drain_loop(state.clone()),
+        in_motion(weft_task_store::dispatcher_picker_loop(picker_store, state.clone(), registry, state.replica.clone())),
+        in_motion(crate::delivery::drain_loop(state.clone())),
+        in_motion(crate::lifecycle_claimer::drain_loop(state.clone())),
         crate::journal_bridge::drain_loop(state.clone()),
         crate::infra_event_bridge::drain_loop(state.clone()),
+        crate::build::follow::drain_loop(state),
+        crate::holders::drain_loop(state),
+        crate::domains::drain_loop(state),
     ];
     loops.extend(crate::reaper::drain_loops(state));
+    // A dispatcher at zero is woken by name for what `loop_wakes` says,
+    // so a loop woken by a write that the list misses would never run on
+    // one: refused here, at every boot, instead.
+    let listed = loop_wakes();
+    for l in loops.iter().filter(|l| !l.wake_on.is_empty()) {
+        anyhow::ensure!(
+            listed.iter().any(|(name, wake_on)| *name == l.name && std::ptr::eq(*wake_on, l.wake_on)),
+            "the dispatcher's loop '{}' wakes by rules `loop_wakes` does not name",
+            l.name
+        );
+    }
+    for (name, _) in &listed {
+        anyhow::ensure!(loops.iter().any(|l| l.name == *name), "`loop_wakes` names '{name}', which is no loop of the dispatcher");
+    }
     Ok(loops)
+}
+
+/// What wakes each of the dispatcher's loops that a write wakes, by
+/// name: what a writer reads to wake a dispatcher at zero for exactly the
+/// loops a write concerns (`weft_runtime::role_waker`).
+/// `drain_loops` refuses to boot when it and the loops disagree. Read at
+/// run time from each loop's own static, so a rule here IS the loop's (one
+/// static is one address; a copy made at compile time would not be).
+pub fn loop_wakes() -> Vec<(&'static str, &'static [WakeOn])> {
+    vec![
+        ("dispatcher_picker", weft_task_store::executor::DISPATCHER_READY),
+        ("delivery", crate::delivery::WAKE_ON),
+        ("lifecycle_claimer", crate::lifecycle_claimer::WAKE_ON),
+        ("journal_bridge", crate::journal_bridge::ON_EXEC_EVENT),
+        ("infra_event_bridge", crate::infra_event_bridge::ON_INFRA_EVENT),
+        ("parked_fires", crate::reaper::ON_PARKED_FIRE),
+        ("storage_sweep", crate::reaper::ON_STORAGE_SWEEP),
+        ("holders", crate::holders::ON_HELD_SIGNALS),
+        ("domains_door", crate::domains::ON_DOMAINS),
+    ]
 }
 
 /// The dispatcher's relays of this process's notifications to the

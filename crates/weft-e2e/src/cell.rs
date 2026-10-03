@@ -156,5 +156,8 @@ fn public_port(install: &weft_core::infra::Install) -> Result<u16> {
     let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let config: weft_platform_traits::InstallConfig =
         serde_json::from_str(&raw).with_context(|| format!("{} is not an install config", path.display()))?;
-    Ok(config.listen.public.port())
+    match config.platform {
+        weft_platform_traits::PlatformConfig::Local(local) => Ok(local.listen.public.port()),
+        weft_platform_traits::PlatformConfig::Gcp(_) => anyhow::bail!("{} is a cloud install's config", path.display()),
+    }
 }

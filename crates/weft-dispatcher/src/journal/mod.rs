@@ -612,6 +612,9 @@ pub struct SignalRegistration {
     /// still there and moves it one past, so every claim a wake took at
     /// the old version fails. Read back, the row's current version.
     pub kind_state_seq: i64,
+    /// Whether the signal keeps a connection open between fires, as the
+    /// listener's `/prepare` decided: a holder holds it.
+    pub holds: bool,
 }
 
 /// What a [`Journal::signal_insert`] did.

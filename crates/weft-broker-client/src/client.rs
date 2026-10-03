@@ -506,6 +506,24 @@ impl BrokerSignalClient {
             .await?;
         Ok(resp.written)
     }
+
+    /// One look of a holder (see [`SignalHoldRequest`]).
+    pub async fn hold(&self, req: &SignalHoldRequest) -> Result<SignalHoldResponse> {
+        self.http.post("/v1/signal/hold", req).await
+    }
+
+    /// Record what a signal's kind decides about holding it (see
+    /// [`SignalSetHoldsRequest`]).
+    pub async fn set_holds(&self, token: &str, holds: bool) -> Result<()> {
+        let _: Value = self.http.post("/v1/signal/set_holds", &SignalSetHoldsRequest { token: token.to_string(), holds }).await?;
+        Ok(())
+    }
+
+    /// Give up the claims on held signals (see [`SignalLetGoRequest`]).
+    pub async fn let_go(&self, req: &SignalLetGoRequest) -> Result<()> {
+        let _: Value = self.http.post("/v1/signal/let_go", req).await?;
+        Ok(())
+    }
 }
 
 // ---------- Provider events (listener serving surface) ----------
@@ -878,6 +896,29 @@ impl BrokerSupervisorClient {
         };
         self.http
             .post_fenced::<_, SupervisorSetStatusResponse>("/v1/supervisor/set_status", &req)
+            .await
+    }
+
+    /// Record what the apply `command_id` waits on for this copy.
+    pub async fn set_waiting(
+        &self,
+        replica: &str,
+        command_id: i64,
+        project_id: Uuid,
+        node_id: &str,
+        instance: Option<&weft_core::instance::InstanceId>,
+        waiting: &str,
+    ) -> Result<WriteOutcome<SupervisorSetWaitingResponse>> {
+        let req = SupervisorSetWaitingRequest {
+            replica: replica.to_string(),
+            command_id,
+            project_id,
+            node_id: node_id.to_string(),
+            instance: instance.cloned(),
+            waiting: waiting.to_string(),
+        };
+        self.http
+            .post_fenced::<_, SupervisorSetWaitingResponse>("/v1/supervisor/set_waiting", &req)
             .await
     }
 

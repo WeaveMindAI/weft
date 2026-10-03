@@ -1,40 +1,45 @@
 //! What a runtime process serves, and on which port.
 //!
-//! The machine's internal port carries every role the machine runs, each
-//! under its own prefix (`CoreRole::internal_prefix`): `/broker/...`,
-//! `/listener/...`, `/supervisor/...`. The dispatcher has no internal
-//! routes there. On an install whose API calls each carry an operator key,
-//! the internal port also carries the public API, for callers on the
-//! private network. The public port (behind the machine's front door)
-//! carries the dispatcher's public API when the dispatcher is on the
-//! machine, or passes it on to the dispatcher's own service when it is
-//! not, and the internal routes again under
+//! A local install's one process serves its internal port, carrying every
+//! role under its own prefix (`CoreRole::internal_prefix`): `/broker/...`,
+//! `/listener/...`, `/supervisor/...` (the dispatcher has no internal
+//! routes there). Its public port carries the dispatcher's public API,
+//! behind the door that routes by name (`weft_dispatcher::door`), and the
+//! internal routes again under
 //! [`weft_platform_traits::roles::INTERNAL_DOOR`], for a caller outside
-//! the private network (a cloud's queue delivering a wake). Every internal
-//! route checks its caller's identity wherever it is reached.
+//! the machine. Every internal route checks its caller's identity wherever
+//! it is reached.
 //!
 //! A process of one role serves it on one port, at its root: its internal
-//! routes and, for the dispatcher, its public API.
+//! routes (its tick, when it scales to zero) and, for the dispatcher, its
+//! public API behind the door.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Request, State};
-use axum::http::{HeaderName, HeaderValue, StatusCode};
+use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
 use weft_platform_traits::roles::TICK_PATH;
-use weft_platform_traits::{Alarm, CoreRole, IdentityTokens, Wake, WORKER_AUTH_HEADER};
+use weft_platform_traits::{Alarm, CoreRole, Wake};
 
 /// A role's own tick, for a role that scales to zero: drain its loops,
-/// then set its next wake.
+/// then set its next wake. `run` takes the loops the caller says a write
+/// woke (`?loop=<name>`, repeated: a writer's waker names them, a
+/// builder's announcement names the build loop); the loops whose own next
+/// look is due run too.
 #[derive(Clone)]
 pub struct Tick {
     pub role: CoreRole,
-    pub run: Arc<dyn Fn() -> futures::future::BoxFuture<'static, Duration> + Send + Sync>,
+    pub run: Arc<dyn Fn(Vec<String>) -> futures::future::BoxFuture<'static, Duration> + Send + Sync>,
     pub alarm: Arc<dyn Alarm>,
 }
+
+/// The name of the query parameter a tick reads its woken loops from.
+// SYNC: TICK_LOOP_PARAM <-> deploy/terraform/gcp/builds.tf (the push endpoint)
+pub const TICK_LOOP_PARAM: &str = "loop";
 
 /// The next wake for a tick that wants another look after `next`: the end
 /// of the `next`-long slot `now` falls in, so every tick inside one slot
@@ -44,8 +49,12 @@ pub fn next_slot(now_ms: i64, next: Duration) -> i64 {
     (now_ms / slot + 1) * slot
 }
 
-async fn tick(State(t): State<Tick>) -> Response {
-    let next = (t.run)().await;
+async fn tick(State(t): State<Tick>, axum::extract::RawQuery(query): axum::extract::RawQuery) -> Response {
+    let woken: Vec<String> = url::form_urlencoded::parse(query.unwrap_or_default().as_bytes())
+        .filter(|(k, _)| k == TICK_LOOP_PARAM)
+        .map(|(_, v)| v.into_owned())
+        .collect();
+    let next = (t.run)(woken).await;
     let now = now_ms();
     let wake = Wake {
         key: format!("tick:{}", t.role),
@@ -75,51 +84,6 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
-/// Passes a role's internal calls on to the machine of its own it runs
-/// on, which has no public address: the caller's credential goes with the
-/// request untouched, and the role checks it itself.
-#[derive(Clone)]
-pub struct ToRole {
-    pub base_url: String,
-    pub http: reqwest::Client,
-}
-
-pub async fn to_role(State(to): State<ToRole>, request: Request) -> Response {
-    let path_and_query = request.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
-    let upstream = weft_dispatcher::proxy::Upstream { what: "the role's machine", base_url: to.base_url.clone(), auth: None, hold: None };
-    weft_dispatcher::proxy::forward(&to.http, upstream, path_and_query, request).await
-}
-
-/// Passes the public API on to the dispatcher's own service. The pass
-/// carries the address the caller used and who the caller is
-/// (`weft_dispatcher::proxy`), so the dispatcher builds its links and
-/// counts its callers as if they had reached it directly.
-#[derive(Clone)]
-pub struct ToDispatcher {
-    pub base_url: String,
-    pub tokens: Arc<dyn IdentityTokens>,
-    pub http: reqwest::Client,
-}
-
-pub async fn to_dispatcher(State(to): State<ToDispatcher>, request: Request) -> Response {
-    let token = match to.tokens.token_for(&to.base_url).await {
-        Ok(t) => t,
-        Err(e) => return (StatusCode::BAD_GATEWAY, format!("no identity for the dispatcher: {e:#}")).into_response(),
-    };
-    let auth = match HeaderValue::from_str(&format!("Bearer {token}")) {
-        Ok(v) => v,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("the dispatcher credential: {e}")).into_response(),
-    };
-    let path_and_query = request.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
-    let upstream = weft_dispatcher::proxy::Upstream {
-        what: "the dispatcher",
-        base_url: to.base_url.clone(),
-        auth: Some((HeaderName::from_static(WORKER_AUTH_HEADER), auth)),
-        hold: None,
-    };
-    weft_dispatcher::proxy::forward(&to.http, upstream, path_and_query, request).await
-}
-
 /// Serve `app` on `listener` until the process ends, with the peer's
 /// address on every request (the public door counts callers by it).
 pub async fn serve(listener: tokio::net::TcpListener, app: Router) -> anyhow::Result<()> {
@@ -129,11 +93,16 @@ pub async fn serve(listener: tokio::net::TcpListener, app: Router) -> anyhow::Re
     Ok(())
 }
 
-async fn shutdown() {
+/// Until the process is told to stop (SIGTERM, or Ctrl+C). The SIGTERM
+/// handler is installed by the call itself, not when the answer is first
+/// awaited, so a stop that arrives while the caller is still busy with
+/// something else is kept for it instead of killing the process.
+pub fn shutdown() -> impl std::future::Future<Output = ()> {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        match signal(SignalKind::terminate()) {
+    let term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+    async move {
+        #[cfg(unix)]
+        match term {
             Ok(mut term) => {
                 tokio::select! {
                     _ = term.recv() => tracing::info!(target: "weft_runtime", "SIGTERM received; draining"),
@@ -145,10 +114,10 @@ async fn shutdown() {
                 let _ = tokio::signal::ctrl_c().await;
             }
         }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
 }
 
