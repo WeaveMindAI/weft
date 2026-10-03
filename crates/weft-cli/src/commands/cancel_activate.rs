@@ -28,9 +28,6 @@ async fn run_inner(
     progress.dispatcher_call_start(&path);
     client.post_with_body(&path, &serde_json::to_value(&scope)?).await?;
     progress.dispatcher_call_done(serde_json::json!({ "project_id": id }));
-    if !ctx.json() {
-        println!("cancel-activate issued for {id}");
-    }
     progress.complete(&format!("cancel-activate issued for {id}"));
     Ok(())
 }

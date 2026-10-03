@@ -363,8 +363,11 @@ pub struct SharedImages {
 impl SharedImages {
     /// Every bare (unsuffixed) ref, one per shared image.
     /// SYNC: `weft build-images` stdout = one registry-qualified bare
-    ///       ref per line <-> .github/workflows/release.yml (the
-    ///       images-manifest job diffs and stitches every line)
+    ///       ref per line, in this order <-> .github/workflows/release.yml
+    ///       (build + push shared images; the images-manifest job diffs
+    ///       and stitches every line), .github/workflows/install-gcp.yml
+    ///       (build the runtime's images: line 1 is the runtime, line 2
+    ///       the builder base)
     pub fn bare_refs(&self) -> Vec<&str> {
         vec![self.runtime.as_str(), self.builder_base.as_str(), self.worker.as_str()]
     }

@@ -70,7 +70,12 @@ pub async fn mint_socket_url(
     };
     let resp = run_connect_call(call, values)
         .await
-        .map_err(|e| PrepareError::Transient(anyhow::anyhow!(e)))?;
+        .map_err(|e| match e {
+            weft_core::access::client::ConnectCallError::Unbuildable(_) => PrepareError::Fatal(e.into()),
+            weft_core::access::client::ConnectCallError::Unreached(_) | weft_core::access::client::ConnectCallError::Refused(_) => {
+                PrepareError::Transient(e.into())
+            }
+        })?;
     let capture = call
         .captures
         .iter()

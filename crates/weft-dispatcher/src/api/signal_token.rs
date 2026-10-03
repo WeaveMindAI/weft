@@ -71,6 +71,16 @@ pub async fn mint_token(
     caller: CallerTenant,
     Json(body): Json<MintTokenRequest>,
 ) -> Result<Json<MintedToken>, (StatusCode, String)> {
+    Ok(Json(mint(&state, &caller, body).await?))
+}
+
+/// Mint `body` for `caller`'s tenant: the one way a token is made, for the
+/// endpoint and for what makes one on a person's behalf (a frontend's).
+pub(crate) async fn mint(
+    state: &DispatcherState,
+    caller: &CallerTenant,
+    body: MintTokenRequest,
+) -> Result<MintedToken, (StatusCode, String)> {
     use weft_core::signal_token as names;
 
     let name = body
@@ -90,7 +100,7 @@ pub async fn mint_token(
     // the caller's: minting one for a project of another tenant would
     // hand a browser a door into it.
     if body.instance.is_some() {
-        crate::authenticator::authorize_project(&state, &caller.0, body.allowed_projects[0]).await?;
+        crate::authenticator::authorize_project(state, &caller.0, body.allowed_projects[0]).await?;
     }
 
     // A display grant that cannot reach anything is refused HERE, with
@@ -99,7 +109,7 @@ pub async fn mint_token(
     // the node exactly as the person spelled it, under a project id in
     // one canonical form.
     let allowed_displays = crate::api::display::canonical_display_grants(
-        &state,
+        state,
         caller.0.as_str(),
         &body.allowed_projects,
         &body.allowed_displays,
@@ -139,7 +149,7 @@ pub async fn mint_token(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("journal: {e}")))?;
     let url = token_url(state.external_base_url(), &token);
-    Ok(Json(MintedToken {
+    Ok(MintedToken {
         id: signal_token.id,
         kind: signal_token.kind,
         token,
@@ -152,7 +162,7 @@ pub async fn mint_token(
         all_displays: signal_token.all_displays,
         instance: signal_token.instance,
         expires_at_unix: signal_token.expires_at,
-    }))
+    })
 }
 
 pub async fn list_tokens(

@@ -27,6 +27,7 @@ pub struct MetadataTokens {
     http: reqwest::Client,
     ids: Mutex<HashMap<String, (String, Instant)>>,
     access: Mutex<Option<(String, Instant)>>,
+    email: Mutex<Option<String>>,
 }
 
 impl Default for MetadataTokens {
@@ -44,6 +45,7 @@ impl MetadataTokens {
                 .expect("a default reqwest client builds"),
             ids: Mutex::new(HashMap::new()),
             access: Mutex::new(None),
+            email: Mutex::new(None),
         }
     }
 
@@ -99,6 +101,29 @@ impl MetadataTokens {
         let until = Instant::now() + Duration::from_secs(token.expires_in).saturating_sub(EARLY);
         *self.access.lock() = Some((token.access_token.clone(), until));
         Ok(token.access_token)
+    }
+}
+
+impl MetadataTokens {
+    /// The service account this process runs as.
+    pub async fn account_email(&self) -> anyhow::Result<String> {
+        if let Some(email) = self.email.lock().as_ref() {
+            return Ok(email.clone());
+        }
+        let email = self
+            .http
+            .get(format!("{METADATA}/email"))
+            .header("Metadata-Flavor", "Google")
+            .send()
+            .await
+            .context("ask the metadata server for this process's account")?
+            .error_for_status()
+            .context("the metadata server named no account")?
+            .text()
+            .await
+            .context("read this process's account")?;
+        *self.email.lock() = Some(email.clone());
+        Ok(email)
     }
 }
 

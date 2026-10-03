@@ -320,7 +320,7 @@ async fn upgrade_legs(
         // meanwhile is the person's answer: `wait` lets them finish up
         // to their cap, `cancel` ends them first.
         settle_running_before_infra_op(state, id, &copies, work.running_policy, triggers_taken_down, None).await?;
-        let mut pending = issue_per_nodes_kicking_supervisor(
+        let mut pending = issue_per_nodes(
             state,
             id,
             &targeted,
@@ -536,14 +536,8 @@ async fn gate_sync(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("transition: {e}")))?
         .unwrap_or(crate::project_store::ProjectTransition::None);
-    if transition.is_building() {
-        return Err(StatusError::Other(
-            StatusCode::CONFLICT,
-            format!(
-                "project is {}; wait for the build to finish or cancel it before syncing infra",
-                transition.as_str()
-            ),
-        ));
+    if let Some(why) = transition.refusal() {
+        return Err(StatusError::Other(StatusCode::CONFLICT, format!("infra cannot change right now: {why}")));
     }
     // Fast reject before any side effect; re-checked under the lock
     // in `apply_sync` (the locked re-check is the race-safe one).
@@ -846,7 +840,7 @@ async fn issue_destroy(
         crate::api::project::execute_trigger_deactivation(&state, id, live_readers, deactivation).await?;
     }
     settle_running_before_infra_op(&state, id, &copies, running_policy, was_active, None).await?;
-    let command_id = issue_lifecycle_kicking_supervisor(
+    let command_id = issue_lifecycle_for(
         &state,
         id,
         None,
@@ -990,7 +984,7 @@ async fn issue_per_node(
     if !orphan {
         settle_running_before_infra_op(&state, id, &copies, running_policy, false, None).await?;
     }
-    let command_id = issue_lifecycle_kicking_supervisor(
+    let command_id = issue_lifecycle_for(
         &state,
         id,
         Some(&node),
@@ -1416,6 +1410,7 @@ async fn read_infra_entries(
         failure_stage: None,
         failure_message: None,
         notes: Vec::new(),
+        progress: None,
     }));
     Ok(entries)
 }
@@ -1437,17 +1432,25 @@ fn row_to_entry(row: InfraNodeRow, front_door: &str) -> InfraStatusEntry {
         failure_stage: row.failure_stage.map(|f| f.as_str().to_string()),
         failure_message: row.failure_message,
         notes: row.notes,
+        progress: provisioning_progress(row.status, row.provisioning_since_unix, row.waiting),
     }
 }
 
-/// Enqueue a lifecycle command and kick the supervisor, which may be
-/// scaled to zero and would otherwise not hear of it until its next
-/// safety tick.
-///
-/// Every dispatcher-side enqueue path goes through this helper.
-/// `issue_lifecycle` itself stays a plain DB-write helper so the
-/// supervisor-side code can call it directly.
-pub(crate) async fn issue_lifecycle_kicking_supervisor(
+/// The progress a row records, shown only while it provisions: the
+/// columns hold the last apply's until the next one rewrites them.
+pub(crate) fn provisioning_progress(
+    status: InfraNodeStatus,
+    since_unix: Option<i64>,
+    waiting: Option<String>,
+) -> Option<weft_core::infra::wire::ApplyProgress> {
+    (status == InfraNodeStatus::Provisioning).then(|| weft_core::infra::wire::ApplyProgress::of(since_unix, waiting)).flatten()
+}
+
+/// Enqueue a lifecycle command for `project_id`, under its tenant. The
+/// command's row announces itself (`INFRA_COMMAND_CHANNEL`), which wakes
+/// the supervisor wherever it runs (`weft_runtime::role_waker` for one at
+/// zero).
+pub(crate) async fn issue_lifecycle_for(
     state: &DispatcherState,
     project_id: uuid::Uuid,
     node_id: Option<&str>,
@@ -1479,13 +1482,12 @@ pub(crate) async fn issue_lifecycle_kicking_supervisor(
             format!("issue {}: {e}", take_down.verb().as_str()),
         )
     })?;
-    state.kick.kick(weft_platform_traits::CoreRole::Supervisor);
     Ok(issued)
 }
 
 /// One command per node for `nodes` of `copies` (an upgrade's stop leg
-/// over exactly the nodes it re-applies), the supervisor kicked.
-async fn issue_per_nodes_kicking_supervisor(
+/// over exactly the nodes it re-applies).
+async fn issue_per_nodes(
     state: &DispatcherState,
     project_id: uuid::Uuid,
     nodes: &std::collections::BTreeSet<String>,
@@ -1497,7 +1499,7 @@ async fn issue_per_nodes_kicking_supervisor(
     let mut ids = Vec::with_capacity(nodes.len());
     for node in nodes {
         ids.push(
-            issue_lifecycle_kicking_supervisor(state, project_id, Some(node), copies, take_down, running_policy, drain_timeout_secs)
+            issue_lifecycle_for(state, project_id, Some(node), copies, take_down, running_policy, drain_timeout_secs)
                 .await?,
         );
     }
@@ -1691,12 +1693,12 @@ pub async fn delete_project(
         .unwrap_or(false);
     if has_infra {
         // Step 1: enqueue a project-wide terminate so the supervisor
-        // tears down the workloads. `issue_lifecycle_kicking_supervisor`
-        // wakes the supervisor first (a serverless one may be at zero), or
-        // `weft rm` would leave the project's infrastructure behind. A
-        // silent failure here is not acceptable;
-        // refuse the rm and let the user retry.
-        let cmd_id = issue_lifecycle_kicking_supervisor(
+        // tears down the workloads. The command's row announces itself
+        // (`issue_lifecycle_for`), which wakes the supervisor even at
+        // zero. A failure to enqueue it refuses the rm, so the user
+        // retries rather than leaving the project's infrastructure
+        // behind.
+        let cmd_id = issue_lifecycle_for(
             state,
             id,
             None,
@@ -1818,6 +1820,8 @@ mod tests {
             keep_disks: Vec::new(),
             units: Default::default(),
             notes: Vec::new(),
+            waiting: None,
+            provisioning_since_unix: None,
         }
     }
 

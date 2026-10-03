@@ -1,16 +1,22 @@
 ---
 name: weft-cloud-install
-description: "Read when the user wants weft itself on their Google Cloud for the first time, or to upgrade or resize the weft already there: getting the user's GitHub and Google Cloud accounts and CLIs ready, the fork, the one-time gcloud block, the fork's variables, running the install workflow, the first operator key, upgrading, and growing the machine. Deploying a project to an install that already exists is weft-deploying, not this."
+description: "Read when the user wants weft itself on their Google Cloud for the first time, or to upgrade or resize the weft already there: getting the user's GitHub and Google Cloud accounts and CLIs ready, the fork, the one-time gcloud block, the database, the fork's variables and secrets, running the install workflow, the first operator key, upgrading, and sizing. Deploying a project to an install that already exists is weft-deploying, not this."
 ---
 
 # Putting weft on GCP
 
-A cloud install is one small machine (an `e2-micro`, in Google's free tier in
-`us-west1`, `us-central1` and `us-east1`) running Postgres and weft's
-listener, with weft's other parts and programs' workers on Cloud Run, builds on Cloud Build, timers on Cloud Tasks
-and infrastructure on Compute Engine machines. It is made by the "install on
-GCP" workflow in the user's own fork of weft. The user owns the GCP project,
-the billing and the fork; you do the work, through their `gh` and `gcloud`.
+A cloud install has no machine of its own. weft's parts and programs' workers
+are Cloud Run services that scale to zero. Triggers that keep a connection
+open run on holders, which weft starts only while at least one such trigger is
+on. Builds run on Cloud Build, timers on Cloud Tasks, and infrastructure on
+Compute Engine machines.
+Everything weft keeps lives in a Postgres database the user brings, by its
+address. So an install with no trigger that keeps a connection open and no
+infrastructure up runs nothing between calls and, within Google's and the database's free tiers,
+costs next to nothing: what it does pay for is storing weft's own images. It is made by the "install on GCP"
+workflow in the user's own fork of weft. The user owns the GCP project, the
+billing, the database and the fork; you do the work, through their `gh` and
+`gcloud`.
 
 ## First: the two CLIs, logged in
 
@@ -99,25 +105,34 @@ to do before anything that creates or costs something:
 
 4. **The fork's variables**, with `gh variable set <NAME> --repo <fork>
    --body <value>`: `GCP_PROJECT_ID`, `GCP_REGION`, `GCP_ZONE`,
-   `TF_STATE_BUCKET`, `GCP_WORKLOAD_IDENTITY_PROVIDER`,
-   `GCP_INSTALL_SERVICE_ACCOUNT`, and the optional ones the guide lists
-   (`WEFT_FRONTEND_REPOS`, `WEFT_MACHINE_TYPE`, `WEFT_SERVERLESS_ROLES`,
-   `WEFT_LISTENER_MACHINE`) only when the user wants them.
-5. **The workflow.** `gh workflow run "install on GCP" --repo <fork>`, then
+   `TF_STATE_BUCKET`, `GCP_WORKLOAD_IDENTITY_PROVIDER` and
+   `GCP_INSTALL_SERVICE_ACCOUNT`. A project's frontend is added later, from
+   the project (read weft-deploying), never here.
+5. **The database.** If the user has no Postgres, read weft-database. If
+   they already have a
+   Postgres they want, put its address in the `WEFT_DATABASE_URL` secret
+   with `gh secret set WEFT_DATABASE_URL --repo <fork>` (piping it in, never
+   echoing it into the chat), and when that address goes through a pooler,
+   a direct address of the same database in `WEFT_DATABASE_LISTEN_URL`.
+6. **The workflow.** `gh workflow run "install on GCP" --repo <fork>`, then
    follow it with `gh run watch` in the background. It runs for a while.
 
-Its summary (`gh run view <id>`) prints the install's address
-(`https://<an IP address>`, working a minute or two after the machine boots)
-and the command that reads the first operator key from Secret Manager. Run
-that command yourself, then the user pastes the key into `weft login`
+Its summary (`gh run view <id>`) prints the install's address (a Cloud Run
+address, `https://weft-role-dispatcher-<number>.<region>.run.app`, working at
+once) and the command that reads the first operator key from Secret Manager.
+Run that command yourself, then the user pastes the key into `weft login`
 (it is a secret: never echo it into the chat).
+
+The install needs no domain: its own address is HTTPS and free. A domain
+costs money, so it is never part of the install; read weft-deploying when
+the user asks for one.
 
 Upgrading weft on the cloud is merging upstream into the fork
 (`gh repo sync <fork>`) and running the workflow again, then rebuilding the
-user's CLI from that commit (`./setup.sh --cli`). If the machine is too
-small, set `WEFT_MACHINE_TYPE` on the fork (say `e2-small`, which is not
-free, so ask first) and run the workflow again; the machine stops, grows and
-starts with its disk.
+user's CLI from that commit (`./setup.sh --cli`). Sizing (how many triggers
+one holder takes, a holder's CPU and memory, how many builds run at once)
+is a default in `deploy/terraform/gcp/variables.tf` in the fork: change it
+there, commit, and run the workflow again.
 
 For deploying projects to the install once the key is in `weft login`,
 read weft-deploying.

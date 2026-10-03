@@ -6,8 +6,10 @@
 //!   POST /prepare      compute a new signal's row (routing, kind
 //!                      state, consumer payload); starts nothing
 //!   POST /start        bring up a signal whose row was just committed
-//!                      (its first wake, its held connection)
-//!   POST /unregister   drop a held connection and its outside state
+//!                      (its first wake; its held connection, where this
+//!                      process holds)
+//!   POST /unregister   drop a removed signal's held connection and
+//!                      what it arranged outside
 //!   POST /process      run kind-specific logic for one fire,
 //!                      return a `ProcessOutcome` (value + target)
 //!                      for the dispatcher to journal on
@@ -23,8 +25,8 @@
 //!   GET  /health       liveness probe
 //!
 //! Every endpoint that names a signal reads it through `registry::held`:
-//! from its durable row, or from this process's registry for a kind that
-//! holds a connection.
+//! from its durable row, or from this process's registry for a connection
+//! it holds.
 
 use axum::{
     extract::State,
@@ -91,6 +93,7 @@ async fn prepare(
     Json(req): Json<PrepareRequest>,
 ) -> Result<Json<PrepareResponse>, (StatusCode, String)> {
     let weft_core::signal::listener_protocol::PrepareSource { prior_kind_state, asked_at_unix_ms } = req.source;
+    let for_instance = req.for_instance;
     let prepared = kinds::prepare_signal(
         &state,
         kinds::SignalIdentity {
@@ -101,9 +104,11 @@ async fn prepare(
             execution_id: req.execution_id,
             spec: req.spec,
         },
+        for_instance,
         prior_kind_state.as_ref(),
         asked_at_unix_ms,
     )
+    .await
     // `{e:#}` keeps the whole cause chain: a refusal's reason must reach
     // the user, not just the outermost context line.
     .map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
@@ -111,6 +116,7 @@ async fn prepare(
         routing: prepared.routing,
         kind_state: prepared.kind_state,
         rendered: prepared.rendered.unwrap_or(Value::Null),
+        holds: prepared.holds,
     }))
 }
 
@@ -129,7 +135,8 @@ async fn start(
         .await
         .map_err(internal)?
         .ok_or((StatusCode::NOT_FOUND, format!("no signal is held under token {}", req.token)))?;
-    crate::registry::hold(&state, row, req.mode).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    // A fresh one's refusal is this registration's.
+    crate::registry::start(&state, row, req.mode).await.map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -153,9 +160,19 @@ async fn unregister(
     State(state): State<ListenerState>,
     Json(req): Json<UnregisterRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    // Detached teardown: the unregister answer must not wait on a
-    // provider round trip.
-    kinds::forget(&state, &req.token);
+    // The teardown is detached unless the token is reused right after
+    // (`UnregisterRequest::reused`): the answer must not otherwise wait on
+    // a provider round trip.
+    // A row no listener can ever read is 422, which a caller reusing the
+    // token may pass; anything trying again can fix is not.
+    kinds::unregister(&state, req).await.map_err(|e| {
+        let status = match &e {
+            kinds::UnregisterError::Unreadable(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            kinds::UnregisterError::UnknownKind(_) => StatusCode::SERVICE_UNAVAILABLE,
+            kinds::UnregisterError::TeardownFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        (status, e.to_string())
+    })?;
     Ok(StatusCode::NO_CONTENT)
 }
 

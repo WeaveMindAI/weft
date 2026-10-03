@@ -45,6 +45,38 @@ pub fn base_client() -> &'static reqwest::Client {
     })
 }
 
+/// Why a declared call ([`run_connect_call`]) did not answer what was
+/// asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectCallError {
+    /// The call cannot be made as declared (a template naming a value
+    /// that is not there): trying again changes nothing.
+    Unbuildable(String),
+    /// The provider was not reached, or did not answer in time: nothing
+    /// says the call itself is wrong, and trying again is the fix.
+    Unreached(String),
+    /// The provider answered, and refused.
+    Refused(String),
+}
+
+impl std::fmt::Display for ConnectCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectCallError::Unbuildable(why) | ConnectCallError::Unreached(why) | ConnectCallError::Refused(why) => f.write_str(why),
+        }
+    }
+}
+
+impl std::error::Error for ConnectCallError {}
+
+/// How long one declared call ([`run_connect_call`]) may take, end to end.
+/// These are short control calls to a provider (mint a socket address,
+/// subscribe, unsubscribe), never a stream a person waits on, and some
+/// run while their signal's subscriptions are locked: a provider that
+/// accepts the connection and never answers must not hold that lock for
+/// ever.
+pub const CONNECT_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Execute one declared authenticated call ([`ConnectCall`]): resolve
 /// the URL, the body and the auth against `values`, send, refuse a
 /// non-success answer loudly with the provider's own words, and hand
@@ -54,44 +86,50 @@ pub fn base_client() -> &'static reqwest::Client {
 pub async fn run_connect_call(
     call: &crate::access::spec::ConnectCall,
     values: &BTreeMap<String, String>,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, ConnectCallError> {
     use crate::access::spec::TestMethod;
-    let url = call.url.resolve(values)?;
+    let url = call.url.resolve(values).map_err(ConnectCallError::Unbuildable)?;
     // Errors name the call by its TEMPLATE, never the resolved URL: a
     // recipe may interpolate a secret into the query, and these strings
     // travel to logs and the user.
     let shown = &call.url.0;
-    let steps = resolve_steps(&call.auth, values)?;
+    let steps = resolve_steps(&call.auth, values).map_err(ConnectCallError::Unbuildable)?;
     let client = authed_client(steps);
     let mut req = match call.method {
         TestMethod::Get => client.get(&url),
         TestMethod::Post => client.post(&url),
-    };
+    }
+    .timeout(CONNECT_CALL_TIMEOUT);
     if let Some(body) = &call.body {
-        req = req.json(&crate::access::spec::resolve_body(body, values)?);
+        req = req.json(&crate::access::spec::resolve_body(body, values).map_err(ConnectCallError::Unbuildable)?);
     }
     let resp = req
         .send()
         .await
-        .map_err(|e| format!("the call to {shown} failed: {}", send_error(e)))?;
+        .map_err(|e| ConnectCallError::Unreached(format!("the call to {shown} failed: {}", send_error(e))))?;
     let status = resp.status();
-    let body_text = resp.text().await.unwrap_or_default();
+    // A body that stops arriving (the call's deadline) is an answer that
+    // never came, not an empty one.
+    let body_text = resp
+        .text()
+        .await
+        .map_err(|e| ConnectCallError::Unreached(format!("the answer from {shown} did not arrive: {}", e.without_url())))?;
     let body: serde_json::Value = serde_json::from_str(&body_text).unwrap_or(serde_json::Value::Null);
     if !status.is_success() {
-        return Err(format!(
+        return Err(ConnectCallError::Refused(format!(
             "{shown} answered {status}: {}",
             body.get("error")
                 .map(|e| e.to_string())
                 .unwrap_or_else(|| body_text.chars().take(300).collect())
-        ));
+        )));
     }
     // The Slack-style 200-with-ok:false refusal, same guard as every
     // other declared call.
     if body.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
-        return Err(format!(
+        return Err(ConnectCallError::Refused(format!(
             "{shown} refused: {}",
             body.get("error").and_then(serde_json::Value::as_str).unwrap_or("unknown error")
-        ));
+        )));
     }
     Ok(body)
 }
@@ -1004,6 +1042,8 @@ mod tests {
         let err = run_connect_call(&call, &values(&[("client_secret", "s3cr3t-value")]))
             .await
             .unwrap_err();
+        assert!(matches!(err, ConnectCallError::Unreached(_)), "a provider not reached is not a refusal: {err:?}");
+        let err = err.to_string();
         assert!(err.contains("{client_secret}"), "names the template: {err}");
         assert!(!err.contains("s3cr3t-value"), "echoed the secret: {err}");
     }

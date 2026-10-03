@@ -252,7 +252,8 @@ fn rig(run_id: &str, broker_base: String) -> Rig {
             // so parallel iterations never share a socket.
             replica: format!("test-listener-{run_id}"),
             broker_url: broker_base,
-            placement: weft_platform_traits::Placement::Machine,
+            holds_here: true,
+            prefer_push: false,
         },
         tasks.clone(),
         // The fake broker ignores the bearer.
@@ -277,7 +278,7 @@ async fn register_subscription(
         "token": token, "tenant_id": "tenant-a", "for_instance": null, "node_id": "node-1",
         "spec_json": serde_json::to_string(&spec).unwrap(), "is_resume": false, "execution_id": null,
         "surface_kind": "internal", "mount_path": null, "mount_methods": [], "auth_kind": "none",
-        "auth_config": null, "kind_state": {}, "kind_state_seq": 1
+        "auth_config": null, "kind_state": {}, "kind_state_seq": 1, "holds": true, "serving": null
     });
     bring_up(&rig.state, serde_json::from_value(row).unwrap(), weft_core::signal::listener_protocol::StartMode::Restore)
         .await

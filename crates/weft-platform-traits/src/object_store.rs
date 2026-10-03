@@ -32,18 +32,23 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 
-/// Which network the presigned URL will be used FROM. An S3 signature is bound to
+/// The longest a presigned URL may live: a presign is an expiring artifact,
+/// never a durable public link, and seven days is also the most an S3 or a
+/// Cloud Storage signature allows. A store refuses a longer one.
+pub const MAX_PRESIGN_TTL_SECS: u64 = 7 * 24 * 3600;
+
+/// Which network the presigned URL will be used FROM. A signature is bound to
 /// the host in the URL, so the store must sign for the host the caller can reach.
-/// The two audiences differ only when the bucket sits behind a split-horizon setup
+/// The audiences differ only when the bucket sits behind a split-horizon setup
 /// (a browser reaches it at a public host; an internal worker reaches it at the
-/// internal host); the local-dev SeaweedFS port-forward is exactly that case. A
-/// bucket whose endpoint is already publicly reachable internal collapses both
-/// to the same URL, so this stays a no-op there.
+/// internal host); a local install's SeaweedFS is exactly that case. A store
+/// every caller reaches at one address (Cloud Storage) signs the same URL for
+/// all of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresignAudience {
     /// A caller OUTSIDE the install (the browser; the open internet when the
     /// operator declared the endpoint internet-reachable): sign for the
-    /// public endpoint (`WEFT_OBJECT_STORE_PUBLIC_ENDPOINT`).
+    /// public endpoint (`objectStore.publicEndpoint`).
     External,
     /// A project's worker running node code: sign for the endpoint workers
     /// reach the store at (`objectStore.workerEndpoint`), or the runtime's
@@ -65,8 +70,9 @@ pub struct ObjectEntry {
 }
 
 /// The flat object store. Async, keyed by opaque string, values are opaque
-/// bytes. Implementations are S3-compatible HTTP clients (the production
-/// impl is `S3ObjectStore` over the AWS SDK; tests use `FakeObjectStore`).
+/// bytes. Implementations: `S3ObjectStore` (any S3-compatible bucket, over
+/// the AWS SDK), the Google platform's `GcsObjectStore` (Cloud Storage as the
+/// process's own account), and `FakeObjectStore` for tests.
 ///
 /// Every method fails LOUD on a backend error (no silent recovery): a put
 /// that does not land, or a get that cannot reach the bucket, returns
@@ -205,21 +211,18 @@ pub trait ObjectStore: Send + Sync {
     async fn multipart_exists(&self, key: &str, upload_id: &str) -> Result<bool>;
 }
 
-/// The deploy-time slot config: where the bucket lives and how to reach it.
-/// This is the one piece of storage configuration, mirroring how `RegistryConfig`
-/// is the image-registry slot. The default fills it from env pointing at the
-/// bundled SeaweedFS service; it can point at any S3-compatible endpoint (e.g.
-/// GCS) instead.
+/// An S3-compatible store's config: where the bucket lives and the key pair
+/// that reaches it. A local install points it at its bundled SeaweedFS.
 ///
 /// `endpoint_url` is what makes this S3-compatible-rather-than-AWS: it
-/// overrides the SDK's default AWS endpoint so the same client talks to GCS,
+/// overrides the SDK's default AWS endpoint so the same client talks to
 /// SeaweedFS, or any S3 API. `force_path_style` (bucket in the PATH, not the
 /// hostname) is required by SeaweedFS and most non-AWS S3 servers, so it
 /// defaults on.
 #[derive(Debug, Clone)]
 pub struct ObjectStoreConfig {
     /// The S3-compatible endpoint URL (e.g. the internal SeaweedFS service,
-    /// or the GCS/AWS regional endpoint).
+    /// or an AWS regional endpoint).
     pub endpoint_url: String,
     /// The single bucket every object lives in (prefixes namespace the
     /// planes: `chunks/`, `trees/`, `runtime/<tenant>/...`).
@@ -227,8 +230,7 @@ pub struct ObjectStoreConfig {
     /// The region to sign requests for. Non-AWS endpoints ignore the value
     /// but the signer still needs one; default `us-east-1`.
     pub region: String,
-    /// Static access key id. For GCS this is an HMAC key; for SeaweedFS the
-    /// configured admin key.
+    /// Static access key id (for SeaweedFS, its configured admin key).
     pub access_key_id: String,
     /// Static secret access key paired with `access_key_id`.
     pub secret_access_key: String,
@@ -257,7 +259,7 @@ impl ObjectStoreConfig {
     /// (secrets reach the process through its environment). Missing
     /// credentials are an error naming them: object storage is a hard
     /// dependency, never a silent default.
-    pub fn from_settings(settings: &crate::config::ObjectStoreSettings) -> Result<Self> {
+    pub fn from_settings(settings: &crate::config::S3StoreSettings) -> Result<Self> {
         let secret = |name: &str| -> Result<String> {
             std::env::var(name)
                 .ok()
@@ -277,16 +279,16 @@ impl ObjectStoreConfig {
     }
 }
 
-/// Build the store the install config names: the one place every role that
-/// needs it (the dispatcher and the broker) constructs it.
-pub async fn object_store_for(settings: &crate::config::ObjectStoreSettings) -> Result<SharedObjectStore> {
+/// Build an S3-compatible store from its settings (a Cloud Storage bucket
+/// reached as the process's own account is the Google platform's).
+pub async fn object_store_for(settings: &crate::config::S3StoreSettings) -> Result<SharedObjectStore> {
     Ok(Arc::new(S3ObjectStore::new(&ObjectStoreConfig::from_settings(settings)?).await?))
 }
 
 /// Production `ObjectStore` over the AWS Rust SDK's S3 client. The SDK is used
 /// purely as the S3-protocol client (request building + SigV4 signing); the
 /// endpoint override points it at whatever S3-compatible server the slot names
-/// (GCS, SeaweedFS, AWS, a client bucket). No AWS service is implied.
+/// (SeaweedFS, AWS, a client bucket). No AWS service is implied.
 pub struct S3ObjectStore {
     client: aws_sdk_s3::Client,
     /// A second client whose endpoint is the BROWSER/host-reachable public

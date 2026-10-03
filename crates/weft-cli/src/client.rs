@@ -168,6 +168,16 @@ impl DispatcherClient {
         Ok(())
     }
 
+    /// `delete_idempotent`, answering the body: `None` when it was already
+    /// gone.
+    pub async fn delete_idempotent_json(&self, path: &str) -> anyhow::Result<Option<serde_json::Value>> {
+        let resp = self.send(reqwest::Method::DELETE, path, None).await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND && resp.headers().contains_key("x-weft-not-found") {
+            return Ok(None);
+        }
+        Ok(Some(Self::check(resp).await?.json().await.context("parse response")?))
+    }
+
     pub async fn post_empty(&self, path: &str) -> anyhow::Result<()> {
         let resp = self.send(reqwest::Method::POST, path, None).await?;
         Self::check(resp).await?;

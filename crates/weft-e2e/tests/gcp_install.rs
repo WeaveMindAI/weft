@@ -1,10 +1,11 @@
 //! A real install on GCP, end to end. By hand only: it deploys to a live
-//! cloud and spends money there (a Cloud Build, a Cloud Run worker, a
-//! Compute Engine machine for a minute or two).
+//! cloud and spends money there (a Cloud Build, a Cloud Run worker, an
+//! infra node's Compute Engine machine for a minute or two).
 //!
 //! It needs an install made by the "install on GCP" workflow, and:
 //!
-//!   WEFT_E2E_GCP_URL           the install's address (`https://<ip>`)
+//!   WEFT_E2E_GCP_URL           the install's address (its dispatcher's
+//!                              `https://...run.app`)
 //!   WEFT_E2E_GCP_OPERATOR_KEY  an operator key for it
 //!   WEFT_E2E_GCP_PROJECT       the GCP project it runs in
 //!   WEFT_E2E_GCP_REGION        its region
@@ -12,11 +13,13 @@
 //! and `weft login` done for that address on this machine, since the CLI
 //! the rig drives finds its key there. It skips when a variable is unset.
 //!
-//! What it proves: a project deploys (the install builds it on Cloud
-//! Build), a route answers through the machine's front door, an infra
-//! node comes up on its own machine and goes away, and the program's
-//! worker service is left able to scale to zero, so an idle project
-//! costs nothing.
+//! What it proves: the install has no machine of its own and runs no
+//! holder while nothing holds a connection; a project deploys (the install
+//! builds it on Cloud Build, and the roles that build and run it are woken
+//! by the writes of the ones before them, since each scales to zero); a
+//! route answers at the install's address; an infra node comes up on its
+//! own machine and goes away; and the program's worker service is left
+//! able to scale to zero, so an idle project costs nothing.
 #![cfg(feature = "e2e")]
 
 use std::sync::Arc;
@@ -45,8 +48,31 @@ async fn a_project_runs_on_a_real_gcp_install_and_idles_at_zero() -> anyhow::Res
     let disp = Dispatcher::for_install(&url, weft_core::infra::Install::default_install())?
         .with_auth(Arc::new(OperatorKey(key)));
     ensure::wait_healthy(&disp).await?;
+    let gcloud = |args: Vec<String>| async move {
+        let out = tokio::process::Command::new("gcloud").args(&args).output().await?;
+        anyhow::ensure!(out.status.success(), "gcloud {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr));
+        anyhow::Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
 
-    // A route, through the front door.
+    // Nothing of the install's own is a machine: every Compute Engine
+    // machine in the project is an infra node's, and none runs yet.
+    let machines = gcloud(vec![
+        "compute".into(), "instances".into(), "list".into(), "--project".into(), gcp_project.clone(),
+        "--format".into(), "value(name)".into(),
+    ])
+    .await?;
+    anyhow::ensure!(machines.is_empty(), "the install runs machines of its own: {machines}");
+    // And no holder runs while nothing holds a connection.
+    let holders = || {
+        gcloud(vec![
+            "run".into(), "worker-pools".into(), "describe".into(), "weft-holder".into(), "--project".into(), gcp_project.clone(),
+            "--region".into(), region.clone(), "--format".into(), "value(scaling.manualInstanceCount)".into(),
+        ])
+    };
+    let running = holders().await?;
+    anyhow::ensure!(running.is_empty() || running == "0", "holders run with nothing to hold: {running}");
+
+    // A route, at the install's address.
     let mut project = Project::prepare("web_trigger", disp.clone()).await?;
     let path = project.unique_live_path()?;
     project.activate().await?;

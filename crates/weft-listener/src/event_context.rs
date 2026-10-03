@@ -9,7 +9,7 @@
 //! provider push. Kinds never re-implement it and never see it.
 
 use serde_json::Value;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use weft_core::signal::predicate::{matches, Predicate};
 
@@ -30,6 +30,11 @@ pub enum FireOutcome {
     /// The enqueue failed (logged); the item was NOT delivered and a
     /// cursor must not advance past it.
     EnqueueFailed,
+    /// This copy no longer holds the signal (HTTP 409): another holder
+    /// took it, or it was registered again to be served another way. NOT
+    /// delivered; whoever serves it now delivers its own events, and this
+    /// copy stops its connection at its next look.
+    NotHeld,
     /// The broker does not know this signal's token (HTTP 404). NOT
     /// delivered. It means either the row is not committed yet (a fire
     /// racing its own registration) or the signal is gone; the broker
@@ -52,6 +57,10 @@ pub struct FireContext {
     for_instance: Option<weft_core::instance::InstanceScope>,
     /// The spec-level pre-fire filter. Empty = fire on everything.
     predicates: Vec<Predicate>,
+    /// The holder whose claim the signal is served under, for a held
+    /// connection: the broker takes its fires only while the row is still
+    /// held under that name.
+    held_by: Option<String>,
 }
 
 impl FireContext {
@@ -62,7 +71,12 @@ impl FireContext {
         for_instance: Option<weft_core::instance::InstanceScope>,
         predicates: Vec<Predicate>,
     ) -> Self {
-        Self { sink, token, tenant_id, for_instance, predicates }
+        Self { sink, token, tenant_id, for_instance, predicates, held_by: None }
+    }
+
+    /// The same context, firing under the claim of the holder `replica`.
+    pub fn held_by(self, replica: String) -> Self {
+        Self { held_by: Some(replica), ..self }
     }
 
     pub fn token(&self) -> &str {
@@ -123,8 +137,19 @@ impl FireContext {
             return FireOutcome::Filtered;
         }
         use weft_task_store::tasks::DedupOutcome;
-        match self.sink.fire(&self.token, &self.tenant_id, payload, identity).await {
+        match self.sink.fire(&self.token, &self.tenant_id, self.held_by.as_deref(), payload, identity).await {
             Ok(DedupOutcome::Inserted(_)) | Ok(DedupOutcome::AlreadyLive(_)) => FireOutcome::Fired,
+            Err(e) if e
+                .downcast_ref::<weft_broker_client::BrokerRefused>()
+                .is_some_and(|r| r.status == reqwest::StatusCode::CONFLICT) =>
+            {
+                info!(
+                    target: "weft_listener::event_context",
+                    kind = target, token = %self.token, error = %e,
+                    "this copy no longer holds the signal; the event is left to the one that does"
+                );
+                FireOutcome::NotHeld
+            }
             Err(e) if e
                 .downcast_ref::<weft_broker_client::BrokerRefused>()
                 .is_some_and(|r| r.status == reqwest::StatusCode::NOT_FOUND) =>

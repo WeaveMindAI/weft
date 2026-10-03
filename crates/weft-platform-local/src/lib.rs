@@ -12,6 +12,9 @@
 
 pub mod alarm;
 pub mod docker;
+pub mod domains;
+pub mod frontends;
+pub mod holders;
 pub mod identity;
 pub mod images;
 pub mod infra_host;
@@ -19,6 +22,9 @@ pub mod runner;
 
 pub use alarm::{Deliver, HttpDeliver, LocalAlarm, NotTaken};
 pub use docker::{Docker, DockerCli};
+pub use domains::NoDomains;
+pub use frontends::NoFrontendHosting;
+pub use holders::OneProcessHolds;
 pub use identity::LocalIdentity;
 pub use images::{bound_build_cache, DockerImageBuilder};
 pub use infra_host::{DiskBacking, GpuAccess, LocalInfraHost, LocalInfraHostConfig, Publish};

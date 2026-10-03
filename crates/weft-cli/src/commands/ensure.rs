@@ -120,6 +120,19 @@ impl ProjectHandle {
     }
 }
 
+/// How often a build in progress is asked which images it is building.
+const BUILD_LOOK_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The image builds running for project `id`. Only ever used to tell a
+/// person where a build is, so the caller warns about a status that
+/// cannot be read rather than failing the build being waited on.
+async fn builds_running(client: &crate::client::DispatcherClient, id: &str) -> Result<Vec<weft_core::projects::BuildInFlight>> {
+    let Some(status) = client.get_json_if_found(&format!("/projects/{id}/status")).await? else { return Ok(Vec::new()) };
+    let status: weft_core::projects::ProjectStatusResponse =
+        serde_json::from_value(status).context("read the project's status")?;
+    Ok(status.builds)
+}
+
 /// Make sure the install knows this project, WITHOUT building anything.
 /// Cheap and a no-op when it already does.
 ///
@@ -282,7 +295,45 @@ pub async fn build_compiled(
     };
     progress.build_start(&project.manifest.package.name);
     progress.dispatcher_call_start(&path);
-    let (status, text) = client.post_json_status(&path, &serde_json::to_value(&body)?).await.context("ask the install to build")?;
+    let body = serde_json::to_value(&body)?;
+    let (status, text) = {
+        // While the install builds, name each image it is building and
+        // where its log is, once: a build can take many minutes, and a
+        // bare "building" says nothing about where it is.
+        let asked = client.post_json_status(&path, &body);
+        let mut asked = std::pin::pin!(asked);
+        // Each image once, and again when its log's address arrives.
+        let mut told: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+        // A status that cannot be read is said once, not every look.
+        let mut warned = false;
+        let mut every = tokio::time::interval(BUILD_LOOK_EVERY);
+        every.tick().await;
+        loop {
+            tokio::select! {
+                answer = &mut asked => break answer.context("ask the install to build")?,
+                _ = every.tick() => {
+                    match builds_running(&client, &id).await {
+                        Ok(builds) => {
+                            for build in builds {
+                                let with_log = build.log_url.is_some();
+                                if told.get(&build.image).is_none_or(|had_log| !had_log && with_log) {
+                                    told.insert(build.image.clone(), with_log);
+                                    progress.build_image(&build);
+                                }
+                            }
+                        }
+                        Err(e) if !warned => {
+                            warned = true;
+                            progress.warn(&format!(
+                                "cannot show which images are building or where their logs are ({e:#}); the build goes on"
+                            ));
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+    };
     if !(200..300).contains(&status) {
         anyhow::bail!(
             "the build failed:\n{}",

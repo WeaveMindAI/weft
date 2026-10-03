@@ -92,8 +92,8 @@ impl KindHandler for TimerHandler {
         Some(serde_json::json!({ "scheduledTime": now, "actualTime": now }))
     }
 
-    fn between_fires(&self) -> BetweenFires {
-        BetweenFires::Wakes
+    fn between_fires(&self, _spec: &SignalSpec, _kind_state: &Value) -> Result<BetweenFires> {
+        Ok(BetweenFires::Wakes)
     }
 
     /// The timer's first moment, pinned on the row so a restart never
@@ -136,12 +136,12 @@ impl KindHandler for TimerHandler {
     ///
     /// A wake aimed at an earlier moment than the row names (one already
     /// served) does nothing; its next wake is the one the row names.
-    async fn on_wake(&self, spec: &SignalSpec, woken: Woken, ctx: SpawnCtx) -> Result<Value> {
+    async fn on_wake(&self, spec: &SignalSpec, woken: Woken, ctx: SpawnCtx) -> Result<Option<Value>> {
         let timer: Timer = serde_json::from_value(spec.config.clone())
             .map_err(|e| anyhow::anyhow!("malformed timer spec: {e}"))?;
-        let Some(due) = next_of(&woken.state) else { return Ok(woken.state) };
+        let Some(due) = next_of(&woken.state) else { return Ok(Some(woken.state)) };
         if due > woken.now_ms.max(woken.aimed_at_ms) {
-            return Ok(woken.state);
+            return Ok(Some(woken.state));
         }
         // A cron's next is its next occurrence after both the moment it
         // just served and now, so a wake that came late does not fire
@@ -165,16 +165,16 @@ impl KindHandler for TimerHandler {
             FireOutcome::Fired | FireOutcome::Filtered => {}
             // The row was read a moment ago, so the broker not knowing the
             // token means the signal went in between: nothing to fire.
-            FireOutcome::UnknownSignal => return Ok(woken.state),
+            FireOutcome::UnknownSignal | FireOutcome::NotHeld => return Ok(Some(woken.state)),
             FireOutcome::EnqueueFailed => anyhow::bail!(
                 "the tick for {scheduled} could not be enqueued (see the warning before this line); \
                  the alarm delivers this wake again"
             ),
         }
         // Losing the claim means another copy claimed this moment; its
-        // tick and ours share one key.
-        ctx.fire.claim_kind_state(after.clone(), woken.seq).await?;
-        Ok(after)
+        // tick and ours share one key, and it set the next wake.
+        let claimed = ctx.fire.claim_kind_state(after.clone(), woken.seq).await?;
+        Ok(claimed.then_some(after))
     }
 
     fn process_entry(

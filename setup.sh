@@ -188,7 +188,6 @@ ext_id="weavemind.weft-vscode"
 # port it saved in ports.json when it started, so a port moved once stays
 # found. Before its first start, the port that start will take.
 # SYNC: 14111 <-> crates/weft-core/src/ports.rs (PUBLIC, InstallPorts),
-# deploy/terraform/gcp/network.tf (local.public_port),
 # extension-vscode/src/localInstall.ts,
 # extension-browser/src/entrypoints/popup/App.svelte
 weft_local_url() {

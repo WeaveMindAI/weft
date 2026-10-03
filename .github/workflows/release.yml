@@ -107,6 +107,7 @@ jobs:
       # multi-arch could satisfy the wrong architecture's leg and then
       # be re-pushed as its half. Stdout is the bare refs, captured for
       # the stitch job.
+      # SYNC: `weft build-images` stdout <-> crates/weft-cli/src/images.rs (SharedImages::bare_refs), .github/workflows/install-gcp.yml (build the runtime's images)
       - name: build + push shared images
         run: cargo run --locked -p weft-cli -- build-images --push-suffix "-${{ matrix.arch }}" > image-refs.txt
       - uses: actions/upload-artifact@v4
@@ -359,7 +360,7 @@ jobs:
           # missing manifest reads as "nothing published". The
           # manifest goes LAST so its commit stamp never vouches for
           # assets that are not up yet.
-          # SYNC: manifest.json keys <-> setup.sh (prebuilt artifacts block: manifest_value)
+          # SYNC: manifest.json keys <-> setup.sh (prebuilt artifacts block: manifest_value), .github/workflows/install-gcp.yml (the weft CLI for this checkout), crates/weft-cli/templates/ci/gcp.yml (download the weft CLI)
           gh release upload latest dist/* --clobber
           {
             printf '{\n  "commit": "%s",\n' "${GITHUB_SHA}"

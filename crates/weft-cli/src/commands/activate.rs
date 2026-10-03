@@ -109,10 +109,7 @@ async fn run_inner(
     if let Some(note) = left_out_note(&left_out) {
         progress.warn(&note);
     }
-    if !ctx.json() {
-        println!("activated {name} ({id})");
-    }
-    progress.complete_with(&format!("activated {name}"), serde_json::json!({ "per_instance_left_out": left_out }));
+    progress.complete_with(&format!("activated {name} ({id})"), serde_json::json!({ "per_instance_left_out": left_out }));
     Ok(())
 }
 

@@ -25,17 +25,14 @@
 
 use anyhow::Result;
 use sqlx::PgPool;
-use weft_broker_client::lifecycle_command::{InfraCommandSignal, INFRA_COMMAND_CHANNEL};
+use weft_broker_client::lifecycle_command::ISSUED_WAKE;
 
 use crate::infra_lifecycle_command::InfraLifecycleVerb;
 use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn, SAFETY_POLL_INTERVAL};
 use crate::state::DispatcherState;
 
 /// A command being issued, for any project: the claimer serves them all.
-const WAKE_ON: &[WakeOn] = &[WakeOn {
-    channel: INFRA_COMMAND_CHANNEL,
-    concerns: |payload| matches!(InfraCommandSignal::parse(payload), Some(InfraCommandSignal::Issued { .. })),
-}];
+pub(crate) static WAKE_ON: &[WakeOn] = &[ISSUED_WAKE];
 
 pub fn drain_loop(state: DispatcherState) -> DrainLoop {
     DrainLoop::new("lifecycle_claimer", WAKE_ON, SAFETY_POLL_INTERVAL, move || {

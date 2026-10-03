@@ -22,10 +22,15 @@ pub enum Access {
     /// account. Cloud Run pulls a worker's image with its own service
     /// agent, never the runtime account, so workers need no grant here.
     ImageRegistry,
+    /// Writing to Cloud Logging, which an infra machine's guest agent
+    /// does as its own account (its boot script's output among it). Only
+    /// a project-wide grant carries it; the core may grant this one role
+    /// and no other (identity.tf).
+    Logging,
 }
 
 impl Access {
-    const ALL: [Access; 2] = [Access::CallerTokenSecret, Access::ImageRegistry];
+    const ALL: [Access; 3] = [Access::CallerTokenSecret, Access::ImageRegistry, Access::Logging];
 
     /// The resource and the role this access is.
     fn binding(self, gcp: &GcpPlatform) -> anyhow::Result<(String, &'static str)> {
@@ -38,13 +43,16 @@ impl Access {
                 format!("https://artifactregistry.googleapis.com/v1/{}", repository_resource(&gcp.artifact_registry)?),
                 "roles/artifactregistry.reader",
             ),
+            Access::Logging => {
+                (format!("https://cloudresourcemanager.googleapis.com/v1/projects/{}", gcp.project), "roles/logging.logWriter")
+            }
         })
     }
 }
 
-/// Make sure `project`'s account exists and holds `access`. Answers its
-/// email.
-pub async fn ensure_project_account(google: &Google, gcp: &GcpPlatform, project: uuid::Uuid, access: Access) -> anyhow::Result<String> {
+/// Make sure `project`'s account exists and holds every `access`.
+/// Answers its email.
+pub async fn ensure_project_account(google: &Google, gcp: &GcpPlatform, project: uuid::Uuid, access: &[Access]) -> anyhow::Result<String> {
     let email = names::project_account_email(project, &gcp.project);
     let url = format!("https://iam.googleapis.com/v1/projects/{}/serviceAccounts/{email}", gcp.project);
     if google.get_opt(&url).await?.is_none() {
@@ -63,10 +71,12 @@ pub async fn ensure_project_account(google: &Google, gcp: &GcpPlatform, project:
             Err(e) => return Err(e.context(format!("create the service account of project {project}"))),
         }
     }
-    let (resource, role) = access.binding(gcp)?;
     let member = format!("serviceAccount:{email}");
-    // A policy refuses an account IAM has not spread yet ("does not exist").
-    until_account_is_known(|| add_binding(google, &resource, role, &member)).await?;
+    for access in access {
+        let (resource, role) = access.binding(gcp)?;
+        // A policy refuses an account IAM has not spread yet ("does not exist").
+        until_account_is_known(|| add_binding(google, &resource, role, &member)).await?;
+    }
     Ok(email)
 }
 
@@ -167,8 +177,17 @@ async fn change_policy(google: &Google, resource: &str, edit: impl Fn(&mut Vec<V
     let mut tries = 0;
     loop {
         tries += 1;
-        let mut policy = google.get(&format!("{resource}:getIamPolicy")).await?;
+        // Read and written at version 3, the one that keeps a binding's
+        // condition: a project's policy carries conditional bindings (the
+        // core's own grant to add log writers), and a version-1 write of
+        // a policy holding one is refused.
+        let mut policy = if reads_policy_with_post(resource) {
+            google.post(&format!("{resource}:getIamPolicy"), &json!({ "options": { "requestedPolicyVersion": 3 } })).await?
+        } else {
+            google.get_query(&format!("{resource}:getIamPolicy"), &[("options.requestedPolicyVersion", "3".into())]).await?
+        };
         let obj = policy.as_object_mut().ok_or_else(|| anyhow::anyhow!("an IAM policy that is not an object"))?;
+        obj.insert("version".into(), json!(3));
         let list = obj.entry("bindings").or_insert_with(|| json!([]));
         let list = list.as_array_mut().ok_or_else(|| anyhow::anyhow!("IAM bindings that are not a list"))?;
         if !edit(list)? {
@@ -179,6 +198,12 @@ async fn change_policy(google: &Google, resource: &str, edit: impl Fn(&mut Vec<V
             done => return done.map(|_| ()),
         }
     }
+}
+
+/// A project's and a service account's policy are read with a POST, every
+/// other resource's with a GET.
+fn reads_policy_with_post(resource: &str) -> bool {
+    resource.starts_with("https://cloudresourcemanager.googleapis.com/") || resource.starts_with("https://iam.googleapis.com/")
 }
 
 /// Add `member` to `role` on `resource`, when it is not there yet.

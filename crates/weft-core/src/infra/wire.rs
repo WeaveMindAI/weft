@@ -324,6 +324,63 @@ pub struct InfraStatusEntry {
     /// warnings. Empty when the copy runs as asked.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    /// How far a start of this copy got, while one is under way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<ApplyProgress>,
+}
+
+/// How far a start of an infra copy got: since when it runs, and what it
+/// waits on right now, in the host's words ("its machine's agent does not
+/// answer yet: ..."). `waiting` is absent before the host reports
+/// anything (the machine is still being made).
+// SYNC: ApplyProgress <-> packages/weft-graph/src/protocol.ts ApplyProgress
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyProgress {
+    #[serde(rename = "sinceUnix")]
+    pub since_unix: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<String>,
+}
+
+impl ApplyProgress {
+    /// The progress a row records, when it records one.
+    pub fn of(since_unix: Option<i64>, waiting: Option<String>) -> Option<Self> {
+        since_unix.map(|since_unix| Self { since_unix, waiting })
+    }
+
+    /// As a person reads it, `now_unix` being the time it is read:
+    /// "for 3m12s, waiting on: ...".
+    // SYNC: describe <-> packages/weft-graph/src/status.ts describeProgress
+    pub fn describe(&self, now_unix: i64) -> String {
+        let secs = (now_unix - self.since_unix).max(0);
+        let elapsed = if secs >= 60 { format!("{}m{:02}s", secs / 60, secs % 60) } else { format!("{secs}s") };
+        match &self.waiting {
+            Some(waiting) => format!("for {elapsed}, waiting on: {waiting}"),
+            None => format!("for {elapsed}"),
+        }
+    }
+
+    /// [`Self::describe`], read now.
+    pub fn describe_now(&self) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(self.since_unix);
+        self.describe(now)
+    }
+}
+
+#[cfg(test)]
+mod apply_progress_tests {
+    use super::ApplyProgress;
+
+    #[test]
+    fn progress_reads_as_how_long_and_on_what() {
+        let p = ApplyProgress { since_unix: 100, waiting: Some("db: its machine's agent does not answer yet".into()) };
+        assert_eq!(p.describe(292), "for 3m12s, waiting on: db: its machine's agent does not answer yet");
+        assert_eq!(ApplyProgress { since_unix: 100, waiting: None }.describe(130), "for 30s");
+        assert_eq!(ApplyProgress::of(None, Some("x".into())), None, "no start, no progress");
+    }
 }
 
 /// What a verb that enqueues a lifecycle command answers (202). No

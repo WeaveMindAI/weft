@@ -35,8 +35,8 @@ impl KindHandler for SocketListenHandler {
         SocketListen::TAG
     }
 
-    fn between_fires(&self) -> BetweenFires {
-        BetweenFires::Holds
+    fn between_fires(&self, _spec: &SignalSpec, _kind_state: &Value) -> Result<BetweenFires> {
+        Ok(BetweenFires::Holds)
     }
 
     fn compute_routing(&self, _spec: &SignalSpec) -> Result<SignalRouting> {

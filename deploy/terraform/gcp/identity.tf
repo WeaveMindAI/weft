@@ -1,10 +1,9 @@
-# Who may do what. Nothing here holds a key file: the machine and the
-# serverless roles run as the core account, project workers and infra
-# machines as an account per project (created by the core when a project
-# first runs), and GitHub Actions authenticate through Workload Identity
-# Federation.
+# Who may do what. Nothing here holds a key file: weft's roles and the
+# holders run as the core account, project workers and infra machines as
+# an account per project (created by the core when a project first runs),
+# and GitHub Actions authenticate through Workload Identity Federation.
 
-# weft's own account: the machine, and any role placed serverless.
+# weft's own account: every role and the holders.
 resource "google_service_account" "core" {
   account_id   = "${var.name}-core"
   display_name = "weft runtime"
@@ -14,8 +13,8 @@ locals {
   core = "serviceAccount:${google_service_account.core.email}"
   # What the core does across the project:
   core_project_roles = [
-    # deploy each project's workers and the serverless roles, and let
-    # only the core call them
+    # deploy each project's workers, set how many holders run, and let
+    # only the core call what it should
     "roles/run.admin",
     # start builds
     "roles/cloudbuild.builds.editor",
@@ -28,6 +27,11 @@ locals {
     "roles/iam.serviceAccountUser",
     # write its logs
     "roles/logging.logWriter",
+    # make and take down the load balancer in front of the install's
+    # domains (`weft domain add`), only while it has any
+    "roles/compute.loadBalancerAdmin",
+    # and the certificates it holds for them
+    "roles/certificatemanager.editor",
   ]
 }
 
@@ -36,6 +40,20 @@ resource "google_project_iam_member" "core" {
   project  = var.project_id
   role     = each.value
   member   = local.core
+}
+
+# Let each project's account write logs (an infra machine's guest agent
+# writes its boot output there), a grant only the project's own policy
+# can carry. The condition lets the core add or remove that one role and
+# no other, so this is not a way for it to grant itself anything.
+resource "google_project_iam_member" "core_grants_log_writers" {
+  project = var.project_id
+  role    = "roles/resourcemanager.projectIamAdmin"
+  member  = local.core
+  condition {
+    title      = "only log writers"
+    expression = "api.getAttribute('iam.googleapis.com/modifiedGrantsByRole', []).hasOnly(['roles/logging.logWriter'])"
+  }
 }
 
 # Make and remove each project's account, and nothing else about accounts:
@@ -70,6 +88,14 @@ resource "google_artifact_registry_repository_iam_member" "core_registry" {
   member     = local.core
 }
 
+# Sign the object store's links as itself (storage.tf): a link is signed
+# by Google for the account, never with a key the install holds.
+resource "google_service_account_iam_member" "core_signs_as_itself" {
+  service_account_id = google_service_account.core.name
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = local.core
+}
+
 resource "google_storage_bucket_iam_member" "core_stages_builds" {
   bucket = google_storage_bucket.builds.name
   role   = "roles/storage.objectAdmin"
@@ -102,9 +128,10 @@ resource "google_project_iam_member" "builder_logs" {
   member  = "serviceAccount:${google_service_account.builder.email}"
 }
 
-# GitHub Actions in every repository of `frontend_repos`, to deploy a
-# frontend. (The install workflow itself authenticates with the identity
-# you made once by hand before the first apply; see the cloud chapter.)
+# GitHub Actions in the repositories of the frontends the install hosts,
+# to deploy them (`weft frontend add <name> --repo <owner/name>`). (The
+# install workflow itself authenticates with the identity you made once by
+# hand before the first apply; see the cloud chapter.)
 resource "google_iam_workload_identity_pool" "github" {
   workload_identity_pool_id = "${var.name}-github"
   display_name              = "GitHub Actions"
@@ -116,11 +143,21 @@ resource "google_iam_workload_identity_pool_provider" "github" {
   workload_identity_pool_provider_id = "github"
   display_name                       = "GitHub Actions"
 
+  # A frontend's repository is let in by its id (the name can be taken by
+  # somebody else once the repository is deleted or renamed).
+  # SYNC: attribute.repository_id <-> crates/weft-platform-gcp/src/frontends.rs (repo_principal)
   attribute_mapping = {
-    "google.subject"       = "assertion.sub"
-    "attribute.repository" = "assertion.repository"
+    "google.subject"          = "assertion.sub"
+    "attribute.repository"    = "assertion.repository"
+    "attribute.repository_id" = "assertion.repository_id"
   }
-  attribute_condition = "assertion.repository in ${jsonencode(var.frontend_repos)}"
+  # Any repository may exchange its GitHub token here, and gets nothing
+  # by it: what a repository may do is only what a binding names it for,
+  # and the install binds each frontend's repository as it adds the
+  # frontend (crates/weft-platform-gcp/src/frontends.rs). Google asks
+  # every GitHub provider for a condition; this one only says the token
+  # names a repository.
+  attribute_condition = "assertion.repository != ''"
 
   oidc {
     issuer_uri = "https://token.actions.githubusercontent.com"
@@ -141,49 +178,14 @@ resource "google_artifact_registry_repository_iam_member" "deployer_push" {
   member     = "serviceAccount:${google_service_account.deployer.email}"
 }
 
-# Each frontend repository deploys to one Cloud Run service of its own,
-# made here, and the deployer may change that service and no other: no
-# role on the project's Cloud Run at all. A project-wide grant would let a
-# frontend repository replace a project's worker service (workers trust
-# every call that reaches them) or open one to the internet. The service
-# is public without any IAM change (`invoker_iam_disabled`), so no deploy
-# ever needs `setIamPolicy`. Terraform makes the service with a stand-in
-# image and then leaves what runs on it to the repository's workflow.
-locals {
-  # SYNC: the frontend service name <-> crates/weft-cli/templates/ci/gcp.yml (FRONT_SERVICE)
-  frontend_services = { for repo in var.frontend_repos : repo => "${var.name}-front-${substr(sha256(repo), 0, 12)}" }
-}
-
-resource "google_cloud_run_v2_service" "frontend" {
-  for_each             = local.frontend_services
-  name                 = each.value
-  location             = var.region
-  ingress              = "INGRESS_TRAFFIC_ALL"
-  invoker_iam_disabled = true
-  deletion_protection  = false
-  labels               = { "weft-frontend-repo" = substr(replace(lower(each.key), "/[^a-z0-9_-]/", "_"), 0, 63) }
-
-  template {
-    service_account = google_service_account.frontend.email
-    containers {
-      image = "us-docker.pkg.dev/cloudrun/container/hello"
-    }
-  }
-
-  lifecycle {
-    ignore_changes = [template, client, client_version]
-  }
-  depends_on = [google_project_service.apis]
-}
-
-resource "google_cloud_run_v2_service_iam_member" "deployer_runs_frontend" {
-  for_each = google_cloud_run_v2_service.frontend
-  project  = var.project_id
-  location = each.value.location
-  name     = each.value.name
-  role     = "roles/run.developer"
-  member   = "serviceAccount:${google_service_account.deployer.email}"
-}
+# Each frontend deploys to one Cloud Run service of its own, which the
+# install makes as the frontend is added and lets the deployer change
+# (crates/weft-platform-gcp/src/frontends.rs): no role on the project's
+# Cloud Run at all. A project-wide grant would let a frontend repository
+# replace a project's worker service (workers trust every call that
+# reaches them) or open one to the internet. The service is public
+# without any IAM change (`invokerIamDisabled`), so no deploy ever needs
+# `setIamPolicy`.
 
 # Google lists `run.operations.get` among what a deploy needs "to read the
 # status of the service", and an operation is not a resource a grant on
@@ -201,8 +203,8 @@ resource "google_project_iam_member" "deployer_reads_deploy_status" {
   member  = "serviceAccount:${google_service_account.deployer.email}"
 }
 
-# A frontend reaches the install's private address through Direct VPC
-# egress on the install's subnet.
+# A frontend reaches its project's infrastructure (a database) through
+# Direct VPC egress on the install's subnet.
 resource "google_compute_subnetwork_iam_member" "deployer_subnet" {
   subnetwork = google_compute_subnetwork.main.name
   region     = var.region
@@ -222,9 +224,17 @@ resource "google_service_account_iam_member" "deployer_acts_as_frontend" {
   member             = "serviceAccount:${google_service_account.deployer.email}"
 }
 
-resource "google_service_account_iam_member" "github_deploys" {
-  for_each           = toset(var.frontend_repos)
+# The install lets a frontend's repository deploy as the deployer when it
+# adds the frontend, and takes that back when it removes it: the core may
+# change who acts as the deployer, and nothing about any other account.
+resource "google_project_iam_custom_role" "deployer_access" {
+  role_id     = "${replace(var.name, "-", "_")}_deployer_access"
+  title       = "weft frontend repositories"
+  permissions = ["iam.serviceAccounts.getIamPolicy", "iam.serviceAccounts.setIamPolicy"]
+}
+
+resource "google_service_account_iam_member" "core_lets_repositories_deploy" {
   service_account_id = google_service_account.deployer.name
-  role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github.name}/attribute.repository/${each.value}"
+  role               = google_project_iam_custom_role.deployer_access.id
+  member             = local.core
 }

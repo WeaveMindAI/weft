@@ -226,6 +226,11 @@ pub enum LiveArrivalResult {
 pub struct FireSignalPayload {
     pub token: String,
     pub payload: serde_json::Value,
+    /// The holder a held connection fired under. The broker takes the
+    /// fire only while the signal is still held under that name, so a
+    /// copy that lost the row delivers nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

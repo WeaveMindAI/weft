@@ -984,6 +984,7 @@ pub(crate) mod tests {
             auth_config: None,
             kind_state: serde_json::Value::Object(Default::default()),
             kind_state_seq: 0,
+            holds: false,
         }
     }
 

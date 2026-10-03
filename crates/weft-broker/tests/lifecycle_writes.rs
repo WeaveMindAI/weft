@@ -12,12 +12,12 @@
 use sqlx::PgPool;
 
 use weft_broker::lifecycle_writes::{
-    complete_command, issue_command, next_command, record_event, set_status, sync_ownership,
+    complete_command, issue_command, next_command, record_event, set_status, set_waiting, sync_ownership,
     unowned_work_waiting, FencedWrite, IssuedCommand,
 };
 use weft_broker_client::protocol::{
     decode_units_json, InfraLifecycleVerb, units_json_repair_sql, FailureStage, InfraNodeStatus as Status,
-    SupervisorCommandCompleteRequest, SupervisorSetStatusRequest,
+    SupervisorCommandCompleteRequest, SupervisorSetStatusRequest, SupervisorSetWaitingRequest,
 };
 
 const TENANT: &str = "t1";
@@ -190,6 +190,64 @@ async fn stamp_by_a_displaced_replica_is_displaced(pool: PgPool) {
     let out = set_status(&pool, &stamp(OTHER, Some(cmd), None, Status::Terminating)).await.unwrap();
     assert_eq!(out, FencedWrite::Displaced);
     assert_eq!(row(&pool).await.0, "running");
+}
+
+/// What an apply waits on is recorded by the owner under its apply only,
+/// refused (the row untouched) for a process that lost the project, and
+/// cleared, with when it began, once the copy leaves provisioning.
+#[sqlx::test]
+async fn what_an_apply_waits_on_is_its_own_and_ends_with_it(pool: PgPool) {
+    schema(&pool).await;
+    lease(&pool, OWNER).await;
+    let stop = command(&pool).await;
+    let (cmd,): (i64,) = sqlx::query_as(
+        "INSERT INTO infra_lifecycle_command (tenant_id, project_id, node_id, verb, issued_by_replica, issued_at_unix) \
+         VALUES ($1, $2, $3, 'apply', 'dispatcher', EXTRACT(EPOCH FROM NOW())::BIGINT) RETURNING id",
+    )
+    .bind(TENANT)
+    .bind(PROJECT)
+    .bind(NODE)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    node_row(&pool, "provisioning", serde_json::json!({ "a": unit("provisioning") })).await;
+    sqlx::query("UPDATE infra_node SET provisioning_since_unix = 100 WHERE project_id = $1").bind(PROJECT).execute(&pool).await.unwrap();
+    let waiting = |replica: &str, text: &str| SupervisorSetWaitingRequest {
+        replica: replica.into(),
+        command_id: cmd,
+        project_id: PROJECT,
+        node_id: NODE.into(),
+        instance: None,
+        waiting: text.into(),
+    };
+    let read = || async {
+        let (w,): (Option<String>,) = sqlx::query_as("SELECT waiting_on FROM infra_node WHERE project_id = $1")
+            .bind(PROJECT)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        w
+    };
+    assert_eq!(set_waiting(&pool, &waiting(OTHER, "theirs")).await.unwrap(), FencedWrite::Displaced);
+    assert_eq!(read().await, None);
+    assert_eq!(
+        set_waiting(&pool, &SupervisorSetWaitingRequest { command_id: stop, ..waiting(OWNER, "under a stop") }).await.unwrap(),
+        FencedWrite::Gone,
+        "only an apply records what it waits on"
+    );
+    assert_eq!(set_waiting(&pool, &waiting(OWNER, "a: its machine's agent does not answer yet")).await.unwrap(), FencedWrite::Applied);
+    assert_eq!(read().await.as_deref(), Some("a: its machine's agent does not answer yet"));
+    // The start fails: its progress goes with it, so a later start never
+    // shows this one's.
+    let failed = SupervisorSetStatusRequest { command_id: Some(cmd), ..stamp(OWNER, None, None, Status::Failed) };
+    assert_eq!(set_status(&pool, &failed).await.unwrap(), FencedWrite::Applied);
+    assert_eq!(read().await, None);
+    let (since,): (Option<i64>,) = sqlx::query_as("SELECT provisioning_since_unix FROM infra_node WHERE project_id = $1")
+        .bind(PROJECT)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(since, None);
 }
 
 /// The autonomous (health) stamp is fenced by ownership too: a process that
@@ -392,6 +450,29 @@ async fn a_tick_reports_the_projects_it_took_on(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(claimed().await, vec![PROJECT], "a lapsed lease taken back is news");
+}
+
+/// A tick says when its supervisor next has something to look at: never
+/// over a project that only declares infra, at the lapse of a sibling's
+/// lease over one with infra nodes, and now once that project is its own.
+#[sqlx::test]
+async fn a_tick_says_when_there_is_next_something_to_look_at(pool: PgPool) {
+    schema(&pool).await;
+    project_row(&pool, PROJECT, true).await;
+    let declared = sync_ownership(&pool, OWNER, &[]).await.unwrap();
+    assert_eq!(declared.owned.len(), 1, "declared infra is ownable");
+    assert!(!declared.owns_work && declared.others_lapse_in_secs.is_none(), "but gives nothing to look at: {declared:?}");
+
+    node_row(&pool, "running", serde_json::json!({})).await;
+    lease(&pool, OTHER).await;
+    let sibling = sync_ownership(&pool, OWNER, &[]).await.unwrap();
+    assert!(sibling.owned.is_empty() && !sibling.owns_work, "a sibling holds the lease");
+    let lapse = sibling.others_lapse_in_secs.expect("its lease may lapse");
+    assert!((3590..=3600).contains(&lapse), "the sibling's lease lapses in an hour: {lapse}");
+
+    lease(&pool, OWNER).await;
+    let own = sync_ownership(&pool, OWNER, &[]).await.unwrap();
+    assert!(own.owns_work && own.others_lapse_in_secs.is_none(), "{own:?}");
 }
 
 /// A project with no infra, no row and nothing on the host is owned only

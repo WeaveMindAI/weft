@@ -257,21 +257,23 @@ async fn run_inner(
     done.insert("instancesStillOn".into(), serde_json::to_value(&answer.instances_still_on)?);
     progress.dispatcher_call_done(serde_json::Value::Object(done));
     if !ctx.json() {
-        let suffix = match grace_minutes {
-            Some(g) => format!("[mode: {mode_str}, running: {running_policy_str}, grace: {g}min]"),
-            None => format!("[mode: {mode_str}, running: {running_policy_str}]"),
-        };
-        if answer.deactivated.is_empty() {
-            println!("no trigger in {name} ({id}) was on; nothing to deactivate {suffix}");
-        } else {
-            let whom = answer.deactivated.iter().map(whose_triggers).collect::<Vec<_>>().join(", ");
-            println!("deactivated {whom} in {name} ({id}) {suffix}");
-        }
         if let Some(line) = instances_still_on_line(&answer.instances_still_on) {
             println!("{line}");
         }
     }
-    progress.complete(&format!("deactivated {name} ({mode_str}/{running_policy_str})"));
+    let suffix = match grace_minutes {
+        Some(g) => format!("[mode: {mode_str}, running: {running_policy_str}, grace: {g}min]"),
+        None => format!("[mode: {mode_str}, running: {running_policy_str}]"),
+    };
+    // The one line saying what happened: `complete` prints it on a
+    // terminal and carries it in `--json`.
+    let summary = if answer.deactivated.is_empty() {
+        format!("no trigger in {name} ({id}) was on; nothing to deactivate {suffix}")
+    } else {
+        let whom = answer.deactivated.iter().map(whose_triggers).collect::<Vec<_>>().join(", ");
+        format!("deactivated {whom} in {name} ({id}) {suffix}")
+    };
+    progress.complete(&summary);
     Ok(())
 }
 

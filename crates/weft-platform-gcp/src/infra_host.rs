@@ -54,6 +54,12 @@ const STARTUP_SCRIPT: &str = r#"#!/bin/bash
 # every boot: mount the unit's disks, install the GPU driver when asked,
 # start the host agent.
 set -eu
+# Container-Optimized OS drops every incoming connection but ssh. The
+# ports that may reach this machine are the network's firewall rules
+# (deploy/terraform/gcp/network.tf), so the machine accepts what those
+# let through: the host agent's port and the ports its units declare.
+iptables -w -A INPUT -p tcp -j ACCEPT
+iptables -w -A INPUT -p udp -j ACCEPT
 md() { curl -sf -H 'Metadata-Flavor: Google' "http://metadata.google.internal/computeMetadata/v1/instance/attributes/$1" || true; }
 for disk in $(md weft-disks); do
   dev="/dev/disk/by-id/google-$disk"
@@ -516,7 +522,7 @@ impl InfraHost for ComputeInfraHost {
 
     async fn apply_unit(&self, node: &ResolvedNode, unit: &str) -> anyhow::Result<()> {
         let resolved = node.unit(unit).ok_or_else(|| anyhow::anyhow!("node '{}' declares no unit '{unit}'", node.node.node))?;
-        let account = crate::accounts::ensure_project_account(&self.google, &self.gcp, node.node.project, Access::ImageRegistry).await?;
+        let account = crate::accounts::ensure_project_account(&self.google, &self.gcp, node.node.project, &[Access::ImageRegistry, Access::Logging]).await?;
         let disks = self.ensure_disks(node, resolved).await?;
         let Some(machine) = self.machine(&node.node, unit).await? else {
             return self.create_machine(node, resolved, &disks, &account).await;

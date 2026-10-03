@@ -131,6 +131,7 @@ fn entry_signal(token: &str, project_id: Uuid) -> SignalRegistration {
         kind_state_seq: 0,
         access_id: None,
         port_snapshot: None,
+        holds: false,
     }
 }
 
@@ -889,7 +890,7 @@ async fn quiesce_waits_until_no_run_of_the_project_is_live(pool: PgPool) {
     let task = execute_task(id, execution_id, "bin-A", None, Some(std::slice::from_ref(&start)));
     journal.start_execution(&start, &[], task, None).await.unwrap();
 
-    let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool, weft_dispatcher::take_down::RUN_ENDING_CHANNELS)
+    let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool.connect_options(), weft_dispatcher::take_down::RUN_ENDING_CHANNELS)
         .await
         .unwrap();
     let journal = std::sync::Arc::new(journal);
@@ -946,7 +947,7 @@ async fn forgetting_an_unrecorded_run_announces_its_ending_at_the_commit(pool: P
     assert_eq!(live().await, vec![execution_id]);
 
     static CHANNELS: &[&str] = &[UNRECORDED_ENDED_CHANNEL];
-    let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool, CHANNELS).await.unwrap();
+    let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool.connect_options(), CHANNELS).await.unwrap();
     let mut heard = watch.subscribe();
     async fn heard_next(heard: &mut weft_task_store::pg_signal::Subscription) -> Option<String> {
         match heard.next().await.unwrap() {
@@ -2047,4 +2048,114 @@ async fn a_second_upgrade_of_the_same_copies_is_refused(pool: PgPool) {
 
     complete_command(&pool, first).await;
     assert!(matches!(issue(None).await, UpgradeIssued::Issued(id) if id != first));
+}
+
+// ----- held signals: the holders' claims and their count --------------------
+
+/// A held entry signal written the way a registration writes it.
+fn held_signal(token: &str, project_id: Uuid, seq: i64) -> SignalRegistration {
+    SignalRegistration { holds: true, kind_state_seq: seq, ..entry_at(token, project_id) }
+}
+
+/// An entry signal at a place of its own, so several sit in one project.
+fn entry_at(token: &str, project_id: Uuid) -> SignalRegistration {
+    SignalRegistration { node_id: token.to_string(), ..entry_signal(token, project_id) }
+}
+
+/// A registration that rewrites a held row takes its holder's claim away,
+/// so the holder running the old row stops it and the new one comes up as
+/// the row now reads.
+#[sqlx::test]
+async fn a_rewritten_held_row_lets_its_holder_go(pool: PgPool) {
+    let (journal, projects) = setup(&pool).await;
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    journal.signal_insert(&held_signal("sse", id, 0)).await.unwrap();
+    sqlx::query("UPDATE signal SET held_by = 'h1', held_until = 9999999999, serving = '{\"status\":\"up\"}' WHERE token = 'sse'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    journal.signal_insert(&held_signal("sse", id, 1)).await.unwrap();
+    let (held_by, serving, holds): (Option<String>, Option<serde_json::Value>, bool) =
+        sqlx::query_as("SELECT held_by, serving, holds FROM signal WHERE token = 'sse'").fetch_one(&pool).await.unwrap();
+    assert_eq!((held_by, serving, holds), (None, None, true));
+}
+
+/// The holders are counted from the held rows a listener holds: a parked
+/// activation's and a signal that holds nothing do not count.
+#[sqlx::test]
+async fn the_holders_count_the_held_rows_of_live_activations(pool: PgPool) {
+    let (journal, projects) = setup(&pool).await;
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    assert_eq!(weft_dispatcher::holders::held_count(&pool).await.unwrap(), 0);
+    journal.signal_insert(&held_signal("one", id, 0)).await.unwrap();
+    journal.signal_insert(&held_signal("two", id, 0)).await.unwrap();
+    journal.signal_insert(&entry_at("form", id)).await.unwrap();
+    assert_eq!(weft_dispatcher::holders::held_count(&pool).await.unwrap(), 2);
+    sqlx::query(
+        "INSERT INTO trigger_activation (project_id, trigger, status, accepting_fires, fires_visible_to_consumers, updated_at) \
+         VALUES ($1, 'parked', 'inactive', FALSE, FALSE, 0)",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE signal SET activation_trigger = 'parked' WHERE token = 'two'").execute(&pool).await.unwrap();
+    assert_eq!(weft_dispatcher::holders::held_count(&pool).await.unwrap(), 1, "a parked activation's row holds nothing");
+}
+
+/// The holders run as many copies as the held signals need, none for none,
+/// and look again only when the count is announced to have changed.
+#[sqlx::test]
+async fn the_holders_are_sized_to_the_held_signals(pool: PgPool) {
+    use weft_task_store::drain::DrainStep;
+    let (journal, projects) = setup(&pool).await;
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    let holders = weft_platform_traits::FakeHolderPool::default();
+    assert_eq!(weft_dispatcher::holders::size(&pool, &holders, 2).await.unwrap(), DrainStep::Done);
+    for t in ["a", "b", "c"] {
+        journal.signal_insert(&held_signal(t, id, 0)).await.unwrap();
+    }
+    assert_eq!(weft_dispatcher::holders::size(&pool, &holders, 2).await.unwrap(), DrainStep::Done);
+    journal.signal_remove_many(&["a".to_string(), "b".to_string(), "c".to_string()]).await.unwrap();
+    weft_dispatcher::holders::size(&pool, &holders, 2).await.unwrap();
+    assert_eq!(*holders.sizes.lock(), vec![0, 2, 0]);
+}
+
+/// A held row coming or going announces itself at its commit, which is
+/// what wakes the holder sizing; a row that holds nothing stays silent.
+#[sqlx::test]
+async fn a_held_row_coming_or_going_wakes_the_holder_sizing(pool: PgPool) {
+    use weft_dispatcher::holders::HELD_SIGNALS_CHANNEL;
+    let (journal, projects) = setup(&pool).await;
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    static CHANNELS: &[&str] = &[HELD_SIGNALS_CHANNEL];
+    let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool.connect_options(), CHANNELS).await.unwrap();
+    let mut heard = watch.subscribe();
+    async fn woken(heard: &mut weft_task_store::pg_signal::Subscription) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        heard.woken_before(deadline, |c, _| c == HELD_SIGNALS_CHANNEL).await.unwrap()
+    }
+    journal.signal_insert(&entry_at("form", id)).await.unwrap();
+    assert!(!woken(&mut heard).await, "a signal that holds nothing is silent");
+    journal.signal_insert(&held_signal("sse", id, 0)).await.unwrap();
+    assert!(woken(&mut heard).await, "a held one coming");
+    journal.signal_remove_many(&["sse".to_string()]).await.unwrap();
+    assert!(woken(&mut heard).await, "and going");
+    sqlx::query(
+        "INSERT INTO trigger_activation (project_id, trigger, status, accepting_fires, fires_visible_to_consumers, updated_at) \
+         VALUES ($1, 'parked', 'active', TRUE, TRUE, 0)",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(woken(&mut heard).await, "an activation coming may change which rows are held");
+    sqlx::query("UPDATE trigger_activation SET status = 'inactive' WHERE project_id = $1 AND trigger = 'parked'").bind(id).execute(&pool).await.unwrap();
+    assert!(woken(&mut heard).await, "an activation parked changes which rows are held");
+    sqlx::query("DELETE FROM trigger_activation WHERE project_id = $1 AND trigger = 'parked'").bind(id).execute(&pool).await.unwrap();
+    assert!(woken(&mut heard).await, "and one forgotten too");
 }

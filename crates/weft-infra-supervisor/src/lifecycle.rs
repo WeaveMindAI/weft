@@ -455,6 +455,9 @@ async fn owned_project(
 async fn wait_for_readiness(
     state: &SupervisorState,
     command_id: i64,
+    project_id: Uuid,
+    node_id: &str,
+    instance: Option<&weft_core::instance::InstanceId>,
     node: &NodeRef,
     units: &std::collections::HashSet<String>,
 ) -> Result<()> {
@@ -472,6 +475,8 @@ async fn wait_for_readiness(
     // unit either comes up or the user stops it.
     let mut next_cancel_check = state.clock.now();
     let mut next_breadcrumb = state.clock.now() + READINESS_BREADCRUMB_INTERVAL;
+    // What the row says it waits on, rewritten only when it changes.
+    let mut recorded = String::new();
     loop {
         if state.clock.now() >= next_cancel_check {
             check_cancel(state, command_id, "waiting for the units to be ready").await?;
@@ -485,12 +490,28 @@ async fn wait_for_readiness(
                 Some(UnitRunState::Failed { why }) => {
                     return Err(anyhow!("unit '{unit}' could not start: {why}"));
                 }
-                Some(other) => waiting.push(format!("{unit} ({other:?})")),
-                None => waiting.push(format!("{unit} (not reported yet)")),
+                Some(UnitRunState::NotReady { why }) => waiting.push(format!("{unit}: {why}")),
+                Some(UnitRunState::Starting) => waiting.push(format!("{unit}: starting")),
+                Some(UnitRunState::Stopped) => waiting.push(format!("{unit}: stopped")),
+                None => waiting.push(format!("{unit}: not reported by its host yet")),
             }
         }
         if waiting.is_empty() {
             return Ok(());
+        }
+        let now_waiting = waiting.join("; ");
+        if now_waiting != recorded {
+            // For `weft status`. A copy the command no longer reaches, or
+            // a project another supervisor took, is the next check's to
+            // end; the record is only what a person reads.
+            match state.broker.set_waiting(&state.replica, command_id, project_id, node_id, instance, &now_waiting).await {
+                Ok(_) => recorded = now_waiting,
+                Err(e) => tracing::warn!(
+                    target: "weft_infra_supervisor::lifecycle",
+                    copy_id = %node.copy_id, error = %format!("{e:#}"),
+                    "could not record what the apply waits on"
+                ),
+            }
         }
         if state.clock.now() >= next_breadcrumb {
             tracing::info!(
@@ -988,7 +1009,7 @@ async fn execute_apply(
         for unit in &reconcile {
             state.host.apply_unit(&resolved, unit).await?;
         }
-        wait_for_readiness(state, cmd.id, &copy, &reconcile).await?;
+        wait_for_readiness(state, cmd.id, cmd.project_id, node_id, instance, &copy, &reconcile).await?;
         endpoint_addresses(state, &resolved).await
     }
     .await;

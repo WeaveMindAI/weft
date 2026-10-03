@@ -645,6 +645,9 @@ fn print_status(name: &str, id: &str, status: &InfraStatus) {
         };
         let url = n.endpoint_url.as_deref().unwrap_or("(no endpoint)");
         println!("  {node} [{}] -> {url}", n.status);
+        if let Some(progress) = &n.progress {
+            println!("    {}", progress.describe_now());
+        }
         // A public endpoint's outside address: what to hand to whoever
         // calls in (the node declared only its own path).
         for (endpoint, address) in &n.public_urls {

@@ -6,13 +6,13 @@
 # the commands):
 #   repository variables  GCP_PROJECT_ID, GCP_REGION, GCP_ZONE,
 #                         TF_STATE_BUCKET, GCP_WORKLOAD_IDENTITY_PROVIDER,
-#                         GCP_INSTALL_SERVICE_ACCOUNT, and optionally
-#                         WEFT_FRONTEND_REPOS (a JSON list of owner/name),
-#                         WEFT_MACHINE_TYPE, WEFT_SERVERLESS_ROLES (a JSON
-#                         list of roles), WEFT_LISTENER_MACHINE (true to
-#                         give the listener a machine of its own)
-#   repository secret     WEFT_ACCESS_APPS (optional: the access-apps.json
-#                         holding OAuth clients and the runtime's own keys)
+#                         GCP_INSTALL_SERVICE_ACCOUNT
+#   repository secrets    WEFT_DATABASE_URL (the Postgres the install keeps
+#                         everything in), WEFT_DATABASE_LISTEN_URL (only
+#                         when that address goes through a pooler: a
+#                         direct one to the same database), WEFT_ACCESS_APPS
+#                         (optional: the access-apps.json holding OAuth
+#                         clients and the runtime's own keys)
 #
 # SYNC: the TF_VAR_* names <-> deploy/terraform/gcp/variables.tf
 name: install on GCP
@@ -39,10 +39,20 @@ jobs:
       TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID }}
       TF_VAR_region: ${{ vars.GCP_REGION }}
       TF_VAR_zone: ${{ vars.GCP_ZONE }}
-      TF_VAR_frontend_repos: ${{ vars.WEFT_FRONTEND_REPOS || '[]' }}
       TF_VAR_weft_repository: ${{ github.repository }}
       TF_VAR_weft_commit: ${{ github.sha }}
     steps:
+      # Before anything is built: without a database there is nothing to
+      # install.
+      - name: the database
+        env:
+          WEFT_DATABASE_URL: ${{ secrets.WEFT_DATABASE_URL }}
+        run: |
+          if [ -z "$WEFT_DATABASE_URL" ]; then
+            echo "::error::the repository secret WEFT_DATABASE_URL is not set: weft needs a Postgres to keep everything in (the cloud chapter of the docs walks through getting one)"
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
 
       - uses: google-github-actions/auth@v2
@@ -56,37 +66,33 @@ jobs:
         with:
           terraform_wrapper: false
 
-      - name: machine size
-        if: vars.WEFT_MACHINE_TYPE != ''
-        run: echo "TF_VAR_machine_type=${{ vars.WEFT_MACHINE_TYPE }}" >> "$GITHUB_ENV"
-
-      # Unset, Terraform's defaults apply: every role on Cloud Run but the
-      # listener, which shares the machine with Postgres.
-      - name: where the roles run
-        run: |
-          if [ -n '${{ vars.WEFT_SERVERLESS_ROLES }}' ]; then
-            echo 'TF_VAR_serverless_roles=${{ vars.WEFT_SERVERLESS_ROLES }}' >> "$GITHUB_ENV"
-          fi
-          if [ -n '${{ vars.WEFT_LISTENER_MACHINE }}' ]; then
-            echo 'TF_VAR_listener_machine=${{ vars.WEFT_LISTENER_MACHINE }}' >> "$GITHUB_ENV"
-          fi
-
       # The registry first: the images this checkout names are pushed there
-      # before the machine that runs them exists.
+      # before the services that run them exist.
       - name: create the registry
         working-directory: deploy/terraform/gcp
         env:
           TF_VAR_runtime_image: unset
           TF_VAR_builder_base_image: unset
+          TF_VAR_database_url: unset
         run: |
           terraform init -input=false -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}"
           terraform apply -input=false -auto-approve \
             -target=google_project_service.apis -target=google_artifact_registry_repository.images
 
+      # Cloud Build announces each build's state on a topic whose name it
+      # fixes, so the topic is the project's, shared by every install in
+      # it: made here when missing (the step above enabled Pub/Sub), read
+      # by Terraform, and never destroyed with one install.
+      # SYNC: the topic name <-> deploy/terraform/gcp/builds.tf (data.google_pubsub_topic.cloud_builds)
+      - name: the build notices topic
+        run: |
+          gcloud pubsub topics describe cloud-builds --project "${{ vars.GCP_PROJECT_ID }}" >/dev/null 2>&1 \
+            || gcloud pubsub topics create cloud-builds --project "${{ vars.GCP_PROJECT_ID }}"
+
       # The CLI the release published for this exact commit, checked
       # against its sha256, when the fork sits on that commit (the same
       # match setup.sh makes); otherwise built from this checkout.
-      # SYNC: release tag + asset name + manifest.json keys <-> .github/workflows/release.yml (the release job), setup.sh (prebuilt artifacts block)
+      # SYNC: release tag + asset name + manifest.json keys <-> .github/workflows/release.yml (the release job), setup.sh (prebuilt artifacts block), crates/weft-cli/templates/ci/gcp.yml (download the weft CLI)
       - name: the weft CLI for this checkout
         run: |
           base=https://github.com/WeaveMindAI/weft/releases/download/latest
@@ -94,13 +100,16 @@ jobs:
           commit=$(sed -n 's/.*"commit": *"\([^"]*\)".*/\1/p' <<<"$manifest")
           sha=$(sed -n 's/.*"sha256_weft-x86_64-linux": *"\([^"]*\)".*/\1/p' <<<"$manifest")
           mkdir -p target/release
-          if [ "$commit" = "$GITHUB_SHA" ] && [ -n "$sha" ]; then
-            curl -fsSL "$base/weft-x86_64-linux" -o target/release/weft
-            echo "$sha  target/release/weft" | sha256sum -c -
+          # A release being replaced can serve a binary its manifest does
+          # not vouch for yet: the checksum then fails, and the CLI is built.
+          if [ "$commit" = "$GITHUB_SHA" ] && [ -n "$sha" ] \
+            && curl -fsSL "$base/weft-x86_64-linux" -o target/release/weft \
+            && echo "$sha  target/release/weft" | sha256sum -c -; then
             chmod +x target/release/weft
             echo "using the CLI the release built from $commit"
           else
-            echo "this commit has no published CLI; building it"
+            echo "this commit has no published CLI that checks out; building it"
+            rm -f target/release/weft
             rustup toolchain install
             cargo build --release --locked -p weft-cli
           fi
@@ -115,7 +124,7 @@ jobs:
           registry=$(terraform -chdir=deploy/terraform/gcp output -raw registry)
           gcloud auth configure-docker "${{ vars.GCP_REGION }}-docker.pkg.dev" --quiet
           WEFT_IMAGE_REGISTRY="$registry" ./target/release/weft build-images --push > "$RUNNER_TEMP/refs.txt"
-          # SYNC: the order of the printed refs <-> crates/weft-cli/src/images.rs (SharedImages::bare_refs)
+          # SYNC: `weft build-images` stdout and its order <-> crates/weft-cli/src/images.rs (SharedImages::bare_refs), .github/workflows/release.yml (build + push shared images)
           echo "TF_VAR_runtime_image=$(sed -n 1p "$RUNNER_TEMP/refs.txt")" >> "$GITHUB_ENV"
           echo "TF_VAR_builder_base_image=$(sed -n 2p "$RUNNER_TEMP/refs.txt")" >> "$GITHUB_ENV"
 
@@ -123,18 +132,19 @@ jobs:
         working-directory: deploy/terraform/gcp
         env:
           TF_VAR_access_apps_json: ${{ secrets.WEFT_ACCESS_APPS }}
+          TF_VAR_database_url: ${{ secrets.WEFT_DATABASE_URL }}
+          TF_VAR_database_listen_url: ${{ secrets.WEFT_DATABASE_LISTEN_URL }}
         run: terraform apply -input=false -auto-approve
 
       - name: what to do next
         working-directory: deploy/terraform/gcp
         run: |
-          address=$(terraform output -raw address)
-          machine=$(terraform output -raw machine)
+          url=$(terraform output -raw url)
           key_secret=$(terraform output -raw bootstrap_operator_key_secret)
           {
             echo "## weft is installed"
             echo
-            echo "It answers at \`https://$address\` once the machine has booted and got its certificate (a minute or two)."
+            echo "It answers at \`$url\`, with nothing running while nobody uses it."
             echo
             echo "1. On your machine, read the first operator key (it never appears in these logs):"
             echo
@@ -142,8 +152,8 @@ jobs:
             echo "gcloud secrets versions access latest --secret $key_secret --project ${{ vars.GCP_PROJECT_ID }}"
             echo '```'
             echo
-            echo "2. In a project: \`weft target add prod https://$address\`, then \`weft login prod\` and paste the key."
-            echo "3. For your own domain: \`weft domain add weft.example.com --on prod\` prints the DNS record to set."
+            echo "2. In a project: \`weft target add prod $url\`, then \`weft login prod\` and paste the key."
+            echo "3. For your own domain, which needs a load balancer that costs money while it stands: \`weft domain add weft.example.com --on prod --accept-cost\` prints the DNS record to set."
             echo
-            echo "The machine's logs: \`gcloud compute ssh $machine --zone ${{ vars.GCP_ZONE }} --tunnel-through-iap -- sudo journalctl -u weft-runtime -f\`"
+            echo "The logs: \`gcloud logging read 'resource.type=\"cloud_run_revision\"' --project ${{ vars.GCP_PROJECT_ID }} --freshness 1h\`"
           } >> "$GITHUB_STEP_SUMMARY"

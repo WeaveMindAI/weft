@@ -58,14 +58,27 @@ impl Google {
         &self.http
     }
 
-    async fn send(&self, req: reqwest::RequestBuilder) -> anyhow::Result<Value> {
+    /// Send `req` as this process's account, answering Google's response
+    /// whatever its status: for a caller that reads an answer that is not
+    /// JSON (Cloud Storage's objects and XML) or treats a status itself.
+    pub async fn send_raw(&self, req: reqwest::RequestBuilder) -> anyhow::Result<reqwest::Response> {
         let token = self.tokens.access_token().await?;
-        let resp = req.bearer_auth(token).send().await?;
-        let status = resp.status();
-        let body = resp.text().await?;
-        if !status.is_success() {
-            return Err(ApiError { status: status.as_u16(), body }.into());
+        Ok(req.bearer_auth(token).send().await?)
+    }
+
+    /// `resp` when it is a success; its status and Google's words, as an
+    /// [`ApiError`], otherwise.
+    pub async fn success(resp: reqwest::Response) -> anyhow::Result<reqwest::Response> {
+        if resp.status().is_success() {
+            return Ok(resp);
         }
+        let status = resp.status().as_u16();
+        Err(ApiError { status, body: resp.text().await.unwrap_or_default() }.into())
+    }
+
+    async fn send(&self, req: reqwest::RequestBuilder) -> anyhow::Result<Value> {
+        let resp = Self::success(self.send_raw(req).await?).await?;
+        let body = resp.text().await?;
         if body.trim().is_empty() {
             return Ok(Value::Null);
         }

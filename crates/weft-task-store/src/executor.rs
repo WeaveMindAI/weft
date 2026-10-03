@@ -101,7 +101,7 @@ impl<Ctx: Send + Sync> TaskRegistryBuilder<Ctx> {
 pub const DISPATCHER_PICKER_CONCURRENCY: usize = 8;
 
 /// A dispatcher task that became claimable.
-const DISPATCHER_READY: &[crate::drain::WakeOn] = &[crate::drain::WakeOn {
+pub static DISPATCHER_READY: &[crate::drain::WakeOn] = &[crate::drain::WakeOn {
     channel: crate::tasks::TASK_READY_CHANNEL,
     concerns: |payload| payload == "dispatcher",
 }];

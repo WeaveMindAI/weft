@@ -18,13 +18,19 @@
 //!
 //! The listening connection is its own, outside the caller's pool: it is
 //! held for the life of the process, and taking it from the pool would
-//! leave one slot fewer for everything else.
+//! leave one slot fewer for everything else. It may need another address
+//! than the pool: a `LISTEN` belongs to one database session, which a
+//! pooler that hands out a connection per transaction (a serverless
+//! Postgres's pooled address) cannot keep. Every time it starts listening
+//! it proves it hears back a notification of its own, so a session that
+//! cannot listen is refused at once, naming the fix, rather than leaving
+//! every waiter to sleep to its deadline.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
-use sqlx::postgres::{PgListener, PgPool, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgListener, PgPool, PgPoolOptions};
 use tokio::sync::broadcast;
 
 /// The longest any request is held open waiting on a signal. A client
@@ -50,6 +56,17 @@ const FANOUT_CAPACITY: usize = 1024;
 /// a way the listener does not recover from by itself.
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
+/// The channel a watch proves it can hear on, every time it listens.
+const PROBE_CHANNEL: &str = "weft_listen_probe";
+
+/// The name the listening session gives itself, so it can be told apart
+/// in `pg_stat_activity` from the connections that do work.
+pub const WATCH_APPLICATION_NAME: &str = "weft_signal_watch";
+
+/// How long a watch waits to hear its own probe back. A session that can
+/// listen hears it in milliseconds.
+const PROBE_WAIT: Duration = Duration::from_secs(5);
+
 pub struct PgSignalWatch {
     /// The channels this watch listens on, fixed at start.
     channels: &'static [&'static str],
@@ -70,16 +87,16 @@ impl Drop for PgSignalWatch {
 }
 
 impl PgSignalWatch {
-    /// Start listening on `pool`'s database, on every one of `channels`.
-    /// Fails when the first connection cannot be made; after that, the
-    /// listener reconnects on its own and every waiter is told to
-    /// recheck.
-    pub async fn start(pool: &PgPool, channels: &'static [&'static str]) -> Result<Arc<Self>> {
+    /// Start listening at `connect` (a session of its own, see the module
+    /// docs), on every one of `channels`. Fails when the first connection
+    /// cannot be made or cannot listen; after that, the listener
+    /// reconnects on its own and every waiter is told to recheck.
+    pub async fn start(connect: &PgConnectOptions, channels: &'static [&'static str]) -> Result<Arc<Self>> {
         let own = PgPoolOptions::new()
             .max_connections(1)
             .max_lifetime(None)
             .idle_timeout(None)
-            .connect_with((*pool.connect_options()).clone())
+            .connect_with(connect.clone().application_name(WATCH_APPLICATION_NAME))
             .await?;
         let listener = listen(&own, channels).await?;
         let (tx, template) = broadcast::channel(FANOUT_CAPACITY);
@@ -182,8 +199,37 @@ fn wakes(heard: &Heard, concerns: &impl Fn(&str, &str) -> bool) -> bool {
 
 async fn listen(own: &PgPool, channels: &[&'static str]) -> Result<PgListener> {
     let mut listener = PgListener::connect_with(own).await?;
-    listener.listen_all(channels.iter().copied()).await?;
+    listener.listen_all(channels.iter().copied().chain([PROBE_CHANNEL])).await?;
+    prove_it_hears(&mut listener).await?;
     Ok(listener)
+}
+
+/// Send a notification on this very session and wait to hear it back. A
+/// pooler that runs each statement on whichever server connection is free
+/// leaves the `LISTEN` on one and the notification on another, and the
+/// session never hears anything.
+async fn prove_it_hears(listener: &mut PgListener) -> Result<()> {
+    let payload = uuid::Uuid::new_v4().to_string();
+    sqlx::query("SELECT pg_notify($1, $2)").bind(PROBE_CHANNEL).bind(&payload).execute(&mut *listener).await?;
+    let heard = tokio::time::timeout(PROBE_WAIT, async {
+        loop {
+            match listener.try_recv().await? {
+                Some(n) if n.channel() == PROBE_CHANNEL && n.payload() == payload => return anyhow::Ok(()),
+                Some(_) => {}
+                None => anyhow::bail!("the listening connection dropped while proving it can hear"),
+            }
+        }
+    })
+    .await;
+    match heard {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!(
+            "the database session cannot LISTEN: a notification it sent itself never came back within {}s. \
+             Its address goes through a pooler that hands out a connection per transaction; set \
+             WEFT_DATABASE_LISTEN_URL to a direct (session) address of the same database",
+            PROBE_WAIT.as_secs()
+        ),
+    }
 }
 
 async fn pump(
@@ -223,6 +269,7 @@ async fn hear(
     loop {
         // No receiver is fine on every send: nobody is waiting right now.
         match listener.try_recv().await {
+            Ok(Some(notification)) if notification.channel() == PROBE_CHANNEL => {}
             Ok(Some(notification)) => {
                 match channels.iter().find(|c| **c == notification.channel()) {
                     Some(channel) => {

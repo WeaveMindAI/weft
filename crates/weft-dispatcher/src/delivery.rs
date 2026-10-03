@@ -28,7 +28,7 @@ const BATCH: i64 = 32;
 /// A worker task that became claimable wakes the loop; so does a task
 /// ending, since a resume waits for its execution's drive to end
 /// (`tasks::EXECUTION_ID_PICK`), and nothing else announces that it may go.
-const WAKE_ON: &[WakeOn] = &[
+pub(crate) static WAKE_ON: &[WakeOn] = &[
     WakeOn { channel: TASK_READY_CHANNEL, concerns: |payload| payload.starts_with("worker:") },
     WakeOn::any(weft_task_store::terminal::TERMINAL_CHANNEL),
 ];

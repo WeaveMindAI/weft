@@ -25,6 +25,7 @@ pub mod deref;
 pub mod error;
 pub mod exec;
 pub mod frames;
+pub mod frontend;
 #[cfg(feature = "runtime")]
 pub mod generator;
 #[cfg(feature = "runtime")]

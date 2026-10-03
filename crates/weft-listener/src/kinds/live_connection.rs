@@ -37,8 +37,8 @@ impl KindHandler for LiveCallerHandler {
         self.tag
     }
 
-    fn between_fires(&self) -> BetweenFires {
-        BetweenFires::Called
+    fn between_fires(&self, _spec: &SignalSpec, _kind_state: &Value) -> Result<BetweenFires> {
+        Ok(BetweenFires::Called)
     }
 
     fn compute_routing(&self, spec: &SignalSpec) -> Result<SignalRouting> {

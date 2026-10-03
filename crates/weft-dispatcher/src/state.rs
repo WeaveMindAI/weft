@@ -48,6 +48,15 @@ pub struct DispatcherState {
     /// Where the projects' infrastructure runs: read here for its logs
     /// (the supervisor is what changes it).
     pub host: Arc<dyn weft_platform_traits::InfraHost>,
+    /// Where a project's frontend runs, when the install hosts it
+    /// (`crate::frontends`).
+    pub frontends: Arc<dyn weft_platform_traits::FrontendHosting>,
+    /// The door in front of the install's domains (`crate::domains`).
+    pub domains: Arc<dyn weft_platform_traits::DomainHosting>,
+    /// How many holders run (`crate::holders`), and how many signals each
+    /// takes.
+    pub holder_pool: Arc<dyn weft_platform_traits::HolderPool>,
+    pub holder_settings: weft_platform_traits::config::HolderSettings,
     /// The worker settings every project starts from.
     pub worker_defaults: weft_platform_traits::WorkerSettings,
     /// Builds a project version inside the install (`crate::build`): the
@@ -99,8 +108,6 @@ pub struct DispatcherState {
     /// HMAC secret the dispatcher signs live-caller routing tickets with
     /// (the worker verifies with the same secret).
     pub caller_token_secret: Arc<Vec<u8>>,
-    /// Wakes a role that may be scaled to zero when work waits for it.
-    pub kick: Arc<dyn weft_platform_traits::Kick>,
 }
 
 impl DispatcherState {

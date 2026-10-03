@@ -1057,6 +1057,9 @@ export interface InstanceInfraEntry {
   node: string;
   instance: string;
   status: string;
+  /// While a start of the copy is under way: since when, and what it
+  /// waits on.
+  progress?: ApplyProgress;
 }
 
 /// The parent run and the original run supplying each reused result,
@@ -1494,6 +1497,9 @@ export type CliPhase =
   /// The install built it; detail `project`, and `built`, the image refs
   /// it had to build (empty when every image was already there).
   | 'build_done'
+  /// One image is building on the install's builder; detail `image`,
+  /// `build` (the builder's id) and `logUrl` when it keeps one.
+  | 'build_image'
   | 'dispatcher_call_start'
   | 'dispatcher_call_done'
   | 'infra_provision_start'
@@ -1714,6 +1720,18 @@ export interface InfraPlacementStatus {
   /// failed (`provision` | `apply` | `execute` | `apply_lifecycle`).
   failureStage?: string;
   failureMessage?: string;
+  /// While a start of the copy is under way: since when, and what it
+  /// waits on.
+  progress?: ApplyProgress;
+}
+
+/// How far a start of an infra copy got.
+// SYNC: ApplyProgress <-> crates/weft-core/src/infra/wire.rs ApplyProgress
+export interface ApplyProgress {
+  sinceUnix: number;
+  /// What it waits on right now, in the host's words; absent before the
+  /// host reports anything.
+  waiting?: string;
 }
 
 /// The project-wide infra state the dispatcher rolls up from its

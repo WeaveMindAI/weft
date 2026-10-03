@@ -1,22 +1,17 @@
-# Every secret the runtime reads from its environment, in Secret Manager.
-# The machine reads them at boot into a file only root can read; a
-# serverless role gets them as its service's environment.
+# Every secret the runtime reads from its environment, in Secret Manager,
+# which each role gets as its service's environment.
 #
 # SYNC: these names <-> crates/weft-platform-traits/src/config.rs (SECRET_ENV),
-#       except WEFT_POSTGRES_PASSWORD (the database container's, not the
-#       runtime's) and WEFT_IDENTITY_KEY (local installs only: on GCP a
-#       caller proves who it is with a Google identity token instead)
+#       except WEFT_IDENTITY_KEY (local installs only: on GCP a caller
+#       proves who it is with a Google identity token instead) and the
+#       object store's two keys (a Cloud Storage bucket is reached as the
+#       core account itself)
 
 # The key stored credentials are sealed with. Generated once and kept in
 # this state; it cannot be rotated, since rows sealed with it stop opening
 # under any other key.
 resource "random_bytes" "sealing_key" {
   length = 32
-}
-
-resource "random_password" "database" {
-  length  = 32
-  special = false
 }
 
 resource "random_id" "caller_token_secret" {
@@ -29,15 +24,16 @@ resource "random_password" "bootstrap_operator_key" {
 }
 
 locals {
-  secrets = {
-    WEFT_DATABASE_URL            = "postgres://weft:${random_password.database.result}@${google_compute_address.machine_private.address}:5432/weft"
-    CREDENTIAL_ENCRYPTION_KEY    = random_bytes.sealing_key.base64
-    WEFT_CALLER_TOKEN_SECRET     = random_id.caller_token_secret.hex
-    WEFT_BOOTSTRAP_OPERATOR_KEY  = random_password.bootstrap_operator_key.result
-    WEFT_OBJECT_STORE_ACCESS_KEY = google_storage_hmac_key.object_store.access_id
-    WEFT_OBJECT_STORE_SECRET_KEY = google_storage_hmac_key.object_store.secret
-    WEFT_POSTGRES_PASSWORD       = random_password.database.result
-  }
+  secrets = merge(
+    {
+      WEFT_DATABASE_URL           = var.database_url
+      CREDENTIAL_ENCRYPTION_KEY   = random_bytes.sealing_key.base64
+      WEFT_CALLER_TOKEN_SECRET    = random_id.caller_token_secret.hex
+      WEFT_BOOTSTRAP_OPERATOR_KEY = random_password.bootstrap_operator_key.result
+    },
+    # Only when the database's address goes through a pooler.
+    { for k, v in { WEFT_DATABASE_LISTEN_URL = var.database_listen_url } : k => v if nonsensitive(v != "") },
+  )
 }
 
 resource "google_secret_manager_secret" "install" {
@@ -55,7 +51,7 @@ resource "google_secret_manager_secret_version" "install" {
   secret_data = local.secrets[each.value]
 }
 
-# The machine and the serverless roles read every secret.
+# The roles read every secret.
 resource "google_secret_manager_secret_iam_member" "core_reads" {
   for_each  = nonsensitive(toset(keys(local.secrets)))
   secret_id = google_secret_manager_secret.install[each.value].id

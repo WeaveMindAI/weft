@@ -169,6 +169,7 @@ async fn subscription_ensure(
     let url = receiver_url(&state, &req.service, &req.topic);
     let ensured = weft_access_store::ensure_subscription(
         &state.pool,
+        &state.lock_pool,
         &weft_access_store::EnsureSubscription {
             for_instance: req.for_instance,
             tenant: req.tenant,
@@ -196,7 +197,7 @@ async fn subscription_drop(
 ) -> Result<Json<Value>, ApiError> {
     listener_only(&caller)?;
     let dropped =
-        weft_access_store::drop_subscriptions_for_signal(&state.pool, &req.tenant, &req.signal_token)
+        weft_access_store::drop_subscriptions_for_signal(&state.pool, &state.lock_pool, &req.tenant, &req.signal_token)
             .await
             .map_err(crate::handlers::store_err)?;
     Ok(Json(serde_json::json!({ "dropped": dropped })))

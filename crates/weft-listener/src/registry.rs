@@ -1,9 +1,10 @@
-//! In-memory map of the signals whose connection this listener holds.
+//! In-memory map of the signals whose connection this process holds.
 //!
-//! Only a kind that holds a connection (`BetweenFires::Holds`) has an
-//! entry: it binds a token to its resolved spec plus the task running its
-//! loop, and unregistering tears the task down. Every other kind is read
-//! from its durable row per call (see [`held`]).
+//! Only a signal that holds a connection (`BetweenFires::Holds`), in a
+//! process that holds them (`crate::hold`), has an entry: it binds a token
+//! to its resolved spec plus the task running its loop, and stopping it
+//! tears the task down. Every other signal is read from its durable row
+//! per call (see [`held`]).
 
 use std::sync::Arc;
 
@@ -93,10 +94,10 @@ impl Drop for TaskGuard {
 pub struct Registry {
     inner: DashMap<String, RegisteredSignal>,
     /// One guard per token being brought up, so two callers bringing the
-    /// same row up (a first use racing a rehydrate, two first uses) run
-    /// one after the other and the second finds it up. Machine-local like
-    /// the entries: a held connection only runs on the machine's single
-    /// listener. An entry lives only while someone holds its guard.
+    /// same row up (a look racing a registration's take) run one after the
+    /// other and the second finds it up. Local to the process like the
+    /// entries: a held connection runs only in the one process that claims
+    /// it. An entry lives only while someone holds its guard.
     bringing: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
     /// Held rows that could not come up, by token. Each has exactly one
     /// retry loop running ([`hold`]), the entry's `owner`; the node's
@@ -162,6 +163,11 @@ impl Registry {
         self.down.get(token).map(|r| r.reason.clone())
     }
 
+    /// Every held row that is down now.
+    pub fn down_tokens(&self) -> Vec<String> {
+        self.down.iter().map(|e| e.key().clone()).collect()
+    }
+
     /// Stop counting `token` as down: it came up, or its row is gone.
     /// Its retry loop sees this at its next turn and ends.
     pub fn clear_down(&self, token: &str) {
@@ -189,21 +195,19 @@ impl Registry {
     }
 }
 
-/// A signal as it stands now: the registry's entry for a kind that holds
-/// a connection, otherwise read fresh from its durable row. `None` when
-/// no held row has that token (the signal is gone, or its activation
-/// parked).
+/// A signal as it stands now: this process's registry entry for one it
+/// holds, otherwise read fresh from its durable row. `None` when no held
+/// row has that token (the signal is gone, or its activation parked).
 ///
 /// Every endpoint that names a signal goes through here, so any copy of
-/// the listener answers for any signal: one that restarted, or one of
-/// several copies of a listener that scales. The row is the truth the
+/// the listener answers for any signal. The row is the truth the
 /// dispatcher routes by, so the routing comes back from its columns,
-/// never recomputed from the kind.
-///
-/// Only a `Holds` kind is kept (its task lives here, on the machine's
-/// single listener). Any other kind is read per call and never cached:
-/// an unregister reaches one serverless copy, and a sibling that had
-/// cached the signal would keep answering `/process` for it.
+/// never recomputed from the kind. A signal some holder holds elsewhere
+/// is read from its row too, with what its holder last said it is doing;
+/// nothing here ever brings one up (its holder's claim does, see
+/// `crate::hold`). Nothing read from a row is cached: an unregister
+/// reaches one copy of the listener, and a sibling that had cached the
+/// signal would keep answering `/process` for it.
 pub async fn held(state: &crate::ListenerState, token: &str) -> anyhow::Result<Option<RegisteredSignal>> {
     if let Some(sig) = state.registry.get(token) {
         return Ok(Some(sig));
@@ -213,38 +217,31 @@ pub async fn held(state: &crate::ListenerState, token: &str) -> anyhow::Result<O
     };
     let spec: SignalSpec = serde_json::from_str(&row.spec_json)
         .map_err(|e| anyhow::anyhow!("malformed spec_json for signal {}: {e}", row.token))?;
-    let handler = crate::kinds::lookup(&spec.kind)
-        .ok_or_else(|| anyhow::anyhow!("signal {} has an unknown kind '{}'", row.token, spec.kind))?;
-    let holds = handler.between_fires() == crate::kinds::BetweenFires::Holds;
     let routing = row.to_routing().map_err(|e| anyhow::anyhow!("to_routing for signal {}: {e}", row.token))?;
-    let from_row = RegisteredSignal {
+    let serving = match row.holds {
+        true => crate::hold::from_wire(row.serving.as_ref()),
+        false => ServingState::default(),
+    };
+    Ok(Some(RegisteredSignal {
         spec,
         node_id: row.node_id.clone(),
         tenant_id: row.tenant_id.clone(),
         is_resume: row.is_resume,
         execution_id: row.execution_id.clone(),
         task: None,
-        // A held connection's task owns its state once it runs.
-        kind_state: (!holds).then(|| row.kind_state.clone()),
+        // A held connection's task owns its state while it runs.
+        kind_state: (!row.holds).then(|| row.kind_state.clone()),
         routing,
-        serving: Arc::default(),
-    };
-    if !holds {
-        return Ok(Some(from_row));
-    }
-    // A held connection that is down still answers from its row (a fire
-    // it raised before going down still processes, its display says it
-    // is down): its retry loop owns bringing it back, so a call here does
-    // not start a second attempt.
-    if state.registry.down_reason(token).is_some() {
-        return Ok(Some(from_row));
-    }
-    match hold(state, row, StartMode::Restore).await {
-        // Up, or its row went while it came up (then nothing holds it).
-        Ok(()) => Ok(state.registry.get(token)),
-        // Down now, logged, retried, and shown as down.
-        Err(_) => Ok(Some(from_row)),
-    }
+        serving: Arc::new(Mutex::new(serving)),
+    }))
+}
+
+/// Whether `row`'s kind decides that it holds a connection, `None` when
+/// its spec, kind or state cannot be read (bringing it up says why).
+fn decided_holds(row: &weft_broker_client::protocol::SignalRowWire) -> Option<bool> {
+    let spec: SignalSpec = serde_json::from_str(&row.spec_json).ok()?;
+    let handler = crate::kinds::lookup(&spec.kind)?;
+    Some(handler.between_fires(&spec, &row.kind_state).ok()? == crate::kinds::BetweenFires::Holds)
 }
 
 /// How long the retry of a down row waits before its first attempt,
@@ -257,9 +254,9 @@ const DOWN_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(300);
 const REREAD_ATTEMPTS: u32 = 5;
 const REREAD_FIRST: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// Bring one held row up: the one path every bring-up of a held row
-/// takes (the dispatcher's `/start`, a rehydrate at boot or activation,
-/// a first use, the retry of a down row).
+/// Bring one held row up: the one path every bring-up of a row takes (the
+/// dispatcher's `/start`, a rehydrate at boot or activation, a holder
+/// taking a held one, the retry of a down row).
 ///
 /// Single-flight per token: a second caller waits for the first and, on
 /// a restore, finds the connection up and leaves it (a restore that
@@ -348,6 +345,24 @@ async fn hold_once(
     Ok(())
 }
 
+/// Bring `row` up where it runs (the dispatcher's `/start`, the retry of
+/// a down row): a held connection, in a process that holds, through a take
+/// of its claim, so it never runs here without one; in any other process
+/// a holder takes it at its next look (the dispatcher sizes the holders
+/// from the rows), and says on the node's display how it is. Every other
+/// row comes up here ([`hold`]).
+pub async fn start(
+    state: &crate::ListenerState,
+    row: weft_broker_client::protocol::SignalRowWire,
+    mode: StartMode,
+) -> anyhow::Result<()> {
+    match (row.holds, state.config.holds_here) {
+        (true, true) => crate::hold::take_now(state, std::slice::from_ref(&row.token), mode).await,
+        (true, false) => Ok(()),
+        (false, _) => hold(state, row, mode).await,
+    }
+}
+
 /// Count `token` as down with `reason`, starting its retry loop unless
 /// one already owns the entry (then only the reason is updated, and that
 /// loop stays the owner).
@@ -385,10 +400,23 @@ async fn retry_down(state: crate::ListenerState, token: String, owner: u64, _run
                 return;
             }
             Ok(Some(row)) => {
-                // A failure is logged and recorded by `hold`.
-                if hold(&state, row, StartMode::Restore).await.is_ok() {
-                    tracing::info!(target: "weft_listener", token = %token, "a down signal is back up");
-                    return;
+                let holds = row.holds;
+                match start(&state, row, StartMode::Restore).await {
+                    // A held connection is up once this process took it.
+                    Ok(()) if !holds || state.registry.get(&token).is_some() => {
+                        tracing::info!(target: "weft_listener", token = %token, "a down signal is back up");
+                        return;
+                    }
+                    Ok(()) => {
+                        state.registry.down.remove_if(&token, |_, d| d.owner == owner);
+                        tracing::info!(target: "weft_listener", token = %token, "a down signal is another holder's now; no longer retrying it here");
+                        return;
+                    }
+                    // A failure to come up is also recorded by `hold`, which
+                    // shows it on the node.
+                    Err(e) => {
+                        tracing::warn!(target: "weft_listener", token = %token, error = %format!("{e:#}"), "a down signal could not be brought back; retrying it");
+                    }
                 }
             }
             Err(e) => {
@@ -398,13 +426,15 @@ async fn retry_down(state: crate::ListenerState, token: String, owner: u64, _run
     }
 }
 
-/// Reconcile what this process holds with the durable `signal` table.
-/// Idempotent. Every held row is brought up ([`hold`]) unless its connection already runs here: a kind that holds a
-/// connection gets its loop started, a kind that wakes gets its next wake
-/// set (setting the same wake twice is one wake), and a kind the outside
-/// calls in to needs nothing.
+/// Reconcile the signals of `project` (every project when `None`) with the
+/// durable `signal` table. Idempotent. Every row is brought up ([`hold`]):
+/// a signal that wakes gets its next wake set (setting the same wake twice
+/// is one wake), and a signal the outside calls in to needs nothing. A
+/// signal that holds a connection is a holder's: a process that holds
+/// (a local install's one) takes them now, and a listener that scales to
+/// zero leaves them to the holders, which take them at their next look.
 ///
-/// Called at boot over every project (`project` is `None`) and by the
+/// Called at a local install's boot over every project and by the
 /// dispatcher's activate flow (`POST /rehydrate`) over the activating
 /// project, after the activation's rows are written.
 ///
@@ -422,13 +452,35 @@ pub async fn rehydrate(
     skip: &[String],
 ) -> anyhow::Result<Vec<String>> {
     let mut failed = Vec::new();
-    for row in state.signals.list_held(project).await? {
+    let mut held = Vec::new();
+    for mut row in state.signals.list_held(project).await? {
         if skip.contains(&row.token) || state.registry.get(&row.token).is_some() {
+            continue;
+        }
+        // The row says what its kind decided when it was registered; a
+        // kind that decides differently now (another weft) is followed,
+        // and the row told, so the holders and their count agree.
+        if let Some(holds) = decided_holds(&row) {
+            if holds != row.holds {
+                if let Err(e) = state.signals.set_holds(&row.token, holds).await {
+                    failed.push(format!("signal {}: record whether it holds a connection: {e:#}", row.token));
+                    continue;
+                }
+                row.holds = holds;
+            }
+        }
+        if row.holds {
+            held.push(row.token);
             continue;
         }
         let token = row.token.clone();
         if let Err(e) = hold(state, row, StartMode::Restore).await {
             failed.push(format!("signal {token}: {e:#}"));
+        }
+    }
+    if state.config.holds_here && !held.is_empty() {
+        if let Err(e) = crate::hold::take_now(state, &held, StartMode::Restore).await {
+            failed.push(format!("{e:#}"));
         }
     }
     Ok(failed)

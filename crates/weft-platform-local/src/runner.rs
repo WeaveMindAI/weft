@@ -46,9 +46,8 @@ const WORKER_TOKEN_LIFE_SECS: i64 = 100 * 365 * 24 * 3600;
 pub struct LocalRunnerConfig {
     /// The broker's address as a container reaches it.
     pub broker_url: String,
-    /// The secret live-caller tickets are signed with (hex); `None` when
-    /// the install has none, and then workers take no live callers.
-    pub caller_token_secret: Option<String>,
+    /// The secret live-caller tickets are signed with (hex).
+    pub caller_token_secret: String,
     /// How long a worker with nothing to do stays up.
     pub idle_stop: Duration,
     /// Where the runner writes a worker's environment file for the moment
@@ -369,9 +368,7 @@ fn worker_env(target: &WorkerTarget, cfg: &LocalRunnerConfig, door: &str, token:
     env.insert("PORT", WORKER_PORT.to_string());
     env.insert("WEFT_WORKER_DOOR", door.to_string());
     env.insert("WEFT_WORKER_IDENTITY", format!("token:{token}"));
-    if let Some(secret) = &cfg.caller_token_secret {
-        env.insert("WEFT_CALLER_TOKEN_SECRET", secret.clone());
-    }
+    env.insert("WEFT_CALLER_TOKEN_SECRET", cfg.caller_token_secret.clone());
     if cfg.time_scale != 1.0 {
         env.insert(weft_core::time_scale::TIME_SCALE_ENV, cfg.time_scale.to_string());
     }
@@ -489,7 +486,7 @@ mod tests {
             clock,
             LocalRunnerConfig {
                 broker_url: "http://host.docker.internal:14113/broker".into(),
-                caller_token_secret: Some("cd".repeat(32)),
+                caller_token_secret: "cd".repeat(32),
                 idle_stop: Duration::from_secs(300),
                 scratch_dir: dir.to_path_buf(),
                 install: weft_core::infra::Install::default_install(),

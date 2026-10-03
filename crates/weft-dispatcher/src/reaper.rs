@@ -11,7 +11,9 @@
 //! sleep until that write is announced, with a slow safety tick for what
 //! no write announces. The ones that notice SILENCE (a lease that lapsed,
 //! a transition whose driver died) cannot be woken by anything, so they
-//! run on their safety tick alone.
+//! run on their safety tick alone, and only while something is in motion
+//! ([`in_motion`]): a lease nobody holds cannot lapse, so a quiet install
+//! looks at nothing and a dispatcher that scales to zero stays there.
 
 use std::time::Duration;
 
@@ -38,13 +40,53 @@ fn parked_fire_longest_sleep() -> Duration {
 }
 
 const NOTHING: &[WakeOn] = &[];
-const ON_PARKED_FIRE: &[WakeOn] = &[WakeOn::any(PARKED_FIRE_CHANNEL)];
-const ON_STORAGE_SWEEP: &[WakeOn] = &[WakeOn::any(STORAGE_SWEEP_CHANNEL)];
+pub(crate) static ON_PARKED_FIRE: &[WakeOn] = &[WakeOn::any(PARKED_FIRE_CHANNEL)];
+pub(crate) static ON_STORAGE_SWEEP: &[WakeOn] = &[WakeOn::any(STORAGE_SWEEP_CHANNEL)];
 
 /// Safety tick of the reapers that are woken by a write: 60 seconds in
 /// real time, at this install's pace (`weft_core::time_scale`).
 fn woken_reaper_safety() -> Duration {
     weft_core::time_scale::scaled(Duration::from_secs(60))
+}
+
+/// Whether anything in the install is in motion: a claim held, work
+/// waiting for a worker, an activation or a build under way, a slot at an
+/// entry for a run that has not started yet, a lifecycle command not
+/// finished. While nothing is, no lease can lapse and no driver can die
+/// mid-way, so the loops that watch for that have nothing to watch.
+///
+/// Only a not-yet-started run's slot needs a timed cleanup (it stops
+/// counting once its `unborn_until` passes). A started run's slot is
+/// released when the run ends (`journal_bridge`), so a run waiting days on
+/// a person does not keep the install awake.
+pub async fn in_motion(pool: &sqlx::PgPool) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM task WHERE status = 'claimed' OR (status = 'pending' AND target = 'worker')) \
+             OR EXISTS (SELECT 1 FROM trigger_activation WHERE status IN ('activating', 'deactivating')) \
+             OR EXISTS (SELECT 1 FROM project WHERE transition <> 'none') \
+             OR EXISTS (SELECT 1 FROM entry_slot s \
+                        WHERE NOT EXISTS (SELECT 1 FROM execution ec WHERE ec.execution_id = s.execution_id)) \
+             OR EXISTS (SELECT 1 FROM infra_lifecycle_command WHERE completed_at_unix IS NULL)",
+    )
+    .fetch_one(pool)
+    .await?)
+}
+
+/// `inner`, looked at again at its safety interval after it ran dry for as
+/// long as anything is in motion ([`in_motion`]), and left to sleep until
+/// a write wakes it once nothing is.
+pub fn while_in_motion(state: &DispatcherState, inner: DrainLoop) -> DrainLoop {
+    let state = state.clone();
+    let (drain, safety) = (inner.drain.clone(), inner.safety);
+    DrainLoop::new(inner.name, inner.wake_on, safety, move || {
+        let (state, drain) = (state.clone(), drain.clone());
+        async move {
+            match drain().await? {
+                DrainStep::Done if in_motion(&state.pg_pool).await? => Ok(DrainStep::RetryIn(safety)),
+                step => Ok(step),
+            }
+        }
+    })
 }
 
 /// Every reaper, as the loops the dispatcher runs.
@@ -53,9 +95,9 @@ pub fn drain_loops(state: &DispatcherState) -> Vec<DrainLoop> {
         // Silence detectors: nothing announces a lease that lapsed.
         timed(state, Duration::from_secs(30), "removed_projects", |s| async move { sweep_removed_projects(&s).await }),
         timed(state, Duration::from_secs(3600), "tasks", sweep_tasks),
-        timed(state, Duration::from_secs(30), "stuck_transitions", sweep_stuck_transitions),
+        while_in_motion(state, timed(state, Duration::from_secs(30), "stuck_transitions", sweep_stuck_transitions)),
         timed(state, Duration::from_secs(3600), "retired_rows", sweep_retired_rows),
-        timed(state, Duration::from_secs(30), "orphaned_live_executions", sweep_orphaned_live_executions),
+        while_in_motion(state, timed(state, Duration::from_secs(30), "orphaned_live_executions", sweep_orphaned_live_executions)),
         timed(state, Duration::from_secs(60), "stale_cancels", |s| async move {
             let dropped = weft_task_store::tasks::drop_stale_cancels(&s.pg_pool).await?;
             if dropped > 0 {
@@ -68,9 +110,12 @@ pub fn drain_loops(state: &DispatcherState) -> Vec<DrainLoop> {
         }),
         // The public edge's counters: minutes that no longer count, and
         // slots of runs that never started.
-        timed(state, Duration::from_secs(60), "entry_rate", |s| async move {
-            crate::entry_limits::sweep(&s.pg_pool, crate::lease::now_unix()).await
-        }),
+        while_in_motion(
+            state,
+            timed(state, Duration::from_secs(60), "entry_rate", |s| async move {
+                crate::entry_limits::sweep(&s.pg_pool, crate::lease::now_unix()).await
+            }),
+        ),
         // Re-parked fires (a route that failed) retry with a backoff stamp
         // on the element; this is what drives the retry once the stamp is
         // due. A newly parked fire wakes it at once; otherwise it sleeps
@@ -78,17 +123,18 @@ pub fn drain_loops(state: &DispatcherState) -> Vec<DrainLoop> {
         woken(state, ON_PARKED_FIRE, "parked_fires", |s| async move {
             crate::api::project::drain_due_parked_fires(&s).await?;
             let now = crate::lease::now_unix();
-            let next = crate::api::project::next_parked_fire_due(&s.pg_pool).await?;
-            Ok(DrainStep::RetryIn(parked_fire_sleep(now, next)))
+            Ok(match crate::api::project::next_parked_fire_due(&s.pg_pool).await? {
+                // Nothing parked: the next park wakes it.
+                None => DrainStep::Done,
+                Some(due) => DrainStep::RetryIn(parked_fire_sleep(now, due)),
+            })
         }),
         // Storage plane: the durable terminate sweep (un-kept exec files of
         // a terminated execution). The queue deletes an execution's row only after
         // the broker confirms the sweep; a transient broker failure leaves
-        // it for the safety tick. The kept-file expiry sweep is the
-        // broker's own loop (it owns the bucket + metadata).
-        woken(state, ON_STORAGE_SWEEP, "storage_sweep", |s| async move {
-            crate::storage::process_sweep_queue(s).await.map(|()| DrainStep::Done)
-        }),
+        // it and asks for another look soon. The kept-file expiry sweep is
+        // the broker's own loop (it owns the bucket + metadata).
+        woken(state, ON_STORAGE_SWEEP, "storage_sweep", crate::storage::process_sweep_queue),
     ]
 }
 
@@ -113,7 +159,7 @@ where
 
 /// A sweep that runs when one of `wake_on` is announced, and on a slow
 /// safety tick. The body's step says whether to look again early.
-fn woken<F, Fut>(state: &DispatcherState, wake_on: &'static [WakeOn], name: &'static str, sweep: F) -> DrainLoop
+pub(crate) fn woken<F, Fut>(state: &DispatcherState, wake_on: &'static [WakeOn], name: &'static str, sweep: F) -> DrainLoop
 where
     F: Fn(DispatcherState) -> Fut + Send + Sync + Clone + 'static,
     Fut: std::future::Future<Output = anyhow::Result<DrainStep>> + Send + 'static,
@@ -123,24 +169,22 @@ where
         let state = state.clone();
         let sweep = sweep.clone();
         async move {
-            // A sibling holding the lock is sweeping right now; what it
-            // misses of this wake, its own next look or this one's safety
-            // tick covers.
-            Ok(sweep_alone(&state, name, || sweep(state.clone())).await?.unwrap_or(DrainStep::Done))
+            // A sibling holding the lock is sweeping right now, but it may
+            // have read before the write this wake is for, so look again
+            // shortly (`LOCK_HELD_RETRY`).
+            Ok(sweep_alone(&state, name, || sweep(state.clone()))
+                .await?
+                .unwrap_or(DrainStep::RetryIn(weft_task_store::drain::LOCK_HELD_RETRY)))
         }
     })
 }
 
-/// How long the parked-fire sweep sleeps: until the earliest queued head
-/// is due, at least a second (a head due now that did not drain was
-/// re-stamped, or is claimed by a live drain) and at most
+/// How long the parked-fire sweep sleeps while a fire is parked: until
+/// the earliest queued head is due, at least a second (a head due now that
+/// did not drain was re-stamped, or is claimed by a live drain) and at most
 /// [`parked_fire_longest_sleep`].
-fn parked_fire_sleep(now_unix: i64, next_due_unix: Option<i64>) -> Duration {
-    let longest = parked_fire_longest_sleep();
-    match next_due_unix {
-        None => longest,
-        Some(due) => Duration::from_secs((due - now_unix).max(1) as u64).min(longest),
-    }
+fn parked_fire_sleep(now_unix: i64, next_due_unix: i64) -> Duration {
+    Duration::from_secs((next_due_unix - now_unix).max(1) as u64).min(parked_fire_longest_sleep())
 }
 
 /// Drop what a removed project left behind that no surviving run needs.
@@ -456,10 +500,9 @@ mod tests {
 
     #[test]
     fn the_parked_fire_sweep_sleeps_until_the_next_head_is_due_within_bounds() {
-        assert_eq!(parked_fire_sleep(100, Some(107)), Duration::from_secs(7));
-        assert_eq!(parked_fire_sleep(100, Some(100)), Duration::from_secs(1), "due now: look again shortly");
-        assert_eq!(parked_fire_sleep(100, Some(50)), Duration::from_secs(1));
-        assert_eq!(parked_fire_sleep(100, Some(10_000)), parked_fire_longest_sleep());
-        assert_eq!(parked_fire_sleep(100, None), parked_fire_longest_sleep(), "nothing queued");
+        assert_eq!(parked_fire_sleep(100, 107), Duration::from_secs(7));
+        assert_eq!(parked_fire_sleep(100, 100), Duration::from_secs(1), "due now: look again shortly");
+        assert_eq!(parked_fire_sleep(100, 50), Duration::from_secs(1));
+        assert_eq!(parked_fire_sleep(100, 10_000), parked_fire_longest_sleep());
     }
 }

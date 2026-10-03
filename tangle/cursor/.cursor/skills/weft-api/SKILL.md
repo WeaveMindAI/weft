@@ -26,7 +26,8 @@ fixed by the install, not minted at activation. On this machine the install
 is `http://127.0.0.1:14111`, so `hello = Route { path: "hello" }` answers at
 `http://127.0.0.1:14111/connect/local/hello`, and a socket at the same
 address with `ws://`. On a cloud install it is the target's `url` in
-`weft.toml` (`https://weft.example.com/connect/local/hello`, and `wss://`). You write those URLs into the frontend-builder's
+`weft.toml` (`https://weft-role-dispatcher-123456789.us-central1.run.app/connect/local/hello`,
+and `wss://`). You write those URLs into the frontend-builder's
 [the brief] the moment the routes are shaped, while the graph is still being
 built; `weft activate` prints the same URLs afterwards and only turns them on.
 
@@ -35,6 +36,15 @@ address (a tunnel), `weft activate` and `weft token mint` print URLs on that
 address instead, and both reach the same dispatcher. A frontend that runs
 anywhere else (a hosted site, a phone, a browser on another machine) uses the
 public one; a server on this same machine may use either.
+
+A program that is an API can have a domain of its own on a cloud install.
+If the user wants one and has agreed to its price, the deployer runs `weft
+domain add api.shop.com --for api --on prod` (with `--accept-cost` for the
+install's first domain), which serves the project's routes at the root of that domain,
+so `hello` answers at `https://api.shop.com/hello` as well as at its
+`/connect/local/` address. A domain costs money, because it needs a load balancer, so
+design for the free address and offer a domain only when the user wants a
+name people see; read weft-deploying before you offer one.
 
 ## The shape
 

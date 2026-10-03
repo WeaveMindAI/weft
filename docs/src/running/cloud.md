@@ -86,8 +86,8 @@ retry gcloud iam service-accounts add-iam-policy-binding \
 ```
 
 The robot account owns the project, because Terraform turns on the rest of
-the services weft uses and creates the network, the machine and the accounts
-everything else runs as.
+the Google APIs weft uses and creates the network, weft's Cloud Run services
+and the accounts everything else runs as.
 
 Then, in your fork's settings on GitHub, add these repository variables:
 
@@ -99,10 +99,27 @@ Then, in your fork's settings on GitHub, add these repository variables:
 | `TF_STATE_BUCKET` | `$PROJECT-weft-state`, the bucket you just made |
 | `GCP_WORKLOAD_IDENTITY_PROVIDER` | `projects/$NUMBER/locations/global/workloadIdentityPools/weft-install/providers/github` (`echo $NUMBER` prints the number) |
 | `GCP_INSTALL_SERVICE_ACCOUNT` | `weft-installer@$PROJECT.iam.gserviceaccount.com` |
-| `WEFT_FRONTEND_REPOS` | optional: the project repositories allowed to deploy a frontend, as JSON, like `["me/shop"]`. You can add these later ([deploy the frontend](#deploy-the-frontend)) |
-| `WEFT_MACHINE_TYPE` | optional: the machine's size, `e2-micro` when unset ([what you get](#what-you-get)) |
-| `WEFT_SERVERLESS_ROLES` | optional: the parts of weft that run on Cloud Run, as JSON; `["dispatcher", "broker", "supervisor"]` when unset ([what you get](#what-you-get)) |
-| `WEFT_LISTENER_MACHINE` | optional: `true` gives the listener a machine of its own ([what you get](#what-you-get)) |
+
+### A database
+
+weft keeps everything in a Postgres database you bring, and only needs its
+address. Any Postgres the internet can reach works. If you want the install to cost next to nothing while
+nobody uses it, pick one that scales to zero: once weft's services
+have scaled to zero they hold no connection to it, so the database can sleep (for
+what keeps it awake, see [what you get](#what-you-get)). If you work with Tangle, it
+can create one that scales to zero and set the secrets below for you.
+
+Put its address in a repository secret named `WEFT_DATABASE_URL`, as a
+connection URL (`postgres://user:password@host/db?sslmode=require`).
+
+If that address goes through a pooler that hands out a connection per
+transaction, also add a direct address of the same database as
+`WEFT_DATABASE_LISTEN_URL`. weft waits on changes to its rows with a Postgres
+`LISTEN`, which needs one connection that stays open, and such a pooler hands
+out a different connection for each transaction. If you leave it out and the
+address cannot listen, weft refuses to start and its log names this secret.
+
+### OAuth apps of your own (optional)
 
 If your programs sign in to services through OAuth apps of your own
 ([the apps file](../connections/the-apps-file.md)), put that file's contents
@@ -115,18 +132,16 @@ takes weft's images from the release when your fork matches it (and
 builds the ones it changed), pushes them to your project, and creates
 everything listed under [what you get](#what-you-get).
 
-When it finishes, the run's summary gives you the install's address,
-`https://<an IP address>`, and the command that reads the first operator
-key: the password your CLI uses to act on the install, which you paste into
-`weft login prod` below. Run that command on your machine (it needs
-`gcloud`): the key is kept in Secret Manager and never printed in the
-workflow's logs.
+When it finishes, the run's summary gives you the install's address, a
+Cloud Run address like `https://weft-role-dispatcher-123456789.us-central1.run.app`,
+and the command that reads the first operator key: the password your CLI
+uses to act on the install, which you paste into `weft login prod` below.
+Run that command on your machine (it needs `gcloud`): the key is kept in
+Secret Manager and never printed in the workflow's logs.
 
-The address works a minute or two after the machine boots: the machine gets
-its own certificate for that IP address from Let's Encrypt. Such a
-certificate lasts about six days, and the machine renews it on its own
-before it runs out. If you want a name instead of an IP, see
-[your own domain](#your-own-domain).
+The address works at once, over HTTPS, with no extra charge. If you want a
+name of your own instead, see [your own domain](#your-own-domain), which
+costs money.
 
 If you want to upgrade weft, merge upstream into your fork and run the
 workflow again; Terraform changes only what is different from last time.
@@ -135,46 +150,51 @@ Then rebuild your CLI from that commit, or `activate` refuses to deploy
 
 ### What you get
 
+While nobody is using the install, no trigger keeps a connection open, and
+no program's infrastructure is up, none of weft runs, apart from a check every
+few hours that wakes each part for a moment.
+
 | Piece | What it is |
 |---|---|
-| One machine | an `e2-micro` running Postgres, the listener and the front door, with a static public address. Its database and certificates live on a disk of their own (20 GB of standard disk by default, beside a 10 GB boot disk) |
-| Cloud Run | weft's dispatcher, broker and supervisor, a service each, and your programs' workers, one service per program. Each scales on its own load and to zero between calls |
+| Cloud Run | weft's dispatcher, broker, listener and supervisor, a service each, and your programs' workers, one service per program. Each scales on its own load, and to zero between calls. A service at zero starts again when it is called: by the part of weft that just wrote work for it, by a Cloud Tasks wake, or by a call from outside (your CLI, a route, a provider's webhook) |
+| The holders | a Cloud Run worker pool for the triggers that keep a connection open between events (a stream, a socket, an event subscription that dials out). weft runs one holder per 200 such triggers and none when there are none |
+| Your database | everything weft keeps, at the address you gave it |
 | Cloud Build | builds your programs' images when you deploy |
-| Cloud Tasks | every timer, schedule and poll your programs set |
+| Pub/Sub | the `cloud-builds` topic, on which Cloud Build announces each build's end, so the dispatcher hears it at once |
+| Cloud Tasks | every timer, schedule and poll your programs set, and the wakes weft schedules for itself to check on its own pending work |
 | Compute Engine | one machine per infrastructure unit your programs start (a database, a GPU model) |
-| A storage bucket | weft's files, reached with a key that opens only this bucket |
+| A storage bucket | weft's files, reached as weft's own service account: no key is made for it, so an organization that forbids service-account keys runs weft as is |
 | Artifact Registry | two image repositories: one for the runtime, workers and infra nodes, which only the install writes, and one for frontends |
 | Secret Manager | every secret weft uses |
 
-`e2-micro` is in Google's free tier in `us-west1`, `us-central1` and
-`us-east1`, and so is 30 GB of standard disk, which is what the two disks
-add up to. `WEFT_LISTENER_MACHINE` adds a third, the listener machine's own
-10 GB boot disk, which takes you past it. The machine has 1 GB of
-memory for Postgres and the listener together, so a busy install outgrows it. If
-you want more room, set `WEFT_MACHINE_TYPE` (say `e2-small`) and run the
-workflow again: the machine stops, grows and starts again with its disk.
-If you want to change anything else (the data disk's size or type, how many
-builds run at once, how many bad tokens a minute the install tolerates), edit
-its default in `deploy/terraform/gcp/variables.tf` in your fork and run the
-workflow again. A disk can grow but never shrink.
+Most triggers need nothing running between events: a route or a form is
+called, a timer or a poll is woken by Cloud Tasks, and a service that pushes
+its events (a provider's webhook) calls the install. If you want to
+know when an event subscription takes a push instead of holding a
+connection, go and read
+[how a trigger picks its road](../connections/events.md#the-two-roads).
+You pay for a holder while it runs. A running holder also checks in with weft
+every 10 seconds, so weft's broker and your database never get to sleep
+while such a trigger is on. A program's infrastructure does the same while it
+is up: the supervisor checks its health every 30 seconds, through the broker,
+so the database stays awake until you stop it. If a
+holder crashes, its triggers hear nothing for up to about 40 seconds: its
+claims run out 30 seconds after it last renewed them, and another holder, or
+its restarted copy, takes them at its next look. A
+holder that is stopped normally hands its triggers over at once.
 
-The listener stays on a machine because a trigger that listens to a stream
-or a socket needs a process holding the connection open between events,
-and a service that scales to zero holds nothing. If those connections load
-the machine, set `WEFT_LISTENER_MACHINE` to `true`: the listener then gets an
-`e2-small` of its own that stays up, and the machine keeps only Postgres and
-the front door. If your programs hold no connections at all, you can put the
-listener on Cloud Run too by naming it in `WEFT_SERVERLESS_ROLES`, and weft
-then refuses such a trigger when you activate it. Naming roles there replaces
-the default list, so list every role you want on Cloud Run.
+If you want to change one of the install's defaults (how many triggers a
+holder takes, a holder's CPU and memory, how many builds run at once, how
+many bad tokens a minute one address may present), edit it in
+`deploy/terraform/gcp/variables.tf` in your fork and run the workflow again.
 
-weft generates the rest of its secrets itself: the database password, the storage
-key, the key your saved connections are encrypted with, and the key live
-callers' tickets are signed with. The encryption key is made once and kept
+weft generates the rest of its secrets itself: the key your saved
+connections are encrypted with, the key live callers' tickets are signed
+with, and the first operator key. The encryption key is made once and kept
 in the Terraform state, in the `$PROJECT-weft-state` bucket, and copied
-into Secret Manager, which is where the machine reads it. If it is ever
-lost or replaced, every saved connection stops working and has to be made again, so keep the
-bucket and never run `terraform destroy`.
+into Secret Manager, which is where weft's services read it. If it is ever
+lost or replaced, every saved connection stops working and has to be made
+again, so keep the bucket and never run `terraform destroy`.
 
 A cloud install belongs to one person. Every project on it shares one
 private network, so a project's code can reach another project's
@@ -183,28 +203,34 @@ installs of their own.
 
 ### Your own domain
 
-If you want the install at a name like `weft.example.com`, buy the domain
-from any registrar. Then run this from any project that has the install as a
-target:
+If you want the install, or one of your projects, at a name like
+`weft.example.com`, buy the domain from any registrar.
+
+A domain needs a load balancer in front of the install, which holds the
+domain's certificate. Google bills it by the hour while it exists: about $18
+a month, plus $0.008 per GB that goes through it. weft makes one with your
+first domain, every later domain shares it, and removing the last one takes
+it down. For your first domain, pass `--accept-cost` to say you accept
+that charge; without it, `weft domain add` stops and prints the cost. Run
+this from any project that has the install as a target:
 
 ```bash
-weft domain add weft.example.com --on prod
+weft domain add weft.example.com --on prod --accept-cost
 ```
 
 It prints the DNS record to set at your registrar (type `A`, the name, and
-the machine's address) and waits until the name points at the install. The
-machine then gets the domain's certificate on its own, and
-`https://weft.example.com` works. `weft domain list --on prod` shows every
-domain with its record.
+the load balancer's address) and waits until the name points there. Google
+then issues the domain's certificate once it sees the record, and
+`https://weft.example.com` works. `weft domain list --on prod` shows
+every domain with its record.
 
 A domain can also serve one project instead of the whole install:
 `--for api` answers that project's routes at the root of the domain
-(`https://api.example.com/users/42`), and `--for frontend --to <address>`
-passes visitors on to the project's frontend on Cloud Run.
-
-If your programs connect to Google, give the install a domain first: Google
-will not send a person back to a bare IP address after they sign in. Until
-the install has one, connecting says so and names `weft domain add`.
+(`https://api.example.com/users/42`, as well as
+`https://<the install's address>/connect/local/users/42`), and
+`--for frontend --to <address>` passes visitors on to the project's
+frontend on Cloud Run, at the address `weft frontend ls --on prod` shows for
+it.
 
 ## Deploy a project
 
@@ -212,17 +238,26 @@ In the project's folder, give your cloud install a name, log in to it, and
 deploy:
 
 ```bash
-weft target add prod https://weft.example.com
+weft target add prod https://weft-role-dispatcher-123456789.us-central1.run.app
 weft login prod
+weft infra start --on prod   # only if the program has infrastructure
 weft activate --on prod
 ```
+
+If your program has infrastructure (a database, a bridge), start it before
+the first activate: activate never starts it for you, and if a trigger reads
+infrastructure that is not running, it refuses with `these triggers' infra is
+not running: db`, naming each piece. `weft infra start --on prod` builds the
+program and brings its infrastructure up, which on GCP means a machine per
+piece booting, so give it a few minutes; `weft status --on prod` shows how
+far each one got.
 
 `weft target add` records the install's name and address in `weft.toml`.
 Commit it, and your team gets the same `prod`:
 
 ```toml
 [targets.prod]
-url = "https://weft.example.com"
+url = "https://weft-role-dispatcher-123456789.us-central1.run.app"
 ```
 
 `weft login prod` asks you to paste an operator key, checks it against the
@@ -244,8 +279,24 @@ only the files the install does not have yet, and the install does the
 rest: it compiles them again itself, builds the images the program needs,
 and activates.
 
-If you deploy again after a small change, only that change is uploaded, and
-only the image it touches is rebuilt. If nothing changed, nothing is built.
+### Deploy a change
+
+Once the program is on, `weft activate` refuses (`these triggers are already
+on`). If you want a change to go live, resync instead: it takes the triggers
+down and brings them back up on the new version.
+
+```bash
+weft resync --on prod --mode park
+```
+
+On prod, pick `park` or `hibernate`, because the calls arriving while the
+triggers are down can be real people's: `park` holds them and runs them once
+the triggers are back, `hibernate` keeps them for a grace window (`--grace`,
+in minutes). `wipe` drops them and cancels the work waiting on the triggers,
+which is fine on a dev install.
+
+Only the change is uploaded, and only the image it touches is rebuilt. If
+nothing changed, nothing is built.
 
 ### Roll back
 
@@ -255,7 +306,7 @@ to go back, find the version in `weft tree --on prod`, then let
 
 ```bash
 weft branch <version> --on prod
-weft activate --on prod
+weft resync --on prod --mode park   # or `weft activate --on prod` if it is off
 ```
 
 `weft branch` stops if your folder holds changes no version records yet;
@@ -307,22 +358,41 @@ leaves your own files alone.
 ## Deploy the frontend
 
 If you want the project's frontend (in `front/`) on the cloud, it runs on
-Cloud Run and talks to weft over your private network. First add the
-project's repository to `WEFT_FRONTEND_REPOS` in your fork's settings and
-run **install on GCP** again. That makes the repository a Cloud Run service
-of its own, public from the start, and lets its workflows sign in to your
-GCP project and change that one service: they cannot touch weft's own
-services or any other repository's. Then, in the project's folder (the repository must
-already be on GitHub, and you must have run `weft login prod`):
+Cloud Run, calls weft at the install's address with a token of its own,
+and reaches the program's infrastructure (its database) over the install's
+private network. In the project's
+folder (the repository must already be on GitHub, and you must have run
+`weft login prod`):
 
 ```bash
+weft frontend add front --repo me/shop --on prod
 weft ci add --cloud gcp
 weft target export prod --github
 ```
 
+`weft frontend add` reads the repository's id with `gh` (access is granted
+to that id, so nobody who takes the name later gets it), makes the frontend
+a Cloud Run service of its own,
+public from the start, and lets that repository's workflows sign in to your
+GCP project and change that one service: they cannot touch weft's own
+services or any other frontend's. Every frontend deploys as the install's one
+deploy account, so a repository you add could deploy to another project's
+frontend too; add only repositories you trust with all of them. The name
+(`front` here) is yours to pick: lower-case letters, digits and hyphens.
+`weft frontend ls --on prod` lists a project's frontends, and
+`weft frontend rm front --on prod` removes one, its service included.
+
+If your frontend runs somewhere else (Vercel, a server of your own), leave
+out `--repo`: the install makes nothing, and the command writes the
+frontend's token, with the install's address, to a file only you can read.
+Put those in the frontend's environment.
+
 `weft ci add` writes `.github/workflows/deploy.yml`, a workflow you run by
-hand from the Actions tab. It builds the weft CLI from the commit your
-install runs, deploys the program with `weft activate --on prod`, then
+hand from the Actions tab. It takes the weft CLI the release built from the
+commit your install runs (or builds it, when the release has none), deploys
+the program (`weft activate --on prod` when it is off,
+`weft resync --on prod --mode park` when it is on: edit the mode in the file
+if `hibernate` or `wipe` suits the program better), then
 builds `front/` with Docker and deploys it to the repository's service. If you run
 `weft ci add` again, it replaces the file only if you have not edited it;
 otherwise it stops and leaves your edits alone. If you are starting a new
@@ -330,19 +400,20 @@ project, `weft new <name> --ci gcp` writes the workflow for you.
 
 `weft target export prod --github` uses the GitHub CLI (`gh`) to set the
 variables and secrets the workflow reads, so run it with `gh` logged in. It
-mints two credentials on the install: an operator key for the workflow, and
-a token for the frontend's server, scoped to this project. If you would
-rather paste them yourself, leave out `--github` and it prints everything.
-If you use the printed version, copy the secrets straight away: the two it
-mints are never shown again.
+mints an operator key for the workflow, and gives the frontend the install
+hosts for this repository a new token, with the name of its service. The
+old token keeps working until the workflow's next run has deployed the new
+one, and then the workflow retires it. If you would rather paste them yourself, leave out
+`--github` and it prints everything. If you use the printed version, copy the
+secrets straight away: they are never shown again.
 
 The frontend's server reads three variables, which the workflow sets on
 Cloud Run:
 
 | Variable | What it is | Value on your machine |
 |---|---|---|
-| `WEFT_DISPATCHER_URL` | where the server calls weft: the machine's private address on its internal port, `http://10.10.0.2:14113`, which answers the same API as the public address and never leaves Google's network | `http://127.0.0.1:14111` |
-| `WEFT_TOKEN` | the token the server calls with; never send it to a browser | a token from `weft token mint` |
+| `WEFT_DISPATCHER_URL` | where the server calls weft: the install's address, over HTTPS | `http://127.0.0.1:14111` |
+| `WEFT_TOKEN` | the token the server calls with; never send it to a browser | a token from `weft frontend add <name>`, written to a file only you can read |
 | `WEFT_PUBLIC_URL` | the start of any link a browser follows | `http://127.0.0.1:14111` |
 
 If the frontend's server needs more than those three (the program's
@@ -383,11 +454,27 @@ them to `0` to turn it off. A call past a limit gets `429` with
 - **`401` on every command**: the key is wrong or was revoked. Run
   `weft login prod` again. In CI, run `weft target export prod --github`
   again.
-- **HTTPS fails right after the install, or right after `weft domain add`**:
-  the certificate is not issued yet. For a domain, check that its record
-  points at the address `weft domain list --on prod` prints. The machine's
-  log says what it is waiting for:
-  `gcloud compute ssh weft-machine --project <project> --zone <zone> --tunnel-through-iap -- sudo journalctl -u weft-runtime -f`.
+- **If you want weft's logs**, the services' logs are in Cloud Logging:
+  `gcloud logging read 'resource.type="cloud_run_revision"' --project <project> --freshness 1h`.
+  The holders' logs are under the worker pool `weft-holder` in the Cloud Run
+  console.
+- **HTTPS fails at a domain right after `weft domain add`**: Google has not
+  issued its certificate yet. Check that its record points at the address
+  `weft domain list --on prod` prints; the certificate follows once Google
+  sees it.
+- **`weft domain list` says the door in front of your domains refuses to
+  follow them**: Google refused to change the load balancer, and the
+  message says why. weft tries again on its own, waiting longer each time,
+  up to six hours. Once you have fixed the cause, any `weft domain add` or
+  `weft domain rm` tries again at once.
+- **weft does not start, and its log says the database session "cannot
+  LISTEN"**: `WEFT_DATABASE_URL` goes through a pooler. Add a direct address
+  of the same database as the `WEFT_DATABASE_LISTEN_URL` secret ([a
+  database](#a-database)) and run the install workflow again.
+- **A trigger that keeps a connection open shows "waiting for a holder to
+  take it" on its node**: a running holder with room takes it within about 10 seconds; otherwise weft
+  is starting one. If it stays
+  that way, the holders' logs say why.
 - **A run on prod is refused with "has no ... connection picked on this
   install"**: the step was connected on your machine, not on prod. Run the
   `weft connect --node <step>` it names, with `--on prod`.
@@ -396,9 +483,9 @@ them to `0` to turn it off. A call past a limit gets `429` with
   only what changed rebuilds.
 - **The frontend deploy fails at its `google-github-actions/auth` step, or
   its `gcloud run deploy` is refused `run.services.get`**: the repository is
-  not in `WEFT_FRONTEND_REPOS` (spelled as GitHub spells it, `owner/name`),
-  or the install has not run since you added it. Add it and run **install
-  on GCP** again.
+  not the one its frontend was added with (`weft frontend ls --on prod` shows
+  it, spelled as GitHub spells it, `owner/name`). Remove the frontend and add
+  it again with the right `--repo`, then run `weft target export` again.
 - **The install workflow stops in "create the cloud"**: Terraform's output
   in that step names the resource it could not make and why. If it names a quota (Compute Engine addresses or CPUs, say), raise
   it in the Google Cloud console and run the workflow again.

@@ -14,11 +14,6 @@ pub struct InstallInfo {
     /// (`https://weft.example.com`).
     #[serde(rename = "publicUrl")]
     pub public_url: String,
-    /// Where a frontend running next to the install reaches it privately
-    /// (the machine's private address on GCP). `None` on a local install,
-    /// whose frontend runs on the same machine.
-    #[serde(rename = "internalUrl", default, skip_serializing_if = "Option::is_none")]
-    pub internal_url: Option<String>,
     /// The cloud the install runs on, `None` on a local one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloud: Option<CloudInstall>,
@@ -27,11 +22,6 @@ pub struct InstallInfo {
     /// `None` on a local install, whose CLI is the one beside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<WeftSource>,
-    /// The machine's static public address, which every domain's DNS
-    /// record points at. `None` when the install has no front door of its
-    /// own (a local install, which the internet reaches through a tunnel).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub address: Option<std::net::IpAddr>,
 }
 
 /// A commit of a weft repository (upstream, or the fork the install
@@ -104,12 +94,55 @@ pub enum DomainServes {
     Api { project: uuid::Uuid },
 }
 
+impl DomainServes {
+    /// The project it belongs to, `None` for the install's own.
+    pub fn project(&self) -> Option<uuid::Uuid> {
+        match self {
+            DomainServes::Install => None,
+            DomainServes::Frontend { project, .. } | DomainServes::Api { project } => Some(*project),
+        }
+    }
+}
+
 /// A stored domain and the DNS record that points it at the install:
 /// what `GET /install/domains` lists and `POST /install/domains` answers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DomainEntry {
     pub domain: Domain,
     pub record: DnsRecord,
+}
+
+/// What `GET /install/domains` answers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomainList {
+    pub domains: Vec<DomainEntry>,
+    /// Why the platform's door refused to follow the stored domains, while
+    /// it keeps refusing. The install tries again on its own, less often
+    /// each time; what it says is usually something a person has to fix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub door_refused: Option<String>,
+}
+
+/// `POST /install/domains`: a domain to answer at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddDomain {
+    pub domain: Domain,
+    /// Agreement to what the door in front of the install's domains costs
+    /// while it stands, which the first domain makes: the install refuses
+    /// to make it without, saying what it costs.
+    #[serde(default, rename = "acceptCost")]
+    pub accept_cost: bool,
+}
+
+/// What `POST /install/domains` answers: the stored domain, its record,
+/// and what the door in front of the install's domains costs while it
+/// stands, when it costs anything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomainAdded {
+    pub domain: Domain,
+    pub record: DnsRecord,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<String>,
 }
 
 /// The DNS record that points a domain at the install.
@@ -135,7 +168,7 @@ impl Domain {
         if let DomainServes::Frontend { upstream, .. } = &self.serves {
             if !upstream.starts_with("https://") {
                 return Err(format!(
-                    "a frontend's address must be https (got '{upstream}'): the front door forwards visitors there over the internet"
+                    "a frontend's address must be https (got '{upstream}'): the install forwards visitors there over the internet"
                 ));
             }
         }
@@ -210,7 +243,6 @@ mod tests {
     fn a_cloud_install_round_trips_and_a_local_one_is_small() {
         let gcp = InstallInfo {
             public_url: "https://weft.example.com".into(),
-            internal_url: Some("http://10.10.0.5".into()),
             cloud: Some(CloudInstall::Gcp(GcpInstall {
                 project: "p".into(),
                 region: "us-central1".into(),
@@ -222,15 +254,13 @@ mod tests {
                 workload_identity_provider: "projects/1/locations/global/workloadIdentityPools/github/providers/github".into(),
             })),
             source: Some(WeftSource { repository: "me/weft".into(), commit: "abc123".into() }),
-            address: Some("34.1.2.3".parse().unwrap()),
         };
         let v = serde_json::to_value(&gcp).unwrap();
         assert_eq!(v["cloud"]["provider"], "gcp");
         assert_eq!(v["cloud"]["subnet"], "weft");
         assert_eq!(v["source"]["repository"], "me/weft");
-        assert_eq!(v["address"], "34.1.2.3");
         assert_eq!(serde_json::from_value::<InstallInfo>(v).unwrap(), gcp);
-        let local = InstallInfo { public_url: "http://127.0.0.1:14112".into(), internal_url: None, cloud: None, source: None, address: None };
+        let local = InstallInfo { public_url: "http://127.0.0.1:14112".into(), cloud: None, source: None };
         assert_eq!(serde_json::to_value(&local).unwrap(), serde_json::json!({ "publicUrl": "http://127.0.0.1:14112" }));
         assert!(serde_json::from_value::<InstallInfo>(serde_json::json!({ "publicUrl": "x", "typo": 1 })).is_err());
     }

@@ -155,6 +155,9 @@ pub fn router(state: Arc<BrokerState>) -> Router {
         // Signals (the listener's rehydrate read)
         .route("/v1/signal/list_held", post(handlers::signal_list_held))
         .route("/v1/signal/get_held", post(handlers::signal_get_held))
+        .route("/v1/signal/hold", post(handlers::signal_hold))
+        .route("/v1/signal/let_go", post(handlers::signal_let_go))
+        .route("/v1/signal/set_holds", post(handlers::signal_set_holds))
         .route("/v1/signal/write_kind_state", post(handlers::signal_write_kind_state))
         // Supervisor surface (pooled, trusted control-plane;
         // InfraSupervisor role only). A supervisor acts only on the
@@ -188,6 +191,10 @@ pub fn router(state: Arc<BrokerState>) -> Router {
         .route(
             "/v1/supervisor/set_status",
             post(handlers::supervisor_set_status),
+        )
+        .route(
+            "/v1/supervisor/set_waiting",
+            post(handlers::supervisor_set_waiting),
         )
         .route(
             "/v1/supervisor/remove_node",

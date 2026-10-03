@@ -64,6 +64,16 @@ impl ProjectTransition {
     pub fn is_building(self) -> bool {
         matches!(self, Self::Building | Self::CancellingBuild)
     }
+
+    /// What a verb refused because of this transition tells the person:
+    /// `None` when there is no build to wait on.
+    pub fn refusal(self) -> Option<&'static str> {
+        match self {
+            Self::Building => Some("the project is building; wait for the build to finish, or cancel it with `weft cancel-build`"),
+            Self::CancellingBuild => Some("the project's build is being cancelled; try again once it has stopped"),
+            Self::None => None,
+        }
+    }
 }
 
 /// `GET /projects/{id}/status`'s query: the hashes the client computed
@@ -141,6 +151,14 @@ pub struct ProjectStatusResponse {
     /// True when the project has any infra-typed nodes in its source:
     /// whether a client shows the infra controls at all.
     pub has_infra: bool,
+    /// Whether this install has built the program at least once. Until
+    /// it has, it knows nothing of the program's nodes, so an empty
+    /// `infra` says nothing about the source.
+    #[serde(default)]
+    pub built: bool,
+    /// The image builds running for the project right now.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub builds: Vec<BuildInFlight>,
     /// True when live `infra_node` rows exist whose node is NOT in the
     /// current source (the node was deleted while deployed). Never gates
     /// run/activate; clients OR it into their infra-controls check so the
@@ -177,6 +195,31 @@ pub struct ProjectStatusResponse {
     pub limited: Vec<LimitedEntry>,
 }
 
+/// What `DELETE /projects/{id}` answers: what a forced removal could not
+/// take off the cloud, one sentence each, naming it (empty otherwise).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectRemoved {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub left: Vec<String>,
+}
+
+/// One image build the project waits on, running on the install's
+/// builder: one it started, or one another project started of the same
+/// content.
+// SYNC: BuildInFlight <-> packages/weft-graph/src/status.ts RawStatusPayload.builds
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildInFlight {
+    /// The image ref it pushes.
+    pub image: String,
+    /// The builder's own id for it.
+    pub build: String,
+    #[serde(rename = "startedAtUnix")]
+    pub started_at_unix: i64,
+    /// Where its log is read, when the builder keeps one at an address.
+    #[serde(default, rename = "logUrl", skip_serializing_if = "Option::is_none")]
+    pub log_url: Option<String>,
+}
+
 /// One public entry that refused calls recently, and by which limit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LimitedEntry {
@@ -195,6 +238,9 @@ pub struct InstanceInfraEntry {
     pub node: String,
     pub instance: crate::instance::InstanceId,
     pub status: String,
+    /// How far a start of the copy got, while one is under way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<crate::infra::wire::ApplyProgress>,
 }
 
 /// One trigger activation in the status answer.
@@ -274,6 +320,9 @@ pub struct ProjectInfraEntry {
     /// is listed in `instance_infra`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_copy_count: Option<usize>,
+    /// How far a start of the copy got, while one is under way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<crate::infra::wire::ApplyProgress>,
 }
 
 // SYNC: ProjectExecutionsSummary <-> packages/weft-graph/src/status.ts RawStatusPayload.executions

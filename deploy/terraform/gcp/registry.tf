@@ -40,7 +40,10 @@ resource "google_artifact_registry_repository" "images" {
 # A repository of its own, so a frontend credential can write nothing the
 # runtime runs.
 resource "google_artifact_registry_repository" "frontends" {
-  location      = var.region
+  location = var.region
+  # The images repository's id plus `-frontends`, which a project's CI
+  # appends to the registry address it is given.
+  # SYNC: the frontend repository <-> crates/weft-cli/templates/ci/gcp.yml (FRONT_IMAGE)
   repository_id = "${var.name}-frontends"
   format        = "DOCKER"
   depends_on    = [google_project_service.apis]

@@ -12,7 +12,9 @@
 //!   `/start` brings the signal up (its first wake, its held
 //!   connection), so whatever starts always finds its row.
 //! - listener owns kind-specific state (timer schedules, SSE
-//!   connections, held sockets). When a held event fires,
+//!   connections, held sockets). A signal that keeps a connection open
+//!   between fires is held by a holder (the listener's code where
+//!   something stays up), which claims its row. When a held event fires,
 //!   the listener enqueues a `FireSignal` task via the broker; the
 //!   dispatcher's task picker drives it through the same routing as
 //!   a stateless fire.
@@ -57,6 +59,11 @@ pub struct PrepareRequest {
     /// Where the registration's kind_state starts from (see
     /// [`PrepareSource`]).
     pub source: PrepareSource,
+    /// Whose signal it is (`None` for a shared one): an instance's signal
+    /// reads its connection through that instance's alone, here as it
+    /// will once up.
+    #[serde(default)]
+    pub for_instance: Option<crate::instance::InstanceScope>,
 }
 
 /// Where a registration's kind_state starts from: the kind computes
@@ -94,6 +101,11 @@ pub struct PrepareResponse {
     /// `Null` for a kind nobody answers by hand. The dispatcher caches
     /// it on the signal row.
     pub rendered: serde_json::Value,
+    /// Whether this signal keeps a connection to the outside open between
+    /// fires, decided for this signal by its kind. The dispatcher writes it
+    /// on the row, where a holder claims it and the number of holders is
+    /// counted from.
+    pub holds: bool,
 }
 
 /// Body for `POST /rehydrate` on the listener: bring up every held
@@ -187,6 +199,20 @@ pub struct LiveResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnregisterRequest {
     pub token: String,
+    /// The removed row's tenant, spec and kind state: the row is gone
+    /// by the time this arrives, and what the signal arranged outside
+    /// (a provider subscription it renews on its wakes) is torn down from
+    /// them.
+    pub tenant_id: String,
+    pub spec: SignalSpec,
+    pub kind_state: Value,
+    /// The token comes back up right after (a registration replaced this
+    /// row with one served the other way round): the answer waits for the
+    /// teardown, which is keyed by the token, so it is over before anything
+    /// serves the token again. Otherwise the answer does not wait on a
+    /// provider round trip.
+    #[serde(default)]
+    pub reused: bool,
 }
 
 /// Body sent by the dispatcher to listener `/process` on every
@@ -327,6 +353,7 @@ mod tests {
                 prior_kind_state: Some(serde_json::json!({"cursor": 42})),
                 asked_at_unix_ms: 1_700_000_000_123,
             },
+            for_instance: None,
         };
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["tenant_id"], "acme");

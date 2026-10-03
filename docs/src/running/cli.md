@@ -90,7 +90,7 @@ reads the file again.
 | `weft executions` | Past runs, newest first. `--limit` (50), `--offset`, `--project`, `--phase`, `--node`, `--since 2h`, `--status`, `--instance`, `--tag`. A run of a `Route` with `recorded: false` shows only if it failed |
 | `weft events <execution-id>` | One run's events in order. `--node`, `--kind`, `--full` for whole values. If you want one time round a loop, `--iteration 3` keeps the fourth (they count from 0), and `3.0` the first time round a loop inside it |
 | `weft logs [<execution-id>]` | What the nodes wrote, plus every failure. A run that wrote nothing lists what it skipped and why (under `skipped` with `--json`). `--limit` |
-| `weft status` | The cwd project: registration, listener, every infra node the program declares (one never started says `not started`, a `@per_instance` one how many instances have a copy), each trigger (with the events an instance's trigger holds until a field is filled), recent runs, what drifted, and what you can do next |
+| `weft status` | The cwd project: registration, listener, every infra node the program declares (one never started says `not started`, a `@per_instance` one how many instances have a copy), each trigger (with the events an instance's trigger holds until a field is filled), recent runs, what drifted, and what you can do next. While the install builds, it names each image building and where its log is; while infra starts, how long it has been going and what it waits on |
 | `weft ps` | Every project the dispatcher knows |
 
 `--phase fire` hides the setup runs that an activate or a resync makes, so it
@@ -112,7 +112,7 @@ answers "has my trigger fired since I changed it".
 
 | Command | What it does |
 |---|---|
-| `weft activate` | Sets up every shared trigger and starts the listeners. Builds and registers first if it has to. A trigger that runs once per instance is left off and named in a warning, with the way to switch it on: `--instance <id>`, or an `ActivateInstanceTriggers` node in the program. It refuses while a connection the program needs is not picked on this install, naming each step. A worker still up from an older build is replaced on the way: `--running-policy cancel` (the default) cancels what it runs, `wait` lets that land first, up to `--drain-timeout`. If the triggers are already on and you changed the source, it tells you to run `weft resync` |
+| `weft activate` | Sets up every shared trigger and starts the listeners. Builds and registers first if it has to. A trigger that runs once per instance is left off and named in a warning, with the way to switch it on: `--instance <id>`, or an `ActivateInstanceTriggers` node in the program. It refuses while a connection the program needs is not picked on this install, naming each step, and while infra a trigger reads is not running (it never starts infra: `weft infra start` does). A worker still up from an older build is replaced on the way: `--running-policy cancel` (the default) cancels what it runs, `wait` lets that land first, up to `--drain-timeout`. If the triggers are already on and you changed the source, it tells you to run `weft resync` |
 | `weft deactivate` | Stops the program's own triggers listening, and tells you how many instances still have theirs on. `--instance <id>` stops one instance's, `--all-instances` stops every instance's and leaves the program's own alone |
 | `weft resync` | Deactivate and re-activate in one shot against your current program. With no flag it does every trigger that is on, the program's own and every instance's, and prints whose it did. It only touches triggers that are on; for ones that are off, use `weft activate` |
 | `weft cancel-activate` | Cancels an activate in flight |
@@ -193,10 +193,15 @@ all take `--instance <id>`.
 | `weft logout <name>` | Forgets your key for it |
 | `weft running-source <folder>` | Writes the program an install is running into a new folder, without touching your own files. Add `--on <target>` to get what a cloud install runs |
 | `weft ci add --cloud gcp` | Writes `.github/workflows/deploy.yml`. Refuses to replace one somebody edited |
-| `weft target export <name> [--github]` | Mints a CI operator key and a frontend token on the install. With `--github` it sets them, and the workflow's other settings, on the repository through `gh`; without it, it prints the variables and writes the secrets to a file only you can read, under the install's `exports/` folder |
-| `weft domain add <name>` | Makes the install answer at a domain you own: prints the DNS record to set and waits until it points here. `--for api` serves the project's routes there instead, `--for frontend --to <address>` its frontend. `--no-wait` returns after printing the record |
+| `weft target export <name> [--github] [--frontend <name>]` | Mints a CI operator key on the install, and gives the frontend the install hosts for this repository a new token along with its service's name (the old token works until the workflow's next run deploys the new one and retires it). With `--github` it sets them, and the workflow's other settings, on the repository through `gh`, and lists what it set; without it, it prints the variables and writes the secrets to a file only you can read, under the install's `exports/` folder |
+| `weft target show <name>` | Where a target's install lives: its address, and on a cloud the project and region it runs in, and the weft it runs |
+| `weft frontend add <name> [--repo owner/name]` | Makes one of the project's frontends and its token, written to a file only you can read. With `--repo` (read through `gh`), a cloud install makes it a Cloud Run service and lets that repository deploy to it; without, it runs wherever you run it |
+| `weft frontend ls` | The project's frontends, and where each runs |
+| `weft frontend rm <name> [--force]` | Removes one: its tokens stop working, and a service the install made for it is deleted. `--force` forgets it even when the service cannot be removed, naming what stays |
+| `weft frontend token <name> [--done <id>]` | A new token, beside the one it has, with its id; `--done <id>` once that token is in place retires every other token of the frontend |
+| `weft domain add <name>` | Makes a cloud install answer at a domain you own: prints the DNS record to set and waits until it points there. `--for api` serves the project's routes there instead, `--for frontend --to <address>` its frontend. `--no-wait` returns after printing the record. The first domain makes a load balancer that is billed while any domain exists, so it needs `--accept-cost` ([your own domain](cloud.md#your-own-domain)) |
 | `weft domain list` | Every domain, with its DNS record |
-| `weft domain rm <name>` | Stops answering at it |
+| `weft domain rm <name>` | Stops answering at it; the last one takes the load balancer down |
 | `weft workers` | The project's worker settings: copies kept warm, the most copies, runs per copy, CPU, memory. It shows which the project sets and which come from the install |
 | `weft workers set --min-instances 1 ...` | Changes settings for this project; the change reaches its running workers at once |
 | `weft workers reset [<setting>...]` | Puts settings back to the install's values |

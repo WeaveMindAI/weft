@@ -89,6 +89,17 @@ pub trait BrokerSupervisorOps: Send + Sync {
         failure_stage: Option<weft_broker_client::protocol::FailureStage>,
         failure_message: Option<&str>,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetStatusResponse>>;
+    /// Record what the apply `command_id` waits on for this copy, for
+    /// `weft status`.
+    async fn set_waiting(
+        &self,
+        replica: &str,
+        command_id: i64,
+        project_id: uuid::Uuid,
+        node_id: &str,
+        instance: Option<&weft_core::instance::InstanceId>,
+        waiting: &str,
+    ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetWaitingResponse>>;
     /// Cascade-delete the node, gated on the caller still OWNING the
     /// project (via `replica` = the supervisor's claim id). `Displaced`
     /// means ownership moved mid-Terminate; the supervisor aborts and
@@ -239,6 +250,17 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
             failure_message,
         )
         .await
+    }
+    async fn set_waiting(
+        &self,
+        replica: &str,
+        command_id: i64,
+        project_id: uuid::Uuid,
+        node_id: &str,
+        instance: Option<&weft_core::instance::InstanceId>,
+        waiting: &str,
+    ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetWaitingResponse>> {
+        BrokerSupervisorClient::set_waiting(self, replica, command_id, project_id, node_id, instance, waiting).await
     }
     async fn remove_node(
         &self,

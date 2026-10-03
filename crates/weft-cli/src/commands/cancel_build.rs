@@ -29,9 +29,6 @@ async fn run_inner(
     progress.dispatcher_call_start(&path);
     client.post_empty(&path).await?;
     progress.dispatcher_call_done(serde_json::json!({ "project_id": id }));
-    if !ctx.json() {
-        println!("cancel-build issued for {id}");
-    }
     progress.complete(&format!("cancel-build issued for {id}"));
     Ok(())
 }

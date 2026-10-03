@@ -1,6 +1,6 @@
 ---
 name: weft-deploying
-description: "Read when the user wants weft or a program live for real people on their cloud, asks about prod, a target, `--on`, a domain or GCP, or a deploy failed: targets and logging in, domains, the deploy workflow `weft ci add` writes, handing it its settings with `weft target export`, what a cloud build is and how it fails, rolling back, and connections on a cloud install. The deployer specialist reads it; you read it before dispatching one."
+description: "Read when the user wants weft or a program live for real people on their cloud, asks about prod, a target, `--on`, a domain or GCP, or a deploy failed: targets and logging in, domains, the deploy workflow `weft ci add` writes, handing it its settings with `weft target export`, a project's frontends (`weft frontend`), what a cloud build is and how it fails, rolling back, and connections on a cloud install. The deployer specialist reads it; you read it before dispatching one."
 ---
 
 # Deploying
@@ -9,7 +9,7 @@ A [target] is one weft install, named in the project's `weft.toml`:
 
 ```toml
 [targets.prod]
-url = "https://weft.example.com"
+url = "https://weft-role-dispatcher-123456789.us-central1.run.app"
 ```
 
 `local` is always a target: the install on this machine, at
@@ -27,20 +27,31 @@ it, Tangle reads the weft-cloud-install skill and does it in
 conversation: the user has to log in to `gh` and `gcloud` along the way,
 so it is never handed to a specialist, which cannot talk to the user.
 
-## A name instead of an IP
+## A name instead of the install's own address
 
-The install answers at its IP address from the start. If the user wants a
-domain (`weft.example.com`), they buy it anywhere, then the deployer runs
-`weft domain add weft.example.com --on prod`: it prints the DNS record to
-set (type `A`, the name, the machine's address) and waits until it resolves,
-and the machine then gets the certificate itself. `--for api` serves one
-project's routes at the root of a domain, and `--for frontend --to <its
-https address>` passes a domain on to the project's frontend.
-`weft domain list --on prod` shows every domain and its record.
+The install answers at its own Cloud Run address (`https://...run.app`) from
+the start, over HTTPS, for free. That address is enough for the CLI,
+frontends and providers' webhooks; a domain gives the install a name people
+see.
 
-A connection to Google needs the install to have a domain: Google refuses a
-bare IP as the place to send a person back after they sign in, and weft's connect flow says so. Set up the domain before any Google
-connection.
+A domain costs money: it needs a Google load balancer in front of the
+install, about $18 a month plus $0.008 per GB through it, for as long as the
+install has any domain. weft makes it with the first domain and takes it
+down with the last. So before the first domain, tell the user that price
+and go on only once they agree. With their yes, the deployer runs `weft domain add <name> --on prod
+--accept-cost` (without `--accept-cost` the first domain is refused, naming
+the price). It prints the DNS record to set (type `A`, the name, the load
+balancer's address), which the deployer hands back for the user to set at
+their registrar; Google then issues the certificate on its own once it sees
+the record. `weft domain list --on prod`
+shows every domain and its record.
+
+A domain can serve one project instead of the whole install: `--for api`
+serves that project's routes at the root of the domain
+(`https://api.shop.com/users/42`, on top of
+`<install address>/connect/local/users/42`), and `--for frontend --to <its
+https address>` passes the domain on to the project's frontend (`weft
+frontend ls --on prod` shows that address).
 
 ## Workers and long runs
 
@@ -52,10 +63,18 @@ than an hour on a cloud install (Cloud Run cuts a request there) runs with
 `weft run --long`, or with `longRuns` on the trigger that starts it, and gets
 a worker of its own for up to seven days.
 
-A trigger that holds a connection open (a stream or a socket it listens to)
-needs the install's listener on the machine. If the install moved `listener`
-to `WEFT_SERVERLESS_ROLES`, such a trigger is refused with a message naming
-that; the fix is the user's, in the fork's variables.
+A trigger that holds a connection open (a stream or a socket it listens to,
+an event subscription that dials out) runs on a holder, which weft starts
+only while such a trigger is on and which is billed while it runs. Its node
+shows "waiting for a holder to take it" until one has. While a holder runs,
+it checks in through weft every 10 seconds, which also keeps weft's broker
+and the database up. Infrastructure that is up also keeps the broker and the
+database awake: the supervisor checks its health every 30 seconds, through the
+broker. Everything else (a route, a form, a timer, a poll, a
+provider that pushes its events) needs nothing running between events. If
+the install's database is on a plan that sleeps and has limited hours, tell
+the user before you deploy such a trigger, or infrastructure, that it keeps
+the database awake around the clock.
 
 ## Setting a project up for its cloud
 
@@ -73,27 +92,96 @@ folder:
    and never pipe one in (`--key-stdin` is for the user's own scripts).
 3. `weft ci add --cloud gcp`: writes `.github/workflows/deploy.yml`. The
    workflow, run by hand from the repository's Actions tab, builds the CLI
-   of the exact weft the install runs, deploys the program with
-   `weft activate --on <target>`, then builds `front/` with Docker and runs
-   it on Cloud Run, reaching the install over its private network.
+   of the exact weft the install runs, deploys the program (`weft activate
+   --on <target>` when it is off, `weft resync --on <target> --mode park`
+   when it is on), then, when the install hosts a frontend for the
+   repository, builds `front/` with Docker and runs it on that frontend's
+   Cloud Run service, which calls the install at its address and reaches the
+   program's infrastructure over the install's private network.
    `weft new --ci gcp` writes the same file when the project is made. If it
    refuses because the file "was changed since weft wrote it (or weft never
    wrote it)", the file is somebody's own and weft never overwrites it: tell
    the user, and leave it.
 4. `weft target export prod --github`: needs step 2 first, and the
    repository already on GitHub. It sets the variables and secrets the
-   workflow reads, with `gh` (logged in, run inside the repo), and mints
-   two credentials on the install: an operator key for CI, and a caller
-   token for the frontend's server, scoped to this project. Every run
-   mints new ones, so it runs once per setup, or again when a CI
-   credential was lost. Without `--github` it prints them, and the
-   secrets are shown only that once.
+   workflow reads, with `gh` (logged in, run inside the repo): it mints
+   an operator key for CI, and gives the frontend the install hosts for
+   this repository a new token (the old one works until the workflow's next
+   run deploys the new one and retires it) and names its service. Every run mints new ones, so it runs once per setup, or again
+   when a CI credential was lost. Without `--github` it prints them, and
+   the secrets are shown only that once.
 
-If the project has a frontend (`front/Dockerfile`), the repository also
-has to be listed in `WEFT_FRONTEND_REPOS` of the weft fork, with the install
-workflow run again since, or the workflow cannot sign in to GCP to deploy
-it. That is the user's to do in the fork. A project with no `front/` needs
-none of that: the workflow deploys the program and stops.
+If the project has a frontend (`front/Dockerfile`), register it on the
+install between steps 3 and 4 (next section). A project with no frontend
+skips that: the workflow deploys the program and stops.
+
+## A project's frontend: `weft frontend`
+
+A frontend is a website that calls the install on its visitors' behalf.
+The install knows each one by a name you pick, and gives it a token of its
+own that can only act on this project. Where the site runs decides how you
+add it.
+
+**If the install should host it** (Cloud Run, deployed by the project's
+GitHub workflow), name the repository whose workflow deploys it:
+
+```bash
+weft frontend add front --repo <owner/name> --on prod
+weft target export prod --github
+```
+
+The first command reads the repository's id with `gh` (logged in; access
+is granted to that id, so the name changing hands later gives nobody
+anything), makes the frontend's Cloud Run service (empty until the first
+deploy) and lets that repository's workflow deploy to that service and
+nothing else on the install. It prints the service's name and the
+address visitors will reach. The export then hands the repository the
+service's name and a fresh token for the frontend, and the next run of the
+deploy workflow builds `front/` and puts it there. The order matters: an
+export run before the frontend exists hands over no frontend, and the
+workflow skips it.
+
+Every hosted frontend deploys as the install's one deploy account, so a
+repository you add here could deploy to another project's frontend too.
+Only add repositories the user trusts with all of them, and ask before
+adding one the user did not name.
+
+**If it runs somewhere else** (Vercel, the user's own server, this
+machine), leave out `--repo`:
+
+```bash
+weft frontend add shop --on prod
+```
+
+The install makes nothing. The command writes the frontend's token, with
+the install's address, as `WEFT_TOKEN`, `WEFT_DISPATCHER_URL` and
+`WEFT_PUBLIC_URL`, to a file under `~/.local/share/weft/exports/` that only
+the user can read. Tell the user that path: they copy the three into the
+site's environment. Never print the token or put it in the chat. A local
+install hosts nothing, so locally this is the only form, and `--repo` is
+refused.
+
+**Afterwards:**
+
+- `weft frontend ls --on prod` lists the project's frontends: each one's
+  name, where it runs, the repository that deploys it, and its address.
+- A new token never breaks the running site: the old one keeps working
+  until the new one is in place. For a hosted frontend, `weft target export
+  prod --github` makes the new one and hands it to the workflow, and the
+  workflow's next run deploys it and then retires the old one itself. For
+  one that runs elsewhere, `weft frontend token <name> --on prod` writes a
+  new one to the private file and prints its id; once the user has put it
+  in the site's environment, `weft frontend token <name> --done <id> --on
+  prod` puts it in place and retires every other token of the frontend.
+- `weft frontend rm <name> --on prod` removes one: its tokens stop working,
+  and a hosted one's service is deleted with whatever runs on it. Ask the
+  user before running it. If the service cannot be removed, it stops and
+  says why; `--force` forgets the frontend anyway and names what stays on
+  the cloud. `weft rm` on the project removes its frontends first, and
+  `weft rm --force` does the same with `--force`.
+
+A name is 1 to 20 lower-case letters, digits or inner hyphens, starting
+with a letter, and is taken once per project.
 
 ## What a deploy does
 
@@ -103,9 +191,25 @@ project's sources, only the files the install does not have yet. The
 install compiles that snapshot itself, builds the images it needs, and
 activates. So a deploy of an unchanged project builds nothing.
 
+Activate never starts infrastructure. On a first deploy of a program with
+infra (a database, a bridge), run `weft infra start --on prod` first: if a
+trigger reads infra that is not running, activate refuses with "these
+triggers' infra is not running: <node>". On GCP each piece boots a machine,
+so it takes a few minutes; `weft status --on prod` shows each one's state.
+
+`weft activate` is for a program that is off. Once its triggers are on, it
+refuses, and a change goes live with `weft resync --on prod --mode <mode>`,
+which takes the triggers down and brings them back on the new version. On
+prod, pick `park` (calls that arrive meanwhile wait and run once the
+triggers are back) or `hibernate` (they keep being answered for a grace
+window), because those calls can be real people's. `wipe` drops them and
+cancels the work waiting on the triggers: fine on a dev install, and on
+prod only when the user says so.
+
 Every target keeps its own versions: `weft tree --on prod` lists what was
 deployed there. To roll back, put an older one's files back in the folder
-with `weft branch <id> --on prod`, then `weft activate --on prod`. Its
+with `weft branch <id> --on prod`, then `weft resync --on prod --mode park`
+(or `weft activate --on prod` if the program is off). Its
 images are already built, so nothing rebuilds. `weft branch` refuses while
 the folder holds changes no version records; `--discard` throws those
 changes away, and you pass it only when the user said to.
@@ -117,8 +221,8 @@ Run and by `front/.env` on this machine:
 
 | Variable | On a cloud install | On this machine |
 |---|---|---|
-| `WEFT_DISPATCHER_URL` | the install's private address | `http://127.0.0.1:14111` |
-| `WEFT_TOKEN` | the caller token `weft target export` minted | a token from `weft token mint` |
+| `WEFT_DISPATCHER_URL` | the install's address | `http://127.0.0.1:14111` |
+| `WEFT_TOKEN` | the frontend's own token, which `weft target export` renews and hands the workflow | a token from `weft frontend add <name>` (no `--repo`), written to a private file |
 | `WEFT_PUBLIC_URL` | the install's public address | `http://127.0.0.1:14111` |
 
 On this machine, 14111 is the default port; if the install was started on

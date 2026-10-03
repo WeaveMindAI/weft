@@ -343,11 +343,22 @@ enum Cmd {
         action: Option<WorkersAction>,
     },
     /// The domains the install answers at: its own, or a project's
-    /// frontend or API. Adding one prints the DNS record to set and waits
-    /// until it points at the install, which then gets its certificate.
+    /// frontend or API. The install answers at its own address for free;
+    /// a domain needs a door in front of it, which the first domain makes
+    /// and the last one takes down. Adding one prints the DNS record to set
+    /// and waits until it points at the door, which then gets its
+    /// certificate.
     Domain {
         #[command(subcommand)]
         action: DomainAction,
+    },
+    /// The project's frontends: websites that call the install for their
+    /// visitors, each with a token of its own. With `--repo`, the install
+    /// hosts one and lets that repository deploy it; without, it runs
+    /// wherever you run it.
+    Frontend {
+        #[command(subcommand)]
+        action: FrontendAction,
     },
     /// Subscribe to the dispatcher's SSE stream for a project.
     Follow { project: String },
@@ -817,6 +828,9 @@ enum TargetCmd {
     /// List the targets, and whether you are logged in to each.
     #[command(alias = "ls")]
     List,
+    /// Where a target's install lives: its address, and on a cloud the
+    /// project and region it runs in.
+    Show { name: String },
     /// Remove a target from weft.toml.
     #[command(alias = "rm")]
     Remove { name: String },
@@ -839,6 +853,10 @@ enum TargetCmd {
         /// secret of the site's own), sent as the WEFT_FRONT_ENV secret.
         #[arg(long, value_name = "file")]
         front_env: Option<std::path::PathBuf>,
+        /// The frontend (`weft frontend add`) the workflow deploys, when
+        /// the install hosts several this repository could.
+        #[arg(long, value_name = "name")]
+        frontend: Option<String>,
     },
 }
 
@@ -1341,6 +1359,11 @@ enum DomainAction {
         /// is in place.
         #[arg(long)]
         no_wait: bool,
+        /// Go ahead with what the door in front of the domains costs while
+        /// it stands (on GCP, a load balancer), which the first domain
+        /// makes. Without it, the first domain is refused, saying the cost.
+        #[arg(long)]
+        accept_cost: bool,
     },
     /// Every domain, with the DNS record each needs.
     List,
@@ -1348,10 +1371,56 @@ enum DomainAction {
     Rm { name: String },
 }
 
+#[derive(Debug, Subcommand)]
+enum FrontendAction {
+    /// Make a frontend, and its token (written to a file only you can
+    /// read). `--repo owner/name` has the install host it: it makes the
+    /// service and lets that repository deploy to it.
+    Add {
+        /// Lower-case letters, digits and hyphens, at most 20.
+        name: String,
+        /// The GitHub repository whose CI deploys it to the install.
+        #[arg(long, value_name = "owner/name")]
+        repo: Option<String>,
+    },
+    /// The project's frontends, and where each runs.
+    #[command(alias = "list")]
+    Ls,
+    /// Remove a frontend: its tokens stop working, and a service the
+    /// install made for it is deleted.
+    Rm {
+        name: String,
+        /// Forget it even when its service cannot be removed; what stays
+        /// on the cloud is named.
+        #[arg(long)]
+        force: bool,
+    },
+    /// A new token for a frontend, beside the one it has, which keeps
+    /// working until `--done <id>` says the new one is in place.
+    Token {
+        name: String,
+        /// The new token with this id is in place: every other token of
+        /// the frontend stops working.
+        #[arg(long, value_name = "token-id")]
+        done: Option<uuid::Uuid>,
+    },
+}
+
+impl From<FrontendAction> for commands::frontend::FrontendAction {
+    fn from(value: FrontendAction) -> Self {
+        match value {
+            FrontendAction::Add { name, repo } => Self::Add { name, repo },
+            FrontendAction::Ls => Self::List,
+            FrontendAction::Rm { name, force } => Self::Rm { name, force },
+            FrontendAction::Token { name, done } => Self::Token { name, done },
+        }
+    }
+}
+
 impl From<DomainAction> for commands::domain::DomainAction {
     fn from(value: DomainAction) -> Self {
         match value {
-            DomainAction::Add { name, serves, to, no_wait } => Self::Add { name, serves, to, no_wait },
+            DomainAction::Add { name, serves, to, no_wait, accept_cost } => Self::Add { name, serves, to, no_wait, accept_cost },
             DomainAction::List => Self::List,
             DomainAction::Rm { name } => Self::Rm { name },
         }
@@ -1658,6 +1727,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Cmd::Prune { version, yes } => commands::prune::run(ctx, version, yes).await,
         Cmd::Wake { execution_id, node } => commands::wake::run(ctx, execution_id, node).await,
         Cmd::Domain { action } => commands::domain::run(ctx, action.into()).await,
+        Cmd::Frontend { action } => commands::frontend::run(ctx, action.into()).await,
         Cmd::Workers { action } => commands::workers::run(ctx, action.map(Into::into).unwrap_or(commands::workers::WorkersAction::Show)).await,
         Cmd::Follow { project } => commands::follow::run(ctx, project).await,
         Cmd::Stop { execution_id } => commands::stop::run(ctx, execution_id).await,
@@ -1728,11 +1798,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             let action = match action {
                 TargetCmd::Add { name, url } => commands::target::TargetAction::Add { name, url },
                 TargetCmd::List => commands::target::TargetAction::List,
+                TargetCmd::Show { name } => commands::target::TargetAction::Show { name },
                 TargetCmd::Remove { name } => commands::target::TargetAction::Remove { name },
                 TargetCmd::Key => {
                     return commands::target::key(&ctx);
                 }
-                TargetCmd::Export { name, github, front_env } => commands::target::TargetAction::Export { name, github, front_env },
+                TargetCmd::Export { name, github, front_env, frontend } => commands::target::TargetAction::Export { name, github, front_env, frontend },
             };
             commands::target::run(ctx, action).await
         }

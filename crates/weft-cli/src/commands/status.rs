@@ -22,8 +22,9 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
     // Both hashes are scoped to the compiled project's referenced /
     // infra-closure nodes, so both need the definition + catalog. If
-    // the project can't compile, leave the desired hashes unset:
-    // status is display-only and tolerates an in-progress project.
+    // the project can't compile, leave the desired hashes unset and say
+    // why: status is display-only and tolerates an in-progress project,
+    // but a person reading no drift must know none was looked for.
     //
     // FULL hashes, never shortened: the dispatcher stores the full
     // `running_*_hash` values register sends and compares by string
@@ -53,19 +54,33 @@ pub async fn run(ctx: Ctx) -> Result<()> {
                 use weft_core::builds::NodeSet;
                 match resolved {
                     Ok(_) => (
-                        weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Referenced).ok(),
-                        weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Full).ok(),
-                        weft_compiler::hash::compute_definition_hash(&def).ok(),
-                        weft_compiler::hash::compute_infra_hash(&def, &project.root, &weft_root, &catalog)
-                            .ok(),
+                        or_warn(
+                            "the worker code's hash",
+                            weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Referenced),
+                        ),
+                        or_warn(
+                            "the worker code's hash with every node",
+                            weft_compiler::hash::compute_binary_hash(&def, project, &weft_root, &catalog, NodeSet::Full),
+                        ),
+                        or_warn("the project definition's hash", weft_compiler::hash::compute_definition_hash(&def)),
+                        or_warn(
+                            "the infra's hash",
+                            weft_compiler::hash::compute_infra_hash(&def, &project.root, &weft_root, &catalog),
+                        ),
                     ),
                     // An asset that cannot resolve is what a build will
                     // refuse; status stays display-only and reports no
                     // desired hashes rather than a made-up drift.
-                    Err(_) => (None, None, None, None),
+                    Err(e) => {
+                        warn_no_drift("its assets do not resolve", &e);
+                        (None, None, None, None)
+                    }
                 }
             }
-            Err(_) => (None, None, None, None),
+            Err(e) => {
+                warn_no_drift("the project does not compile", &e);
+                (None, None, None, None)
+            }
         };
 
     let query = weft_core::projects::StatusQuery {
@@ -105,6 +120,12 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     if data.transition != ProjectTransition::None {
         println!("  build: {} (cancel with `weft cancel-build`)", data.transition);
     }
+    for build in &data.builds {
+        match &build.log_url {
+            Some(log) => println!("    {} building as {}; its log: {log}", build.image, build.build),
+            None => println!("    {} building as {}", build.image, build.build),
+        }
+    }
     println!("  listener: {}", if data.listener_running { "running" } else { "stopped" });
     // Orphaned live infra: never silent (the never-lose-track rule).
     if data.orphaned_infra {
@@ -116,7 +137,9 @@ pub async fn run(ctx: Ctx) -> Result<()> {
 
     // One entry per infra node the program declares, started or not, so
     // an empty list really means no node declares `requires_infra`.
-    if data.infra.is_empty() {
+    if data.infra.is_empty() && !data.built {
+        println!("  infra: (this install has not built the program yet, so it does not know its nodes)");
+    } else if data.infra.is_empty() {
         println!("  infra: (no nodes declare requires_infra)");
     } else {
         println!("  infra:");
@@ -133,7 +156,12 @@ pub async fn run(ctx: Ctx) -> Result<()> {
                     let counted = if copies == 1 { "1 instance has a copy".to_string() } else { format!("{copies} instances have a copy") };
                     println!("    {node}: one copy per instance ({counted}, listed under instance infra)");
                 }
-                st => println!("    {node}: {st} ({})", entry.endpoint_url.as_deref().unwrap_or("-")),
+                st => {
+                    println!("    {node}: {st} ({})", entry.endpoint_url.as_deref().unwrap_or("-"));
+                    if let Some(progress) = &entry.progress {
+                        println!("      {}", progress.describe_now());
+                    }
+                }
             }
         }
     }
@@ -161,6 +189,9 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         println!("  instance infra:");
         for entry in &data.instance_infra {
             println!("    {} (instance {}): {}", entry.node, entry.instance, entry.status);
+            if let Some(progress) = &entry.progress {
+                println!("      {}", progress.describe_now());
+            }
         }
     }
 
@@ -192,6 +223,18 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Say on stderr (stdout may be the one JSON line the editor reads) that
+/// drift cannot be looked for, and why.
+fn warn_no_drift(why: &str, e: &anyhow::Error) {
+    eprintln!("warning: {why}, so whether the running program is behind the source is not checked ({e:#})");
+}
+
+/// One desired hash, or `None` with a warning naming what could not be
+/// worked out.
+fn or_warn(what: &str, hash: Result<String>) -> Option<String> {
+    hash.map_err(|e| warn_no_drift(&format!("{what} cannot be worked out"), &e)).ok()
 }
 
 /// Every drift bit the dispatcher set, each with the verb that clears

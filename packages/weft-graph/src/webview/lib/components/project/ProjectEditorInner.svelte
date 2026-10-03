@@ -2123,6 +2123,7 @@
 							infraInstanceCopies: backendNode?.instanceCopyCount,
 							infraFailureStage: backendNode?.failureStage,
 							infraFailureMessage: backendNode?.failureMessage,
+							infraProgress: backendNode?.progress,
 						},
 						class: cls,
 					};

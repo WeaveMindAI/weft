@@ -225,7 +225,8 @@
 		// dedicated user-facing wording.
 		switch (phase) {
 			case 'preflight': return 'Checking...';
-			case 'build_start': return 'Building...';
+			case 'build_start':
+			case 'build_image': return 'Building...';
 			case 'build_done': return 'Loading...';
 			case 'infra_provision_start':
 			case 'infra_provision_done': return 'Provisioning infra...';

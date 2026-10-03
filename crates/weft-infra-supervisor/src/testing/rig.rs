@@ -54,7 +54,7 @@ impl SupervisorTestRig {
     /// hand back what changed, as the running loop sends it to the
     /// lifecycle loop.
     pub async fn tick_ownership(&self) -> Result<Option<ownership::OwnershipChange>> {
-        ownership::tick(&self.state, &mut *self.owned.lock().await).await
+        Ok(ownership::tick(&self.state, &mut *self.owned.lock().await).await?.change)
     }
 
     /// Step the health loop once.

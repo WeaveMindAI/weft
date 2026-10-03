@@ -81,9 +81,6 @@ async fn run_inner(
     progress.dispatcher_call_done(serde_json::json!({ "project_id": handle.id, "resynced": resynced }));
     progress.trigger_register_done();
     let whom = resynced.iter().map(weft_core::deactivation::whose_triggers).collect::<Vec<_>>().join(", ");
-    if !ctx.json() {
-        println!("resynced {whom} in {} ({})", handle.name, handle.id);
-    }
-    progress.complete(&format!("resynced {whom} in {}", handle.name));
+    progress.complete(&format!("resynced {whom} in {} ({})", handle.name, handle.id));
     Ok(())
 }
