@@ -333,8 +333,8 @@ mod tests {
     #[test]
     fn a_certificate_id_fits_and_is_the_names_own() {
         let id = certificate_id("weft-door", "api.shop.example.com");
-        assert!(id.len() <= 63, "{id}");
-        assert!(id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'), "{id}");
+        assert!(id.len() <= 63);
+        assert!(id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'));
         assert_eq!(id, certificate_id("weft-door", "api.shop.example.com"));
         assert_ne!(id, certificate_id("weft-door", "app.shop.example.com"));
     }

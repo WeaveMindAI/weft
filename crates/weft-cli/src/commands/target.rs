@@ -364,9 +364,9 @@ async fn export(
     for (k, v) in &settings.variables {
         println!("  variable {k}={v}");
     }
-    for (k, _) in &settings.secrets {
-        println!("  secret   {k}");
-    }
+    // Only how many: nothing that comes out of a secret reaches the
+    // terminal, its name included.
+    println!("  secrets  {} set", settings.secrets.len());
     println!("run its deploy workflow from the Actions tab");
     if let Some((_, frontend, _)) = &minted.frontend {
         println!("frontend '{frontend}' keeps its old token working until that run deploys the new one and retires it");
