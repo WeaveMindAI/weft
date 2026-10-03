@@ -59,6 +59,10 @@ const RETRY_DELAY: Duration = Duration::from_secs(1);
 /// The channel a watch proves it can hear on, every time it listens.
 const PROBE_CHANNEL: &str = "weft_listen_probe";
 
+/// The name the listening session gives itself, so it can be told apart
+/// in `pg_stat_activity` from the connections that do work.
+pub const WATCH_APPLICATION_NAME: &str = "weft_signal_watch";
+
 /// How long a watch waits to hear its own probe back. A session that can
 /// listen hears it in milliseconds.
 const PROBE_WAIT: Duration = Duration::from_secs(5);
@@ -92,7 +96,7 @@ impl PgSignalWatch {
             .max_connections(1)
             .max_lifetime(None)
             .idle_timeout(None)
-            .connect_with(connect.clone())
+            .connect_with(connect.clone().application_name(WATCH_APPLICATION_NAME))
             .await?;
         let listener = listen(&own, channels).await?;
         let (tx, template) = broadcast::channel(FANOUT_CAPACITY);

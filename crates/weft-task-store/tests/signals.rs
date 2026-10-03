@@ -85,8 +85,9 @@ async fn a_lost_connection_tells_every_waiter_to_recheck(pool: PgPool) {
     let mut heard = watch.subscribe();
     let killed: Vec<(bool,)> = sqlx::query_as(
         "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-         WHERE datname = current_database() AND query LIKE 'LISTEN%'",
+         WHERE datname = current_database() AND application_name = $1",
     )
+    .bind(weft_task_store::pg_signal::WATCH_APPLICATION_NAME)
     .fetch_all(&pool)
     .await
     .unwrap();
