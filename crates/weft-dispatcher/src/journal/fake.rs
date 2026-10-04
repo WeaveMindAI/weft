@@ -716,16 +716,26 @@ impl Journal for FakeJournal {
 
     // The fake holds no claims (a claim lives in the task store), so a task
     // here is one nobody claimed; the rest of the rule is the real one: a
-    // live run born for a caller, unpinned, past its `arrive_by`.
-    async fn erase_unclaimed_live_run(&self, execution_id: ExecutionId, _task_id: uuid::Uuid, now: i64) -> anyhow::Result<bool> {
+    // live run born for a caller, unpinned, past its `arrive_by` when the
+    // erase is the reaper's.
+    async fn erase_unclaimed_live_run(
+        &self,
+        execution_id: ExecutionId,
+        which: weft_task_store::tasks::UnclaimedLiveRun,
+    ) -> anyhow::Result<bool> {
+        use weft_task_store::tasks::UnclaimedLiveRun;
         {
             let mut g = self.inner.lock().unwrap();
             let id = execution_id.to_string();
             let never_arrived = |task: &weft_task_store::tasks::NewTask| {
+                let arrive_by = task.payload["live_connection"]["arrive_by"].as_i64();
                 task.execution_id.as_deref() == Some(id.as_str())
                     && task.kind == weft_task_store::TaskKind::Execute.as_str()
                     && task.target_replica.is_none()
-                    && task.payload["live_connection"]["arrive_by"].as_i64().is_some_and(|by| by < now)
+                    && match which {
+                        UnclaimedLiveRun::PastDeadline { now } => arrive_by.is_some_and(|by| by < now),
+                        UnclaimedLiveRun::NeverPassedOn => arrive_by.is_some(),
+                    }
             };
             let before = g.tasks.len();
             g.tasks.retain(|task| !never_arrived(task));

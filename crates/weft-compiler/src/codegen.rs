@@ -439,16 +439,12 @@ fn write_package_crates(
         std::fs::create_dir_all(&pkg_src).map_err(CompileError::Io)?;
         std::fs::write(pkg_dir.join("Cargo.toml"), cargo_toml).map_err(CompileError::Io)?;
         std::fs::write(pkg_src.join("lib.rs"), lib_rs).map_err(CompileError::Io)?;
-        // Within one slot, cargo decides whether a cached rlib is still
-        // good by comparing every source mtime, this shim included,
-        // against the rlib's. Written at wall-clock time the shim would
-        // be newer than any rlib another project (or an earlier build)
-        // left in the shared compile cache, and every package would
-        // recompile on every build. Its content is a function of the
-        // package's files, so it takes the newest of their mtimes.
-        let newest = newest_source_mtime(&pkg.package.root)?;
+        // Dated like the staged sources it includes (see
+        // `build::package_source_mtime`): written at wall-clock time it
+        // would be newer than every cached rlib, and every package would
+        // compile on every build.
         for generated in [pkg_dir.join("Cargo.toml"), pkg_src.join("lib.rs")] {
-            crate::build::stamp_mtime(&generated, newest);
+            crate::build::stamp_mtime(&generated, crate::build::package_source_mtime());
         }
         dirs.insert(pkg.module_ident.clone(), dir_name);
     }
@@ -473,22 +469,6 @@ fn package_crate_slot(
     hasher.update(b"\nlib.rs:\n");
     hasher.update(lib_rs.as_bytes());
     Ok(crate::hash::hex(&hasher.finalize()).chars().take(16).collect())
-}
-
-/// The newest mtime among a package root's files (the same walk the
-/// binary hash and the staging copy use, so the stamp tracks exactly the
-/// files the compiled crate reads).
-fn newest_source_mtime(package_root: &Path) -> CompileResult<std::time::SystemTime> {
-    let files = crate::hash::walk_dir(package_root)
-        .map_err(|e| CompileError::Build(format!("walk package {}: {e}", package_root.display())))?;
-    let mut newest = std::time::SystemTime::UNIX_EPOCH;
-    for file in files {
-        let modified = std::fs::metadata(&file)
-            .and_then(|meta| meta.modified())
-            .map_err(CompileError::Io)?;
-        newest = newest.max(modified);
-    }
-    Ok(newest)
 }
 
 fn render_package_cargo_toml(

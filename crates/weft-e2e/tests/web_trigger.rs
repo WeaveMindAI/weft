@@ -39,9 +39,9 @@ async fn http_endpoint_echoes_request_body() -> anyhow::Result<()> {
         "the route did not deliver the body key on its declared port: {body}"
     );
 
-    // A browser page on another origin: the live door the 307 lands on
-    // answers the preflight itself and stamps the reply with CORS headers,
-    // else the browser refuses what the worker sent. The policy allows
+    // A browser page on another origin: the install answers the
+    // preflight itself and stamps the reply with CORS headers, else the
+    // browser refuses what the worker sent. The policy allows
     // every origin, answered as `*` or as the origin that asked, which a
     // browser accepts alike.
     let origin = "http://postcards.example";

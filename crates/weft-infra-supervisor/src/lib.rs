@@ -62,6 +62,13 @@ pub struct SupervisorState {
     /// the ownership loop's sweep deletes a gone copy only while holding
     /// it. See [`ProjectLocks`].
     pub project_locks: Arc<ProjectLocks>,
+    /// Held for the whole of one [`tick`], so the passes of a supervisor
+    /// that scales to zero run one after another in this process. Two
+    /// wakes landing together otherwise ran two passes side by side, and
+    /// both claimed and ran the same command: claiming marks nothing on
+    /// the broker, and only a running loop's busy set (which a pass does
+    /// not keep) stops a second claim of a project's command.
+    pub pass: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// One lock per project, so this process's sweep deletion and apply of
@@ -133,6 +140,9 @@ pub async fn run_loops(state: SupervisorState) -> anyhow::Result<()> {
 /// lapsed lease is taken over), and the moment after. `None` when there
 /// is nothing to look at anywhere: a command being issued wakes it.
 pub async fn tick(state: &SupervisorState) -> anyhow::Result<Option<Duration>> {
+    // A wake that lands during another pass waits for it and then runs
+    // its own, which finds whatever that one left waiting.
+    let _pass = state.pass.lock().await;
     let mut owned = std::collections::HashSet::new();
     let synced = ownership::tick(state, &mut owned).await?;
     while lifecycle::tick(state, Duration::ZERO).await? {}

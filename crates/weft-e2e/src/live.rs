@@ -1,21 +1,20 @@
 //! The live-caller path: an outside party holds an HTTP stream or a two-way
 //! WebSocket against a running program.
 //!
-//! Flow (proven by hand during the live-caller feature):
-//!   1. Handshake: `/connect/<tenant>/{path}` on the dispatcher, any method. For a WebSocket the
-//!      response is `200 { "url": "...", "protocol": "websocket" }`; the URL is
-//!      a live URL (`/live/<project>/...` on the front door) carrying a
-//!      signed routing ticket. For HTTP it is a `307` whose `Location` is the
-//!      same kind of URL.
-//!   2. Connect: open the URL. The dispatcher forwards it to one of the
-//!      project's workers. WS clients must swap the `http(s)` scheme to
-//!      `ws(s)`.
-//!   3. Exchange: send / receive messages (the data type is whatever the
-//!      trigger declared; JSON by default, so a text payload must be JSON).
+//! A call is `/connect/<tenant>/{path}` on the dispatcher, any method, and
+//! is answered in that one request: the dispatcher checks the caller,
+//! starts the run and passes the call to one of the project's workers. A
+//! socket is opened there the same way, by a client that sends the
+//! upgrade itself.
 //!
-//! The handshake URL points at the front door (the install's configured
-//! base when the handshake came straight to the dispatcher's port), NOT
-//! the dispatcher, so these helpers hit absolute URLs.
+//! A browser cannot put a credential on a socket's opening request, so
+//! the route offers it two steps instead, which [`ticket`] and
+//! [`open_socket_at`] take: a plain GET answers
+//! `200 { "url": "...", "protocol": "websocket" }`, a URL on the live door
+//! (`/live/<project>/...`) carrying a signed ticket, and the socket is
+//! opened there. That URL points at the front door (the install's
+//! configured base when the call came straight to the dispatcher's port),
+//! so these helpers hit absolute URLs.
 
 use anyhow::{bail, Context, Result};
 use futures::{SinkExt, StreamExt};
@@ -25,30 +24,6 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::client::Dispatcher;
 
-/// Perform the live-caller handshake for `mount_path` and return the live
-/// connection URL (as the dispatcher hands it out, `http(s)://...`). The caller
-/// then connects via [`open_ws`] (WebSocket) or by streaming the URL (HTTP).
-pub async fn handshake(disp: &Dispatcher, mount_path: &str) -> Result<String> {
-    // `/connect/{path}` is an external-CALLER endpoint: it authenticates via
-    // the route's own auth connection (or is open), NOT the dispatcher's tenant
-    // token, so it goes through the UNAUTHED absolute-URL path, exactly like
-    // the HTTP-live `http_post` + the webhook `fire_webhook`. (Routing it
-    // through the authed `get_raw` would attach a tenant token the gate just
-    // ignores, falsely implying `/connect` is a tenant-token endpoint.)
-    let url = format!("{}/connect/{}", disp.base(), mount_path.trim_start_matches('/'));
-    let (status, bytes) = disp.get_abs_raw(&url).await?;
-    let body = String::from_utf8_lossy(&bytes).into_owned();
-    if !status.is_success() {
-        bail!("live handshake GET {url} -> HTTP {status}: {body}");
-    }
-    let v: Value =
-        serde_json::from_str(&body).with_context(|| format!("handshake body not JSON: {body}"))?;
-    v.get("url")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .with_context(|| format!("handshake response missing `url`: {body}"))
-}
-
 /// A connected live WebSocket to a worker. Send and receive JSON messages until
 /// the test closes it (which ends the run for a caller-tied program).
 pub struct LiveWs {
@@ -57,24 +32,29 @@ pub struct LiveWs {
     >,
 }
 
-/// Open a live WebSocket: handshake for `mount_path`, then connect to the
-/// returned URL (swapping the scheme to `ws`/`wss`, exactly as a browser does).
+/// Open a live WebSocket on `mount_path` in one request, the way a client
+/// that can send headers does.
 pub async fn open_ws(disp: &Dispatcher, mount_path: &str) -> Result<LiveWs> {
-    let http_url = handshake(disp, mount_path).await?;
-    let ws_url = http_url
-        .replacen("https://", "wss://", 1)
-        .replacen("http://", "ws://", 1);
-    let (stream, _resp) = match tokio_tungstenite::connect_async(&ws_url).await {
-        Ok(opened) => opened,
-        // A refused handshake carries the reason in its body: say it.
-        Err(tokio_tungstenite::tungstenite::Error::Http(refused)) => anyhow::bail!(
-            "WebSocket connect to {ws_url} answered {}: {}",
-            refused.status(),
-            refused.body().as_deref().map(String::from_utf8_lossy).unwrap_or_default()
-        ),
-        Err(e) => return Err(e).with_context(|| format!("WebSocket connect to {ws_url}")),
-    };
-    Ok(LiveWs { stream })
+    let url = format!("{}/connect/{}", disp.base(), mount_path.trim_start_matches('/'));
+    match open_socket_at(&url).await? {
+        Ok(ws) => Ok(ws),
+        Err((status, body)) => anyhow::bail!("WebSocket connect to {url} answered {status}: {body}"),
+    }
+}
+
+/// Open a socket at `url` (`http(s)` swapped to `ws(s)`), the second step of
+/// a [`ticket`] among others: the socket, or the status and words of a
+/// refusal, which a test may assert (a late caller's).
+pub async fn open_socket_at(url: &str) -> Result<std::result::Result<LiveWs, (reqwest::StatusCode, String)>> {
+    let ws_url = url.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
+    match tokio_tungstenite::connect_async(&ws_url).await {
+        Ok((stream, _)) => Ok(Ok(LiveWs { stream })),
+        Err(tokio_tungstenite::tungstenite::Error::Http(refused)) => Ok(Err((
+            reqwest::StatusCode::from_u16(refused.status().as_u16()).expect("a status the socket client parsed is a valid status"),
+            refused.body().as_deref().map(String::from_utf8_lossy).unwrap_or_default().into_owned(),
+        ))),
+        Err(e) => Err(e).with_context(|| format!("WebSocket connect to {ws_url}")),
+    }
 }
 
 impl LiveWs {
@@ -165,8 +145,7 @@ impl LiveWs {
 }
 
 /// One live HTTP request of any method with explicit headers and a raw
-/// body, following the dispatcher's `307` to the worker like a browser
-/// does: the status, the response headers and the whole body, whatever
+/// body: the status, the response headers and the whole body, whatever
 /// the status (a `404`, a `405` and a `401` are answers a test asserts,
 /// not failures).
 pub async fn http_request(
@@ -193,11 +172,10 @@ pub async fn http_request(
 }
 
 /// What a browser sees when a page on `origin` POSTs JSON to a route: the
-/// dispatcher's `307` (taken without following it), then, on the gateway
-/// hop its `Location` names, the preflight `OPTIONS` a browser sends
-/// after a cross-origin redirect, then the real POST. The preflight is
-/// the gateway's own answer (it never reaches the worker); the POST's
-/// answer is the worker's, with the gateway's CORS headers on it.
+/// preflight `OPTIONS` a browser sends before a cross-origin POST with a
+/// JSON body, then the POST. The preflight is the install's own answer (it
+/// never reaches the worker); the POST's answer is the worker's, with the
+/// install's CORS headers on it.
 pub struct BrowserCall {
     pub preflight_status: reqwest::StatusCode,
     pub preflight_headers: reqwest::header::HeaderMap,
@@ -208,28 +186,18 @@ pub struct BrowserCall {
 
 pub async fn browser_post_json(disp: &Dispatcher, mount_path: &str, origin: &str, body: &Value) -> Result<BrowserCall> {
     let url = format!("{}/connect/{}", disp.base(), mount_path.trim_start_matches('/'));
-    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build()?;
-    let resp = client.post(&url).header("origin", origin).json(body).send().await
-        .with_context(|| format!("live POST {url} (no redirect)"))?;
-    let status = resp.status();
-    anyhow::ensure!(status == reqwest::StatusCode::TEMPORARY_REDIRECT, "live POST {url} -> HTTP {status}, expected the 307 to the worker");
-    let location = resp
-        .headers()
-        .get(reqwest::header::LOCATION)
-        .and_then(|v| v.to_str().ok())
-        .context("the 307 carries no Location")?
-        .to_string();
+    let client = reqwest::Client::new();
     let preflight = client
-        .request(reqwest::Method::OPTIONS, &location)
+        .request(reqwest::Method::OPTIONS, &url)
         .header("origin", origin)
         .header("access-control-request-method", "POST")
         .header("access-control-request-headers", "content-type")
         .send()
         .await
-        .with_context(|| format!("preflight OPTIONS {location}"))?;
+        .with_context(|| format!("preflight OPTIONS {url}"))?;
     let (preflight_status, preflight_headers) = (preflight.status(), preflight.headers().clone());
-    let resp = client.post(&location).header("origin", origin).json(body).send().await
-        .with_context(|| format!("live POST {location}"))?;
+    let resp = client.post(&url).header("origin", origin).json(body).send().await
+        .with_context(|| format!("live POST {url}"))?;
     let (status, headers) = (resp.status(), resp.headers().clone());
     let body = resp.bytes().await.unwrap_or_default().to_vec();
     Ok(BrowserCall { preflight_status, preflight_headers, status, headers, body })
@@ -284,10 +252,12 @@ pub async fn stream_first_chunk_then_stop_reading(
     disp: &Dispatcher,
     mount_path: &str,
 ) -> Result<SilentCaller> {
-    let url = handshake_or_redirect(disp, mount_path).await?;
-    let parsed = url::Url::parse(&url).with_context(|| format!("worker url {url}"))?;
-    let host = parsed.host_str().context("worker url has no host")?.to_string();
-    let port = parsed.port_or_known_default().context("worker url has no port")?;
+    let url = format!("{}/connect/{}", disp.base(), mount_path.trim_start_matches('/'));
+    let parsed = url::Url::parse(&url).with_context(|| format!("route url {url}"))?;
+    // The request below is written by hand, in plain HTTP.
+    anyhow::ensure!(parsed.scheme() == "http", "{url}: a raw socket here speaks plain http only");
+    let host = parsed.host_str().context("route url has no host")?.to_string();
+    let port = parsed.port_or_known_default().context("route url has no port")?;
     let path = match parsed.query() {
         Some(q) => format!("{}?{q}", parsed.path()),
         None => parsed.path().to_string(),
@@ -299,7 +269,7 @@ pub async fn stream_first_chunk_then_stop_reading(
 
     let mut socket = tokio::net::TcpStream::connect((host.as_str(), port))
         .await
-        .with_context(|| format!("connect to the worker at {authority}"))?;
+        .with_context(|| format!("connect to the install at {authority}"))?;
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: {authority}\r\nAccept: text/event-stream\r\n\r\n"
     );
@@ -320,9 +290,16 @@ pub async fn stream_first_chunk_then_stop_reading(
         .await
         .context("waiting for the first chunk of the stream")?
         .context("read the stream")?;
-        anyhow::ensure!(read > 0, "the worker closed before sending a chunk");
+        anyhow::ensure!(read > 0, "the install closed before sending a chunk");
         seen.extend_from_slice(&buf[..read]);
         if let Some(at) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+            // A refusal comes with a body too: only a success opened a stream.
+            let head = String::from_utf8_lossy(&seen[..at]).into_owned();
+            let status = head.split_whitespace().nth(1).and_then(|s| s.parse::<u16>().ok());
+            anyhow::ensure!(
+                status.is_some_and(|s| (200..300).contains(&s)),
+                "live GET {url} did not open a stream:\n{head}"
+            );
             if seen.len() > at + 4 {
                 break;
             }
@@ -337,107 +314,28 @@ pub struct SilentCaller {
     _socket: tokio::net::TcpStream,
 }
 
-/// Ask for a connection and stop there, holding the worker URL the
-/// dispatcher hands back: the caller's TICKET.
+/// A browser's first step on a socket route: ask with a plain GET and stop
+/// there, holding the URL it answers with, which carries the caller's
+/// TICKET. [`open_socket_at`] is the second step, whenever the test chooses.
 ///
-/// Every other helper here does the handshake and the connection in one
-/// go, the way a browser does, which is right for a test about what a
-/// route answers and useless for a test about WHEN the caller arrives.
 /// This half is the one the gate sees, so a route with auth is checked
-/// here; [`follow`] is the other half.
-///
-/// Works for either kind of route: a WebSocket answers with a JSON
-/// `url`, an HTTP one with a redirect, and both name the same thing.
-pub async fn ticket(
-    disp: &Dispatcher,
-    method: reqwest::Method,
-    mount_path: &str,
-    headers: &[(&str, &str)],
-    body: Option<Vec<u8>>,
-) -> Result<String> {
+/// here.
+// SYNC: the ticket answer's shape <-> crates/weft-dispatcher/src/api/signal.rs (connect_live), packages/weft-connect/src/core/socket.ts (socketAddress)
+pub async fn ticket(disp: &Dispatcher, mount_path: &str, headers: &[(&str, &str)]) -> Result<String> {
     let url = format!("{}/connect/{}", disp.base(), mount_path.trim_start_matches('/'));
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("build a client that does not follow the redirect")?;
-    let mut req = client.request(method.clone(), &url);
+    let mut req = reqwest::Client::new().get(&url);
     for (k, v) in headers {
         req = req.header(*k, *v);
     }
-    if let Some(body) = body {
-        req = req.body(body);
-    }
-    let resp = req.send().await.with_context(|| format!("live {method} {url}"))?;
-    if let Some(location) = resp.headers().get(reqwest::header::LOCATION) {
-        return Ok(location.to_str().context("Location is not text")?.to_string());
-    }
+    let resp = req.send().await.with_context(|| format!("live GET {url}"))?;
     let status = resp.status();
     let body = resp.text().await.context("read the handshake body")?;
-    let v: Value = serde_json::from_str(&body).with_context(|| {
-        format!("no ticket: the handshake answered HTTP {status}, neither a redirect nor JSON: {body}")
-    })?;
+    let v: Value = serde_json::from_str(&body)
+        .with_context(|| format!("no ticket: the route answered HTTP {status}, not a JSON ticket: {body}"))?;
     v.get("url")
         .and_then(Value::as_str)
         .map(str::to_string)
         .with_context(|| format!("handshake response missing `url`: {body}"))
-}
-
-/// Use a ticket: go to the worker URL [`ticket`] handed back, whenever
-/// the test chooses to. The answer is the worker's, including its
-/// refusals, so a test can assert what a caller sees when they arrive
-/// too late or with the wrong request.
-pub async fn follow(
-    url: &str,
-    method: reqwest::Method,
-    headers: &[(&str, &str)],
-    body: Option<Vec<u8>>,
-) -> Result<(reqwest::StatusCode, Vec<u8>)> {
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("build a client that does not follow the redirect")?;
-    let mut req = client.request(method.clone(), url);
-    for (k, v) in headers {
-        req = req.header(*k, *v);
-    }
-    if let Some(body) = body {
-        req = req.body(body);
-    }
-    let resp = req.send().await.with_context(|| format!("live {method} {url}"))?;
-    let status = resp.status();
-    let body = resp.bytes().await.unwrap_or_default().to_vec();
-    Ok((status, body))
-}
-
-/// The worker URL for a bodiless GET, the shape the streaming helpers
-/// need.
-async fn handshake_or_redirect(disp: &Dispatcher, mount_path: &str) -> Result<String> {
-    ticket(disp, reqwest::Method::GET, mount_path, &[], None).await
-}
-
-/// Make the handshake with one request and then send a DIFFERENT one to
-/// the worker the handshake pointed at.
-///
-/// This is the attack the caller token's fingerprint exists to stop.
-/// The gate runs at the dispatcher and the program runs on the worker,
-/// with a redirect in between, so a caller can get one request checked
-/// and then send another down the redirect they were handed. Every
-/// other helper here follows the redirect the way a client does, which
-/// is exactly what this one must not do.
-///
-/// `gate` is what the dispatcher sees and approves; `sent` is what
-/// actually arrives at the worker. Passing the same bytes for both is
-/// the honest control case. Returns the worker's answer.
-pub async fn redirect_then_send(
-    disp: &Dispatcher,
-    method: reqwest::Method,
-    mount_path: &str,
-    headers: &[(&str, &str)],
-    gate: Vec<u8>,
-    sent: Vec<u8>,
-) -> Result<(reqwest::StatusCode, Vec<u8>)> {
-    let url = ticket(disp, method.clone(), mount_path, headers, Some(gate)).await?;
-    follow(&url, method, headers, Some(sent)).await
 }
 
 /// [`http_request`] with a JSON body and the matching content type.
@@ -454,23 +352,16 @@ pub async fn http_json(
     http_request(disp, method, mount_path, &all, Some(bytes)).await
 }
 
-/// Drive an HTTP live request and return the full response body.
-///
-/// Unlike the WebSocket path, the HTTP live connection is NOT a two-step
-/// handshake: the `/connect/{path}` request itself carries the caller's body
-/// and yields the response. The dispatcher answers with a `307` whose Location
-/// is the live URL; reqwest follows it, re-sending the POST body
-/// (307 preserves method + body), and the worker's responder reads the body,
-/// streams progress chunks, and sends a final body. We return the whole stream
-/// (chunks + final concatenated), so callers parse what they expect.
+/// Drive an HTTP live request and return the full response body: the
+/// worker's responder reads the body, streams progress chunks and sends a
+/// final body, and the whole stream comes back (chunks and final
+/// concatenated), so callers parse what they expect.
 pub async fn http_post(disp: &Dispatcher, mount_path: &str, body: &Value) -> Result<Vec<u8>> {
     let url = format!(
         "{}/connect/{}",
         disp.base(),
         mount_path.trim_start_matches('/')
     );
-    // reqwest follows redirects (incl. 307, preserving method + body) by
-    // default, so a single POST to /connect lands on the worker.
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)

@@ -105,6 +105,17 @@ pub struct LocalInfraHost {
 }
 
 impl LocalInfraHost {
+    /// Whether every container of `unit` (its agent and each of its own)
+    /// runs, all of them the version `node` asks for: the unit is up as
+    /// asked, so applying it again changes nothing. A unit half built (an
+    /// apply that failed after its agent started) is not.
+    pub async fn runs_whole(&self, node: &ResolvedNode, unit: &str) -> anyhow::Result<bool> {
+        let resolved = Self::unit(node, unit)?;
+        let rows = self.unit_containers(&node.node, unit).await?;
+        Ok(rows.len() == resolved.unit.containers.len() + 1
+            && rows.iter().all(|c| c.label(labels::UNIT_HASH) == Some(resolved.hash.as_str()) && c.state == "running"))
+    }
+
     pub fn new(docker: Arc<dyn Docker>, cfg: LocalInfraHostConfig) -> Self {
         Self {
             docker,
@@ -299,7 +310,7 @@ impl LocalInfraHost {
         }
         if let Some(c) = apps.iter().find(|c| c.state != "running") {
             return Ok(match c.state.as_str() {
-                "created" => UnitRunState::Starting,
+                "created" => UnitRunState::Starting { step: format!("container {} is starting", container_short(c)) },
                 other => UnitRunState::Failed { why: format!("container {} is {other}", container_short(c)) },
             });
         }
@@ -415,15 +426,10 @@ impl InfraHost for LocalInfraHost {
     }
 
     async fn apply_unit(&self, node: &ResolvedNode, unit: &str) -> anyhow::Result<()> {
-        let resolved = Self::unit(node, unit)?;
-        let rows = self.unit_containers(&node.node, unit).await?;
-        let expected = resolved.unit.containers.len() + 1;
-        let current = rows.len() == expected
-            && rows.iter().all(|c| c.label(labels::UNIT_HASH) == Some(resolved.hash.as_str()) && c.state == "running");
-        if current {
+        if self.runs_whole(node, unit).await? {
             return Ok(());
         }
-        self.create(node, resolved).await
+        self.create(node, Self::unit(node, unit)?).await
     }
 
     async fn stop_unit(&self, node: &NodeRef, unit: &str) -> anyhow::Result<()> {

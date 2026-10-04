@@ -166,7 +166,7 @@ pub async fn start_run(
             let refusal: Refusal = serde_json::from_str(&text).context("parse the refusal")?;
             bail!("the run cannot start:\n{refusal}")
         }
-        _ => bail!("{}", if text.trim().is_empty() { format!("dispatcher returned {status}") } else { text.trim().to_string() }),
+        _ => bail!("{}", crate::client::refusal_text(&text).unwrap_or_else(|| format!("dispatcher returned {status}"))),
     }
 }
 

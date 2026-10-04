@@ -439,11 +439,15 @@ async fn sweep_orphaned_live_executions(state: DispatcherState) -> anyhow::Resul
             );
             continue;
         };
-        match state.journal.erase_unclaimed_live_run(execution_id, gone.task_id, now).await {
+        match state
+            .journal
+            .erase_unclaimed_live_run(execution_id, weft_task_store::tasks::UnclaimedLiveRun::PastDeadline { now })
+            .await
+        {
             Ok(true) => tracing::info!(
                 target: "weft_dispatcher::reaper",
                 execution_id = %execution_id,
-                "erased a live run whose caller never followed the redirect"
+                "erased a live run whose caller never reached a worker"
             ),
             Ok(false) => {}
             Err(e) => tracing::warn!(

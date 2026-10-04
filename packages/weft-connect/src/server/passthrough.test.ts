@@ -93,7 +93,7 @@ describe('the pass-through', () => {
 		expect(seen[0].headers.get('content-type')).toBe('application/json');
 	});
 
-	it("calls a program's live route with the instance's token, following the dispatcher to the worker", async () => {
+	it("calls a program's live route with the instance's token, streaming its body", async () => {
 		let init: RequestInit | undefined;
 		const fetcher = (async (url: string, given: RequestInit) => {
 			init = given;
@@ -109,10 +109,10 @@ describe('the pass-through', () => {
 			'connect/local/bot/ask',
 		);
 		expect(await res.text()).toBe('{"reply":"hi"}');
-		// The redirect to the worker is followed here, not handed to the
-		// browser, and the body is whole so it can be sent again.
-		expect(init?.redirect).toBe('follow');
-		expect(new TextDecoder().decode(init?.body as ArrayBuffer)).toBe('{"text":"hello"}');
+		// The dispatcher answers a route call in the one request, so its
+		// body streams on as every door's does.
+		expect(init?.redirect).toBe('manual');
+		expect(await new Response(init?.body as ReadableStream).text()).toBe('{"text":"hello"}');
 		expect(new Headers(init?.headers).get('weft-instance-token')).toBe('wft-m');
 	});
 

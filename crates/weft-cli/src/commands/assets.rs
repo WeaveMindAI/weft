@@ -67,7 +67,7 @@ pub async fn publish_references(
         // The build's own file is what is missing here (a version's is a
         // warning, never a refusal): the upload just made did not land.
         bail!("update project asset lifetimes: {}\nRun the command again; if it repeats, `weft files ls` shows what storage holds for your account",
-            if text.trim().is_empty() { format!("dispatcher returned {status}") } else { text.trim().to_string() });
+            crate::client::refusal_text(&text).unwrap_or_else(|| format!("dispatcher returned {status}")));
     }
     let published: weft_core::storage::AssetsPublished = serde_json::from_str(&text).context("parse the publish answer")?;
     Ok(published.warnings)

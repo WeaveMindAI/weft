@@ -37,6 +37,22 @@ pub async fn change(
     Ok(Json(crate::install_picks::change(&state, id, &body.set, &clear).await?))
 }
 
+/// `POST /projects/{id}/picks/check`: what activating the program in the
+/// body would refuse of this install's picks (an empty `errors` when
+/// nothing), asked before a deploy so its activation is not where the gaps
+/// are found. The body is the caller's own compile of the program, since it
+/// is asked before the install has built it.
+pub async fn check(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path(id): Path<uuid::Uuid>,
+    Json(program): Json<weft_core::ProjectDefinition>,
+) -> Result<Json<weft_core::run_spec::Refusal>, (StatusCode, String)> {
+    authorize_project(&state, &caller.0, id).await?;
+    let gaps = crate::install_picks::activation_picks(&state, id, &program).await?;
+    Ok(Json(gaps.err().unwrap_or_default()))
+}
+
 /// `POST /projects/{id}/picks/move`: carry a place's picks and every
 /// instance's values to another place, after a node moved in the source.
 pub async fn move_picks(

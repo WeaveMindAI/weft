@@ -4,7 +4,7 @@
 use anyhow::Context;
 use axum::{
     extract::{Path, RawQuery, State},
-    http::{HeaderMap, Method, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::Response,
     Json,
 };
@@ -1601,41 +1601,6 @@ async fn public_entry_target(
     Ok((token, routing, payload))
 }
 
-/// How the dispatcher points a live caller at the worker, decided purely
-/// from the protocol. The two protocol-specific edges of the otherwise
-/// shared live-connection machinery:
-///   - HTTP: a `307` redirect to the gateway URL (the client follows it
-///     invisibly, preserving method + body; one call from the caller's
-///     code).
-///   - WebSocket: a `200` with the gateway WS URL + token in the body
-///     (WS cannot be redirected; the client reads the URL then opens the
-///     real WebSocket to it).
-/// Pure: maps (protocol, gateway_url) to the response form. Unit tested
-/// without a router or socket.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum HandshakeResponse {
-    /// `307 Temporary Redirect` with this `Location`.
-    Redirect { location: String },
-    /// `200 OK` with this JSON body (`{ "url": ..., "protocol": "websocket" }`).
-    ReturnUrl { url: String },
-}
-
-/// Decide the caller-pointing response. `gateway_url` already carries the
-/// routing token (the dispatcher built it after minting the token), so
-/// this step only chooses the HTTP shape per protocol.
-pub(crate) fn handshake_response(
-    protocol: weft_core::signal::Protocol,
-    gateway_url: String,
-) -> HandshakeResponse {
-    match protocol {
-        weft_core::signal::Protocol::Http => HandshakeResponse::Redirect {
-            location: gateway_url,
-        },
-        weft_core::signal::Protocol::Websocket => HandshakeResponse::ReturnUrl { url: gateway_url },
-    }
-}
-
-
 /// The auth gate of a live route: who may open a connection on it.
 /// `none` admits everyone; `connection` asks the broker to check the
 /// caller against the connection the route names (the broker holds the
@@ -1822,9 +1787,10 @@ pub(crate) fn split_tenant(called: &str) -> Result<(&str, &str), (StatusCode, St
 
 // ----- Live caller connection handshake ------------------------------
 
-/// Routing-token lifetime. Generous: it only needs to survive the caller
-/// following the redirect / opening the socket, but a slow client (mobile,
-/// cold DNS) should not race it. The connection, once attached, is not
+/// Routing-token lifetime. Generous: a call passed on in its own request
+/// needs only the hop to the worker, but a browser opens its socket at the
+/// URL it was handed afterwards, and a slow client (mobile, cold DNS)
+/// should not race it. The connection, once attached, is not
 /// re-validated against the token's expiry. 120 seconds in real time, at
 /// this install's pace (`weft_core::time_scale`).
 fn live_token_ttl_secs() -> i64 {
@@ -1838,27 +1804,27 @@ fn live_token_ttl_secs() -> i64 {
 // SYNC: API_PROJECT_HEADER <-> crates/weft-dispatcher/src/door.rs (route)
 pub const API_PROJECT_HEADER: &str = "x-weft-api-project";
 
-/// `ANY /connect/{*path}`: the live caller connection control handshake.
-/// Matches the call against the tenant's routes (pattern + method),
-/// checks the caller against the route's auth, gives birth to the run
-/// (`birth_live_run`), mints a signed routing token naming it, and points
-/// the caller at the install's live door for the project (HTTP: a `307`
-/// redirect; WebSocket: a `200` with the URL in the body). The live door
-/// (`crate::live_door`) forwards the caller to one of the project's
-/// workers, which claims the run and drives it with the caller on the
-/// line. The run is born here so that arriving costs the worker one claim
-/// and nothing else; a caller who never follows the redirect leaves a run
-/// nobody claims, erased with its slot once the token expires
+/// `ANY /connect/{*path}`: a live call. Matches the call against the
+/// tenant's routes (pattern + method), checks the caller against the
+/// route's auth, gives birth to the run (`birth_live_run`), mints a signed
+/// routing token naming it, and passes the call to one of the project's
+/// workers in this same request (`live_relay::to_worker`), which claims
+/// the run and drives it with the caller on the line. A browser asking for
+/// a socket gets a `200` with a URL to open it at instead (see the
+/// handler's last step). The run is born here so that arriving costs the
+/// worker one claim and nothing else; a run whose caller never reaches a
+/// worker (no worker could be reached, or a browser that never opened its
+/// socket) is erased with its slot once the token expires
 /// (`reaper::sweep_orphaned_live_executions`).
 pub async fn connect_live(
     State(state): State<DispatcherState>,
     address: crate::api::CallerAddress,
-    method: Method,
-    headers: HeaderMap,
     Path(called_path): Path<String>,
     RawQuery(raw_query): RawQuery,
-    body: axum::body::Body,
+    request: axum::extract::Request,
 ) -> Result<Response, (StatusCode, String)> {
+    let (parts, body) = request.into_parts();
+    let (method, headers) = (&parts.method, &parts.headers);
     let (tenant_segment, path) = split_tenant(&called_path)?;
     let (tenant_segment, path) = (tenant_segment.to_string(), path.to_string());
     let method_name = method.as_str().to_string();
@@ -1876,6 +1842,9 @@ pub async fn connect_live(
     };
     // Every route of the tenant with how it is armed, in one read: the
     // match is made here, and the matched one's arming is already in hand.
+    // How long each step took, in the line that says the run was born:
+    // what to read first when a call is slow.
+    let began = std::time::Instant::now();
     let armed_rows = sqlx::query(&format!(
         "SELECT s.token, s.mount_path, s.mount_methods, {ARMED_COLUMNS} \
          FROM signal s \
@@ -1922,16 +1891,17 @@ pub async fn connect_live(
     let header_map: std::collections::BTreeMap<String, String> = headers_sent.iter().cloned().collect();
     let query = weft_core::route::parse_query(raw_query.as_deref().unwrap_or(""));
     // The body is read here ONLY when the gate needs it (a signing scheme
-    // covers the bytes); the 307 makes the caller resend it to the worker,
-    // which reads it there in every case.
-    let body_bytes = if auth_kind == "connection" {
+    // covers the bytes); otherwise it streams on to the worker untouched.
+    let (body_bytes, body) = if auth_kind == "connection" {
         let limit = live_config.max_inbound_bytes as usize;
-        axum::body::to_bytes(body, limit)
+        let bytes = axum::body::to_bytes(body, limit)
             .await
-            .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, format!("request body exceeds {limit} bytes")))?
+            .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, format!("request body exceeds {limit} bytes")))?;
+        (bytes.clone(), axum::body::Body::from(bytes))
     } else {
-        axum::body::Bytes::new()
+        (axum::body::Bytes::new(), body)
     };
+    let routed = began.elapsed();
     let caller = caller_gate(
         &state,
         auth_kind,
@@ -1950,6 +1920,7 @@ pub async fn connect_live(
     // Who the run is for: an instance token, or the Weft-Instance header
     // behind the gate that just passed (an open route refuses it).
     let instance = door_instance(&state, &header_map, auth_kind != "none", *project_id).await?;
+    let gated = began.elapsed();
 
     // What the gate approved, so the worker can hold the caller to it.
     // Only when something was actually checked: an open route approves
@@ -1981,6 +1952,7 @@ pub async fn connect_live(
     let issued_at = crate::lease::now_unix();
     let expires_at = issued_at + live_token_ttl_secs();
     let limits = route.spec.limits.resolve();
+    let limits_from = began.elapsed();
     if let Err(refused) = check_entry_limits(
         &state,
         &token,
@@ -1993,11 +1965,10 @@ pub async fn connect_live(
     {
         return Ok(refused);
     }
+    let limited = began.elapsed();
 
     // The caller's opening request, as the trigger reads it: what they
-    // sent here, which is what the redirect has them send on (a socket's
-    // client sends its headers here; the upgrade itself can carry none of
-    // its own).
+    // sent here, which is what reaches the worker.
     let opening = weft_core::caller::LiveRequest {
         method: method_name.clone(),
         path: path.clone(),
@@ -2008,7 +1979,8 @@ pub async fn connect_live(
         caller,
     };
     if let Err(refused) =
-        birth_live_run(&state, &route, &opening, &tenant_segment, execution_id, expires_at, instance.as_ref()).await
+        birth_live_run(&state, &route, &opening, &tenant_segment, execution_id, expires_at, instance.as_ref())
+            .await
     {
         // The slot was taken for this run; nothing will start it now.
         if let Err(e) = crate::entry_limits::release_slot(&state.pg_pool, &execution_id.to_string()).await {
@@ -2020,61 +1992,76 @@ pub async fn connect_live(
         }
         return Err(refused);
     }
+    let born = began.elapsed();
 
-    // Mint the signed routing token: the run just born, its program (the
-    // live door forwards to its workers), and the request the worker holds
-    // the caller to. Then build the live URL on the door the caller came
-    // through.
-    let routing = weft_core::caller_token::mint(
-        &state.caller_token_secret,
-        &weft_core::caller_token::CallerTokenClaims {
-            execution_id,
-            project_id: *project_id,
-            binary_hash: program.binary_hash.clone(),
-            approved,
-            // The same instant the slot's hold and the run's wait were
-            // computed from, so the ticket's life and theirs cannot drift
-            // apart.
-            exp: expires_at,
-        },
-    );
-    let url = crate::live_relay::live_url(
-        &live_door(&headers, &state.public_base_url),
-        *project_id,
-        &called_path,
-        raw_query.as_deref().unwrap_or(""),
-        &routing,
-    );
+    // Mint the signed routing token: the run just born, its program (whose
+    // workers the call is passed to), and the request the worker holds the
+    // caller to.
+    let claims = weft_core::caller_token::CallerTokenClaims {
+        execution_id,
+        project_id: *project_id,
+        binary_hash: program.binary_hash.clone(),
+        approved,
+        // The same instant the slot's hold and the run's wait were
+        // computed from, so the ticket's life and theirs cannot drift
+        // apart.
+        exp: expires_at,
+    };
+    let routing = weft_core::caller_token::mint(&state.caller_token_secret, &claims);
+    // The path and query as the caller sent them, still percent-encoded:
+    // the decoded capture would turn an escaped `?`, `/` or `#` into a real
+    // one on the way to the worker.
+    let raw_path = parts
+        .uri
+        .path()
+        .strip_prefix("/connect")
+        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, format!("a live call reached the handshake at {}, outside /connect", parts.uri.path())))?
+        .to_string();
+    let raw_query = raw_query.unwrap_or_default();
+    let ms = |d: std::time::Duration| d.as_millis() as u64;
     tracing::info!(
         target: "weft_dispatcher::signal",
         execution_id = %execution_id, node = %node_id,
-        "live handshake: run born, caller pointed at the live door"
+        route_ms = ms(routed),
+        gate_ms = ms(gated - routed),
+        limits_ms = ms(limited - limits_from),
+        birth_ms = ms(born - limited),
+        "live call: run born"
     );
 
-    // Point the caller at the worker per protocol.
-    Ok(match handshake_response(*protocol, url) {
-        // The body is for a HUMAN holding curl. Every client follows the
-        // `Location` header on its own, but a person who called without
-        // `-L` sees a blank answer and reads it as a failure, so the one
-        // line that costs nothing says what happened and what to add.
-        HandshakeResponse::Redirect { location } => Response::builder()
-            .status(StatusCode::TEMPORARY_REDIRECT)
-            .header(axum::http::header::LOCATION, location)
-            .header(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .body(axum::body::Body::from(
-                "weft: this run is answered by a worker, named in the Location header.\n\
-                 Your client should follow it; curl needs -L.\n",
-            ))
-            .expect("redirect response builds"),
-        HandshakeResponse::ReturnUrl { url } => {
-            let body = serde_json::json!({ "url": url, "protocol": "websocket" });
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(axum::http::header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(body.to_string()))
-                .expect("json response builds")
-        }
-    })
+    // A browser cannot put a credential on a socket's opening request, so
+    // it asks for its socket with a plain request and opens the socket at
+    // the URL this answers, which carries the ticket. Every other call,
+    // a socket opened by a client that can send headers included, is
+    // passed to the worker in this same request.
+    // SYNC: the ticket answer's shape <-> crates/weft-e2e/src/live.rs (ticket), packages/weft-connect/src/core/socket.ts (socketAddress)
+    if *protocol == weft_core::signal::Protocol::Websocket && !is_socket_opening(headers) {
+        let url = crate::live_relay::live_url(&live_door(headers, &state.public_base_url), *project_id, &raw_path, &raw_query, &routing);
+        let body = serde_json::json!({ "url": url, "protocol": "websocket" });
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("json response builds"));
+    }
+    let request = axum::extract::Request::from_parts(parts, body);
+    let answer = crate::live_relay::to_worker(&state, &claims, &routing, &raw_path, &raw_query, request).await;
+    tracing::info!(
+        target: "weft_dispatcher::signal",
+        execution_id = %execution_id, status = %answer.status(),
+        worker_ms = ms(began.elapsed() - born),
+        "live call: the worker answered (its body may still be streaming)"
+    );
+    Ok(answer)
+}
+
+/// Whether `headers` open a WebSocket (`Upgrade: websocket`), which every
+/// socket client sends, a browser's included.
+pub(crate) fn is_socket_opening(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
 }
 
 /// A public entry as its signal row arms it: the trigger, its spec, the
@@ -2519,30 +2506,6 @@ mod public_url_tests {
 }
 
 
-
-#[cfg(test)]
-mod handshake_tests {
-    use super::*;
-    use weft_core::signal::Protocol;
-
-    #[test]
-    fn http_points_via_redirect() {
-        let r = handshake_response(Protocol::Http, "https://gw/chat?wct=t".into());
-        assert_eq!(
-            r,
-            HandshakeResponse::Redirect { location: "https://gw/chat?wct=t".into() }
-        );
-    }
-
-    #[test]
-    fn websocket_points_via_return_url() {
-        let r = handshake_response(Protocol::Websocket, "wss://gw/chat?wct=t".into());
-        assert_eq!(
-            r,
-            HandshakeResponse::ReturnUrl { url: "wss://gw/chat?wct=t".into() }
-        );
-    }
-}
 
 #[cfg(test)]
 mod connect_url_tests {

@@ -668,8 +668,9 @@ fn rhel_family_version(tag: &str) -> Option<&'static str> {
 ///   by its content (`/work/pkg_<name>-<slot>`,
 ///   `codegen::write_package_crates`: same sources, same slot, shared
 ///   rlib; an edited copy of a stock node gets a slot of its own and can
-///   never be mistaken for the stock one) and on source mtimes the
-///   staging preserves (`build::copy_dir_filtered`). Every distinct
+///   never be mistaken for the stock one) and on every staged package
+///   file carrying one fixed date (`build::package_source_mtime`), so a
+///   package compiled from another checkout still counts. Every distinct
 ///   content compiled keeps its slot's artifacts until no build has
 ///   linked them for [`WORKER_CACHE_RETENTION_DAYS`] ([`CACHE_GC_SCRIPT`]
 ///   runs after every build); `weft clean --images` reports the mount's

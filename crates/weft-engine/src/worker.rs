@@ -397,7 +397,7 @@ impl Worker {
             live_configs: ctx.live_configs.clone(),
             open_charges: ctx.clients.open_charges.clone(),
         };
-        guard_short_run(ctx, execution_id, flag.clone(), payload.run_class);
+        guard_short_run(ctx, execution_id, flag.clone(), payload.run_class, payload.live_connection.is_some());
 
         // Live-connection executions carry their trigger's `live_connection`
         // start record. Register the runtime config + the caller's request
@@ -1136,8 +1136,16 @@ fn spawn_cancel_wait(worker: Worker) {
 
 /// A short run's self-imposed end, just before the platform's cap: the
 /// execution is cancelled with a cause that names the lever, instead of
-/// being cut mid-node with no ending written.
-fn guard_short_run(worker: &Worker, execution_id: ExecutionId, flag: Arc<CancellationFlag>, class: weft_core::run_class::RunClass) {
+/// being cut mid-node with no ending written. A run with a live caller has
+/// no long form (a long run cannot take a connection), so its cause names
+/// what to do instead.
+fn guard_short_run(
+    worker: &Worker,
+    execution_id: ExecutionId,
+    flag: Arc<CancellationFlag>,
+    class: weft_core::run_class::RunClass,
+    live: bool,
+) {
     let Some(cap) = worker.short_run_cap.filter(|_| class.is_short()) else { return };
     let stop_at = cap.saturating_sub(SHORT_RUN_CAP_MARGIN);
     tokio::spawn(async move {
@@ -1145,15 +1153,27 @@ fn guard_short_run(worker: &Worker, execution_id: ExecutionId, flag: Arc<Cancell
         if flag.is_cancelled() {
             return;
         }
-        flag.cancel_because(weft_core::exec::CancelCause::Runtime {
-            detail: format!(
-                "execution {execution_id} reached the {} minute limit this platform puts on a short run. \
-                 Start it as a long run: set `run_class: long` on the trigger that starts it, or \
-                 use `weft run --long`",
-                cap.as_secs() / 60
-            ),
-        });
+        flag.cancel_because(weft_core::exec::CancelCause::Runtime { detail: short_run_cap_reached(execution_id, cap, live) });
     });
+}
+
+/// Why a short run was stopped at the platform's cap, and what to do.
+fn short_run_cap_reached(execution_id: ExecutionId, cap: std::time::Duration, live: bool) -> String {
+    let minutes = cap.as_secs() / 60;
+    if live {
+        format!(
+            "execution {execution_id} reached the {minutes} minute limit this platform puts on one \
+             connection. A conversation meant to last longer keeps its state outside the run and \
+             has its client reconnect, each connection its own run; work that takes longer runs \
+             as a run of its own (`run_class: long`) that the conversation starts"
+        )
+    } else {
+        format!(
+            "execution {execution_id} reached the {minutes} minute limit this platform puts on a short run. \
+             Start it as a long run: set `run_class: long` on the trigger that starts it, or \
+             use `weft run --long`"
+        )
+    }
 }
 
 fn new_worker(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config: &WorkerConfig) -> Worker {
@@ -1362,6 +1382,19 @@ mod tests {
     use super::*;
     use crate::execution_driver::engine_test_rig::{clients, MemJournal};
     use async_trait::async_trait;
+
+    /// A run stopped at the platform's cap is told the way out that fits
+    /// it: a long run for one nobody is talking to, and for one with a
+    /// caller (which has no long form) a reconnect over kept state.
+    #[test]
+    fn the_cap_names_the_way_out_that_fits_the_run() {
+        let cap = std::time::Duration::from_secs(3600);
+        let live = short_run_cap_reached(ExecutionId::nil(), cap, true);
+        assert!(live.contains("60 minute limit") && live.contains("reconnect"), "{live}");
+        assert!(!live.contains("weft run --long"), "{live}");
+        let plain = short_run_cap_reached(ExecutionId::nil(), cap, false);
+        assert!(plain.contains("run_class: long") && plain.contains("weft run --long"), "{plain}");
+    }
 
     #[test]
     fn a_worker_door_admits_only_its_key() {

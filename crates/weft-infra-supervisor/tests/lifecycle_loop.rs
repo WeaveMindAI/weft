@@ -817,6 +817,37 @@ weft_core::stress_test!(
 );
 
 weft_core::stress_test!(
+    name: two_wakes_at_once_run_a_command_once,
+    runs: 16,
+    worker_threads: 4,
+    async fn body() {
+        // A supervisor that scales to zero runs one pass per wake, and two
+        // wakes can land together. The command is held mid-drain so the
+        // second pass would claim it while the first is still running it.
+        let rig = rig();
+        rig.broker.gate_running_count(PROJECT);
+        rig.broker.enqueue_command(stop_of(1, PROJECT, Policy::Wait));
+        let first = tokio::spawn({
+            let state = rig.state.clone();
+            async move { weft_infra_supervisor::tick(&state).await }
+        });
+        until("the first pass holds the command", || running_count_calls(&rig, PROJECT) == 1).await;
+        let second = tokio::spawn({
+            let state = rig.state.clone();
+            async move { weft_infra_supervisor::tick(&state).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(running_count_calls(&rig, PROJECT), 1, "the second pass waits for the first");
+
+        rig.broker.open_running_count(PROJECT);
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert_eq!(completed_ids(&rig), vec![1], "the command ran once");
+        assert_eq!(running_count_calls(&rig, PROJECT), 1);
+    }
+);
+
+weft_core::stress_test!(
     name: a_project_taken_on_ends_the_held_claim,
     runs: 16,
     worker_threads: 4,

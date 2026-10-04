@@ -224,6 +224,7 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         // install, never written in the source.
         .route("/projects/{id}/picks", get(picks::list).put(picks::change))
         .route("/projects/{id}/picks/move", post(picks::move_picks))
+        .route("/projects/{id}/picks/check", post(picks::check))
         // The project's own worker levers.
         .route("/projects/{id}/workers", get(workers::get).put(workers::put))
         .route("/projects/{id}/executions/latest", get(execution::latest_for_project))
@@ -427,11 +428,11 @@ fn outside_caller_routes(state: DispatcherState) -> Router<DispatcherState> {
         .route("/", get(public_page::index))
         .route("/index.html", get(public_page::index))
         .route("/logo.png", get(public_page::logo))
-        // Live caller connection handshake: an outside caller hits
-        // `/connect/<tenant>/<path>` to open a held connection. The
-        // handler matches the route (pattern + method), gates the
-        // caller, and points them at the live door below with a ticket
-        // (307 for HTTP, return-URL for WebSocket). ANY method:
+        // A live call: an outside caller hits `/connect/<tenant>/<path>`.
+        // The handler matches the route (pattern + method), gates the
+        // caller, and passes the call to a worker in the same request
+        // (a browser asking for a socket is handed a URL on the live door
+        // below instead). ANY method:
         // a WS handshake is a GET and a route serves whatever verbs it
         // declared; the handler answers 405 itself. `/connect/*` is more
         // specific than the catch-all, so it never falls through to
@@ -440,9 +441,9 @@ fn outside_caller_routes(state: DispatcherState) -> Router<DispatcherState> {
             "/connect/{*path}",
             any(signal::connect_live).layer(DefaultBodyLimit::max(PUBLIC_FIRE_BODY_LIMIT)),
         )
-        // The live door: a caller holding a handshake's ticket, forwarded
-        // to one of the project's workers (`live_relay`). ANY method, and
-        // a WebSocket upgrade. The ticket is the credential.
+        // The live door: a browser's socket, opened at the URL its
+        // handshake answered with and passed to one of the project's
+        // workers (`live_relay`). The ticket in the URL is the credential.
         .route(&format!("{}/{{project}}", crate::live_relay::LIVE_PREFIX), any(crate::live_relay::forward))
         .route(&format!("{}/{{project}}/", crate::live_relay::LIVE_PREFIX), any(crate::live_relay::forward))
         .route(&format!("{}/{{project}}/{{*rest}}", crate::live_relay::LIVE_PREFIX), any(crate::live_relay::forward))

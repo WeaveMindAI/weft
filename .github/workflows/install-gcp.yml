@@ -64,6 +64,23 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v3
 
+      # GitHub signs in as the install's account through a grant made just
+      # before the first run (the cloud chapter's commands), and Google
+      # can take a few minutes to apply it: until then every call is
+      # refused with `iam.serviceAccounts.getAccessToken`. Asking for a
+      # token is that same exchange, so it is asked until Google says yes.
+      - name: wait for Google to accept GitHub's sign-in
+        run: |
+          for attempt in $(seq 1 40); do
+            if err=$(gcloud auth print-access-token 2>&1 >/dev/null); then
+              exit 0
+            fi
+            echo "Google does not accept this workflow's sign-in yet (a new grant takes a few minutes to apply); asking again in 15s"
+            sleep 15
+          done
+          echo "::error::Google still refuses this workflow's sign-in after 10 minutes, so the grant is missing rather than still applying. Check the GCP_WORKLOAD_IDENTITY_PROVIDER and GCP_INSTALL_SERVICE_ACCOUNT variables and the commands in the cloud chapter. Google's answer: $err"
+          exit 1
+
       - uses: hashicorp/setup-terraform@v4
         with:
           terraform_wrapper: false

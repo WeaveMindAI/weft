@@ -330,7 +330,7 @@ true`), and then you name what ends it, as below. Prove it by hanging up in
 the middle:
 
 ```bash
-curl -N -L <url>/chat -d '{"prompt":"..."}' &   # start it
+curl -N <url>/chat -d '{"prompt":"..."}' &   # start it
 sleep 1 && kill %1                              # leave before it finishes
 weft executions                                 # the run, and what it wrote
 ```
@@ -490,6 +490,28 @@ each run writes to a table in the project's Postgres, and a trigger reads it.
 Two callers seeing each other live is not expressible yet: you say so and
 build the table shape.
 
+**On a cloud install a connection lasts an hour at most**: Google cuts any
+request at 60 minutes, and a socket or a streaming answer is one long
+request. Connections also drop sooner (a phone changing networks), and the
+trigger's `outlivesCaller` decides whether the run stops or carries on alone.
+So when you build something meant to stay open longer than a few minutes (a
+chat page left open, a live dashboard), build its reconnect from the start:
+the client sends a session id on every connection (the `session` query
+parameter, read off the trigger's `query` port; the connect library's
+`openLiveSocket` sends it and reconnects on its own) and reconnects whenever
+its socket closes, and the program keeps the conversation's state in the
+project's storage keyed by that id and reads it back when a connection
+arrives. Each connection is then its own run, and losing one loses nothing.
+To end the conversation for good, the program closes the socket with code
+`4000`; a run that simply ends closes with `1000`, and the client comes back.
+Tell the frontend builder so in its brief.
+
+A browser cannot put a credential on a socket's opening request. On a socket
+whose route checks callers, a browser asks with a plain `GET` first (which
+carries the credential) and gets `{"url": ..., "protocol": "websocket"}`
+back, then opens its socket at that `url`; anything else opens its socket at
+the route's own address.
+
 ## Auth
 
 A [route] is open unless a [gate] is wired into its `auth`. The user stores
@@ -543,21 +565,17 @@ You reach for `ctx` only when the graph cannot say it.
 
 ```bash
 weft activate                      # prints the live URL (/connect/local/<path>)
-curl -L -X POST "<url>/hello" -H 'content-type: application/json' -d '{"name":"ada"}'
-curl -L -i "<url>/users/42?verbose=1"
-curl -L -N "<url>/feed"            # a Stream route: -N shows each frame as it lands
+curl -X POST "<url>/hello" -H 'content-type: application/json' -d '{"name":"ada"}'
+curl -i "<url>/users/42?verbose=1"
+curl -N "<url>/feed"               # a Stream route: -N shows each frame as it lands
 websocat "<url as ws://>/chat/room7"
 weft follow <project>              # one execution per request, live
 ```
 
-Always `curl -L`. The live URL answers a `307` that points the caller at the
-live door serving the run, so a first call without `-L` comes back a redirect and
-looks like total failure. The body says so, and `-L` follows it.
-
 A connection held open is the one thing `--fire` below cannot show you:
 firing serves one request and records one answer, while a node holding the
 caller writes to it over time, and time is what firing has none of. So prove
-that against a real client: `weft activate`, then `curl -L -N`, and watch
+that against a real client: `weft activate`, then `curl -N`, and watch
 the frames land. `-N` turns off curl's buffering; without it everything
 appears at once at the end and tells you nothing about timing.
 

@@ -238,10 +238,21 @@ pub(crate) async fn require_activation_picks(
     project_id: uuid::Uuid,
     project: &weft_core::ProjectDefinition,
 ) -> Result<(), ApiError> {
+    activation_picks(state, project_id, project).await?.map_err(|refusal| crate::api::project::refusal_error(&refusal))
+}
+
+/// What activating `project` would say of the install's picks: nothing, or
+/// the refusal naming every gap. Activation refuses on it; `weft target
+/// export` asks it ahead (`api::picks::check`), so the two never disagree.
+pub(crate) async fn activation_picks(
+    state: &DispatcherState,
+    project_id: uuid::Uuid,
+    project: &weft_core::ProjectDefinition,
+) -> Result<Result<(), weft_core::run_spec::Refusal>, ApiError> {
     let tenant = owning_tenant(state, project_id).await?;
     let picks = weft_access_store::install_picks(&state.pg_pool, &tenant, project_id).await.map_err(access_error)?;
     let stored = weft_access_store::stored_fields(&state.pg_pool, &tenant, project_id).await.map_err(access_error)?;
-    weft_core::picks::activation_picks(project, &picks, &stored).map_err(|refusal| crate::api::project::refusal_error(&refusal))
+    Ok(weft_core::picks::activation_picks(project, &picks, &stored))
 }
 
 /// Set up `live` again on the picks now stored, each owner once. An owner

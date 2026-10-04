@@ -491,7 +491,7 @@ async fn wait_for_readiness(
                     return Err(anyhow!("unit '{unit}' could not start: {why}"));
                 }
                 Some(UnitRunState::NotReady { why }) => waiting.push(format!("{unit}: {why}")),
-                Some(UnitRunState::Starting) => waiting.push(format!("{unit}: starting")),
+                Some(UnitRunState::Starting { step }) => waiting.push(format!("{unit}: {step}")),
                 Some(UnitRunState::Stopped) => waiting.push(format!("{unit}: stopped")),
                 None => waiting.push(format!("{unit}: not reported by its host yet")),
             }

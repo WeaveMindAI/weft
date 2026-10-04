@@ -330,6 +330,7 @@ async fn export(
             .context("read the project's frontends")?;
     let frontend = hosted_frontend(&frontends, frontend, repo.as_ref())?;
 
+    let unpicked = unpicked_connections(&client, project).await;
     let labels = ExportLabels::of(project);
     let (keys, minted) = mint_ci_keys(&client, name, project, &labels, front_env, frontend).await?;
     let prepared = async {
@@ -365,6 +366,7 @@ async fn export(
                 "frontend '{frontend}' keeps its old token working until the deploy workflow puts the new one in place and retires it"
             );
         }
+        print_unpicked(&unpicked, name);
         return Ok(());
     }
     if let Err(e) = set_repository_values(&project.root, &settings) {
@@ -389,7 +391,42 @@ async fn export(
     for id in &stale {
         println!("revoked an earlier export's key {id}");
     }
+    print_unpicked(&unpicked, name);
     Ok(())
+}
+
+/// What activating this program on `client`'s install would refuse of its
+/// connection picks, each gap as the line that says how to fix it: the
+/// deploy workflow's activation refuses the program until they are fixed,
+/// and that is a late place to find out. The install answers with
+/// activation's own check, run on this machine's compile of the program
+/// (the install may not have built it yet). A program that does not
+/// compile, or an install that cannot answer, come back as one line saying
+/// so.
+async fn unpicked_connections(client: &crate::client::DispatcherClient, project: &weft_compiler::project::Project) -> Vec<String> {
+    let definition = match weft_compiler::hash::load_enriched_project_with_diagnostics(project) {
+        Ok((definition, _)) => definition,
+        Err(_) => return vec!["the program does not compile here, so its connections were not checked".into()],
+    };
+    let asked = async {
+        let body = serde_json::to_value(&definition)?;
+        let answer = client.post_json(&format!("/projects/{}/picks/check", project.id()), &body).await?;
+        anyhow::Ok(serde_json::from_value::<weft_core::run_spec::Refusal>(answer)?)
+    };
+    match asked.await {
+        Ok(refusal) => refusal.errors,
+        Err(e) => vec![format!("could not check the install's connection picks ({e:#})")],
+    }
+}
+
+fn print_unpicked(unpicked: &[String], target: &str) {
+    if unpicked.is_empty() {
+        return;
+    }
+    println!("the deploy workflow cannot turn the program on until these are fixed on {target} (add `--on {target}`):");
+    for line in unpicked {
+        println!("  {line}");
+    }
 }
 
 /// An export that failed after minting: nobody holds the keys it minted,

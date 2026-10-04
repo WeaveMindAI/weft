@@ -299,44 +299,37 @@ pub async fn build_compiled(
         // While the install builds, name each image it is building and
         // where its log is, once: a build can take many minutes, and a
         // bare "building" says nothing about where it is.
-        let asked = client.post_json_status(&path, &body);
-        let mut asked = std::pin::pin!(asked);
         // Each image once, and again when its log's address arrives.
         let mut told: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
         // A status that cannot be read is said once, not every look.
         let mut warned = false;
-        let mut every = tokio::time::interval(BUILD_LOOK_EVERY);
-        every.tick().await;
-        loop {
-            tokio::select! {
-                answer = &mut asked => break answer.context("ask the install to build")?,
-                _ = every.tick() => {
-                    match builds_running(&client, &id).await {
-                        Ok(builds) => {
-                            for build in builds {
-                                let with_log = build.log_url.is_some();
-                                if told.get(&build.image).is_none_or(|had_log| !had_log && with_log) {
-                                    told.insert(build.image.clone(), with_log);
-                                    progress.build_image(&build);
-                                }
-                            }
+        crate::progress::while_waiting(client.post_json_status(&path, &body), BUILD_LOOK_EVERY, async |_| {
+            match builds_running(&client, &id).await {
+                Ok(builds) => {
+                    for build in builds {
+                        let with_log = build.log_url.is_some();
+                        if told.get(&build.image).is_none_or(|had_log| !had_log && with_log) {
+                            told.insert(build.image.clone(), with_log);
+                            progress.build_image(&build);
                         }
-                        Err(e) if !warned => {
-                            warned = true;
-                            progress.warn(&format!(
-                                "cannot show which images are building or where their logs are ({e:#}); the build goes on"
-                            ));
-                        }
-                        Err(_) => {}
                     }
                 }
+                Err(e) if !warned => {
+                    warned = true;
+                    progress.warn(&format!(
+                        "cannot show which images are building or where their logs are ({e:#}); the build goes on"
+                    ));
+                }
+                Err(_) => {}
             }
-        }
+        })
+        .await
+        .context("ask the install to build")?
     };
     if !(200..300).contains(&status) {
         anyhow::bail!(
             "the build failed:\n{}",
-            if text.trim().is_empty() { format!("the install answered {status}") } else { text.trim().to_string() }
+            crate::client::refusal_text(&text).unwrap_or_else(|| format!("the install answered {status}"))
         );
     }
     let built: BuiltProgram = serde_json::from_str(&text).context("read the build's answer")?;

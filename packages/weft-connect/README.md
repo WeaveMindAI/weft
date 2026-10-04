@@ -63,12 +63,24 @@ the dispatcher which address the browser used (your site's host and the
 `/weft` mount), so a link the dispatcher hands back, like a chooser page,
 points at your site and not at the address your server reaches weft on.
 
-A call to a program's route is answered with a redirect to the worker
-serving it, and the pass-through follows that itself, so the browser never
-needs the worker's address either. Because a redirect sends the body again,
-a route call's body is read whole before it goes on. Every other door streams
-its body through as it arrives, and hands a redirect back to the browser as
-it is.
+Every door streams its body through as it arrives, and hands a redirect
+back to the browser as it is.
+
+## A socket that comes back
+
+`openLiveSocket` (in the core) opens a socket to one of the program's
+`Socket` routes and reconnects whenever it closes, which on a cloud install
+happens at least once an hour. It keeps a session id and sends it as the
+`session` query parameter on every connection, so the program can read its
+conversation back from its own storage; each connection is a run of its own.
+It stops when the page calls `close()`, when the program closes the socket
+with code `4000` (a run that simply ends closes with `1000`, which only ends
+that connection), or when the route refuses the `headers` it was given with
+a 4xx. Give it `headers` (an instance token) on a route that checks callers:
+a browser cannot put them on a socket's opening request, so it asks for the
+socket's address with a plain `GET` carrying them first. A socket goes to
+the install's public address (`WEFT_PUBLIC_URL`), not through the
+pass-through, which carries no sockets.
 
 The site's cookies stay on the site, and so does `Weft-Instance`, which only
 the site's server may send. If `WEFT_DISPATCHER_URL` is unset it answers 500

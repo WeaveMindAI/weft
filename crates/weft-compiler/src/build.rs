@@ -292,7 +292,36 @@ fn stage_project_nodes(
         // over), so staging and hashing agree on a node's byte-content:
         // a file the build copies but the hash skips (or vice versa)
         // is how a stale worker image gets served.
-        copy_dir_filtered(&root, &dest.join(rel), &weft_catalog::is_node_tree_excluded)?;
+        let staged = dest.join(rel);
+        copy_dir_filtered(&root, &staged, &weft_catalog::is_node_tree_excluded)?;
+        stamp_package_tree(&staged)?;
+    }
+    Ok(())
+}
+
+/// The modification time every staged package file carries, whatever the
+/// file had on disk.
+///
+/// Cargo reuses a compiled crate only while none of its sources is newer
+/// than the compile, and a package compiles in a crate whose directory is
+/// named by a digest of all of its files (`codegen::write_package_crates`),
+/// so within one such crate the content never changes and a date says
+/// nothing. Real dates said something wrong: the builder base is built
+/// from one checkout and a cloud build stages the standard library from
+/// another (the runtime image's copy), and a fresh checkout dates every
+/// file at the moment it was made, so every precompiled package looked
+/// edited and every cloud build compiled the whole library again. One
+/// fixed date on both sides makes an unchanged package reused wherever it
+/// was compiled; a changed one lands in a new directory and compiles.
+pub(crate) fn package_source_mtime() -> std::time::SystemTime {
+    // 2020-01-01.
+    std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800)
+}
+
+/// Give every file under `dir` [`package_source_mtime`].
+fn stamp_package_tree(dir: &Path) -> CompileResult<()> {
+    for file in crate::hash::walk_dir(dir).map_err(|e| CompileError::Build(format!("walk {}: {e}", dir.display())))? {
+        stamp_mtime(&file, package_source_mtime());
     }
     Ok(())
 }
@@ -575,8 +604,8 @@ pub(crate) fn stamp_mtime(dst: &Path, modified: std::time::SystemTime) {
             target: "weft_compiler::build",
             file = %dst.display(),
             error = %e,
-            "could not mirror source mtime; the docker build will treat this \
-             file as changed and rebuild its crate"
+            "could not set the file's modification time; the docker build will \
+             treat it as changed and rebuild its crate"
         );
     }
 }
@@ -1112,6 +1141,21 @@ mod tests {
         // Staged at its project-relative path: a node under `nodes/` and
         // one beside the code under `src/` land side by side under the mount.
         assert!(ctx.join("project-nodes/nodes/base_catalog/basic/format/mod.rs").is_file());
+        // Every package file, staged and generated, carries the one fixed
+        // date, so a package compiled from another checkout is reused.
+        let pkg_dir = std::fs::read_dir(&crate_root)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("pkg_format-"))
+            .expect("the format package's crate");
+        for file in [
+            ctx.join("project-nodes/nodes/base_catalog/basic/format/mod.rs"),
+            pkg_dir.join("Cargo.toml"),
+            pkg_dir.join("src/lib.rs"),
+        ] {
+            let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
+            assert_eq!(modified, super::package_source_mtime(), "{}", file.display());
+        }
         let dockerfile = std::fs::read_to_string(ctx.join("Dockerfile")).unwrap();
         assert!(!dockerfile.contains("{{"), "every token rendered: {dockerfile}");
         assert!(dockerfile.contains(&format!("/work {}", sanitize_crate_name(super::WORKER_CRATE_NAME))));
