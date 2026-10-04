@@ -112,7 +112,10 @@ pub struct DispatcherState {
     /// (see [`DispatcherState::program`]): a definition never changes
     /// under its hash, so a busy route stops reading and parsing its
     /// program on every call.
-    pub programs: Arc<weft_core::content_cache::ContentCache<weft_core::ProjectDefinition>>,
+    pub programs: Arc<weft_core::content_cache::ContentCache<(uuid::Uuid, String), weft_core::ProjectDefinition>>,
+    /// The rows every live call reads, held in memory and read again when
+    /// they change (`crate::held`).
+    pub held: Arc<crate::held::Held>,
 }
 
 impl DispatcherState {
@@ -133,13 +136,13 @@ impl DispatcherState {
         project: uuid::Uuid,
         hash: &str,
     ) -> anyhow::Result<Option<Arc<weft_core::ProjectDefinition>>> {
-        if let Some(program) = self.programs.get(project, hash) {
+        if let Some(program) = self.programs.get(&(project, hash.to_string())) {
             return Ok(Some(program));
         }
         let Some(json) = self.projects.definition_for_hash(project, hash).await? else { return Ok(None) };
         let program: Arc<weft_core::ProjectDefinition> =
             Arc::new(serde_json::from_str(&json).map_err(|e| UnreadableProgram(e.to_string()))?);
-        self.programs.put(project, hash.to_string(), program.clone());
+        self.programs.put((project, hash.to_string()), program.clone());
         Ok(Some(program))
     }
 }

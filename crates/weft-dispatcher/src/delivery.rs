@@ -97,16 +97,18 @@ pub async fn worker_target(
     project: uuid::Uuid,
     binary_hash: &str,
 ) -> anyhow::Result<weft_platform_traits::WorkerTarget> {
-    let overrides = state
-        .projects
-        .worker_overrides(project)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("project {project} is not registered"))?;
+    // A project registered a moment ago may not have been heard yet: its
+    // absence is read from the rows themselves.
+    let overrides = match state.held.worker_overrides.held(&project).filter(|held| held.is_some()) {
+        Some(held) => held,
+        None => state.held.worker_overrides.load_fresh(project, || state.projects.worker_overrides(project)).await?,
+    };
+    let overrides = overrides.as_ref().as_ref().ok_or_else(|| anyhow::anyhow!("project {project} is not registered"))?;
     Ok(weft_platform_traits::WorkerTarget {
         tenant: tenant.to_string(),
         project,
         image: state.builder.images.image_ref(&weft_compiler::build::worker_image_tag(binary_hash)),
-        settings: state.worker_defaults.with(&overrides),
+        settings: state.worker_defaults.with(overrides),
     })
 }
 

@@ -134,6 +134,31 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_infra_node_copy
              ON infra_node(project_id, node_id, instance_id) NULLS NOT DISTINCT"#,
         r#"CREATE INDEX IF NOT EXISTS idx_infra_node_project   ON infra_node(project_id)"#,
+        // Tell every dispatcher a project's copies came, went or changed
+        // status, so its copy of which are up (`crate::held::Held`) is
+        // read again.
+        // SYNC: 'weft_infra_status' <-> crate::held::INFRA_STATUS_CHANNEL
+        r#"CREATE OR REPLACE FUNCTION infra_node_status_notify() RETURNS trigger AS $$
+            BEGIN
+                IF TG_OP = 'DELETE' THEN
+                    PERFORM pg_notify('weft_infra_status', OLD.project_id::text);
+                ELSE
+                    PERFORM pg_notify('weft_infra_status', NEW.project_id::text);
+                END IF;
+                RETURN NULL;
+            END;
+            $$ LANGUAGE plpgsql"#,
+        r#"DROP TRIGGER IF EXISTS infra_node_status_on_row ON infra_node"#,
+        r#"CREATE TRIGGER infra_node_status_on_row
+            AFTER INSERT OR DELETE ON infra_node
+            FOR EACH ROW
+            EXECUTE FUNCTION infra_node_status_notify()"#,
+        r#"DROP TRIGGER IF EXISTS infra_node_status_on_change ON infra_node"#,
+        r#"CREATE TRIGGER infra_node_status_on_change
+            AFTER UPDATE OF status ON infra_node
+            FOR EACH ROW
+            WHEN (NEW.status IS DISTINCT FROM OLD.status)
+            EXECUTE FUNCTION infra_node_status_notify()"#,
     ],
     seed: &[],
 };
@@ -188,6 +213,36 @@ pub async fn get(
         None => Ok(None),
         Some(r) => Ok(Some(parse_row(r)?)),
     }
+}
+
+/// One copy of an infra node and whether it is up: what a run checks
+/// before it starts.
+#[derive(Debug, Clone)]
+pub struct CopyStatus {
+    pub node_id: String,
+    pub instance: Option<weft_core::instance::InstanceId>,
+    pub status: InfraNodeStatus,
+}
+
+/// Every copy of `project_id`'s infra nodes and its status.
+pub async fn statuses(pool: &PgPool, project_id: uuid::Uuid) -> Result<Vec<CopyStatus>> {
+    let rows: Vec<(String, Option<String>, String)> =
+        sqlx::query_as("SELECT node_id, instance_id, status FROM infra_node WHERE project_id = $1")
+            .bind(project_id)
+            .fetch_all(pool)
+            .await?;
+    rows.into_iter()
+        .map(|(node_id, instance, status)| {
+            let instance = instance
+                .map(weft_core::instance::InstanceId::new)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("infra_node.instance_id for project={project_id} node={node_id}: {e}"))?;
+            let status = InfraNodeStatus::parse(&status).ok_or_else(|| {
+                anyhow::anyhow!("infra_node.status='{status}' for project={project_id} node={node_id} is not a status this dispatcher knows")
+            })?;
+            Ok(CopyStatus { node_id, instance, status })
+        })
+        .collect()
 }
 
 /// List every row for a project. Drives the project status response.

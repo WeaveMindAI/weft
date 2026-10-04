@@ -185,13 +185,29 @@ pub trait Journal: Send + Sync {
     /// ATOMICALLY journal an execution's birth together with its queued work
     /// item. Either everything commits or nothing does. `start` must be
     /// `ExecEvent::ExecutionStarted`; `kicks` are its `NodeKicked` events.
+    /// `for_activation`: a trigger setup an activation asked for (the
+    /// activation is the setup's own execution), born only while that
+    /// activation still owns its rows.
     async fn start_execution(
         &self,
         start: &ExecEvent,
         kicks: &[ExecEvent],
         task: weft_task_store::tasks::NewTask,
-        expected_activation: Option<ExecutionId>,
+        for_activation: bool,
     ) -> anyhow::Result<()>;
+
+    /// [`Self::start_execution`] behind the entry's limits, in the SAME
+    /// commit: the run is admitted (`admission`, counted and given its
+    /// slot) and born together, or refused and not born. The answer to a
+    /// caller waiting at the door costs one round trip this way. A run
+    /// already born is left as it is, with the slot it took.
+    async fn admit_and_start_execution(
+        &self,
+        admission: &crate::entry_limits::Admission,
+        start: &ExecEvent,
+        kicks: &[ExecEvent],
+        task: weft_task_store::tasks::NewTask,
+    ) -> anyhow::Result<Result<(), crate::entry_limits::Refused>>;
 
     /// THE dispatcher-side cancel of an execution, in ONE transaction:
     /// strip the execution's wake signals (the parked form, the timer, the

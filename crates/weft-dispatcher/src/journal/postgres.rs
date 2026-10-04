@@ -314,128 +314,147 @@ impl PostgresJournal {
                 .await
                 .map_err(|e| anyhow::anyhow!("{e}"));
         }
-        let mut tx = self.pool.begin().await?;
-        // Execution lock before the first write (`retain_source_version`):
-        // the ordering invariant on `weft_journal::write`.
-        weft_journal::lock_execution_ids(&mut tx, &[event.execution_id()]).await?;
-        Self::write_started_in(&mut tx, event, dedup_key).await?;
-        tx.commit().await?;
+        let started = StartedRow::of(event, dedup_key, crate::lease::now_unix())?;
+        sqlx::query("SELECT weft_execution_started($1)")
+            .bind(serde_json::to_value(&started)?)
+            .execute(&self.pool)
+            .await
+            .map_err(birth_refusal)?;
         Ok(())
     }
 
-    /// Check the durable birth, whose lifetime extends beyond its initial
-    /// execute task. The caller holds the execution's lock
-    /// (`weft_journal::lock_execution_ids`), which is what serializes admission.
-    async fn execution_already_started(tx: &mut sqlx::PgConnection, start: &ExecEvent) -> anyhow::Result<bool> {
-        let ExecEvent::ExecutionStarted { execution_id, run_kind, .. } = start else {
-            anyhow::bail!("execution admission requires a birth event");
+    /// A run's birth (`weft_start_execution`), behind `admission` when it
+    /// has one: one round trip whatever the birth writes.
+    async fn birth(
+        &self,
+        start: &ExecEvent,
+        kicks: &[ExecEvent],
+        task: weft_task_store::tasks::NewTask,
+        trigger_setup: Option<TriggerSetupRow>,
+        admission: Option<&crate::entry_limits::Admission>,
+    ) -> anyhow::Result<Result<(), crate::entry_limits::Refused>> {
+        let now = crate::lease::now_unix();
+        let started = StartedRow::of(start, None, now)?;
+        if let Some(stray) = kicks.iter().find(|kick| kick.execution_id() != start.execution_id()) {
+            anyhow::bail!("a birth of execution {} kicks a node of execution {}", start.execution_id(), stray.execution_id());
+        }
+        let kicks = kicks
+            .iter()
+            .map(|kick| Ok(EventRow { kind: kick.kind_str(), payload: serde_json::to_string(kick)? }))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let call = BirthCall {
+            started,
+            kicks,
+            task: weft_task_store::tasks::DedupRow::of(&task, uuid::Uuid::new_v4(), now)?,
+            trigger_setup,
+            admission,
         };
-        // An unrecorded run journals no `ExecutionStarted`: its birth is
-        // its `execution` row alone.
-        let query = if run_kind.journaled() {
-            "SELECT EXISTS (SELECT 1 FROM exec_event WHERE execution_id = $1 AND kind = 'execution_started')"
-        } else {
-            "SELECT EXISTS (SELECT 1 FROM execution WHERE execution_id = $1)"
-        };
-        Ok(sqlx::query_scalar(query).bind(execution_id.to_string()).fetch_one(&mut *tx).await?)
+        let answer: serde_json::Value = sqlx::query_scalar("SELECT weft_start_execution($1)")
+            .bind(serde_json::to_value(&call)?)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(birth_refusal)?;
+        match answer.get("outcome").and_then(serde_json::Value::as_str) {
+            Some("started" | "already_started") => Ok(Ok(())),
+            Some("refused") => {
+                let refused: crate::entry_limits::Answer =
+                    serde_json::from_value(answer["refused"].clone()).context("read the birth's refusal")?;
+                Ok(Err(refused.refused()?))
+            }
+            _ => anyhow::bail!("the database answered a birth with '{answer}', which weft does not read"),
+        }
     }
+}
 
-    /// Write an `ExecutionStarted` event AND its `execution` seed on the
-    /// caller's transaction (the two must commit together; see
-    /// `record_with_seed`'s doc). A missing project row fails the whole write
-    /// loudly instead of silently journaling an unsweepable execution.
-    /// The caller holds the execution's lock (`weft_journal::lock_execution_ids`)
-    /// from before its first write.
-    async fn write_started_in(
-        tx: &mut sqlx::PgConnection,
-        event: &ExecEvent,
-        dedup_key: Option<&str>,
-    ) -> anyhow::Result<()> {
+/// A failure of the birth functions. One they raise themselves (`RAISE
+/// EXCEPTION`, SQLSTATE P0001) is passed on in its own words, which name
+/// what is missing and what to do; any other keeps the database's whole
+/// error and where in the functions it happened, since one call now does
+/// what several statements did.
+fn birth_refusal(e: sqlx::Error) -> anyhow::Error {
+    let Some(db) = e.as_database_error() else { return anyhow::Error::from(e) };
+    if db.code().as_deref() == Some("P0001") {
+        return anyhow::anyhow!("{}", db.message());
+    }
+    let at = db.try_downcast_ref::<sqlx::postgres::PgDatabaseError>().and_then(|pg| pg.r#where()).map(str::to_string);
+    let e = anyhow::Error::from(e);
+    match at {
+        Some(at) => e.context(format!("a run's birth failed in the database, at: {at}")),
+        None => e.context("a run's birth failed in the database"),
+    }
+}
+
+/// One journal row as the birth functions take it.
+#[derive(serde::Serialize)]
+struct EventRow {
+    kind: &'static str,
+    payload: String,
+}
+
+/// An `ExecutionStarted` and its seed, as `weft_execution_started` takes
+/// them.
+// SYNC: StartedRow's fields <-> weft_execution_started, weft_start_execution (GROUP below)
+#[derive(serde::Serialize)]
+struct StartedRow {
+    execution_id: String,
+    project_id: uuid::Uuid,
+    /// Whether the run keeps a journal; an unrecorded run is born with its
+    /// seed alone, its birth riding the execute task.
+    journaled: bool,
+    kind: &'static str,
+    payload: String,
+    at_unix: i64,
+    phase: &'static str,
+    run_kind: &'static str,
+    instance_id: Option<String>,
+    fired_by: Option<String>,
+    source_version: Option<String>,
+    dedup_key: Option<String>,
+    created_at: i64,
+}
+
+impl StartedRow {
+    fn of(event: &ExecEvent, dedup_key: Option<&str>, created_at: i64) -> anyhow::Result<Self> {
         let ExecEvent::ExecutionStarted { execution_id, project_id, at_unix, phase, run_kind, source_version, instance, fired_trigger, .. } =
             event
         else {
-            anyhow::bail!("write_started_in requires an ExecutionStarted event");
+            anyhow::bail!("an execution's birth row must be its ExecutionStarted");
         };
-        if let Some(version) = source_version {
-            crate::versions::retain_source_version(tx, *project_id, version).await?;
-        }
-        // An unrecorded run is born with its execution row alone: its
-        // `ExecutionStarted` rides the execute task instead.
-        if run_kind.journaled() {
-            weft_journal::record_event_in(&mut *tx, event, None, dedup_key)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
-        let rows = sqlx::query(
-            "INSERT INTO execution (execution_id, project_id, tenant_id, started_at_unix, phase, kind, instance_id, fired_by) \
-             SELECT $1, $2, p.tenant_id, $3, $4, $5, $6, $7 FROM project p WHERE p.id = $2 \
-             ON CONFLICT (execution_id) DO NOTHING",
-        )
-        .bind(execution_id.to_string())
-        .bind(project_id)
-        .bind(*at_unix as i64)
-        .bind(phase.as_str())
-        .bind(run_kind.as_str())
-        .bind(instance.as_ref().map(|m| m.as_str()))
-        .bind(fired_trigger.as_deref())
-        .execute(&mut *tx)
-        .await?;
-        if rows.rows_affected() == 0 {
-            // Zero rows = conflict (already seeded: a dedup'd retry)
-            // OR missing project. Only the latter is an error.
-            let (already_seeded,): (bool,) = sqlx::query_as(
-                "SELECT EXISTS(SELECT 1 FROM execution WHERE execution_id = $1)",
-            )
-            .bind(execution_id.to_string())
-            .fetch_one(&mut *tx)
-            .await?;
-            if !already_seeded {
-                anyhow::bail!(
-                    "refuse to journal ExecutionStarted for execution {execution_id}: project \
-                     {project_id} has no row, so the execution seed (which the \
-                     broker scope check and the terminal sweeps depend on) cannot be \
-                     written; register the project first"
-                );
-            }
-        }
-        Ok(())
+        Ok(Self {
+            execution_id: execution_id.to_string(),
+            project_id: *project_id,
+            journaled: run_kind.journaled(),
+            kind: event.kind_str(),
+            payload: serde_json::to_string(event)?,
+            at_unix: *at_unix as i64,
+            phase: phase.as_str(),
+            run_kind: run_kind.as_str(),
+            instance_id: instance.as_ref().map(|m| m.as_str().to_string()),
+            fired_by: fired_trigger.clone(),
+            source_version: source_version.clone(),
+            dedup_key: dedup_key.map(str::to_string),
+            created_at,
+        })
     }
+}
 
-    /// The one-transaction execution BIRTH: `ExecutionStarted` + seed + the
-    /// entry kicks, written by `start_execution`, which takes the
-    /// execution's lock before its first write.
-    async fn write_birth_in(
-        tx: &mut sqlx::PgConnection,
-        start: &ExecEvent,
-        kicks: &[ExecEvent],
-        expected_activation: Option<ExecutionId>,
-    ) -> anyhow::Result<()> {
-        Self::write_started_in(tx, start, None).await?;
-        if let ExecEvent::ExecutionStarted { execution_id, project_id, phase: weft_core::context::Phase::TriggerSetup, .. } = start {
-            // Serialize with the activation's claim: an activation's setup
-            // is born only while that activation still owns its rows (a
-            // cancel between the claim and here wins). Ownership is born
-            // with the task, so a dead requester cannot leave an owner
-            // without work. A bake (no activation) claims nothing.
-            if let Some(expected) = expected_activation {
-                anyhow::ensure!(expected == *execution_id, "activation {expected} starts setup {execution_id}");
-                let owned: bool = sqlx::query_scalar(
-                    "SELECT EXISTS (SELECT 1 FROM trigger_activation \
-                     WHERE project_id = $1 AND activating_execution_id = $2 AND status = 'activating' FOR UPDATE)",
-                ).bind(project_id).bind(expected).fetch_one(&mut *tx).await?;
-                anyhow::ensure!(owned, "activation {expected} ended before trigger setup could start");
-            }
-            sqlx::query("INSERT INTO trigger_setup (project_id, execution_id) VALUES ($1, $2)")
-                .bind(project_id).bind(execution_id.to_string()).execute(&mut *tx).await?;
-        }
-        let journaled = matches!(start, ExecEvent::ExecutionStarted { run_kind, .. } if run_kind.journaled());
-        for kick in kicks.iter().filter(|_| journaled) {
-            weft_journal::record_event_in(&mut *tx, kick, None, None)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
-        Ok(())
-    }
+/// A trigger setup's birth: recorded in flight, and, when an activation
+/// asked for it (the activation is the setup's own execution), born only
+/// while that activation still owns its rows.
+#[derive(serde::Serialize)]
+struct TriggerSetupRow {
+    for_activation: bool,
+}
+
+/// Everything `weft_start_execution` takes.
+// SYNC: BirthCall's fields <-> weft_start_execution (GROUP below)
+#[derive(serde::Serialize)]
+struct BirthCall<'a> {
+    started: StartedRow,
+    kicks: Vec<EventRow>,
+    task: weft_task_store::tasks::DedupRow,
+    trigger_setup: Option<TriggerSetupRow>,
+    admission: Option<&'a crate::entry_limits::Admission>,
 }
 
 /// The journal's schema. First in `app::ALL_GROUPS` (other groups'
@@ -706,6 +725,42 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             FOR EACH ROW
             WHEN (NEW.holds IS DISTINCT FROM OLD.holds)
             EXECUTE FUNCTION signal_held_notify()"#,
+        // Tell every dispatcher a tenant's routes changed, so its copy of
+        // them (`crate::held::Held::routes`) is read again: a public entry
+        // coming, going, or changing anything the handshake reads. The
+        // project group's trigger uses the same function (a project row
+        // gone reads as an inactive route).
+        // SYNC: 'weft_routes' <-> crate::held::ROUTES_CHANNEL
+        r#"CREATE OR REPLACE FUNCTION routes_notify_tenant() RETURNS trigger AS $$
+            BEGIN
+                IF TG_OP = 'DELETE' THEN
+                    PERFORM pg_notify('weft_routes', OLD.tenant_id);
+                ELSE
+                    PERFORM pg_notify('weft_routes', NEW.tenant_id);
+                END IF;
+                RETURN NULL;
+            END;
+            $$ LANGUAGE plpgsql"#,
+        r#"DROP TRIGGER IF EXISTS signal_routes_on_insert ON signal"#,
+        r#"CREATE TRIGGER signal_routes_on_insert
+            AFTER INSERT ON signal
+            FOR EACH ROW
+            WHEN (NEW.surface_kind = 'public_entry')
+            EXECUTE FUNCTION routes_notify_tenant()"#,
+        r#"DROP TRIGGER IF EXISTS signal_routes_on_delete ON signal"#,
+        r#"CREATE TRIGGER signal_routes_on_delete
+            AFTER DELETE ON signal
+            FOR EACH ROW
+            WHEN (OLD.surface_kind = 'public_entry')
+            EXECUTE FUNCTION routes_notify_tenant()"#,
+        r#"DROP TRIGGER IF EXISTS signal_routes_on_change ON signal"#,
+        r#"CREATE TRIGGER signal_routes_on_change
+            AFTER UPDATE OF surface_kind, mount_path, mount_methods, project_id, node_id, spec_json,
+                auth_kind, auth_config, port_snapshot, program_json, source_version, instance_id,
+                activation_trigger ON signal
+            FOR EACH ROW
+            WHEN (NEW.surface_kind = 'public_entry' OR OLD.surface_kind = 'public_entry')
+            EXECUTE FUNCTION routes_notify_tenant()"#,
         // Entry rows are keyed by (project_id, node_id), `node_id`
         // being the trigger's place spelled the way a person writes
         // it (`one.door`), so a file called from two places holds two
@@ -835,6 +890,145 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             UNIQUE (execution_id, tag)
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_execution_tag_tag ON execution_tag(tag)"#,
+        // An execution's journal lock, held until the transaction ends: the
+        // ONE spelling of its key, taken by every journal write here and by
+        // `weft_journal::lock_execution_ids`.
+        r#"CREATE OR REPLACE FUNCTION weft_lock_execution(p_execution_id TEXT) RETURNS VOID AS $$
+            BEGIN
+                PERFORM pg_advisory_xact_lock(hashtextextended('exec_event:' || p_execution_id, 0));
+            END;
+            $$ LANGUAGE plpgsql"#,
+        // THE journal insert (`weft_journal::write`): the execution's lock,
+        // then the rows in the order given, fenced on `p_owner` when one is
+        // named. Returns how many rows went in. The lock comes first so
+        // rows of one execution are numbered and committed in the same
+        // order; taking it again in a transaction that already holds it is
+        // free.
+        r#"CREATE OR REPLACE FUNCTION weft_journal_append(
+                p_execution_id TEXT, p_kinds TEXT[], p_payloads TEXT[], p_created_at BIGINT,
+                p_replica TEXT, p_owner TEXT, p_dedup_key TEXT
+            ) RETURNS BIGINT AS $$
+            DECLARE
+                written BIGINT;
+            BEGIN
+                PERFORM weft_lock_execution(p_execution_id);
+                INSERT INTO exec_event (execution_id, kind, payload_json, created_at, replica, dedup_key)
+                    SELECT p_execution_id, e.kind, e.payload, p_created_at, p_replica, p_dedup_key
+                    FROM unnest(p_kinds, p_payloads) WITH ORDINALITY AS e(kind, payload, n)
+                    WHERE p_owner IS NULL
+                       OR EXISTS (SELECT 1 FROM execution x
+                                  WHERE x.execution_id = p_execution_id AND x.owner_replica = p_owner)
+                    ORDER BY e.n
+                    ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING;
+                GET DIAGNOSTICS written = ROW_COUNT;
+                RETURN written;
+            END;
+            $$ LANGUAGE plpgsql"#,
+        // An execution's `ExecutionStarted` and its `execution` seed,
+        // which commit together: the seed is what the broker's scope check
+        // and the terminal sweeps see an execution by, so one without the
+        // other would be an execution nothing can ever sweep. A missing
+        // project row refuses the whole write. The source version the run
+        // was prepared from is held (FOR KEY SHARE) so it cannot be removed
+        // under the run. An unrecorded run is born with its seed alone.
+        // SYNC: p's fields <-> crate::journal::postgres::StartedRow
+        r#"CREATE OR REPLACE FUNCTION weft_execution_started(p JSONB) RETURNS VOID AS $$
+            DECLARE
+                v_execution_id TEXT := p->>'execution_id';
+                v_project UUID := (p->>'project_id')::uuid;
+                seeded BIGINT;
+            BEGIN
+                PERFORM weft_lock_execution(v_execution_id);
+                IF p->>'source_version' IS NOT NULL THEN
+                    PERFORM 1 FROM project_version
+                        WHERE project_id = v_project AND id = p->>'source_version' FOR KEY SHARE;
+                    IF NOT FOUND THEN
+                        RAISE EXCEPTION 'source version % was removed during preparation; run the command again',
+                            p->>'source_version';
+                    END IF;
+                END IF;
+                IF (p->>'journaled')::boolean THEN
+                    PERFORM weft_journal_append(v_execution_id, ARRAY[p->>'kind'], ARRAY[p->>'payload'],
+                        (p->>'created_at')::bigint, NULL, NULL, p->>'dedup_key');
+                END IF;
+                INSERT INTO execution (execution_id, project_id, tenant_id, started_at_unix, phase, kind, instance_id, fired_by)
+                    SELECT v_execution_id, v_project, pr.tenant_id, (p->>'at_unix')::bigint, p->>'phase',
+                           p->>'run_kind', p->>'instance_id', p->>'fired_by'
+                    FROM project pr WHERE pr.id = v_project
+                    ON CONFLICT (execution_id) DO NOTHING;
+                GET DIAGNOSTICS seeded = ROW_COUNT;
+                IF seeded = 0 AND NOT EXISTS (SELECT 1 FROM execution WHERE execution_id = v_execution_id) THEN
+                    RAISE EXCEPTION 'refuse to journal ExecutionStarted for execution %: project % has no row, so the execution seed (which the broker scope check and the terminal sweeps depend on) cannot be written; register the project first',
+                        v_execution_id, v_project;
+                END IF;
+            END;
+            $$ LANGUAGE plpgsql"#,
+        // A run's whole birth, in one call: one execution's admission (its
+        // entry's limits, when it has any), its first task, its
+        // `ExecutionStarted` and seed, and the kicks that start it.
+        // Answers `{"outcome": "started" | "already_started" | "refused"}`,
+        // a refusal carrying which limit (`weft_admit`'s answer). Nothing
+        // is written for a run already born (its birth row, or its seed for
+        // an unrecorded run) or whose task is already live: a retried birth
+        // collapses onto the first, which keeps the slot it took. A refused
+        // run writes only its counts. The execution's lock is taken before
+        // any write, which is the journal's ordering rule.
+        // SYNC: p's fields <-> crate::journal::postgres::BirthCall
+        r#"CREATE OR REPLACE FUNCTION weft_start_execution(p JSONB) RETURNS JSONB AS $$
+            DECLARE
+                v_started JSONB := p->'started';
+                v_task JSONB := p->'task';
+                v_execution_id TEXT := v_started->>'execution_id';
+                v_project UUID := (v_started->>'project_id')::uuid;
+                v_journaled BOOLEAN := (v_started->>'journaled')::boolean;
+                v_refused JSONB;
+                v_inserted BOOLEAN;
+            BEGIN
+                PERFORM weft_lock_execution(v_execution_id);
+                IF (v_journaled AND EXISTS (SELECT 1 FROM exec_event
+                        WHERE execution_id = v_execution_id AND kind = 'execution_started'))
+                   OR (NOT v_journaled AND EXISTS (SELECT 1 FROM execution WHERE execution_id = v_execution_id)) THEN
+                    RETURN jsonb_build_object('outcome', 'already_started');
+                END IF;
+                IF jsonb_typeof(p->'admission') = 'object' THEN
+                    v_refused := weft_admit(p->'admission');
+                    IF v_refused IS NOT NULL THEN
+                        RETURN jsonb_build_object('outcome', 'refused', 'refused', v_refused);
+                    END IF;
+                END IF;
+                SELECT d.inserted INTO v_inserted FROM weft_enqueue_dedup(
+                    (v_task->>'id')::uuid, v_task->>'kind', v_task->>'target', (v_task->>'project_id')::uuid,
+                    v_task->>'dedup_key', v_task->>'execution_id', v_task->>'tenant_id', v_task->>'target_replica',
+                    v_task->>'binary_hash', v_task->'payload', (v_task->>'created_at')::bigint) d;
+                IF NOT v_inserted THEN
+                    RETURN jsonb_build_object('outcome', 'already_started');
+                END IF;
+                PERFORM weft_execution_started(v_started);
+                -- A trigger setup is born only while the activation that asked
+                -- for it still owns its rows (a cancel between the claim and
+                -- here wins), and is recorded as in flight.
+                IF jsonb_typeof(p->'trigger_setup') = 'object' THEN
+                    IF (p->'trigger_setup'->>'for_activation')::boolean THEN
+                        PERFORM 1 FROM trigger_activation
+                            WHERE project_id = v_project
+                              AND activating_execution_id = v_execution_id::uuid
+                              AND status = 'activating'
+                            FOR UPDATE;
+                        IF NOT FOUND THEN
+                            RAISE EXCEPTION 'activation % ended before trigger setup could start', v_execution_id;
+                        END IF;
+                    END IF;
+                    INSERT INTO trigger_setup (project_id, execution_id) VALUES (v_project, v_execution_id);
+                END IF;
+                IF v_journaled AND jsonb_array_length(p->'kicks') > 0 THEN
+                    PERFORM weft_journal_append(v_execution_id,
+                        ARRAY(SELECT k->>'kind' FROM jsonb_array_elements(p->'kicks') WITH ORDINALITY AS e(k, n) ORDER BY n),
+                        ARRAY(SELECT k->>'payload' FROM jsonb_array_elements(p->'kicks') WITH ORDINALITY AS e(k, n) ORDER BY n),
+                        (v_started->>'created_at')::bigint, NULL, NULL, NULL);
+                END IF;
+                RETURN jsonb_build_object('outcome', 'started');
+            END;
+            $$ LANGUAGE plpgsql"#,
     ],
     seed: &[],
 };
@@ -919,26 +1113,28 @@ impl Journal for PostgresJournal {
         start: &ExecEvent,
         kicks: &[ExecEvent],
         task: weft_task_store::tasks::NewTask,
-        expected_activation: Option<ExecutionId>,
+        for_activation: bool,
     ) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
-        // Execution lock before the first write (the task enqueue): the
-        // ordering invariant on `weft_journal::write`.
-        weft_journal::lock_execution_ids(&mut tx, &[start.execution_id()]).await?;
-        if Self::execution_already_started(&mut tx, start).await? {
-            tx.commit().await?;
-            return Ok(());
-        }
-        // Enqueue FIRST and only write the birth on a FRESH insert: "one
-        // birth per execution" holds by construction even if a caller ever replays an execution
-        // (the dedup'd task collapses, and the birth is not double-written;
-        // ExecutionStarted itself carries no dedup key).
-        let outcome = weft_task_store::tasks::enqueue_dedup_in(&mut tx, task).await?;
-        if matches!(outcome, weft_task_store::tasks::DedupOutcome::Inserted(_)) {
-            Self::write_birth_in(&mut tx, start, kicks, expected_activation).await?;
-        }
-        tx.commit().await?;
-        Ok(())
+        let trigger_setup = match start {
+            ExecEvent::ExecutionStarted { phase: weft_core::context::Phase::TriggerSetup, .. } => Some(TriggerSetupRow { for_activation }),
+            _ => None,
+        };
+        let born = self.birth(start, kicks, task, trigger_setup, None).await?;
+        born.map_err(|refused| anyhow::anyhow!("a birth with no limits to check was refused: {refused:?}"))
+    }
+
+    async fn admit_and_start_execution(
+        &self,
+        admission: &crate::entry_limits::Admission,
+        start: &ExecEvent,
+        kicks: &[ExecEvent],
+        task: weft_task_store::tasks::NewTask,
+    ) -> anyhow::Result<Result<(), crate::entry_limits::Refused>> {
+        anyhow::ensure!(
+            !matches!(start, ExecEvent::ExecutionStarted { phase: weft_core::context::Phase::TriggerSetup, .. }),
+            "a trigger setup is not admitted at an entry's limits"
+        );
+        self.birth(start, kicks, task, None, Some(admission)).await
     }
 
     async fn cancel_execution(

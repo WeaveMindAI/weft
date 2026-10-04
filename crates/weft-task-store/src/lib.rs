@@ -18,6 +18,8 @@
 //!   - `pg_signal`: the process's one Postgres `LISTEN` connection,
 //!     which every wait on a row sleeps on (`terminal` is the task
 //!     waiter built on it).
+//!   - `held_copy`: a process's copy of rows read on every request,
+//!     dropped the moment a notification says they changed.
 //!   - `schema_guard`: the schema runner every boot routes its
 //!     `SchemaGroup`s through. It builds a new database from the canonical
 //!     `CREATE TABLE` text and carries an existing one forward with the
@@ -27,6 +29,7 @@ pub mod alarm;
 pub mod db;
 pub mod drain;
 pub mod executor;
+pub mod held_copy;
 pub mod kinds;
 pub mod locks;
 pub mod pg_signal;

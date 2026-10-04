@@ -5,7 +5,7 @@
 use anyhow::Context;
 use weft_core::program::ExecutionPage;
 
-use super::{local_time, Ctx};
+use super::{utc_time, Ctx};
 
 /// A value put into a query string. A node id is the author's own
 /// spelling, so it can hold anything they typed; only the handful of
@@ -91,7 +91,7 @@ pub async fn list(ctx: Ctx, filter: ListFilter) -> anyhow::Result<()> {
         return Ok(());
     }
     println!(
-        "{:<36}  {:<9}  {:<13}  {:<19}  {:<36}  entry_node  tags",
+        "{:<36}  {:<9}  {:<13}  {:<23}  {:<36}  entry_node  tags",
         "execution_id", "status", "phase", "started", "project_id"
     );
     for row in &page.executions {
@@ -104,8 +104,8 @@ pub async fn list(ctx: Ctx, filter: ListFilter) -> anyhow::Result<()> {
         // Which instance the run is in, when it is in one.
         let instance = row.instance.as_ref().map(|m| format!("  (instance {m})")).unwrap_or_default();
         println!(
-            "{execution_id:<36}  {status:<9}  {phase:<13}  {:<19}  {project:<36}  {entry}{tags}{instance}",
-            local_time(row.started_at)
+            "{execution_id:<36}  {status:<9}  {phase:<13}  {:<23}  {project:<36}  {entry}{tags}{instance}",
+            utc_time(row.started_at)
         );
     }
     // The server clamps the page size, so a big --limit can come back
@@ -248,8 +248,8 @@ pub fn event_line(row: &serde_json::Value, full: bool) -> String {
     // pulse, a corruption the replay found) have none and get a blank
     // of the same width, so the columns still line up.
     let at = match row.get("at_unix").and_then(|v| v.as_u64()) {
-        Some(at) => format!("[{:<19}]", local_time(at)),
-        None => " ".repeat(21),
+        Some(at) => format!("[{:<23}]", utc_time(at)),
+        None => " ".repeat(25),
     };
     let node = row_node(row).unwrap_or("");
     let mut line = format!("{at} {kind:<23} {node}");

@@ -138,10 +138,15 @@ checked what it did.
 If the node sets `catchErrors` and you wired its `error` output, this failure
 goes there like any other, and that branch carries on.
 
+A step's start is written down in the background, as the step begins (go and
+read [the journal](../running/the-journal.md#a-run-does-not-wait-for-its-writes)).
+If the worker goes away in the moment before that write lands, nothing says the
+step ever started, and the next worker runs it as a step that never did. That
+moment is one write to the database long.
+
 If the body was waiting on `ctx.await_signal` when the worker went away, it is
-not failed: when its answer comes, it replays from the top. This is the only way a body runs
-twice, and its `ctx.run` calls give back their saved results instead of doing
-the work again.
+not failed: when its answer comes, it replays from the top, and its `ctx.run`
+calls give back their saved results instead of doing the work again.
 
 If a step emitted a value before the crash and the step reading it had not
 started yet, that value is still delivered and the reading step runs.

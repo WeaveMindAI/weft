@@ -1,6 +1,8 @@
 //! Signal-related dispatcher routes. Every endpoint here either relays a
 //! fire to the listener or reads/writes the durable signal table.
 
+use std::sync::Arc;
+
 use anyhow::Context;
 use axum::{
     extract::{Path, RawQuery, State},
@@ -382,7 +384,7 @@ async fn fire_signal_inner(
     };
     if !routing.is_resume {
         if let Err(refused) =
-            check_entry_limits(state, token, routing.project_id, &routing.limits, &caller.key(), None).await
+            check_entry_limits(state, token, routing.project_id, &routing.limits, &caller.key()).await
         {
             return refused;
         }
@@ -685,54 +687,37 @@ pub(crate) async fn signal_gate(
 /// The per-minute and at-once limits of one outside call to the entry
 /// `token`, checked before anything is started, so a refused call costs
 /// nothing. `caller` is who is calling, spelled as its key (the verified
-/// identity, or the address). `take_slot_for` is the execution of the run
-/// this call will start and how long its slot holds unborn, when the
-/// slot is taken now (a live handshake); a fire takes its slot when its
-/// run is born, so here it only checks the entry is not already full.
-/// A resume token answers one run already going and is not an entry:
-/// its callers never come here.
+/// identity, or the address). A fire takes its slot when its run is born
+/// (`route_entry`), so here the entry is only checked for room; a live
+/// call is admitted with its birth instead (`connect_live`). A resume
+/// token answers one run already going and is not an entry: its callers
+/// never come here.
 pub(crate) async fn check_entry_limits(
     state: &DispatcherState,
     token: &str,
     project_id: uuid::Uuid,
     limits: &weft_core::signal::ResolvedLimits,
     caller: &str,
-    take_slot_for: Option<(&str, i64)>,
 ) -> Result<(), axum::response::Response> {
-    let now = crate::lease::now_unix();
-    let internal = |e: anyhow::Error| {
-        use axum::response::IntoResponse;
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("rate limit: {e:#}")).into_response()
-    };
-    let mut refused = crate::entry_limits::admit_call(&state.pg_pool, token, caller, limits, now)
-        .await
-        .map_err(internal)?
-        .err();
-    if refused.is_none() {
-        if let Some(max) = limits.at_once {
-            refused = match take_slot_for {
-                Some((execution_id, unborn_until)) => {
-                    crate::entry_limits::take_slot(&state.pg_pool, token, execution_id, max, unborn_until, now)
-                        .await
-                        .map_err(internal)?
-                        .err()
-                }
-                None => crate::entry_limits::at_once_full(&state.pg_pool, token, max, now)
-                    .await
-                    .map_err(internal)?,
-            };
+    let admission = crate::entry_limits::Admission::call(&state.edge, None, token, caller, limits, None, crate::lease::now_unix());
+    match crate::entry_limits::admit(&state.pg_pool, &admission).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(refused)) => Err(refuse_call(token, project_id, refused)),
+        Err(e) => {
+            use axum::response::IntoResponse;
+            Err((StatusCode::INTERNAL_SERVER_ERROR, format!("rate limit: {e:#}")).into_response())
         }
     }
-    let Some(refused) = refused else { return Ok(()) };
+}
+
+/// The answer to a call an entry's limits refused, logged.
+fn refuse_call(token: &str, project_id: uuid::Uuid, refused: crate::entry_limits::Refused) -> axum::response::Response {
     tracing::info!(
         target: "weft_dispatcher::signal",
         token = %token, project_id = %project_id,
         "public call refused: {} is reached", refused.reason.describe()
     );
-    crate::entry_limits::note_refusal(&state.pg_pool, token, refused.reason, now)
-        .await
-        .map_err(internal)?;
-    Err(crate::entry_limits::too_many(refused))
+    crate::entry_limits::too_many(refused)
 }
 
 
@@ -1520,7 +1505,7 @@ pub async fn fire_public_entry(
     };
     // A bare-path fire is always an entry (a resume token has no mount).
     if let Err(refused) =
-        check_entry_limits(&state, &token, routing.project_id, &routing.limits, &caller.key(), None).await
+        check_entry_limits(&state, &token, routing.project_id, &routing.limits, &caller.key()).await
     {
         return refused;
     }
@@ -1559,19 +1544,14 @@ async fn public_entry_target(
     // address holding a capture could never be reached through here at
     // all, whatever was called.
     let (tenant, called) = split_tenant(&normalized).map_err(|_| refuse())?;
-    let rows: Vec<RouteRow> = sqlx::query_as::<_, (String, Vec<String>, String)>(
-        "SELECT s.mount_path, s.mount_methods, s.token \
-         FROM signal s \
-         WHERE s.tenant_id = $1 AND s.surface_kind = 'public_entry' \
-           AND s.mount_path IS NOT NULL",
-    )
-    .bind(tenant)
-    .fetch_all(&state.pg_pool)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("mount lookup: {e}")))?
-    .into_iter()
-    .map(|(mount_path, mount_methods, token)| RouteRow { mount_path, mount_methods, token })
-    .collect();
+    // Matched against the held routes, and against the rows themselves
+    // before refusing: a route activated a moment ago may not have been
+    // heard yet.
+    let rows_of = |routes: &[HeldRoute]| -> Vec<RouteRow> { routes.iter().map(|route| route.row.clone()).collect() };
+    let rows = match state.held.routes.held(&tenant.to_string()).map(|held| rows_of(&held)) {
+        Some(held) if resolve_route(&held, tenant, "POST", called).is_ok() => held,
+        _ => rows_of(&fresh_tenant_routes(state, tenant).await?),
+    };
     let (matched, params) = resolve_route(&rows, tenant, "POST", called).map_err(|_| refuse())?;
     // An address with a capture in it is a live route's shape, and a
     // live route is served (and gated, and answered) at `/connect`.
@@ -1719,7 +1699,7 @@ struct CallerRequestParts<'a> {
 }
 
 /// One public-entry row of the tenant, as the route matcher sees it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct RouteRow {
     pub mount_path: String,
     pub mount_methods: Vec<String>,
@@ -1840,45 +1820,11 @@ pub async fn connect_live(
                 .ok_or((StatusCode::BAD_REQUEST, format!("{API_PROJECT_HEADER} is not a project id")))?,
         ),
     };
-    // Every route of the tenant with how it is armed, in one read: the
-    // match is made here, and the matched one's arming is already in hand.
     // How long each step took, in the line that says the run was born:
     // what to read first when a call is slow.
     let began = std::time::Instant::now();
-    let armed_rows = sqlx::query(&format!(
-        "SELECT s.token, s.mount_path, s.mount_methods, {ARMED_COLUMNS} \
-         FROM signal s \
-         LEFT JOIN project p ON p.id = s.project_id \
-         {} \
-         WHERE s.tenant_id = $1 AND s.surface_kind = 'public_entry' AND s.mount_path IS NOT NULL \
-           AND ($2::uuid IS NULL OR s.project_id = $2)",
-        weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
-    ))
-    .bind(&tenant_segment)
-    .bind(only_project)
-    .fetch_all(&state.pg_pool)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("route lookup: {e}")))?;
-    let rows = armed_rows
-        .iter()
-        .map(|r| {
-            Ok(RouteRow {
-                token: r.try_get("token").map_err(row_err)?,
-                mount_path: r.try_get("mount_path").map_err(row_err)?,
-                mount_methods: r.try_get("mount_methods").map_err(row_err)?,
-            })
-        })
-        .collect::<Result<Vec<_>, (StatusCode, String)>>()?;
-    let (matched, params) = resolve_route(&rows, &tenant_segment, &method_name, &path)?;
-    let token = matched.token.clone();
-    let matched_row = rows
-        .iter()
-        .position(|row| row.token == token)
-        .map(|i| &armed_rows[i])
-        .expect("the matched route is one of the rows it was matched among");
-
-    let route = armed_route_of(matched_row)?;
-    let ArmedRoute { project_id, node_id, protocol, live_config, auth_kind, auth_config, program, .. } = &route;
+    let (route, token, params) = live_route(&state, &tenant_segment, only_project, &method_name, &path).await?;
+    let ArmedRoute { project_id, node_id, protocol, live_config, auth_kind, auth_config, program, .. } = route.as_ref();
 
     // Every header the caller sent, repeats included, less the one the
     // install's door added for itself: what the gate checks, and what the
@@ -1937,12 +1883,12 @@ pub async fn connect_live(
     // Project must be Active to accept a live connection.
     route.require_active()?;
 
-    // The entry's limits, before anything is started. The caller is who
-    // the gate established when the route has auth, else the instance the
-    // run is for, else the address. The slot is taken now, for the execution
-    // this call's run will carry; the run is born just below, and the slot
-    // counts for as long as it runs (the ticket's life only matters if the
-    // birth fails and its slot could not be freed).
+    // The entry's limits are checked as the run is born, in the same
+    // call to the database: the caller is who the gate established when
+    // the route has auth, else the instance the run is for, else the
+    // address. The slot is taken for the execution this call's run
+    // carries, and counts for as long as it runs; the ticket's life only
+    // matters for a run nobody ever claims.
     let execution_id = uuid::Uuid::new_v4();
     let caller_key = match (&caller, &instance) {
         (Some(identity), _) => format!("id:{identity}"),
@@ -1951,21 +1897,16 @@ pub async fn connect_live(
     };
     let issued_at = crate::lease::now_unix();
     let expires_at = issued_at + live_token_ttl_secs();
-    let limits = route.spec.limits.resolve();
-    let limits_from = began.elapsed();
-    if let Err(refused) = check_entry_limits(
-        &state,
+    let admission = crate::entry_limits::Admission::call(
+        &state.edge,
+        Some(address.0),
         &token,
-        *project_id,
-        &limits,
         &caller_key,
+        &route.spec.limits.resolve(),
         Some((&execution_id.to_string(), expires_at)),
-    )
-    .await
-    {
-        return Ok(refused);
-    }
-    let limited = began.elapsed();
+        issued_at,
+    );
+    let admitting = began.elapsed();
 
     // The caller's opening request, as the trigger reads it: what they
     // sent here, which is what reaches the worker.
@@ -1978,19 +1919,10 @@ pub async fn connect_live(
         headers: headers_sent,
         caller,
     };
-    if let Err(refused) =
-        birth_live_run(&state, &route, &opening, &tenant_segment, execution_id, expires_at, instance.as_ref())
-            .await
-    {
-        // The slot was taken for this run; nothing will start it now.
-        if let Err(e) = crate::entry_limits::release_slot(&state.pg_pool, &execution_id.to_string()).await {
-            tracing::warn!(
-                target: "weft_dispatcher::signal",
-                execution_id = %execution_id, error = %format!("{e:#}"),
-                "could not free the slot of a run that was refused at birth; the reaper frees it once it expires"
-            );
-        }
-        return Err(refused);
+    let admitted = birth_live_run(&state, &route, &opening, &tenant_segment, execution_id, expires_at, instance.as_ref(), &admission)
+        .await?;
+    if let Err(refused) = admitted {
+        return Ok(refuse_call(&token, *project_id, refused));
     }
     let born = began.elapsed();
 
@@ -2024,8 +1956,7 @@ pub async fn connect_live(
         execution_id = %execution_id, node = %node_id,
         route_ms = ms(routed),
         gate_ms = ms(gated - routed),
-        limits_ms = ms(limited - limits_from),
-        birth_ms = ms(born - limited),
+        birth_ms = ms(born - admitting),
         "live call: run born"
     );
 
@@ -2038,20 +1969,25 @@ pub async fn connect_live(
     if *protocol == weft_core::signal::Protocol::Websocket && !is_socket_opening(headers) {
         let url = crate::live_relay::live_url(&live_door(headers, &state.public_base_url), *project_id, &raw_path, &raw_query, &routing);
         let body = serde_json::json!({ "url": url, "protocol": "websocket" });
-        return Ok(Response::builder()
+        let mut answer = Response::builder()
             .status(StatusCode::OK)
             .header(axum::http::header::CONTENT_TYPE, "application/json")
             .body(axum::body::Body::from(body.to_string()))
-            .expect("json response builds"));
+            .expect("json response builds");
+        answer.extensions_mut().insert(crate::api::Admitted);
+        return Ok(answer);
     }
     let request = axum::extract::Request::from_parts(parts, body);
-    let answer = crate::live_relay::to_worker(&state, &claims, &routing, &raw_path, &raw_query, request).await;
+    let mut answer = crate::live_relay::to_worker(&state, &claims, &routing, &raw_path, &raw_query, request).await;
     tracing::info!(
         target: "weft_dispatcher::signal",
         execution_id = %execution_id, status = %answer.status(),
         worker_ms = ms(began.elapsed() - born),
         "live call: the worker answered (its body may still be streaming)"
     );
+    // The admission checked the caller's address; the token guard leaves
+    // the answer alone.
+    answer.extensions_mut().insert(crate::api::Admitted);
     Ok(answer)
 }
 
@@ -2064,11 +2000,101 @@ pub(crate) fn is_socket_opening(headers: &HeaderMap) -> bool {
         .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
 }
 
+/// One public entry of a tenant as held in memory (`crate::held`): what
+/// the matcher needs, and how the row arms it (or why it is half-armed,
+/// answered only to a call that matches it).
+pub(crate) struct HeldRoute {
+    project_id: uuid::Uuid,
+    row: RouteRow,
+    armed: Result<Arc<ArmedRoute>, (StatusCode, String)>,
+}
+
+/// A matched live route: the route as it is armed, its token, and the
+/// path's captures.
+type LiveRoute = (Arc<ArmedRoute>, String, std::collections::BTreeMap<String, String>);
+
+/// The live route of `tenant` (of `only_project`, when the call came by a
+/// project's API domain) serving `method` on `path`: the route as it is
+/// armed, its token and the path's captures. Matched against the routes
+/// this dispatcher holds; a refusal (no such route, a half-armed or
+/// inactive one) is made on the rows themselves, since a route activated a
+/// moment ago may not have been heard yet.
+async fn live_route(
+    state: &DispatcherState,
+    tenant: &str,
+    only_project: Option<uuid::Uuid>,
+    method: &str,
+    path: &str,
+) -> Result<LiveRoute, (StatusCode, String)> {
+    if let Some(held) = state.held.routes.held(&tenant.to_string()) {
+        if let Ok(found) = match_live_route(&held, tenant, only_project, method, path) {
+            if found.0.require_active().is_ok() {
+                return Ok(found);
+            }
+        }
+    }
+    match_live_route(&fresh_tenant_routes(state, tenant).await?, tenant, only_project, method, path)
+}
+
+fn match_live_route(
+    routes: &[HeldRoute],
+    tenant: &str,
+    only_project: Option<uuid::Uuid>,
+    method: &str,
+    path: &str,
+) -> Result<LiveRoute, (StatusCode, String)> {
+    let candidates: Vec<&HeldRoute> =
+        routes.iter().filter(|route| only_project.is_none_or(|only| route.project_id == only)).collect();
+    let rows: Vec<RouteRow> = candidates.iter().map(|route| route.row.clone()).collect();
+    let (matched, params) = resolve_route(&rows, tenant, method, path)?;
+    let route = candidates
+        .iter()
+        .find(|route| route.row.token == matched.token)
+        .expect("the matched route is one of the rows it was matched among")
+        .armed
+        .clone()?;
+    Ok((route, matched.token.clone(), params))
+}
+
+/// Every public entry of `tenant` as the rows say now, kept for the next
+/// call (`crate::held`).
+async fn fresh_tenant_routes(state: &DispatcherState, tenant: &str) -> Result<Arc<Vec<HeldRoute>>, (StatusCode, String)> {
+    state.held.routes.load_fresh(tenant.to_string(), || read_tenant_routes(&state.pg_pool, tenant)).await
+}
+
+async fn read_tenant_routes(pool: &sqlx::PgPool, tenant: &str) -> Result<Vec<HeldRoute>, (StatusCode, String)> {
+    let rows = sqlx::query(&format!(
+        "SELECT s.token, s.mount_path, s.mount_methods, {ARMED_COLUMNS} \
+         FROM signal s \
+         LEFT JOIN project p ON p.id = s.project_id \
+         {} \
+         WHERE s.tenant_id = $1 AND s.surface_kind = 'public_entry' AND s.mount_path IS NOT NULL",
+        weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
+    ))
+    .bind(tenant)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("route lookup: {e}")))?;
+    rows.iter()
+        .map(|r| {
+            Ok(HeldRoute {
+                project_id: r.try_get("project_id").map_err(row_err)?,
+                row: RouteRow {
+                    token: r.try_get("token").map_err(row_err)?,
+                    mount_path: r.try_get("mount_path").map_err(row_err)?,
+                    mount_methods: r.try_get("mount_methods").map_err(row_err)?,
+                },
+                armed: armed_route_of(r).map(Arc::new),
+            })
+        })
+        .collect()
+}
+
 /// A public entry as its signal row arms it: the trigger, its spec, the
 /// gate's settings, and the program identity its runs are born under.
 /// Read at the handshake, which gates the caller and gives birth to the
 /// run.
-struct ArmedRoute {
+pub(crate) struct ArmedRoute {
     project_id: uuid::Uuid,
     node_id: String,
     spec: weft_core::primitive::SignalSpec,
@@ -2152,13 +2178,14 @@ fn armed_route_of(row: &sqlx::postgres::PgRow) -> Result<ArmedRoute, (StatusCode
     })
 }
 
-/// Give birth to the run a live caller's handshake was admitted for:
-/// resolve the program, compute the fire from the caller's request, and
-/// ATOMICALLY journal `ExecutionStarted` + the trigger kicks with the
-/// execute task (`Journal::start_execution`). The task waits for the
-/// caller (`LiveConnectionStart::arrive_by`, their token's expiry): the
-/// worker their connection reaches claims it. A failure anywhere leaves
-/// NOTHING journaled or queued.
+/// Give birth to the run a live caller's handshake is for: resolve the
+/// program, compute the fire from the caller's request, and admit it at
+/// the entry's limits and ATOMICALLY journal `ExecutionStarted` + the
+/// trigger kicks with the execute task, in one call to the database
+/// (`Journal::admit_and_start_execution`). The task waits for the caller
+/// (`LiveConnectionStart::arrive_by`, their token's expiry): the worker
+/// their connection reaches claims it. A refusal or a failure anywhere
+/// leaves NOTHING journaled or queued.
 async fn birth_live_run(
     state: &DispatcherState,
     route: &ArmedRoute,
@@ -2167,7 +2194,8 @@ async fn birth_live_run(
     execution_id: uuid::Uuid,
     arrive_by: i64,
     instance: Option<&weft_core::instance::InstanceId>,
-) -> Result<(), (StatusCode, String)> {
+    admission: &crate::entry_limits::Admission,
+) -> Result<Result<(), crate::entry_limits::Refused>, (StatusCode, String)> {
     let project_id = route.project_id;
     let definition_hash = &route.program.definition_hash;
     let project_def = state
@@ -2187,11 +2215,16 @@ async fn birth_live_run(
     // instance provides filled and valid, and finds that instance's infra up:
     // refused here, to the caller standing at the door, rather than
     // mid-run. The values read are the run's.
-    let instance_values = crate::api::project::refuse_instance_gaps(state, project_id, &project_def, &subgraph, instance)
-        .await
-        .map_err(<(StatusCode, String)>::from)?;
-    // The program's own connections, as this install picked them.
-    let picks = crate::api::project::picks_for_run(state, project_id, &project_def, &subgraph).await?;
+    // The program's own connections, as this install picked them. The two
+    // reads go out together: neither needs the other.
+    let (instance_values, picks) = tokio::try_join!(
+        async {
+            crate::api::project::refuse_instance_gaps(state, project_id, &project_def, &subgraph, instance)
+                .await
+                .map_err(<(StatusCode, String)>::from)
+        },
+        crate::api::project::picks_for_run(state, project_id, &project_def, &subgraph),
+    )?;
 
     let now = crate::lease::now_unix() as u64;
     // The fire's computed subgraph rides on ExecutionStarted: the
@@ -2247,7 +2280,7 @@ async fn birth_live_run(
 
     state
         .journal
-        .start_execution(&start, &kick_events, task, None)
+        .admit_and_start_execution(admission, &start, &kick_events, task)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live run birth: {e:#}")))
 }

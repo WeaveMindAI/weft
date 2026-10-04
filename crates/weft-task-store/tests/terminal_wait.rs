@@ -34,7 +34,7 @@ async fn terminal_ids(subscription: &mut Subscription) -> Vec<String> {
         match next.expect("the watch is running") {
             Heard::Signal { channel, payload } if channel == TERMINAL_CHANNEL => ids.push(payload.to_string()),
             Heard::Signal { .. } => {}
-            Heard::Recheck => panic!("a recheck would hide which notifications were sent"),
+            Heard::Recheck | Heard::Lost => panic!("a lost connection would hide which notifications were sent"),
         }
     }
     ids

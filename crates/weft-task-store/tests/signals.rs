@@ -77,7 +77,8 @@ async fn a_committed_notification_is_heard_and_a_rolled_back_one_never_is(pool: 
 }
 
 /// A dropped listening connection loses whatever was sent meanwhile, so
-/// every waiter is told to look again once it is back.
+/// every waiter is told it is lost, and to look again once it is back;
+/// whether it listens can be read in between.
 #[sqlx::test]
 async fn a_lost_connection_tells_every_waiter_to_recheck(pool: PgPool) {
     setup(&pool).await;
@@ -93,7 +94,11 @@ async fn a_lost_connection_tells_every_waiter_to_recheck(pool: PgPool) {
     .unwrap();
     assert_eq!(killed.len(), 1, "exactly one listening connection per watch");
     let next = tokio::time::timeout(Duration::from_secs(20), heard.next()).await.expect("heard in time");
+    assert_eq!(next.unwrap(), Heard::Lost);
+    assert!(!heard.listening(), "not listening while it is lost");
+    let next = tokio::time::timeout(Duration::from_secs(20), heard.next()).await.expect("heard in time");
     assert_eq!(next.unwrap(), Heard::Recheck);
+    assert!(heard.listening(), "listening again");
 }
 
 /// A task announces itself when it becomes claimable, and only then:

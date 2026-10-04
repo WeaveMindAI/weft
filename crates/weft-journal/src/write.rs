@@ -85,7 +85,9 @@ pub async fn record_event_in<'e, E: sqlx::PgExecutor<'e>>(
     Ok(())
 }
 
-/// THE insert every journal write makes. The per-execution lock is taken
+/// THE insert every journal write makes, through the database's
+/// `weft_journal_append` (the dispatcher's journal schema group), which a
+/// run's birth calls too. The per-execution lock is taken
 /// BEFORE any row's id is drawn, and held until the writing transaction
 /// ends, so the rows of one execution are numbered and committed in the
 /// same order: once a reader sees row N of an execution, every earlier row
@@ -114,36 +116,17 @@ async fn insert<'e, E: sqlx::PgExecutor<'e>>(
     let kinds: Vec<&str> = events.iter().map(|e| e.kind_str()).collect();
     let payloads: Vec<String> = events.iter().map(serde_json::to_string).collect::<Result<_, _>>()?;
     let now = unix_now()?;
-    let written = sqlx::query(
-        "WITH locked AS MATERIALIZED ( \
-             SELECT pg_advisory_xact_lock(hashtextextended($6, 0)) \
-         ) \
-         INSERT INTO exec_event (execution_id, kind, payload_json, created_at, replica, dedup_key) \
-         SELECT $1, e.kind, e.payload, $4, $5, $8 \
-         FROM locked, unnest($2::text[], $3::text[]) WITH ORDINALITY AS e(kind, payload, n) \
-         WHERE $7::text IS NULL \
-            OR EXISTS (SELECT 1 FROM execution x WHERE x.execution_id = $1 AND x.owner_replica = $7) \
-         ORDER BY e.n \
-         ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING",
-    )
-    .bind(execution_id.to_string())
-    .bind(&kinds)
-    .bind(&payloads)
-    .bind(now)
-    .bind(replica)
-    .bind(execution_id_lock_key(execution_id))
-    .bind(owner)
-    .bind(dedup_key)
-    .execute(executor)
-    .await?
-    .rows_affected();
-    Ok(written)
-}
-
-/// The advisory lock key of one execution's journal: the ONE definition,
-/// shared by [`lock_execution_ids`] and the lock every write here takes.
-fn execution_id_lock_key(execution_id: weft_core::ExecutionId) -> String {
-    format!("exec_event:{execution_id}")
+    let written: i64 = sqlx::query_scalar("SELECT weft_journal_append($1, $2, $3, $4, $5, $6, $7)")
+        .bind(execution_id.to_string())
+        .bind(&kinds)
+        .bind(&payloads)
+        .bind(now)
+        .bind(replica)
+        .bind(owner)
+        .bind(dedup_key)
+        .fetch_one(executor)
+        .await?;
+    Ok(written as u64)
 }
 
 /// Take the journal lock of every execution in `execution_ids`, held until the
@@ -159,10 +142,8 @@ pub async fn lock_execution_ids(
     sorted.sort_unstable();
     sorted.dedup();
     for execution_id in sorted {
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(execution_id_lock_key(execution_id))
-            .execute(&mut *tx)
-            .await?;
+        // The lock's key is spelled once, in the journal's schema.
+        sqlx::query("SELECT weft_lock_execution($1)").bind(execution_id.to_string()).execute(&mut *tx).await?;
     }
     Ok(())
 }

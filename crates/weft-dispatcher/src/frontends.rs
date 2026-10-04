@@ -19,7 +19,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use sqlx::PgPool;
-use weft_core::frontend::{AddFrontendRequest, Frontend, FrontendHost, FrontendWithToken, Repository};
+use weft_core::frontend::{AddFrontendRequest, AddedFrontend, Frontend, FrontendHost, FrontendWithToken, Repository};
 use weft_core::signal_token::MintTokenRequest;
 use weft_platform_traits::FrontendSite;
 
@@ -45,8 +45,9 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             service TEXT,
             url TEXT,
             -- The caller token it calls with (`signal_token.id`), and the
-            -- ones made to replace it and not put in place yet.
-            token_id UUID NOT NULL,
+            -- ones made to replace it and not put in place yet. NULL for a
+            -- hosted frontend until its deploy puts its first in place.
+            token_id UUID,
             pending_token_ids UUID[] NOT NULL DEFAULT '{}',
             added_unix BIGINT NOT NULL,
             PRIMARY KEY (project_id, name),
@@ -65,7 +66,7 @@ struct Row {
     repo_id: Option<i64>,
     service: Option<String>,
     url: Option<String>,
-    token_id: uuid::Uuid,
+    token_id: Option<uuid::Uuid>,
     pending_token_ids: Vec<uuid::Uuid>,
 }
 
@@ -215,16 +216,19 @@ async fn revoke_token(state: &DispatcherState, owner: &TenantId, id: uuid::Uuid)
     Ok(())
 }
 
-/// `POST /projects/{id}/frontends`: the frontend, its token (shown this
-/// once) and, for one the install hosts, its service. A step that fails
-/// takes back what the steps before it made: the service and the
-/// repository's access (unless another frontend uses it), then the token.
+/// `POST /projects/{id}/frontends`: the frontend and, for one the install
+/// hosts, its service; for one running elsewhere, its token (shown this
+/// once). A hosted one gets no token here: its deploy workflow puts its
+/// first in place (`weft target export` makes it), and one made now would
+/// be a working credential nobody holds. A step that fails takes back what
+/// the steps before it made: the service and the repository's access
+/// (unless another frontend uses it), then the token.
 pub async fn add(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
     Path(project): Path<uuid::Uuid>,
     Json(req): Json<AddFrontendRequest>,
-) -> Result<Json<FrontendWithToken>, (StatusCode, String)> {
+) -> Result<Json<AddedFrontend>, (StatusCode, String)> {
     authorize_project(&state, &caller.0, project).await?;
     req.validate().map_err(|why| (StatusCode::BAD_REQUEST, why))?;
     let taken = || {
@@ -237,7 +241,10 @@ pub async fn add(
         return Err(taken());
     }
     let owner = &caller.0;
-    let minted = mint_token(&state, owner, project, &req.name).await?;
+    let minted = match req.host {
+        FrontendHost::CloudRun => None,
+        FrontendHost::External => Some(mint_token(&state, owner, project, &req.name).await?),
+    };
     let mut frontend = Frontend {
         name: req.name.clone(),
         project,
@@ -245,7 +252,7 @@ pub async fn add(
         repo: req.repo.clone(),
         service: None,
         url: None,
-        token_id: minted.id,
+        token_id: minted.as_ref().map(|minted| minted.id),
         pending_token_ids: Vec::new(),
     };
     let site = site(&frontend);
@@ -272,7 +279,7 @@ pub async fn add(
     }
     .await;
     let failure = match made {
-        Ok(true) => return Ok(Json(FrontendWithToken { frontend, token: minted.token, token_id: minted.id })),
+        Ok(true) => return Ok(Json(AddedFrontend { frontend, token: minted.map(|minted| minted.token) })),
         Ok(false) => taken(),
         Err(e) => (StatusCode::BAD_GATEWAY, format!("add frontend '{}': {e:#}", req.name)),
     };
@@ -286,8 +293,10 @@ pub async fn add(
             ));
         }
     }
-    if let Err(undo) = revoke_token(&state, owner, minted.id).await {
-        msg.push_str(&format!("\n(and its token {} could not be revoked: {undo:#}; `weft token revoke {}` does it)", minted.id, minted.id));
+    if let Some(minted) = &minted {
+        if let Err(undo) = revoke_token(&state, owner, minted.id).await {
+            msg.push_str(&format!("\n(and its token {} could not be revoked: {undo:#}; `weft token revoke {}` does it)", minted.id, minted.id));
+        }
     }
     Err((status, msg))
 }
@@ -402,7 +411,7 @@ pub async fn token_done(
     authorize_project(&state, &caller.0, project).await?;
     let mut tx = state.pg_pool.begin().await.map_err(internal)?;
     lock_frontend(&mut tx, project, &name).await.map_err(internal)?;
-    let row: Option<(uuid::Uuid, Vec<uuid::Uuid>)> = sqlx::query_as(
+    let row: Option<(Option<uuid::Uuid>, Vec<uuid::Uuid>)> = sqlx::query_as(
         "SELECT token_id, pending_token_ids FROM project_frontend WHERE project_id = $1 AND name = $2",
     )
     .bind(project)
@@ -411,7 +420,7 @@ pub async fn token_done(
     .await
     .map_err(internal)?;
     let Some((current, pending)) = row else { return Err(not_found(&name)) };
-    if current == token {
+    if current == Some(token) {
         return Ok(StatusCode::NO_CONTENT);
     }
     if !pending.contains(&token) {
@@ -424,7 +433,7 @@ pub async fn token_done(
         .execute(&mut *tx)
         .await
         .map_err(internal)?;
-    let retired: Vec<uuid::Uuid> = std::iter::once(current).chain(pending).filter(|t| *t != token).collect();
+    let retired: Vec<uuid::Uuid> = current.into_iter().chain(pending).filter(|t| *t != token).collect();
     revoke_all(&state, &caller.0, &retired).await.map_err(internal)?;
     tx.commit().await.map_err(internal)?;
     Ok(StatusCode::NO_CONTENT)
@@ -531,7 +540,7 @@ async fn take_down(
             ));
         }
     }
-    let tokens: Vec<uuid::Uuid> = std::iter::once(frontend.token_id).chain(frontend.pending_token_ids).collect();
+    let tokens: Vec<uuid::Uuid> = frontend.token_id.into_iter().chain(frontend.pending_token_ids).collect();
     revoke_all(state, owner, &tokens).await?;
     forget(&mut *tx, project, name).await?;
     tx.commit().await?;

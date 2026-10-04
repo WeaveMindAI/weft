@@ -23,6 +23,7 @@ pub mod delivery;
 pub mod domains;
 pub mod door;
 pub mod frontends;
+pub mod held;
 pub mod holders;
 pub mod entry_limits;
 pub mod display_feeds;

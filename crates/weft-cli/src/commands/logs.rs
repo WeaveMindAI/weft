@@ -12,7 +12,7 @@
 use anyhow::Context;
 use weft_core::program::{ExecutionLogs, ExecutionSummary};
 
-use super::{local_time, resolve_project_id, Ctx};
+use super::{utc_time, resolve_project_id, Ctx};
 
 /// The nodes a run skipped, with why, spelled the way the program
 /// reads them (`keep.db` for the db of an included file) when the cwd
@@ -117,7 +117,7 @@ pub async fn run(ctx: Ctx, target: Option<String>, limit: Option<u32>) -> anyhow
             .inherited_from
             .map(|execution_id| format!(" [inherited from {}]", super::versions::short(&execution_id.to_string())))
             .unwrap_or_default();
-        println!("[{}] {level:>5}{node}{inherited} {msg}", local_time(entry.at_unix));
+        println!("[{}] {level:>5}{node}{inherited} {msg}", utc_time(entry.at_unix));
     }
     // The dispatcher answers the tail, so a full page means the run
     // may have written more than this; a cut log must never read as

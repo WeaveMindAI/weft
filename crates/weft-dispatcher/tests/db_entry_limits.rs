@@ -8,10 +8,37 @@
 
 use sqlx::PgPool;
 use weft_core::signal::{EntryLimits, ResolvedLimits};
-use weft_dispatcher::entry_limits::{self, Limited};
+use weft_dispatcher::entry_limits::{self, Admission, EdgeConfig, Limited, Refused};
 
 async fn setup(pool: &PgPool) {
     weft_dispatcher::app::apply_core_schema(pool).await.expect("core schema");
+}
+
+fn edge(invalid_tokens_per_minute: Option<u32>) -> EdgeConfig {
+    EdgeConfig {
+        trusted_proxy_hops: weft_platform_traits::config::ProxyHops { public: 1, outside: 1, domains: 2 },
+        invalid_tokens_per_minute,
+    }
+}
+
+/// One call by `caller` to the entry `tok`, admitted on its own.
+async fn call(pool: &PgPool, caller: &str, l: &ResolvedLimits, now: i64) -> Result<(), Refused> {
+    entry_limits::admit(pool, &Admission::call(&edge(None), None, "tok", caller, l, None, now)).await.expect("admit")
+}
+
+/// A slot of `tok` (at most `max` at once) taken for the run `execution_id`,
+/// holding until `unborn_until` if it never starts.
+async fn take(pool: &PgPool, execution_id: &str, max: u32, unborn_until: i64, now: i64) -> Result<(), Refused> {
+    let l = limits(None, None, Some(max));
+    entry_limits::admit(pool, &Admission::call(&edge(None), None, "tok", "ip:a", &l, Some((execution_id, unborn_until)), now))
+        .await
+        .expect("take")
+}
+
+/// Whether `tok` has no room for one more run, taking nothing.
+async fn full(pool: &PgPool, max: u32, now: i64) -> bool {
+    let l = limits(None, None, Some(max));
+    entry_limits::admit(pool, &Admission::call(&edge(None), None, "tok", "ip:a", &l, None, now)).await.expect("check").is_err()
 }
 
 fn limits(per_caller: Option<u32>, per_entry: Option<u32>, at_once: Option<u32>) -> ResolvedLimits {
@@ -31,7 +58,7 @@ async fn concurrent_callers_across_replicas_share_one_count(pool: PgPool) {
     for i in 0..80 {
         let p = if i % 2 == 0 { pool.clone() } else { other_replica.clone() };
         calls.push(tokio::spawn(async move {
-            entry_limits::admit_call(&p, "tok", &format!("ip:10.0.0.{i}"), &l, now).await.expect("count")
+            call(&p, &format!("ip:10.0.0.{i}"), &l, now).await
         }));
     }
     let mut admitted = 0;
@@ -55,12 +82,12 @@ async fn one_caller_is_limited_alone_and_only_for_the_minute(pool: PgPool) {
     let l = limits(Some(2), None, None);
     let now = 600;
     for _ in 0..2 {
-        entry_limits::admit_call(&pool, "tok", "ip:a", &l, now).await.unwrap().unwrap();
+        call(&pool, "ip:a", &l, now).await.unwrap();
     }
-    let refused = entry_limits::admit_call(&pool, "tok", "ip:a", &l, now).await.unwrap().unwrap_err();
+    let refused = call(&pool, "ip:a", &l, now).await.unwrap_err();
     assert_eq!(refused.reason, Limited::PerCaller);
-    entry_limits::admit_call(&pool, "tok", "ip:b", &l, now).await.unwrap().expect("another caller");
-    entry_limits::admit_call(&pool, "tok", "ip:a", &l, now + 60).await.unwrap().expect("the next minute");
+    call(&pool, "ip:b", &l, now).await.expect("another caller");
+    call(&pool, "ip:a", &l, now + 60).await.expect("the next minute");
 }
 
 /// A fire the entry picked up itself counts once, however often its
@@ -91,7 +118,7 @@ async fn an_entry_with_every_limit_off_admits_everything(pool: PgPool) {
     let l = limits(None, None, None);
     assert_eq!(l, ResolvedLimits { per_caller_per_minute: None, per_minute: None, at_once: None });
     for _ in 0..200 {
-        entry_limits::admit_call(&pool, "tok", "ip:a", &l, 60).await.unwrap().unwrap();
+        call(&pool, "ip:a", &l, 60).await.unwrap();
     }
 }
 
@@ -106,7 +133,7 @@ async fn at_once_slots_hold_under_contention_and_free_up(pool: PgPool) {
     for i in 0..40 {
         let p = pool.clone();
         takes.push(tokio::spawn(async move {
-            entry_limits::take_slot(&p, "tok", &format!("execution_id-{i}"), 10, now + 100, now).await.expect("take")
+            take(&p, &format!("execution_id-{i}"), 10, now + 100, now).await
         }));
     }
     let mut taken = Vec::new();
@@ -117,17 +144,14 @@ async fn at_once_slots_hold_under_contention_and_free_up(pool: PgPool) {
     }
     assert_eq!(taken.len(), 10);
     let first = format!("execution_id-{}", taken[0]);
-    entry_limits::take_slot(&pool, "tok", &first, 10, now + 100, now)
-        .await
-        .unwrap()
-        .expect("a retry of a run holding a slot keeps it");
-    assert!(entry_limits::at_once_full(&pool, "tok", 10, now).await.unwrap().is_some());
+    take(&pool, &first, 10, now + 100, now).await.expect("a retry of a run holding a slot keeps it");
+    assert!(full(&pool, 10, now).await);
     entry_limits::release_slot(&pool, &first).await.unwrap();
-    assert!(entry_limits::at_once_full(&pool, "tok", 10, now).await.unwrap().is_none());
+    assert!(!full(&pool, 10, now).await);
     // Every remaining slot is a run that never started: past its expiry
     // none counts, so the next take finds the entry free.
-    assert!(entry_limits::at_once_full(&pool, "tok", 10, now + 101).await.unwrap().is_none());
-    entry_limits::take_slot(&pool, "tok", "late", 1, now + 300, now + 101).await.unwrap().expect("abandoned slots stop counting");
+    assert!(!full(&pool, 10, now + 101).await);
+    take(&pool, "late", 1, now + 300, now + 101).await.expect("abandoned slots stop counting");
 }
 
 /// A run that started keeps its slot past the unborn expiry until it ends.
@@ -141,12 +165,12 @@ async fn a_started_run_keeps_its_slot_until_it_ends(pool: PgPool) {
     .execute(&pool)
     .await
     .unwrap();
-    entry_limits::take_slot(&pool, "tok", "born", 1, 10, 0).await.unwrap().unwrap();
-    assert!(entry_limits::at_once_full(&pool, "tok", 1, 1_000).await.unwrap().is_some());
+    take(&pool, "born", 1, 10, 0).await.unwrap();
+    assert!(full(&pool, 1, 1_000).await);
     entry_limits::sweep(&pool, 1_000).await.unwrap();
-    assert!(entry_limits::take_slot(&pool, "tok", "other", 1, 2_000, 1_000).await.unwrap().is_err());
+    assert!(take(&pool, "other", 1, 2_000, 1_000).await.is_err());
     entry_limits::release_slot(&pool, "born").await.unwrap();
-    entry_limits::take_slot(&pool, "tok", "other", 1, 2_000, 1_000).await.unwrap().unwrap();
+    take(&pool, "other", 1, 2_000, 1_000).await.unwrap();
 }
 
 /// A run that ended frees its slot even when its cleanup never released
@@ -161,9 +185,9 @@ async fn the_sweep_frees_the_slot_of_a_run_that_ended(pool: PgPool) {
     .execute(&pool)
     .await
     .unwrap();
-    entry_limits::take_slot(&pool, "tok", "ended", 1, 10, 0).await.unwrap().unwrap();
+    take(&pool, "ended", 1, 10, 0).await.unwrap();
     entry_limits::sweep(&pool, 1_000).await.unwrap();
-    assert!(entry_limits::at_once_full(&pool, "tok", 1, 1_000).await.unwrap().is_some(), "a live run keeps it");
+    assert!(full(&pool, 1, 1_000).await, "a live run keeps it");
     sqlx::query(
         "INSERT INTO exec_event (execution_id, kind, payload_json, created_at) VALUES ('ended', 'execution_completed', '{}', 0)",
     )
@@ -171,7 +195,7 @@ async fn the_sweep_frees_the_slot_of_a_run_that_ended(pool: PgPool) {
     .await
     .unwrap();
     entry_limits::sweep(&pool, 1_000).await.unwrap();
-    entry_limits::take_slot(&pool, "tok", "next", 1, 2_000, 1_000).await.unwrap().unwrap();
+    take(&pool, "next", 1, 2_000, 1_000).await.unwrap();
 }
 
 /// An address past the bound of refused tokens is blocked for the rest of
@@ -179,7 +203,7 @@ async fn the_sweep_frees_the_slot_of_a_run_that_ended(pool: PgPool) {
 #[sqlx::test]
 async fn token_guessing_blocks_the_address_for_the_minute(pool: PgPool) {
     setup(&pool).await;
-    let edge = entry_limits::EdgeConfig { trusted_proxy_hops: weft_platform_traits::config::ProxyHops { public: 1, outside: 1, domains: 2 }, invalid_tokens_per_minute: Some(3) };
+    let edge = edge(Some(3));
     let addr: std::net::IpAddr = "203.0.113.9".parse().unwrap();
     for _ in 0..3 {
         assert!(entry_limits::token_guessing_blocked(&pool, &edge, addr, 120).await.unwrap().is_none());
@@ -188,8 +212,32 @@ async fn token_guessing_blocks_the_address_for_the_minute(pool: PgPool) {
     let blocked = entry_limits::token_guessing_blocked(&pool, &edge, addr, 150).await.unwrap().expect("blocked");
     assert_eq!(blocked.retry_after_secs, 30);
     assert!(entry_limits::token_guessing_blocked(&pool, &edge, addr, 180).await.unwrap().is_none());
-    let off = entry_limits::EdgeConfig { trusted_proxy_hops: weft_platform_traits::config::ProxyHops { public: 1, outside: 1, domains: 2 }, invalid_tokens_per_minute: None };
-    assert!(entry_limits::token_guessing_blocked(&pool, &off, addr, 150).await.unwrap().is_none());
+    assert!(entry_limits::token_guessing_blocked(&pool, &self::edge(None), addr, 150).await.unwrap().is_none());
+}
+
+/// A live call's admission checks the address the door's guard left to
+/// it (`/connect/`), before it counts or takes anything: a blocked
+/// address is refused and spends none of the entry's allowance.
+#[sqlx::test]
+async fn a_blocked_address_is_refused_by_the_calls_admission(pool: PgPool) {
+    setup(&pool).await;
+    let edge = edge(Some(1));
+    let addr: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+    let l = limits(Some(5), None, Some(1));
+    let admit = |execution_id: &'static str| {
+        let (pool, edge, l) = (pool.clone(), edge.clone(), l.clone());
+        async move {
+            entry_limits::admit(&pool, &Admission::call(&edge, Some(addr), "tok", "ip:a", &l, Some((execution_id, 500)), 120))
+                .await
+                .expect("admit")
+        }
+    };
+    entry_limits::note_invalid_token(&pool, &edge, addr, 120).await.unwrap();
+    let refused = admit("first").await.unwrap_err();
+    assert_eq!(refused.reason, Limited::InvalidTokens);
+    assert!(!full(&pool, 1, 120).await, "a blocked call took no slot");
+    let unblocked = Admission::call(&self::edge(None), Some(addr), "tok", "ip:a", &l, Some(("second", 500)), 120);
+    entry_limits::admit(&pool, &unblocked).await.unwrap().expect("with the bound off the address is not checked");
 }
 
 /// Refusals are counted per entry and limit for `weft status`.
@@ -217,7 +265,7 @@ async fn an_ended_unrecorded_run_stops_counting(pool: PgPool) {
     .execute(&pool)
     .await
     .unwrap();
-    entry_limits::take_slot(&pool, "tok", "quiet", 1, 10_000, 0).await.unwrap().unwrap();
-    assert!(entry_limits::at_once_full(&pool, "tok", 1, 6).await.unwrap().is_none(), "it ended");
-    entry_limits::take_slot(&pool, "tok", "next", 1, 10_000, 6).await.unwrap().expect("its slot is free");
+    take(&pool, "quiet", 1, 10_000, 0).await.unwrap();
+    assert!(!full(&pool, 1, 6).await, "it ended");
+    take(&pool, "next", 1, 10_000, 6).await.expect("its slot is free");
 }

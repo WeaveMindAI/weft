@@ -59,6 +59,21 @@ pub trait JournalClient: Send + Sync {
         Ok(())
     }
 
+    /// How a write of `events` goes out: the parts, in order, each sent in
+    /// one request, so a writer that sends a write again can send only the
+    /// part that failed. One part by default.
+    fn parts<'e>(&self, events: &'e [ExecEvent]) -> anyhow::Result<Vec<&'e [ExecEvent]>> {
+        Ok(vec![events])
+    }
+
+    /// Whether a failed write of one part never reached the journal (the
+    /// connection itself could not be made), so sending it again cannot
+    /// record its rows twice. Never, by default: a write that may have
+    /// landed is not sent again.
+    fn never_reached(&self, _error: &anyhow::Error) -> bool {
+        false
+    }
+
     /// The rows of `execution_id` after `after_id`, in order, as RAW payload
     /// strings, holding up to `wait` for at least one to exist (a zero
     /// `wait` answers at once; empty when none came). An execution's rows

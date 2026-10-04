@@ -50,8 +50,8 @@ Every queued run also carries a key that turns a duplicate into a no-op, so work
 queued twice runs once. A run whose claim ran out may be half done, and the next worker may redo
 part of the runtime's own bookkeeping for it, which is why every step the
 runtime takes has to be safe to run twice. Your nodes are different: a node
-that was running when its worker died is failed, never run again (go and read
-[surviving a restart](../nodes/durable-execution.md#when-the-worker-dies-mid-step)).
+whose start is on record when its worker died is failed, never run again (go
+and read [surviving a restart](../nodes/durable-execution.md#when-the-worker-dies-mid-step)).
 
 ## What happens when an event arrives
 
@@ -97,6 +97,17 @@ a compiled definition.
 
 The next request may land on another copy of the dispatcher, so it keeps
 nothing in memory that another copy would need.
+
+What it does keep is a copy of the rows a call reads every time and that
+rarely change: a tenant's routes, the install's domains, a project's worker
+settings, which of its infrastructure is up. Every write to those rows makes
+Postgres tell every copy of the dispatcher, which drops what it held and reads
+it again on the next call, and anything it is about to refuse (no such route,
+infrastructure not running) it checks against the rows first. While its
+connection that hears those announcements is down, it keeps nothing and reads
+every time. So a live call
+reaches the database once before the worker has it: one call that checks the
+route's limits and writes the run down together.
 
 ## The listener
 

@@ -172,9 +172,12 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         println!("  triggers:");
         for entry in &data.activations {
             let (trigger, mode) = (&entry.trigger, entry.mode.as_str());
+            // Which version of the source its fires run, as `weft tree`
+            // names it.
+            let version = entry.version.as_deref().map(|v| format!(", version {}", super::versions::short(v))).unwrap_or_default();
             match &entry.instance {
-                Some(instance) => println!("    {trigger} (instance {instance}): {mode}"),
-                None => println!("    {trigger}: {mode}"),
+                Some(instance) => println!("    {trigger} (instance {instance}): {mode}{version}"),
+                None => println!("    {trigger}: {mode}{version}"),
             }
             // Fires parked until the instance is given a value they
             // need: its next change of values routes them again.

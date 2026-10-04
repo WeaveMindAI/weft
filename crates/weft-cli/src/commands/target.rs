@@ -361,7 +361,7 @@ async fn export(
         for id in &stale {
             println!("an earlier export's key {id} still works; once these are in place: weft token revoke {id} --on {name}");
         }
-        if let Some((_, frontend, _)) = &minted.frontend {
+        if let Some(frontend) = deployed_before(&minted, frontend) {
             println!(
                 "frontend '{frontend}' keeps its old token working until the deploy workflow puts the new one in place and retires it"
             );
@@ -380,7 +380,7 @@ async fn export(
     // terminal, its name included.
     println!("  secrets  {} set", settings.secrets.len());
     println!("run its deploy workflow from the Actions tab");
-    if let Some((_, frontend, _)) = &minted.frontend {
+    if let Some(frontend) = deployed_before(&minted, frontend) {
         println!("frontend '{frontend}' keeps its old token working until that run deploys the new one and retires it");
     }
     // The repository now holds the new keys, so an earlier export's are
@@ -572,6 +572,14 @@ async fn mint_ci_keys(
         }
     };
     Ok((CiKeys { operator_key, frontend, front_env }, made))
+}
+
+/// The frontend this export made a new token for, when it already calls
+/// with one: that one keeps working until the new one is in place. A
+/// hosted frontend never deployed has none, so nothing is kept.
+fn deployed_before<'a>(minted: &'a Minted, frontend: Option<&weft_core::frontend::Frontend>) -> Option<&'a str> {
+    let (_, name, _) = minted.frontend.as_ref()?;
+    frontend.is_some_and(|f| f.token_id.is_some()).then_some(name.as_str())
 }
 
 /// The frontend an export hands the workflow: its name, its service, and
@@ -891,7 +899,7 @@ mod tests {
             repo: repo.map(|r| weft_core::frontend::Repository { name: r.into(), id: if r == "me/shop" { 1 } else { 2 } }),
             service: Some(format!("fe-{name}")),
             url: None,
-            token_id: uuid::Uuid::nil(),
+            token_id: Some(uuid::Uuid::nil()),
             pending_token_ids: Vec::new(),
         };
         let all = [

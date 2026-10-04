@@ -193,6 +193,20 @@ pub fn as_recorded(events: Vec<ExecEvent>) -> Vec<ExecEvent> {
 
 #[async_trait]
 impl JournalClient for UnrecordedJournal {
+    /// One row per part: rows are held in memory, so cutting costs
+    /// nothing, and a cost that fails to reach the real journal leaves
+    /// nothing of its part held, so sending the part again holds nothing
+    /// twice.
+    fn parts<'e>(&self, events: &'e [ExecEvent]) -> anyhow::Result<Vec<&'e [ExecEvent]>> {
+        Ok(events.chunks(1).collect())
+    }
+
+    /// Only a cost goes to the real journal; whether it never reached it is
+    /// the real journal's to say.
+    fn never_reached(&self, error: &anyhow::Error) -> bool {
+        self.real.never_reached(error)
+    }
+
     async fn record_event(&self, event: &ExecEvent, replica: Option<&str>) -> anyhow::Result<()> {
         anyhow::ensure!(
             event.execution_id() == self.execution_id,
@@ -279,6 +293,8 @@ pub async fn record_retroactively(
         "the record of unrecorded run {execution_id} carries rows of another run"
     );
     let mut tx = pool.begin().await?;
+    // The execution's lock before the row lock below, which is a write.
+    // SYNC: execution lock before first write <-> crates/weft-dispatcher/src/settled.rs (the list)
     crate::write::lock_execution_ids(&mut tx, &[execution_id]).await?;
     let row: Option<(uuid::Uuid, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT project_id, fired_by, instance_id FROM execution WHERE execution_id = $1 AND kind = $2 FOR UPDATE",
@@ -412,12 +428,24 @@ mod tests {
         written: Mutex<Vec<ExecEvent>>,
         recorded: Mutex<Option<Vec<ExecEvent>>>,
         forgotten: Mutex<bool>,
+        /// Writes still to fail as if the journal could not be reached.
+        unreachable: Mutex<usize>,
     }
     #[async_trait]
     impl JournalClient for Real {
         async fn record_event(&self, event: &ExecEvent, _: Option<&str>) -> anyhow::Result<()> {
+            {
+                let mut left = self.unreachable.lock().unwrap();
+                if *left > 0 {
+                    *left -= 1;
+                    anyhow::bail!("unreachable");
+                }
+            }
             self.written.lock().unwrap().push(event.clone());
             Ok(())
+        }
+        fn never_reached(&self, error: &anyhow::Error) -> bool {
+            error.to_string() == "unreachable"
         }
         async fn raw_rows_after(&self, _: ExecutionId, _: i64, _: Duration) -> anyhow::Result<Vec<RawJournalRow>> {
             Ok(Vec::new())
@@ -500,6 +528,25 @@ mod tests {
         tokio::task::yield_now().await;
         journal.record_event(&ExecEvent::ExecutionCompleted { execution_id, at_unix: 3 }, None).await.unwrap();
         assert_eq!(reader.await.unwrap().unwrap().len(), 1);
+    }
+
+    /// A writer that sends a part again sends one row at a time here, and
+    /// hears from the real journal whether a cost never reached it; a cost
+    /// that failed holds nothing, so sending it again holds it once.
+    #[tokio::test]
+    async fn a_cost_that_never_reached_the_journal_can_be_sent_again() {
+        let execution_id = ExecutionId::new_v4();
+        let real = Arc::new(Real::default());
+        *real.unreachable.lock().unwrap() = 1;
+        let journal = UnrecordedJournal::seeded(execution_id, birth(execution_id), real.clone()).unwrap();
+        let rows = [cost(execution_id), ExecEvent::ExecutionCompleted { execution_id, at_unix: 3 }];
+        assert_eq!(journal.parts(&rows).unwrap().len(), 2, "one row per part");
+        let failed = journal.record_event(&rows[0], None).await.unwrap_err();
+        assert!(journal.never_reached(&failed), "the real journal says it never got there");
+        assert_eq!(journal.rows_after(execution_id, 2, Duration::ZERO).await.unwrap().len(), 0, "nothing held");
+        journal.record_event(&rows[0], None).await.unwrap();
+        assert_eq!(real.written.lock().unwrap().len(), 1);
+        assert_eq!(journal.rows_after(execution_id, 2, Duration::ZERO).await.unwrap().len(), 1, "held once");
     }
 
     #[tokio::test]

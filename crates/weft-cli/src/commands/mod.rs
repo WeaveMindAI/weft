@@ -524,37 +524,35 @@ pub fn resolve_project(
     ))
 }
 
-/// A journal unix stamp as the local wall-clock time a person reads
-/// (`2026-09-02 21:36:47`), the one rendering every listing verb uses
-/// so a run's start, its events and its log lines line up by eye.
-/// Zero (a row that never carried a stamp) renders as a dash rather
-/// than as 1970.
-pub fn local_time(unix_secs: u64) -> String {
+/// A journal unix stamp as the UTC time a person reads
+/// (`2026-09-02 21:36:47 UTC`), the one rendering every listing verb
+/// uses so a run's start, its events and its log lines line up by eye,
+/// with the install's own logs too, wherever the install runs. Zero (a
+/// row that never carried a stamp) renders as a dash rather than as
+/// 1970.
+pub fn utc_time(unix_secs: u64) -> String {
     if unix_secs == 0 {
         return "-".to_string();
     }
     // A stamp too large for the calendar prints as its number rather
     // than as a wrapped-around date.
     match i64::try_from(unix_secs).ok().and_then(|s| chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0)) {
-        Some(t) => t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string(),
+        Some(t) => t.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
         None => unix_secs.to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{local_time, resolve_dispatcher_url, Project};
+    use super::{utc_time, resolve_dispatcher_url, Project};
 
     /// The stamp renders as a date and a time, and the two sentinels
     /// (zero, out of range) never render as a bogus date.
     #[test]
-    fn renders_a_readable_local_time() {
-        let text = local_time(1_756_838_207);
-        assert_eq!(text.len(), "2026-09-02 21:36:47".len(), "{text}");
-        assert_eq!(&text[4..5], "-");
-        assert_eq!(&text[10..11], " ");
-        assert_eq!(local_time(0), "-");
-        assert_eq!(local_time(u64::MAX), u64::MAX.to_string());
+    fn renders_a_readable_utc_time() {
+        assert_eq!(utc_time(1_756_838_207), "2025-09-02 18:36:47 UTC");
+        assert_eq!(utc_time(0), "-");
+        assert_eq!(utc_time(u64::MAX), u64::MAX.to_string());
     }
 
     fn project_with_prod() -> (tempfile::TempDir, Project) {

@@ -10,7 +10,8 @@
 //! poll.
 //!
 //! A notification sent while the listening connection is down is lost,
-//! so a reconnect tells every waiter to read its row again: nothing that
+//! so the watch says when it loses the connection ([`Heard::Lost`]) and a
+//! reconnect tells every waiter to read its row again: nothing that
 //! changed during the gap is missed. The row is the truth; a
 //! notification only says when to look. Every waiter follows the same
 //! recipe: subscribe, read the row, wait for a signal that concerns it
@@ -26,6 +27,7 @@
 //! cannot listen is refused at once, naming the fix, rather than leaving
 //! every waiter to sleep to its deadline.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -45,6 +47,11 @@ pub const MAX_HOLD: Duration = Duration::from_secs(25);
 pub enum Heard {
     Signal { channel: &'static str, payload: Arc<str> },
     Recheck,
+    /// The listening connection is gone: nothing is heard until a
+    /// [`Heard::Recheck`] says it listens again. A waiter that reads its
+    /// row anyway has nothing to do; a copy of rows kept in memory
+    /// (`crate::held_copy`) stops trusting itself until then.
+    Lost,
 }
 
 /// How many signals a slow waiter may fall behind by before it is told
@@ -74,6 +81,11 @@ pub struct PgSignalWatch {
     /// sender, so if the pump ever stops, every waiter hears `Closed`
     /// and fails loudly instead of sleeping to its deadline.
     template: Mutex<broadcast::Receiver<Heard>>,
+    /// Whether the watch listens right now: cleared before
+    /// [`Heard::Lost`] goes out, set again before the [`Heard::Recheck`]
+    /// that follows a reconnect. A subscriber that fell behind and missed
+    /// either reads the state here.
+    listening: Arc<AtomicBool>,
     /// The listening task. It lives exactly as long as the watch: when
     /// the process part that owns the watch goes, so does its connection
     /// (a test's database cannot be dropped while it is held).
@@ -100,8 +112,9 @@ impl PgSignalWatch {
             .await?;
         let listener = listen(&own, channels).await?;
         let (tx, template) = broadcast::channel(FANOUT_CAPACITY);
-        let pump = tokio::spawn(pump(listener, own, channels, tx));
-        Ok(Arc::new(Self { channels, template: Mutex::new(template), pump }))
+        let listening = Arc::new(AtomicBool::new(true));
+        let pump = tokio::spawn(pump(listener, own, channels, tx, listening.clone()));
+        Ok(Arc::new(Self { channels, template: Mutex::new(template), listening, pump }))
     }
 
     /// Subscribe BEFORE reading the row: a change that lands between the
@@ -109,6 +122,7 @@ impl PgSignalWatch {
     pub fn subscribe(&self) -> Subscription {
         Subscription {
             rx: self.template.lock().expect("the template receiver is never poisoned").resubscribe(),
+            listening: self.listening.clone(),
         }
     }
 
@@ -129,13 +143,28 @@ impl PgSignalWatch {
 /// One waiter's view of the watch.
 pub struct Subscription {
     rx: broadcast::Receiver<Heard>,
+    listening: Arc<AtomicBool>,
 }
 
 /// Any source of what a watch hears; a test drives a waiter by sending
-/// into the other end.
+/// into the other end. It counts as listening.
 impl From<broadcast::Receiver<Heard>> for Subscription {
     fn from(rx: broadcast::Receiver<Heard>) -> Self {
-        Self { rx }
+        Self::with_listening(rx, Arc::new(AtomicBool::new(true)))
+    }
+}
+
+impl Subscription {
+    /// A subscription whose watch's listening state is `listening` (a
+    /// test sets it as a watch's pump would).
+    pub fn with_listening(rx: broadcast::Receiver<Heard>, listening: Arc<AtomicBool>) -> Self {
+        Self { rx, listening }
+    }
+
+    /// Whether the watch listens right now (see [`PgSignalWatch`]'s
+    /// `listening`).
+    pub fn listening(&self) -> bool {
+        self.listening.load(Ordering::Acquire)
     }
 }
 
@@ -193,6 +222,8 @@ impl Subscription {
 fn wakes(heard: &Heard, concerns: &impl Fn(&str, &str) -> bool) -> bool {
     match heard {
         Heard::Recheck => true,
+        // The recheck that follows a reconnect is what wakes the waiter.
+        Heard::Lost => false,
         Heard::Signal { channel, payload } => concerns(channel, payload),
     }
 }
@@ -237,6 +268,7 @@ async fn pump(
     own: PgPool,
     channels: &'static [&'static str],
     tx: broadcast::Sender<Heard>,
+    listening: Arc<AtomicBool>,
 ) {
     loop {
         let e = hear(&mut listener, channels, &tx).await;
@@ -249,6 +281,8 @@ async fn pump(
         // one could never get it while it lives.
         tracing::warn!(target: "weft_task_store::pg_signal", error = %e, "signal listener failed; listening again");
         drop(listener);
+        listening.store(false, Ordering::Release);
+        let _ = tx.send(Heard::Lost);
         listener = loop {
             tokio::time::sleep(RETRY_DELAY).await;
             match listen(&own, channels).await {
@@ -256,6 +290,7 @@ async fn pump(
                 Err(e) => tracing::warn!(target: "weft_task_store::pg_signal", error = %e, "signal listener cannot listen yet"),
             }
         };
+        listening.store(true, Ordering::Release);
         let _ = tx.send(Heard::Recheck);
     }
 }
@@ -282,10 +317,12 @@ async fn hear(
                     ),
                 }
             }
-            // The connection dropped and the listener has already made a
-            // fresh one and listened again; what changed in between was
-            // not heard.
-            Ok(None) => { let _ = tx.send(Heard::Recheck); }
+            // The connection dropped. The listener would make a fresh one
+            // on its next call, unannounced and without proving it hears,
+            // so it is handed back as a failure: the pump says the
+            // connection is lost, listens again the way it first did, and
+            // tells everyone to look again.
+            Ok(None) => return sqlx::Error::Io(std::io::Error::other("the listening connection dropped")),
             Err(e) => return e,
         }
     }
