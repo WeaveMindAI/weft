@@ -280,6 +280,12 @@ impl JournalClient for BrokerJournalClient {
         event: &ExecEvent,
         replica: Option<&str>,
     ) -> Result<()> {
+        self.record_events(std::slice::from_ref(event), replica).await
+    }
+
+    /// One request per run of events that fits the broker's body limit,
+    /// sent in order: usually one for all of them.
+    async fn record_events(&self, events: &[ExecEvent], replica: Option<&str>) -> Result<()> {
         // The broker journal path is worker-only: every write is
         // fenced by the writer's process. A `None` here is a contract
         // violation (only the dispatcher's in-process writer is
@@ -288,11 +294,10 @@ impl JournalClient for BrokerJournalClient {
         let replica = replica.ok_or_else(|| {
             anyhow::anyhow!("broker journal write requires the writing replica (worker-only path)")
         })?;
-        let req = JournalRecordRequest {
-            event: event.clone(),
-            replica: replica.to_string(),
-        };
-        let _: JournalRecordResponse = self.http.post("/v1/journal/record", &req).await?;
+        for chunk in record_chunks(events)? {
+            let req = JournalRecordRequest { events: chunk.to_vec(), replica: replica.to_string() };
+            let _: JournalRecordResponse = self.http.post("/v1/journal/record", &req).await?;
+        }
         Ok(())
     }
 
@@ -1220,5 +1225,65 @@ mod read_retry_tests {
         .await;
         assert!(answer.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+/// `events` cut, in order, into runs whose request bodies stay under
+/// [`JOURNAL_RECORD_BODY_LIMIT`]. An event too big on its own goes alone,
+/// and the broker refuses it (`413`): the engine refuses an output that
+/// big at the node first, so reaching that refusal is a broken contract.
+fn record_chunks(events: &[ExecEvent]) -> Result<Vec<&[ExecEvent]>> {
+    // Room for the request's own fields around the events.
+    const ENVELOPE: usize = 1024;
+    let mut chunks = Vec::new();
+    let (mut start, mut size) = (0, ENVELOPE);
+    for (i, event) in events.iter().enumerate() {
+        let weight = serde_json::to_vec(event)?.len() + 1;
+        if i > start && size + weight > JOURNAL_RECORD_BODY_LIMIT {
+            chunks.push(&events[start..i]);
+            (start, size) = (i, ENVELOPE);
+        }
+        size += weight;
+    }
+    if start < events.len() {
+        chunks.push(&events[start..]);
+    }
+    Ok(chunks)
+}
+
+#[cfg(test)]
+mod record_chunk_tests {
+    use super::*;
+
+    fn emitted(execution_id: ExecutionId, bytes: usize) -> ExecEvent {
+        ExecEvent::LogLine {
+            execution_id,
+            node_id: "n".into(),
+            frames: Vec::new(),
+            level: "info".into(),
+            message: "x".repeat(bytes),
+            at_unix_ms: None,
+            seq: None,
+            at_unix: 0,
+        }
+    }
+
+    /// Small rows go in one request; rows that would overflow the broker's
+    /// limit start the next one, in order, and one too big alone still
+    /// goes, by itself, for the broker to refuse by name.
+    #[test]
+    fn rows_are_cut_under_the_body_limit_in_order() {
+        let run = ExecutionId::new_v4();
+        let small: Vec<ExecEvent> = (0..10).map(|_| emitted(run, 10)).collect();
+        assert_eq!(record_chunks(&small).unwrap().len(), 1);
+
+        let half = JOURNAL_RECORD_BODY_LIMIT / 2;
+        let big = vec![emitted(run, half), emitted(run, half), emitted(run, 10)];
+        let chunks = record_chunks(&big).unwrap();
+        assert_eq!(chunks.iter().map(|c| c.len()).collect::<Vec<_>>(), [1, 2]);
+
+        let huge = vec![emitted(run, JOURNAL_RECORD_BODY_LIMIT * 2)];
+        assert_eq!(record_chunks(&huge).unwrap().len(), 1);
+        assert!(record_chunks(&[]).unwrap().is_empty());
     }
 }

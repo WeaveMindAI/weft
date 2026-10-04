@@ -16,7 +16,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use weft_core::run_class::RunClass;
-use weft_task_store::tasks::{self, claim_one, ClaimFilter, LiveAdmitOutcome};
+use weft_task_store::tasks::{self, claim_one, ClaimFilter};
 use weft_task_store::{TaskKind, TaskTarget};
 
 use support::setup;
@@ -60,7 +60,9 @@ fn execute(execution_id: &str, run_class: &str) -> tasks::NewTask {
     }
 }
 
-fn live_payload(execution_id: &str) -> Value {
+/// A live run born at its caller's handshake, waiting for them until
+/// `arrive_by`.
+fn live_payload(execution_id: &str, arrive_by: i64) -> Value {
     json!({
         "project_id": PROJECT,
         "execution_id": execution_id,
@@ -68,21 +70,20 @@ fn live_payload(execution_id: &str) -> Value {
         "run_class": "short",
         "live_connection": {
             "spec": { "kind": "socket", "config": {} },
-            "request": { "method": "GET", "path": "" }
+            "request": { "method": "GET", "path": "" },
+            "arrive_by": arrive_by
         }
     })
 }
 
-async fn admit(pool: &PgPool, execution_id: &str, replica: &str) -> LiveAdmitOutcome {
-    let mut tx = pool.begin().await.unwrap();
-    let spec = tasks::NewTask {
-        target_replica: Some(replica.to_string()),
-        payload: live_payload(execution_id),
-        ..execute(execution_id, "short")
-    };
-    let outcome = tasks::admit_live_execution_in(&mut tx, &spec).await.expect("admit");
-    tx.commit().await.unwrap();
-    outcome
+/// Queue the execute task of a live run whose caller is on the way.
+async fn born_for_a_caller(pool: &PgPool, execution_id: &str, arrive_by: i64) -> Uuid {
+    let spec = tasks::NewTask { payload: live_payload(execution_id, arrive_by), ..execute(execution_id, "short") };
+    tasks::enqueue_dedup(pool, spec).await.unwrap().id()
+}
+
+fn far_future() -> i64 {
+    i64::MAX / 2
 }
 
 fn execution_id_filter(execution_id: &str) -> ClaimFilter {
@@ -192,12 +193,13 @@ async fn a_lapsed_claim_is_delivered_again(pool: PgPool) {
     assert_eq!(execution_id_owner(&pool, &execution_id).await.as_deref(), Some("worker-b"), "ownership follows the claim");
 }
 
-/// A live run pinned to its worker is never delivered.
+/// A live run waiting for its caller is never delivered: only the worker
+/// the caller reaches claims it.
 #[sqlx::test]
-async fn a_delivery_skips_pinned_runs(pool: PgPool) {
+async fn a_delivery_skips_runs_waiting_for_their_caller(pool: PgPool) {
     setup(&pool).await;
-    let pinned = Uuid::new_v4().to_string();
-    assert_eq!(admit(&pool, &pinned, "worker-a").await, LiveAdmitOutcome::Admitted);
+    let live = Uuid::new_v4().to_string();
+    born_for_a_caller(&pool, &live, far_future()).await;
     assert!(tasks::take_deliveries(&pool, 10).await.unwrap().is_empty(), "a live run rides its caller's connection");
 }
 
@@ -219,19 +221,38 @@ async fn a_worker_claims_only_the_execution_it_was_called_for(pool: PgPool) {
     assert_eq!(execution_id_owner(&pool, &mine).await.as_deref(), Some("worker-a"));
 }
 
-/// A live run is admitted pinned to the worker its caller reached: only
-/// that worker claims it, a retry of the same arrival is recognised, and
-/// the same arrival on another worker is told who holds it.
+/// A live run is claimed by the first worker its caller reaches, and the
+/// claim pins it there: a copy of the request on another worker finds
+/// nothing, even once the first claim lapses (the caller's socket was on
+/// the first worker, so the run cannot move).
 #[sqlx::test]
 async fn a_live_run_is_pinned_to_the_worker_its_caller_reached(pool: PgPool) {
     setup(&pool).await;
     let execution_id = Uuid::new_v4().to_string();
     seed_execution_id(&pool, &execution_id).await;
-    assert_eq!(admit(&pool, &execution_id, "worker-a").await, LiveAdmitOutcome::Admitted);
-    assert_eq!(admit(&pool, &execution_id, "worker-a").await, LiveAdmitOutcome::AlreadyAdmitted { replica: "worker-a".into() });
-    assert_eq!(admit(&pool, &execution_id, "worker-b").await, LiveAdmitOutcome::AlreadyAdmitted { replica: "worker-a".into() });
-    assert!(claim_one(&pool, "worker-b", &execution_id_filter(&execution_id)).await.unwrap().is_none(), "pinned elsewhere");
-    assert!(claim_one(&pool, "worker-a", &execution_id_filter(&execution_id)).await.unwrap().is_some());
+    born_for_a_caller(&pool, &execution_id, far_future()).await;
+    let claimed = claim_one(&pool, "worker-a", &execution_id_filter(&execution_id)).await.unwrap().expect("claimed");
+    assert!(claim_one(&pool, "worker-b", &execution_id_filter(&execution_id)).await.unwrap().is_none(), "claimed here");
+    lapse_claim(&pool, claimed.id).await;
+    assert!(claim_one(&pool, "worker-b", &execution_id_filter(&execution_id)).await.unwrap().is_none(), "pinned to worker-a");
+    assert!(tasks::take_deliveries(&pool, 10).await.unwrap().is_empty(), "and never delivered");
+}
+
+/// A live run whose caller never came is found once their ticket expires,
+/// and not before; one whose caller did come is never found.
+#[sqlx::test]
+async fn a_caller_who_never_came_is_found_after_their_ticket_expires(pool: PgPool) {
+    setup(&pool).await;
+    let absent = Uuid::new_v4().to_string();
+    let present = Uuid::new_v4().to_string();
+    seed_execution_id(&pool, &present).await;
+    let absent_task = born_for_a_caller(&pool, &absent, 1_000).await;
+    born_for_a_caller(&pool, &present, 1_000).await;
+    claim_one(&pool, "worker-a", &execution_id_filter(&present)).await.unwrap().expect("the caller arrived");
+    assert!(tasks::callers_never_arrived(&pool, 999).await.unwrap().is_empty(), "the ticket is still good");
+    let gone = tasks::callers_never_arrived(&pool, 1_001).await.unwrap();
+    assert_eq!(gone.len(), 1);
+    assert_eq!((gone[0].task_id, gone[0].execution_id.as_str()), (absent_task, absent.as_str()));
 }
 
 /// A resume asked for while its execution is still being driven waits:
@@ -310,29 +331,34 @@ async fn a_cancel_nobody_will_take_is_dropped(pool: PgPool) {
 // ----- orphans -------------------------------------------------------------
 
 /// A live run whose worker went away is an orphan: its claim lapsed, or it
-/// was admitted and never claimed within a claim's duration. A live run
-/// being driven is not.
+/// was put back pending (still pinned to that worker) and not claimed again
+/// within a claim's duration. A live run being driven is not, and neither
+/// is one still waiting for its caller (that one is the reaper's other
+/// sweep, `callers_never_arrived`).
 #[sqlx::test]
 async fn a_live_run_whose_worker_vanished_is_an_orphan(pool: PgPool) {
     setup(&pool).await;
     let driven = Uuid::new_v4().to_string();
     let lapsed = Uuid::new_v4().to_string();
-    let never = Uuid::new_v4().to_string();
-    for c in [&driven, &lapsed, &never] {
+    let put_back = Uuid::new_v4().to_string();
+    let waiting = Uuid::new_v4().to_string();
+    for c in [&driven, &lapsed, &put_back, &waiting] {
         seed_execution_id(&pool, c).await;
-        admit(&pool, c, "worker-a").await;
+        born_for_a_caller(&pool, c, far_future()).await;
     }
     claim_one(&pool, "worker-a", &execution_id_filter(&driven)).await.unwrap().expect("driven");
     let lapsing = claim_one(&pool, "worker-a", &execution_id_filter(&lapsed)).await.unwrap().expect("claimed");
     lapse_claim(&pool, lapsing.id).await;
-    sqlx::query("UPDATE task SET created_at_unix = 0 WHERE execution_id = $1")
-        .bind(&never)
+    let back = claim_one(&pool, "worker-a", &execution_id_filter(&put_back)).await.unwrap().expect("claimed");
+    assert!(tasks::requeue(&pool, back.id, "worker-a").await.unwrap());
+    sqlx::query("UPDATE task SET created_at_unix = 0 WHERE execution_id = ANY($1)")
+        .bind(vec![put_back.clone(), waiting.clone()])
         .execute(&pool)
         .await
         .unwrap();
     let mut orphans: Vec<String> = tasks::orphaned_live_executions(&pool).await.unwrap().into_iter().map(|o| o.execution_id).collect();
     orphans.sort();
-    let mut expected = vec![lapsed, never];
+    let mut expected = vec![lapsed, put_back];
     expected.sort();
     assert_eq!(orphans, expected);
 }

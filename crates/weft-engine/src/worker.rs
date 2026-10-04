@@ -246,6 +246,10 @@ struct Worker {
     /// Per-execution live-connection runtime config, set by the execute path
     /// before the caller attaches, read by the connection server.
     live_configs: LiveConfigMap,
+    /// Runs a live caller just claimed, each told the moment its drive has
+    /// registered the connection's settings (`attach_live_caller`), so the
+    /// connection server waits for exactly that, or for the drive's error.
+    live_ready: LiveReadyMap,
     /// Every drive this worker runs, the gate shutdown waits on.
     background: Arc<weft_core::in_flight::InFlight>,
     short_run_cap: Option<std::time::Duration>,
@@ -288,44 +292,35 @@ impl Worker {
     /// halfway; the drive ends on its own terms (and a short run stops
     /// itself before the cap, see `SHORT_RUN_CAP_MARGIN`).
     async fn run_execution_id(&self, execution_id: ExecutionId) -> Result<RunAnswer> {
+        let Some(task) = self.claim_execution_id(execution_id).await? else {
+            return Ok(RunAnswer::NothingToRun);
+        };
+        self.drive_detached(task).await.context("the drive panicked outside its guard")
+    }
+
+    /// `execution_id`'s execute or resume task, claimed by this worker, or
+    /// `None` when there is nothing here to claim.
+    async fn claim_execution_id(&self, execution_id: ExecutionId) -> Result<Option<Task>> {
         let filter = ClaimFilter::ExecutionId { project_id: self.project_id, execution_id: execution_id.to_string() };
-        let Some(task) = self
-            .clients
+        self.clients
             .tasks
             .claim_one(&self.replica, filter, std::time::Duration::ZERO)
             .await
-            .context("claim the execution's task")?
-        else {
-            return Ok(RunAnswer::NothingToRun);
-        };
+            .context("claim the execution's task")
+    }
+
+    /// Drive a claimed task to its end on a task of its own, so whoever
+    /// handed it here can go away without stopping it.
+    fn drive_detached(&self, task: Task) -> tokio::task::JoinHandle<RunAnswer> {
         let worker = self.clone();
         let token = self.background.token();
-        let drive = tokio::spawn(async move {
+        tokio::spawn(async move {
             let _token = token;
             let store = worker.clients.tasks.clone();
             let replica = worker.replica.clone();
             let end = weft_task_store::run_claimed_worker_task(store, &replica, &task, worker.drive(&task)).await;
             RunAnswer::from(end)
-        });
-        drive.await.context("the drive panicked outside its guard")
-    }
-
-    /// Start `execution_id` for a live caller that just arrived: born pinned to
-    /// this worker, claimed here, driven detached from the connection that
-    /// brought it (the connection is served by the caller registry).
-    fn start_live(&self, execution_id: ExecutionId) {
-        let worker = self.clone();
-        tokio::spawn(async move {
-            match worker.run_execution_id(execution_id).await {
-                Ok(RunAnswer::NothingToRun) => tracing::error!(
-                    target: "weft_engine::worker",
-                    %execution_id,
-                    "a live caller's execution was born on this worker but its task could not be claimed here"
-                ),
-                Ok(_) => {}
-                Err(e) => tracing::error!(target: "weft_engine::worker", %execution_id, error = %format!("{e:#}"), "live drive failed to start"),
-            }
-        });
+        })
     }
 
     /// Drive one claimed execute or resume task: fold the journal and run
@@ -414,7 +409,7 @@ impl Worker {
         // malformed record is a dispatcher/worker mismatch: the execution
         // fails rather than running as if nobody were on the line.
         let caller = match &payload.live_connection {
-            Some(start) => attach_live_caller(ctx, execution_id, start, clients.journal.clone()).await?,
+            Some(start) => attach_live_caller(ctx, execution_id, start, clients.journal.clone(), &flag).await?,
             None => None,
         };
         // Keep the connection so we can end the exchange with the caller
@@ -551,6 +546,7 @@ async fn attach_live_caller(
     execution_id: ExecutionId,
     start: &weft_task_store::kinds::LiveConnectionStart,
     journal: Arc<dyn weft_journal::JournalClient>,
+    cancelled: &CancellationFlag,
 ) -> Result<Option<RunCaller>> {
     // The record carries the full signal spec; its kind says the
     // protocol and the connection's settings (`Signal::CALLER`).
@@ -567,6 +563,10 @@ async fn attach_live_caller(
             journal: journal.clone(),
         }),
     );
+    // The caller who claimed this run is waiting for exactly this.
+    if let Some(ready) = ctx.live_ready.lock().expect("live_ready poisoned").remove(&execution_id) {
+        let _ = ready.send(());
+    }
     // A FIRED run has no socket coming, so waiting for one would burn
     // the whole connect timeout and then run with nobody there. Serve
     // the body the author typed instead, and record the exchange the
@@ -597,12 +597,14 @@ async fn attach_live_caller(
             journal,
         ))));
     }
-    // Wait for the connection server to attach the socket for this execution.
-    Ok(ctx
-        .caller_registry
-        .wait_for_attach(execution_id, connect_timeout)
-        .await
-        .map(RunCaller::Live))
+    // Wait for the connection server to attach the socket for this
+    // execution, or for the run to be cancelled while it waits (its caller
+    // was refused before attaching): the run then goes straight on to its
+    // cancel instead of waiting out the connect timeout.
+    tokio::select! {
+        attached = ctx.caller_registry.wait_for_attach(execution_id, connect_timeout) => Ok(attached.map(RunCaller::Live)),
+        _ = cancelled.cancelled() => Ok(None),
+    }
 }
 
 /// process-local definition fetch: try the cache first; on miss, call
@@ -671,6 +673,9 @@ struct LiveStart {
 }
 
 type LiveConfigMap = Arc<std::sync::Mutex<HashMap<ExecutionId, Arc<LiveStart>>>>;
+
+/// See [`Worker::live_ready`].
+type LiveReadyMap = Arc<std::sync::Mutex<HashMap<ExecutionId, tokio::sync::oneshot::Sender<()>>>>;
 
 /// Insertion-ordered cache bounded to `CAP` entries. On overflow it
 /// evicts the oldest-inserted hash. Not a true LRU (no per-get reorder):
@@ -1039,9 +1044,9 @@ impl crate::caller_conn::CallerJournalSink for BrokerCallerJournal {
 }
 
 /// Resolver over the worker's per-execution live-config map. The connection
-/// server calls this when a caller attaches to learn the protocol/caps so
-/// it can build the connection; an unknown execution (caller raced ahead of,
-/// or long after, the execute task) returns `None` and the server 404s.
+/// server calls this once the run a caller claimed is ready for them
+/// (`LiveStarter::start`), to learn the protocol and caps it builds the
+/// connection with.
 struct LiveConfigResolver {
     live_configs: LiveConfigMap,
     replica: String,
@@ -1076,7 +1081,7 @@ struct RegistryCanceller {
 }
 
 impl crate::caller_conn::ExecutionCanceller for RegistryCanceller {
-    fn cancel(&self, execution_id: ExecutionId) {
+    fn cancel(&self, execution_id: ExecutionId, cause: weft_core::exec::CancelCause) {
         // Block-in-place is wrong here (sync trait method on an async
         // mutex); use try_lock in a short spin via the blocking handle.
         // The cancel registry is a tokio Mutex; grab it with a dedicated
@@ -1084,7 +1089,7 @@ impl crate::caller_conn::ExecutionCanceller for RegistryCanceller {
         let reg = self.cancel_registry.clone();
         tokio::spawn(async move {
             if let Some(flag) = reg.lock().await.get(&execution_id).cloned() {
-                flag.cancel_because(weft_core::exec::CancelCause::CallerGone);
+                flag.cancel_because(cause);
             }
         });
     }
@@ -1163,6 +1168,7 @@ fn new_worker(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config: &Wo
         project_cache: Arc::new(Mutex::new(BoundedProjectCache::new())),
         caller_registry: crate::caller_conn::CallerRegistry::new(),
         live_configs: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        live_ready: Arc::new(std::sync::Mutex::new(HashMap::new())),
         background: weft_core::in_flight::InFlight::new("worker execution"),
         short_run_cap: config.short_run_cap,
     }
@@ -1209,9 +1215,6 @@ pub async fn serve(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config
             clock: worker.clients.clock.clone(),
             canceller: Arc::new(RegistryCanceller { cancel_registry: worker.cancel_registry.clone() }),
             starter: Arc::new(LiveStarter { worker: worker.clone() }),
-            tasks: worker.clients.tasks.clone(),
-            tenant_id: worker.tenant_id.clone(),
-            replica: worker.replica.clone(),
         })),
         None => {
             tracing::info!(
@@ -1294,15 +1297,63 @@ async fn wind_down(worker: &Worker) {
     worker.clients.pending_costs.wait_zero().await;
 }
 
-/// Starts the drive of a live caller's execution (the connection server
-/// calls it once the birth is in).
+/// Claims and starts the run a live caller arrived for (the connection
+/// server calls it once the caller's ticket checks out).
 struct LiveStarter {
     worker: Worker,
 }
 
+#[async_trait::async_trait]
 impl crate::caller_conn::LiveStarter for LiveStarter {
-    fn start(&self, execution_id: ExecutionId) {
-        self.worker.start_live(execution_id);
+    async fn start(&self, execution_id: ExecutionId) -> Result<crate::caller_conn::LiveClaim> {
+        let Some(task) = self.worker.claim_execution_id(execution_id).await? else {
+            return Ok(crate::caller_conn::LiveClaim::NotHere);
+        };
+        let (ready_tx, ready) = tokio::sync::oneshot::channel();
+        self.worker.live_ready.lock().expect("live_ready poisoned").insert(execution_id, ready_tx);
+        let mut starting = Starting { drive: Some(self.worker.drive_detached(task)), execution_id, live_ready: self.worker.live_ready.clone() };
+        let came = {
+            let drive = starting.drive.as_mut().expect("just started");
+            tokio::select! {
+                told = ready => Ok(told),
+                ended = drive => Err(ended),
+            }
+        };
+        // Ready or ended, the drive is no longer this call's to stop.
+        starting.drive = None;
+        match came {
+            Ok(told) => {
+                // Only `attach_live_caller` takes the sender, and it sends;
+                // the guard that could drop it is this call's own.
+                told.expect("a readiness sender is only taken to send on it");
+                Ok(crate::caller_conn::LiveClaim::Ready)
+            }
+            Err(ended) => match ended.context("the drive panicked outside its guard")? {
+                RunAnswer::Failed { error } => anyhow::bail!("{error}"),
+                other => anyhow::bail!("the run of {execution_id} ended ({other:?}) before its caller could attach"),
+            },
+        }
+    }
+}
+
+/// A claimed live run's drive until it is ready for its caller. Dropped
+/// before then (the caller hung up while it started, and the request went
+/// with them) it stops the drive, before any of the program has run: the
+/// run is then left to the reaper, which cancels a live run whose worker
+/// let its claim lapse, rather than running with nobody on the line. It
+/// always takes back the run's readiness slot.
+struct Starting {
+    drive: Option<tokio::task::JoinHandle<RunAnswer>>,
+    execution_id: ExecutionId,
+    live_ready: LiveReadyMap,
+}
+
+impl Drop for Starting {
+    fn drop(&mut self) {
+        self.live_ready.lock().expect("live_ready poisoned").remove(&self.execution_id);
+        if let Some(drive) = self.drive.take() {
+            drive.abort();
+        }
     }
 }
 

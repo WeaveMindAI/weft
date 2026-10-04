@@ -70,6 +70,16 @@ variable "compile_lanes" {
   default     = 2
 }
 
+variable "build_machine" {
+  description = "The Cloud Build machine a program's worker image compiles on. Empty is Cloud Build's default machine, which its free build minutes cover; E2_HIGHCPU_8 or E2_HIGHCPU_32 compile faster and are paid by the minute. An image is built once per version of a program, never per worker started."
+  type        = string
+  default     = ""
+  validation {
+    condition     = contains(["", "E2_MEDIUM", "E2_HIGHCPU_8", "E2_HIGHCPU_32", "N1_HIGHCPU_8", "N1_HIGHCPU_32"], var.build_machine)
+    error_message = "build_machine is empty (the free default) or one of E2_MEDIUM, E2_HIGHCPU_8, E2_HIGHCPU_32, N1_HIGHCPU_8, N1_HIGHCPU_32."
+  }
+}
+
 variable "invalid_tokens_per_minute" {
   description = "Refused tokens one address may present per minute on the token doors before every token door refuses it for the rest of the minute. 0 turns the block off."
   type        = number

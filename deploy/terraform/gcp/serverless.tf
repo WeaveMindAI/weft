@@ -42,6 +42,7 @@ locals {
       workloadIdentityProvider = google_iam_workload_identity_pool_provider.github.name
       callerTokenSecret        = google_secret_manager_secret.install["WEFT_CALLER_TOKEN_SECRET"].secret_id
       infraNetworkTag          = local.infra_tag
+      buildMachine             = var.build_machine == "" ? null : var.build_machine
     }
     auth      = "operator_keys"
     publicUrl = local.role_urls["dispatcher"]

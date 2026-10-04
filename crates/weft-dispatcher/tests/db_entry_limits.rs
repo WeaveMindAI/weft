@@ -125,9 +125,9 @@ async fn at_once_slots_hold_under_contention_and_free_up(pool: PgPool) {
     entry_limits::release_slot(&pool, &first).await.unwrap();
     assert!(entry_limits::at_once_full(&pool, "tok", 10, now).await.unwrap().is_none());
     // Every remaining slot is a run that never started: past its expiry
-    // none counts, and the next take drops them.
+    // none counts, so the next take finds the entry free.
     assert!(entry_limits::at_once_full(&pool, "tok", 10, now + 101).await.unwrap().is_none());
-    entry_limits::take_slot(&pool, "tok", "late", 1, now + 300, now + 101).await.unwrap().expect("abandoned slots dropped");
+    entry_limits::take_slot(&pool, "tok", "late", 1, now + 300, now + 101).await.unwrap().expect("abandoned slots stop counting");
 }
 
 /// A run that started keeps its slot past the unborn expiry until it ends.

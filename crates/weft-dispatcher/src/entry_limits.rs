@@ -317,9 +317,11 @@ fn slot_stopped_counting(now_param: &str) -> String {
 /// admission of the same run) is kept, never counted twice.
 ///
 /// Serialized per entry by a transaction-scoped advisory lock, so two
-/// replicas admitting the last free slot at once cannot both take it.
-/// Slots that stopped counting are dropped first: a handshake nobody
-/// followed, or a run that ended.
+/// replicas admitting the last free slot at once cannot both take it. The
+/// count and the take are then one statement, run after the lock so it
+/// sees every slot a sibling took before letting go. Slots that stopped
+/// counting (a handshake nobody followed, a run that ended) are left out
+/// of the count; the reaper's [`sweep`] deletes them.
 pub async fn take_slot(
     pool: &PgPool,
     token: &str,
@@ -334,35 +336,32 @@ pub async fn take_slot(
         .execute(&mut *tx)
         .await
         .context("lock the entry's slots")?;
-    sqlx::query(&format!("DELETE FROM entry_slot s WHERE s.signal_token = $1 AND {}", slot_stopped_counting("$2")))
+    let (taken,): (bool,) = sqlx::query_as(&format!(
+        "WITH held AS ( \
+             SELECT 1 FROM entry_slot s WHERE s.execution_id = $2 AND NOT {stopped}), \
+         others AS ( \
+             SELECT COUNT(*) AS n FROM entry_slot s \
+             WHERE s.signal_token = $1 AND s.execution_id <> $2 AND NOT {stopped}), \
+         taken AS ( \
+             INSERT INTO entry_slot (execution_id, signal_token, unborn_until) \
+             SELECT $2, $1, $3 \
+             WHERE EXISTS (SELECT 1 FROM held) OR (SELECT n FROM others) < $4 \
+             ON CONFLICT (execution_id) DO UPDATE \
+                 SET unborn_until = GREATEST(entry_slot.unborn_until, EXCLUDED.unborn_until) \
+             RETURNING 1) \
+         SELECT EXISTS (SELECT 1 FROM taken)",
+        stopped = slot_stopped_counting("$5"),
+    ))
     .bind(token)
+    .bind(execution_id)
+    .bind(unborn_until)
+    .bind(max as i64)
     .bind(now)
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await
-    .context("drop the entry's abandoned slots")?;
-    let held: Option<(String,)> = sqlx::query_as("SELECT execution_id FROM entry_slot WHERE execution_id = $1")
-        .bind(execution_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-    if held.is_none() {
-        let (taken,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM entry_slot WHERE signal_token = $1")
-            .bind(token)
-            .fetch_one(&mut *tx)
-            .await?;
-        if taken >= max as i64 {
-            tx.rollback().await?;
-            return Ok(Err(Refused { retry_after_secs: 5, reason: Limited::AtOnce }));
-        }
-        sqlx::query("INSERT INTO entry_slot (execution_id, signal_token, unborn_until) VALUES ($1, $2, $3)")
-        .bind(execution_id)
-        .bind(token)
-        .bind(unborn_until)
-        .execute(&mut *tx)
-        .await
-        .context("take the slot")?;
-    }
+    .context("take the slot")?;
     tx.commit().await.context("commit slot take")?;
-    Ok(Ok(()))
+    Ok(if taken { Ok(()) } else { Err(Refused { retry_after_secs: 5, reason: Limited::AtOnce }) })
 }
 
 /// Whether the entry is already full, without taking anything: the

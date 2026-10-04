@@ -15,7 +15,7 @@ pub async fn run(ctx: Ctx, label: Option<String>, root: bool) -> anyhow::Result<
     let project = ctx.project()?;
     let client = ctx.client()?;
     let id = project.id().to_string();
-    let manifest = super::versions::snapshot(&client, project).await?;
+    let manifest = super::versions::snapshot(&client, project, !ctx.json()).await?;
     let body = CheckpointRequest { manifest, label: label.clone(), root };
     let resp = client
         .post_json(&format!("/projects/{id}/versions"), &serde_json::to_value(&body)?)

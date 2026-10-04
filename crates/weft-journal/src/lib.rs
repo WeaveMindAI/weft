@@ -41,5 +41,5 @@ pub fn decode_event(execution_id: weft_core::ExecutionId, payload: &str) -> Resu
 pub use traits::{JournalClient, JournalRow, NoopJournal, PostgresJournalClient, RawJournalRow};
 pub use unrecorded::UnrecordedJournal;
 pub use write::{
-    lock_execution_ids, record_event, record_event_dedup, record_event_from_replica, record_event_in, RecordError,
+    lock_execution_ids, record_event_in, record_events, RecordError,
 };

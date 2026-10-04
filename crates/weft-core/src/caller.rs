@@ -44,14 +44,11 @@ use crate::error::WeftResult;
 use crate::signal::{Backpressure, DataType, ErrorMode, LiveConnectionConfig, Protocol};
 use crate::wait::SuspendPolicy;
 
-/// What the caller sent to OPEN the exchange, as the gateway saw it:
-/// the request line of an HTTP call, or the upgrade request of a
-/// WebSocket. One shape for both protocols, built when the caller
-/// ARRIVES (the dispatcher's `live_arrival` task), by merging what the
-/// routing token signed at the handshake (the route, the gate's
-/// verdict, the path captures) with the method, query and headers as
-/// they actually arrived. From there it is carried everywhere it is
-/// read: the
+/// What the caller sent to OPEN the exchange, as the install's handshake
+/// (`/connect`) saw it: the method, path, query and headers of their
+/// call, the route's captures and the gate's verdict. One shape for both
+/// protocols, built when the run is born at that handshake. From there it
+/// is carried everywhere it is read: the
 /// trigger's wake payload (so a trigger node fans it onto ports), the
 /// execute task's start record (so the worker puts it on the
 /// connection), and [`HttpRequestParts`] (beside the body).
@@ -80,7 +77,7 @@ pub struct LiveRequest {
     pub caller: Option<Value>,
     /// The address the caller reached this install at (its request's own
     /// `Host` / `X-Forwarded-*`, [`crate::net::request_base_url_of`]),
-    /// stated by the birth that read the arriving request. What a link
+    /// stated by the birth that read the caller's request. What a link
     /// this caller will fetch is built on (a route's answer carrying a
     /// file): a browser on the loopback port gets a loopback link, one
     /// on the tunnel a tunnel link. `None` for a run no real request

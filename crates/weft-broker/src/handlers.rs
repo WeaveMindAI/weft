@@ -32,6 +32,12 @@ pub async fn health() -> &'static str {
 
 // ---------- Journal ----------
 
+/// A worker's journal rows, all of one execution, written in one
+/// statement that also fences them: they go in only while the asking
+/// replica owns the execution's claim (see
+/// [`require_worker_owns_execution_id`] for why). The owner is read in the
+/// write itself, so the common case costs one round trip; only a refused
+/// write reads it again, to say why.
 pub async fn journal_record(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
@@ -40,13 +46,26 @@ pub async fn journal_record(
     if caller.role != Role::Worker {
         return Err((StatusCode::FORBIDDEN, "only workers journal events".into()));
     }
-    let execution_id = req.event.execution_id();
-    require_worker_owns_execution_id(&state, &caller, execution_id, &req.replica).await?;
-    state
-        .journal
-        .record_event(&req.event, Some(req.replica.as_str()))
+    let Some(first) = req.events.first() else {
+        return Ok(Json(JournalRecordResponse {}));
+    };
+    let execution_id = first.execution_id();
+    require_worker_execution_scope(&state, &caller, execution_id, &req.replica).await?;
+    let written = weft_journal::record_events(&state.pool, &req.events, Some(&req.replica), Some(&req.replica))
         .await
-        .map_err(internal)?;
+        .map_err(|e| match e {
+            weft_journal::RecordError::MixedExecutions { .. } => (StatusCode::BAD_REQUEST, e.to_string()),
+            other => internal(other),
+        })?;
+    if written == 0 {
+        require_owner(&state, &caller, execution_id, &req.replica).await?;
+        // The owner read again says the replica owns it: it took the
+        // claim between the write and this read. The rows did not go in.
+        return Err((
+            StatusCode::CONFLICT,
+            "the execution's claim changed hands during the write; nothing was journaled".into(),
+        ));
+    }
     Ok(Json(JournalRecordResponse {}))
 }
 
@@ -123,10 +142,35 @@ async fn require_worker_owns_execution_id(
     execution_id: weft_core::ExecutionId,
     claimed_replica: &str,
 ) -> Result<scope::ExecutionScope, (StatusCode, String)> {
+    let execution_id_scope = require_worker_execution_scope(state, caller, execution_id, claimed_replica).await?;
+    require_owner(state, caller, execution_id, claimed_replica).await?;
+    Ok(execution_id_scope)
+}
+
+/// The execution is in the caller's scope and the caller is the replica
+/// it says it is: the half of [`require_worker_owns_execution_id`] that
+/// needs no read of the execution's owner.
+async fn require_worker_execution_scope(
+    state: &BrokerState,
+    caller: &CallerIdentity,
+    execution_id: weft_core::ExecutionId,
+    claimed_replica: &str,
+) -> Result<scope::ExecutionScope, (StatusCode, String)> {
     let execution_id_scope =
         scope::require_execution_id_scope(&state.scope_cache, &state.pool, caller, &execution_id.to_string())
             .await?;
     require_replica_matches(caller, claimed_replica)?;
+    Ok(execution_id_scope)
+}
+
+/// `claimed_replica` owns `execution_id`'s claim, read from the execution
+/// row; the refusal names which way it does not.
+async fn require_owner(
+    state: &BrokerState,
+    caller: &CallerIdentity,
+    execution_id: weft_core::ExecutionId,
+    claimed_replica: &str,
+) -> Result<(), (StatusCode, String)> {
     let owner: Option<(Option<String>,)> = sqlx::query_as(
         "SELECT owner_replica FROM execution WHERE execution_id = $1",
     )
@@ -152,7 +196,7 @@ async fn require_worker_owns_execution_id(
             "execution owned by a different worker replica".into(),
         ));
     }
-    Ok(execution_id_scope)
+    Ok(())
 }
 
 // ---------- Execution steering ----------
@@ -362,13 +406,11 @@ pub async fn task_enqueue_dedup(
     match caller.role {
         Role::Worker => {
             // Workers enqueue control-plane work for the dispatcher
-            // to handle: register a wake signal, give birth to the
-            // execution a live caller arrived for, provision infra,
+            // to handle: register a wake signal, provision infra,
             // and durable side-effect records (cost + log) that must
             // survive the worker dying.
             if ![
                 TaskKind::RegisterSignal.as_str(),
-                TaskKind::LiveArrival.as_str(),
                 TaskKind::RecordCost.as_str(),
                 TaskKind::RecordLog.as_str(),
                 TaskKind::ProgramCall.as_str(),
@@ -522,15 +564,6 @@ pub async fn task_enqueue_dedup(
                 StatusCode::FORBIDDEN,
                 format!("a {kind} task's payload names the same run as the task"),
             ));
-        }
-    }
-
-    // A live arrival pins the run it asks for to the replica the caller
-    // reached, so it may only name the replica that sends it.
-    if kind == TaskKind::LiveArrival.as_str() {
-        let named = req.spec.payload.get("replica").and_then(|v| v.as_str());
-        if named.is_none() || named != caller.replica.as_deref() {
-            return Err((StatusCode::FORBIDDEN, "a live arrival names the worker replica that sends it".into()));
         }
     }
 
@@ -746,17 +779,64 @@ fn instance_copy(
     }
 }
 
+/// What infra `project`'s registered program declares: from the cache
+/// when its definition's digest is known there (one small read), else
+/// read whole, parsed and kept. `None` when the project is gone.
+async fn declared_infra(
+    state: &BrokerState,
+    project: uuid::Uuid,
+) -> Result<Option<Arc<weft_core::project::DeclaredInfra>>, (StatusCode, String)> {
+    let digest: Option<String> = sqlx::query_scalar("SELECT md5(project_json) FROM project WHERE id = $1")
+        .bind(project)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(definition_unavailable)?;
+    match digest {
+        Some(digest) => declared_infra_under(state, project, digest).await,
+        None => Ok(None),
+    }
+}
+
+/// What the program registered for `project` under `digest`
+/// (`md5(project_json)`) declares: the cached answer, or, the first time,
+/// the definition read and parsed. `None` when the project is gone.
+async fn declared_infra_under(
+    state: &BrokerState,
+    project: uuid::Uuid,
+    digest: String,
+) -> Result<Option<Arc<weft_core::project::DeclaredInfra>>, (StatusCode, String)> {
+    if let Some(declared) = state.declared_infra.get(project, &digest) {
+        return Ok(Some(declared));
+    }
+    // Read with its own digest, so what is kept is filed under the
+    // definition actually parsed, even if it changed since `digest`.
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT project_json, md5(project_json) FROM project WHERE id = $1")
+            .bind(project)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(definition_unavailable)?;
+    let Some((project_json, digest)) = row else { return Ok(None) };
+    let definition: weft_core::project::ProjectDefinition = serde_json::from_str(&project_json)
+        .map_err(|e| internal(anyhow::anyhow!("project {project}: definition: {e}")))?;
+    let declared = Arc::new(weft_core::project::DeclaredInfra::of(&definition));
+    state.declared_infra.put(project, digest, declared.clone());
+    Ok(Some(declared))
+}
+
+fn definition_unavailable(e: sqlx::Error) -> (StatusCode, String) {
+    unavailable_or_internal(anyhow::Error::from(e).context("project definition"))
+}
+
 /// Refuse a handle naming a copy the program (its stored definition)
 /// does not declare: a place that is not infra, or the side it no
 /// longer has. The message names the handle, never an address.
 fn require_declared_infra(
-    project_json: &str,
+    declared: &weft_core::project::DeclaredInfra,
     infra: &weft_core::infra::InfraHandle,
 ) -> Result<(), (StatusCode, String)> {
-    let definition: weft_core::project::ProjectDefinition = serde_json::from_str(project_json)
-        .map_err(|e| internal(anyhow::anyhow!("{infra}: project definition: {e}")))?;
     let instance_copy = infra.instance().is_some();
-    if weft_core::project::DeclaredInfra::of(&definition).declares(infra.place(), instance_copy) {
+    if declared.declares(infra.place(), instance_copy) {
         return Ok(());
     }
     Err((
@@ -799,15 +879,10 @@ pub async fn infra_endpoint_url(
     // since removed, or one that changed sides (shared vs per instance),
     // can leave its old copy running. Only a copy the project's program
     // declares is reachable.
-    let project_json: Option<String> = sqlx::query_scalar("SELECT project_json FROM project WHERE id = $1")
-        .bind(run.project)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("project definition")))?;
-    let project_json = project_json.ok_or_else(|| {
+    let declared = declared_infra(&state, run.project).await?.ok_or_else(|| {
         (StatusCode::NOT_FOUND, format!("{}: the run's project is no longer registered", req.infra))
     })?;
-    require_declared_infra(&project_json, &req.infra)?;
+    require_declared_infra(&declared, &req.infra)?;
     let address = state
         .infra
         .endpoint_address(run.project, req.infra.place(), instance, req.infra.endpoint())
@@ -1152,7 +1227,7 @@ pub async fn supervisor_gone_copies(
     }
     let err = |e: sqlx::Error| internal(anyhow::anyhow!("{e}"));
     let project: Option<(String, bool)> = sqlx::query_as(&format!(
-        "SELECT p.project_json, {owns} FROM project p WHERE p.id = $1",
+        "SELECT md5(p.project_json), {owns} FROM project p WHERE p.id = $1",
         owns = weft_broker_client::lifecycle_command::owns_project_predicate("$2", "p.id"),
     ))
     .bind(req.project)
@@ -1165,10 +1240,11 @@ pub async fn supervisor_gone_copies(
         Some((_, false)) => {
             return Err((StatusCode::GONE, format!("gone_copies of project {}: project ownership moved", req.project)));
         }
-        Some((json, true)) => {
-            let definition: weft_core::project::ProjectDefinition = serde_json::from_str(&json)
-                .map_err(|e| internal(anyhow::anyhow!("project {} definition: {e}", req.project)))?;
-            let declared = weft_core::project::DeclaredInfra::of(&definition);
+        Some((digest, true)) => {
+            let Some(declared) = declared_infra_under(&state, req.project, digest).await? else {
+                // Removed between the two reads: every copy is gone.
+                return Ok(Json(SupervisorGoneCopiesResponse { gone: req.copies.iter().map(|c| c.copy_id.clone()).collect() }));
+            };
             let rows: std::collections::HashSet<String> =
                 sqlx::query_scalar("SELECT copy_id FROM infra_node WHERE project_id = $1")
                     .bind(req.project)
@@ -2494,7 +2570,8 @@ mod tests {
     #[test]
     fn a_handle_reaches_only_a_copy_the_program_declares() {
         use weft_core::infra::InfraHandle;
-        let json = program_json();
+        let definition: weft_core::project::ProjectDefinition = serde_json::from_str(&program_json()).unwrap();
+        let json = weft_core::project::DeclaredInfra::of(&definition);
         let alice = || Some(weft_core::instance::InstanceId::new("alice").unwrap());
         require_declared_infra(&json, &InfraHandle::new("shared", "api", None)).expect("the shared copy");
         require_declared_infra(&json, &InfraHandle::new("mine", "api", alice())).expect("an instance's copy");

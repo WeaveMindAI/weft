@@ -1831,17 +1831,6 @@ fn live_token_ttl_secs() -> i64 {
     weft_core::time_scale::scaled_secs(120)
 }
 
-/// `ANY /connect/{*path}`: the live caller connection control handshake.
-/// Matches the call against the tenant's routes (pattern + method),
-/// checks the caller against the route's auth, mints a signed routing
-/// token (carrying the execution the birth will use and the program armed
-/// now), and points the caller at the install's live door for the project
-/// (HTTP: a `307` redirect; WebSocket: a `200` with the URL in the body).
-/// The live door (`crate::live_door`) forwards the caller to one of the
-/// project's workers. Nothing is admitted and no execution is born here:
-/// the execution is born when the caller actually arrives at a worker
-/// (`birth_on_arrival`), on that worker, so a caller who never follows
-/// the redirect leaves nothing behind.
 /// Set by the install's door on a request that came for one project's API
 /// domain: the handshake then matches only that project's routes. The
 /// door drops any copy a caller sent; one that reaches the handshake some
@@ -1849,6 +1838,18 @@ fn live_token_ttl_secs() -> i64 {
 // SYNC: API_PROJECT_HEADER <-> crates/weft-dispatcher/src/door.rs (route)
 pub const API_PROJECT_HEADER: &str = "x-weft-api-project";
 
+/// `ANY /connect/{*path}`: the live caller connection control handshake.
+/// Matches the call against the tenant's routes (pattern + method),
+/// checks the caller against the route's auth, gives birth to the run
+/// (`birth_live_run`), mints a signed routing token naming it, and points
+/// the caller at the install's live door for the project (HTTP: a `307`
+/// redirect; WebSocket: a `200` with the URL in the body). The live door
+/// (`crate::live_door`) forwards the caller to one of the project's
+/// workers, which claims the run and drives it with the caller on the
+/// line. The run is born here so that arriving costs the worker one claim
+/// and nothing else; a caller who never follows the redirect leaves a run
+/// nobody claims, erased with its slot once the token expires
+/// (`reaper::sweep_orphaned_live_executions`).
 pub async fn connect_live(
     State(state): State<DispatcherState>,
     address: crate::api::CallerAddress,
@@ -1873,41 +1874,56 @@ pub async fn connect_live(
                 .ok_or((StatusCode::BAD_REQUEST, format!("{API_PROJECT_HEADER} is not a project id")))?,
         ),
     };
-    let rows = sqlx::query(
-        "SELECT s.token, s.mount_path, s.mount_methods \
+    // Every route of the tenant with how it is armed, in one read: the
+    // match is made here, and the matched one's arming is already in hand.
+    let armed_rows = sqlx::query(&format!(
+        "SELECT s.token, s.mount_path, s.mount_methods, {ARMED_COLUMNS} \
          FROM signal s \
+         LEFT JOIN project p ON p.id = s.project_id \
+         {} \
          WHERE s.tenant_id = $1 AND s.surface_kind = 'public_entry' AND s.mount_path IS NOT NULL \
            AND ($2::uuid IS NULL OR s.project_id = $2)",
-    )
+        weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
+    ))
     .bind(&tenant_segment)
     .bind(only_project)
     .fetch_all(&state.pg_pool)
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("route lookup: {e}")))?
-    .into_iter()
-    .map(|r| {
-        Ok(RouteRow {
-            token: r.try_get("token").map_err(row_err)?,
-            mount_path: r.try_get("mount_path").map_err(row_err)?,
-            mount_methods: r.try_get("mount_methods").map_err(row_err)?,
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("route lookup: {e}")))?;
+    let rows = armed_rows
+        .iter()
+        .map(|r| {
+            Ok(RouteRow {
+                token: r.try_get("token").map_err(row_err)?,
+                mount_path: r.try_get("mount_path").map_err(row_err)?,
+                mount_methods: r.try_get("mount_methods").map_err(row_err)?,
+            })
         })
-    })
-    .collect::<Result<Vec<_>, (StatusCode, String)>>()?;
+        .collect::<Result<Vec<_>, (StatusCode, String)>>()?;
     let (matched, params) = resolve_route(&rows, &tenant_segment, &method_name, &path)?;
     let token = matched.token.clone();
+    let matched_row = rows
+        .iter()
+        .position(|row| row.token == token)
+        .map(|i| &armed_rows[i])
+        .expect("the matched route is one of the rows it was matched among");
 
-    let route = armed_route(&state, &token).await?;
+    let route = armed_route_of(matched_row)?;
     let ArmedRoute { project_id, node_id, protocol, live_config, auth_kind, auth_config, program, .. } = &route;
 
-    // What the caller sent, as the gate sees it. The body is read here
-    // ONLY when the gate needs it (a signing scheme covers the bytes); the
-    // 307 makes the caller resend it to the worker, which reads it there
-    // in every case.
-    let header_map: std::collections::BTreeMap<String, String> = headers
+    // Every header the caller sent, repeats included, less the one the
+    // install's door added for itself: what the gate checks, and what the
+    // run's trigger reads as the caller's opening request.
+    let headers_sent: Vec<(String, String)> = headers
         .iter()
+        .filter(|(k, _)| k.as_str() != API_PROJECT_HEADER)
         .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
         .collect();
+    let header_map: std::collections::BTreeMap<String, String> = headers_sent.iter().cloned().collect();
     let query = weft_core::route::parse_query(raw_query.as_deref().unwrap_or(""));
+    // The body is read here ONLY when the gate needs it (a signing scheme
+    // covers the bytes); the 307 makes the caller resend it to the worker,
+    // which reads it there in every case.
     let body_bytes = if auth_kind == "connection" {
         let limit = live_config.max_inbound_bytes as usize;
         axum::body::to_bytes(body, limit)
@@ -1937,8 +1953,7 @@ pub async fn connect_live(
 
     // What the gate approved, so the worker can hold the caller to it.
     // Only when something was actually checked: an open route approves
-    // nobody, so there is nothing to be held to and no reason to stop a
-    // caller re-using their own redirect.
+    // nobody, so there is nothing to hold the caller to.
     let approved = (auth_kind != "none").then(|| {
         weft_core::caller_token::RequestFingerprint::of(
             &method_name,
@@ -1954,7 +1969,9 @@ pub async fn connect_live(
     // The entry's limits, before anything is started. The caller is who
     // the gate established when the route has auth, else the instance the
     // run is for, else the address. The slot is taken now, for the execution
-    // this call's run will carry, and holds unborn for the ticket's life.
+    // this call's run will carry; the run is born just below, and the slot
+    // counts for as long as it runs (the ticket's life only matters if the
+    // birth fails and its slot could not be freed).
     let execution_id = uuid::Uuid::new_v4();
     let caller_key = match (&caller, &instance) {
         (Some(identity), _) => format!("id:{identity}"),
@@ -1977,25 +1994,47 @@ pub async fn connect_live(
         return Ok(refused);
     }
 
-    // Mint the signed routing token: the execution the birth will carry, the
-    // program armed now (the live door forwards to its workers), and what
-    // the birth needs that the arriving request cannot supply (the route,
-    // the gate's verdict, the path captures). Then build the live URL on
-    // the door the caller came through.
+    // The caller's opening request, as the trigger reads it: what they
+    // sent here, which is what the redirect has them send on (a socket's
+    // client sends its headers here; the upgrade itself can carry none of
+    // its own).
+    let opening = weft_core::caller::LiveRequest {
+        method: method_name.clone(),
+        path: path.clone(),
+        params,
+        query,
+        base_url: weft_core::net::request_base_url_of(&headers_sent),
+        headers: headers_sent,
+        caller,
+    };
+    if let Err(refused) =
+        birth_live_run(&state, &route, &opening, &tenant_segment, execution_id, expires_at, instance.as_ref()).await
+    {
+        // The slot was taken for this run; nothing will start it now.
+        if let Err(e) = crate::entry_limits::release_slot(&state.pg_pool, &execution_id.to_string()).await {
+            tracing::warn!(
+                target: "weft_dispatcher::signal",
+                execution_id = %execution_id, error = %format!("{e:#}"),
+                "could not free the slot of a run that was refused at birth; the reaper frees it once it expires"
+            );
+        }
+        return Err(refused);
+    }
+
+    // Mint the signed routing token: the run just born, its program (the
+    // live door forwards to its workers), and the request the worker holds
+    // the caller to. Then build the live URL on the door the caller came
+    // through.
     let routing = weft_core::caller_token::mint(
         &state.caller_token_secret,
         &weft_core::caller_token::CallerTokenClaims {
             execution_id,
             project_id: *project_id,
             binary_hash: program.binary_hash.clone(),
-            signal: token.clone(),
-            path: path.clone(),
-            params,
-            caller,
             approved,
-            instance,
-            // The same instant the slot's hold was computed from, so the
-            // ticket's life and the slot's cannot drift apart.
+            // The same instant the slot's hold and the run's wait were
+            // computed from, so the ticket's life and theirs cannot drift
+            // apart.
             exp: expires_at,
         },
     );
@@ -2009,7 +2048,7 @@ pub async fn connect_live(
     tracing::info!(
         target: "weft_dispatcher::signal",
         execution_id = %execution_id, node = %node_id,
-        "live handshake: caller pointed at the live door; the execution is born on arrival"
+        "live handshake: run born, caller pointed at the live door"
     );
 
     // Point the caller at the worker per protocol.
@@ -2039,32 +2078,31 @@ pub async fn connect_live(
 }
 
 /// A public entry as its signal row arms it: the trigger, its spec, the
-/// gate's settings, and the program identity the arrival births under.
-/// Read at the handshake (to gate and to point the caller) and again at
-/// the arrival (to give birth), by the signal token the routing token
-/// carries between the two.
-pub(crate) struct ArmedRoute {
-    pub project_id: uuid::Uuid,
-    pub node_id: String,
-    pub spec: weft_core::primitive::SignalSpec,
-    pub protocol: weft_core::signal::Protocol,
-    pub live_config: weft_core::signal::LiveConnectionConfig,
-    pub auth_kind: String,
-    pub auth_config: Option<Value>,
-    pub port_snapshot: Option<Value>,
-    pub program: weft_core::project::hash::ProgramIdentity,
-    pub source_version: String,
+/// gate's settings, and the program identity its runs are born under.
+/// Read at the handshake, which gates the caller and gives birth to the
+/// run.
+struct ArmedRoute {
+    project_id: uuid::Uuid,
+    node_id: String,
+    spec: weft_core::primitive::SignalSpec,
+    protocol: weft_core::signal::Protocol,
+    live_config: weft_core::signal::LiveConnectionConfig,
+    auth_kind: String,
+    auth_config: Option<Value>,
+    port_snapshot: Option<Value>,
+    program: weft_core::project::hash::ProgramIdentity,
+    source_version: String,
     /// The status of the activation governing the route at the read.
-    pub status: String,
+    status: String,
     /// Whose route it is: the instance whose trigger registered it, `None`
     /// for a shared one. Its gate's connection is that instance's.
-    pub instance: Option<weft_core::instance::InstanceId>,
+    instance: Option<weft_core::instance::InstanceId>,
 }
 
 impl ArmedRoute {
     /// A live connection is accepted only while the route's activation is
     /// Active.
-    pub(crate) fn require_active(&self) -> Result<(), (StatusCode, String)> {
+    fn require_active(&self) -> Result<(), (StatusCode, String)> {
         if crate::project_store::project_status_from_str(&self.status)
             .map(|s| s != crate::project_store::ProjectStatus::Active)
             .unwrap_or(true)
@@ -2078,27 +2116,18 @@ impl ArmedRoute {
     }
 }
 
-/// The armed route behind a signal token, or the HTTP answer when the
-/// row is missing or half-armed.
-pub(crate) async fn armed_route(state: &DispatcherState, token: &str) -> Result<ArmedRoute, (StatusCode, String)> {
-    // The status is the governing activation's (the route's own
-    // trigger, for its owner); a project row gone reads as inactive.
-    let row = sqlx::query(&format!(
-        "SELECT s.project_id, s.node_id, s.spec_json, s.auth_kind, s.auth_config, \
-                s.port_snapshot, s.program_json, s.source_version, s.instance_id, \
-                CASE WHEN p.id IS NULL THEN 'inactive' ELSE COALESCE(a.status, 'active') END AS status \
-         FROM signal s \
-         LEFT JOIN project p ON p.id = s.project_id \
-         {} \
-         WHERE s.token = $1",
-        weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
-    ))
-    .bind(token)
-    .fetch_optional(&state.pg_pool)
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("route lookup: {e}")))?
-    .ok_or((StatusCode::NOT_FOUND, "no live endpoint at this path".into()))?;
+/// The columns [`armed_route_of`] reads, over `signal s` joined to its
+/// project `p` and its governing activation `a`
+/// (`SIGNAL_ACTIVATION_JOIN`). The status is the governing activation's
+/// (the route's own trigger, for its owner); a project row gone reads as
+/// inactive.
+const ARMED_COLUMNS: &str = "s.project_id, s.node_id, s.spec_json, s.auth_kind, s.auth_config, \
+     s.port_snapshot, s.program_json, s.source_version, s.instance_id, \
+     CASE WHEN p.id IS NULL THEN 'inactive' ELSE COALESCE(a.status, 'active') END AS status";
 
+/// The armed route a signal row holds ([`ARMED_COLUMNS`]), or the HTTP
+/// answer when it is half-armed.
+fn armed_route_of(row: &sqlx::postgres::PgRow) -> Result<ArmedRoute, (StatusCode, String)> {
     let project_id: uuid::Uuid = row.try_get("project_id").map_err(row_err)?;
     let node_id: String = row.try_get("node_id").map_err(row_err)?;
     let spec_json: String = row.try_get("spec_json").map_err(row_err)?;
@@ -2136,34 +2165,29 @@ pub(crate) async fn armed_route(state: &DispatcherState, token: &str) -> Result<
     })
 }
 
-/// Give birth to the execution a live caller arrived for, on the worker
-/// replica their connection reached: resolve the program, compute the
-/// fire from the caller's request, and ATOMICALLY admit the execute task
-/// pinned to that replica and journal `ExecutionStarted` + the trigger
-/// kicks in one transaction (`Journal::start_live_execution`). A retry of
-/// the same arrival (the caller's client resent) finds the execution
-/// already admitted and answers the replica it sits on. A failure
-/// anywhere leaves NOTHING journaled or queued. Returns the replica the
-/// execution runs on.
-pub(crate) async fn birth_on_arrival(
+/// Give birth to the run a live caller's handshake was admitted for:
+/// resolve the program, compute the fire from the caller's request, and
+/// ATOMICALLY journal `ExecutionStarted` + the trigger kicks with the
+/// execute task (`Journal::start_execution`). The task waits for the
+/// caller (`LiveConnectionStart::arrive_by`, their token's expiry): the
+/// worker their connection reaches claims it. A failure anywhere leaves
+/// NOTHING journaled or queued.
+async fn birth_live_run(
     state: &DispatcherState,
     route: &ArmedRoute,
     request: &weft_core::caller::LiveRequest,
     tenant: &str,
     execution_id: uuid::Uuid,
-    replica: &str,
+    arrive_by: i64,
     instance: Option<&weft_core::instance::InstanceId>,
-) -> Result<String, (StatusCode, String)> {
+) -> Result<(), (StatusCode, String)> {
     let project_id = route.project_id;
     let definition_hash = &route.program.definition_hash;
-    let project_json = state
-        .projects
-        .definition_for_hash(project_id, definition_hash)
+    let project_def = state
+        .program(project_id, definition_hash)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("def lookup: {e}")))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("def lookup: {e:#}")))?
         .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "no definition for hash".into()))?;
-    let project_def: weft_core::ProjectDefinition = serde_json::from_str(&project_json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("def parse: {e}")))?;
 
     // The caller's request IS the trigger's wake payload: the trigger node
     // reads it off `ctx.wake` and fans it onto its ports.
@@ -2211,11 +2235,12 @@ pub(crate) async fn birth_on_arrival(
     let live_start = weft_task_store::kinds::LiveConnectionStart {
         spec: route.spec.clone(),
         request: request.clone(),
-        // A real caller is standing at the worker, so it waits for their
-        // socket. Only a fired run serves its own body.
+        arrive_by: Some(arrive_by),
+        // A real caller is coming, so the worker waits for their socket.
+        // Only a fired run serves its own body.
         fired: None,
     };
-    // The execute task, pinned to the replica the caller stands at, which
+    // The execute task, claimed by the worker the caller reaches, which
     // drives it inside the caller's own request. `live_connection` carries
     // the trigger's full signal spec (so the worker recovers the protocol
     // + connection knobs and expects a caller) and the caller's request
@@ -2228,22 +2253,16 @@ pub(crate) async fn birth_on_arrival(
         binary_hash: &route.program.binary_hash,
         tenant_id: tenant,
         run_class: weft_core::run_class::RunClass::Short,
-        pinned_to: Some(replica.to_string()),
         live_connection: Some(live_start),
         unrecorded_birth: unrecorded_birth.as_deref(),
     })
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live task spec: {e}")))?;
 
-    use weft_task_store::tasks::LiveAdmitOutcome;
-    match state
+    state
         .journal
-        .start_live_execution(&start, &kick_events, task)
+        .start_execution(&start, &kick_events, task, None)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("admit live exec: {e}")))?
-    {
-        LiveAdmitOutcome::Admitted => Ok(replica.to_string()),
-        LiveAdmitOutcome::AlreadyAdmitted { replica } => Ok(replica),
-    }
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live run birth: {e:#}")))
 }
 
 fn row_err(e: sqlx::Error) -> (StatusCode, String) {

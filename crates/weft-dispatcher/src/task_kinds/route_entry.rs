@@ -207,7 +207,6 @@ impl TaskExecutor<DispatcherState> for RouteEntryExecutor {
                 binary_hash: &program.binary_hash,
                 tenant_id: &payload.tenant_id,
                 run_class,
-                pinned_to: None,
                 live_connection: None,
                 unrecorded_birth: None,
             })?;
@@ -444,18 +443,13 @@ async fn definition_for(
     state: &DispatcherState,
     project_id: Uuid,
     hash: &str,
-) -> Result<weft_core::ProjectDefinition> {
-    let project_json = state
-        .projects
-        .definition_for_hash(project_id, hash)
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "project {project_id} has no recorded definition for hash {hash}; \
-                 the definition history must cover every journaled hash"
-            )
-        })?;
-    Ok(serde_json::from_str(&project_json)?)
+) -> Result<std::sync::Arc<weft_core::ProjectDefinition>> {
+    state.program(project_id, hash).await?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "project {project_id} has no recorded definition for hash {hash}; \
+             the definition history must cover every journaled hash"
+        )
+    })
 }
 
 /// Re-park a fire whose pre-journal routing failed (or which arrived at

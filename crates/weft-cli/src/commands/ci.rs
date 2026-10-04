@@ -44,7 +44,7 @@ pub async fn add(ctx: Ctx, cloud: Cloud) -> Result<()> {
     let project = ctx.project()?;
     let path = write_workflow(&project.root, &project.manifest.package.name, cloud)?;
     println!("wrote {} (deploys to {})", path.display(), cloud.name());
-    println!("next: weft target export <target> --github, to give it what it needs");
+    println!("next: {}, to give it what it needs", super::target::export_command(project, ctx.on()));
     Ok(())
 }
 

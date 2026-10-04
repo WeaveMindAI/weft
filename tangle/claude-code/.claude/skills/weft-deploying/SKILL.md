@@ -85,11 +85,16 @@ folder:
 
 1. `weft target add prod <address>`. It writes `[targets.prod]` into
    `weft.toml`, which is committed, so the team shares the name.
-2. `weft login prod`: asks for an operator key in a hidden prompt, and
-   checks it against the install before storing it in
-   `~/.config/weft/credentials.toml`, which only the user can read. The
-   user types the key into their own terminal; you never ask them for it,
-   and never pipe one in (`--key-stdin` is for the user's own scripts).
+2. `weft login prod`: takes an operator key, checks it against the install,
+   and stores it in `~/.config/weft/credentials.toml`, which only the user
+   can read. If the install is on the user's GCP and its first key is still
+   in Secret Manager, you log in yourself by piping it straight across:
+   `gcloud secrets versions access latest --secret <secret> --project
+   <project> | weft login prod --key-stdin` (the install workflow's log
+   prints that exact line). The key goes from Secret Manager to weft and
+   nowhere else: never print it, put it in a file, or ask the user to paste
+   it into the chat. For any other key, the user runs `weft login prod`
+   themselves and types it into its hidden prompt.
 3. `weft ci add --cloud gcp`: writes `.github/workflows/deploy.yml`. The
    workflow, run by hand from the repository's Actions tab, builds the CLI
    of the exact weft the install runs, deploys the program (`weft activate

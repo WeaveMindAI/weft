@@ -917,10 +917,6 @@ fn validate_place(g: &ProjectGraph, place: &Located, spelled: &str) -> Result<()
     Ok(())
 }
 
-pub(crate) fn is_ordinary_boundary(project: &ProjectDefinition, id: &str) -> bool {
-    project.is_ordinary_boundary(id)
-}
-
 /// Whether `group` is an included file's body.
 pub fn is_body(project: &ProjectDefinition, group: &str) -> bool {
     project.group(group).is_some_and(|g| matches!(g.kind, GroupKind::Body))

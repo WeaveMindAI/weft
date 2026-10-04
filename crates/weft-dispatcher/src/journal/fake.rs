@@ -42,7 +42,7 @@ struct FakeState {
     /// tenant. An unset project defaults to `local`.
     project_tenants: HashMap<uuid::Uuid, String>,
     /// The work items the atomic-birth writers committed with each execution
-    /// (mirror of the `task` rows `start_execution` / `start_live_execution`
+    /// (mirror of the `task` rows `start_execution`
     /// insert). Append-only record for assertions; `cancel_never_claimed_
     /// execution` removes the matching entry exactly like the real DELETE.
     tasks: Vec<weft_task_store::tasks::NewTask>,
@@ -334,39 +334,14 @@ impl Journal for FakeJournal {
             g.trigger_setups.insert(*execution_id, *project_id);
         }
         seed_execution(&mut g, start)?;
-        g.events.push(start.clone());
-        g.events.extend(kicks.iter().cloned());
-        g.tasks.push(task);
-        Ok(())
-    }
-
-    async fn start_live_execution(
-        &self,
-        start: &ExecEvent,
-        kicks: &[ExecEvent],
-        task: weft_task_store::tasks::NewTask,
-    ) -> anyhow::Result<weft_task_store::tasks::LiveAdmitOutcome> {
-        let mut g = self.inner.lock().unwrap();
-        let ExecEvent::ExecutionStarted { execution_id, .. } = start else {
-            anyhow::bail!("start_live_execution requires an ExecutionStarted event");
-        };
-        if g.executions.contains_key(execution_id) {
-            let admitted = g.tasks.iter().find(|task| task.execution_id.as_deref() == Some(execution_id.to_string().as_str()));
-            let replica = admitted.and_then(|task| task.target_replica.clone()).ok_or_else(|| {
-                anyhow::anyhow!("live execution {execution_id} already started and no longer has an active admission; open a new connection")
-            })?;
-            return Ok(weft_task_store::tasks::LiveAdmitOutcome::AlreadyAdmitted { replica });
-        }
-        seed_execution(&mut g, start)?;
         // An unrecorded run is born with its execution row alone, like the
         // real birth: its rows ride the execute task.
         if matches!(start, ExecEvent::ExecutionStarted { run_kind, .. } if run_kind.journaled()) {
             g.events.push(start.clone());
             g.events.extend(kicks.iter().cloned());
         }
-        anyhow::ensure!(task.target_replica.is_some(), "live admission requires the worker replica the caller reached");
         g.tasks.push(task);
-        Ok(weft_task_store::tasks::LiveAdmitOutcome::Admitted)
+        Ok(())
     }
 
     async fn cancel_execution(
@@ -737,6 +712,29 @@ impl Journal for FakeJournal {
         g.executions.remove(&execution_id);
         g.execution_tags.retain(|(c, _), _| *c != execution_id);
         Ok(removed)
+    }
+
+    // The fake holds no claims (a claim lives in the task store), so a task
+    // here is one nobody claimed; the rest of the rule is the real one: a
+    // live run born for a caller, unpinned, past its `arrive_by`.
+    async fn erase_unclaimed_live_run(&self, execution_id: ExecutionId, _task_id: uuid::Uuid, now: i64) -> anyhow::Result<bool> {
+        {
+            let mut g = self.inner.lock().unwrap();
+            let id = execution_id.to_string();
+            let never_arrived = |task: &weft_task_store::tasks::NewTask| {
+                task.execution_id.as_deref() == Some(id.as_str())
+                    && task.kind == weft_task_store::TaskKind::Execute.as_str()
+                    && task.target_replica.is_none()
+                    && task.payload["live_connection"]["arrive_by"].as_i64().is_some_and(|by| by < now)
+            };
+            let before = g.tasks.len();
+            g.tasks.retain(|task| !never_arrived(task));
+            if g.tasks.len() == before {
+                return Ok(false);
+            }
+        }
+        self.delete_execution(execution_id).await?;
+        Ok(true)
     }
 
     async fn delete_project_executions(&self, project_id: uuid::Uuid) -> anyhow::Result<u64> {
@@ -1113,12 +1111,11 @@ pub(crate) mod tests {
             binary_hash: "bin",
             tenant_id: "t",
             run_class: weft_core::run_class::RunClass::Short,
-            pinned_to: Some("worker-1".into()),
             live_connection: None,
             unrecorded_birth: Some(&birth),
         })
         .unwrap();
-        j.start_live_execution(&start, &[kick], task).await.unwrap();
+        j.start_execution(&start, &[kick], task, None).await.unwrap();
         assert!(j.events_log(execution_id).await.unwrap().is_empty(), "no journal row for an unrecorded birth");
         assert!(j.execution_owner(execution_id).await.unwrap().is_some(), "but the execution exists");
         assert!(j.list_non_terminal_execution_ids_for_project(PROJECT).await.unwrap().is_empty());

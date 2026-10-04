@@ -70,7 +70,20 @@ pub const NODE_TREE_EXCLUDE_SUFFIXES: &[&str] = &[".db", ".db-journal", ".db-shm
 /// True if an entry of this name, file or directory, is never part of
 /// a node tree. THE check every node-tree walk makes.
 pub fn is_node_tree_excluded(name: &str) -> bool {
-    NODE_TREE_EXCLUDE.contains(&name) || NODE_TREE_EXCLUDE_SUFFIXES.iter().any(|s| name.ends_with(s))
+    NODE_TREE_EXCLUDE.contains(&name)
+        || NODE_TREE_EXCLUDE_SUFFIXES.iter().any(|s| name.ends_with(s))
+        || is_python_cache(name)
+}
+
+// SYNC: is_python_cache <-> .dockerignore (the `__pycache__` / `*.pyc` lines)
+/// True if an entry of this name is what Python writes beside a module
+/// the first time it imports it (`__pycache__/`, a `.pyc`). Never
+/// source, and leaving it in would make a machine that ran a node hash
+/// the same tree differently from one that did not, and build again for
+/// nothing. Asked at any depth, by every walk that decides what a
+/// project or a node is made of.
+pub fn is_python_cache(name: &str) -> bool {
+    name == "__pycache__" || name.ends_with(".pyc")
 }
 
 /// What one node-tree entry is, symlinks resolved: a symlinked
@@ -1482,6 +1495,17 @@ mod root_tests {
             built_from: None,
             recorded: RecordedInstallRoot::Absent,
         }
+    }
+
+    /// What Python writes beside a node's own code when it first runs
+    /// is never part of the node, so two machines hash the same tree the
+    /// same whether either ran it.
+    #[test]
+    fn a_python_cache_is_never_part_of_a_node() {
+        assert!(is_node_tree_excluded("__pycache__"));
+        assert!(is_node_tree_excluded("helper.cpython-312.pyc"));
+        assert!(!is_node_tree_excluded("helper.py"));
+        assert!(!is_node_tree_excluded("pycache"));
     }
 
     /// The predicate demands everything the consumers read: the crate

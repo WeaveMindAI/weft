@@ -179,8 +179,10 @@ jobs:
             --vpc-egress private-ranges-only \
             --env-vars-file "$RUNNER_TEMP/front-env.yaml"
           rm "$RUNNER_TEMP/front-env.yaml"
-          url=$(gcloud run services describe "$service" --project "${{ vars.GCP_PROJECT_ID }}" --region "${{ vars.GCP_REGION }}" --format 'value(status.url)')
-          echo "frontend: $url" >> "$GITHUB_STEP_SUMMARY"
+          # The address weft recorded for it, the same shape as the
+          # install's own (Cloud Run's main `status.url` is another one).
+          url=$(weft frontend ls --on ${{ vars.WEFT_TARGET }} --json | jq -r --arg name "${{ vars.WEFT_FRONTEND_NAME }}" '.[] | select(.name == $name) | .url')
+          echo "frontend: $url" | tee -a "$GITHUB_STEP_SUMMARY"
 
       # The frontend now calls with the token this deploy gave it (named by
       # its id, so a token made since and not deployed is never put in its

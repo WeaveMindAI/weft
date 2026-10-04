@@ -44,9 +44,20 @@ Replace the three values on the first line. `FORK` is your fork's
 `owner/repo`, with the same capitals as on GitHub, because Google compares
 it letter for letter.
 
+If you are on the free tier and have no reason to be anywhere in particular,
+keep `us-west1` and put the database (below) in Neon's `aws-us-west-2`: both
+are in Oregon, so the install's calls to its database stay short. Google's
+always-free machine and 5 GB of storage exist only in `us-west1`,
+`us-central1` and `us-east1`, and Neon runs on AWS and Azure rather than
+Google, so that pair is the one place both free tiers sit side by side.
+
 ```bash
-PROJECT=my-project REGION=us-central1 FORK=me/weft
+PROJECT=my-project REGION=us-west1 FORK=me/weft
 NUMBER=$(gcloud projects describe $PROJECT --format='value(projectNumber)')
+# On a new project IAM can take a minute to catch up (with the services just
+# enabled, with the account just made), so each IAM step below is retried
+# until it holds.
+retry() { until "$@"; do echo "waiting for IAM to catch up, trying again in 10 seconds"; sleep 10; done; }
 
 gcloud services enable --project $PROJECT \
   iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com \
@@ -56,12 +67,9 @@ gcloud storage buckets create gs://$PROJECT-weft-state --project $PROJECT \
   --location $REGION --uniform-bucket-level-access
 
 gcloud iam service-accounts create weft-installer --project $PROJECT
-gcloud projects add-iam-policy-binding $PROJECT --role roles/owner \
+retry gcloud projects add-iam-policy-binding $PROJECT --role roles/owner \
   --member serviceAccount:weft-installer@$PROJECT.iam.gserviceaccount.com
 
-# On a new project IAM can take a minute to catch up with the services
-# just enabled, so each IAM step below is retried until it holds.
-retry() { until "$@"; do echo "waiting for IAM to catch up, trying again in 10 seconds"; sleep 10; done; }
 pool() {
   gcloud iam workload-identity-pools describe weft-install --project $PROJECT \
     --location global >/dev/null 2>&1 \
@@ -95,7 +103,7 @@ Then, in your fork's settings on GitHub, add these repository variables:
 |---|---|
 | `GCP_PROJECT_ID` | `$PROJECT` |
 | `GCP_REGION` | `$REGION` |
-| `GCP_ZONE` | a zone inside it, like `us-central1-a` |
+| `GCP_ZONE` | a zone inside it, like `us-west1-b` |
 | `TF_STATE_BUCKET` | `$PROJECT-weft-state`, the bucket you just made |
 | `GCP_WORKLOAD_IDENTITY_PROVIDER` | `projects/$NUMBER/locations/global/workloadIdentityPools/weft-install/providers/github` (`echo $NUMBER` prints the number) |
 | `GCP_INSTALL_SERVICE_ACCOUNT` | `weft-installer@$PROJECT.iam.gserviceaccount.com` |
@@ -132,12 +140,13 @@ takes weft's images from the release when your fork matches it (and
 builds the ones it changed), pushes them to your project, and creates
 everything listed under [what you get](#what-you-get).
 
-When it finishes, the run's summary gives you the install's address, a
-Cloud Run address like `https://weft-role-dispatcher-123456789.us-central1.run.app`,
-and the command that reads the first operator key: the password your CLI
-uses to act on the install, which you paste into `weft login prod` below.
-Run that command on your machine (it needs `gcloud`): the key is kept in
-Secret Manager and never printed in the workflow's logs.
+When it finishes, its last step (in the run's summary, and in its log for
+`gh run view <id> --log`) gives you the install's address, a Cloud Run
+address like `https://weft-role-dispatcher-123456789.us-west1.run.app`, and
+the line that logs you in with the first operator key: the password your CLI
+uses to act on the install. The key is kept in Secret Manager and never
+printed in the workflow's logs; that line reads it on your machine (it needs
+`gcloud`) and hands it straight to `weft login`, below.
 
 The address works at once, over HTTPS, with no extra charge. If you want a
 name of your own instead, see [your own domain](#your-own-domain), which
@@ -147,6 +156,20 @@ If you want to upgrade weft, merge upstream into your fork and run the
 workflow again; Terraform changes only what is different from last time.
 Then rebuild your CLI from that commit, or `activate` refuses to deploy
 ([when something goes wrong](#when-something-goes-wrong)).
+
+If you want weft gone, delete the GCP project you made for it: weft and
+everything it ever started live in that project and nowhere else, so that is
+the whole uninstall. Unlink its billing first, so it stops counting against
+your billing account at once:
+
+```bash
+gcloud billing projects unlink $PROJECT
+gcloud projects delete $PROJECT
+```
+
+Google keeps a deleted project for 30 days, during which `gcloud projects
+undelete $PROJECT` brings it back. The database is yours and stays where it
+is: delete it from its own provider if you no longer want it.
 
 ### What you get
 
@@ -238,8 +261,8 @@ In the project's folder, give your cloud install a name, log in to it, and
 deploy:
 
 ```bash
-weft target add prod https://weft-role-dispatcher-123456789.us-central1.run.app
-weft login prod
+weft target add prod https://weft-role-dispatcher-123456789.us-west1.run.app
+gcloud secrets versions access latest --secret <the secret> --project <project> | weft login prod --key-stdin
 weft infra start --on prod   # only if the program has infrastructure
 weft activate --on prod
 ```
@@ -257,11 +280,11 @@ Commit it, and your team gets the same `prod`:
 
 ```toml
 [targets.prod]
-url = "https://weft-role-dispatcher-123456789.us-central1.run.app"
+url = "https://weft-role-dispatcher-123456789.us-west1.run.app"
 ```
 
-`weft login prod` asks you to paste an operator key, checks it against the
-install, and keeps it in `~/.config/weft/credentials.toml`, which only you
+`weft login prod` takes an operator key (from its hidden prompt, or piped in
+with `--key-stdin`), checks it against the install, and keeps it in `~/.config/weft/credentials.toml`, which only you
 can read. If a teammate needs their own key, run
 `weft token mint --operator --on prod` and send them what it prints. To see
 the keys you have handed out, run `weft token ls --on prod`, and to cancel
@@ -350,8 +373,8 @@ folder, exactly like `weft activate --on prod`, not the copy you see on
 screen.
 
 If you want to edit again, click **local**; closing the graph does the same.
-If a target shows faded, you have not logged in to it yet: run
-`weft login <name>` and paste its operator key. And if you want prod's program as files you can read,
+If a target shows faded, you have not logged in to it yet: log in to it as
+in [deploy a project](#deploy-a-project). And if you want prod's program as files you can read,
 `weft running-source <folder> --on prod` writes them into a new folder and
 leaves your own files alone.
 

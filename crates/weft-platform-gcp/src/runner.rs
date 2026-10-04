@@ -699,6 +699,7 @@ mod tests {
             workload_identity_provider: "w".into(),
             caller_token_secret: "weft-caller-token-secret".into(),
             infra_network_tag: "weft-infra".into(),
+            build_machine: None,
         }
     }
 

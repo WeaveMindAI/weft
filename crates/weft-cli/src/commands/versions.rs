@@ -70,6 +70,11 @@ pub fn covers(rel: &str) -> bool {
     if rel.split('/').any(|seg| seg == "node_modules") {
         return false;
     }
+    // What Python writes beside a module it imported is never source
+    // (`weft_catalog::is_python_cache`).
+    if rel.split('/').any(weft_catalog::is_python_cache) {
+        return false;
+    }
     if rel.ends_with(".weft") || rel == "weft.toml" {
         return true;
     }
@@ -196,11 +201,17 @@ pub fn local_manifest(project: &Project) -> Result<Manifest> {
 }
 
 /// Snapshot the project: publish every covered file into the tenant's
-/// assets and answer the manifest a version records.
-pub async fn snapshot(client: &DispatcherClient, project: &Project) -> Result<Manifest> {
+/// assets and answer the manifest a version records. `tell` says on
+/// stderr how far the uploads have got (never under `--json`, whose
+/// output is the program's).
+pub async fn snapshot(client: &DispatcherClient, project: &Project, tell: bool) -> Result<Manifest> {
     let paths = covered_paths(&project.root)?;
     let source = crate::commands::assets::DiskSource::new(project.root.clone());
-    let store = crate::commands::assets::DispatcherStore::new(client);
+    let store = if tell {
+        crate::commands::assets::DispatcherStore::telling(client)
+    } else {
+        crate::commands::assets::DispatcherStore::new(client)
+    };
     let published = weft_assets::publish_files(&paths, &source, &store).await.context("publish the version's files")?;
     Ok(published.into_iter().map(|(path, p)| (path, p.hash)).collect())
 }
@@ -930,8 +941,11 @@ mod tests {
         write("nodes/pkg/target/debug/build.log");
         write("nodes/pkg/node_modules/left-pad/index.js");
         write("prompts/target/tone.txt");
+        write("nodes/pkg/__pycache__/helper.cpython-312.pyc");
+        write("scripts/tool.pyc");
 
         let paths = covered_paths(root).expect("walk");
+        assert!(!paths.iter().any(|p| p.contains("pycache") || p.ends_with(".pyc")), "{paths:?}");
         assert!(paths.contains(&"prompts/target/tone.txt".to_string()), "{paths:?}");
         assert!(paths.contains(&"nodes/pkg/Cargo.toml".to_string()), "{paths:?}");
         assert!(!paths.iter().any(|p| p.starts_with("nodes/pkg/target/")), "{paths:?}");
@@ -944,7 +958,7 @@ mod tests {
     #[test]
     fn the_walk_prunes_what_the_rule_excludes_and_nothing_else() {
         // Every hidden top-level folder is tooling, not a version's files.
-        for rel in [".weft", ".git", ".github", ".vscode", ".weft-notes", "layouts", "target", "nodes/a/node_modules"] {
+        for rel in [".weft", ".git", ".github", ".vscode", ".weft-notes", "layouts", "target", "nodes/a/node_modules", "nodes/a/__pycache__"] {
             assert!(prunes_whole_tree(rel), "{rel} holds nothing a version covers");
         }
         for rel in ["nodes", "nodes/base_catalog", "prompts", "scripts", "sql", "assets", "examples"] {

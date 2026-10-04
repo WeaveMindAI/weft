@@ -20,12 +20,6 @@ pub enum TaskKind {
     /// Dispatcher: register a wake signal with the listener and
     /// return its mint info to the worker that asked.
     RegisterSignal,
-    /// Dispatcher: a live caller's connection reached a worker; give
-    /// birth to the execution the routing token promised, pinned to that
-    /// worker replica. Producer = worker (via broker). Nothing is born
-    /// at the handshake, so a caller who never follows the redirect
-    /// leaves nothing behind.
-    LiveArrival,
     /// Dispatcher: fire a held-event signal that the listener
     /// observed (Timer fired, SSE event arrived, future browser
     /// session resolved). Producer = listener (via broker).
@@ -78,7 +72,6 @@ impl TaskKind {
         match self {
             Self::RouteEntry => "route_entry",
             Self::RegisterSignal => "register_signal",
-            Self::LiveArrival => "live_arrival",
             Self::FireSignal => "fire_signal",
             Self::Execute => "execute",
             Self::Resume => "resume",
@@ -140,14 +133,22 @@ pub struct ExecutionPayload {
 }
 
 /// What a live-caller execution starts with: the trigger's full signal
-/// spec (kind tag + config body) and the caller's opening request, the
-/// gate's verdict from the handshake and the rest from the request as
-/// it arrived at the worker. ONE record, built at the birth, read once
-/// on the worker.
+/// spec (kind tag + config body) and the caller's opening request, as the
+/// handshake read it. ONE record, built at the birth, read once on the
+/// worker.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveConnectionStart {
     pub spec: weft_core::primitive::SignalSpec,
     pub request: weft_core::caller::LiveRequest,
+    /// When a caller is coming: the unix second their routing token
+    /// expires. The run is born at the handshake and waits for them; only
+    /// the worker their connection reaches claims it (it is never
+    /// delivered), and a caller who never came is erased with it once this
+    /// passes (`tasks::callers_never_arrived`). `None` for a fired run,
+    /// which has nobody coming.
+    // SYNC: arrive_by <-> crates/weft-task-store/src/tasks.rs (AWAITS_CALLER)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrive_by: Option<i64>,
     /// Set when the run was FIRED rather than reached by a caller
     /// (`weft run --fire` on a Route). `None` for every real caller,
     /// which is every run that arrives through the gateway.
@@ -179,46 +180,6 @@ pub struct LiveConnectionStart {
 /// none.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FiredExchange {}
-
-/// Payload for `TaskKind::LiveArrival`. Producer = worker (the
-/// connection server, when a caller presents a routing token); consumer
-/// = the dispatcher's executor, which gives birth to the execution the
-/// token promised. The token carries what the handshake established (the
-/// route, the gate's verdict, the path and its captures); the rest is
-/// the request as it arrived at the worker, which is the request the
-/// caller sent to the dispatcher, resent.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LiveArrivalPayload {
-    pub token: String,
-    /// The worker replica the caller's connection reached: the birth
-    /// pins the execution to it. The broker refuses an arrival naming
-    /// any replica but the one calling.
-    pub replica: String,
-    pub method: String,
-    #[serde(default)]
-    pub query: std::collections::BTreeMap<String, String>,
-    #[serde(default)]
-    pub headers: Vec<(String, String)>,
-}
-
-/// The dedup key of the arrival task for `execution_id`: one birth per token,
-/// so a caller's client that resent the request converges on one task.
-pub fn live_arrival_dedup_key(execution_id: weft_core::ExecutionId) -> String {
-    format!("live-arrival:{execution_id}")
-}
-
-/// What a `LiveArrival` task answers with: the run born (its execution and
-/// the process it runs on), or the refusal the caller at the door gets, with
-/// its HTTP status (a run that could not work, refused before it was
-/// born). A refusal is an answer, not a failed task: the worker hands
-/// the caller exactly that status and message.
-// SYNC: LiveArrivalResult <-> crates/weft-engine/src/caller_conn.rs (the arrival wait reads it)
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
-pub enum LiveArrivalResult {
-    Born { execution_id: String, replica: String },
-    Refused { status: u16, message: String },
-}
 
 /// Payload for `TaskKind::FireSignal`. Producer = listener; consumer =
 /// dispatcher's executor, which calls `dispatch_listener_outcome`.
@@ -313,48 +274,8 @@ pub struct RecordLogPayload {
 }
 
 #[cfg(test)]
-mod live_arrival_wire_tests {
-    use super::*;
-
-    #[test]
-    fn the_arrival_payload_round_trips_and_the_key_is_per_execution_id() {
-        let payload = LiveArrivalPayload {
-            token: "v1.x.y".into(),
-            replica: "worker-a".into(),
-            method: "POST".into(),
-            query: [("verbose".to_string(), "1".to_string())].into_iter().collect(),
-            headers: vec![("content-type".into(), "application/json".into())],
-        };
-        let json = serde_json::to_value(&payload).unwrap();
-        let back: LiveArrivalPayload = serde_json::from_value(json).unwrap();
-        assert_eq!(back.method, "POST");
-        assert_eq!(back.replica, "worker-a");
-        assert_eq!(back.query["verbose"], "1");
-        assert_eq!(back.headers.len(), 1);
-        let bare: LiveArrivalPayload = serde_json::from_value(serde_json::json!({ "token": "t", "replica": "w", "method": "GET" })).unwrap();
-        assert!(bare.query.is_empty() && bare.headers.is_empty());
-        let execution_id = weft_core::ExecutionId::from_u128(7);
-        assert_eq!(live_arrival_dedup_key(execution_id), format!("live-arrival:{execution_id}"));
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A live arrival answers a born run or a refusal, each under its
-    /// own tag: the worker tells them apart by `outcome`.
-    #[test]
-    fn a_live_arrival_answer_round_trips() {
-        for answer in [
-            LiveArrivalResult::Born { execution_id: "c".into(), replica: "p".into() },
-            LiveArrivalResult::Refused { status: 422, message: "who is it for".into() },
-        ] {
-            let wire = serde_json::to_value(&answer).unwrap();
-            assert!(wire.get("outcome").is_some(), "{wire}");
-            assert_eq!(serde_json::from_value::<LiveArrivalResult>(wire).unwrap(), answer);
-        }
-    }
 
     /// The two steering payloads are the broker->dispatcher (`stop_tagged`)
     /// and dispatcher->worker (`cancel_execution`) contracts for a tag
@@ -451,6 +372,7 @@ mod tests {
                     serde_json::json!({ "path": "chat/{room}" }),
                 ),
                 request: request.clone(),
+                arrive_by: Some(1_000),
                 fired: None,
             }),
             unrecorded_birth: None,
@@ -463,6 +385,7 @@ mod tests {
             "a real caller carries no stand-in body, and an absent one costs no bytes on the wire"
         );
         assert_eq!(json["live_connection"]["request"]["params"]["room"], "room7");
+        assert_eq!(json["live_connection"]["arrive_by"], 1_000, "the claim and the reaper read it by this name");
         let back: ExecutionPayload = serde_json::from_value(json).unwrap();
         assert_eq!(back.live_connection.unwrap().request, request);
 
@@ -510,6 +433,7 @@ mod tests {
                     path: "cards".into(),
                     ..Default::default()
                 },
+                arrive_by: None,
                 fired: Some(FiredExchange {}),
             }),
             unrecorded_birth: None,

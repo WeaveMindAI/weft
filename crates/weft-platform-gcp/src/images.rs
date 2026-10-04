@@ -80,7 +80,7 @@ impl CloudBuildImages {
 /// The Cloud Build request for `req`, its context at `object` in `bucket`.
 /// `account` is the build's service account as a resource path
 /// (`projects/<p>/serviceAccounts/<email>`).
-fn build_body(req: &BuildRequest, bucket: &str, object: &str, account: &str) -> Value {
+fn build_body(req: &BuildRequest, bucket: &str, object: &str, account: &str, machine: Option<&str>) -> Value {
     let mut args = vec!["build".to_string(), "--tag".into(), req.image_ref.clone()];
     for (k, v) in &req.build_args {
         args.extend(["--build-arg".into(), format!("{k}={v}")]);
@@ -96,12 +96,21 @@ fn build_body(req: &BuildRequest, bucket: &str, object: &str, account: &str) -> 
         }],
         "images": [req.image_ref],
         "timeout": BUILD_TIMEOUT,
-        // A build run as an account of its own writes its log to Cloud
-        // Logging only (Cloud Build refuses the default bucket then).
         "serviceAccount": account,
-        "options": { "logging": "CLOUD_LOGGING_ONLY" },
+        "options": options(machine),
         "tags": ["weft", format!("weft-project-{}", req.project_id.simple())],
     })
+}
+
+/// A build's options: its log goes to Cloud Logging only (Cloud Build
+/// refuses the default bucket for a build run as an account of its own),
+/// on the install's chosen machine when it chose one.
+fn options(machine: Option<&str>) -> Value {
+    let mut options = json!({ "logging": "CLOUD_LOGGING_ONLY" });
+    if let Some(machine) = machine {
+        options["machineType"] = json!(machine);
+    }
+    options
 }
 
 /// How a Cloud Build build is doing, from its `status`.
@@ -153,7 +162,7 @@ impl ImageBuilder for CloudBuildImages {
                 bytes,
             )
             .await?;
-        let op = self.google.post(&self.builds_url(), &build_body(&req, &self.gcp.build_bucket, &object, &format!("projects/{}/serviceAccounts/{}", self.gcp.project, self.gcp.builder_service_account))).await?;
+        let op = self.google.post(&self.builds_url(), &build_body(&req, &self.gcp.build_bucket, &object, &format!("projects/{}/serviceAccounts/{}", self.gcp.project, self.gcp.builder_service_account), self.gcp.build_machine.as_deref())).await?;
         let id = op
             .pointer("/metadata/build/id")
             .and_then(Value::as_str)
@@ -254,12 +263,15 @@ mod tests {
             image_ref: "us-central1-docker.pkg.dev/acme/weft/weft-worker:abc".into(),
             build_args: vec![("WEFT_COMPILE_LANE".into(), "0".into())],
         };
-        let body = build_body(&req, "bucket", "contexts/b1.tar.gz", "projects/acme/serviceAccounts/b@acme.iam.gserviceaccount.com");
+        let body = build_body(&req, "bucket", "contexts/b1.tar.gz", "projects/acme/serviceAccounts/b@acme.iam.gserviceaccount.com", None);
         assert_eq!(body["images"][0], req.image_ref);
         let args: Vec<&str> = body["steps"][0]["args"].as_array().unwrap().iter().map(|a| a.as_str().unwrap()).collect();
         assert_eq!(args, ["build", "--tag", req.image_ref.as_str(), "--build-arg", "WEFT_COMPILE_LANE=0", "."]);
         assert_eq!(body["serviceAccount"], "projects/acme/serviceAccounts/b@acme.iam.gserviceaccount.com");
         assert_eq!(body["options"]["logging"], "CLOUD_LOGGING_ONLY", "a build with its own account logs to Cloud Logging");
+        assert!(body["options"].get("machineType").is_none(), "Cloud Build's own default machine, the free one");
+        let bigger = build_body(&req, "bucket", "contexts/b1.tar.gz", "projects/acme/serviceAccounts/b@acme.iam.gserviceaccount.com", Some("E2_HIGHCPU_8"));
+        assert_eq!(bigger["options"]["machineType"], "E2_HIGHCPU_8");
     }
 
     #[test]

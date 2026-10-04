@@ -7,9 +7,18 @@
 use std::time::Duration;
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::Connection;
 
 /// How long a pool keeps a connection nothing uses.
 pub const IDLE_CLOSE: Duration = Duration::from_secs(30);
+
+/// How long a connection may have sat idle before it is pinged on its way
+/// out of the pool. A connection a request just handed back goes straight
+/// out again: the ping is one more round trip to the database, and a
+/// request that runs thirty queries would pay it thirty times. One that
+/// sat longer may have been cut under the pool (the database restarted,
+/// the network dropped it), so it is checked and, if dead, replaced.
+pub const PING_AFTER_IDLE: Duration = Duration::from_secs(5);
 
 /// How long a boot keeps trying to reach a database that is not
 /// answering yet (a local one still starting, a serverless one waking).
@@ -39,4 +48,13 @@ pub fn options(max_connections: u32, acquire_timeout: Duration) -> PgPoolOptions
         .min_connections(0)
         .idle_timeout(IDLE_CLOSE)
         .acquire_timeout(acquire_timeout)
+        .test_before_acquire(false)
+        .before_acquire(|conn, meta| {
+            Box::pin(async move {
+                if meta.idle_for >= PING_AFTER_IDLE {
+                    conn.ping().await?;
+                }
+                Ok(true)
+            })
+        })
 }

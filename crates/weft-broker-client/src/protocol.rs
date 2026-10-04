@@ -112,9 +112,19 @@ wire_enum! {
 
 // ---------- Journal ----------
 
+/// The most one `/v1/journal/record` body may weigh. The heaviest event
+/// is an emission, one value per output port, each under
+/// `MAX_WIRE_VALUE_BYTES` (the engine refuses more at the node, which is
+/// the refusal a user sees): room for sixty-four such ports, so no run
+/// that obeyed the wire rule ever dies on its journal write. A client
+/// sending several events splits them into requests under this.
+pub const JOURNAL_RECORD_BODY_LIMIT: usize = 64 * weft_core::storage::MAX_WIRE_VALUE_BYTES;
+
+/// `POST /v1/journal/record`: rows of ONE execution, in order, written in
+/// one statement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalRecordRequest {
-    pub event: ExecEvent,
+    pub events: Vec<ExecEvent>,
     /// The writing worker's replica id: the broker takes the write only
     /// from the replica that owns the execution's claim. Always present: only
     /// workers write through this request (every caller passes its own), and the dispatcher's own in-process writes

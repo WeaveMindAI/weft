@@ -164,6 +164,13 @@ pub struct GcpPlatform {
     /// to nothing else.
     #[serde(rename = "infraNetworkTag")]
     pub infra_network_tag: String,
+    /// The Cloud Build machine a project's worker image compiles on (a
+    /// `machineType`, `E2_HIGHCPU_8`), or `None` for Cloud Build's own
+    /// default, the one its free build minutes cover. A bigger one compiles
+    /// faster and is paid for by the minute. An image is built once per
+    /// version of a program, never per worker started.
+    #[serde(default, rename = "buildMachine", skip_serializing_if = "Option::is_none")]
+    pub build_machine: Option<String>,
 }
 
 /// How the install authenticates its management API.
@@ -530,6 +537,7 @@ pub(crate) mod tests {
             workload_identity_provider: "w".into(),
             caller_token_secret: "c".into(),
             infra_network_tag: "it".into(),
+            build_machine: None,
         }));
         c.auth = AuthMode::OperatorKeys;
         c.public_url = "https://d.run.app".into();

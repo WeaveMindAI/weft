@@ -111,9 +111,9 @@ pub struct NewTask {
     pub tenant_id: String,
     /// If set, only the named process replica can claim this task. A
     /// live execution is pinned to the worker replica its caller's
-    /// connection reached (`admit_live_execution_in`), since the caller
-    /// is on THAT replica's socket. NULL means whoever the task is
-    /// delivered to may claim it.
+    /// connection reached when that worker claims it (see
+    /// [`AWAITS_CALLER`]), since the caller is on THAT replica's socket.
+    /// NULL means whoever the task is delivered to may claim it.
     pub target_replica: Option<String>,
     /// The worker IMAGE this task runs on: the project's
     /// `running_binary_hash` at enqueue time. A worker task is delivered
@@ -493,81 +493,6 @@ pub async fn enqueue_or_rearm(pool: &PgPool, spec: NewTask) -> Result<DedupOutco
     Ok(outcome)
 }
 
-/// [`admit_live_execution_in`]'s outcome. `Admitted` = THIS call inserted
-/// the pinned task (the caller's transaction now owns a fresh admission and
-/// should write whatever must commit atomically with it).
-/// `AlreadyAdmitted` = an earlier call for the same execution already inserted
-/// it, pinned to `replica` (an idempotent retry when that is the asker; a
-/// second copy of the caller's request on another worker otherwise).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LiveAdmitOutcome {
-    Admitted,
-    AlreadyAdmitted { replica: String },
-}
-
-/// ATOMICALLY admit a live execution onto the worker replica its caller's
-/// connection reached: insert the execute task for the spec's execution,
-/// pinned to `spec.target_replica` (that replica), unless one is already
-/// live for the execution.
-///
-/// MUST run inside a caller-owned transaction: the caller writes the
-/// execution's journal birth in the same transaction, so "admitted" and
-/// "journaled" can never disagree. Admission IS the task insert, so
-/// "admitted" and "has a task row" can never disagree either. The spec's
-/// `dedup_key` (`{execution_id}:execute`) collapses a crash-retry of the same
-/// arrival.
-pub async fn admit_live_execution_in(conn: &mut sqlx::PgConnection, spec: &NewTask) -> Result<LiveAdmitOutcome> {
-    let project_id = spec.project_id.ok_or_else(|| anyhow::anyhow!("live admission requires project_id"))?;
-    let execution_id = spec.execution_id.as_deref().ok_or_else(|| anyhow::anyhow!("live admission requires execution"))?;
-    let dedup = spec.dedup_key.as_deref().ok_or_else(|| anyhow::anyhow!("live admission requires dedup_key"))?;
-    let replica = spec
-        .target_replica
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("live admission requires the worker replica the caller reached"))?;
-    // Serialize admissions of one execution, so two copies of the same
-    // arrival never both insert.
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(format!("live-admit|{}|{dedup}", spec.tenant_id))
-        .execute(&mut *conn)
-        .await?;
-    let existing: Option<(Option<String>,)> = sqlx::query_as(
-        r#"SELECT target_replica FROM task
-           WHERE tenant_id = $1 AND kind = 'execute' AND dedup_key = $2
-             AND status IN ('pending', 'claimed')
-           LIMIT 1"#,
-    )
-    .bind(spec.tenant_id.as_str())
-    .bind(dedup)
-    .fetch_optional(&mut *conn)
-    .await?;
-    if let Some((pinned,)) = existing {
-        let pinned = pinned.ok_or_else(|| {
-            anyhow::anyhow!("live execution {execution_id} has an execute task pinned to no worker; it was not admitted as a live run")
-        })?;
-        return Ok(LiveAdmitOutcome::AlreadyAdmitted { replica: pinned });
-    }
-    let id = Uuid::new_v4();
-    let now = unix_now();
-    sqlx::query(
-        r#"INSERT INTO task (
-            id, kind, status, target, project_id, dedup_key, execution_id, tenant_id,
-            target_replica, binary_hash, payload, attempts, created_at_unix
-        ) VALUES ($1, 'execute', 'pending', 'worker', $2, $3, $4, $5, $6, $7, $8, 0, $9)"#,
-    )
-    .bind(id)
-    .bind(project_id)
-    .bind(dedup)
-    .bind(execution_id)
-    .bind(spec.tenant_id.as_str())
-    .bind(replica)
-    .bind(spec.binary_hash.as_deref())
-    .bind(&spec.payload)
-    .bind(now)
-    .execute(&mut *conn)
-    .await?;
-    Ok(LiveAdmitOutcome::Admitted)
-}
-
 /// Atomically claim one task for `replica` (the claiming process
 /// replica). Picks oldest pending first; also rescues claims whose lease
 /// expired (the claimant died mid-work).
@@ -605,8 +530,17 @@ pub async fn claim_one(
     row.map(row_to_task).transpose()
 }
 
+/// A live run's execute task whose caller is on the way: born at the
+/// handshake, it is claimed only by the worker the caller's connection
+/// reaches, which the claim pins it to. Never delivered, and erased with
+/// its run if the caller never comes (`callers_never_arrived`).
+// SYNC: AWAITS_CALLER <-> crates/weft-task-store/src/kinds.rs (LiveConnectionStart::arrive_by)
+// A task with no live connection answers false, not NULL: `NOT NULL` is
+// NULL, and the delivery would skip every ordinary task.
+pub const AWAITS_CALLER: &str = "COALESCE(payload -> 'live_connection' ? 'arrive_by', FALSE)";
+
 /// The claim around a pick: `$1` the claimant, `$2` now, `$3` the lease's
-/// end. `RETURNING` hands back the row as claimed, so `attempts` counts the
+/// end. A live run waiting for its caller is pinned to the claimant. `RETURNING` hands back the row as claimed, so `attempts` counts the
 /// claim the caller now holds. A new claim is the run that sees everything
 /// asked before it, so it clears `rerun_requested`, and it is the delivery
 /// the task was waiting for, so it clears `delivered_until_unix`.
@@ -614,7 +548,8 @@ fn claim_sql(pick: &str) -> String {
     format!(
         "UPDATE task \
          SET status = 'claimed', claimed_by = $1, claimed_until_unix = $3, attempts = attempts + 1, \
-             rerun_requested = FALSE, delivered_until_unix = NULL \
+             rerun_requested = FALSE, delivered_until_unix = NULL, \
+             target_replica = CASE WHEN {AWAITS_CALLER} THEN $1 ELSE target_replica END \
          WHERE id = ({pick}) \
          RETURNING id, kind, status, project_id, execution_id, tenant_id, binary_hash, attempts, payload"
     )
@@ -735,19 +670,21 @@ pub struct Undeliverable {
 /// outstanding, and no other task of its execution is being driven (the one
 /// execution, one claim rule of `EXECUTION_ID_PICK`; the sweep that follows the
 /// driving task's end delivers it). A task pinned to a replica is never delivered: it
-/// is a live run, driven inside its caller's own connection. A worker task
+/// is a live run, driven inside its caller's own connection; nor is a live
+/// run still waiting for its caller ([`AWAITS_CALLER`]). A worker task
 /// that cannot be delivered (no image, no run class) comes back in
 /// [`Taken::undeliverable`] with its reason rather than delivered to a
 /// guess, and never holds back the good rows taken beside it.
 pub async fn take_deliveries(pool: &PgPool, limit: i64) -> Result<Taken> {
     let now = unix_now();
-    let rows = sqlx::query(
+    let rows = sqlx::query(&format!(
         r#"UPDATE task SET delivered_until_unix = $2
            WHERE id IN (
                SELECT id FROM task
                WHERE target = 'worker'
                  AND kind IN ('execute', 'resume')
                  AND target_replica IS NULL
+                 AND NOT {AWAITS_CALLER}
                  AND (status = 'pending' OR (status = 'claimed' AND claimed_until_unix < $1))
                  AND (delivered_until_unix IS NULL OR delivered_until_unix < $1)
                  AND NOT EXISTS (SELECT 1 FROM task other
@@ -759,7 +696,7 @@ pub async fn take_deliveries(pool: &PgPool, limit: i64) -> Result<Taken> {
                LIMIT $3
            )
            RETURNING id, project_id, tenant_id, execution_id, binary_hash, payload ->> 'run_class' AS run_class"#,
-    )
+    ))
     .bind(now)
     .bind(now + delivery_lease_secs())
     .bind(limit)
@@ -1192,9 +1129,8 @@ pub struct OrphanedLiveExecution {
 }
 
 /// Every live execution whose replica is gone: its pinned execute task's
-/// claim lapsed (the replica stopped renewing it), or it was admitted and
-/// never claimed within a claim's duration (the replica died between the
-/// birth and the claim, which it makes in the same breath).
+/// claim lapsed (the replica stopped renewing it), or it was put back
+/// pending, still pinned, and not claimed again within a claim's duration.
 ///
 /// A read: the reaper cancels then deletes each, and a sweep that runs
 /// twice re-finds the same not-yet-deleted rows (the cancel dedups).
@@ -1220,6 +1156,46 @@ pub async fn orphaned_live_executions(pool: &PgPool) -> Result<Vec<OrphanedLiveE
             let project_id: Option<Uuid> = r.try_get("project_id")?;
             let execution_id = execution_id.ok_or_else(|| anyhow::anyhow!("live execute task {task_id} has NULL execution"))?;
             Ok(OrphanedLiveExecution { task_id, execution_id, project_id })
+        })
+        .collect()
+}
+
+/// A live run born at its caller's handshake whose caller never reached a
+/// worker before their routing token expired: nobody will ever claim it.
+pub struct CallerNeverArrived {
+    pub task_id: Uuid,
+    pub execution_id: String,
+}
+
+/// The task row (`task`, unqualified) of a live run whose caller never
+/// came: born for a caller, never claimed, past its `arrive_by` (`now` the
+/// SQL parameter holding the current unix second). THE definition: the
+/// reaper's read and the erase that follows both hold a row to it, so a
+/// run claimed in between (even one put back pending since) is never
+/// erased.
+pub fn never_arrived_sql(now: &str) -> String {
+    format!(
+        "(kind = 'execute' AND status = 'pending' AND target_replica IS NULL AND {AWAITS_CALLER} \
+          AND (payload -> 'live_connection' ->> 'arrive_by')::bigint < {now})"
+    )
+}
+
+/// Every live run whose caller never came ([`CallerNeverArrived`],
+/// [`never_arrived_sql`]). A read: the reaper erases each run with its
+/// task in one transaction, so a sweep that stops halfway finds the rest
+/// next time.
+pub async fn callers_never_arrived(pool: &PgPool, now: i64) -> Result<Vec<CallerNeverArrived>> {
+    let rows = sqlx::query(&format!("SELECT id, execution_id FROM task WHERE {}", never_arrived_sql("$1")))
+    .bind(now)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|r| {
+            let task_id: Uuid = r.try_get("id")?;
+            let execution_id: Option<String> = r.try_get("execution_id")?;
+            let execution_id =
+                execution_id.ok_or_else(|| anyhow::anyhow!("live execute task {task_id} has NULL execution"))?;
+            Ok(CallerNeverArrived { task_id, execution_id })
         })
         .collect()
 }

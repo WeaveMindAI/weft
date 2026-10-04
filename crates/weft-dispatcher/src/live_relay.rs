@@ -7,8 +7,8 @@
 //! ticket, asks the platform for an address of the project's workers at
 //! the image the ticket names ([`weft_platform_traits::Runner::endpoint`]),
 //! and forwards the caller's request there, a WebSocket included. The
-//! worker checks the ticket again and asks for the execution to be born on
-//! itself; everything after that is between the caller and that worker,
+//! worker checks the ticket again and claims the run the handshake gave
+//! birth to; everything after that is between the caller and that worker,
 //! with this door passing the bytes along.
 //!
 //! The caller's request reaches the worker as they sent it: method, path

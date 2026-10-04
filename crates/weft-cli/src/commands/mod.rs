@@ -231,6 +231,11 @@ impl Ctx {
         Ok(())
     }
 
+    /// The target `--on` named, if any.
+    pub fn on(&self) -> Option<&str> {
+        self.on.as_deref()
+    }
+
     /// The address and operator key a request from this command carries
     /// (`weft target key` prints them for the editor).
     pub fn install_access(&self) -> anyhow::Result<(&str, Option<&str>)> {

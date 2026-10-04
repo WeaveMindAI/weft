@@ -8,7 +8,6 @@
 
 pub mod execute;
 pub mod fire_signal;
-pub mod live_arrival;
 pub mod program_call;
 pub mod record_cost;
 pub mod record_log;
@@ -21,7 +20,6 @@ pub mod stop_tagged;
 // instantiates them when wiring the registry. Concrete payload /
 // result types are imported directly by their producers.
 pub use fire_signal::FireSignalExecutor;
-pub use live_arrival::LiveArrivalExecutor;
 pub use program_call::ProgramCallExecutor;
 pub use record_cost::RecordCostExecutor;
 pub use record_log::RecordLogExecutor;

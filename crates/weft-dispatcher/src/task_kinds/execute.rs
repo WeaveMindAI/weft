@@ -58,7 +58,6 @@ pub async fn enqueue_resume(
         binary_hash: &program.binary_hash,
         tenant_id,
         run_class,
-        pinned_to: None,
         live_connection: None,
         unrecorded_birth: None,
     })?;
@@ -76,12 +75,10 @@ pub struct ExecutionTask<'a> {
     pub binary_hash: &'a str,
     pub tenant_id: &'a str,
     pub run_class: weft_core::run_class::RunClass,
-    /// The worker replica a live run is pinned to (the one its caller's
-    /// connection reached); `None` for everything else, which is
-    /// delivered to whichever worker the platform gives.
-    pub pinned_to: Option<String>,
     /// `Some(start)` for a live-caller execution (the worker expects a
-    /// caller to attach).
+    /// caller to attach). One whose caller is on the way
+    /// (`LiveConnectionStart::arrive_by`) is never delivered: the worker
+    /// the caller reaches claims it, and the claim pins it there.
     pub live_connection: Option<weft_task_store::kinds::LiveConnectionStart>,
     /// An unrecorded run's birth rows (`ExecutionPayload::unrecorded_birth`),
     /// `None` for every recorded run.
@@ -91,7 +88,7 @@ pub struct ExecutionTask<'a> {
 /// Build the `NewTask` for an execution-family task, UNQUEUED: the caller
 /// decides how it is inserted (a plain dedup'd enqueue, or committed
 /// atomically with the execution's journal birth via
-/// `Journal::start_execution` / `start_live_execution`).
+/// `Journal::start_execution`).
 pub fn execution_task_spec(task: ExecutionTask<'_>) -> Result<NewTask> {
     let execution_id_str = task.execution_id.to_string();
     let payload = ExecutionPayload {
@@ -113,7 +110,7 @@ pub fn execution_task_spec(task: ExecutionTask<'_>) -> Result<NewTask> {
         dedup_key: Some(dedup),
         execution_id: Some(execution_id_str),
         tenant_id: task.tenant_id.to_string(),
-        target_replica: task.pinned_to,
+        target_replica: None,
         binary_hash: Some(task.binary_hash.to_string()),
         payload: serde_json::to_value(&payload)?,
     })

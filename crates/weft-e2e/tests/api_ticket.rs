@@ -1,12 +1,13 @@
 //! A live caller's TICKET: what asking for a connection buys you, and
 //! for how long.
 //!
-//! Asking at `/connect/...` checks the caller and hands back a URL on the
-//! live door carrying a signed ticket: which program to reach and until
-//! when. Nothing is started or queued at that moment, so a caller who never
-//! comes leaves nothing behind but the entry-limit slot the ticket holds.
-//! When the caller does come, the door starts a worker of that program if
-//! none is running and forwards them to it.
+//! Asking at `/connect/...` checks the caller, gives birth to their run and
+//! hands back a URL on the live door carrying a signed ticket: which run,
+//! which program to reach and until when. The run waits for the caller
+//! that long; one whose caller never came is erased once the ticket
+//! expires. When the caller does come, the door starts a worker of that
+//! program if none is running and forwards them to it, and that worker
+//! claims the run.
 //!
 //! Elapsed time against a live install is the thing under test, so it runs
 //! in a cell whose clock runs four times faster: the ticket's life and the

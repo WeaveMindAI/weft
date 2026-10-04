@@ -872,6 +872,7 @@ fn stand_in_caller(
     Ok(weft_task_store::kinds::LiveConnectionStart {
         spec: spec.clone(),
         request,
+        arrive_by: None,
         fired: Some(weft_task_store::kinds::FiredExchange {}),
     })
 }

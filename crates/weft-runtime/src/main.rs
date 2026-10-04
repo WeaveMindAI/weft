@@ -58,7 +58,12 @@ async fn main() -> anyhow::Result<()> {
             let file = weft_runtime::log_file::LogFile::open(path, weft_runtime::log_file::MAX_BYTES)?;
             tracing_subscriber::fmt().with_env_filter(filter).with_ansi(false).with_writer(file).init();
         }
-        _ => tracing_subscriber::fmt().with_env_filter(filter).init(),
+        // Colours only on a terminal: a platform's log collector (Cloud
+        // Run's) keeps the escape codes as text.
+        _ => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
+            .init(),
     }
     match args.command {
         Command::Serve { config, role, .. } => {

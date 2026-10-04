@@ -53,12 +53,28 @@ pub async fn run(ctx: Ctx, action: FrontendAction) -> Result<()> {
             let body = AddFrontendRequest { name, host, repo };
             // Refused here, with the flag still in the person's hand.
             body.validate().map_err(anyhow::Error::msg)?;
+            // A frontend is often the first thing a project gets on an
+            // install, before anything has run there, and it needs only
+            // the project to exist, not a build of it.
+            super::ensure::ensure_project_known(&ctx).await?;
             let made: FrontendWithToken =
                 serde_json::from_value(client.post_json(&base, &serde_json::to_value(&body)?).await?)
                     .context("read the frontend the install made")?;
             hand_over(&ctx, &project, &install_url, made)?;
         }
         FrontendAction::Token { name, done: None } => {
+            // A hosted frontend's token is its workflow's: a new one made
+            // here would reach no server.
+            let frontends: Vec<Frontend> =
+                serde_json::from_value(client.get_json(&base).await?).context("read the project's frontends")?;
+            if let Some(Frontend { repo: Some(repo), .. }) = frontends.iter().find(|f| f.name == name) {
+                anyhow::bail!(
+                    "the install hosts frontend '{name}', and its token is the deploy workflow's: in {}, {} gives \
+                     the workflow a new one, and its next deploy puts it in place",
+                    repo.name,
+                    super::target::export_command(ctx.project()?, ctx.on())
+                );
+            }
             let renewed: FrontendWithToken =
                 serde_json::from_value(client.post_json(&format!("{base}/{name}/token"), &serde_json::json!({})).await?)
                     .context("read the frontend's new token")?;
@@ -110,32 +126,39 @@ pub async fn run(ctx: Ctx, action: FrontendAction) -> Result<()> {
 }
 
 /// Put a fresh token where only this person can read it, and say what
-/// goes where.
+/// goes where. A frontend the install hosts gets no file: its service
+/// gets a token of its own from the repository's workflow (`weft target
+/// export` mints it, the deploy puts it in place and retires every other),
+/// so one written here would only sit on disk until that deploy killed it.
 fn hand_over(ctx: &Ctx, project: &str, install_url: &str, made: FrontendWithToken) -> Result<()> {
     let f = &made.frontend;
-    // A frontend running elsewhere reaches the install at its public
-    // address; one the install hosts is told its own by its workflow.
-    let mut env = vec![("WEFT_TOKEN", made.token.clone())];
-    if f.host == FrontendHost::External {
-        env.push(("WEFT_DISPATCHER_URL", install_url.to_string()));
-        env.push(("WEFT_PUBLIC_URL", install_url.to_string()));
+    if let (Some(repo), Some(service)) = (&f.repo, &f.service) {
+        if ctx.json_out(&serde_json::json!({ "frontend": f, "tokenId": made.token_id }))? {
+            return Ok(());
+        }
+        println!("frontend '{}': the install made its service {service}, and {} may deploy to it", f.name, repo.name);
+        if let Some(url) = &f.url {
+            println!("visitors reach it at {url}");
+        }
+        println!(
+            "next, in {}: {} hands its deploy workflow the service and a token",
+            repo.name,
+            super::target::export_command(ctx.project()?, ctx.on())
+        );
+        return Ok(());
     }
+    // A frontend running elsewhere reaches the install at its public
+    // address.
+    let env = vec![
+        ("WEFT_TOKEN", made.token.clone()),
+        ("WEFT_DISPATCHER_URL", install_url.to_string()),
+        ("WEFT_PUBLIC_URL", install_url.to_string()),
+    ];
     let file = super::target::write_secrets_file(&format!("{project}-frontend-{}", f.name), &env)?;
     if ctx.json_out(&serde_json::json!({ "frontend": f, "tokenId": made.token_id, "tokenFile": file }))? {
         return Ok(());
     }
     println!("frontend '{}': its token is in {} (readable by you only; shown this once)", f.name, file.display());
-    match (&f.repo, &f.service) {
-        (Some(repo), Some(service)) => {
-            println!("the install made its service {service}, and {} may deploy to it", repo.name);
-            if let Some(url) = &f.url {
-                println!("visitors reach it at {url}");
-            }
-            println!("next, in {}: `weft target export <target> --github` hands its deploy workflow the service and a token", repo.name);
-        }
-        _ => println!(
-            "put that file's three variables in its server's environment: it calls the install at {install_url} with that token"
-        ),
-    }
+    println!("put that file's three variables in its server's environment: it calls the install at {install_url} with that token");
     Ok(())
 }

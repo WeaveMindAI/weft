@@ -242,6 +242,7 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         broker: RoleClient::new(CoreRole::Broker, addresses.broker.clone(), tokens, http.clone()),
         http,
         caller_token_secret: Arc::new(caller_token_secret),
+        programs: Arc::new(weft_core::content_cache::ContentCache::new(64)),
     })
 }
 
@@ -275,7 +276,6 @@ pub fn core_task_registry_builder() -> crate::task_executor::TaskRegistryBuilder
     crate::task_executor::TaskRegistry::builder()
         .register(TaskKind::RegisterSignal, Arc::new(crate::task_kinds::RegisterSignalExecutor))
         .register(TaskKind::RouteEntry, Arc::new(crate::task_kinds::RouteEntryExecutor))
-        .register(TaskKind::LiveArrival, Arc::new(crate::task_kinds::LiveArrivalExecutor))
         .register(TaskKind::FireSignal, Arc::new(crate::task_kinds::FireSignalExecutor))
         .register(TaskKind::RecordCost, Arc::new(crate::task_kinds::RecordCostExecutor))
         .register(TaskKind::RecordLog, Arc::new(crate::task_kinds::RecordLogExecutor))

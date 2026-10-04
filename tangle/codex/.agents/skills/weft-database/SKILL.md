@@ -31,9 +31,10 @@ steps plainly, and wait until they are done.
 
 ## What you do
 
-Make the project through Neon's API. Pick the Neon region closest to the
-install's GCP region, by its id (Neon lists them at
-`https://neon.com/docs/introduction/regions`). Run all of this as one Bash call:
+Make the project through Neon's API. The region is `aws-us-west-2` when the
+install is in GCP's `us-west1` (the free-tier default, read weft-cloud-install
+for why); otherwise the Neon region nearest the install's GCP region, by its
+id (Neon lists them at `https://neon.com/docs/introduction/regions`). Run all of this as one Bash call:
 each call starts a fresh shell, so the key and the file name would not
 survive into a second one. The `trap` deletes the file holding Neon's answer,
 which contains the database's password, when that shell ends:
