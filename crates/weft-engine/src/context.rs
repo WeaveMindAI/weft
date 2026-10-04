@@ -64,6 +64,12 @@ fn frames_dedup_key(frames: &weft_core::frames::LoopFrames) -> Result<String, se
 pub struct EngineClients {
     pub journal: Arc<dyn JournalClient>,
     pub tasks: Arc<dyn TaskStoreClient>,
+    /// Where a node's spend is recorded (`metering::CostSink`): the task
+    /// store, never behind a drive's journal ([`JournalFirst`]). A cost
+    /// has no place in the run's order, can be recorded after its run's
+    /// drive ended, and money already spent is recorded even when the
+    /// run's journal failed.
+    pub costs: Arc<dyn TaskStoreClient>,
     pub infra: Arc<dyn InfraReader>,
     /// Broker client for infra applied-state reads + apply enqueue.
     /// Used by the loop driver during `Phase::InfraSetup` to make the
@@ -113,9 +119,11 @@ impl EngineClients {
     /// code.
     pub fn from_broker(broker_url: &str, token: weft_broker_client::TokenSource) -> Self {
         let url = || broker_url.to_string();
+        let tasks: Arc<dyn TaskStoreClient> = weft_broker_client::BrokerTaskStoreClient::new(url(), token.clone());
         Self {
             journal: weft_broker_client::BrokerJournalClient::new(url(), token.clone()),
-            tasks: weft_broker_client::BrokerTaskStoreClient::new(url(), token.clone()),
+            costs: tasks.clone(),
+            tasks,
             infra: weft_broker_client::BrokerInfraClient::new(url(), token.clone()),
             infra_state: weft_broker_client::BrokerInfraStateClient::new(url(), token.clone()),
             project: weft_broker_client::BrokerProjectClient::new(url(), token.clone()),
@@ -1192,144 +1200,271 @@ fn type_accepts(declared: &WeftType, value: &Value) -> bool {
     declared.accepts_runtime_value(value)
 }
 
-/// Journal write for teardown paths that cannot propagate errors.
-/// `DriveJournal` also marks the drive for exit on failure.
+/// Journal write for teardown paths that cannot propagate errors: a
+/// failure is logged. Through a `DriveJournal` the write is only handed
+/// over, so a failure here means the drive was already poisoned or its
+/// sending task is gone; the run stops on the poison itself.
 pub async fn record_from_replica(journal: &dyn JournalClient, event: ExecEvent, replica: &str) {
     if let Err(e) = journal.record_event(&event, Some(replica)).await {
-        tracing::error!(
-            target: "weft_engine::journal",
-            error = %e,
-            "journal write failed; drive is now poisoned and the worker will exit"
-        );
+        tracing::error!(target: "weft_engine::journal", error = %e, "a journal write on a teardown path failed");
     }
 }
 
-/// The journal a drive writes through: it holds the driver's own rows
-/// back and sends them together, and it latches the first failed write.
+/// The journal a drive writes through: every row it is handed goes to the
+/// database in the background, in the order handed, and nothing on the
+/// run's path waits for it.
 ///
-/// **Batching.** A drive writes several rows per step (a firing's
-/// start, its emissions, its end, the next firing's start), and each
-/// write is a round trip to the database. The driver DEFERS its rows
-/// ([`Self::deferring`]): they wait here and go out together at the
-/// points where they must be durable, in one request, in the order
-/// written. Those points are the driver's own ([`Self::flush`] before a
-/// node's body runs, so its start is on record before any of its side
-/// effects, and before the driver waits for news), and every write that
-/// is not deferred: a node's own writes through its ctx go straight out,
-/// carrying whatever was held ahead of them, so the journal's order is
-/// always the order things happened. A read through the drive journal
-/// flushes first, so it never reads past rows the drive wrote; the
-/// driver's own idle read does not (see [`Deferring`]).
+/// **Order and batching.** One task per drive sends the rows: whatever has
+/// queued while the previous write was on its way goes out as the next
+/// write, so a burst of rows is one round trip and a quiet run sends each
+/// row as it comes. The driver's rows and its nodes' own (through their
+/// ctx) share the queue, so the journal's order is the order things
+/// happened.
+///
+/// **Waiting for it.** [`Self::flush`] answers once everything handed so
+/// far is on record. Only three kinds of place ask: before the run ends or
+/// parks (its terminal, a stall, a cancel walk), since what comes after
+/// reads the journal from another worker; before a read (a read never runs
+/// past rows the drive wrote); and before a task goes out, since a task
+/// has another writer act on the run ([`JournalFirst`]). A live call never waits on its own bookkeeping: a run
+/// with a live caller is never resumed elsewhere, and a crash fails it
+/// whatever the journal holds. A run that is resumed redoes the steps whose
+/// rows a crash lost, which is the at-least-once rule every step already
+/// runs under (`ctx.run`).
 ///
 /// **Poison.** A failed write means the journal is now behind what the
-/// live worker believes happened. Continuing to drive on that
-/// divergence makes every later refold (stall refetch, crash resume)
-/// rebuild a different world: a body whose `NodeStarted` was lost but
-/// whose `PortEmitted` rows landed re-runs and double-spends. The drive
-/// loop checks [`Self::is_poisoned`] every iteration and stops with an
-/// error, which `run_one_execution` journals as the run's Failed terminal.
+/// live worker believes happened. Continuing to drive on that divergence
+/// makes every later refold (stall refetch, crash resume) rebuild a
+/// different world: a body whose `NodeStarted` was lost but whose
+/// `PortEmitted` rows landed re-runs and double-spends. So the first
+/// failed write stops all sending, every later [`Self::flush`] and write
+/// fails naming it, and the drive loop checks [`Self::is_poisoned`] every
+/// iteration and stops with an error, which `run_one_execution` journals as
+/// the run's Failed terminal; a drive idling on a long node hears it at
+/// once ([`Self::poisoned`]). A part of a write that never reached the
+/// broker (the connection could not be made) is sent again, part by part
+/// and for a minute at most each, since it cannot have landed; any other
+/// failure poisons at once, since sending a row twice would record it
+/// twice.
 ///
 /// The bus pump deliberately keeps the UNwrapped client: bus rows are
 /// the inspector's replay trail, and their failures already degrade
 /// per-bus without killing the worker.
 pub struct DriveJournal {
     inner: Arc<dyn JournalClient>,
-    /// The deferred rows, and the replica they are written under.
-    held: std::sync::Mutex<(Vec<ExecEvent>, Option<String>)>,
-    /// Held across take-and-send, so two flushes never overtake each
-    /// other on the wire.
-    sending: tokio::sync::Mutex<()>,
-    poisoned: std::sync::atomic::AtomicBool,
+    queue: tokio::sync::mpsc::UnboundedSender<Queued>,
+    /// Why the drive is poisoned, once it is (see the type's docs).
+    failure: Arc<Poison>,
+    /// The replica the drive writes under, fixed by its first row.
+    replica: std::sync::Mutex<Option<Option<String>>>,
 }
 
-impl DriveJournal {
-    pub fn wrap(inner: Arc<dyn JournalClient>) -> Arc<Self> {
-        Arc::new(Self {
-            inner,
-            held: std::sync::Mutex::new((Vec::new(), None)),
-            sending: tokio::sync::Mutex::new(()),
-            poisoned: std::sync::atomic::AtomicBool::new(false),
-        })
+/// Why a drive's journal can no longer be trusted, once it can't: the
+/// first reason is kept, and whoever waits for it hears it at once.
+struct Poison {
+    why: std::sync::Mutex<Option<String>>,
+    heard: tokio::sync::watch::Sender<bool>,
+}
+
+impl Poison {
+    fn new() -> Self {
+        Self { why: std::sync::Mutex::new(None), heard: tokio::sync::watch::Sender::new(false) }
     }
 
-    /// The view the driver writes through: its rows are held until the
-    /// next flush.
+    fn set(&self, why: String) {
+        self.why.lock().expect("drive journal").get_or_insert(why);
+        self.heard.send_replace(true);
+    }
+
+    fn get(&self) -> Option<String> {
+        self.why.lock().expect("drive journal").clone()
+    }
+
+    async fn wait(&self) {
+        let _ = self.heard.subscribe().wait_for(|poisoned| *poisoned).await;
+    }
+}
+
+/// What the sending task is handed, in order.
+enum Queued {
+    Rows(Vec<ExecEvent>, Option<String>),
+    /// Answered once every row queued before it is on record.
+    Written(tokio::sync::oneshot::Sender<Result<(), String>>),
+}
+
+
+impl DriveJournal {
+    /// The drive journal over `inner`, its sending task started. The task
+    /// ends once every handle to the queue is gone, after sending what was
+    /// left in it.
+    pub fn wrap(inner: Arc<dyn JournalClient>) -> Arc<Self> {
+        let (queue, pending) = tokio::sync::mpsc::unbounded_channel();
+        let failure = Arc::new(Poison::new());
+        tokio::spawn(send_in_order(inner.clone(), pending, failure.clone()));
+        Arc::new(Self { inner, queue, failure, replica: std::sync::Mutex::new(None) })
+    }
+
+    /// The view the driver writes through. Its writes are this journal's;
+    /// its reads go straight to the journal beneath (see [`Deferring`]).
     pub fn deferring(self: &Arc<Self>) -> Deferring {
         Deferring(self.clone())
     }
 
     /// A write failed since the drive began.
     pub fn is_poisoned(&self) -> bool {
-        self.poisoned.load(std::sync::atomic::Ordering::Acquire)
+        self.failure.get().is_some()
     }
 
-    /// Send every held row now. Refused once the drive is poisoned (see
-    /// `send`): a drive whose journal is already behind starts nothing more.
+    /// Answers once a write of this drive failed: what a drive waiting on
+    /// something else (a long node, news) also waits on, so it stops at
+    /// once.
+    pub async fn poisoned(&self) {
+        self.failure.wait().await
+    }
+
+    fn poisoned_error(&self) -> Option<anyhow::Error> {
+        self.failure.get().map(|why| anyhow::anyhow!("an earlier journal write of this drive failed: {why}"))
+    }
+
+    /// Answer once every row handed so far is on record. Refused once the
+    /// drive is poisoned: a drive whose journal is already behind starts
+    /// nothing more.
     pub async fn flush(&self) -> anyhow::Result<()> {
-        self.send(&[], None).await
-    }
-
-    fn hold(&self, events: &[ExecEvent], replica: Option<&str>) -> anyhow::Result<()> {
-        let mut held = self.held.lock().expect("drive journal");
-        if !held.0.is_empty() && held.1.as_deref() != replica {
-            drop(held);
-            self.poisoned.store(true, std::sync::atomic::Ordering::Release);
-            anyhow::bail!("one drive wrote under two replicas; its journal can no longer be trusted");
+        if let Some(e) = self.poisoned_error() {
+            return Err(e);
         }
-        held.0.extend_from_slice(events);
-        held.1 = replica.map(str::to_string);
-        Ok(())
+        let (answered, answer) = tokio::sync::oneshot::channel();
+        self.queue
+            .send(Queued::Written(answered))
+            .map_err(|_| anyhow::anyhow!("the drive journal's sending task is gone"))?;
+        answer
+            .await
+            .map_err(|_| anyhow::anyhow!("the drive journal's sending task ended before answering"))?
+            .map_err(|why| anyhow::anyhow!("an earlier journal write of this drive failed: {why}"))
     }
 
-    /// The held rows, then `events`, in one write.
-    async fn send(&self, events: &[ExecEvent], replica: Option<&str>) -> anyhow::Result<()> {
-        // Nothing more goes out once a write failed, a node's own write
-        // included: a row landing after a lost one is the gap a refold
-        // would rebuild a different world from.
-        let _sending = self.sending.lock().await;
-        // Asked holding the lock: a write that was queued behind the one
-        // that failed must not go out after it.
-        anyhow::ensure!(!self.is_poisoned(), "an earlier journal write of this drive failed");
-        let (mut batch, held_replica) = {
-            let mut held = self.held.lock().expect("drive journal");
-            // Checked before the held rows are taken, so a refused write
-            // drops nothing that was already held.
-            if !held.0.is_empty() && !events.is_empty() && held.1.as_deref() != replica {
-                drop(held);
-                self.poisoned.store(true, std::sync::atomic::Ordering::Release);
-                anyhow::bail!("one drive wrote under two replicas; its journal can no longer be trusted");
+    /// Hand `events` to the sending task, at once.
+    fn enqueue(&self, events: &[ExecEvent], replica: Option<&str>) -> anyhow::Result<()> {
+        if let Some(e) = self.poisoned_error() {
+            return Err(e);
+        }
+        {
+            let mut fixed = self.replica.lock().expect("drive journal");
+            match fixed.as_ref() {
+                Some(first) if first.as_deref() != replica => {
+                    drop(fixed);
+                    let why = "one drive wrote under two replicas; its journal can no longer be trusted";
+                    self.failure.set(why.to_string());
+                    anyhow::bail!(why);
+                }
+                Some(_) => {}
+                None => *fixed = Some(replica.map(str::to_string)),
             }
-            std::mem::take(&mut *held)
-        };
-        let replica = if batch.is_empty() { replica.map(str::to_string) } else { held_replica };
-        batch.extend_from_slice(events);
-        if batch.is_empty() {
+        }
+        if events.is_empty() {
             return Ok(());
         }
-        self.inner.record_events(&batch, replica.as_deref()).await.map_err(|e| {
-            self.poisoned.store(true, std::sync::atomic::Ordering::Release);
-            let kinds: Vec<&str> = batch.iter().map(ExecEvent::kind_str).collect();
-            e.context(format!("{} journal row(s) were not written: {}", batch.len(), kinds.join(", ")))
-        })
+        self.queue
+            .send(Queued::Rows(events.to_vec(), replica.map(str::to_string)))
+            .map_err(|_| anyhow::anyhow!("the drive journal's sending task is gone"))
     }
 
     /// The journal this one writes to. The run's terminal goes straight
-    /// there, once everything held has gone out: it is retried on its own,
-    /// and its failing is the terminal's, never a lost row that would
+    /// there, once everything handed has gone out: it is retried on its
+    /// own, and its failing is the terminal's, never a lost row that would
     /// poison the drive and make a run that completed read as failed.
     pub fn beneath(&self) -> &dyn JournalClient {
         self.inner.as_ref()
     }
 }
 
+/// The drive journal's sending task: everything queued while the previous
+/// write was on its way goes out as one write, in order, and each
+/// `Written` is answered once the rows ahead of it are on record.
+async fn send_in_order(
+    inner: Arc<dyn JournalClient>,
+    mut pending: tokio::sync::mpsc::UnboundedReceiver<Queued>,
+    failure: Arc<Poison>,
+) {
+    while let Some(first) = pending.recv().await {
+        let mut batch: Vec<ExecEvent> = Vec::new();
+        let mut replica: Option<String> = None;
+        let mut waiting = Vec::new();
+        let mut next = Some(first);
+        while let Some(item) = next {
+            match item {
+                Queued::Rows(rows, r) => {
+                    replica = r;
+                    batch.extend(rows);
+                }
+                Queued::Written(answer) => waiting.push(answer),
+            }
+            next = pending.try_recv().ok();
+        }
+        if failure.get().is_none() && !batch.is_empty() {
+            if let Err(why) = send(inner.as_ref(), &batch, replica.as_deref()).await {
+                tracing::error!(target: "weft_engine::journal", error = %why, "a drive's journal write failed; the run stops");
+                failure.set(why);
+            }
+        }
+        let outcome = failure.get().map_or(Ok(()), Err);
+        for answer in waiting {
+            let _ = answer.send(outcome.clone());
+        }
+    }
+}
+
+/// How long a part of a write that never reached the journal is sent
+/// again, at first and at most between tries, and in all for that part:
+/// the broker is the install's own service, and one out of reach this
+/// long is down, so the run stops on it like on any failed write.
+const RESEND_FIRST: Duration = Duration::from_millis(100);
+const RESEND_LONGEST: Duration = Duration::from_secs(5);
+const RESEND_FOR: Duration = Duration::from_secs(60);
+
+/// Write `batch`, one part at a time, cut the way the journal sends it
+/// (`JournalClient::parts`): a part that never reached the journal
+/// (`JournalClient::never_reached`) is sent again, since it cannot have
+/// landed, for up to [`RESEND_FOR`] each; any other failure is final,
+/// since the part may have landed and sending it twice would record its
+/// rows twice. Sending part by part is what keeps a part that landed from
+/// being sent again with the rest.
+async fn send(inner: &dyn JournalClient, batch: &[ExecEvent], replica: Option<&str>) -> Result<(), String> {
+    let not_written = |rows: &[ExecEvent], e: &anyhow::Error| {
+        let kinds: Vec<&str> = rows.iter().map(ExecEvent::kind_str).collect();
+        format!("{} journal row(s) were not written ({}): {e:#}", rows.len(), kinds.join(", "))
+    };
+    let chunks = inner.parts(batch).map_err(|e| not_written(batch, &e))?;
+    for chunk in chunks {
+        let started = tokio::time::Instant::now();
+        let mut wait = RESEND_FIRST;
+        loop {
+            match inner.record_events(chunk, replica).await {
+                Ok(()) => break,
+                Err(e) if inner.never_reached(&e) && started.elapsed() < RESEND_FOR => {
+                    tracing::warn!(
+                        target: "weft_engine::journal",
+                        error = %format!("{e:#}"), rows = chunk.len(), retry_in_ms = wait.as_millis() as u64,
+                        "a journal write did not reach the broker; sending it again"
+                    );
+                    tokio::time::sleep(wait).await;
+                    wait = (wait * 2).min(RESEND_LONGEST);
+                }
+                Err(e) => return Err(not_written(chunk, &e)),
+            }
+        }
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl JournalClient for DriveJournal {
     async fn record_event(&self, event: &ExecEvent, replica: Option<&str>) -> anyhow::Result<()> {
-        self.send(std::slice::from_ref(event), replica).await
+        self.enqueue(std::slice::from_ref(event), replica)
     }
 
     async fn record_events(&self, events: &[ExecEvent], replica: Option<&str>) -> anyhow::Result<()> {
-        self.send(events, replica).await
+        self.enqueue(events, replica)
     }
 
     async fn raw_rows_after(
@@ -1358,23 +1493,98 @@ impl JournalClient for DriveJournal {
     }
 }
 
-/// [`DriveJournal`] as the driver writes through it: a write is held for
-/// the next flush. Its reads go straight to the journal without a flush:
-/// the driver flushes before every wait itself (`flush_or_stop`), and its
-/// idle read is a future kept across turns of the loop, which must never
-/// queue for the send lock, since a queued lock is handed over even while
-/// nobody polls its future and the driver's next flush would then wait on
-/// it forever.
+/// A client a drive and its nodes reach another writer through (the task
+/// store, the steering of runs), wrapped so every journal row handed to
+/// the drive so far is on record before the other writer is asked to act.
+/// A task hands the run to the dispatcher (a signal it registers and
+/// journals, a call it makes), a tag is written beside the run's own rows,
+/// and a stop by tag may cancel this very run: none of them may land a
+/// row of this run ahead of ones the drive was handed first.
+pub struct JournalFirst<C: ?Sized> {
+    pub inner: Arc<C>,
+    pub journal: Arc<DriveJournal>,
+}
+
+#[async_trait::async_trait]
+impl ExecutionSteeringClient for JournalFirst<dyn ExecutionSteeringClient> {
+    async fn tag_execution(&self, execution_id: ExecutionId, tags: Vec<String>, replica: &str) -> anyhow::Result<()> {
+        self.journal.flush().await?;
+        self.inner.tag_execution(execution_id, tags, replica).await
+    }
+
+    async fn stop_tagged(
+        &self,
+        execution_id: ExecutionId,
+        tag: String,
+        stop_self: weft_core::StopSelf,
+        replica: &str,
+    ) -> anyhow::Result<bool> {
+        self.journal.flush().await?;
+        self.inner.stop_tagged(execution_id, tag, stop_self, replica).await
+    }
+}
+
+#[async_trait::async_trait]
+impl TaskStoreClient for JournalFirst<dyn TaskStoreClient> {
+    async fn enqueue_dedup(&self, spec: task_store::NewTask) -> anyhow::Result<task_store::DedupOutcome> {
+        self.journal.flush().await?;
+        self.inner.enqueue_dedup(spec).await
+    }
+
+    async fn wait_for_terminal(&self, task_id: uuid::Uuid, timeout: Duration) -> anyhow::Result<task_store::TaskOutcome> {
+        self.inner.wait_for_terminal(task_id, timeout).await
+    }
+
+    async fn claim_one(
+        &self,
+        replica: &str,
+        filter: task_store::ClaimFilter,
+        wait: Duration,
+    ) -> anyhow::Result<Option<task_store::Task>> {
+        self.inner.claim_one(replica, filter, wait).await
+    }
+
+    async fn heartbeat(&self, task_id: uuid::Uuid, replica: &str) -> anyhow::Result<bool> {
+        self.inner.heartbeat(task_id, replica).await
+    }
+
+    async fn requeue(&self, task_id: uuid::Uuid, replica: &str) -> anyhow::Result<bool> {
+        self.inner.requeue(task_id, replica).await
+    }
+
+    async fn complete(&self, task_id: uuid::Uuid, replica: &str, result: Value) -> anyhow::Result<()> {
+        self.inner.complete(task_id, replica, result).await
+    }
+
+    async fn fail(&self, task_id: uuid::Uuid, replica: &str, error: String) -> anyhow::Result<()> {
+        self.inner.fail(task_id, replica, error).await
+    }
+
+    async fn wait_cancels(
+        &self,
+        project_id: uuid::Uuid,
+        execution_ids: Vec<String>,
+        wait: Duration,
+    ) -> anyhow::Result<Vec<task_store::CancelAsked>> {
+        self.inner.wait_cancels(project_id, execution_ids, wait).await
+    }
+}
+
+/// [`DriveJournal`] as the driver holds it: its writes are the drive
+/// journal's, and its reads go straight to the journal beneath without
+/// waiting for what is still being sent. The driver's idle read follows
+/// the run from its own last row, so its own rows arriving later read as
+/// rows it already applied; waiting there would only hold the loop.
 pub struct Deferring(Arc<DriveJournal>);
 
 #[async_trait::async_trait]
 impl JournalClient for Deferring {
     async fn record_event(&self, event: &ExecEvent, replica: Option<&str>) -> anyhow::Result<()> {
-        self.0.hold(std::slice::from_ref(event), replica)
+        self.0.enqueue(std::slice::from_ref(event), replica)
     }
 
     async fn record_events(&self, events: &[ExecEvent], replica: Option<&str>) -> anyhow::Result<()> {
-        self.0.hold(events, replica)
+        self.0.enqueue(events, replica)
     }
 
     async fn raw_rows_after(
@@ -2804,7 +3014,7 @@ impl ContextHandle for RunnerHandle {
                 ))
             })?;
         let sink = Arc::new(crate::metering::CostSink {
-            tasks: self.clients.tasks.clone(),
+            tasks: self.clients.costs.clone(),
             pending: self.clients.pending_costs.clone(),
             open_charges: self.clients.open_charges.clone(),
             project_id: self.project_id,
@@ -3485,6 +3695,7 @@ mod replay_tests {
         let clients = EngineClients {
             journal: Arc::new(NoopJournal),
             tasks: Arc::new(NoopTaskStore),
+            costs: Arc::new(NoopTaskStore),
             infra: Arc::new(NoopInfra),
             infra_state: Arc::new(NoopInfraState),
             project: Arc::new(NoopProject),
@@ -3555,6 +3766,7 @@ mod replay_tests {
         let clients = EngineClients {
             journal: Arc::new(NoopJournal),
             tasks: Arc::new(NoopTaskStore),
+            costs: Arc::new(NoopTaskStore),
             infra: Arc::new(NoopInfra),
             infra_state: Arc::new(NoopInfraState),
             project: Arc::new(NoopProject),
@@ -3820,6 +4032,7 @@ mod replay_tests {
         let worker_clients = EngineClients {
             journal: Arc::new(NoopJournal),
             tasks: Arc::new(NoopTaskStore),
+            costs: Arc::new(NoopTaskStore),
             infra: Arc::new(NoopInfra),
             infra_state: Arc::new(NoopInfraState),
             project: Arc::new(NoopProject),
@@ -3859,6 +4072,7 @@ mod replay_tests {
         let test_clients = EngineClients {
             journal: Arc::new(NoopJournal),
             tasks: Arc::new(NoopTaskStore),
+            costs: Arc::new(NoopTaskStore),
             infra: Arc::new(NoopInfra),
             infra_state: Arc::new(NoopInfraState),
             project: Arc::new(NoopProject),
@@ -4587,17 +4801,38 @@ mod test_journal {
     use std::sync::Mutex as StdMutex;
     use weft_journal::ExecEvent;
 
+    /// A write that could not reach the journal at all.
+    #[derive(Debug)]
+    pub(super) struct Unreachable;
+    impl std::fmt::Display for Unreachable {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("the journal could not be reached")
+        }
+    }
+    impl std::error::Error for Unreachable {}
+
     /// Capturing journal client. Stores every `record_event` payload
     /// so context and bus tests can assert what was saved. `fail_count`
-    /// rejects that many following writes before accepting them again.
+    /// rejects that many following writes before accepting them again;
+    /// `unreachable` fails a row's write as if the journal could not be
+    /// reached.
     #[derive(Default)]
     pub(super) struct CaptureJournal {
         pub(super) events: StdMutex<Vec<ExecEvent>>,
         pub(super) fail_count: StdMutex<usize>,
+        /// Rows (by node) whose write still fails, as many more times, as
+        /// if the journal could not be reached.
+        pub(super) unreachable: StdMutex<HashMap<String, usize>>,
     }
     #[async_trait]
     impl weft_journal::JournalClient for CaptureJournal {
         async fn record_event(&self, event: &ExecEvent, _instance: Option<&str>) -> anyhow::Result<()> {
+            if let ExecEvent::NodeStarted { node_id, .. } = event {
+                if let Some(left) = self.unreachable.lock().unwrap().get_mut(node_id).filter(|left| **left > 0) {
+                    *left -= 1;
+                    return Err(Unreachable.into());
+                }
+            }
             {
                 let mut fc = self.fail_count.lock().unwrap();
                 if *fc > 0 {
@@ -4607,6 +4842,13 @@ mod test_journal {
             }
             self.events.lock().unwrap().push(event.clone());
             Ok(())
+        }
+        /// One part per row, so a write of several rows can fail part way.
+        fn parts<'e>(&self, events: &'e [ExecEvent]) -> anyhow::Result<Vec<&'e [ExecEvent]>> {
+            Ok(events.chunks(1).collect())
+        }
+        fn never_reached(&self, error: &anyhow::Error) -> bool {
+            error.downcast_ref::<Unreachable>().is_some()
         }
         /// Captures are for asserting writes; nothing reads them back.
         async fn raw_rows_after(
@@ -4628,6 +4870,7 @@ mod test_journal {
 mod drive_journal_tests {
     use super::*;
     use super::test_journal::CaptureJournal;
+    use std::sync::Mutex as StdMutex;
 
     fn started(execution_id: ExecutionId, node: &str) -> ExecEvent {
         ExecEvent::NodeStarted { execution_id, node_id: node.into(), frames: Vec::new(), at_unix: 0 }
@@ -4646,29 +4889,26 @@ mod drive_journal_tests {
             .collect()
     }
 
-    /// The driver's rows wait for the next flush, and a node's own write
-    /// carries them out ahead of itself, so the journal's order is the
-    /// order things happened.
+    /// Writes answer at once and reach the journal in the order handed,
+    /// the driver's and its nodes' alike; a flush answers once they all
+    /// have.
     #[tokio::test]
-    async fn held_rows_go_out_first_and_in_order() {
+    async fn rows_go_out_in_the_background_in_order() {
         let capture = Arc::new(CaptureJournal::default());
         let drive = DriveJournal::wrap(capture.clone());
         let driver = drive.deferring();
         let run = ExecutionId::new_v4();
         driver.record_event(&started(run, "a"), Some("w")).await.unwrap();
-        driver.record_event(&started(run, "b"), Some("w")).await.unwrap();
-        assert!(nodes(&capture).is_empty(), "held until a flush");
         drive.record_event(&started(run, "node-write"), Some("w")).await.unwrap();
-        assert_eq!(nodes(&capture), ["a", "b", "node-write"]);
-        driver.record_event(&started(run, "c"), Some("w")).await.unwrap();
+        driver.record_event(&started(run, "b"), Some("w")).await.unwrap();
         drive.flush().await.unwrap();
-        assert_eq!(nodes(&capture), ["a", "b", "node-write", "c"]);
+        assert_eq!(nodes(&capture), ["a", "node-write", "b"]);
         assert!(!drive.is_poisoned());
     }
 
     /// A read never runs past rows the drive wrote.
     #[tokio::test]
-    async fn a_read_sends_what_is_held_first() {
+    async fn a_read_waits_for_what_was_handed_first() {
         let capture = Arc::new(CaptureJournal::default());
         let drive = DriveJournal::wrap(capture.clone());
         let run = ExecutionId::new_v4();
@@ -4677,31 +4917,139 @@ mod drive_journal_tests {
         assert_eq!(nodes(&capture), ["a"]);
     }
 
-    /// A failed send poisons the drive: the journal is now behind what
+    /// A task goes out only once every row handed before it is on record.
+    #[tokio::test]
+    async fn a_task_waits_for_the_rows_handed_before_it() {
+        let capture = Arc::new(CaptureJournal::default());
+        let drive = DriveJournal::wrap(capture.clone());
+        let run = ExecutionId::new_v4();
+        drive.record_event(&started(run, "a"), Some("w")).await.unwrap();
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let inner: Arc<dyn TaskStoreClient> = Arc::new(SeeingTasks { capture: capture.clone(), seen: seen.clone() });
+        let tasks = JournalFirst { inner, journal: drive.clone() };
+        tasks.enqueue_dedup(task_store::NewTask {
+            kind: "noop".into(),
+            target: task_store::TaskTarget::Dispatcher,
+            project_id: None,
+            dedup_key: None,
+            execution_id: None,
+            tenant_id: "t".into(),
+            target_replica: None,
+            binary_hash: None,
+            payload: Value::Null,
+        })
+        .await
+        .unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![1], "the task saw the row already written");
+    }
+
+    /// A failed write poisons the drive: the journal is now behind what
     /// the worker did, and the loop stops on it.
     #[tokio::test]
-    async fn a_failed_send_poisons_the_drive() {
+    async fn a_failed_write_poisons_the_drive() {
         let capture = Arc::new(CaptureJournal::default());
         *capture.fail_count.lock().unwrap() = 1;
         let drive = DriveJournal::wrap(capture.clone());
         drive.deferring().record_event(&started(ExecutionId::new_v4(), "a"), Some("w")).await.unwrap();
         assert!(drive.flush().await.is_err());
         assert!(drive.is_poisoned());
-        drive.deferring().record_event(&started(ExecutionId::new_v4(), "b"), Some("w")).await.unwrap();
-        assert!(drive.flush().await.is_err(), "a poisoned drive sends nothing more");
+        assert!(
+            drive.deferring().record_event(&started(ExecutionId::new_v4(), "b"), Some("w")).await.is_err(),
+            "a poisoned drive takes nothing more"
+        );
+        assert!(drive.flush().await.is_err());
+        assert!(capture.events.lock().unwrap().is_empty());
     }
 
-    /// A write under another replica is refused without dropping what was
-    /// already held.
+    /// A part of a write that never reached the broker is sent again, and
+    /// lands once, in order, without the parts before it going again (one
+    /// that reached it and failed is never sent again:
+    /// `a_failed_write_poisons_the_drive`).
+    #[tokio::test(start_paused = true)]
+    async fn only_a_write_that_never_reached_the_broker_is_sent_again() {
+        let capture = Arc::new(CaptureJournal::default());
+        let drive = DriveJournal::wrap(capture.clone());
+        let run = ExecutionId::new_v4();
+        // One write of three parts: the first lands, the second cannot
+        // reach the journal twice and then does, and the first is never
+        // sent again.
+        capture.unreachable.lock().unwrap().insert("b".into(), 2);
+        drive.deferring().record_events(&[started(run, "a"), started(run, "b"), started(run, "c")], Some("w")).await.unwrap();
+        drive.flush().await.expect("sent once the journal could be reached");
+        assert_eq!(nodes(&capture), ["a", "b", "c"], "each row once, in order");
+    }
+
+    /// A broker out of reach for longer than the resend window stops the
+    /// run, like any failed write.
+    #[tokio::test(start_paused = true)]
+    async fn a_broker_out_of_reach_too_long_stops_the_run() {
+        let capture = Arc::new(CaptureJournal::default());
+        capture.unreachable.lock().unwrap().insert("a".into(), usize::MAX);
+        let drive = DriveJournal::wrap(capture.clone());
+        drive.deferring().record_event(&started(ExecutionId::new_v4(), "a"), Some("w")).await.unwrap();
+        assert!(drive.flush().await.is_err());
+        assert!(drive.is_poisoned());
+    }
+
+    /// A drive waiting on something else hears its journal fail at once.
     #[tokio::test]
-    async fn a_mismatched_replica_drops_nothing_held() {
+    async fn a_waiting_drive_hears_a_failed_write() {
+        let capture = Arc::new(CaptureJournal::default());
+        *capture.fail_count.lock().unwrap() = 1;
+        let drive = DriveJournal::wrap(capture.clone());
+        let waiting = {
+            let drive = drive.clone();
+            tokio::spawn(async move { drive.poisoned().await })
+        };
+        drive.deferring().record_event(&started(ExecutionId::new_v4(), "a"), Some("w")).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), waiting).await.expect("heard the failure").unwrap();
+        assert!(drive.is_poisoned());
+    }
+
+    /// A write under another replica poisons the drive.
+    #[tokio::test]
+    async fn a_mismatched_replica_poisons_the_drive() {
         let capture = Arc::new(CaptureJournal::default());
         let drive = DriveJournal::wrap(capture.clone());
         let run = ExecutionId::new_v4();
         drive.deferring().record_event(&started(run, "a"), Some("w")).await.unwrap();
         assert!(drive.record_event(&started(run, "b"), Some("other")).await.is_err());
         assert!(drive.is_poisoned());
-        assert_eq!(drive.held.lock().unwrap().0.len(), 1, "the held row is still there");
+    }
+
+    /// Counts the journal's rows at each enqueue.
+    struct SeeingTasks {
+        capture: Arc<CaptureJournal>,
+        seen: Arc<StdMutex<Vec<usize>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl TaskStoreClient for SeeingTasks {
+        async fn enqueue_dedup(&self, _spec: task_store::NewTask) -> anyhow::Result<task_store::DedupOutcome> {
+            self.seen.lock().unwrap().push(self.capture.events.lock().unwrap().len());
+            Ok(task_store::DedupOutcome::Inserted(uuid::Uuid::nil()))
+        }
+        async fn wait_for_terminal(&self, _: uuid::Uuid, _: Duration) -> anyhow::Result<task_store::TaskOutcome> {
+            unimplemented!("not asked")
+        }
+        async fn claim_one(&self, _: &str, _: task_store::ClaimFilter, _: Duration) -> anyhow::Result<Option<task_store::Task>> {
+            unimplemented!("not asked")
+        }
+        async fn heartbeat(&self, _: uuid::Uuid, _: &str) -> anyhow::Result<bool> {
+            unimplemented!("not asked")
+        }
+        async fn requeue(&self, _: uuid::Uuid, _: &str) -> anyhow::Result<bool> {
+            unimplemented!("not asked")
+        }
+        async fn complete(&self, _: uuid::Uuid, _: &str, _: Value) -> anyhow::Result<()> {
+            unimplemented!("not asked")
+        }
+        async fn fail(&self, _: uuid::Uuid, _: &str, _: String) -> anyhow::Result<()> {
+            unimplemented!("not asked")
+        }
+        async fn wait_cancels(&self, _: uuid::Uuid, _: Vec<String>, _: Duration) -> anyhow::Result<Vec<task_store::CancelAsked>> {
+            unimplemented!("not asked")
+        }
     }
 }
 

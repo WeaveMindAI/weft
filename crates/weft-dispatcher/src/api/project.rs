@@ -796,11 +796,11 @@ impl InfraSetupRun {
 async fn start_queued_execution(
     state: &DispatcherState,
     mut birth: Birth<'_>,
-    expected_activation: Option<weft_core::ExecutionId>,
+    for_activation: bool,
 ) -> Result<(), (StatusCode, String)> {
     let source_version = super::versions::record_program_source(state, birth.project_id, birth.program).await?;
     birth.source_version = Some(&source_version);
-    start_queued_execution_with(state, birth, &[], expected_activation, None).await
+    start_queued_execution_with(state, birth, &[], for_activation, None).await
 }
 
 /// THE one way a queued execution is born: its birth rows in one
@@ -813,7 +813,10 @@ pub(crate) async fn start_queued_execution_with(
     state: &DispatcherState,
     birth: Birth<'_>,
     extra_rows: &[weft_journal::ExecEvent],
-    expected_activation: Option<weft_core::ExecutionId>,
+    // A trigger setup an activation asked for (the activation is the
+    // setup's own execution): born only while that activation still owns
+    // its rows.
+    for_activation: bool,
     live_connection: Option<weft_task_store::kinds::LiveConnectionStart>,
 ) -> Result<(), (StatusCode, String)> {
     let tenant = state
@@ -837,7 +840,7 @@ pub(crate) async fn start_queued_execution_with(
     kick_events.extend_from_slice(extra_rows);
     state
         .journal
-        .start_execution(&start, &kick_events, task, expected_activation)
+        .start_execution(&start, &kick_events, task, for_activation)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("start execution: {e}")))?;
     Ok(())
@@ -977,32 +980,56 @@ pub(crate) async fn missing_infra_nodes(
     // way, so a run cut to one call waits on that call's instance alone.
     // A per-instance node is looked up in `instance`'s copy: that is the
     // one the run or the instance's triggers read.
-    let mut missing: Vec<MissingCopy> = Vec::new();
+    // Which copy of which place (`None` for a per-instance place with no
+    // instance named, which has no copy to look at), then the project's
+    // copies as this dispatcher holds them (`crate::held`).
+    let mut wanted: Vec<(String, Option<Option<&weft_core::instance::InstanceId>>)> = Vec::new();
     for place in weft_core::project::infra_places(project) {
         let spelled = weft_core::project::address_of(project, &place.id, &place.path);
         if within.is_some_and(|set| !set.contains(&spelled)) {
             continue;
         }
         let per_instance = weft_core::project::is_per_instance(project, &place.id);
-        let copy = if per_instance { instance } else { None };
-        if per_instance && copy.is_none() {
-            // Nobody named, so there is no copy to look at: activate's note
-            // over the whole project lands here (it leaves these out), and
-            // a run never does ([`require_run_infra`] refuses it first).
-            missing.push(MissingCopy { place: spelled, instance: None, needs_instance: true });
-            continue;
+        // Nobody named, so there is no copy to look at: activate's note
+        // over the whole project lands here (it leaves these out), and a
+        // run never does ([`require_run_infra`] refuses it first).
+        let copy = if per_instance { instance.map(Some) } else { Some(None) };
+        wanted.push((spelled, copy));
+    }
+    let missing_of = |copies: &[crate::infra_node::CopyStatus]| -> Vec<MissingCopy> {
+        let mut missing = Vec::new();
+        for (place, copy) in &wanted {
+            let Some(copy) = copy else {
+                missing.push(MissingCopy { place: place.clone(), instance: None, needs_instance: true });
+                continue;
+            };
+            let running = copies.iter().any(|row| {
+                &row.node_id == place && row.instance.as_ref() == *copy && row.status == crate::infra_node::InfraNodeStatus::Running
+            });
+            if !running {
+                missing.push(MissingCopy { place: place.clone(), instance: copy.cloned(), needs_instance: false });
+            }
         }
-        let row = crate::infra_node::get(&state.pg_pool, project_id, &spelled, copy)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node: {e}")))?;
-        let running = row
-            .map(|r| r.status == crate::infra_node::InfraNodeStatus::Running)
-            .unwrap_or(false);
-        if !running {
-            missing.push(MissingCopy { place: spelled, instance: copy.cloned(), needs_instance: false });
+        missing
+    };
+    if wanted.iter().all(|(_, copy)| copy.is_none()) {
+        return Ok(missing_of(&[]));
+    }
+    // A copy that came up a moment ago may not have been heard yet: a
+    // refusal is made on the rows themselves.
+    if let Some(held) = state.held.infra_status.held(&project_id) {
+        let missing = missing_of(&held);
+        if missing.iter().all(|m| m.needs_instance) {
+            return Ok(missing);
         }
     }
-    Ok(missing)
+    let fresh = state
+        .held
+        .infra_status
+        .load_fresh(project_id, || crate::infra_node::statuses(&state.pg_pool, project_id))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node: {e:#}")))?;
+    Ok(missing_of(&fresh))
 }
 
 /// One infra copy a run or a trigger needs and that is not running.
@@ -1247,7 +1274,7 @@ pub async fn start_infra_setup(
             at_unix: crate::lease::now_unix() as u64,
         },
         &[],
-        None,
+        false,
         // An infra setup answers nobody.
         None,
     )
@@ -1755,6 +1782,7 @@ pub async fn status(
                 status: a.lifecycle.status,
                 mode: a.lifecycle.mode(),
                 waiting: waiting.get(&a.key).cloned(),
+                version: a.source_version.clone(),
             })
             .collect(),
         limited: limited_entries(&state, id)
@@ -4572,7 +4600,7 @@ async fn run_trigger_setup(
             run_class: weft_core::run_class::RunClass::Short,
             at_unix: crate::lease::now_unix() as u64,
         },
-        activation,
+        activation.is_some(),
     )
     .await?;
 

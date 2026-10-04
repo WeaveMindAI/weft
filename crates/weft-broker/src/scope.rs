@@ -237,6 +237,16 @@ async fn lookup_project_tenant(
     Ok(tenant)
 }
 
+/// Read `execution_id`'s scope into the cache ahead of the asks that
+/// need it. Only a head start: an execution that cannot be read here is
+/// read again, and refused with the reason, by the first ask that needs
+/// it, so nothing is lost by not answering here.
+pub async fn warm_execution_id_scope(cache: &ScopeCache, pool: &PgPool, execution_id: &str) {
+    if let Err((_, why)) = lookup_execution_id_scope(cache, pool, execution_id).await {
+        tracing::debug!(target: "weft_broker::scope", execution_id, why, "could not read an execution's scope ahead of its asks");
+    }
+}
+
 async fn lookup_execution_id_scope(
     cache: &ScopeCache,
     pool: &PgPool,

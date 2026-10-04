@@ -153,7 +153,7 @@ async fn execution_birth_and_resume_pin_the_original_image(pool: PgPool) {
     };
     let task = execute_task(id, execution_id, "bin-A", None);
     seed_project(&projects, id, "bin-B").await;
-    journal.start_execution(&start, &[], task, None).await.unwrap();
+    journal.start_execution(&start, &[], task, false).await.unwrap();
 
     let (kind, binary_hash): (String, Option<String>) = sqlx::query_as(
         "SELECT kind, binary_hash FROM task WHERE execution_id = $1",
@@ -219,7 +219,7 @@ async fn pruning_a_source_waits_for_setup_and_removes_its_unused_bake(pool: PgPo
         .bind(id).execute(&pool).await.unwrap();
     let execution_id = Uuid::new_v4();
     let (birth, task) = trigger_setup_birth(id, execution_id);
-    journal.start_execution(&birth, &[], task, None).await.unwrap();
+    journal.start_execution(&birth, &[], task, false).await.unwrap();
     assert!(versions.delete_versions(id, &["source".into()]).await.is_err());
     let complete = weft_journal::ExecEvent::ExecutionCompleted { execution_id, at_unix: 2 };
     journal.record_event(&complete).await.unwrap();
@@ -329,7 +329,7 @@ async fn activation_cleanup_cannot_finish_or_wipe_a_newer_activation(pool: PgPoo
     assert_eq!(removed[0].token, "old-entry");
     assert!(journal.signal_get("old-entry").await.unwrap().is_none());
     let (late_birth, late_task) = trigger_setup_birth(id, first);
-    assert!(journal.start_execution(&late_birth, &[], late_task, Some(first)).await.is_err(),
+    assert!(journal.start_execution(&late_birth, &[], late_task, true).await.is_err(),
         "a cancelled activation cannot later start its setup");
     assert!(journal.events_log(first).await.unwrap().is_empty());
 
@@ -562,7 +562,7 @@ async fn trigger_bake_ownership_publication_and_project_cleanup(pool: PgPool) {
         .bind(id).execute(&pool).await.unwrap();
     let first = Uuid::new_v4();
     let (birth, task) = trigger_setup_birth(id, first);
-    journal.start_execution(&birth, &[], task, None).await.unwrap();
+    journal.start_execution(&birth, &[], task, false).await.unwrap();
     let complete = weft_journal::ExecEvent::ExecutionCompleted { execution_id: first, at_unix: 2 };
     journal.record_event(&complete).await.unwrap();
     let bake = weft_dispatcher::journal::TriggerBake::from_events(&[birth.clone(), complete]).unwrap().unwrap();
@@ -572,9 +572,9 @@ async fn trigger_bake_ownership_publication_and_project_cleanup(pool: PgPool) {
     assert!(activations.try_begin_activating(id, &[feed_key()], second, None).await.unwrap().is_ok());
     let (second_birth, second_task) = trigger_setup_birth(id, second);
     let (other_birth, other_task) = trigger_setup_birth(id, Uuid::new_v4());
-    assert!(journal.start_execution(&other_birth, &[], other_task, Some(second)).await.is_err(),
-        "an activation starts only its own setup");
-    journal.start_execution(&second_birth, &[], second_task, Some(second)).await.unwrap();
+    assert!(journal.start_execution(&other_birth, &[], other_task, true).await.is_err(),
+        "a setup no activation is setting up is never born as one");
+    journal.start_execution(&second_birth, &[], second_task, true).await.unwrap();
     let mut entry = governed_entry("baked-entry", id, first);
     entry.program = Some(bake.program.clone());
     entry.source_version = Some(bake.source_version.clone());
@@ -642,7 +642,7 @@ async fn start_execution_birth_is_atomic(pool: PgPool) {
         payload: json!({}),
     };
     let err = journal
-        .start_execution(&start, std::slice::from_ref(&kick), task.clone(), None)
+        .start_execution(&start, std::slice::from_ref(&kick), task.clone(), false)
         .await
         .expect_err("missing project must fail the birth");
     assert!(format!("{err:#}").contains("has no row"), "{err:?}");
@@ -690,7 +690,7 @@ async fn start_execution_birth_is_atomic(pool: PgPool) {
         ..task
     };
     journal
-        .start_execution(&start2, &[], task2.clone(), None)
+        .start_execution(&start2, &[], task2.clone(), false)
         .await
         .expect("birth for a registered project");
     let (events2,): (i64,) =
@@ -707,7 +707,7 @@ async fn start_execution_birth_is_atomic(pool: PgPool) {
     assert_eq!((events2, tasks2), (1, 1), "a successful birth commits the event AND the task");
 
     sqlx::query("DELETE FROM task WHERE execution_id = $1").bind(execution_id2.to_string()).execute(&pool).await.unwrap();
-    journal.start_execution(&start2, &[], task2.clone(), None).await.unwrap();
+    journal.start_execution(&start2, &[], task2.clone(), false).await.unwrap();
     let births: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM exec_event WHERE execution_id = $1 AND kind = 'execution_started'")
         .bind(execution_id2.to_string()).fetch_one(&pool).await.unwrap();
     let tasks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE execution_id = $1")
@@ -762,7 +762,7 @@ async fn an_unrecorded_run_is_born_unjournaled_and_forgotten_or_recorded(pool: P
     // Born: the execution row and the task, no journal row.
     let gone = weft_core::ExecutionId::new_v4();
     let (start, kick, task) = birth(gone);
-    journal.start_execution(&start, std::slice::from_ref(&kick), task, None).await.unwrap();
+    journal.start_execution(&start, std::slice::from_ref(&kick), task, false).await.unwrap();
     assert_eq!(rows(gone).await, 0, "an unrecorded birth writes no journal row");
     assert_eq!(kind(gone).await.as_deref(), Some("unrecorded"));
     let payload: serde_json::Value = sqlx::query_scalar("SELECT payload FROM task WHERE execution_id = $1")
@@ -782,7 +782,7 @@ async fn an_unrecorded_run_is_born_unjournaled_and_forgotten_or_recorded(pool: P
     // A failed one, written afterwards, is an ordinary listed run.
     let failed = weft_core::ExecutionId::new_v4();
     let (start, kick, task) = birth(failed);
-    journal.start_execution(&start, std::slice::from_ref(&kick), task, None).await.unwrap();
+    journal.start_execution(&start, std::slice::from_ref(&kick), task, false).await.unwrap();
     let mut record = vec![start, kick, weft_journal::ExecEvent::ExecutionFailed { execution_id: failed, error: "boom".into(), at_unix: 2 }];
     if let weft_journal::ExecEvent::ExecutionStarted { run_kind, .. } = &mut record[0] {
         *run_kind = weft_core::exec::RunKind::Execution;
@@ -798,7 +798,7 @@ async fn an_unrecorded_run_is_born_unjournaled_and_forgotten_or_recorded(pool: P
     // addressed by it.
     let paid = weft_core::ExecutionId::new_v4();
     let (start, kick, task) = birth(paid);
-    journal.start_execution(&start, std::slice::from_ref(&kick), task, None).await.unwrap();
+    journal.start_execution(&start, std::slice::from_ref(&kick), task, false).await.unwrap();
     weft_journal::record_events(&pool, &[weft_journal::ExecEvent::CostReported {
         execution_id: paid, node_id: "llm".into(), frames: vec![], cost_id: "c".into(), service: "llm".into(),
         model: None, amount_usd: Some(0.1), billed: true, origin: weft_core::CredentialOwner::Author,
@@ -831,7 +831,7 @@ async fn an_unrecorded_run_is_live_while_a_worker_holds_its_task(pool: PgPool) {
         run_class: weft_core::run_class::RunClass::Short,
     };
     let task = execute_task(id, execution_id, "bin-A", Some(std::slice::from_ref(&start)));
-    journal.start_execution(&start, &[], task, None).await.unwrap();
+    journal.start_execution(&start, &[], task, false).await.unwrap();
     sqlx::query("INSERT INTO execution_tag (execution_id, tag, tagged_at_unix) VALUES ($1, 'poll', 1)")
         .bind(execution_id.to_string()).execute(&pool).await.unwrap();
 
@@ -882,7 +882,7 @@ async fn quiesce_waits_until_no_run_of_the_project_is_live(pool: PgPool) {
         run_class: weft_core::run_class::RunClass::Short,
     };
     let task = execute_task(id, execution_id, "bin-A", Some(std::slice::from_ref(&start)));
-    journal.start_execution(&start, &[], task, None).await.unwrap();
+    journal.start_execution(&start, &[], task, false).await.unwrap();
 
     let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool.connect_options(), weft_dispatcher::take_down::RUN_ENDING_CHANNELS)
         .await
@@ -927,7 +927,7 @@ async fn forgetting_an_unrecorded_run_announces_its_ending_at_the_commit(pool: P
         run_class: weft_core::run_class::RunClass::Short,
     };
     let task = execute_task(id, execution_id, "bin-A", Some(std::slice::from_ref(&start)));
-    journal.start_execution(&start, &[], task, None).await.unwrap();
+    journal.start_execution(&start, &[], task, false).await.unwrap();
     sqlx::query("UPDATE task SET status = 'claimed', claimed_by = 'worker-a', claimed_until_unix = $2 WHERE execution_id = $1")
         .bind(execution_id.to_string()).bind(weft_dispatcher::lease::now_unix() + 60).execute(&pool).await.unwrap();
     weft_journal::record_events(&pool, &[weft_journal::ExecEvent::CostReported {
@@ -2154,6 +2154,149 @@ async fn a_held_row_coming_or_going_wakes_the_holder_sizing(pool: PgPool) {
     assert!(woken(&mut heard).await, "and one forgotten too");
 }
 
+/// The rows a dispatcher holds in memory (`weft_dispatcher::held`) say
+/// when they change, naming whose: a tenant's public entries and the
+/// activations that arm them, a project's worker levers, a project's infra
+/// copies. A signal that is no public entry is silent: a run waiting on a
+/// reply writes one, and a tenant's routes are not read again for it.
+#[sqlx::test]
+async fn the_held_rows_announce_their_changes(pool: PgPool) {
+    use weft_dispatcher::held::{INFRA_STATUS_CHANNEL, ROUTES_CHANNEL, WORKER_SETTINGS_CHANNEL};
+    let (journal, projects) = setup(&pool).await;
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    static CHANNELS: &[&str] = &[ROUTES_CHANNEL, WORKER_SETTINGS_CHANNEL, INFRA_STATUS_CHANNEL];
+    let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool.connect_options(), CHANNELS).await.unwrap();
+    let mut heard = watch.subscribe();
+    async fn heard_on(heard: &mut weft_task_store::pg_signal::Subscription, channel: &'static str, key: &str) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        heard.woken_before(deadline, |c, p| c == channel && p == key).await.unwrap()
+    }
+    let project = id.to_string();
+
+    journal.signal_insert(&entry_at("callback", id)).await.unwrap();
+    assert!(!heard_on(&mut heard, ROUTES_CHANNEL, TENANT).await, "a signal that is no public entry is silent");
+    let route = SignalRegistration {
+        surface_kind: "public_entry".into(),
+        mount_path: Some(format!("/{TENANT}/notes")),
+        ..entry_at("route", id)
+    };
+    journal.signal_insert(&route).await.unwrap();
+    assert!(heard_on(&mut heard, ROUTES_CHANNEL, TENANT).await, "a public entry coming names its tenant");
+    sqlx::query(
+        "INSERT INTO trigger_activation (project_id, trigger, status, accepting_fires, fires_visible_to_consumers, updated_at) \
+         VALUES ($1, 'route', 'active', TRUE, TRUE, 0)",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(heard_on(&mut heard, ROUTES_CHANNEL, TENANT).await, "an activation coming");
+    sqlx::query("UPDATE trigger_activation SET status = 'inactive' WHERE project_id = $1").bind(id).execute(&pool).await.unwrap();
+    assert!(heard_on(&mut heard, ROUTES_CHANNEL, TENANT).await, "an activation taken down");
+    journal.signal_remove_many(&["route".to_string()]).await.unwrap();
+    assert!(heard_on(&mut heard, ROUTES_CHANNEL, TENANT).await, "a public entry going");
+
+    sqlx::query("UPDATE project SET worker_settings_json = '{\"minInstances\": 1}'::jsonb WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(heard_on(&mut heard, WORKER_SETTINGS_CHANNEL, &project).await, "a project's worker levers changing name it");
+
+    sqlx::query("INSERT INTO infra_node (project_id, node_id, status) VALUES ($1, 'db', 'provisioning')")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(heard_on(&mut heard, INFRA_STATUS_CHANNEL, &project).await, "an infra copy coming names its project");
+    sqlx::query("UPDATE infra_node SET status = 'running' WHERE project_id = $1").bind(id).execute(&pool).await.unwrap();
+    assert!(heard_on(&mut heard, INFRA_STATUS_CHANNEL, &project).await, "and its status changing");
+}
+
+/// A live run's birth, as a caller's handshake makes it: its
+/// `ExecutionStarted` and its execute task, waiting for the caller until
+/// 1 000.
+fn live_birth(project: Uuid, execution_id: weft_core::ExecutionId) -> (weft_journal::ExecEvent, weft_task_store::tasks::NewTask) {
+    let start = weft_journal::ExecEvent::ExecutionStarted {
+        execution_id,
+        project_id: project,
+        entry_node: "entry".into(),
+        phase: weft_core::context::Phase::Fire,
+        definition_hash: Some("def-1".into()),
+        program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
+        subgraph: None,
+        seed: None,
+        instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+        run_class: weft_core::run_class::RunClass::Short,
+    };
+    let task = weft_dispatcher::task_kinds::execute::execution_task_spec(weft_dispatcher::task_kinds::execute::ExecutionTask {
+        kind: weft_task_store::TaskKind::Execute,
+        project_id: project,
+        execution_id,
+        definition_hash: "def-1",
+        binary_hash: "bin-A",
+        tenant_id: TENANT,
+        run_class: weft_core::run_class::RunClass::Short,
+        live_connection: Some(weft_task_store::kinds::LiveConnectionStart {
+            spec: weft_core::primitive::SignalSpec::of_kind("route", json!({})),
+            request: Default::default(),
+            arrive_by: Some(1_000),
+            fired: None,
+        }),
+        unrecorded_birth: None,
+    })
+    .unwrap();
+    (start, task)
+}
+
+/// A live call's admission at the entry `tok`, which takes `at_once` runs
+/// at once, taking a slot for `execution_id` that holds until 1 000.
+fn live_admission(at_once: u32, execution_id: weft_core::ExecutionId) -> weft_dispatcher::entry_limits::Admission {
+    let limits = weft_core::signal::EntryLimits { per_caller_per_minute: Some(0), per_minute: Some(0), at_once: Some(at_once) }.resolve();
+    let edge = weft_dispatcher::entry_limits::EdgeConfig {
+        trusted_proxy_hops: weft_platform_traits::config::ProxyHops { public: 1, outside: 1, domains: 2 },
+        invalid_tokens_per_minute: None,
+    };
+    weft_dispatcher::entry_limits::Admission::call(&edge, None, "tok", "ip:a", &limits, Some((&execution_id.to_string(), 1_000)), 0)
+}
+
+/// A live call its entry's limits refuse is never born: the refusal and
+/// the birth are one call to the database, so nothing of the run (journal,
+/// execution, task, slot) is written, and the refusal is counted. A run
+/// already born is left as it is when its birth is asked for again.
+#[sqlx::test]
+async fn a_live_call_refused_at_its_limit_is_never_born(pool: PgPool) {
+    let (journal, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project, "bin-A").await;
+    let first = weft_core::ExecutionId::new_v4();
+    let (start, task) = live_birth(project, first);
+    journal.admit_and_start_execution(&live_admission(1, first), &start, &[], task.clone()).await.unwrap().expect("room for one");
+    journal
+        .admit_and_start_execution(&live_admission(1, first), &start, &[], task)
+        .await
+        .unwrap()
+        .expect("a retry of a run already born collapses onto it, slot and all");
+
+    let second = weft_core::ExecutionId::new_v4();
+    let (start, task) = live_birth(project, second);
+    let refused = journal.admit_and_start_execution(&live_admission(1, second), &start, &[], task).await.unwrap().unwrap_err();
+    assert_eq!(refused.reason, weft_dispatcher::entry_limits::Limited::AtOnce);
+    for table in ["exec_event", "execution", "task", "entry_slot"] {
+        let (n,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*)::bigint FROM {table} WHERE execution_id = $1"))
+            .bind(second.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "{table} holds a run its entry refused");
+    }
+    assert_eq!(
+        weft_dispatcher::entry_limits::recent_refusals(&pool, "tok", 0).await.unwrap(),
+        vec![(weft_dispatcher::entry_limits::Limited::AtOnce, 1)]
+    );
+}
+
 /// A live run born at its caller's handshake whose caller never came is
 /// erased whole once their ticket expires: its journal, its execution, its
 /// task and its entry slot, so nothing of it is left. One the caller did
@@ -2163,38 +2306,7 @@ async fn a_live_run_whose_caller_never_came_leaves_nothing(pool: PgPool) {
     let (journal, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project, "bin-A").await;
-    let born = |execution_id: weft_core::ExecutionId| {
-        let start = weft_journal::ExecEvent::ExecutionStarted {
-            execution_id,
-            project_id: project,
-            entry_node: "entry".into(),
-            phase: weft_core::context::Phase::Fire,
-            definition_hash: Some("def-1".into()),
-            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
-            subgraph: None,
-            seed: None,
-            instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-            run_class: weft_core::run_class::RunClass::Short,
-        };
-        let task = weft_dispatcher::task_kinds::execute::execution_task_spec(weft_dispatcher::task_kinds::execute::ExecutionTask {
-            kind: weft_task_store::TaskKind::Execute,
-            project_id: project,
-            execution_id,
-            definition_hash: "def-1",
-            binary_hash: "bin-A",
-            tenant_id: TENANT,
-            run_class: weft_core::run_class::RunClass::Short,
-            live_connection: Some(weft_task_store::kinds::LiveConnectionStart {
-                spec: weft_core::primitive::SignalSpec::of_kind("route", json!({})),
-                request: Default::default(),
-                arrive_by: Some(1_000),
-                fired: None,
-            }),
-            unrecorded_birth: None,
-        })
-        .unwrap();
-        (start, task)
-    };
+    let born = |execution_id: weft_core::ExecutionId| live_birth(project, execution_id);
     let count = |table: &'static str, execution_id: weft_core::ExecutionId| {
         let pool = pool.clone();
         async move {
@@ -2207,14 +2319,18 @@ async fn a_live_run_whose_caller_never_came_leaves_nothing(pool: PgPool) {
         }
     };
 
+    // Born as a live call is: admitted at its entry (a slot taken for it)
+    // in the same commit as its birth.
+    let admitted = |execution_id: weft_core::ExecutionId| live_admission(5, execution_id);
+
     let absent = weft_core::ExecutionId::new_v4();
     let (start, task) = born(absent);
-    journal.start_execution(&start, &[], task, None).await.unwrap();
-    weft_dispatcher::entry_limits::take_slot(&pool, "tok", &absent.to_string(), 5, 1_000, 0).await.unwrap().unwrap();
+    journal.admit_and_start_execution(&admitted(absent), &start, &[], task).await.unwrap().expect("admitted");
+    assert_eq!(count("entry_slot", absent).await, 1, "the slot is taken with the birth");
 
     let present = weft_core::ExecutionId::new_v4();
     let (start, task) = born(present);
-    journal.start_execution(&start, &[], task, None).await.unwrap();
+    journal.start_execution(&start, &[], task, false).await.unwrap();
     let claimed = weft_task_store::tasks::claim_one(
         &pool,
         "worker-a",
@@ -2246,8 +2362,7 @@ async fn a_live_run_whose_caller_never_came_leaves_nothing(pool: PgPool) {
     // the route's slot free; the run a caller did reach is never taken.
     let unreached = weft_core::ExecutionId::new_v4();
     let (start, task) = born(unreached);
-    journal.start_execution(&start, &[], task, None).await.unwrap();
-    weft_dispatcher::entry_limits::take_slot(&pool, "tok", &unreached.to_string(), 5, 1_000, 0).await.unwrap().unwrap();
+    journal.admit_and_start_execution(&admitted(unreached), &start, &[], task).await.unwrap().expect("admitted");
     const UNREACHED: weft_task_store::tasks::UnclaimedLiveRun = weft_task_store::tasks::UnclaimedLiveRun::NeverPassedOn;
     assert!(!journal.erase_unclaimed_live_run(unreached, weft_task_store::tasks::UnclaimedLiveRun::PastDeadline { now: 999 }).await.unwrap(), "its deadline has not passed");
     assert!(journal.erase_unclaimed_live_run(unreached, UNREACHED).await.unwrap());

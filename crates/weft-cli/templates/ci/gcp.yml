@@ -31,7 +31,9 @@ concurrency:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    # A named release: `ubuntu-latest` moves to a new one on GitHub's
+    # schedule, under a workflow that worked the day before.
+    runs-on: ubuntu-24.04
     env:
       WEFT_OPERATOR_KEY: ${{ secrets.WEFT_OPERATOR_KEY }}
       WEFT_REPO_ROOT: ${{ github.workspace }}/.weft

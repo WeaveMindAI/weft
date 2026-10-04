@@ -128,6 +128,9 @@ pub const DISPATCHER_CHANNELS: &[&str] = &[
     crate::display_feeds::LOOK_NOW_CHANNEL,
     crate::holders::HELD_SIGNALS_CHANNEL,
     crate::domains::DOMAINS_CHANNEL,
+    crate::held::ROUTES_CHANNEL,
+    crate::held::WORKER_SETTINGS_CHANNEL,
+    crate::held::INFRA_STATUS_CHANNEL,
 ];
 
 /// What the dispatcher is built from: the install's config and what the
@@ -188,6 +191,7 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
     let versions: crate::versions::VersionStore = Arc::new(crate::versions::PostgresVersionStore::new(pool.clone()));
     let event_bus = crate::EventBus::with_notify(pool.clone(), &signals)?;
     let displays = crate::display_feeds::DisplayFeeds::with_look_now(&signals)?;
+    let held = Arc::new(crate::held::Held::follow(&signals)?);
     // The other roles as this dispatcher reaches them, from where its
     // own placement puts it (a local install's loopback is only its own
     // process's).
@@ -243,6 +247,7 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         http,
         caller_token_secret: Arc::new(caller_token_secret),
         programs: Arc::new(weft_core::content_cache::ContentCache::new(64)),
+        held,
     })
 }
 

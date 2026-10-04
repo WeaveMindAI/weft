@@ -36,12 +36,15 @@
 // if a transaction holds the execution's lock before it gets its xid (at its
 // first write), which is the invariant on `weft_journal::write`. Every
 // transaction that writes something else before its exec_event rows
-// takes `weft_journal::lock_execution_ids` first:
+// takes the execution's lock first (`weft_journal::lock_execution_ids`, or
+// the same lock in SQL):
 // SYNC: execution lock before first write <-> crate::journal::postgres
-//       (record_with_seed, start_execution, cancel_execution). Transactions whose first write is the
-//       exec_event insert are covered by the lock that insert takes:
-//       weft_journal::tags::tag_execution_in (broker execution_tag) and
-//       every single-statement record_event_* call.
+//       (cancel_execution; weft_execution_started and weft_start_execution, the
+//       SQL functions behind record_with_seed and every birth),
+//       weft_journal::unrecorded (record_retroactively). Transactions whose
+//       first write is the exec_event insert are covered by the lock that insert
+//       takes (`weft_journal_append`): weft_journal::tags::tag_execution_in
+//       (broker execution_tag) and every single-statement record_event_* call.
 
 use std::time::{Duration, Instant};
 

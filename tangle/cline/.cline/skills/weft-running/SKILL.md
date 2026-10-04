@@ -383,7 +383,7 @@ node and the wrong value.
   you never open the events. `(no logs: ...)` means the run wrote nothing
   and recorded no failure: it did not fail, so you check its status.
 - **If you want the values on the wires**: `weft events <execution-id>`. One line
-  per event: local time, kind, node, then everything the row carries as
+  per event: UTC time, kind, node, then everything the row carries as
   `key=value`, each cut to a screen's width (`input=` on `node_started`,
   `output=` on `node_completed`, `error=` on `node_failed`, `reason=` on a
   skip or a cancel, `token=` on a suspension, and so on). You narrow before

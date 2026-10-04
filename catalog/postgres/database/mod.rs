@@ -249,9 +249,15 @@ impl Node for PostgresDatabaseNode {
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let database: String = ctx.inputs.get("database")?;
-        let sql = ctx.endpoint("sql").await?;
+        // Three asks that need nothing from each other, so they go out
+        // together.
+        let (sql, credential, published) =
+            tokio::try_join!(ctx.endpoint("sql"), ctx.endpoint("credential"), ctx.published_access())?;
         let (host, port) = sql.host_and_port()?;
-        let credential = ctx.endpoint("credential").await?;
+        let published = match published {
+            Some(access) => Some(ctx.open(&access).await?),
+            None => None,
+        };
 
         // The password comes from the connection this node published
         // last time when there is one, and from the database itself
@@ -263,9 +269,9 @@ impl Node for PostgresDatabaseNode {
         // Asking the database whether it still knows a password also
         // retires it, so a run that gets a yes here has already done
         // the retiring this run owes.
-        let (password, retired) = match ctx.published_access().await? {
-            Some(published) => {
-                let held = ctx.open(&published).await?.value("password")?.to_string();
+        let (password, retired) = match &published {
+            Some(opened) => {
+                let held = opened.value("password")?.to_string();
                 if confirm_stored(&credential, &held).await? {
                     (held, true)
                 } else {
@@ -285,6 +291,8 @@ impl Node for PostgresDatabaseNode {
         values.insert("password".to_string(), password.clone());
         // Inside the project's own network; the database serves no TLS.
         values.insert("sslmode".to_string(), "disable".to_string());
+        // Published every run, values unchanged or not: publishing also
+        // brings the connection's recipe and label up to this node's.
         let access = ctx.publish_access(values).await?;
 
         // Retire the password now that a connection holds it, unless

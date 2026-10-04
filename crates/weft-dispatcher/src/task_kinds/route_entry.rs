@@ -169,36 +169,11 @@ impl TaskExecutor<DispatcherState> for RouteEntryExecutor {
             // re-parks like every step before it. A write that committed
             // but failed to acknowledge re-parks too, and the drained twin
             // finds the execution born (above) and finishes it.
-            // The entry's at-once limit, taken for this run's execution just
-            // before it is born. A full entry parks the fire, which the
-            // reaper retries on its backoff, so the fire waits for a run
-            // to end instead of being lost. The same execution on a retry
-            // keeps the slot it already holds.
-            let limits = spec.limits.resolve();
-            if let Some(max) = limits.at_once {
-                let now = crate::lease::now_unix();
-                let slot = crate::entry_limits::take_slot(
-                    &state.pg_pool,
-                    &payload.token,
-                    &execution_id.to_string(),
-                    max,
-                    now + crate::entry_limits::UNBORN_FIRE_SLOT_SECS,
-                    now,
-                )
-                .await;
-                match slot {
-                    Ok(Ok(())) => {}
-                    Ok(Err(refused)) => {
-                        if let Err(e) =
-                            crate::entry_limits::note_refusal(&state.pg_pool, &payload.token, refused.reason, now).await
-                        {
-                            tracing::warn!(target: "weft_dispatcher::route_entry", error = %e, "could not count a refusal");
-                        }
-                        return park_fire(state, task, &payload, &Unrouted::Retry(format!("{} is reached", refused.reason.describe()))).await;
-                    }
-                    Err(e) => return park_fire(state, task, &payload, &Unrouted::Retry(format!("entry slot: {e}"))).await,
-                }
-            }
+            // The entry's at-once limit is taken for this run's execution
+            // in the same commit as its birth. A full entry parks the fire,
+            // which the reaper retries on its backoff, so the fire waits for
+            // a run to end instead of being lost. The same execution on a
+            // retry keeps the slot it already holds.
             let execution_task = crate::task_kinds::execute::execution_task_spec(crate::task_kinds::execute::ExecutionTask {
                 kind: weft_task_store::TaskKind::Execute,
                 project_id: signal.project_id,
@@ -210,12 +185,20 @@ impl TaskExecutor<DispatcherState> for RouteEntryExecutor {
                 live_connection: None,
                 unrecorded_birth: None,
             })?;
-            if let Err(e) = state
-                .journal
-                .start_execution(&start, &kick_events, execution_task, None)
-                .await
-            {
-                return park_fire(state, task, &payload, &Unrouted::Retry(format!("ExecutionStarted write: {e}"))).await;
+            let admission = crate::entry_limits::Admission::fire(
+                &payload.token,
+                &spec.limits.resolve(),
+                &execution_id.to_string(),
+                crate::lease::now_unix(),
+            );
+            match state.journal.admit_and_start_execution(&admission, &start, &kick_events, execution_task).await {
+                Ok(Ok(())) => {}
+                Ok(Err(refused)) => {
+                    return park_fire(state, task, &payload, &Unrouted::Retry(format!("{} is reached", refused.reason.describe()))).await;
+                }
+                Err(e) => {
+                    return park_fire(state, task, &payload, &Unrouted::Retry(format!("ExecutionStarted write: {e}"))).await;
+                }
             }
         };
 

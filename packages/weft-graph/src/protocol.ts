@@ -1049,6 +1049,8 @@ export interface ActivationEntry {
   /// how many, and why (the refusal naming the field).
   // SYNC: waiting <-> crates/weft-core/src/program.rs WaitingFires
   waiting?: { fires: number; reason: string };
+  /// The version of the source its fires run, once its setup finished.
+  version?: string;
 }
 
 /// One instance's copy of an infra node, as the project status lists it.

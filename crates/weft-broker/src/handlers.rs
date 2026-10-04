@@ -646,16 +646,19 @@ pub async fn task_claim_one(
     require_worker(&caller)?;
     require_replica_matches(&caller, &req.replica)?;
     let filter = req.filter;
-    if let ClaimFilter::ExecutionId { project_id, .. } = &filter {
-        scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, *project_id).await?;
-    } else {
+    let ClaimFilter::ExecutionId { project_id, execution_id } = &filter else {
         return Err((StatusCode::FORBIDDEN, "a worker claims only the execution it was called for".into()));
-    }
-    let task = state
-        .tasks
-        .claim_one(&req.replica, filter, held(req.wait_ms))
-        .await
-        .map_err(internal)?;
+    };
+    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, *project_id).await?;
+    // The worker's next asks (its run's journal first) are scoped by the
+    // execution, so its scope is read while the claim runs rather than
+    // after it, on that first ask.
+    let execution_id = execution_id.clone();
+    let (task, ()) = tokio::join!(
+        state.tasks.claim_one(&req.replica, filter, held(req.wait_ms)),
+        scope::warm_execution_id_scope(&state.scope_cache, &state.pool, &execution_id),
+    );
+    let task = task.map_err(internal)?;
     // Latest-claim-wins execution ownership is bound IN the claim's own
     // transaction by the `task_claim_binds_execution_id_owner` DB trigger:
     // claiming an execution-bearing task atomically stamps
@@ -805,7 +808,7 @@ async fn declared_infra_under(
     project: uuid::Uuid,
     digest: String,
 ) -> Result<Option<Arc<weft_core::project::DeclaredInfra>>, (StatusCode, String)> {
-    if let Some(declared) = state.declared_infra.get(project, &digest) {
+    if let Some(declared) = state.declared_infra.get(&(project, digest.clone())) {
         return Ok(Some(declared));
     }
     // Read with its own digest, so what is kept is filed under the
@@ -820,7 +823,7 @@ async fn declared_infra_under(
     let definition: weft_core::project::ProjectDefinition = serde_json::from_str(&project_json)
         .map_err(|e| internal(anyhow::anyhow!("project {project}: definition: {e}")))?;
     let declared = Arc::new(weft_core::project::DeclaredInfra::of(&definition));
-    state.declared_infra.put(project, digest, declared.clone());
+    state.declared_infra.put((project, digest), declared.clone());
     Ok(Some(declared))
 }
 

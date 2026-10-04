@@ -52,7 +52,7 @@ fn frontend(project: Uuid, name: &str, repo: Option<&str>) -> weft_core::fronten
         repo: repo.map(|r| weft_core::frontend::Repository { name: r.into(), id: if r == "me/site" { 1 } else { 2 } }),
         service: repo.map(|_| format!("fe-{name}")),
         url: None,
-        token_id: Uuid::new_v4(),
+        token_id: repo.is_none().then(Uuid::new_v4),
         pending_token_ids: Vec::new(),
     }
 }

@@ -208,6 +208,15 @@ where
     }
 }
 
+/// Whether a failed broker call never reached the broker: the connection
+/// itself was refused or could not be made, so the request was never
+/// sent. Only such a write is safe to send again; a write that reached it
+/// and failed some other way may have landed, and sending it twice would
+/// apply it twice.
+fn never_sent(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| cause.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_connect))
+}
+
 /// The first wait before asking again after the broker could not answer
 /// a read; each further failure doubles it, up to
 /// [`READ_RETRY_LONGEST`].
@@ -275,6 +284,15 @@ impl BrokerJournalClient {
 
 #[async_trait]
 impl JournalClient for BrokerJournalClient {
+    /// The broker takes a body of at most [`JOURNAL_RECORD_BODY_LIMIT`].
+    fn parts<'e>(&self, events: &'e [ExecEvent]) -> Result<Vec<&'e [ExecEvent]>> {
+        record_chunks(events)
+    }
+
+    fn never_reached(&self, error: &anyhow::Error) -> bool {
+        never_sent(error)
+    }
+
     async fn record_event(
         &self,
         event: &ExecEvent,
@@ -1229,7 +1247,9 @@ mod read_retry_tests {
 }
 
 /// `events` cut, in order, into runs whose request bodies stay under
-/// [`JOURNAL_RECORD_BODY_LIMIT`]. An event too big on its own goes alone,
+/// [`JOURNAL_RECORD_BODY_LIMIT`]: each one request of
+/// [`BrokerJournalClient::record_events`], and the parts a writer that
+/// sends a write again sends one at a time (`JournalClient::parts`). An event too big on its own goes alone,
 /// and the broker refuses it (`413`): the engine refuses an output that
 /// big at the node first, so reaching that refusal is a broken contract.
 fn record_chunks(events: &[ExecEvent]) -> Result<Vec<&[ExecEvent]>> {

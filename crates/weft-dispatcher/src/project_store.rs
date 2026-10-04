@@ -366,6 +366,35 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 head_run UUID
             )"#,
         "CREATE INDEX IF NOT EXISTS idx_project_tenant ON project(tenant_id)",
+        // A project coming or going changes how its tenant's routes read
+        // (a route whose project is gone is inactive); the function is the
+        // journal group's, which applies first.
+        r#"DROP TRIGGER IF EXISTS project_routes_on_row ON project"#,
+        r#"CREATE TRIGGER project_routes_on_row
+            AFTER INSERT OR DELETE ON project
+            FOR EACH ROW
+            EXECUTE FUNCTION routes_notify_tenant()"#,
+        // Tell every dispatcher a project's worker levers changed (or the
+        // project went), so its copy of them (`crate::held::Held`) is read
+        // again.
+        // SYNC: 'weft_worker_settings' <-> crate::held::WORKER_SETTINGS_CHANNEL
+        r#"CREATE OR REPLACE FUNCTION project_worker_settings_notify() RETURNS trigger AS $$
+            BEGIN
+                PERFORM pg_notify('weft_worker_settings', OLD.id::text);
+                RETURN NULL;
+            END;
+            $$ LANGUAGE plpgsql"#,
+        r#"DROP TRIGGER IF EXISTS project_worker_settings_on_change ON project"#,
+        r#"CREATE TRIGGER project_worker_settings_on_change
+            AFTER UPDATE OF worker_settings_json ON project
+            FOR EACH ROW
+            WHEN (NEW.worker_settings_json IS DISTINCT FROM OLD.worker_settings_json)
+            EXECUTE FUNCTION project_worker_settings_notify()"#,
+        r#"DROP TRIGGER IF EXISTS project_worker_settings_on_delete ON project"#,
+        r#"CREATE TRIGGER project_worker_settings_on_delete
+            AFTER DELETE ON project
+            FOR EACH ROW
+            EXECUTE FUNCTION project_worker_settings_notify()"#,
         // Append-only definition-version history. Workers fetch by
         // (project_id, definition_hash) so a suspended execution
         // can always resume on the EXACT shape it was started on,

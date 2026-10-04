@@ -253,6 +253,44 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
         r#"CREATE INDEX IF NOT EXISTS idx_task_terminal_completed
             ON task(completed_at_unix)
             WHERE status IN ('complete', 'failed')"#,
+        // The lock that serializes producers of one live task, held until
+        // the transaction ends: the ONE spelling of its key, taken by
+        // `weft_enqueue_dedup` and `enqueue_or_rearm`.
+        r#"CREATE OR REPLACE FUNCTION weft_lock_dedup(p_tenant TEXT, p_kind TEXT, p_dedup TEXT) RETURNS VOID AS $$
+            BEGIN
+                PERFORM pg_advisory_xact_lock(hashtextextended(p_tenant || '|' || p_kind || '|' || p_dedup, 0));
+            END;
+            $$ LANGUAGE plpgsql"#,
+        // THE dedup'd enqueue ([`enqueue_dedup_in`], and a run's birth,
+        // `weft_start_execution`): the task already live under
+        // `(tenant, kind, dedup_key)`, or the new one. A transaction-scoped
+        // lock on that triple serializes two producers of the same task, so
+        // the second finds the first's row instead of tripping the unique
+        // index. Run inside the caller's transaction, which the lock lasts.
+        r#"CREATE OR REPLACE FUNCTION weft_enqueue_dedup(
+                p_id UUID, p_kind TEXT, p_target TEXT, p_project UUID, p_dedup TEXT, p_execution TEXT,
+                p_tenant TEXT, p_target_replica TEXT, p_binary_hash TEXT, p_payload JSONB, p_now BIGINT,
+                OUT task_id UUID, OUT inserted BOOLEAN
+            ) AS $$
+            BEGIN
+                PERFORM weft_lock_dedup(p_tenant, p_kind, p_dedup);
+                SELECT t.id INTO task_id FROM task t
+                    WHERE t.tenant_id = p_tenant AND t.kind = p_kind AND t.dedup_key = p_dedup
+                      AND t.status IN ('pending', 'claimed')
+                    LIMIT 1;
+                IF FOUND THEN
+                    inserted := FALSE;
+                    RETURN;
+                END IF;
+                INSERT INTO task (
+                    id, kind, status, target, project_id, dedup_key, execution_id, tenant_id,
+                    target_replica, binary_hash, payload, attempts, created_at_unix
+                ) VALUES (p_id, p_kind, 'pending', p_target, p_project, p_dedup, p_execution, p_tenant,
+                          p_target_replica, p_binary_hash, p_payload, 0, p_now);
+                task_id := p_id;
+                inserted := TRUE;
+            END;
+            $$ LANGUAGE plpgsql"#,
         // Announce every task that has just become claimable, so the
         // pickers sleep until there is work instead of asking on a
         // timer. From a trigger rather than from each writer, so no
@@ -378,76 +416,77 @@ pub async fn enqueue(pool: &PgPool, spec: NewTask) -> Result<Uuid> {
 /// the lock, two producers could both pass the SELECT (their snapshots
 /// don't see each other's uncommitted INSERT) and the second would hit
 /// a unique-violation on the partial index instead of returning
-/// AlreadyLive.
+/// AlreadyLive. The whole of it is one statement (`weft_enqueue_dedup`),
+/// so on its own it is its own transaction: one round trip.
 pub async fn enqueue_dedup(pool: &PgPool, spec: NewTask) -> Result<DedupOutcome> {
-    let mut tx = pool.begin().await?;
-    let outcome = enqueue_dedup_in(&mut tx, spec).await?;
-    tx.commit().await?;
-    Ok(outcome)
+    enqueue_dedup_in(&mut *pool.acquire().await?, spec).await
 }
 
-/// [`enqueue_dedup`] on a caller-owned connection. MUST run inside a
-/// transaction: the advisory lock is xact-scoped (it releases when the
-/// caller's transaction ends), and the insert's atomicity with whatever else
-/// the caller writes is the whole point of taking a connection.
+/// [`enqueue_dedup`] on a caller-owned connection: inside the caller's
+/// transaction, the insert commits with whatever else it writes, and the
+/// advisory lock lasts until it ends.
 pub async fn enqueue_dedup_in(
     conn: &mut sqlx::PgConnection,
     spec: NewTask,
 ) -> Result<DedupOutcome> {
-    let dedup = spec
-        .dedup_key
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("enqueue_dedup requires dedup_key"))?;
-
-    // Lock + SELECT are scoped by tenant_id to match the
-    // `(tenant_id, kind, dedup_key)` unique index: dedup never crosses
-    // a tenant boundary. (`tenant_id IS NOT DISTINCT FROM $3` so a
-    // NULL-tenant task dedups against other NULL-tenant tasks, matching
-    // how the unique index treats them.)
-    let tenant = spec.tenant_id.as_str();
-    let lock_input = format!("{}|{}|{}", tenant, spec.kind.as_str(), dedup);
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(&lock_input)
-        .execute(&mut *conn)
-        .await?;
-
-    let existing: Option<(Uuid,)> = sqlx::query_as(
-        r#"SELECT id FROM task
-           WHERE tenant_id IS NOT DISTINCT FROM $1
-             AND kind = $2 AND dedup_key = $3 AND status IN ('pending', 'claimed')
-           LIMIT 1"#,
+    let row = DedupRow::of(&spec, Uuid::new_v4(), unix_now())?;
+    let (id, inserted): (Uuid, bool) = sqlx::query_as(
+        "SELECT task_id, inserted FROM weft_enqueue_dedup($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
-    .bind(spec.tenant_id.as_str())
-    .bind(spec.kind.as_str())
-    .bind(dedup)
-    .fetch_optional(&mut *conn)
+    .bind(row.id)
+    .bind(&row.kind)
+    .bind(row.target)
+    .bind(row.project_id)
+    .bind(&row.dedup_key)
+    .bind(&row.execution_id)
+    .bind(&row.tenant_id)
+    .bind(&row.target_replica)
+    .bind(&row.binary_hash)
+    .bind(&row.payload)
+    .bind(row.created_at)
+    .fetch_one(&mut *conn)
     .await?;
-    if let Some((id,)) = existing {
-        return Ok(DedupOutcome::AlreadyLive(id));
+    Ok(if inserted { DedupOutcome::Inserted(id) } else { DedupOutcome::AlreadyLive(id) })
+}
+
+/// A dedup'd task as `weft_enqueue_dedup` takes it: what
+/// [`enqueue_dedup_in`] binds, and what a run's birth hands the database
+/// whole (`weft_start_execution`'s `task`).
+// SYNC: DedupRow's fields <-> weft_enqueue_dedup's parameters, weft_start_execution's `task`
+#[derive(Debug, Clone, Serialize)]
+pub struct DedupRow {
+    pub id: Uuid,
+    pub kind: String,
+    pub target: &'static str,
+    pub project_id: Option<Uuid>,
+    pub dedup_key: String,
+    pub execution_id: Option<String>,
+    pub tenant_id: String,
+    pub target_replica: Option<String>,
+    pub binary_hash: Option<String>,
+    pub payload: Value,
+    pub created_at: i64,
+}
+
+impl DedupRow {
+    /// `spec` as the dedup'd row `id`, enqueued at `now`. Refused without
+    /// a dedup key: nothing would collapse onto it.
+    pub fn of(spec: &NewTask, id: Uuid, now: i64) -> Result<Self> {
+        let dedup_key = spec.dedup_key.clone().ok_or_else(|| anyhow::anyhow!("enqueue_dedup requires dedup_key"))?;
+        Ok(Self {
+            id,
+            kind: spec.kind.clone(),
+            target: spec.target.as_str(),
+            project_id: spec.project_id,
+            dedup_key,
+            execution_id: spec.execution_id.clone(),
+            tenant_id: spec.tenant_id.clone(),
+            target_replica: spec.target_replica.clone(),
+            binary_hash: spec.binary_hash.clone(),
+            payload: spec.payload.clone(),
+            created_at: now,
+        })
     }
-
-    let id = Uuid::new_v4();
-    let now = unix_now();
-    sqlx::query(
-        r#"INSERT INTO task (
-            id, kind, status, target, project_id, dedup_key, execution_id, tenant_id,
-            target_replica, binary_hash, payload, attempts, created_at_unix
-        ) VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8, $9, $10, 0, $11)"#,
-    )
-    .bind(id)
-    .bind(spec.kind.as_str())
-    .bind(spec.target.as_str())
-    .bind(spec.project_id)
-    .bind(dedup)
-    .bind(spec.execution_id.as_deref())
-    .bind(spec.tenant_id.as_str())
-    .bind(spec.target_replica.as_deref())
-    .bind(spec.binary_hash.as_deref())
-    .bind(&spec.payload)
-    .bind(now)
-    .execute(&mut *conn)
-    .await?;
-    Ok(DedupOutcome::Inserted(id))
 }
 
 /// [`enqueue_dedup`] for a task that means "go and look again": a pending
@@ -465,9 +504,10 @@ pub async fn enqueue_or_rearm(pool: &PgPool, spec: NewTask) -> Result<DedupOutco
         .dedup_key
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("enqueue_or_rearm requires dedup_key"))?;
-    let lock_input = format!("{}|{}|{}", spec.tenant_id.as_str(), spec.kind.as_str(), dedup);
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-        .bind(&lock_input)
+    sqlx::query("SELECT weft_lock_dedup($1, $2, $3)")
+        .bind(spec.tenant_id.as_str())
+        .bind(spec.kind.as_str())
+        .bind(dedup)
         .execute(&mut *tx)
         .await?;
     // The row lock of this UPDATE and the one of `complete`/`fail` order

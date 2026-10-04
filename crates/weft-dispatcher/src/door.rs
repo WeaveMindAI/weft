@@ -9,13 +9,10 @@
 //! its root; the install's own domains and any other name reach the
 //! public API itself.
 //!
-//! The domains are read from the database when a request needs them and
-//! the last read is older than [`READ_EVERY`], never on a timer: a door
-//! that looked on its own would keep the database awake for an install
-//! nobody is using.
+//! The domains are held in memory and read again when one comes or goes
+//! (`crate::held`), so routing a request costs no trip to the database.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use axum::extract::{Request, State};
 use axum::http::header::InvalidHeaderValue;
@@ -26,10 +23,6 @@ use tower::ServiceExt as _;
 use weft_core::install::{Domain, DomainServes};
 
 use crate::state::DispatcherState;
-
-/// How old the door's copy of the domains may be. A domain just added
-/// works at most this long after.
-const READ_EVERY: Duration = Duration::from_secs(30);
 
 /// The scheme a request that came by a stored domain was reached over:
 /// the platform's door in front of the domains holds their certificates
@@ -106,64 +99,31 @@ pub fn api_path(tenant: &str, path_and_query: &str) -> String {
     format!("/connect/{tenant}/{}", path_and_query.trim_start_matches('/'))
 }
 
-/// The door's copy of the stored domains (`None` until a read succeeds),
-/// and when a read of them was last started.
-#[derive(Default)]
-struct Read {
-    at: Option<Instant>,
-    domains: Option<Arc<[Domain]>>,
-}
-
 #[derive(Clone)]
 struct Door {
     inner: Router,
     state: DispatcherState,
-    read: Arc<tokio::sync::Mutex<Read>>,
 }
 
 impl Door {
-    /// The stored domains. The first request to find the copy older than
-    /// [`READ_EVERY`] reads them again, and every request arriving
-    /// meanwhile routes by the last copy, so none waits on another's
-    /// query. A read that fails keeps the last copy until the next one is
-    /// due. With no copy yet, a request reads for itself and is refused
-    /// when that fails: routing it as if there were no domains would send
+    /// The stored domains, from the install's held copy. Refused when
+    /// they cannot be read: routing as if there were no domains would send
     /// a frontend's visitors to the install.
-    async fn domains(&self) -> Result<Arc<[Domain]>, Response> {
-        let (copy, due) = {
-            let mut read = self.read.lock().await;
-            let due = read.at.is_none_or(|at| at.elapsed() >= READ_EVERY);
-            if due {
-                read.at = Some(Instant::now());
-            }
-            (read.domains.clone(), due)
-        };
-        if let (Some(copy), false) = (&copy, due) {
-            return Ok(copy.clone());
-        }
-        match crate::domains::list(&self.state.pg_pool).await {
-            Ok(fresh) => {
-                let fresh: Arc<[Domain]> = fresh.into();
-                self.read.lock().await.domains = Some(fresh.clone());
-                Ok(fresh)
-            }
-            Err(e) => {
-                tracing::warn!(target: "weft_dispatcher::door", error = %format!("{e:#}"), "could not read the install's domains");
-                copy.ok_or_else(|| {
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        format!("the install could not read its domains to route this request ({e:#}); try again shortly"),
-                    )
-                        .into_response()
-                })
-            }
-        }
+    async fn domains(&self) -> Result<Arc<Vec<Domain>>, Response> {
+        self.state.held.domains.get_or_load((), || crate::domains::list(&self.state.pg_pool)).await.map_err(|e| {
+            tracing::warn!(target: "weft_dispatcher::door", error = %format!("{e:#}"), "could not read the install's domains");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("the install could not read its domains to route this request ({e:#}); try again shortly"),
+            )
+                .into_response()
+        })
     }
 }
 
 /// `inner` (the public API) behind the door that routes by name.
 pub fn router(state: DispatcherState, inner: Router) -> Router {
-    Router::new().fallback(route).with_state(Door { inner, state, read: Arc::default() })
+    Router::new().fallback(route).with_state(Door { inner, state })
 }
 
 async fn route(State(door): State<Door>, mut request: Request) -> Response {

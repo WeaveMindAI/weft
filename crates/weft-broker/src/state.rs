@@ -49,7 +49,7 @@ pub struct BrokerState {
     /// project and a digest of its definition: a definition never changes
     /// under its digest, so an entry is never stale, and a program asking
     /// for an endpoint on every run reads its definition once.
-    pub declared_infra: weft_core::content_cache::ContentCache<weft_core::project::DeclaredInfra>,
+    pub declared_infra: weft_core::content_cache::ContentCache<(uuid::Uuid, String), weft_core::project::DeclaredInfra>,
     /// Where runtime-file bytes live: the install's bucket.
     pub object_store: Arc<dyn ObjectStore>,
     /// The runtime-file plane (`ctx.storage`): PG metadata + bucket bytes,

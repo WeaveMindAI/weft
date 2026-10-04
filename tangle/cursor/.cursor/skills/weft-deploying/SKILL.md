@@ -145,9 +145,10 @@ is granted to that id, so the name changing hands later gives nobody
 anything), makes the frontend's Cloud Run service (empty until the first
 deploy) and lets that repository's workflow deploy to that service and
 nothing else on the install. It prints the service's name and the
-address visitors will reach. The export then hands the repository the
-service's name and a fresh token for the frontend, and the next run of the
-deploy workflow builds `front/` and puts it there. The order matters: an
+address visitors will reach. It makes no token: the export makes the
+frontend's first one and hands the repository the service's name and that
+token, and the next run of the deploy workflow builds `front/`, puts it there
+and puts the token in place. The order matters: an
 export run before the frontend exists hands over no frontend, and the
 workflow skips it.
 
@@ -232,7 +233,7 @@ Run and by `front/.env` on this machine:
 | Variable | On a cloud install | On this machine |
 |---|---|---|
 | `WEFT_DISPATCHER_URL` | the install's address | `http://127.0.0.1:14111` |
-| `WEFT_TOKEN` | the frontend's own token, which `weft target export` renews and hands the workflow | a token from `weft frontend add <name>` (no `--repo`), written to a private file |
+| `WEFT_TOKEN` | the frontend's own token, which `weft target export` makes (the first one too) and hands the workflow | a token from `weft frontend add <name>` (no `--repo`), written to a private file |
 | `WEFT_PUBLIC_URL` | the install's public address | `http://127.0.0.1:14111` |
 
 On this machine, 14111 is the default port; if the install was started on

@@ -430,9 +430,10 @@ project, `weft new <name> --ci gcp` writes the workflow for you.
 `weft target export prod --github` uses the GitHub CLI (`gh`) to set the
 variables and secrets the workflow reads, so run it with `gh` logged in. It
 mints an operator key for the workflow, and gives the frontend the install
-hosts for this repository a new token, with the name of its service. The
-old token keeps working until the workflow's next run has deployed the new
-one, and then the workflow retires it. If you would rather paste them yourself, leave out
+hosts for this repository a new token, with the name of its service (its
+first one: `weft frontend add` makes none for a hosted frontend). Once it has
+been deployed, its old token keeps working until the workflow's next run has
+deployed the new one, and then the workflow retires it. If you would rather paste them yourself, leave out
 `--github` and it prints everything. If you use the printed version, copy the
 secrets straight away: they are never shown again.
 
@@ -442,7 +443,7 @@ Cloud Run:
 | Variable | What it is | Value on your machine |
 |---|---|---|
 | `WEFT_DISPATCHER_URL` | where the server calls weft: the install's address, over HTTPS | `http://127.0.0.1:14111` |
-| `WEFT_TOKEN` | the token the server calls with; never send it to a browser | a token from `weft frontend add <name>`, written to a file only you can read |
+| `WEFT_TOKEN` | the token the server calls with; never send it to a browser (on Cloud Run, the one `weft target export` made) | a token from `weft frontend add <name>`, written to a file only you can read |
 | `WEFT_PUBLIC_URL` | the start of any link a browser follows | `http://127.0.0.1:14111` |
 
 If the frontend's server needs more than those three (the program's

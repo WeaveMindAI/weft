@@ -323,7 +323,7 @@ impl Journal for FakeJournal {
         start: &ExecEvent,
         kicks: &[ExecEvent],
         task: weft_task_store::tasks::NewTask,
-        _expected_activation: Option<ExecutionId>,
+        _for_activation: bool,
     ) -> anyhow::Result<()> {
         let mut g = self.inner.lock().unwrap();
         let ExecEvent::ExecutionStarted { execution_id, project_id, phase, .. } = start else {
@@ -342,6 +342,18 @@ impl Journal for FakeJournal {
         }
         g.tasks.push(task);
         Ok(())
+    }
+
+    /// Every run is admitted: the limits are the database's, and the
+    /// database tests are where they are checked.
+    async fn admit_and_start_execution(
+        &self,
+        _admission: &crate::entry_limits::Admission,
+        start: &ExecEvent,
+        kicks: &[ExecEvent],
+        task: weft_task_store::tasks::NewTask,
+    ) -> anyhow::Result<Result<(), crate::entry_limits::Refused>> {
+        self.start_execution(start, kicks, task, false).await.map(Ok)
     }
 
     async fn cancel_execution(
@@ -1125,7 +1137,7 @@ pub(crate) mod tests {
             unrecorded_birth: Some(&birth),
         })
         .unwrap();
-        j.start_execution(&start, &[kick], task, None).await.unwrap();
+        j.start_execution(&start, &[kick], task, false).await.unwrap();
         assert!(j.events_log(execution_id).await.unwrap().is_empty(), "no journal row for an unrecorded birth");
         assert!(j.execution_owner(execution_id).await.unwrap().is_some(), "but the execution exists");
         assert!(j.list_non_terminal_execution_ids_for_project(PROJECT).await.unwrap().is_empty());

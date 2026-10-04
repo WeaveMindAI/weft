@@ -571,6 +571,7 @@
         EngineClients {
             journal,
             tasks: Arc::new(NoopTasks),
+            costs: Arc::new(NoopTasks),
             infra: Arc::new(NoopInfra),
             infra_state: Arc::new(NoopInfraState),
             project: Arc::new(NoopProject),

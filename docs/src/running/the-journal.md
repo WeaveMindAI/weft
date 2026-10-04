@@ -73,14 +73,24 @@ works, what `catchErrors` does with this failure, and what happens when
 `ctx.run` cannot save a result, go and read
 [surviving a restart](../nodes/durable-execution.md).
 
-## Why a failed write stops the worker
+## A run does not wait for its writes
+
+A worker hands each event to a sender of its own and carries on: the rows
+reach the database in the background, in the order they happened. The run
+waits for them only where something else is about to read or act on its
+record: before it reads its own journal, before it hands anything to the
+dispatcher (a task, a tag, a stop), and when it ends or pauses, so a run is
+never reported finished before its record is whole. A write that fails stops
+the run at once, for the reason below.
+
+## Why a failed write stops the run
 
 If the journal is missing rows the live worker believes it wrote, every later
 rebuild would reconstruct a different world: a node whose start was lost but
 whose emissions landed would run again and spend twice.
 
-So a failed write ends that worker rather than carrying on with a record
-nobody can trust.
+So a failed write ends that run, as failed, rather than carrying on with a
+record nobody can trust.
 
 ## Who may write
 

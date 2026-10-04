@@ -58,9 +58,11 @@ pub struct Frontend {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     /// The caller token it calls the install with (its id; the value is
-    /// shown once, when it is made).
-    #[serde(rename = "tokenId")]
-    pub token_id: uuid::Uuid,
+    /// shown once, when it is made), once one is in place. A frontend the
+    /// install hosts has none until its deploy workflow puts the first in
+    /// place: the workflow's is the only token it ever calls with.
+    #[serde(default, rename = "tokenId", skip_serializing_if = "Option::is_none")]
+    pub token_id: Option<uuid::Uuid>,
     /// New tokens made to replace it and not put in place yet: they all
     /// work until one is (`POST .../token/{id}/done`), so a running site is
     /// never left without a working token.
@@ -87,8 +89,18 @@ pub struct AddFrontendRequest {
     pub repo: Option<Repository>,
 }
 
-/// What making a frontend, or giving it a new token, answers: the
-/// frontend and its token, shown this once.
+/// What making a frontend answers: the frontend, and, for one running
+/// elsewhere, the token it calls with, shown this once. One the install
+/// hosts gets its token from its deploy workflow (`weft target export`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddedFrontend {
+    pub frontend: Frontend,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+}
+
+/// What giving a frontend a new token answers: the frontend and the
+/// token, shown this once.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrontendWithToken {
     pub frontend: Frontend,

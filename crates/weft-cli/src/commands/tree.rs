@@ -24,7 +24,7 @@ pub async fn run(ctx: Ctx) -> anyhow::Result<()> {
         ctx.json_out(&raw)?;
         return Ok(());
     }
-    for line in render(&tree, &super::local_time) {
+    for line in render(&tree, &super::utc_time) {
         println!("{line}");
     }
     Ok(())
@@ -126,7 +126,7 @@ fn render_version<'a>(
     for r in runs.get(v.id.as_str()).cloned().unwrap_or_default() {
         let head = if tree.head.head_run == Some(r.execution_id) { " <- HEAD run" } else { "" };
         let seed = r.seed_execution_id.map(|s| format!(" seed {} ({} stale)", short(&s.to_string()), r.stale.len())).unwrap_or_default();
-        let scope = r.spec.as_ref().map(|s| format!(" spec {}", s.name)).unwrap_or_default();
+        let scope = r.spec.as_ref().map(started_by).unwrap_or_default();
         let example = r.example.as_deref().map(|e| format!(" example {e}")).unwrap_or_default();
         let ended = r.completed_at.map(|t| format!(" -> {}", when(t))).unwrap_or_default();
         // A cancelled run says who ended it, because a person stopping
@@ -151,6 +151,17 @@ fn render_version<'a>(
     }
     for child in children.get(&Some(v.id.as_str())).cloned().unwrap_or_default() {
         render_version(tree, child, depth + 1, children, runs, when, shown, out);
+    }
+}
+
+/// What started a run, in the words a person reads it by: the trigger
+/// that fired it, or the starting parameters it was run with (`weft run
+/// --save` names them). A plain run says nothing.
+fn started_by(spec: &weft_core::run_spec::RunSpec) -> String {
+    match (&spec.fire, spec.name.as_str()) {
+        (Some((trigger, _)), _) => format!(" fired by {trigger}"),
+        (None, "") => String::new(),
+        (None, name) => format!(" with starting parameters '{name}'"),
     }
 }
 

@@ -10,7 +10,7 @@
 //! to the terminal.
 
 use anyhow::{Context, Result};
-use weft_core::frontend::{AddFrontendRequest, Frontend, FrontendHost, FrontendWithToken, Repository};
+use weft_core::frontend::{AddFrontendRequest, AddedFrontend, Frontend, FrontendHost, FrontendWithToken, Repository};
 
 use super::Ctx;
 
@@ -71,9 +71,10 @@ pub async fn run(ctx: Ctx, action: FrontendAction) -> Result<()> {
             } else {
                 made.await
             };
-            let made: FrontendWithToken =
+            let made: AddedFrontend =
                 serde_json::from_value(made?).context("read the frontend the install made")?;
-            hand_over(&ctx, &project, &install_url, made)?;
+            let token = made.token.zip(made.frontend.token_id);
+            hand_over(&ctx, &project, &install_url, &made.frontend, token)?;
         }
         FrontendAction::Token { name, done: None } => {
             // A hosted frontend's token is its workflow's: a new one made
@@ -92,7 +93,7 @@ pub async fn run(ctx: Ctx, action: FrontendAction) -> Result<()> {
                 serde_json::from_value(client.post_json(&format!("{base}/{name}/token"), &serde_json::json!({})).await?)
                     .context("read the frontend's new token")?;
             let id = renewed.token_id;
-            hand_over(&ctx, &project, &install_url, renewed)?;
+            hand_over(&ctx, &project, &install_url, &renewed.frontend, Some((renewed.token, id)))?;
             if !ctx.json() {
                 println!(
                     "its old token keeps working until the new one is in place; then `weft frontend token {name} --done {id}` retires it"
@@ -138,15 +139,14 @@ pub async fn run(ctx: Ctx, action: FrontendAction) -> Result<()> {
     Ok(())
 }
 
-/// Put a fresh token where only this person can read it, and say what
-/// goes where. A frontend the install hosts gets no file: its service
-/// gets a token of its own from the repository's workflow (`weft target
-/// export` mints it, the deploy puts it in place and retires every other),
-/// so one written here would only sit on disk until that deploy killed it.
-fn hand_over(ctx: &Ctx, project: &str, install_url: &str, made: FrontendWithToken) -> Result<()> {
-    let f = &made.frontend;
+/// Put a fresh `token` (with its id) where only this person can read it,
+/// and say what goes where. A frontend the install hosts has none to
+/// write: its service gets its token from the repository's workflow
+/// (`weft target export` mints it, the deploy puts it in place and retires
+/// every other).
+fn hand_over(ctx: &Ctx, project: &str, install_url: &str, f: &Frontend, token: Option<(String, uuid::Uuid)>) -> Result<()> {
     if let (Some(repo), Some(service)) = (&f.repo, &f.service) {
-        if ctx.json_out(&serde_json::json!({ "frontend": f, "tokenId": made.token_id }))? {
+        if ctx.json_out(&serde_json::json!({ "frontend": f }))? {
             return Ok(());
         }
         println!("frontend '{}': the install made its service {service}, and {} may deploy to it", f.name, repo.name);
@@ -162,13 +162,15 @@ fn hand_over(ctx: &Ctx, project: &str, install_url: &str, made: FrontendWithToke
     }
     // A frontend running elsewhere reaches the install at its public
     // address.
+    let (token, token_id) =
+        token.with_context(|| format!("the install made frontend '{}' with no token for it to call with", f.name))?;
     let env = vec![
-        ("WEFT_TOKEN", made.token.clone()),
+        ("WEFT_TOKEN", token),
         ("WEFT_DISPATCHER_URL", install_url.to_string()),
         ("WEFT_PUBLIC_URL", install_url.to_string()),
     ];
     let file = super::target::write_secrets_file(&format!("{project}-frontend-{}", f.name), &env)?;
-    if ctx.json_out(&serde_json::json!({ "frontend": f, "tokenId": made.token_id, "tokenFile": file }))? {
+    if ctx.json_out(&serde_json::json!({ "frontend": f, "tokenId": token_id, "tokenFile": file }))? {
         return Ok(());
     }
     println!("frontend '{}': its token is in {} (readable by you only; shown this once)", f.name, file.display());

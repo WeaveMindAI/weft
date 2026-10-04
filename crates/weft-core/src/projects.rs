@@ -258,6 +258,11 @@ pub struct ActivationEntry {
     /// gave an invalid) value they need: how many, and why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting: Option<crate::program::WaitingFires>,
+    /// The version of the source its fires run (`weft tree` shows where
+    /// it sits), once its setup finished; `None` while it is set up and
+    /// once it is taken down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// What a deactivated project kept, for the reactivate-time choice.

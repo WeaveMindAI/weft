@@ -140,6 +140,8 @@ impl RoleWaker {
                 }
                 // Notifications may have been lost.
                 Heard::Recheck => self.ring_every_loop(),
+                // The recheck after the reconnect rings every loop.
+                Heard::Lost => {}
             }
         }
     }

@@ -101,19 +101,36 @@ impl axum::extract::FromRequestParts<DispatcherState> for CallerAddress {
 /// Whether a path is one of the token doors, where a refused answer
 /// means somebody presented a token that does not work.
 fn is_token_door(path: &str) -> bool {
-    ["/signal/", "/signal-token/", "/connect/", "/instance/"].iter().any(|p| path.starts_with(p))
+    ["/signal/", "/signal-token/", LIVE_CALL_DOOR, "/instance/"].iter().any(|p| path.starts_with(p))
 }
+
+/// Where live calls come in (`signal::connect_live`).
+const LIVE_CALL_DOOR: &str = "/connect/";
+
+/// Marks the answer to a live call that was admitted (its address checked
+/// for guessing tokens with its birth): what it says is the program's, or
+/// the socket address its run is reached at.
+#[derive(Clone, Copy)]
+pub(crate) struct Admitted;
 
 /// The layer over the outside-caller surface that stops token guessing:
 /// an address past the install's bound of refused tokens this minute is
 /// answered 429 on every token door until the minute ends, and each
 /// refusal a token door gives (401, 403, or a 404 for an unknown
 /// `/signal/` token) counts toward it.
+///
+/// A live call (`/connect/`) is not held up by a read of its own for this:
+/// a call that is let through is checked by its admission, in the one
+/// call to the database that admits and births its run (its answer is
+/// then marked [`Admitted`]), and any other answer, whatever its status,
+/// is checked here before it leaves. Either way a blocked address hears
+/// 429 and nothing else, so a right guess cannot be told from a wrong one.
 async fn guard_token_doors(
     axum::extract::State(state): axum::extract::State<DispatcherState>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    use axum::http::StatusCode;
     use axum::response::IntoResponse;
     let path = request.uri().path().to_string();
     if !is_token_door(&path) || state.edge.invalid_tokens_per_minute.is_none() {
@@ -125,17 +142,33 @@ async fn guard_token_doors(
         Err(e) => return e.into_response(),
     };
     let now = crate::lease::now_unix();
-    match crate::entry_limits::token_guessing_blocked(&state.pg_pool, &state.edge, address, now).await {
-        Ok(Some(refused)) => return crate::entry_limits::too_many(refused),
-        Ok(None) => {}
-        Err(e) => {
-            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("rate limit: {e:#}")).into_response()
+    let blocked = || async {
+        crate::entry_limits::token_guessing_blocked(&state.pg_pool, &state.edge, address, now).await.map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("rate limit: {e:#}")).into_response()
+        })
+    };
+    let live_call = path.starts_with(LIVE_CALL_DOOR);
+    if !live_call {
+        match blocked().await {
+            Ok(Some(refused)) => return crate::entry_limits::too_many(refused),
+            Ok(None) => {}
+            Err(answer) => return answer,
         }
     }
     let response = next.run(axum::extract::Request::from_parts(parts, body)).await;
     let status = response.status();
-    let refused_token = matches!(status, axum::http::StatusCode::UNAUTHORIZED | axum::http::StatusCode::FORBIDDEN)
-        || (status == axum::http::StatusCode::NOT_FOUND && path.starts_with("/signal/"));
+    let admitted = response.extensions().get::<Admitted>().is_some();
+    if live_call && !admitted && status != StatusCode::TOO_MANY_REQUESTS {
+        match blocked().await {
+            Ok(Some(refused)) => return crate::entry_limits::too_many(refused),
+            Ok(None) => {}
+            Err(answer) => return answer,
+        }
+    }
+    // What the program answered is not a refused token, whatever it says.
+    let refused_token = !admitted
+        && (matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+            || (status == StatusCode::NOT_FOUND && path.starts_with("/signal/")));
     if refused_token {
         if let Err(e) = crate::entry_limits::note_invalid_token(&state.pg_pool, &state.edge, address, now).await {
             // The answer is already decided; a lost count only lets one

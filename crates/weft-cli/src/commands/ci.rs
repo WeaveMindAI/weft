@@ -117,7 +117,7 @@ mod tests {
         assert!(first.contains("-frontends/my-app-front:"), "{first}");
         write_workflow(dir.path(), "my app", Cloud::Gcp).unwrap();
 
-        std::fs::write(&path, first.replace("runs-on: ubuntu-latest", "runs-on: self-hosted")).unwrap();
+        std::fs::write(&path, first.replace("runs-on: ubuntu-24.04", "runs-on: self-hosted")).unwrap();
         let e = write_workflow(dir.path(), "my app", Cloud::Gcp).unwrap_err().to_string();
         assert!(e.contains("changed since weft wrote it"), "{e}");
         assert!(std::fs::read_to_string(&path).unwrap().contains("self-hosted"), "left as it is");
