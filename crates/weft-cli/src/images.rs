@@ -260,7 +260,7 @@ pub async fn ensure_builder_base_at(image_ref: &str, rebuild: bool) -> Result<()
             // `build::stage_builder_base_context`.
             let ctx = weft_compiler::build::stage_builder_base_context(&root)
                 .map_err(|e| anyhow::anyhow!("stage builder-base context: {e}"))?;
-            docker_build(image_ref, &ctx.join("Dockerfile"), &ctx, &[], &[]).await?;
+            docker_build(image_ref, &ctx.join("Dockerfile"), &ctx, &[], &[], &[]).await?;
         }
     }
     // Builder-base images are large (~1GB+: debian + rustup +
@@ -329,11 +329,24 @@ pub fn runtime_image_ref() -> Result<String> {
     Ok(qualified_ref(RUNTIME_REPO, &short_hex(&hasher.finalize())))
 }
 
+/// The build context a prebuilt runtime binary rides in, and the file
+/// name it has there.
+// SYNC: PREBUILT_CONTEXT + PREBUILT_BINARY + the RUNTIME_BINARY arg <-> deploy/docker/runtime.Dockerfile (the prebuilt stage)
+const PREBUILT_CONTEXT: &str = "weft-prebuilt";
+const PREBUILT_BINARY: &str = "weft-runtime";
+
 /// Make the runtime image exist locally under `image_ref`: present ->
 /// done; pull -> done; build `deploy/docker/runtime.Dockerfile`.
 /// `rebuild` skips straight to the build, for when a present image is
 /// corrupt or hand-modified.
-pub async fn ensure_runtime_image(image_ref: &str, rebuild: bool) -> Result<()> {
+///
+/// With `prebuilt`, the build copies that `weft-runtime` binary in
+/// instead of compiling one. It must be built from this same checkout:
+/// the ref hashes the source, and nothing can check a binary against
+/// it. Whether it RUNS in the image (this machine's architecture, a
+/// glibc no newer than Debian bookworm's) is checked by starting it
+/// there once, and an image it cannot run in is removed, never pushed.
+pub async fn ensure_runtime_image(image_ref: &str, rebuild: bool, prebuilt: Option<&Path>) -> Result<()> {
     if !rebuild {
         if image_present(image_ref).await? {
             eprintln!("image {image_ref} present; skipping");
@@ -345,7 +358,40 @@ pub async fn ensure_runtime_image(image_ref: &str, rebuild: bool) -> Result<()> 
     }
     let root = weft_compiler::build::resolve_weft_root().map_err(|e| anyhow::anyhow!("resolve weft repo root: {e}"))?;
     let dockerfile = root.join("deploy/docker").join(RUNTIME_DOCKERFILE);
-    docker_build(image_ref, &dockerfile, &root, &[], &[]).await
+    let Some(binary) = prebuilt else {
+        return docker_build(image_ref, &dockerfile, &root, &[], &[], &[]).await;
+    };
+    // Its own context holding only the binary, under the name the
+    // Dockerfile copies, whatever the file was called on disk.
+    let staged = tempfile::tempdir()?;
+    std::fs::copy(binary, staged.path().join(PREBUILT_BINARY))
+        .map_err(|e| anyhow::anyhow!("stage the prebuilt runtime {}: {e}", binary.display()))?;
+    docker_build(
+        image_ref,
+        &dockerfile,
+        &root,
+        &[],
+        &["RUNTIME_BINARY=prebuilt".to_string()],
+        &[(PREBUILT_CONTEXT, staged.path())],
+    )
+    .await?;
+    let probe = docker().args(["run", "--rm", image_ref, "--version"]).output().await?;
+    if !probe.status.success() {
+        let removed = docker().args(["rmi", image_ref]).output().await?;
+        anyhow::ensure!(
+            removed.status.success(),
+            "remove {image_ref} after its runtime failed to start: {}",
+            String::from_utf8_lossy(&removed.stderr).trim()
+        );
+        anyhow::bail!(
+            "the prebuilt runtime {} does not run in the image (removed {image_ref}): {}\n\
+             build it for this machine's architecture against a glibc no newer than \
+             Debian bookworm's (Ubuntu 22.04 is), or leave out --runtime-binary to compile it in the image",
+            binary.display(),
+            String::from_utf8_lossy(&probe.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Every shared image one ensure materialized: the runtime, the builder
@@ -387,16 +433,21 @@ pub fn suffixed_ref(bare: &str, ref_suffix: Option<&str>) -> String {
 /// content-addressed refs. With `ref_suffix`, each image is materialized
 /// under `<ref><suffix>` instead of its bare name: the release workflow's
 /// per-architecture halves, checked and pulled by their OWN names.
+/// `prebuilt_runtime` is [`ensure_runtime_image`]'s `prebuilt`.
 ///
 /// `tokio::join!`, NOT `try_join!`: an early bail would drop the sibling
 /// future while its `docker build` child keeps running detached; join!
 /// lets both finish, then every error is reported together.
-pub async fn ensure_all_shared_images(rebuild: bool, ref_suffix: Option<&str>) -> Result<SharedImages> {
+pub async fn ensure_all_shared_images(
+    rebuild: bool,
+    ref_suffix: Option<&str>,
+    prebuilt_runtime: Option<&Path>,
+) -> Result<SharedImages> {
     let runtime = runtime_image_ref()?;
     let base = builder_base_ref()?;
     let (runtime_target, base_target) = (suffixed_ref(&runtime, ref_suffix), suffixed_ref(&base, ref_suffix));
     let (r, b) = tokio::join!(
-        ensure_runtime_image(&runtime_target, rebuild),
+        ensure_runtime_image(&runtime_target, rebuild, prebuilt_runtime),
         ensure_builder_base_at(&base_target, rebuild),
     );
     let failures: Vec<String> = [("runtime", r), ("builder-base", b)]
@@ -558,12 +609,15 @@ fn idle_days(last_used: &str) -> u64 {
 /// builds (builder base, runtime, worker, infra, node-test)
 /// funnels here. `labels` stamp the `weft.dev/*` filters later GC
 /// selects on (empty for the shared images, which GC by repo+tag).
+/// `named_contexts` are extra build contexts the Dockerfile reads with
+/// `COPY --from=<name>`.
 pub(crate) async fn docker_build(
     image_ref: &str,
     dockerfile: &Path,
     context: &Path,
     labels: &[String],
     build_args: &[String],
+    named_contexts: &[(&str, &Path)],
 ) -> Result<()> {
     eprintln!(
         "building image {image_ref} (this may take several minutes on first run; \
@@ -582,6 +636,9 @@ pub(crate) async fn docker_build(
     }
     for arg in build_args {
         cmd.args(["--build-arg", arg]);
+    }
+    for (name, dir) in named_contexts {
+        cmd.arg("--build-context").arg(format!("{name}={}", dir.display()));
     }
     let status = cmd.arg(context).status().await?;
     if !status.success() {
@@ -604,7 +661,7 @@ pub(crate) async fn docker_build_worker(
 ) -> Result<()> {
     let lane = CompileLane::hold().await?;
     let arg = format!("{}={}", weft_compiler::worker_image::COMPILE_LANE_ARG, lane.number);
-    docker_build(image_ref, dockerfile, context, labels, &[arg]).await
+    docker_build(image_ref, dockerfile, context, labels, &[arg], &[]).await
 }
 
 /// How many worker builds compile side by side when nobody says

@@ -2,6 +2,8 @@
 //! machines run as, so each can prove which project it is and nothing
 //! more.
 
+use std::time::Duration;
+
 use serde_json::{json, Value};
 use weft_platform_traits::config::GcpPlatform;
 
@@ -94,10 +96,23 @@ pub async fn revoke_project_account(google: &Google, gcp: &GcpPlatform, project:
     Ok(())
 }
 
-/// How many times a call is tried while a new account spreads through
-/// IAM, and how long between tries (doubling).
-const SPREAD_TRIES: u32 = 6;
-const SPREAD_FIRST_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a call waits for Google to apply an IAM change before its
+/// refusal is taken as real: the pause between tries starts at `first`
+/// and doubles up to `longest`, and the pauses add up to `budget` at most.
+pub struct Patience {
+    first: Duration,
+    longest: Duration,
+    budget: Duration,
+}
+
+/// A new account reaching every API: seconds, usually.
+const ACCOUNT_SPREAD: Patience =
+    Patience { first: Duration::from_secs(2), longest: Duration::from_secs(32), budget: Duration::from_secs(62) };
+
+/// A new grant taking effect. Google applies most within two minutes and
+/// some take seven or more.
+pub const GRANT_APPLIES: Patience =
+    Patience { first: Duration::from_secs(5), longest: Duration::from_secs(30), budget: Duration::from_secs(600) };
 
 /// Whether `e` is Google refusing an account it has not heard of yet. A
 /// new account, or a new grant to it, takes a while to reach every API,
@@ -133,17 +148,40 @@ where
 /// Run `call` until it stops failing on an account IAM has not spread yet
 /// or on what `also` names as settling on its own. One budget for both,
 /// so the waits never multiply.
-pub async fn until_settled<T, F, Fut>(also: impl Fn(&anyhow::Error) -> bool, mut call: F) -> anyhow::Result<T>
+pub async fn until_settled<T, F, Fut>(also: impl Fn(&anyhow::Error) -> bool, call: F) -> anyhow::Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
-    let mut pause = SPREAD_FIRST_PAUSE;
-    for _ in 1..SPREAD_TRIES {
+    until_settled_within(&ACCOUNT_SPREAD, also, call).await
+}
+
+/// [`until_settled`] with the patience a change needs, for a change that
+/// takes longer to apply than a new account does to spread (a new grant:
+/// [`GRANT_APPLIES`]). Each wait is logged with the refusal that caused
+/// it, so a call held up here says why.
+pub async fn until_settled_within<T, F, Fut>(
+    patience: &Patience,
+    also: impl Fn(&anyhow::Error) -> bool,
+    mut call: F,
+) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let (mut pause, mut waited) = (patience.first, Duration::ZERO);
+    while waited + pause <= patience.budget {
         match call().await {
             Err(e) if account_not_spread(&e) || also(&e) => {
+                tracing::info!(
+                    target: "weft_platform_gcp::accounts",
+                    error = format!("{e:#}"),
+                    "Google has not applied a recent IAM change yet; asking again in {}s",
+                    pause.as_secs()
+                );
                 tokio::time::sleep(pause).await;
-                pause *= 2;
+                waited += pause;
+                pause = (pause * 2).min(patience.longest);
             }
             done => return done,
         }
@@ -249,6 +287,38 @@ mod tests {
 
     fn api(status: u16, body: &str) -> anyhow::Error {
         anyhow::Error::new(ApiError { status, body: body.into() }).context("POST x")
+    }
+
+    /// A refusal `also` names is asked again until it stops, or until the
+    /// pauses would pass the budget, and then the last answer stands; any
+    /// other refusal is returned at once.
+    #[tokio::test]
+    async fn a_settling_refusal_is_asked_again_within_its_budget() {
+        let ms = Duration::from_millis;
+        let patience = Patience { first: ms(1), longest: ms(2), budget: ms(5) };
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let refusing = |until: u32| {
+            let calls = &calls;
+            move || {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                async move { if n < until { Err(api(403, "denied")) } else { Ok(n) } }
+            }
+        };
+        let settles = |e: &anyhow::Error| is_status(e, 403);
+
+        // Pauses of 1, 2 and 2 ms fit the 5 ms budget: three asks, then a
+        // fourth that answers.
+        assert_eq!(until_settled_within(&patience, settles, refusing(4)).await.unwrap(), 4);
+
+        // Past the budget the fifth answer, still a refusal, stands.
+        calls.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(is_status(&until_settled_within(&patience, settles, refusing(9)).await.unwrap_err(), 403));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 4);
+
+        // A refusal nobody said settles is final on the first ask.
+        calls.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(until_settled_within(&patience, |_| false, refusing(9)).await.is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -30,7 +30,9 @@ concurrency:
 
 jobs:
   install:
-    runs-on: ubuntu-latest
+    # 22.04: a runtime built here goes into the runtime image, whose
+    # Debian bookworm has an older glibc than newer Ubuntus link against.
+    runs-on: ubuntu-22.04
     # No deadline: a first install builds weft's images, and a run cut
     # mid-apply leaves the Terraform state locked. GitHub's own 6-hour job
     # limit is the only cap.
@@ -89,41 +91,44 @@ jobs:
           gcloud pubsub topics describe cloud-builds --project "${{ vars.GCP_PROJECT_ID }}" >/dev/null 2>&1 \
             || gcloud pubsub topics create cloud-builds --project "${{ vars.GCP_PROJECT_ID }}"
 
-      # The CLI the release published for this exact commit, checked
-      # against its sha256, when the fork sits on that commit (the same
-      # match setup.sh makes); otherwise built from this checkout.
-      # SYNC: release tag + asset name + manifest.json keys <-> .github/workflows/release.yml (the release job), setup.sh (prebuilt artifacts block), crates/weft-cli/templates/ci/gcp.yml (download the weft CLI)
+      # The CLI weft's release built from this exact source, waited for
+      # when that release is still being built; otherwise built here,
+      # with the runtime, from a cache that keeps the dependencies
+      # between runs, so only what changed in weft compiles again.
       - name: the weft CLI for this checkout
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          base=https://github.com/WeaveMindAI/weft/releases/download/latest
-          manifest=$(curl -fsSL --max-time 10 "$base/manifest.json" || true)
-          commit=$(sed -n 's/.*"commit": *"\([^"]*\)".*/\1/p' <<<"$manifest")
-          sha=$(sed -n 's/.*"sha256_weft-x86_64-linux": *"\([^"]*\)".*/\1/p' <<<"$manifest")
-          mkdir -p target/release
-          # A release being replaced can serve a binary its manifest does
-          # not vouch for yet: the checksum then fails, and the CLI is built.
-          if [ "$commit" = "$GITHUB_SHA" ] && [ -n "$sha" ] \
-            && curl -fsSL "$base/weft-x86_64-linux" -o target/release/weft \
-            && echo "$sha  target/release/weft" | sha256sum -c -; then
-            chmod +x target/release/weft
-            echo "using the CLI the release built from $commit"
+          if scripts/release-cli.sh . target/release; then
+            echo "found=yes" >> "$GITHUB_OUTPUT"
           else
-            echo "this commit has no published CLI that checks out; building it"
-            rm -f target/release/weft
-            rustup toolchain install
-            cargo build --release --locked -p weft-cli
+            rc=$?
+            [ "$rc" -eq 2 ] || exit "$rc"
           fi
+      - if: steps.release.outputs.found != 'yes'
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: steps.release.outputs.found != 'yes'
+      - name: build the weft CLI and runtime
+        if: steps.release.outputs.found != 'yes'
+        run: cargo build --release --locked -p weft-cli -p weft-runtime
 
       # The runtime image and the worker builder base this checkout names,
       # pushed to the install's registry. Each is taken from the install's
       # registry if there, else copied from the release's (the same tag is
       # the same contents), else built. A fork carrying its own changes
-      # hashes to new tags and gets exactly its own runtime.
+      # hashes to new tags and gets exactly its own runtime, made from the
+      # `weft-runtime` built above instead of compiled again in Docker.
       - name: build the runtime's images
+        env:
+          BUILT_HERE: ${{ steps.release.outputs.found != 'yes' }}
         run: |
           registry=$(terraform -chdir=deploy/terraform/gcp output -raw registry)
           gcloud auth configure-docker "${{ vars.GCP_REGION }}-docker.pkg.dev" --quiet
-          WEFT_IMAGE_REGISTRY="$registry" ./target/release/weft build-images --push > "$RUNNER_TEMP/refs.txt"
+          runtime=()
+          [ "$BUILT_HERE" = true ] && runtime=(--runtime-binary target/release/weft-runtime)
+          WEFT_IMAGE_REGISTRY="$registry" ./target/release/weft build-images --push "${runtime[@]}" > "$RUNNER_TEMP/refs.txt"
           # SYNC: `weft build-images` stdout and its order <-> crates/weft-cli/src/images.rs (SharedImages::bare_refs), .github/workflows/release.yml (build + push shared images)
           echo "TF_VAR_runtime_image=$(sed -n 1p "$RUNNER_TEMP/refs.txt")" >> "$GITHUB_ENV"
           echo "TF_VAR_builder_base_image=$(sed -n 2p "$RUNNER_TEMP/refs.txt")" >> "$GITHUB_ENV"

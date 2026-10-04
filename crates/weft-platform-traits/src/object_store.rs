@@ -324,7 +324,15 @@ impl S3ObjectStore {
             &cfg.secret_access_key,
             None,
         );
+        // HTTPS on `ring`, like every other TLS client in weft (see the
+        // workspace Cargo.toml's `aws-smithy-http-client`).
+        let https = aws_smithy_http_client::Builder::new()
+            .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
+                aws_smithy_http_client::tls::rustls_provider::CryptoMode::Ring,
+            ))
+            .build_https();
         let shared = aws_config::defaults(aws_config::BehaviorVersion::latest())
+            .http_client(https)
             .region(aws_sdk_s3::config::Region::new(cfg.region.clone()))
             .credentials_provider(creds)
             // Set the retry posture EXPLICITLY rather than inheriting the SDK's

@@ -42,15 +42,16 @@ pub fn is_loopback_url(url: &str) -> bool {
 }
 
 /// Install ring as the process-level rustls crypto provider, once.
-/// Called at every binary's startup (and the worker's process entry): the
-/// dependency graph carries TWO providers (ring everywhere, aws-lc-rs
-/// via the S3 stack), and rustls refuses to guess between them, so any
-/// library that builds TLS from the process default (a WebSocket
-/// client, a mail library) would panic at its first dial. Installing
-/// the default up front means every present AND future dependency
-/// builds TLS from a provider that is actually installed; weft's own
-/// dialers additionally pin ring explicitly in
-/// [`tls_config`]. Idempotent (a second install is a no-op).
+/// Called at every binary's startup (and the worker's process entry).
+/// ring is the only provider weft builds (the S3 stack is handed a ring
+/// client too), but rustls refuses to guess the moment a dependency (a
+/// node's library, a future crate) brings a second one, and any library
+/// that builds TLS from the process default (a WebSocket client, a mail
+/// library) would then panic at its first dial. Installing the default up
+/// front means every present AND future dependency builds TLS from a
+/// provider that is actually installed; weft's own dialers additionally
+/// pin ring explicitly in [`tls_config`]. Idempotent (a second install is
+/// a no-op).
 pub fn install_crypto_provider() {
     let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
 }

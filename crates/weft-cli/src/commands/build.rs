@@ -54,8 +54,15 @@ pub async fn run(ctx: Ctx, node_set: weft_core::builds::NodeSet) -> Result<()> {
 /// one per line, for the workflow to capture; progress rides stderr.
 /// `--print` stops after resolving: the refs this tree's content hashes
 /// to, touching no image (setup.sh keys its engine-change sweep on the
-/// builder-base line moving).
-pub async fn run_build_images(push: bool, push_suffix: Option<String>, print: bool) -> Result<()> {
+/// builder-base line moving). `runtime_binary` is a `weft-runtime` built
+/// outside Docker, copied into the runtime image instead of compiled
+/// (`images::ensure_runtime_image`).
+pub async fn run_build_images(
+    push: bool,
+    push_suffix: Option<String>,
+    print: bool,
+    runtime_binary: Option<&std::path::Path>,
+) -> Result<()> {
     if print {
         // The SAME list the ensure path prints (`bare_refs` carries
         // the stdout contract), never a second construction of it.
@@ -72,6 +79,7 @@ pub async fn run_build_images(push: bool, push_suffix: Option<String>, print: bo
     let shared = crate::images::ensure_all_shared_images(
         false,
         push_suffix.as_deref(),
+        runtime_binary,
     )
     .await?;
     if push || push_suffix.is_some() {

@@ -11,6 +11,7 @@
 //! API, which has S3's shape; listing goes through its JSON API, which
 //! answers in JSON. Links are V4 signed URLs (`GOOG4-RSA-SHA256`).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use anyhow::{bail, Context as _, Result};
@@ -32,6 +33,12 @@ pub struct GcsObjectStore {
     /// The service account the process runs as: the one links are signed
     /// for.
     account: String,
+    /// Whether Google has signed for this process yet. Until it has, a
+    /// refusal may be the install's own grant to sign still taking effect
+    /// (a fresh install signs its first link, the standard library
+    /// preload, about a minute after granting it), so it is waited out;
+    /// after that, a refusal means the grant is gone.
+    signed: AtomicBool,
 }
 
 impl GcsObjectStore {
@@ -39,7 +46,7 @@ impl GcsObjectStore {
     /// Fails at boot, naming the cause, when the bucket cannot be reached.
     pub async fn new(google: Google, bucket: String) -> Result<Self> {
         let account = google.tokens().account_email().await?;
-        let store = Self { google, bucket, account };
+        let store = Self { google, bucket, account, signed: AtomicBool::new(false) };
         let probe = store.request(Method::GET, &format!("https://{HOST}/storage/v1/b/{}", store.bucket), &[]).await;
         if let Err(e) = Self::ok("reach the object-store bucket", probe?).await {
             let advice = if is_status(&e, 403) {
@@ -106,17 +113,18 @@ impl GcsObjectStore {
             ttl_secs,
         };
         let (to_sign, query) = link.string_to_sign();
-        let signed = self
-            .google
-            .post(
-                &format!("https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{}:signBlob", self.account),
-                &serde_json::json!({ "payload": base64::engine::general_purpose::STANDARD.encode(to_sign.as_bytes()) }),
-            )
-            .await
-            .map_err(|e| {
-                let advice = if is_status(&e, 403) { ": the account needs roles/iam.serviceAccountTokenCreator on itself" } else { "" };
-                e.context(format!("sign a link as {}{advice}", self.account))
-            })?;
+        let url = format!("https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{}:signBlob", self.account);
+        let body = serde_json::json!({ "payload": base64::engine::general_purpose::STANDARD.encode(to_sign.as_bytes()) });
+        let not_yet_granted = |e: &anyhow::Error| is_status(e, 403) && !self.signed.load(Ordering::Relaxed);
+        let signed = crate::accounts::until_settled_within(&crate::accounts::GRANT_APPLIES, not_yet_granted, || {
+            self.google.post(&url, &body)
+        })
+        .await
+        .map_err(|e| {
+            let advice = if is_status(&e, 403) { ": the account needs roles/iam.serviceAccountTokenCreator on itself" } else { "" };
+            e.context(format!("sign a link as {}{advice}", self.account))
+        })?;
+        self.signed.store(true, Ordering::Relaxed);
         let blob = signed.get("signedBlob").and_then(|v| v.as_str()).context("signBlob answered no signedBlob")?;
         let signature = base64::engine::general_purpose::STANDARD.decode(blob).context("signBlob's signature is not base64")?;
         Ok(format!("https://{HOST}{}?{query}&X-Goog-Signature={}", link.path, hex(&signature)))

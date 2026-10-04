@@ -144,7 +144,7 @@ pub fn router() -> Router<Arc<BrokerState>> {
 // `Other`/anyhow chain carries internal detail (SQL text, driver messages, table
 // names) that must not be disclosed to attacker-controlled code. The typed 4xx
 // variants below are safe and actionable, so they keep their specific messages.
-const INTERNAL_STORAGE_ERROR_BODY: &str = "internal storage error";
+const INTERNAL_STORAGE_ERROR_BODY: &str = "internal storage error (the broker's log names the cause)";
 
 fn map_err(e: RuntimeStoreError) -> ApiError {
     let completing = matches!(e, RuntimeStoreError::Completing(_));

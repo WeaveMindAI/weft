@@ -1,0 +1,41 @@
+# The CLI and the runtime it installs, built on this runner and uploaded
+# as two artifacts, for release.yml's linux and macos jobs. A local
+# install runs `weft-runtime` as a process next to `weft`.
+name: build-binaries
+description: build weft + weft-runtime in release mode and upload both as artifacts
+inputs:
+  asset:
+    description: >-
+      The CLI's asset name (`weft-<arch>-<os>`); the runtime's is the
+      same with `weft-` turned into `weft-runtime-`.
+    required: true
+runs:
+  using: composite
+  steps:
+    # rustup reads rust-toolchain.toml (the single source of the
+    # version and components; see ci.yml's rust job for why no
+    # third-party toolchain action).
+    - shell: bash
+      run: rustup toolchain install
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+    # SYNC: the runtime asset name (weft- -> weft-runtime-) <-> setup.sh
+    #       (prebuilt artifacts block: runtime_asset)
+    - shell: bash
+      run: cargo build --release --locked -p weft-cli -p weft-runtime
+    - shell: bash
+      env:
+        ASSET: ${{ inputs.asset }}
+      run: |
+        cp target/release/weft "$ASSET"
+        cp target/release/weft-runtime "weft-runtime-${ASSET#weft-}"
+        echo "RUNTIME_ASSET=weft-runtime-${ASSET#weft-}" >> "$GITHUB_ENV"
+    - uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.asset }}
+        path: ${{ inputs.asset }}
+        if-no-files-found: error
+    - uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.RUNTIME_ASSET }}
+        path: ${{ env.RUNTIME_ASSET }}
+        if-no-files-found: error

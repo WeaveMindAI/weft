@@ -6,10 +6,18 @@
 # workflow for a cloud one (where it runs the machine, the serverless
 # roles and the agents).
 #
-# The builder uses a plain base + rustup so the toolchain is read from
-# `rust-toolchain.toml` (the single source of truth for the whole
+# Where the `weft-runtime` binary comes from: `compiled` builds it here
+# from the source in the context; `prebuilt` takes a binary built from
+# the same source outside Docker, passed as the `weft-prebuilt` build
+# context (`weft build-images --runtime-binary`), which is how the
+# release workflow reuses the binary its CLI job already compiled.
+# SYNC: RUNTIME_BINARY + the weft-prebuilt context <-> crates/weft-cli/src/images.rs (ensure_runtime_image)
+ARG RUNTIME_BINARY=compiled
+
+# The compiled path uses a plain base + rustup so the toolchain is read
+# from `rust-toolchain.toml` (the single source of truth for the whole
 # system), NOT baked into a `rust:X` image.
-FROM debian:bookworm-slim AS builder
+FROM debian:bookworm-slim AS compiled
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -30,6 +38,13 @@ RUN --mount=type=cache,id=weft-cargo-registry,target=/root/.cargo/registry,shari
     --mount=type=cache,id=weft-cargo-target-runtime,target=/build/target,sharing=locked \
     cargo build --release -p weft-runtime --bin weft-runtime \
     && cp /build/target/release/weft-runtime /usr/local/bin/
+
+# A downloaded artifact loses its executable bit, so the copy sets it.
+FROM scratch AS prebuilt
+COPY --from=weft-prebuilt --chmod=0755 weft-runtime /usr/local/bin/weft-runtime
+
+# Only the stage named here is built; the other is never touched.
+FROM ${RUNTIME_BINARY} AS binary
 
 # The Docker command line, for the host agent on a cloud machine: it runs
 # the machine's unit on the machine's own Docker through its socket.
@@ -52,7 +67,7 @@ FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /usr/local/bin/weft-runtime /usr/local/bin/weft-runtime
+COPY --from=binary /usr/local/bin/weft-runtime /usr/local/bin/weft-runtime
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 # The weft source a project version is compiled against: the dispatcher
 # compiles every version itself and stages its worker build, so this

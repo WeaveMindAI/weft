@@ -1267,7 +1267,7 @@ async fn start(install: &Install, rebuild: bool) -> Result<()> {
     refuse_an_older_install(install).await?;
     let ports = ports(install)?;
 
-    let shared = images::ensure_all_shared_images(rebuild, None).await?;
+    let shared = images::ensure_all_shared_images(rebuild, None, None).await?;
     images::hold_standard_worker(&install.id, &shared.worker).await?;
     ensure_network().await?;
     ensure_postgres(install, ports.postgres).await?;
