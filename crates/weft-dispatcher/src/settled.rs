@@ -330,6 +330,8 @@ mod db_tests {
     /// reopened-run bug `weft_journal::lock_execution_ids` exists for.
     #[sqlx::test]
     async fn locking_the_execution_id_before_any_write_keeps_its_rows_in_xid_order(pool: PgPool) {
+        // The execution's lock is the journal schema's (`weft_lock_execution`).
+        crate::app::apply_core_schema(&pool).await.unwrap();
         table(&pool).await;
         for lock_first in [true, false] {
             let execution_id = uuid::Uuid::new_v4();
