@@ -770,16 +770,18 @@ hint "installing from ${C_BOLD}${here}${C_RESET}"
 #
 # CI publishes a rolling release on every push to the release branch:
 # CLI binaries, the .vsix, and a manifest.json naming the exact commit
-# they were built from plus a sha256 per asset. When this checkout IS
-# that commit with a clean tree, downloading is equivalent to building,
+# and source tree they were built from plus a sha256 per asset. When
+# this checkout holds that source with no local change, downloading is
+# equivalent to building,
 # so the install skips the compilers entirely (no Rust or Node
-# toolchain needed). Any local change, a different commit, or no
+# toolchain needed). Any local change, a different source tree, or no
 # network takes the build path instead, and every branch says so.
 #
-# SYNC: release tag + asset names + manifest.json keys (commit,
+# SYNC: release tag + asset names + manifest.json keys (commit, tree,
 #       vscode_version, sha256_<asset>) <->
-#       .github/workflows/release.yml (cli matrix `asset` values, the
-#       vsix `mv` target, the release job's manifest generation)
+#       .github/workflows/release.yml (the linux and macos matrix `asset`
+#       values, the vsix `mv` target, the release job's manifest
+#       generation, release-macos), scripts/release-cli.sh
 release_assets_url="https://github.com/WeaveMindAI/weft/releases/download/latest"
 prebuilt_dir="${HOME}/.local/share/weft/prebuilt"
 # THE home of the `weft` binary on PATH, whichever path produced it:
@@ -840,12 +842,15 @@ decide_prebuilt_use() {
   fi
   prebuilt_commit="$(manifest_value "commit")"
   prebuilt_vscode_version="$(manifest_value "vscode_version")"
-  if [[ -z "${prebuilt_commit}" ]]; then
-    hint "the published manifest names no commit; building locally"
+  # The source tree, not the commit: a merge that brings in exactly the
+  # published source is another commit with the same tree.
+  prebuilt_tree="$(manifest_value "tree")"
+  if [[ -z "${prebuilt_tree}" ]]; then
+    hint "the published manifest names no source tree; building locally"
     return 0
   fi
-  if [[ "${prebuilt_commit}" != "$(git -C "${here}" rev-parse HEAD)" ]]; then
-    hint "no prebuilt artifacts for this commit yet (latest published: ${prebuilt_commit:0:12}); building locally. If you just pulled, CI is likely still building; re-run in a while to download instead."
+  if [[ "${prebuilt_tree}" != "$(git -C "${here}" rev-parse 'HEAD^{tree}')" ]]; then
+    hint "no prebuilt artifacts for this source yet (latest published: commit ${prebuilt_commit:0:12}); building locally. If you just pulled, CI is likely still building; re-run in a while to download instead."
     return 0
   fi
   if [[ $build_cli -eq 1 ]]; then
@@ -861,7 +866,7 @@ decide_prebuilt_use() {
       if [[ -n "${cli_sha256}" && -n "${runtime_sha256}" ]]; then
         use_prebuilt_cli=1
       else
-        hint "this commit's ${cli_asset} or ${runtime_asset} was not published (its build failed in CI); building the CLI and the runtime locally"
+        hint "this commit's ${cli_asset} or ${runtime_asset} is not published (still building in CI, or its build failed); building the CLI and the runtime locally. Re-run in a while to download instead."
       fi
     fi
   fi

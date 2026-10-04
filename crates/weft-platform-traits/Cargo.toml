@@ -34,6 +34,7 @@ sha2 = { workspace = true }
 # via an endpoint-URL override, which is exactly the deploy-time slot.
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
+aws-smithy-http-client = { workspace = true }
 aws-credential-types = { workspace = true }
 aws-smithy-types = { workspace = true }
 # Fake-only lock. parking_lot's Mutex never poisons and lints cleanly

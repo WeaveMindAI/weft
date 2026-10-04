@@ -61,16 +61,23 @@ jobs:
     if: github.repository == 'WeaveMindAI/weft'
     uses: ./.github/workflows/ci.yml
 
-  # ---- shared images -> ghcr ------------------------------------------
+  # ---- Linux binaries, and the shared images -> ghcr ------------------
   #
-  # One leg per architecture, each on its NATIVE runner (no qemu), each
-  # pushing `<ref>-<arch>`; the stitch job below then publishes the bare
-  # `<ref>` as a multi-arch manifest list, so an Apple-silicon / ARM
-  # machine pulls arm64 and an x86 machine pulls amd64 from the same
-  # content-addressed tag. The tag itself hashes source content only, so
-  # both legs compute the identical ref (the stitch job verifies it).
-  images:
-    name: runtime image + builder base (${{ matrix.arch }})
+  # Each leg builds the CLI and the runtime for its architecture, then the
+  # shared images, on its NATIVE runner (no qemu), pushing `<ref>-<arch>`;
+  # images-manifest then publishes the bare `<ref>` as a multi-arch
+  # manifest list, so an Apple-silicon / ARM machine pulls arm64 and an
+  # x86 machine pulls amd64 from the same content-addressed tag. The tag
+  # hashes source content only, so both legs compute the identical ref
+  # (the stitch job verifies it).
+  #
+  # The runtime image takes the `weft-runtime` its leg just built, so the
+  # image carries the very binary the release ships and nothing compiles
+  # it a second time inside Docker. That works because these legs run on
+  # Ubuntu 22.04, whose glibc is older than the image's Debian bookworm
+  # (`weft build-images` starts the binary in the image to make sure).
+  linux:
+    name: ${{ matrix.asset }} + images
     needs: [ci]
     strategy:
       # One architecture failing must not kill the other's build
@@ -79,8 +86,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: ubuntu-latest, arch: amd64 }
-          - { runner: ubuntu-24.04-arm, arch: arm64 }
+          # ubuntu-22.04: oldest supported runner glibc, so the binary
+          # runs on every distro at least that new, and in the image.
+          # SYNC: CLI asset names <-> setup.sh (prebuilt artifacts
+          #       block: the uname case), the macos job's matrix
+          - { runner: ubuntu-22.04, asset: weft-x86_64-linux, arch: amd64 }
+          - { runner: ubuntu-22.04-arm, asset: weft-aarch64-linux, arch: arm64 }
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -92,11 +103,9 @@ jobs:
       # Android/.NET/GHC toolchains are dead weight here.
       - name: free disk space
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
-      # rustup reads rust-toolchain.toml (the single source of the
-      # version and components; see ci.yml's rust job for why no
-      # third-party toolchain action).
-      - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: ./.github/actions/build-binaries
+        with:
+          asset: ${{ matrix.asset }}
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
@@ -109,17 +118,48 @@ jobs:
       # the stitch job.
       # SYNC: `weft build-images` stdout <-> crates/weft-cli/src/images.rs (SharedImages::bare_refs), .github/workflows/install-gcp.yml (build the runtime's images)
       - name: build + push shared images
-        run: cargo run --locked -p weft-cli -- build-images --push-suffix "-${{ matrix.arch }}" > image-refs.txt
+        run: |
+          ./target/release/weft build-images \
+            --push-suffix "-${{ matrix.arch }}" \
+            --runtime-binary target/release/weft-runtime > image-refs.txt
       - uses: actions/upload-artifact@v4
         with:
           name: image-refs-${{ matrix.arch }}
           path: image-refs.txt
           if-no-files-found: error
 
+  # ---- macOS binaries --------------------------------------------------
+  #
+  # Their own job, so nothing waits on them: the latest release goes out
+  # with the Linux binaries and the images, and release-macos adds these
+  # once they are built. The Intel runner is the slowest machine in the
+  # whole release by far.
+  macos:
+    name: ${{ matrix.asset }}
+    needs: [ci]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-latest is arm64 (Apple silicon); macos-15-intel is
+          # the x86_64 runner GitHub keeps until August 2027.
+          # SYNC: CLI asset names <-> setup.sh (prebuilt artifacts
+          #       block: the uname case), the linux job's matrix
+          - { runner: macos-latest, asset: weft-aarch64-macos }
+          - { runner: macos-15-intel, asset: weft-x86_64-macos }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-binaries
+        with:
+          asset: ${{ matrix.asset }}
+
+  # The bare `<ref>` becomes a multi-arch manifest list over the two
+  # halves the linux job pushed.
   images-manifest:
     name: publish multi-arch image tags
     runs-on: ubuntu-latest
-    needs: [images]
+    needs: [linux]
     permissions:
       contents: read
       packages: write
@@ -171,56 +211,39 @@ jobs:
               || { echo "::error::$ref is not anonymously pullable; open github.com/orgs/WeaveMindAI/packages and flip this package to Public"; exit 1; }
           done < refs-amd64/image-refs.txt
 
-  # ---- CLI binaries ----------------------------------------------------
-  cli:
-    name: cli (${{ matrix.asset }})
-    needs: [ci]
-    strategy:
-      # One platform failing must not take the others' binaries down
-      # with it; the release job below ships whichever legs succeeded
-      # (a missing asset just means "build from source" there, and the
-      # manifest lists only the assets that exist).
-      fail-fast: false
-      matrix:
-        include:
-          # ubuntu-22.04: oldest supported runner glibc, so the binary
-          # runs on every distro at least that new.
-          # SYNC: CLI asset names <-> setup.sh (prebuilt artifacts
-          #       block: the uname case)
-          - { runner: ubuntu-22.04, asset: weft-x86_64-linux }
-          - { runner: ubuntu-22.04-arm, asset: weft-aarch64-linux }
-          # macos-latest is arm64 (Apple silicon); macos-15-intel is
-          # the x86_64 runner GitHub keeps until August 2027.
-          - { runner: macos-latest, asset: weft-aarch64-macos }
-          - { runner: macos-15-intel, asset: weft-x86_64-macos }
-    runs-on: ${{ matrix.runner }}
+  # ---- build caches ----------------------------------------------------
+  #
+  # Only main saves Rust build caches (ci.yml's jobs skip saving on a
+  # PR), and each save is keyed by the Cargo.lock and toolchain it was
+  # built with, so a dependency bump leaves the previous copy behind next
+  # to the new one. Once every job that saves one has finished, each
+  # cache keeps its newest copy and the rest are deleted, so the repo's
+  # cache space holds one warm copy per job and platform. A cache no job
+  # saves any more goes on its own after seven days unused.
+  prune-caches:
+    name: keep one copy of each build cache
+    needs: [ci, linux, macos]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
-      # rustup reads rust-toolchain.toml (the single source of the
-      # version and components; see ci.yml's rust job for why no
-      # third-party toolchain action).
-      - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      # The CLI and the runtime it installs, side by side: a local
-      # install runs `weft-runtime` as a process next to `weft`.
-      # SYNC: the runtime asset name (weft- -> weft-runtime-) <-> setup.sh
-      #       (prebuilt artifacts block: runtime_asset)
-      - run: cargo build --release --locked -p weft-cli -p weft-runtime
-      - run: |
-          cp target/release/weft "${{ matrix.asset }}"
-          runtime_asset="${{ matrix.asset }}"
-          cp target/release/weft-runtime "weft-runtime-${runtime_asset#weft-}"
-          echo "RUNTIME_ASSET=weft-runtime-${runtime_asset#weft-}" >> "$GITHUB_ENV"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.RUNTIME_ASSET }}
-          path: ${{ env.RUNTIME_ASSET }}
-          if-no-files-found: error
+      # A rust-cache key ends in two 8-hex segments (the toolchain and
+      # environment, then the lockfile); what is left before them names
+      # the job and platform, the thing that should exist only once.
+      - name: drop superseded copies
+        run: |
+          set -euo pipefail
+          gh cache list --repo "$GITHUB_REPOSITORY" --ref refs/heads/main --key v0-rust- \
+              --limit 1000 --json id,key,createdAt \
+            | jq -r 'group_by(.key | sub("-[0-9a-f]{8}-[0-9a-f]{8}$"; ""))
+                     | map(sort_by(.createdAt) | reverse | .[1:][]) | .[] | "\(.id) \(.key)"' \
+            | while read -r id key; do
+                echo "dropping $key (a newer copy replaced it)"
+                gh cache delete "$id" --repo "$GITHUB_REPOSITORY"
+              done
 
   # ---- VS Code extension ----------------------------------------------
   vsix:
@@ -302,11 +325,12 @@ jobs:
   release:
     name: update latest release
     runs-on: ubuntu-latest
-    needs: [cli, vsix, browser, images-manifest]
-    # Runs even when a CLI leg or the browser packaging failed (one
-    # unbuildable artifact must not strand every other's assets), but
-    # never without the vsix job (it supplies the version the manifest
-    # needs) and never without the stitched images: manifest.json is
+    needs: [linux, vsix, browser, images-manifest]
+    # Runs even when the browser packaging failed (one unbuildable
+    # artifact must not strand every other's assets), but never without
+    # the vsix job (it supplies the version the manifest needs) and never
+    # without the stitched images (which also means both Linux binaries
+    # built): manifest.json is
     # the "prebuilts for this commit are ready" signal setup.sh keys
     # on, and publishing it while no image is pullable would hand a
     # toolchain-less user a prebuilt CLI whose first `daemon start`
@@ -320,10 +344,12 @@ jobs:
       - uses: actions/checkout@v4
       # Exactly the release payload, by name: the image-refs artifacts
       # (internal plumbing for the stitch job) must never leak into the
-      # public asset list.
+      # public asset list. The macOS binaries are release-macos's, even
+      # when one happens to be built already, so what this job publishes
+      # never depends on which runner was faster.
       - uses: actions/download-artifact@v4
         with:
-          pattern: weft-*
+          pattern: weft-*-linux
           path: dist
           merge-multiple: true
       # A pattern, so a failed browser job just means fewer files (the
@@ -360,10 +386,14 @@ jobs:
           # missing manifest reads as "nothing published". The
           # manifest goes LAST so its commit stamp never vouches for
           # assets that are not up yet.
-          # SYNC: manifest.json keys <-> setup.sh (prebuilt artifacts block: manifest_value), .github/workflows/install-gcp.yml (the weft CLI for this checkout), crates/weft-cli/templates/ci/gcp.yml (download the weft CLI)
+          # SYNC: manifest.json keys <-> setup.sh (prebuilt artifacts block: manifest_value), scripts/release-cli.sh, the release-macos job
           gh release upload latest dist/* --clobber
+          # `tree` names the source content: a fork that merged this
+          # commit into an unchanged copy has another commit but the same
+          # tree, and the same binaries are right for it.
           {
             printf '{\n  "commit": "%s",\n' "${GITHUB_SHA}"
+            printf '  "tree": "%s",\n' "$(git rev-parse "${GITHUB_SHA}^{tree}")"
             printf '  "vscode_version": "%s",\n' "${VSCODE_VERSION}"
             for f in dist/*; do
               printf '  "sha256_%s": "%s",\n' "$(basename "$f")" "$(sha256sum "$f" | cut -d' ' -f1)"
@@ -385,6 +415,50 @@ jobs:
             [ -e "dist/$asset" ] || gh release delete-asset latest "$asset" --yes
           done <<< "$assets"
           gh release edit latest --notes "Built from ${GITHUB_SHA}. setup.sh downloads these when its checkout matches manifest.json's commit."
+
+  # The macOS binaries join the release once they are built, each with
+  # its sha added to the manifest the release job wrote.
+  release-macos:
+    name: add the macOS binaries to the latest release
+    runs-on: ubuntu-latest
+    needs: [release, macos]
+    # Whichever macOS legs succeeded, as long as the release they join
+    # went out.
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # A pattern, so a failed leg just means one file fewer.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: weft-*-macos
+          path: dist
+          merge-multiple: true
+      # SYNC: manifest.json keys <-> the release job (assemble + upload)
+      - name: upload + add to the manifest
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(dist/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::warning::no macOS binary was built; the release has none for this commit"
+            exit 0
+          fi
+          gh release download latest --repo "$GITHUB_REPOSITORY" -p manifest.json -D .
+          # One release at a time (the workflow's concurrency group), so
+          # the manifest is this run's; anything else is a bug to see.
+          [ "$(jq -r .commit manifest.json)" = "$GITHUB_SHA" ] || {
+            echo "::error::the latest release names $(jq -r .commit manifest.json), not $GITHUB_SHA"
+            exit 1
+          }
+          gh release upload latest "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          for f in "${files[@]}"; do
+            jq --arg k "sha256_$(basename "$f")" --arg v "$(sha256sum "$f" | cut -d' ' -f1)" \
+              '. + {($k): $v}' manifest.json > manifest.next && mv manifest.next manifest.json
+          done
+          gh release upload latest manifest.json --repo "$GITHUB_REPOSITORY" --clobber
 
   # ---- store publishes (each store gated on its own version tag, its
   # own tag pushed immediately after its publish, so a failure or an

@@ -44,10 +44,10 @@ jobs:
 
       # The source of the exact weft the install runs (the CLI compiles the
       # project against its nodes), and its CLI: a project compiled by
-      # another weft is refused there. The release's own CLI when the
-      # release was built from that commit (checked against its sha256),
-      # otherwise built from the source and cached for the next run.
-      # SYNC: release tag + asset name + manifest.json keys <-> .github/workflows/release.yml (the release job), .github/workflows/install-gcp.yml (the weft CLI for this checkout)
+      # another weft is refused there. The CLI weft's release built from
+      # that source (waited for when the release is still being built),
+      # otherwise built here from a cache that keeps the dependencies
+      # between runs, so a newer weft compiles only what changed in it.
       - uses: actions/checkout@v7
         with:
           repository: ${{ vars.WEFT_SOURCE_REPOSITORY }}
@@ -56,54 +56,30 @@ jobs:
 
       - name: download the weft CLI
         id: download
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          base=https://github.com/WeaveMindAI/weft/releases/download/latest
-          manifest=$(curl -fsSL --max-time 10 "$base/manifest.json" || true)
-          commit=$(sed -n 's/.*"commit": *"\([^"]*\)".*/\1/p' <<<"$manifest")
-          sha=$(sed -n 's/.*"sha256_weft-x86_64-linux": *"\([^"]*\)".*/\1/p' <<<"$manifest")
-          mkdir -p "$RUNNER_TEMP/weft"
-          # A release being replaced can serve a binary its manifest does
-          # not vouch for yet: the checksum then fails, and the CLI is built.
-          if [ "$commit" = "${{ vars.WEFT_SOURCE_COMMIT }}" ] && [ -n "$sha" ] \
-            && curl -fsSL "$base/weft-x86_64-linux" -o "$RUNNER_TEMP/weft/weft" \
-            && echo "$sha  $RUNNER_TEMP/weft/weft" | sha256sum -c -; then
-            chmod +x "$RUNNER_TEMP/weft/weft"
+          if .weft/scripts/release-cli.sh .weft "$RUNNER_TEMP/weft"; then
             echo "$RUNNER_TEMP/weft" >> "$GITHUB_PATH"
-            echo "using the CLI the release built from $commit"
             echo "found=yes" >> "$GITHUB_OUTPUT"
           else
-            echo "the release has no CLI built from ${{ vars.WEFT_SOURCE_COMMIT }} that checks out; building it"
+            rc=$?
+            [ "$rc" -eq 2 ] || exit "$rc"
           fi
 
-      # Restored and saved as two steps, so a run that fails after the
-      # build still keeps it for the next one.
-      - uses: actions/cache/restore@v6
+      - if: steps.download.outputs.found != 'yes'
+        working-directory: .weft
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: steps.download.outputs.found != 'yes'
-        id: cache
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            .weft/target
-          key: weft-cli-${{ runner.os }}-${{ vars.WEFT_SOURCE_COMMIT }}
-
+          workspaces: .weft -> target
       - name: build the weft CLI
-        id: build
         if: steps.download.outputs.found != 'yes'
         working-directory: .weft
         run: |
-          rustup toolchain install
           cargo build --release --locked -p weft-cli
           echo "$WEFT_REPO_ROOT/target/release" >> "$GITHUB_PATH"
-
-      - uses: actions/cache/save@v6
-        if: always() && steps.build.outcome == 'success' && steps.cache.outputs.cache-hit != 'true'
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            .weft/target
-          key: weft-cli-${{ runner.os }}-${{ vars.WEFT_SOURCE_COMMIT }}
 
       # A program that is off is switched on; one whose triggers are on is
       # brought up to date. `--mode park` holds the calls that arrive while

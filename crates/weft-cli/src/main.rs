@@ -111,8 +111,15 @@ enum Cmd {
         /// Only print the refs this tree resolves to, one per line,
         /// touching nothing (no ensure, no docker). What setup.sh
         /// keys its engine-change sweep on.
-        #[arg(long, conflicts_with_all = ["push", "push_suffix"])]
+        #[arg(long, conflicts_with_all = ["push", "push_suffix", "runtime_binary"])]
         print: bool,
+        /// Put this `weft-runtime` binary in the runtime image instead of
+        /// compiling one inside Docker. It must be built from this same
+        /// checkout, for this machine, against a glibc no newer than
+        /// Debian bookworm's. The release workflow passes the binary its
+        /// CLI job built, so the runtime compiles once per release.
+        #[arg(long, value_name = "PATH")]
+        runtime_binary: Option<std::path::PathBuf>,
     },
     /// Manage a node's service connection from the terminal: list the
     /// stored connections and pick one, connect a new account (paste a
@@ -1687,8 +1694,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Cmd::New { name, assistants, remember, ci } => commands::new::run(ctx, name, assistants, remember, ci).await,
         Cmd::Ci { action: CiCmd::Add { cloud } } => commands::ci::add(ctx, cloud).await,
         Cmd::Build { referenced } => commands::build::run(ctx, node_set(referenced)).await,
-        Cmd::BuildImages { push, push_suffix, print } => {
-            commands::build::run_build_images(push, push_suffix, print).await
+        Cmd::BuildImages { push, push_suffix, print, runtime_binary } => {
+            commands::build::run_build_images(push, push_suffix, print, runtime_binary.as_deref()).await
         }
         Cmd::Connect { opts } => commands::connect::run(ctx, opts).await,
         Cmd::Options { step, field, search } => {

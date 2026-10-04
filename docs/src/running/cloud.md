@@ -136,9 +136,14 @@ in a repository secret named `WEFT_ACCESS_APPS`. Otherwise skip it.
 ### Run the workflow
 
 Open the Actions tab of your fork. GitHub turns workflows off in a new fork, so if the tab asks, enable them first. Then pick **install on GCP** and run it. It
-takes weft's images from the release when your fork matches it (and
-builds the ones it changed), pushes them to your project, and creates
-everything listed under [what you get](#what-you-get).
+takes weft's CLI and images from the release when your fork holds the same
+source (and builds the ones it changed), pushes the images to your project,
+and creates everything listed under [what you get](#what-you-get). If you
+run it right after weft's main moved and your fork caught up, the release
+for that source may still be building: the workflow waits for it rather
+than compiling the same thing, and says so in its log. When it does have to
+build, it keeps the compiled dependencies for the next run, so after an
+upgrade only what changed in weft compiles again.
 
 When it finishes, its last step (in the run's summary, and in its log for
 `gh run view <id> --log`) gives you the install's address, a Cloud Run
@@ -412,7 +417,8 @@ Put those in the frontend's environment.
 
 `weft ci add` writes `.github/workflows/deploy.yml`, a workflow you run by
 hand from the Actions tab. It takes the weft CLI the release built from the
-commit your install runs (or builds it, when the release has none), deploys
+source your install runs (waiting for it while that release is still
+building, or building it when the release has none), deploys
 the program (`weft activate --on prod` when it is off,
 `weft resync --on prod --mode park` when it is on: edit the mode in the file
 if `hibernate` or `wipe` suits the program better), then

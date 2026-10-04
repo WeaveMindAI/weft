@@ -92,8 +92,13 @@ tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 # S3-compatible object storage (the ObjectStore slot: GCS / SeaweedFS / AWS /
 # any S3 endpoint via an endpoint-URL override). rustls so we don't drag in
 # a native TLS toolchain, matching reqwest above.
-aws-config = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "behavior-version-latest"] }
-aws-sdk-s3 = { version = "1", default-features = false, features = ["rustls", "rt-tokio", "sigv4a"] }
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "sigv4a"] }
+# The AWS SDK's HTTPS client, on `ring` like every other TLS client here.
+# The SDK's own `rustls` feature picks `aws-lc-rs`, a second crypto library
+# that compiles a whole C library with cmake on every cold build; the client
+# is handed to the SDK instead (`weft_platform_traits::object_store`).
+aws-smithy-http-client = { version = "1", default-features = false, features = ["rustls-ring"] }
 aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
 aws-smithy-types = "1"
 

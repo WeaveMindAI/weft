@@ -59,7 +59,12 @@ jobs:
       # pinned to a commit it demands an explicit toolchain input,
       # which would fork the version out of the toml.
       - run: rustup toolchain install
+      # Restores everywhere, saves only on main (release.yml's call of
+      # this file): a PR reads main's copy and leaves nothing behind, and
+      # release.yml's prune-caches keeps one copy per job.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # No compile-time query macros anywhere, so the workspace suite needs no
       # database. The tests that do want one are behind the `db-tests` feature.
@@ -99,7 +104,10 @@ jobs:
       - uses: actions/checkout@v4
       # rustup reads rust-toolchain.toml (see the rust job's comment).
       - run: rustup toolchain install
+      # Saves only on main, like the rust job's.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # The script runs the suites under cargo-nextest (every test side by
       # side); its prebuilt binary, from the project's own install script.
       - run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
