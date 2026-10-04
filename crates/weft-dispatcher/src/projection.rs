@@ -809,9 +809,8 @@ pub async fn execution_inheritance(
         return Ok(weft_journal::SeedChain::default());
     }
     weft_journal::seed_chain(rows, |seed| state.journal.events_log(seed), |project_id, hash| async move {
-        let json = state.projects.definition_for_hash(project_id, &hash).await?
-            .ok_or_else(|| anyhow::anyhow!("seed definition {hash} is missing from project {project_id}"))?;
-        Ok(std::sync::Arc::new(serde_json::from_str(&json)?))
+        state.program(project_id, &hash).await?
+            .ok_or_else(|| anyhow::anyhow!("seed definition {hash} is missing from project {project_id}"))
     })
         .await
         .map_err(|e| format!("this run inherits from a seed that cannot be read: {e:#}"))
@@ -882,7 +881,20 @@ pub async fn execution_program(
             "execution {execution_id} has a definition hash but no owner row. `weft clean {execution_id}` removes it."
         )));
     };
-    let Some(json) = state.projects.definition_for_hash(owner.project_id, &hash).await? else {
+    let read = match state.program(owner.project_id, &hash).await {
+        Err(e) => match e.downcast::<crate::state::UnreadableProgram>() {
+            Ok(why) => {
+                return Ok(ProgramLookup::Unreadable(format!(
+                    "the definition recorded for execution {execution_id} (project {}, hash {hash}) no longer reads: \
+                     {}. `weft clean {execution_id}` removes the run.",
+                    owner.project_id, why.0
+                )))
+            }
+            Err(store) => return Err(store),
+        },
+        Ok(read) => read,
+    };
+    let Some(program) = read else {
         // A definition is kept for as long as any run points at it, so
         // reaching here means it was pruned along with the last run
         // that used it, or this journal predates that rule (until
@@ -905,14 +917,7 @@ pub async fn execution_program(
             owner.project_id
         )));
     };
-    match serde_json::from_str(&json) {
-        Ok(program) => Ok(ProgramLookup::Found(Arc::new(program))),
-        Err(e) => Ok(ProgramLookup::Unreadable(format!(
-            "the definition recorded for execution {execution_id} (project {}, hash {hash}) no longer reads: \
-             {e}. `weft clean {execution_id}` removes the run.",
-            owner.project_id
-        ))),
-    }
+    Ok(ProgramLookup::Found(program))
 }
 
 #[cfg(test)]

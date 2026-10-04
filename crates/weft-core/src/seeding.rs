@@ -14,7 +14,7 @@ use crate::frames::{loop_indices, Located, LoopFrames};
 use crate::primitive::ExecutionSnapshot;
 use crate::project::{boundary_in_id, GroupBoundaryRole, GroupKind, ProjectDefinition};
 use crate::project::hash::ProgramIdentity;
-use crate::project::graph::ProjectGraph;
+use crate::project::graph::{GraphView, ProjectGraph};
 use crate::project::selection::{enclosing_loops, every_place, is_body, members_in, source_place, RunSelection, SelectionBounds};
 use crate::run_spec::{OutputWire, RunSpec};
 use crate::ExecutionId;
@@ -212,7 +212,7 @@ pub fn seed_plan(
             // backup is not a starting parameter of this newly selected use case.
             invalid.insert(place.clone());
         }
-        if crate::project::selection::is_ordinary_boundary(project, &place.id)
+        if project.is_ordinary_boundary(&place.id)
             && selection.boundary_ports.get(place).is_some_and(|ports| !ports.is_subset(&old.boundary_ports))
         { invalid.insert(place.clone()); }
         if let Some(authored) = starting_inputs.get(place) {
@@ -237,7 +237,7 @@ pub fn seed_plan(
         let previous = invalid.len();
         for (place, dependencies) in &dependencies {
             if dependencies.iter().any(|dep| selection.nodes.contains(dep) && invalid.contains(dep)
-                && !crate::project::selection::is_ordinary_boundary(project, &dep.id)) {
+                && !project.is_ordinary_boundary(&dep.id)) {
                 invalid.insert((*place).clone());
             }
         }
@@ -307,7 +307,7 @@ pub fn inheritable_nodes(project: &ProjectDefinition, snapshot: &ExecutionSnapsh
     }
     eligible.retain(|place| !unfinished.contains(place));
     let places = snapshot.selection.as_ref().map(|selection| selection.nodes.clone()).unwrap_or_else(|| every_place(project));
-    for place in places.iter().filter(|place| crate::project::selection::is_ordinary_boundary(project, &place.id)) {
+    for place in places.iter().filter(|place| project.is_ordinary_boundary(&place.id)) {
         if skipped_scope(project, snapshot, place, &place.frames()) { eligible.insert(place.clone()); }
     }
     // Loops are reused whole: an outermost loop (none around it, through

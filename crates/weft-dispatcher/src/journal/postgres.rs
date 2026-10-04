@@ -402,8 +402,8 @@ impl PostgresJournal {
     }
 
     /// The one-transaction execution BIRTH: `ExecutionStarted` + seed + the
-    /// entry kicks. Shared by `start_execution` and `start_live_execution`,
-    /// which take the execution's lock before their first write.
+    /// entry kicks, written by `start_execution`, which takes the
+    /// execution's lock before its first write.
     async fn write_birth_in(
         tx: &mut sqlx::PgConnection,
         start: &ExecEvent,
@@ -929,9 +929,8 @@ impl Journal for PostgresJournal {
             tx.commit().await?;
             return Ok(());
         }
-        // Enqueue FIRST and only write the birth on a FRESH insert, exactly
-        // like `start_live_execution` gates on `Admitted`: "one birth per
-        // execution" holds by construction even if a caller ever replays an execution
+        // Enqueue FIRST and only write the birth on a FRESH insert: "one
+        // birth per execution" holds by construction even if a caller ever replays an execution
         // (the dedup'd task collapses, and the birth is not double-written;
         // ExecutionStarted itself carries no dedup key).
         let outcome = weft_task_store::tasks::enqueue_dedup_in(&mut tx, task).await?;
@@ -940,32 +939,6 @@ impl Journal for PostgresJournal {
         }
         tx.commit().await?;
         Ok(())
-    }
-
-    async fn start_live_execution(
-        &self,
-        start: &ExecEvent,
-        kicks: &[ExecEvent],
-        task: weft_task_store::tasks::NewTask,
-    ) -> anyhow::Result<weft_task_store::tasks::LiveAdmitOutcome> {
-        use weft_task_store::tasks::LiveAdmitOutcome;
-        let mut tx = self.pool.begin().await?;
-        // Execution lock before the first write (the admission): the
-        // ordering invariant on `weft_journal::write`.
-        weft_journal::lock_execution_ids(&mut tx, &[start.execution_id()]).await?;
-        let born = Self::execution_already_started(&mut tx, start).await?;
-        let outcome =
-            weft_task_store::tasks::admit_live_execution_in(&mut tx, &task).await?;
-        anyhow::ensure!(!born || matches!(outcome, LiveAdmitOutcome::AlreadyAdmitted { .. }),
-            "live execution {} already started and no longer has an active admission; open a new connection",
-            start.execution_id());
-        // Only a FRESH admission births the execution: `AlreadyAdmitted`'s
-        // original admission already committed the birth.
-        if matches!(outcome, LiveAdmitOutcome::Admitted) {
-            Self::write_birth_in(&mut tx, start, kicks, None).await?;
-        }
-        tx.commit().await?;
-        Ok(outcome)
     }
 
     async fn cancel_execution(
@@ -1585,6 +1558,37 @@ impl Journal for PostgresJournal {
         let removed = erase_execution_ids(&mut tx, &[execution_id]).await?;
         tx.commit().await?;
         Ok(removed)
+    }
+
+    async fn erase_unclaimed_live_run(&self, execution_id: ExecutionId, task_id: uuid::Uuid, now: i64) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        weft_journal::lock_execution_ids(&mut tx, &[execution_id]).await?;
+        let unclaimed = sqlx::query(&format!(
+            "DELETE FROM task WHERE id = $1 AND {}",
+            weft_task_store::tasks::never_arrived_sql("$2")
+        ))
+            .bind(task_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if unclaimed == 0 {
+            return Ok(false);
+        }
+        // A run nothing ever drove parked on nothing, so no listener holds
+        // a signal of it.
+        let removed = erase_execution_ids(&mut tx, &[execution_id]).await?;
+        anyhow::ensure!(
+            removed.is_empty(),
+            "live run {execution_id} was never claimed yet held {} resume signal(s); left in place",
+            removed.len()
+        );
+        sqlx::query("DELETE FROM entry_slot WHERE execution_id = $1")
+            .bind(execution_id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     async fn delete_project_executions(&self, project_id: uuid::Uuid) -> anyhow::Result<u64> {

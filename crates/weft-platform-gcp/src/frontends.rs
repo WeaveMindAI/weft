@@ -105,11 +105,8 @@ impl FrontendHosting for CloudRunFrontends {
             .await
             .map_err(|e| e.context(format!("let {} deploy as the install's deployer", site.repo.name)))?;
         let described = self.google.get(&resource).await?;
-        let url = described
-            .get("uri")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow::anyhow!("Cloud Run named no address for {service}"))?
-            .to_string();
+        let url = stable_address(&described, &self.gcp.region)
+            .ok_or_else(|| anyhow::anyhow!("Cloud Run named no `{}.run.app` address for {service}", self.gcp.region))?;
         Ok(HostedFrontend { service, url })
     }
 
@@ -127,9 +124,37 @@ impl FrontendHosting for CloudRunFrontends {
     }
 }
 
+/// The address of the `<service>-<project number>.<region>.run.app` form
+/// among those Cloud Run serves a service at. A service answers at two
+/// (that one, and an older `-<hash>-<region code>.a.run.app` one Cloud Run
+/// calls its main `uri`); the install's own address is of the first form,
+/// so a frontend's is too, and a person sees one shape everywhere.
+fn stable_address(described: &Value, region: &str) -> Option<String> {
+    let suffix = format!(".{region}.run.app");
+    described
+        .get("urls")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|url| url.ends_with(&suffix))
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Of the two addresses Cloud Run serves a service at, the one of the
+    /// install's own shape.
+    #[test]
+    fn a_frontend_is_reached_at_the_address_of_the_install_s_shape() {
+        let described = serde_json::json!({
+            "uri": "https://weft-front-abc123-uw.a.run.app",
+            "urls": ["https://weft-front-123456.us-west1.run.app", "https://weft-front-abc123-uw.a.run.app"],
+        });
+        assert_eq!(stable_address(&described, "us-west1").as_deref(), Some("https://weft-front-123456.us-west1.run.app"));
+        assert_eq!(stable_address(&serde_json::json!({ "uri": "https://x-uw.a.run.app" }), "us-west1"), None);
+    }
 
     #[test]
     fn a_frontend_service_fits_cloud_run_and_names_its_project() {

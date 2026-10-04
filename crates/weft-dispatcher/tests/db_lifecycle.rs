@@ -80,13 +80,11 @@ async fn seed_project(
         .expect("register project");
 }
 
-/// The execute task of `execution_id`'s birth, on image `binary_hash`, pinned to
-/// `pinned_to` when a live caller reached that replica.
+/// The execute task of `execution_id`'s birth, on image `binary_hash`.
 fn execute_task(
     project_id: Uuid,
     execution_id: weft_core::ExecutionId,
     binary_hash: &str,
-    pinned_to: Option<String>,
     unrecorded_birth: Option<&[weft_journal::ExecEvent]>,
 ) -> weft_task_store::tasks::NewTask {
     weft_dispatcher::task_kinds::execute::execution_task_spec(weft_dispatcher::task_kinds::execute::ExecutionTask {
@@ -97,7 +95,6 @@ fn execute_task(
         binary_hash,
         tenant_id: TENANT,
         run_class: weft_core::run_class::RunClass::Short,
-        pinned_to,
         live_connection: None,
         unrecorded_birth,
     })
@@ -154,7 +151,7 @@ async fn execution_birth_and_resume_pin_the_original_image(pool: PgPool) {
         program: Some(program), source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 1,
         run_class: weft_core::run_class::RunClass::Short,
     };
-    let task = execute_task(id, execution_id, "bin-A", None, None);
+    let task = execute_task(id, execution_id, "bin-A", None);
     seed_project(&projects, id, "bin-B").await;
     journal.start_execution(&start, &[], task, None).await.unwrap();
 
@@ -208,7 +205,7 @@ fn trigger_setup_birth(id: Uuid, execution_id: Uuid) -> (weft_journal::ExecEvent
         program: Some(program), source_version: Some("source".into()), run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 1,
         run_class: weft_core::run_class::RunClass::Short,
     };
-    let task = execute_task(id, execution_id, "bin-A", None, None);
+    let task = execute_task(id, execution_id, "bin-A", None);
     (start, task)
 }
 
@@ -711,9 +708,6 @@ async fn start_execution_birth_is_atomic(pool: PgPool) {
 
     sqlx::query("DELETE FROM task WHERE execution_id = $1").bind(execution_id2.to_string()).execute(&pool).await.unwrap();
     journal.start_execution(&start2, &[], task2.clone(), None).await.unwrap();
-    let pinned = weft_task_store::tasks::NewTask { target_replica: Some("worker-a".into()), ..task2 };
-    let live_error = journal.start_live_execution(&start2, &[], pinned).await.unwrap_err();
-    assert!(live_error.to_string().contains("already started"), "{live_error:#}");
     let births: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM exec_event WHERE execution_id = $1 AND kind = 'execution_started'")
         .bind(execution_id2.to_string()).fetch_one(&pool).await.unwrap();
     let tasks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE execution_id = $1")
@@ -742,7 +736,7 @@ async fn an_unrecorded_run_is_born_unjournaled_and_forgotten_or_recorded(pool: P
         let kick = weft_journal::ExecEvent::NodeKicked {
             execution_id, node_id: "route".into(), frames: vec![], firing: true, payload: None, port_snapshot: None, at_unix: 1,
         };
-        let task = execute_task(id, execution_id, "bin-A", None, Some(&[start.clone(), kick.clone()]));
+        let task = execute_task(id, execution_id, "bin-A", Some(&[start.clone(), kick.clone()]));
         (start, kick, task)
     };
     let rows = |execution_id: weft_core::ExecutionId| {
@@ -805,11 +799,11 @@ async fn an_unrecorded_run_is_born_unjournaled_and_forgotten_or_recorded(pool: P
     let paid = weft_core::ExecutionId::new_v4();
     let (start, kick, task) = birth(paid);
     journal.start_execution(&start, std::slice::from_ref(&kick), task, None).await.unwrap();
-    weft_journal::record_event(&pool, &weft_journal::ExecEvent::CostReported {
+    weft_journal::record_events(&pool, &[weft_journal::ExecEvent::CostReported {
         execution_id: paid, node_id: "llm".into(), frames: vec![], cost_id: "c".into(), service: "llm".into(),
         model: None, amount_usd: Some(0.1), billed: true, origin: weft_core::CredentialOwner::Author,
         metadata: serde_json::json!({}), at_unix: 2,
-    }).await.unwrap();
+    }], None, None).await.unwrap();
     let mut tx = pool.begin().await.unwrap();
     assert!(!weft_journal::unrecorded::forget_in(&mut tx, paid).await.unwrap());
     tx.commit().await.unwrap();
@@ -836,7 +830,7 @@ async fn an_unrecorded_run_is_live_while_a_worker_holds_its_task(pool: PgPool) {
         instance_values: Default::default(), picks: Default::default(), at_unix: 1,
         run_class: weft_core::run_class::RunClass::Short,
     };
-    let task = execute_task(id, execution_id, "bin-A", None, Some(std::slice::from_ref(&start)));
+    let task = execute_task(id, execution_id, "bin-A", Some(std::slice::from_ref(&start)));
     journal.start_execution(&start, &[], task, None).await.unwrap();
     sqlx::query("INSERT INTO execution_tag (execution_id, tag, tagged_at_unix) VALUES ($1, 'poll', 1)")
         .bind(execution_id.to_string()).execute(&pool).await.unwrap();
@@ -887,7 +881,7 @@ async fn quiesce_waits_until_no_run_of_the_project_is_live(pool: PgPool) {
         instance_values: Default::default(), picks: Default::default(), at_unix: 1,
         run_class: weft_core::run_class::RunClass::Short,
     };
-    let task = execute_task(id, execution_id, "bin-A", None, Some(std::slice::from_ref(&start)));
+    let task = execute_task(id, execution_id, "bin-A", Some(std::slice::from_ref(&start)));
     journal.start_execution(&start, &[], task, None).await.unwrap();
 
     let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool.connect_options(), weft_dispatcher::take_down::RUN_ENDING_CHANNELS)
@@ -932,15 +926,15 @@ async fn forgetting_an_unrecorded_run_announces_its_ending_at_the_commit(pool: P
         instance_values: Default::default(), picks: Default::default(), at_unix: 1,
         run_class: weft_core::run_class::RunClass::Short,
     };
-    let task = execute_task(id, execution_id, "bin-A", None, Some(std::slice::from_ref(&start)));
+    let task = execute_task(id, execution_id, "bin-A", Some(std::slice::from_ref(&start)));
     journal.start_execution(&start, &[], task, None).await.unwrap();
     sqlx::query("UPDATE task SET status = 'claimed', claimed_by = 'worker-a', claimed_until_unix = $2 WHERE execution_id = $1")
         .bind(execution_id.to_string()).bind(weft_dispatcher::lease::now_unix() + 60).execute(&pool).await.unwrap();
-    weft_journal::record_event(&pool, &weft_journal::ExecEvent::CostReported {
+    weft_journal::record_events(&pool, &[weft_journal::ExecEvent::CostReported {
         execution_id, node_id: "llm".into(), frames: vec![], cost_id: "c".into(), service: "llm".into(),
         model: None, amount_usd: Some(0.1), billed: true, origin: weft_core::CredentialOwner::Author,
         metadata: serde_json::json!({}), at_unix: 2,
-    }).await.unwrap();
+    }], None, None).await.unwrap();
     let live = || async {
         journal.list_non_terminal_execution_ids_for_project(id).await.unwrap().into_iter().map(|(c, _)| c).collect::<Vec<_>>()
     };
@@ -2158,4 +2152,90 @@ async fn a_held_row_coming_or_going_wakes_the_holder_sizing(pool: PgPool) {
     assert!(woken(&mut heard).await, "an activation parked changes which rows are held");
     sqlx::query("DELETE FROM trigger_activation WHERE project_id = $1 AND trigger = 'parked'").bind(id).execute(&pool).await.unwrap();
     assert!(woken(&mut heard).await, "and one forgotten too");
+}
+
+/// A live run born at its caller's handshake whose caller never came is
+/// erased whole once their ticket expires: its journal, its execution, its
+/// task and its entry slot, so nothing of it is left. One the caller did
+/// reach is never touched.
+#[sqlx::test]
+async fn a_live_run_whose_caller_never_came_leaves_nothing(pool: PgPool) {
+    let (journal, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project, "bin-A").await;
+    let born = |execution_id: weft_core::ExecutionId| {
+        let start = weft_journal::ExecEvent::ExecutionStarted {
+            execution_id,
+            project_id: project,
+            entry_node: "entry".into(),
+            phase: weft_core::context::Phase::Fire,
+            definition_hash: Some("def-1".into()),
+            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
+            subgraph: None,
+            seed: None,
+            instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+            run_class: weft_core::run_class::RunClass::Short,
+        };
+        let task = weft_dispatcher::task_kinds::execute::execution_task_spec(weft_dispatcher::task_kinds::execute::ExecutionTask {
+            kind: weft_task_store::TaskKind::Execute,
+            project_id: project,
+            execution_id,
+            definition_hash: "def-1",
+            binary_hash: "bin-A",
+            tenant_id: TENANT,
+            run_class: weft_core::run_class::RunClass::Short,
+            live_connection: Some(weft_task_store::kinds::LiveConnectionStart {
+                spec: weft_core::primitive::SignalSpec::of_kind("route", json!({})),
+                request: Default::default(),
+                arrive_by: Some(1_000),
+                fired: None,
+            }),
+            unrecorded_birth: None,
+        })
+        .unwrap();
+        (start, task)
+    };
+    let count = |table: &'static str, execution_id: weft_core::ExecutionId| {
+        let pool = pool.clone();
+        async move {
+            let (n,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*)::bigint FROM {table} WHERE execution_id = $1"))
+                .bind(execution_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            n
+        }
+    };
+
+    let absent = weft_core::ExecutionId::new_v4();
+    let (start, task) = born(absent);
+    journal.start_execution(&start, &[], task, None).await.unwrap();
+    weft_dispatcher::entry_limits::take_slot(&pool, "tok", &absent.to_string(), 5, 1_000, 0).await.unwrap().unwrap();
+
+    let present = weft_core::ExecutionId::new_v4();
+    let (start, task) = born(present);
+    journal.start_execution(&start, &[], task, None).await.unwrap();
+    let claimed = weft_task_store::tasks::claim_one(
+        &pool,
+        "worker-a",
+        &weft_task_store::tasks::ClaimFilter::ExecutionId { project_id: project, execution_id: present.to_string() },
+    )
+    .await
+    .unwrap()
+    .expect("the caller arrived");
+
+    let gone = weft_task_store::tasks::callers_never_arrived(&pool, 1_001).await.unwrap();
+    assert_eq!(gone.len(), 1, "only the run nobody claimed");
+    assert!(journal.erase_unclaimed_live_run(absent, gone[0].task_id, 1_001).await.unwrap());
+    for table in ["exec_event", "execution", "task", "entry_slot"] {
+        assert_eq!(count(table, absent).await, 0, "{table} still holds the run nobody came for");
+    }
+    assert!(!journal.erase_unclaimed_live_run(present, claimed.id, 1_001).await.unwrap(), "a claimed run is the caller's");
+    assert!(weft_task_store::tasks::requeue(&pool, claimed.id, "worker-a").await.unwrap());
+    assert!(
+        !journal.erase_unclaimed_live_run(present, claimed.id, 1_001).await.unwrap(),
+        "nor one put back pending: it is pinned to the worker its caller reached"
+    );
+    assert_eq!(count("execution", present).await, 1);
+    assert!(weft_task_store::tasks::callers_never_arrived(&pool, 1_001).await.unwrap().is_empty());
 }

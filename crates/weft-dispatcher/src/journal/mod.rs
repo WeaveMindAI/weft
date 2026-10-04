@@ -193,18 +193,6 @@ pub trait Journal: Send + Sync {
         expected_activation: Option<ExecutionId>,
     ) -> anyhow::Result<()>;
 
-    /// The live-connection variant of [`Journal::start_execution`]: the birth
-    /// commits atomically WITH the admission of the execute task pinned to
-    /// the worker replica the caller reached (`task.target_replica`).
-    /// `AlreadyAdmitted` (a retry of the same arrival) writes nothing new and
-    /// returns the replica the execution was born on.
-    async fn start_live_execution(
-        &self,
-        start: &ExecEvent,
-        kicks: &[ExecEvent],
-        task: weft_task_store::tasks::NewTask,
-    ) -> anyhow::Result<weft_task_store::tasks::LiveAdmitOutcome>;
-
     /// THE dispatcher-side cancel of an execution, in ONE transaction:
     /// strip the execution's wake signals (the parked form, the timer, the
     /// webhook, so nothing can revive it), journal its cancel terminals
@@ -491,6 +479,14 @@ pub trait Journal: Send + Sync {
     /// answering for a run that no longer exists until the caller
     /// unregisters it there (`unregister_many`), the way a cancel does.
     async fn delete_execution(&self, execution_id: ExecutionId) -> anyhow::Result<Vec<SignalRegistration>>;
+
+    /// Erase a live run whose caller never came, in ONE transaction: its
+    /// execute task `task_id`, only while it still is one
+    /// (`tasks::never_arrived_sql` at `now`), then everything its birth
+    /// wrote and the entry slot it held. `false`, with nothing touched,
+    /// when the task was claimed after all (the caller arrived) or is
+    /// already gone. Run by the reaper (`tasks::callers_never_arrived`).
+    async fn erase_unclaimed_live_run(&self, execution_id: ExecutionId, task_id: uuid::Uuid, now: i64) -> anyhow::Result<bool>;
 
     /// Delete all data for every execution of a project, and say how
     /// many went. Called by `weft rm`.

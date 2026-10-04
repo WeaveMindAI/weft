@@ -17,6 +17,15 @@ async fn a_caller_past_the_route_limit_is_refused_before_a_run() -> anyhow::Resu
     project.activate().await?;
     let ping = format!("{base}/ping");
 
+    // The limit counts calls per clock minute, so three calls that span
+    // the turn of a minute are two in one and one in the next, and all
+    // three are let in. Start with enough of the minute left for all
+    // three, the first starting the program's worker included.
+    let into_minute = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() % 60;
+    if into_minute > 30 {
+        tokio::time::sleep(std::time::Duration::from_secs(60 - into_minute)).await;
+    }
+
     for call in 1..=2 {
         let (status, _, body) = live::http_request(&disp, Method::GET, &ping, &[], None).await?;
         assert_eq!(status, 200, "call {call}: {}", String::from_utf8_lossy(&body));

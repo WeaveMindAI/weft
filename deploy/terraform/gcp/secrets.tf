@@ -36,13 +36,21 @@ locals {
   )
 }
 
+# Named after the install and the variable without its own `WEFT_`
+# (`weft-caller-token-secret`, not `weft-weft-caller-token-secret`).
+# Renaming replaces a secret, which keeps its value (every value comes from
+# this state), and the new one is made before the old one goes, so the
+# roles never point at a secret that is not there.
 resource "google_secret_manager_secret" "install" {
   for_each  = nonsensitive(toset(keys(local.secrets)))
-  secret_id = "${var.name}-${lower(replace(each.value, "_", "-"))}"
+  secret_id = "${var.name}-${lower(replace(trimprefix(each.value, "WEFT_"), "_", "-"))}"
   replication {
     auto {}
   }
   depends_on = [google_project_service.apis]
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 resource "google_secret_manager_secret_version" "install" {

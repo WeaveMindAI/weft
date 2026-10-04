@@ -818,6 +818,16 @@ enum CatalogAction {
     /// edited in place under `base_catalog/` IS overwritten; copy a
     /// node out of `base_catalog/` first if you want to keep changes.
     Update,
+    /// Store this weft's standard library in an install's files ahead of
+    /// any project, so a project's first deploy there has none of its
+    /// `nodes/base_catalog/` files left to upload. A local install does
+    /// it each time it starts; the cloud install workflow runs this.
+    Preload {
+        /// Read the operator key from stdin rather than from the keys
+        /// `weft login` stored, for a script that has it from elsewhere.
+        #[arg(long)]
+        key_stdin: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1788,6 +1798,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Cmd::ParseServer => commands::parse::serve(ctx).await,
         Cmd::Catalog { action } => match action {
             CatalogAction::Update => commands::catalog::update(ctx).await,
+            CatalogAction::Preload { key_stdin } => commands::catalog::preload(ctx, key_stdin).await,
         },
         Cmd::ConnectLib { into } => commands::connect_lib::install(ctx, into).await,
         Cmd::InstanceValues { instance, set, clear } => commands::instance_values::run(ctx, instance, set, clear).await,

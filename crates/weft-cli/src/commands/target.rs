@@ -300,7 +300,7 @@ async fn export(
     // stray keys on the install.
     let repo = if github {
         let out = std::process::Command::new("gh")
-            .args(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"])
+            .args(["repo", "view", "--json", "nameWithOwner,defaultBranchRef", "--jq", ".nameWithOwner + \" \" + .defaultBranchRef.name"])
             .current_dir(&project.root)
             .output()
             .context("run gh (the GitHub CLI); install it, or leave out --github to print the settings")?;
@@ -309,7 +309,17 @@ async fn export(
             "gh cannot see this project's GitHub repository (not logged in, or no remote yet); \
              fix that, or leave out --github to print the settings"
         );
-        Some(super::frontend::repository(String::from_utf8_lossy(&out.stdout).trim())?)
+        let seen = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let (repo_name, branch) = seen.split_once(' ').with_context(|| {
+            format!("{seen} has no default branch yet (nothing pushed); push weft.toml, with its `[targets.{name}]`, first")
+        })?;
+        // The workflow runs from the repository's default branch and reaches
+        // the install by the target the `weft.toml` THERE names, so it is
+        // that file, as GitHub has it, that must name this target.
+        let deployed = default_branch_weft_toml(&project.root, repo_name, branch)?;
+        committed_target_matches(&deployed, name, &url)
+            .map_err(|e| e.context(format!("checking weft.toml on {repo_name}'s {branch} branch")))?;
+        Some(super::frontend::repository(repo_name)?)
     } else {
         None
     };
@@ -590,6 +600,86 @@ fn set_repository_values(root: &Path, settings: &RepositorySettings) -> Result<(
     Ok(())
 }
 
+/// This project's `weft.toml` as GitHub holds it on `branch` of `repo`
+/// (the project may sit in a subfolder of the repository).
+fn default_branch_weft_toml(root: &Path, repo: &str, branch: &str) -> Result<String> {
+    let prefix = std::process::Command::new("git")
+        .args(["rev-parse", "--show-prefix"])
+        .current_dir(root)
+        .output()
+        .context("run git to find where the project sits in its repository")?;
+    anyhow::ensure!(prefix.status.success(), "{} is not inside a git repository", root.display());
+    let path = format!("{}weft.toml", String::from_utf8_lossy(&prefix.stdout).trim());
+    let read = std::process::Command::new("gh")
+        .args([
+            "api",
+            "-H",
+            "Accept: application/vnd.github.raw",
+            &format!("repos/{repo}/contents/{}?ref={}", encode_path(&path), encode_path(branch)),
+        ])
+        .current_dir(root)
+        .output()
+        .context("run gh to read weft.toml from GitHub")?;
+    anyhow::ensure!(
+        read.status.success(),
+        "{repo} has no {path} on its {branch} branch, which is where its workflow deploys from; commit \
+         weft.toml and push it to {branch} (gh: {})",
+        String::from_utf8_lossy(&read.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&read.stdout).into_owned())
+}
+
+/// `text` escaped for a URL, `/` kept so a path stays a path.
+fn encode_path(text: &str) -> String {
+    text.split('/')
+        .map(|segment| url::form_urlencoded::byte_serialize(segment.as_bytes()).collect::<String>().replace('+', "%20"))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The deployed `weft.toml` (`committed`) names target `name` at `url`, the
+/// address it has on this machine. The repository's workflow reads the
+/// target from what it deploys, never from this machine.
+fn committed_target_matches(committed: &str, name: &str, url: &str) -> Result<()> {
+    let manifest: toml::Value = toml::from_str(committed).context("parse the committed weft.toml")?;
+    let at = manifest.get("targets").and_then(|t| t.get(name)).and_then(|t| t.get("url")).and_then(toml::Value::as_str);
+    match at {
+        Some(at) if credentials::url_key(at)? == credentials::url_key(url)? => Ok(()),
+        Some(at) => anyhow::bail!(
+            "weft.toml there names target '{name}' at {at}, and this machine at {url}; commit and push \
+             weft.toml as it is now, so the repository's workflow reaches the same install"
+        ),
+        None => anyhow::bail!(
+            "weft.toml there has no `[targets.{name}]`, so the repository's workflow could not find the \
+             install; commit and push weft.toml (`weft target add` wrote the target into it)"
+        ),
+    }
+}
+
+/// The `weft target export ... --github` a person runs next, spelled with
+/// a target they really have: the one this command was given, else the
+/// project's only cloud target, else the choice between them.
+pub fn export_command(project: &weft_compiler::project::Project, on: Option<&str>) -> String {
+    let name = match on {
+        Some(on) => on.to_string(),
+        None => {
+            let cloud: Vec<&str> = project
+                .manifest
+                .targets
+                .keys()
+                .map(String::as_str)
+                .filter(|name| *name != weft_compiler::project::LOCAL_TARGET)
+                .collect();
+            match cloud.as_slice() {
+                [one] => one.to_string(),
+                [] => return "`weft target add <name> <address>`, then `weft target export <name> --github`".into(),
+                many => return format!("`weft target export <{}> --github`", many.join("|")),
+            }
+        }
+    };
+    format!("`weft target export {name} --github`")
+}
+
 /// A target name is what people type after `--on`, and a TOML key.
 fn validate_name(name: &str) -> Result<()> {
     anyhow::ensure!(
@@ -686,6 +776,26 @@ mod tests {
         assert!(repository_settings("prod", &info, keys()).unwrap_err().to_string().contains("install workflow"));
         info.cloud = None;
         assert!(repository_settings("prod", &info, keys()).is_err());
+    }
+
+    /// A folder or branch name with characters a URL would read otherwise
+    /// still names the file on GitHub.
+    #[test]
+    fn a_path_is_escaped_segment_by_segment() {
+        assert_eq!(encode_path("apps/my app#1/weft.toml"), "apps/my%20app%231/weft.toml");
+        assert_eq!(encode_path("feature/a&b"), "feature/a%26b");
+    }
+
+    /// The workflow finds the install in the committed `weft.toml`, so
+    /// export refuses a target that only this machine has.
+    #[test]
+    fn the_committed_weft_toml_must_name_the_target() {
+        let committed = "[package]\nname = \"p\"\n\n[targets.prod]\nurl = \"https://weft.example.com\"\n";
+        committed_target_matches(committed, "prod", "https://weft.example.com/").unwrap();
+        let missing = committed_target_matches(committed, "staging", "https://weft.example.com").unwrap_err();
+        assert!(missing.to_string().contains("no `[targets.staging]`"), "{missing}");
+        let elsewhere = committed_target_matches(committed, "prod", "https://other.example.com").unwrap_err();
+        assert!(elsewhere.to_string().contains("https://other.example.com"), "{elsewhere}");
     }
 
     /// Every variable and secret the workflow reads is one export sets,

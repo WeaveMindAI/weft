@@ -53,18 +53,35 @@ to do before anything that creates or costs something:
    `gcloud projects create <id>`, then link billing
    (`gcloud billing accounts list`, `gcloud billing projects link <id>
    --billing-account <account>`). If they already made one for weft, use it.
-2. **The fork.** `gh repo fork WeaveMindAI/weft --clone=false`. A new fork
+   A billing account links only a few projects (five on a new one): if the
+   link fails with `Cloud billing quota exceeded`, offer to reuse a project
+   made for weft before, or to unlink one they no longer use
+   (`gcloud billing projects unlink <id>`), and let them choose.
+2. **The region.** If the user is on the free tier and has no reason to be
+   anywhere in particular, the install goes in `us-west1` (zone
+   `us-west1-b`) and its database in Neon's `aws-us-west-2`: both are in
+   Oregon, so every call the install makes to its database stays short.
+   Google's always-free machine and 5 GB of storage exist only in
+   `us-west1`, `us-central1` and `us-east1`, and Neon runs on AWS and Azure,
+   not Google, so that pair is the one place both free tiers sit side by
+   side. If they need another region, take theirs, and the Neon region
+   nearest it.
+3. **The fork.** `gh repo fork WeaveMindAI/weft --clone=false`. A new fork
    has its workflows turned off: turn them on with
    `gh api -X PUT repos/<fork>/actions/permissions -F enabled=true`.
-3. **The `gcloud` block** below, as written, with the three values on its
+4. **The `gcloud` block** below, as written, with the three values on its
    first line filled in (`FORK` is the fork's `owner/repo`, with GitHub's
    capitals, because Google compares it letter for letter); never invent a
    flag. Its IAM steps retry on their own while IAM catches up on a
    brand new project, so a few "waiting for IAM" lines are normal.
 
    ```bash
-   PROJECT=my-project REGION=us-central1 FORK=me/weft
+   PROJECT=my-project REGION=us-west1 FORK=me/weft
    NUMBER=$(gcloud projects describe $PROJECT --format='value(projectNumber)')
+   # On a new project IAM can take a minute to catch up (with the services
+   # just enabled, with the account just made), so each IAM step below is
+   # retried until it holds.
+   retry() { until "$@"; do echo "waiting for IAM to catch up, trying again in 10 seconds"; sleep 10; done; }
 
    gcloud services enable --project $PROJECT \
      iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com \
@@ -74,12 +91,9 @@ to do before anything that creates or costs something:
      --location $REGION --uniform-bucket-level-access
 
    gcloud iam service-accounts create weft-installer --project $PROJECT
-   gcloud projects add-iam-policy-binding $PROJECT --role roles/owner \
+   retry gcloud projects add-iam-policy-binding $PROJECT --role roles/owner \
      --member serviceAccount:weft-installer@$PROJECT.iam.gserviceaccount.com
 
-   # On a new project IAM can take a minute to catch up with the services
-   # just enabled, so each IAM step below is retried until it holds.
-   retry() { until "$@"; do echo "waiting for IAM to catch up, trying again in 10 seconds"; sleep 10; done; }
    pool() {
      gcloud iam workload-identity-pools describe weft-install --project $PROJECT \
        --location global >/dev/null 2>&1 \
@@ -103,25 +117,27 @@ to do before anything that creates or costs something:
      --member principalSet://iam.googleapis.com/projects/$NUMBER/locations/global/workloadIdentityPools/weft-install/attribute.repository/$FORK
    ```
 
-4. **The fork's variables**, with `gh variable set <NAME> --repo <fork>
+5. **The fork's variables**, with `gh variable set <NAME> --repo <fork>
    --body <value>`: `GCP_PROJECT_ID`, `GCP_REGION`, `GCP_ZONE`,
    `TF_STATE_BUCKET`, `GCP_WORKLOAD_IDENTITY_PROVIDER` and
    `GCP_INSTALL_SERVICE_ACCOUNT`. A project's frontend is added later, from
    the project (read weft-deploying), never here.
-5. **The database.** If the user has no Postgres, read weft-database. If
+6. **The database.** If the user has no Postgres, read weft-database. If
    they already have a
    Postgres they want, put its address in the `WEFT_DATABASE_URL` secret
    with `gh secret set WEFT_DATABASE_URL --repo <fork>` (piping it in, never
    echoing it into the chat), and when that address goes through a pooler,
    a direct address of the same database in `WEFT_DATABASE_LISTEN_URL`.
-6. **The workflow.** `gh workflow run "install on GCP" --repo <fork>`, then
+7. **The workflow.** `gh workflow run "install on GCP" --repo <fork>`, then
    follow it with `gh run watch` in the background. It runs for a while.
 
-Its summary (`gh run view <id>`) prints the install's address (a Cloud Run
-address, `https://weft-role-dispatcher-<number>.<region>.run.app`, working at
-once) and the command that reads the first operator key from Secret Manager.
-Run that command yourself, then the user pastes the key into `weft login`
-(it is a secret: never echo it into the chat).
+Its last step prints the install's address (a Cloud Run address,
+`https://weft-role-dispatcher-<number>.<region>.run.app`, working at once)
+and the line that logs in with the first operator key, which you read with
+`gh run view <id> --log` (plain `gh run view` leaves it out). Run that line
+from the project, after `weft target add` (read weft-deploying): it reads the
+key from Secret Manager straight into `weft login --key-stdin`, so the key
+never passes through the chat or a file. Never print the key itself.
 
 The install needs no domain: its own address is HTTPS and free. A domain
 costs money, so it is never part of the install; read weft-deploying when
@@ -130,9 +146,20 @@ the user asks for one.
 Upgrading weft on the cloud is merging upstream into the fork
 (`gh repo sync <fork>`) and running the workflow again, then rebuilding the
 user's CLI from that commit (`./setup.sh --cli`). Sizing (how many triggers
-one holder takes, a holder's CPU and memory, how many builds run at once)
-is a default in `deploy/terraform/gcp/variables.tf` in the fork: change it
-there, commit, and run the workflow again.
+one holder takes, a holder's CPU and memory, how many builds run at once,
+the machine builds compile on) is a default in
+`deploy/terraform/gcp/variables.tf` in the fork: change it there, commit,
+and run the workflow again. The build machine defaults to the one Cloud
+Build's free minutes cover; a bigger one (`build_machine = "E2_HIGHCPU_8"`)
+compiles a program's image faster and is paid by the minute, once per
+version of the program, never per worker.
+
+Removing weft from GCP is deleting the project made for it, since weft and
+everything it started live there and nowhere else: `gcloud billing projects
+unlink <id>`, then `gcloud projects delete <id>` (Google keeps it 30 days,
+`gcloud projects undelete <id>` brings it back). It deletes everything in
+it, so say so and wait for the user's yes. The database is theirs, at its
+own provider, and stays.
 
 For deploying projects to the install once the key is in `weft login`,
 read weft-deploying.

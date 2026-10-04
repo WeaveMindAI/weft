@@ -1046,10 +1046,7 @@ pub struct ConnServerState {
     /// The project this worker serves; a ticket for another project is
     /// refused.
     pub project_id: uuid::Uuid,
-    /// This worker's replica: the execution an arriving caller brings is
-    /// born pinned to it.
-    pub replica: String,
-    /// Starts the drive of an execution once its birth is in.
+    /// Claims and drives the run an arriving caller's ticket names.
     pub starter: Arc<dyn LiveStarter>,
     /// Resolves the per-execution runtime config + journal sink. Set by the
     /// worker's drive from the execution's signal config; the server needs the
@@ -1061,132 +1058,6 @@ pub struct ConnServerState {
     /// Fires the per-execution cancel flag (cancel-on-disconnect for a
     /// caller-tied run). Looked up by execution.
     pub canceller: Arc<dyn ExecutionCanceller>,
-    /// The worker's door to the control plane: a caller's arrival is a
-    /// `LiveArrival` task the dispatcher answers by giving birth to the
-    /// execution the routing token promised, on this process.
-    pub tasks: Arc<dyn weft_task_store::TaskStoreClient>,
-    /// The tenant this worker serves, stamped on the arrival task.
-    pub tenant_id: String,
-}
-
-/// How long the connection server waits for the dispatcher to give birth
-/// to an arriving caller's execution before answering the caller. An
-/// internal service-to-service wait the caller cannot influence (the
-/// dispatcher claims a task within its poll interval), so a bound is
-/// right: past it the caller hears that the run did not start, instead
-/// of a hang.
-const ARRIVAL_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// The request as the birth reads it: the method, the query without the
-/// gateway hop's own routing token, and the headers. What the handshake
-/// established (the route, the gate's verdict, the path and its
-/// captures) rides the token instead.
-fn arrival_payload(
-    token: &str,
-    replica: &str,
-    raw_query: &str,
-    request: &axum::extract::Request,
-) -> weft_task_store::kinds::LiveArrivalPayload {
-    let mut query = weft_core::route::parse_query(raw_query);
-    query.remove("wct");
-    weft_task_store::kinds::LiveArrivalPayload {
-        token: token.to_string(),
-        replica: replica.to_string(),
-        method: request.method().as_str().to_string(),
-        query,
-        headers: request
-            .headers()
-            .iter()
-            .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
-            .collect(),
-    }
-}
-
-/// The caller is here: ask the dispatcher for the execution the routing
-/// token promises, born on this worker. The request as it arrived rides
-/// the task with the token (the birth reads the route, the gate's
-/// verdict and the path captures off the token, and the method, query
-/// and headers off this). A birth the dispatcher refuses (the project
-/// went down) is the caller's answer, a `503` with the reason; a
-/// dispatcher that does not answer in time is a `504`.
-async fn ask_for_birth(
-    state: &ConnServerState,
-    claims: &caller_token::CallerTokenClaims,
-    payload: weft_task_store::kinds::LiveArrivalPayload,
-) -> Result<(), Response> {
-    use weft_task_store::tasks::{NewTask, TaskStatus, TaskTarget};
-    let project_id = claims.project_id;
-    let enqueued = state
-        .tasks
-        .enqueue_dedup(NewTask {
-            kind: weft_task_store::TaskKind::LiveArrival.into(),
-            target: TaskTarget::Dispatcher,
-            project_id: Some(project_id),
-            dedup_key: Some(weft_task_store::kinds::live_arrival_dedup_key(claims.execution_id)),
-            // No execution on the row: the broker scopes a task by every
-            // resource it names, and this execution names nothing yet. The
-            // task is what BRINGS it into being, so an execution here would
-            // be refused as unknown. The project is the anchor the
-            // broker checks, the dedup key carries the execution so one
-            // arrival is one birth, and the executor reads the execution
-            // off the signed token, which is the only trustworthy
-            // source for it anyway.
-            execution_id: None,
-            tenant_id: state.tenant_id.clone(),
-            target_replica: None,
-            binary_hash: None,
-            payload: serde_json::to_value(&payload).expect("the arrival payload serializes"),
-        })
-        .await;
-    let task_id = match enqueued {
-        Ok(outcome) => outcome.id(),
-        Err(e) => {
-            tracing::error!(target: "weft_engine::caller_conn", execution_id = %claims.execution_id, error = %e, "arrival enqueue failed");
-            return Err((StatusCode::BAD_GATEWAY, format!("the run could not be asked for: {e}")).into_response());
-        }
-    };
-    let outcome = match state.tasks.wait_for_terminal(task_id, ARRIVAL_WAIT).await {
-        Ok(outcome) => outcome,
-        Err(e) => {
-            tracing::error!(target: "weft_engine::caller_conn", execution_id = %claims.execution_id, error = %e, "arrival wait failed");
-            return Err((StatusCode::BAD_GATEWAY, format!("the run could not be started: {e}")).into_response());
-        }
-    };
-    match outcome.status {
-        TaskStatus::Complete => match outcome.result.map(serde_json::from_value::<weft_task_store::kinds::LiveArrivalResult>) {
-            Some(Ok(weft_task_store::kinds::LiveArrivalResult::Born { replica, .. })) if replica == state.replica => Ok(()),
-            // A resent request that the platform handed to another copy
-            // of the worker: the run was born on the first one and is
-            // driven there, so this copy has nothing to attach to.
-            Some(Ok(weft_task_store::kinds::LiveArrivalResult::Born { .. })) => Err((
-                StatusCode::CONFLICT,
-                caller_token::refusal("it already opened its connection"),
-            )
-                .into_response()),
-            // Refused before the run was born: the caller gets that
-            // answer, with its status.
-            Some(Ok(weft_task_store::kinds::LiveArrivalResult::Refused { status, message })) => Err((
-                StatusCode::from_u16(status).unwrap_or(StatusCode::UNPROCESSABLE_ENTITY),
-                message,
-            )
-                .into_response()),
-            other => Err((
-                StatusCode::BAD_GATEWAY,
-                format!("the arrival answered something unreadable: {other:?}"),
-            )
-                .into_response()),
-        },
-        TaskStatus::Failed => Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("the run could not start: {}", outcome.error.unwrap_or_else(|| "no reason given".into())),
-        )
-            .into_response()),
-        TaskStatus::Pending | TaskStatus::Claimed => Err((
-            StatusCode::GATEWAY_TIMEOUT,
-            "the dispatcher did not start the run in time; retry shortly",
-        )
-            .into_response()),
-    }
 }
 
 /// What the server needs to build an execution's connection when its caller
@@ -1297,14 +1168,71 @@ impl ExchangeEnd {
 /// Fires the per-execution cancel flag (cancel-on-disconnect). The worker
 /// implements this over its cancel registry.
 pub trait ExecutionCanceller: Send + Sync {
-    fn cancel(&self, execution_id: ExecutionId);
+    fn cancel(&self, execution_id: ExecutionId, cause: weft_core::exec::CancelCause);
 }
 
-/// Starts driving an execution whose birth an arriving caller just got:
-/// the worker claims it (it is pinned here) and drives it, detached from
-/// the connection.
+/// Claims the run an arriving caller's ticket names and starts driving it
+/// on this worker, detached from the connection. The run was born at the
+/// caller's handshake and waits for exactly this claim, which pins it
+/// here, where the caller's socket is.
+#[async_trait]
 pub trait LiveStarter: Send + Sync {
-    fn start(&self, execution_id: ExecutionId);
+    /// Claim the run and wait until its drive is ready for the caller (its
+    /// connection settings registered, [`ConnConfigResolver::resolve`]
+    /// answers). An error is why the run could not get that far.
+    async fn start(&self, execution_id: ExecutionId) -> anyhow::Result<LiveClaim>;
+}
+
+/// What claiming an arriving caller's run came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveClaim {
+    /// Claimed here and ready for the caller.
+    Ready,
+    /// Nothing here to claim: the ticket was already used (the caller's
+    /// client resent the request), or its run is over.
+    NotHere,
+}
+
+/// A run claimed for a caller who is not attached to it yet. Dropped
+/// before [`Self::attaching`], it cancels the run: every refusal between the
+/// claim and the attach (a missing upgrade, a body over the cap, a socket
+/// upgrade that never completes) would otherwise leave the run waiting out
+/// its connect timeout and then running with nobody on the line, and the
+/// caller's retry would find it already taken.
+struct Unattached {
+    canceller: Arc<dyn ExecutionCanceller>,
+    execution_id: ExecutionId,
+    armed: bool,
+}
+
+impl Unattached {
+    fn new(canceller: Arc<dyn ExecutionCanceller>, execution_id: ExecutionId) -> Self {
+        Self { canceller, execution_id, armed: true }
+    }
+
+    /// The caller is being attached; from here the connection owns what
+    /// happens to the run.
+    fn attaching(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Unattached {
+    fn drop(&mut self) {
+        if self.armed {
+            // The caller was refused (the answer they got says why), or
+            // left before their connection opened: either way nobody is
+            // on the line, and it was not the caller who ended a running
+            // exchange.
+            self.canceller.cancel(
+                self.execution_id,
+                weft_core::exec::CancelCause::Runtime {
+                    detail: "the caller never attached: refused at the worker, or gone before the connection opened"
+                        .into(),
+                },
+            );
+        }
+    }
 }
 
 /// Build the connection server router. The connection is identified by
@@ -1594,43 +1522,27 @@ async fn handle_connect(
         request
     };
 
-    // 2. The caller is here: have the execution born on this worker, and
-    //    start driving it. Nothing was born at the handshake (a caller who
-    //    never follows the redirect leaves nothing behind); the routing
-    //    token is the dispatcher's promise, and this is where it is kept.
-    let arrival = arrival_payload(&token, &state.replica, &raw_query, &request);
-    if let Err(response) = ask_for_birth(&state, &claims, arrival).await {
-        return response;
-    }
-    state.starter.start(execution_id);
-
-    // 3. Resolve the execution's connection config (protocol, caps, data
-    //    type) + journal sink.
-    //
-    // The birth inserted the pinned execute task; the drive just started
-    // populates the resolver when it CLAIMS and starts that task, a beat
-    // later. So the
-    // resolver can briefly lag the birth. That is "not ready yet," not
-    // "unknown": poll the resolver for a bounded window before giving up.
-    // Without this, a fast caller racing the worker's task-claim gets a
-    // spurious 404 even though the execution is genuinely starting.
-    let resolved = {
-        const READY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
-        const POLL: std::time::Duration = std::time::Duration::from_millis(50);
-        let deadline = state.clock.now() + READY_WAIT;
-        loop {
-            if let Some(r) = state.resolver.resolve(execution_id) {
-                break Some(r);
-            }
-            if state.clock.now() >= deadline {
-                break None;
-            }
-            state.clock.sleep(POLL).await;
+    // 2. The caller is here: claim the run their ticket names (born at
+    //    the handshake, waiting for them) and start driving it here.
+    match state.starter.start(execution_id).await {
+        Ok(LiveClaim::Ready) => {}
+        Ok(LiveClaim::NotHere) => {
+            return (StatusCode::CONFLICT, caller_token::refusal("it was already used, or its run is over")).into_response()
         }
-    };
-    let Some(ResolvedLiveStart { config, heartbeat_secs, request: handshake, journal }) = resolved
+        Err(e) => {
+            tracing::error!(target: "weft_engine::caller_conn", %execution_id, error = %format!("{e:#}"), "an arriving caller's run did not start");
+            return (StatusCode::SERVICE_UNAVAILABLE, format!("the run could not start: {e:#}")).into_response();
+        }
+    }
+    let unattached = Unattached::new(state.canceller.clone(), execution_id);
+
+    // 3. The execution's connection config (protocol, caps, data type) +
+    //    journal sink, registered by the drive before it said it was ready.
+    let Some(ResolvedLiveStart { config, heartbeat_secs, request: handshake, journal }) =
+        state.resolver.resolve(execution_id)
     else {
-        return (StatusCode::NOT_FOUND, "no live execution for this token").into_response();
+        tracing::error!(target: "weft_engine::caller_conn", %execution_id, "a run said it was ready for its caller but holds no connection settings");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "the run is not ready for its caller").into_response();
     };
 
     // The route is known now, so its own answer to "how long may this
@@ -1661,8 +1573,10 @@ async fn handle_connect(
                     // byte count that fits the platform word on any real process.
                     let cap = config.max_inbound_bytes as usize;
                     let upgrade = upgrade.max_message_size(cap).max_frame_size(cap);
+                    // A socket that never completes its upgrade drops the
+                    // closure, and with it `unattached`, which cancels the run.
                     upgrade.on_upgrade(move |socket| {
-                        drive_ws(socket, st, execution_id, config, heartbeat_secs, handshake, journal)
+                        drive_ws(socket, st, execution_id, config, heartbeat_secs, handshake, journal, unattached)
                     })
                 }
                 Err(e) => {
@@ -1683,7 +1597,7 @@ async fn handle_connect(
             // at the handshake and ride in `request`; the worker only
             // reads the body (the 307 made the caller resend it here).
             drop(parts);
-            drive_http(state, execution_id, config, heartbeat_secs, handshake, journal, body).await
+            drive_http(state, execution_id, config, heartbeat_secs, handshake, journal, body, unattached).await
         }
     }
 }
@@ -1705,6 +1619,7 @@ async fn drive_http(
     request: Arc<LiveRequest>,
     journal: Arc<dyn CallerJournalSink>,
     body: axum::body::Body,
+    unattached: Unattached,
 ) -> Response {
     // Enforce the inbound size cap while reading the body (untrusted
     // caller); fail loud past the cap.
@@ -1728,6 +1643,7 @@ async fn drive_http(
     // connect row (`record_arrival`).
     let (conn, outbound, _inb) =
         new_connection(config.clone(), execution_id, request, Some(decoded), journal);
+    unattached.attaching();
     if !state.registry.attach(execution_id, conn.clone()) {
         return (StatusCode::CONFLICT, EXCHANGE_TAKEN).into_response();
     }
@@ -1856,7 +1772,7 @@ async fn drive_http(
         if reason.caller_initiated()
             && matches!(resolve_disconnect(policy), DisconnectAction::CancelExecution)
         {
-            canceller.cancel(execution_id);
+            canceller.cancel(execution_id, weft_core::exec::CancelCause::CallerGone);
         }
     });
 
@@ -1989,10 +1905,12 @@ async fn drive_ws(
     heartbeat_secs: u64,
     request: Arc<LiveRequest>,
     journal: Arc<dyn CallerJournalSink>,
+    unattached: Unattached,
 ) {
     let (conn, outbound, inbound) =
         new_connection(config.clone(), execution_id, request, None, journal.clone());
     let inbound = inbound.expect("websocket connection has an inbound channel");
+    unattached.attaching();
     if !state.registry.attach(execution_id, conn.clone()) {
         // The socket is already upgraded here, so the only way to say
         // no is to close it. One exchange, one connection: the run is
@@ -2145,7 +2063,7 @@ async fn drive_ws(
     if reason.caller_initiated()
         && matches!(resolve_disconnect(policy), DisconnectAction::CancelExecution)
     {
-        state.canceller.cancel(execution_id);
+        state.canceller.cancel(execution_id, weft_core::exec::CancelCause::CallerGone);
     }
 }
 
@@ -2609,7 +2527,7 @@ mod tests {
         cancelled: Mutex<Vec<ExecutionId>>,
     }
     impl ExecutionCanceller for RecordingCanceller {
-        fn cancel(&self, execution_id: ExecutionId) {
+        fn cancel(&self, execution_id: ExecutionId, _cause: weft_core::exec::CancelCause) {
             self.cancelled.lock().unwrap().push(execution_id);
         }
     }
@@ -2618,14 +2536,22 @@ mod tests {
         CallerRuntimeConfig { protocol: Protocol::Http, ..ws_cfg() }
     }
 
-    /// Every execution whose drive the server started.
+    /// Every run the server tried to claim, and whether the claim finds
+    /// one here (unless told otherwise, it does).
     #[derive(Default)]
     struct RecordingStarter {
         started: Mutex<Vec<ExecutionId>>,
+        taken_elsewhere: std::sync::atomic::AtomicBool,
     }
+    #[async_trait]
     impl LiveStarter for RecordingStarter {
-        fn start(&self, execution_id: ExecutionId) {
+        async fn start(&self, execution_id: ExecutionId) -> anyhow::Result<LiveClaim> {
             self.started.lock().unwrap().push(execution_id);
+            Ok(if self.taken_elsewhere.load(std::sync::atomic::Ordering::SeqCst) {
+                LiveClaim::NotHere
+            } else {
+                LiveClaim::Ready
+            })
         }
     }
 
@@ -2635,75 +2561,20 @@ mod tests {
             registry: CallerRegistry::new(),
             token_secret: Arc::new(Vec::new()),
             project_id: PROJECT,
-            replica: "worker-a".into(),
             starter: Arc::new(RecordingStarter::default()),
             resolver: Arc::new(NoResolver),
             clock: weft_platform_traits::FakeClock::new(),
             canceller: canceller.clone(),
-            tasks: Arc::new(ArrivalTasks::default()),
-            tenant_id: "tenant-a".into(),
         };
         (state, canceller)
     }
 
-    /// The control plane as the connection server sees it: every
-    /// arrival task it enqueued, and one answer for all of them.
-    #[derive(Default)]
-    struct ArrivalTasks {
-        asked: Mutex<Vec<weft_task_store::tasks::NewTask>>,
-        /// The status the dispatcher answers every arrival with, and
-        /// the reason when it refused.
-        answer: Mutex<Option<(weft_task_store::tasks::TaskStatus, Option<String>)>>,
-        /// The result a completed arrival answers with.
-        born: Mutex<Option<serde_json::Value>>,
-    }
-    #[async_trait]
-    impl weft_task_store::TaskStoreClient for ArrivalTasks {
-        async fn wait_cancels(
-            &self,
-            _project_id: uuid::Uuid,
-            _execution_ids: Vec<String>,
-            _wait: std::time::Duration,
-        ) -> anyhow::Result<Vec<weft_task_store::tasks::CancelAsked>> {
-            Ok(Vec::new())
-        }
-
-        async fn enqueue_dedup(
-            &self,
-            spec: weft_task_store::tasks::NewTask,
-        ) -> anyhow::Result<weft_task_store::tasks::DedupOutcome> {
-            self.asked.lock().unwrap().push(spec);
-            Ok(weft_task_store::tasks::DedupOutcome::Inserted(uuid::Uuid::new_v4()))
-        }
-        async fn wait_for_terminal(
-            &self,
-            _task_id: uuid::Uuid,
-            _timeout: std::time::Duration,
-        ) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
-            let (status, error) = self.answer.lock().unwrap().clone().expect("the test set an answer");
-            let result = self.born.lock().unwrap().clone();
-            Ok(weft_task_store::tasks::TaskOutcome { status, result, error })
-        }
-        async fn claim_one(
-            &self,
-            _replica: &str,
-            _filter: weft_task_store::tasks::ClaimFilter,
-            _wait: std::time::Duration,
-        ) -> anyhow::Result<Option<weft_task_store::tasks::Task>> {
-            Ok(None)
-        }
-        async fn heartbeat(&self, _task_id: uuid::Uuid, _replica: &str) -> anyhow::Result<bool> {
-            Ok(true)
-        }
-        async fn requeue(&self, _task_id: uuid::Uuid, _replica: &str) -> anyhow::Result<bool> {
-            Ok(true)
-        }
-        async fn complete(&self, _task_id: uuid::Uuid, _replica: &str, _result: serde_json::Value) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn fail(&self, _task_id: uuid::Uuid, _replica: &str, _error: String) -> anyhow::Result<()> {
-            Ok(())
-        }
+    /// `server_state`, with the starter it records into.
+    fn recording_server_state() -> (ConnServerState, Arc<RecordingStarter>) {
+        let (mut state, _) = server_state();
+        let starter = Arc::new(RecordingStarter::default());
+        state.starter = starter.clone();
+        (state, starter)
     }
 
     fn routing_token(secret: &[u8], project: uuid::Uuid, exp: i64) -> (String, ExecutionId) {
@@ -2725,12 +2596,7 @@ mod tests {
                 execution_id,
                 project_id: project,
                 binary_hash: "bin-1".into(),
-                signal: "sig-1".into(),
-                path: "chat/room7".into(),
-                params: [("room".to_string(), "room7".to_string())].into_iter().collect(),
-                caller: None,
                 approved,
-                instance: None,
                 exp,
             },
         );
@@ -2746,9 +2612,8 @@ mod tests {
     /// carries a fingerprint of what was approved; the worker takes the
     /// fingerprint of what actually arrived and compares.
     ///
-    /// The refusal comes BEFORE the birth is asked for, which is the
-    /// half that matters: a rejected caller must leave no execution
-    /// behind.
+    /// The refusal comes BEFORE the run is claimed, which is the half
+    /// that matters: a rejected caller must start nothing.
     #[tokio::test]
     async fn a_door_opens_only_for_the_request_it_was_given_for() {
         use tower::ServiceExt as _;
@@ -2766,9 +2631,7 @@ mod tests {
             ("a dropped query", "POST", "", "{\"say\":\"hi\"}"),
         ];
         for (changed, method, query, body) in cases {
-            let (mut state, _) = server_state();
-            let tasks = Arc::new(ArrivalTasks::default());
-            state.tasks = tasks.clone();
+            let (state, starter) = recording_server_state();
             let (token, _) = approving_token(
                 &[],
                 PROJECT,
@@ -2793,16 +2656,15 @@ mod tests {
                 "changing {changed} must not open the door"
             );
             assert!(
-                tasks.asked.lock().unwrap().is_empty(),
-                "changing {changed} left an execution behind"
+                starter.started.lock().unwrap().is_empty(),
+                "changing {changed} still started the run"
             );
         }
     }
 
     /// The same door, used for the request it was actually given for:
-    /// it opens, and the birth is asked for. Without this the test
-    /// above would pass just as well on a worker that refused
-    /// everything.
+    /// it opens, and the run is claimed. Without this the test above
+    /// would pass just as well on a worker that refused everything.
     ///
     /// The routing token rides in the query and is the hop's business,
     /// not the program's, so it is stripped before the fingerprint is
@@ -2811,13 +2673,7 @@ mod tests {
     #[tokio::test]
     async fn the_approved_request_is_let_through() {
         use tower::ServiceExt as _;
-        let (mut state, _) = server_state();
-        let tasks = Arc::new(ArrivalTasks::default());
-        *tasks.answer.lock().unwrap() = Some((
-            weft_task_store::tasks::TaskStatus::Failed,
-            Some("the project is not listening".into()),
-        ));
-        state.tasks = tasks.clone();
+        let (state, starter) = recording_server_state();
         let approved = caller_token::RequestFingerprint::of(
             "POST",
             "chat/room7",
@@ -2834,7 +2690,7 @@ mod tests {
             .unwrap();
         let response = connection_router(state).oneshot(request).await.unwrap();
         assert_ne!(response.status(), StatusCode::FORBIDDEN, "the door was given for this call");
-        assert_eq!(tasks.asked.lock().unwrap().len(), 1, "the birth was asked for");
+        assert_eq!(starter.started.lock().unwrap().len(), 1, "the run was claimed");
     }
 
     /// One door, one connection. A routing token is spent when it is
@@ -2862,78 +2718,66 @@ mod tests {
         assert_eq!(sink.events(), vec!["connected@0".to_string()]);
     }
 
-    /// A caller with a valid token has the execution asked for before
-    /// anything else: the arrival task carries the token and the request
-    /// as it arrived (its method, query without the routing token,
-    /// headers), keyed to the execution. A birth the dispatcher refuses is
-    /// the caller's answer, with the reason.
+    /// A caller with a valid ticket, holding the request it was given for,
+    /// has the run it names claimed here: the run was born at their
+    /// handshake and waits for the worker their connection reaches.
     #[tokio::test]
-    async fn an_arriving_caller_asks_for_the_birth_and_hears_a_refusal() {
+    async fn an_arriving_caller_has_their_run_claimed_here() {
         use tower::ServiceExt as _;
-        let (mut state, _) = server_state();
-        let tasks = Arc::new(ArrivalTasks::default());
-        *tasks.answer.lock().unwrap() = Some((
-            weft_task_store::tasks::TaskStatus::Failed,
-            Some("the project is not listening".into()),
-        ));
-        state.tasks = tasks.clone();
+        let (state, starter) = recording_server_state();
         let (token, execution_id) = routing_token(&[], PROJECT, state.clock.now_unix() + 60);
-        let request = axum::http::Request::builder()
-            .method("POST")
-            .uri(format!("/chat/room7?verbose=1&wct={token}"))
-            .header("content-type", "application/json")
-            .body(axum::body::Body::from("{}"))
-            .unwrap();
-        let response = connection_router(state).oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("not listening"), "{body:?}");
-        let asked = tasks.asked.lock().unwrap();
-        assert_eq!(asked.len(), 1);
-        let task = &asked[0];
-        assert_eq!(task.kind, "live_arrival");
-        assert_eq!(task.dedup_key.as_deref(), Some(format!("live-arrival:{execution_id}").as_str()));
-        assert_eq!(task.project_id, Some(PROJECT), "the project is the anchor the broker checks");
-        assert_eq!(task.execution_id, None, "the execution does not exist yet; this task is what creates it");
-        assert_eq!(task.tenant_id, "tenant-a");
-        let payload: weft_task_store::kinds::LiveArrivalPayload = serde_json::from_value(task.payload.clone()).unwrap();
-        assert_eq!(payload.token, token);
-        assert_eq!(payload.replica, "worker-a", "the birth is pinned to the worker the caller reached");
-        assert_eq!(payload.method, "POST");
-        assert_eq!(payload.query.get("verbose").map(String::as_str), Some("1"));
-        assert!(!payload.query.contains_key("wct"), "the routing token is the hop's, never the program's");
-        assert!(payload.headers.iter().any(|(k, v)| k == "content-type" && v == "application/json"));
-    }
-
-    /// Once the birth is in, the drive of the execution starts on this
-    /// worker, the one the caller's connection reached: a live run is
-    /// never delivered, so nothing else would start it.
-    #[tokio::test]
-    async fn a_born_execution_starts_driving_here() {
-        use tower::ServiceExt as _;
-        let (mut state, _) = server_state();
-        let tasks = Arc::new(ArrivalTasks::default());
-        let starter = Arc::new(RecordingStarter::default());
-        state.starter = starter.clone();
-        *tasks.answer.lock().unwrap() = Some((weft_task_store::tasks::TaskStatus::Complete, None));
-        let (token, execution_id) = routing_token(&[], PROJECT, state.clock.now_unix() + 60);
-        *tasks.born.lock().unwrap() = Some(
-            serde_json::to_value(weft_task_store::kinds::LiveArrivalResult::Born {
-                execution_id: execution_id.to_string(),
-                replica: "worker-a".into(),
-            })
-            .unwrap(),
-        );
-        state.tasks = tasks.clone();
         let request = axum::http::Request::builder()
             .method("POST")
             .uri(format!("/chat/room7?wct={token}"))
             .body(axum::body::Body::from("{}"))
             .unwrap();
         // No resolver answers here (the drive is a recording), so the
-        // connection itself ends not found; what matters is the start.
+        // connection itself is refused; what matters is the claim.
         let _ = connection_router(state).oneshot(request).await.unwrap();
         assert_eq!(*starter.started.lock().unwrap(), vec![execution_id]);
+    }
+
+    /// A caller refused after their run was claimed, before attaching
+    /// (here a body over the route's cap), cancels the run: otherwise it
+    /// would wait out its connect timeout and run with nobody there.
+    #[tokio::test]
+    async fn a_caller_refused_after_the_claim_cancels_the_run() {
+        let (state, canceller) = server_state();
+        let execution_id = ExecutionId::new_v4();
+        let cfg = CallerRuntimeConfig { max_inbound_bytes: 4, ..http_cfg() };
+        let response = drive_http(
+            state.clone(),
+            execution_id,
+            cfg,
+            0,
+            Arc::new(LiveRequest::default()),
+            Arc::new(RecordingSink::default()),
+            axum::body::Body::from("far more than four bytes"),
+            Unattached::new(state.canceller.clone(), execution_id),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(*canceller.cancelled.lock().unwrap(), vec![execution_id]);
+    }
+
+    /// A copy of the caller's request that the platform handed to another
+    /// worker finds the run already claimed by the first, and is told so
+    /// at once rather than left waiting for a run that is not here.
+    #[tokio::test]
+    async fn a_run_claimed_elsewhere_is_refused_here() {
+        use tower::ServiceExt as _;
+        let (state, starter) = recording_server_state();
+        starter.taken_elsewhere.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (token, _) = routing_token(&[], PROJECT, state.clock.now_unix() + 60);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/chat/room7?wct={token}"))
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        let response = connection_router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("already used"), "{body:?}");
     }
 
     /// A caller who took too long gets told so, in words that say what
@@ -2944,9 +2788,7 @@ mod tests {
     #[tokio::test]
     async fn a_caller_whose_ticket_ran_out_is_told_to_ask_again() {
         use tower::ServiceExt as _;
-        let (mut state, _) = server_state();
-        let tasks = Arc::new(ArrivalTasks::default());
-        state.tasks = tasks.clone();
+        let (state, starter) = recording_server_state();
         let (token, _) = routing_token(&[], PROJECT, state.clock.now_unix() - 1);
         let request = axum::http::Request::builder()
             .method("POST")
@@ -2959,17 +2801,14 @@ mod tests {
         let body = String::from_utf8_lossy(&body);
         assert!(body.contains("expired"), "the reason is named: {body}");
         assert!(body.contains("Ask for a new one"), "and what to do about it: {body}");
-        assert!(tasks.asked.lock().unwrap().is_empty(), "a refused caller starts nothing");
+        assert!(starter.started.lock().unwrap().is_empty(), "a refused caller starts nothing");
     }
 
-    /// A token for another project, or a forged one, never asks for a
-    /// birth.
+    /// A token for another project, or a forged one, never claims a run.
     #[tokio::test]
-    async fn a_token_for_another_project_asks_for_nothing() {
+    async fn a_token_for_another_project_claims_nothing() {
         use tower::ServiceExt as _;
-        let (mut state, _) = server_state();
-        let tasks = Arc::new(ArrivalTasks::default());
-        state.tasks = tasks.clone();
+        let (state, starter) = recording_server_state();
         let (token, _) = routing_token(&[], uuid::Uuid::from_u128(0xbad), state.clock.now_unix() + 60);
         let request = axum::http::Request::builder()
             .method("GET")
@@ -2978,7 +2817,7 @@ mod tests {
             .unwrap();
         let response = connection_router(state).oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(tasks.asked.lock().unwrap().is_empty());
+        assert!(starter.started.lock().unwrap().is_empty());
     }
 
     /// Drive one HTTP exchange: attach with `body`, run `program` against
@@ -3022,6 +2861,7 @@ mod tests {
             path: "chat/room7".into(),
             ..Default::default()
         });
+        let canceller_for_test = state.canceller.clone();
         let response = drive_http(
             state,
             execution_id,
@@ -3030,6 +2870,7 @@ mod tests {
             request,
             Arc::new(RecordingSink::default()),
             axum::body::Body::from(body.to_string()),
+            Unattached::new(canceller_for_test, execution_id),
         )
         .await;
         let status = response.status();
@@ -3083,6 +2924,7 @@ mod tests {
             program(conn).await;
         });
         let request = Arc::new(LiveRequest { method: "GET".into(), path: "feed".into(), ..Default::default() });
+        let canceller_for_test = state.canceller.clone();
         let response = drive_http(
             state,
             execution_id,
@@ -3091,6 +2933,7 @@ mod tests {
             request,
             Arc::new(RecordingSink::default()),
             axum::body::Body::empty(),
+            Unattached::new(canceller_for_test, execution_id),
         )
         .await;
         (response, execution_id, canceller)
@@ -3168,6 +3011,7 @@ mod tests {
         // The handler parks on the head, which is where a real one sits
         // too; dropping the task is what hyper does to it when the
         // connection goes.
+        let canceller_for_test = state.canceller.clone();
         let handler = tokio::spawn(drive_http(
             state,
             execution_id,
@@ -3176,6 +3020,7 @@ mod tests {
             request,
             Arc::new(RecordingSink::default()),
             axum::body::Body::empty(),
+            Unattached::new(canceller_for_test, execution_id),
         ));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert!(!handler.is_finished(), "with nothing written the handler is still holding the head");
@@ -3373,6 +3218,7 @@ mod tests {
         let (status, body) = {
             // Nobody talks; the session cap (1s on the fake clock, which
             // returns at once) ends the exchange with the head held.
+            let canceller_for_test = state.canceller.clone();
             let response = drive_http(
                 state,
                 execution_id,
@@ -3381,6 +3227,7 @@ mod tests {
                 request,
                 Arc::new(RecordingSink::default()),
                 axum::body::Body::from("{}"),
+                Unattached::new(canceller_for_test, execution_id),
             )
             .await;
             let status = response.status();

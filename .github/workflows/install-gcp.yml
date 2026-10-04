@@ -53,16 +53,16 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_INSTALL_SERVICE_ACCOUNT }}
 
-      - uses: google-github-actions/setup-gcloud@v2
+      - uses: google-github-actions/setup-gcloud@v3
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_wrapper: false
 
@@ -136,24 +136,40 @@ jobs:
           TF_VAR_database_listen_url: ${{ secrets.WEFT_DATABASE_LISTEN_URL }}
         run: terraform apply -input=false -auto-approve
 
+      # The standard library's files, stored in the install now, so a
+      # project's first deploy uploads only its own files (a local install
+      # does the same each time it starts). The key goes from Secret
+      # Manager straight to the CLI, never into the log.
+      - name: preload the standard library
+        working-directory: deploy/terraform/gcp
+        run: |
+          url=$(terraform output -raw url)
+          key_secret=$(terraform output -raw bootstrap_operator_key_secret)
+          gcloud secrets versions access latest --secret "$key_secret" --project "${{ vars.GCP_PROJECT_ID }}" \
+            | "$GITHUB_WORKSPACE/target/release/weft" catalog preload --dispatcher "$url" --key-stdin
+
+      # Written to the run's log as well as its summary: `gh run view`
+      # shows the log, never the summary, and whoever installs from a
+      # terminal needs the address and the key command from there.
       - name: what to do next
         working-directory: deploy/terraform/gcp
         run: |
           url=$(terraform output -raw url)
           key_secret=$(terraform output -raw bootstrap_operator_key_secret)
+          key_command="gcloud secrets versions access latest --secret $key_secret --project ${{ vars.GCP_PROJECT_ID }}"
           {
             echo "## weft is installed"
             echo
             echo "It answers at \`$url\`, with nothing running while nobody uses it."
             echo
-            echo "1. On your machine, read the first operator key (it never appears in these logs):"
+            echo "1. In a project: \`weft target add prod $url\`."
+            echo "2. Log in with the first operator key, read straight from Secret Manager on your machine (it never appears in these logs):"
             echo
             echo '```'
-            echo "gcloud secrets versions access latest --secret $key_secret --project ${{ vars.GCP_PROJECT_ID }}"
+            echo "$key_command | weft login prod --key-stdin"
             echo '```'
             echo
-            echo "2. In a project: \`weft target add prod $url\`, then \`weft login prod\` and paste the key."
             echo "3. For your own domain, which needs a load balancer that costs money while it stands: \`weft domain add weft.example.com --on prod --accept-cost\` prints the DNS record to set."
             echo
             echo "The logs: \`gcloud logging read 'resource.type=\"cloud_run_revision\"' --project ${{ vars.GCP_PROJECT_ID }} --freshness 1h\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+          } | tee -a "$GITHUB_STEP_SUMMARY"

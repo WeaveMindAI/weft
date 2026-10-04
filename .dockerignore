@@ -43,3 +43,6 @@
 **/*.db-journal
 **/*.db-shm
 **/*.db-wal
+# SYNC: these two <-> crates/weft-catalog/src/lib.rs (is_python_cache)
+**/__pycache__/
+**/*.pyc

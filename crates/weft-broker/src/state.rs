@@ -45,6 +45,11 @@ pub struct BrokerState {
     pub identity: Arc<dyn CallerIdentity>,
     pub identity_cache: IdentityCache,
     pub scope_cache: ScopeCache,
+    /// What infra each program a project registered declares, keyed by the
+    /// project and a digest of its definition: a definition never changes
+    /// under its digest, so an entry is never stale, and a program asking
+    /// for an endpoint on every run reads its definition once.
+    pub declared_infra: weft_core::content_cache::ContentCache<weft_core::project::DeclaredInfra>,
     /// Where runtime-file bytes live: the install's bucket.
     pub object_store: Arc<dyn ObjectStore>,
     /// The runtime-file plane (`ctx.storage`): PG metadata + bucket bytes,
@@ -133,6 +138,7 @@ impl BrokerState {
             identity: settings.identity,
             identity_cache: IdentityCache::new()?,
             scope_cache: ScopeCache::new(),
+            declared_infra: weft_core::content_cache::ContentCache::new(256),
             object_store: settings.object_store,
             runtime_store,
             entitlements: settings.entitlements,

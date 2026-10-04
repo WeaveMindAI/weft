@@ -183,7 +183,7 @@ async fn run_dispatcher_task<Ctx>(
         &kind,
     )
     .await;
-    heartbeat.abort();
+    drop(heartbeat);
     finalize_task(store.as_ref(), task_id, &replica, &kind, outcome).await;
 }
 
@@ -413,11 +413,11 @@ fn spawn_claim_heartbeat(
     task_id: uuid::Uuid,
     replica: String,
     lease: LeaseSignal,
-) -> tokio::task::JoinHandle<()> {
+) -> Heartbeat {
     let interval = claim_heartbeat_interval();
     let max_consecutive_errors =
         (claim_duration_secs() as f64 / interval.as_secs_f64()) as u32 + 1;
-    tokio::spawn(async move {
+    Heartbeat(tokio::spawn(async move {
         let mut consecutive_errors: u32 = 0;
         loop {
             tokio::time::sleep(interval).await;
@@ -453,7 +453,19 @@ fn spawn_claim_heartbeat(
                 }
             }
         }
-    })
+    }))
+}
+
+/// A claim's heartbeat, stopped when it is dropped: the work it keeps
+/// claimed may be dropped mid-way (its caller went away, its task was
+/// aborted), and a heartbeat left running would hold the claim forever
+/// with nothing doing the work.
+struct Heartbeat(tokio::task::JoinHandle<()>);
+
+impl Drop for Heartbeat {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Run one task a worker claimed for the execution it was called for,
@@ -475,6 +487,6 @@ where
     let kind = task.kind.clone();
     let result = serde_json::json!({ "kind": kind });
     let outcome = run_with_lease_guard(async { work.await.map(|()| result) }, lease, task.id, &kind).await;
-    heartbeat.abort();
+    drop(heartbeat);
     finalize_task(store.as_ref(), task.id, replica, &kind, outcome).await
 }

@@ -219,7 +219,7 @@ impl FromRequestParts<DispatcherState> for ControlPlaneCaller {
 /// at a project that is plainly right there on their disk: the
 /// dispatcher has simply never been told about it.
 pub const NO_SUCH_PROJECT: &str = "this dispatcher holds no project under that id; \
-     if the project is new, `weft run` or `weft activate` registers it";
+     if the project is new, `weft run`, `weft infra start` or `weft activate` registers it";
 
 /// Authorize a caller against a project: the project must exist AND belong to
 /// the caller's tenant. Returns the same `NOT_FOUND` for "no such project" and

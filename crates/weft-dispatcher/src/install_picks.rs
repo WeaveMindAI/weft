@@ -47,7 +47,7 @@ pub async fn change(
         None => None,
     };
     let checked =
-        weft_core::picks::check_picks(project.as_ref(), set).map_err(|refusal| crate::api::project::refusal_error(&refusal))?;
+        weft_core::picks::check_picks(project.as_deref(), set).map_err(|refusal| crate::api::project::refusal_error(&refusal))?;
     // A clear, like a pick, is held to the program where it has the place,
     // and is spelled the way the program spells that place, which is how
     // the pick was stored.
@@ -88,7 +88,7 @@ pub async fn change(
     let (_, rearmed) = store_then_rearm(
         state,
         project_id,
-        project.as_ref(),
+        project.as_deref(),
         Store::Change { tenant: &tenant, writes: &writes, cleared: &cleared, changes: &changes },
     )
     .await?;

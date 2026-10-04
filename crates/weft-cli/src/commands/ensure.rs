@@ -136,12 +136,11 @@ async fn builds_running(client: &crate::client::DispatcherClient, id: &str) -> R
 /// Make sure the install knows this project, WITHOUT building anything.
 /// Cheap and a no-op when it already does.
 ///
-/// The version tree lives on the install, under the project's id, so a
-/// verb that records a version needs the project to exist there.
-/// `weft checkpoint` is the one such verb a person can reasonably reach
-/// for before they have ever run (save a point, then start changing
-/// things), and making them run first would build a worker image for
-/// nothing.
+/// For a verb a person can reasonably reach for before anything has run
+/// on that install, and that needs only the project to exist there, never
+/// a build of it: a checkpoint (the version tree lives under the project's
+/// id), a connection, an option, a frontend. Making them run first would
+/// build a worker image for nothing.
 pub async fn ensure_project_known(ctx: &Ctx) -> Result<()> {
     let project = ctx.project()?;
     let client = ctx.client()?;
@@ -275,7 +274,7 @@ pub async fn build_compiled(
     let CompiledProject { definition, sources } = compiled;
     let project = ctx.project()?;
     let client = ctx.client()?;
-    let manifest = super::versions::snapshot(&client, project).await?;
+    let manifest = super::versions::snapshot(&client, project, !progress.json).await?;
     anyhow::ensure!(manifest == sources,
         "project files changed after compilation; rerun the command to build and record the same sources");
 

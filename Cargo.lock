@@ -4838,6 +4838,7 @@ dependencies = [
  "hmac 0.12.1",
  "http 1.4.0",
  "inventory",
+ "lru",
  "p256",
  "percent-encoding",
  "regex",

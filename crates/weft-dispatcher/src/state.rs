@@ -108,6 +108,11 @@ pub struct DispatcherState {
     /// HMAC secret the dispatcher signs live-caller routing tickets with
     /// (the worker verifies with the same secret).
     pub caller_token_secret: Arc<Vec<u8>>,
+    /// Programs already read and parsed, by project and definition hash
+    /// (see [`DispatcherState::program`]): a definition never changes
+    /// under its hash, so a busy route stops reading and parsing its
+    /// program on every call.
+    pub programs: Arc<weft_core::content_cache::ContentCache<weft_core::ProjectDefinition>>,
 }
 
 impl DispatcherState {
@@ -117,4 +122,36 @@ impl DispatcherState {
     pub fn external_base_url(&self) -> &str {
         self.internet_url.as_deref().unwrap_or(&self.public_base_url)
     }
+
+    /// The program `project` recorded under `hash`, parsed; `None` when
+    /// no such version was ever recorded. THE way the dispatcher reads a
+    /// recorded program. A recorded program that no longer parses is an
+    /// [`UnreadableProgram`] error, which a caller that shows runs tells
+    /// apart from the store failing.
+    pub async fn program(
+        &self,
+        project: uuid::Uuid,
+        hash: &str,
+    ) -> anyhow::Result<Option<Arc<weft_core::ProjectDefinition>>> {
+        if let Some(program) = self.programs.get(project, hash) {
+            return Ok(Some(program));
+        }
+        let Some(json) = self.projects.definition_for_hash(project, hash).await? else { return Ok(None) };
+        let program: Arc<weft_core::ProjectDefinition> =
+            Arc::new(serde_json::from_str(&json).map_err(|e| UnreadableProgram(e.to_string()))?);
+        self.programs.put(project, hash.to_string(), program.clone());
+        Ok(Some(program))
+    }
 }
+
+/// A recorded program that no longer parses as a definition, and why.
+#[derive(Debug)]
+pub struct UnreadableProgram(pub String);
+
+impl std::fmt::Display for UnreadableProgram {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the recorded program no longer reads: {}", self.0)
+    }
+}
+
+impl std::error::Error for UnreadableProgram {}

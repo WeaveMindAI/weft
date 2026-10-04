@@ -73,13 +73,7 @@ pub fn drain_loops(state: Arc<BrokerState>) -> Vec<weft_task_store::drain::Drain
     ]
 }
 
-/// The most one journal record may weigh. A record is one event; the
-/// heaviest event is an emission, one value per output port, each under
-/// `MAX_WIRE_VALUE_BYTES` (the engine refuses more at the node, which is
-/// the refusal a user sees). This bound is the contract check behind it:
-/// room for sixty-four such ports, so no run that obeyed the wire rule
-/// ever dies on its journal write.
-pub const JOURNAL_RECORD_BODY_LIMIT: usize = 64 * weft_core::storage::MAX_WIRE_VALUE_BYTES;
+pub use weft_broker_client::protocol::JOURNAL_RECORD_BODY_LIMIT;
 
 /// The cap on a failed unrecorded run's whole record
 /// (`/v1/journal/record_retroactive`): sixteen of the largest single

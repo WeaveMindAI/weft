@@ -420,12 +420,39 @@ async fn sweep_stuck_transitions(state: DispatcherState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Live executions whose worker went away (`tasks::orphaned_live_executions`):
-/// the caller was on THAT worker's connection, so the run cannot resume
-/// anywhere else, and its execution is terminally cancelled. The task row
-/// is the durable retry handle: anything not fully recovered this tick is
-/// re-found next tick.
+/// Live runs that will never be driven. One whose caller never came
+/// (`tasks::callers_never_arrived`) is erased whole. One whose worker went
+/// away (`tasks::orphaned_live_executions`) had its caller on THAT worker's
+/// connection, so it cannot resume anywhere else, and its execution is
+/// terminally cancelled. The task row is the durable retry handle: anything
+/// not fully recovered this tick is re-found next tick.
 async fn sweep_orphaned_live_executions(state: DispatcherState) -> anyhow::Result<()> {
+    // A run born at a handshake whose caller never reached a worker: no
+    // one saw it run and no one ever will, so it goes entirely.
+    let now = crate::lease::now_unix();
+    for gone in weft_task_store::tasks::callers_never_arrived(&state.pg_pool, now).await? {
+        let Ok(execution_id) = gone.execution_id.parse::<weft_core::ExecutionId>() else {
+            tracing::error!(
+                target: "weft_dispatcher::reaper",
+                execution_id = %gone.execution_id, task = %gone.task_id,
+                "a live run whose caller never came has an unparseable execution; leaving its task for inspection"
+            );
+            continue;
+        };
+        match state.journal.erase_unclaimed_live_run(execution_id, gone.task_id, now).await {
+            Ok(true) => tracing::info!(
+                target: "weft_dispatcher::reaper",
+                execution_id = %execution_id,
+                "erased a live run whose caller never followed the redirect"
+            ),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                target: "weft_dispatcher::reaper",
+                execution_id = %execution_id, error = %format!("{e:#}"),
+                "could not erase a live run whose caller never came; next tick retries"
+            ),
+        }
+    }
     let orphans = weft_task_store::tasks::orphaned_live_executions(&state.pg_pool).await?;
     for orphan in orphans {
         let Ok(execution_id) = orphan.execution_id.parse::<weft_core::ExecutionId>() else {

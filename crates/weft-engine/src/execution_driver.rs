@@ -228,11 +228,16 @@ pub(crate) async fn run_one_execution_observed(
     // panic, a bug) is an error out of the drive like any other: caught
     // here so the run still gets its Failed terminal below, instead of
     // unwinding past it and reading as running forever.
+    // The drive's journal is made out here, around the drive, so the rows
+    // it holds outlive a drive that fails or panics: they go on record
+    // before the Failed terminal below, and the run reads as far as it got.
+    let drive_journal = crate::context::DriveJournal::wrap(clients.journal.clone());
     let drove = match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(drive_execution_id(
         project,
         catalog,
         execution_id,
         clients,
+        drive_journal.clone(),
         replica.clone(),
         tenant_id,
         cancellation,
@@ -257,9 +262,20 @@ pub(crate) async fn run_one_execution_observed(
         Ok(drove) => Ok(drove),
         // The run reached its outcome and the journal would not take
         // the terminal: writing `Failed` in its place would misname a
-        // run that completed, so the error goes back as it is.
+        // run that completed, so the error goes back as it is. (A drive
+        // row that did not land stops the run before its terminal, as an
+        // ordinary error, so it never reaches here.)
         Err(e) if e.is::<TerminalUnwritten>() => Err(e),
-        Err(e) => Err(fail_before_terminal(journal.as_ref(), clock.as_ref(), execution_id, &replica, e).await),
+        Err(e) => {
+            if let Err(unsent) = drive_journal.flush().await {
+                tracing::error!(
+                    target: "weft_engine::execution_driver",
+                    execution_id = %execution_id, error = %format!("{unsent:#}"),
+                    "the drive's last rows could not be journaled before its failure"
+                );
+            }
+            Err(fail_before_terminal(journal.as_ref(), clock.as_ref(), execution_id, &replica, e).await)
+        }
     };
     // Shut down the bus-journal pump. Append `Closed` to every live
     // bus, wait (notify-driven) for the pump to drain, drop the
@@ -319,6 +335,7 @@ async fn drive_execution_id(
     catalog: Arc<dyn NodeCatalog>,
     execution_id: ExecutionId,
     clients: EngineClients,
+    drive_journal: Arc<crate::context::DriveJournal>,
     replica: String,
     tenant_id: String,
     cancellation: Arc<CancellationFlag>,
@@ -356,12 +373,11 @@ async fn drive_execution_id(
     // and pending deliveries. If empty, the producer just journaled
     // ExecutionStarted + NodeKicked; wait briefly for the rows.
     //
-    // The drive's journal client is wrapped so a failed lifecycle
-    // write poisons the drive (the loop checks the flag every
-    // iteration and exits the worker; see `PoisonOnWriteFailure`).
-    let (wrapped_journal, journal_poisoned) =
-        crate::context::PoisonOnWriteFailure::wrap(clients.journal.clone());
-    let clients = EngineClients { journal: wrapped_journal, ..clients };
+    // The drive writes through its journal (`run_one_execution_observed`
+    // made it): the driver's own rows are held and sent together, and a
+    // failed write poisons the drive (the loop checks every iteration and
+    // exits the worker; see `DriveJournal`).
+    let clients = EngineClients { journal: drive_journal.clone(), ..clients };
     let journal = clients.journal.clone();
     // The run's log from its birth row, waited for briefly (see
     // `FIRST_ROWS_WAIT`). The wait yields to cancellation: a cancel
@@ -370,13 +386,15 @@ async fn drive_execution_id(
     let rows = tokio::select! {
         rows = journal.rows_after(execution_id, 0, FIRST_ROWS_WAIT) => rows?,
         _ = cancellation.cancelled() => {
-            return Ok(Drove {
-                outcome: ExecutionOutcome::Cancelled { cause: recorded_cancel_cause(&cancellation) },
-                pulses,
-                executions,
-                loop_runtime: LoopRuntime::new(),
-                kicked,
-            });
+            // Nothing ran, but the run still gets its end: a cancel from
+            // inside this worker (its caller refused or gone before
+            // attaching) has nobody else to write it. One the dispatcher
+            // already ended is seen and left alone (`journal_terminal`).
+            let outcome = ExecutionOutcome::Cancelled { cause: recorded_cancel_cause(&cancellation) };
+            journal_terminal(drive_journal.beneath(), clients.clock.as_ref(), execution_id, &replica, &outcome)
+                .await
+                .map_err(|error| TerminalUnwritten { outcome: outcome.clone(), error })?;
+            return Ok(Drove { outcome, pulses, executions, loop_runtime: LoopRuntime::new(), kicked });
         }
     };
     let events: Vec<weft_journal::ExecEvent> = rows.iter().map(|row| row.event.clone()).collect();
@@ -519,7 +537,7 @@ async fn drive_execution_id(
             catalog.as_ref(),
             execution_id,
             &clients,
-            &journal_poisoned,
+            &drive_journal,
             &replica,
             &tenant_id,
             &cancellation,
@@ -654,6 +672,10 @@ async fn drive_execution_id(
         );
     }
 
+    // Whatever the last drive held goes out now: a stalled run writes
+    // no terminal to carry it.
+    drive_journal.flush().await?;
+
     // Journal the terminal event based on what the worker actually
     // did. The pump shutdown (in `run_one_execution`, on every exit of
     // this function) happens AFTER, so a pump abort surfaces via
@@ -670,6 +692,11 @@ async fn drive_execution_id(
     if matches!(outcome, ExecutionOutcome::Completed) && caller.as_ref().is_some_and(|c| c.owes_answer()) {
         outcome = ExecutionOutcome::Failed { error: weft_core::caller::NO_ANSWER.to_string() };
     }
+    // The terminal is written to the journal beneath the drive's
+    // (`DriveJournal::beneath`), after every held row went out (the flush
+    // above, and the one after a cancel walk below): a failed terminal is
+    // then exactly that, retried by `journal_terminal`, and a failed drive
+    // row has already stopped the run before it gets here.
     let terminal = match &outcome {
         // Cancellation: a drive that observed the flag already ran the
         // cancel walk inside `cancel_cleanup`; the refetch loop's
@@ -686,7 +713,10 @@ async fn drive_execution_id(
                 dispatchable.as_ref(),
             )
             .await;
-            journal_terminal(journal.as_ref(), clients.clock.as_ref(), execution_id, &replica, &outcome).await
+            // A cancel row that did not land leaves the journal behind:
+            // the run then ends Failed, never Cancelled over a gap.
+            drive_journal.flush().await?;
+            journal_terminal(drive_journal.beneath(), clients.clock.as_ref(), execution_id, &replica, &outcome).await
         }
         ExecutionOutcome::Completed | ExecutionOutcome::Failed { .. } | ExecutionOutcome::Stuck { .. } => {
             // No worker-side storage cleanup here: the dispatcher's durable
@@ -695,7 +725,7 @@ async fn drive_execution_id(
             // linger (so the user can still download a run's output), then
             // the broker's expiry sweep deletes them. A worker-side eager
             // delete would defeat that linger.
-            journal_terminal(journal.as_ref(), clients.clock.as_ref(), execution_id, &replica, &outcome).await
+            journal_terminal(drive_journal.beneath(), clients.clock.as_ref(), execution_id, &replica, &outcome).await
         }
         // Returned before the drive loop; unreachable here, and there
         // is nothing to journal for it anyway.
@@ -710,6 +740,19 @@ async fn drive_execution_id(
     };
     terminal.map_err(|error| TerminalUnwritten { outcome: outcome.clone(), error })?;
     Ok(Drove { outcome, pulses, executions, loop_runtime, kicked })
+}
+
+/// Send the drive's held rows, or stop the drive: a write that failed
+/// leaves the journal behind what the worker did (see `DriveJournal`).
+async fn flush_or_stop(drive_journal: &crate::context::DriveJournal, execution_id: ExecutionId) -> anyhow::Result<()> {
+    // A poisoned drive refuses the flush itself, so nothing new starts on
+    // a journal that is already behind.
+    drive_journal.flush().await.map_err(|e| {
+        anyhow::anyhow!(
+            "a journal write failed mid-drive for execution {execution_id}; the journal no longer \
+             holds what the worker did, so the run cannot go on: {e:#}"
+        )
+    })
 }
 
 /// The run's state as its fold says, refusing to resume over a row the
@@ -1130,7 +1173,7 @@ async fn drive(
     catalog: &dyn NodeCatalog,
     execution_id: ExecutionId,
     clients: &EngineClients,
-    journal_poisoned: &std::sync::atomic::AtomicBool,
+    drive_journal: &Arc<crate::context::DriveJournal>,
     replica: &str,
     tenant_id: &str,
     cancellation: &Arc<CancellationFlag>,
@@ -1165,7 +1208,11 @@ async fn drive(
     live: &mut weft_journal::LiveFold,
 ) -> anyhow::Result<ExecutionOutcome> {
     let project: &ProjectDefinition = project_arc;
-    let journal = clients.journal.as_ref();
+    // The driver's own rows are held and go out together at each flush
+    // below (`DriveJournal`); its nodes write through `clients.journal`,
+    // which sends at once and carries the held rows ahead of theirs.
+    let deferring = drive_journal.deferring();
+    let journal: &dyn JournalClient = &deferring;
     // What infra the program declares, read once per drive: every
     // firing's handle checks a shared `Infra` handle against it.
     let declared_infra = Arc::new(weft_core::project::DeclaredInfra::of(project));
@@ -1249,7 +1296,7 @@ async fn drive(
         // Stop here: the error becomes the run's Failed terminal
         // (`run_one_execution`), which is the only end this run gets,
         // since nothing respawns an execution whose task failed.
-        if journal_poisoned.load(std::sync::atomic::Ordering::Acquire) {
+        if drive_journal.is_poisoned() {
             anyhow::bail!(
                 "a journal write failed mid-drive for execution {execution_id}; the journal no longer \
                  holds what the worker did, so the run cannot go on"
@@ -2117,6 +2164,9 @@ async fn drive(
             let provision_clients = clients.clone();
             let provision_copy =
                 weft_core::instance::copy_owner(node_def.per_instance, instance).cloned();
+            // The firing's start (and everything held before it) is on
+            // record before its body can do anything.
+            flush_or_stop(drive_journal, execution_id).await?;
             let abort_handle = in_flight.spawn(async move {
                 if is_infra_setup_provision {
                     // 1. Call the node's provision body.
@@ -2482,6 +2532,8 @@ async fn drive(
         };
         tokio::pin!(resume_poll);
 
+        // Everything this step wrote goes out before the drive waits.
+        flush_or_stop(drive_journal, execution_id).await?;
         let on_wait_change = waits.wait_notified();
         tokio::pin!(on_wait_change);
         on_wait_change.as_mut().enable();

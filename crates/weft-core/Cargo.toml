@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+lru = { version = "0.16", optional = true }
 # Re-exported as the `weft_core::NodeManifest` derive: every node picks up
 # its co-located metadata.json through it. Proc-macro crates build for the
 # host, so the WASM parse build is unaffected.
@@ -98,6 +99,7 @@ runtime = [
     "dep:http",
     "dep:tokio-rustls",
     "dep:rustls-native-certs",
+    "dep:lru",
 ]
 # Ships the hand-rolled fakes colocated with their traits (currently
 # `caller::FakeCallerConnection`) so downstream crates can wire them into

@@ -590,7 +590,7 @@ pub(crate) async fn retire_what_no_run_needs(
 pub(crate) async fn coherent_definition(
     state: &DispatcherState,
     id: uuid::Uuid,
-) -> Result<(weft_core::project::hash::ProgramIdentity, ProjectDefinition), (StatusCode, String)> {
+) -> Result<(weft_core::project::hash::ProgramIdentity, std::sync::Arc<ProjectDefinition>), (StatusCode, String)> {
     let program = state
         .projects
         .running_program_identity(id)
@@ -608,13 +608,10 @@ pub(crate) async fn coherent_definition(
             )
         })?;
     let hash = &program.definition_hash;
-    let json = state
-        .projects
-        .definition_for_hash(id, hash)
+    let project = state
+        .program(id, hash)
         .await
-        .map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("definition_for_hash: {e}"))
-        })?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("recorded definition {hash}: {e:#}")))?
         .ok_or_else(|| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -624,12 +621,6 @@ pub(crate) async fn coherent_definition(
                 ),
             )
         })?;
-    let project: ProjectDefinition = serde_json::from_str(&json).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("parse recorded definition {hash}: {e}"),
-        )
-    })?;
     Ok((program, project))
 }
 
@@ -838,7 +829,6 @@ pub(crate) async fn start_queued_execution_with(
         binary_hash: &birth.program.binary_hash,
         tenant_id: tenant.as_str(),
         run_class: birth.run_class,
-        pinned_to: None,
         live_connection,
         unrecorded_birth: None,
     })
@@ -2139,6 +2129,13 @@ fn unavailable_action(
     // as the blocker rather than buried in the triggers' state.
     if let Some(why) = transition.refusal() {
         return format!("'{verb}' is not available right now: {why}");
+    }
+    // Starting infra that already runs is somebody who changed it and wants
+    // the change live (an upgrade) or who did not know it was up.
+    if verb == "infra_start" && infra_rollup == "running" && allowed.iter().any(|a| a == "infra_upgrade") {
+        return "every piece of this program's infrastructure is already running. If you changed it, \
+                `weft infra upgrade` puts the change live"
+            .into();
     }
     format!(
         "'{verb}' is not available right now: the triggers it names are {} (infra {infra_rollup}); \
@@ -6038,6 +6035,17 @@ mod unavailable_action_tests {
         assert!(message.contains("already on") && message.contains("weft resync"), "{message}");
         let other = unavailable_action("run", ProjectStatus::Active, ProjectTransition::None, "stopped", &allowed);
         assert!(other.contains("allowed actions: [run, deactivate, resync]"), "{other}");
+    }
+
+    #[test]
+    fn starting_infra_that_already_runs_points_at_upgrade() {
+        let allowed = vec!["infra_stop".to_string(), "infra_upgrade".to_string()];
+        let message = unavailable_action("infra_start", ProjectStatus::Active, ProjectTransition::None, "running", &allowed);
+        assert!(message.contains("already running") && message.contains("weft infra upgrade"), "{message}");
+        // Without an upgrade to offer (the infra left running belongs to
+        // nodes no longer in the program), the plain answer stands.
+        let leftover = unavailable_action("infra_start", ProjectStatus::Active, ProjectTransition::None, "running", &["infra_terminate".to_string()]);
+        assert!(leftover.contains("allowed actions: [infra_terminate]"), "{leftover}");
     }
 
     #[test]

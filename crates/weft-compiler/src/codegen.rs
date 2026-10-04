@@ -1177,11 +1177,14 @@ struct Args {{
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {{
+    // Colours only on a terminal: a platform's log collector keeps the
+    // escape codes as text.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "weft_engine=info,weft_core=info".into()),
         )
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
 
     let args = Args::parse();

@@ -267,11 +267,43 @@ pub(crate) struct DispatcherStore<'a> {
     client: &'a DispatcherClient,
     /// For the presigned part PUTs (bucket-direct; not dispatcher traffic).
     http: reqwest::Client,
+    /// Says on stderr how far the uploads have got, when set.
+    told: Option<std::sync::Mutex<Uploads>>,
 }
+
+/// How far a publish's uploads have got, as last said.
+struct Uploads {
+    total: usize,
+    done: usize,
+    said_at: std::time::Instant,
+}
+
+/// How often a publish says how far it has got: a first publish to a new
+/// install sends every file of the project (its copy of the standard
+/// library included), and the person waiting should see it moving.
+const UPLOAD_TELL_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl<'a> DispatcherStore<'a> {
     pub(crate) fn new(client: &'a DispatcherClient) -> Self {
-        Self { client, http: reqwest::Client::new(), publish: true }
+        Self { client, http: reqwest::Client::new(), publish: true, told: None }
+    }
+
+    /// [`Self::new`], saying on stderr how far its uploads have got.
+    pub(crate) fn telling(client: &'a DispatcherClient) -> Self {
+        let told = Uploads { total: 0, done: 0, said_at: std::time::Instant::now() };
+        Self { told: Some(std::sync::Mutex::new(told)), ..Self::new(client) }
+    }
+
+    /// One more upload landed: say so when it has been a while, or when it
+    /// was the last.
+    fn note_uploaded(&self) {
+        let Some(told) = &self.told else { return };
+        let mut told = told.lock().expect("upload progress");
+        told.done += 1;
+        if told.done == told.total || told.said_at.elapsed() >= UPLOAD_TELL_EVERY {
+            told.said_at = std::time::Instant::now();
+            eprintln!("uploaded {} of {} files the install did not have yet", told.done, told.total);
+        }
     }
 }
 
@@ -289,6 +321,14 @@ impl AssetStore for DispatcherStore<'_> {
             .context("ask which contents are already stored")?;
         let held: weft_core::storage::AssetsHeldResponse =
             serde_json::from_value(resp).context("parse the stored-contents answer")?;
+        if let Some(told) = &self.told {
+            let missing = hashes.len().saturating_sub(held.keys.len());
+            if missing > 0 {
+                eprintln!("uploading {missing} files the install does not have yet");
+            }
+            let mut told = told.lock().expect("upload progress");
+            (told.total, told.done) = (missing, 0);
+        }
         // Each key must be the asset its hash names. Parsed through the one
         // key grammar and failed loud on anything else: an entry taken on
         // faith would skip uploading content the store does not hold.
@@ -325,7 +365,9 @@ impl AssetStore for DispatcherStore<'_> {
         // store keeps what arrived, and the next publish of the same
         // content resumes it through the upload protocol. Nothing is lost
         // and nothing is blocked, so there is no reason to own the signal.
-        self.transfer(hash, mime, filename, size_bytes, bytes).await
+        let key = self.transfer(hash, mime, filename, size_bytes, bytes).await?;
+        self.note_uploaded();
+        Ok(key)
     }
 }
 

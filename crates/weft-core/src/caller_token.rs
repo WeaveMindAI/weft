@@ -1,18 +1,12 @@
 //! Signed routing token for a live caller connection. The dispatcher
-//! mints one at the control handshake (after the caller's gate); the
-//! caller brings it back through the install's live door, which forwards
-//! the connection to one of the project's workers; the worker verifies it
-//! before asking for the execution and attaching the connection to it. A
-//! worker rejects any connection whose token is missing, expired, forged,
-//! or addressed to another project, so a worker only ever serves
-//! connections the dispatcher signed.
-//!
-//! The token is also the handshake's memory: nothing is born at the
-//! handshake (a caller who never follows the redirect leaves nothing
-//! behind), so what the birth needs and the arriving request cannot
-//! supply rides in the claims: the route matched, the gate's verdict,
-//! the path captures. The request itself (method, headers, query) is
-//! read again from the caller when they arrive.
+//! gives birth to the caller's run at the control handshake (after the
+//! caller's gate) and mints one naming it; the caller brings it back
+//! through the install's live door, which forwards the connection to one
+//! of the project's workers; the worker verifies it before claiming the
+//! run and attaching the connection to it. A worker rejects any connection
+//! whose token is missing, expired, forged, or addressed to another
+//! project, so a worker only ever serves connections the dispatcher
+//! signed.
 //!
 //! The crypto + wire format live ONCE in [`crate::signed_token`] (HMAC-SHA256
 //! over a base64url JSON payload, `v1.<payload>.<sig>`); this module is just
@@ -21,10 +15,7 @@
 //! (not the dispatcher) because both the dispatcher (mint) and the
 //! engine/worker (verify) need it and both depend on core.
 
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::signed_token::{self, SignedClaims};
 use crate::ExecutionId;
@@ -32,37 +23,23 @@ use crate::ExecutionId;
 /// Caller-safe noun for this token's error strings (no secret leak).
 const NOUN: &str = "routing token";
 
-/// What a routing token grants: the right to have execution `execution_id` of
-/// `project_id` born on whichever of the project's workers the caller's
-/// connection reaches, and to attach ONE live connection to it, until
-/// `exp` (unix seconds).
+/// What a routing token grants: the right to have execution `execution_id`
+/// of `project_id`, born at the handshake, claimed by whichever of the
+/// project's workers the caller's connection reaches, and to attach ONE
+/// live connection to it, until `exp` (unix seconds), which is also when
+/// the run stops waiting for them.
 ///
-/// The execution is pinned to that worker once born (the caller is on its
-/// connection); the worker rejects a token for another project. `execution_id`
-/// binds the connection to the one execution so `ctx.caller()`
-/// resolves to the right run. `signal`, `path`, `params` and `caller`
-/// are what the handshake established and the birth reads back when the
-/// caller arrives (see the module doc).
+/// The claim pins the execution to that worker (the caller is on its
+/// connection); the worker rejects a token for another project.
+/// `execution_id` binds the connection to the one execution so
+/// `ctx.caller()` resolves to the right run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallerTokenClaims {
     pub execution_id: ExecutionId,
     pub project_id: uuid::Uuid,
-    /// The program the handshake armed the run with: the live door
-    /// forwards the caller to the workers running this image, and the
-    /// birth refuses a route re-armed with another program since.
+    /// The program the run was born on: the live door forwards the
+    /// caller to the workers running this image.
     pub binary_hash: String,
-    /// The signal token of the route the handshake matched: the row the
-    /// birth reads the trigger, its spec and its armed program from.
-    pub signal: String,
-    /// The path as the route sees it (the tenant segment off, no
-    /// leading slash), and the route pattern's captures for it.
-    pub path: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub params: BTreeMap<String, String>,
-    /// The identity the gate established at the handshake (`None` on an
-    /// open route).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub caller: Option<Value>,
     /// A fingerprint of the request the gate approved, present only
     /// when something was checked (an open route approves nothing, so
     /// there is nothing to hold the caller to).
@@ -77,10 +54,6 @@ pub struct CallerTokenClaims {
     /// that claim away.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approved: Option<RequestFingerprint>,
-    /// Who the run is for, when the gate honoured a
-    /// [`crate::instance::INSTANCE_HEADER`] (only a gated route does).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instance: Option<crate::instance::InstanceId>,
     pub exp: i64,
 }
 
@@ -170,12 +143,7 @@ mod tests {
             execution_id: execution_id(),
             project_id: uuid::Uuid::nil(),
             binary_hash: "bin-1".into(),
-            signal: "sig-9".into(),
-            path: "chat/room7".into(),
-            params: [("room".to_string(), "room7".to_string())].into_iter().collect(),
-            caller: Some(serde_json::json!({ "sub": "ada" })),
             approved: Some(RequestFingerprint::of("post", "/chat/room7", "a=1", b"{}")),
-            instance: Some(crate::instance::InstanceId::new("ada").unwrap()),
             exp,
         }
     }
@@ -208,9 +176,8 @@ mod tests {
         let tok = mint(SECRET, &claims(1_000));
         let back = validate(SECRET, &tok, 999).unwrap();
         assert_eq!(back, claims(1_000));
-        // An open route on a bare path carries no captures, no caller, no
-        // instance and no approved request.
-        let bare = CallerTokenClaims { params: BTreeMap::new(), caller: None, instance: None, approved: None, ..claims(1_000) };
+        // An open route approved no request.
+        let bare = CallerTokenClaims { approved: None, ..claims(1_000) };
         assert_eq!(validate(SECRET, &mint(SECRET, &bare), 0).unwrap(), bare);
     }
 

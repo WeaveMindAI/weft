@@ -10,6 +10,8 @@ mod wire_enum;
 pub mod bus;
 #[cfg(feature = "runtime")]
 pub mod caller;
+#[cfg(feature = "runtime")]
+pub mod content_cache;
 pub mod access;
 pub mod activation;
 pub mod builds;

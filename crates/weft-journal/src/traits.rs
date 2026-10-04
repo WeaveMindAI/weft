@@ -48,6 +48,17 @@ pub trait JournalClient: Send + Sync {
         replica: Option<&str>,
     ) -> anyhow::Result<()>;
 
+    /// Insert `events`, all of one execution, in order. A journal that
+    /// reaches the database over the network writes them in one go
+    /// (one round trip instead of one per event); the default writes
+    /// them one by one.
+    async fn record_events(&self, events: &[ExecEvent], replica: Option<&str>) -> anyhow::Result<()> {
+        for event in events {
+            self.record_event(event, replica).await?;
+        }
+        Ok(())
+    }
+
     /// The rows of `execution_id` after `after_id`, in order, as RAW payload
     /// strings, holding up to `wait` for at least one to exist (a zero
     /// `wait` answers at once; empty when none came). An execution's rows
@@ -173,8 +184,13 @@ impl JournalClient for PostgresJournalClient {
         event: &ExecEvent,
         replica: Option<&str>,
     ) -> anyhow::Result<()> {
-        crate::write::record_event_from_replica(&self.pool, event, replica)
+        self.record_events(std::slice::from_ref(event), replica).await
+    }
+
+    async fn record_events(&self, events: &[ExecEvent], replica: Option<&str>) -> anyhow::Result<()> {
+        crate::write::record_events(&self.pool, events, replica, None)
             .await
+            .map(|_| ())
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 

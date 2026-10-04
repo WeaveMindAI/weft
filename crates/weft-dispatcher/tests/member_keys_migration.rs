@@ -26,7 +26,6 @@ use weft_core::CredentialOwner;
 use weft_dispatcher::api::signal::ParkedFire;
 use weft_dispatcher::journal::TriggerBake;
 use weft_journal::ExecEvent;
-use weft_task_store::kinds::{LiveArrivalPayload, LiveArrivalResult};
 use weft_task_store::schema_guard::{replay_migrations, replay_origins};
 use weft_task_store::{ExecutionPayload, RecordCostPayload};
 
@@ -324,11 +323,9 @@ async fn rows_written_before_the_rename_read_after_it(pool: PgPool) {
     let call = |i: usize| serde_json::from_value::<ProgramCallPayload>(tasks[i].0.clone()).unwrap().call;
     let answer = |i: usize| serde_json::from_value::<ProgramCallOutcome>(tasks[i].1.clone().unwrap()).unwrap().value;
     assert_eq!(serde_json::from_value::<RecordCostPayload>(tasks[0].0.clone()).unwrap().origin, CredentialOwner::Instance(ada()));
-    assert_eq!(serde_json::from_value::<LiveArrivalPayload>(tasks[1].0.clone()).unwrap().replica, "worker-a");
-    assert_eq!(
-        serde_json::from_value::<LiveArrivalResult>(tasks[1].1.clone().unwrap()).unwrap(),
-        LiveArrivalResult::Born { execution_id: RUN.into(), replica: "worker-a".into() }
-    );
+    // A task kind since retired: the rename still reaches its rows.
+    assert_eq!(tasks[1].0["replica"], "worker-a");
+    assert_eq!(tasks[1].1.clone().unwrap(), json!({ "outcome": "born", "execution_id": RUN, "replica": "worker-a" }));
     assert_eq!(call(2), ProgramCall::InfraStatus { node: "blender".into(), instance: Some(ada()) });
     assert_eq!(serde_json::from_value::<Option<InfraCopy>>(answer(2)).unwrap().and_then(|c| c.instance), Some(ada()));
     assert_eq!(call(3), ProgramCall::InstancesList);
