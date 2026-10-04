@@ -35,13 +35,14 @@ fi
 
 # One line per extension: the package directory, then every path its
 # build reads. The VS Code extension bundles the shared graph package
-# (the graph webview) and ships files from the syntax package through
-# symlinks (the grammar and the markdown highlighter), so an edit in
-# either ships in it. The browser extension reads neither: it is the
-# task popup and never draws a graph.
+# (the graph webview) and the connect library the graph's connection
+# picker is built on, and ships files from the syntax package through
+# symlinks (the grammar and the markdown highlighter), so an edit in any
+# of them ships in it. The browser extension draws no graph, but its
+# connections page is built on the connect library too.
 packages=(
-  "extension-vscode extension-vscode packages/weft-graph packages/weft-syntax"
-  "extension-browser extension-browser"
+  "extension-vscode extension-vscode packages/weft-graph packages/weft-syntax packages/weft-connect"
+  "extension-browser extension-browser packages/weft-connect"
 )
 
 version_at() {

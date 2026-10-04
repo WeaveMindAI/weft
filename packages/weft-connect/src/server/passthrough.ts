@@ -25,12 +25,6 @@ import { trimTrailingSlashes } from '../core/url';
  *  SYNC: PASSED_DOORS <-> crates/weft-dispatcher/src/api/mod.rs outside_caller_routes, crates/weft-dispatcher/src/api/instance_door.rs */
 export const PASSED_DOORS = ['instance', 'signal', 'signal-token', 'connect', 'access', 'public'] as const;
 
-/** The door of the program's live routes. The dispatcher answers a call
- *  there with a redirect to the worker serving the run, an address the
- *  browser may not reach either, so this server follows it itself; the
- *  body is read up front because a redirect sends it again. */
-const ROUTE_DOOR = 'connect';
-
 // The request headers that travel on. Anything else (the site's cookies,
 // its own auth, `Weft-Instance`) stays on the site.
 // SYNC: 'weft-instance-token' <-> src/core/transport.ts INSTANCE_TOKEN_HEADER
@@ -95,20 +89,15 @@ export function weftPassThrough(options: PassThroughOptions): (request: Request,
 		headers.set(WEFT_FORWARDED_PROTO, url.protocol.replace(/:$/, ''));
 		headers.set(FORWARDED_PREFIX, mountOf(url.pathname, segments.length));
 		const hasBody = request.method !== 'GET' && request.method !== 'HEAD';
-		const route = segments[0] === ROUTE_DOOR;
 		let answer: Response;
 		try {
 			answer = await fetcher(target, {
 				method: request.method,
 				headers,
-				...(route
-					? { body: hasBody ? await request.arrayBuffer() : undefined, redirect: 'follow' }
-					: {
-							body: hasBody ? request.body : undefined,
-							redirect: 'manual',
-							// A streamed request body needs this in Node's fetch.
-							...(hasBody ? { duplex: 'half' } : {}),
-						}),
+				body: hasBody ? request.body : undefined,
+				redirect: 'manual',
+				// A streamed request body needs this in Node's fetch.
+				...(hasBody ? { duplex: 'half' } : {}),
 			} as RequestInit);
 		} catch (e) {
 			return new Response(

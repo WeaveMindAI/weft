@@ -46,6 +46,7 @@ impl SupervisorTestRig {
             health: Arc::new(Mutex::new(health::HealthRegistry::default())),
             ownership_wanted: Arc::new(tokio::sync::Notify::new()),
             project_locks: Arc::default(),
+            pass: Arc::default(),
         };
         Self { broker, host, clock, state, owned: Mutex::new(std::collections::HashSet::new()) }
     }

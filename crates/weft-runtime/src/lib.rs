@@ -290,6 +290,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
             health: Arc::default(),
             ownership_wanted: Arc::default(),
             project_locks: Arc::default(),
+            pass: Arc::default(),
         };
         loops.push((CoreRole::Supervisor, Loops::Supervisor(state)));
     }

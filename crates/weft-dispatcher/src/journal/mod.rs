@@ -480,13 +480,18 @@ pub trait Journal: Send + Sync {
     /// unregisters it there (`unregister_many`), the way a cancel does.
     async fn delete_execution(&self, execution_id: ExecutionId) -> anyhow::Result<Vec<SignalRegistration>>;
 
-    /// Erase a live run whose caller never came, in ONE transaction: its
-    /// execute task `task_id`, only while it still is one
-    /// (`tasks::never_arrived_sql` at `now`), then everything its birth
-    /// wrote and the entry slot it held. `false`, with nothing touched,
-    /// when the task was claimed after all (the caller arrived) or is
-    /// already gone. Run by the reaper (`tasks::callers_never_arrived`).
-    async fn erase_unclaimed_live_run(&self, execution_id: ExecutionId, task_id: uuid::Uuid, now: i64) -> anyhow::Result<bool>;
+    /// Erase a live run no worker claimed, in ONE transaction: its execute
+    /// task, only while it still is one of the runs `which` names, then
+    /// everything its birth wrote and the entry slot it held. `false`, with
+    /// nothing touched, when the task was claimed after all (the caller
+    /// arrived) or is already gone. Run by the reaper for a caller who
+    /// never came (`tasks::callers_never_arrived`), and by the handshake
+    /// for a call it could not pass to a worker.
+    async fn erase_unclaimed_live_run(
+        &self,
+        execution_id: ExecutionId,
+        which: weft_task_store::tasks::UnclaimedLiveRun,
+    ) -> anyhow::Result<bool>;
 
     /// Delete all data for every execution of a project, and say how
     /// many went. Called by `weft rm`.

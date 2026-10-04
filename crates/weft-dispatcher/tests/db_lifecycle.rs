@@ -2224,18 +2224,35 @@ async fn a_live_run_whose_caller_never_came_leaves_nothing(pool: PgPool) {
     .unwrap()
     .expect("the caller arrived");
 
+    const PAST: weft_task_store::tasks::UnclaimedLiveRun = weft_task_store::tasks::UnclaimedLiveRun::PastDeadline { now: 1_001 };
     let gone = weft_task_store::tasks::callers_never_arrived(&pool, 1_001).await.unwrap();
     assert_eq!(gone.len(), 1, "only the run nobody claimed");
-    assert!(journal.erase_unclaimed_live_run(absent, gone[0].task_id, 1_001).await.unwrap());
+    assert_eq!(gone[0].execution_id, absent.to_string());
+    assert!(journal.erase_unclaimed_live_run(absent, PAST).await.unwrap());
     for table in ["exec_event", "execution", "task", "entry_slot"] {
         assert_eq!(count(table, absent).await, 0, "{table} still holds the run nobody came for");
     }
-    assert!(!journal.erase_unclaimed_live_run(present, claimed.id, 1_001).await.unwrap(), "a claimed run is the caller's");
+    assert!(!journal.erase_unclaimed_live_run(present, PAST).await.unwrap(), "a claimed run is the caller's");
     assert!(weft_task_store::tasks::requeue(&pool, claimed.id, "worker-a").await.unwrap());
     assert!(
-        !journal.erase_unclaimed_live_run(present, claimed.id, 1_001).await.unwrap(),
+        !journal.erase_unclaimed_live_run(present, PAST).await.unwrap(),
         "nor one put back pending: it is pinned to the worker its caller reached"
     );
     assert_eq!(count("execution", present).await, 1);
     assert!(weft_task_store::tasks::callers_never_arrived(&pool, 1_001).await.unwrap().is_empty());
+
+    // A run its handshake could not pass to any worker goes at once,
+    // long before its deadline, slot and all, so the caller's retry finds
+    // the route's slot free; the run a caller did reach is never taken.
+    let unreached = weft_core::ExecutionId::new_v4();
+    let (start, task) = born(unreached);
+    journal.start_execution(&start, &[], task, None).await.unwrap();
+    weft_dispatcher::entry_limits::take_slot(&pool, "tok", &unreached.to_string(), 5, 1_000, 0).await.unwrap().unwrap();
+    const UNREACHED: weft_task_store::tasks::UnclaimedLiveRun = weft_task_store::tasks::UnclaimedLiveRun::NeverPassedOn;
+    assert!(!journal.erase_unclaimed_live_run(unreached, weft_task_store::tasks::UnclaimedLiveRun::PastDeadline { now: 999 }).await.unwrap(), "its deadline has not passed");
+    assert!(journal.erase_unclaimed_live_run(unreached, UNREACHED).await.unwrap());
+    for table in ["exec_event", "execution", "task", "entry_slot"] {
+        assert_eq!(count(table, unreached).await, 0, "{table} still holds the run no worker got");
+    }
+    assert!(!journal.erase_unclaimed_live_run(present, UNREACHED).await.unwrap(), "a claimed run is the caller's");
 }

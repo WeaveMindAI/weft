@@ -1236,9 +1236,9 @@ impl Drop for Unattached {
 }
 
 /// Build the connection server router. The connection is identified by
-/// the signed `?wct=<token>` query param, NOT the path: the install's
-/// relay forwards the caller's ORIGINAL path (e.g. `/chat`, the author's
-/// mount path), so the worker accepts ANY path via a fallback handler (any
+/// the signed ticket in [`caller_token::TICKET_HEADER`], NOT the path: the install's
+/// relay forwards the caller's ORIGINAL path under its tenant (e.g.
+/// `/local/chat`), so the worker accepts ANY path via a fallback handler (any
 /// method, so HTTP verbs and the WS upgrade GET all land here). The one
 /// reserved prefix is the worker's own, `/_weft/`
 /// (`weft_core::route::RESERVED_PREFIX`).
@@ -1429,23 +1429,6 @@ fn watch_for_a_vanished_caller(stream: &tokio::net::TcpStream) -> CallerSocket {
     socket
 }
 
-/// The caller's own query string, with the routing token taken back
-/// out. The token is the hop's, appended to the caller's query when the
-/// dispatcher built the redirect, so what the gate signed is what is
-/// left once it goes.
-fn query_without_routing_token(raw: &str) -> String {
-    raw.split('&')
-        .filter(|kv| !kv.starts_with("wct=") && !kv.is_empty())
-        .collect::<Vec<_>>()
-        .join("&")
-}
-
-/// Pull the `wct` token out of a raw query string (`a=b&wct=...&c=d`).
-fn token_from_query(raw: &str) -> Option<String> {
-    raw.split('&')
-        .find_map(|kv| kv.strip_prefix("wct=").map(|v| v.to_string()))
-}
-
 /// Single-extractor handler: takes the whole request and pulls method,
 /// headers, query, the optional WS upgrade, and the body manually. axum
 /// caps handler arity and forbids combining several query/body extractors,
@@ -1458,7 +1441,12 @@ async fn handle_connect(
 
     // 1. Verify the dispatcher-signed token, and that it is for this
     //    worker's project.
-    let Some(token) = token_from_query(&raw_query) else {
+    let Some(token) = request
+        .headers()
+        .get(caller_token::TICKET_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+    else {
         return (StatusCode::UNAUTHORIZED, "missing routing token").into_response();
     };
     let now = state.clock.now_unix();
@@ -1472,10 +1460,11 @@ async fn handle_connect(
     let execution_id = claims.execution_id;
 
     // 1b. Hold the caller to the request the gate approved, when the
-    //     gate checked anything at all. The door carries the verdict,
-    //     not the request, so without this a caller could pass the gate
-    //     with one request and send a different one down the redirect
-    //     they were handed. For a password-shaped check that changes
+    //     gate checked anything at all. The ticket carries the verdict,
+    //     not the request: a call is passed on in the request the gate
+    //     checked, but a browser's socket opens later at the URL it was
+    //     handed, so without this it could pass the gate with one request
+    //     and open its socket with another. For a password-shaped check that changes
     //     nothing (the answer really was only about who they are); for
     //     a signature it is the whole point, because a signature's
     //     claim is about one exact request.
@@ -1501,12 +1490,13 @@ async fn handle_connect(
             }
         };
         // The path is not compared: it is signed into the claims, so it
-        // is the dispatcher's word either way, and the gateway rewrote
-        // the one on the wire.
+        // is the dispatcher's word either way, and the one on the wire
+        // carries the tenant (or, for a browser's socket, the live door's
+        // project) in front of it.
         let arrived = caller_token::RequestFingerprint::of(
             parts.method.as_str(),
             &approved.path,
-            &query_without_routing_token(&raw_query),
+            &raw_query,
             &bytes,
         );
         if arrived != approved {
@@ -1595,7 +1585,7 @@ async fn handle_connect(
         Protocol::Http => {
             // The method, headers and query were captured by the dispatcher
             // at the handshake and ride in `request`; the worker only
-            // reads the body (the 307 made the caller resend it here).
+            // reads the body, which the dispatcher passes on as it arrives.
             drop(parts);
             drive_http(state, execution_id, config, heartbeat_secs, handshake, journal, body, unattached).await
         }
@@ -1891,7 +1881,7 @@ fn build_response(head: &ResponseHead, body: axum::body::Body) -> Response {
 
 /// What a second HTTP caller on one exchange is told.
 const EXCHANGE_TAKEN: &str = "this exchange already has a caller: a routing token opens one connection, and \
-     following the same redirect twice is not a second one. Ask for a new one.";
+     using it twice does not make a second one. Call the route again.";
 
 /// WebSocket path: bridge the socket to the connection. Spawns the read
 /// pump (decode caller frames -> broadcast inbound), the write pump (drain
@@ -2606,9 +2596,10 @@ mod tests {
     /// The door opens for the call that was made, and for no other.
     ///
     /// The gate runs at the dispatcher and the program runs on the
-    /// worker, with a redirect in between, so without this the caller
-    /// could get a signature checked against one request and then send
-    /// a different one down the redirect they were handed. The token
+    /// worker, and a browser's socket opens at the worker's door after
+    /// the gate checked its plain request, so without this the caller
+    /// could get a signature checked against one request and then open
+    /// its socket with a different one. The token
     /// carries a fingerprint of what was approved; the worker takes the
     /// fingerprint of what actually arrived and compares.
     ///
@@ -2638,14 +2629,11 @@ mod tests {
                 state.clock.now_unix() + 60,
                 Some(approved.clone()),
             );
-            let uri = if query.is_empty() {
-                format!("/chat/room7?wct={token}")
-            } else {
-                format!("/chat/room7?{query}&wct={token}")
-            };
+            let uri = if query.is_empty() { "/chat/room7".to_string() } else { format!("/chat/room7?{query}") };
             let request = axum::http::Request::builder()
                 .method(method)
                 .uri(uri)
+                .header(caller_token::TICKET_HEADER, &token)
                 .header("content-type", "application/json")
                 .body(axum::body::Body::from(body.to_string()))
                 .unwrap();
@@ -2666,10 +2654,9 @@ mod tests {
     /// it opens, and the run is claimed. Without this the test above
     /// would pass just as well on a worker that refused everything.
     ///
-    /// The routing token rides in the query and is the hop's business,
-    /// not the program's, so it is stripped before the fingerprint is
-    /// taken. That strip has to be byte-exact against what the
-    /// dispatcher hashed, which is what this pins.
+    /// The routing token rides a header of its own, so the query the
+    /// worker fingerprints is byte-exact the one the dispatcher hashed,
+    /// which is what this pins.
     #[tokio::test]
     async fn the_approved_request_is_let_through() {
         use tower::ServiceExt as _;
@@ -2684,7 +2671,8 @@ mod tests {
             approving_token(&[], PROJECT, state.clock.now_unix() + 60, Some(approved));
         let request = axum::http::Request::builder()
             .method("POST")
-            .uri(format!("/chat/room7?verbose=1&page=2&wct={token}"))
+            .uri("/chat/room7?verbose=1&page=2")
+            .header(caller_token::TICKET_HEADER, &token)
             .header("content-type", "application/json")
             .body(axum::body::Body::from("{\"say\":\"hi\"}"))
             .unwrap();
@@ -2728,7 +2716,8 @@ mod tests {
         let (token, execution_id) = routing_token(&[], PROJECT, state.clock.now_unix() + 60);
         let request = axum::http::Request::builder()
             .method("POST")
-            .uri(format!("/chat/room7?wct={token}"))
+            .uri("/chat/room7")
+            .header(caller_token::TICKET_HEADER, &token)
             .body(axum::body::Body::from("{}"))
             .unwrap();
         // No resolver answers here (the drive is a recording), so the
@@ -2771,7 +2760,8 @@ mod tests {
         let (token, _) = routing_token(&[], PROJECT, state.clock.now_unix() + 60);
         let request = axum::http::Request::builder()
             .method("POST")
-            .uri(format!("/chat/room7?wct={token}"))
+            .uri("/chat/room7")
+            .header(caller_token::TICKET_HEADER, &token)
             .body(axum::body::Body::from("{}"))
             .unwrap();
         let response = connection_router(state).oneshot(request).await.unwrap();
@@ -2792,7 +2782,8 @@ mod tests {
         let (token, _) = routing_token(&[], PROJECT, state.clock.now_unix() - 1);
         let request = axum::http::Request::builder()
             .method("POST")
-            .uri(format!("/chat/room7?wct={token}"))
+            .uri("/chat/room7")
+            .header(caller_token::TICKET_HEADER, &token)
             .body(axum::body::Body::from("{}"))
             .unwrap();
         let response = connection_router(state).oneshot(request).await.unwrap();
@@ -2812,7 +2803,8 @@ mod tests {
         let (token, _) = routing_token(&[], uuid::Uuid::from_u128(0xbad), state.clock.now_unix() + 60);
         let request = axum::http::Request::builder()
             .method("GET")
-            .uri(format!("/feed?wct={token}"))
+            .uri("/feed")
+            .header(caller_token::TICKET_HEADER, &token)
             .body(axum::body::Body::empty())
             .unwrap();
         let response = connection_router(state).oneshot(request).await.unwrap();

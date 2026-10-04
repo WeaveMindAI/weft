@@ -303,7 +303,7 @@ async fn tick_project(
                 let why = match reading {
                     Some(weft_platform_traits::UnitRunState::NotReady { why })
                     | Some(weft_platform_traits::UnitRunState::Failed { why }) => why.clone(),
-                    Some(weft_platform_traits::UnitRunState::Starting) => "still starting".into(),
+                    Some(weft_platform_traits::UnitRunState::Starting { step }) => format!("still starting ({step})"),
                     Some(weft_platform_traits::UnitRunState::Stopped) => "stopped outside weft".into(),
                     Some(weft_platform_traits::UnitRunState::Ready) => "ready".into(),
                     None => "the host no longer reports it".into(),

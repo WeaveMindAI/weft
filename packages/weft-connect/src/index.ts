@@ -8,3 +8,4 @@ export * from './core/wire';
 export * from './core/recipe';
 export * from './core/transport';
 export * from './core/consent';
+export * from './core/socket';

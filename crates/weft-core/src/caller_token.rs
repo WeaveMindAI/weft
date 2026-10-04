@@ -99,6 +99,12 @@ impl SignedClaims for CallerTokenClaims {
     }
 }
 
+/// The header a ticket reaches a worker in. Only weft's own door sets it,
+/// on the hop to the worker: a caller never holds a ticket for a call
+/// answered in one request, and the one a browser's socket was handed
+/// rides its URL to the door, which moves it here.
+pub const TICKET_HEADER: &str = "x-weft-caller-ticket";
+
 /// Mint a signed routing token. `secret` is the install's dispatcher
 /// signing key (same provisioning path as the broker / storage HMAC
 /// secrets).
@@ -122,8 +128,8 @@ pub fn validate(secret: &[u8], token: &str, now_unix: i64) -> Result<CallerToken
 pub fn refusal(why: &str) -> String {
     format!(
         "this connection ticket is no good ({why}). Ask for a new one at the \
-         address you called first and follow where it points: a ticket lasts \
-         a couple of minutes and opens one connection."
+         route's address and open the socket at the URL it answers: a ticket \
+         lasts a couple of minutes and opens one connection."
     )
 }
 

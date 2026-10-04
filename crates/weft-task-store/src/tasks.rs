@@ -1174,10 +1174,28 @@ pub struct CallerNeverArrived {
 /// run claimed in between (even one put back pending since) is never
 /// erased.
 pub fn never_arrived_sql(now: &str) -> String {
-    format!(
-        "(kind = 'execute' AND status = 'pending' AND target_replica IS NULL AND {AWAITS_CALLER} \
-          AND (payload -> 'live_connection' ->> 'arrive_by')::bigint < {now})"
-    )
+    format!("({} AND (payload -> 'live_connection' ->> 'arrive_by')::bigint < {now})", unclaimed_live_sql())
+}
+
+/// The task row (`task`, unqualified) of a live run born for a caller that
+/// no worker has claimed, whatever its deadline: what a handshake whose
+/// call never reached a worker erases at once ([`never_arrived_sql`] is
+/// the same row once its deadline passed).
+pub fn unclaimed_live_sql() -> String {
+    format!("(kind = 'execute' AND status = 'pending' AND target_replica IS NULL AND {AWAITS_CALLER})")
+}
+
+/// Which unclaimed live runs an erase may take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnclaimedLiveRun {
+    /// One whose caller never came by its deadline, as of `now`
+    /// ([`never_arrived_sql`]): the reaper's.
+    PastDeadline { now: i64 },
+    /// One the handshake that bore it could not pass to any worker
+    /// ([`unclaimed_live_sql`]): nobody holds a ticket for it, so it is
+    /// erased at once rather than holding its entry slot until the
+    /// deadline.
+    NeverPassedOn,
 }
 
 /// Every live run whose caller never came ([`CallerNeverArrived`],

@@ -389,9 +389,14 @@ its own, `WEFT_ROUTE_KEY` unless the brief names another, and send it as
 `X-Api-Key: <key>` (or `Authorization: Bearer <key>`). For any other gate,
 the gate's own description names the header.
 
-Call a route with a plain server `fetch`: a live route answers `307` to
-send the caller to the worker serving it, and `fetch` follows that by
-itself. Never follow it by hand and never set `redirect: 'manual'`.
+Call a route with a plain server `fetch`.
+
+A page holding a socket open reconnects whenever the socket closes, sending
+the session id the program reads its state back by: on a cloud install a
+connection lasts an hour at most, and phones drop them sooner. The connect
+library's `openLiveSocket` does exactly that (the session rides the
+`session` query parameter, and the program closing with code `4000` ends it for good);
+it opens at `WEFT_PUBLIC_URL`, since the pass-through carries no sockets.
 
 A route counts calls per caller, 60 a minute by default, and the server is
 one caller. A page that polls about once a second sits exactly at that
@@ -538,8 +543,7 @@ The shape, unless the user asks for another:
   `/signal-token/`, `http://127.0.0.1:14111` on a local install) goes in the
   server's environment and nowhere a page can read it. The pass-through
   forwards only `/instance/`, `/signal/`, `/signal-token/`, the program's
-  own routes (`/connect/<tenant>/<path>`, following the route's redirect to
-  the worker itself) and the picture links in their answers
+  own routes (`/connect/<tenant>/<path>`) and the picture links in their answers
   (`/public/files/<token>`), carries the caller's token and body, and keeps the
   site's cookies and the `Weft-Instance` header back. A page fetches
   `/weft/signal-token/displays` with the instance token as bearer, calls a

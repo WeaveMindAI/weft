@@ -1560,18 +1560,24 @@ impl Journal for PostgresJournal {
         Ok(removed)
     }
 
-    async fn erase_unclaimed_live_run(&self, execution_id: ExecutionId, task_id: uuid::Uuid, now: i64) -> anyhow::Result<bool> {
+    async fn erase_unclaimed_live_run(
+        &self,
+        execution_id: ExecutionId,
+        which: weft_task_store::tasks::UnclaimedLiveRun,
+    ) -> anyhow::Result<bool> {
+        use weft_task_store::tasks::UnclaimedLiveRun;
         let mut tx = self.pool.begin().await?;
         weft_journal::lock_execution_ids(&mut tx, &[execution_id]).await?;
-        let unclaimed = sqlx::query(&format!(
-            "DELETE FROM task WHERE id = $1 AND {}",
-            weft_task_store::tasks::never_arrived_sql("$2")
-        ))
-            .bind(task_id)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+        let condition = match which {
+            UnclaimedLiveRun::PastDeadline { .. } => weft_task_store::tasks::never_arrived_sql("$2"),
+            UnclaimedLiveRun::NeverPassedOn => weft_task_store::tasks::unclaimed_live_sql(),
+        };
+        let erase = format!("DELETE FROM task WHERE execution_id = $1 AND {condition}");
+        let mut erase = sqlx::query(&erase).bind(execution_id.to_string());
+        if let UnclaimedLiveRun::PastDeadline { now } = which {
+            erase = erase.bind(now);
+        }
+        let unclaimed = erase.execute(&mut *tx).await?.rows_affected();
         if unclaimed == 0 {
             return Ok(false);
         }

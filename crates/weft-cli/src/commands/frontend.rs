@@ -57,9 +57,22 @@ pub async fn run(ctx: Ctx, action: FrontendAction) -> Result<()> {
             // install, before anything has run there, and it needs only
             // the project to exist, not a build of it.
             super::ensure::ensure_project_known(&ctx).await?;
+            let hosted = body.host == FrontendHost::CloudRun;
+            let asked = serde_json::to_value(&body)?;
+            let made = client.post_json(&base, &asked);
+            // A hosted frontend's service takes Cloud Run a minute or two
+            // to make, and the call answers only once it is ready.
+            let made = if hosted {
+                eprintln!("making the frontend's Cloud Run service (this takes a minute or two)");
+                crate::progress::while_waiting(made, std::time::Duration::from_secs(15), async |elapsed| {
+                    eprintln!("still making the frontend's Cloud Run service ({}s so far)", elapsed.as_secs())
+                })
+                .await
+            } else {
+                made.await
+            };
             let made: FrontendWithToken =
-                serde_json::from_value(client.post_json(&base, &serde_json::to_value(&body)?).await?)
-                    .context("read the frontend the install made")?;
+                serde_json::from_value(made?).context("read the frontend the install made")?;
             hand_over(&ctx, &project, &install_url, made)?;
         }
         FrontendAction::Token { name, done: None } => {

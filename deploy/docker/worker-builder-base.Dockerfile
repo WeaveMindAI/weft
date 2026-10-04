@@ -137,8 +137,9 @@ COPY crates ./crates
 # per-project build COPYs its own crate and node sources to the same
 # paths, and leftovers from the stock worker (a package the project
 # removed, a slot it no longer has) would sit beside them. Cargo judges
-# freshness by path and mtime, and the staging mirrors the sources'
-# mtimes, so the rlibs stay fresh for the files the project puts back.
+# freshness by path and mtime, and the staging gives every package file
+# one fixed date (`build::package_source_mtime`), so the rlibs stay fresh
+# for the files a project puts back, whichever checkout it stages from.
 COPY .weft-warmup /work
 COPY project-nodes /weft/project-nodes
 COPY worker-builder-base-split.sh /usr/local/bin/weft-split-artifacts

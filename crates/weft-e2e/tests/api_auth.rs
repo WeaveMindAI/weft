@@ -120,51 +120,6 @@ async fn api_keys_and_a_signing_secret_gate_their_routes() -> anyhow::Result<()>
     .await?;
     assert_eq!(status, 401, "a replay outside the window is refused");
 
-    // The gate and the program are not the same machine. The gate runs
-    // at the dispatcher, which answers a route with a redirect to the
-    // worker, so a caller can have one request checked and then send a
-    // different one down the redirect they were handed. A signature
-    // says nothing about who you are and everything about one exact
-    // request, so if that worked, signing anything would sign
-    // everything.
-    //
-    // The worker refuses it. The token it was given carries a
-    // fingerprint of the request the gate approved, and the worker
-    // takes the fingerprint of what actually arrived.
-    let good = serde_json::to_vec(&json!({ "text": "pay 1" }))?;
-    let now = chrono::Utc::now().timestamp();
-    let signature = sign(now, &good)?;
-    let ts = now.to_string();
-    let headers = [
-        ("content-type", "application/json"),
-        ("x-signature", signature.as_str()),
-        ("x-timestamp", ts.as_str()),
-    ];
-    let (status, body) = live::redirect_then_send(
-        &disp,
-        Method::POST,
-        &signed,
-        &headers,
-        good.clone(),
-        serde_json::to_vec(&json!({ "text": "pay 1000000" }))?,
-    )
-    .await?;
-    assert_eq!(
-        status, 403,
-        "the door was opened for another call: {}",
-        String::from_utf8_lossy(&body)
-    );
-
-    // The same two hops with the request that was actually approved:
-    // it goes through. Without this the check above would pass just as
-    // well on a worker that refused every redirected call.
-    let (status, body) =
-        live::redirect_then_send(&disp, Method::POST, &signed, &headers, good.clone(), good)
-            .await?;
-    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
-    let v: Value = serde_json::from_slice(&body)?;
-    assert_eq!(v, json!({ "caller": {}, "text": "pay 1" }));
-
     project.finish().await?;
     keys.finish().await?;
     secret.finish().await

@@ -114,7 +114,12 @@ folder:
    this repository a new token (the old one works until the workflow's next
    run deploys the new one and retires it) and names its service. Every run mints new ones, so it runs once per setup, or again
    when a CI credential was lost. Without `--github` it prints them, and
-   the secrets are shown only that once.
+   the secrets are shown only that once. It also lists every connection the
+   program needs that prod has no pick for yet: the workflow cannot turn
+   the program on until those are picked (step 5).
+5. Pick the program's connections on prod, every access node, before the
+   workflow's first run ([Connections](#connections) below says how). A
+   node connected on this machine has nothing picked on prod.
 
 If the project has a frontend (`front/Dockerfile`), register it on the
 install between steps 3 and 4 (next section). A project with no frontend
@@ -252,8 +257,20 @@ connection each access node uses is picked on the install, never written in
 the source. A node connected on this machine has no pick on prod until one
 is made there: `weft connect --on prod --node <node> --list` shows prod's
 stored connections, `--grant <id>` picks one (a live trigger reading it is
-set up again), and a connection prod does not hold yet is the user's to
-add, with the command you hand them (`weft connect --on prod --node <node>`).
+set up again).
+
+A connection prod does not hold yet is added one of two ways:
+
+- **A key the project issued itself**, kept in the project's own `.env`
+  (the key that guards its own API, a webhook signing secret): the
+  deployer stores it without ever reading it, by loading `.env` into the
+  command's environment and naming the variable, so the value goes from
+  the file to the install and never through the chat:
+  `set -a; . ./.env; set +a; weft connect --on prod --node <node> --door own --set-env <field>=<VARIABLE>`.
+- **A person's own account** (a sign-in, a key a provider gave the user):
+  the user adds it, with the command you hand them (`weft connect --on prod
+  --node <node>`).
+
 A run on prod that reaches a node with nothing picked there is refused
 before it starts, naming that command.
 

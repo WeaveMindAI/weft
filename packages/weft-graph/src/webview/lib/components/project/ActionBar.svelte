@@ -252,12 +252,17 @@
 			}
 			case 'infra_wait': {
 				// The heartbeat of an unbounded wait (fires for start,
-				// stop, and terminate alike): show which verb waits and
-				// for how long, so a stuck state stays legible.
+				// stop, and terminate alike): show which verb waits, for
+				// how long, and what each copy starting is doing now, so a
+				// stuck state stays legible.
+				// SYNC: the infra_wait detail <-> crates/weft-cli/src/progress.rs (Progress::infra_wait)
 				const which = typeof detail?.verb === 'string' ? ` ${detail.verb}` : '';
 				const elapsed =
 					typeof detail?.elapsedSeconds === 'number' ? ` (${detail.elapsedSeconds}s)` : '';
-				return `Waiting for infra${which}${elapsed}...`;
+				const doing = Array.isArray(detail?.doing)
+					? detail.doing.filter((d: unknown): d is string => typeof d === 'string')
+					: [];
+				return `Waiting for infra${which}${elapsed}${doing.length ? `: ${doing.join('; ')}` : '...'}`;
 			}
 		}
 		// Default: derive from the verb. Covers the dispatcher-call

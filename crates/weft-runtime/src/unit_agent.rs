@@ -119,8 +119,13 @@ struct Host {
     local: std::sync::Arc<weft_platform_local::LocalInfraHost>,
     tokens: std::sync::Arc<weft_platform_gcp::MetadataTokens>,
     registry: String,
-    /// One apply at a time.
-    applying: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Held for the whole of an apply, so one runs at a time and `observe`
+    /// can tell one is running; holds why the last one failed, until one
+    /// succeeds.
+    applying: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
+    /// Applies asked for that have not taken `applying` yet: a look counts
+    /// them as running, so none falls between one apply and the next.
+    queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Host {
@@ -142,12 +147,35 @@ impl Host {
         Ok(())
     }
 
-    async fn apply(&self) -> anyhow::Result<()> {
-        let _one = self.applying.lock().await;
-        self.login().await?;
-        let a = Self::assignment().await?;
-        use weft_platform_traits::InfraHost as _;
-        self.local.apply_unit(&a.node, &a.unit).await
+    /// Apply the machine's unit in a task of its own, one apply at a time.
+    /// It counts as running from before this returns (`queued`, then
+    /// `applying`), so a look right after already sees the unit starting
+    /// rather than what ran before. A failure is the unit's state on every
+    /// look until an apply succeeds, or until the unit runs whole as asked
+    /// anyway (a failed boot apply over containers Docker brought back).
+    fn apply_in_background(&self) {
+        use std::sync::atomic::Ordering;
+        self.queued.fetch_add(1, Ordering::SeqCst);
+        let host = self.clone();
+        tokio::spawn(async move {
+            let mut last_failure = host.applying.clone().lock_owned().await;
+            host.queued.fetch_sub(1, Ordering::SeqCst);
+            let applied = async {
+                host.login().await?;
+                let a = Self::assignment().await?;
+                use weft_platform_traits::InfraHost as _;
+                host.local.apply_unit(&a.node, &a.unit).await
+            };
+            // A panic is a failure too, never one the next look forgets.
+            let applied = match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(applied)).await {
+                Ok(applied) => applied,
+                Err(_) => Err(anyhow::anyhow!("the apply panicked; the agent's log has where")),
+            };
+            if let Err(e) = &applied {
+                tracing::error!(target: "weft_runtime::unit_agent", error = %format!("{e:#}"), "could not bring the unit up");
+            }
+            *last_failure = applied.err().map(|e| format!("{e:#}"));
+        });
     }
 }
 
@@ -179,6 +207,7 @@ pub async fn host() -> anyhow::Result<()> {
         tokens: std::sync::Arc::new(weft_platform_gcp::MetadataTokens::new()),
         registry,
         applying: std::sync::Arc::default(),
+        queued: std::sync::Arc::default(),
     };
     let ip = metadata("network-interfaces/0/ip").await?;
     let door = crate::guard::CoreOnly {
@@ -190,17 +219,22 @@ pub async fn host() -> anyhow::Result<()> {
         audiences: std::sync::Arc::new(vec![format!("http://{}:{UNIT_AGENT}", ip.trim())]),
     };
 
-    // The unit comes up with the machine; a failure is reported on the
-    // next look (`observe`) and the next apply tries again.
-    if let Err(e) = host.apply().await {
-        tracing::error!(target: "weft_runtime::unit_agent", error = %format!("{e:#}"), "could not bring the unit up");
-    }
+    // The unit comes up with the machine, in the background: the agent
+    // answers from the start, so weft can say what the machine is doing
+    // while its images download (`observe`).
+    host.apply_in_background();
 
     let err = |e: anyhow::Error| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
     let app = Router::new()
+        // Answered at once: pulling a unit's images takes longer than any
+        // one call to the agent may, and a call cut short would drop the
+        // apply half done. How it goes is read off `observe`.
         .route(HOST_APPLY, post({
             let host = host.clone();
-            move || async move { host.apply().await.map_err(err) }
+            move || async move {
+                host.apply_in_background();
+                axum::http::StatusCode::ACCEPTED
+            }
         }))
         .route(HOST_RESTART, post({
             let host = host.clone();
@@ -215,7 +249,34 @@ pub async fn host() -> anyhow::Result<()> {
             move || async move {
                 use weft_platform_traits::InfraHost as _;
                 let a = Host::assignment().await.map_err(err)?;
-                host.local.observe(&a.node.node.tenant, a.node.node.project).await.map(Json).map_err(err)
+                let mut seen = host.local.observe(&a.node.node.tenant, a.node.node.project).await.map_err(err)?;
+                // While an apply runs, that is the unit's state, whatever
+                // containers are there: one still running from before would
+                // read as a ready unit that is not the one asked for. After
+                // one failed, so is the failure, unless the unit runs whole
+                // as asked anyway (Docker brought its containers back).
+                let ours = |o: &weft_platform_traits::UnitObservation| o.copy_id == a.node.node.copy_id && o.unit == a.unit;
+                let wanted = a.node.unit(&a.unit).map(|u| u.hash.clone()).unwrap_or_default();
+                let queued = host.queued.load(std::sync::atomic::Ordering::SeqCst) > 0;
+                let idle = host.applying.try_lock().ok().filter(|_| !queued).map(|last_failure| last_failure.clone());
+                let state = match idle {
+                    Some(Some(_)) if host.local.runs_whole(&a.node, &a.unit).await.map_err(err)? => None,
+                    Some(last_failure) => last_failure.map(|why| weft_platform_traits::UnitRunState::Failed { why }),
+                    None if !seen.iter().any(ours) => {
+                        Some(weft_platform_traits::UnitRunState::Starting { step: "its images are downloading".into() })
+                    }
+                    None => Some(weft_platform_traits::UnitRunState::Starting { step: "its new version is starting".into() }),
+                };
+                if let Some(state) = state {
+                    seen.retain(|o| !ours(o));
+                    seen.push(weft_platform_traits::UnitObservation {
+                        copy_id: a.node.node.copy_id.clone(),
+                        unit: a.unit.clone(),
+                        hash: wanted,
+                        state,
+                    });
+                }
+                Ok::<_, (axum::http::StatusCode, String)>(Json(seen))
             }
         }))
         .route(HOST_LOGS, axum::routing::get({

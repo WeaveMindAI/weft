@@ -83,6 +83,24 @@ docker run -d --name weft-host-agent --restart always --network host \
   "$image" unit-agent host
 "#;
 
+/// How long a machine may take from starting to its agent answering. A
+/// machine boots and starts its agent in about a minute; this leaves room
+/// for a slow one.
+const BOOT_WINDOW: chrono::TimeDelta = chrono::TimeDelta::minutes(10);
+
+/// What a running machine whose agent does not answer is doing: still
+/// booting while it started less than [`BOOT_WINDOW`] ago (`last_start`,
+/// Compute Engine's `lastStartTimestamp`), otherwise not ready, with why.
+fn agent_silent(last_start: Option<&str>, now: chrono::DateTime<chrono::Utc>, e: &anyhow::Error) -> UnitRunState {
+    let silent = |also: String| UnitRunState::NotReady { why: format!("its machine's agent does not answer{also}: {e:#}") };
+    let Some(at) = last_start else { return silent(String::new()) };
+    match chrono::DateTime::parse_from_rfc3339(at) {
+        Ok(at) if now.signed_duration_since(at) < BOOT_WINDOW => UnitRunState::Starting { step: "its machine is booting".into() },
+        Ok(_) => silent(String::new()),
+        Err(parse) => silent(format!(" (and when it started, '{at}', does not read: {parse})")),
+    }
+}
+
 pub struct ComputeInfraHost {
     google: Google,
     gcp: GcpPlatform,
@@ -629,10 +647,14 @@ impl InfraHost for ComputeInfraHost {
             match m.get("status").and_then(Value::as_str) {
                 Some("RUNNING") => match self.agent(&m, reqwest::Method::GET, HOST_OBSERVE).await {
                     Ok(resp) => out.extend(resp.json::<Vec<UnitObservation>>().await?),
-                    // Booting: the agent is not up yet.
-                    Err(e) => out.push(at(UnitRunState::NotReady { why: format!("its machine's agent does not answer yet: {e:#}") })),
+                    // Its agent answers as soon as the machine has booted, and
+                    // says from there what it is doing; past a boot's time,
+                    // an agent that does not answer is a fault to name.
+                    Err(e) => out.push(at(agent_silent(m.get("lastStartTimestamp").and_then(Value::as_str), chrono::Utc::now(), &e))),
                 },
-                Some("PROVISIONING" | "STAGING") => out.push(at(UnitRunState::Starting)),
+                Some("PROVISIONING" | "STAGING") => {
+                    out.push(at(UnitRunState::Starting { step: "Compute Engine is creating its machine".into() }))
+                }
                 Some("REPAIRING") => out.push(at(UnitRunState::NotReady { why: "Compute Engine is repairing its machine".into() })),
                 _ => out.push(at(UnitRunState::Stopped)),
             }
@@ -723,6 +745,20 @@ mod tests {
 
     fn unit(machine: MachineShape) -> ResolvedUnit {
         ResolvedUnit { unit: Unit { name: "main".into(), machine, ..Default::default() }, hash: "h".into() }
+    }
+
+    /// A silent agent is a booting machine only for a boot's time after
+    /// the machine started; later it is a fault, named with what failed.
+    #[test]
+    fn a_silent_agent_is_booting_only_just_after_its_machine_started() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-04T10:00:00Z").unwrap().with_timezone(&chrono::Utc);
+        let e = anyhow::anyhow!("connection refused");
+        assert!(matches!(agent_silent(Some("2026-10-04T09:58:00.000-00:00"), now, &e), UnitRunState::Starting { .. }));
+        match agent_silent(Some("2026-10-04T08:00:00Z"), now, &e) {
+            UnitRunState::NotReady { why } => assert!(why.contains("connection refused"), "{why}"),
+            other => panic!("an agent silent hours after its start is a fault: {other:?}"),
+        }
+        assert!(matches!(agent_silent(None, now, &e), UnitRunState::NotReady { .. }), "no start time read, no excuse");
     }
 
     #[test]

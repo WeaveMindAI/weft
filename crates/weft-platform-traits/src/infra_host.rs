@@ -16,8 +16,10 @@ use weft_core::infra::{NodeRef, ResolvedNode};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UnitRunState {
-    /// Being created or started; not ready yet.
-    Starting,
+    /// Being created or started; not ready yet. `step` says what is
+    /// happening now (the machine being made, the images downloading),
+    /// which is what a person watching a slow start reads.
+    Starting { step: String },
     /// Running and every readiness check passes.
     Ready,
     /// Running, but a readiness check fails (or has not passed yet).
@@ -290,7 +292,7 @@ mod tests {
     #[test]
     fn a_unit_state_round_trips() {
         for s in [
-            UnitRunState::Starting,
+            UnitRunState::Starting { step: "pulling".into() },
             UnitRunState::Ready,
             UnitRunState::NotReady { why: "probe".into() },
             UnitRunState::Stopped,

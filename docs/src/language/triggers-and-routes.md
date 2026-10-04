@@ -89,6 +89,44 @@ in memory and still unable to wait.
 `Socket` is the same idea for a WebSocket: the caller connects, your program
 runs, and the two talk until one of them stops.
 
+A client that can send headers (a server, a script, an app) opens its socket at
+the route's address and is checked like any other call. A browser can't put a
+credential on a socket's opening request, so on a route that checks callers it
+asks first with a plain `GET`, which carries the credential, and gets back
+`{"url": "...", "protocol": "websocket"}`; it opens its socket at that `url`
+within a couple of minutes.
+
+**On a cloud install, one connection lasts an hour at most.** Google cuts any
+request to weft at 60 minutes, and an open socket is one long request, so a
+socket (or a streaming answer) that is still open then is closed. A connection
+can also drop sooner for ordinary reasons: a phone changing networks, a laptop
+going to sleep. When it does, the route's `outlivesCaller` decides what
+happens to the run: off (the default), the run stops; on, it carries on and
+what it sends goes nowhere.
+
+So if you want a conversation to last longer than one connection, keep what it
+needs outside the run, and have the client reconnect:
+
+- the client picks a session id once (or the program hands it one in its
+  first message) and sends it on every connection, as a query parameter or in
+  the first message;
+- the program keeps the conversation's state in its own storage, keyed by that
+  id (a table in the project's Postgres, a file), and reads it back when a
+  connection arrives with an id it knows;
+- the client reconnects whenever its socket closes, with the same id.
+
+Each connection is then its own run, and losing one, at the hour or before,
+loses nothing the conversation needs. If your client is a web page, the
+connect library's `openLiveSocket` does the client's half: it keeps the
+session id, sends it as the `session` query parameter on every connection
+(your program reads it off the trigger's `query` port), and reconnects until
+the page closes the socket, your program closes it with code `4000`, which
+means the conversation is over (a run that simply ends closes with `1000`,
+and that ends only its connection), or, when the page passes credentials,
+the route refuses them. A browser is told nothing about a socket refused at
+its opening (it sees only that it closed), so a socket opened without
+credentials keeps trying, at most every 15 seconds.
+
 ## Which triggers need a public address
 
 Only the ones a provider **pushes** to.

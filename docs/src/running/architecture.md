@@ -61,12 +61,15 @@ belongs to, writes it down, and hands it to
 a worker, which fetches your program by its hash and runs the graph, writing
 what happens into [the journal](the-journal.md) as it goes.
 
-An HTTP or WebSocket caller asks the dispatcher first, at `/connect/...`. The
-dispatcher checks the caller and sends them on to `/live/<project>/...` with a
-signed ticket. When the caller arrives there, the dispatcher forwards the
-connection to one of the program's workers, which claims the run itself and
-drives it with the caller attached. For more, go and read
-[putting it on a URL](../build/public-address.md).
+An HTTP or WebSocket caller calls the dispatcher at `/connect/...`. The
+dispatcher checks the caller, starts their run and passes the call, in that
+same request, to one of the program's workers, which claims the run and
+drives it with the caller attached. The dispatcher stays in the middle,
+passing bytes both ways, because workers are never reachable from outside.
+A browser can't put a credential on a WebSocket's opening request, so a
+browser asks with a plain request first and gets back an address under
+`/live/<project>/...` carrying a signed ticket, which it opens its socket at.
+For more, go and read [putting it on a URL](../build/public-address.md).
 
 ## The worker
 

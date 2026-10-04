@@ -346,12 +346,16 @@ impl Progress {
         self.emit(Phase::TriggerRegisterStart, None);
     }
 
-    pub fn infra_wait(&self, verb: &str, elapsed_seconds: u64) {
+    /// Still waiting on an infra verb, and what the copies starting under
+    /// it are doing now (`weft infra status`'s progress lines), when any.
+    /// SYNC: the infra_wait detail <-> packages/weft-graph/src/webview/lib/components/project/ActionBar.svelte (infra_wait)
+    pub fn infra_wait(&self, verb: &str, elapsed_seconds: u64, doing: &[String]) {
         self.emit(
             Phase::InfraWait,
             Some(serde_json::json!({
                 "verb": verb,
                 "elapsedSeconds": elapsed_seconds,
+                "doing": doing,
             })),
         );
     }
@@ -460,7 +464,17 @@ fn human_line(ev: &Event<'_>) -> Option<String> {
                 .and_then(|d| d.get("elapsedSeconds"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            format!("still waiting on infra {verb} (elapsed {elapsed}s; Ctrl+C to back out)")
+            let doing: Vec<&str> = ev
+                .detail
+                .and_then(|d| d.get("doing"))
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            let mut line = format!("still waiting on infra {verb} (elapsed {elapsed}s; Ctrl+C to back out)");
+            for d in doing {
+                line.push_str(&format!("\n  {d}"));
+            }
+            line
         }
         Phase::Warning => format!(
             "warning: {}",
@@ -484,6 +498,27 @@ fn human_line(ev: &Event<'_>) -> Option<String> {
         // Done counterparts and the catch-alls are silent in human mode.
         _ => return None,
     })
+}
+
+/// `work`'s answer. Every `every` until it comes, `look` runs with how long
+/// it has been, to say what is happening meanwhile: a call that takes
+/// minutes is never silent. The one shape of every such wait (a build, an
+/// infra start, a frontend's service), so each says what it sees and
+/// nothing else.
+pub async fn while_waiting<T>(
+    work: impl std::future::Future<Output = T>,
+    every: std::time::Duration,
+    mut look: impl AsyncFnMut(std::time::Duration),
+) -> T {
+    let started = std::time::Instant::now();
+    let mut work = std::pin::pin!(work);
+    let mut timer = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    loop {
+        tokio::select! {
+            done = &mut work => return done,
+            _ = timer.tick() => look(started.elapsed()).await,
+        }
+    }
 }
 
 #[cfg(test)]

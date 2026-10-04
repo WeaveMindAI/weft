@@ -339,7 +339,15 @@ async fn infra_sync(
         wait_for_command(progress, &handle.client, &handle.id, issued.command_id, "upgrade").await?;
         infra_status_of(&handle.client, &handle.id).await?
     } else {
-        let answer = handle.client.post_json(&path, &serde_json::to_value(&sync)?).await?;
+        // The sync answers once every copy is up, which on a cloud install
+        // is minutes of a machine booting: say what each is doing meanwhile.
+        let body = serde_json::to_value(&sync)?;
+        let answer = crate::progress::while_waiting(
+            handle.client.post_json(&path, &body),
+            std::time::Duration::from_secs(10),
+            async |elapsed| progress.infra_wait("start", elapsed.as_secs(), &starting_now(&handle.client, &handle.id).await),
+        )
+        .await?;
         progress.dispatcher_call_done(serde_json::json!({ "project_id": handle.id }));
         serde_json::from_value(answer).context("read the infra status the sync answered")?
     };
@@ -484,7 +492,7 @@ async fn wait_for_command(
         }
         let now = std::time::Instant::now();
         if now >= next_breadcrumb {
-            progress.infra_wait(verb, (now - start).as_secs());
+            progress.infra_wait(verb, (now - start).as_secs(), &starting_now(client, project_id).await);
             next_breadcrumb = now + breadcrumb_every;
         }
     }
@@ -612,6 +620,27 @@ async fn infra_status(ctx: &Ctx) -> Result<()> {
         eprintln!("warning: {note}");
     }
     Ok(())
+}
+
+/// What each copy still starting is doing, one line each, for a wait's
+/// breadcrumb; a status that cannot be read is that one line instead.
+async fn starting_now(client: &crate::client::DispatcherClient, project_id: &str) -> Vec<String> {
+    let status = match infra_status_of(client, project_id).await {
+        Ok(status) => status,
+        Err(e) => return vec![format!("cannot read what each copy is doing ({e:#}); the wait goes on")],
+    };
+    status
+        .nodes
+        .iter()
+        .filter_map(|n| {
+            let progress = n.progress.as_ref()?;
+            let node = match &n.instance {
+                Some(instance) => format!("{} (instance {instance})", n.node),
+                None => n.node.clone(),
+            };
+            Some(format!("{node}: {}", progress.describe_now()))
+        })
+        .collect()
 }
 
 /// Every infra copy of the project, and its state.

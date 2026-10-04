@@ -112,8 +112,7 @@ impl DispatcherClient {
         let completing = status == reqwest::StatusCode::CONFLICT
             && resp.headers().contains_key(weft_core::storage::COMPLETING_HEADER);
         let body = resp.text().await.unwrap_or_default();
-        let msg = body.trim();
-        let msg = if msg.is_empty() { format!("dispatcher returned {status}") } else { msg.to_string() };
+        let msg = refusal_text(&body).unwrap_or_else(|| format!("dispatcher returned {status}"));
         if completing {
             return Err(anyhow::Error::new(StoreCompleting).context(msg));
         }
@@ -258,3 +257,34 @@ impl DispatcherClient {
     }
 }
 
+
+/// What a refusal's body says, as lines a person reads: a structured
+/// refusal (`{"errors": [...]}`, the shape every validation answers
+/// with) one error per line, any other body as it came. `None` when the
+/// body is empty.
+pub(crate) fn refusal_text(body: &str) -> Option<String> {
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+    match serde_json::from_str::<weft_core::run_spec::Refusal>(body) {
+        Ok(refusal) if !refusal.is_empty() => Some(refusal.to_string()),
+        _ => Some(body.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refusal_text;
+
+    #[test]
+    fn a_structured_refusal_reads_as_its_errors() {
+        assert_eq!(
+            refusal_text(r#"{"errors":["'keys' has no connection picked","'db' is not running"]}"#).as_deref(),
+            Some("'keys' has no connection picked\n'db' is not running")
+        );
+        assert_eq!(refusal_text("project is already activating").as_deref(), Some("project is already activating"));
+        assert_eq!(refusal_text(r#"{"errors":[]}"#).as_deref(), Some(r#"{"errors":[]}"#));
+        assert_eq!(refusal_text("  \n"), None);
+    }
+}

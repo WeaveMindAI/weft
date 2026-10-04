@@ -1,16 +1,16 @@
 //! Connecting to the install's database. Every pool weft opens comes from
-//! here, so every one lets go of a connection it has not used for
-//! [`IDLE_CLOSE`]: a database that scales to zero (a serverless Postgres)
-//! sleeps only once no connection to it is open, and a pool that kept its
-//! idle connections would keep it up long after the last request.
+//! here, and keeps its connections for as long as the process runs: each
+//! process that reaches the database already holds one connection open
+//! for its whole life to hear the database's announcements
+//! (`crate::pg_signal`), so a database that sleeps once nobody is
+//! connected (a serverless Postgres) can only sleep once the process is
+//! gone, and closing the pool's idle connections earlier would only make
+//! the next call open new ones (an encrypted handshake and a sign-in).
 
 use std::time::Duration;
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Connection;
-
-/// How long a pool keeps a connection nothing uses.
-pub const IDLE_CLOSE: Duration = Duration::from_secs(30);
 
 /// How long a connection may have sat idle before it is pinged on its way
 /// out of the pool. A connection a request just handed back goes straight
@@ -46,7 +46,7 @@ pub fn options(max_connections: u32, acquire_timeout: Duration) -> PgPoolOptions
     PgPoolOptions::new()
         .max_connections(max_connections)
         .min_connections(0)
-        .idle_timeout(IDLE_CLOSE)
+        .idle_timeout(None)
         .acquire_timeout(acquire_timeout)
         .test_before_acquire(false)
         .before_acquire(|conn, meta| {
