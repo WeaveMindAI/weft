@@ -316,9 +316,11 @@ stdlib's `nodes/base_catalog/ai/fal/fal.rs` (`run_queued`) for a whole worked ca
 
 You emit only through `ctx.pulse_downstream(NodeOutput::new().set(port, value))`;
 ports you did not emit are closed, which is the skip signal downstream. For
-user-added output ports use `ctx.fan_declared(...)`. A step never runs twice
-by itself: if the worker dies while a body runs, the step is failed (and
-that failure goes to `error` like any other). The one body that runs again
+user-added output ports use `ctx.fan_declared(...)`. A step whose start is on
+record never runs twice by itself: if the worker dies while a body runs, the
+step is failed (and that failure goes to `error` like any other). Its start is
+written as it begins, so only a worker dying in that one write's time runs it
+again as new. The one body that runs again
 is one parked on `ctx.await_signal`, which replays from the top when its
 answer comes, so the work before the wait goes through `ctx.run(...)`, which
 gives back the recorded result.

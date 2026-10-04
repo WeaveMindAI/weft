@@ -443,8 +443,8 @@ node and the wrong value.
    --node <id> --grant <grant>`) or send the user to the node's Connect
    button / `weft connect` in their terminal, then run again. A failure saying
    `the worker running '<node>' went away while it was running` means the
-   worker died mid-step: weft never runs a step twice by itself, because the
-   step may have partly happened. Check what it did outside (the email, the
+   worker died mid-step: weft does not run a step again once its start is on
+   record, because the step may have partly happened. Check what it did outside (the email, the
    row, the post), then `weft run --seed`, which reuses what completed and
    runs that step again.
 3. **A value is wrong, not failed.** Work upstream from the output: open the

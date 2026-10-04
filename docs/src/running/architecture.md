@@ -50,8 +50,8 @@ Every queued run also carries a key that turns a duplicate into a no-op, so work
 queued twice runs once. A run whose claim ran out may be half done, and the next worker may redo
 part of the runtime's own bookkeeping for it, which is why every step the
 runtime takes has to be safe to run twice. Your nodes are different: a node
-that was running when its worker died is failed, never run again (go and read
-[surviving a restart](../nodes/durable-execution.md#when-the-worker-dies-mid-step)).
+whose start is on record when its worker died is failed, never run again (go
+and read [surviving a restart](../nodes/durable-execution.md#when-the-worker-dies-mid-step)).
 
 ## What happens when an event arrives
 
