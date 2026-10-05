@@ -21,6 +21,17 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
+# The line to the broker (`line`).
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
+# The broker's half of the line (`line::server`), for the broker and for
+# tests standing a fake broker up.
+axum = { workspace = true, optional = true }
+tower = { workspace = true, features = ["util"], optional = true }
+bytes = { workspace = true, optional = true }
+
+[features]
+line-server = ["dep:axum", "dep:tower", "dep:bytes"]
 
 [lints]
 workspace = true

@@ -1816,18 +1816,47 @@ pub struct PublishAccess {
 ///
 /// Always the user's own credential: nothing published can resolve to
 /// the runtime's, whatever the caller sends.
+///
+/// A publish that would change nothing writes nothing: a node publishes on
+/// every run, and a write would tell every worker of the project that the
+/// connection changed (`ACCESS_CHANNEL`), so none could keep it.
 pub async fn publish_grant(
     pool: &PgPool,
     tenant: &str,
     req: PublishAccess,
-) -> anyhow::Result<CompletedConnect> {
+) -> anyhow::Result<PublishedConnection> {
     let PublishAccess { spec, project_id, node_id, instance, values, label } = req;
     spec.validate().map_err(AccessError::Invalid)?;
     let fields =
         weft_core::access::spec::publishable_fields(&spec).map_err(AccessError::Invalid)?;
     let values = storable_values(&spec, fields, values)?;
     let identity = resolve_identity(&spec, &values)?;
-    insert_grant(
+    let current: Option<Published> = sqlx::query_as(
+        "SELECT id, spec_json, values_sealed, label, identity FROM access_grant
+         WHERE tenant_id = $1 AND project_id = $2 AND published_by_node = $3
+           AND service = $4 AND instance_id IS NOT DISTINCT FROM $5",
+    )
+    .bind(tenant)
+    .bind(project_id)
+    .bind(&node_id)
+    .bind(&spec.service)
+    .bind(instance.as_ref().map(|m| m.as_str()))
+    .fetch_optional(pool)
+    .await?;
+    if let Some(current) = current {
+        // Every other column a publish writes follows from these (it
+        // stores no app, no scopes and no expiry), so equal ones mean an
+        // equal row. Stored values that no longer open are not equal to
+        // anything: the publish writes the row over them.
+        let unchanged = current.spec_json == serde_json::to_value(&spec)?
+            && crate::open_json(&current.values_sealed).is_ok_and(|stored| crate::values_of(&stored) == values)
+            && current.label == label
+            && current.identity == identity;
+        if unchanged {
+            return Ok(PublishedConnection { connection_id: current.id.to_string(), identity: current.identity });
+        }
+    }
+    let done = insert_grant(
         pool,
         tenant,
         NewGrant {
@@ -1846,7 +1875,18 @@ pub async fn publish_grant(
             expires_at: None,
         },
     )
-    .await
+    .await?;
+    Ok(PublishedConnection { connection_id: done.grant.id.to_string(), identity: done.grant.identity })
+}
+
+/// What a node's published connection holds now, as a publish compares it.
+#[derive(sqlx::FromRow)]
+struct Published {
+    id: uuid::Uuid,
+    spec_json: Value,
+    values_sealed: String,
+    label: Option<String>,
+    identity: Option<String>,
 }
 
 /// The connection this node published for `service`, if it has one.

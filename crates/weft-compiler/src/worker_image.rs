@@ -707,19 +707,35 @@ fn rhel_family_version(tag: &str) -> Option<&'static str> {
 /// path deps (the `pkg_<node>` crates) absent from the seeded
 /// workspace lock, so cargo must be allowed to EXTEND the lock with
 /// those. Seeding the lock pins the shared set; cargo appends the rest.
+///
+/// A builder that keeps nothing between builds (a cloud's, where every
+/// build runs on a fresh machine) says so with [`COMPILE_CACHE_ARG`]
+/// `=none`: its cache mount starts empty every time, so seeding it would
+/// copy the whole baked target (gigabytes) on every build only to throw it
+/// away. That build compiles in the baked `/weft/target` itself instead,
+/// which already is everything the seed would have been, and the sweep,
+/// which only tends a cache kept for later builds, does not run.
 const CARGO_BUILD_RUN_FRAGMENT: &str = concat!(
     "ENV CARGO_TARGET_DIR=/cache/target\n",
     "ARG WEFT_COMPILE_LANE\n",
+    "ARG WEFT_COMPILE_CACHE=kept\n",
     "RUN --mount=type=cache,id=weft-worker-cargo-registry-${WEFT_COMPILE_LANE},target=/root/.cargo/registry,sharing=locked \\\n",
     "    --mount=type=cache,id=weft-worker-target-{{worker_cache_key}}-${WEFT_COMPILE_LANE},target=/cache/target,sharing=locked \\\n",
-    "    ( [ -f /cache/target/.weft-seeded ] || ! [ -d /weft/target ] \\\n",
-    "      || ( cp -a /weft/target/. /cache/target/ && touch /cache/target/.weft-seeded ) ) \\\n",
+    "    if [ \"$WEFT_COMPILE_CACHE\" = none ] && [ -d /weft/target ]; then export CARGO_TARGET_DIR=/weft/target; \\\n",
+    "    elif ! [ -f /cache/target/.weft-seeded ] && [ -d /weft/target ]; then \\\n",
+    "      cp -a /weft/target/. /cache/target/ && touch /cache/target/.weft-seeded; fi \\\n",
     "    && cp {{seed_lock}} /work/Cargo.lock \\\n",
     "    && cargo build --release \\\n",
-    "    && cp /cache/target/release/{{binary_name}} /worker \\\n",
-    "    && ( sh /work/{{cache_gc_script}} /cache/target/release {{cache_retention_days}} /work {{binary_name}} {{cache_versions_kept}} \\\n",
+    "    && cp \"$CARGO_TARGET_DIR\"/release/{{binary_name}} /worker \\\n",
+    "    && ( [ \"$CARGO_TARGET_DIR\" != /cache/target ] \\\n",
+    "         || sh /work/{{cache_gc_script}} /cache/target/release {{cache_retention_days}} /work {{binary_name}} {{cache_versions_kept}} \\\n",
     "         || echo 'weft: the compile cache sweep failed; the build is unaffected' >&2 )\n",
 );
+
+/// The build-arg a builder that keeps nothing between builds sets to
+/// `none` (see [`CARGO_BUILD_RUN_FRAGMENT`]).
+// SYNC: COMPILE_CACHE_ARG <-> the `ARG WEFT_COMPILE_CACHE` line of CARGO_BUILD_RUN_FRAGMENT above, crates/weft-platform-gcp/src/images.rs (COMPILE_CACHE_ARG)
+pub const COMPILE_CACHE_ARG: &str = "WEFT_COMPILE_CACHE";
 
 /// Where the builder base keeps the lock its stock worker resolved to,
 /// which a per-project build on that base starts from (see
@@ -1289,11 +1305,20 @@ mod tests {
             "prebuilt path seeds the worker lock from the stock worker's lock: {}",
             out.body
         );
-        // The binary is copied out of the shared cache inside the same
-        // RUN (the mount is gone in the next instruction).
+        // The binary is copied out of wherever it compiled (the shared
+        // cache, or the baked target on a builder that keeps nothing)
+        // inside the same RUN (the mount is gone in the next instruction).
         assert!(
-            out.body.contains("cp /cache/target/release/worker_test /worker"),
-            "prebuilt path copies the binary out of the shared cache: {}",
+            out.body.contains("cp \"$CARGO_TARGET_DIR\"/release/worker_test /worker"),
+            "prebuilt path copies the binary out of where it compiled: {}",
+            out.body
+        );
+        // A builder that keeps nothing between builds compiles in the
+        // baked target instead of seeding a cache it throws away.
+        assert!(
+            out.body.contains(&format!("ARG {COMPILE_CACHE_ARG}=kept"))
+                && out.body.contains("= none ] && [ -d /weft/target ]; then export CARGO_TARGET_DIR=/weft/target"),
+            "a builder that keeps no cache compiles in the baked target: {}",
             out.body
         );
         let sweep = format!("sh /work/{CACHE_GC_SCRIPT_NAME} /cache/target/release {WORKER_CACHE_RETENTION_DAYS} /work worker_test");

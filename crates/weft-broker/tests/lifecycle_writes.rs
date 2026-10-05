@@ -58,15 +58,22 @@ async fn command(pool: &PgPool) -> i64 {
 
 /// An uncompleted lifecycle command of `project`; returns its id.
 async fn command_of(pool: &PgPool, project: uuid::Uuid) -> i64 {
+    command_on(pool, project, None).await
+}
+
+/// An uncompleted lifecycle command of `project` on one copy of the node:
+/// the shared one (`None`) or an instance's.
+async fn command_on(pool: &PgPool, project: uuid::Uuid, instance: Option<&str>) -> i64 {
     let (id,): (i64,) = sqlx::query_as(
         "INSERT INTO infra_lifecycle_command \
-         (tenant_id, project_id, node_id, verb, issued_by_replica, issued_at_unix) \
-         VALUES ($1, $2, $3, 'stop', 'dispatcher', EXTRACT(EPOCH FROM NOW())::BIGINT) \
+         (tenant_id, project_id, node_id, verb, issued_by_replica, issued_at_unix, instance_id) \
+         VALUES ($1, $2, $3, 'stop', 'dispatcher', EXTRACT(EPOCH FROM NOW())::BIGINT, $4) \
          RETURNING id",
     )
     .bind(TENANT)
     .bind(project)
     .bind(NODE)
+    .bind(instance)
     .fetch_one(pool)
     .await
     .expect("command");
@@ -363,11 +370,13 @@ async fn command_completion_is_once_and_owner_only(pool: PgPool) {
     assert_eq!(complete_command(&pool, &req(OWNER, cmd + 1000, None)).await.unwrap(), FencedWrite::Gone);
 }
 
-/// The owner is handed its projects' commands oldest first, never one of
-/// a project it names busy (that project's next command waits for the
-/// running one), and never one of a project it does not own.
+/// The owner is handed its projects' commands oldest first. A command it
+/// is already running is never handed out again, a command waits while an
+/// older one on the same copy is uncompleted, commands on different copies
+/// of one node are handed out side by side, and a project it does not own
+/// is never handed out at all.
 #[sqlx::test]
-async fn next_command_skips_busy_and_foreign_projects(pool: PgPool) {
+async fn next_command_runs_copies_side_by_side_and_one_copy_in_order(pool: PgPool) {
     schema(&pool).await;
     let second = uuid::Uuid::from_u128(2);
     let foreign = uuid::Uuid::from_u128(3);
@@ -378,18 +387,21 @@ async fn next_command_skips_busy_and_foreign_projects(pool: PgPool) {
     lease_of(&pool, second, OWNER).await;
     lease_of(&pool, foreign, OTHER).await;
     let foreign_cmd = command_of(&pool, foreign).await;
-    let first_a = command_of(&pool, PROJECT).await;
-    let first_b = command_of(&pool, second).await;
-    let second_a = command_of(&pool, PROJECT).await;
+    let ada = command_on(&pool, PROJECT, Some("ada")).await;
+    let bob = command_on(&pool, PROJECT, Some("bob")).await;
+    let ada_again = command_on(&pool, PROJECT, Some("ada")).await;
+    let other_project = command_of(&pool, second).await;
 
-    let next = |busy: Vec<uuid::Uuid>| {
+    let next = |busy: Vec<i64>| {
         let pool = pool.clone();
         async move { next_command(&pool, OWNER, &busy).await.unwrap().map(|c| c.id) }
     };
-    assert_eq!(next(vec![]).await, Some(first_a));
-    // Busy with PROJECT: its second command waits, the other project's runs.
-    assert_eq!(next(vec![PROJECT]).await, Some(first_b));
-    assert_eq!(next(vec![PROJECT, second]).await, None);
+    assert_eq!(next(vec![]).await, Some(ada));
+    // Running ada's command: bob's copy is another copy, so it goes now.
+    assert_eq!(next(vec![ada]).await, Some(bob));
+    // ada's second command waits for her first; the other project goes.
+    assert_eq!(next(vec![ada, bob]).await, Some(other_project));
+    assert_eq!(next(vec![ada, bob, other_project]).await, None);
     // The other supervisor's project is never handed out.
     assert_ne!(next(vec![]).await, Some(foreign_cmd));
 
@@ -397,14 +409,55 @@ async fn next_command_skips_busy_and_foreign_projects(pool: PgPool) {
         &pool,
         &SupervisorCommandCompleteRequest {
             replica: OWNER.into(),
-            command_id: first_a,
+            command_id: ada,
             error: None,
             cancelled: false,
         },
     )
     .await
     .unwrap();
-    assert_eq!(next(vec![second]).await, Some(second_a));
+    assert_eq!(next(vec![bob, other_project]).await, Some(ada_again));
+}
+
+/// A command on every copy (the project going) overlaps every copy's
+/// command, so it waits for the older ones and the younger ones wait for it.
+#[sqlx::test]
+async fn a_command_on_every_copy_waits_for_and_holds_up_each_copy(pool: PgPool) {
+    schema(&pool).await;
+    project_row(&pool, PROJECT, true).await;
+    lease(&pool, OWNER).await;
+    let ada = command_on(&pool, PROJECT, Some("ada")).await;
+    let (every,): (i64,) = sqlx::query_as(
+        "INSERT INTO infra_lifecycle_command \
+         (tenant_id, project_id, node_id, verb, issued_by_replica, issued_at_unix, every_copy) \
+         VALUES ($1, $2, NULL, 'terminate', 'dispatcher', EXTRACT(EPOCH FROM NOW())::BIGINT, TRUE) \
+         RETURNING id",
+    )
+    .bind(TENANT)
+    .bind(PROJECT)
+    .fetch_one(&pool)
+    .await
+    .expect("every-copy command");
+    let bob = command_on(&pool, PROJECT, Some("bob")).await;
+
+    let next = |busy: Vec<i64>| {
+        let pool = pool.clone();
+        async move { next_command(&pool, OWNER, &busy).await.unwrap().map(|c| c.id) }
+    };
+    let done = |command_id: i64| {
+        let pool = pool.clone();
+        async move {
+            let req = SupervisorCommandCompleteRequest { replica: OWNER.into(), command_id, error: None, cancelled: false };
+            complete_command(&pool, &req).await.unwrap();
+        }
+    };
+    assert_eq!(next(vec![]).await, Some(ada));
+    assert_eq!(next(vec![ada]).await, None, "everything waits on ada");
+    done(ada).await;
+    assert_eq!(next(vec![]).await, Some(every));
+    assert_eq!(next(vec![every]).await, None, "bob waits on the project going");
+    done(every).await;
+    assert_eq!(next(vec![]).await, Some(bob));
 }
 
 /// A command nobody holds a lease over is unowned work; once a live

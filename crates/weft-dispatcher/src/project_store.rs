@@ -395,6 +395,23 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             AFTER DELETE ON project
             FOR EACH ROW
             EXECUTE FUNCTION project_worker_settings_notify()"#,
+        // A project registered again may declare other infra (a node gone,
+        // a node now one copy per instance), and which handles the broker
+        // answers for follows what it declares: tell whoever keeps an
+        // answer about the project's infra (a worker's addresses) to drop it.
+        // SYNC: 'weft_infra_status' <-> weft_broker_client::line::INFRA_STATUS_CHANNEL, crates/weft-dispatcher/src/infra_node.rs (infra_node_status_notify), crates/weft-broker/src/line.rs (audience)
+        r#"CREATE OR REPLACE FUNCTION project_declared_infra_notify() RETURNS trigger AS $$
+            BEGIN
+                PERFORM pg_notify('weft_infra_status', NEW.id::text);
+                RETURN NULL;
+            END;
+            $$ LANGUAGE plpgsql"#,
+        r#"DROP TRIGGER IF EXISTS project_declared_infra_on_change ON project"#,
+        r#"CREATE TRIGGER project_declared_infra_on_change
+            AFTER UPDATE OF project_json ON project
+            FOR EACH ROW
+            WHEN (NEW.project_json IS DISTINCT FROM OLD.project_json)
+            EXECUTE FUNCTION project_declared_infra_notify()"#,
         // Append-only definition-version history. Workers fetch by
         // (project_id, definition_hash) so a suspended execution
         // can always resume on the EXACT shape it was started on,

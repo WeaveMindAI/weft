@@ -43,7 +43,7 @@ Build the recovery path when it's worth it (high value, plausible failure) and s
 
 **pnpm, not npm.** The projects are pnpm-based.
 
-**Never mass-edit code with sed/awk/python.** Past incident: a sed command and a python "fix comments" script stripped `//` from code lines, commented out parameters and return statements, broke the parser; an hour of manual repair. Regex mass edits can't tell comments from code. Use exact-match edits (apply_patch), one change at a time, one change at a time, and verify compilation after each batch.
+**Never mass-edit code with sed/awk/python.** Past incident: a sed command and a python "fix comments" script stripped `//` from code lines, commented out parameters and return statements, broke the parser; an hour of manual repair. Regex mass edits can't tell comments from code. Use exact-match edits (apply_patch), one change at a time, and verify compilation after each batch.
 
 ## Python function pattern
 

@@ -114,6 +114,7 @@
         let journal = UnrecordedJournal::seeded(execution_id, birth, durable.clone()).unwrap();
         let mut run_clients = clients(Arc::new(MemJournal::default()));
         run_clients.journal = journal.clone();
+        let first_rows = journal.raw_rows_after(execution_id, 0, std::time::Duration::ZERO).await.unwrap();
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(60),
             run_one_execution(
@@ -125,6 +126,7 @@
                 "tenant-test".into(),
                 CancellationFlag::new_arc(),
                 None,
+                first_rows,
             ),
         )
         .await

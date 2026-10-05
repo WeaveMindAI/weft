@@ -1,11 +1,11 @@
 ---
 name: weft-grow
-description: "COMMAND, not reference: Grow the program one stage at a time against a real input, seeded runs and frozen examples included. Run this when the user asks for this step by name, optionally naming the stage to grow or an example name to rerun. The seventeen `weft-` reference skills beside it are things you read; this is a procedure you carry out."
+description: "COMMAND, not reference: Grow the program one stage at a time against a real input, seeded runs and frozen examples included. Run this when the user asks for this step by name, optionally naming the stage to grow or an example name to rerun. The `weft-` reference skills beside it are things you read; this is a procedure you carry out."
 ---
 
 Run one pass of Sequential Diffusion Programming: inspect the current stage on a real input, preserve an accepted result, then grow the next stage.
 
-1. Read `weft-sdp` and `weft-running`. The user's argument names the stage to grow or the saved example to rerun.
+1. Read `weft-sdp`, `weft-running`, `weft-debugging` (how to read what a run did) and `weft-people-in-the-loop` (a run waiting on someone, and its token). The user's argument names the stage to grow or the saved example to rerun.
 2. Read `weft tree` and `weft examples`. Checkpoint work you may want back with `weft checkpoint start-<what>`.
 3. Pick a real input the user cares about; ask if none is available. Grow one stage and run `weft validate --file src/main.weft < src/main.weft`.
 4. Run that stage: `weft run --from '<node>={"port":value}' --target <end> --save <name> --detach`, or `--group '<group>={"port":value}'` for the whole group or included file. Use `--before <end>` when the ending node must stay out. A trigger uses `weft bake` followed by `weft run --fire '<trigger>=<wake-json>'`; `--emit '<node>={"port":value}'` supplies outputs without executing that node. Read the actual interface before choosing payloads.

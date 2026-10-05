@@ -83,12 +83,6 @@ use crate::wait_tracker::DeliveryGate;
 /// have several hundred entries across all buses to flush.
 const BUS_PUMP_SHUTDOWN_DEADLINE_SECS: u64 = 10;
 
-/// How long a worker waits for its run's birth row to be readable. The
-/// dispatcher journals `ExecutionStarted` before it enqueues the task
-/// this worker claimed, so the row is normally there already; the wait
-/// only covers a read that lands just ahead of that commit.
-const FIRST_ROWS_WAIT: std::time::Duration = std::time::Duration::from_secs(6);
-
 /// Outcome the loop reports back to the binary wrapper.
 #[derive(Debug, Clone)]
 pub enum ExecutionOutcome {
@@ -142,6 +136,12 @@ pub enum ExecutionOutcome {
 /// would read as running forever. The birth row exists at every such
 /// exit: the dispatcher commits it in the same transaction as the
 /// execute task this worker claimed.
+///
+/// `first_rows` is the run's journal as it stood when the drive began: as
+/// the worker's claim read it (`weft_task_store::tasks::claim_execution`),
+/// or, for an unrecorded run, as its memory holds it. The birth row is
+/// always among them (it commits with the task the claim takes).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_one_execution(
     project: Arc<ProjectDefinition>,
     catalog: Arc<dyn NodeCatalog>,
@@ -151,8 +151,9 @@ pub async fn run_one_execution(
     tenant_id: String,
     cancellation: Arc<CancellationFlag>,
     caller: Option<Arc<dyn weft_core::caller::CallerConnection>>,
+    first_rows: Vec<weft_journal::RawJournalRow>,
 ) -> anyhow::Result<ExecutionOutcome> {
-    run_one_execution_observed(project, catalog, execution_id, clients, replica, tenant_id, cancellation, caller)
+    run_one_execution_observed(project, catalog, execution_id, clients, replica, tenant_id, cancellation, caller, first_rows)
     .await
     .map(|drove| drove.outcome)
 }
@@ -182,6 +183,7 @@ pub(crate) async fn run_one_execution_observed(
     tenant_id: String,
     cancellation: Arc<CancellationFlag>,
     caller: Option<Arc<dyn weft_core::caller::CallerConnection>>,
+    first_rows: Vec<weft_journal::RawJournalRow>,
 ) -> anyhow::Result<Drove> {
     let journal = clients.journal.clone();
     let clock = clients.clock.clone();
@@ -242,6 +244,7 @@ pub(crate) async fn run_one_execution_observed(
         tenant_id,
         cancellation,
         caller,
+        first_rows,
         waits,
         bus_coordinator.clone(),
     )))
@@ -345,6 +348,7 @@ async fn drive_execution_id(
     // into the loop's keep-warm decision (an attached caller under a
     // `keep_alive` reconcile holds the worker warm like a live bus does).
     caller: Option<Arc<dyn weft_core::caller::CallerConnection>>,
+    first_rows: Vec<weft_journal::RawJournalRow>,
     waits: Arc<crate::wait_tracker::WaitTracker>,
     bus_coordinator: Arc<crate::context::BusCoordinator>,
 ) -> anyhow::Result<Drove> {
@@ -368,10 +372,9 @@ async fn drive_execution_id(
     // single-await-per-body world.
     let mut awaited_sequences: HashMap<FiringLocation, Vec<weft_core::primitive::AwaitedEntry>> = HashMap::new();
 
-    // Fold the journal: this is the source of truth. If the log is
-    // non-empty (resume case), apply it to seed pulses, executions,
-    // and pending deliveries. If empty, the producer just journaled
-    // ExecutionStarted + NodeKicked; wait briefly for the rows.
+    // Fold the journal: this is the source of truth. On a resume it seeds
+    // pulses, executions and pending deliveries; on a first drive it holds
+    // the ExecutionStarted + NodeKicked the producer journaled.
     //
     // The drive writes through its journal (`run_one_execution_observed`
     // made it): rows go out in the background, in order, and a failed
@@ -382,36 +385,28 @@ async fn drive_execution_id(
     let steering = Arc::new(crate::context::JournalFirst { inner: clients.steering.clone(), journal: drive_journal.clone() });
     let clients = EngineClients { journal: drive_journal.clone(), tasks, steering, ..clients };
     let journal = clients.journal.clone();
-    // The run's log from its birth row, waited for briefly (see
-    // `FIRST_ROWS_WAIT`). The wait yields to cancellation: a cancel
-    // landing mid-wait breaks us out instead of forcing the worker to
-    // sit idle.
-    let rows = tokio::select! {
-        rows = journal.rows_after(execution_id, 0, FIRST_ROWS_WAIT) => rows?,
-        _ = cancellation.cancelled() => {
-            // Nothing ran, but the run still gets its end: a cancel from
-            // inside this worker (its caller refused or gone before
-            // attaching) has nobody else to write it. One the dispatcher
-            // already ended is seen and left alone (`journal_terminal`).
-            let outcome = ExecutionOutcome::Cancelled { cause: recorded_cancel_cause(&cancellation) };
-            journal_terminal(drive_journal.beneath(), clients.clock.as_ref(), execution_id, &replica, &outcome)
-                .await
-                .map_err(|error| TerminalUnwritten { outcome: outcome.clone(), error })?;
-            return Ok(Drove { outcome, pulses, executions, loop_runtime: LoopRuntime::new(), kicked });
-        }
-    };
+    if cancellation.is_cancelled() {
+        // Nothing ran, but the run still gets its end: a cancel from
+        // inside this worker (its caller refused or gone before
+        // attaching) has nobody else to write it. One the dispatcher
+        // already ended is seen and left alone (`journal_terminal`).
+        let outcome = ExecutionOutcome::Cancelled { cause: recorded_cancel_cause(&cancellation) };
+        journal_terminal(drive_journal.beneath(), clients.clock.as_ref(), execution_id, &replica, &outcome)
+            .await
+            .map_err(|error| TerminalUnwritten { outcome: outcome.clone(), error })?;
+        return Ok(Drove { outcome, pulses, executions, loop_runtime: LoopRuntime::new(), kicked });
+    }
+    let rows = weft_journal::decode_rows(execution_id, first_rows)?;
     let events: Vec<weft_journal::ExecEvent> = rows.iter().map(|row| row.event.clone()).collect();
-    // The dispatcher's contract is "ExecutionStarted is journaled
-    // before the worker boots." If we sat through the full wait
-    // and the journal is STILL empty, that contract is broken: bail
-    // loudly instead of silently proceeding with phase=Fire (which
-    // would bypass the setup-phase dispatch bound for what might have been a
-    // TriggerSetup execution).
+    // The dispatcher journals ExecutionStarted in the same transaction as
+    // the task this drive claimed, so the claim always reads it. With no
+    // rows that contract is broken: bail loudly instead of silently
+    // proceeding with phase=Fire (which would bypass the setup-phase
+    // dispatch bound for what might have been a TriggerSetup execution).
     if events.is_empty() {
         anyhow::bail!(
-            "worker booted for execution {execution_id} but no ExecutionStarted \
-             arrived within {}s; the dispatcher contract is broken",
-            FIRST_ROWS_WAIT.as_secs()
+            "worker claimed execution {execution_id} but its journal had no rows, not even its \
+             ExecutionStarted; the dispatcher contract is broken"
         );
     }
     // A terminal already in the journal means this execution is finished:
@@ -2035,6 +2030,7 @@ async fn drive(
             .with_emit_channel(task_tx.clone())
             .with_caller_connection(caller.cloned())
             .with_per_instance(node_def.per_instance)
+            .with_run_instance(instance.cloned())
             .with_declared_infra(declared_infra.clone())
             .with_catch_errors(node_def.features.catch_errors)
             .with_run_kind(run_kind);

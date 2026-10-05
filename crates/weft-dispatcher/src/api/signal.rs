@@ -2116,16 +2116,30 @@ impl ArmedRoute {
     /// A live connection is accepted only while the route's activation is
     /// Active.
     fn require_active(&self) -> Result<(), (StatusCode, String)> {
-        if crate::project_store::project_status_from_str(&self.status)
-            .map(|s| s != crate::project_store::ProjectStatus::Active)
-            .unwrap_or(true)
-        {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "project is not active; cannot accept a live connection".into(),
-            ));
+        use crate::project_store::ProjectStatus;
+        let refused = |why: String| Err((StatusCode::SERVICE_UNAVAILABLE, why));
+        let node = &self.node_id;
+        match crate::project_store::project_status_from_str(&self.status) {
+            Ok(ProjectStatus::Active) => Ok(()),
+            Ok(ProjectStatus::Activating) => {
+                refused(format!("this route's trigger '{node}' is being switched on right now, so it takes no calls yet; call again in a moment"))
+            }
+            Ok(ProjectStatus::Deactivating) => refused(format!(
+                "this route's trigger '{node}' is being switched off right now, so it takes no calls; \
+                 a caller is never held while it is off"
+            )),
+            Ok(ProjectStatus::Registered | ProjectStatus::Inactive) => {
+                let activate = match &self.instance {
+                    Some(instance) => format!("weft activate --instance {instance}"),
+                    None => "weft activate".to_string(),
+                };
+                refused(format!(
+                    "this route is switched off (its trigger '{node}' is off), so it takes no calls; a caller \
+                     is never held while it is off. Whoever runs the program turns it back on with `{activate}`"
+                ))
+            }
+            Err(_) => refused(format!("this route's trigger '{node}' reads as '{}', which this install does not know", self.status)),
         }
-        Ok(())
     }
 }
 

@@ -1,0 +1,2 @@
+DROP TRIGGER infra_node_status_on_change ON infra_node;
+CREATE TRIGGER infra_node_status_on_change AFTER UPDATE OF status, endpoints_json, public_paths_json ON infra_node FOR EACH ROW WHEN (((new.status IS DISTINCT FROM old.status) OR (new.endpoints_json IS DISTINCT FROM old.endpoints_json) OR (new.public_paths_json IS DISTINCT FROM old.public_paths_json))) EXECUTE FUNCTION infra_node_status_notify();

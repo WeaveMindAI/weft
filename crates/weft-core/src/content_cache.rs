@@ -48,6 +48,18 @@ impl<K: Hash + Eq, V> ContentCache<K, V> {
     }
 }
 
+impl<K: Hash + Eq + Clone, V> ContentCache<K, V> {
+    /// Drop every entry `whose` picks, by its key or by what it holds: for a
+    /// copy of rows whose change names a group (a project's, a tenant's).
+    pub fn forget_where(&self, whose: impl Fn(&K, &V) -> bool) {
+        let mut entries = self.entries.lock().expect("content cache");
+        let picked: Vec<K> = entries.iter().filter(|(key, value)| whose(key, value)).map(|(key, _)| key.clone()).collect();
+        for key in &picked {
+            entries.pop(key);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

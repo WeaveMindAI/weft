@@ -97,16 +97,45 @@ pub struct StatusQuery {
     /// Compared against the running infra hash: the upgrade signal.
     #[serde(default, rename = "desiredInfraHash", skip_serializing_if = "Option::is_none")]
     pub desired_infra_hash: Option<String>,
+    /// The triggers a verb is about to act on, comma-separated, as the
+    /// program spells them: `available_actions` and `preservation` are
+    /// then about those triggers (with `instance`, that instance's), the
+    /// way the verb itself is judged. Neither given: the program's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<crate::instance::InstanceId>,
 }
 
 impl StatusQuery {
-    /// The query string, `?` included; empty when no hash is named.
+    /// The scope a verb is judged over, when the query names one.
+    pub fn scope(&self) -> Option<crate::activation::ActivationScope> {
+        if self.trigger.is_none() && self.instance.is_none() {
+            return None;
+        }
+        let triggers = self.trigger.iter().flat_map(|t| t.split(',')).filter(|t| !t.is_empty()).map(str::to_string).collect();
+        Some(crate::activation::ActivationScope { triggers, instance: self.instance.clone() })
+    }
+
+    /// The status asked about `scope`'s triggers.
+    pub fn for_scope(scope: &crate::activation::ActivationScope) -> Self {
+        Self {
+            trigger: (!scope.triggers.is_empty()).then(|| scope.triggers.join(",")),
+            instance: scope.instance.clone(),
+            ..Self::default()
+        }
+    }
+
+    /// The query string, `?` included; empty when nothing is named.
     pub fn to_query_string(&self) -> String {
+        let instance = self.instance.as_ref().map(|i| i.as_str().to_string());
         let pairs = [
             ("desiredBinaryHash", &self.desired_binary_hash),
             ("desiredFullBinaryHash", &self.desired_full_binary_hash),
             ("desiredDefinitionHash", &self.desired_definition_hash),
             ("desiredInfraHash", &self.desired_infra_hash),
+            ("trigger", &self.trigger),
+            ("instance", &instance),
         ];
         let named: Vec<String> =
             pairs.iter().filter_map(|(key, value)| value.as_ref().map(|v| format!("{key}={v}"))).collect();
@@ -218,6 +247,25 @@ pub struct BuildInFlight {
     /// Where its log is read, when the builder keeps one at an address.
     #[serde(default, rename = "logUrl", skip_serializing_if = "Option::is_none")]
     pub log_url: Option<String>,
+}
+
+/// Where one image build of a project is: going on, or how it ended
+/// (`GET /projects/{id}/builds/{build}`, `build` the builder's id).
+// SYNC: BuildState <-> crates/weft-dispatcher/src/build/ledger.rs (image_build.status)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildState {
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+/// The answer to `GET /projects/{id}/builds/{build}`: `None` when no such
+/// build of the project is on record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildStateResponse {
+    pub state: Option<BuildState>,
 }
 
 /// One public entry that refused calls recently, and by which limit.
@@ -333,7 +381,13 @@ pub struct ProjectInfraEntry {
 // SYNC: ProjectExecutionsSummary <-> packages/weft-graph/src/status.ts RawStatusPayload.executions
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectExecutionsSummary {
+    /// The program's own runs (fires and manual runs): what `weft tree`
+    /// lists.
     pub total: usize,
+    /// The runs that set the program up (arming its triggers, bringing its
+    /// infra up), which `total` leaves out.
+    #[serde(default)]
+    pub setup: usize,
     pub last_completed_at: Option<u64>,
     pub last_execution_id: Option<String>,
     pub last_status: Option<crate::program::SummaryStatus>,

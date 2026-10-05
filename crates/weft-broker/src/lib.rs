@@ -25,6 +25,7 @@ pub mod runtime_storage;
 pub mod runtime_store;
 pub mod scope;
 pub mod held_signals;
+pub mod line;
 pub mod state;
 
 use std::sync::Arc;
@@ -82,6 +83,11 @@ pub use weft_broker_client::protocol::JOURNAL_RECORD_BODY_LIMIT;
 pub const JOURNAL_RETROACTIVE_BODY_LIMIT: usize = 16 * JOURNAL_RECORD_BODY_LIMIT;
 
 pub fn router(state: Arc<BrokerState>) -> Router {
+    line::routes(api(state.clone()), state)
+}
+
+/// Every call the broker answers, as a request and on a line alike.
+fn api(state: Arc<BrokerState>) -> Router {
     Router::new()
         .route("/health", axum::routing::get(handlers::health))
         // Journal
@@ -114,7 +120,7 @@ pub fn router(state: Arc<BrokerState>) -> Router {
             "/v1/task/wait_terminal",
             post(handlers::task_wait_terminal),
         )
-        .route("/v1/task/claim_one", post(handlers::task_claim_one))
+        .route("/v1/task/claim_execution", post(handlers::task_claim_execution))
         .route("/v1/task/heartbeat", post(handlers::task_heartbeat))
         .route("/v1/task/requeue", post(handlers::task_requeue))
         .route("/v1/task/complete", post(handlers::task_complete))

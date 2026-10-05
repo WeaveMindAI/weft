@@ -36,6 +36,9 @@ use crate::docker::{self, labels, roles, ContainerRow, Docker};
 const PART: &str = "weft.part";
 const PART_AGENT: &str = "agent";
 const PART_APP: &str = "app";
+/// The short-lived container that hands a unit's volumes to its group
+/// before anything else starts (`own_args`).
+const PART_OWN: &str = "own";
 /// On a volume: its name in the spec, and whether it is a disk.
 const VOLUME: &str = "weft.volume";
 const VOLUME_KIND: &str = "weft.volume-kind";
@@ -199,6 +202,14 @@ impl LocalInfraHost {
                 VolumeKind::Scratch { .. } => scratch.push(scratch_volume(r, name, &v.name)),
             }
         }
+        // A unit's scratch space is fresh on every start, and only the
+        // unit's own containers ever mount it, all removed just above: a
+        // container still holding it is a leftover of an earlier start,
+        // and would keep it in use, failing this start and every next one.
+        for volume in &scratch {
+            let holders = docker::containers_using(self.docker.as_ref(), volume).await?;
+            docker::remove_containers(self.docker.as_ref(), &holders).await?;
+        }
         self.remove_volumes(&scratch).await?;
         for v in node.spec.volumes.iter().filter(|v| mounted.contains(v.name.as_str())) {
             if matches!(v.kind, VolumeKind::Scratch { .. }) {
@@ -207,7 +218,7 @@ impl LocalInfraHost {
         }
         if let Some(gid) = unit.unit.fs_group {
             let owned: Vec<String> = mounted.iter().map(|v| volume_name(node, name, v, &self.cfg.disks)).collect();
-            docker::run(self.docker.as_ref(), own_args(&self.cfg.agent_image, gid, &owned)).await?;
+            docker::run(self.docker.as_ref(), own_args(&self.cfg, r, name, gid, &owned)).await?;
         }
 
         docker::run(self.docker.as_ref(), agent_args(node, unit, &self.cfg)).await?;
@@ -492,6 +503,12 @@ impl InfraHost for LocalInfraHost {
         let rows = docker::containers(self.docker.as_ref(), self.cfg.install.label_value(), &[(labels::ROLE, roles::INFRA), (labels::PROJECT, &project_label)]).await?;
         let mut by_unit: BTreeMap<(String, String), Vec<ContainerRow>> = BTreeMap::new();
         for r in rows {
+            // The helper that hands a starting unit its volumes says nothing
+            // about the unit's state: seen alone while it runs, it would
+            // read as a unit whose agent is gone.
+            if r.label(PART) == Some(PART_OWN) {
+                continue;
+            }
             let (Some(c), Some(u)) = (r.label(labels::COPY), r.label(labels::UNIT)) else { continue };
             by_unit.entry((c.to_string(), u.to_string())).or_default().push(r);
         }
@@ -625,6 +642,12 @@ pub fn agent_name(node: &NodeRef, unit: &str) -> String {
     format!("{}-{unit}", node.resource_base())
 }
 
+/// The volume-owning helper's name (`own_args`): beside the agent's, with
+/// a separator no container a spec declares can carry.
+fn own_name(node: &NodeRef, unit: &str) -> String {
+    format!("{}.own", agent_name(node, unit))
+}
+
 pub fn container_name(node: &NodeRef, unit: &str, container: &str) -> String {
     format!("{}-{unit}-{container}", node.resource_base())
 }
@@ -687,15 +710,25 @@ fn volume_create_args(install: &weft_core::infra::Install, node: &NodeRef, unit:
 }
 
 /// Hand every mounted volume to group `gid` (a unit's `fsGroup`).
-fn own_args(agent_image: &str, gid: u32, volumes: &[String]) -> Vec<String> {
-    let mut args = vec!["run".to_string(), "--rm".into()];
+///
+/// Named and labelled as one of the unit's containers, so a helper a start
+/// was interrupted around (created, never run, its `--rm` never reached)
+/// is removed with the unit's other containers: by the next start before
+/// it touches the volumes, and by a stop's removal or a terminate. An
+/// unnamed one was found by nothing, and kept the unit's scratch volume in
+/// use, so every later start failed removing it.
+fn own_args(cfg: &LocalInfraHostConfig, node: &NodeRef, unit: &str, gid: u32, volumes: &[String]) -> Vec<String> {
+    let mut l = base_labels(&cfg.install, node, unit);
+    l.insert(PART, PART_OWN.to_string());
+    let mut args = vec!["run".to_string(), "--rm".into(), "--name".into(), own_name(node, unit)];
+    args.extend(docker::label_args(&l));
     let mut paths = Vec::new();
     for (i, v) in volumes.iter().enumerate() {
         let path = format!("/weft-own/{i}");
         args.extend(["--volume".into(), format!("{v}:{path}")]);
         paths.push(path);
     }
-    args.extend([agent_image.to_string(), "unit-agent".into(), "own".into(), gid.to_string()]);
+    args.extend([cfg.agent_image.clone(), "unit-agent".into(), "own".into(), gid.to_string()]);
     args.extend(paths);
     args
 }
@@ -1055,6 +1088,33 @@ mod tests {
         let before = docker.calls_to("run").len();
         h.apply_unit(&node, "main").await.unwrap();
         assert_eq!(docker.calls_to("run").len(), before, "running as asked: nothing restarts");
+    }
+
+    /// The helper that hands a unit's volumes to its group is one of the
+    /// unit's containers by name and labels, so the unit's own cleanup finds
+    /// it; and whatever still holds the unit's scratch space when it starts
+    /// again is removed before that space is made afresh.
+    #[tokio::test]
+    async fn a_start_clears_whatever_still_holds_the_units_scratch_space() {
+        let mut s = spec();
+        s.units[0].fs_group = Some(70);
+        s.units[0].containers[0].mounts.push(Mount::new("sock", "/var/run/postgresql"));
+        s.volumes.push(Volume { name: "sock".into(), kind: VolumeKind::Scratch { size_limit: None } });
+        let node = resolve(&s, &node_ref(), &BTreeMap::new()).unwrap();
+        let scratch = scratch_volume(&node.node, "main", "sock");
+        let docker = Arc::new(FakeDocker::new());
+        docker.answer(&["ps", "--all", "--filter", &format!("volume={scratch}")], "leftover\n");
+        host(docker.clone(), false).apply_unit(&node, "main").await.unwrap();
+
+        let calls = docker.calls();
+        let at = |call: &[&str]| calls.iter().position(|c| c.iter().map(String::as_str).eq(call.iter().copied())).unwrap_or_else(|| panic!("no call {call:?} in {calls:?}"));
+        assert!(at(&["rm", "--force", "leftover"]) < at(&["volume", "rm", "--force", &scratch]), "the holder goes before its volume");
+
+        let own = docker.calls_to("run").into_iter().next().expect("the helper runs first");
+        assert!(own.windows(2).any(|w| w == ["--name".to_string(), own_name(&node.node, "main")]), "{own:?}");
+        for label in [format!("{PART}={PART_OWN}"), format!("{}={}", labels::COPY, node.node.copy_id), format!("{}=main", labels::UNIT)] {
+            assert!(own.windows(2).any(|w| w[0] == "--label" && w[1] == label), "{label} on {own:?}");
+        }
     }
 
     /// An empty read marks its start on the daemon's clock, the one that

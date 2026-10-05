@@ -26,7 +26,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::pg_signal::PgSignalWatch;
-use crate::tasks::{CancelAsked, ClaimFilter, DedupOutcome, NewTask, Task, TaskOutcome};
+use crate::tasks::{CancelAsked, ClaimedExecution, DedupOutcome, NewTask, Task, TaskOutcome};
 
 #[async_trait]
 pub trait TaskStoreClient: Send + Sync {
@@ -37,13 +37,11 @@ pub trait TaskStoreClient: Send + Sync {
     /// [`crate::terminal`]), never on a polling tick.
     async fn wait_for_terminal(&self, task_id: Uuid, timeout: Duration) -> Result<TaskOutcome>;
 
-    /// Claim one pending or stale-claimed row that matches the filter,
-    /// and when there is none, hold for up to `wait` for one to become
-    /// claimable (see [`crate::tasks::TASK_READY_CHANNEL`]). `None` once
-    /// `wait` passed with nothing to claim; a zero `wait` answers at once.
-    /// The dispatcher's picker holds; a worker handed one execution asks
-    /// once.
-    async fn claim_one(&self, replica: &str, filter: ClaimFilter, wait: Duration) -> Result<Option<Task>>;
+    /// Claim the execute or resume task of the execution this worker was
+    /// handed, with the execution's journal (see
+    /// [`crate::tasks::claim_execution`]). `None` when there is nothing
+    /// here to claim.
+    async fn claim_execution(&self, replica: &str, project_id: Uuid, execution_id: &str) -> Result<Option<ClaimedExecution>>;
 
     async fn heartbeat(&self, task_id: Uuid, replica: &str) -> Result<bool>;
 
@@ -82,6 +80,15 @@ impl PostgresTaskStoreClient {
         signals.require(crate::terminal::TERMINAL_CHANNEL)?;
         Ok(Self { pool, signals })
     }
+
+    /// Claim one pending or stale-claimed dispatcher task, `None` when
+    /// none is claimable (the dispatcher's picker is woken when one
+    /// becomes so, see [`crate::executor::DISPATCHER_READY`]). Only the
+    /// dispatcher claims these, from the database, so this is no part of
+    /// [`TaskStoreClient`], which a worker reaches through the broker.
+    pub async fn claim_dispatcher_task(&self, replica: &str) -> Result<Option<Task>> {
+        crate::tasks::claim_one(&self.pool, replica).await
+    }
 }
 
 #[async_trait]
@@ -94,20 +101,8 @@ impl TaskStoreClient for PostgresTaskStoreClient {
         crate::terminal::wait_for_terminal(&self.pool, &self.signals, task_id, timeout).await
     }
 
-    async fn claim_one(&self, replica: &str, filter: ClaimFilter, wait: Duration) -> Result<Option<Task>> {
-        let deadline = tokio::time::Instant::now() + wait;
-        // Subscribed before the first claim, so a task that lands
-        // between an empty claim and the wait still wakes it.
-        let mut signals = self.signals.subscribe();
-        let ready = filter.ready_payload();
-        loop {
-            if let Some(task) = crate::tasks::claim_one(&self.pool, replica, &filter).await? {
-                return Ok(Some(task));
-            }
-            if !signals.woken_before(deadline, |c, p| c == crate::tasks::TASK_READY_CHANNEL && p == ready).await? {
-                return Ok(None);
-            }
-        }
+    async fn claim_execution(&self, replica: &str, project_id: Uuid, execution_id: &str) -> Result<Option<ClaimedExecution>> {
+        crate::tasks::claim_execution(&self.pool, replica, project_id, execution_id).await
     }
 
     async fn heartbeat(&self, task_id: Uuid, replica: &str) -> Result<bool> {
@@ -156,10 +151,14 @@ pub trait InfraReader: Send + Sync {
     /// `ctx.endpoint_of(&handle)` in node code. The project is the
     /// broker's to resolve from the run, and a handle naming an instance
     /// other than the run's is refused there, so a run can never reach
-    /// another project's or another instance's copy.
+    /// another project's or another instance's copy. `run_instance` is
+    /// the run's instance as the worker read it from the run's journal:
+    /// the broker reads it again off the run's row and goes by that; the
+    /// worker keys what it keeps by it (`weft_engine`'s `held`).
     async fn endpoint_address(
         &self,
         execution_id: weft_core::ExecutionId,
+        run_instance: Option<&weft_core::instance::InstanceId>,
         infra: &weft_core::infra::InfraHandle,
     ) -> Result<Option<weft_core::infra::EndpointAddress>>;
 }

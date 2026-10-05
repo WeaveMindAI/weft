@@ -101,6 +101,11 @@ pub struct DispatcherState {
     /// CLI's `weft files` verbs (the broker owns the runtime-file bucket
     /// and its metadata; the dispatcher never touches bytes).
     pub broker: crate::role_client::RoleClient,
+    /// The dispatcher's line to the broker (`weft_broker_client::line`): the
+    /// admin and verify calls it forwards (`crate::broker_admin`), one of
+    /// which stands in front of every gated live call, ride it instead of
+    /// a request each.
+    pub broker_line: weft_broker_client::BrokerLink,
     /// The process's one HTTP client: the role clients above, an infra
     /// unit's `/live` and `/action`, and a worker's `/_weft/...`. Follows
     /// no redirect (see `app.rs`): every peer answers in place.

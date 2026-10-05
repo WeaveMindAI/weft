@@ -12,7 +12,7 @@ mod support;
 use serde_json::json;
 use sqlx::PgPool;
 
-use weft_task_store::tasks::{self, claim_one, enqueue_or_rearm, ClaimFilter, DedupOutcome};
+use weft_task_store::tasks::{self, claim_one, enqueue_or_rearm, DedupOutcome};
 use weft_task_store::TaskTarget;
 
 use support::setup;
@@ -46,12 +46,12 @@ async fn a_task_asked_for_again_while_claimed_runs_once_more(pool: PgPool) {
     };
     assert!(matches!(enqueue_or_rearm(&pool, resume()).await.unwrap(), DedupOutcome::AlreadyLive(same) if same == id));
 
-    claim_one(&pool, "disp-1", &ClaimFilter::Dispatcher).await.unwrap().expect("claimed");
+    claim_one(&pool, "disp-1").await.unwrap().expect("claimed");
     assert!(matches!(enqueue_or_rearm(&pool, resume()).await.unwrap(), DedupOutcome::AlreadyLive(same) if same == id));
     tasks::complete(&pool, id, "disp-1", json!(1)).await.unwrap();
     assert_eq!(status_of(&pool, id).await, "pending", "the ask that came while it ran runs it again");
 
-    claim_one(&pool, "disp-1", &ClaimFilter::Dispatcher).await.unwrap().expect("claimed again");
+    claim_one(&pool, "disp-1").await.unwrap().expect("claimed again");
     tasks::fail(&pool, id, "disp-1", "boom".into()).await.unwrap();
     assert_eq!(status_of(&pool, id).await, "failed", "with no new ask, a finish ends it");
 
@@ -70,11 +70,11 @@ async fn the_next_claim_serves_an_ask_left_by_a_claim_that_never_finished(pool: 
     let DedupOutcome::Inserted(id) = enqueue_or_rearm(&pool, resume()).await.unwrap() else {
         panic!("the first ask inserts");
     };
-    claim_one(&pool, "disp-1", &ClaimFilter::Dispatcher).await.unwrap().expect("claimed");
+    claim_one(&pool, "disp-1").await.unwrap().expect("claimed");
     assert!(matches!(enqueue_or_rearm(&pool, resume()).await.unwrap(), DedupOutcome::AlreadyLive(same) if same == id));
     assert!(tasks::requeue(&pool, id, "disp-1").await.unwrap());
 
-    claim_one(&pool, "disp-2", &ClaimFilter::Dispatcher).await.unwrap().expect("claimed again");
+    claim_one(&pool, "disp-2").await.unwrap().expect("claimed again");
     tasks::complete(&pool, id, "disp-2", json!(1)).await.unwrap();
     assert_eq!(status_of(&pool, id).await, "complete", "the second claim already ran for the ask");
 }

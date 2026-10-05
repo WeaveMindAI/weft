@@ -9,10 +9,12 @@
       "git restore *": "deny",
       "git reset --hard*": "deny",
       "git clean -f*": "deny",
+      "git checkout .": "deny",
+      "git checkout -- *": "deny",
+      "git checkout": "ask",
       "git checkout *": "ask",
       "git reset*": "ask",
-      "git clean*": "ask",
-      "git push*": "ask"
+      "git clean*": "ask"
     }
   }
 }

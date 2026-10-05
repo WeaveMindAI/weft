@@ -77,12 +77,19 @@ pub enum Phase {
     /// `{ "project": <name> }`.
     BuildStart,
     /// The install finished building the project. Detail carries
-    /// `{ "project": <name> }`.
+    /// `{ "project": <name>, "built": [...] }`: the image refs it had to
+    /// build (empty when every image was already there).
     BuildDone,
     /// One image of the build is building on the install's builder.
     /// Detail carries `{ "image", "build", "logUrl"? }`: the image ref,
     /// the builder's id for the build, and where its log is read.
     BuildImage,
+    /// One image of the build was built (its build succeeded). Detail
+    /// carries `{ "image", "seconds" }`: about how long it took.
+    BuildImageDone,
+    /// Periodic heartbeat while the install builds. Detail carries
+    /// `{ "elapsedSeconds", "images": [...] }`: the images still building.
+    BuildWait,
     /// HTTP request to the dispatcher started.
     DispatcherCallStart,
     /// HTTP request to the dispatcher finished. Body in `detail`
@@ -297,6 +304,16 @@ impl Progress {
         );
     }
 
+    /// An image of the build finished, about `seconds` after it started.
+    pub fn build_image_done(&self, image: &str, seconds: u64) {
+        self.emit(Phase::BuildImageDone, Some(serde_json::json!({ "image": image, "seconds": seconds })));
+    }
+
+    /// The build goes on: `images` still building, `elapsed` since it began.
+    pub fn build_wait(&self, elapsed: std::time::Duration, images: &[String]) {
+        self.emit(Phase::BuildWait, Some(serde_json::json!({ "elapsedSeconds": elapsed.as_secs(), "images": images })));
+    }
+
     /// `built`: the image refs the install had to build (empty when every
     /// image was already there).
     pub fn build_done(&self, project: &str, built: &[String]) {
@@ -413,6 +430,15 @@ impl Progress {
     }
 }
 
+/// `seconds` as a person reads a wait: `45s`, `1m51s`.
+fn elapsed_text(seconds: u64) -> String {
+    if seconds >= 60 {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -439,6 +465,24 @@ fn human_line(ev: &Event<'_>) -> Option<String> {
             match field("logUrl") {
                 Some(log) => format!("  building {image} as {build}; its log: {log}"),
                 None => format!("  building {image} as {build}"),
+            }
+        }
+        Phase::BuildImageDone => {
+            let image = ev.detail.and_then(|d| d.get("image")).and_then(|v| v.as_str()).unwrap_or("an image");
+            let seconds = ev.detail.and_then(|d| d.get("seconds")).and_then(|v| v.as_u64()).unwrap_or(0);
+            format!("  built {image} in about {}", elapsed_text(seconds))
+        }
+        Phase::BuildWait => {
+            let elapsed = ev.detail.and_then(|d| d.get("elapsedSeconds")).and_then(|v| v.as_u64()).unwrap_or(0);
+            let images: Vec<&str> = ev
+                .detail
+                .and_then(|d| d.get("images"))
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            match images.as_slice() {
+                [] => format!("  still building ({} so far)", elapsed_text(elapsed)),
+                images => format!("  still building {} ({} so far)", images.join(", "), elapsed_text(elapsed)),
             }
         }
         Phase::InfraProvisionStart => "provisioning infra".to_string(),

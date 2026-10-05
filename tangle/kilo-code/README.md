@@ -66,10 +66,13 @@ commands are the expert's hand on the same loop.
 | `.kilo/skills/weft-models/` | on demand, before wiring an LLM call | reasoning on or off, `maxTokens`, an empty reply, what a model costs, prompt caching |
 | `.kilo/skills/weft-safety/` | on demand, when a program talks to a model or acts on the world | the swiss cheese model, the free layers built by default (a defensive prompt, one more key on the call already being made, limits at the interface), the layers that add a call or a person offered once when the stakes are real, the gate and human-check wiring |
 | `.kilo/skills/weft-node-authoring/` | on demand, around dispatches | the dispatch protocol and review checklist for Tangle, and the authoring manual the specialist reads |
-| `.kilo/skills/weft-running/` | on demand, when running or debugging | the CLI map, the daemon, journal inspection, the debugging playbook |
+| `.kilo/skills/weft-running/` | on demand, when running | the CLI map, the daemon, the build and run flow, the deactivate modes, the infra verbs, how long each command takes |
+| `.kilo/skills/weft-debugging/` | on demand, when a run failed or did the wrong thing | reading a run (executions, logs, events), every skip and cancel reason, the debugging playbook |
 | `.kilo/skills/weft-sdp/` | on demand, when growing a program stage by stage | seeded runs, specs that run one piece with values handed in, firing a trigger without activating, the version tree, freezing and checking examples, every refusal and the verb that answers it |
 | `.kilo/skills/weft-editor/` | on demand, about the VS Code interface | the graph view: toolbar, action bar, palette, gestures, groups and loops, inspector, labels verbatim |
-| `.kilo/skills/weft-connections/` | on demand, about accounts | the connect flow door by door, permissions, the browser extension, a public URL |
+| `.kilo/skills/weft-connections/` | on demand, about accounts | the connect flow door by door, permissions, what each banner means |
+| `.kilo/skills/weft-people-in-the-loop/` | on demand, when a person answers the program | how a waiting question reaches people, the browser extension, task tokens |
+| `.kilo/skills/weft-public-address/` | on demand, when the internet must reach weft | the public URL, the activation error that asks for one, tunnels |
 | `.kilo/skills/weft-consumers/` | on demand, when building a consumer of a program's signals | the api token, the dispatcher doors, the listing and form shapes, how a new kind reaches consumers, the reference extension |
 | `.kilo/skills/weft-frontend/` | on demand, when the user wants a page, app, or site | the default stack (pnpm, SvelteKit, PostgreSQL, BetterAuth, shadcn-svelte), calling the program's own routes as its API, the signal doors for human steps, sharing one Postgres, the build |
 | `.kilo/skills/weft-api/` | on demand, when the program is an HTTP API or a WebSocket service | the `Route` and `Socket` triggers, `Reply`, `Stream` and `Close`, gating a route with an auth connection, the shapes that need a custom node, trying it with curl and a socket client |

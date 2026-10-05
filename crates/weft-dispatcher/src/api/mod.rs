@@ -158,22 +158,25 @@ async fn guard_token_doors(
     let response = next.run(axum::extract::Request::from_parts(parts, body)).await;
     let status = response.status();
     let admitted = response.extensions().get::<Admitted>().is_some();
-    if live_call && !admitted && status != StatusCode::TOO_MANY_REQUESTS {
-        match blocked().await {
-            Ok(Some(refused)) => return crate::entry_limits::too_many(refused),
-            Ok(None) => {}
-            Err(answer) => return answer,
-        }
-    }
     // What the program answered is not a refused token, whatever it says.
     let refused_token = !admitted
         && (matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
             || (status == StatusCode::NOT_FOUND && path.starts_with("/signal/")));
     if refused_token {
-        if let Err(e) = crate::entry_limits::note_invalid_token(&state.pg_pool, &state.edge, address, now).await {
-            // The answer is already decided; a lost count only lets one
-            // more guess through.
-            tracing::warn!(target: "weft_dispatcher::api", error = %e, "could not count a refused token");
+        // Counted and checked in one trip: a live call past the bound hears
+        // 429 like every other answer from a blocked address.
+        match crate::entry_limits::note_invalid_token(&state.pg_pool, &state.edge, address, now).await {
+            Ok(Some(refused)) if live_call => return crate::entry_limits::too_many(refused),
+            Ok(_) => {}
+            // A lost count only lets one more guess through, and the
+            // refusal is the answer either way.
+            Err(e) => tracing::warn!(target: "weft_dispatcher::api", error = %e, "could not count a refused token"),
+        }
+    } else if live_call && !admitted && status != StatusCode::TOO_MANY_REQUESTS {
+        match blocked().await {
+            Ok(Some(refused)) => return crate::entry_limits::too_many(refused),
+            Ok(None) => {}
+            Err(answer) => return answer,
         }
     }
     response
@@ -253,6 +256,7 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         .route("/projects/{id}/trigger-bakes", get(versions::trigger_bakes))
         .route("/projects/{id}/versions/{version}", axum::routing::delete(versions::prune))
         .route("/projects/{id}/status", get(project::status))
+        .route("/projects/{id}/builds/{build}", get(project::build_state))
         // The connections the program's own access nodes use on this
         // install, never written in the source.
         .route("/projects/{id}/picks", get(picks::list).put(picks::change))

@@ -118,6 +118,14 @@ pub async fn containers(docker: &dyn Docker, install: &str, labels: &[(&str, &st
     out.lines().filter(|l| !l.trim().is_empty()).map(ContainerRow::parse).collect()
 }
 
+/// The names of every container that mounts the volume `volume`, whoever
+/// made it.
+pub async fn containers_using(docker: &dyn Docker, volume: &str) -> anyhow::Result<Vec<String>> {
+    let args = vec!["ps".to_string(), "--all".into(), "--filter".into(), format!("volume={volume}"), "--format".into(), "{{.Names}}".into()];
+    let out = run(docker, args).await?;
+    Ok(out.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
+}
+
 /// One line of `docker ps --format '{{json .}}'`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerRow {

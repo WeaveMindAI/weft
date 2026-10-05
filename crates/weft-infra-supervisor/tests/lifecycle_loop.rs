@@ -801,11 +801,12 @@ weft_core::stress_test!(
         let (lifecycle, _changes) = rig.spawn_lifecycle_loop();
 
         // P2's command runs while P1's first is held mid-drain, and P1's
-        // second waits behind it: the claims name P1 busy.
+        // second (which reaches the same copies) waits behind it: the claims
+        // name the running command, and the broker holds back what it reaches.
         until("the other project's command completed", || completed_ids(&rig) == vec![3]).await;
         assert!(rig.broker.calls().iter().any(|c| matches!(
             c,
-            BrokerCall::ClaimCommand { busy_projects, .. } if busy_projects == &vec![PROJECT]
+            BrokerCall::ClaimCommand { busy_commands, .. } if busy_commands == &vec![1]
         )));
 
         // The finished task frees its project: the second command runs next.
@@ -813,6 +814,95 @@ weft_core::stress_test!(
         until("both of P1's commands completed", || completed_ids(&rig).len() == 3).await;
         assert_eq!(completed_ids(&rig), vec![3, 1, 2], "P1's commands run in the order issued");
         lifecycle.abort();
+    }
+);
+
+/// [`stop_of`], for one instance's copies of `node`.
+fn stop_of_copy(id: i64, project: uuid::Uuid, node: &str, instance: &str) -> SupervisorCommandRow {
+    SupervisorCommandRow {
+        node_id: Some(node.to_string()),
+        copies: weft_core::instance::Copies::Instance(weft_core::instance::InstanceId::new(instance).unwrap()),
+        ..stop_of(id, project, Policy::Wait)
+    }
+}
+
+weft_core::stress_test!(
+    name: commands_on_different_copies_run_side_by_side,
+    runs: 16,
+    worker_threads: 4,
+    async fn body() {
+        // Three instances' copies stopped together: the first two reach
+        // different copies and are both running at once (each held
+        // mid-drain); the third reaches the first one's copy again, so it
+        // waits for it, then runs.
+        let rig = rig();
+        rig.broker.gate_running_count(PROJECT);
+        rig.broker.enqueue_command(stop_of_copy(1, PROJECT, "db", "ann"));
+        rig.broker.enqueue_command(stop_of_copy(2, PROJECT, "db", "bob"));
+        rig.broker.enqueue_command(stop_of_copy(3, PROJECT, "db", "ann"));
+        let (lifecycle, _changes) = rig.spawn_lifecycle_loop();
+
+        until("both copies' stops are running", || running_count_calls(&rig, PROJECT) >= 2).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(running_count_calls(&rig, PROJECT), 2, "the stop reaching ann's copy again waits");
+        assert!(completed_ids(&rig).is_empty());
+
+        rig.broker.open_running_count(PROJECT);
+        until("every stop completed", || completed_ids(&rig).len() == 3).await;
+        let done = completed_ids(&rig);
+        let at = |id: i64| done.iter().position(|d| *d == id).unwrap();
+        assert!(at(1) < at(3), "ann's copy is stopped in the order asked: {done:?}");
+        lifecycle.abort();
+    }
+);
+
+weft_core::stress_test!(
+    name: a_pass_runs_different_copies_side_by_side,
+    runs: 16,
+    worker_threads: 4,
+    async fn body() {
+        // A supervisor that scales to zero runs the same way inside one
+        // pass: both copies' stops are running at once, and the pass ends
+        // once both are done.
+        let rig = rig();
+        rig.broker.gate_running_count(PROJECT);
+        rig.broker.enqueue_command(stop_of_copy(1, PROJECT, "db", "ann"));
+        rig.broker.enqueue_command(stop_of_copy(2, PROJECT, "db", "bob"));
+        let pass = tokio::spawn({
+            let state = rig.state.clone();
+            async move { weft_infra_supervisor::tick(&state).await }
+        });
+        until("both copies' stops are running in the pass", || running_count_calls(&rig, PROJECT) >= 2).await;
+        rig.broker.open_running_count(PROJECT);
+        pass.await.unwrap().unwrap();
+        let mut done = completed_ids(&rig);
+        done.sort_unstable();
+        assert_eq!(done, vec![1, 2]);
+    }
+);
+
+weft_core::stress_test!(
+    name: a_pass_keeps_renewing_its_leases_while_a_command_runs,
+    runs: 16,
+    worker_threads: 4,
+    async fn body() {
+        // A start or a stop takes the cloud minutes, longer than a lease:
+        // the pass renews while the command runs, so no sibling takes the
+        // project over and runs the command again.
+        use weft_infra_supervisor::broker_ops::BrokerCall;
+        let syncs = |rig: &SupervisorTestRig| rig.broker.calls().iter().filter(|c| matches!(c, BrokerCall::SyncOwnership { .. })).count();
+        let rig = rig();
+        rig.broker.gate_running_count(PROJECT);
+        rig.broker.enqueue_command(stop_of(1, PROJECT, Policy::Wait));
+        let pass = tokio::spawn({
+            let state = rig.state.clone();
+            async move { weft_infra_supervisor::tick(&state).await }
+        });
+        until("the command is running", || running_count_calls(&rig, PROJECT) >= 1).await;
+        until("the leases were renewed while it runs", || syncs(&rig) >= 3).await;
+        rig.broker.open_running_count(PROJECT);
+        pass.await.unwrap().unwrap();
+        assert_eq!(completed_ids(&rig), vec![1]);
     }
 );
 

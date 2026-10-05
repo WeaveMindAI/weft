@@ -138,7 +138,7 @@
         async fn wait_for_terminal(&self, _t: uuid::Uuid, _to: std::time::Duration) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
             unreachable!()
         }
-        async fn claim_one(&self, _p: &str, _f: weft_task_store::tasks::ClaimFilter, _w: std::time::Duration) -> anyhow::Result<Option<weft_task_store::tasks::Task>> { Ok(None) }
+        async fn claim_execution(&self, _p: &str, _project: uuid::Uuid, _execution: &str) -> anyhow::Result<Option<weft_task_store::tasks::ClaimedExecution>> { Ok(None) }
         async fn heartbeat(&self, _t: uuid::Uuid, _p: &str) -> anyhow::Result<bool> { Ok(true) }
         async fn requeue(&self, _t: uuid::Uuid, _p: &str) -> anyhow::Result<bool> { Ok(true) }
         async fn complete(&self, _t: uuid::Uuid, _p: &str, _r: Value) -> anyhow::Result<()> { Ok(()) }
@@ -157,7 +157,7 @@
     pub(super) struct NoopInfra;
     #[async_trait]
     impl InfraReader for NoopInfra {
-        async fn endpoint_address(&self, _c: weft_core::ExecutionId, _i: &weft_core::infra::InfraHandle) -> anyhow::Result<Option<weft_core::infra::EndpointAddress>> { Ok(None) }
+        async fn endpoint_address(&self, _c: weft_core::ExecutionId, _r: Option<&weft_core::instance::InstanceId>, _i: &weft_core::infra::InfraHandle) -> anyhow::Result<Option<weft_core::infra::EndpointAddress>> { Ok(None) }
     }
     pub(super) struct NoopInfraState;
     #[async_trait]
@@ -601,6 +601,8 @@
         caller: Option<Arc<dyn weft_core::caller::CallerConnection>>,
     ) -> anyhow::Result<Drove> {
         let projects = clients.project.clone();
+        // What a worker's claim would hand the drive: the run's rows so far.
+        let first_rows = clients.journal.raw_rows_after(execution_id, 0, std::time::Duration::ZERO).await?;
         let drove = tokio::time::timeout(
             std::time::Duration::from_secs(60),
             run_one_execution_observed(
@@ -612,6 +614,7 @@
                 "tenant-test".into(),
                 cancellation,
                 caller,
+                first_rows,
             ),
         )
         .await

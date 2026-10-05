@@ -58,37 +58,39 @@ pub struct SupervisorState {
     /// than at the end of its interval.
     pub ownership_wanted: Arc<tokio::sync::Notify>,
     /// Who is changing a project's copies on the host right now: a
-    /// lifecycle command holds its project's lock for its whole run, and
+    /// lifecycle command shares its project's lock for its whole run, and
     /// the ownership loop's sweep deletes a gone copy only while holding
-    /// it. See [`ProjectLocks`].
+    /// it alone. See [`ProjectLocks`].
     pub project_locks: Arc<ProjectLocks>,
     /// Held for the whole of one [`tick`], so the passes of a supervisor
     /// that scales to zero run one after another in this process. Two
     /// wakes landing together otherwise ran two passes side by side, and
     /// both claimed and ran the same command: claiming marks nothing on
-    /// the broker, and only a running loop's busy set (which a pass does
-    /// not keep) stops a second claim of a project's command.
+    /// the broker, and only the commands a running pass names as its own
+    /// stop a second claim of one.
     pub pass: Arc<tokio::sync::Mutex<()>>,
 }
 
-/// One lock per project, so this process's sweep deletion and apply of
-/// the same project never interleave on the host.
+/// One lock per project, so this process's sweep deletion and its
+/// commands on the same project never interleave on the host.
 ///
 /// A copy's id is derived from (project, node, instance), so a node removed
 /// and then added back names the very same copy. Without this, the sweep
 /// could judge the copy gone, an apply of the re-added node could adopt
 /// its kept disks, and the sweep's delete would then take the disks and
-/// the fresh containers with it. The lock covers this process only:
-/// other supervisors are kept off by the project's `infra_owner` lease,
-/// which the sweep holds and re-checks through its judgment and deletion
-/// (`ownership::sweep_gone_copies`) exactly as an apply does, and commands
-/// of one project already run one at a time in this process (the
-/// lifecycle loop's busy set).
+/// the fresh containers with it. Commands share the lock: they run side by
+/// side whenever they touch different copies (the broker hands out a
+/// command only once every older one touching any of its copies has ended,
+/// `lifecycle_writes::next_command`), and the sweep takes it alone. The
+/// lock covers this process only: other supervisors are kept off by the
+/// project's `infra_owner` lease, which the sweep holds and re-checks
+/// through its judgment and deletion (`ownership::sweep_gone_copies`)
+/// exactly as an apply does.
 #[derive(Default)]
-pub struct ProjectLocks(std::sync::Mutex<std::collections::HashMap<uuid::Uuid, Arc<tokio::sync::Mutex<()>>>>);
+pub struct ProjectLocks(std::sync::Mutex<std::collections::HashMap<uuid::Uuid, Arc<tokio::sync::RwLock<()>>>>);
 
 impl ProjectLocks {
-    fn entry(&self, project: uuid::Uuid) -> Arc<tokio::sync::Mutex<()>> {
+    fn entry(&self, project: uuid::Uuid) -> Arc<tokio::sync::RwLock<()>> {
         let mut locks = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // A lock nobody holds or waits on is dropped, so the map stays
         // the size of what is in flight. Safe under the map's own lock:
@@ -97,16 +99,17 @@ impl ProjectLocks {
         locks.entry(project).or_default().clone()
     }
 
-    /// Wait for the project's lock (a lifecycle command).
-    pub async fn lock(&self, project: uuid::Uuid) -> tokio::sync::OwnedMutexGuard<()> {
-        self.entry(project).lock_owned().await
+    /// Share the project's lock (a lifecycle command), waiting while the
+    /// sweep holds it.
+    pub async fn share(&self, project: uuid::Uuid) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.entry(project).read_owned().await
     }
 
-    /// The project's lock if nobody holds it (the sweep, which must never
-    /// wait: an apply can hold a project for minutes, and the ownership
-    /// tick that sweeps also renews every lease).
-    pub fn try_lock(&self, project: uuid::Uuid) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-        self.entry(project).try_lock_owned().ok()
+    /// The project's lock alone, if nobody holds it (the sweep, which must
+    /// never wait: an apply can hold a project for minutes, and the
+    /// ownership tick that sweeps also renews every lease).
+    pub fn try_alone(&self, project: uuid::Uuid) -> Option<tokio::sync::OwnedRwLockWriteGuard<()>> {
+        self.entry(project).try_write_owned().ok()
     }
 }
 
@@ -131,7 +134,11 @@ pub async fn run_loops(state: SupervisorState) -> anyhow::Result<()> {
 
 /// One pass of every loop, for a supervisor that scales to zero: renew
 /// and claim, run every waiting command of what it owns, look at their
-/// health. Each command runs to its end inside the pass. Answers when to
+/// health. Each command runs to its end inside the pass, side by side with
+/// the others the way [`run_loops`] runs them, and the leases are renewed
+/// all along as they are there: a start or a stop takes the cloud a minute
+/// or two, and a lease left to lapse meanwhile hands the project to a
+/// sibling, which runs the command again from the start. Answers when to
 /// look again: at the health interval while a project it owns has
 /// something to look at (infra nodes, a command), or while the host
 /// listing or the gone-copy sweep left something; otherwise when the
@@ -145,7 +152,14 @@ pub async fn tick(state: &SupervisorState) -> anyhow::Result<Option<Duration>> {
     let _pass = state.pass.lock().await;
     let mut owned = std::collections::HashSet::new();
     let synced = ownership::tick(state, &mut owned).await?;
-    while lifecycle::tick(state, Duration::ZERO).await? {}
+    let (changes, ownership_changed) = tokio::sync::mpsc::unbounded_channel();
+    tokio::select! {
+        drained = lifecycle::drain(state.clone(), ownership_changed) => drained?,
+        renewing = ownership::keep_renewing(state.clone(), owned, vec![changes]) => {
+            renewing?;
+            anyhow::bail!("the supervisor's ownership renewal ended mid-pass");
+        }
+    }
     health::tick(state).await?;
     Ok(next_look(&synced, state.health_interval))
 }

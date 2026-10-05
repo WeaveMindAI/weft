@@ -367,6 +367,78 @@ async fn an_infra_stop_takes_down_only_what_reads_it_and_recovers() -> anyhow::R
     project.finish().await
 }
 
+/// An infra stop takes down only the triggers reading that infra, so the
+/// project is left partly on: once the infra runs again, `weft activate`
+/// turns back on the trigger that is off and leaves the other as it is, and
+/// the trigger it turned back on fires.
+#[tokio::test]
+async fn activate_turns_back_on_only_the_triggers_an_infra_stop_took_down() -> anyhow::Result<()> {
+    let disp = ensure::up().await?;
+    let mut project = Project::prepare("lifecycle", disp.clone()).await?;
+    let pid = project.id();
+
+    let feed = SseFake::start().await?;
+    project.add_node_from_fixture("infra_min", "mini_service")?;
+    project.add_node_from_fixture("human_form", "test_sse_trigger")?;
+    // `reads` takes its event name off the service, so it reads that infra;
+    // `plain` reads nothing of it.
+    project.set_main(&format!(
+        "svc = MiniService\n\
+         reads = TestSseTrigger -> (value: String) {{ url: \"{url}\" }}\n\
+         reads.event_name = svc.status\n\
+         heard = Debug\n\
+         heard.data = reads.value\n\
+         plain = TestSseTrigger -> (value: String) {{\n\
+         \x20 url: \"{url}\"\n\
+         \x20 event_name: \"plain\"\n\
+         }}\n\
+         also = Debug\n\
+         also.data = plain.value\n",
+        url = feed.url()
+    ))?;
+
+    infra::start_and_wait_running(&mut project, INFRA_NODE).await?;
+    project.activate().await?;
+    status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE).await?;
+
+    project
+        .weft(&["infra", "stop", "--mode", "park", "--running-policy", "cancel"])
+        .await?;
+    // `plain` still listens, so the project reads active; `reads` is down,
+    // and turning it on waits for its infra.
+    status::wait_until(&disp, &pid, "the stop took down the trigger reading it", STATUS_DEADLINE, |s| {
+        s.status() == "active" && s.infra_rollup() == "stopped"
+    })
+    .await?
+    .assert_actions_exactly(&["deactivate", "infra_start", "infra_terminate"])?;
+
+    infra::start_and_wait_running(&mut project, INFRA_NODE).await?;
+    status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE)
+        .await?
+        .assert_actions_exactly(&["run", "deactivate", "activate", "infra_stop", "infra_terminate"])?;
+    project.activate().await?;
+    status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE)
+        .await?
+        .assert_actions_exactly(&["run", "deactivate", "infra_stop", "infra_terminate"])?;
+
+    // `plain` never let go of the feed, so one subscriber says nothing about
+    // `reads`: wait until both are listening before pushing.
+    feed.wait_for_subscribers(2, std::time::Duration::from_secs(60)).await?;
+    let before = run::executions(&disp, &pid).await?;
+    let execution_id = fire_until_execution(&feed, &disp, &pid, "ready", &before).await?;
+    SettledRun::observe(&disp, execution_id)
+        .await?
+        .completed()?
+        .assert_input("heard", "data", &json!("go"))?;
+
+    project
+        .weft(&["deactivate", "--mode", "wipe", "--running-policy", "cancel"])
+        .await?;
+    status::wait_until_status(&disp, &pid, "inactive", STATUS_DEADLINE).await?;
+    infra::terminate_and_wait_gone(&project, INFRA_NODE).await?;
+    project.finish().await
+}
+
 /// A SUSPENDED execution (HumanQuery) survives deactivate + reactivate: the
 /// inactive row offers `reactivate` (preserved state exists, not a bare
 /// activate), and the form is still answerable after the round trip, resuming

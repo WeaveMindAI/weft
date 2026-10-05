@@ -74,17 +74,17 @@ async fn run_inner(
         }
     };
 
-    // --reactivate-choice always wins. Otherwise:
-    //   - JSON mode: detect preserved state via /status; bail loud
-    //     if present so the caller (extension) is forced to pass an
-    //     explicit choice. No silent default.
-    //   - TTY mode: interactive prompt iff preserved state.
+    // --reactivate-choice always wins. Otherwise a terminal is asked when
+    // the triggers being turned on kept work while they were off. With
+    // nobody to ask (JSON mode), no choice is sent, and the dispatcher
+    // refuses an activate over kept work that names none: never a silent
+    // default.
     let reactivate_choice = if reactivate_choice_flag.is_some() {
         reactivate_choice_flag
     } else if ctx.json() {
-        require_choice_when_preserved(&client, &id).await?
+        None
     } else {
-        prompt_reactivate_choice(&client, &id).await?
+        prompt_reactivate_choice(&client, &id, &scope).await?
     };
 
     let path = format!("/projects/{id}/activate");
@@ -127,22 +127,23 @@ fn left_out_note(left_out: &[String]) -> Option<String> {
     ))
 }
 
-/// Read the project's preserved state from `/status`. Returns
-/// `Some((parked, suspended))` only when the project is `inactive`
-/// AND at least one count is non-zero; `None` when the project is in no
-/// state that preserves anything, or preserved nothing. A status that
-/// cannot be read is an error: guessing "nothing preserved" would skip
-/// the choice and drop the parked work on the default.
+/// What the triggers `scope` names kept while they were off, as the
+/// dispatcher counts it for that scope (`/status` asked about it): the
+/// parked fires and the runs waiting on a person that a reactivate's choice
+/// decides about. `None` when they kept nothing. A status that cannot be
+/// read is an error: guessing "nothing kept" would skip the question.
 async fn fetch_preserved_state(
     client: &crate::client::DispatcherClient,
     id: &str,
+    scope: &weft_core::activation::ActivationScope,
 ) -> anyhow::Result<Option<(usize, usize)>> {
-    let path = format!("/projects/{id}/status");
+    let query = weft_core::projects::StatusQuery::for_scope(scope).to_query_string();
+    let path = format!("/projects/{id}/status{query}");
     let resp: weft_core::projects::ProjectStatusResponse = serde_json::from_value(
         client
             .get_json(&path)
             .await
-            .context("read the project's status to see what its inactive window preserved")?,
+            .context("read the project's status to see what the triggers kept while they were off")?,
     )
     .with_context(|| {
         format!(
@@ -150,9 +151,6 @@ async fn fetch_preserved_state(
              dispatcher or this CLI so the versions match"
         )
     })?;
-    if resp.status != weft_core::projects::ProjectStatus::Inactive {
-        return Ok(None);
-    }
     let weft_core::projects::PreservationCounts { parked, suspended } = resp.preservation;
     if parked == 0 && suspended == 0 {
         return Ok(None);
@@ -160,34 +158,17 @@ async fn fetch_preserved_state(
     Ok(Some((parked, suspended)))
 }
 
-/// JSON-mode preserved-state check. Bails with a clear message
-/// when there's preserved state so callers must pass an explicit
-/// `--reactivate-choice` instead of falling through to a default.
-async fn require_choice_when_preserved(
-    client: &crate::client::DispatcherClient,
-    id: &str,
-) -> anyhow::Result<Option<ReactivateChoice>> {
-    let Some((parked, suspended)) = fetch_preserved_state(client, id).await? else {
-        return Ok(None);
-    };
-    anyhow::bail!(
-        "project {id} has preserved state (parked={parked}, suspended={suspended}); \
-         pass --reactivate-choice ({})",
-        ReactivateChoice::VARIANTS.iter().map(|choice| choice.as_str()).collect::<Vec<_>>().join(" | ")
-    )
-}
-
-/// TTY mode: if the project has preserved state, prompt the user.
-/// Otherwise return None and let the dispatcher default
-/// (`execute_parked_keep_suspended`) kick in.
+/// TTY mode: when the triggers being turned on kept work while they were
+/// off, ask what to do with it; `None` when they kept nothing.
 async fn prompt_reactivate_choice(
     client: &crate::client::DispatcherClient,
     id: &str,
+    scope: &weft_core::activation::ActivationScope,
 ) -> anyhow::Result<Option<ReactivateChoice>> {
-    let Some((parked, suspended)) = fetch_preserved_state(client, id).await? else {
+    let Some((parked, suspended)) = fetch_preserved_state(client, id, scope).await? else {
         return Ok(None);
     };
-    println!("Preserved during inactive window:");
+    println!("Kept while these triggers were off:");
     println!("  - {parked} parked signal(s) (queued submissions, will execute on reactivate)");
     println!("  - {suspended} pending suspension(s) (registered, no submission yet)");
     println!();

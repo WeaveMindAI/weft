@@ -398,6 +398,57 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         CREATE INDEX IF NOT EXISTS signal_subscription_signal
             ON signal_subscription (signal_token);
         "#,
+        // Tell every process keeping a copy of a project's connections,
+        // its install picks or its instances' values (a worker's opened
+        // connections, the dispatcher's picks for a run's birth, the
+        // broker's caller verifiers) that they changed, named so that every
+        // process that may read the row hears it: a connection that is no
+        // instance's own can serve any project of the tenant, so it is
+        // announced as `tenant:<tenant>`; everything else as its project.
+        // An update announces the row as it was and as it is, since a
+        // rotate can move a connection from one owner to another.
+        // SYNC: 'weft_access' and its payloads <-> weft_broker_client::line::ACCESS_CHANNEL, crates/weft-broker/src/line.rs (audience), crates/weft-broker/src/caller_auth.rs (names), crates/weft-dispatcher/src/held.rs (access_changed)
+        r#"CREATE OR REPLACE FUNCTION access_notify() RETURNS trigger AS $$
+            BEGIN
+                IF TG_OP <> 'INSERT' THEN
+                    -- Nested: a field only access_grant has is read only there.
+                    IF TG_TABLE_NAME = 'access_grant' THEN
+                        IF OLD.instance_id IS NULL THEN
+                            PERFORM pg_notify('weft_access', 'tenant:' || OLD.tenant_id);
+                        ELSE
+                            PERFORM pg_notify('weft_access', OLD.project_id::text);
+                        END IF;
+                    ELSE
+                        PERFORM pg_notify('weft_access', OLD.project_id::text);
+                    END IF;
+                END IF;
+                IF TG_OP <> 'DELETE' THEN
+                    -- Nested: a field only access_grant has is read only there.
+                    IF TG_TABLE_NAME = 'access_grant' THEN
+                        IF NEW.instance_id IS NULL THEN
+                            PERFORM pg_notify('weft_access', 'tenant:' || NEW.tenant_id);
+                        ELSE
+                            PERFORM pg_notify('weft_access', NEW.project_id::text);
+                        END IF;
+                    ELSE
+                        PERFORM pg_notify('weft_access', NEW.project_id::text);
+                    END IF;
+                END IF;
+                RETURN NULL;
+            END;
+            $$ LANGUAGE plpgsql"#,
+        r#"DROP TRIGGER IF EXISTS access_grant_notify ON access_grant"#,
+        r#"CREATE TRIGGER access_grant_notify
+            AFTER INSERT OR UPDATE OR DELETE ON access_grant
+            FOR EACH ROW EXECUTE FUNCTION access_notify()"#,
+        r#"DROP TRIGGER IF EXISTS install_pick_notify ON install_pick"#,
+        r#"CREATE TRIGGER install_pick_notify
+            AFTER INSERT OR UPDATE OR DELETE ON install_pick
+            FOR EACH ROW EXECUTE FUNCTION access_notify()"#,
+        r#"DROP TRIGGER IF EXISTS instance_value_notify ON instance_value"#,
+        r#"CREATE TRIGGER instance_value_notify
+            AFTER INSERT OR UPDATE OR DELETE ON instance_value
+            FOR EACH ROW EXECUTE FUNCTION access_notify()"#,
     ],
     seed: &[],
 };

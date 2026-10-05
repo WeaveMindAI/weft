@@ -48,13 +48,14 @@ pub trait BrokerSupervisorOps: Send + Sync {
         &self,
         project_id: uuid::Uuid,
     ) -> Result<Option<serde_json::Value>>;
-    /// The oldest waiting command of a project this supervisor owns and is not
-    /// already running a command for (`busy_projects`), holding up to
-    /// `wait` for one to be issued when none is waiting.
+    /// The oldest waiting command of a project this supervisor owns that no
+    /// older waiting command reaches a copy of, other than the ones it runs
+    /// already (`busy_commands`), holding up to `wait` for one to be issued
+    /// when none is waiting.
     async fn claim_command(
         &self,
         claimer: &str,
-        busy_projects: &[uuid::Uuid],
+        busy_commands: &[i64],
         wait: std::time::Duration,
     ) -> Result<SupervisorClaim>;
     /// Record one typed infra_event. The kind + payload pair comes
@@ -211,10 +212,10 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
     async fn claim_command(
         &self,
         claimer: &str,
-        busy_projects: &[uuid::Uuid],
+        busy_commands: &[i64],
         wait: std::time::Duration,
     ) -> Result<SupervisorClaim> {
-        BrokerSupervisorClient::claim_command(self, claimer, busy_projects, wait).await
+        BrokerSupervisorClient::claim_command(self, claimer, busy_commands, wait).await
     }
     async fn event_record(
         &self,

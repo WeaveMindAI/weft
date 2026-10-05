@@ -263,6 +263,39 @@ impl ComputeInfraHost {
         self.google.get_opt(&self.instance_url(&names::unit_machine(&node.resource_base(), unit))).await
     }
 
+    /// Wait until the unit's machine, which is stopping, is off (or gone).
+    /// No deadline: a stop is a person's wait, and Compute Engine ends one
+    /// by itself once the guest has had its time to shut down; a slow one
+    /// says so in the log. A machine that is no longer stopping and not off
+    /// was started again meanwhile (from the console, by its own restart
+    /// policy), and that fails the stop, naming what it found.
+    async fn until_off(&self, node: &NodeRef, unit: &str) -> anyhow::Result<()> {
+        let started = tokio::time::Instant::now();
+        let mut said = started;
+        loop {
+            let Some(machine) = self.machine(node, unit).await? else { return Ok(()) };
+            let status = machine.get("status").and_then(Value::as_str).unwrap_or_default();
+            if is_off(status) {
+                return Ok(());
+            }
+            if !matches!(status, "STOPPING" | "SUSPENDING") {
+                anyhow::bail!(
+                    "machine '{}' was being stopped and is {status} now: something started it again meanwhile; stop it again once it is up",
+                    name_of(&machine)
+                );
+            }
+            if said.elapsed() >= STOP_BREADCRUMB {
+                said = tokio::time::Instant::now();
+                tracing::info!(
+                    target: "weft_platform_gcp::infra_host",
+                    machine = %name_of(&machine), %status, waited_secs = started.elapsed().as_secs(),
+                    "still waiting for the machine to be off"
+                );
+            }
+            tokio::time::sleep(STOP_POLL).await;
+        }
+    }
+
     async fn set_assignment(&self, machine: &Value, node: &ResolvedNode, unit: &ResolvedUnit) -> anyhow::Result<()> {
         let fingerprint = machine.pointer("/metadata/fingerprint").and_then(Value::as_str).unwrap_or_default();
         let mut items: Vec<Value> = machine.pointer("/metadata/items").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -496,6 +529,17 @@ fn disk_copy(disk: &Value) -> anyhow::Result<NodeRef> {
     serde_json::from_str(raw).map_err(|e| anyhow::anyhow!("disk '{}': its description is not a copy: {e}", name_of(disk)))
 }
 
+/// How often a stop someone else asked for is looked at until it lands,
+/// and how often a slow one is mentioned in the log.
+const STOP_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+const STOP_BREADCRUMB: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether a machine in `status` is off: it runs nothing and bills no
+/// compute.
+fn is_off(status: &str) -> bool {
+    matches!(status, "TERMINATED" | "SUSPENDED")
+}
+
 fn name_of(machine: &Value) -> &str {
     machine.get("name").and_then(Value::as_str).unwrap_or_default()
 }
@@ -591,13 +635,21 @@ impl InfraHost for ComputeInfraHost {
         Ok(())
     }
 
+    /// Returns once the machine is off: a stop someone else asked for (a
+    /// supervisor that lost the project mid-stop, a person in the console)
+    /// is waited out rather than taken as done, so nothing records the unit
+    /// stopped while its machine still runs and bills.
     async fn stop_unit(&self, node: &NodeRef, unit: &str) -> anyhow::Result<()> {
         let Some(machine) = self.machine(node, unit).await? else { return Ok(()) };
-        if matches!(machine.get("status").and_then(Value::as_str), Some("TERMINATED" | "STOPPING" | "SUSPENDED")) {
-            return Ok(());
+        match machine.get("status").and_then(Value::as_str) {
+            Some(status) if is_off(status) => return Ok(()),
+            Some("STOPPING" | "SUSPENDING") => {}
+            _ => {
+                let op = self.google.post(&format!("{}/stop", self.instance_url(name_of(&machine))), &json!({})).await?;
+                self.wait(op).await?;
+            }
         }
-        let op = self.google.post(&format!("{}/stop", self.instance_url(name_of(&machine))), &json!({})).await?;
-        self.wait(op).await.map(|_| ())
+        self.until_off(node, unit).await
     }
 
     async fn restart_unit(&self, node: &NodeRef, unit: &str) -> anyhow::Result<()> {

@@ -45,4 +45,17 @@ pub async fn setup(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("execution stub");
+    // The journal's rows, which a worker's claim reads in the same
+    // statement (`tasks::claim_execution`).
+    // SYNC: exec_event's (execution_id, id, payload_json) <-> crates/weft-dispatcher/src/journal/postgres.rs (the journal's table), crates/weft-task-store/src/journal_rows.rs (rows_after_sql)
+    sqlx::query(
+        r#"CREATE TABLE IF NOT EXISTS exec_event (
+            id BIGSERIAL PRIMARY KEY,
+            execution_id TEXT NOT NULL,
+            payload_json TEXT NOT NULL
+        )"#,
+    )
+    .execute(pool)
+    .await
+    .expect("exec_event stub");
 }

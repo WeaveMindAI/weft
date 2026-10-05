@@ -152,7 +152,7 @@ project has the thing to show, or they ask.
     the run. The wait costs nothing, however long, and there is no
     deadline on it: ending one is somebody's decision, through "Cancel
     run" on the card or `weft stop <execution-id>`. Extension setup, including
-    minting the token it needs, is in the `weft-connections` skill.
+    minting the token it needs, is in the `weft-people-in-the-loop` skill.
 14. **When it breaks.** The Problems panel fills as they type, the red
     banner names what failed, and a failed box is clickable like any
     other. A skipped box says why in words. Tell them: nothing here fails
@@ -166,7 +166,10 @@ your labels match the screen.
 | The question is about | The skill |
 |---|---|
 | anything on screen, a label, a button, a gesture | `weft-editor` |
-| running, watching, past runs, the terminal side | `weft-running` |
-| accounts, keys, sign-ins, the browser extension, a public URL | `weft-connections` |
+| running, watching, the terminal side | `weft-running` |
+| a run that failed or did the wrong thing, reading a past run | `weft-debugging` |
+| accounts, keys, sign-ins | `weft-connections` |
+| a person answering the program, the browser extension | `weft-people-in-the-loop` |
+| a public URL, a tunnel | `weft-public-address` |
 | the language itself, what a program may say | `weft-language` |
 | what nodes exist | `weft-catalog` |

@@ -49,7 +49,7 @@ async fn caller_verify(
 ) -> Result<Json<CallerVerified>, ApiError> {
     crate::auth::control_plane(&state, &headers_in).await?;
     let now = chrono::Utc::now().timestamp();
-    match verify_caller(&state.pool, &req, now).await {
+    match verify_caller(&state.verifiers, &state.pool, &req, now).await {
         Ok(identity) => Ok(Json(CallerVerified { identity })),
         Err(CallerRefusal::Refused(e)) => {
             tracing::warn!(
@@ -79,11 +79,52 @@ impl From<VerifyError> for CallerRefusal {
     }
 }
 
-/// The check itself, over the pool: load the connection's scheme and
-/// values, resolve the scheme's templates against the values, run it.
-/// Answers the identity the scheme established. Separate from the route
-/// so the db-tests exercise it directly.
+/// Which connection a gate verifies against, and for whom: everything the
+/// read of its verifier depends on.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct VerifierKey {
+    tenant: String,
+    for_instance: Option<(uuid::Uuid, weft_core::instance::InstanceId)>,
+    access_id: uuid::Uuid,
+    service: String,
+}
+
+/// The verifiers this broker keeps (`BrokerState::verifiers`): a gate
+/// checks every caller of its route against the same connection, so the
+/// connection is read once and kept until it changes
+/// (`weft_broker_client::line::ACCESS_CHANNEL`). The process already holds
+/// the key that opens every stored connection, so keeping one open adds
+/// nothing a look at its memory would not already give.
+pub type HeldVerifiers = weft_task_store::held_copy::HeldCopy<VerifierKey, weft_access_store::CallerVerifier>;
+
+/// Which verifiers a notice on `weft_access` drops (its payload is
+/// `weft_access_store`'s `access_notify`).
+pub fn verifiers_changed(payload: &str) -> weft_task_store::held_copy::Changed<VerifierKey, weft_access_store::CallerVerifier> {
+    let payload = payload.to_string();
+    weft_task_store::held_copy::Changed::Matching(Box::new(move |key: &VerifierKey, _| names(&payload, key)))
+}
+
+/// Whether a change announced with `payload` reaches the verifier under
+/// `key`: a tenant's shared connections reach every verifier of the tenant,
+/// a project's own (its instances') every verifier for that project's
+/// instances. A payload that names neither reaches every verifier.
+// SYNC: the payloads <-> crates/weft-access-store/src/lib.rs (access_notify), crates/weft-dispatcher/src/held.rs (access_changed), crates/weft-broker/src/line.rs (audience)
+fn names(payload: &str, key: &VerifierKey) -> bool {
+    match payload.strip_prefix("tenant:") {
+        Some(tenant) => key.tenant == tenant,
+        None => match payload.parse::<uuid::Uuid>() {
+            Ok(project) => key.for_instance.as_ref().is_some_and(|(of, _)| *of == project),
+            Err(_) => true,
+        },
+    }
+}
+
+/// The check itself: load the connection's scheme and values (kept in
+/// `verifiers` until they change), resolve the scheme's templates against
+/// the values, run it. Answers the identity the scheme established.
+/// Separate from the route so the db-tests exercise it directly.
 pub async fn verify_caller(
+    verifiers: &HeldVerifiers,
     pool: &PgPool,
     req: &CallerVerifyRequest,
     now_unix: i64,
@@ -92,18 +133,27 @@ pub async fn verify_caller(
         .access_id
         .parse()
         .map_err(|_| CallerRefusal::Failed(anyhow::anyhow!("malformed connection id '{}'", req.access_id)))?;
-    let verifier =
-        weft_access_store::caller_verifier(pool, &req.tenant, weft_access_store::GrantUser::of(req.for_instance.as_ref()), access_id, &req.service)
-            .await
-            .map_err(|e| match e.downcast_ref::<weft_access_store::AccessError>() {
-                // A connection that is not there (or another tenant's,
-                // which reads the same) cannot admit anyone.
-                Some(weft_access_store::AccessError::NotFound) => {
-                    CallerRefusal::Refused("no such connection".into())
-                }
-                _ => CallerRefusal::Failed(e),
-            })?;
-    let Some(kind) = verifier.verify else {
+    let key = VerifierKey {
+        tenant: req.tenant.clone(),
+        for_instance: req.for_instance.as_ref().map(|scope| (scope.project_id, scope.instance.clone())),
+        access_id,
+        service: req.service.clone(),
+    };
+    let verifier = verifiers
+        .get_or_load(key, || async {
+            weft_access_store::caller_verifier(pool, &req.tenant, weft_access_store::GrantUser::of(req.for_instance.as_ref()), access_id, &req.service)
+                .await
+                .map_err(|e| match e.downcast_ref::<weft_access_store::AccessError>() {
+                    // A connection that is not there (or another tenant's,
+                    // which reads the same) cannot admit anyone.
+                    Some(weft_access_store::AccessError::NotFound) => {
+                        CallerRefusal::Refused("no such connection".into())
+                    }
+                    _ => CallerRefusal::Failed(e),
+                })
+        })
+        .await?;
+    let Some(kind) = verifier.verify.clone() else {
         return Err(CallerRefusal::Refused(format!(
             "the '{}' service declares no `verify` block, so its connections cannot gate a route",
             req.service
@@ -140,6 +190,26 @@ pub async fn verify_caller(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn a_change_drops_the_verifiers_it_can_reach() {
+        let (project, other) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+        let key = |tenant: &str, for_instance: Option<uuid::Uuid>| VerifierKey {
+            tenant: tenant.into(),
+            for_instance: for_instance.map(|p| (p, weft_core::instance::InstanceId::new("ann").unwrap())),
+            access_id: uuid::Uuid::from_u128(9),
+            service: "api_key_auth".into(),
+        };
+        assert!(names("tenant:t", &key("t", None)), "a shared connection of the tenant");
+        assert!(names("tenant:t", &key("t", Some(project))), "an instance may use the tenant's shared ones too");
+        assert!(!names("tenant:t", &key("u", None)), "another tenant's");
+        assert!(names(&project.to_string(), &key("t", Some(project))), "the project's instances");
+        assert!(!names(&project.to_string(), &key("t", None)), "an instance's connection is never the author's");
+        assert!(!names(&project.to_string(), &key("t", Some(other))), "another project's instances");
+        assert!(names("garbled", &key("t", None)), "a payload naming nothing reaches everything");
+    }
+
     /// jsonwebtoken carries no crypto of its own; a build without a backend
     /// feature compiles and then panics at the first signature it checks,
     /// which is how every genuine token once took the broker down.

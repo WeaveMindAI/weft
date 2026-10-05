@@ -1,6 +1,6 @@
 ---
 name: weft-deploy
-description: "COMMAND, not reference: Deploy the program to a cloud install, through the deployer. Run this when the user asks for this step by name, naming the target and optionally what to do. The seventeen `weft-` reference skills beside it are things you read; this is a procedure you carry out."
+description: "COMMAND, not reference: Deploy the program to a cloud install, through the deployer. Run this when the user asks for this step by name, naming the target and optionally what to do. The `weft-` reference skills beside it are things you read; this is a procedure you carry out."
 ---
 
 Act on the cloud install named in the arguments: a deploy, unless the arguments ask for a rollback or for setting up CI.

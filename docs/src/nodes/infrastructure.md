@@ -164,6 +164,19 @@ It works during provisioning after the apply, and in every later phase once the
 infrastructure is running. If the endpoint is not declared, or the
 infrastructure is down, the error says which and points at `weft infra status`.
 
+Your node's `run` runs on every run that reaches it: behind a route, once per
+call. The worker keeps what `ctx.endpoint`, `ctx.published_access`,
+`ctx.publish_access` and `ctx.open` answered from one run to the next, and
+weft tells it the moment any of it changes, so after the first run those
+calls cost nothing. Two kinds of answer are asked for again: a credential
+weft lends for one firing, every time, and a token that expires, once it is
+due a refresh. A request to the running service itself (`call(...)`, a
+health check, a query) is a trip there on every run: quick inside the install's
+own network, and still one more thing that can fail while the service
+restarts. If you want a route behind your node to stay fast, keep `run` to
+reading what weft already holds and handing it on, plus whatever the service
+itself has to be asked every time.
+
 When a program marks your node `@per_instance`, each instance of the program
 gets its own container, and `ctx.endpoint` answers with the copy of the
 instance the run is for; your node's code does not change. Each copy has its

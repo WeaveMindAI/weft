@@ -27,12 +27,12 @@ use crate::instance::InstanceId;
 pub const INFRA_MARKER_KEY: &str = "__weft_infra__";
 
 /// One endpoint of one copy of an infra node, by name.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct InfraHandle {
     inner: InfraHandleInner,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InfraHandleInner {
     /// The infra node's place in the program, spelled the way infra

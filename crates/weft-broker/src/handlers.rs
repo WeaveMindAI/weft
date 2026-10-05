@@ -17,7 +17,7 @@ use axum::{
 };
 use weft_broker_client::lifecycle_command::{InfraCommandSignal, INFRA_COMMAND_CHANNEL, ISSUED_WAKE};
 use weft_broker_client::protocol::*;
-use weft_task_store::tasks::{ClaimFilter, DedupOutcome, TaskTarget};
+use weft_task_store::tasks::{DedupOutcome, TaskTarget};
 use weft_task_store::TaskKind;
 
 use crate::auth::{AuthedCaller, CallerIdentity, Role};
@@ -130,7 +130,7 @@ pub async fn journal_forget_unrecorded(
 /// project, so this only orders writers inside one project.
 ///
 /// Cross-execution sabotage gate: the execution's owning replica (stamped at
-/// first task_claim_one) must match the caller's. A compromised worker
+/// first task_claim_execution) must match the caller's. A compromised worker
 /// can act only on executions it legitimately owns, not
 /// arbitrary sibling executions in the same tenant. `owner_replica IS
 /// NULL` means the execution has not been claimed yet (e.g. a
@@ -638,27 +638,21 @@ pub async fn task_wait_terminal(
     Ok(Json(TaskWaitTerminalResponse::from_outcome(outcome)))
 }
 
-pub async fn task_claim_one(
+pub async fn task_claim_execution(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<TaskClaimOneRequest>,
-) -> Resp<TaskClaimOneResponse> {
+    Json(req): Json<TaskClaimExecutionRequest>,
+) -> Resp<TaskClaimExecutionResponse> {
     require_worker(&caller)?;
     require_replica_matches(&caller, &req.replica)?;
-    let filter = req.filter;
-    let ClaimFilter::ExecutionId { project_id, execution_id } = &filter else {
-        return Err((StatusCode::FORBIDDEN, "a worker claims only the execution it was called for".into()));
-    };
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, *project_id).await?;
-    // The worker's next asks (its run's journal first) are scoped by the
-    // execution, so its scope is read while the claim runs rather than
-    // after it, on that first ask.
-    let execution_id = execution_id.clone();
-    let (task, ()) = tokio::join!(
-        state.tasks.claim_one(&req.replica, filter, held(req.wait_ms)),
-        scope::warm_execution_id_scope(&state.scope_cache, &state.pool, &execution_id),
+    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id).await?;
+    // The worker's next asks are scoped by the execution, so its scope is
+    // read while the claim runs rather than after it, on that first ask.
+    let (claimed, ()) = tokio::join!(
+        state.tasks.claim_execution(&req.replica, req.project_id, &req.execution_id),
+        scope::warm_execution_id_scope(&state.scope_cache, &state.pool, &req.execution_id),
     );
-    let task = task.map_err(internal)?;
+    let claimed = claimed.map_err(internal)?;
     // Latest-claim-wins execution ownership is bound IN the claim's own
     // transaction by the `task_claim_binds_execution_id_owner` DB trigger:
     // claiming an execution-bearing task atomically stamps
@@ -666,7 +660,7 @@ pub async fn task_claim_one(
     // does NOT stamp it here, so "claimed by X" and "owned by X" can never
     // disagree. The journal_record owner check reads what the trigger
     // wrote.
-    Ok(Json(TaskClaimOneResponse { task }))
+    Ok(Json(TaskClaimExecutionResponse { claimed }))
 }
 
 pub async fn task_heartbeat(
@@ -1016,6 +1010,7 @@ pub async fn resolve_connection(
             identity: resolved.identity,
             relay_url: None,
             owner: resolved.owner,
+            keep_until_unix: Some(resolved.fresh_until.map_or(i64::MAX, |at| at.timestamp())),
         },
         weft_core::CredentialOwner::Platform => {
             // The row's service (already matched against the request)
@@ -1045,6 +1040,8 @@ pub async fn resolve_connection(
                         identity: resolved.identity,
                         relay_url,
                         owner: resolved.owner,
+                        // Leased per firing: never kept.
+                        keep_until_unix: None,
                     }
                 }
                 crate::credential::KeyResolution::NotConfigured => {
@@ -1113,7 +1110,7 @@ pub async fn publish_access(
             ),
         ));
     }
-    let done = weft_access_store::publish_grant(
+    let connection = weft_access_store::publish_grant(
         &state.pool,
         &owner.tenant,
         weft_access_store::PublishAccess {
@@ -1129,12 +1126,7 @@ pub async fn publish_access(
     )
     .await
     .map_err(store_err)?;
-    Ok(Json(PublishAccessResponse {
-        connection: weft_core::access::wire::PublishedConnection {
-            connection_id: done.grant.id.to_string(),
-            identity: done.grant.identity,
-        },
-    }))
+    Ok(Json(PublishAccessResponse { connection }))
 }
 
 /// The connection this node published for this service, if any. How a
@@ -1410,7 +1402,7 @@ pub async fn supervisor_claim_command(
         let next = crate::lifecycle_writes::next_command(
             &state.pool,
             &req.claimer_replica,
-            &req.busy_projects,
+            &req.busy_commands,
         )
         .await
         .map_err(internal)?;

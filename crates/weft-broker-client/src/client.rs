@@ -14,38 +14,27 @@ use uuid::Uuid;
 
 use weft_core::ExecutionId;
 use weft_journal::{ExecEvent, JournalClient, RawJournalRow};
-use weft_task_store::tasks::{CancelAsked, ClaimFilter, DedupOutcome, NewTask, Task, TaskOutcome};
+use weft_task_store::tasks::{CancelAsked, ClaimedExecution, DedupOutcome, NewTask, TaskOutcome};
 use weft_task_store::{InfraReader, TaskStoreClient};
 
+use crate::line::{Answer, BrokerLink, CallWait, LineError, DEFAULT_CALL_WAIT};
 use crate::protocol::*;
-use crate::token::TokenSource;
 
+/// Every call of every client below, over the process's one line to the
+/// broker (`crate::line`), with the status read the way each kind of call
+/// reads it.
 #[derive(Clone)]
 struct HttpCore {
-    /// One client (one connection pool) for every call, short or held;
-    /// a held call sets its own per-request timeout.
-    client: reqwest::Client,
-    base_url: String,
-    token: TokenSource,
+    link: BrokerLink,
 }
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// How much longer than the hold the HTTP layer waits for a held
-/// answer, so the network never cuts a hold the broker is about to end.
+/// How much longer than the hold the line waits for a held answer, so it
+/// never gives up on a hold the broker is about to end.
 const HOLD_GRACE: Duration = Duration::from_secs(5);
 
 impl HttpCore {
-    pub fn new(base_url: String, token: TokenSource) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(DEFAULT_TIMEOUT)
-            .build()
-            .expect("reqwest client builds");
-        Self {
-            client,
-            base_url,
-            token,
-        }
+    fn new(link: BrokerLink) -> Self {
+        Self { link }
     }
 
     async fn post<Req: Serialize, Res: for<'de> serde::Deserialize<'de>>(
@@ -53,60 +42,44 @@ impl HttpCore {
         path: &str,
         body: &Req,
     ) -> Result<Res> {
-        let resp = self.post_raw(path, body, None).await?;
-        Self::parse_success(resp, path).await
+        let answer = self.post_raw(path, body, DEFAULT_CALL_WAIT).await?;
+        Self::parse_success(answer, path)
     }
 
     /// A call the broker holds open for up to `hold` (never more than
-    /// `MAX_HOLD`, which it enforces). The HTTP deadline is the hold plus
-    /// [`HOLD_GRACE`], so it never fires before the broker's own.
+    /// `MAX_HOLD`, which it enforces). The hold starts once the call is
+    /// written, which may take up to the usual wait to send, so the line
+    /// waits that, the hold and [`HOLD_GRACE`], and never gives up before
+    /// the broker's own hold ends.
     async fn post_held<Req: Serialize, Res: for<'de> serde::Deserialize<'de>>(
         &self,
         path: &str,
         body: &Req,
         hold: Duration,
     ) -> Result<Res> {
-        let resp = self.post_raw(path, body, Some(hold + HOLD_GRACE)).await?;
-        Self::parse_success(resp, path).await
+        let to_send = DEFAULT_CALL_WAIT.to_send;
+        let wait = CallWait { to_send, to_answer: to_send + hold + HOLD_GRACE };
+        let answer = self.post_raw(path, body, wait).await?;
+        Self::parse_success(answer, path)
     }
 
-    /// Single POST core: build the request (url join, bearer token,
-    /// JSON body, the timeout when it is not the client's), send, hand
-    /// back the raw response. Status interpretation lives in the thin
-    /// wrappers (`post` = 2xx-or-error, `post_or_404` = 404 is "no row",
-    /// `post_fenced` = 410 / 409 are the two stale `WriteOutcome`s) so
-    /// the build/send body exists exactly once.
-    async fn post_raw<Req: Serialize>(
-        &self,
-        path: &str,
-        body: &Req,
-        timeout: Option<Duration>,
-    ) -> Result<reqwest::Response> {
-        let base = self.base_url.trim_end_matches('/');
-        let url = format!("{base}{path}");
-        let bearer = self.token.read(base).await.context("get an identity token for the broker")?;
-        let mut request = self.client.post(&url).bearer_auth(bearer).json(body);
-        for (name, value) in self.token.headers() {
-            request = request.header(name, value);
-        }
-        if let Some(timeout) = timeout {
-            request = request.timeout(timeout);
-        }
-        request.send().await.with_context(|| format!("POST {path}"))
+    /// Single call core: the body as JSON, sent on the line, the raw
+    /// answer back. Status interpretation lives in the thin wrappers
+    /// (`post` = 2xx-or-error, `post_or_404` = 404 is "no row",
+    /// `post_fenced` = 410 / 409 are the two stale `WriteOutcome`s).
+    async fn post_raw<Req: Serialize>(&self, path: &str, body: &Req, wait: CallWait) -> Result<Answer> {
+        let body = serde_json::to_vec(body).with_context(|| format!("serialize {path}"))?;
+        self.link.call(path, body, wait).await.with_context(|| format!("POST {path}"))
     }
 
     /// Shared 2xx gate + JSON parse for the status-interpreting
     /// wrappers.
-    async fn parse_success<Res: for<'de> serde::Deserialize<'de>>(
-        resp: reqwest::Response,
-        path: &str,
-    ) -> Result<Res> {
-        if !resp.status().is_success() {
-            let code = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(BrokerRefused { path: path.to_string(), status: code, body }.into());
+    fn parse_success<Res: for<'de> serde::Deserialize<'de>>(answer: Answer, path: &str) -> Result<Res> {
+        if !answer.status.is_success() {
+            let body = String::from_utf8_lossy(&answer.body).into_owned();
+            return Err(BrokerRefused { path: path.to_string(), status: answer.status, body }.into());
         }
-        resp.json().await.with_context(|| format!("parse {path}"))
+        serde_json::from_slice(&answer.body).with_context(|| format!("parse {path}"))
     }
 
     /// Variant of `post` for content-addressed reads where 404 means
@@ -120,11 +93,11 @@ impl HttpCore {
         path: &str,
         body: &Req,
     ) -> Result<Option<Res>> {
-        let resp = self.post_raw(path, body, None).await?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        let answer = self.post_raw(path, body, DEFAULT_CALL_WAIT).await?;
+        if answer.status == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        Ok(Some(Self::parse_success(resp, path).await?))
+        Ok(Some(Self::parse_success(answer, path)?))
     }
 
     /// Variant of `post` for the fenced lifecycle writes: HTTP 410
@@ -139,11 +112,11 @@ impl HttpCore {
         path: &str,
         body: &Req,
     ) -> Result<WriteOutcome<Res>> {
-        let resp = self.post_raw(path, body, None).await?;
-        match resp.status() {
+        let answer = self.post_raw(path, body, DEFAULT_CALL_WAIT).await?;
+        match answer.status {
             reqwest::StatusCode::GONE => Ok(WriteOutcome::Displaced),
             reqwest::StatusCode::CONFLICT => Ok(WriteOutcome::Gone),
-            _ => Ok(WriteOutcome::Applied(Self::parse_success(resp, path).await?)),
+            _ => Ok(WriteOutcome::Applied(Self::parse_success(answer, path)?)),
         }
     }
 }
@@ -208,13 +181,12 @@ where
     }
 }
 
-/// Whether a failed broker call never reached the broker: the connection
-/// itself was refused or could not be made, so the request was never
-/// sent. Only such a write is safe to send again; a write that reached it
-/// and failed some other way may have landed, and sending it twice would
-/// apply it twice.
+/// Whether a failed broker call never reached the broker: the line was
+/// down for the call's whole wait, so it was never written. Only such a
+/// write is safe to send again; a write that went out and failed some
+/// other way may have landed, and sending it twice would apply it twice.
 fn never_sent(e: &anyhow::Error) -> bool {
-    e.chain().any(|cause| cause.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_connect))
+    e.chain().any(|cause| matches!(cause.downcast_ref::<LineError>(), Some(LineError::NotSent { .. })))
 }
 
 /// The first wait before asking again after the broker could not answer
@@ -224,17 +196,17 @@ const READ_RETRY_FIRST: Duration = Duration::from_millis(200);
 const READ_RETRY_LONGEST: Duration = Duration::from_secs(5);
 
 /// Whether a failed broker call means the broker could not answer right
-/// now: it could not be reached, or it said so (503, which it answers
-/// when its database is unreachable). Any other status, including a 500
-/// (a row that does not decode fails the same way every time), or an
-/// answer that does not parse, would say the same thing again, so it is
-/// not.
+/// now: the line could not carry it or its answer, or the broker said so
+/// (503, which it answers when its database is unreachable). Any other
+/// status, including a 500 (a row that does not decode fails the same way
+/// every time), or an answer that does not parse, would say the same
+/// thing again, so it is not.
 // SYNC: 503 = ask again <-> crates/weft-broker/src/handlers.rs unavailable_or_internal
 fn broker_unavailable(e: &anyhow::Error) -> bool {
     if let Some(refused) = e.downcast_ref::<BrokerRefused>() {
         return refused.status == reqwest::StatusCode::SERVICE_UNAVAILABLE;
     }
-    e.downcast_ref::<reqwest::Error>().is_some_and(|e| !e.is_decode())
+    e.chain().any(|cause| cause.downcast_ref::<LineError>().is_some())
 }
 
 /// Run a read of a run's history until the broker answers it. Reading
@@ -275,10 +247,8 @@ pub struct BrokerJournalClient {
 }
 
 impl BrokerJournalClient {
-    pub fn new(base_url: String, token: TokenSource) -> Arc<Self> {
-        Arc::new(Self {
-            http: HttpCore::new(base_url, token),
-        })
+    pub fn new(link: BrokerLink) -> Arc<Self> {
+        Arc::new(Self { http: HttpCore::new(link) })
     }
 }
 
@@ -386,10 +356,8 @@ pub struct BrokerTaskStoreClient {
 }
 
 impl BrokerTaskStoreClient {
-    pub fn new(base_url: String, token: TokenSource) -> Arc<Self> {
-        Arc::new(Self {
-            http: HttpCore::new(base_url, token),
-        })
+    pub fn new(link: BrokerLink) -> Arc<Self> {
+        Arc::new(Self { http: HttpCore::new(link) })
     }
 }
 
@@ -416,23 +384,10 @@ impl TaskStoreClient for BrokerTaskStoreClient {
         .await
     }
 
-    async fn claim_one(&self, replica: &str, filter: ClaimFilter, wait: Duration) -> Result<Option<Task>> {
-        held(
-            wait,
-            |hold| {
-                let req = TaskClaimOneRequest {
-                    replica: replica.to_string(),
-                    filter: filter.clone(),
-                    wait_ms: hold.as_millis() as u64,
-                };
-                async move {
-                    let resp: TaskClaimOneResponse = self.http.post_held("/v1/task/claim_one", &req, hold).await?;
-                    Ok(resp.task)
-                }
-            },
-            Option::is_some,
-        )
-        .await
+    async fn claim_execution(&self, replica: &str, project_id: Uuid, execution_id: &str) -> Result<Option<ClaimedExecution>> {
+        let req = TaskClaimExecutionRequest { replica: replica.to_string(), project_id, execution_id: execution_id.to_string() };
+        let resp: TaskClaimExecutionResponse = self.http.post("/v1/task/claim_execution", &req).await?;
+        Ok(resp.claimed)
     }
 
     async fn heartbeat(&self, task_id: Uuid, replica: &str) -> Result<bool> {
@@ -496,10 +451,8 @@ pub struct BrokerSignalClient {
 }
 
 impl BrokerSignalClient {
-    pub fn new(base_url: String, token: TokenSource) -> Arc<Self> {
-        Arc::new(Self {
-            http: HttpCore::new(base_url, token),
-        })
+    pub fn new(link: BrokerLink) -> Arc<Self> {
+        Arc::new(Self { http: HttpCore::new(link) })
     }
 
     /// Every signal the listener must hold, of `project` alone when it
@@ -559,10 +512,8 @@ pub struct BrokerEventsClient {
 }
 
 impl BrokerEventsClient {
-    pub fn new(base_url: String, token: TokenSource) -> Arc<Self> {
-        Arc::new(Self {
-            http: HttpCore::new(base_url, token),
-        })
+    pub fn new(link: BrokerLink) -> Arc<Self> {
+        Arc::new(Self { http: HttpCore::new(link) })
     }
 
     pub async fn listener_resolve(
@@ -596,10 +547,8 @@ pub struct BrokerInfraClient {
 }
 
 impl BrokerInfraClient {
-    pub fn new(base_url: String, token: TokenSource) -> Arc<Self> {
-        Arc::new(Self {
-            http: HttpCore::new(base_url, token),
-        })
+    pub fn new(link: BrokerLink) -> Arc<Self> {
+        Arc::new(Self { http: HttpCore::new(link) })
     }
 }
 
@@ -608,6 +557,7 @@ impl InfraReader for BrokerInfraClient {
     async fn endpoint_address(
         &self,
         execution_id: weft_core::ExecutionId,
+        _run_instance: Option<&weft_core::instance::InstanceId>,
         infra: &weft_core::infra::InfraHandle,
     ) -> Result<Option<weft_core::infra::EndpointAddress>> {
         let req = InfraEndpointUrlRequest { execution_id, infra: infra.clone() };
@@ -627,10 +577,8 @@ pub struct BrokerAccessClient {
 }
 
 impl BrokerAccessClient {
-    pub fn new(base_url: String, token: TokenSource) -> Arc<Self> {
-        Arc::new(Self {
-            http: HttpCore::new(base_url, token),
-        })
+    pub fn new(link: BrokerLink) -> Arc<Self> {
+        Arc::new(Self { http: HttpCore::new(link) })
     }
 
     pub async fn resolve_connection(
@@ -679,10 +627,8 @@ pub struct BrokerExecutionClient {
 }
 
 impl BrokerExecutionClient {
-    pub fn new(base_url: String, token: TokenSource) -> Arc<Self> {
-        Arc::new(Self {
-            http: HttpCore::new(base_url, token),
-        })
+    pub fn new(link: BrokerLink) -> Arc<Self> {
+        Arc::new(Self { http: HttpCore::new(link) })
     }
 
     /// Tag `execution_id` with `tags`. Synchronous: on return the tag rows
@@ -737,10 +683,8 @@ pub struct BrokerProjectClient {
 }
 
 impl BrokerProjectClient {
-    pub fn new(base_url: String, token: TokenSource) -> Arc<Self> {
-        Arc::new(Self {
-            http: HttpCore::new(base_url, token),
-        })
+    pub fn new(link: BrokerLink) -> Arc<Self> {
+        Arc::new(Self { http: HttpCore::new(link) })
     }
 
     /// Fetch the project's `ProjectDefinition` JSON keyed by hash.
@@ -774,10 +718,8 @@ pub struct BrokerSupervisorClient {
 }
 
 impl BrokerSupervisorClient {
-    pub fn new(base_url: String, token: TokenSource) -> Arc<Self> {
-        Arc::new(Self {
-            http: HttpCore::new(base_url, token),
-        })
+    pub fn new(link: BrokerLink) -> Arc<Self> {
+        Arc::new(Self { http: HttpCore::new(link) })
     }
 
     /// Sync this supervisor's project ownership: renew its existing
@@ -848,13 +790,14 @@ impl BrokerSupervisorClient {
         Ok(resp.protocols)
     }
 
-    /// The oldest waiting command of a project this supervisor owns and
-    /// is not already running a command for (`busy_projects`), holding
-    /// up to `wait` for one to be issued when none is waiting.
+    /// The oldest waiting command of a project this supervisor owns that
+    /// no older waiting command reaches a copy of, other than the ones it
+    /// runs already (`busy_commands`), holding up to `wait` for one to be
+    /// issued when none is waiting.
     pub async fn claim_command(
         &self,
         claimer_replica: &str,
-        busy_projects: &[Uuid],
+        busy_commands: &[i64],
         wait: Duration,
     ) -> Result<SupervisorClaim> {
         held(
@@ -862,7 +805,7 @@ impl BrokerSupervisorClient {
             |hold| {
                 let req = SupervisorClaimCommandRequest {
                     claimer_replica: claimer_replica.to_string(),
-                    busy_projects: busy_projects.to_vec(),
+                    busy_commands: busy_commands.to_vec(),
                     wait_ms: hold.as_millis() as u64,
                 };
                 async move {
@@ -1149,10 +1092,8 @@ pub struct BrokerInfraStateClient {
 }
 
 impl BrokerInfraStateClient {
-    pub fn new(base_url: String, token: TokenSource) -> Arc<Self> {
-        Arc::new(Self {
-            http: HttpCore::new(base_url, token),
-        })
+    pub fn new(link: BrokerLink) -> Arc<Self> {
+        Arc::new(Self { http: HttpCore::new(link) })
     }
 
     pub async fn enqueue_apply(

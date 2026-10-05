@@ -39,7 +39,9 @@ flowchart TD
 
 Every run starts as a row in a table. The dispatcher writes the row, then
 hands the run to one of the program's workers, and the worker claims the row
-before it does anything. If the dispatcher dies after writing, the row is
+before it does anything. The claim hands the worker the run's journal in the
+same trip to the database, so the worker starts driving without reading it
+again. If the dispatcher dies after writing, the row is
 still there, and the dispatcher hands it out the next time it checks for
 waiting work. If a worker dies holding a run,
 its claim runs out and the run is handed out again.
@@ -82,6 +84,17 @@ started when a run needs it and stopped after five minutes with nothing to do.
 On a cloud install it is a Cloud Run service, which scales to zero between
 calls and out when calls pile up.
 
+A worker keeps, between runs, what its runs read of the program's
+infrastructure and connections: where each piece answers, the connections it
+opened, the ones an infrastructure node published. None of that changes from
+one run to the next, so after the first run a call no longer asks the broker
+where things answer or for its connections: it claims its run, and writes its
+journal after the answer goes out. Whenever one of
+those changes (a piece restarts somewhere else, a connection is replaced), the
+broker tells the worker, which drops what it kept and asks again. A
+credential the runtime lends for one firing is never kept, and a token that
+expires is kept only until it is due a refresh.
+
 If you want to change how many copies stay warm, how many runs one copy serves
 at once, or its CPU and memory, `weft workers` sets them for a project, on top
 of the install's defaults. If a run may take longer than a Cloud Run request
@@ -100,7 +113,8 @@ nothing in memory that another copy would need.
 
 What it does keep is a copy of the rows a call reads every time and that
 rarely change: a tenant's routes, the install's domains, a project's worker
-settings, which of its infrastructure is up. Every write to those rows makes
+settings, which of its infrastructure is up, the connections the install
+picked for it and what each instance provides. Every write to those rows makes
 Postgres tell every copy of the dispatcher, which drops what it held and reads
 it again on the next call, and anything it is about to refuse (no such route,
 infrastructure not running) it checks against the rows first. While its
@@ -108,6 +122,13 @@ connection that hears those announcements is down, it keeps nothing and reads
 every time. So a live call
 reaches the database once before the worker has it: one call that checks the
 route's limits and writes the run down together.
+
+The dispatcher's background work (handing runs to workers, answering what a
+program asks of weft, registering triggers) waits on rows in the database, and
+Postgres announces each one as it is written. A dispatcher that is up hears
+that and starts at once, on your machine and on a cloud install alike. On a
+cloud install, where the dispatcher can be at zero, whichever part of weft
+wrote the work also calls it to start one.
 
 ## The listener
 
@@ -149,6 +170,11 @@ so before it changes anything a supervisor takes an exclusive lease on the
 project. It keeps renewing that lease while the work runs, and if it expires
 another supervisor picks the project up.
 
+Inside the one supervisor that holds a project, the work on different copies
+runs side by side: three instances started together come up together. Work on
+the same copy runs in the order it was asked for, so a stop asked after a start
+waits for that start.
+
 A supervisor can still die between changing something and recording that it
 did. The next one works out what to do from what is actually running, rather
 than trusting the record.
@@ -157,6 +183,21 @@ than trusting the record.
 
 Only the dispatcher and the broker hold a database connection; the listener,
 the supervisor and every worker go through the broker.
+
+Each of those processes keeps one WebSocket open to the broker, and every call
+it makes rides that one connection, numbered and answered in whatever order
+they finish. A call the broker holds until something happens (a cancel, new
+journal rows) costs nothing while it waits, so a worker takes one seat at the
+broker however many calls its runs hold open. The broker also pushes the
+changes a worker keeps a copy of down the same connection (see [the
+worker](#the-worker)). When the connection breaks, it comes back by itself: a
+call not yet sent goes out on the new one if it is back within the call's wait.
+Past that, or when a sent call got no answer, two kinds of call are made again
+because doing so is safe: a journal write that never reached the broker, and
+a read of a run's history. Any other call fails the way a request whose
+connection reset does, since it may have landed. Uploads and
+downloads of files stay ordinary requests, so a big file never holds up the
+calls behind it.
 
 The broker checks every request. The caller proves who it is with a token its
 platform gave it: on your machine, one the runtime signed when it started the

@@ -20,12 +20,16 @@ use crate::scope::ScopeCache;
 
 /// Every channel the broker listens on: what a held request from a
 /// worker or a role (which have no database connection of their own)
-/// waits for. The process's one `LISTEN` connection must hold them all.
+/// waits for, and what its lines push. The process's one `LISTEN`
+/// connection must hold them all.
 pub const BROKER_CHANNELS: &[&str] = &[
     weft_task_store::tasks::TASK_READY_CHANNEL,
     weft_task_store::terminal::TERMINAL_CHANNEL,
     weft_journal::EXEC_EVENT_CHANNEL,
     weft_broker_client::lifecycle_command::INFRA_COMMAND_CHANNEL,
+    // What a line pushes to the workers following it (`crate::line`).
+    weft_broker_client::line::INFRA_STATUS_CHANNEL,
+    weft_broker_client::line::ACCESS_CHANNEL,
 ];
 
 pub struct BrokerState {
@@ -50,6 +54,11 @@ pub struct BrokerState {
     /// under its digest, so an entry is never stale, and a program asking
     /// for an endpoint on every run reads its definition once.
     pub declared_infra: weft_core::content_cache::ContentCache<(uuid::Uuid, String), weft_core::project::DeclaredInfra>,
+    /// The connections live routes are gated by, kept until they change
+    /// (`crate::caller_auth::HeldVerifiers`).
+    pub verifiers: Arc<crate::caller_auth::HeldVerifiers>,
+    /// The lines that follow notifications (`crate::line::LineFanout`).
+    pub lines: Arc<crate::line::LineFanout>,
     /// Where runtime-file bytes live: the install's bucket.
     pub object_store: Arc<dyn ObjectStore>,
     /// The runtime-file plane (`ctx.storage`): PG metadata + bucket bytes,
@@ -113,6 +122,14 @@ impl BrokerState {
             signals.require(channel)?;
         }
         let journal: Arc<dyn JournalClient> = Arc::new(PostgresJournalClient::new(pool.clone(), signals.clone())?);
+        let verifiers = weft_task_store::held_copy::HeldCopy::follow(
+            &signals,
+            weft_broker_client::line::ACCESS_CHANNEL,
+            4096,
+            crate::caller_auth::verifiers_changed,
+            |_| true,
+        )?;
+        let lines = crate::line::LineFanout::start(&signals);
         let tasks: Arc<dyn TaskStoreClient> = Arc::new(PostgresTaskStoreClient::new(pool.clone(), signals.clone())?);
         // A public infra endpoint's address is handed to whoever calls in
         // (a provider's webhook target), so it is built on the address the
@@ -139,6 +156,8 @@ impl BrokerState {
             identity_cache: IdentityCache::new()?,
             scope_cache: ScopeCache::new(),
             declared_infra: weft_core::content_cache::ContentCache::new(256),
+            verifiers,
+            lines,
             object_store: settings.object_store,
             runtime_store,
             entitlements: settings.entitlements,

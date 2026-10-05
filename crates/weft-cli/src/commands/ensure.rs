@@ -20,10 +20,10 @@
 //!     in-flight work finishes on the old processes while new work flows to
 //!     fresh, current-image processes.
 
-
 use anyhow::{Context, Result};
 
 use weft_core::builds::BuiltProgram;
+use weft_core::projects::BuildState;
 
 use super::Ctx;
 use crate::client::DispatcherClient;
@@ -122,6 +122,27 @@ impl ProjectHandle {
 
 /// How often a build in progress is asked which images it is building.
 const BUILD_LOOK_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often a build that goes on says so.
+const BUILD_SAY_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// An image seen building while the CLI waits on the install's build.
+struct Seen {
+    /// The builder's id for its build.
+    build: String,
+    /// Whether the address of its log was said.
+    log_said: bool,
+    /// How long into the wait it was first seen.
+    since: std::time::Duration,
+}
+
+/// Where the build `build` of project `id` is, `None` when the install has
+/// no such build on record.
+async fn build_state(client: &crate::client::DispatcherClient, id: &str, build: &str) -> Result<Option<BuildState>> {
+    let answer = client.get_json(&format!("/projects/{id}/builds/{build}")).await?;
+    let answer: weft_core::projects::BuildStateResponse = serde_json::from_value(answer).context("read a build's state")?;
+    Ok(answer.state)
+}
 
 /// The image builds running for project `id`. Only ever used to tell a
 /// person where a build is, so the caller warns about a status that
@@ -297,20 +318,57 @@ pub async fn build_compiled(
     let body = serde_json::to_value(&body)?;
     let (status, text) = {
         // While the install builds, name each image it is building and
-        // where its log is, once: a build can take many minutes, and a
-        // bare "building" says nothing about where it is.
-        // Each image once, and again when its log's address arrives.
-        let mut told: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
-        // A status that cannot be read is said once, not every look.
+        // where its log is, say when each is done, and say every
+        // `BUILD_SAY_EVERY` that it goes on: a build can take minutes,
+        // and a quiet terminal reads as a hang.
+        // Each image once, and again when its log's address arrives: its
+        // build, whether its log was said, and when it was first seen.
+        let mut building: std::collections::BTreeMap<String, Seen> = std::collections::BTreeMap::new();
+        let mut said = std::time::Duration::ZERO;
+        // A status that cannot be read is said once, not every look; the
+        // same for an image's own state.
         let mut warned = false;
-        crate::progress::while_waiting(client.post_json_status(&path, &body), BUILD_LOOK_EVERY, async |_| {
+        let mut state_warned = false;
+        crate::progress::while_waiting(client.post_json_status(&path, &body), BUILD_LOOK_EVERY, async |elapsed| {
             match builds_running(&client, &id).await {
                 Ok(builds) => {
-                    for build in builds {
+                    let now: std::collections::BTreeSet<&str> = builds.iter().map(|b| b.image.as_str()).collect();
+                    let gone: Vec<String> = building.keys().filter(|image| !now.contains(image.as_str())).cloned().collect();
+                    // An image no longer building may have failed: only one the
+                    // ledger says succeeded is said built. A failure is the
+                    // build's own answer, at its end.
+                    for image in gone {
+                        let seen = &building[&image];
+                        match build_state(&client, &id, &seen.build).await {
+                            Ok(Some(BuildState::Running)) => continue,
+                            Ok(Some(BuildState::Succeeded)) => {
+                                progress.build_image_done(&image, elapsed.saturating_sub(seen.since).as_secs());
+                            }
+                            Ok(Some(BuildState::Failed | BuildState::Cancelled) | None) => {}
+                            // Not said built, nor listed as building any more:
+                            // what became of it is the build's own answer, at
+                            // its end.
+                            Err(e) => {
+                                if !state_warned {
+                                    state_warned = true;
+                                    progress.warn(&format!("cannot tell whether {image} built ({e:#}); the build's answer will"));
+                                }
+                            }
+                        }
+                        building.remove(&image);
+                    }
+                    for build in &builds {
                         let with_log = build.log_url.is_some();
-                        if told.get(&build.image).is_none_or(|had_log| !had_log && with_log) {
-                            told.insert(build.image.clone(), with_log);
-                            progress.build_image(&build);
+                        match building.get_mut(&build.image) {
+                            None => {
+                                building.insert(build.image.clone(), Seen { build: build.build.clone(), log_said: with_log, since: elapsed });
+                                progress.build_image(build);
+                            }
+                            Some(seen) if !seen.log_said && with_log => {
+                                seen.log_said = true;
+                                progress.build_image(build);
+                            }
+                            Some(_) => {}
                         }
                     }
                 }
@@ -321,6 +379,10 @@ pub async fn build_compiled(
                     ));
                 }
                 Err(_) => {}
+            }
+            if elapsed.saturating_sub(said) >= BUILD_SAY_EVERY {
+                said = elapsed;
+                progress.build_wait(elapsed, &building.keys().cloned().collect::<Vec<_>>());
             }
         })
         .await

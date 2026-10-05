@@ -1253,12 +1253,12 @@
                 error: None,
             })
         }
-        async fn claim_one(
+        async fn claim_execution(
             &self,
             _p: &str,
-            _f: weft_task_store::tasks::ClaimFilter,
-            _w: std::time::Duration,
-        ) -> anyhow::Result<Option<weft_task_store::tasks::Task>> {
+            _project: uuid::Uuid,
+            _execution: &str,
+        ) -> anyhow::Result<Option<weft_task_store::tasks::ClaimedExecution>> {
             Ok(None)
         }
         async fn heartbeat(&self, _t: uuid::Uuid, _p: &str) -> anyhow::Result<bool> {

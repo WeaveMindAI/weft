@@ -43,6 +43,8 @@ weft-platform-traits = { workspace = true, features = ["test-helpers"] }
 # test-support macro + futures' catch_unwind.
 weft-core = { workspace = true, features = ["test-helpers"] }
 futures = { workspace = true }
+# The fake brokers serve the line the listener's broker clients speak.
+weft-broker-client = { path = "../weft-broker-client", features = ["line-server"] }
 
 [lints]
 workspace = true

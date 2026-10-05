@@ -192,7 +192,7 @@ async fn a_project_a_command_holds_is_swept_only_after_it_lets_go() {
     rig.host.set_state(&removed, "main", weft_platform_traits::UnitRunState::Ready);
     rig.broker.undeclare(P1, "removed");
 
-    let command = rig.state.project_locks.lock(P1).await;
+    let command = rig.state.project_locks.share(P1).await;
     rig.tick_ownership().await.unwrap();
     assert!(
         !rig.host.calls().iter().any(|c| matches!(c, HostCall::Terminate { .. })),

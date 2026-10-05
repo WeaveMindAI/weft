@@ -111,26 +111,27 @@ pub struct EngineClients {
 }
 
 impl EngineClients {
-    /// The production bundle: every client speaks to the same broker with the
-    /// same identity, and the clock is the real one. The worker binary is
+    /// The production bundle: every client speaks on the process's one line
+    /// to the broker, and the clock is the real one. The worker binary is
     /// GENERATED, so it cannot be typechecked with the engine; keeping the
     /// composition here means a field added or renamed on `EngineClients` is a
     /// compile error in this crate rather than a silent break in generated
     /// code.
-    pub fn from_broker(broker_url: &str, token: weft_broker_client::TokenSource) -> Self {
-        let url = || broker_url.to_string();
-        let tasks: Arc<dyn TaskStoreClient> = weft_broker_client::BrokerTaskStoreClient::new(url(), token.clone());
+    pub fn from_broker(link: &weft_broker_client::BrokerLink) -> Self {
+        let tasks: Arc<dyn TaskStoreClient> = weft_broker_client::BrokerTaskStoreClient::new(link.clone());
         Self {
-            journal: weft_broker_client::BrokerJournalClient::new(url(), token.clone()),
+            journal: weft_broker_client::BrokerJournalClient::new(link.clone()),
             costs: tasks.clone(),
             tasks,
-            infra: weft_broker_client::BrokerInfraClient::new(url(), token.clone()),
-            infra_state: weft_broker_client::BrokerInfraStateClient::new(url(), token.clone()),
-            project: weft_broker_client::BrokerProjectClient::new(url(), token.clone()),
+            // What the run reads of its infra and its connections is kept
+            // between runs, and dropped when the broker says it changed.
+            infra: crate::held::HeldInfra::new(weft_broker_client::BrokerInfraClient::new(link.clone()), link),
+            infra_state: weft_broker_client::BrokerInfraStateClient::new(link.clone()),
+            project: weft_broker_client::BrokerProjectClient::new(link.clone()),
             clock: Arc::new(weft_platform_traits::clock::SystemClock),
-            storage: crate::storage::WorkerStorage::new(url(), token.clone()),
-            access_broker: weft_broker_client::BrokerAccessClient::new(url(), token.clone()),
-            steering: weft_broker_client::BrokerExecutionClient::new(url(), token),
+            storage: crate::storage::WorkerStorage::new(link.base_url().to_string(), link.token().clone()),
+            access_broker: crate::held::HeldAccess::new(weft_broker_client::BrokerAccessClient::new(link.clone()), link),
+            steering: weft_broker_client::BrokerExecutionClient::new(link.clone()),
             pending_costs: crate::metering::PendingCostRecords::new(),
             open_charges: crate::metering::OpenCharges::new(),
         }
@@ -289,9 +290,13 @@ impl InfraStateClient for weft_broker_client::client::BrokerInfraStateClient {
 /// broker-backed HTTP client.
 #[async_trait]
 pub trait AccessBroker: Send + Sync {
+    /// `run_instance` is the run's instance as the worker read it: the
+    /// broker goes by the run's own row, and a worker keys what it keeps
+    /// by it (`crate::held`).
     async fn resolve_connection(
         &self,
         req: &weft_broker_client::protocol::ResolveConnectionRequest,
+        run_instance: Option<&weft_core::instance::InstanceId>,
     ) -> anyhow::Result<weft_broker_client::protocol::ResolveConnectionResponse>;
 
     async fn release_connection(
@@ -302,11 +307,13 @@ pub trait AccessBroker: Send + Sync {
     async fn publish_access(
         &self,
         req: &weft_broker_client::protocol::PublishAccessRequest,
+        run_instance: Option<&weft_core::instance::InstanceId>,
     ) -> anyhow::Result<weft_broker_client::protocol::PublishAccessResponse>;
 
     async fn published_access(
         &self,
         req: &weft_broker_client::protocol::PublishedAccessRequest,
+        run_instance: Option<&weft_core::instance::InstanceId>,
     ) -> anyhow::Result<weft_broker_client::protocol::PublishedAccessResponse>;
 
     /// A token for one instance of the run's project.
@@ -321,6 +328,7 @@ impl AccessBroker for weft_broker_client::client::BrokerAccessClient {
     async fn resolve_connection(
         &self,
         req: &weft_broker_client::protocol::ResolveConnectionRequest,
+        _run_instance: Option<&weft_core::instance::InstanceId>,
     ) -> anyhow::Result<weft_broker_client::protocol::ResolveConnectionResponse> {
         self.resolve_connection(req).await
     }
@@ -328,6 +336,7 @@ impl AccessBroker for weft_broker_client::client::BrokerAccessClient {
     async fn publish_access(
         &self,
         req: &weft_broker_client::protocol::PublishAccessRequest,
+        _run_instance: Option<&weft_core::instance::InstanceId>,
     ) -> anyhow::Result<weft_broker_client::protocol::PublishAccessResponse> {
         self.publish_access(req).await
     }
@@ -335,6 +344,7 @@ impl AccessBroker for weft_broker_client::client::BrokerAccessClient {
     async fn published_access(
         &self,
         req: &weft_broker_client::protocol::PublishedAccessRequest,
+        _run_instance: Option<&weft_core::instance::InstanceId>,
     ) -> anyhow::Result<weft_broker_client::protocol::PublishedAccessResponse> {
         self.published_access(req).await
     }
@@ -423,6 +433,7 @@ impl FakeAccessBroker {
             identity: None,
             relay_url: None,
             owner,
+            keep_until_unix: None,
         });
     }
 }
@@ -433,6 +444,7 @@ impl AccessBroker for FakeAccessBroker {
     async fn resolve_connection(
         &self,
         req: &weft_broker_client::protocol::ResolveConnectionRequest,
+        _run_instance: Option<&weft_core::instance::InstanceId>,
     ) -> anyhow::Result<weft_broker_client::protocol::ResolveConnectionResponse> {
         self.resolved.lock().unwrap().push(req.clone());
         match self.connections.lock().unwrap().get(&req.connection_id) {
@@ -455,6 +467,7 @@ impl AccessBroker for FakeAccessBroker {
     async fn publish_access(
         &self,
         req: &weft_broker_client::protocol::PublishAccessRequest,
+        _run_instance: Option<&weft_core::instance::InstanceId>,
     ) -> anyhow::Result<weft_broker_client::protocol::PublishAccessResponse> {
         self.published.lock().unwrap().push(req.clone());
         Ok(weft_broker_client::protocol::PublishAccessResponse {
@@ -465,6 +478,7 @@ impl AccessBroker for FakeAccessBroker {
     async fn published_access(
         &self,
         req: &weft_broker_client::protocol::PublishedAccessRequest,
+        _run_instance: Option<&weft_core::instance::InstanceId>,
     ) -> anyhow::Result<weft_broker_client::protocol::PublishedAccessResponse> {
         let found = self
             .published
@@ -1535,13 +1549,14 @@ impl TaskStoreClient for JournalFirst<dyn TaskStoreClient> {
         self.inner.wait_for_terminal(task_id, timeout).await
     }
 
-    async fn claim_one(
+
+    async fn claim_execution(
         &self,
         replica: &str,
-        filter: task_store::ClaimFilter,
-        wait: Duration,
-    ) -> anyhow::Result<Option<task_store::Task>> {
-        self.inner.claim_one(replica, filter, wait).await
+        project_id: uuid::Uuid,
+        execution_id: &str,
+    ) -> anyhow::Result<Option<task_store::ClaimedExecution>> {
+        self.inner.claim_execution(replica, project_id, execution_id).await
     }
 
     async fn heartbeat(&self, task_id: uuid::Uuid, replica: &str) -> anyhow::Result<bool> {
@@ -1629,6 +1644,10 @@ pub struct RunnerHandle {
     /// Whether this node exists once per instance: its infra is then the
     /// run instance's own copy, never the shared one.
     per_instance: Option<weft_core::instance::PerInstance>,
+    /// The instance the run is for, as its journal says. The broker never
+    /// takes it from here (it reads the run's own row); the worker keys
+    /// the answers it keeps by it (`crate::held`).
+    run_instance: Option<weft_core::instance::InstanceId>,
     /// Which copies of its infra the run's program declares: an `Infra`
     /// handle another node shared resolves only to one of these.
     declared_infra: Arc<weft_core::project::DeclaredInfra>,
@@ -1819,6 +1838,7 @@ impl RunnerHandle {
             execution_id,
             run_kind: weft_core::exec::RunKind::Execution,
             per_instance: None,
+            run_instance: None,
             declared_infra: Arc::new(weft_core::project::DeclaredInfra::default()),
             catch_errors: false,
             place,
@@ -1953,10 +1973,14 @@ impl RunnerHandle {
     }
 
     /// Whether this node exists once per instance (from its definition).
-    /// Which instance the run is for never rides on the handle: the broker
-    /// reads it off the run's own execution row.
     pub fn with_per_instance(mut self, per_instance: Option<weft_core::instance::PerInstance>) -> Self {
         self.per_instance = per_instance;
+        self
+    }
+
+    /// The instance the run is for (see `run_instance`).
+    pub fn with_run_instance(mut self, run_instance: Option<weft_core::instance::InstanceId>) -> Self {
+        self.run_instance = run_instance;
         self
     }
 
@@ -2805,7 +2829,7 @@ impl ContextHandle for RunnerHandle {
         let endpoint = self
             .clients
             .infra
-            .endpoint_address(self.execution_id, infra)
+            .endpoint_address(self.execution_id, self.run_instance.as_ref(), infra)
             .await
             .map_err(|e| WeftError::Config(format!("infra_node lookup: {e}")))?;
         let address = endpoint.ok_or_else(|| {
@@ -2946,7 +2970,7 @@ impl ContextHandle for RunnerHandle {
             label: Some(self.place.clone()),
             per_instance: self.per_instance.is_some(),
         };
-        let resp = self.clients.access_broker.publish_access(&req).await.map_err(|e| {
+        let resp = self.clients.access_broker.publish_access(&req, self.run_instance.as_ref()).await.map_err(|e| {
             WeftError::NodeExecution(format!("publish the '{service}' connection: {e:#}"))
         })?;
         Ok(weft_core::access::Access::new(
@@ -2965,7 +2989,7 @@ impl ContextHandle for RunnerHandle {
             service: service.clone(),
             per_instance: self.per_instance.is_some(),
         };
-        let resp = self.clients.access_broker.published_access(&req).await.map_err(|e| {
+        let resp = self.clients.access_broker.published_access(&req, self.run_instance.as_ref()).await.map_err(|e| {
             WeftError::NodeExecution(format!(
                 "look up the '{service}' connection this node published: {e:#}"
             ))
@@ -2992,7 +3016,7 @@ impl ContextHandle for RunnerHandle {
             required_values: access.required_values().to_vec(),
             expected_duration_secs: window.as_secs(),
         };
-        let resp = self.clients.access_broker.resolve_connection(&req).await.map_err(|e| {
+        let resp = self.clients.access_broker.resolve_connection(&req, self.run_instance.as_ref()).await.map_err(|e| {
             WeftError::NodeExecution(format!("open the '{service}' connection: {e:#}"))
         })?;
         // Remember the lease so the loop driver releases it when this
@@ -4297,12 +4321,12 @@ mod replay_tests {
         ) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
             unreachable!("replay tests do not wait")
         }
-        async fn claim_one(
+        async fn claim_execution(
             &self,
             _replica: &str,
-            _filter: weft_task_store::tasks::ClaimFilter,
-            _wait: std::time::Duration,
-        ) -> anyhow::Result<Option<weft_task_store::tasks::Task>> {
+            _project_id: uuid::Uuid,
+            _execution_id: &str,
+        ) -> anyhow::Result<Option<weft_task_store::tasks::ClaimedExecution>> {
             Ok(None)
         }
         async fn heartbeat(
@@ -4342,6 +4366,7 @@ mod replay_tests {
         async fn endpoint_address(
             &self,
             _execution_id: weft_core::ExecutionId,
+            _run_instance: Option<&weft_core::instance::InstanceId>,
             _infra: &weft_core::infra::InfraHandle,
         ) -> anyhow::Result<Option<weft_core::infra::EndpointAddress>> {
             Ok(None)
@@ -5032,7 +5057,7 @@ mod drive_journal_tests {
         async fn wait_for_terminal(&self, _: uuid::Uuid, _: Duration) -> anyhow::Result<task_store::TaskOutcome> {
             unimplemented!("not asked")
         }
-        async fn claim_one(&self, _: &str, _: task_store::ClaimFilter, _: Duration) -> anyhow::Result<Option<task_store::Task>> {
+        async fn claim_execution(&self, _: &str, _: uuid::Uuid, _: &str) -> anyhow::Result<Option<task_store::ClaimedExecution>> {
             unimplemented!("not asked")
         }
         async fn heartbeat(&self, _: uuid::Uuid, _: &str) -> anyhow::Result<bool> {

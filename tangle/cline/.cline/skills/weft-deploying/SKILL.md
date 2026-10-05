@@ -107,7 +107,20 @@ folder:
    refuses because the file "was changed since weft wrote it (or weft never
    wrote it)", the file is somebody's own and weft never overwrites it: tell
    the user, and leave it.
-4. `weft target export prod --github`: needs step 2 first, and the
+4. If the project has a frontend (`front/Dockerfile`), register it on the
+   install now (next section). A project with no frontend skips this: the
+   workflow deploys the program and stops.
+5. Pick the program's connections on prod, every access node
+   ([Connections](#connections) below says how), the program's own keys
+   included. A node connected on this machine has nothing picked on prod.
+6. If the program has infrastructure (a database, a bridge), `weft infra
+   start --on prod`. It builds the program for prod first, on the
+   install's builder (the worker and every piece's image, about 2 minutes
+   the first time, nothing when they are built already), then brings each
+   piece up: on GCP each boots a machine of its own, about 2 to 3 minutes,
+   and several pieces boot side by side. The workflow's activate refuses
+   while a trigger reads infra that is not running.
+7. `weft target export prod --github`: needs step 2 first, and the
    repository already on GitHub. It sets the variables and secrets the
    workflow reads, with `gh` (logged in, run inside the repo): it mints
    an operator key for CI, and gives the frontend the install hosts for
@@ -115,15 +128,12 @@ folder:
    run deploys the new one and retires it) and names its service. Every run mints new ones, so it runs once per setup, or again
    when a CI credential was lost. Without `--github` it prints them, and
    the secrets are shown only that once. It also lists every connection the
-   program needs that prod has no pick for yet: the workflow cannot turn
+   program needs that prod still has no pick for: the workflow cannot turn
    the program on until those are picked (step 5).
-5. Pick the program's connections on prod, every access node, before the
-   workflow's first run ([Connections](#connections) below says how). A
-   node connected on this machine has nothing picked on prod.
 
-If the project has a frontend (`front/Dockerfile`), register it on the
-install between steps 3 and 4 (next section). A project with no frontend
-skips that: the workflow deploys the program and stops.
+Then the user runs the workflow from the repository's Actions tab: about a
+minute and a half for the program, plus however long the frontend's build
+takes.
 
 ## A project's frontend: `weft frontend`
 
@@ -203,10 +213,11 @@ install compiles that snapshot itself, builds the images it needs, and
 activates. So a deploy of an unchanged project builds nothing.
 
 Activate never starts infrastructure. On a first deploy of a program with
-infra (a database, a bridge), run `weft infra start --on prod` first: if a
-trigger reads infra that is not running, activate refuses with "these
-triggers' infra is not running: <node>". On GCP each piece boots a machine,
-so it takes a few minutes; `weft status --on prod` shows each one's state.
+infra (a database, a bridge), run `weft infra start --on prod` first (step 6
+above, which builds the program too): if a trigger reads infra that is not
+running, activate refuses with "these triggers' infra is not running:
+<node>". On GCP each piece boots a machine, so it takes a few minutes;
+`weft status --on prod` shows each one's state.
 
 `weft activate` is for a program that is off. Once its triggers are on, it
 refuses, and a change goes live with `weft resync --on prod --mode <mode>`,

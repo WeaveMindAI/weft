@@ -740,21 +740,19 @@ export function activate(context: vscode.ExtensionContext) {
   async function maybePromptReactivateChoice(
     project: WeftProject,
   ): Promise<string | null | undefined> {
-    let status: StatusResult | undefined;
-    try {
-      status = await fetchActionAvailability(project.id, project.rootPath);
-    } catch {
-      return null;
-    }
-    if (!status) return null;
-    // Reactivate-choice prompt only fires when the project is in
-    // an inactive lifecycle state with preserved state worth
-    // discussing. Active projects skip; clean-Inactive (no rows)
-    // skip; deactivating skips (we should never be activating
-    // mid-deactivate via this path; the UI surfaces "Resume
-    // Active" instead).
-    const ps = status.snapshot.projectStatus;
-    if (ps !== 'inactive') return null;
+    // A status that cannot be read stops the activate: going on without
+    // it would send no choice, and the dispatcher refuses an activate over
+    // kept work that names none with a CLI flag the editor never shows.
+    // The read says why above the bar (`fetchActionAvailability`).
+    const status = await fetchActionAvailability(project.id, project.rootPath);
+    if (!status) return undefined;
+    // The prompt fires exactly when the triggers the bar turns on (the
+    // program's own) kept work while they were off, whether the project
+    // is inactive or partly on (an infra stop took down only the triggers
+    // reading it): the counts are the dispatcher's, for those triggers, and
+    // it refuses an activate over kept work that names no choice. The same
+    // rule as the CLI (`crates/weft-cli/src/commands/activate.rs
+    // fetch_preserved_state`).
     const parked = status.snapshot.preservation.parked;
     const suspended = status.snapshot.preservation.suspended;
     if (parked === 0 && suspended === 0) return null;

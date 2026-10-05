@@ -134,10 +134,11 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_infra_node_copy
              ON infra_node(project_id, node_id, instance_id) NULLS NOT DISTINCT"#,
         r#"CREATE INDEX IF NOT EXISTS idx_infra_node_project   ON infra_node(project_id)"#,
-        // Tell every dispatcher a project's copies came, went or changed
-        // status, so its copy of which are up (`crate::held::Held`) is
-        // read again.
-        // SYNC: 'weft_infra_status' <-> crate::held::INFRA_STATUS_CHANNEL
+        // Tell every dispatcher a project's copies came, went, changed
+        // status or now answer at another address, so its copy of which
+        // are up (`crate::held::Held`) is read again; the broker passes it
+        // on to the project's workers, which keep the addresses.
+        // SYNC: 'weft_infra_status' <-> weft_broker_client::line::INFRA_STATUS_CHANNEL
         r#"CREATE OR REPLACE FUNCTION infra_node_status_notify() RETURNS trigger AS $$
             BEGIN
                 IF TG_OP = 'DELETE' THEN
@@ -155,9 +156,11 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             EXECUTE FUNCTION infra_node_status_notify()"#,
         r#"DROP TRIGGER IF EXISTS infra_node_status_on_change ON infra_node"#,
         r#"CREATE TRIGGER infra_node_status_on_change
-            AFTER UPDATE OF status ON infra_node
+            AFTER UPDATE OF status, endpoints_json, public_paths_json ON infra_node
             FOR EACH ROW
-            WHEN (NEW.status IS DISTINCT FROM OLD.status)
+            WHEN (NEW.status IS DISTINCT FROM OLD.status
+                  OR NEW.endpoints_json IS DISTINCT FROM OLD.endpoints_json
+                  OR NEW.public_paths_json IS DISTINCT FROM OLD.public_paths_json)
             EXECUTE FUNCTION infra_node_status_notify()"#,
     ],
     seed: &[],

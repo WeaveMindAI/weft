@@ -25,10 +25,16 @@ use weft_core::content_cache::ContentCache;
 
 use crate::pg_signal::{Heard, PgSignalWatch, Subscription};
 
+/// Which entries a [`Changed::Matching`] drops, by key or by what each holds.
+pub type EntryFilter<K, V> = Box<dyn Fn(&K, &V) -> bool + Send>;
+
 /// Which entries a notification on the copy's channel drops.
-pub enum Changed<K> {
+pub enum Changed<K, V> {
     /// The rows of this one key.
     Key(K),
+    /// Every entry this picks, by its key or by what it holds: the payload
+    /// names a group (a project's, a tenant's) rather than one key.
+    Matching(EntryFilter<K, V>),
     /// Anything: the payload names nothing this copy can key by.
     Everything,
 }
@@ -72,7 +78,7 @@ where
         signals: &PgSignalWatch,
         channel: &'static str,
         capacity: usize,
-        key_of: fn(&str) -> Changed<K>,
+        key_of: fn(&str) -> Changed<K, V>,
         keep: fn(&V) -> bool,
     ) -> anyhow::Result<Arc<Self>> {
         signals.require(channel)?;
@@ -85,7 +91,7 @@ where
         subscription: Subscription,
         channel: &'static str,
         capacity: usize,
-        key_of: fn(&str) -> Changed<K>,
+        key_of: fn(&str) -> Changed<K, V>,
         keep: fn(&V) -> bool,
     ) -> Arc<Self> {
         let copy = Arc::new(Self {
@@ -100,6 +106,15 @@ where
         let follower = tokio::spawn(follow(Arc::downgrade(&copy), subscription, channel, key_of));
         *copy.follower.lock().expect("held copy follower") = Some(follower);
         copy
+    }
+
+    /// A copy that follows nothing and so keeps nothing: every read goes
+    /// to the rows. For a process (a test, a tool) with nothing to tell it
+    /// about changes.
+    pub fn unfollowed(capacity: usize, keep: fn(&V) -> bool) -> Arc<Self> {
+        let (_, rx) = tokio::sync::broadcast::channel(1);
+        let subscription = Subscription::with_listening(rx, Arc::new(AtomicBool::new(false)));
+        Self::following(subscription, "", capacity, |_| Changed::Everything, keep)
     }
 
     /// The rows under `key` as this process holds them, if it does.
@@ -145,11 +160,12 @@ where
         Ok(read)
     }
 
-    fn drop_changed(&self, changed: Changed<K>) {
+    fn drop_changed(&self, changed: Changed<K, V>) {
         let mut generation = self.generation.lock().expect("held copy generation");
         *generation += 1;
         match changed {
             Changed::Key(key) => self.entries.forget(&key),
+            Changed::Matching(whose) => self.entries.forget_where(whose),
             Changed::Everything => self.entries.forget_all(),
         }
     }
@@ -171,7 +187,7 @@ where
     }
 }
 
-async fn follow<K, V>(copy: Weak<HeldCopy<K, V>>, mut subscription: Subscription, channel: &'static str, key_of: fn(&str) -> Changed<K>)
+async fn follow<K, V>(copy: Weak<HeldCopy<K, V>>, mut subscription: Subscription, channel: &'static str, key_of: fn(&str) -> Changed<K, V>)
 where
     K: Hash + Eq + Clone + Send + Sync + 'static,
     V: Send + Sync + 'static,
@@ -207,9 +223,14 @@ mod tests {
 
     const CHANNEL: &str = "rows";
 
-    fn by_payload(payload: &str) -> Changed<String> {
+    fn by_payload(payload: &str) -> Changed<String, u32> {
         match payload {
             "" => Changed::Everything,
+            // `group:<prefix>`: every key starting with it, or holding 0.
+            group if group.starts_with("group:") => {
+                let prefix = group["group:".len()..].to_string();
+                Changed::Matching(Box::new(move |key: &String, value: &u32| key.starts_with(&prefix) || *value == 0))
+            }
             key => Changed::Key(key.to_string()),
         }
     }
@@ -369,6 +390,24 @@ mod tests {
             }
             assert_eq!(read(&copy, "a", 2).await, 2);
             assert_eq!(read(&copy, "a", 3).await, 3, "nothing is kept any more");
+        }
+    );
+
+    weft_core::stress_test!(
+        name: a_change_naming_a_group_drops_that_group_alone,
+        runs: 32,
+        worker_threads: 4,
+        async fn body() {
+            let (tx, copy) = copy();
+            read(&copy, "ann/a", 1).await;
+            read(&copy, "ann/b", 2).await;
+            read(&copy, "bob/a", 3).await;
+            read(&copy, "eve/a", 0).await;
+            hear(&tx, &copy, Heard::Signal { channel: CHANNEL, payload: "group:ann/".into() }).await;
+            assert_eq!(read(&copy, "ann/a", 10).await, 10, "named by its key");
+            assert_eq!(read(&copy, "ann/b", 20).await, 20);
+            assert_eq!(read(&copy, "eve/a", 30).await, 30, "named by what it holds");
+            assert_eq!(read(&copy, "bob/a", 40).await, 3, "another group stays held");
         }
     );
 }

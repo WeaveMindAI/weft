@@ -207,10 +207,14 @@ async fn token_guessing_blocks_the_address_for_the_minute(pool: PgPool) {
     let addr: std::net::IpAddr = "203.0.113.9".parse().unwrap();
     for _ in 0..3 {
         assert!(entry_limits::token_guessing_blocked(&pool, &edge, addr, 120).await.unwrap().is_none());
-        entry_limits::note_invalid_token(&pool, &edge, addr, 120).await.unwrap();
+        let already = entry_limits::note_invalid_token(&pool, &edge, addr, 120).await.unwrap();
+        assert!(already.is_none(), "an address under the bound is counted, not refused");
     }
     let blocked = entry_limits::token_guessing_blocked(&pool, &edge, addr, 150).await.unwrap().expect("blocked");
     assert_eq!(blocked.retry_after_secs, 30);
+    // Counting one more says, in the same trip, that it was already blocked.
+    let counted = entry_limits::note_invalid_token(&pool, &edge, addr, 150).await.unwrap().expect("already blocked");
+    assert_eq!((counted.reason, counted.retry_after_secs), (Limited::InvalidTokens, 30));
     assert!(entry_limits::token_guessing_blocked(&pool, &edge, addr, 180).await.unwrap().is_none());
     assert!(entry_limits::token_guessing_blocked(&pool, &self::edge(None), addr, 150).await.unwrap().is_none());
 }
