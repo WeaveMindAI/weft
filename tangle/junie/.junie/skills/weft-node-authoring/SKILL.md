@@ -598,6 +598,15 @@ network error or a body that is not JSON is an error. The call has no
 timeout of its own, so a call that waits on slow work never returns while a
 person presses stop: that is what the shape below is for.
 
+An infra node's `run` runs on every run that reaches it, so behind a route it
+runs once per call. The worker keeps what `ctx.endpoint`, `ctx.published_access`,
+`ctx.publish_access` and `ctx.open` answered from one run to the next (weft
+tells it when any of that changes), so those cost nothing after the first run,
+but every `call(...)` to the service is a trip there on every run: quick
+inside the install's own network, and still one more thing that can fail while
+the service restarts. Keep `run` to reading what weft holds and handing it on,
+plus whatever the service itself has to be asked every time.
+
 **If other nodes need your service** (a bridge every send node talks
 through), pass them `api.infra_handle()` instead of `api.url()`, because the address
 changes each time the service is set up again. Declare an

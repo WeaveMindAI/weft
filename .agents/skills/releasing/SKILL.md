@@ -13,16 +13,27 @@ concept and nothing merges there. Work lands on a feature branch, goes
 into `main` through a PR, and the merge is what publishes.
 
 1. Commit on the feature branch (only when the [user] says so).
-   If the change touches `extension-vscode/`, `extension-browser/` or
-   `packages/weft-graph/` (both editors bundle it), bump that package's
-   version IN THE SAME PR (`pnpm version patch --no-git-tag-version`
+   If the change touches `extension-vscode/`, `packages/weft-graph/`,
+   `packages/weft-syntax/` or `packages/weft-connect/` (the VS Code
+   extension ships all four), bump `extension-vscode`; if it touches
+   `extension-browser/` or `packages/weft-connect/` (its connections page
+   is built on the connect library), bump that one too. Bump IN THE SAME PR (`pnpm version patch --no-git-tag-version`
    in the package directory): a merge without a bump publishes nothing
    to the stores. The `extension versions bumped` CI check refuses a
    PR that forgot; `scripts/check-extension-bump.sh origin/main` is the
    same check locally.
 2. `gh pr create --base main --head <branch>`.
-3. `gh pr merge <n> --auto --merge`, which lands it the moment CI
-   passes. Earlier PRs into `main` are merge commits, so match that.
+3. Never `--auto`. Wait for every check to finish (`gh pr checks <n>
+   --watch`), then read what the PR collected besides the checks before
+   merging:
+   - the code-scanning alerts it opened (CodeQL comments on the diff):
+     `gh api "repos/WeaveMindAI/weft/code-scanning/alerts?state=open&ref=refs/pull/<n>/merge"`;
+   - any review comment (`gh pr view <n> --comments`).
+   Fix each real one on the branch and push, which runs the checks
+   again. Dismiss a false positive only with the [user]'s say-so, with
+   the reason in the dismissal. Only when every check is green and
+   nothing is left open, `gh pr merge <n> --merge`. Earlier PRs into
+   `main` are merge commits, so match that.
 4. The push to `main` runs `release.yml`, which builds the images, the
    CLI binaries, the `.vsix` and the browser zips, updates the rolling
    `latest` release, and then publishes to each store.

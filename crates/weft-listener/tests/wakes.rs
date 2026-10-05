@@ -45,12 +45,12 @@ impl weft_task_store::TaskStoreClient for FakeTasks {
     async fn wait_for_terminal(&self, _: uuid::Uuid, _: std::time::Duration) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
         unreachable!()
     }
-    async fn claim_one(
+    async fn claim_execution(
         &self,
         _: &str,
-        _: weft_task_store::tasks::ClaimFilter,
-        _: std::time::Duration,
-    ) -> anyhow::Result<Option<weft_task_store::tasks::Task>> {
+        _: uuid::Uuid,
+        _: &str,
+    ) -> anyhow::Result<Option<weft_task_store::tasks::ClaimedExecution>> {
         unreachable!()
     }
     async fn heartbeat(&self, _: uuid::Uuid, _: &str) -> anyhow::Result<bool> {
@@ -218,7 +218,7 @@ async fn spawn_broker(rows: Rows, landing: Landing, get_held: Arc<GetHeld>) -> S
                 }
             }),
         );
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::spawn(async move { axum::serve(listener, weft_broker_client::line::server::with_line(app)).await.unwrap() });
     format!("http://{addr}")
 }
 
@@ -229,6 +229,20 @@ struct Rig {
     rows: Rows,
     landing: Landing,
     get_held: Arc<GetHeld>,
+    /// The fake broker's address.
+    broker: String,
+}
+
+/// The listener's way to the fake broker at `broker`.
+fn link(broker: &str) -> weft_broker_client::BrokerLink {
+    weft_broker_client::BrokerLink::new(
+        broker.to_string(),
+        weft_broker_client::TokenSource::role(
+            Arc::new(weft_platform_traits::FixedToken("test-token".into())),
+            "test-listener",
+            weft_platform_traits::CoreRole::Listener,
+        ),
+    )
 }
 
 async fn rig(holds_here: bool) -> Rig {
@@ -239,16 +253,12 @@ async fn rig(holds_here: bool) -> Rig {
     let tasks = Arc::new(FakeTasks::default());
     let alarm = Arc::new(FakeAlarm::new());
     let state = ListenerState::new(
-        ListenerConfig { replica: "test-listener".into(), broker_url: broker, holds_here, prefer_push: false },
+        ListenerConfig { replica: "test-listener".into(), holds_here, prefer_push: false },
         tasks.clone(),
-        weft_broker_client::TokenSource::role(
-            Arc::new(weft_platform_traits::FixedToken("test-token".into())),
-            "test-listener",
-            weft_platform_traits::CoreRole::Listener,
-        ),
+        link(&broker),
         alarm.clone(),
     );
-    Rig { state, tasks, alarm, rows, landing, get_held }
+    Rig { state, tasks, alarm, rows, landing, get_held, broker }
 }
 
 fn identity(token: &str, spec: weft_core::primitive::SignalSpec) -> SignalIdentity {
@@ -443,16 +453,7 @@ async fn spawn_feed(failing: Arc<std::sync::atomic::AtomicBool>) -> String {
 /// Another copy of the listener, as a serverless platform starts one per
 /// request: nothing in memory, the same broker, task store and alarm.
 fn fresh_listener(rig: &Rig) -> ListenerState {
-    ListenerState::new(
-        (*rig.state.config).clone(),
-        rig.tasks.clone(),
-        weft_broker_client::TokenSource::role(
-            Arc::new(weft_platform_traits::FixedToken("test-token".into())),
-            "test-listener",
-            weft_platform_traits::CoreRole::Listener,
-        ),
-        rig.alarm.clone(),
-    )
+    ListenerState::new((*rig.state.config).clone(), rig.tasks.clone(), link(&rig.broker), rig.alarm.clone())
 }
 
 /// What a signal's display says, as one string.

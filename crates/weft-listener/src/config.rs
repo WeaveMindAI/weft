@@ -9,10 +9,6 @@ pub struct ListenerConfig {
     /// shared provider sockets apart from another in-process listener's
     /// (tests).
     pub replica: String,
-    /// Broker base URL: the listener's only door to the durable `signal`
-    /// table (loading a signal, writing its kind state, claiming held
-    /// ones) and to the task queue its fires ride.
-    pub broker_url: String,
     /// Whether this process holds the signals that keep a connection open
     /// (a local install's one process, or a holder): it runs the hold loop
     /// (`crate::hold`) and brings such a signal up itself. A listener that

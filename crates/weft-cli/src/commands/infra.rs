@@ -638,7 +638,7 @@ async fn starting_now(client: &crate::client::DispatcherClient, project_id: &str
                 Some(instance) => format!("{} (instance {instance})", n.node),
                 None => n.node.clone(),
             };
-            Some(format!("{node}: {}", progress.describe_now()))
+            Some(format!("{node}: {} {}", n.status, progress.describe_now()))
         })
         .collect()
 }

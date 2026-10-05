@@ -554,7 +554,7 @@ pub async fn wait_for_commands(
 }
 
 /// Whether any infra-work lifecycle command (apply / stop / terminate,
-/// or an upgrade) is uncompleted for the project. The dispatcher-side
+/// or an upgrade) reaching the project's shared copies is uncompleted. The dispatcher-side
 /// "infra operation in flight" fact: while it holds, the
 /// reconciliation treats the project as infra-transitional (only
 /// infra_cancel offered), which is what stops NEW runs from starving
@@ -562,11 +562,15 @@ pub async fn wait_for_commands(
 /// empty; a new run would keep refilling it). In-flight work is
 /// untouched; only new launches are gated.
 pub async fn any_in_flight(pool: &PgPool, project_id: uuid::Uuid) -> Result<bool> {
+    // Only what reaches the shared copies, which the bar starts and stops:
+    // one instance's copy booting holds none of the program's own verbs
+    // back (a command for every copy names no instance, and counts).
     let (exists,): (bool,) = sqlx::query_as(&format!(
         "SELECT EXISTS( \
              SELECT 1 FROM infra_lifecycle_command \
              WHERE project_id = $1 \
                AND completed_at_unix IS NULL \
+               AND instance_id IS NULL \
                AND verb IN ({INFRA_WORK_VERBS_SQL}) \
          )",
     ))

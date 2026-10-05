@@ -1502,6 +1502,11 @@ export type CliPhase =
   /// One image is building on the install's builder; detail `image`,
   /// `build` (the builder's id) and `logUrl` when it keeps one.
   | 'build_image'
+  /// One image finished building; detail `image` and `seconds`.
+  | 'build_image_done'
+  /// The build goes on; detail `elapsedSeconds` and `images`, the ones
+  /// still building.
+  | 'build_wait'
   | 'dispatcher_call_start'
   | 'dispatcher_call_done'
   | 'infra_provision_start'

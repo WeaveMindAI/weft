@@ -318,6 +318,7 @@ mod tests {
             service: "openrouter".into(),
             owner: weft_core::CredentialOwner::Platform,
             app_client_id: None,
+            fresh_until: None,
         }
     }
 

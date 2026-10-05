@@ -50,12 +50,12 @@ impl weft_task_store::TaskStoreClient for FakeTasks {
     ) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
         unreachable!("not used by the serving side")
     }
-    async fn claim_one(
+    async fn claim_execution(
         &self,
         _: &str,
-        _: weft_task_store::tasks::ClaimFilter,
-        _: std::time::Duration,
-    ) -> anyhow::Result<Option<weft_task_store::tasks::Task>> {
+        _: uuid::Uuid,
+        _: &str,
+    ) -> anyhow::Result<Option<weft_task_store::tasks::ClaimedExecution>> {
         unreachable!()
     }
     async fn heartbeat(&self, _: uuid::Uuid, _: &str) -> anyhow::Result<bool> {
@@ -171,7 +171,7 @@ async fn spawn_broker() -> String {
         "/v1/infra/listener-address",
         post(|axum::Json(req): axum::Json<Value>| async move { axum::Json(json!({ "authority": req["authority"] })) }),
     );
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::spawn(async move { axum::serve(listener, weft_broker_client::line::server::with_line(app)).await.unwrap() });
     format!("http://{addr}")
 }
 
@@ -213,16 +213,18 @@ async fn run_scenario() {
     let state = ListenerState::new(
         ListenerConfig {
             replica: format!("test-listener-{run_id}"),
-            broker_url: broker_base,
             holds_here: true,
             prefer_push: false,
         },
         tasks.clone(),
         // The fake broker ignores the bearer.
-        weft_broker_client::TokenSource::role(
-            Arc::new(weft_platform_traits::FixedToken("test-token".into())),
-            format!("test-listener-{run_id}"),
-            weft_platform_traits::CoreRole::Listener,
+        weft_broker_client::BrokerLink::new(
+            broker_base,
+            weft_broker_client::TokenSource::role(
+                Arc::new(weft_platform_traits::FixedToken("test-token".into())),
+                format!("test-listener-{run_id}"),
+                weft_platform_traits::CoreRole::Listener,
+            ),
         ),
         Arc::new(weft_platform_traits::FakeAlarm::new()),
     );

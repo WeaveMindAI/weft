@@ -201,7 +201,7 @@ Past runs: in the Executions view, "View in Graph" replays the run in the
 graph with every value in place and locks the [follow toggle] onto it;
 "N new run(s) · Follow" jumps to the newest. From the terminal the same
 facts are `weft executions`, `weft events <execution-id>`, `weft logs` (the
-`weft-running` skill).
+`weft-debugging` skill).
 
 ## Diagnostics and AI edits
 

@@ -225,23 +225,19 @@ async fn cancel_terminals_in(
 async fn payload_rows<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
     execution_id: ExecutionId,
-) -> anyhow::Result<Vec<(i64, String)>> {
-    let rows = sqlx::query_as(
-        "SELECT id, payload_json FROM exec_event WHERE execution_id = $1 ORDER BY id ASC",
-    )
-    .bind(execution_id.to_string())
-    .fetch_all(executor)
-    .await?;
-    Ok(rows)
+) -> anyhow::Result<Vec<weft_journal::RawJournalRow>> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(&weft_task_store::journal_rows::rows_after_sql("$1", "0"))
+        .bind(execution_id.to_string())
+        .fetch_all(executor)
+        .await?;
+    Ok(rows.into_iter().map(|(id, payload)| weft_journal::RawJournalRow { id, payload }).collect())
 }
 
 /// Strictly decode every row: one undecodable row fails the whole read
 /// (a fold over a partial event list rebuilds a state that never
 /// existed).
-fn decode_all(execution_id: ExecutionId, rows: Vec<(i64, String)>) -> anyhow::Result<Vec<ExecEvent>> {
-    rows.into_iter()
-        .map(|(_, payload)| decode_event(execution_id, &payload).map_err(anyhow::Error::msg))
-        .collect()
+fn decode_all(execution_id: ExecutionId, rows: Vec<weft_journal::RawJournalRow>) -> anyhow::Result<Vec<ExecEvent>> {
+    Ok(weft_journal::decode_rows(execution_id, rows)?.into_iter().map(|row| row.event).collect())
 }
 
 impl PostgresJournal {
@@ -493,6 +489,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // that crash mid-execution) populate; the partial UNIQUE
         // means unkeyed events (most worker-side events) are
         // unrestricted, keyed events collapse on conflict.
+        // SYNC: exec_event's (execution_id, id, payload_json) <-> crates/weft-task-store/src/journal_rows.rs (rows_after_sql), crates/weft-task-store/tests/support/mod.rs (its stand-in)
         r#"CREATE TABLE IF NOT EXISTS exec_event (
             id BIGSERIAL PRIMARY KEY,
             execution_id TEXT NOT NULL,
@@ -806,7 +803,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             phase TEXT NOT NULL,
             -- Worker replica that owns this execution's writes. NULL until the
             -- first worker claims an execution-bearing task (the broker
-            -- stamps it in task_claim_one); thereafter it is the replica of
+            -- stamps it in task_claim_execution); thereafter it is the replica of
             -- the LATEST claimer. The broker rejects any journal_record
             -- whose caller.replica doesn't match, so a compromised
             -- worker can only journal under its own bound replica, not
@@ -1099,9 +1096,9 @@ impl Journal for PostgresJournal {
         let rows = payload_rows(&self.pool, execution_id).await?;
         let mut out = Vec::with_capacity(rows.len());
         let mut bad = Vec::new();
-        for (id, payload) in rows {
-            match decode_event(execution_id, &payload) {
-                Ok(ev) => out.push(crate::events::IdentifiedEvent::recorded(id, ev)),
+        for row in rows {
+            match decode_event(execution_id, &row.payload) {
+                Ok(ev) => out.push(crate::events::IdentifiedEvent::recorded(row.id, ev)),
                 Err(reason) => bad.push(reason),
             }
         }
@@ -2111,6 +2108,26 @@ pub(crate) async fn activation_signals<'e>(
     rows.into_iter().map(row_to_signal).collect()
 }
 
+/// What the activations `keys` kept while their triggers were off: the
+/// fires parked on their signals and the runs of theirs waiting on a
+/// person, which a reactivate's choice decides about
+/// (`crate::api::project::apply_reactivate_choice`).
+pub(crate) async fn activation_preservation(
+    pool: &sqlx::PgPool,
+    project_id: uuid::Uuid,
+    keys: &[weft_core::activation::ActivationKey],
+) -> anyhow::Result<weft_core::projects::PreservationCounts> {
+    let (triggers, instances) = activation_key_arrays(keys);
+    let (parked, suspended): (i64, i64) = sqlx::query_as(PRESERVED_BY_ACTIVATIONS)
+        .bind(project_id)
+        .bind(&triggers)
+        .bind(&instances)
+        .fetch_one(pool)
+        .await
+        .context("count what the activations kept")?;
+    Ok(weft_core::projects::PreservationCounts { parked: parked as usize, suspended: suspended as usize })
+}
+
 /// Delete every signal the activations `keys` govern, handed back for
 /// the listener cleanup.
 pub(crate) async fn remove_activation_signals<'e>(
@@ -2285,18 +2302,28 @@ const SIGNAL_DELETE_OF_REMOVED_PROJECTS_RETURNING: &str = concat!(
     signal_columns!("")
 );
 
-const SIGNAL_SELECT_BY_ACTIVATIONS: &str = concat!(
-    "SELECT ",
-    signal_columns!(""),
-    " FROM signal WHERE project_id = $1 \
-      AND (activation_trigger, COALESCE(instance_id, '')) IN (SELECT * FROM unnest($2::text[], $3::text[]))"
-);
+/// The signals a set of activations governs: project `$1`, the
+/// activations given as the parallel arrays `$2` (triggers) and `$3`
+/// (instances, `''` for the shared one), as [`activation_key_arrays`]
+/// builds them.
+macro_rules! governed_by_activations {
+    () => {
+        "project_id = $1 \
+         AND (activation_trigger, COALESCE(instance_id, '')) IN (SELECT * FROM unnest($2::text[], $3::text[]))"
+    };
+}
 
-const SIGNAL_DELETE_BY_ACTIVATIONS_RETURNING: &str = concat!(
-    "DELETE FROM signal WHERE project_id = $1 \
-      AND (activation_trigger, COALESCE(instance_id, '')) IN (SELECT * FROM unnest($2::text[], $3::text[])) \
-      RETURNING ",
-    signal_columns!("")
+const SIGNAL_SELECT_BY_ACTIVATIONS: &str =
+    concat!("SELECT ", signal_columns!(""), " FROM signal WHERE ", governed_by_activations!());
+
+const SIGNAL_DELETE_BY_ACTIVATIONS_RETURNING: &str =
+    concat!("DELETE FROM signal WHERE ", governed_by_activations!(), " RETURNING ", signal_columns!(""));
+
+const PRESERVED_BY_ACTIVATIONS: &str = concat!(
+    "SELECT COALESCE(SUM(jsonb_array_length(parked_fires)), 0)::bigint, \
+            COUNT(*) FILTER (WHERE is_resume = TRUE AND jsonb_array_length(parked_fires) = 0) \
+     FROM signal WHERE ",
+    governed_by_activations!()
 );
 
 const SIGNAL_DELETE_BY_TOKENS_RETURNING: &str =

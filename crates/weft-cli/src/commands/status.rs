@@ -88,6 +88,7 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         desired_full_binary_hash,
         desired_definition_hash,
         desired_infra_hash,
+        ..Default::default()
     };
     let path = format!("/projects/{project_id}/status{}", query.to_query_string());
 
@@ -99,8 +100,10 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         if !ctx.json_out(&serde_json::json!({ "registered": false, "project_id": project_id }))? {
             println!(
                 "project: {} ({project_id})\n  not registered with the dispatcher yet: \
-                 use `weft run` to run it, or `weft activate` to enable its triggers",
-                project.manifest.package.name
+                 use `{}` to run it, or `{}` to enable its triggers",
+                project.manifest.package.name,
+                ctx.weft("run"),
+                ctx.weft("activate"),
             );
         }
         return Ok(());
@@ -118,7 +121,7 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     println!("  registration: {}", data.status);
     // The build-transition axis: only worth a line while in flight.
     if data.transition != ProjectTransition::None {
-        println!("  build: {} (cancel with `weft cancel-build`)", data.transition);
+        println!("  build: {} (cancel with `{}`)", data.transition, ctx.weft("cancel-build"));
     }
     for build in &data.builds {
         match &build.log_url {
@@ -149,7 +152,7 @@ pub async fn run(ctx: Ctx) -> Result<()> {
             let node = &entry.node;
             match entry.status.as_str() {
                 weft_core::infra::wire::INFRA_NOT_STARTED => {
-                    println!("    {node}: not started (`weft infra start` brings it up)")
+                    println!("    {node}: not started (`{}` brings it up)", ctx.weft("infra start"))
                 }
                 weft_core::infra::wire::INFRA_PER_INSTANCE => {
                     let copies = entry.instance_copy_count.unwrap_or(0);
@@ -199,7 +202,12 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     }
 
     let execs = &data.executions;
-    println!("  executions: {} total", execs.total);
+    // `weft tree` lists the program's own runs; the ones that set it up
+    // (arming triggers, starting infra) are counted apart so the two agree.
+    match execs.setup {
+        0 => println!("  executions: {} runs", execs.total),
+        setup => println!("  executions: {} runs (and {setup} that set the program up: its triggers, its infra)", execs.total),
+    }
     if let (Some(execution_id), Some(status)) = (&execs.last_execution_id, &execs.last_status) {
         match execs.last_completed_at {
             Some(ts) => {
@@ -209,7 +217,7 @@ pub async fn run(ctx: Ctx) -> Result<()> {
             None => println!("    last: {execution_id} ({status}, in flight)"),
         }
     }
-    print_drift(&data.drift);
+    print_drift(&ctx, &data.drift);
     // A public entry turning callers away, so the author knows a limit
     // is acting and which one (each is a setting on the trigger).
     if !data.limited.is_empty() {
@@ -242,12 +250,12 @@ fn or_warn(what: &str, hash: Result<String>) -> Option<String> {
 
 /// Every drift bit the dispatcher set, each with the verb that clears
 /// it. Silent when nothing drifted.
-fn print_drift(drift: &ProjectDrift) {
+fn print_drift(ctx: &Ctx, drift: &ProjectDrift) {
     let lines = [
-        (drift.infra_drift, "infra: source has changed; `weft infra upgrade` rebuilds it"),
-        (drift.binary_drift, "binary: worker code has changed; the next run or `weft build` rebuilds the image"),
-        (drift.definition_drift, "definition: project shape has changed; the next run picks it up"),
-        (drift.activation_drift, "activation: the listeners fire an older program; `weft resync` re-registers them against this one"),
+        (drift.infra_drift, format!("infra: source has changed; `{}` rebuilds it", ctx.weft("infra upgrade"))),
+        (drift.binary_drift, format!("binary: worker code has changed; the next run or `{}` rebuilds the image", ctx.weft("build"))),
+        (drift.definition_drift, "definition: project shape has changed; the next run picks it up".to_string()),
+        (drift.activation_drift, format!("activation: the listeners fire an older program; `{}` re-registers them against this one", ctx.weft("resync"))),
     ];
     if lines.iter().all(|(set, _)| !set) {
         return;

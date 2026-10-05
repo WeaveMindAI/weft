@@ -210,15 +210,17 @@ where
 }
 
 /// The command `claimer_replica` runs next: the oldest uncompleted one of a
-/// project it owns (the `infra_owner` exclusive lease) and is not
-/// already running a command for (`busy_projects`), or `None`.
+/// project it owns (the `infra_owner` exclusive lease) that it is not
+/// already running (`busy_commands`) and that no older uncompleted command
+/// of the project reaches a copy of (`commands_overlap`), or `None`.
 ///
 /// Ownership is the supervisor's one single-actor authority: exclusive
 /// (one process per project) and renewed on every ownership tick, so two
-/// supervisors never change one project's infrastructure. Inside the owner, one
-/// project's commands run in order, because the process names the projects
-/// it is busy with and gets none of theirs back; different projects'
-/// commands run side by side.
+/// supervisors never change one project's infrastructure. Inside the owner,
+/// the commands that touch a copy run in the order they were issued, since
+/// a younger one waits until every older one touching one of its copies has
+/// completed, and the ones touching different copies run side by side:
+/// three instances started together come up together.
 ///
 /// There is no per-command claim lease and no row update: this is a
 /// pure read. A lease would be redundant with exclusive ownership, and
@@ -235,23 +237,29 @@ where
 pub async fn next_command(
     pool: &PgPool,
     claimer_replica: &str,
-    busy_projects: &[uuid::Uuid],
+    busy_commands: &[i64],
 ) -> anyhow::Result<Option<SupervisorCommandRow>> {
     let sql = format!(
         "SELECT c.id, c.project_id, c.node_id, c.verb, c.running_policy, c.spec_json, c.force, \
                 c.drain_timeout_secs, c.instance_id, c.every_copy \
          FROM infra_lifecycle_command c \
          WHERE {pending} \
-           AND NOT (c.project_id = ANY($2)) \
+           AND NOT (c.id = ANY($2)) \
            AND {owns} \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM infra_lifecycle_command o \
+               WHERE {older_pending} AND o.project_id = c.project_id AND o.id < c.id AND {overlap} \
+           ) \
          ORDER BY c.id ASC \
          LIMIT 1",
         pending = pending_supervisor_command("c"),
+        older_pending = pending_supervisor_command("o"),
         owns = owns_project_predicate("$1", "c.project_id"),
+        overlap = weft_broker_client::lifecycle_command::commands_overlap("o", "c"),
     );
     let row = sqlx::query(&sql)
         .bind(claimer_replica)
-        .bind(busy_projects)
+        .bind(busy_commands)
         .fetch_optional(pool)
         .await?;
     row.as_ref().map(decode_command).transpose()

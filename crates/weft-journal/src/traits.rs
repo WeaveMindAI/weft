@@ -13,17 +13,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use weft_task_store::pg_signal::PgSignalWatch;
 
 use crate::events::ExecEvent;
 
-/// One journal row as stored: its place in the table and its payload,
-/// undecoded.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RawJournalRow {
-    pub id: i64,
-    pub payload: String,
+pub use weft_task_store::journal_rows::RawJournalRow;
+
+/// `rows` of `execution_id`, decoded, in order. One row that no longer
+/// decodes fails them all (see [`JournalClient::rows_after`]).
+pub fn decode_rows(execution_id: weft_core::ExecutionId, rows: Vec<RawJournalRow>) -> anyhow::Result<Vec<JournalRow>> {
+    rows.into_iter()
+        .map(|row| {
+            let event = crate::decode_event(execution_id, &row.payload).map_err(anyhow::Error::msg)?;
+            Ok(JournalRow { id: row.id, event })
+        })
+        .collect()
 }
 
 /// One journal row, decoded.
@@ -102,14 +106,7 @@ pub trait JournalClient: Send + Sync {
         after_id: i64,
         wait: Duration,
     ) -> anyhow::Result<Vec<JournalRow>> {
-        self.raw_rows_after(execution_id, after_id, wait)
-            .await?
-            .into_iter()
-            .map(|row| {
-                let event = crate::decode_event(execution_id, &row.payload).map_err(anyhow::Error::msg)?;
-                Ok(JournalRow { id: row.id, event })
-            })
-            .collect()
+        decode_rows(execution_id, self.raw_rows_after(execution_id, after_id, wait).await?)
     }
 
     /// Every event of one execution, in order, as it stands now. For a
@@ -232,9 +229,7 @@ impl JournalClient for PostgresJournalClient {
         // an empty read and the wait still ends the wait.
         let mut heard = self.signals.subscribe();
         loop {
-            let rows: Vec<(i64, String)> = sqlx::query_as(
-                "SELECT id, payload_json FROM exec_event WHERE execution_id = $1 AND id > $2 ORDER BY id ASC",
-            )
+            let rows: Vec<(i64, String)> = sqlx::query_as(&weft_task_store::journal_rows::rows_after_sql("$1", "$2"))
             .bind(&execution_id)
             .bind(after_id)
             .fetch_all(&self.pool)

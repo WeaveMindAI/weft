@@ -1390,9 +1390,11 @@ enum DomainAction {
 
 #[derive(Debug, Subcommand)]
 enum FrontendAction {
-    /// Make a frontend, and its token (written to a file only you can
-    /// read). `--repo owner/name` has the install host it: it makes the
-    /// service and lets that repository deploy to it.
+    /// Make a frontend. Without `--repo` it runs wherever you run it, and
+    /// its token is made now (written to a file only you can read). With
+    /// `--repo owner/name` the install hosts it: it makes the service and
+    /// lets that repository deploy to it, and its token is the deploy
+    /// workflow's, handed over by `weft target export`.
     Add {
         /// Lower-case letters, digits and hyphens, at most 20.
         name: String,

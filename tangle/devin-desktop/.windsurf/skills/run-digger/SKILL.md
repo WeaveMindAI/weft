@@ -34,7 +34,7 @@ You never sit on a quiet command. Anything that can take more than a few seconds
 ## Method
 
 The commands below are the ones this method leans on; what each flag does,
-and the rest of the journal surface, is the `weft-running` skill, which you
+and the rest of the journal surface, is the `weft-debugging` skill, which you
 read when a command here does not show you what you expected.
 
 1. **Orient.** `weft executions --limit 10` and `weft status`: [the execution id] and its status, the project's state, and sibling runs worth comparing (an older green run of the same program is gold).

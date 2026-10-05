@@ -226,7 +226,9 @@
 		switch (phase) {
 			case 'preflight': return 'Checking...';
 			case 'build_start':
-			case 'build_image': return 'Building...';
+			case 'build_image':
+			case 'build_image_done':
+			case 'build_wait': return 'Building...';
 			case 'build_done': return 'Loading...';
 			case 'infra_provision_start':
 			case 'infra_provision_done': return 'Provisioning infra...';
@@ -340,7 +342,9 @@
 		| { kind: 'absent' }
 		| { kind: 'cli_working'; phase: BarPhase }
 		| { kind: 'building'; cancelling: boolean }
-		| { kind: 'active'; canDeactivate: boolean; showDrift: boolean }
+		// `turnOn`: some triggers are off while the others run (an infra
+		// stop took down the ones reading it), and this verb turns them on.
+		| { kind: 'active'; canDeactivate: boolean; showDrift: boolean; turnOn?: 'activate' | 'reactivate' }
 		| { kind: 'activating'; canCancel: boolean }
 		| { kind: 'deactivating'; runningCount: number; canCancel: boolean; canResume: boolean }
 		| { kind: 'reactivate'; mode: string; enabled: boolean }
@@ -506,6 +510,11 @@
 					kind: 'active',
 					canDeactivate: !verbsBlocked && nodeCount > 0 && isVerbAvailable('deactivate'),
 					showDrift: sourceDrift && isVerbAvailable('resync'),
+					turnOn: verbsBlocked || nodeCount === 0
+						? undefined
+						: isVerbAvailable('reactivate') ? 'reactivate'
+						: isVerbAvailable('activate') ? 'activate'
+						: undefined,
 				};
 			case 'activating':
 				return {
@@ -905,21 +914,33 @@
 	{:else if slot.kind === 'pending'}
 		{@render workingButton(slot.message)}
 	{:else if slot.kind === 'active'}
-		<div class="relative flex items-stretch">
-			<button
-				class="{btn} {btnDisabled} bg-emerald-600 border-emerald-600 text-white hover:bg-emerald-700 {specMenuHost === 'trigger' ? 'rounded-r-none' : ''}"
-				onclick={onDeactivate}
-				disabled={!slot.canDeactivate}
-			>
-				<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>
-				<span class={labelCss}>Deactivate</span>
-				<span class="flex h-2 w-2 relative ml-1">
-					<span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
-					<span class="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
-				</span>
-			</button>
-			{#if specMenuHost === 'trigger'}
-				{@render specMenu('bg-emerald-600 border-emerald-600 text-white hover:bg-emerald-700 border-l-emerald-500')}
+		<div class="flex items-center gap-1.5">
+			<div class="relative flex items-stretch">
+				<button
+					class="{btn} {btnDisabled} bg-emerald-600 border-emerald-600 text-white hover:bg-emerald-700 {specMenuHost === 'trigger' ? 'rounded-r-none' : ''}"
+					onclick={onDeactivate}
+					disabled={!slot.canDeactivate}
+				>
+					<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="1"/></svg>
+					<span class={labelCss}>Deactivate</span>
+					<span class="flex h-2 w-2 relative ml-1">
+						<span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+						<span class="relative inline-flex rounded-full h-2 w-2 bg-green-500"></span>
+					</span>
+				</button>
+				{#if specMenuHost === 'trigger'}
+					{@render specMenu('bg-emerald-600 border-emerald-600 text-white hover:bg-emerald-700 border-l-emerald-500')}
+				{/if}
+			</div>
+			{#if slot.turnOn}
+				<button
+					class="{btn} {btnDisabled} bg-zinc-900 border-zinc-900 text-white hover:bg-zinc-800"
+					onclick={slot.turnOn === 'reactivate' ? onReactivate : onActivate}
+					title="Some triggers are off while the others run (an infra stop took down the ones reading it). Turn them back on."
+				>
+					<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+					<span class={labelCss}>{slot.turnOn === 'reactivate' ? 'Reactivate the rest' : 'Activate the rest'}</span>
+				</button>
 			{/if}
 		</div>
 	{:else if slot.kind === 'activating'}

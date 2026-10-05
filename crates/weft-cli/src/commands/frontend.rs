@@ -60,10 +60,10 @@ pub async fn run(ctx: Ctx, action: FrontendAction) -> Result<()> {
             let hosted = body.host == FrontendHost::CloudRun;
             let asked = serde_json::to_value(&body)?;
             let made = client.post_json(&base, &asked);
-            // A hosted frontend's service takes Cloud Run a minute or two
-            // to make, and the call answers only once it is ready.
+            // A hosted frontend's service takes Cloud Run a few seconds to
+            // make, and the call answers only once it is ready.
             let made = if hosted {
-                eprintln!("making the frontend's Cloud Run service (this takes a minute or two)");
+                eprintln!("making the frontend's Cloud Run service");
                 crate::progress::while_waiting(made, std::time::Duration::from_secs(15), async |elapsed| {
                     eprintln!("still making the frontend's Cloud Run service ({}s so far)", elapsed.as_secs())
                 })

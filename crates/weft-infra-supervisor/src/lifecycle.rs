@@ -225,33 +225,70 @@ async fn wait_for_drain(
 /// asks again, so a broker that is down is not asked in a tight loop.
 const CLAIM_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 
-/// Claim and run commands for as long as the process lives, one project's
-/// commands in order and different projects' side by side: an apply
-/// waiting minutes on a slow database's readiness, or a stop draining
-/// its runs, holds up only its own project.
+/// Claim and run commands for as long as the process lives. Commands that
+/// touch different copies run side by side; the ones that touch a copy in
+/// common run in the order they were issued (the broker hands out a command
+/// only once every older one touching one of its copies has ended,
+/// `lifecycle_writes::next_command`): an apply waiting minutes on a slow
+/// database's readiness holds up only the copies it touches.
 ///
 /// With nothing waiting, the claim itself sleeps: the broker holds it
 /// until a command is issued (or the hold ends). Two things in this supervisor
 /// end the hold early and ask again: a command finishing, since the
-/// project it frees may already have its next command waiting and the
-/// held claim still names it busy; and the ownership loop reporting a
-/// change (`changes`). A project this supervisor took on may have had its
-/// command issued while nobody owned it; a project it lost has a new
-/// owner, which runs its command again from the start, so the command
+/// command it was blocking may already be waiting; and the ownership loop
+/// reporting a change (`changes`). A project this supervisor took on may
+/// have had its command issued while nobody owned it; a project it lost has
+/// a new owner, which runs its command again from the start, so the command
 /// running here is stopped rather than left issuing host calls for a
 /// project that is no longer this supervisor's. When the broker answers that a
 /// command waits on a project nobody owns, the ownership loop is asked
 /// to tick now.
 pub async fn run_loop(
     state: SupervisorState,
+    changes: tokio::sync::mpsc::UnboundedReceiver<crate::ownership::OwnershipChange>,
+) -> Result<()> {
+    work(state, changes, Until::Forever).await
+}
+
+/// One pass of [`run_loop`] for a supervisor that scales to zero: claim and
+/// run, side by side the same way, every command claimable now and every
+/// one that becomes claimable while any runs (issued meanwhile, or freed
+/// by one ending), and return once none is running and none is left to
+/// claim. A claim that fails with nothing running fails the pass.
+pub async fn drain(
+    state: SupervisorState,
+    changes: tokio::sync::mpsc::UnboundedReceiver<crate::ownership::OwnershipChange>,
+) -> Result<()> {
+    work(state, changes, Until::Idle).await
+}
+
+/// How long [`work`] goes on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Until {
+    Forever,
+    Idle,
+}
+
+async fn work(
+    state: SupervisorState,
     mut changes: tokio::sync::mpsc::UnboundedReceiver<crate::ownership::OwnershipChange>,
+    until: Until,
 ) -> Result<()> {
     let mut running: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-    // The project each running task serves, and how to stop it.
-    let mut busy: std::collections::HashMap<tokio::task::Id, (Uuid, tokio::task::AbortHandle)> =
+    // The command each running task runs (its project, its id), and how to
+    // stop it.
+    let mut busy: std::collections::HashMap<tokio::task::Id, (Uuid, i64, tokio::task::AbortHandle)> =
         std::collections::HashMap::new();
     loop {
-        let busy_projects: Vec<Uuid> = busy.values().map(|(project, _)| *project).collect();
+        // While anything runs, the claim sleeps on the broker until a
+        // command is issued, in a pass too: a command issued for another
+        // copy mid-pass starts beside the running ones rather than after
+        // them. A pass with nothing running asks once and ends on nothing.
+        let hold = match (until, busy.is_empty()) {
+            (Until::Idle, true) => Duration::ZERO,
+            _ => weft_broker_client::protocol::MAX_HOLD,
+        };
+        let busy_commands: Vec<i64> = busy.values().map(|(_, command, _)| *command).collect();
         // Ownership first: a claim can only hand out a project this supervisor
         // took back AFTER the loss that is already queued here, so the
         // loss is applied before that claim spawns anything, and never
@@ -263,7 +300,7 @@ pub async fn run_loop(
                 let change = change.ok_or_else(|| {
                     anyhow!("the ownership loop is gone; the lifecycle loop cannot follow what this supervisor owns")
                 })?;
-                busy.retain(|_, (project_id, task)| {
+                busy.retain(|_, (project_id, _, task)| {
                     if !change.lost.contains(project_id) {
                         return true;
                     }
@@ -275,38 +312,52 @@ pub async fn run_loop(
                     false
                 });
             }
-            claimed = state.broker.claim_command(
-                &state.replica,
-                &busy_projects,
-                weft_broker_client::protocol::MAX_HOLD,
-            ) => match claimed {
+            claimed = state.broker.claim_command(&state.replica, &busy_commands, hold) => match claimed {
                 Ok(SupervisorClaim::Command(cmd)) => {
-                    let project_id = cmd.project_id;
+                    let (project_id, command_id) = (cmd.project_id, cmd.id);
                     let task_state = state.clone();
                     let task = running.spawn(async move {
                         if let Err(e) = run_command(&task_state, cmd).await {
                             tracing::warn!(error = %e, "lifecycle command could not be recorded");
                         }
                     });
-                    busy.insert(task.id(), (project_id, task));
+                    busy.insert(task.id(), (project_id, command_id, task));
                 }
-                Ok(SupervisorClaim::UnownedWork) => state.ownership_wanted.notify_one(),
-                Ok(SupervisorClaim::Nothing) => {}
+                // A pass with nothing running is done: the project nobody
+                // owns is taken on by the ownership tick it asked for, and
+                // its command runs in the next pass.
+                Ok(SupervisorClaim::UnownedWork) => {
+                    state.ownership_wanted.notify_one();
+                    if until == Until::Idle && busy.is_empty() {
+                        return Ok(());
+                    }
+                }
+                Ok(SupervisorClaim::Nothing) => {
+                    if until == Until::Idle && busy.is_empty() {
+                        return Ok(());
+                    }
+                }
+                // A pass with nothing running fails, so the tick that ran it
+                // fails and is run again; one with commands running lets
+                // them finish and asks again.
+                Err(e) if until == Until::Idle && busy.is_empty() => return Err(e.context("claim a lifecycle command")),
                 Err(e) => {
                     tracing::warn!(error = %e, "lifecycle claim failed");
                     state.clock.sleep(CLAIM_ERROR_BACKOFF).await;
                 }
             },
-            Some(done) = running.join_next_with_id() => match done {
-                Ok((id, ())) => {
-                    busy.remove(&id);
+            Some(done) = running.join_next_with_id() => {
+                match done {
+                    Ok((id, ())) => {
+                        busy.remove(&id);
+                    }
+                    // Stopped above, its busy entry already gone.
+                    Err(e) if e.is_cancelled() => {}
+                    // A command that panicked leaves its project's state
+                    // unknown to this supervisor: exit, so the process restarts clean.
+                    Err(e) => return Err(anyhow!("a lifecycle command panicked: {e}")),
                 }
-                // Stopped above, its busy entry already gone.
-                Err(e) if e.is_cancelled() => {}
-                // A command that panicked leaves its project's state
-                // unknown to this supervisor: exit, so the process restarts clean.
-                Err(e) => return Err(anyhow!("a lifecycle command panicked: {e}")),
-            },
+            }
         }
     }
 }
@@ -340,9 +391,9 @@ async fn run_command(
         verb = %cmd.verb,
         "lifecycle command claimed"
     );
-    // Held until the command is recorded, so the ownership loop's sweep
+    // Shared until the command is recorded, so the ownership loop's sweep
     // never deletes a copy this command is building (`ProjectLocks`).
-    let _project = state.project_locks.lock(cmd.project_id).await;
+    let _project = state.project_locks.share(cmd.project_id).await;
     let result = execute(state, &cmd).await;
     // A user-honored cancel is its own outcome, never a failure.
     let cancelled = result

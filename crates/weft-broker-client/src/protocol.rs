@@ -11,7 +11,7 @@ use uuid::Uuid;
 // answers the same struct, so publish and read-back cannot drift.
 use weft_core::access::wire::PublishedConnection;
 use weft_journal::ExecEvent;
-use weft_task_store::tasks::{ClaimFilter, NewTask, Task, TaskOutcome, TaskStatus};
+use weft_task_store::tasks::{ClaimedExecution, NewTask, TaskOutcome, TaskStatus};
 
 /// The longest the broker holds any request open (every `wait_ms`
 /// field is capped at it). A client that wants to wait longer asks
@@ -276,19 +276,19 @@ impl TaskWaitTerminalResponse {
     }
 }
 
-/// Claim one task, holding up to `wait_ms` (the broker caps it at
-/// `pg_signal::MAX_HOLD`) for one to be announced when none is
-/// claimable yet.
+/// `POST /v1/task/claim_execution`: a worker claims the execution it was
+/// handed, and reads its journal in the same trip
+/// (`weft_task_store::tasks::claim_execution`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskClaimOneRequest {
+pub struct TaskClaimExecutionRequest {
     pub replica: String,
-    pub filter: ClaimFilter,
-    pub wait_ms: u64,
+    pub project_id: Uuid,
+    pub execution_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskClaimOneResponse {
-    pub task: Option<Task>,
+pub struct TaskClaimExecutionResponse {
+    pub claimed: Option<ClaimedExecution>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -527,6 +527,13 @@ pub struct ResolveConnectionResponse {
     /// Whose credential the values carry; rides every cost record so
     /// the trail says whose account each figure landed on.
     pub owner: weft_core::CredentialOwner,
+    /// Until when (unix seconds) a worker may keep this answer and hand
+    /// it out again without asking, as long as nothing says the
+    /// connection changed (`line::ACCESS_CHANNEL`): `None` for a credential
+    /// the runtime supplies per firing, which is never kept, and
+    /// `i64::MAX` for stored values that never expire.
+    #[serde(default)]
+    pub keep_until_unix: Option<i64>,
 }
 
 // A measured call's cost record rides the generic task rail (a
@@ -764,10 +771,9 @@ pub struct SupervisorClaimCommandRequest {
     /// `infra_owner` exclusive lease), so two supervisors never change
     /// the same project's infrastructure.
     pub claimer_replica: String,
-    /// The projects this process is running a command for right now. Their
-    /// next command waits until that one completes, so one project's
-    /// commands run in order while different projects' run side by side.
-    pub busy_projects: Vec<uuid::Uuid>,
+    /// The commands this process is running right now, which it must not
+    /// be handed again (they stay uncompleted until they end).
+    pub busy_commands: Vec<i64>,
     /// How long to hold for a command to be issued when none is
     /// waiting (the broker caps it at `pg_signal::MAX_HOLD`).
     pub wait_ms: u64,
@@ -821,6 +827,16 @@ pub struct SupervisorCommandRow {
     /// choice); defaults to `DEFAULT_DRAIN_TIMEOUT_SECS`.
     #[serde(default = "default_drain_timeout_secs")]
     pub drain_timeout_secs: u64,
+}
+
+impl SupervisorCommandRow {
+    /// Whether this command and `other` reach a copy in common, so the
+    /// younger waits for the older.
+    // SYNC: SupervisorCommandRow::overlaps <-> crates/weft-broker-client/src/lifecycle_command.rs (commands_overlap), crates/weft-core/src/instance.rs (Copies::overlaps)
+    pub fn overlaps(&self, other: &SupervisorCommandRow) -> bool {
+        let nodes_meet = self.node_id.is_none() || other.node_id.is_none() || self.node_id == other.node_id;
+        nodes_meet && self.copies.overlaps(&other.copies)
+    }
 }
 
 /// A terminate command's work, carried in its `spec_json`: what the
@@ -2205,14 +2221,14 @@ mod supervisor_protocol_tests {
     fn claim_round_trip() {
         let req = SupervisorClaimCommandRequest {
             claimer_replica: "sup-1".into(),
-            busy_projects: vec![uuid::Uuid::from_u128(0xa1)],
+            busy_commands: vec![7],
             wait_ms: 25_000,
         };
         assert_eq!(
             serde_json::to_value(&req).unwrap(),
             json!({
                 "claimer_replica": "sup-1",
-                "busy_projects": ["00000000-0000-0000-0000-0000000000a1"],
+                "busy_commands": [7],
                 "wait_ms": 25_000,
             })
         );
@@ -2430,6 +2446,7 @@ mod supervisor_protocol_tests {
                 identity: Some("Q @ Acme".into()),
                 relay_url: relay_url.clone(),
                 owner: weft_core::CredentialOwner::Platform,
+                keep_until_unix: None,
             };
             // Field names pinned literally (a symmetric rename would
             // round-trip but break the peer).
@@ -2442,7 +2459,8 @@ mod supervisor_protocol_tests {
                                "value": "Bearer {token}" }],
                     "identity": "Q @ Acme",
                     "relay_url": relay_url,
-                    "owner": "platform"
+                    "owner": "platform",
+                    "keep_until_unix": null
                 })
             );
             let back: ResolveConnectionResponse = serde_json::from_value(v).unwrap();

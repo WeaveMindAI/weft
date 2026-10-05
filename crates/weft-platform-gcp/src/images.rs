@@ -77,6 +77,11 @@ impl CloudBuildImages {
     }
 }
 
+/// The build-arg that tells a worker build its builder keeps no cache
+/// between builds.
+// SYNC: COMPILE_CACHE_ARG <-> crates/weft-compiler/src/worker_image.rs (COMPILE_CACHE_ARG)
+const COMPILE_CACHE_ARG: &str = "WEFT_COMPILE_CACHE";
+
 /// The Cloud Build request for `req`, its context at `object` in `bucket`.
 /// `account` is the build's service account as a resource path
 /// (`projects/<p>/serviceAccounts/<email>`).
@@ -85,6 +90,11 @@ fn build_body(req: &BuildRequest, bucket: &str, object: &str, account: &str, mac
     for (k, v) in &req.build_args {
         args.extend(["--build-arg".into(), format!("{k}={v}")]);
     }
+    // Every Cloud Build runs on a fresh machine, so a build's cache mounts
+    // start empty and are gone after it: a worker build compiles where its
+    // builder base already compiled, instead of seeding a cache nothing
+    // keeps (`weft_compiler::worker_image`'s build step).
+    args.extend(["--build-arg".into(), format!("{COMPILE_CACHE_ARG}=none")]);
     args.push(".".into());
     json!({
         "source": { "storageSource": { "bucket": bucket, "object": object } },
@@ -266,7 +276,7 @@ mod tests {
         let body = build_body(&req, "bucket", "contexts/b1.tar.gz", "projects/acme/serviceAccounts/b@acme.iam.gserviceaccount.com", None);
         assert_eq!(body["images"][0], req.image_ref);
         let args: Vec<&str> = body["steps"][0]["args"].as_array().unwrap().iter().map(|a| a.as_str().unwrap()).collect();
-        assert_eq!(args, ["build", "--tag", req.image_ref.as_str(), "--build-arg", "WEFT_COMPILE_LANE=0", "."]);
+        assert_eq!(args, ["build", "--tag", req.image_ref.as_str(), "--build-arg", "WEFT_COMPILE_LANE=0", "--build-arg", "WEFT_COMPILE_CACHE=none", "."]);
         assert_eq!(body["serviceAccount"], "projects/acme/serviceAccounts/b@acme.iam.gserviceaccount.com");
         assert_eq!(body["options"]["logging"], "CLOUD_LOGGING_ONLY", "a build with its own account logs to Cloud Logging");
         assert!(body["options"].get("machineType").is_none(), "Cloud Build's own default machine, the free one");

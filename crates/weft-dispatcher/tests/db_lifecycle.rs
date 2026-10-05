@@ -1482,6 +1482,41 @@ async fn copies_read_with_the_commands_under_way(pool: PgPool) {
     assert_eq!(copies.status_of("bridge", None), None, "no shared copy, nothing starting one");
 }
 
+/// What holds the program's own verbs back is infra work on the copies
+/// the bar starts and stops: an instance's copy coming up holds nothing
+/// back, the shared copies' work does, and so does the project going.
+#[sqlx::test]
+async fn only_work_on_the_shared_copies_holds_the_program_back(pool: PgPool) {
+    use weft_dispatcher::infra_lifecycle_command::{any_in_flight, issue_lifecycle, RunningPolicy, TakeDown};
+    use weft_core::instance::Copies;
+    let (_journal, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project, "bin-A").await;
+    let stop = |copies: Copies| {
+        let pool = pool.clone();
+        async move {
+            issue_lifecycle(&pool, TENANT, project, Some("db"), &copies, TakeDown::Stop { force: false }, RunningPolicy::Cancel, 60, "disp-1")
+                .await
+                .unwrap()
+        }
+    };
+    let finish = |id: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query("UPDATE infra_lifecycle_command SET completed_at_unix = 1 WHERE id = $1").bind(id).execute(&pool).await.unwrap();
+        }
+    };
+
+    let ada = stop(Copies::Instance(InstanceId::new("ada").unwrap())).await;
+    assert!(!any_in_flight(&pool, project).await.unwrap(), "an instance's copy holds nothing back");
+    finish(ada).await;
+    let shared = stop(Copies::Shared).await;
+    assert!(any_in_flight(&pool, project).await.unwrap(), "the shared copies' work does");
+    finish(shared).await;
+    stop(Copies::Every).await;
+    assert!(any_in_flight(&pool, project).await.unwrap(), "and so does the project going");
+}
+
 /// The claim answers every named row as it was before, and a failure
 /// before setup touched anything puts each back as it was: a parked
 /// trigger parked, and one never activated without a row, so it reads
@@ -2212,6 +2247,16 @@ async fn the_held_rows_announce_their_changes(pool: PgPool) {
     assert!(heard_on(&mut heard, INFRA_STATUS_CHANNEL, &project).await, "an infra copy coming names its project");
     sqlx::query("UPDATE infra_node SET status = 'running' WHERE project_id = $1").bind(id).execute(&pool).await.unwrap();
     assert!(heard_on(&mut heard, INFRA_STATUS_CHANNEL, &project).await, "and its status changing");
+    // A worker keeps where each piece answers, so a move is news too.
+    sqlx::query("UPDATE infra_node SET endpoints_json = '{\"main\": \"db:5432\"}'::jsonb WHERE project_id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(heard_on(&mut heard, INFRA_STATUS_CHANNEL, &project).await, "and where it answers changing");
+    // A program registered again may declare other infra.
+    sqlx::query("UPDATE project SET project_json = project_json || ' ' WHERE id = $1").bind(id).execute(&pool).await.unwrap();
+    assert!(heard_on(&mut heard, INFRA_STATUS_CHANNEL, &project).await, "and the infra it declares changing");
 }
 
 /// A live run's birth, as a caller's handshake makes it: its
@@ -2331,14 +2376,11 @@ async fn a_live_run_whose_caller_never_came_leaves_nothing(pool: PgPool) {
     let present = weft_core::ExecutionId::new_v4();
     let (start, task) = born(present);
     journal.start_execution(&start, &[], task, false).await.unwrap();
-    let claimed = weft_task_store::tasks::claim_one(
-        &pool,
-        "worker-a",
-        &weft_task_store::tasks::ClaimFilter::ExecutionId { project_id: project, execution_id: present.to_string() },
-    )
-    .await
-    .unwrap()
-    .expect("the caller arrived");
+    let claimed = weft_task_store::tasks::claim_execution(&pool, "worker-a", project, &present.to_string())
+        .await
+        .unwrap()
+        .expect("the caller arrived")
+        .task;
 
     const PAST: weft_task_store::tasks::UnclaimedLiveRun = weft_task_store::tasks::UnclaimedLiveRun::PastDeadline { now: 1_001 };
     let gone = weft_task_store::tasks::callers_never_arrived(&pool, 1_001).await.unwrap();

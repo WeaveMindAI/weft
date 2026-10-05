@@ -64,7 +64,7 @@ pub enum BrokerCall {
     },
     ClaimCommand {
         claimer: String,
-        busy_projects: Vec<uuid::Uuid>,
+        busy_commands: Vec<i64>,
     },
     EventRecord {
         project_id: uuid::Uuid,
@@ -264,13 +264,19 @@ impl Inner {
         self.completed_commands.iter().any(|(id, _, _)| *id == command_id)
     }
 
-    /// The oldest uncompleted command of an owned project not in `busy`,
+    /// The oldest uncompleted command of an owned project, not in `busy`,
+    /// that no older uncompleted command of its project reaches a copy of,
     /// as the broker's `next_command` picks it.
-    fn next_command(&self, busy: &[uuid::Uuid]) -> Option<SupervisorCommandRow> {
-        self.commands
+    fn next_command(&self, busy: &[i64]) -> Option<SupervisorCommandRow> {
+        let waiting: Vec<&SupervisorCommandRow> = self.commands.iter().filter(|c| !self.completed(c.id)).collect();
+        waiting
             .iter()
-            .find(|c| !self.completed(c.id) && self.owns(c.project_id) && !busy.contains(&c.project_id))
-            .cloned()
+            .find(|c| {
+                self.owns(c.project_id)
+                    && !busy.contains(&c.id)
+                    && !waiting.iter().any(|o| o.project_id == c.project_id && o.id < c.id && o.overlaps(c))
+            })
+            .map(|c| (*c).clone())
     }
 
     /// Whether a supervisor may own `project_id`, as the broker's
@@ -826,12 +832,12 @@ impl BrokerSupervisorOps for FakeBroker {
     async fn claim_command(
         &self,
         claimer: &str,
-        busy_projects: &[uuid::Uuid],
+        busy_commands: &[i64],
         wait: std::time::Duration,
     ) -> Result<SupervisorClaim> {
         self.inner.lock().calls.push(BrokerCall::ClaimCommand {
             claimer: claimer.to_string(),
-            busy_projects: busy_projects.to_vec(),
+            busy_commands: busy_commands.to_vec(),
         });
         let deadline = tokio::time::Instant::now() + wait;
         let mut woken_once = false;
@@ -843,7 +849,7 @@ impl BrokerSupervisorOps for FakeBroker {
             issued.as_mut().enable();
             {
                 let mut inner = self.inner.lock();
-                if let Some(cmd) = inner.next_command(busy_projects) {
+                if let Some(cmd) = inner.next_command(busy_commands) {
                     inner.claimed_command_project.insert(cmd.id, cmd.project_id);
                     if inner.displaced_on_claim.remove(&cmd.project_id) {
                         inner.owners.insert(cmd.project_id, Owner::Other);
@@ -1297,7 +1303,7 @@ mod tests {
         }
     }
 
-    async fn claim(b: &FakeBroker, busy: &[uuid::Uuid]) -> SupervisorClaim {
+    async fn claim(b: &FakeBroker, busy: &[i64]) -> SupervisorClaim {
         b.claim_command("sup-1", busy, std::time::Duration::ZERO).await.unwrap()
     }
 
@@ -1307,7 +1313,7 @@ mod tests {
         b.enqueue_command(stop(1, P1));
         assert!(matches!(claim(&b, &[]).await, SupervisorClaim::Command(c) if c.id == 1));
         assert!(matches!(claim(&b, &[]).await, SupervisorClaim::Command(c) if c.id == 1));
-        assert!(matches!(claim(&b, &[P1]).await, SupervisorClaim::Nothing), "a busy project's command waits");
+        assert!(matches!(claim(&b, &[1]).await, SupervisorClaim::Nothing), "a command already running here is not handed out again");
         b.command_complete("sup-1", 1, None, false).await.unwrap();
         assert!(matches!(claim(&b, &[]).await, SupervisorClaim::Nothing));
     }

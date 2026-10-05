@@ -454,12 +454,12 @@ mod tests {
         ) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
             unreachable!("socket tests only enqueue")
         }
-        async fn claim_one(
+        async fn claim_execution(
             &self,
             _replica: &str,
-            _filter: weft_task_store::tasks::ClaimFilter,
-            _wait: std::time::Duration,
-        ) -> anyhow::Result<Option<weft_task_store::tasks::Task>> {
+            _project_id: uuid::Uuid,
+            _execution_id: &str,
+        ) -> anyhow::Result<Option<weft_task_store::tasks::ClaimedExecution>> {
             Ok(None)
         }
         async fn requeue(&self, _task_id: uuid::Uuid, _replica: &str) -> anyhow::Result<bool> {

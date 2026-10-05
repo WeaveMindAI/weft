@@ -131,6 +131,7 @@ pub const DISPATCHER_CHANNELS: &[&str] = &[
     crate::held::ROUTES_CHANNEL,
     crate::held::WORKER_SETTINGS_CHANNEL,
     crate::held::INFRA_STATUS_CHANNEL,
+    crate::held::ACCESS_CHANNEL,
 ];
 
 /// What the dispatcher is built from: the install's config and what the
@@ -217,7 +218,7 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         .build()
         .expect("a default reqwest client builds");
     Ok(DispatcherState {
-        replica,
+        replica: replica.clone(),
         journal: Arc::new(journal),
         pg_pool: pool,
         lock_pool,
@@ -243,7 +244,11 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         public_base_url: config.public_url.trim_end_matches('/').to_string(),
         internet_url: config.internet_url.clone(),
         edge: config.edge,
-        broker: RoleClient::new(CoreRole::Broker, addresses.broker.clone(), tokens, http.clone()),
+        broker: RoleClient::new(CoreRole::Broker, addresses.broker.clone(), tokens.clone(), http.clone()),
+        broker_line: weft_broker_client::BrokerLink::new(
+            addresses.broker.clone(),
+            weft_broker_client::TokenSource::role(tokens, replica.clone(), CoreRole::Dispatcher),
+        ),
         http,
         caller_token_secret: Arc::new(caller_token_secret),
         programs: Arc::new(weft_core::content_cache::ContentCache::new(64)),
@@ -297,7 +302,7 @@ pub fn core_task_registry_builder() -> crate::task_executor::TaskRegistryBuilder
 /// reapers. The runtime runs them where the dispatcher is placed (see
 /// `weft_task_store::drain`).
 pub fn drain_loops(state: &DispatcherState, registry: crate::task_executor::TaskRegistry) -> anyhow::Result<Vec<DrainLoop>> {
-    let picker_store: Arc<dyn weft_task_store::TaskStoreClient> = Arc::new(
+    let picker_store = Arc::new(
         weft_task_store::PostgresTaskStoreClient::new(state.pg_pool.clone(), state.signals.clone())
             .context("the dispatcher's signal watch listens on every task channel")?,
     );

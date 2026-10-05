@@ -1737,15 +1737,15 @@ async fn publishing_twice_updates_one_connection(pool: PgPool) {
     .await
     .expect("second publish");
 
-    assert_eq!(first.grant.id, second.grant.id, "the node's one connection, updated");
-    assert_eq!(second.grant.identity.as_deref(), Some("db.new"));
+    assert_eq!(first.connection_id, second.connection_id, "the node's one connection, updated");
+    assert_eq!(second.identity.as_deref(), Some("db.new"));
     assert_eq!(list_grants(&pool, TENANT_A, Some("selfrun"), weft_access_store::GrantOwnerScope::Author).await.unwrap().len(), 1);
 
     let found = weft_access_store::published_connection(&pool, TENANT_A, PROJECT_1, "db", None, "selfrun")
         .await
         .expect("look up")
         .expect("the node finds what it published");
-    assert_eq!(found.connection_id, first.grant.id.to_string());
+    assert_eq!(found.connection_id, first.connection_id);
     assert!(
         weft_access_store::published_connection(&pool, TENANT_A, PROJECT_1, "other", None, "selfrun")
             .await
@@ -1753,6 +1753,44 @@ async fn publishing_twice_updates_one_connection(pool: PgPool) {
             .is_none(),
         "another node published nothing"
     );
+}
+
+/// A node publishes on every run, and every write tells the workers that
+/// may use the connection to drop what they kept. So a publish that changes
+/// nothing writes nothing and announces nothing, and one that changes the
+/// connection announces it. A shared copy's connection is no instance's
+/// own, so any project of the tenant may use it: it is announced for the
+/// tenant.
+#[sqlx::test]
+async fn only_a_publish_that_changes_the_connection_announces_it(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    static CHANNELS: &[&str] = &["weft_access"];
+    let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool.connect_options(), CHANNELS).await.unwrap();
+    let mut heard = watch.subscribe();
+    async fn heard_it(heard: &mut weft_task_store::pg_signal::Subscription) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let tenant = format!("tenant:{TENANT_A}");
+        heard.woken_before(deadline, |c, p| c == "weft_access" && p == tenant).await.unwrap()
+    }
+
+    weft_access_store::publish_grant(&pool, TENANT_A, publish(&[("host", "db"), ("password", "p")])).await.unwrap();
+    assert!(heard_it(&mut heard).await, "the first publish is news");
+    weft_access_store::publish_grant(&pool, TENANT_A, publish(&[("host", "db"), ("password", "p")])).await.unwrap();
+    assert!(!heard_it(&mut heard).await, "the same values again write nothing");
+    let published = weft_access_store::publish_grant(&pool, TENANT_A, publish(&[("host", "db"), ("password", "q")])).await.unwrap();
+    assert!(heard_it(&mut heard).await, "a new password is news");
+
+    // A pick is the project's own: announced for the project alone.
+    sqlx::query("INSERT INTO install_pick (tenant_id, project_id, step, field, grant_id) VALUES ($1, $2, 'db', 'access', $3::uuid)")
+        .bind(TENANT_A)
+        .bind(PROJECT_1)
+        .bind(&published.connection_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let project = PROJECT_1.to_string();
+    assert!(heard.woken_before(deadline, |c, p| c == "weft_access" && p == project).await.unwrap(), "a pick names its project");
 }
 
 /// The shapes a published recipe may not have. Each one would later

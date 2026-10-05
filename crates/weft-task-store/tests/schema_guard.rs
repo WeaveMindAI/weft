@@ -271,6 +271,38 @@ async fn changing_the_ddl_with_no_migration_refuses(pool: PgPool) {
     assert!(!has_extra_column(&pool).await, "the drifted DDL did not run");
 }
 
+/// A function or trigger is written with `CREATE OR REPLACE` and `DROP
+/// ... IF EXISTS`, so running the new text would itself make the database
+/// hold the new shape: the boot checks the database before running it, and
+/// a body changed with no migration refuses like a column does.
+#[sqlx::test]
+async fn replacing_a_function_with_no_migration_refuses(pool: PgPool) {
+    static V1: SchemaGroup = SchemaGroup {
+        name: "guard_probe",
+        tables: &["guard_probe"],
+        ddl: &[
+            "CREATE TABLE IF NOT EXISTS guard_probe (id INT PRIMARY KEY, note TEXT)",
+            "CREATE OR REPLACE FUNCTION guard_probe_answer() RETURNS INT AS $$ SELECT 1 $$ LANGUAGE sql",
+        ],
+        seed: &[],
+    };
+    static V2: SchemaGroup = SchemaGroup {
+        name: "guard_probe",
+        tables: &["guard_probe"],
+        ddl: &[
+            "CREATE TABLE IF NOT EXISTS guard_probe (id INT PRIMARY KEY, note TEXT)",
+            "CREATE OR REPLACE FUNCTION guard_probe_answer() RETURNS INT AS $$ SELECT 2 $$ LANGUAGE sql",
+        ],
+        seed: &[],
+    };
+    apply(&pool, &[&V1], NONE).await.expect("the old shape");
+    let err = apply(&pool, &[&V2], NONE).await.expect_err("a replaced body must refuse");
+    assert!(err.to_string().contains("does not hold the shape"), "{err}");
+    let (answer,): (i32,) = sqlx::query_as("SELECT guard_probe_answer()").fetch_one(&pool).await.unwrap();
+    assert_eq!(answer, 1, "the new body did not run");
+    apply(&pool, &[&V1], NONE).await.expect("the unchanged code still boots");
+}
+
 /// A fingerprint that moved with NO shape change (a comment edit, a
 /// seed statement moved out of the DDL) restamps silently: the shape
 /// check proves the live schema already matches the canonical build,

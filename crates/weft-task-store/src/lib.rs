@@ -30,6 +30,7 @@ pub mod db;
 pub mod drain;
 pub mod executor;
 pub mod held_copy;
+pub mod journal_rows;
 pub mod kinds;
 pub mod locks;
 pub mod pg_signal;
@@ -49,7 +50,7 @@ pub use kinds::{
 };
 pub use tasks::{
     bind_execution_id_owner, claim_one, complete, enqueue, enqueue_dedup, fail, heartbeat, sweep_terminal, take_deliveries,
-    CancelAsked, ClaimFilter, DedupOutcome, Delivery, NewTask, Task, TaskOutcome, TaskStatus,
+    CancelAsked, ClaimedExecution, DedupOutcome, Delivery, NewTask, Task, TaskOutcome, TaskStatus,
     TaskTarget, claim_duration_secs, claim_heartbeat_interval, TERMINAL_RETENTION_SECS,
 };
 pub use traits::{InfraReader, PostgresInfraReader, PostgresTaskStoreClient, TaskStoreClient};

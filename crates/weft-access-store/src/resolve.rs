@@ -45,6 +45,11 @@ pub struct ResolvedAccess {
     /// chooser widgets need it (Google's picker derives its required
     /// app id from it); it is never a secret.
     pub app_client_id: Option<String>,
+    /// Until when the values handed over stay the ones a resolve would
+    /// hand: the moment they are due a refresh, `None` when they never
+    /// are. What lets a worker keep them (the broker's
+    /// `ResolveConnectionResponse::keep_until_unix`).
+    pub fresh_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// The permission drift backstop, pure: a VERIFIED connection short of
@@ -119,6 +124,8 @@ struct WalledGrant {
     owner: weft_core::CredentialOwner,
     door: Door,
     provider_account: Option<String>,
+    /// See [`ResolvedAccess::fresh_until`].
+    fresh_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Who is about to use a connection. An instance's connection is its own,
@@ -293,9 +300,11 @@ async fn read_walled_grant(
             owner,
             door,
             provider_account,
+            fresh_until: None,
         });
     }
     let mut values = values_of(&crate::open_json(&values_sealed)?);
+    let mut expires_at = expires_at;
     if let Some(mut tx) = tx {
         let stale = match expires_at {
             Some(at) => at < chrono::Utc::now() + REFRESH_MARGIN,
@@ -314,6 +323,7 @@ async fn read_walled_grant(
             .bind(new_expiry)
             .execute(&mut *tx)
             .await?;
+            expires_at = new_expiry;
         }
         tx.commit().await?;
     }
@@ -326,6 +336,7 @@ async fn read_walled_grant(
         owner,
         door,
         provider_account,
+        fresh_until: expires_at.map(|at| at - REFRESH_MARGIN),
     })
 }
 
@@ -356,7 +367,7 @@ fn worker_handoff(
     service: &str,
     required_values: &[String],
 ) -> anyhow::Result<ResolvedAccess> {
-    let WalledGrant { service: row_service, spec, registration, values, identity, owner, .. } =
+    let WalledGrant { service: row_service, spec, registration, values, identity, owner, fresh_until, .. } =
         grant;
     let app_client_id = registration.as_ref().map(|r| r.client_id.clone());
     if matches!(spec.acquisition, Acquisition::Runtime {}) {
@@ -367,6 +378,7 @@ fn worker_handoff(
             service: row_service,
             owner,
             app_client_id,
+            fresh_until,
         });
     }
 
@@ -413,6 +425,7 @@ fn worker_handoff(
         service: row_service,
         owner,
         app_client_id,
+        fresh_until,
     })
 }
 

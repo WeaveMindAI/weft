@@ -1,7 +1,7 @@
 # Tangle
 
 Tangle is the AI builder that lives inside a weft project. It is not a
-product and not a plugin: it is a persona, seventeen skills, six specialists
+product and not a plugin: it is a persona, its reference skills, six specialists
 and seven commands, written as files that an AI coding assistant loads when
 the user opens the project.
 

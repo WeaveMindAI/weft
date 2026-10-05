@@ -236,6 +236,17 @@ impl Ctx {
         self.on.as_deref()
     }
 
+    /// `weft <verb>` as a hint for this command's reader, aimed at the
+    /// install this command acts on: with its `--on <target>` when it
+    /// named one, so the command a person copies acts where they were
+    /// looking.
+    pub fn weft(&self, verb: &str) -> String {
+        match &self.on {
+            Some(on) => format!("weft {verb} --on {on}"),
+            None => format!("weft {verb}"),
+        }
+    }
+
     /// The address and operator key a request from this command carries
     /// (`weft target key` prints them for the editor).
     pub fn install_access(&self) -> anyhow::Result<(&str, Option<&str>)> {

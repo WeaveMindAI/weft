@@ -14,7 +14,7 @@ use serde_json::json;
 use sqlx::PgPool;
 
 use weft_task_store::pg_signal::{Heard, Subscription};
-use weft_task_store::tasks::{self, claim_one, enqueue_or_rearm, ClaimFilter};
+use weft_task_store::tasks::{self, claim_one, enqueue_or_rearm};
 use weft_task_store::terminal::TERMINAL_CHANNEL;
 use weft_task_store::{PostgresTaskStoreClient, TaskStatus, TaskStoreClient, TaskTarget};
 
@@ -68,7 +68,7 @@ async fn a_wait_ends_the_moment_the_task_completes(pool: PgPool) {
         let pool = pool.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
-            claim_one(&pool, "disp-1", &ClaimFilter::Dispatcher).await.expect("claim").expect("the task");
+            claim_one(&pool, "disp-1").await.expect("claim").expect("the task");
             tasks::complete(&pool, id, "disp-1", json!({"token": "t"})).await.expect("complete");
         })
     };
@@ -95,7 +95,7 @@ async fn a_wait_ends_the_moment_the_task_fails(pool: PgPool) {
         let pool = pool.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
-            let first = claim_one(&pool, "disp-1", &ClaimFilter::Dispatcher).await.expect("claim").expect("a task");
+            let first = claim_one(&pool, "disp-1").await.expect("claim").expect("a task");
             tasks::fail(&pool, first.id, "disp-1", "boom".into()).await.expect("fail");
             let other = if first.id == claimed { pending } else { claimed };
             // Whichever is left: failed where it stands if pending, or
@@ -123,7 +123,7 @@ async fn a_done_task_answers_at_once_and_an_unfinished_one_at_the_timeout(pool: 
     setup(&pool).await;
     let client = PostgresTaskStoreClient::new(pool.clone(), signals(&pool).await).expect("client");
     let done = tasks::enqueue(&pool, task("done")).await.expect("enqueue");
-    claim_one(&pool, "disp-1", &ClaimFilter::Dispatcher).await.expect("claim").expect("the task");
+    claim_one(&pool, "disp-1").await.expect("claim").expect("the task");
     tasks::complete(&pool, done, "disp-1", json!(1)).await.expect("complete");
     assert_eq!(client.wait_for_terminal(done, Duration::from_secs(30)).await.unwrap().status, TaskStatus::Complete);
 
@@ -146,12 +146,12 @@ async fn a_finish_that_runs_the_task_again_wakes_nobody(pool: PgPool) {
         panic!("the first ask inserts");
     };
 
-    claim_one(&pool, "disp-1", &ClaimFilter::Dispatcher).await.expect("claim").expect("the task");
+    claim_one(&pool, "disp-1").await.expect("claim").expect("the task");
     enqueue_or_rearm(&pool, task("rerun")).await.expect("ask again");
     tasks::complete(&pool, id, "disp-1", json!(1)).await.expect("complete");
     assert_eq!(terminal_ids(&mut heard).await, Vec::<String>::new(), "back to pending is not an end");
 
-    claim_one(&pool, "disp-1", &ClaimFilter::Dispatcher).await.expect("claim").expect("the task again");
+    claim_one(&pool, "disp-1").await.expect("claim").expect("the task again");
     tasks::complete(&pool, id, "disp-1", json!(2)).await.expect("complete");
     assert_eq!(terminal_ids(&mut heard).await, vec![id.to_string()]);
 }
@@ -178,7 +178,7 @@ async fn a_project_scoped_wait_sees_only_its_own_projects_task(pool: PgPool) {
         let pool = pool.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(300)).await;
-            claim_one(&pool, "disp-1", &ClaimFilter::Dispatcher).await.expect("claim").expect("the task");
+            claim_one(&pool, "disp-1").await.expect("claim").expect("the task");
             tasks::complete(&pool, id, "disp-1", json!(1)).await.expect("complete");
         })
     };

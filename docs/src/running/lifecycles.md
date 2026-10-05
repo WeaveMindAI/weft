@@ -90,6 +90,12 @@ turns on one and leaves the rest alone; for the other flags, go and read
 listens and none is part way through turning on or off, and `weft status` lists
 each trigger's own state under `triggers:`.
 
+If you stopped infrastructure that some triggers read, those triggers came
+down with it and the rest stayed on. After `weft infra start`, a plain `weft
+activate` turns back on the ones that are off and leaves the others as they
+are. A route whose trigger is off answers its callers 503 at once, saying it
+is switched off: a caller is never held while it waits.
+
 A trigger that reads an instance's copy or an instance's value
 (`@per_instance`, `@instance_filled`) exists once per instance, and its copies
 are turned on with `--instance <id>`. For those, go and read

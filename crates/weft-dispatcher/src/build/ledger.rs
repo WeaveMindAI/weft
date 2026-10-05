@@ -54,6 +54,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- weft_compiler::worker_image::COMPILE_LANE_ARG); NULL for an
             -- image that compiles nothing.
             lane INTEGER,
+            -- SYNC: the statuses <-> weft_core::projects::BuildState
             status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'cancelled')),
             reason TEXT,
             -- Until when its start may still record `builder_id`.
@@ -409,6 +410,21 @@ pub async fn running_for(pool: &PgPool, image_ref: &str) -> Result<Option<Runnin
     .fetch_optional(pool)
     .await
     .context("read the running build")
+}
+
+/// Where the build the builder knows as `builder_id` is, when it is one
+/// `project` started or waits on (the same builds [`running`] lists for it).
+pub async fn state_of(pool: &PgPool, project: uuid::Uuid, builder_id: &str) -> Result<Option<weft_core::projects::BuildState>> {
+    let status: Option<String> = sqlx::query_scalar(
+        "SELECT b.status FROM image_build b WHERE b.builder_id = $2 AND (b.project_id = $1 \
+             OR EXISTS (SELECT 1 FROM image_claim c WHERE c.image_ref = b.image_ref AND c.project_id = $1))",
+    )
+    .bind(project)
+    .bind(builder_id)
+    .fetch_optional(pool)
+    .await
+    .context("read a build's state")?;
+    status.map(|s| serde_json::from_value(serde_json::Value::String(s)).context("a build state the ledger does not know")).transpose()
 }
 
 /// Every build running, oldest first; when `project` is given, the ones it

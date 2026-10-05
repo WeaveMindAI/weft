@@ -483,13 +483,14 @@ pub async fn token_guessing_blocked(pool: &PgPool, edge: &EdgeConfig, address: I
         .map(|_| Refused { retry_after_secs: left, reason: Limited::InvalidTokens }))
 }
 
-/// Count one refused token from `address`.
-pub async fn note_invalid_token(pool: &PgPool, edge: &EdgeConfig, address: IpAddr, now: i64) -> Result<()> {
-    if edge.invalid_tokens_per_minute.is_none() {
-        return Ok(());
-    }
-    count(pool, &invalid_tokens_key(address), now).await?;
-    Ok(())
+/// Count one refused token from `address`, and say whether the address
+/// was already past the bound before it: one trip to the database for
+/// both, since a refused token is answered by what this decides.
+pub async fn note_invalid_token(pool: &PgPool, edge: &EdgeConfig, address: IpAddr, now: i64) -> Result<Option<Refused>> {
+    let Some(limit) = edge.invalid_tokens_per_minute else { return Ok(None) };
+    let (hits, left) = count(pool, &invalid_tokens_key(address), now).await?;
+    // Past the bound before this one: more hits than the bound, this one included.
+    Ok((hits > limit as i64).then_some(Refused { retry_after_secs: left, reason: Limited::InvalidTokens }))
 }
 
 /// Count one refusal against the entry, for `weft status`.

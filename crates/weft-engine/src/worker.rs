@@ -34,7 +34,7 @@ use tokio::sync::Mutex;
 use weft_core::cancellation::CancellationFlag;
 use weft_core::caller::{InboundMessage, OutboundChunk};
 use weft_core::{ExecutionId, NodeCatalog, ProjectDefinition};
-use weft_task_store::tasks::{ClaimFilter, Task};
+use weft_task_store::tasks::{ClaimedExecution, Task};
 use weft_task_store::{ExecutionPayload, TaskEnd};
 
 use crate::context::EngineClients;
@@ -292,42 +292,43 @@ impl Worker {
     /// halfway; the drive ends on its own terms (and a short run stops
     /// itself before the cap, see `SHORT_RUN_CAP_MARGIN`).
     async fn run_execution_id(&self, execution_id: ExecutionId) -> Result<RunAnswer> {
-        let Some(task) = self.claim_execution_id(execution_id).await? else {
+        let Some(claimed) = self.claim_execution_id(execution_id).await? else {
             return Ok(RunAnswer::NothingToRun);
         };
-        self.drive_detached(task).await.context("the drive panicked outside its guard")
+        self.drive_detached(claimed).await.context("the drive panicked outside its guard")
     }
 
-    /// `execution_id`'s execute or resume task, claimed by this worker, or
-    /// `None` when there is nothing here to claim.
-    async fn claim_execution_id(&self, execution_id: ExecutionId) -> Result<Option<Task>> {
-        let filter = ClaimFilter::ExecutionId { project_id: self.project_id, execution_id: execution_id.to_string() };
+    /// `execution_id`'s execute or resume task, claimed by this worker
+    /// with the execution's journal, or `None` when there is nothing here
+    /// to claim.
+    async fn claim_execution_id(&self, execution_id: ExecutionId) -> Result<Option<ClaimedExecution>> {
         self.clients
             .tasks
-            .claim_one(&self.replica, filter, std::time::Duration::ZERO)
+            .claim_execution(&self.replica, self.project_id, &execution_id.to_string())
             .await
             .context("claim the execution's task")
     }
 
     /// Drive a claimed task to its end on a task of its own, so whoever
     /// handed it here can go away without stopping it.
-    fn drive_detached(&self, task: Task) -> tokio::task::JoinHandle<RunAnswer> {
+    fn drive_detached(&self, claimed: ClaimedExecution) -> tokio::task::JoinHandle<RunAnswer> {
         let worker = self.clone();
         let token = self.background.token();
         tokio::spawn(async move {
             let _token = token;
             let store = worker.clients.tasks.clone();
             let replica = worker.replica.clone();
-            let end = weft_task_store::run_claimed_worker_task(store, &replica, &task, worker.drive(&task)).await;
+            let ClaimedExecution { task, journal } = claimed;
+            let end = weft_task_store::run_claimed_worker_task(store, &replica, &task, worker.drive(&task, journal)).await;
             RunAnswer::from(end)
         })
     }
 
-    /// Drive one claimed execute or resume task: fold the journal and run
-    /// the loop driver. The two are identical here (the journal carries
-    /// the lifecycle truth); the dispatcher distinguishes them so the
-    /// editor can label the event.
-    async fn drive(&self, task: &Task) -> Result<()> {
+    /// Drive one claimed execute or resume task: fold the journal the
+    /// claim read and run the loop driver. The two are identical here (the
+    /// journal carries the lifecycle truth); the dispatcher distinguishes
+    /// them so the editor can label the event.
+    async fn drive(&self, task: &Task, journal: Vec<weft_journal::RawJournalRow>) -> Result<()> {
         let ctx = self;
         let payload: ExecutionPayload = serde_json::from_value(task.payload.clone())?;
         let execution_id: ExecutionId = payload
@@ -377,9 +378,14 @@ impl Worker {
                 Some(weft_journal::UnrecordedJournal::seeded(execution_id, birth, ctx.clients.journal.clone())?)
             }
         };
-        let clients = match &unrecorded {
-            Some(journal) => EngineClients { journal: journal.clone(), ..ctx.clients.clone() },
-            None => ctx.clients.clone(),
+        // A recorded run starts from the rows its claim read; an unrecorded
+        // one's rows are its own memory, which holds its birth.
+        let (clients, first_rows) = match &unrecorded {
+            Some(memory) => (
+                EngineClients { journal: memory.clone(), ..ctx.clients.clone() },
+                weft_journal::JournalClient::raw_rows_after(memory.as_ref(), execution_id, 0, std::time::Duration::ZERO).await?,
+            ),
+            None => (ctx.clients.clone(), journal),
         };
 
         let flag = CancellationFlag::new_arc();
@@ -429,6 +435,7 @@ impl Worker {
             ctx.tenant_id.clone(),
             flag,
             caller,
+            first_rows,
         )
         .await;
 
@@ -1326,12 +1333,12 @@ struct LiveStarter {
 #[async_trait::async_trait]
 impl crate::caller_conn::LiveStarter for LiveStarter {
     async fn start(&self, execution_id: ExecutionId) -> Result<crate::caller_conn::LiveClaim> {
-        let Some(task) = self.worker.claim_execution_id(execution_id).await? else {
+        let Some(claimed) = self.worker.claim_execution_id(execution_id).await? else {
             return Ok(crate::caller_conn::LiveClaim::NotHere);
         };
         let (ready_tx, ready) = tokio::sync::oneshot::channel();
         self.worker.live_ready.lock().expect("live_ready poisoned").insert(execution_id, ready_tx);
-        let mut starting = Starting { drive: Some(self.worker.drive_detached(task)), execution_id, live_ready: self.worker.live_ready.clone() };
+        let mut starting = Starting { drive: Some(self.worker.drive_detached(claimed)), execution_id, live_ready: self.worker.live_ready.clone() };
         let came = {
             let drive = starting.drive.as_mut().expect("just started");
             tokio::select! {
@@ -1450,7 +1457,7 @@ mod tests {
         async fn wait_for_terminal(&self, _t: uuid::Uuid, _to: std::time::Duration) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
             unreachable!()
         }
-        async fn claim_one(&self, _p: &str, _f: ClaimFilter, _w: std::time::Duration) -> anyhow::Result<Option<Task>> {
+        async fn claim_execution(&self, _p: &str, _project: uuid::Uuid, _execution: &str) -> anyhow::Result<Option<ClaimedExecution>> {
             Ok(None)
         }
         async fn heartbeat(&self, _t: uuid::Uuid, _p: &str) -> anyhow::Result<bool> {

@@ -240,6 +240,17 @@ pub fn command_reaches_copy(command_alias: &str, node_expr: &str, instance_expr:
     )
 }
 
+/// SQL condition that is true iff the `infra_lifecycle_command` rows
+/// aliased `a` and `b` reach a copy in common: their nodes meet (the same
+/// node, or either names the whole project) and so do their copies.
+// SYNC: commands_overlap <-> crates/weft-core/src/instance.rs (Copies::overlaps), crates/weft-broker-client/src/protocol.rs (SupervisorCommandRow::overlaps)
+pub fn commands_overlap(a: &str, b: &str) -> String {
+    format!(
+        "({a}.node_id IS NULL OR {b}.node_id IS NULL OR {a}.node_id = {b}.node_id) \
+         AND ({a}.every_copy OR {b}.every_copy OR {a}.instance_id IS NOT DISTINCT FROM {b}.instance_id)"
+    )
+}
+
 /// The channel an `infra_lifecycle_command` row notifies on, from the
 /// `infra_command_notify` trigger in the dispatcher's
 /// `infra_lifecycle_command::GROUP`: once when the command is issued,

@@ -68,7 +68,23 @@ pub struct Synced {
 /// Tick for as long as the process lives, handing every change to each work
 /// loop in `changes` (lifecycle and health).
 pub async fn run_loop(state: SupervisorState, changes: Vec<UnboundedSender<OwnershipChange>>) -> Result<()> {
-    let mut owned = HashSet::new();
+    follow(state, HashSet::new(), changes, true).await
+}
+
+/// Renew what a pass of a supervisor that scales to zero owns (`owned`,
+/// what its first tick found) for as long as the pass runs, ticking at the
+/// loop's interval and handing every change to `changes`. The pass drops
+/// it when its commands are done.
+pub async fn keep_renewing(state: SupervisorState, owned: HashSet<Uuid>, changes: Vec<UnboundedSender<OwnershipChange>>) -> Result<()> {
+    follow(state, owned, changes, false).await
+}
+
+/// Tick, and again at every interval (or when a work loop asks), from
+/// `owned`; the first tick at once when `tick_first`.
+async fn follow(state: SupervisorState, mut owned: HashSet<Uuid>, changes: Vec<UnboundedSender<OwnershipChange>>, tick_first: bool) -> Result<()> {
+    if !tick_first {
+        wait_for_next_tick(&state).await;
+    }
     loop {
         match tick(&state, &mut owned).await.map(|synced| synced.change) {
             Ok(Some(change)) => {
@@ -81,10 +97,15 @@ pub async fn run_loop(state: SupervisorState, changes: Vec<UnboundedSender<Owner
             Ok(None) => {}
             Err(e) => tracing::warn!(error = %e, "ownership tick failed"),
         }
-        tokio::select! {
-            () = state.clock.sleep(state.ownership_interval) => {}
-            () = state.ownership_wanted.notified() => {}
-        }
+        wait_for_next_tick(&state).await;
+    }
+}
+
+/// The ownership interval, or less when a work loop asks for a tick now.
+async fn wait_for_next_tick(state: &SupervisorState) {
+    tokio::select! {
+        () = state.clock.sleep(state.ownership_interval) => {}
+        () = state.ownership_wanted.notified() => {}
     }
 }
 
@@ -161,10 +182,10 @@ pub async fn tick(state: &SupervisorState, owned: &mut HashSet<Uuid>) -> Result<
 ///   the window every fenced host call has: between that last check and
 ///   the host call, which a new owner can only enter after this
 ///   supervisor stopped renewing for a whole lease.
-/// - The project's lock (`ProjectLocks`), the one every lifecycle command
-///   of this process holds, so this supervisor's own apply of the project
-///   cannot interleave. A project a command holds is skipped this tick
-///   rather than waited on.
+/// - The project's lock (`ProjectLocks`), taken alone, which every
+///   lifecycle command of this process shares, so this supervisor's own
+///   apply of the project cannot interleave. A project a command holds is
+///   skipped this tick rather than waited on.
 ///
 /// A removed project (no row) is judged for anyone: nothing can apply it
 /// until it is registered again, which the per-copy check right before
@@ -180,7 +201,7 @@ pub async fn sweep_gone_copies(state: &SupervisorState, copies: Vec<NodeRef>) ->
     }
     let mut left = false;
     for (project, copies) in by_project {
-        let Some(_project) = state.project_locks.try_lock(project) else {
+        let Some(_project) = state.project_locks.try_alone(project) else {
             tracing::debug!(project_id = %project, "a lifecycle command holds the project; its gone copies wait for the next tick");
             left = true;
             continue;

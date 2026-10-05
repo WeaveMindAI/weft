@@ -360,7 +360,7 @@ async fn run_one(catalog: &'static dyn NodeCatalog, request: TestRequest, live_e
             let service = declared.service.expect("NodeTest::live always carries its service");
             let token = weft_broker_client::TokenSource::worker(env.identity.clone(), live.replica.clone());
             let runner = LiveTestRunner::new(
-                crate::EngineClients::from_broker(&env.broker_url, token),
+                crate::EngineClients::from_broker(&weft_broker_client::BrokerLink::new(env.broker_url.clone(), token)),
                 catalog,
                 live.replica,
                 env.tenant_id.clone(),

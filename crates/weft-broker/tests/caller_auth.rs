@@ -14,7 +14,7 @@ use serde_json::json;
 use sqlx::PgPool;
 
 use weft_access_store::connect_direct;
-use weft_broker::caller_auth::{verify_caller, CallerRefusal};
+use weft_broker::caller_auth::{verify_caller, CallerRefusal, HeldVerifiers};
 use weft_broker_client::protocol::CallerVerifyRequest;
 use weft_core::access::spec::Door;
 use weft_core::access::wire::ConnectDirect;
@@ -24,6 +24,12 @@ const TENANT: &str = "tenant-a";
 
 async fn schema(pool: &PgPool) {
     weft_task_store::apply_groups(pool, &[&weft_access_store::GROUP]).await.expect("schema");
+}
+
+/// A fresh held copy of the verifiers with nothing kept yet, so every
+/// check reads its connection from the database.
+fn verifiers() -> std::sync::Arc<HeldVerifiers> {
+    HeldVerifiers::unfollowed(16, |_| true)
 }
 
 /// The shape of a shipped auth access node's recipe: pasted fields, no
@@ -98,18 +104,18 @@ async fn a_stored_key_admits_and_names_which_one(pool: PgPool) {
     let spec = auth_spec("api_key_auth", &["keys"], json!({ "kind": "api_keys" }));
     let id = store(&pool, TENANT, spec, &[("keys", "first-key\nsecond-key\n")]).await;
 
-    let ok = verify_caller(&pool, &request(TENANT, &id, "api_key_auth", &[("x-api-key", "second-key")], b""), 0)
+    let ok = verify_caller(&verifiers(),&pool, &request(TENANT, &id, "api_key_auth", &[("x-api-key", "second-key")], b""), 0)
         .await
         .expect("the second key verifies");
     assert_eq!(ok, json!({ "key": 1 }));
-    let ok = verify_caller(&pool, &request(TENANT, &id, "api_key_auth", &[("authorization", "Bearer first-key")], b""), 0)
+    let ok = verify_caller(&verifiers(),&pool, &request(TENANT, &id, "api_key_auth", &[("authorization", "Bearer first-key")], b""), 0)
         .await
         .expect("the bearer slot works");
     assert_eq!(ok, json!({ "key": 0 }));
 
-    let why = refused(verify_caller(&pool, &request(TENANT, &id, "api_key_auth", &[("x-api-key", "nope")], b""), 0).await);
+    let why = refused(verify_caller(&verifiers(),&pool, &request(TENANT, &id, "api_key_auth", &[("x-api-key", "nope")], b""), 0).await);
     assert!(why.contains("does not match"), "{why}");
-    let why = refused(verify_caller(&pool, &request(TENANT, &id, "api_key_auth", &[], b""), 0).await);
+    let why = refused(verify_caller(&verifiers(),&pool, &request(TENANT, &id, "api_key_auth", &[], b""), 0).await);
     assert!(why.contains("X-Api-Key"), "{why}");
 }
 
@@ -147,11 +153,11 @@ async fn a_signed_body_admits_with_the_stored_secret(pool: PgPool) {
     )
     .unwrap();
     let headers = [("x-signature", signature.as_str()), ("x-timestamp", "1700000000")];
-    let ok = verify_caller(&pool, &request(TENANT, &id, "hmac_auth", &headers, body), now)
+    let ok = verify_caller(&verifiers(),&pool, &request(TENANT, &id, "hmac_auth", &headers, body), now)
         .await
         .expect("a genuine signature verifies");
     assert_eq!(ok, json!({}));
-    let why = refused(verify_caller(&pool, &request(TENANT, &id, "hmac_auth", &headers, b"{}"), now).await);
+    let why = refused(verify_caller(&verifiers(),&pool, &request(TENANT, &id, "hmac_auth", &headers, b"{}"), now).await);
     assert!(why.contains("does not match"), "{why}");
 }
 
@@ -164,10 +170,10 @@ async fn the_wall_the_service_and_a_missing_scheme_all_refuse(pool: PgPool) {
     let id = store(&pool, TENANT, spec, &[("keys", "k")]).await;
     let headers = [("x-api-key", "k")];
 
-    let why = refused(verify_caller(&pool, &request("tenant-b", &id, "api_key_auth", &headers, b""), 0).await);
+    let why = refused(verify_caller(&verifiers(),&pool, &request("tenant-b", &id, "api_key_auth", &headers, b""), 0).await);
     assert!(why.contains("no such connection"), "{why}");
 
-    match verify_caller(&pool, &request(TENANT, &id, "other_service", &headers, b""), 0).await {
+    match verify_caller(&verifiers(),&pool, &request(TENANT, &id, "other_service", &headers, b""), 0).await {
         Err(CallerRefusal::Failed(e)) => assert!(format!("{e:#}").contains("other_service"), "{e:#}"),
         other => panic!("a wrong service is a loud failure, got {other:?}"),
     }
@@ -178,10 +184,10 @@ async fn the_wall_the_service_and_a_missing_scheme_all_refuse(pool: PgPool) {
     }))
     .unwrap();
     let plain_id = store(&pool, TENANT, plain, &[("token", "t")]).await;
-    let why = refused(verify_caller(&pool, &request(TENANT, &plain_id, "plain", &headers, b""), 0).await);
+    let why = refused(verify_caller(&verifiers(),&pool, &request(TENANT, &plain_id, "plain", &headers, b""), 0).await);
     assert!(why.contains("no `verify` block"), "{why}");
 
-    match verify_caller(&pool, &request(TENANT, "not-a-uuid", "api_key_auth", &headers, b""), 0).await {
+    match verify_caller(&verifiers(),&pool, &request(TENANT, "not-a-uuid", "api_key_auth", &headers, b""), 0).await {
         Err(CallerRefusal::Failed(_)) => {}
         other => panic!("a malformed id is a loud failure, got {other:?}"),
     }

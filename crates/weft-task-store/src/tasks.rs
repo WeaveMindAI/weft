@@ -24,6 +24,8 @@ use sqlx::postgres::PgPool;
 use sqlx::Row;
 use uuid::Uuid;
 
+use crate::journal_rows::RawJournalRow;
+
 /// How long a claim is valid before another process can steal it, at this
 /// install's pace (`weft_core::time_scale`): 60 seconds in real time.
 /// processes heartbeat the claim while they work.
@@ -126,29 +128,16 @@ pub struct NewTask {
     pub payload: Value,
 }
 
-/// Which task the caller wants to claim. Internally-tagged serde shape
-/// so the wire form is `{"kind": "dispatcher"}` or
-/// `{"kind": "execution_id", "project_id": "...", "execution_id": "..."}`.
+/// One execution's driving task, claimed by the worker it was handed to,
+/// with every row of the execution's journal as the claim found them: the
+/// two things a worker needs before it can drive, read in the claim's own
+/// statement so arriving costs it one trip to the database.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ClaimFilter {
-    /// Any dispatcher task.
-    Dispatcher,
-    /// The execute or resume task of one execution: what a worker that
-    /// was handed that execution claims. A worker is never handed "some
-    /// work of the project"; it is called for one execution.
-    ExecutionId { project_id: Uuid, execution_id: String },
-}
-
-impl ClaimFilter {
-    /// The [`TASK_READY_CHANNEL`] payload a task this filter can claim
-    /// is announced with.
-    pub fn ready_payload(&self) -> String {
-        match self {
-            Self::Dispatcher => ready_payload(TaskTarget::Dispatcher, None),
-            Self::ExecutionId { project_id, .. } => ready_payload(TaskTarget::Worker, Some(*project_id)),
-        }
-    }
+pub struct ClaimedExecution {
+    pub task: Task,
+    /// Each journal row, in order, raw: the claim ferries them, and the
+    /// worker decodes them (`weft_journal`).
+    pub journal: Vec<RawJournalRow>,
 }
 
 /// The channel a task that has just become claimable (inserted pending,
@@ -533,41 +522,57 @@ pub async fn enqueue_or_rearm(pool: &PgPool, spec: NewTask) -> Result<DedupOutco
     Ok(outcome)
 }
 
-/// Atomically claim one task for `replica` (the claiming process
-/// replica). Picks oldest pending first; also rescues claims whose lease
-/// expired (the claimant died mid-work).
+/// Atomically claim one dispatcher task for `replica` (the claiming
+/// process replica). Picks oldest pending first; also rescues claims whose
+/// lease expired (the claimant died mid-work).
 ///
 /// One statement: the pick locks its row (`FOR UPDATE SKIP LOCKED`, so
 /// sibling claimants skip it rather than queue behind it) and the claim
 /// updates it, with no round trip between.
-pub async fn claim_one(
+pub async fn claim_one(pool: &PgPool, replica: &str) -> Result<Option<Task>> {
+    let now = unix_now();
+    let row = sqlx::query(&claim_sql(DISPATCHER_PICK))
+        .bind(replica)
+        .bind(now)
+        .bind(now + claim_duration_secs())
+        .fetch_optional(pool)
+        .await?;
+    row.map(row_to_task).transpose()
+}
+
+/// Claim `execution_id`'s execute or resume task for `replica`, the worker
+/// that was handed the execution (a worker is never handed "some work of
+/// the project"; it is called for one execution), and read the execution's
+/// journal in the same statement (see [`ClaimedExecution`]). `None` when
+/// there is nothing here to claim.
+pub async fn claim_execution(
     pool: &PgPool,
     replica: &str,
-    filter: &ClaimFilter,
-) -> Result<Option<Task>> {
+    project_id: Uuid,
+    execution_id: &str,
+) -> Result<Option<ClaimedExecution>> {
     let now = unix_now();
-    let claim_until = now + claim_duration_secs();
-    let row = match filter {
-        ClaimFilter::Dispatcher => {
-            sqlx::query(&claim_sql(DISPATCHER_PICK))
-                .bind(replica)
-                .bind(now)
-                .bind(claim_until)
-                .fetch_optional(pool)
-                .await?
-        }
-        ClaimFilter::ExecutionId { project_id, execution_id } => {
-            sqlx::query(&claim_sql(EXECUTION_ID_PICK))
-                .bind(replica)
-                .bind(now)
-                .bind(claim_until)
-                .bind(*project_id)
-                .bind(execution_id.as_str())
-                .fetch_optional(pool)
-                .await?
-        }
-    };
-    row.map(row_to_task).transpose()
+    let row = sqlx::query(&format!(
+        "WITH claimed AS ({claim}) \
+         SELECT claimed.*, COALESCE( \
+             (SELECT json_agg(json_build_array(r.id, r.payload_json) ORDER BY r.id) FROM ({rows}) r), \
+             '[]'::json) AS journal \
+         FROM claimed",
+        claim = claim_sql(EXECUTION_ID_PICK),
+        rows = crate::journal_rows::rows_after_sql("claimed.execution_id", "0"),
+    ))
+    .bind(replica)
+    .bind(now)
+    .bind(now + claim_duration_secs())
+    .bind(project_id)
+    .bind(execution_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    let journal: Value = row.try_get("journal")?;
+    let journal: Vec<(i64, String)> = serde_json::from_value(journal)?;
+    let journal = journal.into_iter().map(|(id, payload)| RawJournalRow { id, payload }).collect();
+    Ok(Some(ClaimedExecution { task: row_to_task(row)?, journal }))
 }
 
 /// A live run's execute task whose caller is on the way: born at the

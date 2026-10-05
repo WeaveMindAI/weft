@@ -244,16 +244,16 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
             Some(_) => replica.clone(),
         };
         let token = weft_broker_client::TokenSource::role(parts.tokens.clone(), replica.clone(), CoreRole::Listener);
-        let tasks = weft_broker_client::BrokerTaskStoreClient::new(addresses.broker.clone(), token.clone());
+        let link = weft_broker_client::BrokerLink::new(addresses.broker.clone(), token);
+        let tasks = weft_broker_client::BrokerTaskStoreClient::new(link.clone());
         let state = weft_listener::ListenerState::new(
             weft_listener::ListenerConfig {
                 replica: replica.clone(),
-                broker_url: addresses.broker.clone(),
                 holds_here: runs(CoreRole::Holder),
                 prefer_push: !matches!(config.platform, PlatformConfig::Local(_)),
             },
             tasks,
-            token,
+            link,
             parts.alarm.clone(),
         );
         if runs(CoreRole::Listener) {
@@ -281,7 +281,7 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
     if runs(CoreRole::Supervisor) {
         let token = weft_broker_client::TokenSource::role(parts.tokens.clone(), replica.clone(), CoreRole::Supervisor);
         let state = weft_infra_supervisor::SupervisorState {
-            broker: weft_broker_client::BrokerSupervisorClient::new(addresses.broker.clone(), token),
+            broker: weft_broker_client::BrokerSupervisorClient::new(weft_broker_client::BrokerLink::new(addresses.broker.clone(), token)),
             replica: replica.clone(),
             host: parts.host.clone(),
             clock: Arc::new(weft_platform_traits::SystemClock),
@@ -302,6 +302,22 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                 // When each loop is due lives in the database, shared by
                 // every instance of the role, since a tick may land on any.
                 Loops::Drain(loops) => {
+                    // A process that hears the database itself (a role that
+                    // writes, so it is up with CPU of its own whenever an
+                    // instance of it is) also runs its loops for as long as
+                    // it lives, woken by what it hears, the way the local
+                    // process does: a task written for it is picked up the
+                    // moment it is announced, never after a ring's trip
+                    // through the platform, which waits behind the tick
+                    // already running. The tick still starts the role when it
+                    // is at zero, and runs what is due; both claim the same
+                    // rows, so whichever reaches a task first runs it.
+                    if let Some(signals) = &signals {
+                        for l in loops.clone() {
+                            let subscription = signals.subscribe();
+                            weft_dispatcher::app::spawn_supervised(l.name, async move { l.run_forever(subscription).await });
+                        }
+                    }
                     let loops = Arc::new(loops);
                     let (_, pool) = pool.as_ref().expect("a process with drain loops holds the database");
                     let pool = pool.clone();

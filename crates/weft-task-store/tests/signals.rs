@@ -16,7 +16,7 @@ use serde_json::json;
 use sqlx::PgPool;
 
 use weft_task_store::pg_signal::{Heard, Subscription};
-use weft_task_store::tasks::{self, claim_one, ClaimFilter, TASK_READY_CHANNEL};
+use weft_task_store::tasks::{self, claim_one, TASK_READY_CHANNEL};
 use weft_task_store::{PostgresTaskStoreClient, TaskStoreClient, TaskTarget};
 
 use support::{setup, signals};
@@ -117,14 +117,14 @@ async fn a_task_is_announced_exactly_when_it_becomes_claimable(pool: PgPool) {
         vec!["dispatcher".to_string(), format!("worker:{PROJECT}")],
     );
 
-    claim_one(&pool, "disp-1", &ClaimFilter::Dispatcher).await.unwrap().expect("claimed");
+    claim_one(&pool, "disp-1").await.unwrap().expect("claimed");
     tasks::heartbeat(&pool, dispatcher, "disp-1").await.unwrap();
     assert!(on(&drain(&mut heard).await, TASK_READY_CHANNEL).is_empty(), "claim and heartbeat are silent");
 
     assert!(tasks::requeue(&pool, dispatcher, "disp-1").await.unwrap());
     assert_eq!(on(&drain(&mut heard).await, TASK_READY_CHANNEL), vec!["dispatcher".to_string()]);
 
-    claim_one(&pool, "disp-1", &ClaimFilter::Dispatcher).await.unwrap().expect("claimed");
+    claim_one(&pool, "disp-1").await.unwrap().expect("claimed");
     tasks::complete(&pool, dispatcher, "disp-1", json!(1)).await.unwrap();
     assert!(on(&drain(&mut heard).await, TASK_READY_CHANNEL).is_empty(), "completing is silent");
 }

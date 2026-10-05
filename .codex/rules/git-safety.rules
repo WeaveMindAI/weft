@@ -37,41 +37,27 @@ prefix_rule(
     not_match = ["git clean -n"],
 )
 
-# Prompt: commands that touch history, the review surface, or what is staged.
-
 prefix_rule(
-    pattern = ["git", "commit"],
-    decision = "prompt",
-    justification = "The uncommitted diff is the user's review surface; commit only on their explicit say-so.",
-    match = ["git commit -m 'fix: handle empty input'"],
+    pattern = ["git", "checkout", "."],
+    decision = "forbidden",
+    justification = "git checkout . discards every working-tree change.",
+    match = ["git checkout ."],
 )
 
 prefix_rule(
-    pattern = ["git", "add"],
-    decision = "prompt",
-    justification = "Staged-versus-unstaged is the user's review state; never stage on your own.",
-    match = ["git add .", "git add -p"],
+    pattern = ["git", "checkout", "--"],
+    decision = "forbidden",
+    justification = "git checkout -- <path> discards that path's working-tree changes; revert the specific lines with an exact-match patch instead.",
+    match = ["git checkout -- src/main.rs", "git checkout -- ."],
 )
 
-prefix_rule(
-    pattern = ["git", "push"],
-    decision = "prompt",
-    justification = "Pushes are published history; explicit approval every time.",
-    match = ["git push", "git push origin main"],
-)
+# Prompt: commands that can touch the review surface.
 
 prefix_rule(
     pattern = ["git", "checkout"],
     decision = "prompt",
     justification = "Switching branches or files can touch the review surface; ask first.",
-    match = ["git checkout main", "git checkout -- src/main.rs"],
-)
-
-prefix_rule(
-    pattern = ["git", "switch"],
-    decision = "prompt",
-    justification = "Switching branches can touch the review surface; ask first.",
-    match = ["git switch main"],
+    match = ["git checkout main"],
 )
 
 prefix_rule(
@@ -86,25 +72,4 @@ prefix_rule(
     decision = "prompt",
     justification = "git clean deletes untracked files; ask first.",
     match = ["git clean -n"],
-)
-
-prefix_rule(
-    pattern = ["git", "merge"],
-    decision = "prompt",
-    justification = "Merges change history state; ask first.",
-    match = ["git merge main"],
-)
-
-prefix_rule(
-    pattern = ["git", "rebase"],
-    decision = "prompt",
-    justification = "Rebases rewrite history; ask first.",
-    match = ["git rebase main"],
-)
-
-prefix_rule(
-    pattern = ["git", "tag"],
-    decision = "prompt",
-    justification = "Tags are named references others may rely on; ask first.",
-    match = ["git tag v1.0.0"],
 )

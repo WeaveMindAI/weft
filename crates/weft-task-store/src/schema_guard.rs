@@ -36,7 +36,9 @@
 //!
 //! **A stamp that moved is refreshed on evidence, never on faith**: the
 //! canonical DDL is built into a scratch schema in the same transaction
-//! and compared, object by object, with what the live schema holds. A
+//! and compared, object by object, with what the live schema holds, before
+//! the group's own DDL is run on it (a replaced function would otherwise
+//! make the live schema the code's whatever migrations ran). A
 //! match restamps silently (the fingerprint moved with no shape change,
 //! or a migration provably landed the shape). A difference is the drift
 //! case: the boot fails naming the group and the exact objects that
@@ -47,6 +49,18 @@ use std::collections::HashMap;
 
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+
+/// Run `group`'s canonical DDL on the live schema (every statement is
+/// idempotent on a database that already holds its shape).
+async fn run_ddl(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, group: &SchemaGroup) -> anyhow::Result<()> {
+    for stmt in group.ddl {
+        sqlx::raw_sql(stmt)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| anyhow::anyhow!("schema group '{}': DDL failed: {e}", group.name))?;
+    }
+    Ok(())
+}
 
 /// One change to one group's tables: the file's SQL, the group it sits under,
 /// and the id it is filed by. Ids sort chronologically
@@ -483,32 +497,21 @@ pub async fn apply_groups_with(
         record_migration(&mut tx, group.name, m.id, m.sql).await?;
     }
 
-    // Pass 4: re-run every stamped group's DDL (idempotent; repairs a
-    // hand-dropped table). A stamp that moved is only NOTED here; it is
-    // refreshed by pass 5 on evidence, never on faith.
-    let mut moved: Vec<&GroupState> = Vec::new();
-    for st in &states {
-        let Some(stored_fp) = &st.stamped else { continue };
-        for stmt in st.group.ddl {
-            sqlx::raw_sql(stmt).execute(&mut *tx).await.map_err(|e| {
-                anyhow::anyhow!("schema group '{}': DDL failed: {e}", st.group.name)
-            })?;
-        }
-        if *stored_fp != st.fp {
-            moved.push(st);
-        }
-    }
-
-    // Pass 5: verify every moved stamp against the database itself. The
-    // canonical DDL is built into a scratch schema inside this same
-    // transaction and compared, object by object, with what the live
-    // schema now holds (after pass 3's migrations and pass 4's
-    // idempotent re-run). A group whose live shape matches is restamped:
-    // a fingerprint that moved with no shape change (a comment, a seed
-    // moved out of the DDL) is a non-event, and a migration that landed
-    // the shape is proven rather than assumed. A group whose live shape
-    // differs is the drift case, whatever migrations ran: "something was
-    // pending" must never launder a DDL edit nothing carried across.
+    // Pass 4: verify every moved stamp against the database itself, as it
+    // stands after pass 3's migrations and before any DDL of this boot runs
+    // on it: a `CREATE OR REPLACE` or a dropped and re-created trigger would
+    // otherwise rewrite the live schema to the new text first, and the
+    // check would compare the code with itself, letting an edit no
+    // migration carries boot. The canonical DDL is built into a scratch
+    // schema inside this same transaction and compared, object by object,
+    // with what the live schema holds. A group whose live shape matches is
+    // restamped: a fingerprint that moved with no shape change (a comment,
+    // a seed moved out of the DDL) is a non-event, and a migration that
+    // landed the shape is proven rather than assumed. A group whose live
+    // shape differs is the drift case, whatever migrations ran: "something
+    // was pending" must never launder a DDL edit nothing carried across.
+    let moved: Vec<&GroupState> =
+        states.iter().filter(|st| st.stamped.as_ref().is_some_and(|stored_fp| *stored_fp != st.fp)).collect();
     let mut mismatched: Vec<(&SchemaGroup, String)> = Vec::new();
     if !moved.is_empty() {
         sqlx::raw_sql(
@@ -585,6 +588,15 @@ pub async fn apply_groups_with(
             diffs,
             reset_sql
         );
+    }
+
+    // Pass 5: re-run every stamped group's DDL, in the groups' order
+    // (idempotent on the shape just verified; repairs a hand-dropped table
+    // of a group whose stamp did not move).
+    for st in &states {
+        if st.stamped.is_some() {
+            run_ddl(&mut tx, st.group).await?;
+        }
     }
 
     // Pass 6: seeds, idempotent DML re-run on every boot, after every

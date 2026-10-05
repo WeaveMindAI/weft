@@ -1184,7 +1184,7 @@ async fn main() -> anyhow::Result<()> {{
     // The engine composes its own client bundle from the broker address and
     // the worker's identity, so this generated binary never names the
     // bundle's fields.
-    let clients = EngineClients::from_broker(&args.broker_url, token);
+    let clients = EngineClients::from_broker(&weft_broker_client::BrokerLink::new(args.broker_url.clone(), token));
     let catalog = Arc::new(CatalogRef) as Arc<dyn NodeCatalog>;
 
     // An empty HMAC key would validate forgeable tickets (fail-open), so

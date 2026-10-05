@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -20,7 +19,7 @@ use futures::FutureExt;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::tasks::{claim_duration_secs, claim_heartbeat_interval, ClaimFilter, Task};
+use crate::tasks::{claim_duration_secs, claim_heartbeat_interval, Task};
 
 use crate::traits::TaskStoreClient;
 
@@ -112,7 +111,7 @@ pub static DISPATCHER_READY: &[crate::drain::WakeOn] = &[crate::drain::WakeOn {
 /// rescues a task whose claim lapsed (its claimant died), which nothing
 /// announces.
 pub fn dispatcher_picker_loop<Ctx>(
-    store: Arc<dyn TaskStoreClient>,
+    store: Arc<crate::traits::PostgresTaskStoreClient>,
     ctx: Ctx,
     registry: TaskRegistry<Ctx>,
     replica: String,
@@ -127,11 +126,11 @@ where
             // At capacity: wait for a running task to finish before claiming
             // another.
             let slot = slots.acquire_owned().await.expect("the picker's semaphore is never closed");
-            match store.claim_one(&replica, ClaimFilter::Dispatcher, Duration::ZERO).await? {
+            match store.claim_dispatcher_task(&replica).await? {
                 Some(task) => {
                     tokio::spawn(async move {
                         let _slot = slot;
-                        run_dispatcher_task(store, ctx, registry, replica, task).await;
+                        run_dispatcher_task(store as Arc<dyn TaskStoreClient>, ctx, registry, replica, task).await;
                     });
                     Ok(crate::drain::DrainStep::More)
                 }

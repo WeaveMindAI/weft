@@ -188,6 +188,13 @@ impl Copies {
         }
     }
 
+    /// Whether these and `other` share a copy: either is every copy, or
+    /// both name the same one.
+    // SYNC: Copies::overlaps <-> crates/weft-broker-client/src/lifecycle_command.rs (commands_overlap), crates/weft-broker-client/src/protocol.rs (SupervisorCommandRow::overlaps)
+    pub fn overlaps(&self, other: &Copies) -> bool {
+        matches!(self, Copies::Every) || matches!(other, Copies::Every) || self == other
+    }
+
     /// The two columns a stored command keeps them in: `instance_id`
     /// and `every_copy`.
     pub fn columns(&self) -> (Option<&str>, bool) {

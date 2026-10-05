@@ -37,7 +37,7 @@ pub use router::router;
 
 use std::sync::Arc;
 
-use weft_broker_client::{BrokerSignalClient, TokenSource};
+use weft_broker_client::{BrokerLink, BrokerSignalClient};
 use weft_platform_traits::Alarm;
 use weft_task_store::TaskStoreClient;
 
@@ -67,12 +67,12 @@ impl ListenerState {
     pub fn new(
         config: ListenerConfig,
         tasks: Arc<dyn TaskStoreClient>,
-        token_source: TokenSource,
+        link: BrokerLink,
         alarm: Arc<dyn Alarm>,
     ) -> Self {
-        let signals = BrokerSignalClient::new(config.broker_url.clone(), token_source.clone());
+        let signals = BrokerSignalClient::new(link.clone());
         let fire_sink = FireSignalSink::new(tasks, signals.clone());
-        let events_broker = weft_broker_client::BrokerEventsClient::new(config.broker_url.clone(), token_source);
+        let events_broker = weft_broker_client::BrokerEventsClient::new(link);
         Self {
             config: Arc::new(config),
             registry: Arc::new(Registry::new()),

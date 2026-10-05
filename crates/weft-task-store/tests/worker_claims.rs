@@ -16,7 +16,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use weft_core::run_class::RunClass;
-use weft_task_store::tasks::{self, claim_one, ClaimFilter};
+use weft_task_store::tasks::{self, claim_one};
 use weft_task_store::{TaskKind, TaskTarget};
 
 use support::setup;
@@ -86,8 +86,9 @@ fn far_future() -> i64 {
     i64::MAX / 2
 }
 
-fn execution_id_filter(execution_id: &str) -> ClaimFilter {
-    ClaimFilter::ExecutionId { project_id: PROJECT, execution_id: execution_id.to_string() }
+/// The task a worker handed `execution_id` claims, as `replica`.
+async fn claim(pool: &PgPool, replica: &str, execution_id: &str) -> anyhow::Result<Option<tasks::Task>> {
+    Ok(tasks::claim_execution(pool, replica, PROJECT, execution_id).await?.map(|claimed| claimed.task))
 }
 
 async fn lapse_claim(pool: &PgPool, task_id: Uuid) {
@@ -183,14 +184,39 @@ async fn a_lapsed_claim_is_delivered_again(pool: PgPool) {
     seed_execution_id(&pool, &execution_id).await;
     tasks::enqueue_dedup(&pool, execute(&execution_id, "short")).await.unwrap();
     assert_eq!(tasks::take_deliveries(&pool, 10).await.unwrap().len(), 1);
-    let claimed = claim_one(&pool, "worker-a", &execution_id_filter(&execution_id)).await.unwrap().expect("claimed");
+    let claimed = claim(&pool, "worker-a", &execution_id).await.unwrap().expect("claimed");
     assert!(tasks::take_deliveries(&pool, 10).await.unwrap().is_empty(), "a claimed execution needs no delivery");
     lapse_claim(&pool, claimed.id).await;
     let again = tasks::take_deliveries(&pool, 10).await.unwrap();
     assert_eq!(again.len(), 1, "the worker died: deliver it again");
-    let reclaimed = claim_one(&pool, "worker-b", &execution_id_filter(&execution_id)).await.unwrap().expect("rescued");
+    let reclaimed = claim(&pool, "worker-b", &execution_id).await.unwrap().expect("rescued");
     assert_eq!(reclaimed.attempts, 2);
     assert_eq!(execution_id_owner(&pool, &execution_id).await.as_deref(), Some("worker-b"), "ownership follows the claim");
+}
+
+/// A worker's claim hands back the execution's journal as it stood, in
+/// order, and only that execution's: the worker drives from it without
+/// reading it again.
+#[sqlx::test]
+async fn a_claim_hands_back_the_execution_journal(pool: PgPool) {
+    setup(&pool).await;
+    let (execution_id, other) = (Uuid::new_v4().to_string(), Uuid::new_v4().to_string());
+    seed_execution_id(&pool, &execution_id).await;
+    for (execution, payload) in [(&execution_id, "first"), (&other, "elsewhere"), (&execution_id, "second")] {
+        sqlx::query("INSERT INTO exec_event (execution_id, payload_json) VALUES ($1, $2)")
+            .bind(execution)
+            .bind(payload)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    tasks::enqueue_dedup(&pool, execute(&execution_id, "short")).await.unwrap();
+    let claimed = tasks::claim_execution(&pool, "worker-a", PROJECT, &execution_id).await.unwrap().expect("claimed");
+    let payloads: Vec<&str> = claimed.journal.iter().map(|row| row.payload.as_str()).collect();
+    assert_eq!(payloads, ["first", "second"]);
+    assert!(claimed.journal[0].id < claimed.journal[1].id, "in the journal's order");
+    assert_eq!(claimed.task.attempts, 1);
+    assert!(tasks::claim_execution(&pool, "worker-b", PROJECT, &execution_id).await.unwrap().is_none(), "claimed once");
 }
 
 /// A live run waiting for its caller is never delivered: only the worker
@@ -215,9 +241,9 @@ async fn a_worker_claims_only_the_execution_it_was_called_for(pool: PgPool) {
     seed_execution_id(&pool, &mine).await;
     tasks::enqueue_dedup(&pool, execute(&mine, "short")).await.unwrap();
     tasks::enqueue_dedup(&pool, execute(&other, "short")).await.unwrap();
-    let claimed = claim_one(&pool, "worker-a", &execution_id_filter(&mine)).await.unwrap().expect("claimed");
+    let claimed = claim(&pool, "worker-a", &mine).await.unwrap().expect("claimed");
     assert_eq!(claimed.execution_id.as_deref(), Some(mine.as_str()));
-    assert!(claim_one(&pool, "worker-b", &execution_id_filter(&mine)).await.unwrap().is_none(), "a duplicate delivery claims nothing");
+    assert!(claim(&pool, "worker-b", &mine).await.unwrap().is_none(), "a duplicate delivery claims nothing");
     assert_eq!(execution_id_owner(&pool, &mine).await.as_deref(), Some("worker-a"));
 }
 
@@ -231,10 +257,10 @@ async fn a_live_run_is_pinned_to_the_worker_its_caller_reached(pool: PgPool) {
     let execution_id = Uuid::new_v4().to_string();
     seed_execution_id(&pool, &execution_id).await;
     born_for_a_caller(&pool, &execution_id, far_future()).await;
-    let claimed = claim_one(&pool, "worker-a", &execution_id_filter(&execution_id)).await.unwrap().expect("claimed");
-    assert!(claim_one(&pool, "worker-b", &execution_id_filter(&execution_id)).await.unwrap().is_none(), "claimed here");
+    let claimed = claim(&pool, "worker-a", &execution_id).await.unwrap().expect("claimed");
+    assert!(claim(&pool, "worker-b", &execution_id).await.unwrap().is_none(), "claimed here");
     lapse_claim(&pool, claimed.id).await;
-    assert!(claim_one(&pool, "worker-b", &execution_id_filter(&execution_id)).await.unwrap().is_none(), "pinned to worker-a");
+    assert!(claim(&pool, "worker-b", &execution_id).await.unwrap().is_none(), "pinned to worker-a");
     assert!(tasks::take_deliveries(&pool, 10).await.unwrap().is_empty(), "and never delivered");
 }
 
@@ -248,7 +274,7 @@ async fn a_caller_who_never_came_is_found_after_their_ticket_expires(pool: PgPoo
     seed_execution_id(&pool, &present).await;
     let absent_task = born_for_a_caller(&pool, &absent, 1_000).await;
     born_for_a_caller(&pool, &present, 1_000).await;
-    claim_one(&pool, "worker-a", &execution_id_filter(&present)).await.unwrap().expect("the caller arrived");
+    claim(&pool, "worker-a", &present).await.unwrap().expect("the caller arrived");
     assert!(tasks::callers_never_arrived(&pool, 999).await.unwrap().is_empty(), "the ticket is still good");
     let gone = tasks::callers_never_arrived(&pool, 1_001).await.unwrap();
     assert_eq!(gone.len(), 1);
@@ -264,7 +290,7 @@ async fn a_resume_waits_for_the_live_drive_of_its_execution_id(pool: PgPool) {
     let execution_id = Uuid::new_v4().to_string();
     seed_execution_id(&pool, &execution_id).await;
     tasks::enqueue_dedup(&pool, execute(&execution_id, "short")).await.unwrap();
-    let driving = claim_one(&pool, "worker-a", &execution_id_filter(&execution_id)).await.unwrap().expect("claimed");
+    let driving = claim(&pool, "worker-a", &execution_id).await.unwrap().expect("claimed");
     tasks::enqueue_dedup(
         &pool,
         tasks::NewTask { kind: TaskKind::Resume.into(), dedup_key: Some(format!("{execution_id}:resume")), ..execute(&execution_id, "short") },
@@ -272,10 +298,10 @@ async fn a_resume_waits_for_the_live_drive_of_its_execution_id(pool: PgPool) {
     .await
     .unwrap();
     assert!(tasks::take_deliveries(&pool, 10).await.unwrap().is_empty(), "not delivered while driven");
-    assert!(claim_one(&pool, "worker-b", &execution_id_filter(&execution_id)).await.unwrap().is_none(), "not claimable while driven");
+    assert!(claim(&pool, "worker-b", &execution_id).await.unwrap().is_none(), "not claimable while driven");
     tasks::complete(&pool, driving.id, "worker-a", json!(null)).await.unwrap();
     assert_eq!(tasks::take_deliveries(&pool, 10).await.unwrap().len(), 1, "the drive ended: deliver the resume");
-    let resumed = claim_one(&pool, "worker-b", &execution_id_filter(&execution_id)).await.unwrap().expect("the resume");
+    let resumed = claim(&pool, "worker-b", &execution_id).await.unwrap().expect("the resume");
     assert_eq!(resumed.kind, "resume");
 }
 
@@ -320,7 +346,7 @@ async fn a_cancel_nobody_will_take_is_dropped(pool: PgPool) {
     let driven = Uuid::new_v4().to_string();
     seed_execution_id(&pool, &driven).await;
     tasks::enqueue_dedup(&pool, execute(&driven, "short")).await.unwrap();
-    claim_one(&pool, "worker-a", &execution_id_filter(&driven)).await.unwrap().expect("driven");
+    claim(&pool, "worker-a", &driven).await.unwrap().expect("driven");
     tasks::enqueue_dedup(&pool, cancel(&stale)).await.unwrap();
     tasks::enqueue_dedup(&pool, cancel(&driven)).await.unwrap();
     sqlx::query("UPDATE task SET created_at_unix = 0 WHERE kind = 'cancel_execution'").execute(&pool).await.unwrap();
@@ -346,10 +372,10 @@ async fn a_live_run_whose_worker_vanished_is_an_orphan(pool: PgPool) {
         seed_execution_id(&pool, c).await;
         born_for_a_caller(&pool, c, far_future()).await;
     }
-    claim_one(&pool, "worker-a", &execution_id_filter(&driven)).await.unwrap().expect("driven");
-    let lapsing = claim_one(&pool, "worker-a", &execution_id_filter(&lapsed)).await.unwrap().expect("claimed");
+    claim(&pool, "worker-a", &driven).await.unwrap().expect("driven");
+    let lapsing = claim(&pool, "worker-a", &lapsed).await.unwrap().expect("claimed");
     lapse_claim(&pool, lapsing.id).await;
-    let back = claim_one(&pool, "worker-a", &execution_id_filter(&put_back)).await.unwrap().expect("claimed");
+    let back = claim(&pool, "worker-a", &put_back).await.unwrap().expect("claimed");
     assert!(tasks::requeue(&pool, back.id, "worker-a").await.unwrap());
     sqlx::query("UPDATE task SET created_at_unix = 0 WHERE execution_id = ANY($1)")
         .bind(vec![put_back.clone(), waiting.clone()])
@@ -390,7 +416,7 @@ async fn partial_result_round_trips_on_the_task_row(pool: PgPool) {
     assert_eq!(tasks::stored_result(&pool, task_id).await.expect("read"), None);
     let report = json!({"passed": true, "node": "X", "test": "t"});
     assert!(tasks::store_result_partial(&pool, task_id, "disp-1", &report).await.is_err(), "unclaimed");
-    let claimed = claim_one(&pool, "disp-1", &ClaimFilter::Dispatcher).await.expect("claim").expect("the task");
+    let claimed = claim_one(&pool, "disp-1").await.expect("claim").expect("the task");
     assert_eq!(claimed.id, task_id);
     assert_eq!(claimed.attempts, 1, "first claim");
     assert!(tasks::store_result_partial(&pool, task_id, "disp-2", &report).await.is_err(), "not the claimant");
@@ -408,13 +434,13 @@ async fn partial_result_round_trips_on_the_task_row(pool: PgPool) {
 async fn surrender_requeues_only_while_claim_is_ours(pool: PgPool) {
     setup(&pool).await;
     let task_id = tasks::enqueue(&pool, dispatcher_task("t1")).await.expect("enqueue");
-    claim_one(&pool, "disp-1", &ClaimFilter::Dispatcher).await.expect("claim").expect("the task");
+    claim_one(&pool, "disp-1").await.expect("claim").expect("the task");
     assert!(!tasks::requeue(&pool, task_id, "disp-2").await.expect("requeue"));
     assert!(tasks::requeue(&pool, task_id, "disp-1").await.expect("requeue"));
     let (status, claimed_by): (String, Option<String>) =
         sqlx::query_as("SELECT status, claimed_by FROM task WHERE id = $1").bind(task_id).fetch_one(&pool).await.unwrap();
     assert_eq!((status.as_str(), claimed_by), ("pending", None));
-    let reclaimed = claim_one(&pool, "disp-2", &ClaimFilter::Dispatcher).await.expect("claim").expect("requeued");
+    let reclaimed = claim_one(&pool, "disp-2").await.expect("claim").expect("requeued");
     assert_eq!(reclaimed.attempts, 2);
     assert!(!tasks::requeue(&pool, task_id, "disp-1").await.expect("requeue"));
     let (status, claimed_by): (String, Option<String>) =
