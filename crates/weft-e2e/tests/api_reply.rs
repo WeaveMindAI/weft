@@ -9,7 +9,7 @@
 
 use reqwest::Method;
 use serde_json::{json, Value};
-use weft_e2e::{ensure, live, project::Project, run::SettledRun};
+use weft_e2e::{ensure, live, project::Project, run::SettledRun, status};
 
 #[path = "common/mod.rs"]
 mod common;
@@ -213,6 +213,44 @@ async fn firing_a_get_route_needs_no_body() -> anyhow::Result<()> {
         answered == Some(json!({ "id": "42", "name": "Ada", "verbose": "1" })),
         "the program's answer: {answered:?}"
     );
+
+    project.finish().await
+}
+
+/// A parked route keeps its callers: a call that arrives while the
+/// project is parked waits, and is answered by the program once it is
+/// back, the same way a parked trigger keeps its fires. A wipe is the
+/// other answer: the route is gone with its trigger's signals, and a
+/// caller is refused at once.
+#[tokio::test]
+async fn a_parked_route_holds_its_caller_until_it_is_back() -> anyhow::Result<()> {
+    let disp = ensure::up().await?;
+    let mut project = Project::prepare("api_reply", disp.clone()).await?;
+    let base = project.unique_live_path()?;
+    project.activate().await?;
+
+    project.weft(&["deactivate", "--mode", "park", "--running-policy", "cancel"]).await?;
+    status::wait_until_status(&disp, &project.id(), "inactive", status::STATUS_DEADLINE).await?;
+
+    let call = {
+        let disp = disp.clone();
+        let path = format!("{base}/users/42");
+        tokio::spawn(async move { live::http_request(&disp, Method::GET, &path, &[], None).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    anyhow::ensure!(!call.is_finished(), "a parked route answered at once: {:?}", call.await);
+
+    project.activate().await?;
+    let (status, _, body) = call.await??;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+    let body: Value = serde_json::from_slice(&body)?;
+    assert_eq!(body["name"], "Ada", "{body}");
+
+    project.weft(&["deactivate", "--mode", "wipe", "--running-policy", "cancel"]).await?;
+    status::wait_until_status(&disp, &project.id(), "inactive", status::STATUS_DEADLINE).await?;
+    let (status, _, body) =
+        live::http_request(&disp, Method::GET, &format!("{base}/users/42"), &[], None).await?;
+    assert_eq!(status, 404, "{}", String::from_utf8_lossy(&body));
 
     project.finish().await
 }

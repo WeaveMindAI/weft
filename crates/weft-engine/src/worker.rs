@@ -163,8 +163,8 @@ struct ExecutionResidue {
     /// it: the exact failure this guard exists to prevent, moved into
     /// the gap between the guard and the task.
     flag: Arc<CancellationFlag>,
-    /// Poked once the flag is gone, so the cancel wait stops asking
-    /// for this execution.
+    /// Poked once the flag is gone, so the cancel watch lets the line go
+    /// once nothing is driven.
     driving_changed: Arc<tokio::sync::Notify>,
     caller_registry: crate::caller_conn::CallerRegistry,
     live_configs: LiveConfigMap,
@@ -224,6 +224,13 @@ impl Drop for ExecutionResidue {
     }
 }
 
+/// A claimed execute or resume task, with how many rechecks the cancel
+/// watch had made before the claim ([`Worker::rechecks`]).
+struct Claim {
+    claimed: ClaimedExecution,
+    rechecks: u64,
+}
+
 /// One worker process: what every drive on it shares.
 ///
 /// The `ProjectDefinition` is not held here: each execution names its
@@ -237,8 +244,20 @@ struct Worker {
     tenant_id: String,
     cancel_registry: CancelRegistry,
     /// Poked whenever the set of executions this worker drives changes, so
-    /// the cancel wait re-asks for exactly those.
+    /// the cancel watch holds the line open exactly while there are some.
     driving_changed: Arc<tokio::sync::Notify>,
+    /// Cancels heard for executions this worker does not drive (yet): a
+    /// cancel can be announced between a claim and the moment its drive
+    /// registers its flag, which then takes it. Read and written only
+    /// under the cancel registry's lock, so a cancel heard and a flag
+    /// registered never miss each other.
+    early_cancels: Arc<std::sync::Mutex<HashMap<ExecutionId, std::time::Instant>>>,
+    /// How many times the cancel watch asked for the cancels of every
+    /// execution driven, because the line may have missed some. A drive
+    /// that registers after one that came since its claim asks for its own
+    /// cancels: that ask could not include it, and what it missed is not
+    /// announced again.
+    rechecks: Arc<std::sync::atomic::AtomicU64>,
     project_cache: ProjectCache,
     /// The live caller registry: the connection server attaches an
     /// accepted socket here keyed by execution; the execute path awaits it.
@@ -301,25 +320,31 @@ impl Worker {
     /// `execution_id`'s execute or resume task, claimed by this worker
     /// with the execution's journal, or `None` when there is nothing here
     /// to claim.
-    async fn claim_execution_id(&self, execution_id: ExecutionId) -> Result<Option<ClaimedExecution>> {
-        self.clients
+    async fn claim_execution_id(&self, execution_id: ExecutionId) -> Result<Option<Claim>> {
+        // Read before the claim: a recheck after it may have come before
+        // the drive registers (`register_cancel_flag`).
+        let rechecks = self.rechecks.load(std::sync::atomic::Ordering::SeqCst);
+        Ok(self
+            .clients
             .tasks
             .claim_execution(&self.replica, self.project_id, &execution_id.to_string())
             .await
-            .context("claim the execution's task")
+            .context("claim the execution's task")?
+            .map(|claimed| Claim { claimed, rechecks }))
     }
 
     /// Drive a claimed task to its end on a task of its own, so whoever
     /// handed it here can go away without stopping it.
-    fn drive_detached(&self, claimed: ClaimedExecution) -> tokio::task::JoinHandle<RunAnswer> {
+    fn drive_detached(&self, claim: Claim) -> tokio::task::JoinHandle<RunAnswer> {
         let worker = self.clone();
         let token = self.background.token();
         tokio::spawn(async move {
             let _token = token;
             let store = worker.clients.tasks.clone();
             let replica = worker.replica.clone();
-            let ClaimedExecution { task, journal } = claimed;
-            let end = weft_task_store::run_claimed_worker_task(store, &replica, &task, worker.drive(&task, journal)).await;
+            let Claim { claimed: ClaimedExecution { task, journal }, rechecks } = claim;
+            let end =
+                weft_task_store::run_claimed_worker_task(store, &replica, &task, worker.drive(&task, journal, rechecks)).await;
             RunAnswer::from(end)
         })
     }
@@ -328,7 +353,7 @@ impl Worker {
     /// claim read and run the loop driver. The two are identical here (the
     /// journal carries the lifecycle truth); the dispatcher distinguishes
     /// them so the editor can label the event.
-    async fn drive(&self, task: &Task, journal: Vec<weft_journal::RawJournalRow>) -> Result<()> {
+    async fn drive(&self, task: &Task, journal: Vec<weft_journal::RawJournalRow>, rechecks: u64) -> Result<()> {
         let ctx = self;
         let payload: ExecutionPayload = serde_json::from_value(task.payload.clone())?;
         let execution_id: ExecutionId = payload
@@ -389,9 +414,7 @@ impl Worker {
         };
 
         let flag = CancellationFlag::new_arc();
-        ctx.cancel_registry.lock().await.insert(execution_id, flag.clone());
-        // The cancel wait now asks for this execution too.
-        ctx.driving_changed.notify_one();
+        register_cancel_flag(ctx, execution_id, flag.clone(), rechecks).await;
         // From here on every exit path, including a panic, releases what
         // this execution registered on the worker.
         let _residue = ExecutionResidue {
@@ -1103,42 +1126,156 @@ impl crate::caller_conn::ExecutionCanceller for RegistryCanceller {
 }
 
 
-/// The cancel wait: one held call to the broker for the executions this worker
-/// drives, re-asked whenever that set changes. A cancel it hears fires the
-/// execution's flag at once.
-fn spawn_cancel_wait(worker: Worker) {
+/// How long a cancel heard for an execution this worker does not drive is
+/// kept for a drive that registers just after: far longer than the moment
+/// between a claim and its drive's registration, short enough that the
+/// cancels of other workers' executions do not pile up.
+const EARLY_CANCEL_KEPT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The cancel watch: the broker pushes every cancel of this worker's
+/// project down its line (`weft_task_store::tasks::CANCEL_CHANNEL`), and
+/// the one for an execution this worker drives is asked for and fires its
+/// flag at once. When the line may have missed some (it opened again, or
+/// fell behind), the cancels of every execution driven are asked for in
+/// one call. The line is held open while anything is driven, so a cancel
+/// is heard however long a run goes without calling the broker.
+fn spawn_cancel_watch(worker: Worker) {
+    // Subscribed before anything is driven, so no cancel is announced
+    // before the watch hears.
+    let mut heard = worker.clients.line.subscribe();
     tokio::spawn(async move {
+        let mut held_open: Option<Box<dyn Send + Sync>> = None;
         loop {
             // Armed before the set is read, so a change between the read
-            // and the wait still ends the wait.
+            // and the wait still wakes it.
             let changed = worker.driving_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            let execution_ids: Vec<String> = worker.cancel_registry.lock().await.keys().map(|c| c.to_string()).collect();
-            if execution_ids.is_empty() {
-                changed.await;
-                continue;
+            let driving = !worker.cancel_registry.lock().await.is_empty();
+            match (driving, held_open.is_some()) {
+                (true, false) => held_open = Some(worker.clients.line.stay_open()),
+                (false, true) => held_open = None,
+                _ => {}
             }
-            let heard = tokio::select! {
+            let next = tokio::select! {
                 _ = &mut changed => continue,
-                heard = worker.clients.tasks.wait_cancels(worker.project_id, execution_ids, weft_task_store::pg_signal::MAX_HOLD) => heard,
+                next = heard.next() => next,
             };
-            match heard {
-                Ok(cancels) => {
-                    for asked in cancels {
-                        match asked.execution_id.parse::<ExecutionId>() {
-                            Ok(execution_id) => cancel_execution_id(&worker.cancel_registry, execution_id, asked.cause).await,
-                            Err(e) => tracing::error!(target: "weft_engine::worker", execution_id = %asked.execution_id, error = %e, "a cancel named no execution"),
-                        }
+            match next {
+                Ok(weft_task_store::pg_signal::Heard::Signal { channel, payload }) if channel == weft_task_store::tasks::CANCEL_CHANNEL => {
+                    let Some((project, execution)) = weft_task_store::tasks::parse_cancel_payload(&payload) else {
+                        tracing::error!(target: "weft_engine::worker", %payload, "a cancel announcement that names no execution");
+                        continue;
+                    };
+                    if project != worker.project_id {
+                        continue;
+                    }
+                    match execution.parse::<ExecutionId>() {
+                        Ok(execution_id) => heard_cancel(&worker, execution_id).await,
+                        Err(e) => tracing::error!(target: "weft_engine::worker", %payload, error = %e, "a cancel announcement that names no execution"),
                     }
                 }
+                Ok(weft_task_store::pg_signal::Heard::Recheck) => {
+                    // Counted before the registry is read: a drive that
+                    // registers after the read sees the count moved and asks
+                    // for its own (`register_cancel_flag`).
+                    worker.rechecks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let driven: Vec<ExecutionId> = worker.cancel_registry.lock().await.keys().copied().collect();
+                    if !driven.is_empty() {
+                        fire_cancels_asked(&worker, driven).await;
+                    }
+                }
+                Ok(_) => {}
                 Err(e) => {
-                    tracing::warn!(target: "weft_engine::worker", error = %format!("{e:#}"), "cancel wait failed; asking again");
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    tracing::error!(target: "weft_engine::worker", error = %format!("{e:#}"), "the cancel watch stopped hearing the line");
+                    return;
                 }
             }
         }
     });
+}
+
+/// Register `flag` as `execution_id`'s, so its cancel reaches it, and ask
+/// for its cancels when one may have been missed: heard before it
+/// registered, or announced while the line could not hear, which the
+/// watch's ask for every execution driven (a recheck since `rechecks`, the
+/// count read before the claim) did not include.
+async fn register_cancel_flag(worker: &Worker, execution_id: ExecutionId, flag: Arc<CancellationFlag>, rechecks: u64) {
+    let missed = {
+        let mut registry = worker.cancel_registry.lock().await;
+        registry.insert(execution_id, flag);
+        let heard_early = worker.early_cancels.lock().expect("early cancels").remove(&execution_id).is_some();
+        heard_early || worker.rechecks.load(std::sync::atomic::Ordering::SeqCst) != rechecks
+    };
+    // The cancel watch now holds the line open for this execution too.
+    worker.driving_changed.notify_one();
+    if missed {
+        fire_cancels_asked(worker, vec![execution_id]).await;
+    }
+}
+
+/// A cancel was announced for `execution_id`: asked for now if this worker
+/// drives it, kept for a drive about to register otherwise.
+async fn heard_cancel(worker: &Worker, execution_id: ExecutionId) {
+    let driven = {
+        let registry = worker.cancel_registry.lock().await;
+        let driven = registry.contains_key(&execution_id);
+        if !driven {
+            let mut early = worker.early_cancels.lock().expect("early cancels");
+            early.retain(|_, heard| heard.elapsed() < EARLY_CANCEL_KEPT);
+            early.insert(execution_id, std::time::Instant::now());
+        }
+        driven
+    };
+    if driven {
+        fire_cancels_asked(worker, vec![execution_id]).await;
+    }
+}
+
+/// How long an ask that failed waits before it is made again, at first and
+/// at most.
+const REASK_FIRST: std::time::Duration = std::time::Duration::from_secs(1);
+const REASK_LONGEST: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Ask for the cancels of `execution_ids` and fire their flags. An ask that
+/// fails (the broker could not answer, or its answer was lost) is made
+/// again for as long as any of them is still driven here: asking only
+/// reads, so the cancel is still there to find, and nothing would
+/// announce it again.
+async fn fire_cancels_asked(worker: &Worker, execution_ids: Vec<ExecutionId>) {
+    if let Err(e) = fire_cancels_asked_once(worker, &execution_ids).await {
+        tracing::warn!(target: "weft_engine::worker", error = %format!("{e:#}"), "could not ask for the cancels heard; asking again");
+        let worker = worker.clone();
+        tokio::spawn(async move {
+            let mut wait = REASK_FIRST;
+            loop {
+                tokio::time::sleep(wait).await;
+                let still: Vec<ExecutionId> = {
+                    let registry = worker.cancel_registry.lock().await;
+                    execution_ids.iter().copied().filter(|id| registry.contains_key(id)).collect()
+                };
+                if still.is_empty() {
+                    return;
+                }
+                match fire_cancels_asked_once(&worker, &still).await {
+                    Ok(()) => return,
+                    Err(e) => tracing::warn!(target: "weft_engine::worker", error = %format!("{e:#}"), "could not ask for the cancels heard; asking again"),
+                }
+                wait = (wait * 2).min(REASK_LONGEST);
+            }
+        });
+    }
+}
+
+async fn fire_cancels_asked_once(worker: &Worker, execution_ids: &[ExecutionId]) -> Result<()> {
+    let ids: Vec<String> = execution_ids.iter().map(ToString::to_string).collect();
+    for asked in worker.clients.tasks.cancels_asked(worker.project_id, ids).await? {
+        match asked.execution_id.parse::<ExecutionId>() {
+            Ok(execution_id) => cancel_execution_id(&worker.cancel_registry, execution_id, asked.cause).await,
+            Err(e) => tracing::error!(target: "weft_engine::worker", execution_id = %asked.execution_id, error = %e, "a cancel named no execution"),
+        }
+    }
+    Ok(())
 }
 
 /// A short run's self-imposed end, just before the platform's cap: the
@@ -1192,6 +1329,8 @@ fn new_worker(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config: &Wo
         tenant_id: config.tenant_id.clone(),
         cancel_registry: Arc::new(Mutex::new(HashMap::new())),
         driving_changed: Arc::new(tokio::sync::Notify::new()),
+        early_cancels: Arc::default(),
+        rechecks: Arc::default(),
         project_cache: Arc::new(Mutex::new(BoundedProjectCache::new())),
         caller_registry: crate::caller_conn::CallerRegistry::new(),
         live_configs: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1227,7 +1366,7 @@ pub async fn serve(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config
     weft_core::net::install_crypto_provider();
     weft_core::time_scale::announce();
     let worker = new_worker(catalog, clients, &config);
-    spawn_cancel_wait(worker.clone());
+    spawn_cancel_watch(worker.clone());
     // SYNC: the `/_weft` prefix <-> weft_core::route::RESERVED_SEGMENT
     let own = Router::new()
         .route("/_weft/run/{execution_id}", post(run_handler))
@@ -1251,6 +1390,7 @@ pub async fn serve(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config
             own
         }
     };
+    let app = app.layer(axum::middleware::from_fn(crate::memory_guard::refuse_when_full));
     crate::caller_conn::serve(app.layer(axum::middleware::map_response(mark_worker_answer)), config.port, shutdown_signal()).await?;
     wind_down(&worker).await;
     Ok(())
@@ -1270,7 +1410,7 @@ pub async fn run_long(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, con
     weft_core::net::install_crypto_provider();
     weft_core::time_scale::announce();
     let worker = new_worker(catalog, clients, &WorkerConfig { short_run_cap: None, ..config });
-    spawn_cancel_wait(worker.clone());
+    spawn_cancel_watch(worker.clone());
     let answer = tokio::select! {
         answer = worker.run_execution_id(execution_id) => answer?,
         _ = shutdown_signal() => {
@@ -1434,22 +1574,22 @@ mod tests {
         assert_eq!(serde_json::to_value(RunAnswer::NothingToRun).unwrap(), serde_json::json!({ "ended": "nothing_to_run" }));
     }
 
-    /// Answers one scripted cancel for the first execution it is asked about,
-    /// then holds each later wait for its full length.
-    struct OneCancel {
+    /// Answers the cancels it holds for the executions it is asked about
+    /// (asking only reads, so every ask finds them), and records every
+    /// ask.
+    #[derive(Default)]
+    struct Cancels {
         asked: std::sync::Mutex<Vec<Vec<String>>>,
-        given: std::sync::atomic::AtomicBool,
+        waiting: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait]
-    impl weft_task_store::TaskStoreClient for OneCancel {
-        async fn wait_cancels(&self, _p: uuid::Uuid, execution_ids: Vec<String>, wait: std::time::Duration) -> anyhow::Result<Vec<weft_task_store::tasks::CancelAsked>> {
+    impl weft_task_store::TaskStoreClient for Cancels {
+        async fn cancels_asked(&self, _p: uuid::Uuid, execution_ids: Vec<String>) -> anyhow::Result<Vec<weft_task_store::tasks::CancelAsked>> {
             self.asked.lock().unwrap().push(execution_ids.clone());
-            if !self.given.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                return Ok(vec![weft_task_store::tasks::CancelAsked { execution_id: execution_ids[0].clone(), cause: weft_core::exec::CancelCause::User }]);
-            }
-            tokio::time::sleep(wait).await;
-            Ok(Vec::new())
+            let waiting = self.waiting.lock().unwrap();
+            let asked: Vec<String> = waiting.iter().filter(|id| execution_ids.contains(id)).cloned().collect();
+            Ok(asked.into_iter().map(|execution_id| weft_task_store::tasks::CancelAsked { execution_id, cause: weft_core::exec::CancelCause::User }).collect())
         }
         async fn enqueue_dedup(&self, _s: weft_task_store::tasks::NewTask) -> anyhow::Result<weft_task_store::tasks::DedupOutcome> {
             unreachable!()
@@ -1474,9 +1614,10 @@ mod tests {
         }
     }
 
-    fn worker_over(tasks: Arc<dyn weft_task_store::TaskStoreClient>) -> Worker {
+    fn worker_over(tasks: Arc<dyn weft_task_store::TaskStoreClient>, line: Arc<crate::context::TestLine>) -> Worker {
         let mut clients = clients(Arc::new(MemJournal::default()));
         clients.tasks = tasks;
+        clients.line = line;
         struct NoCatalog;
         impl NodeCatalog for NoCatalog {
             fn lookup(&self, _t: &str) -> Option<&'static dyn weft_core::Node> {
@@ -1501,36 +1642,102 @@ mod tests {
         )
     }
 
-    // A cancel the broker answers reaches the flag of the execution being
-    // driven, and the wait asks for exactly the executions driven: it starts
-    // only once an execution is registered, whichever of the two comes first.
+    fn cancel_heard(execution_id: ExecutionId) -> weft_task_store::pg_signal::Heard {
+        weft_task_store::pg_signal::Heard::Signal {
+            channel: weft_task_store::tasks::CANCEL_CHANNEL,
+            payload: weft_task_store::tasks::cancel_payload(uuid::Uuid::from_u128(1), &execution_id.to_string()).into(),
+        }
+    }
+
+    async fn cancelled(flag: &CancellationFlag) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !flag.is_cancelled() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the cancel reached the flag");
+    }
+
+    // A cancel the line announces reaches the flag of the execution driven,
+    // whether it is heard after the drive registered or just before; the
+    // line is held open exactly while something is driven; a line that
+    // opens again asks for the cancels of every execution driven; and a
+    // drive that registers after such an ask asks for its own.
     weft_core::stress_test! {
         name: a_heard_cancel_fires_the_flag_of_the_execution_id_driven,
         runs: 20,
         worker_threads: 4,
         async fn body() {
-            let tasks = Arc::new(OneCancel { asked: std::sync::Mutex::new(Vec::new()), given: false.into() });
-            let worker = worker_over(tasks.clone());
-            spawn_cancel_wait(worker.clone());
-            let execution_id = ExecutionId::new_v4();
+            let tasks = Arc::new(Cancels::default());
+            let line = crate::context::TestLine::new();
+            let worker = worker_over(tasks.clone(), line.clone());
+            spawn_cancel_watch(worker.clone());
+
+            let after = ExecutionId::new_v4();
             let flag = CancellationFlag::new_arc();
-            worker.cancel_registry.lock().await.insert(execution_id, flag.clone());
-            worker.driving_changed.notify_one();
+            register_cancel_flag(&worker, after, flag.clone(), 0).await;
             tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                while !flag.is_cancelled() {
+                while line.held.load(std::sync::atomic::Ordering::SeqCst) == 0 {
                     tokio::task::yield_now().await;
                 }
             })
             .await
-            .expect("the cancel reached the flag");
-            assert_eq!(tasks.asked.lock().unwrap()[0], vec![execution_id.to_string()]);
+            .expect("driving, the line is held open");
+            tasks.waiting.lock().unwrap().push(after.to_string());
+            line.pushed.send(cancel_heard(after)).unwrap();
+            cancelled(&flag).await;
+            assert_eq!(tasks.asked.lock().unwrap()[0], vec![after.to_string()], "only the execution heard is asked about");
+
+            let before = ExecutionId::new_v4();
+            tasks.waiting.lock().unwrap().push(before.to_string());
+            line.pushed.send(cancel_heard(before)).unwrap();
+            let flag = CancellationFlag::new_arc();
+            // Heard before it registered: the watch may not have read it
+            // yet, so the registration finds it or the watch does.
+            tokio::task::yield_now().await;
+            register_cancel_flag(&worker, before, flag.clone(), 0).await;
+            cancelled(&flag).await;
+
+            let missed = ExecutionId::new_v4();
+            let flag = CancellationFlag::new_arc();
+            register_cancel_flag(&worker, missed, flag.clone(), 0).await;
+            tasks.waiting.lock().unwrap().push(missed.to_string());
+            line.pushed.send(weft_task_store::pg_signal::Heard::Recheck).unwrap();
+            cancelled(&flag).await;
+
+            // Claimed before a recheck, registered after it: the recheck
+            // could not include it, so the registration asks.
+            let late = ExecutionId::new_v4();
+            let claimed_at = worker.rechecks.load(std::sync::atomic::Ordering::SeqCst);
+            tasks.waiting.lock().unwrap().push(late.to_string());
+            line.pushed.send(weft_task_store::pg_signal::Heard::Recheck).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while worker.rechecks.load(std::sync::atomic::Ordering::SeqCst) == claimed_at {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the watch heard the recheck");
+            let flag = CancellationFlag::new_arc();
+            register_cancel_flag(&worker, late, flag.clone(), claimed_at).await;
+            cancelled(&flag).await;
+
+            worker.cancel_registry.lock().await.clear();
+            worker.driving_changed.notify_one();
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while line.held.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("with nothing driven, the line is let go of");
         }
     }
 
     #[tokio::test]
     async fn a_call_for_an_execution_with_nothing_to_claim_says_so() {
-        let tasks = Arc::new(OneCancel { asked: std::sync::Mutex::new(Vec::new()), given: true.into() });
-        let worker = worker_over(tasks);
+        let worker = worker_over(Arc::new(Cancels::default()), crate::context::TestLine::new());
         assert_eq!(worker.run_execution_id(ExecutionId::new_v4()).await.unwrap(), RunAnswer::NothingToRun);
     }
 }

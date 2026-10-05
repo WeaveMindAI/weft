@@ -206,6 +206,18 @@ impl InfraStartAnswer {
     }
 }
 
+/// What `ProgramCall::InfraStop` and `ProgramCall::InfraTerminate`
+/// answer: the copy was taken down by this call, it was already down (or
+/// on its way down), or there is no copy of that node for that instance,
+/// which is also what a copy terminated earlier reads as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "copy", rename_all = "snake_case")]
+pub enum InfraDownAnswer {
+    TakenDown,
+    AlreadyDown,
+    NoCopy,
+}
+
 /// What `ProgramCall::ConnectionsForget` answers: how many connections
 /// went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -290,7 +302,7 @@ impl InstanceHoldings {
 crate::wire_enum! {
     /// Where a run stands, as a filter asks for it: each word is the
     /// [`ExecutionSummary::status`] a run reads in a listing.
-    // SYNC: RunStatus <-> crates/weft-dispatcher/src/journal/postgres.rs list_executions (status clause)
+    // SYNC: RunStatus <-> crates/weft-dispatcher/src/journal/postgres.rs list_executions (status clause), extension-vscode/src/sidebar/runSearch.ts STATUSES
     pub enum RunStatus {
         /// Not ended: no terminal event yet. A run parked on a wait has
         /// not ended either, so it is here too.

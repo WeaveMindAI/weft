@@ -33,8 +33,8 @@ pub enum TaskKind {
     /// Worker: resume a suspended execution after a fire.
     Resume,
     /// Worker: cancel a running execution by execution. Never claimed: the
-    /// worker driving the execution takes it through its cancel wait
-    /// (`tasks::take_cancels`).
+    /// worker driving the execution hears it announced on its line and asks
+    /// for it (`tasks::cancels_asked`).
     CancelExecution,
     /// Dispatcher: journal a `CostReported` event for one metered
     /// call (a provider meter's figure). Routed

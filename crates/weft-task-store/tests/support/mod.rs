@@ -11,7 +11,7 @@ use weft_task_store::tasks;
 /// Every channel this crate's writes notify on. (Each test file
 /// compiles this module; the ones that never wait leave these unused.)
 #[allow(dead_code)]
-pub const CHANNELS: &[&str] = &[tasks::TASK_READY_CHANNEL, weft_task_store::terminal::TERMINAL_CHANNEL];
+pub const CHANNELS: &[&str] = &[tasks::TASK_READY_CHANNEL, tasks::CANCEL_CHANNEL, weft_task_store::terminal::TERMINAL_CHANNEL];
 
 /// A signal watch on the test database, listening on [`CHANNELS`].
 #[allow(dead_code)]
@@ -21,7 +21,7 @@ pub async fn signals(pool: &PgPool) -> Arc<PgSignalWatch> {
 
 /// Apply the task and worker-process schema to a fresh test database.
 pub async fn setup(pool: &PgPool) {
-    weft_task_store::apply_groups(pool, &[&tasks::GROUP])
+    weft_task_store::apply_groups(pool, &[&weft_task_store::announce::GROUP, &tasks::GROUP])
         .await
         .expect("tasks schema");
     // `tasks::GROUP` creates a trigger ON `task` that stamps

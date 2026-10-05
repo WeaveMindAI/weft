@@ -39,17 +39,22 @@ async fn ownership_tick_syncs_under_this_supervisors_identity() {
     assert!(synced, "ownership tick must sync_ownership(test-supervisor)");
 }
 
-/// A pass answers when it next has something to look at: soon while a
-/// project it owns has infra running, when a sibling's lease over one
-/// lapses while it owns none of them, and never while nothing anywhere
-/// has anything to do (a declared infra alone included).
+/// A pass answers when it next has something to look at: never over infra
+/// of its own that runs fine (its machine says when that changes), when a
+/// sibling's lease over a project with infra lapses (the word that one
+/// changed may have reached this replica, not the sibling), and never while
+/// nothing anywhere has anything to do (a declared infra alone included).
 #[tokio::test]
 async fn a_pass_looks_again_only_while_there_is_something_to_look_at() {
     use weft_broker_client::protocol::InfraNodeStatus;
     let running = SupervisorTestRig::with_tenant("alice");
     running.broker.add_project(P1);
     running.broker.add_infra_node(P1, "db", "i-1", InfraNodeStatus::Running);
-    assert_eq!(weft_infra_supervisor::tick(&running.state).await.unwrap(), Some(running.state.health_interval));
+    assert_eq!(
+        weft_infra_supervisor::tick(&running.state).await.unwrap(),
+        None,
+        "infra of its own that runs needs no look on a clock: its machine says when it changes"
+    );
 
     let sibling = SupervisorTestRig::with_tenant("alice");
     sibling.broker.add_project(P1);

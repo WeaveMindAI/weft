@@ -350,6 +350,7 @@ pub async fn record_retroactively(
         .await?;
     announce_ended(&mut tx, UnrecordedEnded { execution_id, project_id, fired_by, instance }).await?;
     tx.commit().await?;
+    weft_task_store::announce::committed(pool);
     Ok(())
 }
 
@@ -363,9 +364,11 @@ struct HeldCost {
 }
 
 /// Announce an unrecorded run's ending on [`UNRECORDED_ENDED_CHANNEL`],
-/// delivered when the caller's transaction commits.
+/// through the announcement outbox (`weft_task_store::announce`): it
+/// commits with the caller's transaction, whose committer pokes the
+/// flusher.
 async fn announce_ended(tx: &mut sqlx::PgConnection, ended: UnrecordedEnded) -> anyhow::Result<()> {
-    sqlx::query("SELECT pg_notify($1, $2)")
+    sqlx::query("SELECT weft_announce($1, $2)")
         .bind(UNRECORDED_ENDED_CHANNEL)
         .bind(serde_json::to_string(&ended)?)
         .execute(&mut *tx)
@@ -377,7 +380,9 @@ async fn announce_ended(tx: &mut sqlx::PgConnection, ended: UnrecordedEnded) -> 
 /// when no row of it is in the journal, or stamp it ended when its costs
 /// keep it (they are addressed by execution; it never lists, only recorded
 /// runs do), and announce the ending on [`UNRECORDED_ENDED_CHANNEL`],
-/// delivered when the transaction commits. True when the row went.
+/// sent once the transaction commits and its caller pokes the
+/// announcement flusher (`weft_task_store::announce::committed`). True
+/// when the row went.
 pub async fn forget_in(tx: &mut sqlx::PgConnection, execution_id: ExecutionId) -> anyhow::Result<bool> {
     crate::write::lock_execution_ids(&mut *tx, &[execution_id]).await?;
     let owner: Option<(uuid::Uuid, Option<String>, Option<String>)> = sqlx::query_as(

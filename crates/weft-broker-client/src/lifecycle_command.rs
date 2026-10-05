@@ -156,24 +156,43 @@ pub fn live_lease_exists(replica_param: Option<&str>, project_col: &str) -> Stri
 ///     mid-command.
 pub fn ownable_project(project_alias: &str, held_param: &str) -> String {
     format!(
-        "({p}.has_infra OR {p}.id = ANY({held_param}) OR {work})",
+        "({p}.has_infra OR {p}.id = ANY({held_param}) OR {nodes} OR {work})",
         p = project_alias,
+        nodes = has_infra_nodes(project_alias),
         work = supervisor_work(project_alias)
     )
 }
 
 /// SQL condition that is true iff the `project` row aliased
-/// `project_alias` gives its owner something to look at now: infra
-/// nodes whose health it watches, or a supervisor command waiting. A
-/// project that only declares infra, or whose host holds only kept disks
-/// of it, is ownable ([`ownable_project`]) but gives its owner nothing to
-/// do until a command is issued, which wakes it, so a supervisor that
-/// scales to zero sleeps over it.
+/// `project_alias` has infra copies (`infra_node` rows), whatever their
+/// status: copies a supervisor may still have to take down.
+pub fn has_infra_nodes(project_alias: &str) -> String {
+    format!("EXISTS (SELECT 1 FROM infra_node own_n WHERE own_n.project_id = {project_alias}.id)")
+}
+
+/// SQL condition that is true iff the `project` row aliased
+/// `project_alias` has infra copies expected to run: what a supervisor
+/// watches the health of, and is woken for when one of them changes.
+// SYNC: the statuses <-> weft_core::infra::InfraNodeStatus::expects_running_units
+pub fn runs_infra(project_alias: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM infra_node run_n WHERE run_n.project_id = {project_alias}.id \
+                 AND run_n.status IN ('running', 'flaky'))"
+    )
+}
+
+/// SQL condition that is true iff the `project` row aliased
+/// `project_alias` gives its owner something to do now that nothing
+/// else will announce: a supervisor command waiting. A project whose
+/// infra runs is ownable ([`ownable_project`]) but gives a supervisor
+/// that scales to zero nothing to look at on a clock: a command being
+/// issued, a machine saying how its unit stands changed
+/// ([`LOOK_WAKE`]) and the cloud saying a machine went away each wake it,
+/// and its health keeps it looking only while it is not settled.
 pub fn supervisor_work(project_alias: &str) -> String {
     format!(
-        "(EXISTS (SELECT 1 FROM infra_node work_n WHERE work_n.project_id = {p}.id) \
-          OR EXISTS (SELECT 1 FROM infra_lifecycle_command work_c \
-                     WHERE work_c.project_id = {p}.id AND {pending}))",
+        "EXISTS (SELECT 1 FROM infra_lifecycle_command work_c \
+                 WHERE work_c.project_id = {p}.id AND {pending})",
         p = project_alias,
         pending = pending_supervisor_command("work_c"),
     )
@@ -255,7 +274,10 @@ pub fn commands_overlap(a: &str, b: &str) -> String {
 /// `infra_command_notify` trigger in the dispatcher's
 /// `infra_lifecycle_command::GROUP`: once when the command is issued,
 /// and once when it completes. The claimers wake on the first, and
-/// whoever waits on a command's outcome wakes on the second.
+/// whoever waits on a command's outcome wakes on the second. The broker
+/// also announces here when a machine running a project's infra says
+/// how it stands changed (`look:<project_id>`), which wakes a supervisor
+/// that scales to zero to look at it.
 pub const INFRA_COMMAND_CHANNEL: &str = "weft_infra_command";
 
 /// What an [`INFRA_COMMAND_CHANNEL`] notification says.
@@ -265,6 +287,9 @@ pub enum InfraCommandSignal<'a> {
     Issued { project_id: &'a str },
     /// This command completed (`done:<id>`).
     Done { id: i64 },
+    /// Something running this project's infra changed how it stands, so
+    /// its health is looked at now (`look:<project_id>`).
+    Look { project_id: &'a str },
 }
 
 impl<'a> InfraCommandSignal<'a> {
@@ -275,6 +300,9 @@ impl<'a> InfraCommandSignal<'a> {
     pub fn parse(payload: &'a str) -> Option<Self> {
         if let Some(project_id) = payload.strip_prefix("issued:") {
             return Some(Self::Issued { project_id });
+        }
+        if let Some(project_id) = payload.strip_prefix("look:") {
+            return Some(Self::Look { project_id });
         }
         payload.strip_prefix("done:")?.parse().ok().map(|id| Self::Done { id })
     }
@@ -289,6 +317,20 @@ pub const ISSUED_WAKE: weft_task_store::drain::WakeOn = weft_task_store::drain::
     channel: INFRA_COMMAND_CHANNEL,
     concerns: |payload| matches!(InfraCommandSignal::parse(payload), Some(InfraCommandSignal::Issued { .. })),
 };
+
+/// What wakes a supervisor that scales to zero to look at a project's
+/// health: something running its infra said how it stands changed. Its
+/// health is otherwise looked at only while something is not settled, so
+/// infra that runs fine costs no look at all.
+pub const LOOK_WAKE: weft_task_store::drain::WakeOn = weft_task_store::drain::WakeOn {
+    channel: INFRA_COMMAND_CHANNEL,
+    concerns: |payload| matches!(InfraCommandSignal::parse(payload), Some(InfraCommandSignal::Look { .. })),
+};
+
+/// The [`INFRA_COMMAND_CHANNEL`] payload asking for a look at `project`.
+pub fn look_payload(project: uuid::Uuid) -> String {
+    format!("look:{project}")
+}
 
 #[cfg(test)]
 mod verb_tests {

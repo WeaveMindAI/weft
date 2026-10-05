@@ -35,11 +35,24 @@
 //! run's history is asked again on either (`client::read_until_answered`),
 //! and any other call fails the way a request whose connection reset does.
 //!
+//! A caller that stops waiting for a call it already wrote tells the
+//! broker (`Notice::Forget`), which stops working on it, the way a request
+//! whose caller hung up stops its handler: a wait the broker holds for
+//! nobody would otherwise go on reading the database for its whole hold.
+//!
+//! A line with nothing to do closes ([`LINE_IDLE`]) and opens again on the
+//! next call: an open line is an open request on the broker, and one held
+//! by a process with nothing to ask would keep a broker that scales to
+//! zero up for as long as that process lives. While it is closed nothing
+//! is heard, so what is kept on it is not trusted until it is back. A
+//! process that must hear while it asks nothing (a worker driving runs,
+//! which hears their cancels) holds it open ([`BrokerLink::stay_open`]).
+//!
 //! Byte streams (`ctx.storage` uploads and downloads) stay ordinary
 //! requests: a large body on the line would hold up every call behind it.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -106,6 +119,12 @@ const PONG_WAIT: Duration = Duration::from_secs(15);
 /// told to look again instead (`broadcast`'s lag).
 const NOTICE_CAPACITY: usize = 1024;
 
+/// How long a line with no call out and nothing holding it open stays
+/// open before it closes (see the module doc), and how often that is
+/// looked at.
+pub const LINE_IDLE: Duration = Duration::from_secs(60);
+const IDLE_LOOK: Duration = Duration::from_secs(5);
+
 /// Why a call on the line got no answer.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum LineError {
@@ -146,13 +165,18 @@ pub struct AnswerHead {
     pub status: u16,
 }
 
-/// What the broker says on the line besides answers, as text frames.
+/// What either end says on the line besides calls and answers, as text
+/// frames: the caller's requests (`Follow`, `Forget`), and the broker's
+/// news.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Notice {
     /// Sent by the caller once the line is open: push the notifications
     /// this caller may see.
     Follow,
+    /// Sent by the caller: it stopped waiting for the call `id`, so the
+    /// broker stops working on it.
+    Forget { id: u64 },
     /// The broker follows for this caller; `listening` is whether its own
     /// database listener hears right now.
     Following { listening: bool },
@@ -186,8 +210,8 @@ pub fn unframe<H: for<'de> Deserialize<'de>>(bytes: &[u8]) -> anyhow::Result<(H,
 
 /// The notification channels a line may carry, by name: what turns a
 /// name the broker sent back into the `&'static str` a [`Heard`] holds.
-// SYNC: LINE_CHANNELS <-> crates/weft-broker/src/line.rs (audience), crates/weft-dispatcher/src/infra_node.rs (infra_node_status_notify), crates/weft-dispatcher/src/project_store.rs (project_declared_infra_notify), crates/weft-access-store/src/lib.rs (access_notify)
-pub const LINE_CHANNELS: &[&str] = &[INFRA_STATUS_CHANNEL, ACCESS_CHANNEL];
+// SYNC: LINE_CHANNELS <-> crates/weft-broker/src/line.rs (audience), crates/weft-task-store/src/tasks.rs (task_ready_notify), crates/weft-dispatcher/src/infra_node.rs (infra_node_status_notify), crates/weft-dispatcher/src/project_store.rs (project_declared_infra_notify), crates/weft-access-store/src/lib.rs (access_notify)
+pub const LINE_CHANNELS: &[&str] = &[INFRA_STATUS_CHANNEL, ACCESS_CHANNEL, CANCEL_CHANNEL];
 
 /// Announced with a project's id when one of its infra copies comes,
 /// goes, changes status or answers at another address, and when the
@@ -199,6 +223,11 @@ pub const INFRA_STATUS_CHANNEL: &str = "weft_infra_status";
 /// instance provides changes or goes: with its project's id, or
 /// `tenant:<tenant>` for a connection shared across the tenant's projects.
 pub const ACCESS_CHANNEL: &str = "weft_access";
+
+/// Announced with `<project id> <execution id>` when a running execution
+/// is asked to stop: the worker driving it asks for the cancel
+/// (`weft_task_store::tasks::cancels_asked`).
+pub use weft_task_store::tasks::CANCEL_CHANNEL;
 
 /// A process's way to the broker. Every broker client of the process
 /// holds the same one, so the process has one line, opened on the first
@@ -214,6 +243,8 @@ struct LinkInner {
     /// Byte streams, which stay requests (see the module doc).
     http: reqwest::Client,
     line: OnceLock<Arc<Line>>,
+    /// How long the line stays open with nothing to do ([`LINE_IDLE`]).
+    idle_after: Duration,
     /// Dropped with the last [`BrokerLink`], which tells the line's task
     /// to close the line: nothing will call on it again.
     _closing: tokio::sync::watch::Sender<()>,
@@ -233,10 +264,18 @@ impl BrokerLink {
                 token,
                 http,
                 line: OnceLock::new(),
+                idle_after: weft_core::time_scale::scaled(LINE_IDLE),
                 _closing: closing,
                 closed,
             }),
         }
+    }
+
+    /// Close the line after `after` with nothing to do instead of
+    /// [`LINE_IDLE`]. Only on a link no clone of which was made yet.
+    pub fn closing_when_idle_after(mut self, after: Duration) -> Self {
+        Arc::get_mut(&mut self.inner).expect("set before the link is shared").idle_after = after;
+        self
     }
 
     /// The broker's base URL.
@@ -270,8 +309,32 @@ impl BrokerLink {
         Subscription::with_listening(line.notices.subscribe(), line.listening.clone())
     }
 
+    /// Hold the line open while the guard lives, calls or not, so what the
+    /// broker pushes is heard (see the module doc). A line closed for want
+    /// of anything to do opens again at once.
+    pub fn stay_open(&self) -> StayOpen {
+        let line = self.line().clone();
+        if line.keeps.fetch_add(1, Ordering::AcqRel) == 0 {
+            let _ = line.outbox.send(Out::Wake);
+        }
+        StayOpen { line }
+    }
+
     fn line(&self) -> &Arc<Line> {
-        self.inner.line.get_or_init(|| Line::open(Arc::downgrade(&self.inner), self.inner.closed.clone()))
+        self.inner
+            .line
+            .get_or_init(|| Line::open(Arc::downgrade(&self.inner), self.inner.closed.clone(), self.inner.idle_after))
+    }
+}
+
+/// Holds the line open (see [`BrokerLink::stay_open`]).
+pub struct StayOpen {
+    line: Arc<Line>,
+}
+
+impl Drop for StayOpen {
+    fn drop(&mut self) {
+        self.line.keeps.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -283,22 +346,38 @@ struct Waiting {
 }
 
 /// Takes a call off the line when its caller stops waiting for it, however
-/// it stops (an answer already took it off; that is fine).
+/// it stops (an answer already took it off; that is fine). One already
+/// written is forgotten by the broker too.
 struct Forget<'a> {
-    calls: &'a Mutex<HashMap<u64, Waiting>>,
+    line: &'a Line,
     id: u64,
 }
 
 impl Drop for Forget<'_> {
     fn drop(&mut self) {
-        self.calls.lock().expect("line calls").remove(&self.id);
+        let removed = self.line.calls.lock().expect("line calls").remove(&self.id);
+        if removed.is_some_and(|waiting| waiting.frame.is_none()) {
+            let _ = self.line.outbox.send(Out::Forget(self.id));
+        }
     }
+}
+
+/// What the line's task is asked to write, in order.
+enum Out {
+    /// The call with this id, unless its caller gave up first.
+    Call(u64),
+    /// That the caller stopped waiting for this written call.
+    Forget(u64),
+    /// Nothing: the line is wanted open (a [`StayOpen`] was taken).
+    Wake,
 }
 
 struct Line {
     calls: Mutex<HashMap<u64, Waiting>>,
-    /// The ids of calls to write, in order.
-    outbox: mpsc::UnboundedSender<u64>,
+    /// What to write, in order.
+    outbox: mpsc::UnboundedSender<Out>,
+    /// How many [`StayOpen`]s hold the line open.
+    keeps: AtomicUsize,
     next_id: AtomicU64,
     notices: broadcast::Sender<Heard>,
     /// Whether what the line pushes can be trusted right now (see
@@ -309,18 +388,19 @@ struct Line {
 }
 
 impl Line {
-    fn open(link: Weak<LinkInner>, closed: tokio::sync::watch::Receiver<()>) -> Arc<Self> {
+    fn open(link: Weak<LinkInner>, closed: tokio::sync::watch::Receiver<()>, idle_after: Duration) -> Arc<Self> {
         let (outbox, ids) = mpsc::unbounded_channel();
         let (notices, _) = broadcast::channel(NOTICE_CAPACITY);
         let line = Arc::new(Self {
             calls: Mutex::new(HashMap::new()),
             outbox,
+            keeps: AtomicUsize::new(0),
             next_id: AtomicU64::new(1),
             notices,
             listening: Arc::new(AtomicBool::new(false)),
             down: Mutex::new(Some("not opened yet".into())),
         });
-        tokio::spawn(keep_open(link, Arc::downgrade(&line), ids, closed));
+        tokio::spawn(keep_open(link, Arc::downgrade(&line), ids, closed, idle_after));
         line
     }
 
@@ -331,11 +411,12 @@ impl Line {
         self.calls.lock().expect("line calls").insert(id, Waiting { frame: Some(frame), answer });
         // A caller that stops waiting (its own timeout, a cancelled task)
         // takes its call off the line, so an abandoned write is never sent
-        // later behind its back.
-        let _forget = Forget { calls: &self.calls, id };
+        // later behind its back, and one already sent is dropped by the
+        // broker too.
+        let _forget = Forget { line: self, id };
         // The receiving end lives as long as the line's task, which lives
         // as long as this line: a send can only fail once neither does.
-        let _ = self.outbox.send(id);
+        let _ = self.outbox.send(Out::Call(id));
         let start = tokio::time::Instant::now();
         let to_send = wait.to_send.min(wait.to_answer);
         tokio::pin!(answered);
@@ -379,6 +460,19 @@ impl Line {
         }
     }
 
+    /// The line closed for want of anything to do: nothing is heard until
+    /// it opens again.
+    fn idled(&self) {
+        self.listening.store(false, Ordering::Release);
+        let _ = self.notices.send(Heard::Lost);
+        *self.down.lock().expect("line down") = Some("closed while idle; it opens again on the next call".into());
+    }
+
+    /// Whether the line may close: no call is out and nothing holds it open.
+    fn idle(&self) -> bool {
+        self.keeps.load(Ordering::Acquire) == 0 && self.calls.lock().expect("line calls").is_empty()
+    }
+
     fn answered(&self, id: u64, answer: Answer) {
         if let Some(waiting) = self.calls.lock().expect("line calls").remove(&id) {
             let _ = waiting.answer.send(Ok(answer));
@@ -408,7 +502,9 @@ impl Line {
                 }
                 None => tracing::warn!(target: "weft_broker_client::line", %channel, "the broker pushed a channel this build does not know"),
             },
-            Notice::Follow => tracing::warn!(target: "weft_broker_client::line", "the broker sent a follow request"),
+            Notice::Follow | Notice::Forget { .. } => {
+                tracing::warn!(target: "weft_broker_client::line", ?notice, "the broker sent what only a caller sends")
+            }
         }
     }
 }
@@ -419,10 +515,13 @@ impl Line {
 async fn keep_open(
     link: Weak<LinkInner>,
     line: Weak<Line>,
-    mut ids: mpsc::UnboundedReceiver<u64>,
+    mut outbox: mpsc::UnboundedReceiver<Out>,
     mut closed: tokio::sync::watch::Receiver<()>,
+    idle_after: Duration,
 ) {
     let mut retry = RECONNECT_FIRST;
+    // What woke a closed line, written first once it is open again.
+    let mut first: Option<Out> = None;
     loop {
         let (Some(inner), Some(held)) = (link.upgrade(), line.upgrade()) else { return };
         // What opening needs, taken out so nothing holds the link while it
@@ -439,11 +538,23 @@ async fn keep_open(
             Ok(socket) => {
                 retry = RECONNECT_FIRST;
                 *held.down.lock().expect("line down") = None;
-                match serve(socket, &held, &mut ids, &mut closed).await {
+                match serve(socket, &held, first.take(), &mut outbox, &mut closed, idle_after).await {
                     Served::LetGo => return,
                     Served::Broke(why) => {
                         tracing::warn!(target: "weft_broker_client::line", reason = %why, "the line to the broker broke; opening it again");
                         held.broke(&why);
+                    }
+                    Served::Idle => {
+                        held.idled();
+                        drop(held);
+                        // Closed until something is asked of it.
+                        tokio::select! {
+                            out = outbox.recv() => match out {
+                                Some(out) => first = Some(out),
+                                None => return,
+                            },
+                            _ = closed.changed() => return,
+                        }
                     }
                 }
             }
@@ -466,6 +577,9 @@ async fn keep_open(
 enum Served {
     /// It broke, for this reason; it is opened again.
     Broke(String),
+    /// It had nothing to do for [`LINE_IDLE`] and closed; it opens again
+    /// when something is asked of it.
+    Idle,
     /// The process let go of its last link: nothing will call on it again.
     LetGo,
 }
@@ -516,17 +630,28 @@ fn line_url(base_url: &str) -> anyhow::Result<String> {
 async fn serve(
     socket: Socket,
     line: &Line,
-    ids: &mut mpsc::UnboundedReceiver<u64>,
+    first: Option<Out>,
+    outbox: &mut mpsc::UnboundedReceiver<Out>,
     closed: &mut tokio::sync::watch::Receiver<()>,
+    idle_after: Duration,
 ) -> Served {
     let (mut sink, mut stream) = socket.split();
     let follow = serde_json::to_string(&Notice::Follow).expect("a notice serializes");
     if let Err(why) = write(&mut sink, Message::Text(follow), "asking to follow").await {
         return Served::Broke(why);
     }
+    if let Some(out) = first {
+        if let Err(why) = write_out(&mut sink, line, out).await {
+            return Served::Broke(why);
+        }
+    }
     let mut ping = tokio::time::interval(PING_EVERY);
     ping.tick().await;
     let mut pong_due: Option<tokio::time::Instant> = None;
+    let mut idle_look = tokio::time::interval(IDLE_LOOK.min(idle_after));
+    idle_look.tick().await;
+    // Since when the line has had nothing to do, while it has not.
+    let mut idle_since: Option<tokio::time::Instant> = None;
     loop {
         let pong_deadline = pong_due.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
         let written = tokio::select! {
@@ -536,11 +661,25 @@ async fn serve(
                 let _ = write(&mut sink, Message::Close(None), "closing").await;
                 return Served::LetGo;
             }
-            id = ids.recv() => {
-                let Some(id) = id else { return Served::LetGo };
-                // A call whose caller gave up has no frame left to write.
-                let Some(frame) = line.take_frame(id) else { continue };
-                write(&mut sink, Message::Binary(frame), "writing a call").await
+            out = outbox.recv() => {
+                let Some(out) = out else { return Served::LetGo };
+                write_out(&mut sink, line, out).await
+            }
+            _ = idle_look.tick() => {
+                // Looked at from this task alone, which is the one that
+                // writes calls: none can be written between the look and
+                // the close, and one asked for meanwhile waits in the
+                // outbox and opens the line again.
+                match (line.idle(), idle_since) {
+                    (false, _) => idle_since = None,
+                    (true, None) => idle_since = Some(tokio::time::Instant::now()),
+                    (true, Some(since)) if since.elapsed() >= idle_after => {
+                        let _ = write(&mut sink, Message::Close(None), "closing while idle").await;
+                        return Served::Idle;
+                    }
+                    (true, Some(_)) => {}
+                }
+                Ok(())
             }
             message = stream.next() => {
                 pong_due = None;
@@ -585,6 +724,22 @@ async fn serve(
 
 type Sink = futures::stream::SplitSink<Socket, Message>;
 
+/// Write what the outbox asked for.
+async fn write_out(sink: &mut Sink, line: &Line, out: Out) -> Result<(), String> {
+    match out {
+        // A call whose caller gave up has no frame left to write.
+        Out::Call(id) => match line.take_frame(id) {
+            Some(frame) => write(sink, Message::Binary(frame), "writing a call").await,
+            None => Ok(()),
+        },
+        Out::Forget(id) => {
+            let forget = serde_json::to_string(&Notice::Forget { id }).expect("a notice serializes");
+            write(sink, Message::Text(forget), "forgetting a call").await
+        }
+        Out::Wake => Ok(()),
+    }
+}
+
 /// Write one message, within [`PONG_WAIT`]; `doing` names it in the reason
 /// the line broke.
 async fn write(sink: &mut Sink, message: Message, doing: &str) -> Result<(), String> {
@@ -620,6 +775,7 @@ mod tests {
     fn a_notice_reads_back() {
         for notice in [
             Notice::Follow,
+            Notice::Forget { id: 7 },
             Notice::Following { listening: true },
             Notice::Signal { channel: INFRA_STATUS_CHANNEL.into(), payload: "p".into() },
             Notice::Lost,
@@ -710,6 +866,10 @@ pub mod server {
         // for journal rows, a claim) would otherwise go on waiting for a
         // caller that is gone.
         let mut running = tokio::task::JoinSet::new();
+        // Each running call by its id, so a caller that stops waiting
+        // stops it (`Notice::Forget`), the way a request whose caller hung
+        // up stops its handler. A call takes itself out when it ends.
+        let by_id: Arc<std::sync::Mutex<std::collections::HashMap<u64, tokio::task::AbortHandle>>> = Arc::default();
         let bytes = Arc::new(tokio::sync::Semaphore::new(BYTES_IN_FLIGHT));
         let mut follower = follower;
         // The tasks pushing notices down this line, stopped when it goes.
@@ -731,13 +891,19 @@ pub mod server {
                     let size = u32::try_from(message.len()).expect("a line message is at most MAX_MESSAGE");
                     let Ok(call) = calls.clone().acquire_owned().await else { break };
                     let Ok(held) = bytes.clone().acquire_many_owned(size).await else { break };
-                    let (api, out) = (api.clone(), out.clone());
+                    let (api, out, ended) = (api.clone(), out.clone(), by_id.clone());
                     while running.try_join_next().is_some() {}
-                    running.spawn(async move {
+                    let id = head.id;
+                    // Spawned under the lock its end takes, so a call that
+                    // ends at once still finds itself there to take out.
+                    let mut ids = by_id.lock().expect("line calls by id");
+                    let handle = running.spawn(async move {
                         let (status, answer) = run(api, &head, message.slice(body_at..)).await;
+                        ended.lock().expect("line calls by id").remove(&head.id);
                         let _ = out.send(Message::Binary(frame(&AnswerHead { id: head.id, status }, &answer).into())).await;
                         drop((call, held));
                     });
+                    ids.insert(id, handle);
                 }
                 Ok(Message::Text(text)) => match serde_json::from_str::<Notice>(&text) {
                     Ok(Notice::Follow) if following.is_empty() => {
@@ -756,6 +922,11 @@ pub mod server {
                             None => {
                                 let _ = notices.send(Notice::Following { listening: false }).await;
                             }
+                        }
+                    }
+                    Ok(Notice::Forget { id }) => {
+                        if let Some(call) = by_id.lock().expect("line calls by id").remove(&id) {
+                            call.abort();
                         }
                     }
                     Ok(_) => {}

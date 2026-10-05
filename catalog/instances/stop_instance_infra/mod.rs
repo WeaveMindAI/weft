@@ -4,10 +4,9 @@
 
 use async_trait::async_trait;
 
-use weft::node::NodeOutput;
 use weft::{ExecutionContext, Node, NodeManifest, WeftResult};
 
-use super::lifecycle::{instance, stop_self, take_down_spec};
+use super::lifecycle::{instance, stop_self, take_down_spec, taken_down};
 
 #[derive(NodeManifest)]
 pub struct StopInstanceInfraNode;
@@ -25,7 +24,7 @@ impl Node for StopInstanceInfraNode {
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let node: String = ctx.inputs.get("node")?;
         let spec = take_down_spec(&ctx)?;
-        ctx.infra(node).instance(instance(&ctx)?).stop(spec, stop_self(&ctx)?).await?;
-        ctx.pulse_downstream(NodeOutput::new().set("done", true)).await
+        let answer = ctx.infra(node).instance(instance(&ctx)?).stop(spec, stop_self(&ctx)?).await?;
+        ctx.pulse_downstream(taken_down(answer)).await
     }
 }

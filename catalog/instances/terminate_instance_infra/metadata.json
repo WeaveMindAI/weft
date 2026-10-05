@@ -36,7 +36,7 @@
       },
       "default": "park",
       "label": "Triggers",
-      "description": "The instance's triggers reading it: park queues what arrives, hibernate keeps accepting for `graceMinutes`, wipe drops it."
+      "description": "The instance's triggers reading it: park keeps everything that arrives (calls, answers, the trigger's own fires) and runs it once the trigger is back, a caller on a route held on the line; hibernate does the same for `graceMinutes` with its questions hidden, then takes nothing more; wipe drops it all."
     },
     {
       "name": "running",
@@ -76,7 +76,12 @@
     {
       "name": "done",
       "type": "Boolean",
-      "description": "True once the triggers reading the copy are down and the delete is handed off; the copy is deleted afterwards."
+      "description": "True once the triggers reading the copy are down and the delete is handed off (or the copy was already going); the copy is deleted afterwards."
+    },
+    {
+      "name": "noCopy",
+      "type": "Boolean",
+      "description": "True instead of `done` when this instance has no copy of the node: the id names no instance that has one, or its copy was terminated before. Wire it to tell whoever asked."
     }
   ],
   "validate": [

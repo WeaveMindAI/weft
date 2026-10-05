@@ -112,10 +112,10 @@ async fn a_task_is_announced_exactly_when_it_becomes_claimable(pool: PgPool) {
 
     let dispatcher = tasks::enqueue(&pool, task(TaskTarget::Dispatcher, "d")).await.unwrap();
     tasks::enqueue_dedup(&pool, task(TaskTarget::Worker, "w")).await.unwrap();
-    assert_eq!(
-        on(&drain(&mut heard).await, TASK_READY_CHANNEL),
-        vec!["dispatcher".to_string(), format!("worker:{PROJECT}")],
-    );
+    // Sent in one batch or two (`announce`), in no promised order.
+    let mut ready = on(&drain(&mut heard).await, TASK_READY_CHANNEL);
+    ready.sort();
+    assert_eq!(ready, vec!["dispatcher".to_string(), format!("worker:{PROJECT}")]);
 
     claim_one(&pool, "disp-1").await.unwrap().expect("claimed");
     tasks::heartbeat(&pool, dispatcher, "disp-1").await.unwrap();
@@ -143,56 +143,45 @@ fn cancel(execution_id: &str) -> tasks::NewTask {
     }
 }
 
-/// A worker's cancel wait held open ends the moment a cancel for one of
-/// its executions is enqueued, and comes back empty at its deadline when none
-/// is.
+/// A cancel is announced to the workers of its project with the
+/// execution it stops, never as work to claim.
 #[sqlx::test]
-async fn a_held_cancel_wait_ends_when_a_cancel_arrives_or_at_its_deadline(pool: PgPool) {
+async fn a_cancel_is_announced_with_its_execution(pool: PgPool) {
     setup(&pool).await;
-    let client = PostgresTaskStoreClient::new(pool.clone(), signals(&pool).await).expect("client");
-    let execution_ids = vec!["c1".to_string()];
+    let watch = signals(&pool).await;
+    let mut heard = watch.subscribe();
+    let client = PostgresTaskStoreClient::new(pool.clone(), watch.clone()).expect("client");
 
-    let started = tokio::time::Instant::now();
-    assert!(client.wait_cancels(PROJECT, execution_ids.clone(), Duration::from_millis(500)).await.unwrap().is_empty());
-    assert!(started.elapsed() >= Duration::from_millis(500));
+    tasks::enqueue_dedup(&pool, cancel("c1")).await.unwrap();
+    let heard = drain(&mut heard).await;
+    assert_eq!(on(&heard, tasks::CANCEL_CHANNEL), vec![tasks::cancel_payload(PROJECT, "c1")]);
+    assert!(on(&heard, TASK_READY_CHANNEL).is_empty(), "a cancel is no work for a picker");
+    assert_eq!(tasks::parse_cancel_payload(&tasks::cancel_payload(PROJECT, "c1")), Some((PROJECT, "c1")));
 
-    let enqueuer = {
-        let pool = pool.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            tasks::enqueue_dedup(&pool, cancel("c1")).await.unwrap();
-        })
-    };
-    let started = tokio::time::Instant::now();
-    let taken = client.wait_cancels(PROJECT, execution_ids, Duration::from_secs(20)).await.unwrap();
-    enqueuer.await.unwrap();
-    assert_eq!(taken.len(), 1);
-    assert!(started.elapsed() < Duration::from_secs(10), "woken, not timed out: {:?}", started.elapsed());
+    assert!(client.cancels_asked(PROJECT, vec!["other".into()]).await.unwrap().is_empty());
+    assert_eq!(client.cancels_asked(PROJECT, vec!["c1".into()]).await.unwrap().len(), 1);
 }
 
-/// The subscription is taken before the first look, so a cancel that
-/// lands anywhere around it (before it, during it, just after the empty
-/// answer) still ends the hold. Raced many times with the enqueue at
-/// shifting offsets, since a subscribe-after-look window is only a few
-/// microseconds wide.
+/// What a write leaves in the outbox goes out once it commits and its
+/// writer pokes the flusher, each announcement once however many times it
+/// was left; what a rolled-back write left never does.
 #[sqlx::test]
-async fn a_cancel_landing_around_the_wait_is_never_missed(pool: PgPool) {
+async fn an_announcement_goes_out_once_its_write_commits(pool: PgPool) {
     setup(&pool).await;
-    let client = std::sync::Arc::new(PostgresTaskStoreClient::new(pool.clone(), signals(&pool).await).expect("client"));
-    for round in 0..40u64 {
-        let execution_id = format!("race-{round}");
-        let waiter = {
-            let client = client.clone();
-            let execution_ids = vec![execution_id.clone()];
-            tokio::spawn(async move { client.wait_cancels(PROJECT, execution_ids, Duration::from_secs(20)).await })
-        };
-        tokio::time::sleep(Duration::from_micros(round * 150)).await;
-        tasks::enqueue_dedup(&pool, cancel(&execution_id)).await.unwrap();
-        let taken = tokio::time::timeout(Duration::from_secs(10), waiter)
-            .await
-            .unwrap_or_else(|_| panic!("round {round}: the wait missed its cancel"))
-            .unwrap()
-            .unwrap();
-        assert_eq!(taken.len(), 1, "round {round}");
+    let watch = signals(&pool).await;
+    let mut heard = watch.subscribe();
+
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("SELECT weft_announce($1, 'rolled back')").bind(TASK_READY_CHANNEL).execute(&mut *tx).await.unwrap();
+    tx.rollback().await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    for _ in 0..3 {
+        sqlx::query("SELECT weft_announce($1, 'committed')").bind(TASK_READY_CHANNEL).execute(&mut *tx).await.unwrap();
     }
+    tx.commit().await.unwrap();
+    assert!(on(&drain(&mut heard).await, TASK_READY_CHANNEL).is_empty(), "nothing goes out before the flusher is poked");
+    weft_task_store::announce::committed(&pool);
+    assert_eq!(on(&drain(&mut heard).await, TASK_READY_CHANNEL), vec!["committed".to_string()]);
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM weft_announcement").fetch_one(&pool).await.unwrap();
+    assert_eq!(left, 0, "the outbox is empty once sent");
 }

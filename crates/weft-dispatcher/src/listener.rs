@@ -229,3 +229,91 @@ pub async fn project_is_listening(pool: &sqlx::PgPool, project: uuid::Uuid) -> R
         .fetch_one(pool)
         .await?)
 }
+
+/// How long one call to the listener while letting go may take: a
+/// teardown can call out to a provider, so this is generous; one that
+/// runs past it is tried again on the next pass.
+const LET_GO_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How many signals are let go of at once.
+const LET_GO_AT_ONCE: usize = 16;
+
+/// Have the listener let go of `signals`, whose activations took no work
+/// when the caller looked (a hibernation past its grace window), each
+/// answered once its teardown is over ([`ListenerClient::unregister_replaced`],
+/// which also passes a row no listener can ever read). Then any of them
+/// listening by now (a reactivation landed meanwhile, and its own bring-up
+/// may have been undone by the teardown) is torn down and brought up again
+/// whole (what fails there is logged with its recovery, never stopping the
+/// others). Answers the tokens the listener did not let go of, for the
+/// caller to try again; fails only when the look after could not be made.
+pub async fn let_go_of_stopped(
+    pool: &sqlx::PgPool,
+    listener: &ListenerClient,
+    signals: &[crate::journal::SignalRegistration],
+) -> Result<Vec<String>> {
+    use futures::StreamExt;
+    if signals.is_empty() {
+        return Ok(Vec::new());
+    }
+    let kept: Vec<String> = futures::stream::iter(signals.iter().cloned())
+        .map(|sig| {
+            let listener = listener.clone();
+            async move {
+                match tokio::time::timeout(LET_GO_WAIT, listener.unregister_replaced(&sig)).await {
+                    Ok(Ok(_)) => None,
+                    Ok(Err(e)) => {
+                        tracing::warn!(target: "weft_dispatcher::listener", token = %sig.token, error = %format!("{e:#}"), "the listener did not let go of a signal; tried again later");
+                        Some(sig.token.clone())
+                    }
+                    Err(_) => {
+                        tracing::warn!(target: "weft_dispatcher::listener", token = %sig.token, "the listener did not answer in time when told to let go of a signal; tried again later");
+                        Some(sig.token.clone())
+                    }
+                }
+            }
+        })
+        .buffer_unordered(LET_GO_AT_ONCE)
+        .filter_map(|kept| async move { kept })
+        .collect()
+        .await;
+    let tokens: Vec<&str> = signals.iter().map(|s| s.token.as_str()).collect();
+    let listening: Vec<(String, uuid::Uuid)> = sqlx::query_as(&format!(
+        "SELECT s.token, s.project_id FROM signal s {} WHERE s.token = ANY($1) AND {}",
+        weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
+        weft_broker_client::protocol::ACTIVATION_LISTENS,
+    ))
+    .bind(&tokens)
+    .fetch_all(pool)
+    .await?;
+    // Every one of them is brought up, whatever happens to another: one
+    // left torn down would read as listening with nothing behind it, and
+    // nothing would look at it again.
+    let mut projects = std::collections::BTreeSet::new();
+    let mut failed = Vec::new();
+    for (token, project) in &listening {
+        if let Some(sig) = signals.iter().find(|s| &s.token == token) {
+            match tokio::time::timeout(LET_GO_WAIT, listener.unregister_replaced(sig)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => failed.push(format!("{token}: {e:#}")),
+                Err(_) => failed.push(format!("{token}: no answer within {}s", LET_GO_WAIT.as_secs())),
+            }
+        }
+        projects.insert(*project);
+    }
+    for project in projects {
+        match tokio::time::timeout(LET_GO_WAIT, listener.rehydrate(project, &[])).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => failed.push(format!("project {project}: {e:#}")),
+            Err(_) => failed.push(format!("project {project}: no answer within {}s", LET_GO_WAIT.as_secs())),
+        }
+    }
+    if !failed.is_empty() {
+        tracing::error!(
+            target: "weft_dispatcher::listener",
+            failed = %failed.join("; "),
+            "signals switched back on while being let go of could not all be brought up again; `weft activate` on their project brings them up"
+        );
+    }
+    Ok(kept)
+}

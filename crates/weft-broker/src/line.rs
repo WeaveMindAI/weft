@@ -27,7 +27,7 @@ use axum::Router;
 use tokio::sync::mpsc;
 
 use weft_broker_client::line::server::{self, Follower};
-use weft_broker_client::line::{Notice, ACCESS_CHANNEL, INFRA_STATUS_CHANNEL, LINE_PATH};
+use weft_broker_client::line::{Notice, ACCESS_CHANNEL, CANCEL_CHANNEL, INFRA_STATUS_CHANNEL, LINE_PATH};
 use weft_platform_traits::identity::Principal;
 use weft_task_store::pg_signal::{Heard, PgSignalWatch};
 
@@ -103,11 +103,13 @@ fn follower(fanout: Arc<LineFanout>, principal: Principal) -> Follower {
 /// Who a notification on `channel` is for, by its `payload`: an infra
 /// copy's change is its project's; a connection's is its project's, or its
 /// tenant's when it is shared across the tenant's projects
-/// (`tenant:<tenant>`). Every other channel is for nobody on a line.
-// SYNC: the channels and payloads <-> weft_broker_client::line::LINE_CHANNELS, crates/weft-dispatcher/src/infra_node.rs (infra_node_status_notify), crates/weft-dispatcher/src/project_store.rs (project_declared_infra_notify), crates/weft-access-store/src/lib.rs (access_notify), crates/weft-broker/src/caller_auth.rs (names), crates/weft-dispatcher/src/held.rs (access_changed)
+/// (`tenant:<tenant>`); a cancel is its run's project's
+/// (`<project> <execution>`). Every other channel is for nobody on a line.
+// SYNC: the channels and payloads <-> weft_broker_client::line::LINE_CHANNELS, crates/weft-dispatcher/src/infra_node.rs (infra_node_status_notify), crates/weft-dispatcher/src/project_store.rs (project_declared_infra_notify), crates/weft-access-store/src/lib.rs (access_notify), crates/weft-task-store/src/tasks.rs (task_ready_notify, cancel_payload), crates/weft-broker/src/caller_auth.rs (names), crates/weft-dispatcher/src/held.rs (access_changed)
 fn audience<'a>(channel: &str, payload: &'a str) -> Option<Audience<'a>> {
     match channel {
         INFRA_STATUS_CHANNEL => Some(Audience::Project(payload)),
+        CANCEL_CHANNEL => payload.split_once(' ').map(|(project, _)| Audience::Project(project)),
         ACCESS_CHANNEL => Some(match payload.strip_prefix("tenant:") {
             Some(tenant) => Audience::Tenant(tenant),
             None => Audience::Project(payload),
@@ -345,6 +347,80 @@ mod tests {
         assert_eq!(counted.load(Ordering::SeqCst), 1, "only the call still waited on reached the broker");
     }
 
+    /// A call whose caller stopped waiting stops at the broker too: a held
+    /// wait goes on for nobody no longer.
+    #[tokio::test]
+    async fn a_call_its_caller_gave_up_on_stops_at_the_broker() {
+        struct Stopped(StdArc<tokio::sync::Notify>);
+        impl Drop for Stopped {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        let stopped = StdArc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let api = api(StdArc::default()).route(
+            "/v1/forever",
+            post({
+                let stopped = stopped.clone();
+                move || {
+                    let guard = Stopped(stopped.clone());
+                    async move {
+                        let _guard = guard;
+                        std::future::pending::<&'static str>().await
+                    }
+                }
+            }),
+        );
+        let _server = serve(listener, server::with_line(api)).await;
+        let link = link(address);
+        let wait = CallWait { to_send: Duration::from_secs(10), to_answer: Duration::from_millis(300) };
+        let gave_up = link.call("/v1/forever", Vec::new(), wait).await.unwrap_err();
+        assert!(format!("{gave_up:#}").contains("did not answer"), "{gave_up:#}");
+        tokio::time::timeout(Duration::from_secs(10), stopped.notified()).await.expect("the broker stopped the call");
+        let answer = link.call("/v1/echo", b"still".to_vec(), CallWait::within(Duration::from_secs(10))).await.unwrap();
+        assert!(String::from_utf8(answer.body).unwrap().starts_with("still|"), "the line stays usable");
+    }
+
+    /// A line with nothing to do closes, so the broker holds no request for
+    /// it, and opens again for the next call; one held open stays open.
+    #[tokio::test]
+    async fn an_idle_line_closes_and_opens_again_for_the_next_call() {
+        use axum::extract::ws::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (opened_tx, mut opened) = mpsc::unbounded_channel::<()>();
+        let (closed_tx, mut closed) = mpsc::unbounded_channel::<()>();
+        let app = Router::new().route(
+            LINE_PATH,
+            get(move |ws: WebSocketUpgrade| {
+                let (opened, closed) = (opened_tx.clone(), closed_tx.clone());
+                async move {
+                    ws.on_upgrade(move |mut socket| async move {
+                        let _ = opened.send(());
+                        while let Some(Ok(message)) = socket.recv().await {
+                            if matches!(message, Message::Close(_)) {
+                                break;
+                            }
+                        }
+                        let _ = closed.send(());
+                    })
+                }
+            }),
+        );
+        let _server = serve(listener, app).await;
+        let link = link(address).closing_when_idle_after(Duration::from_millis(300));
+        let held = link.stay_open();
+        tokio::time::timeout(Duration::from_secs(10), opened.recv()).await.expect("held open, the line opened").unwrap();
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(closed.try_recv().is_err(), "a line held open stays open");
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(10), closed.recv()).await.expect("with nothing to do, it closed").unwrap();
+        let _woken = link.stay_open();
+        tokio::time::timeout(Duration::from_secs(10), opened.recv()).await.expect("asked for again, it opened").unwrap();
+    }
+
     /// A process that lets go of its last link closes its line: nothing
     /// stays open at the broker for a link nobody holds.
     #[tokio::test]
@@ -426,6 +502,8 @@ mod tests {
         assert_eq!(audience(INFRA_STATUS_CHANNEL, &project), Some(Audience::Project(&project)));
         assert_eq!(audience(ACCESS_CHANNEL, &project), Some(Audience::Project(&project)));
         assert_eq!(audience(ACCESS_CHANNEL, "tenant:t"), Some(Audience::Tenant("t")));
+        let cancel = format!("{project} e-1");
+        assert_eq!(audience(CANCEL_CHANNEL, &cancel), Some(Audience::Project(&project)));
         assert_eq!(audience("weft_task_ready", "worker:x"), None);
     }
 

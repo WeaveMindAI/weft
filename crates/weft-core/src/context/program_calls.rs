@@ -25,7 +25,7 @@ use crate::instance::InstanceId;
 use crate::infra::{InfraNodeStatus, TerminateDisks};
 use crate::instance_door::ValuesChanged;
 use crate::program::{
-    CleanOutcome, ConnectionsForgotten, CostFilter, CostRecord, ExecutionPage, InfraCopy, InfraStartAnswer, InstanceHoldings,
+    CleanOutcome, ConnectionsForgotten, CostFilter, CostRecord, ExecutionPage, InfraCopy, InfraDownAnswer, InfraStartAnswer, InstanceHoldings,
     MintedInstanceToken, PaidBy, ProgramCall, RunFilter, RunsCounted, TokensRevoked, MAX_RUNS_PAGE,
 };
 use crate::running_policy::{DeactivateSpec, RunningPolicy};
@@ -207,29 +207,31 @@ impl InfraCalls<'_> {
 
     /// Scale the copy down, keeping its disk. `spec` says what happens to
     /// the triggers reading it and the runs using it; `stop_self` whether
-    /// this run goes too when it uses the copy.
-    pub async fn stop(self, spec: DeactivateSpec, stop_self: StopSelf) -> WeftResult<()> {
+    /// this run goes too when it uses the copy. Answers whether there was
+    /// a copy to take down ([`InfraDownAnswer`]), so a program can tell an
+    /// instance with no copy (a mistyped id, one terminated before) apart.
+    pub async fn stop(self, spec: DeactivateSpec, stop_self: StopSelf) -> WeftResult<InfraDownAnswer> {
         let call = ProgramCall::InfraStop { node: self.node, instance: instance_id(&self.instance)?, spec };
-        self.ctx.program_call::<Value>(call, stop_self).await.map(drop)
+        self.ctx.program_call(call, stop_self).await
     }
 
     /// Delete the copy and its disks, keeping the ones its node lists in
     /// `keepOnTerminate` (a later start of the same copy finds them
     /// again). Same `spec` and `stop_self` as [`Self::stop`].
-    pub async fn terminate(self, spec: DeactivateSpec, stop_self: StopSelf) -> WeftResult<()> {
+    pub async fn terminate(self, spec: DeactivateSpec, stop_self: StopSelf) -> WeftResult<InfraDownAnswer> {
         self.take_away(spec, stop_self, TerminateDisks::KeepListed).await
     }
 
     /// Delete the copy and every one of its disks, the ones listed in
     /// `keepOnTerminate` too: the copy's owner is going for good (a
     /// instance being wiped). Same `spec` and `stop_self` as [`Self::stop`].
-    pub async fn wipe(self, spec: DeactivateSpec, stop_self: StopSelf) -> WeftResult<()> {
+    pub async fn wipe(self, spec: DeactivateSpec, stop_self: StopSelf) -> WeftResult<InfraDownAnswer> {
         self.take_away(spec, stop_self, TerminateDisks::DeleteAll).await
     }
 
-    async fn take_away(self, spec: DeactivateSpec, stop_self: StopSelf, disks: TerminateDisks) -> WeftResult<()> {
+    async fn take_away(self, spec: DeactivateSpec, stop_self: StopSelf, disks: TerminateDisks) -> WeftResult<InfraDownAnswer> {
         let call = ProgramCall::InfraTerminate { node: self.node, instance: instance_id(&self.instance)?, spec, disks };
-        self.ctx.program_call::<Value>(call, stop_self).await.map(drop)
+        self.ctx.program_call(call, stop_self).await
     }
 
     /// The copy's state now, or `None` when it was never started (or was

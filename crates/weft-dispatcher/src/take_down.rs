@@ -24,6 +24,7 @@ use weft_core::running_policy::{DeactivateSpec, DeactivationMode, RunningPolicy}
 use weft_core::ExecutionId;
 
 use crate::activation_store::{ActivationLifecycle, LifecycleWrite, ProjectStatus, SignalsGoing};
+pub use weft_broker_client::activation::{DownWith, WentDown};
 use crate::events::DispatcherEvent;
 use crate::state::DispatcherState;
 
@@ -88,13 +89,13 @@ pub fn runs_using_copies<'a>(
 }
 
 /// The lifecycle a spec lands its activations at, before any drain.
-pub fn landing_lifecycle(spec: &DeactivateSpec, now_unix: i64, by_health: bool) -> ActivationLifecycle {
+pub fn landing_lifecycle(spec: &DeactivateSpec, now_unix: i64, went_down: Option<WentDown>) -> ActivationLifecycle {
     let target = match spec.mode {
         DeactivationMode::Wipe => ActivationLifecycle::wiped(),
         DeactivationMode::Hibernate => ActivationLifecycle::hibernating(now_unix + (spec.grace_minutes as i64) * 60),
         DeactivationMode::Park => ActivationLifecycle::parked(),
     };
-    let target = ActivationLifecycle { deactivated_by_health: by_health, ..target };
+    let target = ActivationLifecycle { went_down, ..target };
     if spec.drains() {
         let cap = spec.drain_timeout_secs.unwrap_or(weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS);
         ActivationLifecycle::deactivating_to(target, now_unix + cap as i64)
@@ -139,8 +140,8 @@ pub(crate) async fn live_runs(state: &DispatcherState, project_id: uuid::Uuid) -
 /// left half done: refuse a target that is mid-activation (cancel that
 /// first) or a project mid-build; then wipe drops what the target's
 /// activations had registered and cancels every run it reaches, while
-/// hibernate and park keep the rows and take the listeners' copies away
-/// (reactivating restores them from the rows); `cancel` stops what is
+/// hibernate and park keep the rows and the listeners keep holding them
+/// (what they hear waits for the trigger: `crate::arrival`); `cancel` stops what is
 /// running now (a parked run survives hibernate and park), `wait` leaves
 /// it to finish and lands the activations once it has (the reaper cancels
 /// what is left at the cap). The lifecycle write comes before any of
@@ -150,7 +151,7 @@ pub async fn take_down(
     project_id: uuid::Uuid,
     target: &TakeDownTarget,
     spec: &DeactivateSpec,
-    by_health: bool,
+    went_down_with: Option<DownWith>,
     asked_by: Option<ExecutionId>,
 ) -> Result<bool, (StatusCode, String)> {
     spec.validate().map_err(|m| (StatusCode::BAD_REQUEST, m.to_string()))?;
@@ -182,10 +183,22 @@ pub async fn take_down(
     // instance's wiped row goes) and their signals leave together: a
     // failure after it leaves nothing registered for a row that is gone,
     // and the cancels below are safe to repeat. A park or a hibernate
-    // keeps the rows (the parking gate needs them) and reads them in that
-    // transaction: a reactivation landing right after registers fresh
-    // signals this cleanup never sees.
-    let landing = landing_lifecycle(spec, crate::lease::now_unix(), by_health);
+    // keeps the rows, and the listeners keep holding them: what they hear
+    // waits for the trigger to be back on (`crate::arrival`).
+    // When it went down is the database's moment, the clock an infra
+    // copy's apply is stamped with, which is what it is compared with
+    // (`crate::api::infra::bring_back_triggers_whose_infra_returned`).
+    let went_down = match went_down_with {
+        None => None,
+        Some(with) => {
+            let at_unix: i64 = sqlx::query_scalar("SELECT EXTRACT(EPOCH FROM NOW())::BIGINT")
+                .fetch_one(&state.pg_pool)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read the database's clock: {e}")))?;
+            Some(WentDown { with, at_unix })
+        }
+    };
+    let landing = landing_lifecycle(spec, crate::lease::now_unix(), went_down);
     let signals = match (spec.mode, target) {
         (DeactivationMode::Wipe, TakeDownTarget::WholeProject) => SignalsGoing::Project { except: asked_by },
         (DeactivationMode::Wipe, TakeDownTarget::Activations(_)) => SignalsGoing::Activations,
@@ -203,8 +216,8 @@ pub async fn take_down(
             return Err((StatusCode::CONFLICT, format!("cannot deactivate: {blocker}; cancel it first")));
         }
     };
-    // Take the listeners' copies away; a reactivation restores the
-    // kept ones. A retry reads the kept rows again and repeats this.
+    // Take the listeners' copies of the wiped signals away. A retry finds
+    // the rows already gone and repeats nothing.
     if !unlisten.is_empty() {
         state.listener.unregister_many(&unlisten).await;
     }
@@ -357,14 +370,18 @@ mod tests {
             running_policy: RunningPolicy::Wait,
             drain_timeout_secs: Some(30),
         };
-        let landing = landing_lifecycle(&spec, 100, false);
+        let landing = landing_lifecycle(&spec, 100, None);
         assert_eq!(landing.status, ProjectStatus::Deactivating);
         assert_eq!(landing.drain_deadline_unix, Some(130));
         assert_eq!(landing.mode().as_str(), "deactivating");
         let spec = DeactivateSpec { running_policy: RunningPolicy::Cancel, ..spec };
-        assert_eq!(landing_lifecycle(&spec, 100, true).mode().as_str(), "park");
-        assert!(landing_lifecycle(&spec, 100, true).deactivated_by_health);
+        let health = WentDown { with: DownWith::Health, at_unix: 90 };
+        assert_eq!(landing_lifecycle(&spec, 100, Some(health)).mode().as_str(), "park");
+        assert_eq!(
+            landing_lifecycle(&spec, 100, Some(WentDown { with: DownWith::Infra, at_unix: 90 })).went_down,
+            Some(WentDown { with: DownWith::Infra, at_unix: 90 })
+        );
         let hibernate = DeactivateSpec { mode: DeactivationMode::Hibernate, ..spec };
-        assert_eq!(landing_lifecycle(&hibernate, 100, false).fires_deadline_unix, Some(100 + 15 * 60));
+        assert_eq!(landing_lifecycle(&hibernate, 100, None).fires_deadline_unix, Some(100 + 15 * 60));
     }
 }

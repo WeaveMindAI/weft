@@ -55,7 +55,7 @@ pub async fn journal_record(
         .await
         .map_err(|e| match e {
             weft_journal::RecordError::MixedExecutions { .. } => (StatusCode::BAD_REQUEST, e.to_string()),
-            other => internal(other),
+            other => unavailable_or_internal(other.into()),
         })?;
     if written == 0 {
         require_owner(&state, &caller, execution_id, &req.replica).await?;
@@ -171,13 +171,14 @@ async fn require_owner(
     execution_id: weft_core::ExecutionId,
     claimed_replica: &str,
 ) -> Result<(), (StatusCode, String)> {
+    // SYNC: execution.owner_replica <-> weft_bind_execution_id_owner, bind_execution_id_owner (crates/weft-task-store/src/tasks.rs)
     let owner: Option<(Option<String>,)> = sqlx::query_as(
         "SELECT owner_replica FROM execution WHERE execution_id = $1",
     )
     .bind(execution_id.to_string())
     .fetch_optional(&state.pool)
     .await
-    .map_err(internal)?;
+    .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("execution owner lookup")))?;
     let owner_replica = owner.and_then(|(p,)| p).ok_or((
         StatusCode::FORBIDDEN,
         "execution has no owning replica yet; worker may not act on it".into(),
@@ -231,6 +232,7 @@ pub async fn execution_tag(
         .await
         .map_err(internal)?;
     tx.commit().await.map_err(internal)?;
+    weft_task_store::announce::committed(&state.pool);
     Ok(Json(ExecutionTagResponse {}))
 }
 
@@ -652,7 +654,7 @@ pub async fn task_claim_execution(
         state.tasks.claim_execution(&req.replica, req.project_id, &req.execution_id),
         scope::warm_execution_id_scope(&state.scope_cache, &state.pool, &req.execution_id),
     );
-    let claimed = claimed.map_err(internal)?;
+    let claimed = claimed.map_err(unavailable_or_internal)?;
     // Latest-claim-wins execution ownership is bound IN the claim's own
     // transaction by the `task_claim_binds_execution_id_owner` DB trigger:
     // claiming an execution-bearing task atomically stamps
@@ -707,7 +709,7 @@ pub async fn task_complete(
         .tasks
         .complete(req.task_id, &req.replica, req.result)
         .await
-        .map_err(internal)?;
+        .map_err(unavailable_or_internal)?;
     Ok(Json(TaskCompleteResponse {}))
 }
 
@@ -723,21 +725,22 @@ pub async fn task_fail(
         .tasks
         .fail(req.task_id, &req.replica, req.error)
         .await
-        .map_err(internal)?;
+        .map_err(unavailable_or_internal)?;
     Ok(Json(TaskFailResponse {}))
 }
 
-pub async fn task_wait_cancels(
+pub async fn task_cancels_asked(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<TaskWaitCancelsRequest>,
-) -> Resp<TaskWaitCancelsResponse> {
+    Json(req): Json<TaskCancelsAskedRequest>,
+) -> Resp<TaskCancelsAskedResponse> {
     require_worker(&caller)?;
     scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id).await?;
-    // Only the executions the calling replica drives: a cancel is taken as it
-    // is answered, so a worker waiting on an execution it does not own would
-    // swallow a cancel meant for the one that does.
+    // Only the executions the calling replica drives. One it asks about and
+    // no longer drives (its claim moved to another worker, or its drive is
+    // ending) is answered nothing, without failing the ask for the others.
     let replica = caller.replica.as_deref().ok_or((StatusCode::FORBIDDEN, "a worker names its replica".into()))?;
+    // SYNC: execution.owner_replica <-> weft_bind_execution_id_owner, bind_execution_id_owner (crates/weft-task-store/src/tasks.rs)
     let owned: Vec<String> = sqlx::query_scalar(
         "SELECT execution_id FROM execution WHERE execution_id = ANY($1) AND project_id = $2 AND owner_replica = $3",
     )
@@ -747,11 +750,8 @@ pub async fn task_wait_cancels(
     .fetch_all(&state.pool)
     .await
     .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("owned executions")))?;
-    if owned.len() != req.execution_ids.len() {
-        return Err((StatusCode::FORBIDDEN, "a worker waits only on the executions it drives".into()));
-    }
-    let cancels = state.tasks.wait_cancels(req.project_id, owned, held(req.wait_ms)).await.map_err(internal)?;
-    Ok(Json(TaskWaitCancelsResponse { cancels }))
+    let cancels = state.tasks.cancels_asked(req.project_id, owned).await.map_err(internal)?;
+    Ok(Json(TaskCancelsAskedResponse { cancels }))
 }
 
 // ---------- Infra ----------
@@ -844,6 +844,26 @@ fn require_declared_infra(
             if instance_copy { " once per instance" } else { " with one shared copy" },
         ),
     ))
+}
+
+/// A machine running `project_id`'s infra says how its units stand
+/// changed: announce it, which wakes a supervisor that scales to zero to
+/// look at the project's health (`lifecycle_command::LOOK_WAKE`). The
+/// machine runs as its project's own account, so a project asks only
+/// about itself; weft's own roles may ask about any.
+pub async fn infra_look(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<InfraLookRequest>,
+) -> Resp<InfraLookResponse> {
+    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id).await?;
+    sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(weft_broker_client::lifecycle_command::INFRA_COMMAND_CHANNEL)
+        .bind(weft_broker_client::lifecycle_command::look_payload(req.project_id))
+        .execute(&state.pool)
+        .await
+        .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("announce the look")))?;
+    Ok(Json(InfraLookResponse {}))
 }
 
 pub async fn infra_endpoint_url(
@@ -2439,7 +2459,7 @@ async fn require_task_owned_by(
     .bind(task_id)
     .fetch_optional(&state.pool)
     .await
-    .map_err(|e| internal(anyhow::anyhow!("{e}")))?;
+    .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("task owner lookup")))?;
     let owner = row.and_then(|(t,)| t).ok_or((
         StatusCode::NOT_FOUND,
         format!("unknown task {task_id}"),
@@ -2473,16 +2493,29 @@ pub(crate) fn internal<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
 
 /// A failed database call, as a caller that can wait must tell it
 /// apart: 503 when the database could not be reached right now (asking
-/// again will work once it can), 500 for anything else (a row that does
-/// not decode fails the same way every time). The worker's journal
-/// client waits out a 503 and fails the run on a 500.
-// SYNC: 503 = ask again <-> crates/weft-broker-client/src/client.rs broker_unavailable
+/// again will work once it can), with [`NOT_DONE`] when no connection
+/// could even be had, so nothing ran and a write may be sent again; 500
+/// for anything else (a row that does not decode fails the same way every
+/// time). The worker's journal client sends a write again on a 503 that
+/// did nothing, waits out any 503 on a read, and fails the run otherwise.
+// SYNC: 503 = ask again <-> crates/weft-broker-client/src/client.rs broker_unavailable, did_nothing
 pub(crate) fn unavailable_or_internal(e: anyhow::Error) -> (StatusCode, String) {
-    if e.chain().filter_map(|cause| cause.downcast_ref::<sqlx::Error>()).any(database_unreachable) {
+    let causes = || e.chain().filter_map(|cause| cause.downcast_ref::<sqlx::Error>());
+    if causes().any(no_connection) {
+        tracing::warn!(target: "weft_broker", "no connection to the database could be had: {e:#}");
+        return (StatusCode::SERVICE_UNAVAILABLE, NOT_DONE.into());
+    }
+    if causes().any(database_unreachable) {
         tracing::warn!(target: "weft_broker", "could not reach the database: {e:#}");
         return (StatusCode::SERVICE_UNAVAILABLE, "the database is unavailable; ask again".into());
     }
     internal(e)
+}
+
+/// Whether a database error means no connection could be had for the
+/// call, so not one of its statements ran.
+fn no_connection(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed)
 }
 
 /// Whether a database error means the server could not be reached or

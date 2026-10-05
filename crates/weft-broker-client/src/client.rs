@@ -189,6 +189,17 @@ fn never_sent(e: &anyhow::Error) -> bool {
     e.chain().any(|cause| matches!(cause.downcast_ref::<LineError>(), Some(LineError::NotSent { .. })))
 }
 
+/// Whether the broker answered that the call did nothing at all
+/// ([`NOT_DONE`]), so sending it again repeats nothing.
+// SYNC: NOT_DONE <-> crates/weft-broker/src/handlers.rs unavailable_or_internal
+fn did_nothing(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<BrokerRefused>()
+            .is_some_and(|refused| refused.status == reqwest::StatusCode::SERVICE_UNAVAILABLE && refused.body == NOT_DONE)
+    })
+}
+
 /// The first wait before asking again after the broker could not answer
 /// a read; each further failure doubles it, up to
 /// [`READ_RETRY_LONGEST`].
@@ -240,6 +251,38 @@ where
     }
 }
 
+/// How long a call the broker answered [`NOT_DONE`] is sent again for, at
+/// first and at most between tries, and in all: the broker's database
+/// connections were all busy, which passes in moments, and one busy this
+/// long is a broker in trouble the caller hears about.
+const NOT_DONE_FIRST: Duration = Duration::from_millis(50);
+const NOT_DONE_LONGEST: Duration = Duration::from_secs(2);
+const NOT_DONE_FOR: Duration = Duration::from_secs(20);
+
+/// Make a call, and send it again for as long as the broker answers that it
+/// did nothing ([`did_nothing`]), within [`NOT_DONE_FOR`]: a claim or a
+/// task's end the broker could not even start is safe to send again, and
+/// failing it instead would fail a caller's run, or leave a finished task
+/// claimed until its lease runs out and it runs again.
+async fn until_done<T, F, Fut>(path: &str, mut call: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let started = tokio::time::Instant::now();
+    let mut wait = NOT_DONE_FIRST;
+    loop {
+        match call().await {
+            Err(e) if did_nothing(&e) && started.elapsed() < NOT_DONE_FOR => {
+                tracing::warn!(target: "weft_broker_client", path, retry_in_ms = wait.as_millis() as u64, "the broker did nothing with a call (its database connections were busy); sending it again");
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(NOT_DONE_LONGEST);
+            }
+            answer => return answer,
+        }
+    }
+}
+
 // ---------- Journal ----------
 
 pub struct BrokerJournalClient {
@@ -260,7 +303,7 @@ impl JournalClient for BrokerJournalClient {
     }
 
     fn never_reached(&self, error: &anyhow::Error) -> bool {
-        never_sent(error)
+        never_sent(error) || did_nothing(error)
     }
 
     async fn record_event(
@@ -386,7 +429,8 @@ impl TaskStoreClient for BrokerTaskStoreClient {
 
     async fn claim_execution(&self, replica: &str, project_id: Uuid, execution_id: &str) -> Result<Option<ClaimedExecution>> {
         let req = TaskClaimExecutionRequest { replica: replica.to_string(), project_id, execution_id: execution_id.to_string() };
-        let resp: TaskClaimExecutionResponse = self.http.post("/v1/task/claim_execution", &req).await?;
+        let path = "/v1/task/claim_execution";
+        let resp: TaskClaimExecutionResponse = until_done(path, || self.http.post(path, &req)).await?;
         Ok(resp.claimed)
     }
 
@@ -414,7 +458,8 @@ impl TaskStoreClient for BrokerTaskStoreClient {
             replica: replica.to_string(),
             result,
         };
-        let _: TaskCompleteResponse = self.http.post("/v1/task/complete", &req).await?;
+        let path = "/v1/task/complete";
+        let _: TaskCompleteResponse = until_done(path, || self.http.post(path, &req)).await?;
         Ok(())
     }
 
@@ -424,23 +469,15 @@ impl TaskStoreClient for BrokerTaskStoreClient {
             replica: replica.to_string(),
             error,
         };
-        let _: TaskFailResponse = self.http.post("/v1/task/fail", &req).await?;
+        let path = "/v1/task/fail";
+        let _: TaskFailResponse = until_done(path, || self.http.post(path, &req)).await?;
         Ok(())
     }
 
-    async fn wait_cancels(&self, project_id: Uuid, execution_ids: Vec<String>, wait: Duration) -> Result<Vec<CancelAsked>> {
-        held(
-            wait,
-            |hold| {
-                let req = TaskWaitCancelsRequest { project_id, execution_ids: execution_ids.clone(), wait_ms: hold.as_millis() as u64 };
-                async move {
-                    let resp: TaskWaitCancelsResponse = self.http.post_held("/v1/task/wait_cancels", &req, hold).await?;
-                    Ok(resp.cancels)
-                }
-            },
-            |cancels: &Vec<CancelAsked>| !cancels.is_empty(),
-        )
-        .await
+    async fn cancels_asked(&self, project_id: Uuid, execution_ids: Vec<String>) -> Result<Vec<CancelAsked>> {
+        let req = TaskCancelsAskedRequest { project_id, execution_ids };
+        let resp: TaskCancelsAskedResponse = self.http.post("/v1/task/cancels_asked", &req).await?;
+        Ok(resp.cancels)
     }
 }
 
@@ -549,6 +586,13 @@ pub struct BrokerInfraClient {
 impl BrokerInfraClient {
     pub fn new(link: BrokerLink) -> Arc<Self> {
         Arc::new(Self { http: HttpCore::new(link) })
+    }
+
+    /// Ask for `project`'s infra health to be looked at now: what a machine
+    /// running its infra says when how its units stand changed.
+    pub async fn ask_for_a_look(&self, project: Uuid) -> Result<()> {
+        let _: InfraLookResponse = self.http.post("/v1/infra/look", &InfraLookRequest { project_id: project }).await?;
+        Ok(())
     }
 }
 
@@ -1171,6 +1215,41 @@ mod read_retry_tests {
         .unwrap();
         assert_eq!(answer, 7);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    /// Only the broker's own "nothing was done" makes a write safe to send
+    /// again: any other 503 may have half happened.
+    #[test]
+    fn only_nothing_done_is_safe_to_send_again() {
+        let not_done: anyhow::Error =
+            BrokerRefused { path: "/v1/task/complete".into(), status: reqwest::StatusCode::SERVICE_UNAVAILABLE, body: NOT_DONE.into() }.into();
+        assert!(did_nothing(&not_done));
+        assert!(!did_nothing(&refused(reqwest::StatusCode::SERVICE_UNAVAILABLE)));
+        assert!(!did_nothing(&refused(reqwest::StatusCode::INTERNAL_SERVER_ERROR)));
+    }
+
+    /// A call the broker did nothing with is sent again until it is done;
+    /// one that failed otherwise is not.
+    #[tokio::test(start_paused = true)]
+    async fn a_call_that_did_nothing_is_sent_again() {
+        let calls = AtomicU32::new(0);
+        let answer = until_done("/v1/task/complete", || async {
+            match calls.fetch_add(1, Ordering::SeqCst) {
+                0 | 1 => Err(BrokerRefused { path: "/v1/task/complete".into(), status: reqwest::StatusCode::SERVICE_UNAVAILABLE, body: NOT_DONE.into() }.into()),
+                _ => Ok(7),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!((answer, calls.load(Ordering::SeqCst)), (7, 3));
+        let calls = AtomicU32::new(0);
+        let failed: Result<u32> = until_done("/v1/task/complete", || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(refused(reqwest::StatusCode::SERVICE_UNAVAILABLE))
+        })
+        .await;
+        assert!(failed.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a 503 that may have half happened is not sent again");
     }
 
     /// A refusal would say the same thing again: it fails at once.

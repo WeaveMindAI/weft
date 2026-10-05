@@ -652,6 +652,17 @@ pub struct ListExecutionsParams {
     pub instance: Option<weft_core::instance::InstanceId>,
     /// Only runs carrying this tag.
     pub tag: Option<String>,
+    /// Only runs in which this node fired.
+    pub node: Option<String>,
+    /// Only finished runs whose recorded values carry every word of this
+    /// (`crate::run_search`).
+    pub search: Option<String>,
+    /// The page after the run that started at `before_started` with id
+    /// `before_execution` (the last run of the page before): a walk that
+    /// hands each page's last run back here reaches every run once,
+    /// whatever starts or ends meanwhile, which `offset` cannot promise.
+    pub before_started: Option<u64>,
+    pub before_execution: Option<ExecutionId>,
 }
 
 const DEFAULT_PAGE: u32 = 50;
@@ -662,6 +673,11 @@ pub async fn list_executions(
     caller: CallerTenant,
     Query(params): Query<ListExecutionsParams>,
 ) -> Result<Json<ExecutionPage>, StatusCode> {
+    let below = match (params.before_started, params.before_execution) {
+        (Some(started), Some(execution_id)) => Some((started, execution_id)),
+        (None, None) => None,
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
     let query = ExecutionQuery {
         limit: params.limit.unwrap_or(DEFAULT_PAGE).clamp(1, MAX_PAGE),
         offset: params.offset.unwrap_or(0),
@@ -673,7 +689,9 @@ pub async fn list_executions(
         status: params.status,
         instance: params.instance,
         tag: params.tag,
-        below: None,
+        node: params.node.filter(|n| !n.trim().is_empty()),
+        search: params.search.filter(|s| !s.trim().is_empty()),
+        below,
     };
     let mut page = state
         .journal
@@ -708,6 +726,8 @@ pub async fn latest_for_project(
         status: None,
         instance: None,
         tag: None,
+        node: None,
+        search: None,
         below: None,
     };
     let mut page = state
@@ -895,6 +915,8 @@ pub(crate) fn run_query(
         status: filter.status,
         instance: filter.instance.clone(),
         tag: filter.tag.clone(),
+        node: None,
+        search: None,
         below: None,
     }
 }

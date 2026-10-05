@@ -964,11 +964,10 @@ mod tests {
 
     #[async_trait::async_trait]
     impl weft_task_store::TaskStoreClient for RecordingTaskStore {
-        async fn wait_cancels(
+        async fn cancels_asked(
             &self,
             _project_id: uuid::Uuid,
             _execution_ids: Vec<String>,
-            _wait: std::time::Duration,
         ) -> anyhow::Result<Vec<weft_task_store::tasks::CancelAsked>> {
             Ok(Vec::new())
         }

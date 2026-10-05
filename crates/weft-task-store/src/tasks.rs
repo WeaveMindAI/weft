@@ -141,11 +141,32 @@ pub struct ClaimedExecution {
 }
 
 /// The channel a task that has just become claimable (inserted pending,
-/// or put back to pending by a requeue or a reclaim) notifies on, from
-/// the `task_ready_notify` trigger in [`GROUP`]. A lease that merely
-/// expires announces nothing: a waiter's own deadline is what rescues
-/// it.
+/// or put back to pending by a requeue or a reclaim) is announced on, from
+/// the `task_ready_notify` trigger in [`GROUP`] (through
+/// `crate::announce`). A lease that merely expires announces nothing: a
+/// waiter's own deadline is what rescues it. A cancel is announced on
+/// [`CANCEL_CHANNEL`] instead: only the worker driving its run cares.
+// SYNC: TASK_READY_CHANNEL <-> 'weft_task_ready' in the `task_ready_notify` function in GROUP
 pub const TASK_READY_CHANNEL: &str = "weft_task_ready";
+
+/// The channel a cancel for a running execution is announced on, with
+/// `<project id> <execution id>` ([`cancel_payload`]): the broker pushes
+/// it down the lines of the project's workers, and the one driving the
+/// execution asks for it ([`cancels_asked`]).
+// SYNC: CANCEL_CHANNEL <-> weft_broker_client::line::LINE_CHANNELS, crates/weft-broker/src/line.rs (audience), 'weft_cancel' in the `task_ready_notify` function in GROUP
+pub const CANCEL_CHANNEL: &str = "weft_cancel";
+
+/// A [`CANCEL_CHANNEL`] payload.
+// SYNC: cancel_payload <-> the `task_ready_notify` function in `GROUP`, parse_cancel_payload
+pub fn cancel_payload(project_id: Uuid, execution_id: &str) -> String {
+    format!("{project_id} {execution_id}")
+}
+
+/// The project and execution a [`CANCEL_CHANNEL`] payload names.
+pub fn parse_cancel_payload(payload: &str) -> Option<(Uuid, &str)> {
+    let (project, execution) = payload.split_once(' ')?;
+    Some((project.parse().ok()?, execution))
+}
 
 /// A [`TASK_READY_CHANNEL`] payload: `dispatcher` for a dispatcher task,
 /// `worker:<project_id>` for a worker one, since only that project's
@@ -282,16 +303,22 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             $$ LANGUAGE plpgsql"#,
         // Announce every task that has just become claimable, so the
         // pickers sleep until there is work instead of asking on a
-        // timer. From a trigger rather than from each writer, so no
-        // write path (an enqueue, a live admission, a requeue, the
-        // orphan reclaim) can forget it, and the notification goes out
-        // when the write commits.
-        // SYNC: task_ready_notify's payload <-> ready_payload above.
+        // timer, and a cancel to the workers of its project, so the one
+        // driving its run hears it. From a trigger rather than from each
+        // writer, so no write path (an enqueue, a live admission, a
+        // requeue, the orphan reclaim) can forget it; through the
+        // announcement outbox (`crate::announce`), since a task is
+        // written on every run.
+        // SYNC: task_ready_notify's channels and payloads <-> TASK_READY_CHANNEL, CANCEL_CHANNEL, ready_payload, cancel_payload above.
         r#"CREATE OR REPLACE FUNCTION task_ready_notify() RETURNS trigger AS $$
             BEGIN
-                PERFORM pg_notify('weft_task_ready',
-                    CASE WHEN NEW.target = 'dispatcher' THEN 'dispatcher'
-                         ELSE 'worker:' || COALESCE(NEW.project_id::text, '') END);
+                IF NEW.kind = 'cancel_execution' THEN
+                    PERFORM weft_announce('weft_cancel', COALESCE(NEW.project_id::text, '') || ' ' || COALESCE(NEW.execution_id, ''));
+                ELSE
+                    PERFORM weft_announce('weft_task_ready',
+                        CASE WHEN NEW.target = 'dispatcher' THEN 'dispatcher'
+                             ELSE 'worker:' || COALESCE(NEW.project_id::text, '') END);
+                END IF;
                 RETURN NULL;
             END;
             $$ LANGUAGE plpgsql"#,
@@ -330,8 +357,9 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
         // SYNC: execution.owner_replica has exactly two writers,
         // this trigger and `bind_execution_id_owner` below (the appointed-driver
         // path for processes that never claim a task); the readers are
-        // crates/weft-broker/src/handlers.rs journal_record and
-        // crates/weft-broker/src/auth.rs resolve_storage_caller.
+        // crates/weft-broker/src/handlers.rs (require_owner, task_cancels_asked),
+        // crates/weft-broker/src/auth.rs resolve_storage_caller, and
+        // weft_journal_append in crates/weft-dispatcher/src/journal/postgres.rs.
         r#"CREATE OR REPLACE FUNCTION weft_bind_execution_id_owner() RETURNS trigger AS $$
             BEGIN
                 IF NEW.execution_id IS NOT NULL AND NEW.claimed_by IS NOT NULL THEN
@@ -349,14 +377,13 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
         //     task UPDATE (complete, heartbeat-renew, requeue), so the
         //     hot path stamps ownership exactly once per claim; AND
         //   - tasks that actually DRIVE the execution: 'execute' and
-        //     'resume'. A side-channel task that merely carries an execution
-        //     (a 'cancel_execution' addressed to the owner) must NOT
-        //     restamp ownership: ownership follows the driver. (cancel is
-        //     pinned to the owner anyway, so even if it did fire the
-        //     stamp would be owner->owner, but scoping by kind makes a
-        //     future execution-bearing task kind unable to steal ownership by
+        //     'resume'. A task that merely carries an execution must NOT
+        //     restamp ownership: ownership follows the driver. (A
+        //     'cancel_execution' is never claimed, only read by the worker
+        //     driving its run, but scoping by kind makes any
+        //     execution-bearing task kind unable to steal ownership by
         //     accident, which is the property we want to hold by
-        //     construction, not by every caller remembering to pin.)
+        //     construction.)
         r#"CREATE TRIGGER task_claim_binds_execution_id_owner
             AFTER UPDATE OF claimed_by ON task
             FOR EACH ROW
@@ -392,6 +419,7 @@ pub async fn enqueue(pool: &PgPool, spec: NewTask) -> Result<Uuid> {
     .bind(now)
     .execute(pool)
     .await?;
+    crate::announce::committed(pool);
     Ok(id)
 }
 
@@ -408,12 +436,15 @@ pub async fn enqueue(pool: &PgPool, spec: NewTask) -> Result<Uuid> {
 /// AlreadyLive. The whole of it is one statement (`weft_enqueue_dedup`),
 /// so on its own it is its own transaction: one round trip.
 pub async fn enqueue_dedup(pool: &PgPool, spec: NewTask) -> Result<DedupOutcome> {
-    enqueue_dedup_in(&mut *pool.acquire().await?, spec).await
+    let outcome = enqueue_dedup_in(&mut *pool.acquire().await?, spec).await?;
+    crate::announce::committed(pool);
+    Ok(outcome)
 }
 
 /// [`enqueue_dedup`] on a caller-owned connection: inside the caller's
 /// transaction, the insert commits with whatever else it writes, and the
-/// advisory lock lasts until it ends.
+/// advisory lock lasts until it ends. The caller pokes the announcement
+/// flusher once it commits (`crate::announce::committed`).
 pub async fn enqueue_dedup_in(
     conn: &mut sqlx::PgConnection,
     spec: NewTask,
@@ -519,6 +550,7 @@ pub async fn enqueue_or_rearm(pool: &PgPool, spec: NewTask) -> Result<DedupOutco
         None => enqueue_dedup_in(&mut tx, spec).await?,
     };
     tx.commit().await?;
+    crate::announce::committed(pool);
     Ok(outcome)
 }
 
@@ -807,6 +839,7 @@ pub async fn fail_undeliverable(pool: &PgPool, task_id: Uuid, error: &str) -> Re
     .bind(task_id)
     .fetch_all(pool)
     .await?;
+    crate::announce::committed(pool);
     Ok(())
 }
 
@@ -827,26 +860,21 @@ pub struct CancelAsked {
     pub cause: weft_core::exec::CancelCause,
 }
 
-/// Take the pending `cancel_execution` tasks of `project_id` for any of
-/// `execution_ids` (the executions the asking worker drives), completing each as
-/// it is taken: the worker fires the execution's flag the moment it hears.
-pub async fn take_cancels(pool: &PgPool, project_id: Uuid, execution_ids: &[String]) -> Result<Vec<CancelAsked>> {
+/// The pending `cancel_execution` tasks of `project_id` for any of
+/// `execution_ids` (the executions the asking worker drives): the worker
+/// fires each execution's flag the moment it hears. Asking only reads, so
+/// an answer lost on its way back costs nothing (the worker asks again
+/// and finds the same cancels); a cancel goes once nothing drives its
+/// execution any more ([`drop_stale_cancels`]).
+pub async fn cancels_asked(pool: &PgPool, project_id: Uuid, execution_ids: &[String]) -> Result<Vec<CancelAsked>> {
     if execution_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let now = unix_now();
-    // Taken and announced finished in one statement: a canceller waiting
-    // on the task hears it the moment the worker has it.
-    let rows = sqlx::query(&format!(
-        "WITH taken AS ( \
-             UPDATE task SET status = 'complete', completed_at_unix = $1, result = 'null'::jsonb \
-             WHERE target = 'worker' AND kind = 'cancel_execution' AND status = 'pending' \
-               AND project_id = $2 AND execution_id = ANY($3) \
-             RETURNING id, execution_id, payload) \
-         SELECT execution_id, payload, pg_notify('{}', id::text) FROM taken",
-        crate::terminal::TERMINAL_CHANNEL
-    ))
-    .bind(now)
+    let rows = sqlx::query(
+        "SELECT execution_id, payload FROM task \
+         WHERE target = 'worker' AND kind = 'cancel_execution' AND status = 'pending' \
+           AND project_id = $1 AND execution_id = ANY($2)",
+    )
     .bind(project_id)
     .bind(execution_ids)
     .fetch_all(pool)
@@ -899,6 +927,7 @@ pub async fn requeue(pool: &PgPool, task_id: Uuid, replica: &str) -> Result<bool
     .bind(replica)
     .execute(pool)
     .await?;
+    crate::announce::committed(pool);
     Ok(rows.rows_affected() > 0)
 }
 
@@ -948,16 +977,17 @@ pub async fn stored_result(pool: &PgPool, task_id: Uuid) -> Result<Option<Value>
 }
 
 /// `update` (an `UPDATE task ... ` that makes rows terminal) wrapped so
-/// each row it changes notifies [`crate::terminal::TERMINAL_CHANNEL`]
-/// with its id, in the same statement: the notification goes out when
-/// the write commits. Returns one row per task it changed. A row the
-/// update put back to pending (`rerun_requested`) is changed but not
-/// terminal, so it is returned without the notification.
+/// each row it changes is announced on [`crate::terminal::TERMINAL_CHANNEL`]
+/// with its id, in the same statement (`crate::announce`: the
+/// announcement commits with the write, and its caller pokes the flusher).
+/// Returns one row per task it changed. A row the update put back to
+/// pending (`rerun_requested`) is changed but not terminal, so it is
+/// returned without the announcement.
 fn notify_terminal(update: &str) -> String {
     format!(
         "WITH done AS ({update} RETURNING id, status) \
          SELECT CASE WHEN status = 'pending' THEN NULL \
-                     ELSE pg_notify('{}', id::text) END FROM done",
+                     ELSE weft_announce('{}', id::text) END FROM done",
         crate::terminal::TERMINAL_CHANNEL
     )
 }
@@ -997,6 +1027,7 @@ pub async fn complete(
     .bind(replica)
     .fetch_all(pool)
     .await?;
+    crate::announce::committed(pool);
     if updated.is_empty() {
         anyhow::bail!("complete: task {task_id} no longer claimed by {replica}");
     }
@@ -1021,6 +1052,7 @@ pub async fn fail_pending(pool: &PgPool, task_id: Uuid, error: &str) -> Result<b
     .bind(task_id)
     .fetch_all(pool)
     .await?;
+    crate::announce::committed(pool);
     Ok(!updated.is_empty())
 }
 
@@ -1047,6 +1079,7 @@ pub async fn fail(
     .bind(replica)
     .fetch_all(pool)
     .await?;
+    crate::announce::committed(pool);
     if updated.is_empty() {
         anyhow::bail!("fail: task {task_id} no longer claimed by {replica}");
     }
@@ -1135,16 +1168,17 @@ pub async fn sweep_terminal(pool: &PgPool) -> Result<u64> {
     Ok(rows.rows_affected())
 }
 
-/// Delete the cancels nobody will take: pending for longer than a claim's
-/// duration while nothing drives their execution any more (the drive ended,
-/// or its worker went away, before the worker's cancel wait took them).
-/// The execution's own terminal row is the cancel's record; the task was
-/// only its delivery. Returns how many.
+/// Delete the cancels nothing will ask for any more: pending for longer
+/// than a claim's duration while nothing drives their execution (the drive
+/// ended, cancelled or not, or its worker went away). The execution's own
+/// terminal row is the cancel's record; the task was only its delivery.
+/// Returns how many.
 pub async fn drop_stale_cancels(pool: &PgPool) -> Result<u64> {
     let now = unix_now();
     Ok(sqlx::query(
         r#"DELETE FROM task c
-           WHERE c.kind = 'cancel_execution' AND c.status = 'pending'
+           WHERE c.status = 'pending' AND c.target = 'worker' AND c.project_id IS NOT NULL
+             AND c.kind = 'cancel_execution'
              AND c.created_at_unix < $1 - $2
              AND NOT EXISTS (SELECT 1 FROM task d
                  WHERE d.execution_id = c.execution_id AND d.kind IN ('execute', 'resume')

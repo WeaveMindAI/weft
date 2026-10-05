@@ -225,17 +225,19 @@ pub struct CopyStatus {
     pub node_id: String,
     pub instance: Option<weft_core::instance::InstanceId>,
     pub status: InfraNodeStatus,
+    /// When its last apply landed (a start, an upgrade), if one did.
+    pub applied_at_unix: Option<i64>,
 }
 
 /// Every copy of `project_id`'s infra nodes and its status.
 pub async fn statuses(pool: &PgPool, project_id: uuid::Uuid) -> Result<Vec<CopyStatus>> {
-    let rows: Vec<(String, Option<String>, String)> =
-        sqlx::query_as("SELECT node_id, instance_id, status FROM infra_node WHERE project_id = $1")
+    let rows: Vec<(String, Option<String>, String, Option<i64>)> =
+        sqlx::query_as("SELECT node_id, instance_id, status, applied_at_unix FROM infra_node WHERE project_id = $1")
             .bind(project_id)
             .fetch_all(pool)
             .await?;
     rows.into_iter()
-        .map(|(node_id, instance, status)| {
+        .map(|(node_id, instance, status, applied_at_unix)| {
             let instance = instance
                 .map(weft_core::instance::InstanceId::new)
                 .transpose()
@@ -243,7 +245,7 @@ pub async fn statuses(pool: &PgPool, project_id: uuid::Uuid) -> Result<Vec<CopyS
             let status = InfraNodeStatus::parse(&status).ok_or_else(|| {
                 anyhow::anyhow!("infra_node.status='{status}' for project={project_id} node={node_id} is not a status this dispatcher knows")
             })?;
-            Ok(CopyStatus { node_id, instance, status })
+            Ok(CopyStatus { node_id, instance, status, applied_at_unix })
         })
         .collect()
 }

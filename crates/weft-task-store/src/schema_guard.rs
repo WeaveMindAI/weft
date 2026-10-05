@@ -25,20 +25,30 @@
 //! each way and compares them, which is what catches a migration that runs
 //! but does not land on the same shape.
 //!
-//! Applied in one transaction under an advisory lock, in the same order
-//! the agreement test replays: first the DDL of every group new to this
-//! database (its migrations are recorded as history it was born with),
-//! then every PENDING migration across every group in one global id
-//! order (ids are timestamps, so this is the order the changes were
-//! actually written, and what a migration referencing another group's
-//! table relies on), then every group's DDL re-run (idempotent, and it
-//! repairs a hand-dropped table), and every group's seeds re-run.
+//! A database that already holds what the code declares (every group
+//! stamped with its current fingerprint, every table there, no migration
+//! pending, its history intact) is left alone: a boot only reads, takes no
+//! lock, and runs no DDL. That is every boot but the first of a new release, and it matters
+//! because a boot can land on a database serving traffic: another copy of
+//! the role starting under load. Running a group's DDL locks its tables
+//! (a trigger is dropped and created again), so a boot that re-ran it
+//! stalled every write and, under enough of them, deadlocked with them.
+//!
+//! When there is work, it is applied in one transaction under an advisory
+//! lock, in the same order the agreement test replays: first the DDL of
+//! every group new to this database (its migrations are recorded as
+//! history it was born with), then every PENDING migration across every
+//! group in one global id order (ids are timestamps, so this is the order
+//! the changes were actually written, and what a migration referencing
+//! another group's table relies on), then every group's seeds. The
+//! transaction waits a short while for each table lock it needs, never
+//! behind the writes queued on it; one that cannot get its locks, or meets
+//! a write in a deadlock, is rolled back whole and tried again, since a
+//! release's work on a busy database is exactly that.
 //!
 //! **A stamp that moved is refreshed on evidence, never on faith**: the
 //! canonical DDL is built into a scratch schema in the same transaction
-//! and compared, object by object, with what the live schema holds, before
-//! the group's own DDL is run on it (a replaced function would otherwise
-//! make the live schema the code's whatever migrations ran). A
+//! and compared, object by object, with what the live schema holds. A
 //! match restamps silently (the fingerprint moved with no shape change,
 //! or a migration provably landed the shape). A difference is the drift
 //! case: the boot fails naming the group and the exact objects that
@@ -49,18 +59,6 @@ use std::collections::HashMap;
 
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-
-/// Run `group`'s canonical DDL on the live schema (every statement is
-/// idempotent on a database that already holds its shape).
-async fn run_ddl(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, group: &SchemaGroup) -> anyhow::Result<()> {
-    for stmt in group.ddl {
-        sqlx::raw_sql(stmt)
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| anyhow::anyhow!("schema group '{}': DDL failed: {e}", group.name))?;
-    }
-    Ok(())
-}
 
 /// One change to one group's tables: the file's SQL, the group it sits under,
 /// and the id it is filed by. Ids sort chronologically
@@ -99,11 +97,12 @@ pub struct SchemaGroup {
     /// semicolon-separated statements (executed via `raw_sql`).
     pub ddl: &'static [&'static str],
     /// Idempotent DML the group needs present (a cursor row, a seed
-    /// record), re-run on EVERY boot after the DDL. Seeds are not
-    /// schema: they are outside the fingerprint and outside the
-    /// migration history, so editing one is a non-event rather than a
-    /// "write the migration" dead end (a seed row is invisible to the
-    /// schema reader, so no migration could ever be generated for it).
+    /// record), run after the DDL whenever a boot has work to do. Seeds
+    /// are in the fingerprint, so editing one moves the stamp and the next
+    /// boot runs it; they are outside the migration history, so editing
+    /// one is a non-event rather than a "write the migration" dead end (a
+    /// seed row is invisible to the schema reader, so the shape check
+    /// finds nothing to differ and restamps).
     pub seed: &'static [&'static str],
 }
 
@@ -218,13 +217,24 @@ fn for_group<'a>(migrations: &'a [Migration], group: &str) -> Vec<&'a Migration>
     migrations.iter().filter(|m| m.group == group).collect()
 }
 
-/// Hex sha256 over the group's DDL statements, each followed by a newline.
-/// Any textual edit to the DDL (a new column, a changed default, a comment)
-/// changes the fingerprint; that is the point: the stamp certifies "the
-/// database's tables were created by exactly this text".
-fn fingerprint(ddl: &[&str]) -> String {
+/// Hex sha256 over the group's DDL statements, each followed by a newline,
+/// then its seeds the same way. Any textual edit to the DDL (a new column, a
+/// changed default, a comment) changes the fingerprint; that is the point:
+/// the stamp certifies "the database's tables were created by exactly this
+/// text". The seeds are in it so a changed seed is a moved stamp, which is
+/// what makes a boot run it: a boot whose stamps all match runs nothing.
+fn fingerprint(group: &SchemaGroup) -> String {
+    fingerprint_of(group.ddl, group.seed)
+}
+
+fn fingerprint_of(ddl: &[&str], seed: &[&str]) -> String {
     let mut hasher = Sha256::new();
     for stmt in ddl {
+        hasher.update(stmt.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.update(b"-- seeds\n");
+    for stmt in seed {
         hasher.update(stmt.as_bytes());
         hasher.update(b"\n");
     }
@@ -349,10 +359,137 @@ pub async fn apply_groups_with(
     migrations: &[Migration],
 ) -> anyhow::Result<()> {
     validate_identifiers(groups)?;
+    if holds_everything(pool, groups, migrations).await? {
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    let mut wait = CONTENDED_FIRST;
+    loop {
+        match apply_under_lock(pool, groups, migrations).await {
+            Ok(()) => return Ok(()),
+            Err(e) if contended(&e) && started.elapsed() < CONTENDED_FOR => {
+                tracing::warn!(
+                    target: "weft_task_store::schema_guard",
+                    error = %format!("{e:#}"),
+                    retry_in_ms = wait.as_millis() as u64,
+                    "the schema's changes met writes holding their tables; trying again"
+                );
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(CONTENDED_LONGEST);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// How long a release's schema work waits for one table lock before it
+/// gives way to the writes queued behind it, and how long, in all, it keeps
+/// trying again before the boot fails naming the contention.
+const LOCK_WAIT: &str = "5s";
+const CONTENDED_FIRST: std::time::Duration = std::time::Duration::from_millis(500);
+const CONTENDED_LONGEST: std::time::Duration = std::time::Duration::from_secs(10);
+const CONTENDED_FOR: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Whether `e` is the database giving up a lock (its wait ran out, or it
+/// broke a deadlock with a write): the whole transaction rolled back and can
+/// be tried again as it was.
+fn contended(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<sqlx::Error>()
+            .and_then(|e| e.as_database_error())
+            .and_then(|db| db.code())
+            .is_some_and(|code| code == "55P03" || code == "40P01")
+    })
+}
+
+/// Whether the database already holds everything `groups` and `migrations`
+/// declare, read without a lock: every group stamped with its current
+/// fingerprint, every table there, no migration pending, and its history
+/// intact (what ran
+/// unedited, nothing recorded this build has no file for, the frozen origin
+/// recorded as built). Anything else, including a history this build
+/// refuses, is the locked path's to do or to explain.
+async fn holds_everything(pool: &PgPool, groups: &[&SchemaGroup], migrations: &[Migration]) -> anyhow::Result<bool> {
+    let ledgers: (bool,) = sqlx::query_as(
+        "SELECT to_regclass('weft_schema_stamp') IS NOT NULL AND to_regclass('weft_migration') IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !ledgers.0 {
+        return Ok(false);
+    }
+    let stamps: HashMap<String, String> =
+        sqlx::query_as::<_, (String, String)>("SELECT group_name, fingerprint FROM weft_schema_stamp")
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .collect();
+    let mut applied: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for (group, id, sum) in
+        sqlx::query_as::<_, (String, String, String)>("SELECT group_name, id, checksum FROM weft_migration")
+            .fetch_all(pool)
+            .await?
+    {
+        applied.entry(group).or_default().insert(id, sum);
+    }
+    if !applied.get(HISTORY_GROUP).is_some_and(|ids| ids.contains_key(HISTORY_EPOCH)) {
+        return Ok(false);
+    }
+    if !missing_tables(pool, groups).await?.is_empty() {
+        return Ok(false);
+    }
+    let none = HashMap::new();
+    Ok(groups.iter().all(|group| {
+        let applied = applied.get(group.name).unwrap_or(&none);
+        let mine = for_group(migrations, group.name);
+        stamps.get(group.name).is_some_and(|stamped| *stamped == fingerprint(group))
+            && pending(&mine, applied).is_empty()
+            && edited_after_running(&mine, applied).is_empty()
+            && recorded_without_file(&mine, applied).is_empty()
+            && embedded_origin(group.name).is_none_or(|origin| applied.get(ORIGIN_ID) == Some(&checksum(origin)))
+    }))
+}
+
+/// What resets `group` on a database someone is iterating on: its tables
+/// dropped and its records gone, so the next boot builds it from the
+/// current DDL.
+fn reset_sql(group: &SchemaGroup) -> String {
+    let mut sql = String::new();
+    for table in group.tables {
+        sql.push_str(&format!("DROP TABLE IF EXISTS {table} CASCADE;\n"));
+    }
+    sql.push_str(&format!(
+        "DELETE FROM weft_schema_stamp WHERE group_name = '{}';\n\
+         DELETE FROM weft_migration WHERE group_name = '{}';\n",
+        group.name, group.name
+    ));
+    sql
+}
+
+/// The tables `groups` declare that the database does not hold.
+async fn missing_tables<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+    groups: &[&SchemaGroup],
+) -> anyhow::Result<Vec<String>> {
+    let tables: Vec<&str> = groups.iter().flat_map(|g| g.tables.iter().copied()).collect();
+    Ok(sqlx::query_scalar("SELECT t FROM unnest($1::text[]) AS t WHERE to_regclass(t) IS NULL")
+        .bind(&tables)
+        .fetch_all(executor)
+        .await?)
+}
+
+/// The schema's work, in one transaction under the advisory lock (see the
+/// module doc).
+async fn apply_under_lock(pool: &PgPool, groups: &[&SchemaGroup], migrations: &[Migration]) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('weft:schema-migrate', 0))")
         .execute(&mut *tx)
         .await?;
+    // Every table lock taken from here waits this long at most, so the
+    // work never sits at the head of a table's queue holding back the
+    // writes behind it (`apply_groups_with` tries again).
+    sqlx::query(&format!("SET LOCAL lock_timeout = '{LOCK_WAIT}'")).execute(&mut *tx).await?;
     sqlx::raw_sql(
         "CREATE TABLE IF NOT EXISTS weft_schema_stamp (\
              group_name TEXT PRIMARY KEY, fingerprint TEXT NOT NULL);\
@@ -444,7 +581,7 @@ pub async fn apply_groups_with(
         }
         states.push(GroupState {
             group,
-            fp: fingerprint(group.ddl),
+            fp: fingerprint(group),
             stamped: stored.map(|(fp,)| fp),
             applied,
         });
@@ -458,9 +595,10 @@ pub async fn apply_groups_with(
             continue;
         }
         for stmt in st.group.ddl {
-            sqlx::raw_sql(stmt).execute(&mut *tx).await.map_err(|e| {
-                anyhow::anyhow!("schema group '{}': DDL failed: {e}", st.group.name)
-            })?;
+            sqlx::raw_sql(stmt)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| anyhow::Error::from(e).context(format!("schema group '{}': DDL failed", st.group.name)))?;
         }
         sqlx::query("INSERT INTO weft_schema_stamp (group_name, fingerprint) VALUES ($1, $2)")
             .bind(st.group.name)
@@ -472,6 +610,30 @@ pub async fn apply_groups_with(
         }
         if let Some(origin) = embedded_origin(st.group.name) {
             record_migration(&mut tx, st.group.name, ORIGIN_ID, origin).await?;
+        }
+    }
+
+    // Pass 2b: a group this database holds at its current shape (stamp
+    // current, nothing pending) whose table is gone (dropped by hand) is
+    // built again from its canonical DDL, every statement of which is
+    // idempotent on what is still there (it runs on the group's other
+    // tables too, and on any table its triggers sit on). A group with a
+    // migration pending is not: a table its migration creates is missing
+    // until pass 3 runs it, and the canonical DDL is the shape after every
+    // migration, which a pending one would then run on. Its missing tables
+    // are pass 3's to make, or pass 4's to name.
+    for st in &states {
+        if st.stamped.as_deref() != Some(st.fp.as_str())
+            || !pending(&for_group(migrations, st.group.name), &st.applied).is_empty()
+            || missing_tables(&mut *tx, &[st.group]).await?.is_empty()
+        {
+            continue;
+        }
+        tracing::warn!(target: "weft_task_store::schema_guard", group = st.group.name, "a table of this group is gone; building it again");
+        for stmt in st.group.ddl {
+            sqlx::raw_sql(stmt).execute(&mut *tx).await.map_err(|e| {
+                anyhow::Error::from(e).context(format!("schema group '{}': rebuilding a table that is gone failed", st.group.name))
+            })?;
         }
     }
 
@@ -492,17 +654,13 @@ pub async fn apply_groups_with(
     todo.sort_by_key(|(_, m)| m.id);
     for (group, m) in todo {
         sqlx::raw_sql(m.sql).execute(&mut *tx).await.map_err(|e| {
-            anyhow::anyhow!("schema group '{}': migration '{}' failed: {e}", group.name, m.id)
+            anyhow::Error::from(e).context(format!("schema group '{}': migration '{}' failed", group.name, m.id))
         })?;
         record_migration(&mut tx, group.name, m.id, m.sql).await?;
     }
 
     // Pass 4: verify every moved stamp against the database itself, as it
-    // stands after pass 3's migrations and before any DDL of this boot runs
-    // on it: a `CREATE OR REPLACE` or a dropped and re-created trigger would
-    // otherwise rewrite the live schema to the new text first, and the
-    // check would compare the code with itself, letting an edit no
-    // migration carries boot. The canonical DDL is built into a scratch
+    // stands after pass 3's migrations. The canonical DDL is built into a scratch
     // schema inside this same transaction and compared, object by object,
     // with what the live schema holds. A group whose live shape matches is
     // restamped: a fingerprint that moved with no shape change (a comment,
@@ -527,10 +685,7 @@ pub async fn apply_groups_with(
         for group in groups {
             for stmt in group.ddl {
                 sqlx::raw_sql(stmt).execute(&mut *tx).await.map_err(|e| {
-                    anyhow::anyhow!(
-                        "schema group '{}': DDL failed in the shape check: {e}",
-                        group.name
-                    )
+                    anyhow::Error::from(e).context(format!("schema group '{}': DDL failed in the shape check", group.name))
                 })?;
             }
         }
@@ -563,18 +718,11 @@ pub async fn apply_groups_with(
     // swallow the one message this mechanism exists to produce.
     if !mismatched.is_empty() {
         let names: Vec<&str> = mismatched.iter().map(|(g, _)| g.name).collect();
-        let mut reset_sql = String::new();
+        let mut reset = String::new();
         let mut diffs = String::new();
         for (group, diff) in &mismatched {
             diffs.push_str(&format!("group '{}':\n{diff}", group.name));
-            for table in group.tables {
-                reset_sql.push_str(&format!("DROP TABLE IF EXISTS {table} CASCADE;\n"));
-            }
-            reset_sql.push_str(&format!(
-                "DELETE FROM weft_schema_stamp WHERE group_name = '{}';\n\
-                 DELETE FROM weft_migration WHERE group_name = '{}';\n",
-                group.name, group.name
-            ));
+            reset.push_str(&reset_sql(group));
         }
         anyhow::bail!(
             "the canonical schema changed and this database does not hold the shape it \
@@ -586,26 +734,17 @@ pub async fn apply_groups_with(
              then restart the service so they are rebuilt from the current DDL.",
             names.join(", "),
             diffs,
-            reset_sql
+            reset
         );
     }
 
-    // Pass 5: re-run every stamped group's DDL, in the groups' order
-    // (idempotent on the shape just verified; repairs a hand-dropped table
-    // of a group whose stamp did not move).
-    for st in &states {
-        if st.stamped.is_some() {
-            run_ddl(&mut tx, st.group).await?;
-        }
-    }
-
-    // Pass 6: seeds, idempotent DML re-run on every boot, after every
-    // table exists.
+    // Pass 5: seeds, idempotent DML, after every table exists.
     for group in groups {
         for stmt in group.seed {
-            sqlx::raw_sql(stmt).execute(&mut *tx).await.map_err(|e| {
-                anyhow::anyhow!("schema group '{}': seed failed: {e}", group.name)
-            })?;
+            sqlx::raw_sql(stmt)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| anyhow::Error::from(e).context(format!("schema group '{}': seed failed", group.name)))?;
         }
     }
 
@@ -854,6 +993,12 @@ const THING_QUERIES: &[&str] = &[
      FROM pg_type t JOIN pg_enum e ON e.enumtypid = t.oid \
      JOIN pg_namespace n ON n.oid = t.typnamespace \
      WHERE n.nspname = $1 GROUP BY t.typname",
+    // A table written without the write-ahead log (`CREATE UNLOGGED
+    // TABLE`): its rows go with a crash, which is part of what the table
+    // promises, so a table that lost or gained it differs.
+    "SELECT 'persistence' AS kind, rel.relname AS \"table\", 'unlogged' AS name, 'UNLOGGED' AS body \
+     FROM pg_class rel JOIN pg_namespace n ON n.oid = rel.relnamespace \
+     WHERE n.nspname = $1 AND rel.relkind = 'r' AND rel.relpersistence = 'u'",
 ];
 
 /// Who a planned statement belongs to, so [`file_per_group`] can file it
@@ -1315,6 +1460,7 @@ fn added(thing: &Thing) -> String {
         "constraint" => {
             format!("ALTER TABLE {} ADD CONSTRAINT {} {};", thing.table, thing.name, thing.body)
         }
+        "persistence" => format!("ALTER TABLE {} SET UNLOGGED;", thing.table),
         _ => format!("{};", thing.body),
     }
 }
@@ -1430,6 +1576,7 @@ fn removed(thing: &Thing) -> String {
         "constraint" => {
             format!("ALTER TABLE {} DROP CONSTRAINT IF EXISTS {};", thing.table, thing.name)
         }
+        "persistence" => format!("ALTER TABLE {} SET LOGGED;", thing.table),
         _ => format!(
             "-- Throws away what is in {}.{}. Ship this in a later release than the one \n\
              -- that stopped reading the column, so replicas still on the old release do not fall over.\n\
@@ -2157,7 +2304,7 @@ mod tests {
     // a database still owes.
     use std::collections::HashMap;
 
-    use super::{checksum, edited_after_running, fingerprint, pending, recorded_without_file, Migration, ORIGIN_ID};
+    use super::{checksum, edited_after_running, fingerprint_of, pending, recorded_without_file, Migration, ORIGIN_ID};
 
     static A: Migration = Migration { group: "g", id: "20260101_a", draft: false, sql: "SELECT 1" };
     static B: Migration = Migration { group: "g", id: "20260202_b", draft: false, sql: "SELECT 2" };
@@ -2165,8 +2312,8 @@ mod tests {
 
     #[test]
     fn same_ddl_same_fingerprint() {
-        let a = fingerprint(&["CREATE TABLE t (id INT)", "CREATE INDEX i ON t(id)"]);
-        let b = fingerprint(&["CREATE TABLE t (id INT)", "CREATE INDEX i ON t(id)"]);
+        let a = fingerprint_of(&["CREATE TABLE t (id INT)", "CREATE INDEX i ON t(id)"], &[]);
+        let b = fingerprint_of(&["CREATE TABLE t (id INT)", "CREATE INDEX i ON t(id)"], &[]);
         assert_eq!(a, b);
         // Hex sha256: 64 lowercase hex chars.
         assert_eq!(a.len(), 64);
@@ -2175,8 +2322,8 @@ mod tests {
 
     #[test]
     fn changed_ddl_changes_fingerprint() {
-        let base = fingerprint(&["CREATE TABLE t (id INT)"]);
-        let edited = fingerprint(&["CREATE TABLE t (id INT, name TEXT)"]);
+        let base = fingerprint_of(&["CREATE TABLE t (id INT)"], &[]);
+        let edited = fingerprint_of(&["CREATE TABLE t (id INT, name TEXT)"], &[]);
         assert_ne!(base, edited);
     }
 
@@ -2203,8 +2350,8 @@ mod tests {
     fn statement_boundaries_matter() {
         // The per-statement newline separator keeps ["ab"] distinct from
         // ["a", "b"]: concatenation without a separator would collide.
-        let joined = fingerprint(&["ab"]);
-        let split = fingerprint(&["a", "b"]);
+        let joined = fingerprint_of(&["ab"], &[]);
+        let split = fingerprint_of(&["a", "b"], &[]);
         assert_ne!(joined, split);
     }
 

@@ -43,7 +43,7 @@ pub fn prompt_trigger_deactivation(
     drain_timeout_secs: Option<u64>,
 ) -> anyhow::Result<DeactivateSpec> {
     // Mode resolution priority: explicit --mode flag > interactive
-    // prompt (human terminal only) > error (a script, or `--json`).
+    // prompt (human terminal only) > `wipe` (a script, or `--json`).
     let scripted = json || !crate::prompt::is_interactive();
     let mode = match mode {
         Some(m) => DeactivationMode::parse(m).ok_or_else(|| {
@@ -294,8 +294,8 @@ fn prompt_grace() -> anyhow::Result<u32> {
 fn prompt_mode() -> anyhow::Result<DeactivationMode> {
     println!("Choose preservation mode for in-flight signals:");
     println!("  1) wipe       drop all signals, cancel suspended runs (fully fresh on reactivate)");
-    println!("  2) hibernate  keep signals; hide pending tasks from extension; park late submissions");
-    println!("  3) park       keep signals visible; queue new submissions for reactivate");
+    println!("  2) hibernate  like park for a grace window, questions hidden; after it, nothing new is taken");
+    println!("  3) park       nothing is dropped: calls, answers and the triggers' own fires wait and run once they are back");
     let line = crate::prompt::prompt_line("Enter 1, 2, or 3: ", "--mode wipe | hibernate | park")?;
     Ok(match line.as_str() {
         "1" | "wipe" => DeactivationMode::Wipe,

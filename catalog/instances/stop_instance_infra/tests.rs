@@ -14,7 +14,25 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("parks_and_waits_by_default", defaults),
         NodeTest::fake("the_choices_reach_the_call", choices),
         NodeTest::fake("waiting_before_a_wipe_is_refused", wipe_wait),
+        NodeTest::fake("no_copy_is_told_apart_from_done", no_copy),
+        NodeTest::fake("a_copy_already_down_is_done", already_down),
     ]
+}
+
+async fn no_copy(rig: FakeRig) -> WeftResult<()> {
+    rig.answer_program_call("weft.infra.stop", json!({ "copy": "no_copy" }));
+    let out = rig.run(&StopInstanceInfraNode, json!({ "node": "bridge", "instance": "adaa" })).await.ok()?;
+    assert_eq!(out.output("noCopy")?, &json!(true));
+    assert!(out.output("done").is_err(), "nothing was taken down");
+    Ok(())
+}
+
+async fn already_down(rig: FakeRig) -> WeftResult<()> {
+    rig.answer_program_call("weft.infra.stop", json!({ "copy": "already_down" }));
+    let out = rig.run(&StopInstanceInfraNode, json!({ "node": "bridge", "instance": "ada" })).await.ok()?;
+    assert_eq!(out.output("done")?, &json!(true));
+    assert!(out.output("noCopy").is_err());
+    Ok(())
 }
 
 async fn defaults(rig: FakeRig) -> WeftResult<()> {

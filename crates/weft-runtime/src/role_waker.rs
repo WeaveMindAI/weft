@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use weft_broker_client::lifecycle_command::ISSUED_WAKE;
+use weft_broker_client::lifecycle_command::{ISSUED_WAKE, LOOK_WAKE};
 use weft_platform_traits::config::InstallConfig;
 use weft_platform_traits::roles::TICK_PATH;
 use weft_platform_traits::{CoreRole, IdentityTokens, Placement, RoleAddresses};
@@ -42,8 +42,9 @@ use weft_task_store::pg_signal::{Heard, Subscription};
 
 use crate::server::TICK_LOOP_PARAM;
 
-/// The supervisor's one pass, woken by a lifecycle command being issued.
-const SUPERVISOR_WAKES: &[(&str, &[WakeOn])] = &[("supervisor", &[ISSUED_WAKE])];
+/// The supervisor's one pass, woken by a lifecycle command being issued, or
+/// by a machine running a project's infra saying how it stands changed.
+const SUPERVISOR_WAKES: &[(&str, &[WakeOn])] = &[("supervisor", &[ISSUED_WAKE, LOOK_WAKE])];
 
 /// What wakes each of `role`'s loops, by loop name. The broker's loops run
 /// on their own timers, so only its first ring and its alarms wake it; the

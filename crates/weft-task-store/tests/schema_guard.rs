@@ -56,8 +56,8 @@ async fn fresh_apply_stamps_and_reruns_are_idempotent(pool: PgPool) {
     .unwrap();
     assert_eq!(fp, fp2);
 
-    // A matching stamp still re-runs the DDL, so a manually dropped table
-    // is repaired on the next boot.
+    // A matching stamp with a table gone builds the group again, so a
+    // manually dropped table is repaired on the next boot.
     sqlx::raw_sql("DROP TABLE guard_probe").execute(&pool).await.unwrap();
     apply(&pool, &[&GUARDED], NONE).await.expect("repair apply");
     sqlx::query("SELECT 1 FROM guard_probe")

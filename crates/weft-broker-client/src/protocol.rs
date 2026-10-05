@@ -110,6 +110,14 @@ wire_enum! {
     }
 }
 
+/// The body of a 503 the broker answers when a call did nothing at all: it
+/// could not even get a connection to its database (every connection
+/// busy, or the database refusing new ones), so no statement ran and
+/// sending the call again cannot repeat anything. Any other 503 may have
+/// half happened; a write is sent again only on this one.
+// SYNC: NOT_DONE <-> crates/weft-broker/src/handlers.rs (unavailable_or_internal), crates/weft-broker-client/src/client.rs (did_nothing)
+pub const NOT_DONE: &str = "the broker could not get a connection to its database, so nothing was done; send it again";
+
 // ---------- Journal ----------
 
 /// The most one `/v1/journal/record` body may weigh. The heaviest event
@@ -335,22 +343,30 @@ pub struct TaskFailRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskFailResponse {}
 
-/// The cancels asked for any of `execution_ids` of `project_id` (the executions
-/// the asking worker drives), holding up to `wait_ms` (the broker caps it
-/// at `pg_signal::MAX_HOLD`) for one when there are none.
+/// The cancels asked for any of `execution_ids` of `project_id`, answered
+/// for those the asking worker drives; asking only reads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskWaitCancelsRequest {
+pub struct TaskCancelsAskedRequest {
     pub project_id: Uuid,
     pub execution_ids: Vec<String>,
-    pub wait_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskWaitCancelsResponse {
+pub struct TaskCancelsAskedResponse {
     pub cancels: Vec<weft_task_store::tasks::CancelAsked>,
 }
 
 // ---------- Infra ----------
+
+/// A machine running `project_id`'s infra asking for its health to be
+/// looked at now (`BrokerInfraClient::ask_for_a_look`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfraLookRequest {
+    pub project_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfraLookResponse {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfraEndpointUrlRequest {
@@ -658,9 +674,9 @@ pub struct SupervisorSyncOwnershipResponse {
     /// on one of them while nobody held it woke none of this replica's
     /// claims, so it asks again at once when this is not empty.
     pub claimed: Vec<Uuid>,
-    /// Whether a project this replica owns gives it something to look at
-    /// now (`lifecycle_command::supervisor_work`): its health is looked at
-    /// again soon while this is true.
+    /// Whether a project this replica owns gives it something to do now
+    /// that nothing will announce (`lifecycle_command::supervisor_work`: a
+    /// command waiting): it looks again soon while this is true.
     pub owns_work: bool,
     /// In how many seconds (on the database's clock, 0 when already) the
     /// soonest lease this replica does not hold lapses, over the projects
@@ -1213,7 +1229,7 @@ pub enum LifecycleSpec {
     /// Take down what a health protocol reaches, under `spec`.
     Deactivate(TakeDownReaders),
     /// Bring back what the health loop took down: each activation it
-    /// took carries the mark (`deactivated_by_health`) the take-down
+    /// took carries the mark (`went_down_with`: health) the take-down
     /// set, and of those this restores every one that reads none of the
     /// `still_broken` copies.
     Reactivate(RestoreReaders),
@@ -1635,18 +1651,21 @@ impl InFlightCommand {
 
 // ---------- Signals ----------
 
-/// The activation statuses whose signal rows belong in a listener process's
-/// in-RAM registry: the activation governing the signal (its trigger's
-/// for an entry, the trigger's that fired its run for a wait) is being
-/// activated (the rehydrate at the end of activate runs before the flip
-/// to active) or live. A signal no activation governs reads as live. A
-/// hibernated or parked activation keeps its rows in the table so
-/// reactivate can restore them, but the process was told to forget them at
-/// deactivate, and a listener restarting must not bring them back. The
-/// broker's `signal/list_held` (what a starting listener rehydrates)
-/// reads this list.
-pub const LISTENER_HELD_STATUSES: [&str; 2] =
-    [ProjectStatus::Activating.as_str(), ProjectStatus::Active.as_str()];
+/// Whether the activation `a` governing a signal (its trigger's for an
+/// entry, the trigger's that fired its run for a wait; read through
+/// [`SIGNAL_ACTIVATION_JOIN`]) has its listeners listen: being activated
+/// (the rehydrate at the end of activate runs before the flip to active),
+/// live, or off in a way that takes work while it is off (parked, or
+/// hibernating within its grace window), since what a parked trigger hears
+/// waits for it to be back on (`weft_dispatcher::arrival`). A signal no
+/// activation governs listens. A wiped activation's rows are gone, and a
+/// hibernation past its grace window stops listening. What a starting
+/// listener rehydrates, what holders claim, and how many holders run all
+/// read this.
+// SYNC: ACTIVATION_LISTENS <-> crates/weft-dispatcher/src/arrival.rs (Standing::arrival), crates/weft-dispatcher/src/activation_store.rs (IN_GRACE_WINDOW_SQL)
+pub const ACTIVATION_LISTENS: &str = "(a.status IS NULL OR a.status IN ('activating', 'active') \
+    OR (a.status IN ('deactivating', 'inactive') AND a.accepting_fires \
+        AND (a.fires_deadline_unix IS NULL OR a.fires_deadline_unix >= EXTRACT(EPOCH FROM NOW())::BIGINT)))";
 
 /// The join every "is this signal held" read goes through: the
 /// activation governing signal `s` as `a` (absent when none governs it).
@@ -1663,7 +1682,7 @@ pub const SIGNAL_ACTIVATION_JOIN: &str = "LEFT JOIN trigger_activation a \
 pub const STILL_HELD_BY: &str = "SELECT EXISTS (SELECT 1 FROM signal WHERE token = $1 AND holds AND held_by = $2)";
 
 /// Every signal the listener must hold: the rows whose governing
-/// activation's status is one of [`LISTENER_HELD_STATUSES`], of one
+/// activation listens ([`ACTIVATION_LISTENS`]), of one
 /// project when `project` names it (an activation's rehydrate), of every
 /// project when it is `None` (a listener's boot).
 #[derive(Debug, Clone, Serialize, Deserialize)]

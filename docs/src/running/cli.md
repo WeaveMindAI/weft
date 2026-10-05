@@ -87,7 +87,7 @@ reads the file again.
 
 | Command | What it does |
 |---|---|
-| `weft executions` | Past runs, newest first. `--limit` (50), `--offset`, `--project`, `--phase`, `--node`, `--since 2h`, `--status`, `--instance`, `--tag`. A run of a `Route` with `recorded: false` shows only if it failed |
+| `weft executions` | Past runs, newest first. `--limit` (50), `--offset`, `--project`, `--phase`, `--node` (the node that started the run), `--since 2h`, `--status`, `--instance`, `--tag`. `--through <node>` keeps the runs in which that node fired, wherever it sits. `--search <words>` keeps the finished runs that carried every one of those words somewhere in what they recorded (the trigger's input, what a node sent on, an error, a log line): an email, an order id, a phrase in quotes. A run of a `Route` with `recorded: false` shows only if it failed |
 | `weft events <execution-id>` | One run's events in order. `--node`, `--kind`, `--full` for whole values. If you want one time round a loop, `--iteration 3` keeps the fourth (they count from 0), and `3.0` the first time round a loop inside it |
 | `weft logs [<execution-id>]` | What the nodes wrote, plus every failure. A run that wrote nothing lists what it skipped and why (under `skipped` with `--json`). `--limit` |
 | `weft status` | The cwd project: registration, listener, every infra node the program declares (one never started says `not started`, a `@per_instance` one how many instances have a copy), each trigger and the version of the source it fires (with the events an instance's trigger holds until a field is filled), recent runs, what drifted, and what you can do next. While the install builds, it names each image building and where its log is; while infra starts, how long it has been going and what it waits on |
@@ -124,8 +124,8 @@ answers "has my trigger fired since I changed it".
 
 | Flag | What it does |
 |---|---|
-| `--mode wipe\|hibernate\|park` | What happens to work in flight. `wipe` drops it all, the other two keep it |
-| `--grace <minutes>` | How long hibernate accepts late answers. 15 by default |
+| `--mode wipe\|hibernate\|park` | What happens to work that arrives while the triggers are down. `park` keeps all of it and runs it once they are back, `hibernate` does that for a grace window, `wipe` drops it ([the full rules](lifecycles.md#choosing-what-happens-to-work-in-flight)) |
+| `--grace <minutes>` | How long hibernate keeps taking work. 15 by default |
 | `--running-policy cancel\|wait` | Cancel the running executions, or wait for them. `cancel` unless you say otherwise; `wipe` refuses `wait`. On `weft infra stop` and `terminate` it works on an inactive project too: no triggers to take down, but a run may still be using the infra |
 | `--drain-timeout <seconds>` | Cap on a wait, so only beside `--running-policy wait`; passed with cancel it is refused. 60 by default. What is still running at the cap is cancelled |
 
@@ -142,10 +142,10 @@ Every trigger verb (`activate`, `deactivate`, `resync`, `bake`,
 
 | Command | What it does |
 |---|---|
-| `weft infra start` | Brings up whatever is down |
+| `weft infra start` | Brings up whatever is down, and turns back on the triggers that came down with it (never one you switched off yourself) |
 | `weft infra stop` | Scales to nothing, keeping the disk. The project's running executions are cancelled first unless you pass `--running-policy wait`, because they may be using this infra |
 | `weft infra terminate` | Deletes it, disk included, unless the node asked for the disk to be kept. Asks first, and off a terminal or with `--json` it needs `--yes`. The same running-policy rule as stop |
-| `weft infra upgrade` | Rebuilds against your current source. Leaves the project deactivated. When a build changes an infra node's image, every command that builds says so: a copy started from then on gets the new image, and one already running keeps its own until this |
+| `weft infra upgrade` | Rebuilds against your current source; the triggers it took down come back once the new copies are up. When a build changes an infra node's image, every command that builds says so: a copy started from then on gets the new image, and one already running keeps its own until this |
 | `weft infra status` | Where each copy that exists stands, with its address. A start or stop on its way shows as `provisioning` or `stopping` at once |
 | `weft infra list-doors` | Which pieces you can reach from this machine, and at what address |
 | `weft infra logs [<node>]` | What the containers printed. `--tail` (200), `-f` |

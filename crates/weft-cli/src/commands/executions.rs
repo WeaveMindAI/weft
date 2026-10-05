@@ -56,6 +56,12 @@ async fn executions_page(
     if let Some(tag) = &filter.tag {
         path.push_str(&format!("&tag={}", query_escaped(tag)));
     }
+    if let Some(through) = &filter.through {
+        path.push_str(&format!("&node={}", query_escaped(through)));
+    }
+    if let Some(search) = &filter.search {
+        path.push_str(&format!("&search={}", query_escaped(search)));
+    }
     serde_json::from_value(client.get_json(&path).await?).context("read the executions listing")
 }
 
@@ -78,6 +84,10 @@ pub struct ListFilter {
     pub instance: Option<weft_core::instance::InstanceId>,
     /// A tag the run carries.
     pub tag: Option<String>,
+    /// A node that fired in the run.
+    pub through: Option<String>,
+    /// Words the finished run carried among what it recorded.
+    pub search: Option<String>,
 }
 
 pub async fn list(ctx: Ctx, filter: ListFilter) -> anyhow::Result<()> {

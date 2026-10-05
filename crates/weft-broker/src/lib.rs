@@ -126,12 +126,14 @@ fn api(state: Arc<BrokerState>) -> Router {
         .route("/v1/task/complete", post(handlers::task_complete))
         .route("/v1/task/fail", post(handlers::task_fail))
         // The cancels for the executions a worker drives.
-        .route("/v1/task/wait_cancels", post(handlers::task_wait_cancels))
+        .route("/v1/task/cancels_asked", post(handlers::task_cancels_asked))
         // Infra reads
         .route(
             "/v1/infra/endpoint_url",
             post(handlers::infra_endpoint_url),
         )
+        // A machine running a project's infra asking for a look at it.
+        .route("/v1/infra/look", post(handlers::infra_look))
         // Project (worker fetches its own ProjectDefinition)
         .route(
             "/v1/project/fetch_definition",

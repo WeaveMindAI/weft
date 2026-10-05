@@ -27,7 +27,6 @@ use sqlx::postgres::PgPool;
 use tokio::sync::Mutex;
 
 use crate::auth::CallerIdentity;
-use crate::handlers::internal;
 
 /// Cache size per resource kind. 100k is well above any realistic
 /// active-execution count and avoids the perf cliff DashMap's "drop
@@ -224,7 +223,7 @@ async fn lookup_project_tenant(
         .bind(project_id)
         .fetch_optional(pool)
         .await
-        .map_err(|e| internal(anyhow::anyhow!("project lookup: {e}")))?;
+        .map_err(|e| crate::handlers::unavailable_or_internal(anyhow::Error::from(e).context("project lookup")))?;
     let tenant = row
         .ok_or((StatusCode::NOT_FOUND, "unknown project".into()))?
         .0;

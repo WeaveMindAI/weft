@@ -17,6 +17,7 @@
 pub mod activation_store;
 pub mod api;
 pub mod app;
+pub mod arrival;
 pub mod authenticator;
 pub mod build;
 pub mod delivery;
@@ -46,6 +47,7 @@ pub mod install_picks;
 pub mod projection;
 pub mod project_store;
 pub mod reaper;
+pub mod run_search;
 pub mod reclaim;
 pub mod settled;
 pub mod state;

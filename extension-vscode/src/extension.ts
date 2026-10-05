@@ -31,6 +31,7 @@ import { fetchRunningSource, installAccess, listTargets, onArgs, type InstallTar
 
 import { ProjectsProvider, ProjectNode, type WeftProject } from './sidebar/projects';
 import { ExecutionsProvider, ExecutionNode, RunNode, VersionNode, type ExecutionSummary } from './sidebar/executions';
+import { parseRunSearch } from './sidebar/runSearch';
 import { runWeftJson, WeftCliError } from './cli';
 import { ExecutionFollower } from './execFollower';
 import { AutoFollowController } from './autoFollow';
@@ -436,6 +437,57 @@ export function activate(context: vscode.ExtensionContext) {
       installSwitching = null;
       postInstallView();
     }
+  }
+
+  /// Ask what to search the runs for, and show the runs it finds (see
+  /// `sidebar/runSearch` for what it reads). An empty answer shows every
+  /// run again; one that does not read is said, and asked again.
+  async function searchRuns(): Promise<void> {
+    let value = executionsProvider.currentSearch() ?? '';
+    for (;;) {
+      const text = await vscode.window.showInputBox({
+        title: `Search the runs on ${pinnedProject ? installOf(pinnedProject.id) : LOCAL_INSTALL}`,
+        value,
+        prompt: 'Words a run carried (an email, an id, "a phrase"), and filters: status:failed route:<trigger> node:<node> instance:<id> tag:<tag> since:2h',
+      });
+      if (text === undefined) return;
+      if (!text.trim()) {
+        executionsProvider.setSearch(undefined);
+        return;
+      }
+      const read = parseRunSearch(text, Math.floor(Date.now() / 1000));
+      if ('error' in read) {
+        void vscode.window.showWarningMessage(read.error);
+        value = text;
+        continue;
+      }
+      executionsProvider.setSearch({ text: text.trim(), params: read.params });
+      return;
+    }
+  }
+
+  /// Pick the install whose runs the list shows (and the graph follows
+  /// them on): the local one, or a target the project's `weft.toml` names.
+  async function showRunsOn(): Promise<void> {
+    const project = pinnedProject;
+    if (!project) {
+      void vscode.window.showInformationMessage('Open a project to see its runs.');
+      return;
+    }
+    let targets: InstallTarget[];
+    try {
+      targets = await listTargets(project.rootPath);
+    } catch (err) {
+      void vscode.window.showErrorMessage(`could not list the project's installs: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    const current = installOf(project.id);
+    const names = [LOCAL_INSTALL, ...targets.map((t) => t.name).filter((n) => n !== LOCAL_INSTALL)];
+    const picked = await vscode.window.showQuickPick(
+      names.map((name) => ({ label: name, description: name === current ? 'shown now' : undefined })),
+      { title: 'Show the runs on' },
+    );
+    if (picked && picked.label !== current) await switchInstall(picked.label);
   }
 
   /// Which version the files on disk are, beside the one the install
@@ -1484,6 +1536,9 @@ export function activate(context: vscode.ExtensionContext) {
       n instanceof RunNode ? viewExecution(n.summary, n.versionId) : viewExecution('summary' in n ? n.summary : n),
     ),
     vscode.commands.registerCommand('weft.toggleExecutionsMode', () => executionsProvider.toggleMode()),
+    vscode.commands.registerCommand('weft.searchRuns', () => searchRuns()),
+    vscode.commands.registerCommand('weft.clearRunSearch', () => executionsProvider.setSearch(undefined)),
+    vscode.commands.registerCommand('weft.showRunsOn', () => showRunsOn()),
     vscode.commands.registerCommand('weft.branchHere', (n: VersionNode | RunNode) => branchHere(n)),
     vscode.commands.registerCommand('weft.checkpointLabel', () => checkpointLabel()),
     vscode.commands.registerCommand('weft.pruneVersion', (n: VersionNode) => pruneVersion(n)),

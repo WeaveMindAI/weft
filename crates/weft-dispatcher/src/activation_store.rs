@@ -68,10 +68,12 @@ pub enum LifecycleWrite {
 /// signals still registered.
 #[derive(Debug, Clone, Copy)]
 pub enum SignalsGoing {
-    /// None (a park or a hibernate keeps them for the reactivation). The
-    /// ones the written activations govern are read in the same
-    /// transaction, so a reactivation committing after it cannot slip
-    /// its fresh signals into the listener cleanup.
+    /// None, and the listener keeps holding them: a parked or
+    /// hibernating trigger goes on listening, and what it hears waits for
+    /// it to be back on (`crate::arrival`). Once a hibernation's grace
+    /// window ends, the listener lets go of them (`crate::reaper`'s
+    /// `hibernations`), and the holders of its held ones already have
+    /// (their claims read the window).
     Kept,
     /// Every signal of the project, except the ones `except`'s run
     /// holds (the run that asked for the take-down).
@@ -214,26 +216,76 @@ pub trait ActivationStoreOps: Send + Sync {
     async fn list_deactivating(&self) -> anyhow::Result<Vec<(uuid::Uuid, ActivationKey)>>;
 }
 
+/// Whether a `trigger_activation` row (`a`) is a hibernation still in its
+/// grace window: going or gone down, taking work until a deadline.
+// SYNC: IN_GRACE_WINDOW_SQL <-> crate::arrival::Standing::arrival, weft_broker_client::protocol::ACTIVATION_LISTENS
+const IN_GRACE_WINDOW_SQL: &str =
+    "a.accepting_fires AND a.fires_deadline_unix IS NOT NULL AND a.status IN ('inactive', 'deactivating')";
+
+/// The hibernations whose grace window is over and still take work, with
+/// their project. Over by the database's clock, the one the listening
+/// condition (`ACTIVATION_LISTENS`) reads.
+pub async fn grace_windows_over(pool: &PgPool) -> anyhow::Result<Vec<(uuid::Uuid, ActivationKey)>> {
+    let rows = sqlx::query_as(&format!(
+        "SELECT a.project_id, a.trigger, a.instance_id FROM trigger_activation a \
+         WHERE {IN_GRACE_WINDOW_SQL} AND a.fires_deadline_unix < EXTRACT(EPOCH FROM NOW())::BIGINT"
+    ))
+    .fetch_all(pool)
+    .await?;
+    project_keys(rows)
+}
+
+/// End the hibernations of `keys` of `project_id` whose grace window is
+/// over: they stop taking work. The arrival rule and the listening
+/// condition already read the deadline against the clock; the flip is what
+/// is announced (holder sizing, the routes). One reactivated meanwhile no
+/// longer matches and is left alone. Answers how many it ended.
+pub async fn end_grace_windows(pool: &PgPool, project_id: uuid::Uuid, keys: &[ActivationKey]) -> anyhow::Result<u64> {
+    let (triggers, instances) = key_arrays(keys);
+    Ok(sqlx::query(&format!(
+        "UPDATE trigger_activation a SET accepting_fires = FALSE, updated_at = EXTRACT(EPOCH FROM NOW())::BIGINT \
+         WHERE a.project_id = $1 AND {KEYS_JOIN} \
+           AND {IN_GRACE_WINDOW_SQL} AND a.fires_deadline_unix < EXTRACT(EPOCH FROM NOW())::BIGINT"
+    ))
+    .bind(project_id)
+    .bind(&triggers)
+    .bind(&instances)
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
+/// When the earliest grace window still open ends, if one is.
+pub async fn next_grace_end(pool: &PgPool) -> anyhow::Result<Option<i64>> {
+    Ok(sqlx::query_scalar(&format!("SELECT MIN(a.fires_deadline_unix) FROM trigger_activation a WHERE {IN_GRACE_WINDOW_SQL}"))
+        .fetch_one(pool)
+        .await?)
+}
+
 pub type ActivationStore = Arc<dyn ActivationStoreOps>;
 
 /// Whether an activation of `key` landing at `lifecycle` leaves its row
-/// behind. An instance's copy of a trigger wiped (inactive and refusing
-/// fires) is the same as one never activated, so its row goes: nothing
-/// lists the instance any more, and activating it again starts fresh. The
-/// shared copy keeps its row, which is what the project's status reads.
+/// behind. An instance's copy of a trigger wiped is the same as one never
+/// activated, so its row goes: nothing lists the instance any more, and
+/// activating it again starts fresh. The shared copy keeps its row, which
+/// is what the project's status reads.
 fn wipe_forgets(key: &ActivationKey, lifecycle: &ActivationLifecycle) -> bool {
-    key.instance().is_some() && lands_wiped(lifecycle)
+    key.instance().is_some() && forgets_instance_rows(lifecycle)
 }
 
-/// Whether `lifecycle` is a wipe (inactive, refusing fires): the half of
-/// [`wipe_forgets`] about where a row lands.
-fn lands_wiped(lifecycle: &ActivationLifecycle) -> bool {
-    lifecycle.status == ProjectStatus::Inactive && !lifecycle.accepting_fires
+/// Whether an instance's row landing at `lifecycle` goes ([`wipe_forgets`]
+/// with the owner left out): a wipe ([`ActivationLifecycle::is_wiped`]),
+/// unless it went down with its infra, whose row is what brings it back
+/// once that infra is up again.
+fn forgets_instance_rows(lifecycle: &ActivationLifecycle) -> bool {
+    lifecycle.is_wiped() && lifecycle.went_down.map(|w| w.with) != Some(weft_broker_client::activation::DownWith::Infra)
 }
 
 /// The same test as [`wipe_forgets`], over a `trigger_activation` row
 /// (`a`) landing at status `$1`.
-const WIPE_FORGETS_SQL: &str = "a.instance_id IS NOT NULL AND $1 = 'inactive' AND NOT a.accepting_fires";
+// SYNC: WIPE_FORGETS_SQL <-> wipe_forgets, weft_broker_client::activation::ActivationLifecycle::is_wiped, 'infra' = DownWith::Infra
+const WIPE_FORGETS_SQL: &str = "a.instance_id IS NOT NULL AND $1 = 'inactive' AND NOT a.accepting_fires \
+     AND a.fires_deadline_unix IS NULL AND a.went_down_with IS DISTINCT FROM 'infra'";
 
 /// The `trigger_activation` table: one row per trigger per owner that
 /// was ever activated. The canonical CREATE lives here, edited in place;
@@ -258,6 +310,22 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             fires_visible_to_consumers BOOLEAN NOT NULL,
             fires_deadline_unix BIGINT,
             drain_deadline_unix BIGINT,
+            -- Why it is down when the infra it reads took it down rather
+            -- than a person: 'health' (the health loop parked it) or
+            -- 'infra' (an infra verb took it down with its copies). NULL
+            -- otherwise. The copy coming back brings it back.
+            -- SYNC: the spellings <-> weft_broker_client::activation::DownWith
+            went_down_with TEXT,
+            -- When it went down so: a copy it reads that was applied after
+            -- this has come back up since, which is what brings it back.
+            went_down_at_unix BIGINT,
+            -- What `went_down_with` replaced, read by nothing here: it stays
+            -- for the release that stopped reading it, kept equal to
+            -- `went_down_with = 'health'` on every write, so a replica still
+            -- on the release before reads the health loop's parks right
+            -- while the new one rolls out (the seed below carries the parks
+            -- it made before the other way). Dropped in the release after,
+            -- with the seed.
             deactivated_by_health BOOLEAN NOT NULL DEFAULT FALSE,
             -- The trigger-setup run of the activation in flight; one run
             -- sets up every activation a verb names, so rows share it.
@@ -274,21 +342,28 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
              ON trigger_activation (activating_execution_id) WHERE activating_execution_id IS NOT NULL"#,
         r#"CREATE INDEX IF NOT EXISTS trigger_activation_transitional
              ON trigger_activation (status) WHERE status IN ('activating', 'deactivating')"#,
-        // An activation changing status, coming or going can start or stop
-        // the holding of its held signals without any signal row changing
-        // (a parked or hibernated trigger woken, a wiped instance's row
+        // An activation changing status, whether it takes work or until
+        // when, coming or going can start or stop the holding of its held
+        // signals without any signal row changing (a trigger woken, a
+        // hibernation's grace window set or ending, a wiped instance's row
         // forgotten, which a signal with no activation reads as active), so
-        // each wakes the holder sizing too. The function is the journal
-        // group's, which applies first.
+        // each wakes the holder sizing too, and the hibernation sweep
+        // (`crate::reaper`), which then knows when the next window ends. The
+        // function is the journal group's, which applies first.
         r#"DROP TRIGGER IF EXISTS trigger_activation_held_on_status ON trigger_activation"#,
         r#"CREATE TRIGGER trigger_activation_held_on_status
-            AFTER UPDATE OF status ON trigger_activation
+            AFTER UPDATE OF status, accepting_fires, fires_deadline_unix ON trigger_activation
             FOR EACH ROW
-            WHEN (NEW.status IS DISTINCT FROM OLD.status)
+            WHEN (NEW.status IS DISTINCT FROM OLD.status
+                  OR NEW.accepting_fires IS DISTINCT FROM OLD.accepting_fires
+                  OR NEW.fires_deadline_unix IS DISTINCT FROM OLD.fires_deadline_unix)
             EXECUTE FUNCTION signal_held_notify()"#,
-        // An activation's status is part of how its routes read (only an
-        // active one takes a caller), so a change tells every dispatcher
-        // to read its tenant's routes again (`crate::held::Held::routes`).
+        // An activation's status, whether it takes work while off and until
+        // when, are part of how its routes read (an active one serves a
+        // caller, a parked one holds them, until its grace window ends:
+        // `crate::arrival`), so a change tells every dispatcher to read its
+        // tenant's routes again (`crate::held::Held::routes`), and wakes the
+        // callers held there.
         // SYNC: 'weft_routes' <-> crate::held::ROUTES_CHANNEL
         r#"CREATE OR REPLACE FUNCTION trigger_activation_routes_notify() RETURNS trigger AS $$
             DECLARE
@@ -305,22 +380,59 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             $$ LANGUAGE plpgsql"#,
         r#"DROP TRIGGER IF EXISTS trigger_activation_routes_on_status ON trigger_activation"#,
         r#"CREATE TRIGGER trigger_activation_routes_on_status
-            AFTER UPDATE OF status ON trigger_activation
+            AFTER UPDATE OF status, accepting_fires, fires_deadline_unix ON trigger_activation
             FOR EACH ROW
-            WHEN (NEW.status IS DISTINCT FROM OLD.status)
+            WHEN (NEW.status IS DISTINCT FROM OLD.status
+                  OR NEW.accepting_fires IS DISTINCT FROM OLD.accepting_fires
+                  OR NEW.fires_deadline_unix IS DISTINCT FROM OLD.fires_deadline_unix)
             EXECUTE FUNCTION trigger_activation_routes_notify()"#,
         r#"DROP TRIGGER IF EXISTS trigger_activation_routes_on_row ON trigger_activation"#,
         r#"CREATE TRIGGER trigger_activation_routes_on_row
             AFTER INSERT OR DELETE ON trigger_activation
             FOR EACH ROW
             EXECUTE FUNCTION trigger_activation_routes_notify()"#,
+        // While a release rolls out, a replica on the release before writes
+        // `deactivated_by_health` and never the cause columns: its activate
+        // leaves an old cause behind, its health park sets none, and a park
+        // after this release's health park clears only the old column. This
+        // keeps the cause in step with what such a replica writes, the old
+        // column being right about the health loop's parks either way. Goes
+        // with the old column.
+        r#"CREATE OR REPLACE FUNCTION trigger_activation_old_health_flag() RETURNS trigger AS $$
+            BEGIN
+                IF NEW.status = 'activating' THEN
+                    NEW.went_down_with := NULL;
+                    NEW.went_down_at_unix := NULL;
+                ELSIF NEW.deactivated_by_health AND NEW.went_down_with IS NULL THEN
+                    NEW.went_down_with := 'health';
+                    NEW.went_down_at_unix := EXTRACT(EPOCH FROM NOW())::BIGINT;
+                ELSIF NOT NEW.deactivated_by_health AND NEW.went_down_with = 'health' THEN
+                    NEW.went_down_with := NULL;
+                    NEW.went_down_at_unix := NULL;
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql"#,
+        r#"DROP TRIGGER IF EXISTS trigger_activation_old_health_flag ON trigger_activation"#,
+        r#"CREATE TRIGGER trigger_activation_old_health_flag
+            BEFORE INSERT OR UPDATE ON trigger_activation
+            FOR EACH ROW
+            EXECUTE FUNCTION trigger_activation_old_health_flag()"#,
         r#"DROP TRIGGER IF EXISTS trigger_activation_held_on_row ON trigger_activation"#,
         r#"CREATE TRIGGER trigger_activation_held_on_row
             AFTER INSERT OR DELETE ON trigger_activation
             FOR EACH ROW
             EXECUTE FUNCTION signal_held_notify()"#,
     ],
-    seed: &[],
+    seed: &[
+        // A health-loop park the release before wrote sets only the old
+        // column: carried to the cause this release reads (its moment
+        // unknown, so the row's last write) by the boot that applies this
+        // release, so the health loop's auto-recover still brings it back.
+        // Goes with the old column.
+        r#"UPDATE trigger_activation SET went_down_with = 'health', went_down_at_unix = updated_at
+            WHERE deactivated_by_health AND went_down_with IS NULL"#,
+    ],
 };
 
 #[derive(Clone)]
@@ -342,14 +454,15 @@ type LifecycleRow = (
     bool,
     Option<i64>,
     Option<i64>,
-    bool,
+    Option<String>,
+    Option<i64>,
     Option<uuid::Uuid>,
     Option<serde_json::Value>,
     Option<String>,
 );
 
 fn row_to_activation(row: LifecycleRow) -> anyhow::Result<Activation> {
-    let (trigger, instance, status, accepting, visible, deadline, drain, by_health, execution_id, program, version) = row;
+    let (trigger, instance, status, accepting, visible, deadline, drain, went_down_with, went_down_at, execution_id, program, version) = row;
     let instance = instance.map(InstanceId::new).transpose().map_err(|e| anyhow::anyhow!("trigger_activation.instance_id: {e}"))?;
     Ok(Activation {
         key: ActivationKey::new(trigger, Owner::from_instance(instance)),
@@ -360,7 +473,15 @@ fn row_to_activation(row: LifecycleRow) -> anyhow::Result<Activation> {
             fires_visible_to_consumers: visible,
             fires_deadline_unix: deadline,
             drain_deadline_unix: drain,
-            deactivated_by_health: by_health,
+            went_down: match (went_down_with, went_down_at) {
+                (None, None) => None,
+                (Some(cause), Some(at_unix)) => Some(weft_broker_client::activation::WentDown {
+                    with: weft_broker_client::activation::DownWith::parse(&cause)
+                        .ok_or_else(|| anyhow::anyhow!("unknown trigger_activation.went_down_with '{cause}'"))?,
+                    at_unix,
+                }),
+                (cause, at) => anyhow::bail!("trigger_activation.went_down_with={cause:?} and went_down_at_unix={at:?} must be set together"),
+            },
             activating_execution_id: execution_id,
         },
         program: program.map(serde_json::from_value).transpose()?,
@@ -412,7 +533,7 @@ impl ActivationStoreOps for PostgresActivationStore {
     async fn list(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<Activation>> {
         let rows: Vec<LifecycleRow> = sqlx::query_as(
             "SELECT trigger, instance_id, status, accepting_fires, fires_visible_to_consumers, \
-                    fires_deadline_unix, drain_deadline_unix, deactivated_by_health, activating_execution_id, \
+                    fires_deadline_unix, drain_deadline_unix, went_down_with, went_down_at_unix, activating_execution_id, \
                     activation_program, activation_version \
              FROM trigger_activation WHERE project_id = $1 ORDER BY trigger, instance_id NULLS FIRST",
         )
@@ -446,7 +567,7 @@ impl ActivationStoreOps for PostgresActivationStore {
         }
         let before: Vec<LifecycleRow> = sqlx::query_as(&format!(
             "SELECT a.trigger, a.instance_id, a.status, a.accepting_fires, a.fires_visible_to_consumers, \
-                    a.fires_deadline_unix, a.drain_deadline_unix, a.deactivated_by_health, a.activating_execution_id, \
+                    a.fires_deadline_unix, a.drain_deadline_unix, a.went_down_with, a.went_down_at_unix, a.activating_execution_id, \
                     a.activation_program, a.activation_version \
              FROM trigger_activation a WHERE a.project_id = $1 AND {KEYS_JOIN} FOR UPDATE"
         ))
@@ -463,9 +584,9 @@ impl ActivationStoreOps for PostgresActivationStore {
         sqlx::query(
             "INSERT INTO trigger_activation \
                (project_id, trigger, instance_id, status, accepting_fires, fires_visible_to_consumers, \
-                fires_deadline_unix, drain_deadline_unix, deactivated_by_health, activating_execution_id, \
+                fires_deadline_unix, drain_deadline_unix, went_down_with, went_down_at_unix, activating_execution_id, \
                 heartbeat_unix, activation_program, activation_version, updated_at) \
-             SELECT $1, t, NULLIF(m, ''), $4, $5, $6, NULL, NULL, FALSE, $7, $8, NULL, NULL, $8 \
+             SELECT $1, t, NULLIF(m, ''), $4, $5, $6, NULL, NULL, NULL, NULL, $7, $8, NULL, NULL, $8 \
              FROM unnest($2::text[], $3::text[]) AS k(t, m) \
              ON CONFLICT (project_id, trigger, instance_id) DO UPDATE SET \
                  status = EXCLUDED.status, \
@@ -473,6 +594,8 @@ impl ActivationStoreOps for PostgresActivationStore {
                  fires_visible_to_consumers = EXCLUDED.fires_visible_to_consumers, \
                  fires_deadline_unix = NULL, \
                  drain_deadline_unix = NULL, \
+                 went_down_with = NULL, \
+                 went_down_at_unix = NULL, \
                  deactivated_by_health = FALSE, \
                  activating_execution_id = EXCLUDED.activating_execution_id, \
                  heartbeat_unix = EXCLUDED.heartbeat_unix, \
@@ -506,7 +629,7 @@ impl ActivationStoreOps for PostgresActivationStore {
         let owned = "project_id = $1 AND activating_execution_id = $2 AND status = 'activating'";
         // An instance's rows landing wiped go ([`wipe_forgets`]); the rest
         // move to `to`.
-        let mut ended: Vec<(String, Option<String>)> = if lands_wiped(to) {
+        let mut ended: Vec<(String, Option<String>)> = if forgets_instance_rows(to) {
             sqlx::query_as(&format!(
                 "DELETE FROM trigger_activation WHERE {owned} AND instance_id IS NOT NULL RETURNING trigger, instance_id"
             ))
@@ -520,7 +643,8 @@ impl ActivationStoreOps for PostgresActivationStore {
         let moved: Vec<(String, Option<String>)> = sqlx::query_as(
             "UPDATE trigger_activation \
              SET status = $1, accepting_fires = $2, fires_visible_to_consumers = $3, \
-                 fires_deadline_unix = $4, deactivated_by_health = $5, drain_deadline_unix = $6, \
+                 fires_deadline_unix = $4, went_down_with = $5, drain_deadline_unix = $6, \
+                 went_down_at_unix = $10, deactivated_by_health = ($5::text IS NOT DISTINCT FROM 'health'), \
                  activating_execution_id = NULL, \
                  activation_program = CASE WHEN $1 = 'active' THEN activation_program ELSE NULL END, \
                  activation_version = CASE WHEN $1 = 'active' THEN activation_version ELSE NULL END, \
@@ -532,11 +656,12 @@ impl ActivationStoreOps for PostgresActivationStore {
         .bind(to.accepting_fires)
         .bind(to.fires_visible_to_consumers)
         .bind(to.fires_deadline_unix)
-        .bind(to.deactivated_by_health)
+        .bind(to.went_down.map(|w| w.with.as_str()))
         .bind(to.drain_deadline_unix)
         .bind(crate::lease::now_unix())
         .bind(project_id)
         .bind(execution_id)
+        .bind(to.went_down.map(|w| w.at_unix))
         .fetch_all(&mut *tx)
         .await?;
         ended.extend(moved);
@@ -576,7 +701,8 @@ impl ActivationStoreOps for PostgresActivationStore {
             restored += sqlx::query(
                 "UPDATE trigger_activation \
                  SET status = $1, accepting_fires = $2, fires_visible_to_consumers = $3, \
-                     fires_deadline_unix = $4, deactivated_by_health = $5, drain_deadline_unix = $6, \
+                     fires_deadline_unix = $4, went_down_with = $5, drain_deadline_unix = $6, went_down_at_unix = $14, \
+                     deactivated_by_health = ($5::text IS NOT DISTINCT FROM 'health'), \
                      activating_execution_id = NULL, activation_program = $7, activation_version = $8, updated_at = $9 \
                  WHERE project_id = $10 AND activating_execution_id = $11 AND status = 'activating' \
                    AND trigger = $12 AND instance_id IS NOT DISTINCT FROM $13",
@@ -585,7 +711,7 @@ impl ActivationStoreOps for PostgresActivationStore {
             .bind(before.accepting_fires)
             .bind(before.fires_visible_to_consumers)
             .bind(before.fires_deadline_unix)
-            .bind(before.deactivated_by_health)
+            .bind(before.went_down.map(|w| w.with.as_str()))
             .bind(before.drain_deadline_unix)
             .bind(activation.program.as_ref().map(sqlx::types::Json))
             .bind(activation.source_version.as_deref())
@@ -594,6 +720,7 @@ impl ActivationStoreOps for PostgresActivationStore {
             .bind(execution_id)
             .bind(&activation.key.trigger)
             .bind(activation.key.instance().map(InstanceId::as_str))
+            .bind(before.went_down.map(|w| w.at_unix))
             .execute(&mut *tx)
             .await?
             .rows_affected();
@@ -679,7 +806,8 @@ impl ActivationStoreOps for PostgresActivationStore {
         sqlx::query(&format!(
             "UPDATE trigger_activation a \
              SET status = $4, accepting_fires = $5, fires_visible_to_consumers = $6, \
-                 fires_deadline_unix = $7, deactivated_by_health = $8, drain_deadline_unix = $9, \
+                 fires_deadline_unix = $7, went_down_with = $8, drain_deadline_unix = $9, went_down_at_unix = $11, \
+                 deactivated_by_health = ($8::text IS NOT DISTINCT FROM 'health'), \
                  activating_execution_id = NULL, \
                  activation_program = CASE WHEN $4 IN ('inactive', 'deactivating') THEN NULL ELSE activation_program END, \
                  activation_version = CASE WHEN $4 IN ('inactive', 'deactivating') THEN NULL ELSE activation_version END, \
@@ -693,13 +821,14 @@ impl ActivationStoreOps for PostgresActivationStore {
         .bind(lifecycle.accepting_fires)
         .bind(lifecycle.fires_visible_to_consumers)
         .bind(lifecycle.fires_deadline_unix)
-        .bind(lifecycle.deactivated_by_health)
+        .bind(lifecycle.went_down.map(|w| w.with.as_str()))
         .bind(lifecycle.drain_deadline_unix)
         .bind(crate::lease::now_unix())
+        .bind(lifecycle.went_down.map(|w| w.at_unix))
         .execute(&mut *tx)
         .await?;
         let unlisten = match signals {
-            SignalsGoing::Kept => crate::journal::postgres::activation_signals(&mut *tx, project_id, keys).await?,
+            SignalsGoing::Kept => Vec::new(),
             SignalsGoing::Project { except } => {
                 crate::journal::postgres::remove_project_signals_except(&mut *tx, project_id, except).await?
             }
@@ -769,18 +898,23 @@ impl ActivationStoreOps for PostgresActivationStore {
     }
 
     async fn list_deactivating(&self) -> anyhow::Result<Vec<(uuid::Uuid, ActivationKey)>> {
-        let rows: Vec<(uuid::Uuid, String, Option<String>)> = sqlx::query_as(
+        let rows = sqlx::query_as(
             "SELECT project_id, trigger, instance_id FROM trigger_activation WHERE status = 'deactivating'",
         )
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter()
-            .map(|(project, trigger, instance)| {
-                let instance = instance.map(InstanceId::new).transpose().map_err(anyhow::Error::msg)?;
-                Ok((project, ActivationKey::new(trigger, Owner::from_instance(instance))))
-            })
-            .collect()
+        project_keys(rows)
     }
+}
+
+/// `(project_id, trigger, instance_id)` rows as the activations they key.
+fn project_keys(rows: Vec<(uuid::Uuid, String, Option<String>)>) -> anyhow::Result<Vec<(uuid::Uuid, ActivationKey)>> {
+    rows.into_iter()
+        .map(|(project, trigger, instance)| {
+            let instance = instance.map(InstanceId::new).transpose().map_err(anyhow::Error::msg)?;
+            Ok((project, ActivationKey::new(trigger, Owner::from_instance(instance))))
+        })
+        .collect()
 }
 
 /// One fake row: the lifecycle, the heartbeat, and the code and version

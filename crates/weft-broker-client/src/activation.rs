@@ -29,10 +29,13 @@ pub struct ActivationLifecycle {
     /// second past which the drain gives up, cancels what is still running,
     /// and lands Inactive (enforced by the stuck-transition reaper).
     pub drain_deadline_unix: Option<i64>,
-    /// True iff the CURRENT deactivation was the health loop parking this
-    /// activation because the infra it reads broke. Its auto-recover
-    /// reactivates only such an activation, never one a person took down.
-    pub deactivated_by_health: bool,
+    /// Why the CURRENT deactivation happened, when it was the infra the
+    /// trigger reads going down rather than a person: the health loop
+    /// parking it because a copy broke, or an infra verb (stop, terminate,
+    /// upgrade) taking it down with its copies. The copy coming back
+    /// brings it back (the health loop's auto-recover, an infra start);
+    /// one a person took down stays down until they switch it on.
+    pub went_down: Option<WentDown>,
     /// The trigger-setup run of the activation in flight, reserved before
     /// setup is queued; every write the activation makes is guarded by it.
     /// `None` outside Activating.
@@ -53,7 +56,7 @@ impl ActivationLifecycle {
             fires_visible_to_consumers: true,
             fires_deadline_unix: None,
             drain_deadline_unix: None,
-            deactivated_by_health: false,
+            went_down: None,
             activating_execution_id: None,
         }
     }
@@ -80,8 +83,8 @@ impl ActivationLifecycle {
         }
     }
 
-    /// Hibernate: parking until the deadline, then refusing; hidden the
-    /// whole time.
+    /// Hibernate: parking until the deadline, then refusing (the dispatcher
+    /// clears `accepting_fires` once it passes); hidden the whole time.
     pub fn hibernating(deadline_unix: i64) -> Self {
         Self {
             status: ProjectStatus::Inactive,
@@ -107,6 +110,20 @@ impl ActivationLifecycle {
         }
     }
 
+    /// Whether this is a wipe: inactive, refusing work, with no grace
+    /// window (a hibernation whose window ended refuses work too, and keeps
+    /// its deadline).
+    // SYNC: is_wiped <-> WIPE_FORGETS_SQL (crates/weft-dispatcher/src/activation_store.rs)
+    pub fn is_wiped(&self) -> bool {
+        self.status == ProjectStatus::Inactive && !self.accepting_fires && self.fires_deadline_unix.is_none()
+    }
+
+    /// Whether the health loop took this down and it is still down: what
+    /// its auto-recover brings back.
+    pub fn parked_by_health(&self) -> bool {
+        self.went_down.is_some_and(|w| w.with == DownWith::Health) && self.status == ProjectStatus::Inactive
+    }
+
     /// Where the activation stands, as a person reads it: `registered`,
     /// `activating`, `active`, `deactivating`, or for an inactive
     /// activation how it went down: `wipe`, `hibernate`, `park`.
@@ -118,7 +135,7 @@ impl ActivationLifecycle {
             ProjectStatus::Activating => ActivationMode::Activating,
             ProjectStatus::Active => ActivationMode::Active,
             ProjectStatus::Deactivating => ActivationMode::Deactivating,
-            ProjectStatus::Inactive => ActivationMode::Down(if !self.accepting_fires {
+            ProjectStatus::Inactive => ActivationMode::Down(if self.is_wiped() {
                 DeactivationMode::Wipe
             } else if !self.fires_visible_to_consumers {
                 DeactivationMode::Hibernate
@@ -151,7 +168,7 @@ pub fn aggregate<'a>(lifecycles: impl IntoIterator<Item = &'a ActivationLifecycl
             fires_visible_to_consumers: draining.iter().any(|l| l.fires_visible_to_consumers),
             fires_deadline_unix: draining.iter().filter_map(|l| l.fires_deadline_unix).max(),
             drain_deadline_unix: draining.iter().filter_map(|l| l.drain_deadline_unix).max(),
-            deactivated_by_health: draining.iter().all(|l| l.deactivated_by_health),
+            went_down: same_cause(&draining),
             activating_execution_id: None,
         };
     }
@@ -168,8 +185,53 @@ pub fn aggregate<'a>(lifecycles: impl IntoIterator<Item = &'a ActivationLifecycl
         fires_visible_to_consumers: inactive.iter().any(|l| l.fires_visible_to_consumers),
         fires_deadline_unix: inactive.iter().filter_map(|l| l.fires_deadline_unix).max(),
         drain_deadline_unix: None,
-        deactivated_by_health: inactive.iter().all(|l| l.deactivated_by_health),
+        went_down: same_cause(&inactive),
         activating_execution_id: None,
+    }
+}
+
+/// The cause every one of `lifecycles` went down with, when they all went
+/// down with the same one, at the latest of their moments.
+fn same_cause(lifecycles: &[&ActivationLifecycle]) -> Option<WentDown> {
+    let with = lifecycles.first()?.went_down?.with;
+    let mut at_unix = i64::MIN;
+    for lifecycle in lifecycles {
+        let went = lifecycle.went_down.filter(|w| w.with == with)?;
+        at_unix = at_unix.max(went.at_unix);
+    }
+    Some(WentDown { with, at_unix })
+}
+
+/// What took a trigger down when it was not a person, and when (see
+/// [`ActivationLifecycle::went_down`]). The moment is what tells a copy
+/// that came back up since from one still going down: only the first
+/// brings the trigger back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WentDown {
+    pub with: DownWith,
+    pub at_unix: i64,
+}
+
+/// What took a trigger down when it was not a person ([`WentDown`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownWith {
+    /// The health loop parked it: a copy it reads broke.
+    Health,
+    /// An infra verb took it down with the copies it reads.
+    Infra,
+}
+
+impl DownWith {
+    // SYNC: the spellings <-> trigger_activation.went_down_with (crates/weft-dispatcher/src/activation_store.rs)
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DownWith::Health => "health",
+            DownWith::Infra => "infra",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        [DownWith::Health, DownWith::Infra].into_iter().find(|cause| cause.as_str() == s)
     }
 }
 

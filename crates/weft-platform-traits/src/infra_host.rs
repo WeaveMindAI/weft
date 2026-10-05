@@ -30,6 +30,21 @@ pub enum UnitRunState {
     Failed { why: String },
 }
 
+impl UnitRunState {
+    /// Which state it is, without what it says about it: what a watcher
+    /// compares between two looks, since the words of one state may
+    /// change from one look to the next.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            UnitRunState::Starting { .. } => "starting",
+            UnitRunState::Ready => "ready",
+            UnitRunState::NotReady { .. } => "not_ready",
+            UnitRunState::Stopped => "stopped",
+            UnitRunState::Failed { .. } => "failed",
+        }
+    }
+}
+
 /// One unit the host runs for a project.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnitObservation {

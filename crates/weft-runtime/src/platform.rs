@@ -57,7 +57,7 @@ pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>) -> anyho
                     // A local worker gets the ticket secret from the runner
                     // that starts it; a GCP one reads it from Secret Manager.
                     caller_token_secret: crate::secret("WEFT_CALLER_TOKEN_SECRET")?,
-                    idle_stop: Duration::from_secs(local.worker_idle_stop_seconds),
+                    idle_stop: local.worker_idle_stop(),
                     scratch_dir: scratch.clone(),
                     install: config.install.clone(),
                     time_scale: weft_core::time_scale::factor(),
@@ -127,7 +127,12 @@ pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>) -> anyho
             Ok(Parts {
                 runner: Arc::new(weft_platform_gcp::CloudRunRunner::new(google.clone(), gcp.clone(), config.role_addresses(Vantage::Private).broker, config.install.clone())),
                 images: Arc::new(weft_platform_gcp::CloudBuildImages::new(google.clone(), gcp.clone())?),
-                host: Arc::new(weft_platform_gcp::ComputeInfraHost::new(google.clone(), gcp.clone(), config.install.clone())),
+                host: Arc::new(weft_platform_gcp::ComputeInfraHost::new(
+                    google.clone(),
+                    gcp.clone(),
+                    config.install.clone(),
+                    config.role_addresses(Vantage::Private).broker,
+                )),
                 alarm: Arc::new(weft_platform_gcp::CloudTasksAlarm::new(google.clone(), gcp.clone(), config.role_addresses(Vantage::Public))),
                 frontends: Arc::new(weft_platform_gcp::CloudRunFrontends::new(google.clone(), gcp.clone())),
                 domains: Arc::new(weft_platform_gcp::LoadBalancerDomains::new(google.clone(), gcp.clone())),

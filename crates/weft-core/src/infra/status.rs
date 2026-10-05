@@ -71,6 +71,7 @@ impl InfraNodeStatus {
     /// the health loop should observe. Used by the supervisor's
     /// health tick: a node mid-apply or mid-stop has no SLO; only
     /// `Running` / `Flaky` does.
+    // SYNC: expects_running_units <-> weft_broker_client::lifecycle_command::runs_infra
     pub fn expects_running_units(self) -> bool {
         matches!(self, Self::Running | Self::Flaky)
     }

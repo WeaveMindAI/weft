@@ -77,6 +77,45 @@ fn restarts(rig: &SupervisorTestRig) -> usize {
     rig.host.calls().iter().filter(|c| matches!(c, HostCall::Restart { .. })).count()
 }
 
+// ---------- when a supervisor that scales to zero looks again ----------
+
+/// A supervisor that scales to zero looks on a clock only while time
+/// passing can change what it decides: a unit inside its flaky window (not
+/// ready after having been) or its recovery window (ready again after
+/// being flaky). A unit that runs fine is settled, and so is one broken and
+/// already declared flaky, once what that set off has run: neither changes
+/// until the unit does, which its machine says.
+#[tokio::test]
+async fn health_is_unsettled_only_while_time_can_change_a_decision() {
+    let rig = rig();
+    rig.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
+    observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", true)]);
+    assert!(!rig.tick_health().await.unwrap(), "every unit ready: nothing to look at again");
+
+    observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", false)]);
+    assert!(rig.tick_health().await.unwrap(), "not ready inside its flaky window");
+    observe(&rig, PROJECT, &[]);
+    assert!(rig.tick_health().await.unwrap(), "no longer reported reads as not ready, still inside the window");
+
+    rig.advance(Duration::from_secs(31));
+    rig.tick_health().await.unwrap();
+    let mut settled = false;
+    for _ in 0..5 {
+        if !rig.tick_health().await.unwrap() {
+            settled = true;
+            break;
+        }
+        rig.advance(Duration::from_secs(1));
+    }
+    assert!(settled, "declared flaky, once what that set off has run: nothing to look at again");
+
+    observe(&rig, PROJECT, &[(NODE, "inst1", "bridge", true)]);
+    assert!(rig.tick_health().await.unwrap(), "ready again inside its recovery window");
+    rig.advance(Duration::from_secs(31));
+    rig.tick_health().await.unwrap();
+    assert!(!rig.tick_health().await.unwrap(), "recovered: settled");
+}
+
 // ---------- false-flaky-on-fresh-provision ----------
 
 #[tokio::test]

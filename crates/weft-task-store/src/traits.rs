@@ -56,10 +56,10 @@ pub trait TaskStoreClient: Send + Sync {
     async fn fail(&self, task_id: Uuid, replica: &str, error: String) -> Result<()>;
 
     /// The cancels asked for any of `execution_ids` of `project_id` (the
-    /// executions the asking worker drives), each taken as it is
-    /// answered; when there are none, hold for up to `wait` for one. An
-    /// empty answer once `wait` passed.
-    async fn wait_cancels(&self, project_id: Uuid, execution_ids: Vec<String>, wait: Duration) -> Result<Vec<CancelAsked>>;
+    /// executions the asking worker drives); asking only reads, so asking
+    /// again finds them again. A worker asks when it hears one announced
+    /// ([`crate::tasks::CANCEL_CHANNEL`]) and when it may have missed some.
+    async fn cancels_asked(&self, project_id: Uuid, execution_ids: Vec<String>) -> Result<Vec<CancelAsked>>;
 }
 
 // ---------- Postgres impls ----------
@@ -121,23 +121,8 @@ impl TaskStoreClient for PostgresTaskStoreClient {
         crate::tasks::fail(&self.pool, task_id, replica, error).await
     }
 
-    async fn wait_cancels(&self, project_id: Uuid, execution_ids: Vec<String>, wait: Duration) -> Result<Vec<CancelAsked>> {
-        let deadline = tokio::time::Instant::now() + wait;
-        // Subscribed before the first look, so a cancel that lands
-        // between an empty look and the wait still wakes it: a cancel
-        // task is a worker task of the project, announced on its ready
-        // payload like any other.
-        let mut signals = self.signals.subscribe();
-        let ready = crate::tasks::ready_payload(crate::tasks::TaskTarget::Worker, Some(project_id));
-        loop {
-            let taken = crate::tasks::take_cancels(&self.pool, project_id, &execution_ids).await?;
-            if !taken.is_empty() {
-                return Ok(taken);
-            }
-            if !signals.woken_before(deadline, |c, p| c == crate::tasks::TASK_READY_CHANNEL && p == ready).await? {
-                return Ok(Vec::new());
-            }
-        }
+    async fn cancels_asked(&self, project_id: Uuid, execution_ids: Vec<String>) -> Result<Vec<CancelAsked>> {
+        crate::tasks::cancels_asked(&self.pool, project_id, &execution_ids).await
     }
 }
 

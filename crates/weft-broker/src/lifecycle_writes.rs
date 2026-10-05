@@ -112,19 +112,23 @@ pub async fn sync_ownership(
 
     // 3. When this supervisor next has something to look at: now, while a
     //    project it owns gives it work; or when the soonest lease a
-    //    sibling holds over such a project, or over one the host holds
-    //    copies of (which a sibling's gone-copy sweep may have left
-    //    half done), lapses: the sibling may be gone, and only a lapsed
-    //    lease is taken over. One of those that nobody holds (past this
-    //    tick's batch) counts as lapsed.
+    //    sibling holds lapses, over a project with work, with infra copies
+    //    expected to run (a machine's word that one changed may have woken
+    //    this replica rather than the sibling holding the project, which
+    //    sleeps; a stopped copy says nothing), or
+    //    whose copies the host holds (which a sibling's gone-copy sweep may
+    //    have left half done): the sibling may be gone, and only a lapsed
+    //    lease is taken over, then looked at. One of those that nobody
+    //    holds (past this tick's batch) counts as lapsed.
     let (owns_work, others_lapse_in_secs): (bool, Option<i64>) = sqlx::query_as(&format!(
         "SELECT \
            EXISTS (SELECT 1 FROM project p JOIN infra_owner io ON io.project_id = p.id \
                    WHERE io.supervisor_replica = $1 AND {work}), \
            (SELECT MIN(GREATEST(COALESCE(io.leased_until_unix, 0) - EXTRACT(EPOCH FROM NOW())::BIGINT, 0)) \
               FROM project p LEFT JOIN infra_owner io ON io.project_id = p.id \
-             WHERE io.supervisor_replica IS DISTINCT FROM $1 AND ({work} OR p.id = ANY($2)))",
+             WHERE io.supervisor_replica IS DISTINCT FROM $1 AND ({work} OR {nodes} OR p.id = ANY($2)))",
         work = supervisor_work("p"),
+        nodes = weft_broker_client::lifecycle_command::runs_infra("p"),
     ))
     .bind(replica)
     .bind(held_projects)
@@ -157,7 +161,7 @@ where
     let sql = format!(
         "SELECT p.id AS project_id, p.tenant_id, \
                 a.status, a.accepting_fires, a.fires_visible_to_consumers, a.fires_deadline_unix, \
-                a.drain_deadline_unix, a.deactivated_by_health, a.activating_execution_id \
+                a.drain_deadline_unix, a.went_down_with, a.went_down_at_unix, a.activating_execution_id \
          FROM infra_owner io \
          JOIN project p ON p.id = io.project_id \
          LEFT JOIN trigger_activation a ON a.project_id = p.id \
@@ -188,7 +192,18 @@ where
             fires_visible_to_consumers: r.try_get("fires_visible_to_consumers").context("decode visibility")?,
             fires_deadline_unix: r.try_get("fires_deadline_unix").context("decode deadline")?,
             drain_deadline_unix: r.try_get("drain_deadline_unix").context("decode drain deadline")?,
-            deactivated_by_health: r.try_get("deactivated_by_health").context("decode deactivated_by_health")?,
+            went_down: match (
+                r.try_get::<Option<String>, _>("went_down_with").context("decode went_down_with")?,
+                r.try_get::<Option<i64>, _>("went_down_at_unix").context("decode went_down_at_unix")?,
+            ) {
+                (None, None) => None,
+                (Some(cause), Some(at_unix)) => Some(weft_broker_client::activation::WentDown {
+                    with: weft_broker_client::activation::DownWith::parse(&cause)
+                        .with_context(|| format!("trigger_activation.went_down_with='{cause}' is not a known cause"))?,
+                    at_unix,
+                }),
+                (cause, at) => anyhow::bail!("trigger_activation.went_down_with={cause:?} and went_down_at_unix={at:?} must be set together"),
+            },
             activating_execution_id: r.try_get("activating_execution_id").context("decode activating_execution_id")?,
         };
         projects.last_mut().expect("pushed above").2.push(lifecycle);
@@ -203,7 +218,7 @@ where
                 status: aggregate.status,
                 health_parked: lifecycles
                     .iter()
-                    .any(|l| l.deactivated_by_health && l.status == ProjectStatus::Inactive),
+                    .any(weft_broker_client::activation::ActivationLifecycle::parked_by_health),
             }
         })
         .collect())

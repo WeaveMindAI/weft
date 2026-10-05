@@ -214,6 +214,7 @@ impl JournalClient for PostgresJournalClient {
         let mut tx = self.pool.begin().await?;
         crate::unrecorded::forget_in(&mut tx, execution_id).await?;
         tx.commit().await?;
+        weft_task_store::announce::committed(&self.pool);
         Ok(())
     }
 

@@ -407,7 +407,9 @@ enum Cmd {
     },
     /// Deactivate a registered project. Choose --mode wipe, hibernate,
     /// or park explicitly in scripts; a terminal prompts when it is omitted.
-    /// Wipe cancels suspended work; hibernate and park preserve it.
+    /// Park keeps everything that arrives and runs it once the triggers are
+    /// back; hibernate does that for a grace window; wipe drops it all and
+    /// cancels the runs waiting on the triggers.
     ///
     /// `--running-policy` controls how in-flight executions are
     /// handled: `cancel` (the default) kills running executions and
@@ -706,6 +708,17 @@ enum Cmd {
         /// Only runs carrying this tag (`ctx.tag_execution`).
         #[arg(long)]
         tag: Option<String>,
+        /// Only runs in which this node fired, wherever it sits in the
+        /// program (`--node` is the node that started the run). Spelled
+        /// the way `weft events` names nodes.
+        #[arg(long, value_name = "node")]
+        through: Option<String>,
+        /// Only finished runs that carried every one of these words
+        /// somewhere in what they recorded: the trigger's input, what
+        /// every node sent on, an error, a log line. An email, an order
+        /// id, a phrase in quotes. A run still going is not searched yet.
+        #[arg(long, value_name = "words")]
+        search: Option<String>,
     },
     /// Print a past execution's events in order, one line each:
     /// time, kind, node, and a short summary of the value or error.
@@ -1020,10 +1033,12 @@ impl From<ScopeOpts> for weft_core::activation::ActivationScope {
 /// for.
 #[derive(Debug, clap::Args, Default, Clone)]
 struct TriggerDeactivationOpts {
-    /// Preservation mode for active triggers: wipe | hibernate | park.
+    /// What happens to work arriving while the triggers are down: park
+    /// keeps it all and runs it once they are back, hibernate does that for
+    /// a grace window, wipe drops it.
     #[arg(long, value_name = "wipe|hibernate|park")]
     mode: Option<String>,
-    /// Hibernate grace window in minutes (only meaningful with
+    /// How long hibernate keeps taking work, in minutes (only with
     /// --mode hibernate). Default 15.
     #[arg(long, value_name = "minutes")]
     grace: Option<u32>,
@@ -1830,11 +1845,11 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Cmd::Login { target, key_stdin } => commands::target::login(ctx, target, key_stdin).await,
         Cmd::Logout { target } => commands::target::logout(ctx, target).await,
         Cmd::Token { action } => commands::token::run(ctx, action.into()).await,
-        Cmd::Executions { limit, project, phase, node, since, offset, status, instance, tag } => {
+        Cmd::Executions { limit, project, phase, node, since, offset, status, instance, tag, through, search } => {
             commands::executions::list(
                 ctx,
                 commands::executions::ListFilter {
-                    limit, offset, project, phase, node, since, status, instance, tag,
+                    limit, offset, project, phase, node, since, status, instance, tag, through, search,
                 },
             )
             .await

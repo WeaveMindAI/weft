@@ -222,9 +222,10 @@ running, activate refuses with "these triggers' infra is not running:
 `weft activate` is for a program that is off. Once its triggers are on, it
 refuses, and a change goes live with `weft resync --on prod --mode <mode>`,
 which takes the triggers down and brings them back on the new version. On
-prod, pick `park` (calls that arrive meanwhile wait and run once the
-triggers are back) or `hibernate` (they keep being answered for a grace
-window), because those calls can be real people's. `wipe` drops them and
+prod, pick `park` (calls that arrive meanwhile wait, a caller on a route
+kept on the line, and run on the new version once the triggers are back) or
+`hibernate` (the same for a grace window), because those calls can be real
+people's. `wipe` drops them and
 cancels the work waiting on the triggers: fine on a dev install, and on
 prod only when the user says so.
 
