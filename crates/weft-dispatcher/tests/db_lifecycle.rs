@@ -935,6 +935,8 @@ async fn quiesce_waits_until_no_run_of_the_project_is_live(pool: PgPool) {
     let mut tx = pool.begin().await.unwrap();
     weft_journal::unrecorded::forget_in(&mut tx, execution_id).await.unwrap();
     tx.commit().await.unwrap();
+    // What every caller of `forget_in` does once its transaction commits.
+    weft_task_store::announce::committed(&pool);
     tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
         .await
         .expect("the ending wakes the quiesce at once")
