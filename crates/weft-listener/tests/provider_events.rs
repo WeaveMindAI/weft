@@ -132,21 +132,26 @@ async fn spawn_gateway() -> FakeGateway {
 /// The fake broker + provider in one server: the listener-resolve
 /// route (answering the connection's values + the events recipe) and
 /// the socket-mint endpoint (answering the gateway's address,
-/// recording the auth it saw).
+/// recording the auth it saw). The mint answers once `mint_open` is
+/// true, so a scenario can hold the socket back until every
+/// subscription it registers has joined it.
 struct FakeBroker {
     mint_auth_seen: Arc<Mutex<Vec<String>>>,
+    mint_open: tokio::sync::watch::Sender<bool>,
 }
 
-async fn spawn_broker(gateway_url: String, multi_account: bool) -> (String, FakeBroker) {
+async fn spawn_broker(gateway_url: String, multi_account: bool, mint_open: bool) -> (String, FakeBroker) {
     use axum::extract::State;
     use axum::routing::post;
     let mint_auth_seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let (open_tx, open_rx) = tokio::sync::watch::channel(mint_open);
     #[derive(Clone)]
     struct S {
         gateway_url: String,
         mint_auth_seen: Arc<Mutex<Vec<String>>>,
+        mint_open: tokio::sync::watch::Receiver<bool>,
     }
-    let state = S { gateway_url, mint_auth_seen: mint_auth_seen.clone() };
+    let state = S { gateway_url, mint_auth_seen: mint_auth_seen.clone(), mint_open: open_rx };
     // The mint URL must be known before the recipe is written, and
     // the recipe is answered by this same server: bind first, then
     // build the app around the address.
@@ -200,12 +205,14 @@ async fn spawn_broker(gateway_url: String, multi_account: bool) -> (String, Fake
                     .unwrap_or("")
                     .to_string();
                 s.mint_auth_seen.lock().unwrap().push(auth);
+                let mut open = s.mint_open.clone();
+                open.wait_for(|open| *open).await.expect("the scenario holds the gate");
                 axum::Json(json!({ "ok": true, "url": s.gateway_url }))
             }),
         )
         .with_state(state);
     tokio::spawn(async move { axum::serve(listener, weft_broker_client::line::server::with_line(app)).await.unwrap() });
-    (base, FakeBroker { mint_auth_seen })
+    (base, FakeBroker { mint_auth_seen, mint_open: open_tx })
 }
 
 async fn wait_until(mut check: impl FnMut() -> bool, what: &str) {
@@ -290,7 +297,7 @@ async fn run_scenario() {
     let run_id = uuid::Uuid::new_v4().simple().to_string();
     let sig_token = format!("sig-{run_id}");
     let gateway = spawn_gateway().await;
-    let (broker_base, broker) = spawn_broker(gateway.url.clone(), false).await;
+    let (broker_base, broker) = spawn_broker(gateway.url.clone(), false, true).await;
     let rig = rig(&run_id, broker_base);
     let tasks = rig.tasks.clone();
     let registry = rig.state.registry.clone();
@@ -418,7 +425,7 @@ async fn run_multi_account_scenario() {
     let account_token = format!("sig-acct-{run_id}");
     let app_token = format!("sig-app-{run_id}");
     let gateway = spawn_gateway().await;
-    let (broker_base, _broker) = spawn_broker(gateway.url.clone(), true).await;
+    let (broker_base, broker) = spawn_broker(gateway.url.clone(), true, false).await;
     let rig = rig(&run_id, broker_base);
 
     // Two subscriptions on the SAME connection (one shared socket):
@@ -436,6 +443,15 @@ async fn run_multi_account_scenario() {
         to_spec(ProviderEvents::new(&access, "messages", Vec::new()).app_wide()),
     )
     .await;
+    // A frame reaches the subscriptions on the socket when it arrives, so
+    // the socket opens only once both have joined it (each settles its
+    // transport right as it joins); else the first could hear a frame
+    // before the second is there.
+    let joined = |token: &str| {
+        rig.state.registry.get(token).is_some_and(|sig| sig.serving.lock().transport.is_some())
+    };
+    wait_until(|| joined(&account_token) && joined(&app_token), "both subscriptions joining the socket").await;
+    broker.mint_open.send(true).unwrap();
 
     let frame = |team: Option<&str>, text: &str| {
         let mut payload = json!({
