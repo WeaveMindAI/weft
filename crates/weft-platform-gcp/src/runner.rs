@@ -714,7 +714,7 @@ mod tests {
         let t = &body["template"];
         assert_eq!(t["scaling"]["minInstanceCount"], 0);
         assert_eq!(t["scaling"]["maxInstanceCount"], 10);
-        assert_eq!(t["maxInstanceRequestConcurrency"], 20);
+        assert_eq!(t["maxInstanceRequestConcurrency"], 80);
         assert_eq!(t["timeout"], "3600s");
         assert_eq!(t["serviceAccount"], "wp-x@acme.iam.gserviceaccount.com");
         assert_eq!(t["vpcAccess"]["networkInterfaces"][0]["subnetwork"], "weft-sub", "workers leave from the install's main subnet");

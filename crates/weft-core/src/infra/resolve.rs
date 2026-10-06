@@ -60,6 +60,7 @@ impl NodeRef {
     /// resource name on every platform: lowercase letters, digits and `-`,
     /// starting with a letter, at most 40 characters, so a platform may
     /// add a unit or volume name after it and stay under 63.
+    // SYNC: the `wi-` prefix <-> deploy/terraform/gcp/machines.tf (the machine events' filter)
     pub fn resource_base(&self) -> String {
         let digest = Sha256::digest(format!("{}|{}|{}", self.project, self.node, self.copy_id).as_bytes());
         let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();

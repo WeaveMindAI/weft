@@ -191,7 +191,7 @@ impl RoleAddresses {
 }
 
 /// The path a role's tick answers at, under its internal address.
-// SYNC: TICK_PATH <-> deploy/terraform/gcp/builds.tf (the push endpoint)
+// SYNC: TICK_PATH <-> deploy/terraform/gcp/builds.tf (the push endpoint), deploy/terraform/gcp/machines.tf (the push endpoint)
 pub const TICK_PATH: &str = "/_weft/tick";
 
 /// Where the internal routes are reached on a local install's public

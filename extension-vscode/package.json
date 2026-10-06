@@ -2,7 +2,7 @@
   "name": "weft-vscode",
   "displayName": "Weft",
   "description": "Write Weft programs and watch them run: a live, editable graph of every .weft file, with diagnostics, runs and executions in the editor.",
-  "version": "0.2.259",
+  "version": "0.2.260",
   "publisher": "weavemind",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
@@ -181,6 +181,24 @@
         "icon": "$(list-tree)"
       },
       {
+        "command": "weft.searchRuns",
+        "title": "Search runs",
+        "category": "Weft",
+        "icon": "$(search)"
+      },
+      {
+        "command": "weft.clearRunSearch",
+        "title": "Show every run",
+        "category": "Weft",
+        "icon": "$(close)"
+      },
+      {
+        "command": "weft.showRunsOn",
+        "title": "Show the runs on…",
+        "category": "Weft",
+        "icon": "$(cloud)"
+      },
+      {
         "command": "weft.branchHere",
         "title": "Branch here",
         "category": "Weft",
@@ -283,6 +301,16 @@
           "group": "navigation@3"
         },
         {
+          "command": "weft.searchRuns",
+          "when": "view == weft.executions",
+          "group": "navigation@3"
+        },
+        {
+          "command": "weft.showRunsOn",
+          "when": "view == weft.executions",
+          "group": "navigation@3"
+        },
+        {
           "command": "weft.checkpointLabel",
           "when": "view == weft.executions",
           "group": "navigation@4"
@@ -343,6 +371,11 @@
           "command": "weft.deleteExecution",
           "when": "view == weft.executions && viewItem =~ /^weftRun-/",
           "group": "inline@2"
+        },
+        {
+          "command": "weft.clearRunSearch",
+          "when": "view == weft.executions && viewItem == weftRunSearch",
+          "group": "inline"
         }
       ]
     },

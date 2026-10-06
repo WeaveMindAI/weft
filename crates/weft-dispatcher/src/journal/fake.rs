@@ -59,6 +59,13 @@ pub struct FakeJournal {
 }
 
 impl FakeJournal {
+    /// Whether `node` started in `execution_id`: the listing's `node` filter.
+    fn ran_node(&self, execution_id: ExecutionId, node: &str) -> bool {
+        self.inner.lock().unwrap().events.iter().any(|e| {
+            matches!(e, ExecEvent::NodeStarted { execution_id: of, node_id, .. } if *of == execution_id && node_id == node)
+        })
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -562,6 +569,10 @@ impl Journal for FakeJournal {
         tenant: &str,
         query: &ExecutionQuery,
     ) -> anyhow::Result<ExecutionPage> {
+        // The words of a run are Postgres's full-text search, which a fake
+        // would only imitate: `search` is tested against Postgres
+        // (`tests/db_tags.rs`).
+        assert!(query.search.is_none(), "the listing's `search` is tested against Postgres, not the fake journal");
         // Every summary for this tenant, newest first, then apply the same
         // project + start-time filters the Postgres query does, then page.
         // A run parked on a wait (a resume signal registered for it) reads
@@ -583,6 +594,7 @@ impl Journal for FakeJournal {
             .filter(|s| query.status.is_none_or(|st| st.reaches(honest(s))))
             .filter(|s| query.instance.as_ref().is_none_or(|m| s.instance.as_ref() == Some(m)))
             .filter(|s| query.tag.as_deref().is_none_or(|t| s.tags.iter().any(|x| x == t)))
+            .filter(|s| query.node.as_deref().is_none_or(|node| self.ran_node(s.execution_id, node)))
             .collect();
         all.sort_by(|a, b| b.started_at.cmp(&a.started_at).then(b.execution_id.cmp(&a.execution_id)));
         let total = all.len() as u64;

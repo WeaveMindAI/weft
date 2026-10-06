@@ -55,9 +55,16 @@ Google, so that pair is the one place both free tiers sit side by side.
 PROJECT=my-project REGION=us-west1 FORK=me/weft
 NUMBER=$(gcloud projects describe $PROJECT --format='value(projectNumber)')
 # On a new project IAM can take a minute to catch up (with the services just
-# enabled, with the account just made), so each IAM step below is retried
-# until it holds.
-retry() { until "$@"; do echo "waiting for IAM to catch up, trying again in 10 seconds"; sleep 10; done; }
+# enabled, with the account just made), so each IAM step below is tried
+# again, quietly, for up to three minutes; a last try shows its own error.
+retry() {
+  for _ in $(seq 18); do
+    "$@" >/dev/null 2>&1 && return 0
+    echo "waiting for IAM to catch up, trying again in 10 seconds"
+    sleep 10
+  done
+  "$@"
+}
 
 gcloud services enable --project $PROJECT \
   iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com \
@@ -188,7 +195,7 @@ few hours that wakes each part for a moment.
 | The holders | a Cloud Run worker pool for the triggers that keep a connection open between events (a stream, a socket, an event subscription that dials out). weft runs one holder per 200 such triggers and none when there are none |
 | Your database | everything weft keeps, at the address you gave it |
 | Cloud Build | builds your programs' images when you deploy |
-| Pub/Sub | the `cloud-builds` topic, on which Cloud Build announces each build's end, so the dispatcher hears it at once |
+| Pub/Sub | the `cloud-builds` topic, on which Cloud Build announces each build's end, so the dispatcher hears it at once, and one carrying Compute Engine's record of an infrastructure machine stopping or failing to the supervisor |
 | Cloud Tasks | every timer, schedule and poll your programs set, and the wakes weft schedules for itself to check on its own pending work |
 | Compute Engine | one machine per infrastructure unit your programs start (a database, a GPU model) |
 | A storage bucket | weft's files, reached as weft's own service account: no key is made for it, so an organization that forbids service-account keys runs weft as is |
@@ -318,9 +325,10 @@ weft resync --on prod --mode park
 ```
 
 On prod, pick `park` or `hibernate`, because the calls arriving while the
-triggers are down can be real people's: `park` holds them and runs them once
-the triggers are back, `hibernate` keeps them for a grace window (`--grace`,
-in minutes). `wipe` drops them and cancels the work waiting on the triggers,
+triggers are down can be real people's: `park` holds them (a caller on a
+route stays on the line) and runs them on the new version once the triggers
+are back, `hibernate` does the same for a grace window (`--grace`, in
+minutes). `wipe` drops them and cancels the work waiting on the triggers,
 which is fine on a dev install.
 
 Only the change is uploaded, and only the image it touches is rebuilt. If

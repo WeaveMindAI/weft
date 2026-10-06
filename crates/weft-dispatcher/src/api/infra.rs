@@ -678,13 +678,95 @@ pub(crate) async fn finish_sync(
     crate::api::project::reconcile_worker(state, id, running_policy, drain_timeout_secs)
         .await?;
 
-    // No auto-reactivate. An upgrade takes its triggers down before its
-    // stop leg, and a user-invoked
-    // upgrade intentionally leaves it deactivated (the user clicks
-    // Activate when ready). Automatic reactivation lives only in the
-    // autonomous health-recovery path (the supervisor's AutoRecover
-    // protocol -> dispatcher lifecycle_claimer -> activate_inner), where
-    // there is no human to click.
+    Ok(())
+}
+
+/// Switch back on, in every project, the triggers an infra verb took down
+/// with the copies they read (`DownWith::Infra`), once each of those
+/// copies runs again. Woken by any change of a copy's status
+/// (`crate::reaper`'s `infra_returns`), so whichever way a copy came back
+/// up (a `weft infra start`, an upgrade's start leg, a program's own
+/// `ctx.infra(..).start()`) and whichever dispatcher heard it, the marks
+/// in the rows are what it acts on: one that died midway leaves them for
+/// the next pass. One a person took down since carries no mark and stays
+/// down, and one whose other copies are still down waits for their start.
+pub(crate) async fn bring_back_triggers_whose_infra_returned(state: DispatcherState) -> anyhow::Result<weft_task_store::drain::DrainStep> {
+    // SYNC: 'infra' <-> weft_broker_client::activation::DownWith::Infra
+    let marked: Vec<uuid::Uuid> = sqlx::query_scalar(
+        "SELECT DISTINCT project_id FROM trigger_activation WHERE went_down_with = 'infra' AND status = 'inactive'",
+    )
+    .fetch_all(&state.pg_pool)
+    .await?;
+    for id in marked {
+        bring_back_what_went_down_with_infra(&state, id).await?;
+    }
+    Ok(weft_task_store::drain::DrainStep::Done)
+}
+
+/// [`bring_back_triggers_whose_infra_returned`] for project `id`. Owner by
+/// owner, since one setup run is one owner's: one that cannot come back is
+/// logged with its owner and the others still come back.
+async fn bring_back_what_went_down_with_infra(state: &DispatcherState, id: uuid::Uuid) -> anyhow::Result<()> {
+    let Some(project) = state.projects.project(id).await? else { return Ok(()) };
+    let deps = crate::api::project::compute_trigger_deps(&project);
+    let copies = crate::infra_node::statuses(&state.pg_pool, id).await?;
+    let mut by_owner: std::collections::BTreeMap<Option<weft_core::instance::InstanceId>, Vec<String>> = Default::default();
+    for activation in state.activations.list(id).await? {
+        let lifecycle = &activation.lifecycle;
+        let Some(went_down) = lifecycle.went_down.filter(|w| w.with == crate::take_down::DownWith::Infra) else { continue };
+        if lifecycle.status != crate::activation_store::ProjectStatus::Inactive {
+            continue;
+        }
+        let reads: std::collections::HashSet<String> =
+            deps.iter().filter(|(_, trigger)| *trigger == activation.key.trigger).map(|(infra, _)| infra.clone()).collect();
+        match crate::api::project::missing_infra_nodes(state, id, &project, Some(&reads), activation.key.instance()).await {
+            Ok(missing) if missing.is_empty() => {
+                // Every copy it reads runs, and one came back up since it
+                // went down: the verb takes a trigger down before its copy,
+                // so a copy still running from before may be on its way
+                // down. Both moments are the database's clock.
+                let came_back = copies.iter().any(|row| {
+                    row.applied_at_unix.is_some_and(|at| at >= went_down.at_unix)
+                        && crate::api::project::copies_read(&project, Some(&reads), activation.key.instance())
+                            .iter()
+                            .any(|(place, copy)| &row.node_id == place && Some(row.instance.as_ref()) == *copy)
+                });
+                if came_back {
+                    by_owner.entry(activation.key.instance().cloned()).or_default().push(activation.key.trigger)
+                }
+            }
+            Ok(_) => {}
+            Err((status, message)) => tracing::error!(
+                target: "weft_dispatcher::infra",
+                project_id = %id, trigger = %activation.key.trigger, instance = ?activation.key.instance(),
+                "could not tell whether a trigger's infra is back, so it stays down for now: {status}: {message}"
+            ),
+        }
+    }
+    for (instance, triggers) in by_owner {
+        tracing::info!(target: "weft_dispatcher::infra", project_id = %id, ?instance, ?triggers, "bringing back the triggers that went down with their infra");
+        let request = weft_core::activation::ActivateRequest {
+            scope: weft_core::activation::ActivationScope { triggers: triggers.clone(), instance: instance.clone() },
+            ..Default::default()
+        };
+        match crate::api::project::activate_with(state, id, request, crate::api::project::ActivateAsker::Outside).await {
+            Ok(_) => {}
+            // Another dispatcher heard the same copy come back and is
+            // switching them on.
+            Err(crate::api::project::ActivateError::Refused(crate::activation_store::ClaimRefused::Claimed)) => {
+                tracing::info!(target: "weft_dispatcher::infra", project_id = %id, ?instance, ?triggers, "already being brought back");
+            }
+            Err(error) => {
+                let (status, message) = <(axum::http::StatusCode, String)>::from(error);
+                tracing::error!(
+                    target: "weft_dispatcher::infra",
+                    project_id = %id, ?instance, ?triggers,
+                    "the infra the triggers read is up, but they did not come back; tried again at the next change of a copy, \
+                     or `weft activate` switches them on: {status}: {message}"
+                );
+            }
+        }
+    }
     Ok(())
 }
 

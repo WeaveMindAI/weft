@@ -47,6 +47,9 @@ pub async fn apply_core_schema(pool: &sqlx::PgPool) -> anyhow::Result<()> {
 /// applies it whole, the migration generator writes its origins from it,
 /// and the agreement test builds from it.
 pub static ALL_GROUPS: &[&weft_task_store::SchemaGroup] = &[
+    // What the writes a run makes announce, sent in batches: every
+    // trigger on a run's path writes to it.
+    &weft_task_store::announce::GROUP,
     &crate::journal::postgres::GROUP,
     // The exclusive infra ownership leases.
     &crate::infra_owner::GROUP,
@@ -76,6 +79,9 @@ pub static ALL_GROUPS: &[&weft_task_store::SchemaGroup] = &[
     // The public edge's counters: per-minute buckets and the runs each
     // entry has going (no FK: a slot outlives nothing it names).
     &crate::entry_limits::GROUP,
+    // Every finished run's words, for finding a run by what went through
+    // it (`run_search`).
+    &crate::run_search::GROUP,
     // The image builds running and done, by image ref (`build::ledger`).
     &crate::build::ledger::GROUP,
     // The wakes a local install has set and not yet delivered (a cloud
@@ -230,7 +236,7 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         domains,
         holder_pool,
         holder_settings: config.holders,
-        worker_defaults: config.workers.clone(),
+        worker_defaults: config.worker_settings(),
         builder,
         install_info: install_info(config),
         projects,
@@ -353,6 +359,8 @@ pub fn loop_wakes() -> Vec<(&'static str, &'static [WakeOn])> {
         ("infra_event_bridge", crate::infra_event_bridge::ON_INFRA_EVENT),
         ("parked_fires", crate::reaper::ON_PARKED_FIRE),
         ("storage_sweep", crate::reaper::ON_STORAGE_SWEEP),
+        ("hibernations", crate::reaper::ON_HIBERNATION),
+        ("infra_returns", crate::reaper::ON_INFRA_STATUS),
         ("holders", crate::holders::ON_HELD_SIGNALS),
         ("domains_door", crate::domains::ON_DOMAINS),
     ]

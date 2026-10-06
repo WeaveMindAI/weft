@@ -34,7 +34,7 @@
       },
       "default": "park",
       "label": "Triggers",
-      "description": "park queues what arrives, hibernate keeps accepting for `graceMinutes`, wipe drops it."
+      "description": "Park keeps everything that arrives (calls, answers, the trigger's own fires) and runs it once the trigger is back, a caller on a route held on the line; hibernate does the same for `graceMinutes` with its questions hidden, then takes nothing more; wipe drops it all."
     },
     {
       "name": "running",

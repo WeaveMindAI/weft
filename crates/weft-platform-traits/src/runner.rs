@@ -65,8 +65,13 @@ impl WorkerSettings {
     fn default_max_instances() -> u32 {
         10
     }
+    /// Cloud Run's own default for a service: a run mostly waits (on a
+    /// model, a database, a person), so one copy serves many, and when its
+    /// CPU fills the platform adds copies. A copy nearly out of memory turns
+    /// new work away itself (`weft_engine`'s memory guard) rather than
+    /// taking a run that would bring the others down.
     fn default_concurrency() -> u32 {
-        20
+        80
     }
     fn default_cpu() -> String {
         "1".into()
@@ -121,6 +126,11 @@ pub struct WorkerOverrides {
 }
 
 impl WorkerOverrides {
+    /// Whether no lever is set.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
     /// Every lever's name, as the flags, the API and a `weft.toml` spell it.
     pub const LEVERS: [&'static str; 7] =
         ["min_instances", "max_instances", "concurrency", "cpu", "memory", "startup_boost", "cpu_always_allocated"];

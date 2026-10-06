@@ -100,6 +100,20 @@ impl NodeHealthState {
     pub fn has_seen(&self) -> bool {
         self.last_ready_at.is_some() || self.last_not_ready_at.is_some()
     }
+
+    /// Whether time passing alone can change what this latch says, the unit
+    /// last seen `ready` or not: a unit seen ready before and not ready now
+    /// turns flaky once its window has passed, and a flaky one ready again
+    /// recovers once its window has passed. Anything else stays as it is
+    /// until the unit itself changes, which its machine says
+    /// (`weft_runtime::unit_agent`).
+    pub fn waits_on_time(&self, ready: bool) -> bool {
+        if ready {
+            self.declared_flaky
+        } else {
+            !self.declared_flaky && self.last_ready_at.is_some()
+        }
+    }
 }
 
 /// Pure: one unit's decision from what this look saw of it (`None`: the
@@ -411,6 +425,22 @@ mod tests {
 
     fn obs(ready: bool) -> NodeObservation {
         NodeObservation { ready }
+    }
+
+    /// Only a latch inside one of its windows waits on time: a unit never
+    /// seen ready (its apply owns it), one running fine, and one declared
+    /// flaky and still down stay as they are until the unit changes.
+    #[test]
+    fn only_a_latch_inside_a_window_waits_on_time() {
+        let now = t0();
+        let fresh = NodeHealthState::default();
+        assert!(!fresh.waits_on_time(false), "never seen ready: the apply owns it");
+        let was_ready = NodeHealthState { last_ready_at: Some(now), ..NodeHealthState::default() };
+        assert!(!was_ready.waits_on_time(true), "running fine");
+        assert!(was_ready.waits_on_time(false), "inside the flaky window");
+        let flaky = NodeHealthState { declared_flaky: true, last_not_ready_at: Some(now), ..was_ready.clone() };
+        assert!(!flaky.waits_on_time(false), "flaky and still down");
+        assert!(flaky.waits_on_time(true), "inside the recovery window");
     }
 
     // ---------- latch seeding from the row ----------

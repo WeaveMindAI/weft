@@ -4,6 +4,8 @@
 //! choices with the same defaults.
 
 use weft::instance::InstanceId;
+use weft::node::NodeOutput;
+use weft::program::InfraDownAnswer;
 use weft::{node_bail, DeactivateSpec, DeactivationMode, ExecutionContext, RunningPolicy, StopSelf, WeftResult};
 
 /// The instance id a node was handed, checked the way every instance id
@@ -45,4 +47,15 @@ pub fn take_down_spec(ctx: &ExecutionContext) -> WeftResult<DeactivateSpec> {
 /// the take-down reaches.
 pub fn stop_self(ctx: &ExecutionContext) -> WeftResult<StopSelf> {
     Ok(if ctx.inputs.get::<bool>("includeSelf")? { StopSelf::Include } else { StopSelf::Keep })
+}
+
+/// What a node that takes one instance's copy down sends on: `done` when
+/// the copy is down (taken down now, or already down), `noCopy` when that
+/// instance has no copy of the node (a mistyped id, or one terminated
+/// before), so a program answering a person can tell them which.
+pub fn taken_down(answer: InfraDownAnswer) -> NodeOutput {
+    match answer {
+        InfraDownAnswer::TakenDown | InfraDownAnswer::AlreadyDown => NodeOutput::new().set("done", true),
+        InfraDownAnswer::NoCopy => NodeOutput::new().set("noCopy", true),
+    }
 }

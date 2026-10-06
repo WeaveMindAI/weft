@@ -179,6 +179,77 @@ impl Host {
     }
 }
 
+impl Host {
+    /// How the machine's unit stands, as weft is told it (`observe`).
+    async fn seen(&self) -> anyhow::Result<Vec<weft_platform_traits::UnitObservation>> {
+        use weft_platform_traits::InfraHost as _;
+        let a = Self::assignment().await?;
+        let mut seen = self.local.observe(&a.node.node.tenant, a.node.node.project).await?;
+        // While an apply runs, that is the unit's state, whatever
+        // containers are there: one still running from before would read
+        // as a ready unit that is not the one asked for. After one failed,
+        // so is the failure, unless the unit runs whole as asked anyway
+        // (Docker brought its containers back).
+        let ours = |o: &weft_platform_traits::UnitObservation| o.copy_id == a.node.node.copy_id && o.unit == a.unit;
+        let wanted = a.node.unit(&a.unit).map(|u| u.hash.clone()).unwrap_or_default();
+        let queued = self.queued.load(std::sync::atomic::Ordering::SeqCst) > 0;
+        let idle = self.applying.try_lock().ok().filter(|_| !queued).map(|last_failure| last_failure.clone());
+        let state = match idle {
+            Some(Some(_)) if self.local.runs_whole(&a.node, &a.unit).await? => None,
+            Some(last_failure) => last_failure.map(|why| weft_platform_traits::UnitRunState::Failed { why }),
+            None if !seen.iter().any(ours) => Some(weft_platform_traits::UnitRunState::Starting { step: "its images are downloading".into() }),
+            None => Some(weft_platform_traits::UnitRunState::Starting { step: "its new version is starting".into() }),
+        };
+        if let Some(state) = state {
+            seen.retain(|o| !ours(o));
+            seen.push(weft_platform_traits::UnitObservation { copy_id: a.node.node.copy_id.clone(), unit: a.unit.clone(), hash: wanted, state });
+        }
+        Ok(seen)
+    }
+
+    /// Watch how the unit stands, here on its machine where looking costs
+    /// nothing, and ask for a look at the project's health each time it
+    /// changes (a container stopped, a check started failing or passing
+    /// again, an apply ended). The supervisor looks at infra that runs
+    /// fine only when told to, so an install whose infra runs fine
+    /// wakes nothing; the death of the whole machine is told by the cloud
+    /// itself. The first look after the agent starts always asks.
+    async fn watch(self, broker: std::sync::Arc<weft_broker_client::BrokerInfraClient>) {
+        let mut told: Option<Vec<(String, String, String)>> = None;
+        loop {
+            match self.seen().await.map(|seen| Self::stands(&seen)) {
+                Ok(stands) if told.as_ref() == Some(&stands) => {}
+                Ok(stands) => {
+                    let asked = async {
+                        let a = Self::assignment().await?;
+                        broker.ask_for_a_look(a.node.node.project).await
+                    };
+                    match asked.await {
+                        Ok(()) => told = Some(stands),
+                        Err(e) => tracing::warn!(target: "weft_runtime::unit_agent", error = %format!("{e:#}"), "could not ask for a look at the unit; asking again at the next look"),
+                    }
+                }
+                Err(e) => tracing::warn!(target: "weft_runtime::unit_agent", error = %format!("{e:#}"), "could not see how the unit stands"),
+            }
+            tokio::time::sleep(WATCH_EVERY).await;
+        }
+    }
+
+    /// What a look compares: each unit and the kind of state it is in
+    /// (never the words, which may change between looks of one state).
+    fn stands(seen: &[weft_platform_traits::UnitObservation]) -> Vec<(String, String, String)> {
+        let mut stands: Vec<(String, String, String)> =
+            seen.iter().map(|o| (o.copy_id.clone(), o.unit.clone(), o.state.kind().to_string())).collect();
+        stands.sort();
+        stands
+    }
+}
+
+/// How often the agent looks at its unit (`Host::watch`). Looking is a
+/// call to the machine's own Docker and the unit's checks, and costs
+/// nothing off the machine.
+const WATCH_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Run the machine's unit and answer weft about it.
 pub async fn host() -> anyhow::Result<()> {
     use weft_platform_gcp::infra_host::{MD_CORE_ACCOUNT, MD_GCP_PROJECT, MD_GPU, MD_RUNTIME_IMAGE};
@@ -224,6 +295,26 @@ pub async fn host() -> anyhow::Result<()> {
     // while its images download (`observe`).
     host.apply_in_background();
 
+    // Asking for a look goes through the broker, as the project's own
+    // account: the one the machine runs as. A machine made before its
+    // agent was told where the broker is cannot ask; it says so, and its
+    // health is looked at when the supervisor looks for another reason.
+    match attribute(weft_platform_gcp::infra_host::MD_BROKER_URL).await {
+        Ok(broker_url) => {
+            let machine = metadata("name").await?;
+            let link = weft_broker_client::BrokerLink::new(
+                broker_url,
+                weft_broker_client::TokenSource::worker(host.tokens.clone(), format!("infra-{}", machine.trim())),
+            );
+            tokio::spawn(host.clone().watch(weft_broker_client::BrokerInfraClient::new(link)));
+        }
+        Err(e) => tracing::warn!(
+            target: "weft_runtime::unit_agent",
+            error = %format!("{e:#}"),
+            "this machine was made by a weft that did not give it the broker's address, so it cannot ask for a look when its unit changes; every machine this weft makes has it"
+        ),
+    }
+
     let err = |e: anyhow::Error| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
     let app = Router::new()
         // Answered at once: pulling a unit's images takes longer than any
@@ -246,38 +337,7 @@ pub async fn host() -> anyhow::Result<()> {
         }))
         .route(HOST_OBSERVE, axum::routing::get({
             let host = host.clone();
-            move || async move {
-                use weft_platform_traits::InfraHost as _;
-                let a = Host::assignment().await.map_err(err)?;
-                let mut seen = host.local.observe(&a.node.node.tenant, a.node.node.project).await.map_err(err)?;
-                // While an apply runs, that is the unit's state, whatever
-                // containers are there: one still running from before would
-                // read as a ready unit that is not the one asked for. After
-                // one failed, so is the failure, unless the unit runs whole
-                // as asked anyway (Docker brought its containers back).
-                let ours = |o: &weft_platform_traits::UnitObservation| o.copy_id == a.node.node.copy_id && o.unit == a.unit;
-                let wanted = a.node.unit(&a.unit).map(|u| u.hash.clone()).unwrap_or_default();
-                let queued = host.queued.load(std::sync::atomic::Ordering::SeqCst) > 0;
-                let idle = host.applying.try_lock().ok().filter(|_| !queued).map(|last_failure| last_failure.clone());
-                let state = match idle {
-                    Some(Some(_)) if host.local.runs_whole(&a.node, &a.unit).await.map_err(err)? => None,
-                    Some(last_failure) => last_failure.map(|why| weft_platform_traits::UnitRunState::Failed { why }),
-                    None if !seen.iter().any(ours) => {
-                        Some(weft_platform_traits::UnitRunState::Starting { step: "its images are downloading".into() })
-                    }
-                    None => Some(weft_platform_traits::UnitRunState::Starting { step: "its new version is starting".into() }),
-                };
-                if let Some(state) = state {
-                    seen.retain(|o| !ours(o));
-                    seen.push(weft_platform_traits::UnitObservation {
-                        copy_id: a.node.node.copy_id.clone(),
-                        unit: a.unit.clone(),
-                        hash: wanted,
-                        state,
-                    });
-                }
-                Ok::<_, (axum::http::StatusCode, String)>(Json(seen))
-            }
+            move || async move { host.seen().await.map(Json).map_err(err) }
         }))
         .route(HOST_LOGS, axum::routing::get({
             let host = host.clone();

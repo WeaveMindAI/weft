@@ -51,8 +51,11 @@ pub enum Role {
     InfraSupervisor,
 }
 
-// NOTE: there is deliberately no `Infra` role. What an infra unit runs
-// never talks to the broker: its endpoints are resolved by the WORKER via
+// NOTE: there is deliberately no `Infra` role. An infra machine's own
+// agent asks the broker for one thing, a look at its project's health
+// (`/v1/infra/look`), and does so as its project's worker, which is the
+// account the machine runs as: anything on that machine can ask the same,
+// for that project only. A unit's endpoints are resolved by the WORKER via
 // `ctx.endpoint()`, and its lifecycle is the supervisor's.
 
 /// The tenant authority of a caller.
@@ -248,6 +251,7 @@ pub async fn resolve_storage_caller(
             let (execution_id, instance) = match execution_id {
                 None => (None, None),
                 Some(execution_id) => {
+                    // SYNC: execution.owner_replica <-> weft_bind_execution_id_owner, bind_execution_id_owner (crates/weft-task-store/src/tasks.rs)
                     let row: Option<(String, uuid::Uuid, Option<String>, Option<String>)> = sqlx::query_as(
                         "SELECT tenant_id, project_id, owner_replica, instance_id FROM execution WHERE execution_id = $1",
                     )

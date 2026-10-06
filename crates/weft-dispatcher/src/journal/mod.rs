@@ -768,6 +768,12 @@ pub struct ExecutionQuery {
     pub instance: Option<weft_core::instance::InstanceId>,
     /// Only runs carrying this tag (`ctx.tag_execution`).
     pub tag: Option<String>,
+    /// Only runs in which this node fired (it started at least once),
+    /// spelled the way the journal names it.
+    pub node: Option<String>,
+    /// Only finished runs whose recorded values carry every word of this
+    /// (`crate::run_search`; a quoted phrase as written).
+    pub search: Option<String>,
     /// Keyset cursor: only runs strictly after this `(started_at,
     /// execution)` in the listing's order (newest first, then execution
     /// descending). A walk that hands each page's last run back here

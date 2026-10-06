@@ -39,6 +39,9 @@ pub const MD_GPU: &str = "weft-gpu";
 pub const MD_RUNTIME_IMAGE: &str = "weft-runtime-image";
 pub const MD_CORE_ACCOUNT: &str = "weft-core-account";
 pub const MD_GCP_PROJECT: &str = "weft-gcp-project";
+/// Where the machine's agent reaches the broker, to ask for a look at
+/// its project's health when how its unit stands changes.
+pub const MD_BROKER_URL: &str = "weft-broker-url";
 
 /// The boot image of every infra machine.
 const BOOT_IMAGE: &str = "projects/cos-cloud/global/images/family/cos-stable";
@@ -105,11 +108,13 @@ pub struct ComputeInfraHost {
     google: Google,
     gcp: GcpPlatform,
     install: weft_core::infra::Install,
+    /// Where a machine's agent reaches the broker ([`MD_BROKER_URL`]).
+    broker_url: String,
 }
 
 impl ComputeInfraHost {
-    pub fn new(google: Google, gcp: GcpPlatform, install: weft_core::infra::Install) -> Self {
-        Self { google, gcp, install }
+    pub fn new(google: Google, gcp: GcpPlatform, install: weft_core::infra::Install, broker_url: String) -> Self {
+        Self { google, gcp, install, broker_url }
     }
 
     fn zone_base(&self) -> String {
@@ -213,6 +218,7 @@ impl ComputeInfraHost {
                 { "key": MD_RUNTIME_IMAGE, "value": self.gcp.runtime_image },
                 { "key": MD_CORE_ACCOUNT, "value": self.gcp.core_service_account },
                 { "key": MD_GCP_PROJECT, "value": self.gcp.project },
+                { "key": MD_BROKER_URL, "value": self.broker_url },
             ]},
         });
         if let Some(kind) = &shape.accelerator {

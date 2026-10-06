@@ -2471,10 +2471,13 @@ impl ContextHandle for TestHandle {
     async fn program_call(&self, call: crate::program::ProgramCall, stop_self: crate::tag::StopSelf, _call_index: u32) -> WeftResult<Value> {
         let name = call.journal_name();
         // A call that only acts, left unanswered by the test, answers the
-        // way the runtime answers one it carried out: a start is queued,
-        // a change of values set nothing up again.
+        // way the runtime answers one it carried out: a start is queued, a
+        // copy taken down, a change of values set nothing up again.
         let unanswered = match call {
             crate::program::ProgramCall::InfraStart { .. } => serde_json::to_value(crate::program::InfraStartAnswer::Started),
+            crate::program::ProgramCall::InfraStop { .. } | crate::program::ProgramCall::InfraTerminate { .. } => {
+                serde_json::to_value(crate::program::InfraDownAnswer::TakenDown)
+            }
             crate::program::ProgramCall::ValuesChange { .. } | crate::program::ProgramCall::ValuesForget { .. } => {
                 serde_json::to_value(crate::instance_door::ValuesChanged::default())
             }

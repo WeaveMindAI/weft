@@ -30,6 +30,7 @@ pub const BROKER_CHANNELS: &[&str] = &[
     // What a line pushes to the workers following it (`crate::line`).
     weft_broker_client::line::INFRA_STATUS_CHANNEL,
     weft_broker_client::line::ACCESS_CHANNEL,
+    weft_broker_client::line::CANCEL_CHANNEL,
 ];
 
 pub struct BrokerState {

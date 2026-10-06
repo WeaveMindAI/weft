@@ -268,18 +268,18 @@ async fn infra_down(
     // no row, or one mid-terminate, may still hold the disks an earlier
     // terminate kept, and only the supervisor's pass over the host can
     // tell.
-    let already_down = match (row, take_down) {
-        (_, TakeDown::Terminate { disks: weft_core::infra::TerminateDisks::DeleteAll }) => false,
-        (None, _) => true,
-        (Some(InfraNodeStatus::Stopped | InfraNodeStatus::Stopping), TakeDown::Stop { .. }) => true,
-        (Some(InfraNodeStatus::Terminating), TakeDown::Terminate { .. }) => true,
-        (Some(_), _) => false,
+    use weft_core::program::InfraDownAnswer;
+    let answered = |answer: InfraDownAnswer| -> Result<ProgramCallOutcome, CallError> {
+        Ok(ProgramCallOutcome { value: serde_json::to_value(answer).map_err(internal("answer"))?, stops_asker: false })
     };
-    if already_down {
-        return Ok(ProgramCallOutcome {
-            value: serde_json::json!({ "issued": false, "cancelled_start": cancelled_start }),
-            stops_asker: false,
-        });
+    match (row, take_down) {
+        (_, TakeDown::Terminate { disks: weft_core::infra::TerminateDisks::DeleteAll }) => {}
+        // A start of it still in its setup run was the copy, and is gone.
+        (None, _) if cancelled_start => return answered(InfraDownAnswer::TakenDown),
+        (None, _) => return answered(InfraDownAnswer::NoCopy),
+        (Some(InfraNodeStatus::Stopped | InfraNodeStatus::Stopping), TakeDown::Stop { .. })
+        | (Some(InfraNodeStatus::Terminating), TakeDown::Terminate { .. }) => return answered(InfraDownAnswer::AlreadyDown),
+        (Some(_), _) => {}
     }
     let copies = Copies::of(instance.cloned());
     let nodes = std::collections::BTreeSet::from([node.to_string()]);
@@ -297,7 +297,13 @@ async fn infra_down(
             project_id,
             &crate::take_down::TakeDownTarget::Activations(live_readers),
             spec,
-            false,
+            // Down with the copy: the copy's start brings it back. A wipe
+            // takes the copy away for good (its owner is going), so nothing
+            // is left to bring them back.
+            match take_down {
+                TakeDown::Terminate { disks: weft_core::infra::TerminateDisks::DeleteAll } => None,
+                TakeDown::Stop { .. } | TakeDown::Terminate { .. } => Some(crate::take_down::DownWith::Infra),
+            },
             Some(asker),
         )
         .await?;
@@ -326,7 +332,8 @@ async fn infra_down(
     .await?;
     let stops_asker = stop_self == StopSelf::Include && asker_uses_it;
     stop_asker(state, asker, stops_asker).await?;
-    Ok(ProgramCallOutcome { value: serde_json::json!({ "issued": true, "command": command_id }), stops_asker })
+    tracing::info!(target: "weft_dispatcher::program_call", %project_id, node, command = %command_id, "a program took an infra copy down");
+    Ok(ProgramCallOutcome { value: serde_json::to_value(InfraDownAnswer::TakenDown).map_err(internal("answer"))?, stops_asker })
 }
 
 /// Activate the activations `scope` names. Those already active answer
@@ -376,7 +383,7 @@ async fn triggers_deactivate(
     let target = crate::take_down::TakeDownTarget::Activations(keys);
     let runs = crate::take_down::live_runs(state, project_id).await.map_err(internal("live runs"))?;
     let asker_fired = crate::take_down::affected_runs(&target, &runs, None).iter().any(|r| r.execution_id == asker);
-    crate::take_down::take_down(state, project_id, &target, spec, false, Some(asker)).await?;
+    crate::take_down::take_down(state, project_id, &target, spec, None, Some(asker)).await?;
     let stops_asker = stop_self == StopSelf::Include && asker_fired;
     stop_asker(state, asker, stops_asker).await?;
     Ok(ProgramCallOutcome { value: serde_json::json!({ "deactivated": true }), stops_asker })

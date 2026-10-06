@@ -139,13 +139,16 @@ pub async fn run_loops(state: SupervisorState) -> anyhow::Result<()> {
 /// all along as they are there: a start or a stop takes the cloud a minute
 /// or two, and a lease left to lapse meanwhile hands the project to a
 /// sibling, which runs the command again from the start. Answers when to
-/// look again: at the health interval while a project it owns has
-/// something to look at (infra nodes, a command), or while the host
-/// listing or the gone-copy sweep left something; otherwise when the
-/// soonest lease a sibling holds over such a project, or over one the
-/// host holds copies of, lapses (the sibling may be gone, and only a
-/// lapsed lease is taken over), and the moment after. `None` when there
-/// is nothing to look at anywhere: a command being issued wakes it.
+/// look again: at the health interval while a project it owns has a
+/// command waiting, while the host listing or the gone-copy sweep left
+/// something, or while the health it saw is not settled (`health::tick`);
+/// otherwise when the soonest lease a sibling holds over a project with a
+/// command waiting, or over one the host holds copies of, lapses (the
+/// sibling may be gone, and only a lapsed lease is taken over), and the
+/// moment after. `None` when there is nothing to look at anywhere: infra
+/// that runs fine needs no look, and a command being issued, a machine
+/// saying how its unit stands changed, or the cloud saying a machine went
+/// away wakes it.
 pub async fn tick(state: &SupervisorState) -> anyhow::Result<Option<Duration>> {
     // A wake that lands during another pass waits for it and then runs
     // its own, which finds whatever that one left waiting.
@@ -160,14 +163,14 @@ pub async fn tick(state: &SupervisorState) -> anyhow::Result<Option<Duration>> {
             anyhow::bail!("the supervisor's ownership renewal ended mid-pass");
         }
     }
-    health::tick(state).await?;
-    Ok(next_look(&synced, state.health_interval))
+    let unsettled = health::tick(state).await?;
+    Ok(next_look(&synced, unsettled, state.health_interval))
 }
 
 /// When a supervisor that scales to zero looks again after a pass that
-/// found `synced`.
-fn next_look(synced: &ownership::Synced, health_interval: Duration) -> Option<Duration> {
-    if synced.owns_work {
+/// found `synced`, and health `unsettled` or not.
+fn next_look(synced: &ownership::Synced, unsettled: bool, health_interval: Duration) -> Option<Duration> {
+    if synced.owns_work || unsettled {
         return Some(health_interval);
     }
     synced.others_lapse_in.map(|lapse| lapse + Duration::from_secs(1))

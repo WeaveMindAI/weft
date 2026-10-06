@@ -975,27 +975,8 @@ pub(crate) async fn missing_infra_nodes(
     within: Option<&HashSet<String>>,
     instance: Option<&weft_core::instance::InstanceId>,
 ) -> Result<Vec<MissingCopy>, (StatusCode, String)> {
-    // Per PLACE, spelled: an infra node inside a file included twice is
-    // two instances with two rows, and `within` names places the same
-    // way, so a run cut to one call waits on that call's instance alone.
-    // A per-instance node is looked up in `instance`'s copy: that is the
-    // one the run or the instance's triggers read.
-    // Which copy of which place (`None` for a per-instance place with no
-    // instance named, which has no copy to look at), then the project's
-    // copies as this dispatcher holds them (`crate::held`).
-    let mut wanted: Vec<(String, Option<Option<&weft_core::instance::InstanceId>>)> = Vec::new();
-    for place in weft_core::project::infra_places(project) {
-        let spelled = weft_core::project::address_of(project, &place.id, &place.path);
-        if within.is_some_and(|set| !set.contains(&spelled)) {
-            continue;
-        }
-        let per_instance = weft_core::project::is_per_instance(project, &place.id);
-        // Nobody named, so there is no copy to look at: activate's note
-        // over the whole project lands here (it leaves these out), and a
-        // run never does ([`require_run_infra`] refuses it first).
-        let copy = if per_instance { instance.map(Some) } else { Some(None) };
-        wanted.push((spelled, copy));
-    }
+    // The project's copies as this dispatcher holds them (`crate::held`).
+    let wanted = copies_read(project, within, instance);
     let missing_of = |copies: &[crate::infra_node::CopyStatus]| -> Vec<MissingCopy> {
         let mut missing = Vec::new();
         for (place, copy) in &wanted {
@@ -1030,6 +1011,34 @@ pub(crate) async fn missing_infra_nodes(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_node: {e:#}")))?;
     Ok(missing_of(&fresh))
+}
+
+/// Which copy of which infra place a run or a trigger reads, the places
+/// narrowed to `within` (see [`missing_infra_nodes`]): each place spelled
+/// (an infra node inside a file included twice is two places with two
+/// rows, and `within` names places the same way), with its copy: the
+/// shared one (`Some(None)`), `instance`'s for a per-instance place, or
+/// `None` for a per-instance place with no instance named, which has no
+/// copy to look at.
+pub(crate) fn copies_read<'a>(
+    project: &ProjectDefinition,
+    within: Option<&HashSet<String>>,
+    instance: Option<&'a weft_core::instance::InstanceId>,
+) -> Vec<(String, Option<Option<&'a weft_core::instance::InstanceId>>)> {
+    let mut wanted = Vec::new();
+    for place in weft_core::project::infra_places(project) {
+        let spelled = weft_core::project::address_of(project, &place.id, &place.path);
+        if within.is_some_and(|set| !set.contains(&spelled)) {
+            continue;
+        }
+        let per_instance = weft_core::project::is_per_instance(project, &place.id);
+        // Nobody named, so there is no copy to look at: activate's note
+        // over the whole project lands here (it leaves these out), and a
+        // run never does ([`require_run_infra`] refuses it first).
+        let copy = if per_instance { instance.map(Some) } else { Some(None) };
+        wanted.push((spelled, copy));
+    }
+    wanted
 }
 
 /// One infra copy a run or a trigger needs and that is not running.
@@ -1704,6 +1713,8 @@ pub async fn status(
         status: None,
         instance: None,
         tag: None,
+        node: None,
+        search: None,
         below: None,
     };
     let (program_runs, every_run) = (runs_of(Some(weft_core::context::Phase::Fire)), runs_of(None));
@@ -3153,9 +3164,12 @@ pub(crate) async fn activate_with(
     }
     let keys = resolve_scope(&project, &scope)?;
     // An activate turns on the triggers that are off and leaves the ones
-    // already on as they are: after an infra stop took down only the
-    // triggers reading it, this is what brings them back. A re-arm is the
-    // other way round: its triggers are on, and it sets them up again.
+    // already on (or being switched on) as they are: after an infra stop
+    // took down only the triggers reading it, this is what brings them
+    // back. One being switched off is not on: an activate on it is the
+    // change of mind that rolls its drain back (`resume_active`). A re-arm
+    // is the other way round: its triggers are on, and it sets them up
+    // again.
     let keys = match rearm {
         Some(_) => keys,
         None => {
@@ -3165,7 +3179,12 @@ pub(crate) async fn activate_with(
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("activations: {e}")))?
                 .into_iter()
-                .filter(|a| !is_down(&a.lifecycle))
+                .filter(|a| {
+                    matches!(
+                        a.lifecycle.status,
+                        crate::project_store::ProjectStatus::Active | crate::project_store::ProjectStatus::Activating
+                    )
+                })
                 .map(|a| a.key)
                 .collect();
             let off: Vec<weft_core::activation::ActivationKey> = keys.into_iter().filter(|k| !on.contains(k)).collect();
@@ -3940,7 +3959,8 @@ pub async fn execute_trigger_deactivation(
     spec.validate()
         .map_err(|m| (StatusCode::BAD_REQUEST, format!("triggerDeactivation: {m}")))?;
     let target = crate::take_down::TakeDownTarget::Activations(keys);
-    let existed = crate::take_down::take_down(state, id, &target, spec, false, None).await?;
+    // Down with the copies the verb takes down: their start brings it back.
+    let existed = crate::take_down::take_down(state, id, &target, spec, Some(crate::take_down::DownWith::Infra), None).await?;
     if !existed {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3986,7 +4006,7 @@ pub async fn deactivate(
         let keys = keys_to_take_down(&rows, &scope)?;
         let target = crate::take_down::TakeDownTarget::Activations(keys);
         // user-initiated (the standalone Deactivate verb)
-        let existed = crate::take_down::take_down(&state, id, &target, &body.spec, false, None).await?;
+        let existed = crate::take_down::take_down(&state, id, &target, &body.spec, None, None).await?;
         if !existed {
             // Vanished between the gate and the deactivate (a concurrent
             // rm): same "no project I may see" answer, marker included.
@@ -4331,7 +4351,7 @@ pub async fn deactivate_project(
         running_policy: crate::infra_lifecycle_command::RunningPolicy::Cancel,
         drain_timeout_secs: None,
     };
-    crate::take_down::take_down(state, id, &crate::take_down::TakeDownTarget::WholeProject, &spec, false, None).await
+    crate::take_down::take_down(state, id, &crate::take_down::TakeDownTarget::WholeProject, &spec, None, None).await
 }
 
 /// `POST /projects/{id}/quiesce`: take the whole project down (every

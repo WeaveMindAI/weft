@@ -453,3 +453,78 @@ async fn an_instance_token_is_one_project_and_expires(pool: PgPool) {
     assert_eq!(left.len(), 2, "{left:?}");
     assert!(left.contains(&"bob-1".to_string()) && left.contains(&"author".to_string()));
 }
+
+/// The listing's `node` and `search` filters: `node` finds the runs a
+/// node started in, `search` the finished runs whose recorded values carry
+/// every word asked for. A run still going has no search document yet, and
+/// a run's document is built once, whatever asks twice.
+#[sqlx::test]
+async fn runs_are_found_by_a_node_they_ran_and_by_what_went_through_them(pool: PgPool) {
+    use std::sync::Arc;
+    let (journal, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project).await;
+    let ran = |execution_id, value: &'static str| {
+        let journal = &journal;
+        async move {
+            for event in [
+                ExecEvent::NodeStarted { execution_id, node_id: "wait".into(), frames: vec![], at_unix: 1 },
+                ExecEvent::PortEmitted {
+                    execution_id,
+                    emission_id: Uuid::new_v4(),
+                    node_id: "wait".into(),
+                    frames: vec![],
+                    port: "out".into(),
+                    value: Arc::new(json!({ "email": value, "order": 4217 })),
+                    provided: false,
+                    at_unix: 2,
+                },
+            ] {
+                journal.record_event(&event).await.expect("node event");
+            }
+        }
+    };
+    let ada = start_execution(&journal, project, weft_core::exec::RunKind::Execution).await;
+    let bob = start_execution(&journal, project, weft_core::exec::RunKind::Execution).await;
+    let idle = start_execution(&journal, project, weft_core::exec::RunKind::Execution).await;
+    let going = start_execution(&journal, project, weft_core::exec::RunKind::Execution).await;
+    ran(ada, "ada@example.com").await;
+    ran(bob, "bob@example.com").await;
+    ran(going, "ada@example.com").await;
+    for finished in [ada, bob, idle] {
+        journal
+            .record_event(&ExecEvent::ExecutionCompleted { execution_id: finished, at_unix: 3 })
+            .await
+            .expect("ExecutionCompleted");
+        weft_dispatcher::run_search::index_finished_run(&pool, finished).await.expect("index");
+    }
+    weft_dispatcher::run_search::index_finished_run(&pool, ada).await.expect("a second index of the same run");
+
+    let listed = |node: Option<&'static str>, search: Option<&'static str>| {
+        let journal = &journal;
+        async move {
+            let query = weft_dispatcher::journal::ExecutionQuery {
+                limit: 10,
+                node: node.map(Into::into),
+                search: search.map(Into::into),
+                ..Default::default()
+            };
+            let page = journal.list_executions(TENANT, &query).await.unwrap();
+            let mut ids: Vec<_> = page.executions.into_iter().map(|s| s.execution_id).collect();
+            assert_eq!(page.total, ids.len() as u64, "the count agrees with the list");
+            ids.sort();
+            ids
+        }
+    };
+    let sorted = |mut ids: Vec<weft_core::ExecutionId>| {
+        ids.sort();
+        ids
+    };
+    assert_eq!(listed(Some("wait"), None).await, sorted(vec![ada, bob, going]));
+    assert_eq!(listed(Some("elsewhere"), None).await, Vec::<weft_core::ExecutionId>::new());
+    assert_eq!(listed(None, Some("ada@example.com")).await, vec![ada], "the run still going has no document yet");
+    assert_eq!(listed(None, Some("4217")).await, sorted(vec![ada, bob]), "numbers are words too");
+    assert_eq!(listed(None, Some("ada@example.com 4217")).await, vec![ada], "every word asked for");
+    assert_eq!(listed(None, Some("email")).await, Vec::<weft_core::ExecutionId>::new(), "a field's name is not one of its values");
+    assert_eq!(listed(Some("wait"), Some("bob@example.com")).await, vec![bob]);
+}

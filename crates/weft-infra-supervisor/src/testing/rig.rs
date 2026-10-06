@@ -58,8 +58,8 @@ impl SupervisorTestRig {
         Ok(ownership::tick(&self.state, &mut *self.owned.lock().await).await?.change)
     }
 
-    /// Step the health loop once.
-    pub async fn tick_health(&self) -> Result<()> {
+    /// Step the health loop once; whether anything it saw is unsettled.
+    pub async fn tick_health(&self) -> Result<bool> {
         health::tick(&self.state).await
     }
 

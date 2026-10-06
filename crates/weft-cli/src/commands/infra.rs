@@ -57,11 +57,10 @@ pub enum InfraAction {
 /// `--mode` or `--grace` is always sent; without one, the dispatcher
 /// says when it needs one (a trigger reading this infra is on), and
 /// then a TTY is asked and `--json` or a script fails naming the flags
-/// (see `post_with_trigger_choice`). There is NO auto-reactivate: a user-triggered
-/// upgrade leaves the project deactivated, and the user clicks Activate
-/// when ready. Automatic reactivation belongs only to the autonomous
-/// health-recovery path (deactivate -> fix infra -> reactivate with no
-/// human present), not to a verb the user invoked themselves.
+/// (see `post_with_trigger_choice`). The triggers a stop, terminate or
+/// upgrade takes down come back on by themselves once their infra is up
+/// again (a start, the upgrade's own start leg); a trigger the person
+/// switched off themselves stays off.
 #[derive(Default, Clone)]
 pub struct InfraOpts {
     pub trigger: super::deactivate::TriggerChoiceFlags,

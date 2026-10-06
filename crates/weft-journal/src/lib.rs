@@ -19,9 +19,12 @@ pub mod write;
 
 pub use events::{ExecEvent, Seed, EXECUTION_TERMINAL_KINDS_SQL, RUN_PARKED_SQL};
 
-/// The channel every journal row notifies on when it commits, with its
-/// execution as the payload, from the `exec_event_notify_on_insert` trigger
-/// in the dispatcher's journal schema group.
+/// The channel a write of journal rows is announced on, once per execution
+/// it wrote to, with the execution as the payload: from the
+/// `exec_event_notify_on_insert` trigger in the dispatcher's journal schema
+/// group, through the announcement outbox (`weft_task_store::announce`),
+/// sent once the write commits and its writer pokes the flusher.
+// SYNC: EXEC_EVENT_CHANNEL <-> 'weft_exec_event' in exec_event_notify (crates/weft-dispatcher/src/journal/postgres.rs)
 pub const EXEC_EVENT_CHANNEL: &str = "weft_exec_event";
 pub use fold::{fold_to_snapshot, FiringView, Fold, FoldEffects};
 pub use seed::{fold_seeded, seed_chain, LiveFold, SeedChain};

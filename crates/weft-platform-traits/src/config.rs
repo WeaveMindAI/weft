@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use weft_core::infra::Install;
 
 use crate::roles::{CoreRole, Placement, RoleAddresses, RolePlacement, Vantage, INTERNAL_DOOR};
-use crate::runner::WorkerSettings;
+use crate::runner::{WorkerOverrides, WorkerSettings};
 
 // SYNC: InstallConfig <-> deploy/terraform/gcp/serverless.tf (local.install_config)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -38,9 +38,11 @@ pub struct InstallConfig {
     /// service serves the role at. Required for exactly those roles.
     #[serde(default, rename = "roleUrls", skip_serializing_if = "BTreeMap::is_empty")]
     pub role_urls: BTreeMap<CoreRole, String>,
-    /// The worker settings every project starts from.
-    #[serde(default)]
-    pub workers: WorkerSettings,
+    /// The worker levers this install sets for every project; each one it
+    /// leaves out follows weft's own default ([`Self::worker_settings`]),
+    /// so a default weft changes reaches the install.
+    #[serde(default, skip_serializing_if = "WorkerOverrides::is_empty")]
+    pub workers: WorkerOverrides,
     /// How the holders share the held connections, where they run in a
     /// pool.
     #[serde(default)]
@@ -79,9 +81,10 @@ pub struct LocalPlatform {
     #[serde(rename = "runtimeImage")]
     pub runtime_image: String,
     /// How long a worker with nothing to do stays up before it is
-    /// stopped. Raise it to keep workers warm longer between runs.
-    #[serde(default = "LocalPlatform::default_worker_idle_stop_seconds", rename = "workerIdleStopSeconds")]
-    pub worker_idle_stop_seconds: u64,
+    /// stopped, when this install sets it ([`Self::worker_idle_stop`]).
+    /// Raise it to keep workers warm longer between runs.
+    #[serde(default, rename = "workerIdleStopSeconds", skip_serializing_if = "Option::is_none")]
+    pub worker_idle_stop_seconds: Option<u64>,
     /// The ports the install's one process serves.
     pub listen: Listen,
     /// Where the internal port is reached from the machine itself
@@ -92,9 +95,16 @@ pub struct LocalPlatform {
     pub internal_url: String,
 }
 
+/// How long a local worker with nothing to do stays up, unless the install
+/// says otherwise: long enough to serve the next call of someone trying
+/// things out without starting again, short enough that a laptop is not
+/// left running a container for nothing.
+pub const DEFAULT_WORKER_IDLE_STOP: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl LocalPlatform {
-    fn default_worker_idle_stop_seconds() -> u64 {
-        300
+    /// How long a worker with nothing to do stays up.
+    pub fn worker_idle_stop(&self) -> std::time::Duration {
+        self.worker_idle_stop_seconds.map_or(DEFAULT_WORKER_IDLE_STOP, std::time::Duration::from_secs)
     }
 }
 
@@ -366,9 +376,15 @@ impl InstallConfig {
         Ok(cfg)
     }
 
+    /// The worker settings every project starts from: weft's defaults with
+    /// the levers this install sets.
+    pub fn worker_settings(&self) -> WorkerSettings {
+        WorkerSettings::default().with(&self.workers)
+    }
+
     /// Refuse a config no install could run, naming the setting.
     pub fn validate(&self) -> Result<(), String> {
-        self.workers.validate()?;
+        self.worker_settings().validate()?;
         if self.holders.signals_per_copy == 0 {
             return Err("holders.signalsPerCopy is 0: no holder could take a signal; set it to 1 or more".into());
         }
@@ -488,7 +504,7 @@ pub(crate) mod tests {
                 data_dir: "/home/u/.local/share/weft".into(),
                 container_internal_url: "http://host.docker.internal:14113".into(),
                 runtime_image: "weft-runtime:dev".into(),
-                worker_idle_stop_seconds: 300,
+                worker_idle_stop_seconds: None,
                 listen: Listen { public: "127.0.0.1:14111".parse().unwrap(), internal: "127.0.0.1:14113".parse().unwrap(), outside: None },
                 internal_url: "http://127.0.0.1:14113".into(),
             }),
@@ -497,7 +513,7 @@ pub(crate) mod tests {
             internet_url: None,
             roles: RolePlacement::default(),
             role_urls: BTreeMap::new(),
-            workers: WorkerSettings::default(),
+            workers: WorkerOverrides::default(),
             holders: HolderSettings::default(),
             build: BuildConfig { compile_lanes: 4, builder_base_image: "b".into(), runtime_base_image: "r".into() },
             edge: EdgeConfig { trusted_proxy_hops: ProxyHops { public: 0, outside: 0, domains: 0 }, invalid_tokens_per_minute: Some(30) },

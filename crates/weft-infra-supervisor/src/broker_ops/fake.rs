@@ -280,18 +280,29 @@ impl Inner {
     }
 
     /// Whether a supervisor may own `project_id`, as the broker's
-    /// `ownable_project` answers it: infra to manage, copies on the host
-    /// (`held`), or an uncompleted command waiting on it.
+    /// `ownable_project` answers it: infra to manage, infra copies, copies
+    /// on the host (`held`), or an uncompleted command waiting on it.
     fn ownable(&self, project_id: uuid::Uuid, held: &[uuid::Uuid]) -> bool {
-        !self.infraless.contains(&project_id) || held.contains(&project_id) || self.has_work(project_id)
+        !self.infraless.contains(&project_id) || self.has_infra_nodes(project_id) || held.contains(&project_id) || self.has_work(project_id)
     }
 
-    /// Whether `project_id` gives its owner something to look at now, as
-    /// the broker's `supervisor_work` answers it: infra nodes, or an
-    /// uncompleted command.
-    fn has_work(&self, project_id: uuid::Uuid) -> bool {
+    /// Whether `project_id` has infra copies, as the broker's
+    /// `has_infra_nodes` answers it.
+    fn has_infra_nodes(&self, project_id: uuid::Uuid) -> bool {
         self.infra_nodes.keys().any(|k| k.0 == project_id)
-            || self.commands.iter().any(|c| c.project_id == project_id && !self.completed(c.id))
+    }
+
+    /// Whether `project_id` has infra copies expected to run, as the
+    /// broker's `runs_infra` answers it.
+    fn runs_infra(&self, project_id: uuid::Uuid) -> bool {
+        self.infra_nodes.iter().any(|(k, n)| k.0 == project_id && n.status.expects_running_units())
+    }
+
+    /// Whether `project_id` gives its owner something to do now that
+    /// nothing will announce, as the broker's `supervisor_work` answers it:
+    /// an uncompleted command.
+    fn has_work(&self, project_id: uuid::Uuid) -> bool {
+        self.commands.iter().any(|c| c.project_id == project_id && !self.completed(c.id))
     }
 
     /// Whether an uncompleted command waits on a project nobody holds.
@@ -743,10 +754,11 @@ impl BrokerSupervisorOps for FakeBroker {
         let others_lapse_in_secs = inner
             .projects
             .keys()
-            .filter(|id| inner.has_work(**id) || held_projects.contains(id))
+            .filter(|id| inner.has_work(**id) || inner.runs_infra(**id) || held_projects.contains(id))
             .filter_map(|id| match inner.owners.get(id) {
                 Some(Owner::Other) => Some(weft_broker_client::lifecycle_command::infra_owner_lease_secs()),
                 Some(Owner::Nobody) => Some(0),
+                // The fake's default owner is this supervisor (`owns`).
                 Some(Owner::Us) | None => None,
             })
             .min();

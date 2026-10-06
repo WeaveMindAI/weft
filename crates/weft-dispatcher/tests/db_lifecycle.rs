@@ -289,11 +289,11 @@ async fn an_instances_wipe_takes_its_row_and_its_signals_in_one_write(pool: PgPo
     assert!(journal.signal_get("ada-wiped-entry").await.unwrap().is_none(), "and its signal went with it");
 }
 
-/// A park keeps the signals and hands back, from its own transaction, the
-/// ones its activations govern: the listener cleanup never reads them
-/// after a reactivation could have registered fresh ones.
+/// A park keeps the signals and leaves them listening: what they hear
+/// waits for the trigger to be back on, so the write hands nothing back
+/// for the listener to let go of.
 #[sqlx::test]
-async fn a_park_hands_back_the_signals_it_keeps(pool: PgPool) {
+async fn a_park_keeps_its_signals_listening(pool: PgPool) {
     let (journal, projects) = setup(&pool).await;
     let activations = PostgresActivationStore::new(pool.clone());
     let id = Uuid::new_v4();
@@ -308,9 +308,45 @@ async fn a_park_hands_back_the_signals_it_keeps(pool: PgPool) {
         .await
         .unwrap();
     let LifecycleWrite::Applied { unlisten } = written else { panic!("applied: {written:?}") };
-    assert_eq!(unlisten.iter().map(|s| s.token.as_str()).collect::<Vec<_>>(), vec!["parked-entry"],
-        "the kept signals are handed back for the listener cleanup");
-    assert!(journal.signal_get("parked-entry").await.unwrap().is_some(), "and stay stored for the reactivation");
+    assert!(unlisten.is_empty(), "a parked trigger goes on listening: {unlisten:?}");
+    assert!(journal.signal_get("parked-entry").await.unwrap().is_some(), "and its signal stays stored");
+}
+
+/// A hibernation takes work until its grace window ends, then stops: the
+/// end flips only the windows that are over, keeps them hibernating (the
+/// row stays, so `weft activate` brings it back), and says when the next
+/// window still open ends.
+#[sqlx::test]
+async fn a_hibernation_stops_taking_work_once_its_window_ends(pool: PgPool) {
+    use weft_dispatcher::activation_store::{end_grace_windows, grace_windows_over, next_grace_end};
+    let (_journal, projects) = setup(&pool).await;
+    let activations = PostgresActivationStore::new(pool.clone());
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    let (over, open) = (feed_key(), ActivationKey::new("reads", Owner::Shared));
+    let setup_execution_id = Uuid::new_v4();
+    assert!(activations.try_begin_activating(id, &[over.clone(), open.clone()], setup_execution_id, None).await.unwrap().is_ok());
+    activations.end_activating(id, setup_execution_id, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
+    for (key, deadline) in [(&over, 100), (&open, i64::MAX / 2)] {
+        activations
+            .set_lifecycle_guarded(id, std::slice::from_ref(key), &ActivationLifecycle::hibernating(deadline), SignalsGoing::Kept)
+            .await
+            .unwrap();
+    }
+    assert_eq!(next_grace_end(&pool).await.unwrap(), Some(100));
+
+    // The windows are over by the database's clock: one in the past, one
+    // far ahead.
+    assert_eq!(grace_windows_over(&pool).await.unwrap(), vec![(id, over.clone())]);
+    assert_eq!(end_grace_windows(&pool, id, &[over.clone(), open.clone()]).await.unwrap(), 1, "only the window that is over ends");
+    assert!(grace_windows_over(&pool).await.unwrap().is_empty(), "taking no work, it is over no longer");
+    assert_eq!(end_grace_windows(&pool, id, std::slice::from_ref(&over)).await.unwrap(), 0, "a window ends once");
+    let listed = activations.list(id).await.unwrap();
+    let lifecycle = |key: &ActivationKey| listed.iter().find(|a| &a.key == key).expect("kept").lifecycle.clone();
+    assert!(!lifecycle(&over).accepting_fires, "the window that is over takes no more work");
+    assert_eq!(lifecycle(&over).mode(), weft_core::activation::ActivationMode::Down(weft_core::DeactivationMode::Hibernate), "and is still a hibernation");
+    assert!(lifecycle(&open).accepting_fires, "the window still open takes work");
+    assert_eq!(next_grace_end(&pool).await.unwrap(), Some(i64::MAX / 2));
 }
 
 #[sqlx::test]
@@ -899,6 +935,8 @@ async fn quiesce_waits_until_no_run_of_the_project_is_live(pool: PgPool) {
     let mut tx = pool.begin().await.unwrap();
     weft_journal::unrecorded::forget_in(&mut tx, execution_id).await.unwrap();
     tx.commit().await.unwrap();
+    // What every caller of `forget_in` does once its transaction commits.
+    weft_task_store::announce::committed(&pool);
     tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
         .await
         .expect("the ending wakes the quiesce at once")
@@ -957,6 +995,8 @@ async fn forgetting_an_unrecorded_run_announces_its_ending_at_the_commit(pool: P
     let before = tokio::time::timeout(std::time::Duration::from_millis(300), heard_next(&mut heard)).await;
     assert!(before.is_err(), "nothing is announced before the commit");
     tx.commit().await.unwrap();
+    // What every caller of `forget_in` does once its transaction commits.
+    weft_task_store::announce::committed(&pool);
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     let announced = loop {
         let got = tokio::time::timeout_at(deadline, heard_next(&mut heard)).await.expect("the ending is announced");
@@ -2124,14 +2164,19 @@ async fn the_holders_count_the_held_rows_of_live_activations(pool: PgPool) {
     assert_eq!(weft_dispatcher::holders::held_count(&pool).await.unwrap(), 2);
     sqlx::query(
         "INSERT INTO trigger_activation (project_id, trigger, status, accepting_fires, fires_visible_to_consumers, updated_at) \
-         VALUES ($1, 'parked', 'inactive', FALSE, FALSE, 0)",
+         VALUES ($1, 'wiped', 'inactive', FALSE, FALSE, 0)",
     )
     .bind(id)
     .execute(&pool)
     .await
     .unwrap();
-    sqlx::query("UPDATE signal SET activation_trigger = 'parked' WHERE token = 'two'").execute(&pool).await.unwrap();
-    assert_eq!(weft_dispatcher::holders::held_count(&pool).await.unwrap(), 1, "a parked activation's row holds nothing");
+    sqlx::query("UPDATE signal SET activation_trigger = 'wiped' WHERE token = 'two'").execute(&pool).await.unwrap();
+    assert_eq!(weft_dispatcher::holders::held_count(&pool).await.unwrap(), 1, "a wiped activation's row holds nothing");
+    sqlx::query("UPDATE trigger_activation SET accepting_fires = TRUE, fires_visible_to_consumers = TRUE WHERE trigger = 'wiped'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(weft_dispatcher::holders::held_count(&pool).await.unwrap(), 2, "a parked one's goes on holding: what it hears waits");
 }
 
 /// The holders run as many copies as the held signals need, none for none,

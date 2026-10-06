@@ -18,6 +18,8 @@
 //!   - `pg_signal`: the process's one Postgres `LISTEN` connection,
 //!     which every wait on a row sleeps on (`terminal` is the task
 //!     waiter built on it).
+//!   - `announce`: how the writes a run makes announce themselves without
+//!     every commit waiting on every other (an outbox, flushed in batches).
 //!   - `held_copy`: a process's copy of rows read on every request,
 //!     dropped the moment a notification says they changed.
 //!   - `schema_guard`: the schema runner every boot routes its
@@ -26,6 +28,7 @@
 //!     group's migration files.
 
 pub mod alarm;
+pub mod announce;
 pub mod db;
 pub mod drain;
 pub mod executor;

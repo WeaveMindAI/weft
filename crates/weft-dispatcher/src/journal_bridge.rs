@@ -260,6 +260,8 @@ async fn process_one_row(
                 }
             }
             terminal_cleanup(state, execution_id).await?;
+            // Its words, for finding it by what went through it.
+            crate::run_search::index_finished_run(&state.pg_pool, execution_id).await?;
             // Storage terminate sweep: queue the un-kept exec-file
             // sweep DURABLY (workers stall-then-die, so worker-side
             // cleanup is only an eager optimization; this row is the

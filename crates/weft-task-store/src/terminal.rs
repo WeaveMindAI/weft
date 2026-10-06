@@ -1,11 +1,12 @@
 //! Waking whoever waits on a task the moment it finishes.
 //!
 //! Every write that makes a task terminal (`complete`, `fail`,
-//! `fail_pending`) sends `pg_notify(TERMINAL_CHANNEL, <task id>)` in the
-//! same statement, so the notification goes out exactly when the row
-//! commits. The process's [`PgSignalWatch`] hears it and the waiter reads
-//! the row, so a wait ends when the task does, instead of on the next
-//! tick of a poll.
+//! `fail_pending`) announces it on [`TERMINAL_CHANNEL`] with the task's id
+//! in the same statement, through the announcement outbox
+//! (`crate::announce`), sent once the row commits and its writer pokes
+//! the flusher. The process's [`PgSignalWatch`] hears it and the waiter
+//! reads the row, so a wait ends when the task does, instead of on the
+//! next tick of a poll.
 
 use std::time::Duration;
 
@@ -15,8 +16,9 @@ use uuid::Uuid;
 
 use crate::pg_signal::PgSignalWatch;
 
-/// The channel a terminal task write notifies on, with the task's id as
-/// the payload.
+/// The channel a terminal task write is announced on, with the task's id
+/// as the payload, through the announcement outbox (`crate::announce`):
+/// sent once the write commits and its writer pokes the flusher.
 pub const TERMINAL_CHANNEL: &str = "weft_task_terminal";
 
 /// Wait for `task_id` to finish, or for `timeout` to pass, and hand back

@@ -115,6 +115,9 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
   /// The group the editor is focused inside (an include's alias chain),
   /// so the runs scoped to it are marked. Set by the graph view.
   private focusedGroup: string | null = null;
+  /// What the person searched for (`runSearch`), as typed and as the
+  /// listing's filters; the flat list shows only the runs it finds.
+  private search: { text: string; params: Record<string, string> } | undefined;
 
   /// `installArgs` answers the `--on` the tree's CLI call carries: the
   /// install the graph shows the pinned project on.
@@ -143,6 +146,23 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
     // the button did nothing at all and said nothing either.
     this._onDidChange.fire();
     void this.refresh();
+  }
+
+  /** The search the flat list shows the runs of, as typed. */
+  currentSearch(): string | undefined {
+    return this.search?.text;
+  }
+
+  /** Show only the runs `search` finds (its filters already read by
+   *  `parseRunSearch`), or every run again with `undefined`. */
+  setSearch(search: { text: string; params: Record<string, string> } | undefined): void {
+    this.search = search;
+    this.mode = 'flat';
+    this.cache = [];
+    this.total = 0;
+    this.loaded = ExecutionsProvider.PAGE_SIZE;
+    this._onDidChange.fire();
+    void this.startRefresh(this.pinnedProject?.id);
   }
 
   setFocusedGroup(group: string | null): void {
@@ -211,16 +231,18 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
     this._onDidChange.dispose();
   }
 
-  /** Fetch ONE page (`PAGE_SIZE` rows at `offset`, newest first, filtered to the
-   *  pinned project). Kept to PAGE_SIZE so a single request never exceeds the
-   *  dispatcher's per-request page cap (which is why growing one window's `limit`
-   *  past the cap silently stopped returning more). */
-  private async fetchPage(offset: number, projectId: string | undefined): Promise<ExecutionPage> {
-    const params = new URLSearchParams({
-      limit: String(ExecutionsProvider.PAGE_SIZE),
-      offset: String(offset),
-    });
+  /** Fetch ONE page (`PAGE_SIZE` rows, newest first, filtered to the
+   *  pinned project and the search), the one after `after` (the last run
+   *  of the page before): each page picks up exactly where the last left
+   *  off, whatever runs start or end meanwhile. Kept to PAGE_SIZE so a
+   *  single request never exceeds the dispatcher's per-request page cap. */
+  private async fetchPage(after: ExecutionSummary | undefined, projectId: string | undefined): Promise<ExecutionPage> {
+    const params = new URLSearchParams({ limit: String(ExecutionsProvider.PAGE_SIZE), ...this.search?.params });
     if (projectId) params.set('project_id', projectId);
+    if (after) {
+      params.set('before_started', String(after.started_at));
+      params.set('before_execution', after.execution_id);
+    }
     return this.client.get<ExecutionPage>(`/executions?${params}`);
   }
 
@@ -310,9 +332,11 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
       // project open there is nothing to list, so nothing is fetched:
       // an unscoped read returned every project's history, and that is
       // what the view showed until the graph opened and pinned one.
-      for (let offset = 0; projectId && offset < this.loaded; offset += ExecutionsProvider.PAGE_SIZE) {
-        const page = await this.fetchPage(offset, projectId);
-        total = page.total;
+      for (let fetched = 0; projectId && fetched < this.loaded; fetched += ExecutionsProvider.PAGE_SIZE) {
+        const page = await this.fetchPage(rebuilt[rebuilt.length - 1], projectId);
+        // The first page's count is the whole listing's: a later page's
+        // counts only what is past its cursor.
+        if (fetched === 0) total = page.total;
         for (const e of page.executions) {
           if (!seen.has(e.execution_id)) {
             seen.add(e.execution_id);
@@ -376,6 +400,7 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
       this.total,
       this.loaded,
       this.lastError ?? '',
+      this.search?.text ?? '',
       this.cache.map((e) => `${e.execution_id}:${e.status}`).join(','),
       versions,
       runs,
@@ -386,7 +411,7 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
   }
 
   /** Grow the window by one page and rebuild through the ONE rebuild
-   *  path (true offset pagination, so there is no ceiling). Bound to
+   *  path (each page picks up after the last, so there is no ceiling). Bound to
    *  the "Load more" node's command. Delegating instead of appending
    *  in place keeps a concurrent event-driven refresh from undoing
    *  the growth (both paths share the same sequence-guarded commit). */
@@ -445,6 +470,7 @@ export class ExecutionsProvider implements vscode.TreeDataProvider<vscode.TreeIt
       nodes.push(new HintNode('Open a project to see its runs'));
       return nodes;
     }
+    if (this.search) nodes.push(new SearchNode(this.search.text, this.total));
     // The server already ordered newest-first; no client sort.
     for (const s of this.cache) nodes.push(new ExecutionNode(s));
     if (this.cache.length < this.total) nodes.push(new LoadMoreNode(this.total - this.cache.length));
@@ -461,6 +487,19 @@ class ListErrorNode extends vscode.TreeItem {
     this.iconPath = new vscode.ThemeIcon('warning', new vscode.ThemeColor('errorForeground'));
     this.tooltip = message;
     this.contextValue = 'weftExecutionListError';
+  }
+}
+
+/** The search the list shows the runs of, first; clicking it searches
+ *  again, and its inline action shows every run. */
+class SearchNode extends vscode.TreeItem {
+  constructor(text: string, found: number) {
+    super(`Search: ${text}`, vscode.TreeItemCollapsibleState.None);
+    this.description = `${found} run${found === 1 ? '' : 's'} found`;
+    this.iconPath = new vscode.ThemeIcon('search');
+    this.tooltip = 'Runs that finished carrying these words, narrowed by any name:value filter. Click to search again.';
+    this.contextValue = 'weftRunSearch';
+    this.command = { command: 'weft.searchRuns', title: 'Search runs' };
   }
 }
 

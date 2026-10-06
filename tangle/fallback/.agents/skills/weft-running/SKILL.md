@@ -170,8 +170,8 @@ status` and the graph print back.
 | `weft events <execution-id> [--node <id>] [--kind <kind>] [--iteration <n>] [--full] [--json]` | a run's events in order, one compact line each (see Reading a run, in the `weft-debugging` skill) |
 | `weft logs [execution-id]` | a run's log (no argument: the latest execution of the project in the current directory; see Reading a run, in the `weft-debugging` skill) |
 | `weft follow <project>` | live events for a project |
-| `weft activate` / `weft deactivate` | turn triggers on / off. `deactivate` on an active project needs `--mode <wipe\|hibernate\|park>` (a [mode], defined under The three modes). Both take `--running-policy <cancel\|wait>`, default `cancel`: on `activate` it says what happens to a worker still up from an older build (cancel what it runs and replace it now, or `wait` for its executions to land, up to `--drain-timeout` seconds); on `deactivate` the same for the project's running executions |
-| `weft resync` | deactivate + activate against a fresh build, after editing a trigger subgraph. Only while some trigger is on, the program's or an instance's (with none on it refuses: `weft activate` first), and it needs the same `--mode` answer as `deactivate`; without it, it stops and asks |
+| `weft activate` / `weft deactivate` | turn triggers on / off. `deactivate` on an active project takes `--mode <wipe\|hibernate\|park>` (a [mode], defined under The three modes), `wipe` when you leave it out. Both take `--running-policy <cancel\|wait>`, default `cancel`: on `activate` it says what happens to a worker still up from an older build (cancel what it runs and replace it now, or `wait` for its executions to land, up to `--drain-timeout` seconds); on `deactivate` the same for the project's running executions |
+| `weft resync` | deactivate + activate against a fresh build, after editing a trigger subgraph. Only while some trigger is on, the program's or an instance's (with none on it refuses: `weft activate` first), and it takes the same `--mode` as `deactivate`, `wipe` when you leave it out |
 | `weft infra start` / `status` / `stop` / `upgrade` / `terminate` / `cancel` / `logs` / `show` / `press` / `env` | the project's [infra] (see The infra verbs) |
 | `weft connect-lib` | copy weft's connect library into the frontend (`front/src/lib/weft-connect`, `--into <dir>` for another folder) so its pages show the editor's connection pickers; the `weft-frontend` skill has when and how. Replaces that folder each run |
 | `weft token mint` / `ls` / `revoke` | signal tokens: scoped access for an outside listener such as the browser extension. `mint` prints the connect URL, then the bare token on its own line for a script |
@@ -260,20 +260,27 @@ not a bug or a gap in weft, so it does not go in a report as friction.
 
 ### The three modes
 
-A [mode] is what happens to the runs parked on a person or a timer when the
-triggers go down (`deactivate`, `resync` on an active project, the [infra]
-verbs that deactivate on the way):
+A [mode] is what happens to the work that arrives while the triggers are
+down, and to the runs waiting on a person or a timer (`deactivate`, `resync`
+on an active project, the [infra] verbs that deactivate on the way):
 
-- `wipe`: their forms and timers are dropped and the runs end cancelled. You
-  pass it only when nothing is in flight (`weft executions` shows no
-  suspended run of the project) or the user said to drop the waiting work.
-- `hibernate`: the runs stay alive for a grace window (`--grace <minutes>`,
-  15 unless set); a fire arriving inside it is held and delivered when the
-  project comes back. Past the window new fires are refused; the waiting runs
-  and the project survive (`wipe` is the [mode] that drops them).
-- `park`: the runs stay alive with no time limit; every fire is held until
-  the project is reactivated. Your pick when the user is editing and people
-  are mid-conversation.
+- `wipe`: everything waiting is dropped, the questions deleted, and the
+  runs waiting on the triggers end cancelled; new work is refused. You pass
+  it only when nothing is in flight (`weft executions` shows no suspended
+  run of the project) or the user said to drop the waiting work.
+- `park`: nothing is dropped. A call from outside, an answer to a waiting
+  run, and every fire a trigger makes by itself (a schedule's tick, a
+  message on a connection it holds) wait, and run once the triggers are
+  back, on the version they come back with; someone calling a route is kept
+  on the line until then. The questions stay listed for the people who
+  answer them. Your pick when the user is editing and people are
+  mid-conversation. A schedule parked for two hours has two hours of ticks
+  waiting when it comes back.
+- `hibernate`: the same as `park` for a grace window (`--grace <minutes>`,
+  15 unless set), with the questions hidden (someone who already had one
+  open can still send their answer). Past the window, new work is refused
+  and the triggers stop listening; the waiting runs and the project survive
+  (`wipe` is the [mode] that drops them).
 
 **`wipe` is what you pass while you are building.** Nothing waiting on the
 program is anyone's conversation yet, so dropping it costs nothing and the
@@ -288,10 +295,13 @@ under `hibernate` and `park` alike (the mode says what happens to the parked
 work, the policy what happens to the running work: two separate answers),
 and it ends by cancelling whatever is still running at its cap
 (`--drain-timeout`, 60 seconds unless set); under `wipe` waiting is refused.
-With no `--mode` and no terminal (which is every command you run) the mode
-is `wipe`. That is the right answer while you are building, so you rarely
-type it; you type `--mode hibernate` or `--mode park` when the program is one
-people are using and the work in flight has to survive.
+With no `--mode` and no terminal (which is every command you run),
+`deactivate` and `resync` use `wipe`. That is the right answer while you are
+building, so you rarely type it; you type `--mode hibernate` or `--mode park`
+when the program is one people are using and the work in flight has to
+survive. The [infra] verbs never pick for you: when a trigger reads the
+[infra], they stop and name `--mode` and `--grace`, and you run them again
+with one.
 
 ## The infra verbs
 
@@ -301,11 +311,13 @@ restarts. You pick the verb by what you want to keep:
 
 - **If the [infra] is not running yet**, or was stopped: `weft infra start`.
   It brings every unit up to its spec and waits until ready. Running it again
-  does nothing for units already up. It leaves activation alone.
+  does nothing for units already up. The triggers that came down with the
+  [infra] (a stop, a terminate) come back on by themselves once it is up; one
+  switched off with `weft deactivate` stays off.
 - **If you changed an infra node's spec** (image, env, volumes) and want it
   live: `weft infra upgrade`. Each unit whose spec changed goes down and
   comes back on the new spec, the others are left alone, every disk is kept.
-  Once the [infra] reports ready, `weft activate`.
+  The triggers it took down come back on once the [infra] reports ready.
 - **If you want it off for a while and the data kept** (a paired WhatsApp
   session, a database's rows): `weft infra stop`. The containers go, the
   disks stay, and `weft infra start` brings it back with everything in it.

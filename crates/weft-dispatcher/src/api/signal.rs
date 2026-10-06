@@ -415,7 +415,7 @@ async fn fire_checked(
     if !routing.is_resume {
         refuse_gated_entry(&routing.auth_kind, "its /connect address")?;
     }
-    apply_lifecycle_gate(state, token, routing, payload).await
+    apply_lifecycle_gate(state, token, routing, payload, None).await
 }
 
 /// Refuse to start a run through an entry gated by a connection (its
@@ -453,135 +453,84 @@ pub(crate) async fn fire_registered_signal(
             return Err((StatusCode::TOO_MANY_REQUESTS, format!("fire dropped: {} is reached", refused.reason.describe())));
         }
     }
-    apply_lifecycle_gate(state, token, &routing, payload).await
+    apply_lifecycle_gate(state, token, &routing, payload, None).await
 }
 
-/// One chokepoint for every external fire. Reads the project's
-/// lifecycle (status + accepting/visible/deadline) and decides:
+/// One chokepoint for every fire that reaches a signal (a call at the
+/// door, a provider's push, an answer to a waiting run, an event a
+/// listener picked up itself): the rule `crate::arrival` states, applied.
 ///
-/// - **Live**: dispatch to listener for immediate processing.
-/// - **Park**: append `payload` to `signal.parked_fires`. Drained on
-///   reactivate by `drain_parked_fires`, which calls the exact same
-///   `dispatch_listener_outcome` a live fire would. Entry signals
-///   append on every fire; resume signals append iff the queue is
-///   empty (first submission answers the suspension, later ones are
-///   dropped as duplicates).
-/// - **Refuse**: 410 Gone. Used when the project is wiped, the
-///   hibernate deadline has expired, or status is fully Inactive
-///   with `accepting_fires=false`.
+/// - **Live**: dispatch to the listener for immediate processing.
+/// - **Wait**: append `payload` to `signal.parked_fires`, under `id` (the
+///   fire's identity when it can come back, a fresh one otherwise).
+///   Drained when the trigger is back by `drain_parked_fires`, which
+///   calls the exact same `dispatch_listener_outcome` a live fire would,
+///   so the run is born on the version the trigger came back with. Entry
+///   signals append on every fire; resume signals append iff the queue
+///   is empty (the first submission answers the suspension, later ones
+///   are dropped as duplicates).
+/// - **Refused**: 410 Gone.
 ///
-/// The function is signal-kind agnostic past the resume vs entry
-/// queue-cap rule: park / refuse / dispatch work uniformly across
-/// webhook, form, resume tokens. Stateful kinds (timer, sse) bypass
-/// entirely via internal fire paths.
-async fn apply_lifecycle_gate(
+/// The function is signal-kind agnostic past the resume vs entry queue-cap
+/// rule.
+pub(crate) async fn apply_lifecycle_gate(
     state: &DispatcherState,
     token: &str,
     routing: &FireGateInfo,
     payload: Value,
+    id: Option<&str>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    use crate::activation_store::ProjectStatus;
-
-    // The governing activation is live: live fire. A signal no
-    // activation governs (a wait of a run started by hand) reads as live
-    // too: it has no activate/drain moment ever, so a fire parked here
-    // would strand the suspended run forever.
-    if matches!(
-        routing.status,
-        ProjectStatus::Active | ProjectStatus::Registered
-    ) {
-        return dispatch_listener_outcome(
-            state,
-            token,
-            routing.project_id,
-            &routing.tenant_id,
-            payload,
-            None,
-        )
-        .await;
-    }
-
-    // Past the deadline (hibernate-style grace expired): refuse,
-    // even if accepting_fires is still true on the row. We could
-    // also lazily flip accepting_fires=false when this triggers,
-    // but the gate is the cheapest place to evaluate the deadline
-    // and avoids a write per fire.
-    if let Some(deadline) = routing.fires_deadline_unix {
-        if (crate::lease::now_unix()) > deadline {
-            return Err((
-                StatusCode::GONE,
-                "Project is not accepting requests. Please contact the project administrator.".into(),
-            ));
+    let parked = id.map(|id| ParkedRef { id, attempts: 0 });
+    match routing.standing().arrival(crate::lease::now_unix()) {
+        crate::arrival::Arrival::Live => {
+            dispatch_listener_outcome(state, token, routing.project_id, &routing.tenant_id, payload, parked).await
         }
-    }
-
-    // Not Active but still accepting fires. Append to the queue.
-    // Cases:
-    //   - Activating: TriggerSetup is mid-flight; the listener may
-    //     not have every signal registered yet. The drain at the
-    //     end of activate replays everything queued here.
-    //   - Inactive in park / hibernate-in-grace mode.
-    //   - Deactivating toward park / hibernate.
-    // Reactivate's drain replays each element through
-    // dispatch_listener_outcome in FIFO order.
-    if routing.accepting_fires {
-        // `id` distinguishes this queued fire from any other fire on
-        // the same token, even when bodies are identical. The drain
-        // uses it as the task-table dedup nonce so a crash between
-        // task-insert and head-pop collapses the retry back to one
-        // task (same id, same dedup_key) while two genuinely
-        // distinct fires (different ids) produce two executions.
-        let entry = ParkedFire {
-            id: uuid::Uuid::new_v4().to_string(),
-            payload,
-            received_at_unix: crate::lease::now_unix(),
-            attempts: 0,
-            not_before_unix: 0,
-            instance_gap: None,
-        };
-        // The shared append names its refusal; never swallow one under a
-        // 200. A fresh-UUID id can't hit the dedup guard on a live fire, so
-        // that arm is a contract violation if it ever fires.
-        match append_parked_fire(&state.pg_pool, token, &entry)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("park: {e}")))?
-        {
-            ParkAppend::Parked => {}
-            ParkAppend::Refused(ParkRefusal::ResumeAlreadyAnswered) => {
-                return Err((
+        crate::arrival::Arrival::Refused => Err((StatusCode::GONE, crate::arrival::REFUSED_FOR_CALLER.into())),
+        crate::arrival::Arrival::Wait => {
+            // The id tells this queued fire apart from any other on the
+            // same token, even when bodies are identical. The drain uses
+            // it as the task-table dedup nonce so a crash between
+            // task-insert and head-pop collapses the retry back to one
+            // task (same id, same dedup_key) while two genuinely distinct
+            // fires (different ids) produce two executions.
+            let entry = ParkedFire {
+                id: id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string),
+                payload,
+                received_at_unix: crate::lease::now_unix(),
+                attempts: 0,
+                not_before_unix: 0,
+                instance_gap: None,
+            };
+            // The shared append names its refusal; never swallow one under
+            // a 200.
+            match append_parked_fire(&state.pg_pool, token, &entry)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("park: {e}")))?
+            {
+                ParkAppend::Parked => Ok(StatusCode::OK),
+                ParkAppend::Refused(ParkRefusal::ResumeAlreadyAnswered) => Err((
                     StatusCode::CONFLICT,
                     "suspension already answered; duplicate submission ignored".into(),
-                ));
-            }
-            ParkAppend::Refused(ParkRefusal::QueueFull) => {
-                return Err((
+                )),
+                ParkAppend::Refused(ParkRefusal::QueueFull) => Err((
                     StatusCode::TOO_MANY_REQUESTS,
                     "this entry has too many pending fires queued; wait for the project \
                      to process them (it is currently parked) or retry later"
                         .into(),
-                ));
-            }
-            ParkAppend::Refused(ParkRefusal::RowGone) => {
-                return Err((
+                )),
+                ParkAppend::Refused(ParkRefusal::RowGone) => Err((
                     StatusCode::GONE,
                     "this signal is no longer registered; the fire was not accepted".into(),
-                ));
-            }
-            ParkAppend::Refused(ParkRefusal::AlreadyQueued) => {
-                return Err((
+                )),
+                // The same fire queued again (a retried task): it waits once.
+                ParkAppend::Refused(ParkRefusal::AlreadyQueued) if id.is_some() => Ok(StatusCode::OK),
+                ParkAppend::Refused(ParkRefusal::AlreadyQueued) => Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("park: a fresh fire id {} is already queued; dispatcher contract broken", entry.id),
-                ));
+                )),
             }
         }
-        return Ok(StatusCode::OK);
     }
-
-    // Wiped or hibernate-post-grace fully off: refuse.
-    Err((
-        StatusCode::GONE,
-        "Project is not accepting requests. Please contact the project administrator.".into(),
-    ))
 }
 
 // `crate::lease::now_unix` is the canonical wall-clock reader.
@@ -611,6 +560,17 @@ pub(crate) struct FireGateInfo {
     /// its node registered (`SignalSpec::limits`), resolved against the
     /// language defaults.
     pub limits: weft_core::signal::ResolvedLimits,
+}
+
+impl FireGateInfo {
+    /// How the governing activation stands, for the arrival rule.
+    pub(crate) fn standing(&self) -> crate::arrival::Standing {
+        crate::arrival::Standing {
+            status: self.status,
+            accepting_fires: self.accepting_fires,
+            fires_deadline_unix: self.fires_deadline_unix,
+        }
+    }
 }
 
 /// The gate columns of a signal, read through the activation that
@@ -1509,7 +1469,7 @@ pub async fn fire_public_entry(
     {
         return refused;
     }
-    apply_lifecycle_gate(&state, &token, &routing, payload).await.into_response()
+    apply_lifecycle_gate(&state, &token, &routing, payload, None).await.into_response()
 }
 
 /// Which open entry a bare-path fire reaches, with its gate info and
@@ -1823,7 +1783,9 @@ pub async fn connect_live(
     // How long each step took, in the line that says the run was born:
     // what to read first when a call is slow.
     let began = std::time::Instant::now();
-    let (route, token, params) = live_route(&state, &tenant_segment, only_project, &method_name, &path).await?;
+    // A route whose trigger is parked holds the caller here until it is
+    // back on, then serves them as it is armed then (`crate::arrival`).
+    let (route, token, params) = route_taking_calls(&state, &tenant_segment, only_project, &method_name, &path).await?;
     let ArmedRoute { project_id, node_id, protocol, live_config, auth_kind, auth_config, program, .. } = route.as_ref();
 
     // Every header the caller sent, repeats included, less the one the
@@ -1879,9 +1841,6 @@ pub async fn connect_live(
             &body_bytes,
         )
     });
-
-    // Project must be Active to accept a live connection.
-    route.require_active()?;
 
     // The entry's limits are checked as the run is born, in the same
     // call to the database: the caller is who the gate established when
@@ -2014,11 +1973,77 @@ pub(crate) struct HeldRoute {
 type LiveRoute = (Arc<ArmedRoute>, String, std::collections::BTreeMap<String, String>);
 
 /// The live route of `tenant` (of `only_project`, when the call came by a
-/// project's API domain) serving `method` on `path`: the route as it is
-/// armed, its token and the path's captures. Matched against the routes
-/// this dispatcher holds; a refusal (no such route, a half-armed or
-/// inactive one) is made on the rows themselves, since a route activated a
-/// moment ago may not have been heard yet.
+/// project's API domain) serving `method` on `path`, once it takes calls:
+/// the route as it is armed then, its token and the path's captures. A
+/// route whose trigger is parked (or hibernating within its grace window,
+/// or being set up) holds the caller until its trigger is back on, with
+/// no deadline of weft's own: the caller's own connection bounds the wait.
+/// One that takes no work is refused, in the caller's terms.
+async fn route_taking_calls(
+    state: &DispatcherState,
+    tenant: &str,
+    only_project: Option<uuid::Uuid>,
+    method: &str,
+    path: &str,
+) -> Result<LiveRoute, (StatusCode, String)> {
+    // Subscribed before the first read, so a route switched back on
+    // between the read and the wait still ends the wait.
+    let mut heard = state.signals.subscribe();
+    let mut found = live_route(state, tenant, only_project, method, path).await?;
+    let mut held_since: Option<std::time::Instant> = None;
+    loop {
+        let standing = found.0.standing();
+        match standing.arrival(crate::lease::now_unix()) {
+            crate::arrival::Arrival::Live => {
+                if let Some(since) = held_since {
+                    tracing::info!(target: "weft_dispatcher::signal", node = %found.0.node_id, held_ms = since.elapsed().as_millis() as u64, "a caller held while the route's trigger was off is served");
+                }
+                return Ok(found);
+            }
+            crate::arrival::Arrival::Refused => {
+                tracing::info!(
+                    target: "weft_dispatcher::signal",
+                    node = %found.0.node_id, status = %found.0.status.as_str(),
+                    "a caller refused: the route's trigger takes no work (`weft status` shows it; `weft activate` switches it back on)"
+                );
+                return Err((StatusCode::SERVICE_UNAVAILABLE, crate::arrival::REFUSED_FOR_CALLER.into()));
+            }
+            crate::arrival::Arrival::Wait => {}
+        }
+        if held_since.is_none() {
+            held_since = Some(std::time::Instant::now());
+            tracing::info!(target: "weft_dispatcher::signal", node = %found.0.node_id, status = %found.0.status.as_str(), "a caller held until the route's trigger is back on");
+        }
+        // Until the tenant's routes change, or the grace window ends.
+        let until = standing.waits_until().map_or_else(far_future, |deadline| {
+            let left = (deadline + 1 - crate::lease::now_unix()).max(0) as u64;
+            tokio::time::Instant::now() + std::time::Duration::from_secs(left)
+        });
+        heard
+            .woken_before(until, |channel, payload| channel == crate::held::ROUTES_CHANNEL && payload == tenant)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    target: "weft_dispatcher::signal",
+                    node = %found.0.node_id, error = %format!("{e:#}"),
+                    "a caller held until the route's trigger is back on lost the wait: this dispatcher stopped hearing the database"
+                );
+                (StatusCode::SERVICE_UNAVAILABLE, crate::arrival::REFUSED_FOR_CALLER.to_string())
+            })?;
+        found = match_live_route(&fresh_tenant_routes(state, tenant).await?, tenant, only_project, method, path)?;
+    }
+}
+
+/// A deadline nothing reaches, for a wait that ends on a signal alone.
+fn far_future() -> tokio::time::Instant {
+    tokio::time::Instant::now() + std::time::Duration::from_secs(86_400 * 365)
+}
+
+/// The live route of `tenant` serving `method` on `path` as it is armed
+/// now, whether or not it takes calls. Matched against the routes this
+/// dispatcher holds; one that does not take calls there is read again from
+/// the rows, since a route activated a moment ago may not have been heard
+/// yet.
 async fn live_route(
     state: &DispatcherState,
     tenant: &str,
@@ -2028,7 +2053,7 @@ async fn live_route(
 ) -> Result<LiveRoute, (StatusCode, String)> {
     if let Some(held) = state.held.routes.held(&tenant.to_string()) {
         if let Ok(found) = match_live_route(&held, tenant, only_project, method, path) {
-            if found.0.require_active().is_ok() {
+            if found.0.standing().arrival(crate::lease::now_unix()) == crate::arrival::Arrival::Live {
                 return Ok(found);
             }
         }
@@ -2106,39 +2131,23 @@ pub(crate) struct ArmedRoute {
     program: weft_core::project::hash::ProgramIdentity,
     source_version: String,
     /// The status of the activation governing the route at the read.
-    status: String,
+    status: crate::activation_store::ProjectStatus,
+    /// Whether that activation takes work while off, and until when
+    /// (`crate::arrival`).
+    accepting_fires: bool,
+    fires_deadline_unix: Option<i64>,
     /// Whose route it is: the instance whose trigger registered it, `None`
     /// for a shared one. Its gate's connection is that instance's.
     instance: Option<weft_core::instance::InstanceId>,
 }
 
 impl ArmedRoute {
-    /// A live connection is accepted only while the route's activation is
-    /// Active.
-    fn require_active(&self) -> Result<(), (StatusCode, String)> {
-        use crate::project_store::ProjectStatus;
-        let refused = |why: String| Err((StatusCode::SERVICE_UNAVAILABLE, why));
-        let node = &self.node_id;
-        match crate::project_store::project_status_from_str(&self.status) {
-            Ok(ProjectStatus::Active) => Ok(()),
-            Ok(ProjectStatus::Activating) => {
-                refused(format!("this route's trigger '{node}' is being switched on right now, so it takes no calls yet; call again in a moment"))
-            }
-            Ok(ProjectStatus::Deactivating) => refused(format!(
-                "this route's trigger '{node}' is being switched off right now, so it takes no calls; \
-                 a caller is never held while it is off"
-            )),
-            Ok(ProjectStatus::Registered | ProjectStatus::Inactive) => {
-                let activate = match &self.instance {
-                    Some(instance) => format!("weft activate --instance {instance}"),
-                    None => "weft activate".to_string(),
-                };
-                refused(format!(
-                    "this route is switched off (its trigger '{node}' is off), so it takes no calls; a caller \
-                     is never held while it is off. Whoever runs the program turns it back on with `{activate}`"
-                ))
-            }
-            Err(_) => refused(format!("this route's trigger '{node}' reads as '{}', which this install does not know", self.status)),
+    /// How the route's activation stands, for the arrival rule.
+    fn standing(&self) -> crate::arrival::Standing {
+        crate::arrival::Standing {
+            status: self.status,
+            accepting_fires: self.accepting_fires,
+            fires_deadline_unix: self.fires_deadline_unix,
         }
     }
 }
@@ -2150,7 +2159,9 @@ impl ArmedRoute {
 /// inactive.
 const ARMED_COLUMNS: &str = "s.project_id, s.node_id, s.spec_json, s.auth_kind, s.auth_config, \
      s.port_snapshot, s.program_json, s.source_version, s.instance_id, \
-     CASE WHEN p.id IS NULL THEN 'inactive' ELSE COALESCE(a.status, 'active') END AS status";
+     CASE WHEN p.id IS NULL THEN 'inactive' ELSE COALESCE(a.status, 'active') END AS status, \
+     CASE WHEN p.id IS NULL THEN FALSE ELSE COALESCE(a.accepting_fires, TRUE) END AS accepting_fires, \
+     a.fires_deadline_unix";
 
 /// The armed route a signal row holds ([`ARMED_COLUMNS`]), or the HTTP
 /// answer when it is half-armed.
@@ -2159,6 +2170,10 @@ fn armed_route_of(row: &sqlx::postgres::PgRow) -> Result<ArmedRoute, (StatusCode
     let node_id: String = row.try_get("node_id").map_err(row_err)?;
     let spec_json: String = row.try_get("spec_json").map_err(row_err)?;
     let status: String = row.try_get("status").map_err(row_err)?;
+    let status = crate::activation_store::ProjectStatus::parse(&status)
+        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, format!("unknown activation status '{status}'")))?;
+    let accepting_fires: bool = row.try_get("accepting_fires").map_err(row_err)?;
+    let fires_deadline_unix: Option<i64> = row.try_get("fires_deadline_unix").map_err(row_err)?;
     let auth_kind: String = row.try_get("auth_kind").map_err(row_err)?;
     let auth_config: Option<Value> = row.try_get("auth_config").map_err(row_err)?;
     let port_snapshot: Option<Value> = row.try_get("port_snapshot").map_err(row_err)?;
@@ -2188,7 +2203,7 @@ fn armed_route_of(row: &sqlx::postgres::PgRow) -> Result<ArmedRoute, (StatusCode
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live config: {e}")))?;
     Ok(ArmedRoute {
         project_id, node_id, spec, protocol, live_config, auth_kind, auth_config,
-        port_snapshot, program, source_version, status, instance,
+        port_snapshot, program, source_version, status, accepting_fires, fires_deadline_unix, instance,
     })
 }
 
@@ -2235,7 +2250,15 @@ async fn birth_live_run(
         async {
             crate::api::project::refuse_instance_gaps(state, project_id, &project_def, &subgraph, instance)
                 .await
-                .map_err(<(StatusCode, String)>::from)
+                .map_err(|gap| match gap {
+                    // Infra the run reads is down: the fix is the operator's
+                    // (logged), and the caller is told what is true for them.
+                    crate::api::project::RunGap::Other((StatusCode::PRECONDITION_REQUIRED, why)) => {
+                        tracing::info!(target: "weft_dispatcher::signal", %project_id, node = %route.node_id, "a caller refused: {why}");
+                        (StatusCode::SERVICE_UNAVAILABLE, crate::arrival::INFRA_DOWN_FOR_CALLER.to_string())
+                    }
+                    gap => gap.into(),
+                })
         },
         crate::api::project::picks_for_run(state, project_id, &project_def, &subgraph),
     )?;

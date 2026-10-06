@@ -1,8 +1,8 @@
 //! Producer helpers for `execute`, `resume`, and `cancel_execution`
 //! tasks. The first two are the work a worker is called for (the
 //! dispatcher's `delivery` hands each to the project's workers); a cancel
-//! is taken by the worker driving its execution, through its cancel wait. The
-//! handlers live in `weft_engine::worker`.
+//! is heard by the worker driving its execution, announced on its line,
+//! which asks for it. The handlers live in `weft_engine::worker`.
 
 use anyhow::Result;
 
@@ -119,7 +119,7 @@ pub fn execution_task_spec(task: ExecutionTask<'_>) -> Result<NewTask> {
 /// Enqueue a `cancel_execution` task for `execution_id` when a worker is driving
 /// it right now (its execute or resume task holds a claim that is being
 /// renewed). The cancel flag lives in that worker's memory; the worker
-/// takes the task through its cancel wait and fires the flag.
+/// hears the task announced on its line, asks for it, and fires the flag.
 ///
 /// `cause` rides in the payload so the worker flips the execution's flag WITH
 /// it: when the worker's terminal write beats the dispatcher's, the

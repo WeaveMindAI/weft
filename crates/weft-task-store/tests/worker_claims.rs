@@ -321,26 +321,27 @@ fn cancel(execution_id: &str) -> tasks::NewTask {
     }
 }
 
-/// A cancel is taken only by a worker driving its execution, once, and never
-/// delivered as work.
+/// A cancel answers an ask for its execution, every time it is asked (an
+/// answer lost on its way loses nothing), and is never delivered as work.
 #[sqlx::test]
-async fn a_cancel_reaches_the_worker_driving_its_execution_id_once(pool: PgPool) {
+async fn a_cancel_answers_every_ask_for_its_execution(pool: PgPool) {
     setup(&pool).await;
     let execution_id = Uuid::new_v4().to_string();
     tasks::enqueue_dedup(&pool, cancel(&execution_id)).await.unwrap();
     assert!(tasks::take_deliveries(&pool, 10).await.unwrap().is_empty(), "a cancel is never delivered");
-    assert!(tasks::take_cancels(&pool, PROJECT, &["someone-else".into()]).await.unwrap().is_empty());
-    let taken = tasks::take_cancels(&pool, PROJECT, std::slice::from_ref(&execution_id)).await.unwrap();
-    assert_eq!(taken.len(), 1);
-    assert_eq!(taken[0].execution_id, execution_id);
-    assert!(tasks::take_cancels(&pool, PROJECT, &[execution_id]).await.unwrap().is_empty(), "taken once");
+    assert!(tasks::cancels_asked(&pool, PROJECT, &["someone-else".into()]).await.unwrap().is_empty());
+    for _ in 0..2 {
+        let asked = tasks::cancels_asked(&pool, PROJECT, std::slice::from_ref(&execution_id)).await.unwrap();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].execution_id, execution_id);
+    }
 }
 
-/// A cancel nobody will take (its execution is not driven any more) is
-/// dropped once it is older than a claim; one waiting on a live drive is
-/// kept.
+/// A cancel nothing will ask for (its execution is not driven any more)
+/// is dropped once it is older than a claim; one waiting on a live drive
+/// is kept.
 #[sqlx::test]
-async fn a_cancel_nobody_will_take_is_dropped(pool: PgPool) {
+async fn a_cancel_nothing_will_ask_for_is_dropped(pool: PgPool) {
     setup(&pool).await;
     let stale = Uuid::new_v4().to_string();
     let driven = Uuid::new_v4().to_string();
@@ -351,7 +352,7 @@ async fn a_cancel_nobody_will_take_is_dropped(pool: PgPool) {
     tasks::enqueue_dedup(&pool, cancel(&driven)).await.unwrap();
     sqlx::query("UPDATE task SET created_at_unix = 0 WHERE kind = 'cancel_execution'").execute(&pool).await.unwrap();
     assert_eq!(tasks::drop_stale_cancels(&pool).await.unwrap(), 1);
-    assert_eq!(tasks::take_cancels(&pool, PROJECT, &[driven]).await.unwrap().len(), 1, "the driven execution's cancel stays");
+    assert_eq!(tasks::cancels_asked(&pool, PROJECT, &[driven]).await.unwrap().len(), 1, "the driven execution's cancel stays");
 }
 
 // ----- orphans -------------------------------------------------------------

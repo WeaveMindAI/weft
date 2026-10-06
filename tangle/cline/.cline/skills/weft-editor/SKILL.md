@@ -111,8 +111,9 @@ line) and the verb is not sent, so a build that cannot run never starts.
   "Deactivate" / "Resync" (amber "Out of sync" when the project changed
   since activation). An eye toggle "Show trigger subgraph". Deactivating
   opens the picker "Deactivate: how should triggers come down?": **Park**
-  (submissions wait indefinitely), **Hibernate** (grace window, then
-  refuse), **Wipe** (drop everything, cancels suspended runs), plus what to
+  (nothing dropped: everything that arrives waits and runs once the
+  triggers are back), **Hibernate** (the same for a grace window, questions
+  hidden, then refuse), **Wipe** (drop everything, cancels suspended runs), plus what to
   do with running executions. Reactivating offers "Execute parked + keep
   suspensions", "Keep suspensions only", "Wipe all".
 

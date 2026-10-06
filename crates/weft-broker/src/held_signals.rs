@@ -10,24 +10,22 @@
 
 use sqlx::{PgPool, Row};
 use weft_broker_client::protocol::{
-    HeldNow, HeldServing, SignalAuthKind, SignalHoldResponse, SignalRowWire, SignalSurfaceKind, LISTENER_HELD_STATUSES,
+    HeldNow, HeldServing, SignalAuthKind, SignalHoldResponse, SignalRowWire, SignalSurfaceKind, ACTIVATION_LISTENS,
     SIGNAL_ACTIVATION_JOIN, STILL_HELD_BY,
 };
 
 /// The signal rows a booting or rehydrating listener must hold: every row
-/// whose governing activation is in [`LISTENER_HELD_STATUSES`] (or that
-/// none governs). A hibernated or parked activation keeps its rows
-/// (reactivate restores them from here) while deactivate told the
-/// listener to forget them; handing them back to a restarting listener
-/// would revive a parked trigger's timers behind the user's back, so those
-/// rows never come out of this query. Mixed tenants: each row carries its
-/// own. `project` narrows it to one project's rows.
+/// whose governing activation listens ([`ACTIVATION_LISTENS`], or that
+/// none governs). A wiped activation's rows are gone; a hibernation past
+/// its grace window keeps its rows (a reactivate restores them from here)
+/// but no longer listens, so they never come out of this query. Mixed
+/// tenants: each row carries its own. `project` narrows it to one
+/// project's rows.
 pub async fn signals_held(pool: &PgPool, project: Option<uuid::Uuid>) -> anyhow::Result<Vec<SignalRowWire>> {
     let rows = sqlx::query(&format!(
-        "{} WHERE COALESCE(a.status, 'active') = ANY($1) AND ($2::uuid IS NULL OR s.project_id = $2)",
+        "{} WHERE {ACTIVATION_LISTENS} AND ($1::uuid IS NULL OR s.project_id = $1)",
         held_select()
     ))
-    .bind(&LISTENER_HELD_STATUSES[..])
     .bind(project)
     .fetch_all(pool)
     .await?;
@@ -35,14 +33,10 @@ pub async fn signals_held(pool: &PgPool, project: Option<uuid::Uuid>) -> anyhow:
 }
 
 /// One held signal by its token, or `None` when no row with that token is
-/// held (gone, or its activation parked): what the listener loads a
-/// signal it has not seen yet from.
+/// held (gone, or its activation no longer listens): what the listener
+/// loads a signal it has not seen yet from.
 pub async fn signal_held(pool: &PgPool, token: &str) -> anyhow::Result<Option<SignalRowWire>> {
-    let row = sqlx::query(&format!(
-        "{} WHERE s.token = $2 AND COALESCE(a.status, 'active') = ANY($1)",
-        held_select()
-    ))
-    .bind(&LISTENER_HELD_STATUSES[..])
+    let row = sqlx::query(&format!("{} WHERE s.token = $1 AND {ACTIVATION_LISTENS}", held_select()))
     .bind(token)
     .fetch_optional(pool)
     .await?;
@@ -55,9 +49,8 @@ pub async fn signal_held(pool: &PgPool, token: &str) -> anyhow::Result<Option<Si
 pub async fn signal_held_project(pool: &PgPool, token: &str) -> anyhow::Result<Option<uuid::Uuid>> {
     let row: Option<(uuid::Uuid,)> = sqlx::query_as(&format!(
         "SELECT s.project_id FROM signal s {SIGNAL_ACTIVATION_JOIN} \
-         WHERE s.token = $2 AND COALESCE(a.status, 'active') = ANY($1)"
+         WHERE s.token = $1 AND {ACTIVATION_LISTENS}"
     ))
-    .bind(&LISTENER_HELD_STATUSES[..])
     .bind(token)
     .fetch_optional(pool)
     .await?;
@@ -110,21 +103,19 @@ pub async fn hold(
          FROM unnest($1::text[], $2::jsonb[]) AS x(token, serving) \
          WHERE r.token = x.token AND r.holds AND r.held_by = $4 AND {held} \
          RETURNING r.token",
-        held = activation_held("r", "$5"),
+        held = activation_held("r"),
     ))
     .bind(&tokens)
     .bind(&servings)
     .bind(lease_secs)
     .bind(replica)
-    .bind(&LISTENER_HELD_STATUSES[..])
     .fetch_all(&mut *tx)
     .await?;
     let ended: Vec<String> = sqlx::query_scalar(&format!(
         "SELECT x.token FROM unnest($1::text[]) AS x(token) WHERE NOT {held}",
-        held = activation_held("x", "$2"),
+        held = activation_held("x"),
     ))
     .bind(&tokens)
-    .bind(&LISTENER_HELD_STATUSES[..])
     .fetch_all(&mut *tx)
     .await?;
     let room = room.map(|r| i64::from(r).saturating_sub(kept.len() as i64).max(0));
@@ -140,14 +131,13 @@ pub async fn hold(
          UPDATE signal s SET held_by = $4, held_until = EXTRACT(EPOCH FROM NOW())::BIGINT + $5, serving = NULL \
          FROM free WHERE s.token = free.token \
          RETURNING s.token",
-        held = activation_held("r", "$6"),
+        held = activation_held("r"),
     ))
     .bind(&tokens)
     .bind(want)
     .bind(room)
     .bind(replica)
     .bind(lease_secs)
-    .bind(&LISTENER_HELD_STATUSES[..])
     .fetch_all(&mut *tx)
     .await?;
     let rows = sqlx::query(&format!("{} WHERE s.token = ANY($1)", held_select()))
@@ -222,14 +212,14 @@ pub async fn let_go(pool: &PgPool, replica: &str) -> anyhow::Result<()> {
 }
 
 /// Whether the token `row.token` names a signal row that a listener holds
-/// (`statuses` names the bound list of [`LISTENER_HELD_STATUSES`]): false
-/// when the row is gone or its activation is parked. A condition an
-/// UPDATE can carry, read through the one [`SIGNAL_ACTIVATION_JOIN`].
-/// That join names its signal `s`, so `row` is any other alias.
-fn activation_held(row: &str, statuses: &str) -> String {
+/// ([`ACTIVATION_LISTENS`]): false when the row is gone or its activation
+/// no longer listens. A condition an UPDATE can carry, read through the
+/// one [`SIGNAL_ACTIVATION_JOIN`]. That join names its signal `s`, so
+/// `row` is any other alias.
+fn activation_held(row: &str) -> String {
     format!(
         "EXISTS (SELECT 1 FROM signal s {SIGNAL_ACTIVATION_JOIN} \
-                 WHERE s.token = {row}.token AND COALESCE(a.status, 'active') = ANY({statuses}))"
+                 WHERE s.token = {row}.token AND {ACTIVATION_LISTENS})"
     )
 }
 

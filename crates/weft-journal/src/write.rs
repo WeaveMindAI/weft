@@ -49,8 +49,9 @@ fn unix_now() -> Result<i64, RecordError> {
 
 /// Insert `events`, all of execution `events[0]`'s, in order, in ONE
 /// statement: one round trip whatever their number. The table's own
-/// trigger announces the rows on [`crate::EXEC_EVENT_CHANNEL`] when the
-/// write commits, which is what wakes the dispatcher's event bridge and a
+/// trigger announces the rows on [`crate::EXEC_EVENT_CHANNEL`] through the
+/// announcement outbox (`weft_task_store::announce`), sent once the write
+/// commits, which is what wakes the dispatcher's event bridge and a
 /// worker waiting on its run's journal.
 ///
 /// `replica` is the writing worker's replica id, stamped on every row;
@@ -67,11 +68,15 @@ pub async fn record_events(
     replica: Option<&str>,
     owner: Option<&str>,
 ) -> Result<u64, RecordError> {
-    insert(pool, events, replica, owner, None).await
+    let written = insert(pool, events, replica, owner, None).await?;
+    weft_task_store::announce::committed(pool);
+    Ok(written)
 }
 
 /// One event, inside the caller's own transaction (the dispatcher pairs
-/// `ExecutionStarted` with its `execution` seed atomically). `dedup_key`
+/// `ExecutionStarted` with its `execution` seed atomically). The caller
+/// pokes the announcement flusher once it commits
+/// (`weft_task_store::announce::committed`). `dedup_key`
 /// makes it idempotent: a retry of the same write collapses on the
 /// partial UNIQUE index, so a dispatcher task that re-executes after a
 /// crash never double-fires `ExecutionStarted` / `NodeKicked`.

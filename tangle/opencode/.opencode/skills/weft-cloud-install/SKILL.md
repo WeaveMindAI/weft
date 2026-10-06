@@ -80,8 +80,16 @@ to do before anything that creates or costs something:
    NUMBER=$(gcloud projects describe $PROJECT --format='value(projectNumber)')
    # On a new project IAM can take a minute to catch up (with the services
    # just enabled, with the account just made), so each IAM step below is
-   # retried until it holds.
-   retry() { until "$@"; do echo "waiting for IAM to catch up, trying again in 10 seconds"; sleep 10; done; }
+   # tried again, quietly, for up to three minutes; a last try shows its
+   # own error.
+   retry() {
+     for _ in $(seq 18); do
+       "$@" >/dev/null 2>&1 && return 0
+       echo "waiting for IAM to catch up, trying again in 10 seconds"
+       sleep 10
+     done
+     "$@"
+   }
 
    gcloud services enable --project $PROJECT \
      iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com \

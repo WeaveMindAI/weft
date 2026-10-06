@@ -785,7 +785,7 @@ fn edge_config(kept: Option<KeptEdge>) -> Result<EdgeConfig> {
 #[derive(Debug, Clone, Default, PartialEq)]
 struct Levers {
     worker_idle_stop_seconds: Option<u64>,
-    workers: Option<weft_platform_traits::WorkerSettings>,
+    workers: Option<weft_platform_traits::WorkerOverrides>,
     edge: Option<KeptEdge>,
 }
 
@@ -835,10 +835,12 @@ fn install_config(
     internet_url: Option<String>,
     previous: Levers,
 ) -> Result<InstallConfig> {
+    // Only what a person set is written: a lever left out follows weft's
+    // default (`LocalPlatform::worker_idle_stop`), so a changed default
+    // reaches the install at its next start.
     let idle_stop = match (previous.worker_idle_stop_seconds, std::env::var("WEFT_WORKER_IDLE_STOP_SECONDS").ok().filter(|v| !v.trim().is_empty())) {
-        (_, Some(v)) => v.trim().parse().map_err(|_| anyhow::anyhow!("WEFT_WORKER_IDLE_STOP_SECONDS='{v}' is not a whole number"))?,
-        (Some(kept), None) => kept,
-        (None, None) => 300,
+        (_, Some(v)) => Some(v.trim().parse().map_err(|_| anyhow::anyhow!("WEFT_WORKER_IDLE_STOP_SECONDS='{v}' is not a whole number"))?),
+        (kept, None) => kept,
     };
     let workers = previous.workers.unwrap_or_default();
     let edge = edge_config(previous.edge)?;
@@ -1478,7 +1480,10 @@ mod tests {
         let file = dir.path().join("config.json");
         std::fs::write(&file, serde_json::to_vec(&edited).unwrap()).unwrap();
         let again = install_config(&install(None), ports, "weft-runtime:y".into(), "b".into(), None, Levers::read(&file).unwrap()).unwrap();
-        assert_eq!(again.workers.min_instances, 1);
+        assert_eq!(again.workers.min_instances, Some(1));
+        assert_eq!(again.worker_settings().concurrency, weft_platform_traits::WorkerSettings::default().concurrency, "what the file leaves out follows weft's default");
+        let written = serde_json::to_value(&closed).unwrap();
+        assert!(written.get("workers").is_none() && written["platform"].get("workerIdleStopSeconds").is_none(), "a lever nobody set is not written");
         assert_eq!(again.edge.trusted_proxy_hops, ProxyHops { public: 2, outside: 1, domains: 0 });
         assert_eq!(again.platform, PlatformConfig::Local(LocalPlatform { runtime_image: "weft-runtime:y".into(), ..match closed.platform { PlatformConfig::Local(l) => l, _ => unreachable!() } }));
     }

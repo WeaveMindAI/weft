@@ -43,12 +43,36 @@ versions bumped` (PRs only), `build`, `public proxy routes`,
 `cargo test + clippy`, `cargo test --features db-tests`, and
 `graph + editor`.
 
-## Run the checks CI runs, not the ones you touched
+## Before every push to a PR, run what the PR runs
 
-`cargo clippy --workspace --all-targets --locked -- -D warnings` is
-the CI line. Running clippy on the crates you edited is not the same
-thing and has already sent a PR red on a lint in a crate the change
-only touched indirectly.
+Before you push a commit to a branch with a PR (the first push that
+opens it, and every fix pushed after), run locally everything the PR's
+checks run, not only the tests your change reaches. This is the one
+place the [test scope] does not apply: a red PR costs a full CI round
+trip, and twice a PR has gone red on a test in a crate the change only
+touched indirectly. Background each one, and fix everything before the
+push, not after.
+
+The PR runs `.github/workflows/ci.yml` and `.github/workflows/docs.yml`;
+read them for the current list. At the time of writing:
+
+- `scripts/check-extension-bump.sh origin/main`
+- `cargo nextest run --workspace --locked`
+- `cargo test --workspace --locked --doc`
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`
+- `cargo check -p weft-compiler --no-default-features --locked`
+- `scripts/validate-examples.sh`
+- `scripts/run-db-tests.sh` (every crate, no filter)
+- `pnpm -C packages/weft-graph test`, `pnpm -C packages/weft-connect test`,
+  `pnpm -C packages/weft-syntax test`, `pnpm -C extension-vscode test`,
+  `pnpm -C extension-vscode run compile`
+- `node --test catalog/bailey/bridge/images/bridge/src/*.test.js`
+- `pnpm -C extension-browser exec tsc --noEmit`, `pnpm -C extension-browser check`
+- the docs build: `cd docs && mdbook-mermaid install . && mdbook build`
+
+Clippy on the crates you edited is not the same as the workspace line
+above, and has sent a PR red on a lint in a crate the change only
+touched indirectly.
 
 `scripts/validate-examples.sh` compiles every example. It fails on
 ERRORS only, so a warning is advice an example may carry. If an

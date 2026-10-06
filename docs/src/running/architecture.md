@@ -80,9 +80,14 @@ runs from an image named after a hash of its contents, so two projects that comp
 thing share an image.
 
 On your machine a worker is a Docker container, one per program and image,
-started when a run needs it and stopped after five minutes with nothing to do.
-On a cloud install it is a Cloud Run service, which scales to zero between
-calls and out when calls pile up.
+started when a run needs it and stopped after thirty seconds with nothing to
+do (`workerIdleStopSeconds` in the install's `config.json` changes that). On a
+cloud install it is a Cloud Run service, which scales to zero between calls
+and out when calls pile up; Cloud Run decides when an idle copy goes, and an
+idle copy costs nothing there unless the project keeps its CPU on between
+calls (`weft workers set --cpu-always-allocated true`). A worker whose memory is nearly full turns new
+work away (`503`, with a `Retry-After`) until its runs end, rather than taking
+on a run that would bring every run on it down.
 
 A worker keeps, between runs, what its runs read of the program's
 infrastructure and connections: where each piece answers, the connections it
@@ -129,6 +134,16 @@ Postgres announces each one as it is written. A dispatcher that is up hears
 that and starts at once, on your machine and on a cloud install alike. On a
 cloud install, where the dispatcher can be at zero, whichever part of weft
 wrote the work also calls it to start one.
+
+The writes every run makes (its birth, its journal rows, its task's end) are
+announced in batches. Postgres hands announcements out in the order their
+writes committed, so a write that announces itself makes every other one
+wait its turn to commit; with every run announcing several, a busy install
+spent most of its time with writes queued on that one turn. Instead each of
+those writes leaves its announcement in a table as part of the write, and
+right after it commits the process that wrote sends every announcement
+waiting there in one go: the turn is taken once per batch rather than once
+per write.
 
 ## The listener
 
@@ -179,6 +194,16 @@ A supervisor can still die between changing something and recording that it
 did. The next one works out what to do from what is actually running, rather
 than trusting the record.
 
+On your machine the supervisor looks at the health of what it runs every
+thirty seconds. On a cloud install nothing looks while everything is fine, so
+infrastructure that runs fine costs no look at all and lets the rest of the
+install sleep: the agent on each machine watches its unit right there, for
+free, and asks for a look when how the unit stands changes (a container
+stopped, a check started failing or passing again), and Compute Engine's own
+record of a machine stopping or failing asks too. Once something is not fine,
+the supervisor keeps looking until it is settled, which is what its flaky and
+recovery windows need.
+
 ## The broker, and who may talk to what
 
 Only the dispatcher and the broker hold a database connection; the listener,
@@ -186,18 +211,23 @@ the supervisor and every worker go through the broker.
 
 Each of those processes keeps one WebSocket open to the broker, and every call
 it makes rides that one connection, numbered and answered in whatever order
-they finish. A call the broker holds until something happens (a cancel, new
-journal rows) costs nothing while it waits, so a worker takes one seat at the
-broker however many calls its runs hold open. The broker also pushes the
-changes a worker keeps a copy of down the same connection (see [the
-worker](#the-worker)). When the connection breaks, it comes back by itself: a
-call not yet sent goes out on the new one if it is back within the call's wait.
+they finish. A call the broker holds until something happens (new journal
+rows) costs nothing while it waits, so a worker takes one seat at the broker
+however many calls its runs hold open, and a call whose caller stops waiting
+is dropped at the broker too. The broker also pushes down the same connection
+the changes a worker keeps a copy of (see [the worker](#the-worker)), and the
+cancel of a run the worker drives. A connection with nothing to do for a
+minute closes, and opens again on the next call, so an idle process holds
+nothing open at the broker; a worker driving runs keeps it open, to hear
+their cancels. When the connection breaks, it comes back by itself: a call
+not yet sent goes out on the new one if it is back within the call's wait.
 Past that, or when a sent call got no answer, two kinds of call are made again
 because doing so is safe: a journal write that never reached the broker, and
-a read of a run's history. Any other call fails the way a request whose
-connection reset does, since it may have landed. Uploads and
-downloads of files stay ordinary requests, so a big file never holds up the
-calls behind it.
+a read of a run's history. A call the broker says it could not even start
+(every one of its database connections busy) is sent again too, since nothing
+of it ran. Any other call fails the way a request whose connection reset
+does, since it may have landed. Uploads and downloads of files stay ordinary
+requests, so a big file never holds up the calls behind it.
 
 The broker checks every request. The caller proves who it is with a token its
 platform gave it: on your machine, one the runtime signed when it started the

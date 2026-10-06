@@ -11,13 +11,18 @@
 //!      flight, subsequent matches queue (next look re-checks once
 //!      the current one settles).
 //!
-//! When it looks: every `health_interval`, every owned project (the
-//! flaky and recovery windows are about TIME passing with nothing
-//! changing, so a look on a clock is what they need). What this
-//! supervisor owns is followed as the ownership loop changes it: a lost
-//! project's health state is dropped the moment the loss is known (a look
-//! already running finishes; its status write is fenced by ownership),
-//! and a claim runs a tick right away.
+//! When it looks: in one process that lives as long as the install (a
+//! local one), every `health_interval`, every owned project. A supervisor
+//! that scales to zero looks when told to (a machine running a project's
+//! infra says how its unit stands changed, or the cloud says a machine
+//! went away), and then again at the health interval only while something
+//! it saw is not settled: a unit inside its flaky or recovery window, which
+//! only TIME passing closes, or an action under way or backing off. A
+//! unit that runs fine, or one broken and already declared flaky, needs no
+//! look until it changes. What this supervisor owns is followed as the ownership loop
+//! changes it: a lost project's health state is dropped the moment the
+//! loss is known (a look already running finishes; its status write is
+//! fenced by ownership), and a claim runs a tick right away.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -163,16 +168,23 @@ pub async fn on_ownership_change(state: &SupervisorState, change: &crate::owners
 
 /// One tick of the health loop: evaluate every owned project. Exposed
 /// (rather than only running inside `run_loop`) so integration tests can
-/// step the loop one tick at a time.
-pub async fn tick(state: &SupervisorState) -> Result<()> {
+/// step the loop one tick at a time. Answers whether anything it saw is
+/// not settled yet (see the module doc): a project whose look failed
+/// counts as unsettled, so it is looked at again.
+pub async fn tick(state: &SupervisorState) -> Result<bool> {
     let projects = state.broker.owned_projects(&state.replica).await?;
+    let mut unsettled = false;
     for project in &projects {
-        if let Err(e) = tick_project(state, project).await {
-            tracing::warn!(
-                project_id = %project.project_id,
-                error = %e,
-                "health tick (project) failed"
-            );
+        match tick_project(state, project).await {
+            Ok(project_unsettled) => unsettled |= project_unsettled,
+            Err(e) => {
+                unsettled = true;
+                tracing::warn!(
+                    project_id = %project.project_id,
+                    error = %e,
+                    "health tick (project) failed"
+                );
+            }
         }
     }
 
@@ -184,13 +196,18 @@ pub async fn tick(state: &SupervisorState) -> Result<()> {
             projects.iter().map(|p| p.project_id).collect();
         state.health.lock().await.keep_only(|project| live.contains(&project));
     }
-    Ok(())
+    Ok(unsettled)
 }
 
+/// Look at one project's health; answers whether anything there is not
+/// settled yet: a unit whose latch time passing alone can change
+/// (`NodeHealthState::waits_on_time`), or a protocol's action under way or
+/// waiting out its backoff. A unit broken and already declared flaky is
+/// settled: nothing changes until the unit does, which its machine says.
 async fn tick_project(
     state: &SupervisorState,
     project: &weft_broker_client::protocol::SupervisorProject,
-) -> Result<()> {
+) -> Result<bool> {
     // Stand down, copy by copy, while a user infra action runs on it:
     // an uncompleted supervisor command (apply / stop / terminate) that
     // reaches a copy means the lifecycle handler owns that copy's status
@@ -255,6 +272,8 @@ async fn tick_project(
         String,
     )> = Vec::new();
     let mut units: Vec<UnitView> = Vec::new();
+    // Whether time passing alone can change what a unit's latch says.
+    let mut units_unsettled = false;
     {
         let mut registry = state.health.lock().await;
         for n in &nodes {
@@ -290,11 +309,13 @@ async fn tick_project(
                 ) else {
                     continue;
                 };
+                let ready = observed.is_some_and(|o| o.ready);
+                units_unsettled |= decision.next.waits_on_time(ready);
                 units.push(UnitView {
                     node_id: n.node_id.clone(),
                     instance: n.instance.clone(),
                     unit: unit.clone(),
-                    ready: observed.is_some_and(|o| o.ready),
+                    ready,
                     flaky: decision.next.declared_flaky,
                 });
                 registry.state.insert(key, decision.next.clone());
@@ -431,7 +452,7 @@ async fn tick_project(
                     error = %e,
                     "health_protocols_json malformed; skipping protocol eval until fixed"
                 );
-                return Ok(());
+                return Ok(units_unsettled);
             }
         },
         None => protocol::default_protocols(),
@@ -466,7 +487,8 @@ async fn tick_project(
     };
 
     let Some(matched) = evaluate_protocols(&protocols, &fired_snap, in_flight_snap, &inputs) else {
-        return Ok(());
+        let backing_off = state.health.lock().await.backoff.keys().any(|(proj, _)| *proj == project.project_id);
+        return Ok(units_unsettled || in_flight_snap || backing_off);
     };
     let matched_name = matched.protocol.name.clone();
     let matched_proto = matched.protocol.clone();
@@ -483,7 +505,7 @@ async fn tick_project(
         let mut registry = state.health.lock().await;
         if let Some(b) = registry.backoff.get(&backoff_key) {
             if state.clock.now() < b.next_retry_at {
-                return Ok(());
+                return Ok(true);
             }
         }
         registry.in_flight.insert(project.project_id);
@@ -564,7 +586,8 @@ async fn tick_project(
             "HealthProtocol action failed; un-latched from fired set to retry next tick"
         );
     }
-    Ok(())
+    // An action just ran: what it changed is looked at next.
+    Ok(true)
 }
 
 /// What `plan_action` decided. The I/O wrapper turns each variant

@@ -42,6 +42,12 @@ fn parked_fire_longest_sleep() -> Duration {
 const NOTHING: &[WakeOn] = &[];
 pub(crate) static ON_PARKED_FIRE: &[WakeOn] = &[WakeOn::any(PARKED_FIRE_CHANNEL)];
 pub(crate) static ON_STORAGE_SWEEP: &[WakeOn] = &[WakeOn::any(STORAGE_SWEEP_CHANNEL)];
+/// A trigger's activation changing status, whether it takes work, or until
+/// when: a hibernation starting has a grace window to end.
+pub(crate) static ON_HIBERNATION: &[WakeOn] = &[WakeOn::any(crate::holders::HELD_SIGNALS_CHANNEL)];
+/// An infra copy coming, going or changing status: one running again
+/// brings back the triggers that went down with it.
+pub(crate) static ON_INFRA_STATUS: &[WakeOn] = &[WakeOn::any(crate::held::INFRA_STATUS_CHANNEL)];
 
 /// Safety tick of the reapers that are woken by a write: 60 seconds in
 /// real time, at this install's pace (`weft_core::time_scale`).
@@ -50,7 +56,8 @@ fn woken_reaper_safety() -> Duration {
 }
 
 /// Whether anything in the install is in motion: a claim held, work
-/// waiting for a worker, an activation or a build under way, a slot at an
+/// waiting for a worker (a cancel waiting for the worker driving its run
+/// is not: that drive's own claim counts), an activation or a build under way, a slot at an
 /// entry for a run that has not started yet, a lifecycle command not
 /// finished. While nothing is, no lease can lapse and no driver can die
 /// mid-way, so the loops that watch for that have nothing to watch.
@@ -61,7 +68,8 @@ fn woken_reaper_safety() -> Duration {
 /// a person does not keep the install awake.
 pub async fn in_motion(pool: &sqlx::PgPool) -> anyhow::Result<bool> {
     Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM task WHERE status = 'claimed' OR (status = 'pending' AND target = 'worker')) \
+        "SELECT EXISTS (SELECT 1 FROM task WHERE status = 'claimed' \
+                                OR (status = 'pending' AND target = 'worker' AND kind <> 'cancel_execution')) \
              OR EXISTS (SELECT 1 FROM trigger_activation WHERE status IN ('activating', 'deactivating')) \
              OR EXISTS (SELECT 1 FROM project WHERE transition <> 'none') \
              OR EXISTS (SELECT 1 FROM entry_slot s \
@@ -135,8 +143,64 @@ pub fn drain_loops(state: &DispatcherState) -> Vec<DrainLoop> {
         // it and asks for another look soon. The kept-file expiry sweep is
         // the broker's own loop (it owns the bucket + metadata).
         woken(state, ON_STORAGE_SWEEP, "storage_sweep", crate::storage::process_sweep_queue),
+        // A hibernation's grace window ending: its triggers stop listening
+        // and taking work. Sleeps until the next one ends.
+        woken(state, ON_HIBERNATION, "hibernations", end_hibernations),
+        // An infra copy running again: the triggers its stop took down
+        // with it come back.
+        woken(state, ON_INFRA_STATUS, "infra_returns", crate::api::infra::bring_back_triggers_whose_infra_returned),
     ]
 }
+
+/// End every hibernation whose grace window has passed: the listener lets
+/// go of its signals (`crate::listener::let_go_of_stopped`), and then its
+/// activation stops taking work (`crate::activation_store::end_grace_windows`).
+/// In that order, so one whose letting go failed (the listener down, a
+/// signal it cannot tear down yet) stays for the next pass, which lets go
+/// again, and holds back no other. Then sleep until the next window ends,
+/// or until an activation changes.
+async fn end_hibernations(state: DispatcherState) -> anyhow::Result<DrainStep> {
+    let mut by_project: std::collections::BTreeMap<uuid::Uuid, Vec<weft_core::activation::ActivationKey>> = Default::default();
+    for (project_id, key) in crate::activation_store::grace_windows_over(&state.pg_pool).await? {
+        by_project.entry(project_id).or_default().push(key);
+    }
+    let mut kept_any = false;
+    for (project_id, keys) in by_project {
+        let signals = crate::journal::postgres::activation_signals(&state.pg_pool, project_id, &keys).await?;
+        let kept = crate::listener::let_go_of_stopped(&state.pg_pool, &state.listener, &signals).await?;
+        let let_go: Vec<weft_core::activation::ActivationKey> = keys
+            .into_iter()
+            .filter(|key| {
+                !signals.iter().any(|s| {
+                    kept.contains(&s.token)
+                        && s.activation_trigger.as_deref() == Some(key.trigger.as_str())
+                        && s.instance.as_ref() == key.instance()
+                })
+            })
+            .collect();
+        kept_any |= !kept.is_empty();
+        let ended = crate::activation_store::end_grace_windows(&state.pg_pool, project_id, &let_go).await?;
+        if ended > 0 {
+            tracing::info!(
+                target: "weft_dispatcher::reaper",
+                %project_id, triggers = ended,
+                "a hibernation's grace window ended: its triggers stopped listening and take no more work"
+            );
+        }
+    }
+    if kept_any {
+        return Ok(DrainStep::RetryIn(HIBERNATION_LET_GO_RETRY));
+    }
+    let now = crate::lease::now_unix();
+    Ok(match crate::activation_store::next_grace_end(&state.pg_pool).await? {
+        None => DrainStep::Done,
+        Some(deadline) => DrainStep::RetryIn(Duration::from_secs((deadline + 1 - now).max(1) as u64)),
+    })
+}
+
+/// How soon a hibernation whose signals the listener did not let go of is
+/// tried again.
+const HIBERNATION_LET_GO_RETRY: Duration = Duration::from_secs(30);
 
 /// A sweep that runs on its interval alone. `interval` is given in real
 /// time and runs at this install's pace (`weft_core::time_scale`), like

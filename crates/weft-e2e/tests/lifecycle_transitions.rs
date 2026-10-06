@@ -368,11 +368,11 @@ async fn an_infra_stop_takes_down_only_what_reads_it_and_recovers() -> anyhow::R
 }
 
 /// An infra stop takes down only the triggers reading that infra, so the
-/// project is left partly on: once the infra runs again, `weft activate`
-/// turns back on the trigger that is off and leaves the other as it is, and
-/// the trigger it turned back on fires.
+/// project is left partly on; once the infra runs again, the trigger it took
+/// down comes back on by itself and fires. One a person switched off
+/// themselves stays off through the next stop and start.
 #[tokio::test]
-async fn activate_turns_back_on_only_the_triggers_an_infra_stop_took_down() -> anyhow::Result<()> {
+async fn an_infra_start_brings_back_the_triggers_its_stop_took_down() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let mut project = Project::prepare("lifecycle", disp.clone()).await?;
     let pid = project.id();
@@ -412,14 +412,13 @@ async fn activate_turns_back_on_only_the_triggers_an_infra_stop_took_down() -> a
     .await?
     .assert_actions_exactly(&["deactivate", "infra_start", "infra_terminate"])?;
 
+    // The start brings `reads` back with its infra: nothing is left off.
     infra::start_and_wait_running(&mut project, INFRA_NODE).await?;
-    status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE)
-        .await?
-        .assert_actions_exactly(&["run", "deactivate", "activate", "infra_stop", "infra_terminate"])?;
-    project.activate().await?;
-    status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE)
-        .await?
-        .assert_actions_exactly(&["run", "deactivate", "infra_stop", "infra_terminate"])?;
+    status::wait_until(&disp, &pid, "the start brought the trigger back", STATUS_DEADLINE, |s| {
+        s.status() == "active" && !s.available_actions().contains(&"activate")
+    })
+    .await?
+    .assert_actions_exactly(&["run", "deactivate", "infra_stop", "infra_terminate"])?;
 
     // `plain` never let go of the feed, so one subscriber says nothing about
     // `reads`: wait until both are listening before pushing.
@@ -430,6 +429,20 @@ async fn activate_turns_back_on_only_the_triggers_an_infra_stop_took_down() -> a
         .await?
         .completed()?
         .assert_input("heard", "data", &json!("go"))?;
+
+    // Switched off by a person, `reads` stays off through a stop and a
+    // start: only what the stop itself took down comes back.
+    project
+        .weft(&["deactivate", "--trigger", "reads", "--mode", "park", "--running-policy", "cancel"])
+        .await?;
+    project
+        .weft(&["infra", "stop", "--mode", "park", "--running-policy", "cancel"])
+        .await?;
+    status::wait_until(&disp, &pid, "the infra stopped", STATUS_DEADLINE, |s| s.infra_rollup() == "stopped").await?;
+    infra::start_and_wait_running(&mut project, INFRA_NODE).await?;
+    status::wait_until_status(&disp, &pid, "active", STATUS_DEADLINE)
+        .await?
+        .assert_actions_exactly(&["run", "deactivate", "activate", "infra_stop", "infra_terminate"])?;
 
     project
         .weft(&["deactivate", "--mode", "wipe", "--running-policy", "cancel"])

@@ -42,18 +42,18 @@
 			value: 'park',
 			label: 'Park',
 			detail:
-				'Park submissions indefinitely. Project visible to consumers; submissions drained on reactivate.',
+				'Nothing is dropped: calls, answers and the triggers\' own fires wait, and run on the version they come back with. A caller on a route is kept on the line. Questions stay listed.',
 		},
 		{
 			value: 'hibernate',
 			label: 'Hibernate',
 			detail:
-				'Park submissions for a grace window, then refuse them. Project hidden from consumer enumeration the entire time.',
+				'Like park for a grace window, with its questions hidden; after it, nothing new is taken and the triggers stop listening.',
 		},
 		{
 			value: 'wipe',
 			label: 'Wipe',
-			detail: 'Drop every signal + cancel suspended runs. Reactivate is a fresh boot.',
+			detail: 'Drop everything waiting and cancel the runs waiting on the triggers. Reactivating starts fresh.',
 		},
 	];
 
@@ -71,7 +71,7 @@
 			value: 'wait',
 			label: 'Wait for running executions',
 			detail:
-				'New fires park immediately; in-flight runs drain naturally. You can cancel running anytime.',
+				'New work waits as the mode says; the runs going now finish first. You can cancel them anytime.',
 		},
 	];
 

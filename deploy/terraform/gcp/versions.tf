@@ -42,6 +42,8 @@ resource "google_project_service" "apis" {
     "compute.googleapis.com",
     "iam.googleapis.com",
     "iamcredentials.googleapis.com",
+    # carrying infra machine events to the supervisor (machines.tf)
+    "logging.googleapis.com",
     "pubsub.googleapis.com",
     "run.googleapis.com",
     "secretmanager.googleapis.com",

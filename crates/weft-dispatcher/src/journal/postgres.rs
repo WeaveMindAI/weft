@@ -306,9 +306,11 @@ impl PostgresJournal {
         dedup_key: Option<&str>,
     ) -> anyhow::Result<()> {
         if !matches!(event, ExecEvent::ExecutionStarted { .. }) {
-            return weft_journal::record_event_in(&self.pool, event, None, dedup_key)
+            weft_journal::record_event_in(&self.pool, event, None, dedup_key)
                 .await
-                .map_err(|e| anyhow::anyhow!("{e}"));
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            weft_task_store::announce::committed(&self.pool);
+            return Ok(());
         }
         let started = StartedRow::of(event, dedup_key, crate::lease::now_unix())?;
         sqlx::query("SELECT weft_execution_started($1)")
@@ -316,6 +318,7 @@ impl PostgresJournal {
             .execute(&self.pool)
             .await
             .map_err(birth_refusal)?;
+        weft_task_store::announce::committed(&self.pool);
         Ok(())
     }
 
@@ -350,6 +353,7 @@ impl PostgresJournal {
             .fetch_one(&self.pool)
             .await
             .map_err(birth_refusal)?;
+        weft_task_store::announce::committed(&self.pool);
         match answer.get("outcome").and_then(serde_json::Value::as_str) {
             Some("started" | "already_started") => Ok(Ok(())),
             Some("refused") => {
@@ -509,23 +513,25 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         r#"CREATE INDEX IF NOT EXISTS idx_exec_event_kind ON exec_event(kind, id DESC)"#,
         r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_exec_event_dedup
            ON exec_event(dedup_key) WHERE dedup_key IS NOT NULL"#,
-        // Announce every row, with its execution, when it commits: the
-        // dispatcher's event bridge wakes on any, and a worker waiting
-        // on its run's journal (through the broker) on its own execution's.
-        // Many rows of one execution in one transaction collapse to one
-        // notification, since Postgres drops a duplicate payload within
-        // a transaction.
+        // Announce the executions a write added rows to, once each, when
+        // it commits: the dispatcher's event bridge wakes on any, and a
+        // worker waiting on its run's journal (through the broker) on its
+        // own execution's. Once per statement, over the rows it added,
+        // and through the announcement outbox (`weft_task_store::announce`),
+        // since every run writes here.
         // SYNC: 'weft_exec_event' <-> weft_journal::EXEC_EVENT_CHANNEL
         r#"CREATE OR REPLACE FUNCTION exec_event_notify() RETURNS trigger AS $$
             BEGIN
-                PERFORM pg_notify('weft_exec_event', NEW.execution_id);
+                PERFORM weft_announce('weft_exec_event', a.execution_id)
+                    FROM (SELECT DISTINCT execution_id FROM added) a;
                 RETURN NULL;
             END;
             $$ LANGUAGE plpgsql"#,
         r#"DROP TRIGGER IF EXISTS exec_event_notify_on_insert ON exec_event"#,
         r#"CREATE TRIGGER exec_event_notify_on_insert
             AFTER INSERT ON exec_event
-            FOR EACH ROW
+            REFERENCING NEW TABLE AS added
+            FOR EACH STATEMENT
             EXECUTE FUNCTION exec_event_notify()"#,
         // signal_token: token-scoped enumeration credential. Allow
         // sets are TEXT[] arrays so parameterized binding gives no
@@ -901,6 +907,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // rows of one execution are numbered and committed in the same
         // order; taking it again in a transaction that already holds it is
         // free.
+        // SYNC: execution.owner_replica <-> weft_bind_execution_id_owner, bind_execution_id_owner (crates/weft-task-store/src/tasks.rs)
         r#"CREATE OR REPLACE FUNCTION weft_journal_append(
                 p_execution_id TEXT, p_kinds TEXT[], p_payloads TEXT[], p_created_at BIGINT,
                 p_replica TEXT, p_owner TEXT, p_dedup_key TEXT
@@ -1188,6 +1195,7 @@ impl Journal for PostgresJournal {
             }
         }
         tx.commit().await?;
+        weft_task_store::announce::committed(&self.pool);
         Ok(write)
     }
 
@@ -1402,9 +1410,9 @@ impl Journal for PostgresJournal {
         // SQL so a tenant with a huge history never truncates blindly.
         //
         // Bind order is fixed ($1 tenant, $2 project filter, $3 after, $4 before,
-        // $5 phase, $6 entry node, $7 status, $8 instance, $9 tag) and every optional filter is a
-        // `($n IS NULL OR ...)` clause so one prepared statement serves every
-        // filter combination.
+        // $5 phase, $6 entry node, $7 status, $8 instance, $9 tag, $10 node,
+        // $11 search) and every optional filter is a `($n IS NULL OR ...)`
+        // clause so one prepared statement serves every filter combination.
         // The `execution` row (seeded at start) carries the real, indexed
         // columns the filters key on: `tenant_id` (the wall), `project_id`, and
         // `started_at_unix`. `exec_event` only has `execution_id`/`kind`/`payload_json`,
@@ -1456,6 +1464,14 @@ impl Journal for PostgresJournal {
              AND ($8::text IS NULL OR ec.instance_id = $8) \
              AND ($9::text IS NULL OR EXISTS ( \
                      SELECT 1 FROM execution_tag et WHERE et.execution_id = ec.execution_id AND et.tag = $9 \
+                 )) \
+             AND ($10::text IS NULL OR EXISTS ( \
+                     SELECT 1 FROM exec_event WHERE execution_id = ec.execution_id \
+                       AND kind = 'node_started' AND payload_json::jsonb->>'node_id' = $10 \
+                 )) \
+             AND ($11::text IS NULL OR EXISTS ( \
+                     SELECT 1 FROM execution_search es WHERE es.execution_id = ec.execution_id \
+                       AND es.words @@ websearch_to_tsquery('simple', $11) \
                  ))");
 
         // The count carries the SAME started-event predicate as the row
@@ -1480,6 +1496,8 @@ impl Journal for PostgresJournal {
         .bind(status)
         .bind(query.instance.as_ref().map(|m| m.as_str()))
         .bind(query.tag.as_deref())
+        .bind(query.node.as_deref())
+        .bind(query.search.as_deref())
         .fetch_one(&self.pool)
         .await?;
 
@@ -1500,8 +1518,8 @@ impl Journal for PostgresJournal {
                  ORDER BY id DESC LIMIT 1 \
              ) t ON TRUE \
              WHERE {where_clause} \
-               AND ($12::bigint IS NULL OR (ec.started_at_unix, ec.execution_id) < ($12, $13::text)) \
-             ORDER BY ec.started_at_unix DESC, ec.execution_id DESC LIMIT $10 OFFSET $11"
+               AND ($14::bigint IS NULL OR (ec.started_at_unix, ec.execution_id) < ($14, $15::text)) \
+             ORDER BY ec.started_at_unix DESC, ec.execution_id DESC LIMIT $12 OFFSET $13"
         ))
         .bind(tenant)
         .bind(project)
@@ -1512,6 +1530,8 @@ impl Journal for PostgresJournal {
         .bind(status)
         .bind(query.instance.as_ref().map(|m| m.as_str()))
         .bind(query.tag.as_deref())
+        .bind(query.node.as_deref())
+        .bind(query.search.as_deref())
         .bind(query.limit as i64)
         .bind(query.offset as i64)
         .bind(query.below.map(|(started, _)| started as i64))
@@ -2037,6 +2057,8 @@ async fn erase_execution_ids(
     // execution forever as non-terminal (its NOT EXISTS terminal check
     // passes vacuously once every event is gone), so wipe and
     // cancel_running re-sweep a ghost.
+    sqlx::query("DELETE FROM execution_search WHERE execution_id = ANY($1)")
+        .bind(&ids).execute(&mut *tx).await?;
     sqlx::query("DELETE FROM execution WHERE execution_id = ANY($1)")
         .bind(&ids).execute(&mut *tx).await?;
     // The run's row in the version tree belongs to the version store,

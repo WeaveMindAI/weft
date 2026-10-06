@@ -505,9 +505,12 @@ async fn a_tick_reports_the_projects_it_took_on(pool: PgPool) {
     assert_eq!(claimed().await, vec![PROJECT], "a lapsed lease taken back is news");
 }
 
-/// A tick says when its supervisor next has something to look at: never
-/// over a project that only declares infra, at the lapse of a sibling's
-/// lease over one with infra nodes, and now once that project is its own.
+/// A tick says when its supervisor next has something to do: never over a
+/// project of its own whose infra runs (a machine saying how its unit
+/// stands changed wakes it instead), at the lapse of a sibling's lease over
+/// one with infra copies expected to run (the word that one changed may
+/// have woken this replica, not the sibling; a stopped copy says nothing),
+/// and now once a command waits on one of its own.
 #[sqlx::test]
 async fn a_tick_says_when_there_is_next_something_to_look_at(pool: PgPool) {
     schema(&pool).await;
@@ -517,12 +520,19 @@ async fn a_tick_says_when_there_is_next_something_to_look_at(pool: PgPool) {
     assert!(!declared.owns_work && declared.others_lapse_in_secs.is_none(), "but gives nothing to look at: {declared:?}");
 
     node_row(&pool, "running", serde_json::json!({})).await;
+    let running = sync_ownership(&pool, OWNER, &[]).await.unwrap();
+    assert!(!running.owns_work && running.others_lapse_in_secs.is_none(), "infra that runs needs no look on a clock: {running:?}");
+
     lease(&pool, OTHER).await;
     let sibling = sync_ownership(&pool, OWNER, &[]).await.unwrap();
     assert!(sibling.owned.is_empty() && !sibling.owns_work, "a sibling holds the lease");
-    let lapse = sibling.others_lapse_in_secs.expect("its lease may lapse");
+    let lapse = sibling.others_lapse_in_secs.expect("its lease over a project with infra copies may lapse");
     assert!((3590..=3600).contains(&lapse), "the sibling's lease lapses in an hour: {lapse}");
+    sqlx::query("UPDATE infra_node SET status = 'stopped'").execute(&pool).await.unwrap();
+    let stopped = sync_ownership(&pool, OWNER, &[]).await.unwrap();
+    assert!(stopped.others_lapse_in_secs.is_none(), "a stopped copy says nothing to wake for: {stopped:?}");
 
+    command_of(&pool, PROJECT).await;
     lease(&pool, OWNER).await;
     let own = sync_ownership(&pool, OWNER, &[]).await.unwrap();
     assert!(own.owns_work && own.others_lapse_in_secs.is_none(), "{own:?}");

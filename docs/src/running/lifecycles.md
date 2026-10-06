@@ -20,7 +20,7 @@ Nothing starts it for you. Not `weft run`, not `weft build`, not activation.
 | `weft infra start` | Brings up whatever is down and leaves whatever is already up alone |
 | `weft infra stop` | Scales to nothing and **keeps the disk**. Start it again and your rows are there |
 | `weft infra terminate` | Deletes it, **disk included**, unless the step asked for the disk to be kept |
-| `weft infra upgrade` | Rebuilds against your current source. Leaves the project deactivated afterwards, so you choose when the new version takes traffic |
+| `weft infra upgrade` | Rebuilds against your current source. The triggers it took down come back once the new infrastructure is up |
 | `weft infra status` | Where each piece stands, with its address |
 | `weft infra doors` | The addresses this project's infra answers on |
 | `weft infra logs <node>` | What the containers actually printed |
@@ -91,10 +91,12 @@ listens and none is part way through turning on or off, and `weft status` lists
 each trigger's own state under `triggers:`.
 
 If you stopped infrastructure that some triggers read, those triggers came
-down with it and the rest stayed on. After `weft infra start`, a plain `weft
-activate` turns back on the ones that are off and leaves the others as they
-are. A route whose trigger is off answers its callers 503 at once, saying it
-is switched off: a caller is never held while it waits.
+down with it and the rest stayed on. When `weft infra start` (or the
+program's own `ctx.infra(..).start()`) has the infrastructure up again, the
+triggers that came down with it come back on by themselves; one you switched
+off yourself since stays off. A plain `weft activate` turns back on whatever
+is still off. While a route's trigger is parked, its callers are kept on the
+line and served once it is back.
 
 A trigger that reads an instance's copy or an instance's value
 (`@per_instance`, `@instance_filled`) exists once per instance, and its copies
@@ -114,13 +116,17 @@ Prepare it again: `weft bake` does it without listening, `weft activate` does it
 
 ### Choosing what happens to work in flight
 
-`weft deactivate` and `weft resync` both ask:
+`weft deactivate` and `weft resync` both ask. If you want nothing lost while
+the triggers are down, park them:
 
-| Mode | What it does |
-|---|---|
-| `wipe` | Drops every waiting signal and cancels suspended runs. A clean slate, and what you want while building |
-| `hibernate` | Keeps the signals, hides pending tasks from the browser extension, parks late answers |
-| `park` | Keeps the signals visible and queues new answers until you reactivate |
+| Mode | Work that arrives meanwhile | What a person sees |
+|---|---|---|
+| `park` | Nothing is dropped. A call from outside, an answer to a waiting run, and every fire a trigger makes by itself (a schedule's tick, a message on a connection it holds) wait, and run once the triggers are back, on the version they come back with. Someone calling a route is kept on the line until then | Questions stay listed for the people who answer them, and an answer sent now waits too |
+| `hibernate` | The same as `park` for the grace window (`--grace`, in minutes). After it, nothing new is taken and the triggers stop listening | Questions are hidden for the whole time; someone who already has one open can still send their answer within the window |
+| `wipe` | Refused. Everything waiting is dropped and the runs waiting on the triggers are cancelled: a clean slate, and what you want while building | Questions are deleted |
+
+A schedule parked for two hours has two hours of ticks waiting when it comes
+back; the reactivate choice below decides whether they run.
 
 With no terminal attached, or with `--json`, the default is `wipe`. Running
 executions are cancelled unless you pass `--running-policy wait`, which lets

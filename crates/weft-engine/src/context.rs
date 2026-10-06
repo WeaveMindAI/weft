@@ -108,6 +108,60 @@ pub struct EngineClients {
     /// Charges opened by a call whose amount only a later response
     /// states, held process-wide until that response lands.
     pub open_charges: Arc<crate::metering::OpenCharges>,
+    /// What the process's line to the broker pushes, which is how a worker
+    /// hears that a run it drives is asked to stop.
+    pub line: Arc<dyn WorkerLine>,
+}
+
+/// What a worker reads off its line to the broker besides answers: the
+/// notices the broker pushes, and a hold that keeps the line open while
+/// the worker must hear them (`weft_broker_client::line`'s module doc).
+pub trait WorkerLine: Send + Sync {
+    fn subscribe(&self) -> weft_task_store::pg_signal::Subscription;
+    fn stay_open(&self) -> Box<dyn Send + Sync>;
+}
+
+impl WorkerLine for weft_broker_client::BrokerLink {
+    fn subscribe(&self) -> weft_task_store::pg_signal::Subscription {
+        weft_broker_client::BrokerLink::subscribe(self)
+    }
+
+    fn stay_open(&self) -> Box<dyn Send + Sync> {
+        Box::new(weft_broker_client::BrokerLink::stay_open(self))
+    }
+}
+
+/// A line whose notices are what a test sends into [`TestLine::pushed`].
+#[cfg(test)]
+pub(crate) struct TestLine {
+    pub pushed: tokio::sync::broadcast::Sender<weft_task_store::pg_signal::Heard>,
+    /// How many holds are taken right now.
+    pub held: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl TestLine {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self { pushed: tokio::sync::broadcast::channel(64).0, held: Arc::default() })
+    }
+}
+
+#[cfg(test)]
+impl WorkerLine for TestLine {
+    fn subscribe(&self) -> weft_task_store::pg_signal::Subscription {
+        self.pushed.subscribe().into()
+    }
+
+    fn stay_open(&self) -> Box<dyn Send + Sync> {
+        struct Hold(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Hold {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        self.held.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::new(Hold(self.held.clone()))
+    }
 }
 
 impl EngineClients {
@@ -134,6 +188,7 @@ impl EngineClients {
             steering: weft_broker_client::BrokerExecutionClient::new(link.clone()),
             pending_costs: crate::metering::PendingCostRecords::new(),
             open_charges: crate::metering::OpenCharges::new(),
+            line: Arc::new(link.clone()),
         }
     }
 }
@@ -1575,13 +1630,12 @@ impl TaskStoreClient for JournalFirst<dyn TaskStoreClient> {
         self.inner.fail(task_id, replica, error).await
     }
 
-    async fn wait_cancels(
+    async fn cancels_asked(
         &self,
         project_id: uuid::Uuid,
         execution_ids: Vec<String>,
-        wait: Duration,
     ) -> anyhow::Result<Vec<task_store::CancelAsked>> {
-        self.inner.wait_cancels(project_id, execution_ids, wait).await
+        self.inner.cancels_asked(project_id, execution_ids).await
     }
 }
 
@@ -3728,6 +3782,7 @@ mod replay_tests {
             access_broker: FakeAccessBroker::new(),
             pending_costs: crate::metering::PendingCostRecords::new(),
             open_charges: crate::metering::OpenCharges::new(),
+            line: TestLine::new(),
             steering: Arc::new(NoopSteering),
         };
         RunnerHandle::new(
@@ -3799,6 +3854,7 @@ mod replay_tests {
             access_broker,
             pending_costs: crate::metering::PendingCostRecords::new(),
             open_charges: crate::metering::OpenCharges::new(),
+            line: TestLine::new(),
             steering: Arc::new(NoopSteering),
         };
         RunnerHandle::new(
@@ -4065,6 +4121,7 @@ mod replay_tests {
             access_broker: worker_broker.clone(),
             pending_costs: crate::metering::PendingCostRecords::new(),
             open_charges: crate::metering::OpenCharges::new(),
+            line: TestLine::new(),
             steering: Arc::new(NoopSteering),
         };
         let execution_id = uuid::Uuid::from_u128(0xC0);
@@ -4105,6 +4162,7 @@ mod replay_tests {
             access_broker: test_broker.clone(),
             pending_costs: crate::metering::PendingCostRecords::new(),
             open_charges: crate::metering::OpenCharges::new(),
+            line: TestLine::new(),
             steering: Arc::new(NoopSteering),
         };
         let runner = crate::test_rig::LiveTestRunner::new(
@@ -4299,11 +4357,10 @@ mod replay_tests {
     struct NoopTaskStore;
     #[async_trait]
     impl TaskStoreClient for NoopTaskStore {
-        async fn wait_cancels(
+        async fn cancels_asked(
             &self,
             _project_id: uuid::Uuid,
             _execution_ids: Vec<String>,
-            _wait: std::time::Duration,
         ) -> anyhow::Result<Vec<weft_task_store::tasks::CancelAsked>> {
             Ok(Vec::new())
         }
@@ -5072,7 +5129,7 @@ mod drive_journal_tests {
         async fn fail(&self, _: uuid::Uuid, _: &str, _: String) -> anyhow::Result<()> {
             unimplemented!("not asked")
         }
-        async fn wait_cancels(&self, _: uuid::Uuid, _: Vec<String>, _: Duration) -> anyhow::Result<Vec<task_store::CancelAsked>> {
+        async fn cancels_asked(&self, _: uuid::Uuid, _: Vec<String>) -> anyhow::Result<Vec<task_store::CancelAsked>> {
             unimplemented!("not asked")
         }
     }

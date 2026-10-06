@@ -359,7 +359,8 @@ async fn run_deactivate(
         project_id,
         &crate::take_down::TakeDownTarget::Activations(targets),
         &take_down.spec,
-        true, // health-loop autonomous park: its auto-recover MAY reactivate this
+        // The health loop's own park: its auto-recover may bring it back.
+        Some(crate::take_down::DownWith::Health),
         None,
     )
     .await
@@ -464,7 +465,7 @@ fn health_restore_targets(
 ) -> Vec<weft_core::activation::ActivationKey> {
     activations
         .iter()
-        .filter(|a| a.lifecycle.deactivated_by_health && a.lifecycle.status == crate::activation_store::ProjectStatus::Inactive)
+        .filter(|a| a.lifecycle.parked_by_health())
         .filter(|a| {
             !deps
                 .iter()
@@ -502,7 +503,7 @@ mod tests {
     /// An activation the health loop took down.
     fn by_health(trigger: &str, owner: Owner) -> crate::activation_store::Activation {
         let mut a = activation(trigger, owner, crate::activation_store::ProjectStatus::Inactive);
-        a.lifecycle.deactivated_by_health = true;
+        a.lifecycle.went_down = Some(weft_broker_client::activation::WentDown { with: crate::take_down::DownWith::Health, at_unix: 0 });
         a
     }
 
