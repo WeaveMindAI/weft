@@ -47,9 +47,11 @@ jobs:
   # ---- the gate --------------------------------------------------------
   #
   # The full CI suite (tests, clippy, schema agreement, editor checks)
-  # runs first and every publishing job below waits on it. A commit
-  # that fails the checks publishes NOTHING: no images, no binaries, no
-  # store uploads. Whoever pulls such a commit builds from source and
+  # runs and every publishing job below waits on it. What only builds
+  # (the binaries, the .vsix, the browser zips) starts at once beside it,
+  # so the slow compiles overlap the checks; nothing it makes leaves the
+  # run's own artifacts until the gate is green. A commit that fails the
+  # checks publishes NOTHING: no images, no binaries, no store uploads. Whoever pulls such a commit builds from source and
   # hits the same loud local failure the dev did; their data is safe
   # either way (the boot refuses on schema drift instead of guessing).
   #
@@ -76,9 +78,9 @@ jobs:
   # it a second time inside Docker. That works because these legs run on
   # Ubuntu 22.04, whose glibc is older than the image's Debian bookworm
   # (`weft build-images` starts the binary in the image to make sure).
-  linux:
-    name: ${{ matrix.asset }} + images
-    needs: [ci]
+  linux-binaries:
+    name: ${{ matrix.asset }}
+    if: github.repository == 'WeaveMindAI/weft'
     strategy:
       # One architecture failing must not kill the other's build
       # mid-way; the stitch below requires both, so nothing partial is
@@ -89,9 +91,28 @@ jobs:
           # ubuntu-22.04: oldest supported runner glibc, so the binary
           # runs on every distro at least that new, and in the image.
           # SYNC: CLI asset names <-> setup.sh (prebuilt artifacts
-          #       block: the uname case), the macos job's matrix
+          #       block: the uname case), the macos job's matrix, the linux job's matrix
           - { runner: ubuntu-22.04, asset: weft-x86_64-linux, arch: amd64 }
           - { runner: ubuntu-22.04-arm, asset: weft-aarch64-linux, arch: arm64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/build-binaries
+        with:
+          asset: ${{ matrix.asset }}
+
+  # The images push to ghcr, so they wait on the gate; the binaries they
+  # carry come from the leg above.
+  linux:
+    name: ${{ matrix.asset }} images
+    needs: [ci, linux-binaries]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # SYNC: the matrix <-> the linux-binaries job's matrix
+          - { runner: ubuntu-22.04, asset: weft-x86_64-linux, runtime: weft-runtime-x86_64-linux, arch: amd64 }
+          - { runner: ubuntu-22.04-arm, asset: weft-aarch64-linux, runtime: weft-runtime-aarch64-linux, arch: arm64 }
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -99,13 +120,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # The builder base alone is >1GB and the builds run through
-      # BuildKit on the same disk as the cargo cache; the preinstalled
-      # Android/.NET/GHC toolchains are dead weight here.
+      # BuildKit on this disk; the preinstalled Android/.NET/GHC
+      # toolchains are dead weight here.
       - name: free disk space
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
-      - uses: ./.github/actions/build-binaries
+      - uses: actions/download-artifact@v4
         with:
-          asset: ${{ matrix.asset }}
+          name: ${{ matrix.asset }}
+          path: ${{ runner.temp }}/bin
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.runtime }}
+          path: ${{ runner.temp }}/bin
+      # Outside the checkout: the image refs hash the source tree, and the
+      # two legs' binaries differ.
+      - run: chmod +x "$RUNNER_TEMP"/bin/*
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
@@ -119,9 +148,9 @@ jobs:
       # SYNC: `weft build-images` stdout <-> crates/weft-cli/src/images.rs (SharedImages::bare_refs), .github/workflows/install-gcp.yml (build the runtime's images)
       - name: build + push shared images
         run: |
-          ./target/release/weft build-images \
+          "$RUNNER_TEMP/bin/${{ matrix.asset }}" build-images \
             --push-suffix "-${{ matrix.arch }}" \
-            --runtime-binary target/release/weft-runtime > image-refs.txt
+            --runtime-binary "$RUNNER_TEMP/bin/${{ matrix.runtime }}" > image-refs.txt
       - uses: actions/upload-artifact@v4
         with:
           name: image-refs-${{ matrix.arch }}
@@ -136,7 +165,7 @@ jobs:
   # whole release by far.
   macos:
     name: ${{ matrix.asset }}
-    needs: [ci]
+    if: github.repository == 'WeaveMindAI/weft'
     strategy:
       fail-fast: false
       matrix:
@@ -222,7 +251,7 @@ jobs:
   # saves any more goes on its own after seven days unused.
   prune-caches:
     name: keep one copy of each build cache
-    needs: [ci, linux, macos]
+    needs: [ci, linux-binaries, macos]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
@@ -248,7 +277,7 @@ jobs:
   # ---- VS Code extension ----------------------------------------------
   vsix:
     name: package .vsix
-    needs: [ci]
+    if: github.repository == 'WeaveMindAI/weft'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.tags.outputs.version }}
@@ -291,7 +320,7 @@ jobs:
   # ---- browser extension ----------------------------------------------
   browser:
     name: package browser zips
-    needs: [ci]
+    if: github.repository == 'WeaveMindAI/weft'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.tags.outputs.version }}
@@ -325,7 +354,7 @@ jobs:
   release:
     name: update latest release
     runs-on: ubuntu-latest
-    needs: [linux, vsix, browser, images-manifest]
+    needs: [ci, linux, vsix, browser, images-manifest]
     # Runs even when the browser packaging failed (one unbuildable
     # artifact must not strand every other's assets), but never without
     # the vsix job (it supplies the version the manifest needs) and never
@@ -335,7 +364,7 @@ jobs:
     # on, and publishing it while no image is pullable would hand a
     # toolchain-less user a prebuilt CLI whose first `daemon start`
     # falls back to a multi-GB local docker build.
-    if: ${{ !cancelled() && needs.vsix.result == 'success' && needs['images-manifest'].result == 'success' }}
+    if: ${{ !cancelled() && needs.ci.result == 'success' && needs.vsix.result == 'success' && needs['images-manifest'].result == 'success' }}
     permissions:
       contents: write
     env:
@@ -468,7 +497,7 @@ jobs:
   publish-marketplace:
     name: publish to VS Code Marketplace
     runs-on: ubuntu-latest
-    needs: [vsix]
+    needs: [ci, vsix]
     # `contains` on the pending ARRAY fails closed: an unknown store
     # name simply is not in it.
     if: ${{ contains(fromJSON(needs.vsix.outputs.pending), 'marketplace') }}
@@ -512,7 +541,7 @@ jobs:
   publish-openvsx:
     name: publish to Open VSX
     runs-on: ubuntu-latest
-    needs: [vsix]
+    needs: [ci, vsix]
     if: ${{ contains(fromJSON(needs.vsix.outputs.pending), 'openvsx') }}
     permissions:
       contents: write
@@ -548,7 +577,7 @@ jobs:
   publish-browser:
     name: publish to ${{ matrix.store }}
     runs-on: ubuntu-latest
-    needs: [browser]
+    needs: [ci, browser]
     # The matrix IS the gate: it is built from the probe's `pending`
     # array, so a store that already carries this version has no leg
     # at all, and adding a store means touching only the probe's

@@ -48,8 +48,14 @@ jobs:
           fetch-depth: 0
       - run: scripts/check-extension-bump.sh "origin/${{ github.base_ref }}"
 
-  rust:
-    name: cargo test + clippy
+  # The Rust checks, each on its own runner so they run side by side:
+  # the wall time is the slowest one instead of their sum. Each builds
+  # what it needs from the tests job's cache (`shared-key`), which only
+  # that job saves, on main: one warm copy in the repo's cache space
+  # instead of one per job. The `rust` job below gathers them under the
+  # one name the main ruleset requires.
+  test:
+    name: cargo nextest
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -61,28 +67,88 @@ jobs:
       - run: rustup toolchain install
       # Restores everywhere, saves only on main (release.yml's call of
       # this file): a PR reads main's copy and leaves nothing behind, and
-      # release.yml's prune-caches keeps one copy per job.
+      # release.yml's prune-caches keeps one copy per cache.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          shared-key: workspace
           save-if: ${{ github.ref == 'refs/heads/main' }}
-
       # No compile-time query macros anywhere, so the workspace suite needs no
       # database. The tests that do want one are behind the `db-tests` feature.
       # Under cargo-nextest, as developers run it: each test in its own
-      # process, which tests that set the process's env vars rely on. Doc
-      # tests are the one kind nextest does not run.
+      # process, which tests that set the process's env vars rely on.
       - run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
       - run: cargo nextest run --workspace --locked
+
+  doc:
+    name: cargo doc tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: workspace
+          save-if: false
+      # Doc tests are the one kind nextest does not run.
       - run: cargo test --workspace --locked --doc
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: workspace
+          save-if: false
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  parse-only:
+    name: parse-only build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: workspace
+          save-if: false
       # The parse-only build (weft-core without its `runtime` layer, what a
       # WASM parser links). A workspace build always turns `runtime` on, so
       # nothing else compiles this shape.
       - run: cargo check -p weft-compiler --no-default-features --locked
+
+  examples:
+    name: examples compile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: workspace
+          save-if: false
       # The examples are the first thing a new user copies, and nothing
       # else compiles them. The script tolerates only the
       # connect-a-credential diagnostics a fresh checkout produces.
       - run: scripts/validate-examples.sh
+
+  # The name the main ruleset requires: green only when every Rust check
+  # above is. It runs whatever happened above (unless the run was
+  # cancelled), so a failure there shows here as a failure, never as a
+  # skip the ruleset would wait on.
+  rust:
+    name: cargo test + clippy
+    needs: [test, doc, clippy, parse-only, examples]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    env:
+      NEEDS: ${{ toJSON(needs) }}
+    steps:
+      - run: |
+          jq -e 'all(.[]; .result == "success")' <<< "$NEEDS" >/dev/null \
+            || { jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$NEEDS"; exit 1; }
 
   db:
     name: cargo test --features db-tests
@@ -115,8 +181,10 @@ jobs:
       # container, so the crate list lives in exactly one place.
       - run: scripts/run-db-tests.sh
 
-  editor:
-    name: graph + editor
+  # The JS checks, side by side like the Rust ones, gathered under the
+  # name the main ruleset requires by the `editor` job below.
+  graph:
+    name: weft-graph tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -125,17 +193,71 @@ jobs:
           workspace: extension-vscode
           borrow-packages: packages/weft-graph packages/weft-syntax packages/weft-connect
       - run: pnpm -C packages/weft-graph test
+
+  connect:
+    name: weft-connect tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-node-workspace
+        with:
+          workspace: extension-vscode
+          borrow-packages: packages/weft-graph packages/weft-syntax packages/weft-connect
       - run: pnpm -C packages/weft-connect test
+
+  syntax:
+    name: weft-syntax tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-node-workspace
+        with:
+          workspace: extension-vscode
+          borrow-packages: packages/weft-graph packages/weft-syntax packages/weft-connect
       - run: pnpm -C packages/weft-syntax test
+
+  vscode:
+    name: VS Code extension
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-node-workspace
+        with:
+          workspace: extension-vscode
+          borrow-packages: packages/weft-graph packages/weft-syntax packages/weft-connect
       - run: pnpm -C extension-vscode test
       - run: pnpm -C extension-vscode run compile
-      # The WhatsApp bridge's pure parts; `node --test` needs no install.
+
+  bridge:
+    name: WhatsApp bridge tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The bridge's pure parts; `node --test` needs no install.
       - run: node --test catalog/bailey/bridge/images/bridge/src/*.test.js
-      # The browser extension ships to three stores gated only on a
-      # version bump, so its checks belong in the same gate as
-      # everything else JS.
+
+  # The browser extension ships to three stores gated only on a version
+  # bump, so its checks belong in the same gate as everything else JS.
+  browser:
+    name: browser extension
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-node-workspace
         with:
           workspace: extension-browser
       - run: pnpm -C extension-browser exec tsc --noEmit
       - run: pnpm -C extension-browser check
+
+  # The name the main ruleset requires (see the `rust` job).
+  editor:
+    name: graph + editor
+    needs: [graph, connect, syntax, vscode, bridge, browser]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    env:
+      NEEDS: ${{ toJSON(needs) }}
+    steps:
+      - run: |
+          jq -e 'all(.[]; .result == "success")' <<< "$NEEDS" >/dev/null \
+            || { jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$NEEDS"; exit 1; }

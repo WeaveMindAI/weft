@@ -38,10 +38,16 @@ into `main` through a PR, and the merge is what publishes.
    CLI binaries, the `.vsix` and the browser zips, updates the rolling
    `latest` release, and then publishes to each store.
 
-CI runs on `pull_request` into `main` only. Six checks: `extension
-versions bumped` (PRs only), `build`, `public proxy routes`,
-`cargo test + clippy`, `cargo test --features db-tests`, and
-`graph + editor`.
+CI runs on `pull_request` into `main` only. Every check is its own
+job, so they run side by side. The main ruleset requires four names:
+`extension versions bumped` (PRs only), `cargo test --features
+db-tests`, and two gates that are green only when every job under them
+is: `cargo test + clippy` (nextest, doc tests, clippy, the parse-only
+build, the examples) and `graph + editor` (each JS package, the VS Code
+extension, the WhatsApp bridge, the browser extension). The docs book
+builds beside them. On `main`, `release.yml` runs the same suite as its
+gate, and starts the builds (binaries, .vsix, browser zips) beside it;
+only what publishes waits for the gate.
 
 ## Before every push to a PR, run what the PR runs
 
@@ -50,8 +56,11 @@ opens it, and every fix pushed after), run locally everything the PR's
 checks run, not only the tests your change reaches. This is the one
 place the [test scope] does not apply: a red PR costs a full CI round
 trip, and twice a PR has gone red on a test in a crate the change only
-touched indirectly. Background each one, and fix everything before the
-push, not after.
+touched indirectly. Background the run, and fix everything before the
+push, not after. Locally the cargo commands go one after another (they
+share one build directory, which cargo locks, and overlapping cargo runs
+have crashed this machine); the JS checks and the docs build run beside
+them.
 
 The PR runs `.github/workflows/ci.yml` and `.github/workflows/docs.yml`;
 read them for the current list. At the time of writing:
