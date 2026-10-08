@@ -76,10 +76,10 @@ address, and `weft status` shows it. For how a browser opens a socket on a
 route that checks callers, go and read [answering on a
 socket](../language/triggers-and-routes.md#answering-on-a-socket).
 
-The address an install shares between its projects (`/connect/local/...`,
+The address an install shares between its projects (`/connect/local/<project id>/...`,
 the tunnel's hostname, the install's own domain) still works: the dispatcher
-picks the project and the program by the route, from routes it holds in
-memory, and passes the call on. It adds headers giving the caller's address and
+picks the project by the id in the address and the program by the route, from
+routes it holds in memory, and passes the call on. It adds headers giving the caller's address and
 the `Host` they sent, and the worker trusts those headers only
 when the call carries weft's own key. The dispatcher checks nothing else
 and writes nothing.

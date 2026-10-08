@@ -1249,6 +1249,29 @@ async fn limited_entries(state: &DispatcherState, project_id: uuid::Uuid) -> any
     Ok(out)
 }
 
+/// weft's own calls the project's work waits on that keep failing: every
+/// role weft cannot wake, and the project's workers when runs cannot be
+/// handed to them.
+pub(crate) async fn unanswered_for(state: &DispatcherState, project_id: uuid::Uuid) -> Result<Vec<weft_core::projects::Unanswered>, (StatusCode, String)> {
+    let failing = weft_task_store::unanswered::failing_for(&state.pg_pool, project_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("calls that keep failing: {e:#}")))?;
+    Ok(failing
+        .into_iter()
+        .map(|f| weft_core::projects::Unanswered {
+            callee: match f.role.as_deref() {
+                None => "this project's workers, which runs are handed to,".to_string(),
+                Some("supervisor") => "weft's supervisor, which starts and stops infra,".to_string(),
+                Some("dispatcher") => "weft's dispatcher, which hands runs to workers,".to_string(),
+                Some(role) => format!("weft's {role}"),
+            },
+            error: f.error,
+            since_unix: f.since_ms / 1000,
+            last_unix: f.last_ms / 1000,
+        })
+        .collect())
+}
+
 /// The runs each of the project's triggers started in this minute and the
 /// one before, named by the trigger's node.
 async fn trigger_runs(state: &DispatcherState, project_id: uuid::Uuid) -> anyhow::Result<Vec<weft_core::projects::TriggerRuns>> {
@@ -1551,6 +1574,7 @@ pub async fn status(
         runs: trigger_runs(&state, id)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("run counts: {e}")))?,
+        unanswered: unanswered_for(&state, id).await?,
     }))
 }
 
@@ -1949,6 +1973,16 @@ fn unavailable_action(
     // as the blocker rather than buried in the triggers' state.
     if let Some(why) = transition.refusal() {
         return format!("'{verb}' is not available right now: {why}");
+    }
+    // Infra being started, stopped or terminated blocks every verb but
+    // its cancel (the table's master rule), so the infra is named as the
+    // blocker rather than the triggers' state, which is not why.
+    if allowed == ["infra_cancel"] {
+        return format!(
+            "'{verb}' is not available right now: this program's infra is changing (infra {infra_rollup}). \
+             `weft infra status` shows where each piece is and `weft infra cancel` stops the change; \
+             run this again once it settles"
+        );
     }
     // Starting infra that already runs is somebody who changed it and wants
     // the change live (an upgrade) or who did not know it was up.
@@ -5317,6 +5351,13 @@ mod unavailable_action_tests {
         // nodes no longer in the program), the plain answer stands.
         let leftover = unavailable_action("infra_start", ProjectStatus::Active, ProjectTransition::None, "running", &["infra_terminate".to_string()]);
         assert!(leftover.contains("allowed actions: [infra_terminate]"), "{leftover}");
+    }
+
+    #[test]
+    fn infra_that_is_changing_is_named_as_the_blocker() {
+        let message = unavailable_action("activate", ProjectStatus::Registered, ProjectTransition::None, "provisioning", &["infra_cancel".to_string()]);
+        assert!(message.contains("infra is changing (infra provisioning)") && message.contains("weft infra status"), "{message}");
+        assert!(!message.contains("registered"), "the triggers' state is not why: {message}");
     }
 
     #[test]

@@ -434,8 +434,8 @@ fn outside_caller_routes(state: DispatcherState) -> Router<DispatcherState> {
         .route("/index.html", get(public_page::index))
         .route("/logo.png", get(public_page::logo))
         // A live call at the install's shared address
-        // (`/connect/<tenant>/<path>`): the route (pattern + method) picks
-        // the project, and the call is passed on to its workers, whose door
+        // (`/connect/<tenant>/<project>/<path>`): the address names the
+        // project, and the call is passed on to its workers, whose door
         // checks it (`live_relay`). ANY method:
         // a WS handshake is a GET and a route serves whatever verbs it
         // declared; the handler answers 405 itself. `/connect/*` is more

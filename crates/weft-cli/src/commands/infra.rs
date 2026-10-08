@@ -622,28 +622,34 @@ async fn infra_status(ctx: &Ctx) -> Result<()> {
     for note in status.host_notes() {
         eprintln!("warning: {note}");
     }
+    // Printed apart from the copies: a start stuck this way has none yet.
+    let now = crate::progress::now_unix() as i64;
+    for entry in &status.unanswered {
+        eprintln!("warning: {}", entry.describe(now));
+    }
     Ok(())
 }
 
 /// What each copy still starting is doing, one line each, for a wait's
-/// breadcrumb; a status that cannot be read is that one line instead.
+/// breadcrumb, after each of weft's own calls that keeps failing; a status that cannot be read is that one line instead.
 async fn starting_now(client: &crate::client::DispatcherClient, project_id: &str) -> Vec<String> {
     let status = match infra_status_of(client, project_id).await {
         Ok(status) => status,
         Err(e) => return vec![format!("cannot read what each copy is doing ({e:#}); the wait goes on")],
     };
-    status
-        .nodes
-        .iter()
-        .filter_map(|n| {
-            let progress = n.progress.as_ref()?;
-            let node = match &n.instance {
-                Some(instance) => format!("{} (instance {instance})", n.node),
-                None => n.node.clone(),
-            };
-            Some(format!("{node}: {} {}", n.status, progress.describe_now()))
-        })
-        .collect()
+    // A call of weft's own that keeps failing comes first: it is why
+    // nothing below moves.
+    let now = crate::progress::now_unix() as i64;
+    let unanswered = status.unanswered.iter().map(|u| u.describe(now));
+    let copies = status.nodes.iter().filter_map(|n| {
+        let progress = n.progress.as_ref()?;
+        let node = match &n.instance {
+            Some(instance) => format!("{} (instance {instance})", n.node),
+            None => n.node.clone(),
+        };
+        Some(format!("{node}: {} {}", n.status, progress.describe_now()))
+    });
+    unanswered.chain(copies).collect()
 }
 
 /// Every infra copy of the project, and its state.

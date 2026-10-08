@@ -3,6 +3,7 @@
 use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
+use weft_core::net::EmptyBody;
 
 /// In an error's chain when the store refused because the upload is being
 /// completed by another caller right now
@@ -90,9 +91,11 @@ impl DispatcherClient {
         if let Some(key) = self.current_bearer()? {
             builder = builder.bearer_auth(key);
         }
-        if let Some(body) = body {
-            builder = builder.json(body);
-        }
+        builder = match body {
+            Some(body) => builder.json(body),
+            None if [reqwest::Method::POST, reqwest::Method::PUT, reqwest::Method::PATCH].contains(&method) => builder.empty_body(),
+            None => builder,
+        };
         builder.send().await.with_context(|| format!("{method} {url}"))
     }
 

@@ -230,7 +230,7 @@ async fn the_project_answers_at_its_own_address() -> anyhow::Result<()> {
     let status: Value = disp.get_json(&format!("/projects/{}/status", project.id())).await?;
     anyhow::ensure!(status["address"]["state"] == "serving", "the project's address: {}", status["address"]);
     let url = status["address"]["url"].as_str().expect("a serving address has a url").to_string();
-    let path = base.trim_start_matches("local/");
+    let path = base.trim_start_matches(&format!("local/{}/", project.id()));
     let answered = reqwest::get(format!("{url}/{path}/users/42")).await?;
     assert_eq!(answered.status(), 200);
     let body: Value = answered.json().await?;

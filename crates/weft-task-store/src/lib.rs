@@ -20,6 +20,8 @@
 //!     waiter built on it).
 //!   - `announce`: how a write announces itself without every commit
 //!     waiting on every other (an outbox, flushed in batches).
+//!   - `unanswered`: weft's own calls that keep failing, kept for
+//!     whoever waits on the work behind them to see why.
 //!   - `held_copy`: a process's copy of rows read on every request,
 //!     dropped the moment a notification says they changed.
 //!   - `schema_guard`: the schema runner every boot routes its
@@ -43,6 +45,7 @@ pub mod schema_guard;
 pub mod tasks;
 pub mod terminal;
 pub mod traits;
+pub mod unanswered;
 pub mod worker_door;
 
 pub use schema_guard::{apply_groups, Migration, SchemaGroup};

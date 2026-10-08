@@ -98,9 +98,10 @@ fn without_port(host: &str) -> &str {
 const FILE_LINKS: &str = "/public/files/";
 
 /// Where the path of an API domain's request goes on the install: one of
-/// the project's routes, passed on through the relay under its tenant.
-pub fn api_path(tenant: &str, path_and_query: &str) -> String {
-    format!("/connect/{tenant}/{}", path_and_query.trim_start_matches('/'))
+/// the project's routes, passed on through the relay under its tenant and
+/// project.
+pub fn api_path(tenant: &str, project: uuid::Uuid, path_and_query: &str) -> String {
+    format!("/connect{}/{}", weft_core::route::SharedMount::new(tenant, project).prefix(), path_and_query.trim_start_matches('/'))
 }
 
 #[derive(Clone)]
@@ -169,7 +170,7 @@ async fn route(State(door): State<Door>, mut request: Request) -> Response {
                 Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("the domain's project: {e:#}")).into_response(),
             };
             let path_and_query = request.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
-            let Ok(uri) = api_path(&tenant, &path_and_query).parse::<Uri>() else {
+            let Ok(uri) = api_path(&tenant, project, &path_and_query).parse::<Uri>() else {
                 return (StatusCode::BAD_REQUEST, "the request's path is not a path").into_response();
             };
             *request.uri_mut() = uri;
@@ -242,8 +243,9 @@ mod tests {
 
     #[test]
     fn an_api_domain_serves_the_projects_routes_at_its_root() {
-        assert_eq!(api_path("local", "/users/42?x=1"), "/connect/local/users/42?x=1");
-        assert_eq!(api_path("local", "/"), "/connect/local/");
-        assert_eq!(api_path("local", "/chat?a=1&wct=t"), "/connect/local/chat?a=1&wct=t");
+        let p = uuid::Uuid::from_u128(7);
+        assert_eq!(api_path("local", p, "/users/42?x=1"), format!("/connect/local/{p}/users/42?x=1"));
+        assert_eq!(api_path("local", p, "/"), format!("/connect/local/{p}/"));
+        assert_eq!(api_path("local", p, "/chat?a=1&wct=t"), format!("/connect/local/{p}/chat?a=1&wct=t"));
     }
 }

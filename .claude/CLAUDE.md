@@ -34,7 +34,7 @@ Ask (below the line, with compressed context) in exactly two cases, [the fork ru
 
 The only valid reasons to end a turn are a true blocker or finished work.
 
-Don't launch agents to "design a plan" when you already have full context from the conversation; write the plan directly. Use agents only when the [user] explicitly says to (review commands count).
+**Parallelize with agents whenever the work splits.** Once a round's work is known and it holds pieces that do not depend on each other (separate crates, docs beside code, a set of copies to update, an investigation beside an edit), hand the independent pieces to agents without waiting on one before starting the next (background agents, or several in one message), and keep doing your own piece meanwhile; doing them one after another yourself is wasted time for the [user]. Each brief names the exact files, the change, and its crates per the [test scope] rule below, and pieces are split so no two touch the same file or build the same crate. Keep for yourself what needs the whole picture (the design, the merge, the final build and tests). If you catch yourself doing a second independent piece by hand while the first could have gone to an agent, write verbatim "Wait, this splits. Dispatching the independent parts." and dispatch them. Don't dispatch agents to "design a plan" when you already have full context from the conversation; write the plan directly.
 
 ## Boundaries
 

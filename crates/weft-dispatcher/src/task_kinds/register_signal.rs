@@ -55,30 +55,22 @@ pub struct RegisterSignalPayload {
 
 pub struct RegisterSignalExecutor;
 
-/// The stored mount path for a public-entry surface, namespaced by the owning
-/// tenant: `/<tenant>/<pattern>`. The tenant prefix walls each account into
-/// its own path space, so two tenants can both claim `chat` without
-/// colliding, and one tenant claiming a path never blocks another (the old
-/// global unique index did both wrong). Callers reach it at
-/// `/connect/<tenant>/<path>` (live) or `POST /<tenant>/<path>` (public
-/// fire), the tenant segment is in the URL. A guessable URL is fine here:
-/// live/public endpoints are API surfaces whose callers bring their own
-/// auth; the tenant prefix is for COLLISION, not secrecy. The path is a
-/// route PATTERN (`chat/{room}`), stored as written; the dispatcher matches
-/// calls against it in Rust.
+/// The stored mount path for a public-entry surface: its pattern under the
+/// project on the install's shared address (`/<tenant>/<project id>/<pattern>`,
+/// [`weft_core::route::SharedMount`]), so each project has its own path
+/// space and two projects can both serve `chat`. Callers reach it at
+/// `/connect/<tenant>/<project id>/<path>` (live) or `POST /<tenant>/<project
+/// id>/<path>` (public fire). A guessable URL is fine here: live and public
+/// endpoints are API surfaces whose callers bring their own auth; the
+/// prefix is for collision, not secrecy. The path is a route PATTERN
+/// (`chat/{room}`), stored as written; the dispatcher matches calls against
+/// it in Rust.
 fn mount_path_for(
     surface: &weft_core::primitive::SignalSurface,
-    tenant: &str,
+    mount: weft_core::route::SharedMount<'_>,
 ) -> Option<String> {
     match surface {
-        weft_core::primitive::SignalSurface::PublicEntry { path, .. } => {
-            let path = path.trim_start_matches('/');
-            Some(if path.is_empty() {
-                format!("/{tenant}")
-            } else {
-                format!("/{tenant}/{path}")
-            })
-        }
+        weft_core::primitive::SignalSurface::PublicEntry { path, .. } => Some(mount.mount_path(path)),
         weft_core::primitive::SignalSurface::TaskCallback
         | weft_core::primitive::SignalSurface::Internal => None,
     }
@@ -98,7 +90,6 @@ fn mount_methods_for(surface: &weft_core::primitive::SignalSurface) -> Vec<Strin
 pub(crate) struct RegisteredRoute {
     pub pattern: String,
     pub methods: Vec<String>,
-    pub project_id: uuid::Uuid,
     pub node_id: String,
 }
 
@@ -375,7 +366,7 @@ impl RegisterSignalExecutor {
                         port_snapshot: payload.port_snapshot.clone(),
                         consumer_payload: (!prepared.rendered.is_null()).then_some(prepared.rendered),
                         surface_kind: prepared.routing.surface.kind_tag().to_string(),
-                        mount_path: mount_path_for(&prepared.routing.surface, tenant.as_str()),
+                        mount_path: mount_path_for(&prepared.routing.surface, weft_core::route::SharedMount::new(tenant.as_str(), project_id)),
                         mount_methods: mount_methods_for(&prepared.routing.surface),
                         auth_kind: prepared.routing.auth.kind_tag().to_string(),
                         auth_config: (!prepared.routing.auth_config.is_null()).then_some(prepared.routing.auth_config),
@@ -651,53 +642,38 @@ async fn refuse_unarmable_route(
         );
     }
 
-    // Route overlap check: another (project, node) of THIS tenant already
-    // serves a call this route would claim (`chat/{room}` against
-    // `chat/{x}`, or `chat/general`, on a shared method). Refuse with a
-    // clear error rather than let the gateway pick one at call time. Same
-    // (project, node) reclaiming its route on reactivate is fine because
-    // it reuses the existing token. The rows are already tenant-prefixed,
-    // so only the caller's own account is in play; another tenant's
-    // identical pattern has a different prefix and cannot collide.
+    // Route overlap check: another trigger of THIS project already serves
+    // a call this route would claim (`chat/{room}` against `chat/{x}`, or
+    // `chat/general`, on a shared method). Refuse with a clear error rather
+    // than let the door pick one at call time. The same node reclaiming its
+    // route on reactivate is fine because it reuses the existing token.
+    // Each project has its own path space (`SharedMount`), so another
+    // project's routes are never in play.
+    let mount = weft_core::route::SharedMount::new(tenant, project_id);
     let mine = weft_core::route::RoutePattern::parse(path).map_err(anyhow::Error::msg)?;
-    let others: Vec<RegisteredRoute> = sqlx::query_as::<_, (String, Vec<String>, uuid::Uuid, String)>(
-        "SELECT mount_path, mount_methods, project_id, node_id \
+    let others: Vec<RegisteredRoute> = sqlx::query_as::<_, (String, Vec<String>, String)>(
+        "SELECT mount_path, mount_methods, node_id \
          FROM signal \
-         WHERE tenant_id = $1 AND mount_path IS NOT NULL \
-           AND NOT (project_id = $2 AND node_id = $3)",
+         WHERE project_id = $1 AND mount_path IS NOT NULL AND node_id <> $2",
     )
-    .bind(tenant)
     .bind(project_id)
     .bind(place)
     .fetch_all(&state.pg_pool)
     .await?
     .into_iter()
-    .map(|(mp, ms, project_id, node_id)| RegisteredRoute {
-        pattern: weft_core::route::pattern_of_mount_path(&mp, tenant),
-        methods: ms,
-        project_id,
-        node_id,
-    })
+    .map(|(mp, ms, node_id)| RegisteredRoute { pattern: mount.pattern_of(&mp), methods: ms, node_id })
     .collect();
     if let Some(taken) = ambiguous_route(&mine, methods, &others) {
         let method_words = |m: &[String]| if m.is_empty() { "any method".to_string() } else { m.join("/") };
         anyhow::bail!(
-            "route `{}` ({}) and `{}` ({}), already registered by \
-             project='{}' node='{}', can both be reached by one \
-             call and neither is the more specific, so that call \
-             has no answer. Both projects are yours, so: make one \
-             of them spell out what the other captures, change \
-             this route's `path` or `method`, or free the other \
-             with `weft deactivate --project {}` (a project you \
-             are done with can also go entirely, `weft rm {}`)",
+            "route `{}` ({}) and `{}` ({}) of trigger '{}' can both be reached by one call and \
+             neither is the more specific, so that call has no answer. Make one of them spell out \
+             what the other captures, or change this route's `path` or `method`",
             mine.as_str(),
             method_words(methods),
             taken.pattern,
             method_words(&taken.methods),
-            taken.project_id,
             taken.node_id,
-            taken.project_id,
-            taken.project_id,
         );
     }
     Ok(())
@@ -790,32 +766,33 @@ mod tests {
         SignalSurface::PublicEntry { path: path.into(), methods: Vec::new() }
     }
 
+    const ONE: uuid::Uuid = uuid::Uuid::from_u128(1);
+    const TWO: uuid::Uuid = uuid::Uuid::from_u128(2);
+
+    fn under(tenant: &str, project: uuid::Uuid) -> weft_core::route::SharedMount<'_> {
+        weft_core::route::SharedMount::new(tenant, project)
+    }
+
     #[test]
-    fn public_entry_path_is_tenant_namespaced() {
+    fn a_public_entry_is_stored_under_its_tenant_and_project() {
         let s = entry("chat");
-        assert_eq!(mount_path_for(&s, "alice").as_deref(), Some("/alice/chat"));
-        // Same path, different tenant -> different mount path (no collision).
-        assert_eq!(mount_path_for(&s, "bob").as_deref(), Some("/bob/chat"));
+        assert_eq!(mount_path_for(&s, under("alice", ONE)), Some(format!("/alice/{ONE}/chat")));
+        // The same path in another project or another tenant is another
+        // mount path, so neither blocks the other.
+        assert_eq!(mount_path_for(&s, under("alice", TWO)), Some(format!("/alice/{TWO}/chat")));
+        assert_eq!(mount_path_for(&s, under("bob", ONE)), Some(format!("/bob/{ONE}/chat")));
+        // The project's root, and a leading slash written in the path.
+        assert_eq!(mount_path_for(&entry(""), under("alice", ONE)), Some(format!("/alice/{ONE}")));
+        assert_eq!(mount_path_for(&entry("/webhooks/stripe"), under("acme", ONE)), Some(format!("/acme/{ONE}/webhooks/stripe")));
     }
 
     #[test]
-    fn public_entry_empty_path_is_just_the_tenant() {
-        assert_eq!(mount_path_for(&entry(""), "alice").as_deref(), Some("/alice"));
-    }
-
-    #[test]
-    fn leading_slash_in_path_is_normalized() {
-        let s = entry("/webhooks/stripe");
-        assert_eq!(mount_path_for(&s, "acme").as_deref(), Some("/acme/webhooks/stripe"));
-    }
-
-    #[test]
-    fn a_pattern_is_stored_as_written_and_read_back_without_the_tenant() {
+    fn a_pattern_is_stored_as_written_and_read_back_without_the_prefix() {
         let s = SignalSurface::PublicEntry { path: "chat/{room}".into(), methods: vec!["POST".into()] };
-        let stored = mount_path_for(&s, "alice").unwrap();
-        assert_eq!(stored, "/alice/chat/{room}");
-        assert_eq!(weft_core::route::pattern_of_mount_path(&stored, "alice"), "chat/{room}");
-        assert_eq!(weft_core::route::pattern_of_mount_path("/alice", "alice"), "");
+        let stored = mount_path_for(&s, under("alice", ONE)).unwrap();
+        assert_eq!(stored, format!("/alice/{ONE}/chat/{{room}}"));
+        assert_eq!(under("alice", ONE).pattern_of(&stored), "chat/{room}");
+        assert_eq!(under("alice", ONE).pattern_of(&format!("/alice/{ONE}")), "");
         assert_eq!(mount_methods_for(&s), vec!["POST".to_string()]);
         assert!(mount_methods_for(&SignalSurface::TaskCallback).is_empty());
     }
@@ -824,7 +801,6 @@ mod tests {
         RegisteredRoute {
             pattern: pattern.into(),
             methods: methods.iter().map(|m| m.to_string()).collect(),
-            project_id: uuid::Uuid::from_u128(0x106),
             node_id: "other".into(),
         }
     }
@@ -1085,7 +1061,7 @@ mod tests {
 
     #[test]
     fn non_public_surfaces_have_no_mount_path() {
-        assert!(mount_path_for(&SignalSurface::TaskCallback, "alice").is_none());
-        assert!(mount_path_for(&SignalSurface::Internal, "alice").is_none());
+        assert!(mount_path_for(&SignalSurface::TaskCallback, under("alice", ONE)).is_none());
+        assert!(mount_path_for(&SignalSurface::Internal, under("alice", ONE)).is_none());
     }
 }

@@ -1,7 +1,7 @@
 //! The live-caller path: an outside party holds an HTTP stream or a two-way
 //! WebSocket against a running program.
 //!
-//! A call is `/connect/<tenant>/{path}` on the install's shared address,
+//! A call is `/connect/<tenant>/<project>/{path}` on the install's shared address,
 //! any method, and is answered in that one request: the install passes it
 //! on to the project's workers, whose door checks the caller and starts the
 //! run. A socket is opened there the same way, by a client that sends the

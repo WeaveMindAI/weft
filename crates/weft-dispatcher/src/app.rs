@@ -91,6 +91,9 @@ pub static ALL_GROUPS: &[&weft_task_store::SchemaGroup] = &[
     // When each loop of a role that scales to zero next wants a look
     // (`weft_task_store::drain`); empty on a local install.
     &weft_task_store::drain::GROUP,
+    // weft's own calls that keep failing (a role it cannot wake, workers
+    // it cannot hand a run to), for `weft status` to show.
+    &weft_task_store::unanswered::GROUP,
     &RETIRED_DISPATCHER_CURSOR,
     &RETIRED_INFRA_EVENT_BRIDGE_CURSOR,
 ];

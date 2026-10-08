@@ -538,11 +538,11 @@ The shape, unless the user asks for another:
   `/signal-token/`, `http://127.0.0.1:14111` on a local install) goes in the
   server's environment and nowhere a page can read it. The pass-through
   forwards only `/instance/`, `/signal/`, `/signal-token/`, the program's
-  own routes (`/connect/<tenant>/<path>`) and the picture links in their answers
+  own routes (`/connect/<tenant>/<project id>/<path>`) and the picture links in their answers
   (`/public/files/<token>`), carries the caller's token and body, and keeps the
   site's cookies and the `Weft-Instance` header back. A page fetches
   `/weft/signal-token/displays` with the instance token as bearer, calls a
-  program route as `/weft/connect/<tenant>/<path>` with the instance token in
+  program route as `/weft/connect/<tenant>/<project id>/<path>` with the instance token in
   `Weft-Instance-Token`, and `new InstanceDoor(instanceToken)` already calls
   `/weft/instance/...`. A route called through the pass-through builds the
   picture links in its answer on the site's own address, so those pictures

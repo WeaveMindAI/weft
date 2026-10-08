@@ -229,13 +229,55 @@ impl RouteKey {
     }
 }
 
-/// The pattern under the tenant prefix a stored mount path carries
-/// (`/alice/chat/{room}` -> `chat/{room}`, `/alice` -> ``). Every row of a
-/// tenant is prefixed the same way, so the strip is exact.
-pub fn pattern_of_mount_path(mount_path: &str, tenant: &str) -> String {
-    let prefix = format!("/{tenant}");
-    let rest = mount_path.strip_prefix(&prefix).unwrap_or(mount_path);
-    rest.trim_start_matches('/').to_string()
+/// Where one project's routes sit on an address the install shares
+/// between its projects: under the tenant, then the project's id
+/// (`/alice/2c65.../chat/{room}`). The id is fixed in the project's
+/// `weft.toml`, so the address is known before anything runs and two
+/// projects may serve the same path. A project's own address (its port,
+/// its API domain) serves the same routes at its root, with neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedMount<'a> {
+    pub tenant: &'a str,
+    pub project: uuid::Uuid,
+}
+
+impl<'a> SharedMount<'a> {
+    pub fn new(tenant: &'a str, project: uuid::Uuid) -> Self {
+        Self { tenant, project }
+    }
+
+    /// What every route of the project sits under (`/alice/<id>`).
+    pub fn prefix(&self) -> String {
+        format!("/{}/{}", self.tenant, self.project)
+    }
+
+    /// The stored mount path of a route `pattern` (`chat/{room}`, or empty
+    /// for the project's root).
+    pub fn mount_path(&self, pattern: &str) -> String {
+        match pattern.trim_start_matches('/') {
+            "" => self.prefix(),
+            pattern => format!("{}/{pattern}", self.prefix()),
+        }
+    }
+
+    /// The pattern a stored mount path of this project carries
+    /// (`/alice/<id>/chat/{room}` -> `chat/{room}`, `/alice/<id>` -> ``).
+    /// Every row of the project is prefixed the same way, so the strip is
+    /// exact.
+    pub fn pattern_of(&self, mount_path: &str) -> String {
+        let prefix = self.prefix();
+        mount_path.strip_prefix(&prefix).unwrap_or(mount_path).trim_start_matches('/').to_string()
+    }
+
+    /// A path called on the shared address (`alice/<id>/chat/7`, a leading
+    /// slash or none) as the project it names and the path under it.
+    /// `None` when it does not start with a tenant and a project id.
+    pub fn split(called: &'a str) -> Option<(Self, &'a str)> {
+        let mut parts = called.trim_start_matches('/').splitn(3, '/');
+        let tenant = parts.next().filter(|t| !t.is_empty())?;
+        let project = parts.next()?.parse::<uuid::Uuid>().ok()?;
+        Some((Self { tenant, project }, parts.next().unwrap_or("")))
+    }
 }
 
 /// What a lookup found.
@@ -311,6 +353,26 @@ pub fn parse_query(raw: &str) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shared_mount_puts_routes_under_the_tenant_and_project_and_reads_them_back() {
+        let project = uuid::Uuid::from_u128(7);
+        let mount = SharedMount::new("alice", project);
+        assert_eq!(mount.mount_path("chat/{room}"), format!("/alice/{project}/chat/{{room}}"));
+        assert_eq!(mount.mount_path("/chat"), format!("/alice/{project}/chat"));
+        assert_eq!(mount.mount_path(""), format!("/alice/{project}"));
+        assert_eq!(mount.pattern_of(&mount.mount_path("chat/{room}")), "chat/{room}");
+        assert_eq!(mount.pattern_of(&mount.mount_path("")), "");
+
+        let called = format!("alice/{project}/chat/7");
+        assert_eq!(SharedMount::split(&called), Some((mount, "chat/7")));
+        let root = format!("/alice/{project}");
+        assert_eq!(SharedMount::split(&root), Some((mount, "")));
+        // A path that names no project is no project's route.
+        assert_eq!(SharedMount::split("alice/chat/7"), None);
+        assert_eq!(SharedMount::split("alice"), None);
+        assert_eq!(SharedMount::split(""), None);
+    }
 
     fn pat(s: &str) -> RoutePattern {
         RoutePattern::parse(s).expect("parses")

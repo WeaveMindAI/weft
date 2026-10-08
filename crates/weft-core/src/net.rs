@@ -12,6 +12,8 @@
 //! install answers at several addresses at once, so a link the caller
 //! will fetch is built from that caller's own request rather than from
 //! anything configured.
+//!
+//! OUTBOUND HTTP: [`EmptyBody`], for a call that sends nothing.
 
 use std::sync::Arc;
 
@@ -111,7 +113,7 @@ pub fn tls_config() -> Result<Arc<rustls::ClientConfig>, String> {
 pub const WEFT_FORWARDED_PROTO: &str = "x-weft-forwarded-proto";
 
 /// What weft's relay tells a project's worker about a call it passed on
-/// from an address the install shares (`/connect/<tenant>/...`, an API
+/// from an address the install shares (`/connect/<tenant>/<project>/...`, an API
 /// domain, a local project's port): where the caller stood, which the
 /// worker cannot see past the relay. A worker reads these only on a hop
 /// that carries weft's own credential, and removes them (with that
@@ -124,7 +126,7 @@ pub mod relay_hop {
     /// replaces with the worker's own.
     pub const CALLER_HOST: &str = "x-weft-caller-host";
     /// The path the project's routes sit under at that address
-    /// (`/connect/<tenant>`, or empty at a project's own address): what a
+    /// (`/connect/<tenant>/<project>`, or empty at a project's own address): what a
     /// browser's socket URL is built on.
     pub const ROUTE_PREFIX: &str = "x-weft-route-prefix";
     /// Every one of them.
@@ -235,6 +237,27 @@ pub fn caller_address(forwarded_for: Option<&str>, peer: std::net::IpAddr, trust
     chain.push(peer);
     let index = chain.len().saturating_sub(1).saturating_sub(trusted_hops);
     chain[index]
+}
+
+/// A call that sends no body, saying so with `Content-Length: 0`.
+///
+/// Sent with no body at all, a POST goes out over HTTP/1.1 with no length,
+/// and Google's front end, in front of every Cloud Run service, refuses
+/// it with `411 Length Required` before the service ever sees it. A local
+/// install has nothing in between, so only a cloud install meets it.
+/// Offering HTTP/2 instead would get past the front end too, but HTTP/2
+/// puts every call to one service on one connection, which Cloud Run caps
+/// at 100 calls at once: a call held for a run's whole life (a run handed
+/// to a worker) would make the 101st wait. So weft's calls stay HTTP/1.1,
+/// one connection each, and a call with nothing to send says its length.
+pub trait EmptyBody {
+    fn empty_body(self) -> Self;
+}
+
+impl EmptyBody for reqwest::RequestBuilder {
+    fn empty_body(self) -> Self {
+        self.header(reqwest::header::CONTENT_LENGTH, 0)
+    }
 }
 
 /// The first value of a header a chain of proxies may list comma-separated.
@@ -482,5 +505,48 @@ mod caller_address_tests {
         // Garbage entries are skipped, never read as an address.
         assert_eq!(caller_address(Some("not-an-ip, 203.0.113.9"), ip("10.0.0.1"), 1), ip("203.0.113.9"));
         assert_eq!(caller_address(Some("203.0.113.9"), ip("10.0.0.1"), 0), ip("10.0.0.1"));
+    }
+}
+
+#[cfg(test)]
+mod empty_body_tests {
+    use super::EmptyBody;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A server on a free port that answers the way Google's front end
+    /// does: `411` to a POST that names no length, `204` to anything else.
+    async fn length_required_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        if socket.read(&mut byte).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        head.push(byte[0]);
+                    }
+                    let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                    let status = match head.starts_with("post ") && !head.contains("\r\ncontent-length:") {
+                        true => "411 Length Required",
+                        false => "204 No Content",
+                    };
+                    let _ = socket.write_all(format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").as_bytes()).await;
+                });
+            }
+        });
+        address
+    }
+
+    #[tokio::test]
+    async fn a_post_with_nothing_to_send_names_its_length() {
+        let url = format!("{}/_weft/tick", length_required_server().await);
+        let http = reqwest::Client::new();
+        assert_eq!(http.post(&url).send().await.unwrap().status(), 411, "the refusal this guards against");
+        assert_eq!(http.post(&url).empty_body().send().await.unwrap().status(), 204);
     }
 }

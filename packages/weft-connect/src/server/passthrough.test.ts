@@ -101,12 +101,12 @@ describe('the pass-through', () => {
 		}) as unknown as typeof fetch;
 		const pass = weftPassThrough({ dispatcher: 'http://d', fetcher });
 		const res = await pass(
-			new Request(`${site}/connect/local/bot/ask`, {
+			new Request(`${site}/connect/local/2c65676f-ac18-496c-8e61-2d4a170d2f00/bot/ask`, {
 				method: 'POST',
 				body: '{"text":"hello"}',
 				headers: { 'Weft-Instance-Token': 'wft-m', 'content-type': 'application/json' },
 			}),
-			'connect/local/bot/ask',
+			'connect/local/2c65676f-ac18-496c-8e61-2d4a170d2f00/bot/ask',
 		);
 		expect(await res.text()).toBe('{"reply":"hi"}');
 		// The dispatcher answers a route call in the one request, so its

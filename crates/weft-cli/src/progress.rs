@@ -439,7 +439,7 @@ fn elapsed_text(seconds: u64) -> String {
     }
 }
 
-fn now_unix() -> u64 {
+pub(crate) fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock past UNIX_EPOCH")

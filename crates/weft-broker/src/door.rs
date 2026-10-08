@@ -84,7 +84,8 @@ async fn door_triggers(
         .fetch_all(&state.pool)
         .await
         .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read the project's triggers")))?;
-    let triggers = rows.iter().map(|row| door_trigger(row, tenant)).collect::<anyhow::Result<Vec<_>>>().map_err(unavailable_or_internal)?;
+    let mount = weft_core::route::SharedMount::new(tenant, project);
+    let triggers = rows.iter().map(|row| door_trigger(row, mount)).collect::<anyhow::Result<Vec<_>>>().map_err(unavailable_or_internal)?;
     Ok(Json(DoorTriggers { triggers }))
 }
 
@@ -164,12 +165,12 @@ async fn door_park_fire(
 
 /// One trigger as its signal row arms it: a public entry with a mount is
 /// a route somebody calls, which must take a caller on the line.
-fn door_trigger(row: &sqlx::postgres::PgRow, tenant: &str) -> anyhow::Result<DoorTrigger> {
+fn door_trigger(row: &sqlx::postgres::PgRow, mount: weft_core::route::SharedMount<'_>) -> anyhow::Result<DoorTrigger> {
     let node_id: String = row.try_get("node_id")?;
     let surface_kind: String = row.try_get("surface_kind")?;
     let route = match row.try_get::<Option<String>, _>("mount_path")? {
         Some(mount_path) if surface_kind == "public_entry" => Some(DoorMount {
-            pattern: weft_core::route::pattern_of_mount_path(&mount_path, tenant),
+            pattern: mount.pattern_of(&mount_path),
             methods: row.try_get("mount_methods")?,
         }),
         _ => None,
