@@ -52,14 +52,14 @@
       "type": "String",
       "default": "0.25",
       "label": "CPUs",
-      "description": "CPUs the machine sustains (`0.25`, `1`, `250m`). A cloud install picks its cheapest machine holding this and `memory`: a quarter CPU with 1Gi is Compute Engine's `e2-micro`, about $6 a month. A local install caps the container at it."
+      "description": "CPUs the machine sustains (`0.25`, `1`, `250m`). A cloud install picks its cheapest machine holding this and `memory`: a quarter CPU with 1Gi is Compute Engine's `e2-micro`, about $6 a month. A local install does not cap the container."
     },
     {
       "name": "memory",
       "type": "String",
       "default": "1Gi",
       "label": "Memory",
-      "description": "Memory, a number followed by Gi, Mi, G or M (`1Gi`). Sized with `cpu`; a local install caps the container at it."
+      "description": "Memory, a number followed by Gi, Mi, G or M (`1Gi`). Sized with `cpu`; a local install does not cap the container."
     },
     {
       "name": "machineType",
@@ -73,7 +73,8 @@
     {
       "name": "access",
       "type": "Access",
-      "description": "Wire into the Postgres query and write nodes, like a PostgresAccess node's."
+      "description": "Wire into the Postgres query and write nodes, like a PostgresAccess node's. Baked: made when the database's infra is applied, so a run that reads only this output uses the saved connection and does not run this node.",
+      "baked": true
     }
   ],
   "validate": [

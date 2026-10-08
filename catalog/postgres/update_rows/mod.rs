@@ -98,8 +98,7 @@ impl Node for PostgresUpdateRowsNode {
             .collect();
         params.extend(obj.values().cloned());
 
-        let conn = ctx.open(&account).await?;
-        let client = connect(&ctx, &conn).await?;
+        let client = connect(&ctx, &account).await?;
         let rows = query_json(&client, &sql, &names, &params).await?;
         let count = rows.len() as f64;
         ctx.pulse_downstream(NodeOutput::new().set("rows", json!(rows)).set("count", count))

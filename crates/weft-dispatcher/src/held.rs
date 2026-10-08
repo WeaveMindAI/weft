@@ -15,10 +15,8 @@ use weft_core::install::Domain;
 use weft_task_store::held_copy::{Changed, HeldCopy};
 use weft_task_store::pg_signal::PgSignalWatch;
 
-/// Announced with a tenant's id when one of its routes changes (the
-/// signal, project and activation groups' triggers).
-// SYNC: ROUTES_CHANNEL <-> crates/weft-dispatcher/src/journal/postgres.rs (routes_notify_tenant), crates/weft-dispatcher/src/activation_store.rs (trigger_activation_routes_notify)
-pub const ROUTES_CHANNEL: &str = "weft_routes";
+/// Announced with a tenant's id when one of its routes changes.
+pub use weft_broker_client::line::ROUTES_CHANNEL;
 
 /// Announced with a project's id when its worker levers change or it
 /// goes (the project group's trigger).

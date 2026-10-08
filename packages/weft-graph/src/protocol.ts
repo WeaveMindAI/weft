@@ -681,6 +681,9 @@ export interface OutputSpec {
   name: string;
   type: string;
   description?: string;
+  /// An infra node's output made once when its infra is applied, and
+  /// read saved by every fire.
+  baked?: boolean;
 }
 
 // SYNC: CatalogEntry/InputSpec/Widget/OutputSpec <-> crates/weft-core/src/node.rs
@@ -1177,7 +1180,7 @@ export type LoopInspectorEvent =
 /// marker. `busId` groups lines by channel so a node attached to
 /// multiple buses gets one scrollable section per bus. Replay orders
 /// lines by arrival from the SSE stream (the dispatcher already orders
-/// them by journal row id).
+/// them by their place in the run's record).
 /// A journaled message's payload, in its declared kind: a JSON value,
 /// or raw bytes carried as base64 (the wire form of a media frame; the
 /// panel renders its size, not the base64). The ONE wire payload

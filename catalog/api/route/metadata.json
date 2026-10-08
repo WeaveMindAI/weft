@@ -61,23 +61,6 @@
       "description": "Auth access node (ApiKeyAuth, JwtAuth, HmacAuth). Unwired, anyone with the URL may call. The established identity comes out on `caller`."
     },
     {
-      "name": "outlivesCaller",
-      "type": "Boolean",
-      "label": "May outlive the caller",
-      "description": "Off (default): the caller leaving cancels the run, and a long durable wait is killed instead of parked. On: the run is its own (answer early, keep working), so whatever runs after the answer must end by itself; anything that watches or loops needs `maxSessionSecs` or a TagRun/StopTagged pair."
-    },
-    {
-      "name": "defaultHoldSecs",
-      "type": "Number",
-      "widget": {
-        "kind": "number",
-        "min": 1,
-        "step": 1
-      },
-      "label": "Hold seconds before giving up on a wait",
-      "description": "Caller-tied run only: how long a node's wait holds the worker (and the connection) before giving up. Per-wait overrides win. Never unbounded."
-    },
-    {
       "name": "maxSessionSecs",
       "type": "Number",
       "widget": {
@@ -117,13 +100,6 @@
       "type": "Boolean",
       "label": "Keep the exchange out of the journal",
       "description": "On: the journal keeps only sizes and counts, never the request or answer content (also hidden from you when debugging). Off (default): both are recorded, trimmed above 100 KB; raw bytes are never recorded."
-    },
-    {
-      "name": "recorded",
-      "type": "Boolean",
-      "default": true,
-      "label": "Record each run",
-      "description": "Off: a successful or cancelled run leaves nothing in `weft executions` but its cost; a failed one is still written down whole. For cheap, frequently polled routes. An unrecorded run cannot wait (timer, form), cannot outlive its caller, and is lost if the worker dies."
     }
   ],
   "outputs": [
@@ -178,6 +154,7 @@
     "body?": "JsonDict | String"
   },
   "features": {
+    "pure": true,
     "isTrigger": true,
     "liveConnection": "http",
     "canAddOutputPorts": true

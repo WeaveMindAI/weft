@@ -302,7 +302,7 @@ fn worker_emission_declares_but_never_enables_node_tests() {
         group_boundary: None,
         requires_infra: false, per_instance: None,
         images: Vec::new(),
-        fires_with: Default::default(),
+        fires_with: Default::default(), baked_outputs: Default::default(),
         published_service: None,
         instance_service: None,
         instance_rules: None,
@@ -324,6 +324,7 @@ fn worker_emission_declares_but_never_enables_node_tests() {
         groups: Vec::new(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        defaults: Default::default(),
     };
     // Worker (container-mode) emission maps includes relative to
     // `<project_root>/nodes`, so stage a minimal project holding just

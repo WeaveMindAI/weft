@@ -38,9 +38,13 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     // project with an asset in it, and the drift banner would never
     // clear. Asset resolution also publishes the current references,
     // including an empty set when the last asset was removed.
+    // Whether the program runs infra of its own, for the first deploy's
+    // order (its infra first, then its triggers).
+    let mut declares_infra = false;
     let (desired_binary_hash, desired_full_binary_hash, desired_definition_hash, desired_infra_hash) =
         match weft_compiler::hash::load_enriched_project(project) {
             Ok((mut def, catalog)) => {
+                declares_infra = weft_core::project::has_infra(&def);
                 let resolved = crate::commands::assets::resolve_project_assets(
                     &ctx.client()?,
                     &project.root,
@@ -98,12 +102,17 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     // "no project I know under this id" (as opposed to a missing route).
     let Some(data) = ctx.client()?.get_json_if_found(&path).await? else {
         if !ctx.json_out(&serde_json::json!({ "registered": false, "project_id": project_id }))? {
+            // A program with infra of its own has it started before its
+            // triggers are switched on: a trigger reads its infra.
+            let first = if declares_infra {
+                format!("`{}` to start its infra, then `{}` to enable its triggers", ctx.weft("infra start"), ctx.weft("activate"))
+            } else {
+                format!("`{}` to enable its triggers", ctx.weft("activate"))
+            };
             println!(
-                "project: {} ({project_id})\n  not registered with the dispatcher yet: \
-                 use `{}` to run it, or `{}` to enable its triggers",
+                "project: {} ({project_id})\n  not registered with the dispatcher yet: use `{}` to run it, or {first}",
                 project.manifest.package.name,
                 ctx.weft("run"),
-                ctx.weft("activate"),
             );
         }
         return Ok(());
@@ -119,6 +128,11 @@ pub async fn run(ctx: Ctx) -> Result<()> {
 
     println!("project: {} ({project_id})", data.name);
     println!("  registration: {}", data.status);
+    match &data.address {
+        Some(weft_core::projects::ProjectAddress::Serving { url }) => println!("  address: {url} (its routes, at the root)"),
+        Some(weft_core::projects::ProjectAddress::Unavailable { why }) => println!("  address: unavailable: {why}"),
+        None => {}
+    }
     // The build-transition axis: only worth a line while in flight.
     if data.transition != ProjectTransition::None {
         println!("  build: {} (cancel with `{}`)", data.transition, ctx.weft("cancel-build"));
@@ -218,10 +232,21 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         }
     }
     print_drift(&ctx, &data.drift);
+    // What each trigger started lately: the one trace a run kept
+    // unrecorded leaves when it goes well.
+    if !data.runs.is_empty() {
+        println!("  runs started (the last minute or two):");
+        for entry in &data.runs {
+            match entry.failed {
+                0 => println!("    {}: {}", entry.node, entry.started),
+                failed => println!("    {}: {} ({failed} failed)", entry.node, entry.started),
+            }
+        }
+    }
     // A public entry turning callers away, so the author knows a limit
     // is acting and which one (each is a setting on the trigger).
     if !data.limited.is_empty() {
-        println!("  refused calls (last two minutes):");
+        println!("  refused calls (the last minute or two):");
         for entry in &data.limited {
             println!("    {}: {} by {}", entry.node, entry.refused, entry.limit);
         }

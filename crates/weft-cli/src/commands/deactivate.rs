@@ -186,7 +186,7 @@ impl std::error::Error for NeedsTriggerChoice {}
 /// The line a plain deactivate adds when instances still have triggers
 /// on: how many, which, and the flag that takes theirs down too. `None`
 /// when no instance's are on.
-fn instances_still_on_line(instances: &[weft_core::instance::InstanceId]) -> Option<String> {
+fn instances_still_on_line(instances: &[weft_core::instance::InstanceId], on: Option<&str>) -> Option<String> {
     if instances.is_empty() {
         return None;
     }
@@ -196,7 +196,8 @@ fn instances_still_on_line(instances: &[weft_core::instance::InstanceId]) -> Opt
         n => (format!("{n} instances"), "have"),
     };
     Some(format!(
-        "{count} still {have} triggers on ({names}); `weft deactivate --all-instances` takes theirs down too"
+        "{count} still {have} triggers on ({names}); `{}` takes theirs down too",
+        super::weft_on(on, "deactivate --all-instances")
     ))
 }
 
@@ -257,7 +258,7 @@ async fn run_inner(
     done.insert("instancesStillOn".into(), serde_json::to_value(&answer.instances_still_on)?);
     progress.dispatcher_call_done(serde_json::Value::Object(done));
     if !ctx.json() {
-        if let Some(line) = instances_still_on_line(&answer.instances_still_on) {
+        if let Some(line) = instances_still_on_line(&answer.instances_still_on, ctx.on()) {
             println!("{line}");
         }
     }
@@ -333,14 +334,15 @@ mod tests {
 
     #[test]
     fn a_plain_deactivate_names_the_instances_still_on() {
-        assert_eq!(super::instances_still_on_line(&[]), None);
-        let one = super::instances_still_on_line(&[weft_core::instance::InstanceId::new("ada").unwrap()]).unwrap();
+        assert_eq!(super::instances_still_on_line(&[], None), None);
+        let one = super::instances_still_on_line(&[weft_core::instance::InstanceId::new("ada").unwrap()], None).unwrap();
         assert!(one.starts_with("1 instance still has triggers on (ada)") && one.contains("--all-instances"), "{one}");
         let two = super::instances_still_on_line(&[
             weft_core::instance::InstanceId::new("ada").unwrap(),
             weft_core::instance::InstanceId::new("bob").unwrap(),
-        ])
+        ], Some("prod"))
         .unwrap();
+        assert!(two.contains("weft deactivate --all-instances --on prod"), "the hint acts on the same install: {two}");
         assert!(two.starts_with("2 instances still have triggers on (ada, bob)"), "{two}");
     }
 

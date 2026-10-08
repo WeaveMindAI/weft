@@ -432,8 +432,8 @@ impl FsCatalog {
 /// key, falls through to `default` otherwise, and errors out
 /// only if NEITHER is present. A node that supports every
 /// distro via one install line just fills `default`; a node
-/// whose package name varies (libpython) fills one key per
-/// (distro, version) it verified.
+/// whose package name varies from one distro to the next fills one
+/// key per (distro, version) it verified.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeDeps {
     #[serde(default)]
@@ -480,11 +480,10 @@ pub struct BuildEnv {
 /// Two stages, two different concerns:
 ///
 /// - `build`: packages the BUILDER container needs to COMPILE the
-///   worker binary. `libpython3-dev`, `pkg-config`, `libssl-dev`,
-///   and so on. These end up in the builder stage and are
+///   worker binary. `pkg-config`, `libssl-dev`, and so on. These end up in the builder stage and are
 ///   discarded before the runtime image is sealed.
 /// - `runtime`: packages the RUNTIME container needs to RUN the
-///   compiled binary. `libpython3.11-minimal`, `ca-certificates`.
+///   compiled binary. `python3`, `ca-certificates`.
 ///
 /// Each stage has the same shape: a `BTreeMap<manager, BTreeMap<
 /// distro_key, Vec<String>>>`. `distro_key` is `<distro>_<major>`
@@ -493,12 +492,11 @@ pub struct BuildEnv {
 ///
 /// ```toml
 /// [system.build.apt]
-/// default = ["libpython3-dev", "pkg-config"]
+/// default = ["libssl-dev", "pkg-config"]
 ///
 /// [system.runtime.apt]
-/// default = ["python3-minimal"]
-/// debian_12 = ["libpython3.11-minimal"]
-/// debian_13 = ["libpython3.13-minimal"]
+/// default = ["libssl3"]
+/// debian_11 = ["libssl1.1"]
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SystemPackages {
@@ -1400,7 +1398,7 @@ fn load_node_entry(
     };
     let mut metadata: NodeMetadata =
         serde_json::from_value(value).map_err(|e| parse_error(e.to_string()))?;
-    // The settings the language owns (long runs, entry limits), added
+    // The settings the language owns (how runs are kept, entry limits), added
     // before the semantic check so they are checked like any input.
     metadata.add_language_ports().map_err(parse_error)?;
     // Semantic rules serde can't express (field/port name collisions).

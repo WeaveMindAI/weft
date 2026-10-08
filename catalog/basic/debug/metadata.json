@@ -19,6 +19,7 @@
   ],
   "outputs": [],
   "features": {
+    "pure": true,
     "showDebugPreview": true
   }
 }

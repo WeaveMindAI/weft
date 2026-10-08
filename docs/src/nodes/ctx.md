@@ -110,8 +110,9 @@ you like until you close it.
 | `run("name", closure).await` | Runs the closure and writes down its result, or gives back what was written down last time | The closure itself fails |
 
 `ctx.run` is how you stop a replay from doing an expensive thing twice. A body
-only replays after a wait; if the worker dies while it is running, the step is
-failed instead (go and read [surviving a restart](durable-execution.md)).
+replays only after a wait. If the worker dies while the body is running, the
+step is not replayed: a durable run fails it, and a fast run ends cancelled
+(go and read [surviving a restart](durable-execution.md)).
 
 ## Connections
 
@@ -128,6 +129,80 @@ failed instead (go and read [surviving a restart](durable-execution.md)).
 On an opened connection: `client()`, `credential()`, `value(name)`,
 `identity()`, `owner()`. On an endpoint handle: `url()`,
 `host_and_port()`, and `call(method, path, body)`.
+
+## Sharing something between runs
+
+If your node builds something on every run that is slow to build (a pool of database
+connections, a process to hand work to), let the worker's runs share one
+instead:
+
+```rust
+let pool = ctx.shared(&access, |opened| async move { Pool::new(&opened) }).await?;
+```
+
+The closure is async and its result is a `WeftResult` of the thing (`Pool`
+here is your own type, whose `new` returns a `WeftResult<Pool>`).
+
+The first argument is the key weft keeps the thing under. If you pass a
+connection (`&access`), the closure gets the opened connection, and once one
+of its values changes (a new password), the next run that asks gets your
+thing built again from the new values. To notice the change, weft opens the
+connection every time a run calls `ctx.shared`. For a connection a person made or an infra node
+published, the worker answers that open from memory, so a reused thing costs
+no extra call. A connection set to **Use ours** (weft's own key) costs one
+network call to weft each time.
+
+If you pass a name of your own instead, the closure gets `()`:
+
+```rust
+let python = ctx.shared("exec_python", |()| async { Ok(Interpreters::new()) }).await?;
+```
+
+On one worker, every node that asks under the same name for the same Rust
+type gets the same thing, so pick a name that is your node's own, the way
+`ExecPython` uses `"exec_python"`. A worker serves one project, so nothing
+another project builds can collide with yours.
+
+`ctx.shared` hands back a `weft::shared::SharedHandle<T>`, which derefs to the
+thing. If two runs ask at the same moment, it is built only once. A build that
+fails keeps nothing, so the next run tries again.
+
+If the thing can only serve so many runs at once, say so with `with_limit`:
+
+```rust
+let pool = ctx.shared(&access, |opened| async move { Pool::new(&opened) }).with_limit(100).await?;
+```
+
+Then at most that many handles to it exist at once on one worker, and the
+next run that calls `ctx.shared` waits until one is dropped. A run that asks again while it still
+holds a handle can end up waiting on itself once the limit is reached, so
+keep one handle per run. Only the limit of the first call that asks counts, until weft lets the thing go (after it goes idle, or after its
+connection changes), so pass the same limit everywhere you call it. The limit counts the handles to one thing on one worker: two workers can go
+past it between them, and so can the old thing and the new one for a moment
+after a connection's values change, while runs still hold handles to the old
+one. The Postgres nodes that query through the
+shared pool ask for 100, Postgres's own default connection limit.
+
+If a task you spawn needs the thing after your run returns (handing a
+connection back to its pool later), move the handle into the task: it keeps
+its place under `with_limit` until the task drops it, which is what the
+Postgres nodes do. If your task should not count against the limit, take `handle.arc()`
+instead: the `Arc` keeps the value alive but holds no place under
+`with_limit`, and weft can let go of the thing while you hold it, so the next
+run may build a new one beside yours.
+
+By default, weft lets go of a shared thing about five minutes after the last
+run asked for it or dropped its handle, once no handle is left. Your
+thing's `Drop` runs once weft has let go of it and the last handle and `Arc`
+are gone, which is when a pool closes its connections. When the worker
+stops, everything goes with the process.
+
+If you want a quiet stretch not to cost a rebuild, raise the five minutes
+with `weft workers set --shared-idle-seconds <n>` (or lower it to let go
+sooner). It is one setting for the whole project, covering every
+shared thing on its workers. The change applies from the next run: weft starts workers with the
+new value (a new revision on Cloud Run), and the old ones finish what they
+are running and stop.
 
 ## Storage
 

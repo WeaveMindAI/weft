@@ -371,5 +371,6 @@ fn empty_project(project_id: Uuid) -> ProjectDefinition {
         groups: Vec::new(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        defaults: Default::default(),
     }
 }

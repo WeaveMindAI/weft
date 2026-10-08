@@ -51,12 +51,13 @@ pub enum Role {
     InfraSupervisor,
 }
 
-// NOTE: there is deliberately no `Infra` role. An infra machine's own
-// agent asks the broker for one thing, a look at its project's health
-// (`/v1/infra/look`), and does so as its project's worker, which is the
-// account the machine runs as: anything on that machine can ask the same,
-// for that project only. A unit's endpoints are resolved by the WORKER via
-// `ctx.endpoint()`, and its lifecycle is the supervisor's.
+// NOTE: there is deliberately no `Infra` role. The agent beside an infra
+// copy (`Principal::InfraCopy`) asks the broker for two things, each
+// checked by its own handler: a look at its project's health
+// (`/v1/infra/look`) and a push of its copy's values (`/v1/infra/pushed`).
+// Every other surface refuses it (`infra_copy_refused`). A unit's
+// endpoints are resolved by the WORKER via `ctx.endpoint()`, and its
+// lifecycle is the supervisor's.
 
 /// The tenant authority of a caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,7 +94,7 @@ pub struct CallerIdentity {
     pub scope: CallerScope,
     pub role: Role,
     /// The calling process replica (`REPLICA_HEADER`). Required from a
-    /// worker: journal writes, claims and the execution it drives are all
+    /// worker: its records, its claims and the runs it drives are all
     /// bound to it.
     pub replica: Option<String>,
 }
@@ -212,7 +213,17 @@ pub(crate) fn interpret(principal: Principal, role: Option<CoreRole>, replica: O
             };
             Ok(CallerIdentity { scope: CallerScope::ControlPlane, role, replica })
         }
+        Principal::InfraCopy { .. } => Err(infra_copy_refused()),
     }
+}
+
+/// An infra copy's agent may only look at its project's health
+/// (`/v1/infra/look`) and push its own copy's values (`/v1/infra/pushed`).
+pub(crate) fn infra_copy_refused() -> (StatusCode, String) {
+    (
+        StatusCode::FORBIDDEN,
+        "an infra copy's agent may only look at its project's health (/v1/infra/look) and push its own copy's values (/v1/infra/pushed)".into(),
+    )
 }
 
 /// The broker surface's identity: a worker, the listener or the
@@ -221,7 +232,7 @@ pub async fn extract_identity(state: &Arc<BrokerState>, headers: &HeaderMap) -> 
     let principal = verified_principal(state, headers).await?;
     let role = match principal {
         Principal::Core => Some(role_of(headers)?),
-        Principal::Worker { .. } => None,
+        Principal::Worker { .. } | Principal::InfraCopy { .. } => None,
     };
     interpret(principal, role, replica_of(headers))
 }
@@ -231,9 +242,8 @@ pub async fn extract_identity(state: &Arc<BrokerState>, headers: &HeaderMap) -> 
 /// wall:
 ///   - the dispatcher -> ControlPlane (the CLI admin verbs).
 ///   - a worker -> Worker { tenant, project, execution }, verifying any
-///     claimed `execution_id` the way journal writes do (the execution's owner must
-///     be the calling replica, and the execution must be the caller's
-///     project's).
+///     claimed `execution_id` the way its records are: the run must be the
+///     caller's project's, running, and driven by the calling replica.
 /// Any other weft role has no runtime-storage identity (403).
 pub async fn resolve_storage_caller(
     state: &Arc<BrokerState>,
@@ -251,16 +261,19 @@ pub async fn resolve_storage_caller(
             let (execution_id, instance) = match execution_id {
                 None => (None, None),
                 Some(execution_id) => {
-                    // SYNC: execution.owner_replica <-> weft_bind_execution_id_owner, bind_execution_id_owner (crates/weft-task-store/src/tasks.rs)
-                    let row: Option<(String, uuid::Uuid, Option<String>, Option<String>)> = sqlx::query_as(
-                        "SELECT tenant_id, project_id, owner_replica, instance_id FROM execution WHERE execution_id = $1",
+                    let parsed: weft_core::ExecutionId =
+                        execution_id.parse().map_err(|e| (StatusCode::BAD_REQUEST, format!("not an execution id: {e}")))?;
+                    // The worker writes a run's record before any call that
+                    // names it, so the row is there.
+                    let row = sqlx::query_as::<_, (String, uuid::Uuid, Option<String>, Option<String>)>(
+                        "SELECT tenant_id, project_id, owner, instance_id FROM run WHERE execution_id = $1 AND state = 'running'",
                     )
-                    .bind(execution_id)
+                    .bind(parsed)
                     .fetch_optional(&state.pool)
                     .await
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")))?;
                     let Some((execution_id_tenant, execution_id_project, owner, instance)) = row else {
-                        return Err((StatusCode::FORBIDDEN, "unknown execution".into()));
+                        return Err((StatusCode::FORBIDDEN, "no such run is running".into()));
                     };
                     if execution_id_tenant != tenant || execution_id_project != project {
                         tracing::warn!(
@@ -271,16 +284,17 @@ pub async fn resolve_storage_caller(
                         );
                         return Err((StatusCode::FORBIDDEN, "execution belongs to a different project".into()));
                     }
-                    // Same gate as journal writes: only the replica that
-                    // claimed the execution drives its execution.
+                    // Same gate as its records: only the replica driving the
+                    // run acts for it.
                     if replica.is_none() || owner.as_deref() != replica.as_deref() {
-                        return Err((StatusCode::FORBIDDEN, "execution is not owned by the calling replica".into()));
+                        return Err((StatusCode::FORBIDDEN, "execution is not driven by the calling replica".into()));
                     }
                     (Some(execution_id.to_string()), instance)
                 }
             };
             Ok(CallerAuth::Worker { tenant, project_id: project.to_string(), execution_id, instance })
         }
+        Principal::InfraCopy { .. } => Err(infra_copy_refused()),
     }
 }
 

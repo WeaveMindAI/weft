@@ -104,10 +104,6 @@ pub enum BrokerCall {
     CommandCancelRequested {
         command_id: i64,
     },
-    RunningCount {
-        project_id: uuid::Uuid,
-        copies: weft_core::instance::Copies,
-    },
     InfraCommandsInFlight {
         project_id: uuid::Uuid,
     },
@@ -147,19 +143,6 @@ fn copy_key(project_id: uuid::Uuid, node_id: &str, instance: Option<&weft_core::
     (project_id, node_id.to_string(), instance.cloned())
 }
 
-/// Whose running count answers for `copies`, as the broker counts: a
-/// instance's live runs for an instance's copies, the project's live workers
-/// (`None`) for the shared ones and for every copy.
-fn running_key(
-    project_id: uuid::Uuid,
-    copies: &weft_core::instance::Copies,
-) -> (uuid::Uuid, Option<weft_core::instance::InstanceId>) {
-    match copies {
-        weft_core::instance::Copies::Instance(i) => (project_id, Some(i.clone())),
-        weft_core::instance::Copies::Shared | weft_core::instance::Copies::Every => (project_id, None),
-    }
-}
-
 #[derive(Default)]
 struct Inner {
     /// All projects under this tenant. Keyed by project_id.
@@ -180,11 +163,9 @@ struct Inner {
     /// the broker's row does: `completed_commands` is what retires it.
     commands: Vec<SupervisorCommandRow>,
 
-    /// Running execution counts returned by `running_count`, keyed as
-    /// the broker counts: an instance's copies by that instance's live runs,
-    /// the shared ones (and every copy) by the project's live workers
-    /// (`None`). Absent = 0.
-    running_counts: HashMap<(uuid::Uuid, Option<weft_core::instance::InstanceId>), i64>,
+    /// Commands whose cancel checks answer only once released, so a test
+    /// can hold a command mid-run.
+    held_commands: HashMap<i64, Arc<tokio::sync::Semaphore>>,
 
     /// Per-project uncompleted supervisor commands returned by
     /// `infra_commands_in_flight`. Absent = none.
@@ -229,10 +210,6 @@ struct Inner {
     /// `infra_node` row: `ownable_project` only while the host holds
     /// their copies or a command waits on them.
     infraless: std::collections::HashSet<uuid::Uuid>,
-
-    /// Projects whose `running_count` answers only once the gate opens,
-    /// so a test can hold a `wait`-policy command mid-drain.
-    running_count_gates: HashMap<uuid::Uuid, Arc<tokio::sync::Semaphore>>,
 
     /// Places (project, node) the program no longer declares, any copy
     /// of them. Absent = declared (the seeded default).
@@ -555,28 +532,18 @@ impl FakeBroker {
         self.inner.lock().displaced_on_claim.insert(project_id);
     }
 
-    /// Hold every `running_count` of `project_id` until
-    /// [`Self::open_running_count`]: a `wait`-policy command stays
-    /// mid-drain for as long as the test needs it running.
-    pub fn gate_running_count(&self, project_id: uuid::Uuid) {
-        self.inner
-            .lock()
-            .running_count_gates
-            .insert(project_id, Arc::new(tokio::sync::Semaphore::new(0)));
+    /// Hold command `command_id` at its next cancel check until
+    /// [`Self::release_command`]: it stays mid-run for as long as the test
+    /// needs it running.
+    pub fn hold_command(&self, command_id: i64) {
+        self.inner.lock().held_commands.insert(command_id, Arc::new(tokio::sync::Semaphore::new(0)));
     }
 
-    /// Let every held and later `running_count` of `project_id` answer.
-    pub fn open_running_count(&self, project_id: uuid::Uuid) {
-        if let Some(gate) = self.inner.lock().running_count_gates.get(&project_id) {
+    /// Let every held and later cancel check of `command_id` answer.
+    pub fn release_command(&self, command_id: i64) {
+        if let Some(gate) = self.inner.lock().held_commands.get(&command_id) {
             gate.close();
         }
-    }
-
-    /// What `running_count` answers for `copies`: one instance's live runs
-    /// for an instance's copies, the project's live workers for the shared
-    /// ones and for every copy (the one count the broker gives both).
-    pub fn set_running_count(&self, project_id: uuid::Uuid, copies: &weft_core::instance::Copies, n: i64) {
-        self.inner.lock().running_counts.insert(running_key(project_id, copies), n);
     }
 
     /// The uncompleted supervisor commands `infra_commands_in_flight`
@@ -1053,27 +1020,16 @@ impl BrokerSupervisorOps for FakeBroker {
     }
 
     async fn command_cancel_requested(&self, command_id: i64) -> Result<bool> {
-        let mut inner = self.inner.lock();
-        inner
-            .calls
-            .push(BrokerCall::CommandCancelRequested { command_id });
-        Ok(inner.cancel_requested.get(&command_id).copied().unwrap_or(false))
-    }
-
-    async fn running_count(&self, project_id: uuid::Uuid, copies: &weft_core::instance::Copies) -> Result<i64> {
         let gate = {
             let mut inner = self.inner.lock();
-            inner.calls.push(BrokerCall::RunningCount {
-                project_id,
-                copies: copies.clone(),
-            });
-            inner.running_count_gates.get(&project_id).cloned()
+            inner.calls.push(BrokerCall::CommandCancelRequested { command_id });
+            inner.held_commands.get(&command_id).cloned()
         };
         if let Some(gate) = gate {
-            // Opening the gate closes it: every acquire then returns.
+            // Releasing the gate closes it: every acquire then returns.
             let _ = gate.acquire().await;
         }
-        Ok(self.inner.lock().running_counts.get(&running_key(project_id, copies)).copied().unwrap_or(0))
+        Ok(self.inner.lock().cancel_requested.get(&command_id).copied().unwrap_or(false))
     }
 
     async fn infra_commands_in_flight(
@@ -1307,10 +1263,8 @@ mod tests {
             project_id,
             node_id: None,
             verb: weft_broker_client::protocol::InfraLifecycleVerb::Stop,
-            running_policy: Some(weft_broker_client::protocol::RunningPolicy::Wait),
             spec_json: None,
             force: false,
-            drain_timeout_secs: weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
             copies: weft_core::instance::Copies::Shared,
         }
     }

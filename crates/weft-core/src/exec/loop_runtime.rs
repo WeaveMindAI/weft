@@ -49,7 +49,7 @@ use crate::exec::ready::{FiringInput, InputBag};
 use crate::frames::{Frame, LoopFrames};
 use crate::generator::{StreamBuffer, StreamEnd};
 use crate::primitive::{LoopInstanceKey, LoopTerminationReason};
-use crate::project::{EdgeIndex, NodeDefinition, ProjectDefinition};
+use crate::project::{ProgramIndex, NodeDefinition, ProjectDefinition};
 use crate::pulse::{Failure, PulseTable};
 use crate::ExecutionId;
 
@@ -1196,7 +1196,7 @@ pub fn launch_iteration(
     index: u32,
     stream_item: Option<LoopStreamItem>,
     project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
     pulses: &mut PulseTable,
 ) -> Result<IterationLaunch, String> {
     let group_id = key.group_id.as_str();
@@ -1251,7 +1251,7 @@ pub fn launch_iteration(
     let emission_id = iteration_launch_emission(group_id, &key.parent_frames, index);
     let mut emissions = Vec::new();
     let mentioned = postprocess_output(
-        &loop_in_id, &output, emission_id, key.execution_id, &body_frames, project, pulses, edge_idx,
+        &loop_in_id, &output, emission_id, key.execution_id, &body_frames, project, pulses, program_idx,
         &mut emissions,
     )
     .map_err(|e| e.to_string())?;
@@ -1268,13 +1268,13 @@ pub fn launch_iteration(
     // sweep leaves it alone: a failure reaches the body as a failure.
     crate::exec::postprocess::close_failed_then_unmentioned_downstream(
         &loop_in_id, &inst.outer_closed_failures, &mentioned, emission_id, key.execution_id,
-        &body_frames, project, pulses, edge_idx, &mut emissions,
+        &body_frames, project, pulses, program_idx, &mut emissions,
     )
     .map_err(|e| e.to_string())?;
     // The body's own roots (members no wire feeds) start with the
     // iteration, at its frames: everything inside a loop runs once per
     // iteration, wired to the loop's edges or not.
-    let roots = crate::project::scope_body_roots(project, edge_idx, group_id, &body_frames);
+    let roots = crate::project::scope_body_roots(project, program_idx, group_id, &body_frames);
     loop_runtime.record_launched(key, index);
     Ok(IterationLaunch { emissions, roots, body_frames })
 }
@@ -1382,7 +1382,7 @@ pub fn emit_loop_outward(
     gather: HashMap<String, Vec<Option<Arc<Value>>>>,
     carry: HashMap<String, Arc<Value>>,
     project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
     pulses: &mut PulseTable,
 ) -> Result<(OutputBag, Vec<PulseEmission>), String> {
     let loop_out_id = crate::project::boundary_out_id(&key.group_id);
@@ -1408,7 +1408,7 @@ pub fn emit_loop_outward(
         &key.parent_frames,
         project,
         pulses,
-        edge_idx,
+        program_idx,
         &mut emissions,
     )
     .map_err(|e| format!("loop '{}' outward emit failed: {e}", key.group_id))?;
@@ -1421,13 +1421,13 @@ pub fn emit_loop_outward(
 pub fn close_loop_outward(
     key: &LoopInstanceKey,
     project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
     pulses: &mut PulseTable,
     reason: LoopTerminationReason,
 ) -> Vec<PulseEmission> {
     crate::exec::boundary::close_scope_outward(
         project,
-        edge_idx,
+        program_idx,
         pulses,
         loop_termination_emission(&key.group_id, &key.parent_frames),
         key.execution_id,
@@ -2141,12 +2141,12 @@ mod tests {
     #[test]
     fn launch_iteration_puts_the_slice_the_carry_and_the_index_on_the_body_wires() {
         let project = loop_project();
-        let edge_idx = EdgeIndex::build(&project);
+        let program_idx = ProgramIndex::build(&project);
         let mut rt = LoopRuntime::new();
         let mut pulses = PulseTable::default();
         let input = bag(&[("items", serde_json::json!([10, 20])), ("acc", serde_json::json!(5))]);
         let firing = instantiate(&mut rt, def(&project, "lp__in"), &project, &FiringInput { input: input.clone(), ..Default::default() }, &Vec::new(), Uuid::nil()).unwrap();
-        let launch = launch_iteration(&mut rt, &firing.key, 1, None, &project, &edge_idx, &mut pulses).unwrap();
+        let launch = launch_iteration(&mut rt, &firing.key, 1, None, &project, &program_idx, &mut pulses).unwrap();
         assert_eq!(launch.body_frames, vec![Frame::Loop { index: 1 }]);
         assert_eq!(launch.roots, vec!["lonely".to_string()]);
         let step = pending_at(&pulses, "step");
@@ -2157,9 +2157,9 @@ mod tests {
         assert_eq!(rt.get(&firing.key).unwrap().launched, vec![1]);
         // The same launch replayed puts nothing new on the wires.
         let before = pulses["step"].len();
-        launch_iteration(&mut rt, &firing.key, 1, None, &project, &edge_idx, &mut pulses).unwrap();
+        launch_iteration(&mut rt, &firing.key, 1, None, &project, &program_idx, &mut pulses).unwrap();
         assert_eq!(pulses["step"].len(), before, "derived ids make a replay idempotent");
-        assert!(launch_iteration(&mut rt, &firing.key, 7, None, &project, &edge_idx, &mut pulses).is_err(), "past the list is drift, not null");
+        assert!(launch_iteration(&mut rt, &firing.key, 7, None, &project, &program_idx, &mut pulses).is_err(), "past the list is drift, not null");
     }
 
     #[test]
@@ -2191,33 +2191,33 @@ mod tests {
     #[test]
     fn emit_and_close_loop_outward_reach_the_consumer_with_derived_ids() {
         let project = loop_project();
-        let edge_idx = EdgeIndex::build(&project);
+        let program_idx = ProgramIndex::build(&project);
         let k = LoopInstanceKey { group_id: "lp".into(), parent_frames: Vec::new(), execution_id: Uuid::nil() };
         let mut pulses = PulseTable::default();
         let mut gather = HashMap::new();
         gather.insert("res".to_string(), vec![Some(Arc::new(serde_json::json!(1))), None]);
         let mut carry = HashMap::new();
         carry.insert("acc".to_string(), Arc::new(serde_json::json!(9)));
-        emit_loop_outward(&k, gather, carry, &project, &edge_idx, &mut pulses).unwrap();
+        emit_loop_outward(&k, gather, carry, &project, &program_idx, &mut pulses).unwrap();
         let sink = pending_at(&pulses, "sink");
         let value = |port: &str| sink.iter().find(|p| p.target_port == port).map(|p| (*p.value).clone());
         assert_eq!(value("res"), Some(serde_json::json!([1, null])), "a closed slot is a null in the list");
         assert_eq!(value("acc"), Some(serde_json::json!(9)));
 
         let mut closed_pulses = PulseTable::default();
-        close_loop_outward(&k, &project, &edge_idx, &mut closed_pulses, LoopTerminationReason::OverExhausted);
+        close_loop_outward(&k, &project, &program_idx, &mut closed_pulses, LoopTerminationReason::OverExhausted);
         let sink = pending_at(&closed_pulses, "sink");
         assert_eq!(sink.len(), 2);
         assert!(sink.iter().all(|p| p.closed && p.failure.is_none()), "a loop that ran out closes plainly");
         let mut failed_pulses = PulseTable::default();
-        close_loop_outward(&k, &project, &edge_idx, &mut failed_pulses, LoopTerminationReason::Failed);
+        close_loop_outward(&k, &project, &program_idx, &mut failed_pulses, LoopTerminationReason::Failed);
         assert!(
             pending_at(&failed_pulses, "sink").iter().all(|p| p.failure.as_ref().is_some_and(|f| f.node == "lp")),
             "a loop that failed says so on every outward closure"
         );
         let mut twice = PulseTable::default();
-        close_loop_outward(&k, &project, &edge_idx, &mut twice, LoopTerminationReason::OverExhausted);
-        close_loop_outward(&k, &project, &edge_idx, &mut twice, LoopTerminationReason::OverExhausted);
+        close_loop_outward(&k, &project, &program_idx, &mut twice, LoopTerminationReason::OverExhausted);
+        close_loop_outward(&k, &project, &program_idx, &mut twice, LoopTerminationReason::OverExhausted);
         assert_eq!(pending_at(&twice, "sink").len(), 2, "one instance ends once: the same ids dedup");
     }
 }

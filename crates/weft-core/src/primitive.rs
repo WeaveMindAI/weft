@@ -67,17 +67,23 @@ pub struct SignalSpec {
     /// every public entry. Default = the language defaults.
     #[serde(default, skip_serializing_if = "crate::signal::EntryLimits::is_default")]
     pub limits: crate::signal::EntryLimits,
-    /// How long the executions this signal starts may run
-    /// (`crate::run_class`). Set by whatever registers the signal.
-    #[serde(default, rename = "runClass", alias = "run_class", skip_serializing_if = "crate::run_class::RunClass::is_default")]
-    pub run_class: crate::run_class::RunClass,
+    /// How the executions this signal starts are kept
+    /// (`crate::run_settings`): fast or durable, recorded or not. Set by whatever registers the signal; written
+    /// beside the other fields, each default left out.
+    #[serde(flatten)]
+    pub settings: crate::run_settings::RunSettings,
 }
 
-/// Preparing an entry captures it; waiting on a signal registers a live token.
+/// Preparing an entry captures it; waiting on a signal registers a live
+/// token. The asking worker writes what the answer says into its run's
+/// record (`TriggerCaptured`, `SuspensionRegistered`): only the worker
+/// driving a run writes its record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RegisterSignalResult {
-    Captured,
+    /// The entry's parameters were captured for the trigger at this
+    /// address (the place the capture is stored under).
+    Captured { node_id: String },
     Registered { token: String },
 }
 
@@ -94,7 +100,7 @@ impl SignalSpec {
             access: None,
             match_predicates: Vec::new(),
             limits: crate::signal::EntryLimits::default(),
-            run_class: crate::run_class::RunClass::default(),
+            settings: crate::run_settings::RunSettings::default(),
         }
     }
 }
@@ -267,7 +273,10 @@ pub struct ExecutionSnapshot {
     pub execution_id: ExecutionId,
     /// The immutable selection and supplied inputs recorded at birth.
     pub selection: Option<crate::project::selection::RunSelection>,
-    pub program: Option<crate::project::hash::ProgramIdentity>,
+    /// The worker binary the run was born on (`ExecutionStarted`): with
+    /// the definition hash it names the program identity, read from the
+    /// project's stored code when reuse needs it.
+    pub binary_hash: Option<String>,
     /// Chosen history includes bodies of zero-iteration loops, which have no
     /// firing record on which to store an origin.
     pub inherited_origins: std::collections::BTreeMap<crate::frames::Located, ExecutionId>,
@@ -385,9 +394,8 @@ pub enum CorruptionSite {
 /// order on every dispatch. Two kinds of observable points within
 /// a node body produce entries:
 ///
-/// - `Await { token, resolved }`: a past `ctx.await_signal` call.
-///   `resolved=Some(value)` if the matching `SuspensionResolved`
-///   already arrived; `None` for the still-pending tail.
+/// - `Await { token, ended }`: a past `ctx.await_signal` call, and how
+///   it ended: `None` for the still-pending tail.
 ///
 /// - `Run { name, value }`: a past `ctx.run("name", fn)` call.
 ///   The closure's output was journaled and replays here without
@@ -404,9 +412,8 @@ pub struct AwaitedEntry {
 pub enum AwaitedEntryKind {
     Await {
         token: String,
-        /// `Some(value)` iff `SuspensionResolved` arrived;
         /// `None` for the still-pending tail.
-        resolved: Option<Value>,
+        ended: Option<AwaitEnd>,
     },
     Run {
         /// Author-supplied identifier for the call site. Used for
@@ -417,9 +424,22 @@ pub enum AwaitedEntryKind {
     },
 }
 
+/// How a past `ctx.await_signal` ended. The first ending on record
+/// stands: an answer that comes after a wait was given up is ignored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AwaitEnd {
+    /// Its answer arrived (`SuspensionResolved`).
+    Answered { value: Value },
+    /// The run held it in its worker and gave it up
+    /// (`SuspensionGaveUp`): the call failed with `error`.
+    GaveUp { error: String },
+}
+
 /// What a body's `ctx.await_signal` finds in its journal at its call
 /// index: the answer that already arrived, or the token of the wait
-/// it is still parked on.
+/// it is still parked on. A wait given up is the call's error instead
+/// ([`replay_await`]).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReplayedAwait {
     Resolved(Value),
@@ -449,10 +469,11 @@ pub fn replay_await(
         )));
     }
     match entry.kind {
-        AwaitedEntryKind::Await { token, resolved } => Ok(Some(match resolved {
-            Some(value) => ReplayedAwait::Resolved(value),
-            None => ReplayedAwait::Pending { token },
-        })),
+        AwaitedEntryKind::Await { token, ended } => match ended {
+            Some(AwaitEnd::Answered { value }) => Ok(Some(ReplayedAwait::Resolved(value))),
+            Some(AwaitEnd::GaveUp { error }) => Err(crate::error::WeftError::WaitGaveUp(error)),
+            None => Ok(Some(ReplayedAwait::Pending { token })),
+        },
         AwaitedEntryKind::Run { name, .. } => Err(crate::error::WeftError::NodeExecution(format!(
             "await_signal at call_index={call_index} but journal has Run('{name}'). \
              This means the node body called `ctx.run` here on a previous run \
@@ -619,8 +640,10 @@ impl Phase {
             Self::Fire => "fire",
         }
     }
-    /// written as text (the DB column, a CLI flag) comes through here,
-    /// so the set of names has one definition.
+
+    /// The phase `tag` names ([`Self::as_str`]). Every phase read back
+    /// from text (the DB column, a CLI flag) comes through here, so the
+    /// set of names has one definition.
     pub fn from_tag(tag: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|p| p.as_str() == tag)
     }

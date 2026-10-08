@@ -4,13 +4,11 @@
 //! metering, exactly like a firing inside an execution.
 //!
 //! What differs from a real firing, and only this:
-//!   - the journal is [`weft_journal::NoopJournal`]: a node test is
-//!     not an execution, nothing folds it, and it must not fabricate
-//!     execution rows;
+//!   - the run is a node test's (`RunKind::NodeTest`): this process bears
+//!     it, writes what it spends and its ending, and nothing folds it;
 //!   - emitted outputs are captured at the ctx seam instead of routed
 //!     (there is no downstream graph);
-//!   - each RUNNER carries one execution identity (execution id +
-//!     execution), so a test's spends attribute to one real execution, however
+//!   - each RUNNER is one run, so a test's spends attribute to it, however
 //!     many times its body fires the rig.
 
 use std::sync::{Arc, Mutex};
@@ -21,7 +19,8 @@ use weft_core::context::ContextHandle;
 use weft_core::node_test::LiveHandleFactory;
 use weft_core::{ExecutionId, LiveRig};
 
-use crate::context::{BusCoordinator, EngineClients, RunnerHandle};
+use crate::context::{BusCoordinator, EngineClients, RunRecord, RunnerHandle};
+use crate::journal_writer::{DriveJournal, Leaving, RunSpec};
 
 /// Composes live rigs over one broker-client bundle and settles their
 /// debts when the runs are over. One runner serves every live test of
@@ -33,13 +32,16 @@ pub struct LiveTestRunner {
     replica: String,
     tenant_id: String,
     project_id: uuid::Uuid,
-    /// THE run's execution identity: the pre-registered execution the
-    /// spawning runtime supplied (it registered the execution so the
-    /// broker can scope the run), or a fresh mint. One runner serves
-    /// one test run, so the runner IS one execution: every rig and
-    /// every handle it mints carries this same execution, and every spend
-    /// attributes to it.
+    /// THE run's execution identity, which the install chose. One runner
+    /// serves one test run, so the runner IS one run: every rig and every
+    /// handle it mints carries it, and every spend attributes to it.
     execution_id: ExecutionId,
+    /// The run's record: its birth, what it spends, its ending.
+    record: RunRecord,
+    journal: Arc<DriveJournal>,
+    /// Renews this process's lease while the run goes: a run whose
+    /// driver holds no lease reads as lost.
+    lease: tokio::task::JoinHandle<()>,
     /// Every handle a rig minted, so `settle` can release the
     /// runtime-owned connections their bodies opened.
     handles: Arc<Mutex<Vec<Arc<RunnerHandle>>>>,
@@ -85,28 +87,71 @@ fn published_spec(
 }
 
 impl LiveTestRunner {
-    /// `clients` should come from `EngineClients::from_broker`; the
-    /// journal is replaced with the no-write impl here (see module
-    /// doc), so callers hand in the production bundle unmodified.
-    pub fn new(
-        mut clients: EngineClients,
+    /// Bear the test's run, `execution_id` (`RunKind::NodeTest`), and keep
+    /// this process's lease while it goes. `clients` come from
+    /// `EngineClients::from_broker`. `entry` names the test on its record.
+    pub async fn start(
+        clients: EngineClients,
         catalog: &'static dyn weft_core::NodeCatalog,
         replica: String,
         tenant_id: String,
         project_id: uuid::Uuid,
-        fixed_execution_id: Option<ExecutionId>,
-    ) -> Self {
-        clients.journal = Arc::new(weft_journal::NoopJournal);
-        Self {
+        execution_id: ExecutionId,
+        entry: String,
+    ) -> Result<Self, String> {
+        // Kept like the runtime's own bookkeeping runs: what a test spent
+        // is on record before its report says it ran.
+        let settings = weft_core::run_settings::RunSettings::bookkeeping();
+        let journal = clients.writer.run(RunSpec {
+            execution_id,
+            settings,
+            keep_for: settings.kept_for(weft_core::run_settings::KeepFor::WEFT_DEFAULT),
+            epoch: 1,
+            next_seq: 0,
+            redaction: Default::default(),
+        });
+        let birth = weft_journal::ExecEvent::ExecutionStarted {
+            execution_id,
+            project_id,
+            entry_node: entry,
+            phase: weft_core::context::Phase::Fire,
+            // A node test executes the package's image, never a project
+            // definition.
+            definition_hash: None,
+            binary_hash: None,
+            source_version: None,
+            run_kind: weft_core::exec::RunKind::NodeTest,
+            selection: None,
+            seed: None,
+            // No picks: a node test runs no program, and its connections
+            // are the ones the test itself hands the node, never the
+            // install's.
+            instance: None,
+            fired_trigger: None,
+            stand_in: None,
+            instance_values: Default::default(),
+            picks: Default::default(),
+            settings,
+            at_unix: crate::now_unix(),
+        };
+        weft_journal::JournalClient::record_event(journal.as_ref(), &birth, Some(&replica))
+            .await
+            .map_err(|e| format!("the test's run could not be recorded: {e:#}"))?;
+        journal.flush().await.map_err(|e| format!("the test's run could not be recorded: {e:#}"))?;
+        let lease = tokio::spawn(keep_lease(clients.door_broker.clone()));
+        Ok(Self {
+            record: RunRecord { journal: journal.clone(), costs: crate::metering::PendingCostRecords::new() },
+            journal,
+            lease,
             clients,
             replica,
             tenant_id,
             project_id,
-            execution_id: fixed_execution_id.unwrap_or_else(ExecutionId::new_v4),
+            execution_id,
             handles: Arc::new(Mutex::new(Vec::new())),
             catalog,
             watchdogs: Mutex::new(Vec::new()),
-        }
+        })
     }
 
     /// A rig for one live test: `connection_id` is the chosen grant
@@ -119,6 +164,7 @@ impl LiveTestRunner {
     pub fn rig(&self, connection_id: &str, service: &str, fixtures: std::collections::BTreeMap<String, String>) -> LiveRig {
         let access = Access::new(connection_id, service, None);
         let clients = self.clients.clone();
+        let record = self.record.clone();
         let replica = self.replica.clone();
         let tenant_id = self.tenant_id.clone();
         let project_id = self.project_id;
@@ -207,17 +253,18 @@ impl LiveTestRunner {
                 node_type,
                 weft_core::frames::LoopFrames::default(),
                 clients.clone(),
+                record.clone(),
                 published,
                 replica.clone(),
                 tenant_id.clone(),
                 Arc::new(CancellationFlag::new()),
                 waits.clone(),
                 bus_coordinator.clone(),
-                declared,
+                Arc::new(declared),
                 // The rig's capturing wrapper answers the declared
                 // inputs (it knows the manifest); the inner handle is
                 // never asked.
-                std::collections::HashMap::new(),
+                Default::default(),
                 // Likewise the wired outputs: the capturing wrapper
                 // answers them from the case (`LiveRig::wire_output`).
                 std::collections::HashSet::new(),
@@ -238,12 +285,13 @@ impl LiveTestRunner {
         self.execution_id
     }
 
-    /// Settle everything the runs left open: releases every leased
-    /// connection, then blocks until every in-flight cost record has
-    /// landed. MUST run before the process reports and exits; skipping
-    /// it drops money. Returns one entry per release that failed
-    /// (naming the grant, so an operator can release it by hand);
-    /// empty means everything was released.
+    /// Settle everything the run left open and end it: releases every
+    /// leased connection, waits until every spend is on its record, then
+    /// writes its ending. MUST run before the process reports and exits;
+    /// skipping it drops money. Returns one entry per release that failed
+    /// (naming the grant, so an operator can release it by hand), and one
+    /// when the run's record could not be finished; empty means everything
+    /// was settled.
     pub async fn settle(&self) -> Vec<String> {
         // Watchdogs are also reaped by Drop; aborting here too just
         // stops them the moment the run is over.
@@ -257,7 +305,18 @@ impl LiveTestRunner {
             failures.extend(handle.close_opened_accesses().await);
         }
         self.clients.open_charges.flush_execution_id(self.execution_id, "the node test ended before the job was read back");
-        self.clients.pending_costs.wait_zero().await;
+        self.record.costs.wait_zero().await;
+        let ending = weft_journal::ExecEvent::ExecutionCompleted { execution_id: self.execution_id, at_unix: crate::now_unix() };
+        let ended = match weft_journal::JournalClient::record_event(self.journal.as_ref(), &ending, Some(&self.replica)).await {
+            Ok(()) => self.journal.leave(Leaving::Ended).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = ended {
+            let why = format!("the test's run could not be ended on record: {e:#}");
+            self.clients.writer.give_up(self.execution_id, &why).await;
+            failures.push(why);
+        }
+        self.lease.abort();
         failures
     }
 }
@@ -269,6 +328,28 @@ impl Drop for LiveTestRunner {
     fn drop(&mut self) {
         for watchdog in self.watchdogs.lock().unwrap().drain(..) {
             watchdog.abort();
+        }
+        self.lease.abort();
+    }
+}
+
+/// Renew this process's lease once a second, the way a worker's door
+/// tick does (`crate::door`), for as long as the test's run goes: it
+/// counts nothing at a door, so its tick says only that it is alive.
+async fn keep_lease(broker: Arc<dyn crate::door::DoorBroker>) {
+    let mut every = tokio::time::interval(std::time::Duration::from_secs(1));
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        every.tick().await;
+        let tick = weft_broker_client::protocol::DoorTickRequest {
+            binary_hash: None,
+            in_flight: Default::default(),
+            window_start: weft_core::signal::limits::window(crate::now_unix() as i64).0,
+            counts: Vec::new(),
+            tokens: Vec::new(),
+        };
+        if let Err(e) = broker.tick(&tick).await {
+            tracing::warn!(target: "weft_engine::test_rig", error = %format!("{e:#}"), "the test's lease could not be renewed; the next second tries again");
         }
     }
 }

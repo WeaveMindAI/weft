@@ -25,9 +25,8 @@ service's calls are measured. There is no flag anywhere else.
 | `resolve(path, observed, follow_up)` | Yes | Price one observed call |
 | `prepare(path, body)` | No | Rewrite an outgoing body so the cost comes back reportable |
 | `priceable(path, follow_up)` | No | Asked before sending: can this be priced at all when it returns? |
-| `ceiling_usd(...)` | No | The worst case, from the request bytes alone, before the call |
 | `opens_charge`, `charge_reported_on`, `fold_report` | No | For a provider that reports the cost later, on a separate response |
-| `observe_session`, `session_slice_usd`, `session_max_frame_bytes` | No | For a long-lived session priced by its frames |
+| `observe_session(path, query)` | For a session route | A fresh tap for one long-lived session, priced by its frames |
 
 ## Routes
 

@@ -1,8 +1,9 @@
 //! `infra_event` table. The infra-supervisor writes; the dispatcher
-//! polls (via `infra_event_bridge`) and fans events out over SSE.
+//! reads each row as it is announced (`infra_event_bridge`) and fans it
+//! out over SSE.
 //!
-//! Distinct from the `exec_event` journal: those are durable
-//! execution-graph events. `infra_event` is for control-plane
+//! Distinct from a run's record: that holds durable execution-graph
+//! events. `infra_event` is for control-plane
 //! state changes about the infra itself (a node went flaky, the
 //! supervisor finished a terminate, etc).
 
@@ -46,21 +47,17 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             instance_id   TEXT,
             kind        TEXT NOT NULL,
             payload     JSONB NOT NULL,
-            at_unix     BIGINT NOT NULL,
-            -- The transaction that wrote the row, the order the
-            -- bridge's cursor reads in (`crate::settled`).
-            writer_xid  XID8 NOT NULL DEFAULT pg_current_xact_id()
+            at_unix     BIGINT NOT NULL
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_infra_event_chrono ON infra_event(id)"#,
-        r#"CREATE INDEX IF NOT EXISTS idx_infra_event_settled ON infra_event(writer_xid, id)"#,
         r#"CREATE INDEX IF NOT EXISTS idx_infra_event_project ON infra_event(project_id)"#,
-        // Wake the dispatcher's bridge on every event, whoever wrote it
-        // (the broker for a supervisor, or this crate's own `insert`),
-        // when the write commits.
+        // Announce every event, whoever wrote it (the broker for a
+        // supervisor, or this crate's own `insert`), when the write
+        // commits, naming its project and its id.
         // SYNC: 'weft_infra_event' <-> crate::infra_event_bridge::INFRA_EVENT_CHANNEL
         r#"CREATE OR REPLACE FUNCTION infra_event_notify() RETURNS trigger AS $$
             BEGIN
-                PERFORM pg_notify('weft_infra_event', NEW.id::text);
+                PERFORM pg_notify('weft_infra_event', NEW.project_id::text || ' ' || NEW.id::text);
                 RETURN NULL;
             END;
             $$ LANGUAGE plpgsql"#,
@@ -97,48 +94,22 @@ pub async fn insert(
     Ok(row.0)
 }
 
-/// The columns a settled read of `infra_event` takes next to `id`, the
-/// ones [`parse_rows`] reads (`crate::settled::SettledReader::read`).
-pub const READ_COLUMNS: &str = "tenant_id, project_id, node_id, kind, payload, at_unix";
-
-pub fn parse_rows(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<InfraEventRow>> {
-    use sqlx::Row;
-    let mut out = Vec::with_capacity(rows.len());
-    for r in rows {
-        let id: i64 = r.try_get("id")?;
-        let tenant_id: String = r.try_get("tenant_id")?;
-        let project_id: uuid::Uuid = r.try_get("project_id")?;
-        let node_id: Option<String> = r.try_get("node_id")?;
-        let kind_str: String = r.try_get("kind")?;
-        let payload: Value = r.try_get("payload")?;
-        let at_unix: i64 = r.try_get("at_unix")?;
-        // Fail loud on unknown kind OR unparseable payload: a newer
-        // supervisor emits a shape this dispatcher doesn't
-        // understand. Advancing the cursor past unparseable rows
-        // would silently lose the event forever. The bridge bails
-        // the drain; the cursor stays put; retry on next tick.
-        let kind = InfraEventKind::parse(&kind_str).ok_or_else(|| {
-            anyhow::anyhow!(
-                "infra_event row id={id} has unknown kind '{kind_str}'; \
-                 refusing to advance cursor. Upgrade the dispatcher."
-            )
-        })?;
-        let event = InfraEvent::from_kind_and_payload(kind, &payload).map_err(|e| {
-            anyhow::anyhow!(
-                "infra_event row id={id} kind='{kind_str}' has malformed payload: {e}. \
-                 Refusing to advance cursor."
-            )
-        })?;
-        out.push(InfraEventRow {
-            id,
-            tenant_id,
-            project_id,
-            node_id,
-            event,
-            at_unix,
-        });
-    }
-    Ok(out)
+/// The row `id`, `None` when it is gone. A row whose kind or payload this
+/// dispatcher cannot read is an error naming it: a newer supervisor wrote
+/// a shape this dispatcher does not know.
+pub async fn read(pool: &PgPool, id: i64) -> Result<Option<InfraEventRow>> {
+    let row: Option<(String, uuid::Uuid, Option<String>, String, Value, i64)> = sqlx::query_as(
+        "SELECT tenant_id, project_id, node_id, kind, payload, at_unix FROM infra_event WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((tenant_id, project_id, node_id, kind_str, payload, at_unix)) = row else { return Ok(None) };
+    let kind = InfraEventKind::parse(&kind_str)
+        .ok_or_else(|| anyhow::anyhow!("infra_event row id={id} has unknown kind '{kind_str}'. Upgrade the dispatcher."))?;
+    let event = InfraEvent::from_kind_and_payload(kind, &payload)
+        .map_err(|e| anyhow::anyhow!("infra_event row id={id} kind='{kind_str}' has malformed payload: {e}."))?;
+    Ok(Some(InfraEventRow { id, tenant_id, project_id, node_id, event, at_unix }))
 }
 
 /// Drop every row for a project. Called on `weft rm`.

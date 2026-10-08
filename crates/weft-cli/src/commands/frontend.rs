@@ -96,7 +96,8 @@ pub async fn run(ctx: Ctx, action: FrontendAction) -> Result<()> {
             hand_over(&ctx, &project, &install_url, &renewed.frontend, Some((renewed.token, id)))?;
             if !ctx.json() {
                 println!(
-                    "its old token keeps working until the new one is in place; then `weft frontend token {name} --done {id}` retires it"
+                    "its old token keeps working until the new one is in place; then `{}` retires it",
+                    ctx.weft(&format!("frontend token {name} --done {id}"))
                 );
             }
         }
@@ -113,7 +114,7 @@ pub async fn run(ctx: Ctx, action: FrontendAction) -> Result<()> {
                 return Ok(());
             }
             if frontends.is_empty() {
-                println!("{project} has no frontend (`weft frontend add <name>` makes one)");
+                println!("{project} has no frontend (`{}` makes one)", ctx.weft("frontend add <name>"));
             }
             for f in &frontends {
                 match (&f.repo, &f.url) {

@@ -78,6 +78,9 @@ pub struct WaitTracker {
     /// within an execution, so a stale `exit_wait` can never address a
     /// later wait.
     next_wait_id: AtomicU64,
+    /// The signal waits the run holds in this worker because it cannot
+    /// pause (`crate::held_waits`).
+    held: Arc<crate::held_waits::HeldWaits>,
 }
 
 impl WaitTracker {
@@ -86,7 +89,13 @@ impl WaitTracker {
             wait_notify: Notify::new(),
             nodes: Mutex::new(HashMap::new()),
             next_wait_id: AtomicU64::new(0),
+            held: crate::held_waits::HeldWaits::new(),
         })
+    }
+
+    /// The signal waits the run holds in this worker.
+    pub(crate) fn held(&self) -> &Arc<crate::held_waits::HeldWaits> {
+        &self.held
     }
 
     /// Wait-wake-up future the loop awaits in its idle-`select!`.

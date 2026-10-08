@@ -42,13 +42,10 @@ pub async fn run(
         &state.pg_pool,
         weft_task_store::NewTask {
             kind: RUN_NODE_TEST_KIND.to_string(),
-            target: weft_task_store::TaskTarget::Dispatcher,
             project_id: Some(id),
             dedup_key: None,
             execution_id: None,
             tenant_id: caller.0 .0.clone(),
-            target_replica: None,
-            binary_hash: None,
             payload: serde_json::to_value(&payload)
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?,
         },

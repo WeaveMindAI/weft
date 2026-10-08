@@ -164,19 +164,6 @@ It works during provisioning after the apply, and in every later phase once the
 infrastructure is running. If the endpoint is not declared, or the
 infrastructure is down, the error says which and points at `weft infra status`.
 
-Your node's `run` runs on every run that reaches it: behind a route, once per
-call. The worker keeps what `ctx.endpoint`, `ctx.published_access`,
-`ctx.publish_access` and `ctx.open` answered from one run to the next, and
-weft tells it the moment any of it changes, so after the first run those
-calls cost nothing. Two kinds of answer are asked for again: a credential
-weft lends for one firing, every time, and a token that expires, once it is
-due a refresh. A request to the running service itself (`call(...)`, a
-health check, a query) is a trip there on every run: quick inside the install's
-own network, and still one more thing that can fail while the service
-restarts. If you want a route behind your node to stay fast, keep `run` to
-reading what weft already holds and handing it on, plus whatever the service
-itself has to be asked every time.
-
 When a program marks your node `@per_instance`, each instance of the program
 gets its own container, and `ctx.endpoint` answers with the copy of the
 instance the run is for; your node's code does not change. Each copy has its
@@ -184,6 +171,114 @@ own address, so its `public_url()` is its own too. A connection your node
 publishes (`ctx.publish_access`) from an instance's copy is recorded as that
 instance's. For what an instance is, go and read
 [programs with instances](../running/instances.md).
+
+## Outputs saved with the infrastructure: baking
+
+If an output only says where your infrastructure is or how to connect to it
+(an address, a database connection), it stays the same from one run to the
+next, so weft can save it when the infrastructure is applied and stop running
+your node just to hand it out. Mark it `baked` in `metadata.json`:
+
+```json
+{ "name": "access", "type": "Access", "baked": true }
+```
+
+(Baked outputs have nothing to do with `weft bake`, which prepares a
+trigger's settings.)
+
+Only an infrastructure node can bake an output: on any other node, the
+catalog refuses to load the metadata and names the output.
+
+Every time the infrastructure is applied (`weft infra start`, `weft infra
+upgrade`, `weft infra rebake <node>`, or a program's own
+`ctx.infra(..).start()`), weft runs your node's `run` right after and saves what it sent on its baked outputs
+alongside that infrastructure. A baked output your `run` sent nothing on keeps the value saved
+last time.
+
+While the infrastructure is running, if everything a run reads from your
+node comes from baked outputs that have a saved value, your node does not
+run: the saved values go down its wires instead.
+Nodes that only fed your node do not run either. Your node's log says why:
+`did not run: everything this run reads from it is baked, so its saved
+<outputs> went out instead`. The Postgres node bakes `access`, so a route that
+queries the database gets the saved connection without the Postgres node
+running. If you want your node to run anyway (to debug it), name it in the
+run: `weft run --target <node>` or `--from <node>` always runs it.
+
+If a run also reads an output that is not baked (a bridge's `status`, which
+changes while the bridge runs), your node runs as usual, and if its `run`
+sends nothing on a baked output, the saved value goes out on it instead of
+the output closing. Only wires into nodes that are part of this run count: a
+`status` wired to a node outside the run does not make your node run.
+
+If your container changes a value itself (a password reset from a button,
+say), have it POST the new value to the address in
+`WEFT_VALUES_URL`:
+
+```sh
+curl -X POST "$WEFT_VALUES_URL" -H 'Content-Type: application/json' \
+  -d '{"connection": {"password": "the-new-one"}}'
+```
+
+`connection` changes values inside the connection your node published, and
+`outputs` replaces saved baked outputs by name (`{"outputs": {"<output>":
+<value>}}`).
+
+weft sets `WEFT_VALUES_URL` in every container of your unit, init containers
+included, and refuses a spec that sets it. A push only ever changes the copy
+whose container sent it. weft does not check a pushed value against the
+output's type. A saved value that does not fit its output's type, pushed or
+left over from older code, is never handed out: a run that reads it runs
+your node instead, and if your `run` sends nothing on that output the run
+fails saying `what this node's infra saved for its baked outputs no longer
+fits them`.
+
+The request answers `200` once weft has written the value. If you name a key
+the connection does not store or an output with nothing saved, or send
+`connection` from a node that published none (or several), it answers `422`
+with a body that names the problem, and nothing is written. Any other answer
+means nothing was written either, and `502` means weft could not be reached
+at all.
+
+If you want a button for this, give one of the items on your container's
+panel an `action`: `{"label": "Reset password", "actionKind":
+"reset_password", "confirm": "<what to ask before pressing>"}`. For serving a
+panel, go and read [showing something in the graph](display.md#a-live-panel).
+A press reaches your container as a `POST` to `/action` with `{"action":
+"<actionKind>", "payload": null}`, or with the button's own `payload` if you
+gave it one. For how to answer it, go and read [letting other nodes reach
+it](#letting-other-nodes-reach-it).
+
+If the push fails, or a value changed without anything telling weft, the
+person running the program fixes it with `weft infra rebake <node>` (add
+`--instance <id>` for a `@per_instance` node's copy). It applies your
+infrastructure again, restarting nothing that already matches its spec, then
+runs your node's `run` and saves what it sends. That only helps if your `run`
+reads the current value from your infrastructure instead of trusting what it
+published last time. The Postgres node does this: it asks its credential
+container whether the password it holds is still the current one, and reads
+the new one when it is not.
+
+If your container pushes from a button and the push fails, answer the press
+with `{"result": {"error": "..."}}` telling the person to run `weft infra
+rebake <node>`, the way the Postgres node's Reset password button does. You
+do not need to add that hint anywhere else: when any node fails after
+opening the connection your node published, weft adds a line to that node's
+error naming `weft infra rebake <node>`.
+
+If you change what your `run` emits on a baked output, runs that skip your
+node keep handing out the old saved value until it bakes again. `weft infra
+upgrade` builds your current source, then stops the infrastructure and
+starts it again. If you would rather restart nothing, build first (`weft
+build`, or any `weft run`) and then run `weft infra rebake <node>`, which
+runs whatever weft built last.
+
+Without `--instance`, the upgrade stops the program's shared infrastructure
+and starts it again. A `@per_instance` node's copies are left alone, so run
+it with `--instance <id>` for each instance whose copy should bake your new
+code. For what an upgrade does to running work and to triggers, go and read
+[choosing what happens to work in
+flight](../running/lifecycles.md#choosing-what-happens-to-work-in-flight).
 
 ## Letting other nodes reach it
 
@@ -215,11 +310,12 @@ let sent = bridge.action("sendMessage", json!({ "to": to, "text": text })).await
 `ctx.endpoint_of` gives back the same handle `ctx.endpoint` does, so `url()`
 and `call(..)` work on it as well. `action(name, payload)` posts
 `{"action": name, "payload": payload}` to the service's `/action` and gives
-you the `result` of its answer. Your service answers `{"result": ...}`. If
-`result` carries an `error`, the node fails with that message, the same as
-on a non-2xx. If `result` is missing, the node fails too. The buttons
-of [a live panel](#a-live-panel) post to the same `/action`, so one handler in
-your container serves both.
+you the `result` of its answer. Your service answers `{"result": ...}`. `action`
+returns an error when your service answers non-2xx, when the answer has no
+`result`, or when `result` carries an `error` string (the error then reads
+`<action>: <error>`). An `error` that is not a string comes back as part of
+the result. The buttons of [a live panel](#a-live-panel) post to the same
+`/action`, so one handler in your container serves both.
 
 An `Infra` input only takes a handle from an `Infra` output. The compiler
 refuses a `String` wired into it, and it refuses a value typed into it by

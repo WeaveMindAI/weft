@@ -42,16 +42,14 @@ use serde_json::Value;
 
 use crate::error::WeftResult;
 use crate::signal::{Backpressure, DataType, ErrorMode, LiveConnectionConfig, Protocol};
-use crate::wait::SuspendPolicy;
 
-/// What the caller sent to OPEN the exchange, as the install's handshake
-/// (`/connect`) saw it: the method, path, query and headers of their
-/// call, the route's captures and the gate's verdict. One shape for both
-/// protocols, built when the run is born at that handshake. From there it
-/// is carried everywhere it is read: the
-/// trigger's wake payload (so a trigger node fans it onto ports), the
-/// execute task's start record (so the worker puts it on the
-/// connection), and [`HttpRequestParts`] (beside the body).
+/// What the caller sent to OPEN the exchange, as the worker's door
+/// (`weft_engine::door`) saw it: the method, path, query and headers of
+/// their call, the route's captures and the gate's verdict. One shape for
+/// both protocols, built when the run is born at the door. From there it
+/// is carried everywhere it is read: the trigger's wake payload (so a
+/// trigger node fans it onto ports), the task of a durable or fired run
+/// (`LiveConnectionStart`), and [`HttpRequestParts`] (beside the body).
 ///
 /// `path` is the path AS CALLED under the project, without the tenant
 /// prefix and without a leading slash (`chat/room7`); `params` are the
@@ -76,7 +74,7 @@ pub struct LiveRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caller: Option<Value>,
     /// The address the caller reached this install at (its request's own
-    /// `Host` / `X-Forwarded-*`, [`crate::net::request_base_url_of`]),
+    /// `Host` / `X-Forwarded-*`, [`crate::net::request_base_url`]),
     /// stated by the birth that read the caller's request. What a link
     /// this caller will fetch is built on (a route's answer carrying a
     /// file): a browser on the loopback port gets a loopback link, one
@@ -97,6 +95,91 @@ impl LiveRequest {
     /// Read a header case-insensitively, as HTTP headers are.
     pub fn header(&self, name: &str) -> Option<&str> {
         find_header(&self.headers, name)
+    }
+
+    /// The credentials this request carries, which its run keeps in memory
+    /// and never writes down ([`Redaction`]): the values of the headers that
+    /// carry credentials on any request ([`CREDENTIAL_HEADERS`]) and of
+    /// `also`, the headers the route's own gate read.
+    pub fn credentials(&self, also: &[String]) -> Redaction {
+        let mut secrets = Vec::new();
+        for (name, value) in &self.headers {
+            let carries = CREDENTIAL_HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
+                || also.iter().any(|h| name.eq_ignore_ascii_case(h));
+            if !carries || value.trim().is_empty() {
+                continue;
+            }
+            secrets.push(value.trim().to_string());
+            // `Bearer <token>`: the token alone is the credential too, and
+            // a node passing it on writes it without its scheme.
+            if let Some((_, token)) = value.trim().split_once(' ') {
+                if !token.trim().is_empty() {
+                    secrets.push(token.trim().to_string());
+                }
+            }
+        }
+        // The longest first, so a value that contains another is replaced
+        // whole.
+        secrets.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+        secrets.dedup();
+        Redaction { secrets }
+    }
+}
+
+/// Headers that carry a credential on any request, whatever the route's
+/// gate reads: an `Authorization`, a proxy's, a session cookie, and an
+/// instance token.
+pub const CREDENTIAL_HEADERS: &[&str] =
+    &["authorization", "proxy-authorization", "cookie", crate::instance::INSTANCE_TOKEN_HEADER];
+
+/// How long a credential is before it is also replaced inside other text
+/// (see [`Redaction::scrub`]).
+pub const SCRUBBED_INSIDE: usize = 8;
+
+/// What stands in a run's record for a credential its caller sent.
+pub const REDACTED: &str = "(a credential the caller sent: not written down)";
+
+/// The credentials a run holds in memory and never writes down: wherever
+/// one appears in what the run records (its opening request, a value a node
+/// passes on), the record holds [`REDACTED`] in its place. The live run
+/// keeps the real values: only its record is cleaned.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Redaction {
+    secrets: Vec<String>,
+}
+
+impl Redaction {
+    /// Nothing to clean: the record is written as it is.
+    pub fn is_empty(&self) -> bool {
+        self.secrets.is_empty()
+    }
+
+    /// `value` with every credential replaced, in every string it holds. A
+    /// credential is replaced wherever it appears inside a string; one
+    /// shorter than [`SCRUBBED_INSIDE`] only where it is the whole string,
+    /// since a few characters turn up inside unrelated text (an id, a
+    /// count) and replacing them there would corrupt the record.
+    pub fn scrub(&self, value: &mut serde_json::Value) {
+        if self.is_empty() {
+            return;
+        }
+        match value {
+            serde_json::Value::String(text) => {
+                let inside = |secret: &&String| secret.len() >= SCRUBBED_INSIDE && text.contains(secret.as_str());
+                if self.secrets.iter().any(|secret| secret == text) {
+                    *text = REDACTED.to_string();
+                } else if self.secrets.iter().any(|secret| inside(&secret)) {
+                    let mut cleaned = text.clone();
+                    for secret in self.secrets.iter().filter(|secret| secret.len() >= SCRUBBED_INSIDE) {
+                        cleaned = cleaned.replace(secret.as_str(), REDACTED);
+                    }
+                    *text = cleaned;
+                }
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(|item| self.scrub(item)),
+            serde_json::Value::Object(fields) => fields.values_mut().for_each(|field| self.scrub(field)),
+            _ => {}
+        }
     }
 }
 
@@ -236,9 +319,6 @@ pub struct CallerRuntimeConfig {
     pub data_type: DataType,
     pub backpressure: Backpressure,
     pub error_mode: ErrorMode,
-    /// Worker-clock bound on the wait for the caller to attach before
-    /// the run starts. Always > 0 (validated on the signal).
-    pub connect_timeout_secs: u64,
     /// Reject an inbound body / message larger than this.
     pub max_inbound_bytes: u64,
     /// How long the caller's machine may leave what we sent it
@@ -248,12 +328,12 @@ pub struct CallerRuntimeConfig {
     pub caller_silence_secs: u64,
     /// Max total session duration. `0` = no cap.
     pub max_session_secs: u64,
-    /// The run's suspension defaults (the single `can_suspend` axis +
-    /// the default hold time). Seeds the wait-policy resolution chain AND
-    /// decides what a disconnect means (see [`resolve_disconnect`]): a
-    /// non-suspendable run that loses its caller is killed; a suspendable
-    /// run continues with sends going into the void.
-    pub suspend: SuspendPolicy,
+    /// Whether the run goes on once its caller has left (the trigger's
+    /// `outlivesCaller`). Decides what a disconnect means (see
+    /// [`resolve_disconnect`]): a run that does not outlive its caller is
+    /// cancelled when it leaves, and cannot pause while it is on the line;
+    /// one that does carries on, its sends going into the void.
+    pub outlives_caller: bool,
     /// In-RAM inbound window size (WebSocket): how many recent messages the
     /// connection retains for cursors. Bounds RAM on a long-lived socket;
     /// cursors only read this window (never the DB). Always >= 1.
@@ -276,11 +356,10 @@ impl CallerRuntimeConfig {
             data_type: cfg.data_type,
             backpressure: cfg.backpressure,
             error_mode: cfg.error_mode,
-            connect_timeout_secs: cfg.connect_timeout_secs,
             max_inbound_bytes: cfg.max_inbound_bytes,
             caller_silence_secs: cfg.caller_silence_secs,
             max_session_secs: cfg.max_session_secs,
-            suspend: cfg.suspend,
+            outlives_caller: cfg.outlives_caller,
             inbound_window: cfg.window.unwrap_or(DEFAULT_INBOUND_WINDOW),
             journal: cfg.journal_policy(),
         }
@@ -292,11 +371,9 @@ impl CallerRuntimeConfig {
 pub const DEFAULT_INBOUND_WINDOW: usize = 64;
 
 /// What happens when the caller is gone (disconnected, or the response
-/// completed: the same event from the run's view). Derived purely from
-/// the run's `can_suspend` axis, NOT a separate setting (collapsing the
-/// two removed the contradictory combinations): a run that cannot be
-/// suspended is tied to its caller, so losing the caller kills it; a run
-/// that may be suspended outlives the caller, so it keeps running.
+/// completed: the same event from the run's view), read off the run's
+/// `outlivesCaller`: a run tied to its caller ends with it; a run that
+/// outlives its caller keeps running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DisconnectAction {
     /// Cancel THIS execution (via the per-execution cancel-by-execution
@@ -307,11 +384,10 @@ pub enum DisconnectAction {
     ContinueIntoVoid,
 }
 
-/// Resolve the disconnect action from the run's suspendability. Pure; the
-/// one place the mapping lives. `can_suspend == false` (caller-tied) ->
-/// cancel; `true` (survives) -> continue into the void.
-pub fn resolve_disconnect(suspend: SuspendPolicy) -> DisconnectAction {
-    if suspend.can_suspend {
+/// Resolve the disconnect action from the run's `outlivesCaller`. Pure;
+/// the one place the mapping lives.
+pub fn resolve_disconnect(outlives_caller: bool) -> DisconnectAction {
+    if outlives_caller {
         DisconnectAction::ContinueIntoVoid
     } else {
         DisconnectAction::CancelExecution
@@ -516,10 +592,8 @@ pub trait CallerConnection: Send + Sync {
     /// disconnect outcome (under `cancel` a `Disconnected`, under
     /// `keep-running` an `Ok(())` into the void).
     ///
-    /// The bounded wait for a caller to show up happens once, earlier:
-    /// `run_instance::attach_live_caller` waits on `wait_for_attach` for
-    /// `connect_timeout_secs` before the run starts. A no-show leaves
-    /// the run with no caller at all, and `ctx.caller()` fails.
+    /// A caller's run is born with its caller's connection in hand, so
+    /// there is no wait for one to show up.
     async fn ensure_connected(&self) -> Result<(), CallerError>;
 
     /// What the caller sent to open the exchange (method, path, route
@@ -635,7 +709,7 @@ pub struct HttpRequestParts {
 /// shapes so the talk surface is honest: the `Http` variant exposes
 /// respond/write/close and the request parts; the `Websocket` variant
 /// exposes send/receive/request/close. Both share the queries
-/// (`is_connected`) and the one barrier (`ensure_connected`).
+/// (`is_connected`, `ensure_connected`).
 #[derive(Clone)]
 pub enum CallerHandle {
     Http(HttpCaller),
@@ -666,9 +740,8 @@ impl CallerHandle {
         self.conn().is_connected()
     }
 
-    /// Wait until the caller is attached (or fail loud on timeout /
-    /// disconnect). The single barrier; identical meaning for both
-    /// protocols.
+    /// Is the caller still there? Never waits; a gone caller fails loud
+    /// under the disconnect policy. Identical meaning for both protocols.
     pub async fn ensure_connected(&self) -> WeftResult<()> {
         self.conn().ensure_connected().await.map_err(Into::into)
     }
@@ -695,9 +768,9 @@ pub struct HttpCaller {
 }
 
 impl HttpCaller {
-    /// Wait until the caller is attached (no-op if already connected;
-    /// fails loud on the connect timeout / disconnect policy). The single
-    /// barrier, also reachable on the protocol-agnostic `CallerHandle`.
+    /// Is the caller still there? Never waits; a gone caller fails loud
+    /// under the disconnect policy. Also reachable on the
+    /// protocol-agnostic `CallerHandle`.
     pub async fn ensure_connected(&self) -> WeftResult<()> {
         self.conn.ensure_connected().await.map_err(Into::into)
     }
@@ -775,9 +848,9 @@ pub struct WsCaller {
 }
 
 impl WsCaller {
-    /// Wait until the caller is attached (no-op if already connected;
-    /// fails loud on the connect timeout / disconnect policy). The single
-    /// barrier, also reachable on the protocol-agnostic `CallerHandle`.
+    /// Is the caller still there? Never waits; a gone caller fails loud
+    /// under the disconnect policy. Also reachable on the
+    /// protocol-agnostic `CallerHandle`.
     pub async fn ensure_connected(&self) -> WeftResult<()> {
         self.conn.ensure_connected().await.map_err(Into::into)
     }
@@ -1077,8 +1150,10 @@ impl FakeCallerConnection {
         })
     }
 
-    /// Enforce the head-before-first-item rule and mark the wire started.
+    /// Refuse a write after the terminal, enforce the head-before-first-item
+    /// rule and mark the wire started.
     fn commit_head(g: &mut FakeCallerInner, head: &Option<ResponseHead>) -> Result<(), CallerError> {
+        try_terminate(g.terminated)?;
         if head.is_some() {
             try_send_head(g.wire_started)?;
         }
@@ -1104,7 +1179,7 @@ impl FakeCallerConnection {
     /// `keep-running` it is a silent no-op into the void. Mirrors what the
     /// production connection does so the fake exercises the same contract.
     fn disconnected_outcome(&self) -> Result<(), CallerError> {
-        match resolve_disconnect(self.config.suspend) {
+        match resolve_disconnect(self.config.outlives_caller) {
             DisconnectAction::ContinueIntoVoid => Ok(()),
             DisconnectAction::CancelExecution => Err(CallerError::Disconnected),
         }
@@ -1271,19 +1346,37 @@ impl CallerConnection for FakeCallerConnection {
 mod tests {
     use super::*;
 
-    fn tied() -> SuspendPolicy {
-        SuspendPolicy { can_suspend: false, default_hold_secs: 300 }
-    }
-    fn survives() -> SuspendPolicy {
-        SuspendPolicy { can_suspend: true, default_hold_secs: 300 }
-    }
-
+    /// The credentials a request carries are cleaned from everything its
+    /// record holds, the token alone included, and nothing else is.
     #[test]
-    fn disconnect_derives_from_suspendability() {
-        // Caller-tied (can't suspend): a disconnect cancels the run.
-        assert_eq!(resolve_disconnect(tied()), DisconnectAction::CancelExecution);
-        // Survives: a disconnect just sends into the void, run continues.
-        assert_eq!(resolve_disconnect(survives()), DisconnectAction::ContinueIntoVoid);
+    fn a_requests_credentials_are_cleaned_from_its_record() {
+        let request = LiveRequest {
+            headers: vec![
+                ("Authorization".into(), "Bearer tok-12345678".into()),
+                ("X-Api-Key".into(), "key-9".into()),
+                ("Accept".into(), "application/json".into()),
+            ],
+            ..Default::default()
+        };
+        let redaction = request.credentials(&["x-api-key".to_string()]);
+        let mut record = serde_json::json!({
+            "headers": [["Authorization", "Bearer tok-12345678"], ["X-Api-Key", "key-9"], ["Accept", "application/json"]],
+            "passed_on": "token=tok-12345678",
+            "short_inside": "key-9 in a sentence",
+            "short_alone": "key-9",
+            "count": 3,
+        });
+        redaction.scrub(&mut record);
+        assert_eq!(record["headers"][0][1], REDACTED);
+        assert_eq!(record["headers"][1][1], REDACTED);
+        assert_eq!(record["headers"][2][1], "application/json");
+        assert_eq!(record["passed_on"], format!("token={REDACTED}"));
+        // A value shorter than SCRUBBED_INSIDE would match ordinary text,
+        // so only a string that is exactly it is replaced.
+        assert_eq!(record["short_inside"], "key-9 in a sentence");
+        assert_eq!(record["short_alone"], REDACTED);
+        assert_eq!(record["count"], 3);
+        assert!(LiveRequest::default().credentials(&[]).is_empty());
     }
 
     #[test]
@@ -1330,8 +1423,7 @@ mod tests {
             path: "chat".into(),
             methods: Vec::new(),
             auth: crate::signal::PublicEntryAuth::None,
-            suspend: SuspendPolicy { can_suspend: true, default_hold_secs: 120 },
-            connect_timeout_secs: 12,
+            outlives_caller: true,
             heartbeat_interval_secs: 25,
             caller_silence_secs: 45,
             max_inbound_bytes: 4096,
@@ -1342,16 +1434,13 @@ mod tests {
             journal_mode: crate::signal::JournalMode::Journaled,
             journal_window_secs: None,
             window: None,
-            recorded: true,
         };
         let rc = CallerRuntimeConfig::from_config(&cfg, Protocol::Websocket);
         assert_eq!(rc.protocol, Protocol::Websocket);
-        assert!(rc.suspend.can_suspend);
-        assert_eq!(rc.suspend.default_hold_secs, 120);
+        assert!(rc.outlives_caller);
         assert_eq!(rc.data_type, DataType::Text);
         assert_eq!(rc.backpressure, Backpressure::DropNewest);
         assert_eq!(rc.error_mode, ErrorMode::DropChunk);
-        assert_eq!(rc.connect_timeout_secs, 12);
         assert_eq!(rc.max_inbound_bytes, 4096);
         assert_eq!(rc.max_session_secs, 600);
         assert_eq!(
@@ -1366,12 +1455,11 @@ mod tests {
             data_type: DataType::Json,
             backpressure: Backpressure::Block,
             error_mode: ErrorMode::Surface,
-            connect_timeout_secs: 5,
             max_inbound_bytes: 1024,
             caller_silence_secs: crate::signal::DEFAULT_CALLER_SILENCE_SECS,
             max_session_secs: 0,
             // Caller-tied: a gone caller cancels (exercised below).
-            suspend: tied(),
+            outlives_caller: false,
             inbound_window: DEFAULT_INBOUND_WINDOW,
             journal: crate::stream_journal::JournalPolicy::default(),
         }
@@ -1392,12 +1480,12 @@ mod tests {
     #[test]
     fn who_owns_the_run_decides_what_a_disconnect_does() {
         assert_eq!(
-            resolve_disconnect(tied()),
+            resolve_disconnect(false),
             DisconnectAction::CancelExecution,
             "a tied run ends with its caller"
         );
         assert_eq!(
-            resolve_disconnect(SuspendPolicy { can_suspend: true, default_hold_secs: 0 }),
+            resolve_disconnect(true),
             DisconnectAction::ContinueIntoVoid,
             "a run that outlives its caller carries on, writing into the void"
         );
@@ -1557,9 +1645,9 @@ mod tests {
 
     #[tokio::test]
     async fn talk_into_void_when_survives_but_cancels_when_tied() {
-        // survives (can_suspend = true): a gone caller is a silent no-op.
+        // Outlives its caller: a gone caller is a silent no-op.
         let keep = FakeCallerConnection::connected(CallerRuntimeConfig {
-            suspend: survives(),
+            outlives_caller: true,
             ..http_cfg()
         });
         keep.set_connected(false);
@@ -1567,7 +1655,7 @@ mod tests {
         h.write(OutboundChunk::Json(serde_json::json!("x"))).await
             .expect("survives drops into the void, no error");
 
-        // tied (can_suspend = false): a gone caller errors (maps to cancel).
+        // Tied to its caller: a gone caller errors (maps to cancel).
         let cancel = FakeCallerConnection::connected(http_cfg());
         cancel.set_connected(false);
         let CallerHandle::Http(h2) = CallerHandle::from_connection(cancel) else { unreachable!() };

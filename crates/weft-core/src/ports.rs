@@ -36,6 +36,12 @@ pub const OBJECT_STORE: u16 = 14115;
 /// port a user's image is likely to use.
 pub const UNIT_AGENT: u16 = 14116;
 
+/// The block the default install gives its projects their own ports
+/// from, one each, both ends included (`projectPorts` in its config). An
+/// install beside it takes free ports instead, since this block is the
+/// default install's.
+pub const PROJECTS: (u16, u16) = (14200, 14399);
+
 /// Where the default install answers on this machine until it is started
 /// on another port. A literal because a `&str` const cannot be formatted;
 /// the test below keeps it on [`PUBLIC`].

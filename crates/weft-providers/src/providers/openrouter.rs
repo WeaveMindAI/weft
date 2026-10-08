@@ -16,21 +16,9 @@
 //! - `GET models` is FREE: the public price catalog.
 //!
 //! Everything else is Unknown.
-//!
-//! The price ceiling is minillmlib's own estimator, fed EXCLUSIVELY from
-//! the request bytes about to be forwarded: the body IS the JSON minillmlib
-//! serialized, so the conversation and the output bounds deserialize
-//! straight back out of it. Nothing besides those bytes ever influences the
-//! figure, so a caller cannot understate what it is about to spend.
 
-use std::collections::BTreeMap;
-use std::sync::Mutex;
 use std::time::Duration;
 
-use minillmlib::{
-    estimate_cost_usd, CompletionParameters, GeneratorInfo, Message, ProviderSettings,
-    ReasoningConfig,
-};
 use serde_json::{json, Value};
 use weft_core::access::spec::percent_encode;
 
@@ -39,12 +27,7 @@ use crate::{
     CallObservation, FollowUp, MeasuredCost, ObservedCall, Pricing, ProviderMeter, RouteClass,
 };
 
-pub struct OpenRouterMeter {
-    /// Pooled keyless generators per pricing key: minillmlib caches the
-    /// model's published rates on the generator (clones share the cache),
-    /// so the price catalog is fetched once per TTL rather than per call.
-    generators: Mutex<BTreeMap<String, GeneratorInfo>>,
-}
+pub struct OpenRouterMeter;
 
 /// A generation's ledger record becomes queryable ~9s after the generation
 /// ends, and a CANCELLED generation only after the upstream run finishes on
@@ -52,67 +35,13 @@ pub struct OpenRouterMeter {
 /// margin. The polled route is free, so the retry spends nothing.
 const LEDGER_POLLS: u32 = 25;
 
-/// The process-wide OpenRouter meter (its rates pool is shared state, so it
-/// lives in a `static`, not a `const`).
-pub static OPENROUTER: OpenRouterMeter =
-    OpenRouterMeter { generators: Mutex::new(BTreeMap::new()) };
+/// The OpenRouter meter.
+pub static OPENROUTER: OpenRouterMeter = OpenRouterMeter;
 
 // Self-register into the crate's meter registry: this line is the ONLY thing
 // besides the `mod` declaration that adding a provider needs.
 crate::register_meter!(OPENROUTER);
 
-impl OpenRouterMeter {
-    /// The pooled generator whose price cache serves `model`.
-    fn generator_for(&self, model: &str) -> GeneratorInfo {
-        let fresh = GeneratorInfo::openrouter(model);
-        let mut pool = self.generators.lock().expect("generator pool lock");
-        pool.entry(fresh.pricing_key()).or_insert(fresh).clone()
-    }
-}
-
-/// Everything the ceiling estimate reads, extracted from the request body.
-/// Pure, so the extraction is testable without a price catalog: the
-/// conversation, the output bounds, and the provider pin, all straight off
-/// the wire bytes (the only input a billing figure may trust).
-fn ceiling_inputs(
-    body: &[u8],
-) -> anyhow::Result<(String, Vec<Message>, CompletionParameters, Option<String>)> {
-    let parsed: Value = serde_json::from_slice(body)
-        .map_err(|e| anyhow::anyhow!("chat/completions body is not JSON: {e}"))?;
-    let model = parsed["model"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("chat/completions body names no model"))?
-        .to_string();
-    // The body is the JSON minillmlib itself serializes, so the
-    // conversation deserializes straight back out of it.
-    let messages: Vec<Message> = serde_json::from_value(parsed["messages"].clone())
-        .map_err(|e| anyhow::anyhow!("chat/completions messages do not parse: {e}"))?;
-
-    // The output bounds the estimator reads: the completion cap (either
-    // wire spelling) and the reasoning budget.
-    let mut params = CompletionParameters::new();
-    if let Some(cap) =
-        parsed["max_tokens"].as_u64().or_else(|| parsed["max_completion_tokens"].as_u64())
-    {
-        params = params.with_max_tokens(u32::try_from(cap).unwrap_or(u32::MAX));
-    }
-    if !parsed["reasoning"].is_null() {
-        let reasoning: ReasoningConfig = serde_json::from_value(parsed["reasoning"].clone())
-            .map_err(|e| anyhow::anyhow!("chat/completions reasoning does not parse: {e}"))?;
-        params = params.with_reasoning(reasoning);
-    }
-
-    // A routing pin with fallbacks off pins the serving provider, and
-    // therefore the price; anything looser prices at the dearest endpoint.
-    let billing_provider = if parsed["provider"].is_null() {
-        None
-    } else {
-        let routing: ProviderSettings = serde_json::from_value(parsed["provider"].clone())
-            .map_err(|e| anyhow::anyhow!("chat/completions provider routing does not parse: {e}"))?;
-        routing.billing_provider()
-    };
-    Ok((model, messages, params, billing_provider))
-}
 
 #[async_trait::async_trait]
 impl ProviderMeter for OpenRouterMeter {
@@ -141,9 +70,9 @@ impl ProviderMeter for OpenRouterMeter {
         // `usage: {include: true}` opt-in is deprecated on chat and not
         // an accepted field on embeddings/rerank at all, docs checked
         // 2026-08), so no route needs a cost opt-in rewrite. Only chat
-        // rewrites: it sheds the media estimation metadata the caller's
-        // wire carried for the ceiling (`ceiling_inputs` has read it by
-        // now); internal breadcrumbs have no business riding upstream.
+        // rewrites: it sheds the media metadata minillmlib's wire carries
+        // for its own cost estimates (a clip's length, an image's size);
+        // internal breadcrumbs have no business riding upstream.
         // Any route this meter never classified billable refuses loud
         // (in release too) rather than assume the caller classified
         // first.
@@ -171,59 +100,6 @@ impl ProviderMeter for OpenRouterMeter {
             }
         }
         Ok(Some(serde_json::to_vec(&parsed)?))
-    }
-
-    async fn ceiling_usd(
-        &self,
-        path: &str,
-        body: &[u8],
-        _follow_up: FollowUp<'_>,
-    ) -> anyhow::Result<f64> {
-        // Embeddings and rerank estimate from the request's own text at
-        // the REQUEST MODEL's published input rate (the same catalog the
-        // chat estimator prices from), over-counting tokens at one per 3
-        // characters. A per-search-priced rerank model (Cohere: $2.50 per
-        // 1k searches) is covered by the flat per-search component.
-        // `usage.cost` in the response settles the truth.
-        if path == "embeddings" || path == "rerank" {
-            let parsed: Value = serde_json::from_slice(body)
-                .map_err(|e| anyhow::anyhow!("{path} body is not JSON: {e}"))?;
-            let model = parsed
-                .get("model")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("{path} body names no model"))?
-                .to_string();
-            let mut chars = 0usize;
-            let mut count = |v: &Value| match v {
-                Value::String(s) => chars += s.len(),
-                Value::Array(items) => {
-                    for i in items {
-                        if let Some(s) = i.as_str() {
-                            chars += s.len();
-                        }
-                    }
-                }
-                _ => {}
-            };
-            count(parsed.get("input").unwrap_or(&Value::Null));
-            count(parsed.get("query").unwrap_or(&Value::Null));
-            count(parsed.get("documents").unwrap_or(&Value::Null));
-            let rates = self
-                .generator_for(&model)
-                .model_rates_served_by(None)
-                .await
-                .map_err(|e| anyhow::anyhow!("cannot price model '{model}': {e}"))?;
-            const PER_SEARCH_USD: f64 = 0.0025;
-            let tokens = chars as f64 / 3.0;
-            return Ok(PER_SEARCH_USD + tokens * rates.price.input_per_mtok / 1_000_000.0);
-        }
-        let (model, messages, params, billing_provider) = ceiling_inputs(body)?;
-        let rates = self
-            .generator_for(&model)
-            .model_rates_served_by(billing_provider.as_deref())
-            .await
-            .map_err(|e| anyhow::anyhow!("cannot price model '{model}': {e}"))?;
-        Ok(estimate_cost_usd(&messages, &params, &rates))
     }
 
     fn observe(&self, _path: &str, _query: &str, _request_body: &[u8]) -> Box<dyn CallObservation> {
@@ -627,9 +503,8 @@ mod tests {
         assert_eq!(percent_encode("gen-a b/c?&#%"), "gen-a%20b%2Fc%3F%26%23%25");
     }
 
-    /// The media estimation metadata the caller's wire carried (for the
-    /// price ceiling) is shed before the bytes go upstream; the media
-    /// itself is untouched.
+    /// The media estimation metadata the caller's wire carried is shed
+    /// before the bytes go upstream; the media itself is untouched.
     #[test]
     fn prepare_sheds_the_estimation_metadata_before_forwarding() {
         let body = serde_json::json!({
@@ -651,34 +526,6 @@ mod tests {
         assert_eq!(parts[0]["input_audio"]["format"], "mp3");
         assert!(parts[1]["image_url"].get("width").is_none(), "{parsed}");
         assert_eq!(parts[1]["image_url"]["url"], "https://x/y.png");
-    }
-
-    /// Declared media metadata sharpens the ceiling: the same request with
-    /// a long declared audio clip must price higher than with a short one.
-    #[test]
-    fn declared_media_metadata_sharpens_the_ceiling() {
-        let body_with = |secs: f64| {
-            serde_json::to_vec(&serde_json::json!({
-                "model": "m", "max_tokens": 10,
-                "messages": [{"role": "user", "content": [
-                    {"type": "input_audio",
-                     "input_audio": {"data": "AAAA", "format": "mp3", "duration_secs": secs}}
-                ]}]
-            }))
-            .unwrap()
-        };
-        let rates = minillmlib::ModelRates {
-            price: minillmlib::TokenPrice::new(3.0, 15.0),
-            max_completion_tokens: Some(1000),
-            context_length: 200_000,
-        };
-        let estimate = |body: &[u8]| {
-            let (_, messages, params, _) = ceiling_inputs(body).unwrap();
-            estimate_cost_usd(&messages, &params, &rates)
-        };
-        let short = estimate(&body_with(5.0));
-        let long = estimate(&body_with(3600.0));
-        assert!(long > short, "long clip {long} must out-price short clip {short}");
     }
 
     // ---- L2: observation + resolve against recorded real responses -----
@@ -718,7 +565,9 @@ mod tests {
         let observed = obs.end(false);
 
         let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
-        let follow_up = FollowUp { http: &http, base_url: "http://unused.test" };
+
+        let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
+        let follow_up = FollowUp { http: &http, base_url: "http://unused.test", shared: &shared };
         let cost = meter().resolve("chat/completions", observed, follow_up).await;
         assert_eq!(cost.amount_usd, Some(0.000096));
         assert_eq!(cost.model.as_deref(), Some("anthropic/claude-sonnet-4.6"));
@@ -740,7 +589,8 @@ mod tests {
         obs.on_chunk(body.as_bytes());
         let observed = obs.end(false);
         let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
-        let follow_up = FollowUp { http: &http, base_url: "http://unused.test" };
+        let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
+        let follow_up = FollowUp { http: &http, base_url: "http://unused.test", shared: &shared };
         let cost = meter().resolve("embeddings", observed, follow_up).await;
         assert_eq!(cost.amount_usd, Some(0.0000006));
         assert_eq!(cost.model.as_deref(), Some("openai/text-embedding-3-small"));
@@ -762,7 +612,8 @@ mod tests {
         obs.on_chunk(body.as_bytes());
         let observed = obs.end(false);
         let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
-        let follow_up = FollowUp { http: &http, base_url: "http://unused.test" };
+        let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
+        let follow_up = FollowUp { http: &http, base_url: "http://unused.test", shared: &shared };
         let cost = meter().resolve("rerank", observed, follow_up).await;
         assert_eq!(cost.amount_usd, Some(0.0025));
         assert_eq!(cost.model.as_deref(), Some("cohere/rerank-3.5"));
@@ -783,8 +634,9 @@ mod tests {
         obs.on_status(200);
         obs.on_chunk(body.as_bytes());
         let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         let cost = meter()
-            .resolve("chat/completions", obs.end(false), FollowUp { http: &http, base_url: "http://u.test" })
+            .resolve("chat/completions", obs.end(false), FollowUp { http: &http, base_url: "http://u.test", shared: &shared })
             .await;
         assert_eq!(cost.amount_usd, Some(0.00042));
     }
@@ -809,8 +661,10 @@ mod tests {
         let observed = obs.end(false);
 
         let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+
+        let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         let cost = meter()
-            .resolve("chat/completions", observed, FollowUp { http: &http, base_url: "http://u.test" })
+            .resolve("chat/completions", observed, FollowUp { http: &http, base_url: "http://u.test", shared: &shared })
             .await;
         assert_eq!(cost.amount_usd, Some(0.000031));
         assert_eq!(cost.model.as_deref(), Some("anthropic/claude-sonnet-4.6"));
@@ -823,8 +677,9 @@ mod tests {
         obs.on_status(401);
         obs.on_chunk(br#"{"error":{"message":"invalid key","code":401}}"#);
         let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         let cost = meter()
-            .resolve("chat/completions", obs.end(false), FollowUp { http: &http, base_url: "http://u.test" })
+            .resolve("chat/completions", obs.end(false), FollowUp { http: &http, base_url: "http://u.test", shared: &shared })
             .await;
         assert_eq!(cost.amount_usd, Some(0.0));
     }
@@ -835,86 +690,11 @@ mod tests {
     async fn an_unanchored_interrupt_is_unknown_not_zero() {
         let obs = meter().observe("chat/completions", "", b"");
         let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         let cost = meter()
-            .resolve("chat/completions", obs.end(true), FollowUp { http: &http, base_url: "http://u.test" })
+            .resolve("chat/completions", obs.end(true), FollowUp { http: &http, base_url: "http://u.test", shared: &shared })
             .await;
         assert_eq!(cost.amount_usd, None);
         assert!(cost.metadata["resolution"].as_str().unwrap().starts_with("unknown"));
-    }
-
-    // ---- L1: the ceiling inputs come ONLY from the wire bytes ----------
-
-    /// The estimator's inputs are extracted from the request body itself
-    /// (the conversation round-trips through minillmlib's own wire shape),
-    /// and the figure they produce moves with the declared output cap.
-    /// Rates are hand-built, so this is pure.
-    #[test]
-    fn the_ceiling_reads_the_wire_bytes_and_scales_with_the_declared_cap() {
-        let body = serde_json::json!({
-            "model": "anthropic/claude-sonnet-4.6",
-            "messages": [
-                {"role": "system", "content": "You are helpful."},
-                {"role": "user", "content": "Hello there, meter."}
-            ],
-            "max_tokens": 1000,
-            "stream": true,
-            "usage": {"include": true}
-        });
-        let (model, messages, params, pin) =
-            ceiling_inputs(&serde_json::to_vec(&body).unwrap()).unwrap();
-        assert_eq!(model, "anthropic/claude-sonnet-4.6");
-        assert_eq!(messages.len(), 2, "the conversation round-trips off the wire");
-        assert_eq!(pin, None, "no routing pin on the body");
-
-        let rates = minillmlib::ModelRates {
-            price: minillmlib::TokenPrice::new(3.0, 15.0),
-            max_completion_tokens: Some(64000),
-            context_length: 200000,
-        };
-        let capped = estimate_cost_usd(&messages, &params, &rates);
-        // Without the declared cap, the model's published cap bounds the
-        // output side, so the ceiling must be strictly larger.
-        let (_, _, uncapped_params, _) = ceiling_inputs(
-            &serde_json::to_vec(&serde_json::json!({
-                "model": "anthropic/claude-sonnet-4.6",
-                "messages": body["messages"],
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let uncapped = estimate_cost_usd(&messages, &uncapped_params, &rates);
-        assert!(capped > 0.0, "{capped}");
-        assert!(uncapped > capped, "uncapped {uncapped} must exceed capped {capped}");
-    }
-
-    /// A routing pin with fallbacks OFF pins the billing provider; anything
-    /// looser prices at the dearest endpoint (no pin).
-    #[test]
-    fn the_billing_pin_requires_fallbacks_off() {
-        let pinned = serde_json::json!({
-            "model": "m", "messages": [],
-            "provider": {"order": ["anthropic"], "allow_fallbacks": false}
-        });
-        let (_, _, _, pin) = ceiling_inputs(&serde_json::to_vec(&pinned).unwrap()).unwrap();
-        assert_eq!(pin.as_deref(), Some("anthropic"));
-
-        let loose = serde_json::json!({
-            "model": "m", "messages": [],
-            "provider": {"order": ["anthropic"]}
-        });
-        let (_, _, _, pin) = ceiling_inputs(&serde_json::to_vec(&loose).unwrap()).unwrap();
-        assert_eq!(pin, None, "fallbacks allowed = anyone may serve = no price pin");
-    }
-
-    /// An unpriceable request is a loud error, never a guess: no model
-    /// named, or a conversation that does not parse.
-    #[test]
-    fn an_unpriceable_call_is_a_loud_error_never_a_guess() {
-        assert!(ceiling_inputs(br#"{"messages": []}"#).is_err(), "no model");
-        assert!(
-            ceiling_inputs(br#"{"model": "m", "messages": "not an array"}"#).is_err(),
-            "unparseable conversation"
-        );
-        assert!(ceiling_inputs(b"not json").is_err());
     }
 }

@@ -2,15 +2,15 @@
 //!
 //! A worker is the project's compiled program serving HTTP. Weft does not
 //! keep workers running and hand them work from a queue: it CALLS a worker
-//! for each execution (`POST /run/<execution_id>` for a short run, the caller's
-//! own forwarded request for a live one), and the worker answers when the
-//! execution ends or waits on something outside it. A long run is started
-//! as a job instead. That is the whole protocol, and it is weft's, the
-//! same on every platform (see `weft_engine::worker_server`).
+//! for each execution (`POST /run/<execution_id>`, or the caller's own
+//! forwarded request for a live one), and the worker answers when the
+//! execution ends or waits on something outside it. That is the whole
+//! protocol, and it is weft's, the same on every platform (see
+//! `weft_engine::worker_server`).
 //!
 //! What differs per platform is only where that HTTP server lives and how
 //! to get an address for it, which is what this trait answers: a local
-//! container started on demand, a Cloud Run service, a Cloud Run job.
+//! container started on demand, or a Cloud Run service.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,9 @@ pub struct WorkerTarget {
     pub project: uuid::Uuid,
     /// The worker image to run (content-addressed by its binary hash).
     pub image: String,
+    /// The program's binary the image holds, whose routes the worker
+    /// serves; `None` for a node-test server, which serves no routes.
+    pub binary_hash: Option<String>,
     pub settings: WorkerSettings,
 }
 
@@ -41,13 +44,18 @@ pub struct WorkerSettings {
     /// Most copies at once.
     #[serde(default = "WorkerSettings::default_max_instances")]
     pub max_instances: u32,
-    /// Executions one copy serves at once.
+    /// How many calls Cloud Run sends one copy at once; a local install
+    /// does not use it.
     #[serde(default = "WorkerSettings::default_concurrency")]
     pub concurrency: u32,
-    /// CPUs per copy, as the platform counts them ("1", "2", "0.5").
-    #[serde(default = "WorkerSettings::default_cpu")]
-    pub cpu: String,
-    /// Memory per copy ("512Mi", "2Gi").
+    /// CPUs per copy on a cloud, as the platform counts them ("1", "2",
+    /// "0.5"); unset, one CPU on Cloud Run
+    /// ([`WorkerSettings::CLOUD_DEFAULT_CPU`]). A local install does not
+    /// cap a copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<String>,
+    /// Memory per copy on a cloud ("512Mi", "2Gi"). A local install does
+    /// not cap a copy.
     #[serde(default = "WorkerSettings::default_memory")]
     pub memory: String,
     /// Extra CPU while a copy starts, where the platform offers it.
@@ -59,9 +67,59 @@ pub struct WorkerSettings {
     /// bills the copy for as long as it is up.
     #[serde(default)]
     pub cpu_always_allocated: bool,
+    /// How long a copy holds a live thing its runs share (`ctx.shared`: a
+    /// pool of database connections, ready Python processes) once nothing
+    /// used it, in seconds. Longer saves rebuilding it after a quiet
+    /// stretch; shorter lets it go sooner. The worker reads it from
+    /// [`SHARED_IDLE_ENV`].
+    #[serde(default = "WorkerSettings::default_shared_idle_seconds")]
+    pub shared_idle_seconds: u64,
+    /// The most runs one copy takes at once. A call past it waits for a
+    /// run to end (`max_queue_wait_seconds`) instead of being refused.
+    /// Unset, a copy takes as many as its memory holds at a MiB each, and
+    /// never fewer than 64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_runs_at_once: Option<u32>,
+    /// How long a call waits for one of a copy's runs to end when it takes
+    /// all it may, in seconds, before it is answered busy (`503`).
+    #[serde(default = "WorkerSettings::default_max_queue_wait_seconds")]
+    pub max_queue_wait_seconds: u64,
+}
+
+/// The variable a worker reads [`WorkerSettings::shared_idle_seconds`]
+/// from; every platform sets it on every worker it starts.
+pub const SHARED_IDLE_ENV: &str = "WEFT_SHARED_IDLE_SECS";
+
+/// The variable a worker reads [`WorkerSettings::max_runs_at_once`] from,
+/// set only when the setting is.
+pub const MAX_RUNS_AT_ONCE_ENV: &str = "WEFT_MAX_RUNS_AT_ONCE";
+
+/// The variable a worker reads [`WorkerSettings::max_queue_wait_seconds`]
+/// from; every platform sets it on every worker it starts.
+pub const MAX_QUEUE_WAIT_ENV: &str = "WEFT_MAX_QUEUE_WAIT_SECS";
+
+impl WorkerSettings {
+    /// The variables a platform sets on every worker it starts for these
+    /// settings, each with its value.
+    pub fn worker_env(&self) -> Vec<(&'static str, String)> {
+        let mut env = vec![
+            (SHARED_IDLE_ENV, self.shared_idle_seconds.to_string()),
+            (MAX_QUEUE_WAIT_ENV, self.max_queue_wait_seconds.to_string()),
+        ];
+        if let Some(most) = self.max_runs_at_once {
+            env.push((MAX_RUNS_AT_ONCE_ENV, most.to_string()));
+        }
+        env
+    }
 }
 
 impl WorkerSettings {
+    fn default_shared_idle_seconds() -> u64 {
+        300
+    }
+    fn default_max_queue_wait_seconds() -> u64 {
+        30
+    }
     fn default_max_instances() -> u32 {
         10
     }
@@ -73,9 +131,9 @@ impl WorkerSettings {
     fn default_concurrency() -> u32 {
         80
     }
-    fn default_cpu() -> String {
-        "1".into()
-    }
+    /// What a copy gets on a cloud whose services need a CPU count when
+    /// the project and the install set none.
+    pub const CLOUD_DEFAULT_CPU: &'static str = "1";
     fn default_memory() -> String {
         "1Gi".into()
     }
@@ -97,89 +155,128 @@ impl WorkerSettings {
         if self.concurrency == 0 {
             return Err("workers.concurrency is 0: a copy could serve nothing; set it to 1 or more".into());
         }
-        if self.cpu.trim().is_empty() || self.memory.trim().is_empty() {
-            return Err("workers.cpu and workers.memory must both be set".into());
+        if self.cpu.as_deref().is_some_and(|cpu| cpu.trim().is_empty()) {
+            return Err("workers.cpu is empty; set a CPU count (\"1\", \"0.5\") or unset it for the platform's own".into());
+        }
+        if self.memory.trim().is_empty() {
+            return Err("workers.memory must be set".into());
+        }
+        if self.max_runs_at_once == Some(0) {
+            return Err("workers.max_runs_at_once is 0: a copy could take no run; set it to 1 or more, or unset it to follow the copy's memory".into());
         }
         Ok(())
     }
 }
 
-/// A project's own worker levers: each one it sets replaces the install's
-/// ([`WorkerSettings::with`]); unset ones follow the install.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkerOverrides {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub min_instances: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_instances: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub concurrency: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub startup_boost: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu_always_allocated: Option<bool>,
-}
-
-impl WorkerOverrides {
-    /// Whether no lever is set.
-    pub fn is_empty(&self) -> bool {
-        *self == Self::default()
-    }
-
-    /// Every lever's name, as the flags, the API and a `weft.toml` spell it.
-    pub const LEVERS: [&'static str; 7] =
-        ["min_instances", "max_instances", "concurrency", "cpu", "memory", "startup_boost", "cpu_always_allocated"];
-
-    /// `self` with every lever `o` sets in its place.
-    pub fn merged(&self, o: &WorkerOverrides) -> Self {
-        Self {
-            min_instances: o.min_instances.or(self.min_instances),
-            max_instances: o.max_instances.or(self.max_instances),
-            concurrency: o.concurrency.or(self.concurrency),
-            cpu: o.cpu.clone().or_else(|| self.cpu.clone()),
-            memory: o.memory.clone().or_else(|| self.memory.clone()),
-            startup_boost: o.startup_boost.or(self.startup_boost),
-            cpu_always_allocated: o.cpu_always_allocated.or(self.cpu_always_allocated),
+/// What a project may set of [`WorkerSettings`] for itself: a lever
+/// replaces the install's setting ([`WorkerSettings::with`]) where a
+/// project sets it. Listed here once; the overrides struct, the lever
+/// names and every per-lever operation follow from the list, and
+/// `every_setting_is_a_lever` holds it to [`WorkerSettings`]' fields.
+macro_rules! worker_levers {
+    ($($lever:ident: $setting:ty),* $(,)?) => {
+        /// A project's own worker levers: each one it sets replaces the
+        /// install's ([`WorkerSettings::with`]); unset ones follow the
+        /// install.
+        #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        pub struct WorkerOverrides {
+            $(
+                #[serde(default, skip_serializing_if = "Option::is_none")]
+                pub $lever: Option<<$setting as Lever>::Set>,
+            )*
         }
-    }
 
-    /// Put the lever named `name` back on the install's. Refused, listing
-    /// the levers, for a name that is not one.
-    pub fn unset(&mut self, name: &str) -> Result<(), String> {
-        match name {
-            "min_instances" => self.min_instances = None,
-            "max_instances" => self.max_instances = None,
-            "concurrency" => self.concurrency = None,
-            "cpu" => self.cpu = None,
-            "memory" => self.memory = None,
-            "startup_boost" => self.startup_boost = None,
-            "cpu_always_allocated" => self.cpu_always_allocated = None,
-            other => {
-                return Err(format!("'{other}' is not a worker lever; the levers are {}", Self::LEVERS.join(", ")))
+        impl WorkerOverrides {
+            /// Whether no lever is set.
+            pub fn is_empty(&self) -> bool {
+                *self == Self::default()
+            }
+
+            /// Every lever's name, as the flags, the API and a `weft.toml`
+            /// spell it.
+            pub const LEVERS: &'static [&'static str] = &[$(stringify!($lever)),*];
+
+            /// `self` with every lever `o` sets in its place.
+            pub fn merged(&self, o: &WorkerOverrides) -> Self {
+                Self { $($lever: o.$lever.clone().or_else(|| self.$lever.clone()),)* }
+            }
+
+            /// Put the lever named `name` back on the install's. Refused,
+            /// listing the levers, for a name that is not one.
+            pub fn unset(&mut self, name: &str) -> Result<(), String> {
+                $(if name == stringify!($lever) {
+                    self.$lever = None;
+                    return Ok(());
+                })*
+                Err(format!("'{name}' is not a worker lever; the levers are {}", Self::LEVERS.join(", ")))
+            }
+
+            /// Whether the lever named `name` is set here.
+            pub fn sets(&self, name: &str) -> bool {
+                $(if name == stringify!($lever) {
+                    return self.$lever.is_some();
+                })*
+                false
             }
         }
-        Ok(())
-    }
 
-    /// Whether the lever named `name` is set here.
-    pub fn sets(&self, name: &str) -> bool {
-        match name {
-            "min_instances" => self.min_instances.is_some(),
-            "max_instances" => self.max_instances.is_some(),
-            "concurrency" => self.concurrency.is_some(),
-            "cpu" => self.cpu.is_some(),
-            "memory" => self.memory.is_some(),
-            "startup_boost" => self.startup_boost.is_some(),
-            "cpu_always_allocated" => self.cpu_always_allocated.is_some(),
-            _ => false,
+        impl WorkerSettings {
+            /// These settings with `o`'s set levers in their place.
+            pub fn with(&self, o: &WorkerOverrides) -> Self {
+                Self { $($lever: self.$lever.overridden(&o.$lever),)* }
+            }
         }
-    }
+    };
 }
+
+worker_levers! {
+    min_instances: u32,
+    max_instances: u32,
+    concurrency: u32,
+    cpu: Option<String>,
+    memory: String,
+    startup_boost: bool,
+    cpu_always_allocated: bool,
+    shared_idle_seconds: u64,
+    max_runs_at_once: Option<u32>,
+    max_queue_wait_seconds: u64,
+}
+
+/// A setting a project can override: what it sets, and the setting once
+/// it did.
+pub trait Lever: Clone {
+    /// What a project sets.
+    type Set: Clone;
+    fn overridden(&self, by: &Option<Self::Set>) -> Self;
+}
+
+macro_rules! plain_lever {
+    ($($ty:ty),*) => {$(
+        impl Lever for $ty {
+            type Set = $ty;
+            fn overridden(&self, by: &Option<$ty>) -> Self {
+                by.clone().unwrap_or_else(|| self.clone())
+            }
+        }
+    )*};
+}
+plain_lever!(u32, u64, bool, String);
+
+/// A setting the install may leave to the platform (`cpu`) or to the
+/// copy (`max_runs_at_once`): a project sets a value, never that default
+/// back.
+macro_rules! optional_lever {
+    ($($ty:ty),*) => {$(
+        impl Lever for Option<$ty> {
+            type Set = $ty;
+            fn overridden(&self, by: &Option<$ty>) -> Self {
+                by.clone().or_else(|| self.clone())
+            }
+        }
+    )*};
+}
+optional_lever!(String, u32);
 
 /// `GET/PUT /projects/{id}/workers`: a project's worker levers, where
 /// each one comes from, and what its workers run with.
@@ -193,31 +290,19 @@ pub struct WorkersResponse {
     pub effective: WorkerSettings,
 }
 
-impl WorkerSettings {
-    /// These settings with `o`'s set levers in their place.
-    pub fn with(&self, o: &WorkerOverrides) -> Self {
-        Self {
-            min_instances: o.min_instances.unwrap_or(self.min_instances),
-            max_instances: o.max_instances.unwrap_or(self.max_instances),
-            concurrency: o.concurrency.unwrap_or(self.concurrency),
-            cpu: o.cpu.clone().unwrap_or_else(|| self.cpu.clone()),
-            memory: o.memory.clone().unwrap_or_else(|| self.memory.clone()),
-            startup_boost: o.startup_boost.unwrap_or(self.startup_boost),
-            cpu_always_allocated: o.cpu_always_allocated.unwrap_or(self.cpu_always_allocated),
-        }
-    }
-}
-
 impl Default for WorkerSettings {
     fn default() -> Self {
         Self {
             min_instances: 0,
             max_instances: Self::default_max_instances(),
             concurrency: Self::default_concurrency(),
-            cpu: Self::default_cpu(),
+            cpu: None,
             memory: Self::default_memory(),
             startup_boost: Self::default_startup_boost(),
             cpu_always_allocated: false,
+            shared_idle_seconds: Self::default_shared_idle_seconds(),
+            max_runs_at_once: None,
+            max_queue_wait_seconds: Self::default_max_queue_wait_seconds(),
         }
     }
 }
@@ -226,11 +311,12 @@ impl Default for WorkerSettings {
 ///
 /// Not `Authorization`: a live caller's request is forwarded to the worker
 /// with its headers intact (they are the program's data), and a caller's
-/// own `Authorization` must reach the program untouched. Cloud Run checks
-/// the invoker's identity in this header when present, so the one header
-/// serves both the platform door and the key door.
-// SYNC: WORKER_AUTH_HEADER <-> crates/weft-engine/src/worker.rs (WorkerDoor::admits_headers)
-pub const WORKER_AUTH_HEADER: &str = "x-serverless-authorization";
+/// own `Authorization` must reach the program untouched. Not Cloud Run's
+/// `X-Serverless-Authorization` either: a project's service takes calls
+/// from anybody, and the platform reads that one as its own. The worker
+/// takes it out of every call before the program sees it.
+// SYNC: WORKER_AUTH_HEADER <-> crates/weft-engine/src/worker.rs (WeftCredential::admits_headers)
+pub const WORKER_AUTH_HEADER: &str = "x-weft-worker-key";
 
 /// The header a worker's server sets on every answer it gives, so weft
 /// can tell an answer from the program (a route's own 404 included) from
@@ -291,8 +377,7 @@ impl WorkerCall {
     }
 }
 
-/// How long a caller of [`Runner::endpoint`] or [`Runner::start_long`]
-/// will wait on a bring-up of the project's workers. The caller says it,
+/// How long a caller of [`Runner::endpoint`] will wait on a bring-up of the project's workers. The caller says it,
 /// so no caller loops on [`WorkerStarting`] to wait longer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Patience {
@@ -305,7 +390,7 @@ pub enum Patience {
     ToTheEnd,
 }
 
-/// The answer [`Runner::endpoint`] and [`Runner::start_long`] give a
+/// The answer [`Runner::endpoint`] gives a
 /// [`Patience::Brief`] caller when the project's workers are being
 /// brought up (a deploy or its revision still settling) and did not
 /// become ready within the platform's short hold. Nothing failed: the bring-up goes on without the caller, so a
@@ -332,6 +417,28 @@ impl WorkerStarting {
     }
 }
 
+/// The port [`Runner::front`] was asked to publish is held by another
+/// program on the machine. [`PortTaken::of`] recognizes it.
+#[derive(Debug)]
+pub struct PortTaken {
+    pub port: u16,
+}
+
+impl std::fmt::Display for PortTaken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "port {} is held by another program", self.port)
+    }
+}
+
+impl std::error::Error for PortTaken {}
+
+impl PortTaken {
+    /// The port, when `e` is (or wraps) this answer.
+    pub fn of(e: &anyhow::Error) -> Option<u16> {
+        e.downcast_ref::<PortTaken>().map(|taken| taken.port)
+    }
+}
+
 /// Where to reach a project's worker server right now, and with what.
 pub struct WorkerEndpoint {
     /// Base URL of the worker's HTTP server (`/_weft/...`, and the live
@@ -348,8 +455,20 @@ pub struct WorkerEndpoint {
 impl WorkerEndpoint {
     /// The value of [`WORKER_AUTH_HEADER`] on a call to this worker.
     pub fn auth_value(&self) -> String {
-        format!("Bearer {}", self.bearer)
+        worker_auth_value(&self.bearer)
     }
+}
+
+/// The value of [`WORKER_AUTH_HEADER`] on a call carrying the worker key
+/// `key`.
+pub fn worker_auth_value(key: &str) -> String {
+    format!("Bearer {key}")
+}
+
+/// The worker key a [`WORKER_AUTH_HEADER`] value carries (the reverse of
+/// [`worker_auth_value`]).
+pub fn worker_auth_key(value: &str) -> Option<&str> {
+    value.strip_prefix("Bearer ")
 }
 
 impl std::fmt::Debug for WorkerEndpoint {
@@ -390,23 +509,29 @@ pub trait Runner: Send + Sync {
         let _ = target;
     }
 
-    /// Start `execution_id` as a long run: a job of its own running the worker
-    /// image with `--run <execution_id>`. Returns once started, or
-    /// waits on a bring-up as `patience` says, as [`Runner::endpoint`] does.
-    async fn start_long(&self, target: &WorkerTarget, execution_id: uuid::Uuid, patience: Patience) -> anyhow::Result<()>;
+    /// Make `target` the program the project's callers reach at its own
+    /// address, straight, with nothing of weft's in between: on a cloud,
+    /// the project's service sends its traffic to `target`'s revision; on
+    /// a machine, `target`'s worker publishes the project's `port` itself
+    /// and is kept running. Whatever served the address before stops (its
+    /// runs leave the way they do when the platform stops a worker), so a
+    /// caller arriving in that moment is refused and tries again.
+    /// Answers the address. A `port` another program holds is
+    /// [`PortTaken`], and nothing is started. Idempotent.
+    async fn front(&self, target: &WorkerTarget, port: Option<u16>) -> anyhow::Result<weft_core::projects::ProjectAddress>;
+
+    /// Stop serving the project's own address: nothing of it takes calls
+    /// any more (every trigger it has was wiped). Its workers go once idle.
+    async fn let_front_go(&self, project: uuid::Uuid) -> anyhow::Result<()>;
 
     /// Remove everything the platform keeps for the project's workers
-    /// (a service, a job, stopped containers). Idempotent.
+    /// (a service, stopped containers). Idempotent.
     async fn retire(&self, tenant: &str, project: uuid::Uuid) -> anyhow::Result<()>;
 
     /// Remove what the platform keeps running from `image` (a container,
     /// a service revision), for an image about to be deleted because
     /// nothing references it. Idempotent.
     async fn forget_image(&self, image: &str) -> anyhow::Result<()>;
-
-    /// The hard cap on one short run on this platform, when it has one.
-    /// A short run cut there fails loudly naming the run class.
-    fn short_run_cap(&self) -> Option<std::time::Duration>;
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -418,7 +543,8 @@ pub mod fake {
     pub enum RunnerCall {
         Prepare(WorkerTarget),
         Endpoint { project: uuid::Uuid },
-        StartLong { project: uuid::Uuid, execution_id: uuid::Uuid },
+        Front { target: WorkerTarget, port: Option<u16> },
+        LetFrontGo { project: uuid::Uuid },
         Retire { project: uuid::Uuid },
         ForgetImage(String),
     }
@@ -426,13 +552,12 @@ pub mod fake {
     /// Records every call; hands out `base_url` as the endpoint.
     pub struct FakeRunner {
         pub base_url: String,
-        pub cap: Option<std::time::Duration>,
         calls: Mutex<Vec<RunnerCall>>,
     }
 
     impl FakeRunner {
         pub fn new(base_url: impl Into<String>) -> Self {
-            Self { base_url: base_url.into(), cap: None, calls: Mutex::new(Vec::new()) }
+            Self { base_url: base_url.into(), calls: Mutex::new(Vec::new()) }
         }
 
         pub fn calls(&self) -> Vec<RunnerCall> {
@@ -450,8 +575,12 @@ pub mod fake {
             self.calls.lock().push(RunnerCall::Endpoint { project: target.project });
             Ok(WorkerEndpoint { base_url: self.base_url.clone(), bearer: "fake".into(), hold: None })
         }
-        async fn start_long(&self, target: &WorkerTarget, execution_id: uuid::Uuid, _patience: Patience) -> anyhow::Result<()> {
-            self.calls.lock().push(RunnerCall::StartLong { project: target.project, execution_id });
+        async fn front(&self, target: &WorkerTarget, port: Option<u16>) -> anyhow::Result<weft_core::projects::ProjectAddress> {
+            self.calls.lock().push(RunnerCall::Front { target: target.clone(), port });
+            Ok(weft_core::projects::ProjectAddress::Serving { url: self.base_url.clone() })
+        }
+        async fn let_front_go(&self, project: uuid::Uuid) -> anyhow::Result<()> {
+            self.calls.lock().push(RunnerCall::LetFrontGo { project });
             Ok(())
         }
         async fn retire(&self, _tenant: &str, project: uuid::Uuid) -> anyhow::Result<()> {
@@ -461,9 +590,6 @@ pub mod fake {
         async fn forget_image(&self, image: &str) -> anyhow::Result<()> {
             self.calls.lock().push(RunnerCall::ForgetImage(image.to_string()));
             Ok(())
-        }
-        fn short_run_cap(&self) -> Option<std::time::Duration> {
-            self.cap
         }
     }
 }
@@ -481,6 +607,9 @@ mod tests {
             memory: Some("2Gi".into()),
             startup_boost: Some(false),
             cpu_always_allocated: Some(true),
+            shared_idle_seconds: Some(60),
+            max_runs_at_once: Some(200),
+            max_queue_wait_seconds: Some(5),
         }
     }
 
@@ -495,6 +624,25 @@ mod tests {
         assert_eq!(keys, levers);
         let full = every_lever_set();
         assert!(WorkerOverrides::LEVERS.iter().all(|lever| full.sets(lever)));
+    }
+
+    #[test]
+    fn every_setting_is_a_lever() {
+        let settings = WorkerSettings { cpu: Some("1".into()), max_runs_at_once: Some(100), ..WorkerSettings::default() };
+        let wire = serde_json::to_value(settings).unwrap();
+        let mut keys: Vec<&str> = wire.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut levers = WorkerOverrides::LEVERS.to_vec();
+        levers.sort_unstable();
+        assert_eq!(keys, levers);
+    }
+
+    #[test]
+    fn a_set_lever_replaces_the_setting_and_an_unset_one_keeps_it() {
+        let install = WorkerSettings::default();
+        let with = install.with(&WorkerOverrides { cpu: Some("2".into()), concurrency: Some(4), ..Default::default() });
+        assert_eq!(with, WorkerSettings { cpu: Some("2".into()), concurrency: 4, ..install.clone() });
+        assert_eq!(install.with(&WorkerOverrides::default()), install);
     }
 
     #[test]

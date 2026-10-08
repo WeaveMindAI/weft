@@ -33,7 +33,7 @@ pub use predicate::{Predicate, PredicateOp};
 
 // Wire-pure like `predicate`: `SignalSpec` carries it.
 pub mod limits;
-pub use limits::{EntryLimits, ResolvedLimits};
+pub use limits::{EntryLimits, Limited, ResolvedLimits};
 
 // The dispatcher <-> listener wire, also wire-pure, so the dispatcher
 // speaks it without linking the listener.
@@ -116,9 +116,8 @@ pub trait Signal: Serialize + DeserializeOwned + Sized {
 
     /// For a kind that serves a caller waiting on the line (its run is
     /// driven inside that caller's own request): the protocol the caller
-    /// speaks. Such a kind goes through the install's live door
-    /// (`/connect/...`, then `/live/...` to the worker holding the run)
-    /// and hands [`Signal::live_connection`] its connection settings.
+    /// speaks. Such a kind is served at the worker's door (the
+    /// dispatcher passes `/connect/...` calls on to it) and hands [`Signal::live_connection`] its connection settings.
     /// Default `None`: nobody waits on the line.
     const CALLER: Option<live_connection::Protocol> = None;
 
@@ -194,7 +193,7 @@ pub fn to_spec<K: Signal>(kind: K) -> SignalSpec {
         config: serde_json::to_value(&kind).expect("kind serialization is infallible"),
         consumer_kind,
         limits: crate::signal::EntryLimits::default(),
-        run_class: crate::run_class::RunClass::default(),
+        settings: crate::run_settings::RunSettings::default(),
     }
 }
 
@@ -282,16 +281,6 @@ pub fn validate_spec(spec: &SignalSpec) -> Result<(), String> {
         return Err(format!(
             "signal kind '{}' acts as a connection, but none was set; build the kind with \
              the access value the node's input carries",
-            spec.kind
-        ));
-    }
-    // A live caller's run is driven inside the caller's own request, so
-    // it lives exactly as long as that request may: it cannot be a job.
-    if spec.run_class == crate::run_class::RunClass::Long && entry.caller.is_some() {
-        return Err(format!(
-            "a '{}' signal serves a caller who is waiting on the line, so its run is driven \
-             inside their request and cannot be `long`; leave its run class `short`, and hand \
-             long work to a separate run the route starts",
             spec.kind
         ));
     }

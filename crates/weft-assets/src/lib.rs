@@ -85,6 +85,12 @@ pub trait AssetStore: Send + Sync {
         size_bytes: u64,
         bytes: &mut (dyn Read + Send),
     ) -> Result<String>;
+
+    /// Whether `error`, from [`Self::upload`], is the upload cut off on
+    /// the way (a dropped connection, a timeout): sending the same bytes
+    /// again resumes it. A refusal (the store said no) is not, and is
+    /// never sent again.
+    fn interrupted(&self, error: &anyhow::Error) -> bool;
 }
 
 /// The tenant's assets the resolved definition uses, including nested file
@@ -235,10 +241,22 @@ pub async fn publish_hashed(
             anyhow::ensure!(actual_hash == *hash && actual_size == *size,
                 "{path} changed while it was being published; rerun the command");
             reader.rewind().with_context(|| format!("rewind verified snapshot of {path}"))?;
-            let key = store
-                .upload(hash, mime, path, *size, reader.as_mut())
-                .await
-                .with_context(|| format!("upload {path}"))?;
+            // An upload cut off on the way loses nothing: the store keeps
+            // the parts that landed, and the next try resumes after them.
+            // A refusal is the store's answer, and is not asked again.
+            let mut tries = 1;
+            let key = loop {
+                match store.upload(hash, mime, path, *size, reader.as_mut()).await {
+                    Ok(key) => break key,
+                    Err(e) if tries < UPLOAD_TRIES && store.interrupted(&e) => {
+                        tracing::warn!(target: "weft_assets", %path, error = %format!("{e:#}"), tries, "an upload failed; trying it again");
+                        tokio::time::sleep(std::time::Duration::from_secs(tries as u64)).await;
+                        tries += 1;
+                        reader.rewind().with_context(|| format!("rewind verified snapshot of {path}"))?;
+                    }
+                    Err(e) => return Err(e.context(format!("upload {path} ({tries} tries)"))),
+                }
+            };
             Ok::<_, anyhow::Error>((hash.clone(), key))
         })
         .buffer_unordered(UPLOADS_IN_FLIGHT)
@@ -247,6 +265,9 @@ pub async fn publish_hashed(
     keys.extend(uploaded);
     Ok(keys)
 }
+
+/// How many times [`publish_hashed`] sends one file before it gives up.
+const UPLOAD_TRIES: u32 = 3;
 
 /// How many uploads [`publish_hashed`] keeps in flight. A version holds
 /// hundreds of small files (its `nodes/base_catalog/` included), so one

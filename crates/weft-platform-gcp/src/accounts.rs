@@ -17,9 +17,6 @@ use crate::names;
 /// takes every one back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
-    /// The caller-ticket secret, which a worker's Cloud Run service reads
-    /// as its runtime account.
-    CallerTokenSecret,
     /// The install's images, which an infra machine pulls as its own
     /// account. Cloud Run pulls a worker's image with its own service
     /// agent, never the runtime account, so workers need no grant here.
@@ -32,15 +29,11 @@ pub enum Access {
 }
 
 impl Access {
-    const ALL: [Access; 3] = [Access::CallerTokenSecret, Access::ImageRegistry, Access::Logging];
+    const ALL: [Access; 2] = [Access::ImageRegistry, Access::Logging];
 
     /// The resource and the role this access is.
     fn binding(self, gcp: &GcpPlatform) -> anyhow::Result<(String, &'static str)> {
         Ok(match self {
-            Access::CallerTokenSecret => (
-                format!("https://secretmanager.googleapis.com/v1/projects/{}/secrets/{}", gcp.project, gcp.caller_token_secret),
-                "roles/secretmanager.secretAccessor",
-            ),
             Access::ImageRegistry => (
                 format!("https://artifactregistry.googleapis.com/v1/{}", repository_resource(&gcp.artifact_registry)?),
                 "roles/artifactregistry.reader",

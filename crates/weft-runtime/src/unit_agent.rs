@@ -1,7 +1,9 @@
 //! The agent beside every infra unit (`weft-runtime unit-agent`).
 //!
-//! `serve` holds the unit's network and answers weft's readiness and
-//! liveness checks from inside it (`weft_platform_traits::unit_agent`).
+//! `serve` holds the unit's network, answers weft's readiness and
+//! liveness checks from inside it, and passes on to the broker what the
+//! unit's containers say changed of their copy's values
+//! (`weft_platform_traits::unit_agent`).
 //! `own` hands a unit's disks to its group before its containers start
 //! (a unit's `fsGroup`). `host` runs on a cloud machine given one unit: it
 //! runs the unit on the machine's Docker (the laptop's own code,
@@ -14,16 +16,37 @@ use anyhow::Context as _;
 use axum::routing::post;
 use axum::{Json, Router};
 use weft_core::infra::ProbeKind;
-use weft_platform_traits::unit_agent::{ProbeAnswer, ProbeRequest, PROBE_PATH};
+use weft_platform_traits::unit_agent::{ProbeAnswer, ProbeRequest, AGENT_BROKER_URL_ENV, AGENT_IDENTITY_ENV, PROBE_PATH, VALUES_PATH};
 use weft_core::ports::UNIT_AGENT;
 
-/// Serve checks until the container is stopped.
+/// Serve checks, and pass on what the unit's containers push, until the
+/// container is stopped.
 pub async fn serve() -> anyhow::Result<()> {
-    let app = Router::new().route(PROBE_PATH, post(probe));
+    let broker_url = std::env::var(AGENT_BROKER_URL_ENV).with_context(|| format!("{AGENT_BROKER_URL_ENV} is required: where this agent reaches the broker"))?;
+    let tokens = weft_platform_gcp::identity_from_env(AGENT_IDENTITY_ENV)?;
+    let link = weft_broker_client::BrokerLink::new(broker_url, weft_broker_client::TokenSource::worker(tokens, weft_platform_traits::identity::mint_replica_id("unit-agent")));
+    let broker = weft_broker_client::BrokerInfraClient::new(link);
+    let app = Router::new().route(PROBE_PATH, post(probe)).route(VALUES_PATH, post(push)).with_state(broker);
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", UNIT_AGENT))
         .await
         .with_context(|| format!("bind the unit agent on port {UNIT_AGENT}"))?;
     axum::serve(listener, app).await.context("serve the unit agent")
+}
+
+/// A container says what changed: passed on to the broker as this copy,
+/// and answered with what the broker said, so the container knows whether
+/// it landed.
+async fn push(
+    axum::extract::State(broker): axum::extract::State<std::sync::Arc<weft_broker_client::BrokerInfraClient>>,
+    Json(values): Json<weft_core::infra::bake::PushedValues>,
+) -> (axum::http::StatusCode, String) {
+    match broker.push_values(&values).await {
+        Ok(()) => (axum::http::StatusCode::OK, "{}".into()),
+        Err(e) => match e.downcast_ref::<weft_broker_client::BrokerRefused>() {
+            Some(refused) => (axum::http::StatusCode::from_u16(refused.status.as_u16()).unwrap_or(axum::http::StatusCode::BAD_GATEWAY), refused.body.clone()),
+            None => (axum::http::StatusCode::BAD_GATEWAY, format!("the broker could not be reached: {e:#}")),
+        },
+    }
 }
 
 async fn probe(Json(req): Json<ProbeRequest>) -> Json<ProbeAnswer> {
@@ -261,6 +284,12 @@ pub async fn host() -> anyhow::Result<()> {
     let image = attribute(MD_RUNTIME_IMAGE).await?;
     let registry = image.split('/').next().unwrap_or_default().to_string();
     let gpu = if attribute(MD_GPU).await? == "yes" { GpuAccess::CosDriver } else { GpuAccess::None };
+    // Where the unit's agent pushes its values and this machine asks for
+    // looks. Every machine weft makes is told; one that was not is from a
+    // weft too old to run here, and applying its node again replaces it.
+    let broker_url = attribute(weft_platform_gcp::infra_host::MD_BROKER_URL)
+        .await
+        .context("this machine was not told where the broker is; apply its infra node again to replace it")?;
     let local = std::sync::Arc::new(weft_platform_local::LocalInfraHost::new(
         std::sync::Arc::new(weft_platform_local::DockerCli),
         LocalInfraHostConfig {
@@ -271,6 +300,11 @@ pub async fn host() -> anyhow::Result<()> {
             publish: Publish::AllPorts,
             // A machine runs one unit of one install.
             install: weft_core::infra::Install::default_install(),
+            // The machine's own identity names the copy it runs.
+            agent_broker: weft_platform_local::AgentBroker {
+                url: broker_url.clone(),
+                identity: weft_platform_local::AgentIdentity::Machine,
+            },
         },
     ));
     let host = Host {
@@ -295,25 +329,14 @@ pub async fn host() -> anyhow::Result<()> {
     // while its images download (`observe`).
     host.apply_in_background();
 
-    // Asking for a look goes through the broker, as the project's own
-    // account: the one the machine runs as. A machine made before its
-    // agent was told where the broker is cannot ask; it says so, and its
-    // health is looked at when the supervisor looks for another reason.
-    match attribute(weft_platform_gcp::infra_host::MD_BROKER_URL).await {
-        Ok(broker_url) => {
-            let machine = metadata("name").await?;
-            let link = weft_broker_client::BrokerLink::new(
-                broker_url,
-                weft_broker_client::TokenSource::worker(host.tokens.clone(), format!("infra-{}", machine.trim())),
-            );
-            tokio::spawn(host.clone().watch(weft_broker_client::BrokerInfraClient::new(link)));
-        }
-        Err(e) => tracing::warn!(
-            target: "weft_runtime::unit_agent",
-            error = %format!("{e:#}"),
-            "this machine was made by a weft that did not give it the broker's address, so it cannot ask for a look when its unit changes; every machine this weft makes has it"
-        ),
-    }
+    // Asking for a look goes through the broker, as the copy this machine
+    // runs (its token names the machine).
+    let machine = metadata("name").await?;
+    let link = weft_broker_client::BrokerLink::new(
+        broker_url,
+        weft_broker_client::TokenSource::worker(host.tokens.clone(), format!("infra-{}", machine.trim())),
+    );
+    tokio::spawn(host.clone().watch(weft_broker_client::BrokerInfraClient::new(link)));
 
     let err = |e: anyhow::Error| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"));
     let app = Router::new()

@@ -20,8 +20,6 @@
 //!   - `domains`: the door in front of the install's own domains.
 //!   - `holder_pool`: how many holders keep held connections open.
 //!   - `clock`: time, abstracted so tests advance it deterministically.
-//!   - `drain`: waiting for a project's running executions to finish
-//!     before a disruptive lifecycle step.
 //!   - `unit_agent`: what weft asks the agent beside an infra unit.
 //!
 //! Test builds enable the `test-helpers` feature to also pull in the
@@ -31,7 +29,6 @@ pub mod alarm;
 pub mod clock;
 pub mod config;
 pub mod domains;
-pub mod drain;
 pub mod frontends;
 pub mod holder_pool;
 pub mod identity;
@@ -45,7 +42,6 @@ pub mod unit_agent;
 pub use alarm::{Alarm, Wake, WakeCall, WakeRefusal};
 pub use clock::{Clock, SystemClock};
 pub use config::{InstallConfig, PlatformConfig};
-pub use drain::{drain_until_zero, DrainOutcome, DRAIN_POLL_INTERVAL};
 pub use identity::{CallerIdentity, FixedToken, IdentityRefused, IdentityTokens, Principal};
 pub use domains::DomainHosting;
 pub use frontends::{FrontendHosting, FrontendSite, HostedFrontend};
@@ -57,7 +53,7 @@ pub use object_store::{
     S3ObjectStore, SharedObjectStore,
 };
 pub use roles::{CoreRole, Placement, RoleAddresses, RolePlacement, Vantage};
-pub use runner::{Patience, Runner, WorkerCall, WorkerEndpoint, WorkerOverrides, WorkerSettings, WorkerStarting, WorkerTarget, WorkersResponse, WORKER_ANSWER_HEADER, WORKER_AUTH_HEADER};
+pub use runner::{worker_auth_key, worker_auth_value, Patience, PortTaken, Runner, WorkerCall, WorkerEndpoint, WorkerOverrides, WorkerSettings, WorkerStarting, WorkerTarget, WorkersResponse, MAX_QUEUE_WAIT_ENV, MAX_RUNS_AT_ONCE_ENV, SHARED_IDLE_ENV, WORKER_ANSWER_HEADER, WORKER_AUTH_HEADER};
 #[cfg(any(test, feature = "test-helpers"))]
 pub use alarm::fake::FakeAlarm;
 #[cfg(any(test, feature = "test-helpers"))]

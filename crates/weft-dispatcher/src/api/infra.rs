@@ -39,14 +39,11 @@ use crate::infra_node::{self, InfraNodeRow, InfraNodeStatus};
 use crate::state::DispatcherState;
 
 /// Make `cancel` mean cancel before an infra command that will take
-/// the containers away. The supervisor treats a `cancel` command as
-/// "the dispatcher already ended the running executions" and tears
-/// down at once, and that is true only when a trigger deactivation
-/// ran (an active project's picker). On an inactive project nothing
-/// ran, so a `weft run` using that infra would have its container
-/// pulled out from under it and fail at the node with no cancel on
-/// record; this is the cancel it gets instead. `wait` needs nothing
-/// here: the supervisor drains before acting.
+/// the containers away: the running work its copies reach is cancelled
+/// here, as the command is issued. That is already done when a trigger
+/// deactivation ran (an active project's picker), which cancelled by the
+/// same answer. `wait` needs nothing here: the command waits for the
+/// running work before a supervisor takes it ([`drain_first`]).
 pub(crate) async fn settle_running_before_infra_op(
     state: &DispatcherState,
     project_id: uuid::Uuid,
@@ -58,21 +55,27 @@ pub(crate) async fn settle_running_before_infra_op(
     asked_by: Option<weft_core::ExecutionId>,
 ) -> Result<(), (StatusCode, String)> {
     if running_policy == RunningPolicy::Cancel && !trigger_deactivation_ran {
-        let runs = crate::take_down::live_runs(state, project_id)
+        let scope = crate::drain::DrainScope { project_id, reaching: crate::drain::Reaching::Copies(copies), except: asked_by };
+        crate::drain::cancel_left(state, &scope, &weft_core::exec::CancelCause::User)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live runs: {e}")))?;
-        let user = weft_core::exec::CancelCause::User;
-        let targets: Vec<(weft_core::ExecutionId, &weft_core::exec::CancelCause)> =
-            crate::take_down::runs_using_copies(copies, &runs, asked_by)
-                .into_iter()
-                .filter(|r| !r.suspended)
-                .map(|r| (r.execution_id, &user))
-                .collect();
-        crate::api::execution::cancel_execution_ids(state, &targets)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel: {e}")))?;
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel: {e:#}")))?;
     }
     Ok(())
+}
+
+/// What a take-down command waits for before a supervisor takes it, by the
+/// person's answer: under `wait`, the running work its copies reach, for at
+/// most `drain_timeout_secs`; under `cancel`, nothing (it was cancelled
+/// already, [`settle_running_before_infra_op`]).
+pub(crate) fn drain_first(
+    running_policy: RunningPolicy,
+    drain_timeout_secs: u64,
+    asked_by: Option<weft_core::ExecutionId>,
+) -> Option<infra_lifecycle_command::DrainFirst> {
+    (running_policy == RunningPolicy::Wait).then(|| infra_lifecycle_command::DrainFirst {
+        by_unix: crate::lease::now_unix() + i64::try_from(drain_timeout_secs).unwrap_or(i64::MAX / 2),
+        asked_by,
+    })
 }
 
 /// The activations whose triggers read any of `nodes` (places) in one of
@@ -326,8 +329,7 @@ async fn upgrade_legs(
             &targeted,
             &copies,
             TakeDown::Stop { force: false },
-            work.running_policy,
-            work.drain_timeout_secs,
+            drain_first(work.running_policy, work.drain_timeout_secs, None),
         )
         .await?;
         // No deadline: a drain the person asked to wait for can run as
@@ -395,7 +397,7 @@ async fn upgrade_legs(
     // Its outcome is not this upgrade's: whatever it ended in, the start
     // below goes again (a cancel meant for this upgrade is read off the
     // command's own flag, right after).
-    let left = crate::api::project::live_infra_setup_execution_ids(state, id, Some(instance))
+    let left = crate::api::project::infra_setup_execution_ids(state, id, Some(instance))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_setup executions: {e:#}")))?;
     for execution_id in left {
@@ -456,7 +458,9 @@ async fn take_down_upgrade_readers(
             ),
         ));
     };
-    crate::api::project::execute_trigger_deactivation(state, id, live, deactivation).await?;
+    // Down with the copies the verb takes down: their start brings them
+    // back.
+    crate::api::project::execute_trigger_deactivation(state, id, live, deactivation, Some(crate::take_down::DownWith::Infra)).await?;
     Ok(true)
 }
 
@@ -727,7 +731,7 @@ async fn bring_back_what_went_down_with_infra(state: &DispatcherState, id: uuid:
                 // down. Both moments are the database's clock.
                 let came_back = copies.iter().any(|row| {
                     row.applied_at_unix.is_some_and(|at| at >= went_down.at_unix)
-                        && crate::api::project::copies_read(&project, Some(&reads), activation.key.instance())
+                        && weft_core::infra::run_gate::copies_read(&project, Some(&reads), activation.key.instance())
                             .iter()
                             .any(|(place, copy)| &row.node_id == place && Some(row.instance.as_ref()) == *copy)
                 });
@@ -826,7 +830,7 @@ pub async fn cancel(
 
     // Cancel the provisioning sub-execution too (the InfraSetup worker
     // run that computes specs and enqueues applies).
-    let execution_ids = crate::api::project::non_terminal_infra_setup_execution_ids(&state, id, Some(copy.instance.as_ref()))
+    let execution_ids = crate::api::project::infra_setup_execution_ids(&state, id, Some(copy.instance.as_ref()))
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra_setup executions: {e}")))?;
     let had_setup = !execution_ids.is_empty();
@@ -919,7 +923,7 @@ async fn issue_destroy(
                 verb.as_str()
             ))));
         };
-        crate::api::project::execute_trigger_deactivation(&state, id, live_readers, deactivation).await?;
+        crate::api::project::execute_trigger_deactivation(&state, id, live_readers, deactivation, Some(crate::take_down::DownWith::Infra)).await?;
     }
     settle_running_before_infra_op(&state, id, &copies, running_policy, was_active, None).await?;
     let command_id = issue_lifecycle_for(
@@ -928,8 +932,7 @@ async fn issue_destroy(
         None,
         &copies,
         take_down,
-        running_policy,
-        drain_timeout_secs,
+        drain_first(running_policy, drain_timeout_secs, None),
     )
     .await?;
     Ok((
@@ -1072,8 +1075,7 @@ async fn issue_per_node(
         Some(&node),
         &copies,
         take_down,
-        running_policy,
-        drain_timeout_secs,
+        drain_first(running_policy, drain_timeout_secs, None),
     )
     .await?;
     Ok((
@@ -1336,6 +1338,22 @@ pub async fn action(
     Ok(Json(press_live(&state, id, &node, copy.instance.as_ref(), &body.kind, &body.payload).await?))
 }
 
+/// POST /projects/{id}/infra/nodes/{node}/rebake, `{node}` being the
+/// node's placement as a person spells it (`one.db`): make the node's
+/// baked outputs again (`crate::infra_bake::rebake`), by hand, for a copy
+/// whose values changed in a way weft did not see (a password changed by
+/// hand inside a database). Answers once its infra setup ended.
+pub async fn rebake(
+    State(state): State<DispatcherState>,
+    caller: CallerTenant,
+    Path((id, node)): Path<(uuid::Uuid, String)>,
+    Query(copy): Query<CopyQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    authorize_project(&state, &caller.0, id).await?;
+    crate::infra_bake::rebake(&state, id, &node, copy.instance.as_ref()).await?;
+    Ok(Json(serde_json::json!({ "rebaked": node })))
+}
+
 /// Press a button one of an infra node's `/live` items carries. The
 /// caller has already been authorized for the project; both doors onto
 /// a node's display land here.
@@ -1538,8 +1556,7 @@ pub(crate) async fn issue_lifecycle_for(
     node_id: Option<&str>,
     copies: &weft_core::instance::Copies,
     take_down: TakeDown,
-    running_policy: RunningPolicy,
-    drain_timeout_secs: u64,
+    drain: Option<infra_lifecycle_command::DrainFirst>,
 ) -> Result<i64, (StatusCode, String)> {
     let tenant = state
         .tenant_router
@@ -1553,8 +1570,7 @@ pub(crate) async fn issue_lifecycle_for(
         node_id,
         copies,
         take_down,
-        running_policy,
-        drain_timeout_secs,
+        drain,
         state.replica.as_str(),
     )
     .await
@@ -1575,13 +1591,12 @@ async fn issue_per_nodes(
     nodes: &std::collections::BTreeSet<String>,
     copies: &weft_core::instance::Copies,
     take_down: TakeDown,
-    running_policy: RunningPolicy,
-    drain_timeout_secs: u64,
+    drain: Option<infra_lifecycle_command::DrainFirst>,
 ) -> Result<Vec<i64>, (StatusCode, String)> {
     let mut ids = Vec::with_capacity(nodes.len());
     for node in nodes {
         ids.push(
-            issue_lifecycle_for(state, project_id, Some(node), copies, take_down, running_policy, drain_timeout_secs)
+            issue_lifecycle_for(state, project_id, Some(node), copies, take_down, drain)
                 .await?,
         );
     }
@@ -1655,10 +1670,8 @@ async fn reap_orphans(
                 Some(&node_id),
                 &copies,
                 TakeDown::TERMINATE,
-                RunningPolicy::Cancel,
-                // Cancel never drains; the cap is inert. Default keeps
-                // the row honest.
-                weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
+                // An orphan is no copy of the program's: no run reaches it.
+                None,
                 &replica,
             )
             .await;
@@ -1786,10 +1799,10 @@ pub async fn delete_project(
             None,
             &weft_core::instance::Copies::Every,
             // The disks the nodes keep go with the project: the
-            // supervisor's sweep deletes a removed project's copies.
+            // supervisor's sweep deletes a removed project's copies. What
+            // ran was cancelled by the removal's take-down.
             TakeDown::TERMINATE,
-            RunningPolicy::Cancel,
-            weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
+            None,
         )
         .await?;
         // Step 2: wait for the supervisor unless --force. A wedged

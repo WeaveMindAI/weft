@@ -326,8 +326,7 @@ async fn infra_down(
         Some(node),
         &copies,
         take_down,
-        spec.running_policy,
-        drain,
+        crate::api::infra::drain_first(spec.running_policy, drain, Some(asker)),
     )
     .await?;
     let stops_asker = stop_self == StopSelf::Include && asker_uses_it;
@@ -418,39 +417,50 @@ async fn asker_matches_filter(
     };
     Ok(run.project_id == project_id
         && filter.instance.as_ref().is_none_or(|m| run.instance.as_ref() == Some(m))
-        && filter.status.is_none_or(|s| s.reaches(weft_core::program::RunStatus::Running.into()))
+        && filter.status.is_none_or(|s| s.reaches(weft_core::program::RunStatus::Running))
         && filter.node.as_deref().is_none_or(|n| n == run.entry_node)
         && filter.older_than_secs.is_none_or(|secs| run.started_at <= now.saturating_sub(secs))
         && tagged)
 }
 
-/// Cost records of the project's runs, filtered. The run's instance is its
-/// `execution` row's, born with the run and never changed.
+/// Cost records of the project's runs, filtered: the `CostReported`
+/// events of the records of the runs the filter can reach (its run, its
+/// instance, and the runs still going or ended since its `since`). The
+/// run's instance is its run row's, born with the run and never changed.
 async fn costs(state: &DispatcherState, project_id: uuid::Uuid, filter: &CostFilter) -> Result<Vec<CostRecord>, CallError> {
-    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT e.execution_id, e.payload_json, ec.instance_id \
-         FROM exec_event e JOIN execution ec ON ec.execution_id = e.execution_id \
-         WHERE ec.project_id = $1 AND e.kind = 'cost_reported' \
-           AND ($2::text IS NULL OR ec.instance_id = $2) \
-           AND ($3::text IS NULL OR e.execution_id = $3) \
-           AND ($4::bigint IS NULL OR e.created_at >= $4) \
-         ORDER BY e.id",
+    let runs: Vec<(ExecutionId, Option<String>)> = sqlx::query_as(
+        "SELECT execution_id, instance_id FROM run \
+         WHERE project_id = $1 \
+           AND ($2::text IS NULL OR instance_id = $2) \
+           AND ($3::uuid IS NULL OR execution_id = $3) \
+           AND ($4::bigint IS NULL OR ended_at IS NULL OR ended_at >= $4) \
+         ORDER BY started_at, execution_id",
     )
     .bind(project_id)
     .bind(filter.instance.as_ref().map(|m| m.as_str()))
-    .bind(filter.run.map(|r| r.to_string()))
+    .bind(filter.run)
     .bind(filter.since_unix.map(|s| s as i64))
     .fetch_all(&state.pg_pool)
     .await
     .map_err(internal("costs"))?;
     let project = state.projects.project(project_id).await.map_err(internal("project"))?;
     let mut out = Vec::new();
-    for (execution_id, payload, instance) in rows {
-        let execution_id: ExecutionId = execution_id.parse().map_err(internal("cost row execution"))?;
-        let event = weft_journal::decode_event(execution_id, &payload).map_err(internal("cost row"))?;
+    let mut reported = Vec::new();
+    for (execution_id, instance) in runs {
+        let record = {
+            let mut conn = state.pg_pool.acquire().await.map_err(internal("costs"))?;
+            weft_journal::record::read_record(&mut conn, execution_id, None).await.map_err(internal("cost record"))?
+        };
+        let events = record.events(execution_id).map_err(internal("cost record"))?;
+        reported.push(events.into_iter().map(move |event| (execution_id, event, instance.clone())));
+    }
+    for (execution_id, event, instance) in reported.into_iter().flatten() {
         let weft_journal::ExecEvent::CostReported { node_id, frames, service, model, amount_usd, origin, at_unix, .. } = event else {
             continue;
         };
+        if filter.since_unix.is_some_and(|since| at_unix < since) {
+            continue;
+        }
         let node = match &project {
             Some(project) => {
                 let call_path: Vec<String> = weft_core::frames::call_path(&frames).into_iter().map(str::to_string).collect();

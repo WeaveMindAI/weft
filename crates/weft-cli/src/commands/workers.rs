@@ -1,8 +1,8 @@
 //! `weft workers [set|reset]`: the project's own worker levers.
 //!
 //! Every lever the install sets for workers the project can set for
-//! itself; what it leaves unset follows the install. A change applies to
-//! the running workers at once.
+//! itself; what it leaves unset follows the install. A change reaches the
+//! calls that follow it: they go to workers started with the new levers.
 
 use anyhow::Context;
 use weft_platform_traits::{WorkerOverrides, WorkersResponse};
@@ -48,7 +48,11 @@ pub async fn run(ctx: Ctx, action: WorkersAction) -> anyhow::Result<()> {
     let effective = serde_json::to_value(&answer.effective)?;
     for lever in WorkerOverrides::LEVERS {
         let from = if answer.project.sets(lever) { "this project" } else { "the install" };
-        println!("{lever:<22} {:<8} ({from})", effective[lever].to_string().trim_matches('"'));
+        let shown = match &effective[lever] {
+            serde_json::Value::Null => "unset".to_string(),
+            value => value.to_string().trim_matches('"').to_string(),
+        };
+        println!("{lever:<22} {shown:<8} ({from})");
     }
     Ok(())
 }

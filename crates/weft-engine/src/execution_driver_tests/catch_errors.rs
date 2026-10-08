@@ -52,6 +52,26 @@
         }
     }
 
+    /// Emits `out`: a pure step, run again after a crash.
+    struct Echo;
+    test_manifest!(Echo, "Echo");
+    #[async_trait]
+    impl Node for Echo {
+        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            ctx.pulse_downstream(weft_core::node::NodeOutput::new().set("out", "again")).await
+        }
+    }
+
+    /// Reaches outside (it tags its run) while marked pure.
+    struct Tagging;
+    test_manifest!(Tagging, "Tagging");
+    #[async_trait]
+    impl Node for Tagging {
+        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            ctx.tag_execution(["seen"]).await
+        }
+    }
+
     /// Reads its input and emits nothing.
     struct Sink;
     test_manifest!(Sink, "Sink");
@@ -69,6 +89,8 @@
             ("Misconfigured", Box::new(Misconfigured)),
             ("Panicking", Box::new(Panicking)),
             ("NeverAgain", Box::new(NeverAgain)),
+            ("Echo", Box::new(Echo)),
+            ("Tagging", Box::new(Tagging)),
             ("Sink", Box::new(Sink)),
         ])
     }
@@ -177,10 +199,10 @@
                 entry_node: "step".into(),
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: Some(weft_core::project::hash::compute_definition_hash(project).unwrap()),
-                program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
-                subgraph: None, seed: None, instance: None, fired_trigger: None,
+                binary_hash: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
+                selection: None, seed: None, instance: None, stand_in: None, fired_trigger: None,
                 instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-                run_class: weft_core::run_class::RunClass::Short,
+                settings: Default::default(),
             },
             ExecEvent::NodeKicked {
                 execution_id, node_id: "step".into(), frames: vec![], firing: false,
@@ -207,6 +229,31 @@
             .filter(|e| matches!(e, ExecEvent::NodeStarted { node_id, .. } | ExecEvent::NodeResumed { node_id, .. } if node_id == "step"))
             .count();
         assert_eq!(starts, 1, "only the dead worker's start: {events:?}");
+    }
+
+    /// A run's birth and its kick, with how it is kept: what the next
+    /// worker reads when the step's own rows never landed.
+    fn kicked_rows(project: &ProjectDefinition, execution_id: ExecutionId, settings: weft_core::run_settings::RunSettings) -> Vec<ExecEvent> {
+        let mut rows = crashed_rows(project, execution_id);
+        rows.pop();
+        if let Some(ExecEvent::ExecutionStarted { settings: born, .. }) = rows.first_mut() {
+            *born = settings;
+        }
+        rows
+    }
+
+    /// A durable run's record is whole: handed out again, it carries on
+    /// from it and runs the step it never started.
+    #[tokio::test]
+    async fn a_durable_run_handed_out_again_carries_on() {
+        let project = project("Refused", false);
+        let execution_id = uuid::Uuid::new_v4();
+        let durable = weft_core::run_settings::RunSettings::new(weft_core::run_settings::Keeping::Durable, true).unwrap();
+        let rows = kicked_rows(&project, execution_id, durable);
+        let (outcome, events) = drive_journal(project, nodes(), execution_id, rows, CancellationFlag::new_arc()).await;
+        let outcome = outcome.expect("the drive runs");
+        assert!(matches!(outcome, ExecutionOutcome::Failed { .. }), "{outcome:?}");
+        assert!(failed(&events, "step").is_some_and(|e| e.contains("the service refused")), "{events:?}");
     }
 
     /// The crash failure is an outcome of the step too: with `error`
@@ -247,4 +294,64 @@
         assert_eq!(error_rows, 1, "only the dead worker's emission: {events:?}");
         assert_eq!(error_value(&events).as_deref(), Some("the service refused"));
         assert!(completed(&events, "handler"), "{events:?}");
+    }
+
+    /// [`project`] with `step` marked `features.pure`.
+    fn pure_project(step_type: &str, error_wired: bool) -> ProjectDefinition {
+        let mut marked = project(step_type, error_wired);
+        let step = marked.nodes.iter_mut().find(|n| n.id == "step").unwrap();
+        step.features.pure = true;
+        marked
+    }
+
+    fn starts_of_step(events: &[ExecEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, ExecEvent::NodeStarted { node_id, .. } | ExecEvent::NodeResumed { node_id, .. } if node_id == "step"))
+            .count()
+    }
+
+    /// A pure step the worker died in, before it emitted anything, did
+    /// nothing anybody can see: the next worker runs it again and the run
+    /// goes on.
+    #[tokio::test]
+    async fn a_pure_step_the_worker_died_in_runs_again() {
+        let project = pure_project("Echo", false);
+        let execution_id = uuid::Uuid::new_v4();
+        let rows = crashed_rows(&project, execution_id);
+        let (outcome, events) = drive_journal(project, nodes(), execution_id, rows, CancellationFlag::new_arc()).await;
+        let outcome = outcome.expect("the drive runs");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
+        assert!(completed(&events, "step") && failed(&events, "step").is_none(), "{events:?}");
+        assert!(completed(&events, "after"), "{events:?}");
+        assert_eq!(starts_of_step(&events), 2, "the dead worker's start, then the new one: {events:?}");
+    }
+
+    /// One that emitted already has a value downstream a second run would
+    /// emit again: it is failed like any step.
+    #[tokio::test]
+    async fn a_pure_step_that_emitted_is_failed_not_run_again() {
+        let project = pure_project("NeverAgain", false);
+        let execution_id = uuid::Uuid::new_v4();
+        let mut rows = crashed_rows(&project, execution_id);
+        rows.push(ExecEvent::PortEmitted {
+            execution_id, emission_id: uuid::Uuid::new_v4(), node_id: "step".into(), frames: vec![],
+            port: "out".into(), value: Arc::new(json!("once")), provided: false, at_unix: 0,
+        });
+        let (outcome, events) = drive_journal(project, nodes(), execution_id, rows, CancellationFlag::new_arc()).await;
+        let outcome = outcome.expect("the drive runs");
+        assert!(matches!(outcome, ExecutionOutcome::Failed { .. }), "{outcome:?}");
+        assert!(failed(&events, "step").is_some_and(|e| e.contains("not run again")), "{events:?}");
+        assert_eq!(starts_of_step(&events), 1, "{events:?}");
+    }
+
+    /// A node marked pure that reaches outside fails at that call, naming
+    /// the flag, and the failure is the node's declaration, never caught.
+    #[tokio::test]
+    async fn a_pure_node_reaching_outside_fails_naming_the_flag() {
+        let (outcome, events) = drive(pure_project("Tagging", true), nodes(), &["step"]).await;
+        assert!(matches!(outcome, ExecutionOutcome::Failed { .. }), "{outcome:?}");
+        let error = failed(&events, "step").expect("the step fails");
+        assert!(error.contains("features.pure") && error.contains("tag its run"), "{error}");
+        assert!(error_value(&events).is_none(), "a wrong declaration is never caught");
     }

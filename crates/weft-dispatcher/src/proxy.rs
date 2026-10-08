@@ -7,11 +7,13 @@
 //! weft's credential for the upstream rides a header of its own
 //! ([`weft_platform_traits::WORKER_AUTH_HEADER`]), so a caller's own
 //! `Authorization` reaches the upstream untouched. The door says who the
-//! caller is and which address it used (`X-Forwarded-For`, `-Host`,
-//! `-Proto`), since the upstream sees the door as its peer and its own
-//! address as the host: that is what it builds links from
-//! (`weft_core::net::request_base_url`) and counts callers by
-//! (`crate::entry_limits::caller_address`).
+//! caller is and which address it used, since the upstream sees the door
+//! as its peer and its own address as the host: that is what it builds
+//! links from (`weft_core::net::request_base_url`) and counts callers by
+//! (`weft_core::net::caller_address`). Any server is told the usual way
+//! (`X-Forwarded-For`, `-Host`, `-Proto`); a project's worker is told in
+//! weft's own hop headers, which it removes, so the run reads the request
+//! as its caller sent it ([`Forwarding`]).
 
 use axum::extract::ws::{CloseFrame, Message as CallerMessage, WebSocket, WebSocketUpgrade};
 use std::net::{IpAddr, SocketAddr};
@@ -46,22 +48,65 @@ impl Upstream {
     }
 }
 
+/// How the upstream is told who called, and at which address.
+pub enum Forwarding {
+    /// The usual way, in `X-Forwarded-*`: a frontend, an infra endpoint.
+    Proxied,
+    /// In weft's own hop headers (`weft_core::net::relay_hop`), which a
+    /// project's worker reads and removes: the caller's address as this
+    /// door read it, and the path the project's routes sit under here.
+    ToWorker { caller: IpAddr, route_prefix: String },
+}
+
 /// Pass `request` on to `upstream` at `path_and_query`.
-pub async fn forward(http: &reqwest::Client, upstream: Upstream, path_and_query: String, request: Request) -> Response {
-    let Some(peer) = request.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip()) else {
-        // Every server weft runs is started with connection info; a request
-        // without it is a wiring bug, refused rather than passed on with
-        // its caller unnamed.
-        return (StatusCode::INTERNAL_SERVER_ERROR, "no peer address on the request").into_response();
+pub async fn forward(http: &reqwest::Client, upstream: Upstream, path_and_query: String, request: Request, forwarding: Forwarding) -> Response {
+    let to_worker = matches!(forwarding, Forwarding::ToWorker { .. });
+    let told = match forwarding {
+        Forwarding::Proxied => {
+            let Some(peer) = request.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip()) else {
+                // Every server weft runs is started with connection info; a
+                // request without it is a wiring bug, refused rather than
+                // passed on with its caller unnamed.
+                return (StatusCode::INTERNAL_SERVER_ERROR, "no peer address on the request").into_response();
+            };
+            forwarded_headers(request.headers(), peer)
+        }
+        Forwarding::ToWorker { caller, route_prefix } => relay_hop_headers(request.headers(), caller, &route_prefix),
     };
-    let forwarded = match forwarded_headers(request.headers(), peer) {
+    let forwarded = match told {
         Ok(forwarded) => forwarded,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("the request's forwarding headers: {e}")).into_response(),
     };
+    let passed = Passed { forwarded, to_worker };
     if is_websocket(request.headers()) {
-        forward_socket(upstream, path_and_query, request, forwarded).await
+        forward_socket(upstream, path_and_query, request, passed).await
     } else {
-        forward_http(http, upstream, path_and_query, request, forwarded).await
+        forward_http(http, upstream, path_and_query, request, passed).await
+    }
+}
+
+/// What this door tells the upstream, and which of the caller's headers
+/// it passes on.
+struct Passed {
+    forwarded: Vec<(HeaderName, HeaderValue)>,
+    to_worker: bool,
+}
+
+impl Passed {
+    /// Whether the caller's header `name` reaches the upstream. A worker
+    /// gets every header the caller sent but the hop's own and the ones
+    /// this door sets; any other server also loses the caller's
+    /// `X-Forwarded-*` and `Host`, which this door says afresh.
+    fn passes(&self, name: &HeaderName) -> bool {
+        if self.to_worker {
+            !is_connection_header(name)
+                && name != axum::http::header::HOST
+                && name.as_str() != weft_platform_traits::WORKER_AUTH_HEADER
+                && !self.forwarded.iter().any(|(set, _)| set == name)
+                && !weft_core::net::relay_hop::ALL.contains(&name.as_str())
+        } else {
+            !is_hop_header(name)
+        }
     }
 }
 
@@ -95,29 +140,47 @@ fn forwarded_headers(headers: &HeaderMap, peer: IpAddr) -> Result<Vec<(HeaderNam
     Ok(out)
 }
 
+/// What a project's worker is told about a call this door passes on
+/// (see [`Forwarding::ToWorker`]): its caller, the `Host` it was sent to,
+/// the scheme it came over (as the usual way would say it), and the prefix
+/// its routes sit under. Whatever the caller sent under these names is
+/// replaced, never appended to.
+fn relay_hop_headers(headers: &HeaderMap, caller: IpAddr, route_prefix: &str) -> Result<Vec<(HeaderName, HeaderValue)>, axum::http::header::InvalidHeaderValue> {
+    use weft_core::net::relay_hop;
+    let mut out = vec![
+        (HeaderName::from_static(relay_hop::CALLER_ADDRESS), HeaderValue::from_str(&caller.to_string())?),
+        (HeaderName::from_static(relay_hop::ROUTE_PREFIX), HeaderValue::from_str(route_prefix)?),
+    ];
+    if let Some(host) = headers.get(axum::http::header::HOST) {
+        out.push((HeaderName::from_static(relay_hop::CALLER_HOST), host.clone()));
+    }
+    let proto = headers
+        .get(weft_core::net::WEFT_FORWARDED_PROTO)
+        .or_else(|| headers.get(X_FORWARDED_PROTO))
+        .cloned()
+        .unwrap_or_else(|| HeaderValue::from_static("http"));
+    out.push((HeaderName::from_static(weft_core::net::WEFT_FORWARDED_PROTO), proto));
+    Ok(out)
+}
+
 const X_FORWARDED_FOR: &str = "x-forwarded-for";
 const X_FORWARDED_HOST: &str = "x-forwarded-host";
 const X_FORWARDED_PROTO: &str = "x-forwarded-proto";
 
 /// Headers that belong to one hop and never travel past it, plus the ones
-/// this door sets itself.
+/// this door sets itself for any server but a worker.
 fn is_hop_header(name: &HeaderName) -> bool {
+    is_connection_header(name)
+        || matches!(name.as_str(), "host" | X_FORWARDED_FOR | X_FORWARDED_HOST | X_FORWARDED_PROTO | weft_core::net::WEFT_FORWARDED_PROTO)
+        || name.as_str() == weft_platform_traits::WORKER_AUTH_HEADER
+}
+
+/// Headers about the connection itself, which each hop makes afresh.
+fn is_connection_header(name: &HeaderName) -> bool {
     matches!(
         name.as_str(),
-        "connection"
-            | "keep-alive"
-            | "proxy-authenticate"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-            | "host"
-            | X_FORWARDED_FOR
-            | X_FORWARDED_HOST
-            | X_FORWARDED_PROTO
-            | weft_core::net::WEFT_FORWARDED_PROTO
-    ) || name.as_str() == weft_platform_traits::WORKER_AUTH_HEADER
+        "connection" | "keep-alive" | "proxy-authenticate" | "proxy-authorization" | "te" | "trailer" | "transfer-encoding" | "upgrade"
+    )
 }
 
 /// The headers of a WebSocket handshake that the connection to the worker
@@ -138,15 +201,15 @@ async fn forward_http(
     upstream: Upstream,
     path_and_query: String,
     request: Request,
-    forwarded: Vec<(HeaderName, HeaderValue)>,
+    passed: Passed,
 ) -> Response {
     let (parts, body) = request.into_parts();
     let url = format!("{}{path_and_query}", upstream.base_url.trim_end_matches('/'));
     let mut call = http.request(parts.method, &url);
-    for (name, value) in parts.headers.iter().filter(|(name, _)| !is_hop_header(name)) {
+    for (name, value) in parts.headers.iter().filter(|(name, _)| passed.passes(name)) {
         call = call.header(name, value);
     }
-    for (name, value) in forwarded {
+    for (name, value) in passed.forwarded {
         call = call.header(name, value);
     }
     if let Some((name, value)) = &upstream.auth {
@@ -183,7 +246,7 @@ async fn forward_socket(
     upstream: Upstream,
     path_and_query: String,
     request: Request,
-    forwarded: Vec<(HeaderName, HeaderValue)>,
+    passed: Passed,
 ) -> Response {
     let (mut parts, _body) = request.into_parts();
     let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
@@ -200,10 +263,10 @@ async fn forward_socket(
         Ok(call) => call,
         Err(e) => return (StatusCode::BAD_GATEWAY, format!("the socket address of {}: {e}", upstream.what)).into_response(),
     };
-    for (name, value) in parts.headers.iter().filter(|(name, _)| !is_hop_header(name) && !is_ws_handshake_header(name)) {
+    for (name, value) in parts.headers.iter().filter(|(name, _)| passed.passes(name) && !is_ws_handshake_header(name)) {
         call.headers_mut().append(name.clone(), value.clone());
     }
-    for (name, value) in forwarded {
+    for (name, value) in passed.forwarded {
         call.headers_mut().insert(name, value);
     }
     if let Some((name, value)) = &upstream.auth {

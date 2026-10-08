@@ -35,6 +35,27 @@ describe('run spec', () => {
       answers: [{ node: 'review', payload: 'yes', question: 'Continue?' }], caller: [{ text: 'hello' }] };
     expect(parseRunSpec(spec)).toEqual(spec);
   });
+  it('reads how long a run is kept and refuses what is no duration', () => {
+    expect(parseRunSpec({ name: 'x', settings: { keep_for: '12h' } }).settings).toEqual({ keep_for: '12h' });
+    expect(parseRunSpec({ name: 'x', settings: { keep_for: 'forever' } }).settings).toEqual({ keep_for: 'forever' });
+    expect(() => parseRunSpec({ name: 'x', settings: { keep_for: 'a week' } })).toThrow('keep_for');
+  });
+  it('reads how long a wait holds and refuses what is no hold', () => {
+    expect(parseRunSpec({ name: 'x', settings: { hold_secs: 0 } }).settings).toEqual({ hold_secs: 0 });
+    expect(() => parseRunSpec({ name: 'x', settings: { hold_secs: 1.5 } })).toThrow('hold_secs');
+    expect(() => parseRunSpec({ name: 'x', settings: { hold_secs: 30 * 24 * 3600 + 1 } })).toThrow('hold_secs');
+  });
+
+  it('reads how a run is kept', () => {
+    const kept = { name: 'x', settings: { keeping: 'durable' } };
+    expect(parseRunSpec(kept)).toEqual(kept);
+    expect(() => parseRunSpec({ name: 'x', settings: { runClass: 'long' } })).toThrow('unknown field');
+    expect(() => parseRunSpec({ name: 'x', settings: { keeping: 'slow' } })).toThrow('keeping');
+    // A null is left out, as the runtime reads it.
+    expect(() => parseRunSpec({ name: 'x', settings: { keeping: null } })).not.toThrow();
+    // A run started by hand is always recorded: there is nothing to choose.
+    expect(() => parseRunSpec({ name: 'x', settings: { recorded: false } })).toThrow('unknown field');
+  });
   it('turns a spec into the same flags a person would type', () => {
     const spec: RunSpec = {
       name: 'x',
@@ -58,6 +79,13 @@ describe('run spec', () => {
     // seeding to decide it is runnable, so a run without `--seed` is
     // refused for an input the preview said was covered.
     expect(specToRunArgs({ name: 'plain' }, true)).toEqual(['--seed']);
+    // The instance and how the run is kept travel too, or a one-off run
+    // of a saved spec would run somewhere else, kept some other way.
+    expect(specToRunArgs({ name: 'kept', instance: 'ws-a', settings: { keeping: 'durable' } }))
+      .toEqual(['--instance', 'ws-a', '--durable']);
+    expect(specToRunArgs({ name: 'kept', settings: { keep_for: '30d' } })).toEqual(['--keep-for', '30d']);
+    expect(specToRunArgs({ name: 'held', settings: { hold_secs: 0 } })).toEqual(['--hold-secs', '0']);
+    expect(specToRunArgs({ name: 'over', settings: { keeping: 'fast' } })).toEqual(['--fast']);
   });
 
   it('summarises a spec for a menu', () => {

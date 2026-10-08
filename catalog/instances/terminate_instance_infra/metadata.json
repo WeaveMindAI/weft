@@ -36,7 +36,7 @@
       },
       "default": "park",
       "label": "Triggers",
-      "description": "The instance's triggers reading it: park keeps everything that arrives (calls, answers, the trigger's own fires) and runs it once the trigger is back, a caller on a route held on the line; hibernate does the same for `graceMinutes` with its questions hidden, then takes nothing more; wipe drops it all."
+      "description": "The instance's triggers reading it: park keeps everything that arrives (answers, events, the trigger's own fires) and runs it once the trigger is back, while a caller on a route is told to try again in a moment; hibernate does the same for `graceMinutes` with its questions hidden, then takes nothing more; wipe drops it all."
     },
     {
       "name": "running",

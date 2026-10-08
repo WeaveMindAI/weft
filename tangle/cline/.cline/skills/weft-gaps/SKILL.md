@@ -33,7 +33,7 @@ GitHub issue forms are prefilled through URL query parameters, one per field `id
 |---|---|---|
 | a language, compiler, or editor capability | `feature_request.yml` | `problem`, `proposal`, `alternatives`, `design-fit` |
 | [a contribution] | `node_request.yml` | `name`, `what-it-does`, `inputs-outputs`, `use-case`, `workarounds` |
-| a provider on the shared keys | `provider_request.yml` | `name`, `base-url`, `pricing`, `existing-meter`, `use-case` |
+| a provider weft should measure | `provider_request.yml` | `name`, `base-url`, `pricing`, `existing-meter`, `use-case` |
 | something in weft is broken | `bug_report.yml` | `what-happened`, `expected`, `repro`, `weft-code`, `logs`, `version`, `platform`, `extra` |
 
 Blank issues are off, so a template is required. When none of the four fits, you use `feature_request.yml` and say so in the issue.

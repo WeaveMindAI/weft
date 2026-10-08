@@ -68,21 +68,156 @@ error.** `cards/count` beside `cards/{id}` is fine, because the first is more
 specific. Two spellings that genuinely overlap are the `route-overlap` error,
 because a call arriving would have no defined answer.
 
-The address is known before you activate:
-`<dispatcher>/connect/<tenant>/<path>`, where the tenant is `local` on your own
-machine.
+You know a route's address before you activate: on your machine it is
+`http://127.0.0.1:14111/connect/local/cards` (the install's address, then
+`/connect/local/`, then the path). On a cloud install it is the install's own
+address, then `/connect/local/`, then the path.
 
-If a page asks a route for something every few seconds (a status, a count), set
-`recorded: false` on the `Route`, or those calls fill `weft executions` with
-hundreds of runs. A run that succeeds or is cancelled then leaves nothing behind
-except what it cost. A run that fails is written down whole after the fact, so
-it lists and inspects exactly like a recorded one. The steps of an unrecorded
-run live in the worker's memory while it runs, which has two consequences: it
-cannot wait (a timer, a form, anything that parks the run fails at the call
-naming `recorded`), and it is lost without a trace if the worker dies mid-call,
-since running it again could repeat what it had already done. With
-`outlivesCaller` on as well, it keeps running after the caller leaves, still
-in memory and still unable to wait.
+If you want the fastest way in, or a frontend wants your routes at the root of
+an address, call the project's own address, where your program answers with
+nothing of weft's in between. On your machine that is a free port the project
+gets the first time you activate it and keeps from then on
+(`http://127.0.0.1:14200/cards`); if another program takes that port, the
+project moves to another free one. On a cloud install it is the project's own
+Cloud Run address. On your machine, if you want a port of your choosing, `weft
+activate --port 8080` opens that one, and the project keeps it for later
+activates. If another program or another of your projects holds that port,
+`weft activate` fails and nothing is activated.
+`weft activate` prints the address, and `weft status` shows it later or says
+why it is unavailable. Your routes keep answering under `/connect/local/` as well.
+
+If a call arrives while the route's trigger is parked, hibernating within its
+grace window, or still being set up, it is answered `503` with a `Retry-After`
+at once, so a client that retries gets through once the trigger is on. Once
+the project is switched off (wiped), its own port is closed and
+`/connect/local/<path>` answers `404`.
+
+## How a run is kept
+
+Your runs happen inside a worker: a copy of your compiled program, running as
+a Docker container on your machine, or as a Cloud Run service on a cloud
+install. A worker
+keeps the runs it is working on in its memory. A trigger has inputs that
+decide what happens to those runs: whether they survive their worker dying,
+whether they are written down, how long they are kept once they end, and how
+long a wait holds when the run cannot pause. You write them in the trigger's braces like
+any other input:
+
+```weft
+pay = Route -> (body: JsonDict) {
+  path: "pay"
+  method: "POST"
+  durable: true
+}
+```
+
+| Input | Default | Change it when |
+|---|---|---|
+| `durable` | off | a run has to carry on after its worker dies, instead of ending |
+| `recorded` | on | a page asks a route for something every few seconds (turn it off) |
+| `outlivesCaller` | off | a run answers its caller early and keeps working (only on a trigger that holds a caller on the line, like `Route` and `Socket`) |
+| `keepRunsFor` | the project's, else a week | you want its runs kept longer or shorter once they end (`12h`, `30d`, `forever`). For the project-wide default, go and read [how long a run is kept](../running/the-journal.md#how-long-a-run-is-kept) |
+| `holdSecs` | 60 | a run that cannot pause should wait longer for an answer (up to 30 days), or not at all (`0`). See [when a run cannot pause](#when-a-run-cannot-pause) |
+
+**By default (`durable` off), a run is fast: it only waits for the database
+when it has to.** That is when it pauses (a timer, a form), and in a few
+other places (for the full list, go and read [when a run waits for
+its writes](../running/the-journal.md#when-a-run-waits-for-its-writes)). The
+rest of the time its steps live in the worker's memory, and its record (the
+journal that `weft events` and the editor read) is written a moment after
+each step. If its worker dies, the run ends
+cancelled and is not run again. For why, and for what happens when the
+platform shuts a worker down on purpose, go and read [what happens when
+something dies](../running/architecture.md#what-happens-when-something-dies).
+
+**If a run must not end when its worker dies (it moves money, say), turn
+`durable` on.** Before each step starts, everything the run did so far is
+written to the database, and a route's answer is written before it is sent.
+The exception is a step of a [pure](../nodes/metadata.md#features) node
+(`Text`, `JsonObject`, `Switch`, `Reply`), which does nothing outside the run
+but answer its caller and handle the run's own files, and starts without
+waiting.
+
+If the worker dies mid-run, another worker picks the run up where it stopped:
+every finished step stays finished, and a step that was in the middle of its
+work is failed with a message saying it may have partly happened, so you know
+which step to check. The exception is a step of a pure node that takes no
+stream and had not passed anything on yet: it simply runs again. If a caller
+started the run, its connection was on the old worker and is gone: the run
+carries on in the new worker with nobody on the line, so a step that answers
+the caller fails, saying no live caller is attached. If the platform stops the
+worker instead, a run that can pause gets 5 seconds for the steps already
+running to finish, and only a step still running after that is failed. A run
+that cannot pause ([below](#when-a-run-cannot-pause)) keeps running on the
+stopping worker for as long as the platform lets it, and if the worker goes
+before the run ends, that is the same as the worker dying. If you want to know
+what `catchErrors` does with that failure, or what happens to a step that was
+waiting on an answer or reading a stream, go and read [surviving a
+restart](../nodes/durable-execution.md#when-the-worker-dies-mid-step).
+
+Even with `durable` off, a run waiting on a timer or a form, with nothing else
+of it running, survives its worker, because its whole record is written before
+it pauses. A run that cannot pause is the exception, below.
+
+### When a run cannot pause
+
+Three kinds of run cannot pause: one whose caller is still on the line while
+its trigger leaves `outlivesCaller` off (the caller cannot follow it), one with
+`recorded` off (there is no record to pick it back up from), and one with a
+bus between its nodes open (a bus lives in its worker's memory alone).
+
+**When such a run reaches a timer or a form, the wait holds in the node's call
+instead.** The wait is registered as usual, the run stays on its worker, and
+the answer carries it on right there. The hold clock only runs while the run
+is quiet, meaning every step still running is waiting, on an answer or on a
+bus. Anything that moves (a bus message, a step finishing) starts it over. If
+the run stays quiet for `holdSecs` (60 seconds unless the trigger says
+otherwise), the call that was waiting fails, saying it gave up, and the wait is
+withdrawn, so a form is no longer offered. The node can handle that error like
+any other, or send it to `error` with `catchErrors`. With `holdSecs: 0`, such a
+wait fails at once.
+
+If the run becomes able to pause while a wait holds (the last bus between its
+nodes closes), the wait pauses after all, the way it would have from the
+start. A run whose caller leaves while `outlivesCaller` is off is cancelled,
+as always. And a fast run holding a wait still ends with its worker.
+
+**If a page asks a route for a status every few seconds, turn `recorded`
+off**, or `weft executions` fills with hundreds of runs. weft keeps no history
+of such a run, not even in its worker's memory. If it fails, `weft executions`
+lists it with the step that failed and why, and nothing of what ran before. If
+it reports a cost, or asks weft for something on its behalf that its worker
+does not already hold (a stored file, a new connection or infrastructure
+address, a task such as starting or stopping its infra, a stop through
+`ctx.stop_tagged`, a wait on a timer or a form), it is listed with its costs
+and how it ended. Otherwise it leaves nothing. If you want to check that a
+trigger with `recorded` off is being called at all, `weft status` shows how
+many runs each trigger started in the last minute or two, and how many of them
+failed.
+
+An unrecorded run cannot pause, so a timer or a form in it holds
+([when a run cannot pause](#when-a-run-cannot-pause)). If a node tags it with
+`ctx.tag_execution` (a label you later find or stop runs by), the node fails:
+an unrecorded run has no record a tag could point at. The compiler also
+refuses `durable: true` with `recorded: false`.
+
+**On a cloud install, one stretch of a run lasts an hour at most.** Cloud Run
+cuts a request at 60 minutes, so a run stops itself 59 minutes after a worker
+starts it. It ends cancelled with a message saying so, instead of being cut
+off mid-step with no ending written. A run that pauses whole (every branch
+waiting on a timer or a form) starts a fresh hour when it picks back up; one
+branch waiting while another runs does not. So if a job can take longer than
+an hour, split it with a pause. On your machine no run is cut.
+
+A run that answers a caller lives on the worker the caller reached. While the
+caller is on the line, the run stops at 59 minutes too, with a message telling
+you to have the client reconnect. Once the caller has gone, a route with
+`outlivesCaller` on keeps its run going, and on a cloud install the run moves:
+it starts no new step on that worker, and once the steps it was running end, it
+carries on under a call weft holds open for it, with a fresh hour. Moving works
+from the run's record, so the compiler refuses `outlivesCaller: true` with
+`recorded: false`. A run with a bus open cannot move, since a bus lives in its worker's memory
+alone, so it keeps running on that worker for as long as the worker stays up.
 
 ## Answering on a socket
 
@@ -168,6 +303,11 @@ weft run --fire inbound='{"chatId":"123","text":"hello"}'
 
 The payload is checked against what that trigger declared it fires with, both
 ways: a missing field is refused, and so is one you invented.
+
+A run you fire this way follows the trigger's `durable` and `keepRunsFor`, and
+it is always recorded, even when the trigger has `recorded` off, so you can
+find it in `weft executions`. For the flags that change how one run is kept, go and read [the `weft
+run` flags](../running/cli.md#run-something).
 
 For writing a trigger of your own, go and read
 [writing a trigger](../nodes/triggers.md).

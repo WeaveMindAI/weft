@@ -24,9 +24,11 @@ Two jobs, one script, chosen by argv:
          its one button, `/action` with
          `reset_password`, mints a new password, sets it on the
          database over the unix socket (which needs no password), and
-         makes it readable again. That is the way out when the
-         connection that held the password is gone: press it, and the
-         program's next run publishes a fresh one.
+         makes it readable again. Then it tells weft the new password
+         (`WEFT_VALUES_URL`, the agent beside this unit), which writes it
+         into the connection the node published, so the program's next
+         run signs in with it; the card shows it until the node's next
+         run retires it.
 
 Where the files live and which port to serve on come from the node
 that declares this container, so the two sides cannot drift.
@@ -38,6 +40,8 @@ import os
 import secrets
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 
 SECRET_DIR = os.environ.get("WEFT_SECRET_DIR")
 PASSWORD_FILE = os.environ.get("WEFT_PASSWORD_FILE")
@@ -45,11 +49,17 @@ PORT = os.environ.get("WEFT_CREDENTIAL_PORT")
 SOCKET_DIR = os.environ.get("WEFT_SOCKET_DIR")
 ADMIN_USER = os.environ.get("WEFT_ADMIN_USER")
 DATABASE = os.environ.get("WEFT_DATABASE")
+# Where this unit tells weft what changed of what the node handed it: set
+# by weft on every container of an infra unit, never by the node.
+# SYNC: WEFT_VALUES_URL <-> crates/weft-core/src/infra/resolve.rs (VALUES_URL_ENV)
+VALUES_URL = os.environ.get("WEFT_VALUES_URL")
 if not SECRET_DIR or not PASSWORD_FILE or not PORT or not SOCKET_DIR or not ADMIN_USER or not DATABASE:
     sys.exit(
         "WEFT_SECRET_DIR, WEFT_PASSWORD_FILE, WEFT_CREDENTIAL_PORT, WEFT_SOCKET_DIR, "
         "WEFT_ADMIN_USER and WEFT_DATABASE must be set by the node"
     )
+if not VALUES_URL:
+    sys.exit("WEFT_VALUES_URL must be set by weft on every container of an infra unit")
 PORT = int(PORT)
 SEALED_FILE = os.path.join(SECRET_DIR, "sealed")
 
@@ -108,14 +118,14 @@ def sealed() -> bool:
     return os.path.exists(SEALED_FILE)
 
 
-def reset_password() -> str | None:
+def reset_password() -> tuple[str | None, str]:
     """Mint a new password, set it on the database, make it readable again.
 
     The database is told first, over its unix socket, which trusts a
     local connection without a password: a file that named a password
-    the database did not have would lock every sign-in out. Returns
-    the refusal text when the database would not take it, so the
-    caller sees exactly what psql said."""
+    the database did not have would lock every sign-in out. Returns the
+    refusal text when the database would not take it, so the caller
+    sees exactly what psql said, and the new password."""
     password = new_password()
     # `psql` variables interpolate with quoting (`:'name'` quotes as a
     # literal, `:"name"` as an identifier), so the password never touches
@@ -139,14 +149,29 @@ def reset_password() -> str | None:
     if run.returncode != 0:
         detail = (run.stderr or run.stdout).strip() or f"psql exited {run.returncode}"
         sys.stderr.write(f"credential: reset refused by the database: {detail}\n")
-        return detail
+        return detail, password
     write_password(password)
     try:
         os.remove(SEALED_FILE)
     except FileNotFoundError:
         pass
     sys.stderr.write("credential: password reset; readable again until a run stores it\n")
-    return None
+    return None, password
+
+
+def push_password(password: str) -> str | None:
+    """Tell weft the connection's new password: why it did not land, or None once it did."""
+    # SYNC: push_values <-> crates/weft-core/src/infra/bake.rs (PushedValues), catalog/postgres/database/mod.rs (the published `password`)
+    body = json.dumps({"connection": {"password": password}}).encode("utf-8")
+    request = urllib.request.Request(VALUES_URL, data=body, method="POST", headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as answer:
+            answer.read()
+        return None
+    except urllib.error.HTTPError as e:
+        return e.read().decode("utf-8", "replace").strip() or f"weft answered {e.code}"
+    except (urllib.error.URLError, OSError) as e:
+        return str(e)
 
 
 def stored_password() -> str | None:
@@ -237,14 +262,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _action(self, body: dict) -> None:
         # The graph's button, in the dispatcher's envelope: a refusal
         # travels as `result.error`, which the user reads as it is.
-        # SYNC: the /action envelope <-> crates/weft-dispatcher/src/api/infra.rs (infra_action_result), catalog/bailey/bridge/images/bridge/src/actions.js
+        # SYNC: the /action envelope <-> crates/weft-core/src/infra/action.rs, catalog/bailey/bridge/images/bridge/src/actions.js
         action = body.get("action")
         if action != RESET_ACTION:
             self._send(200, {"result": {"error": f"no such action: {action!r}"}})
             return
-        refused = reset_password()
+        refused, password = reset_password()
         if refused is not None:
             self._send(200, {"result": {"error": f"the database refused the new password: {refused}"}})
+            return
+        # The connection the node published still holds the old password
+        # until weft is told the new one.
+        unheard = push_password(password)
+        if unheard is not None:
+            sys.stderr.write(f"credential: weft was not told the new password: {unheard}\n")
+            self._send(200, {"result": {"error": (
+                f"the database has a new password, but weft could not be told ({unheard}), so the "
+                "program still signs in with the old one. Run `weft infra rebake` on this node: "
+                "its run reads the new password from the database."
+            )}})
             return
         self._send(200, {"result": {"reset": True}})
 

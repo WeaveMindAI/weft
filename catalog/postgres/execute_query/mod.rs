@@ -78,8 +78,7 @@ impl Node for PostgresExecuteQueryNode {
                 .collect()
         };
 
-        let conn = ctx.open(&account).await?;
-        let mut client = connect(&ctx, &conn).await?;
+        let mut client = connect(&ctx, &account).await?;
         let rows = match plan {
             Plan::Query { sql, names } => query_json(&client, &sql, &names, &bind(&names)).await?,
             Plan::Script { head, last } => script_json(&client, &head, &last).await?,

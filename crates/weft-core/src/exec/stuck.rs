@@ -12,7 +12,7 @@
 use std::fmt;
 
 use crate::frames::LoopFrames;
-use crate::project::{EdgeIndex, ProjectDefinition};
+use crate::project::{ProgramIndex, ProjectDefinition};
 use crate::pulse::PulseTable;
 use crate::ExecutionId;
 
@@ -42,7 +42,7 @@ pub struct StuckReport {
 /// gives the same report.
 pub fn stuck_report(
     project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
     pulses: &PulseTable,
 ) -> StuckReport {
     let mut firings = Vec::new();
@@ -69,7 +69,7 @@ pub fn stuck_report(
             }
         }
         for ((_, frames), holding) in groups {
-            let wired: Vec<String> = edge_idx
+            let wired: Vec<String> = program_idx
                 .get_incoming(project, &node.id, &frames)
                 .iter()
                 .map(|e| e.target_handle.clone().unwrap_or_else(|| "default".to_string()))
@@ -173,7 +173,7 @@ mod tests {
             vec![node("src", &[]), node("theirs", &["value", "go"])],
             &[("src", "theirs", "value"), ("src", "theirs", "go")],
         );
-        let idx = EdgeIndex::build(&p);
+        let idx = ProgramIndex::build(&p);
         let execution_id = uuid::Uuid::new_v4();
         let mut pulses = PulseTable::new();
         pulses.insert("theirs".into(), vec![pulse(execution_id, vec![], "theirs", "value")]);
@@ -199,7 +199,7 @@ mod tests {
             vec![node("src", &[]), node("step", &["a", "b"])],
             &[("src", "step", "a"), ("src", "step", "b")],
         );
-        let idx = EdgeIndex::build(&p);
+        let idx = ProgramIndex::build(&p);
         let execution_id = uuid::Uuid::new_v4();
         let f2 = vec![Frame::Loop { index: 2 }];
         let f5 = vec![Frame::Loop { index: 5 }];
@@ -223,7 +223,7 @@ mod tests {
     #[test]
     fn absorbed_pulses_are_not_stuck() {
         let p = project(vec![node("src", &[]), node("sink", &["value"])], &[("src", "sink", "value")]);
-        let idx = EdgeIndex::build(&p);
+        let idx = ProgramIndex::build(&p);
         let execution_id = uuid::Uuid::new_v4();
         let mut absorbed = pulse(execution_id, vec![], "sink", "value");
         absorbed.status = crate::pulse::PulseStatus::Absorbed;

@@ -115,6 +115,28 @@ async fn the_listener_holds_what_takes_work_and_never_what_refuses_it(pool: PgPo
     assert!(signal_held(&pool, "nothing").await.unwrap().is_none());
 }
 
+/// A run's wait comes back naming the run it answers: its `execution_id`
+/// is a real id on the wire, never text the listener has to parse.
+#[sqlx::test]
+async fn a_held_wait_names_its_run(pool: PgPool) {
+    schema(&pool).await;
+    project(&pool, ACTIVE).await;
+    let run = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO signal (token, tenant_id, project_id, execution_id, node_id, is_resume, spec_json, created_at) \
+         VALUES ('wait', 'local', $1, $2, 'hold', TRUE, '{}', 0)",
+    )
+    .bind(ACTIVE)
+    .bind(run)
+    .execute(&pool)
+    .await
+    .expect("wait row");
+    let held = signal_held(&pool, "wait").await.expect("query").expect("held");
+    assert!(held.is_resume);
+    assert_eq!(held.execution_id, Some(run));
+    assert_eq!(signals_held(&pool, Some(ACTIVE)).await.expect("query")[0].execution_id, Some(run));
+}
+
 #[sqlx::test]
 async fn a_kind_state_claim_has_one_winner(pool: PgPool) {
     schema(&pool).await;
@@ -203,7 +225,8 @@ async fn a_claim_lives_while_renewed_and_lapses_to_another_holder(pool: PgPool) 
     assert!(lost.kept.is_empty() && lost.ended.is_empty(), "lost to another holder, not ended: {lost:?}");
     let fire = |held_by: Option<&str>| weft_task_store::kinds::FireSignalPayload {
         token: "sse".into(),
-        payload: serde_json::json!({}),
+        execution_id: weft_core::ExecutionId::from_u128(1),
+        value: serde_json::json!({}),
         held_by: held_by.map(str::to_string),
     };
     assert_eq!(judge_held_fire(&pool, Some("h2"), &fire(Some("h2"))).await.unwrap(), HeldFire::Taken, "the new holder's fires are taken");

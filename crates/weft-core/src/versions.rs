@@ -60,6 +60,12 @@ pub struct VersionSummary {
     /// What changed against the parent (empty on a root).
     pub diff: ManifestDiff,
     pub manifest: Manifest,
+    /// How many runs the project's triggers started on this version (each
+    /// one too many to list), and the newest.
+    #[serde(default)]
+    pub trigger_runs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_trigger_run: Option<ExecutionId>,
 }
 
 // SYNC: RunSummary <-> extension-vscode/src/sidebar/version-tree.ts RunSummary
@@ -78,7 +84,7 @@ pub struct RunSummary {
     /// The execution's status as the executions list reports it, or
     /// `None` when its journal is gone.
     // SYNC: RunSummary.status <-> extension-vscode/src/sidebar/version-tree.ts RunSummary.status
-    pub status: Option<crate::program::SummaryStatus>,
+    pub status: Option<crate::program::RunStatus>,
     pub started_at: u64,
     pub completed_at: Option<u64>,
     /// For a cancelled run, who or what stopped it.

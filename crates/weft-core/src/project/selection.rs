@@ -55,6 +55,11 @@ pub struct SelectionBounds {
     /// that feeds it, found through any doors on the way, and nothing
     /// above that node.
     pub feed: Vec<(String, BTreeSet<String>)>,
+    /// Infra places the run reads only baked outputs of, every one saved
+    /// (`crate::infra::bake::covered`): each one this run reaches does not
+    /// run, its saved values go out in its place, and nothing above it
+    /// runs for its sake.
+    pub baked: BTreeSet<Located>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -481,10 +486,15 @@ impl RunSelection {
                 return Err("the fired trigger is outside the selected group".into());
             }
             nodes.extend(feeders);
-            Self::from_nodes(g, nodes, BTreeSet::new())
+            let supplied: BTreeSet<Located> = nodes.intersection(&bounds.baked).cloned().collect();
+            nodes.retain(|place| !supplied.contains(place));
+            drop_only_feeding(g, &mut nodes, &supplied, &supplied, &fire.iter().cloned().collect(), &BTreeSet::new());
+            Self::from_nodes(g, nodes, supplied)
         } else {
             let is_trigger = |place: &Located| g.is_trigger(&place.id);
-            let stops = |place: &Located| is_trigger(place) || entries.contains(place) || emits.contains(place);
+            let stops = |place: &Located| {
+                is_trigger(place) || entries.contains(place) || emits.contains(place) || bounds.baked.contains(place)
+            };
             let starts: Vec<Located> = entries.iter().cloned().chain(emits.iter().cloned()).chain(fire.iter().cloned()).collect();
             let mut nodes = if starts.is_empty() {
                 every_place_in(g)
@@ -519,6 +529,14 @@ impl RunSelection {
             }
             suppliers.retain(|place| !before.contains(place));
             nodes.retain(|place| !excluded.contains(place));
+            // A baked place the run reaches supplies its saved values.
+            let baked: BTreeSet<Located> = nodes.iter().filter(|place| bounds.baked.contains(place)).cloned().collect();
+            for place in &baked {
+                nodes.remove(place);
+                suppliers.insert(place.clone());
+            }
+            let named: BTreeSet<Located> = entries.iter().chain(fire.iter()).chain(target.iter()).cloned().collect();
+            drop_only_feeding(g, &mut nodes, &baked, &suppliers, &named, &before.iter().cloned().collect());
             let selection = Self::from_nodes(g, nodes, suppliers);
             // Structural completion cannot restore an explicitly excluded endpoint.
             if selection.nodes.iter().any(|place| excluded.contains(place)) {
@@ -691,7 +709,10 @@ impl RunSelection {
                     .filter(|(edge, _, _)| edge.target_handle.as_deref() == Some("_should_flow"))
                     .map(|(edge, source, _)| (source, Some(edge.source_handle.as_deref().unwrap_or("default").to_string())))
                     .collect();
-                nodes.extend(walk_ports(g, sources, Direction::Upstream, &is_trigger));
+                // A supplier's values are handed in, so nothing above it
+                // runs for the gate either (a baked place, an `--emit`).
+                let stops = |place: &Located| is_trigger(place) || suppliers.contains(place);
+                nodes.extend(walk_ports(g, sources, Direction::Upstream, &stops).into_iter().filter(|place| !suppliers.contains(place)));
             }
             if nodes.len() == before { break; }
         }
@@ -740,6 +761,52 @@ impl RunSelection {
         }
         Self { nodes, edges, boundary_ports, gates, suppliers, input: BTreeMap::new(), input_origins: BTreeMap::new() }
     }
+}
+
+/// Take out of `nodes` what only feeds the `baked` places: a node above
+/// one of them that reaches nothing kept without passing through a
+/// supplier (a baked place's saved values go out in its place, so its
+/// feeders have nothing to feed). Kept are the other nodes, `named` (what
+/// the run was asked to start at or run), the `goals` the run stops before
+/// (what it exists to feed), and anything inside a loop, which runs whole.
+fn drop_only_feeding(
+    g: &ProjectGraph,
+    nodes: &mut BTreeSet<Located>,
+    baked: &BTreeSet<Located>,
+    suppliers: &BTreeSet<Located>,
+    named: &BTreeSet<Located>,
+    goals: &BTreeSet<Located>,
+) {
+    if baked.is_empty() {
+        return;
+    }
+    let starts: Vec<Located> = baked.iter().cloned().collect();
+    let candidates: BTreeSet<Located> = walk(g, &starts, Direction::Upstream, &|place| g.is_trigger(&place.id))
+        .into_iter()
+        .filter(|place| nodes.contains(place) && !named.contains(place) && loops_around(g, place).is_empty())
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    // One walk up from everything kept, never through a supplier nor into
+    // a trigger's inputs (a run never delivers those: a trigger read them
+    // when it was set up): a candidate it reaches feeds something kept.
+    let kept: Vec<Located> = nodes.difference(&candidates).chain(goals.iter()).filter(|place| !g.is_trigger(&place.id)).cloned().collect();
+    let feeds_kept = walk(g, &kept, Direction::Upstream, &|place| suppliers.contains(place) || g.is_trigger(&place.id));
+    nodes.retain(|place| !candidates.contains(place) || feeds_kept.contains(place));
+}
+
+/// The output ports of `place` that a wire into one of `runs` reads, each
+/// wire followed on its path (so a file included twice reads its own
+/// site's node, never the other site's). A wire into a trigger is not a
+/// read: a run never delivers it (a trigger read its inputs when it was
+/// set up).
+pub fn ports_read_by(project: &ProjectDefinition, place: &Located, runs: &BTreeSet<Located>) -> BTreeSet<String> {
+    let g = ProjectGraph::new(project);
+    outgoing(&g, place)
+        .filter(|(_, target, _)| runs.contains(target) && !g.is_trigger(&target.id))
+        .map(|(edge, _, _)| edge.source_handle.clone().unwrap_or_else(|| "default".into()))
+        .collect()
 }
 
 /// Every place in the program: the top-level nodes, and each included
@@ -1015,6 +1082,85 @@ fn gated_group(g: &ProjectGraph, place: &Located) -> Option<String> {
 /// walked one at a time); `None` for any other node.
 fn port_of(g: &ProjectGraph, node: &str, handle: Option<&str>) -> Option<String> {
     g.is_ordinary_boundary(node).then(|| handle.unwrap_or("default").to_string())
+}
+
+/// A run's selection as its record keeps it: the selection itself, and the
+/// digest it is stored under. Every run of one trigger of one program has
+/// the same selection, so the record keeps each one once, by digest
+/// (`run_selection`), and a run's birth names only the digest: that is its
+/// written form. Reading a birth back resolves the digest to the selection
+/// the reader read with the run ([`RecordedSelection::resolving`]); a
+/// birth read with no selection to resolve it fails to decode, naming the
+/// digest, rather than reading as a run of the whole program.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedSelection {
+    digest: std::sync::Arc<str>,
+    selection: std::sync::Arc<RunSelection>,
+}
+
+thread_local! {
+    /// The selections a decode in progress on this thread may resolve
+    /// ([`RecordedSelection::resolving`]).
+    static RESOLVABLE: std::cell::RefCell<Vec<RecordedSelection>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl RecordedSelection {
+    /// `selection`, with the digest it is kept under.
+    pub fn new(selection: RunSelection) -> Self {
+        let value = serde_json::to_value(&selection).expect("a selection serializes");
+        let digest = super::hash::sha256_hex(super::hash::canonical_json(&value).as_bytes());
+        Self { digest: digest.into(), selection: std::sync::Arc::new(selection) }
+    }
+
+    /// A selection read back from the record under `digest`.
+    pub fn read(digest: String, selection: RunSelection) -> Self {
+        Self { digest: digest.into(), selection: std::sync::Arc::new(selection) }
+    }
+
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    pub fn selection(&self) -> &std::sync::Arc<RunSelection> {
+        &self.selection
+    }
+
+    /// Run `decode` with `known` resolvable by digest: a birth decoded
+    /// inside it reads its selection from them. Decoding is synchronous,
+    /// so the scope is exactly the decode.
+    pub fn resolving<R>(known: &[RecordedSelection], decode: impl FnOnce() -> R) -> R {
+        struct Restore(Vec<RecordedSelection>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                RESOLVABLE.with(|cell| *cell.borrow_mut() = std::mem::take(&mut self.0));
+            }
+        }
+        let _restore = Restore(RESOLVABLE.with(|cell| std::mem::replace(&mut *cell.borrow_mut(), known.to_vec())));
+        decode()
+    }
+}
+
+impl std::ops::Deref for RecordedSelection {
+    type Target = RunSelection;
+
+    fn deref(&self) -> &RunSelection {
+        &self.selection
+    }
+}
+
+impl Serialize for RecordedSelection {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.digest)
+    }
+}
+
+impl<'de> Deserialize<'de> for RecordedSelection {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let digest = String::deserialize(deserializer)?;
+        RESOLVABLE
+            .with(|cell| cell.borrow().iter().find(|known| *known.digest == *digest).cloned())
+            .ok_or_else(|| serde::de::Error::custom(format!("the run's selection {digest} is not on record with it")))
+    }
 }
 
 #[cfg(test)]
@@ -1350,8 +1496,8 @@ mod tests {
             ])).unwrap();
             let from: crate::run_spec::RunSpec = serde_json::from_value(json!({"name":"case", "from":{"g":{"x":"backup"}}})).unwrap();
             let group: crate::run_spec::RunSpec = serde_json::from_value(json!({"name":"case", "group":["g",{"x":"backup"}]})).unwrap();
-            let start = crate::run_spec::resolve_spec(&from, &project).unwrap().selection;
-            let confined = crate::run_spec::resolve_spec(&group, &project).unwrap().selection;
+            let start = crate::run_spec::resolve_spec(&from, &project, &Default::default()).unwrap().selection;
+            let confined = crate::run_spec::resolve_spec(&group, &project, &Default::default()).unwrap().selection;
             assert_eq!(start.input[&top("g__in")]["x"], json!("backup"));
             assert_eq!(confined.input, start.input);
             assert!(start.nodes.contains(&top("after")));
@@ -1360,7 +1506,7 @@ mod tests {
             assert!(top_members(&project, "g").is_subset(&confined.nodes));
             assert!(!start.nodes.contains(&top("a")));
             let both = crate::run_spec::RunSpec { group: group.group, ..from };
-            assert!(crate::run_spec::resolve_spec(&both, &project).unwrap_err().to_string().contains("cannot be combined"));
+            assert!(crate::run_spec::resolve_spec(&both, &project, &Default::default()).unwrap_err().to_string().contains("cannot be combined"));
         }
     }
 
@@ -1522,7 +1668,7 @@ mod tests {
         // The spec's backup lands at the first place only.
         let spec: crate::run_spec::RunSpec = serde_json::from_value(json!({"name": "case", "from": {"a.n": {"in": "cut"}}, "target": ["b.n"]})).unwrap();
         project.nodes.iter_mut().find(|n| n.id == "B.n").unwrap().inputs = serde_json::from_value(json!([{"name": "in", "portType": "String", "required": true}])).unwrap();
-        let resolved = crate::run_spec::resolve_spec(&spec, &project).unwrap();
+        let resolved = crate::run_spec::resolve_spec(&spec, &project, &Default::default()).unwrap();
         assert_eq!(resolved.selection.input.keys().cloned().collect::<Vec<_>>(), vec![at("B.n", &["a"])]);
         assert_eq!(resolved.kicks.iter().map(|k| (k.node.clone(), k.frames.clone())).collect::<Vec<_>>(), vec![("a__in".to_string(), vec![])]);
     }
@@ -1756,5 +1902,21 @@ mod tests {
         assert!(fire.nodes.contains(&top("g__in")));
         assert!(!fire.nodes.contains(&top("g.make")), "nothing reads `when`, so the member is not pulled in: {:?}", fire.nodes);
         assert!(!fire.nodes.contains(&at("S.query", &["s"])));
+    }
+
+    /// A recorded selection is written as its digest, and reads back only
+    /// where the selection it names is known: two equal selections share a
+    /// digest, and a digest nothing resolves is refused, naming it.
+    #[test]
+    fn a_recorded_selection_is_written_as_its_digest_and_read_from_what_is_known() {
+        let selection = RunSelection { nodes: [top("a"), top("b")].into_iter().collect(), ..Default::default() };
+        let recorded = RecordedSelection::new(selection.clone());
+        assert_eq!(recorded.digest(), RecordedSelection::new(selection.clone()).digest());
+        let written = serde_json::to_value(&recorded).unwrap();
+        assert_eq!(written, json!(recorded.digest()));
+        let back: RecordedSelection = RecordedSelection::resolving(std::slice::from_ref(&recorded), || serde_json::from_value(written.clone()).unwrap());
+        assert_eq!(*back, selection);
+        let unknown = serde_json::from_value::<RecordedSelection>(written).unwrap_err().to_string();
+        assert!(unknown.contains(recorded.digest()), "{unknown}");
     }
 }

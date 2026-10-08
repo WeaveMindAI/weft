@@ -56,7 +56,7 @@ screen, never a lecture about what is not.
 | a trigger | what starts the program on its own (a message arriving, a schedule, a form); the action bar grows an Activate button when one is in the program |
 | a node with a status pill | infra: the program's own long-running service (its own Postgres, the WhatsApp bridge) that stays up between runs |
 | a node with "Connect ..." | an access node: where an account gets attached; the credential lives outside the code |
-| the run list in the sidebar | executions: every run of this program, recorded step by step with its values |
+| the run list in the sidebar | executions: the runs of this program, step by step with their values (a trigger with `recorded` off shows only the runs that failed or reported a cost) |
 | a cyan box mid-run | waiting: the run paused for a person or an event and costs nothing while it waits |
 
 ## The tour, in order

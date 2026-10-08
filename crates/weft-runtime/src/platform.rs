@@ -54,13 +54,13 @@ pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>) -> anyho
                 Arc::new(weft_platform_traits::SystemClock),
                 weft_platform_local::LocalRunnerConfig {
                     broker_url: config.role_addresses(Vantage::Private).broker,
-                    // A local worker gets the ticket secret from the runner
-                    // that starts it; a GCP one reads it from Secret Manager.
-                    caller_token_secret: crate::secret("WEFT_CALLER_TOKEN_SECRET")?,
+                    install_secret: crate::install_secret()?,
                     idle_stop: local.worker_idle_stop(),
                     scratch_dir: scratch.clone(),
                     install: config.install.clone(),
                     time_scale: weft_core::time_scale::factor(),
+                    edge: config.edge,
+                    project_ip: local.listen.public.ip(),
                 },
             ));
             let gpu = weft_platform_local::LocalInfraHost::detect_gpu(docker.as_ref()).await?;
@@ -73,6 +73,12 @@ pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>) -> anyho
                     disks: weft_platform_local::DiskBacking::Volumes,
                     publish: weft_platform_local::Publish::Loopback,
                     install: config.install.clone(),
+                    // A unit's agent sits on the workers' network, so it
+                    // reaches the broker where they do.
+                    agent_broker: weft_platform_local::AgentBroker {
+                        url: config.role_addresses(Vantage::Private).broker,
+                        identity: weft_platform_local::AgentIdentity::Minted(identity.clone()),
+                    },
                 },
             ));
             let alarm = Arc::new(weft_platform_local::LocalAlarm::new(pool.clone()));
@@ -125,7 +131,14 @@ pub async fn build(config: &InstallConfig, pool: Option<&sqlx::PgPool>) -> anyho
             let tokens = Arc::new(weft_platform_gcp::MetadataTokens::new());
             let google = weft_platform_gcp::Google::new(tokens.clone());
             Ok(Parts {
-                runner: Arc::new(weft_platform_gcp::CloudRunRunner::new(google.clone(), gcp.clone(), config.role_addresses(Vantage::Private).broker, config.install.clone())),
+                runner: Arc::new(weft_platform_gcp::CloudRunRunner::new(
+                    google.clone(),
+                    gcp.clone(),
+                    config.role_addresses(Vantage::Private).broker,
+                    config.install.clone(),
+                    config.edge,
+                    crate::install_secret()?,
+                )),
                 images: Arc::new(weft_platform_gcp::CloudBuildImages::new(google.clone(), gcp.clone())?),
                 host: Arc::new(weft_platform_gcp::ComputeInfraHost::new(
                     google.clone(),

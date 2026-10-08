@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 
 use crate::exec::skip::{check_flow_permission, check_should_skip, SkipReason};
 use crate::frames::{Located, LoopFrames};
-use crate::project::{Edge, EdgeIndex, GroupBoundaryRole, NodeDefinition, ProjectDefinition};
+use crate::project::{Edge, ProgramIndex, GroupBoundaryRole, NodeDefinition, ProjectDefinition};
 use crate::primitive::Phase;
 use crate::pulse::{Failure, Pulse, PulseStatus, PulseTable};
 use crate::weft_type::WeftType;
@@ -86,12 +86,12 @@ pub fn effective_input_pulses(
     actual: &[&Pulse],
     wired: &HashSet<&str>,
     project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
     execution_id: ExecutionId,
     frames: &LoopFrames,
 ) -> Vec<Pulse> {
     let mut effective: Vec<_> = actual.iter().map(|pulse| (*pulse).clone()).collect();
-    let Some(selection) = edge_idx.selection() else { return effective };
+    let Some(selection) = program_idx.selection() else { return effective };
     let at = Located::at(&node.id, frames);
     for port in &node.inputs {
         if !selection.includes_port(&at, node, &port.name) { continue; }
@@ -126,11 +126,11 @@ fn pulse_rank(p: &Pulse) -> u8 {
 /// over body literals.
 pub fn wired_inputs<'a>(
     project: &'a ProjectDefinition,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
     node_id: &str,
     frames: &LoopFrames,
 ) -> HashSet<&'a str> {
-    edge_idx
+    program_idx
         .get_incoming(project, node_id, frames)
         .iter()
         .map(|e| e.target_handle.as_deref().unwrap_or("default"))
@@ -212,9 +212,9 @@ pub fn settle_out_of_run(
 /// items on such an edge are two items, and a closure (the stream's
 /// end) coexists with still-buffered ones, so every dedup and every
 /// pending-value rule exempts these edges.
-pub fn edge_targets_generator(project: &ProjectDefinition, edge: &Edge) -> bool {
+pub fn edge_targets_generator(program_idx: &ProgramIndex, edge: &Edge) -> bool {
     let handle = edge.target_handle.as_deref().unwrap_or("default");
-    project.nodes.iter().find(|n| n.id == edge.target).is_some_and(|n| is_generator_input(n, handle))
+    program_idx.stream_inputs(&edge.target).iter().any(|input| input == handle)
 }
 
 /// `dispatchable`, when set, is the only part of the graph this
@@ -228,10 +228,10 @@ pub fn edge_targets_generator(project: &ProjectDefinition, edge: &Edge) -> bool 
 pub fn find_ready_nodes(
     project: &ProjectDefinition,
     pulses: &PulseTable,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
     dispatchable: Option<&HashSet<Located>>,
 ) -> Vec<(String, ReadyGroup)> {
-    find_ready_among(project, project.nodes.iter(), pulses, edge_idx, dispatchable)
+    find_ready_among(project, project.nodes.iter(), pulses, program_idx, dispatchable)
         .into_iter()
         .map(|(node, group)| (node.id.clone(), group))
         .collect()
@@ -244,7 +244,7 @@ pub fn find_ready_among<'a>(
     project: &ProjectDefinition,
     candidates: impl IntoIterator<Item = &'a NodeDefinition>,
     pulses: &PulseTable,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
     dispatchable: Option<&HashSet<Located>>,
 ) -> Vec<(&'a NodeDefinition, ReadyGroup)> {
     let mut result = Vec::new();
@@ -271,16 +271,16 @@ pub fn find_ready_among<'a>(
         }
         for ((execution_id, frames), group_pulses) in groups {
             let out_of_scope = dispatchable.is_some_and(|s| !s.contains(&Located::at(&node.id, &frames)));
-            let wired = wired_inputs(project, edge_idx, &node.id, &frames);
+            let wired = wired_inputs(project, program_idx, &node.id, &frames);
             let required: HashSet<&str> = node
                 .inputs
                 .iter()
-                .filter(|p| p.required && edge_idx.includes_port(node, &frames, &p.name))
+                .filter(|p| p.required && program_idx.includes_port(node, &frames, &p.name))
                 .map(|p| p.name.as_str())
                 .collect();
-            let literal_filled = literal_filled_ports(node, &wired, &frames, edge_idx);
+            let literal_filled = literal_filled_ports(node, &wired, &frames, program_idx);
             if let Some(group) = ready_group_at(
-                node, &group_pulses, execution_id, &frames, &required, &wired, &literal_filled, out_of_scope, project, edge_idx,
+                node, &group_pulses, execution_id, &frames, &required, &wired, &literal_filled, out_of_scope, project, program_idx,
             ) {
                 result.push((node, group));
             }
@@ -308,10 +308,10 @@ fn ready_group_at(
     literal_filled: &HashSet<&str>,
     out_of_scope: bool,
     project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
 ) -> Option<ReadyGroup> {
     let has_incoming = !wired.is_empty();
-    let effective = effective_input_pulses(node, group_pulses, wired, project, edge_idx, execution_id, frames);
+    let effective = effective_input_pulses(node, group_pulses, wired, project, program_idx, execution_id, frames);
     let effective_refs: Vec<_> = effective.iter().collect();
     let all_satisfied = wired.iter().all(|port_name| {
         effective_refs.iter().any(|p| p.target_port == *port_name)
@@ -324,7 +324,7 @@ fn ready_group_at(
         return None;
     }
 
-    let received = firing_input(node, &effective_refs, wired, frames, edge_idx);
+    let received = firing_input(node, &effective_refs, wired, frames, program_idx);
 
     // Group/Loop boundary skip rules: only In-boundary skips; Out
     // forwards whatever came through.
@@ -378,16 +378,16 @@ pub fn kicked_group(
     frames: &LoopFrames,
     execution_id: ExecutionId,
     project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
 ) -> ReadyGroup {
-    let wired = wired_inputs(project, edge_idx, &node.id, frames);
-    let effective = effective_input_pulses(node, &[], &wired, project, edge_idx, execution_id, frames);
+    let wired = wired_inputs(project, program_idx, &node.id, frames);
+    let effective = effective_input_pulses(node, &[], &wired, project, program_idx, execution_id, frames);
     let effective_refs: Vec<_> = effective.iter().collect();
     let received = if kick.firing {
         let (input, errors) = build_kicked_input(node, kick.port_snapshot.as_ref());
         FiringInput { input, type_errors: errors, ..Default::default() }
     } else {
-        firing_input(node, &effective_refs, &wired, frames, edge_idx)
+        firing_input(node, &effective_refs, &wired, frames, program_idx)
     };
     let skip = match &kick.scope_skipped {
         Some(scope) => Some(SkipReason::ScopeSkipped { scope: scope.clone() }),
@@ -397,8 +397,8 @@ pub fn kicked_group(
         // gates still decide scope_permission before this kick dispatches.
         None if kick.firing => check_flow_permission(node, &[]),
         None => check_should_skip(node, &effective_refs,
-            &node.inputs.iter().filter(|p| p.required && edge_idx.includes_port(node, frames, &p.name)).map(|p| p.name.as_str()).collect(),
-            &wired, &literal_filled_ports(node, &wired, frames, edge_idx)),
+            &node.inputs.iter().filter(|p| p.required && program_idx.includes_port(node, frames, &p.name)).map(|p| p.name.as_str()).collect(),
+            &wired, &literal_filled_ports(node, &wired, frames, program_idx)),
     };
     ReadyGroup {
         frames: frames.clone(),
@@ -466,7 +466,7 @@ pub fn firing_input(
     group_pulses: &[&Pulse],
     wired: &HashSet<&str>,
     frames: &LoopFrames,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
 ) -> FiringInput {
     let mut obj = InputBag::new();
 
@@ -486,7 +486,7 @@ pub fn firing_input(
     }
 
     fill_input_from_literals(node, wired, &mut obj);
-    obj.retain(|port, _| edge_idx.includes_port(node, frames, port));
+    obj.retain(|port, _| program_idx.includes_port(node, frames, port));
 
     // Runtime type enforcement on input ports: the single check point
     // (see `check_input`). A mismatch on a required port aggregates
@@ -620,12 +620,12 @@ pub fn literal_filled_ports<'a>(
     node: &'a NodeDefinition,
     wired: &HashSet<&str>,
     frames: &LoopFrames,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
 ) -> HashSet<&'a str> {
     node.port_literals
         .iter()
         .filter(|(name, value)| {
-            edge_idx.includes_port(node, frames, name) && !wired.contains(name.as_str()) && literal_is_data(node, name, value)
+            program_idx.includes_port(node, frames, name) && !wired.contains(name.as_str()) && literal_is_data(node, name, value)
         })
         .map(|(name, _)| name.as_str())
         .collect()
@@ -748,7 +748,7 @@ mod tests {
     use crate::frames::{Frame, Located};
     use super::{build_kicked_input, check_input, resolve_port_value, InputCheck};
     use serde_json::Value;
-    use crate::project::{EdgeIndex, InputDefinition, NodeDefinition, Position, ProjectDefinition};
+    use crate::project::{ProgramIndex, InputDefinition, NodeDefinition, Position, ProjectDefinition};
     use super::{effective_input_pulses, firing_input};
     use std::collections::HashSet;
     use crate::pulse::Pulse;
@@ -836,8 +836,9 @@ mod tests {
         let project = ProjectDefinition {
             id: execution_id, nodes: vec![node.clone()], edges: vec![], groups: vec![],
             created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
+            defaults: Default::default(),
         };
-        let index = EdgeIndex::build(&project);
+        let index = ProgramIndex::build(&project);
         let groups: Vec<_> = pulses.iter().map(|p| p.frames.clone()).collect::<std::collections::BTreeSet<_>>().into_iter()
             .filter_map(|frames| {
                 let at: Vec<&Pulse> = pulses.iter().filter(|p| p.frames == frames).collect();
@@ -1072,7 +1073,7 @@ mod tests {
             group_boundary: None,
             requires_infra: false, per_instance: None,
             images: Vec::new(),
-            fires_with: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(),
             published_service: None,
             instance_service: None,
             instance_rules: None,
@@ -1104,12 +1105,13 @@ mod tests {
         let project = ProjectDefinition {
             id: uuid::Uuid::nil(), nodes: vec![node.clone()], edges: vec![], groups: vec![],
             created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
+            defaults: Default::default(),
         };
         let mut selection = crate::project::selection::RunSelection::default();
         selection.nodes.insert(Located::top(&node.id));
         selection.boundary_ports.insert(Located::top(&node.id), ["selected".into()].into());
         selection.input.insert(Located::top(&node.id), [("p".into(), json!("unused"))].into());
-        let index = EdgeIndex::selected(&project, selection);
+        let index = ProgramIndex::selected(&project, selection);
         let effective = effective_input_pulses(&node, &[], &HashSet::new(), &project, &index, project.id, &vec![]);
         assert!(effective.is_empty());
         let received = firing_input(&node, &[], &HashSet::new(), &vec![], &index);
@@ -1129,8 +1131,9 @@ mod tests {
         let project = ProjectDefinition {
             id: uuid::Uuid::nil(), nodes: vec![node.clone()], edges: vec![], groups: vec![],
             created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
+            defaults: Default::default(),
         };
-        let index = EdgeIndex::selected(&project, crate::project::selection::RunSelection::whole(&project));
+        let index = ProgramIndex::selected(&project, crate::project::selection::RunSelection::whole(&project));
         let kick = crate::primitive::KickedNode {
             firing: false, payload: None, port_snapshot: None, dispatched: false, scope_skipped: None,
         };
@@ -1148,10 +1151,11 @@ mod tests {
             id: uuid::Uuid::nil(), nodes: vec![source, node.clone()],
             edges: vec![serde_json::from_value(json!({"id":"wire", "source":"source", "target":"k", "sourceHandle":"out", "targetHandle":"p"})).unwrap()],
             groups: vec![], created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
+            defaults: Default::default(),
         };
         let mut selection = crate::project::selection::RunSelection::whole(&project);
         selection.input.entry(Located::top("k")).or_default().insert("p".into(), json!("backup"));
-        let index = EdgeIndex::selected(&project, selection.clone());
+        let index = ProgramIndex::selected(&project, selection.clone());
         let wired = HashSet::from(["p"]);
         let execution_id = project.id;
         let effective = effective_input_pulses(&node, &[], &wired, &project, &index, execution_id, &vec![]);
@@ -1167,7 +1171,7 @@ mod tests {
         let effective = effective_input_pulses(&node, &[&closure], &wired, &project, &index, execution_id, &vec![]);
         assert_eq!(*firing_input(&node, &effective.iter().collect::<Vec<_>>(), &wired, &vec![], &index).input["p"], json!("backup"));
         selection.nodes.remove(&Located::top("source"));
-        let index = EdgeIndex::selected(&project, selection);
+        let index = ProgramIndex::selected(&project, selection);
         let effective = effective_input_pulses(&node, &[], &wired, &project, &index, execution_id, &vec![]);
         assert_eq!(*firing_input(&node, &effective.iter().collect::<Vec<_>>(), &wired, &vec![], &index).input["p"], json!("backup"));
         let null = data(execution_id, vec![], "k", "p", Value::Null);

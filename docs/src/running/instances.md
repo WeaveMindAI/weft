@@ -166,12 +166,12 @@ weft honours the `Weft-Instance` header: on an open route anybody could claim
 any instance, so weft refuses the header there and says why. A browser presents
 an instance token instead.
 
-If you call a route and want the run to be for an instance, call it at
-`<dispatcher>/connect/<tenant>/<path>` (for where that address comes from, go
-and read
+If you call a route and want the run to be for an instance, call it at one of
+its route addresses: `/connect/local/<path>` on the install, the project's own
+port on your machine, or an API domain (for where those come from, go and read
 [answering on a URL](../language/triggers-and-routes.md#answering-on-a-url)).
 A webhook also answers at a plain address without `/connect`, but a run started
-there is always for no instance, and weft refuses an instance header sent there.
+there is never for an instance, and weft refuses an instance header sent there.
 
 ## What is checked before a run starts
 

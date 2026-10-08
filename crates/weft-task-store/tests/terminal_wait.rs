@@ -13,10 +13,8 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use sqlx::PgPool;
 
-use weft_task_store::pg_signal::{Heard, Subscription};
-use weft_task_store::tasks::{self, claim_one, enqueue_or_rearm};
-use weft_task_store::terminal::TERMINAL_CHANNEL;
-use weft_task_store::{PostgresTaskStoreClient, TaskStatus, TaskStoreClient, TaskTarget};
+use weft_task_store::tasks::{self, claim_one};
+use weft_task_store::{PostgresTaskStoreClient, TaskStatus, TaskStoreClient};
 
 use support::{setup, signals};
 
@@ -24,32 +22,13 @@ use support::{setup, signals};
 /// that ends before this was woken, not timed out.
 const WOKEN: Duration = Duration::from_secs(10);
 
-/// How long the line has to stay quiet before nothing more is coming.
-const QUIET: Duration = Duration::from_millis(500);
-
-/// The ids announced as terminal until the line goes quiet.
-async fn terminal_ids(subscription: &mut Subscription) -> Vec<String> {
-    let mut ids = Vec::new();
-    while let Ok(next) = tokio::time::timeout(QUIET, subscription.next()).await {
-        match next.expect("the watch is running") {
-            Heard::Signal { channel, payload } if channel == TERMINAL_CHANNEL => ids.push(payload.to_string()),
-            Heard::Signal { .. } => {}
-            Heard::Recheck | Heard::Lost => panic!("a lost connection would hide which notifications were sent"),
-        }
-    }
-    ids
-}
-
 fn task(dedup: &str) -> tasks::NewTask {
     tasks::NewTask {
         kind: "register_signal".to_string(),
-        target: TaskTarget::Dispatcher,
         project_id: None,
         dedup_key: Some(dedup.to_string()),
         execution_id: None,
         tenant_id: "tenant-1".to_string(),
-        target_replica: None,
-        binary_hash: None,
         payload: json!({}),
     }
 }
@@ -132,28 +111,6 @@ async fn a_done_task_answers_at_once_and_an_unfinished_one_at_the_timeout(pool: 
     let outcome = client.wait_for_terminal(open, Duration::from_millis(500)).await.expect("wait");
     assert_eq!(outcome.status, TaskStatus::Pending);
     assert!(started.elapsed() >= Duration::from_millis(500));
-}
-
-/// A finish that puts the task back to pending (it was asked to run
-/// again while claimed) is not an end, so it wakes nobody; the finish of
-/// the run it asked for wakes waiters exactly once.
-#[sqlx::test]
-async fn a_finish_that_runs_the_task_again_wakes_nobody(pool: PgPool) {
-    setup(&pool).await;
-    let watch = signals(&pool).await;
-    let mut heard = watch.subscribe();
-    let tasks::DedupOutcome::Inserted(id) = enqueue_or_rearm(&pool, task("rerun")).await.expect("enqueue") else {
-        panic!("the first ask inserts");
-    };
-
-    claim_one(&pool, "disp-1").await.expect("claim").expect("the task");
-    enqueue_or_rearm(&pool, task("rerun")).await.expect("ask again");
-    tasks::complete(&pool, id, "disp-1", json!(1)).await.expect("complete");
-    assert_eq!(terminal_ids(&mut heard).await, Vec::<String>::new(), "back to pending is not an end");
-
-    claim_one(&pool, "disp-1").await.expect("claim").expect("the task again");
-    tasks::complete(&pool, id, "disp-1", json!(2)).await.expect("complete");
-    assert_eq!(terminal_ids(&mut heard).await, vec![id.to_string()]);
 }
 
 /// The project-scoped wait reads only its own project's task: another

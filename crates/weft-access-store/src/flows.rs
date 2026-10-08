@@ -542,7 +542,7 @@ fn storable_values(
 }
 
 async fn insert_grant(
-    pool: &PgPool,
+    db: impl sqlx::PgExecutor<'_>,
     tenant: &str,
     grant: NewGrant<'_>,
 ) -> anyhow::Result<CompletedConnect> {
@@ -610,7 +610,7 @@ async fn insert_grant(
     .bind(grant.expires_at)
     .bind(&grant.published_by_node)
     .bind(grant.instance.as_ref().map(|m| m.as_str()))
-    .fetch_one(pool)
+    .fetch_one(db)
     .await?;
     Ok(CompletedConnect {
         grant: GrantSummary {
@@ -1825,6 +1825,17 @@ pub async fn publish_grant(
     tenant: &str,
     req: PublishAccess,
 ) -> anyhow::Result<PublishedConnection> {
+    publish_grant_in(&mut *pool.acquire().await?, tenant, req).await
+}
+
+/// [`publish_grant`] on the caller's connection, so a write that must land
+/// with others (a push carrying both a connection's values and baked
+/// outputs) commits or fails as one.
+async fn publish_grant_in(
+    conn: &mut sqlx::PgConnection,
+    tenant: &str,
+    req: PublishAccess,
+) -> anyhow::Result<PublishedConnection> {
     let PublishAccess { spec, project_id, node_id, instance, values, label } = req;
     spec.validate().map_err(AccessError::Invalid)?;
     let fields =
@@ -1841,7 +1852,7 @@ pub async fn publish_grant(
     .bind(&node_id)
     .bind(&spec.service)
     .bind(instance.as_ref().map(|m| m.as_str()))
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
     if let Some(current) = current {
         // Every other column a publish writes follows from these (it
@@ -1857,7 +1868,7 @@ pub async fn publish_grant(
         }
     }
     let done = insert_grant(
-        pool,
+        &mut *conn,
         tenant,
         NewGrant {
             spec: &spec,
@@ -1877,6 +1888,87 @@ pub async fn publish_grant(
     )
     .await?;
     Ok(PublishedConnection { connection_id: done.grant.id.to_string(), identity: done.grant.identity })
+}
+
+/// Write what an infra copy said changed of what its node handed weft
+/// (`weft_core::infra::bake::PushedValues`), with no node running:
+/// `connection` over the values of the connection the node published,
+/// through the same publish a node makes (so workers hear it), and
+/// `outputs` over the baked outputs saved with the copy
+/// (`infra_node.baked_json`). Only what the node handed weft already can
+/// change: a key the connection does not store, or an output the copy did
+/// not bake, is refused as [`AccessError::Invalid`], naming it, and so is a
+/// copy that is gone. Pushes to one copy take turns, so two at once never
+/// lose each other's keys, and a push lands whole or not at all: both
+/// writes share one transaction.
+pub async fn write_pushed_values(
+    pool: &PgPool,
+    project_id: uuid::Uuid,
+    copy_id: &str,
+    values: &weft_core::infra::bake::PushedValues,
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    let copy: Option<(String, Option<String>, Value)> = sqlx::query_as(
+        "SELECT node_id, instance_id, baked_json FROM infra_node WHERE project_id = $1 AND copy_id = $2 FOR UPDATE",
+    )
+    .bind(project_id)
+    .bind(copy_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((node_id, instance_id, baked)) = copy else {
+        return Err(AccessError::Invalid(format!("infra copy {copy_id} is no longer running here, so nothing it says changed can be written")).into());
+    };
+    if let Some(stray) = values.outputs.keys().find(|port| baked.get(port.as_str()).is_none()) {
+        return Err(AccessError::Invalid(format!("{node_id} has no baked output '{stray}', so the value its infrastructure sent for it has nowhere to go")).into());
+    }
+    if !values.connection.is_empty() {
+        let published: Vec<(Value, String, Option<String>, String)> = sqlx::query_as(
+            "SELECT g.spec_json, g.values_sealed, g.label, g.tenant_id FROM access_grant g JOIN project p ON p.tenant_id = g.tenant_id \
+             WHERE p.id = $1 AND g.project_id = $1 AND g.published_by_node = $2 AND g.instance_id IS NOT DISTINCT FROM $3",
+        )
+        .bind(project_id)
+        .bind(&node_id)
+        .bind(&instance_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let (spec, sealed, label, tenant) = match published.as_slice() {
+            [one] => one,
+            [] => return Err(AccessError::Invalid(format!("{node_id} has published no connection, so the connection values its infrastructure sent have nowhere to go")).into()),
+            _ => return Err(AccessError::Invalid(format!("{node_id} published several connections, so the connection values its infrastructure sent name none of them")).into()),
+        };
+        let mut stored = crate::values_of(&crate::open_json(sealed)?);
+        if let Some(stray) = values.connection.keys().find(|key| !stored.contains_key(key.as_str())) {
+            return Err(AccessError::Invalid(format!(
+                "{node_id}'s connection stores no '{stray}', so the value its infrastructure sent for it has nowhere to go (it stores {})",
+                stored.keys().map(String::as_str).collect::<Vec<_>>().join(", ")
+            ))
+            .into());
+        }
+        stored.extend(values.connection.clone());
+        publish_grant_in(
+            &mut tx,
+            tenant,
+            PublishAccess {
+                spec: crate::spec_of(spec)?,
+                project_id,
+                node_id: node_id.clone(),
+                instance: instance_id.map(weft_core::instance::InstanceId::new).transpose().map_err(anyhow::Error::msg)?,
+                values: stored,
+                label: label.clone(),
+            },
+        )
+        .await?;
+    }
+    if !values.outputs.is_empty() {
+        sqlx::query("UPDATE infra_node SET baked_json = baked_json || $3 WHERE project_id = $1 AND copy_id = $2")
+            .bind(project_id)
+            .bind(copy_id)
+            .bind(sqlx::types::Json(&values.outputs))
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
 /// What a node's published connection holds now, as a publish compares it.

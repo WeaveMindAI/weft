@@ -10,7 +10,6 @@ use axum::{
     response::Response,
     Json,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::Row;
 
@@ -19,70 +18,25 @@ use weft_core::signal::listener_protocol::ProcessTarget;
 use crate::authenticator::{authorize_project, CallerTenant};
 use crate::state::DispatcherState;
 
-/// One element of `signal.parked_fires`. Single source of truth for
-/// the queue element shape: the park path serializes one of these
-/// onto the array; the drain loop deserializes it back. A typo on
-/// either side becomes a compile error.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ParkedFire {
-    /// Per-fire UUID stamped at park time. The drain pass uses this
-    /// as the task-table dedup nonce so a crash between
-    /// `dispatch_listener_outcome`'s task-insert and the head-pop
-    /// collapses the next drain's retry to the same task. Distinct
-    /// queued fires have distinct ids and never collapse.
-    pub id: String,
-    pub payload: Value,
-    pub received_at_unix: i64,
-    /// How many times the dispatcher has tried and failed to move this
-    /// fire along: a dispatch that could not place it, or a route that
-    /// failed (a transient read, the project not Active at route time).
-    /// Zero for a fire parked by the lifecycle gate. Drives the backoff
-    /// below; an element written before the field existed reads as
-    /// zero.
-    #[serde(default)]
-    pub attempts: u32,
-    /// Not drained before this instant. A re-parked fire waits
-    /// `park_backoff_secs(attempts)` before the next try, so a fire that
-    /// keeps failing (a missing definition, a project row gone) retries
-    /// every few minutes instead of spinning against Postgres and the
-    /// logs. Zero (the default) means due now.
-    #[serde(default)]
-    pub not_before_unix: i64,
-    /// Set when the fire parked because its instance has not given (or gave
-    /// an invalid) value it needs: the refusal, naming each field. Such a
-    /// fire is not retried on a timer (the reaper's sweep passes it by,
-    /// whatever `not_before_unix` says); the instance's next change of
-    /// values routes it again (`instance_values::change`), and so does
-    /// activating its trigger. Shown per trigger by `weft status` and
-    /// `ctx.instances().list()`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instance_gap: Option<String>,
+pub use weft_task_store::parked_fires::{park, park_backoff_secs, ParkAppend, ParkRefusal, Waiting};
+
+/// What became of an entry's event handed to the worker's door.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Landed {
+    /// It is dealt with: a run started (or had already), or it was dropped
+    /// (and why is logged).
+    Done,
+    /// It waits in its trigger's queue: the trigger is parked, its runs at
+    /// once are all going, what it reads is not ready, or its worker was
+    /// out of reach. `instance_gap` when it waits on what its instance
+    /// provides.
+    Waits { reason: String, instance_gap: bool },
+    /// A caller past the trigger's per-caller limit, and when to come back.
+    Refused { reason: String, retry_after_secs: u64 },
 }
 
-/// A parked fire's identity as a drain hands it to the fire path: the
-/// stable fire id (the route task's dedup nonce and execution seed) and how
-/// many routes have already failed, so the next re-park backs off
-/// further.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ParkedRef<'a> {
-    pub id: &'a str,
-    pub attempts: u32,
-}
-
-/// Seconds a fire waits before its `attempts`-th retry: 1, 2, 4, ...
-/// doubling, capped at five minutes. The first failure retries almost at
-/// once (a transient read); a fire that keeps failing settles at the cap
-/// and the reaper's parked-fire sweep picks it up when due.
-pub(crate) fn park_backoff_secs(attempts: u32) -> i64 {
-    const CAP_SECS: i64 = 300;
-    if attempts == 0 {
-        return 0;
-    }
-    1i64.checked_shl(attempts - 1).unwrap_or(CAP_SECS).min(CAP_SECS)
-}
-
-/// Every instance trigger's fires waiting on a value its instance has not
-/// given (`ParkedFire::instance_gap`) in `project_id`: how many, and the
+/// Every instance trigger's events waiting on a value its instance has not
+/// given (`parked_fire.instance_gap`) in `project_id`: how many, and the
 /// reason the one parked last gave.
 pub async fn instance_waits(
     pool: &sqlx::PgPool,
@@ -90,9 +44,9 @@ pub async fn instance_waits(
 ) -> anyhow::Result<std::collections::BTreeMap<weft_core::activation::ActivationKey, weft_core::program::WaitingFires>> {
     let rows: Vec<(String, Option<String>, i64, String)> = sqlx::query_as(
         "SELECT s.activation_trigger, s.instance_id, count(*)::bigint, \
-                (array_agg(t.elem ->> 'instance_gap' ORDER BY t.ord DESC))[1] \
-         FROM signal s, jsonb_array_elements(s.parked_fires) WITH ORDINALITY AS t(elem, ord) \
-         WHERE s.project_id = $1 AND s.activation_trigger IS NOT NULL AND t.elem ? 'instance_gap' \
+                (array_agg(p.instance_gap #>> '{}' ORDER BY p.seq DESC))[1] \
+         FROM parked_fire p JOIN signal s ON s.token = p.token \
+         WHERE s.project_id = $1 AND s.activation_trigger IS NOT NULL AND p.instance_gap IS NOT NULL \
          GROUP BY s.activation_trigger, s.instance_id",
     )
     .bind(project_id)
@@ -110,7 +64,7 @@ pub async fn instance_waits(
         .collect()
 }
 
-/// The signal rows of `instance` in `project_id` whose queue holds a fire
+/// The signals of `instance` in `project_id` whose queue holds an event
 /// waiting on that instance's values, and whose activation is Active: what
 /// a change of the instance's values routes again.
 pub async fn instance_gap_tokens(
@@ -122,7 +76,7 @@ pub async fn instance_gap_tokens(
         "SELECT s.token FROM signal s {} \
          WHERE s.project_id = $1 AND s.instance_id = $2 \
            AND COALESCE(a.status, 'active') = 'active' \
-           AND EXISTS (SELECT 1 FROM jsonb_array_elements(s.parked_fires) e WHERE e ? 'instance_gap')",
+           AND EXISTS (SELECT 1 FROM parked_fire p WHERE p.token = s.token AND p.instance_gap IS NOT NULL)",
         weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
     ))
     .bind(project_id)
@@ -131,215 +85,9 @@ pub async fn instance_gap_tokens(
     .await?)
 }
 
-/// Ceiling on an ENTRY signal's `parked_fires` queue. Entry fires accumulate while
-/// a project is parked (inactive); an unbounded queue lets an external caller who
-/// knows a public mount path grow one row without limit. Cap it so a flood is
-/// refused loudly (the append returns 0 rows) rather than growing the row until a
-/// write fails. Resume signals are already capped at one element. Sized generously
-/// so a legitimately busy parked project isn't cut off.
-const MAX_PARKED_ENTRY_FIRES: i64 = 1000;
-
-/// THE one append onto `signal.parked_fires`. Every park site (the
-/// lifecycle gate on external fires, the route_entry executor's
-/// authoritative re-check) goes through here so the queue-element
-/// shape and the append guards live in one place. Guards, all in
-/// one atomic UPDATE (no read-then-write race):
-///   - resume cap: resume signals append iff the queue is empty
-///     (one submission answers one suspension; later ones are
-///     duplicates). Entry signals append while under the entry cap.
-///   - entry cap: an entry signal appends only while its queue is
-///     below `MAX_PARKED_ENTRY_FIRES`, so a flood can't grow the row
-///     without bound.
-///   - id dedup: an element with the same `ParkedFire.id` already
-///     queued matches zero rows, so a retry of the same park (task
-///     re-run after a crash) collapses instead of double-queueing.
-/// Returns what happened; a refusal names its cause, read back from the
-/// row in a second query, so no caller has to guess from "0 rows" (the
-/// guards above are four different facts and each one means something
-/// different to the caller). The read is not in the UPDATE's
-/// transaction, so the row can move between them (a drain pops the
-/// queue, a sibling appends); the classification is made from the state
-/// actually observed, and when that state no longer explains a refusal
-/// (the queue drained under us) the append is simply tried again.
-pub async fn append_parked_fire(
-    pool: &sqlx::PgPool,
-    token: &str,
-    entry: &ParkedFire,
-) -> anyhow::Result<ParkAppend> {
-    let entry_json = serde_json::to_value(entry)?;
-    // `@>` containment on `[{"id": ...}]` matches any element
-    // carrying that id, regardless of its other fields.
-    let dedup_probe = serde_json::json!([{ "id": entry.id }]);
-    // Bounded so two writers racing the row forever cannot spin here;
-    // hitting the bound is a loud error, not a silent drop.
-    const CONTENDED_ATTEMPTS: usize = 3;
-    for _ in 0..CONTENDED_ATTEMPTS {
-        // `is_resume` is read from the TARGETED ROW (not a caller arg) so a
-        // caller that could not first fetch the signal row (a transient read
-        // error before re-parking) can still park correctly: a resume signal
-        // caps `parked_fires` at one element, an entry signal caps at
-        // `MAX_PARKED_ENTRY_FIRES`.
-        let updated = sqlx::query(
-            "UPDATE signal \
-             SET parked_fires = parked_fires || $1::jsonb \
-             WHERE token = $2 \
-               AND (is_resume = FALSE OR jsonb_array_length(parked_fires) = 0) \
-               AND (is_resume = TRUE OR jsonb_array_length(parked_fires) < $4) \
-               AND NOT (parked_fires @> $3::jsonb)",
-        )
-        .bind(&entry_json)
-        .bind(token)
-        .bind(&dedup_probe)
-        .bind(MAX_PARKED_ENTRY_FIRES)
-        .execute(pool)
-        .await?;
-        if updated.rows_affected() > 0 {
-            return Ok(ParkAppend::Parked);
-        }
-        // Refused: read the row once and classify from what it holds NOW,
-        // in the order that matters to a caller (an element already
-        // carrying this id is the retry case and never a loss; the caps
-        // are). `jsonb_array_length` is INT4, cast to BIGINT so the
-        // i64 decode matches (a mismatch here only shows at runtime,
-        // against a real Postgres).
-        let row: Option<(bool, i64, bool)> = sqlx::query_as(
-            "SELECT is_resume, jsonb_array_length(parked_fires)::bigint, \
-                    parked_fires @> $2::jsonb \
-             FROM signal WHERE token = $1",
-        )
-        .bind(token)
-        .bind(&dedup_probe)
-        .fetch_optional(pool)
-        .await?;
-        let refusal = match row {
-            None => ParkRefusal::RowGone,
-            Some((_, _, true)) => ParkRefusal::AlreadyQueued,
-            Some((true, len, _)) if len > 0 => ParkRefusal::ResumeAlreadyAnswered,
-            Some((false, len, _)) if len >= MAX_PARKED_ENTRY_FIRES => ParkRefusal::QueueFull,
-            // The row no longer refuses this append: the queue moved
-            // between the UPDATE and the read. Try again.
-            Some(_) => continue,
-        };
-        return Ok(ParkAppend::Refused(refusal));
-    }
-    anyhow::bail!(
-        "could not park fire {} on signal {}: the parked queue kept changing under the \
-         append for {CONTENDED_ATTEMPTS} attempts",
-        entry.id,
-        token
-    )
-}
-
-/// Outcome of [`append_parked_fire`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ParkAppend {
-    Parked,
-    Refused(ParkRefusal),
-}
-
-/// Why [`append_parked_fire`] refused, one per guard plus the row being
-/// gone. Each is a different fact for the caller: a retry that finds its
-/// element already queued has lost nothing; a cap has refused a NEW fire,
-/// which is a loss the caller must say out loud; a vanished row means the
-/// project was wiped under the fire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ParkRefusal {
-    /// An element with this `ParkedFire.id` is already queued.
-    AlreadyQueued,
-    /// A resume signal whose one submission is already queued.
-    ResumeAlreadyAnswered,
-    /// An entry signal at `MAX_PARKED_ENTRY_FIRES`.
-    QueueFull,
-    /// No signal row for this token.
-    RowGone,
-}
-
-/// THE one removal from `parked_fires` (mirror of `append_parked_fire`).
-/// Removes the element whose `id` equals `fire_id` BY ID, not by array
-/// index, so concurrent removals of different fires commute and a drain
-/// pop can never delete the wrong element after a sibling removed the
-/// head out from under it (an index-based pop assumed a head-stable
-/// array, which a success-path removal breaks). `fence` is the drain's
-/// claim nonce: when `Some`, the removal only applies while we still own
-/// the drain claim (a sibling takeover yields 0 rows, preserving the
-/// drain's abort-on-takeover semantics); the success path passes `None`.
-/// Returns rows affected (0 = row gone, or not our claim).
-pub(crate) async fn remove_parked_fire(
-    pool: &sqlx::PgPool,
-    token: &str,
-    fire_id: &str,
-    fence: Option<&str>,
-) -> anyhow::Result<u64> {
-    let updated = sqlx::query(
-        "UPDATE signal \
-         SET parked_fires = COALESCE( \
-             (SELECT jsonb_agg(elem ORDER BY ord) \
-              FROM jsonb_array_elements(parked_fires) WITH ORDINALITY AS t(elem, ord) \
-              WHERE elem ->> 'id' <> $2), '[]'::jsonb) \
-         WHERE token = $1 \
-           AND ($3::text IS NULL OR drain_claimed_by = $3)",
-    )
-    .bind(token)
-    .bind(fire_id)
-    .bind(fence)
-    .execute(pool)
-    .await?;
-    Ok(updated.rows_affected())
-}
-
-/// THE one re-stamp of a `parked_fires` element (completes the set with
-/// [`append_parked_fire`] / [`remove_parked_fire`]): bump its attempt
-/// count and push its due time out to `not_before_unix`, IN PLACE. The
-/// caller is a drain whose dispatch of this element failed without
-/// popping it: the fire is still the queue's head, and re-appending it
-/// at the tail would reorder one trigger's events, so the failed
-/// element keeps its position and only its retry clock moves. `fence`
-/// is the drain's claim nonce, same semantics as
-/// [`remove_parked_fire`]'s. Returns rows affected (0 = row gone, no
-/// such element, or not our claim; the containment guard means an id
-/// that is not queued writes nothing at all).
-pub async fn restamp_parked_fire(
-    pool: &sqlx::PgPool,
-    token: &str,
-    fire_id: &str,
-    attempts: u32,
-    not_before_unix: i64,
-    fence: Option<&str>,
-) -> anyhow::Result<u64> {
-    // Same containment probe shape as the append's id-dedup guard: an
-    // array element carrying this id, regardless of its other fields.
-    let probe = serde_json::json!([{ "id": fire_id }]);
-    let updated = sqlx::query(
-        "UPDATE signal \
-         SET parked_fires = COALESCE( \
-             (SELECT jsonb_agg( \
-                 CASE WHEN elem ->> 'id' = $2 THEN \
-                     elem || jsonb_build_object('attempts', $3, 'not_before_unix', $4) \
-                 ELSE elem END \
-                 ORDER BY ord) \
-              FROM jsonb_array_elements(parked_fires) WITH ORDINALITY AS t(elem, ord)), \
-             '[]'::jsonb) \
-         WHERE token = $1 \
-           AND parked_fires @> $6::jsonb \
-           AND ($5::text IS NULL OR drain_claimed_by = $5)",
-    )
-    .bind(token)
-    .bind(fire_id)
-    .bind(attempts as i64)
-    .bind(not_before_unix)
-    .bind(fence)
-    .bind(&probe)
-    .execute(pool)
-    .await?;
-    Ok(updated.rows_affected())
-}
-
 /// `POST /signal/{token}`. Dispatcher entry point for every
 /// stateless signal fire (webhook, form submission, extension's
-/// resume completion). Architecture-4: dispatcher routes by token,
-/// runs the lifecycle gate (live / park / refuse), relays through
-/// the `/process` of the listener process holding the signal, then journals based on the
-/// returned action.
+/// resume completion): routed by token through [`take_event`].
 pub async fn fire_signal(
     State(state): State<DispatcherState>,
     caller: crate::api::CallerAddress,
@@ -382,14 +130,7 @@ async fn fire_signal_inner(
         Ok(r) => r,
         Err(e) => return e.into_response(),
     };
-    if !routing.is_resume {
-        if let Err(refused) =
-            check_entry_limits(state, token, routing.project_id, &routing.limits, &caller.key()).await
-        {
-            return refused;
-        }
-    }
-    fire_checked(state, token, &routing, payload).await.into_response()
+    fire_checked(state, token, &routing, payload, caller).await.into_response()
 }
 
 async fn fire_checked(
@@ -397,17 +138,15 @@ async fn fire_checked(
     token: &str,
     routing: &FireGateInfo,
     payload: Value,
-) -> Result<StatusCode, (StatusCode, String)> {
+    caller: &crate::api::CallerAddress,
+) -> Result<StatusCode, GateRefusal> {
     // Internal-surface signals (Timer, SSE) have no public path;
     // they fire from inside the listener via the FireSignal broker
     // task. External callers that somehow guess the token still hit
     // our public handler; refuse loudly instead of silently
     // swallowing.
     if routing.surface_kind == "internal" {
-        return Err((
-            StatusCode::NOT_FOUND,
-            "internal signal kind has no public surface".into(),
-        ));
+        return Err((StatusCode::NOT_FOUND, "internal signal kind has no public surface".to_string()).into());
     }
     // A resume answers a run that is already waiting; an entry gated by
     // a connection starts one only after the caller is checked, which
@@ -415,7 +154,9 @@ async fn fire_checked(
     if !routing.is_resume {
         refuse_gated_entry(&routing.auth_kind, "its /connect address")?;
     }
-    apply_lifecycle_gate(state, token, routing, payload, None).await
+    // The caller is counted against the entry's per-caller limit at the
+    // worker's door.
+    take_event(state, token, routing, payload, Some(caller.key())).await
 }
 
 /// Refuse to start a run through an entry gated by a connection (its
@@ -432,11 +173,10 @@ fn refuse_gated_entry(auth_kind: &str, at: &str) -> Result<(), (StatusCode, Stri
     ))
 }
 
-/// Fire one registered signal through the shared lifecycle gate:
-/// look up its routing by token, then park / refuse / dispatch. What
-/// the public events receiver calls per matched subscription, so a
-/// provider push passes exactly the gate every other external fire
-/// does.
+/// Fire one registered signal through [`take_event`], looked up by
+/// token. What the public events receiver calls per matched
+/// subscription, so a provider push takes exactly the path every other
+/// external fire does.
 pub(crate) async fn fire_registered_signal(
     state: &DispatcherState,
     token: &str,
@@ -444,89 +184,147 @@ pub(crate) async fn fire_registered_signal(
 ) -> Result<StatusCode, (StatusCode, String)> {
     let routing = lookup_signal_routing(state, token).await?;
     // A provider's push has no caller to count: only the entry's own
-    // per-minute limit applies, and a fire past it is dropped.
-    if !routing.is_resume {
-        let admitted = crate::entry_limits::admit_fire(&state.pg_pool, token, None, &routing.limits, crate::lease::now_unix())
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("rate limit: {e:#}")))?;
-        if let Err(refused) = admitted {
-            return Err((StatusCode::TOO_MANY_REQUESTS, format!("fire dropped: {} is reached", refused.reason.describe())));
-        }
-    }
-    apply_lifecycle_gate(state, token, &routing, payload, None).await
+    // per-minute limit applies (at the worker's door), and a fire past it
+    // is dropped.
+    take_event(state, token, &routing, payload, None).await.map_err(Into::into)
 }
 
-/// One chokepoint for every fire that reaches a signal (a call at the
-/// door, a provider's push, an answer to a waiting run, an event a
-/// listener picked up itself): the rule `crate::arrival` states, applied.
-///
-/// - **Live**: dispatch to the listener for immediate processing.
-/// - **Wait**: append `payload` to `signal.parked_fires`, under `id` (the
-///   fire's identity when it can come back, a fresh one otherwise).
-///   Drained when the trigger is back by `drain_parked_fires`, which
-///   calls the exact same `dispatch_listener_outcome` a live fire would,
-///   so the run is born on the version the trigger came back with. Entry
-///   signals append on every fire; resume signals append iff the queue
-///   is empty (the first submission answers the suspension, later ones
-///   are dropped as duplicates).
-/// - **Refused**: 410 Gone.
-///
-/// The function is signal-kind agnostic past the resume vs entry queue-cap
-/// rule.
-pub(crate) async fn apply_lifecycle_gate(
+/// Why a fire was not taken, as its sender is answered: the status and
+/// the message, and when to try again for a caller past a limit.
+#[derive(Debug)]
+pub(crate) struct GateRefusal {
+    pub status: StatusCode,
+    pub message: String,
+    pub retry_after_secs: Option<u64>,
+}
+
+impl From<(StatusCode, String)> for GateRefusal {
+    fn from((status, message): (StatusCode, String)) -> Self {
+        Self { status, message, retry_after_secs: None }
+    }
+}
+
+impl From<GateRefusal> for (StatusCode, String) {
+    fn from(refused: GateRefusal) -> Self {
+        (refused.status, refused.message)
+    }
+}
+
+impl axum::response::IntoResponse for GateRefusal {
+    fn into_response(self) -> axum::response::Response {
+        match self.retry_after_secs {
+            Some(secs) => (self.status, [(axum::http::header::RETRY_AFTER, secs.to_string())], self.message).into_response(),
+            None => (self.status, self.message).into_response(),
+        }
+    }
+}
+
+/// One chokepoint for every event that reaches a signal through the
+/// install (a call at its doors, a provider's push, an answer to a waiting
+/// run): the listener's `/process` says what the event is (the dispatcher
+/// stays kind-unaware). An entry's event goes to the worker's door
+/// ([`fire_entry`]), which applies the trigger's standing and limits the
+/// way it does for a caller; an answer to a waiting run goes to
+/// [`answer_run`], which applies the standing here (an answer has no door).
+pub(crate) async fn take_event(
     state: &DispatcherState,
     token: &str,
     routing: &FireGateInfo,
     payload: Value,
-    id: Option<&str>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    let parked = id.map(|id| ParkedRef { id, attempts: 0 });
-    match routing.standing().arrival(crate::lease::now_unix()) {
-        crate::arrival::Arrival::Live => {
-            dispatch_listener_outcome(state, token, routing.project_id, &routing.tenant_id, payload, parked).await
-        }
-        crate::arrival::Arrival::Refused => Err((StatusCode::GONE, crate::arrival::REFUSED_FOR_CALLER.into())),
-        crate::arrival::Arrival::Wait => {
-            // The id tells this queued fire apart from any other on the
-            // same token, even when bodies are identical. The drain uses
-            // it as the task-table dedup nonce so a crash between
-            // task-insert and head-pop collapses the retry back to one
-            // task (same id, same dedup_key) while two genuinely distinct
-            // fires (different ids) produce two executions.
-            let entry = ParkedFire {
-                id: id.map_or_else(|| uuid::Uuid::new_v4().to_string(), str::to_string),
-                payload,
-                received_at_unix: crate::lease::now_unix(),
+    caller: Option<String>,
+) -> Result<StatusCode, GateRefusal> {
+    // The listener answers for any signal whose row exists, whether it
+    // has it in memory or not (it loads the row on a miss).
+    let outcome = state
+        .listener
+        .process(token, &payload)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("listener dispatch: {e:#}")))?;
+    match outcome.target {
+        ProcessTarget::Resume { .. } => Ok(answer_run(state, token, routing, outcome.value).await?),
+        ProcessTarget::Entry => {
+            let fire = weft_core::door_fire::DoorFire {
+                token: token.to_string(),
+                fire_id: uuid::Uuid::new_v4(),
+                payload: outcome.value,
+                caller,
+                // A fire the install hands over is the trigger's: one a
+                // holder picked up was held to its holder when it was kept
+                // (`/v1/door/park_fire`), and none other names one.
+                held_by: None,
                 attempts: 0,
-                not_before_unix: 0,
-                instance_gap: None,
             };
-            // The shared append names its refusal; never swallow one under
-            // a 200.
-            match append_parked_fire(&state.pg_pool, token, &entry)
+            match fire_entry(state, routing, fire)
                 .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("park: {e}")))?
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("hand the event to its worker: {e:#}")))?
             {
+                Landed::Done | Landed::Waits { .. } => Ok(StatusCode::OK),
+                Landed::Refused { reason, retry_after_secs } => Err(GateRefusal {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    message: format!("too many calls: {reason}; try again in {retry_after_secs}s"),
+                    retry_after_secs: Some(retry_after_secs),
+                }),
+            }
+        }
+        ProcessTarget::Drop { reason } => {
+            tracing::debug!(target: "weft_dispatcher::signal", %token, ?reason, "listener dropped fire");
+            Ok(StatusCode::OK)
+        }
+    }
+}
+
+/// THE one way an answer reaches a waiting run (entrance 2), whatever
+/// brought it (a call at `/signal/{token}`, an answer a listener picked up,
+/// `weft wake`, a parked answer drained): `value` is already the kind's.
+/// Its run's trigger decides, by the rule `weft_core::arrival` states:
+///
+/// - **Live**: it reaches its run now (`Journal::answer`).
+/// - **Wait**: it waits in the wait's queue (one answer per wait), and the
+///   parked-fire drain hands it over once the trigger is back.
+/// - **Refused**: 410 Gone; the trigger takes no work any more.
+pub(crate) async fn answer_run(
+    state: &DispatcherState,
+    token: &str,
+    routing: &FireGateInfo,
+    value: Value,
+) -> Result<StatusCode, (StatusCode, String)> {
+    match routing.standing().arrival(crate::lease::now_unix()) {
+        weft_core::arrival::Arrival::Live => {
+            let answered = state.journal.answer(token, &value).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("answer: {e:#}")))?;
+            match answered {
+                crate::journal::Answered::Reached { consumed } => {
+                    // The row is gone now, so the listener only learns of
+                    // it from here.
+                    state.listener.unregister_many(&[consumed]).await;
+                    Ok(StatusCode::OK)
+                }
+                crate::journal::Answered::RunEnded { consumed } => {
+                    state.listener.unregister_many(&[consumed]).await;
+                    Err((StatusCode::GONE, "the run this answers has ended".into()))
+                }
+                crate::journal::Answered::Gone => {
+                    Err((StatusCode::CONFLICT, "suspension already answered; duplicate submission ignored".into()))
+                }
+            }
+        }
+        // An answer for a waiting run whose trigger takes no work any more:
+        // there is no run to hand it to now, or later.
+        weft_core::arrival::Arrival::Refused => Err((StatusCode::GONE, "This no longer takes answers.".into())),
+        weft_core::arrival::Arrival::Wait => {
+            let waiting = weft_task_store::parked_fires::waiting(uuid::Uuid::new_v4(), value, None, 0, None);
+            // The shared park names its refusal; never swallow one under a
+            // 200.
+            match park(&state.pg_pool, token, &waiting, None).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("park: {e}")))? {
                 ParkAppend::Parked => Ok(StatusCode::OK),
-                ParkAppend::Refused(ParkRefusal::ResumeAlreadyAnswered) => Err((
-                    StatusCode::CONFLICT,
-                    "suspension already answered; duplicate submission ignored".into(),
-                )),
-                ParkAppend::Refused(ParkRefusal::QueueFull) => Err((
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "this entry has too many pending fires queued; wait for the project \
-                     to process them (it is currently parked) or retry later"
-                        .into(),
-                )),
-                ParkAppend::Refused(ParkRefusal::RowGone) => Err((
-                    StatusCode::GONE,
-                    "this signal is no longer registered; the fire was not accepted".into(),
-                )),
-                // The same fire queued again (a retried task): it waits once.
-                ParkAppend::Refused(ParkRefusal::AlreadyQueued) if id.is_some() => Ok(StatusCode::OK),
-                ParkAppend::Refused(ParkRefusal::AlreadyQueued) => Err((
+                ParkAppend::Refused(ParkRefusal::ResumeAlreadyAnswered) => {
+                    Err((StatusCode::CONFLICT, "suspension already answered; duplicate submission ignored".into()))
+                }
+                ParkAppend::Refused(ParkRefusal::RowGone) => {
+                    Err((StatusCode::CONFLICT, "suspension already answered; duplicate submission ignored".into()))
+                }
+                refused @ ParkAppend::Refused(ParkRefusal::QueueFull | ParkRefusal::AlreadyQueued | ParkRefusal::NotHeld) => Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("park: a fresh fire id {} is already queued; dispatcher contract broken", entry.id),
+                    format!("park: an answer with a fresh id, in no holder's name, was refused: {refused:?}"),
                 )),
             }
         }
@@ -556,16 +354,15 @@ pub(crate) struct FireGateInfo {
     pub auth_kind: String,
     /// A resume token answers one waiting run; an entry starts new ones.
     pub is_resume: bool,
-    /// What outside callers may do with this entry, off the stored spec
-    /// its node registered (`SignalSpec::limits`), resolved against the
-    /// language defaults.
-    pub limits: weft_core::signal::ResolvedLimits,
+    /// The binary of the program its trigger is armed on (an entry's),
+    /// read off the same row: where its events are handed.
+    pub binary_hash: Option<String>,
 }
 
 impl FireGateInfo {
     /// How the governing activation stands, for the arrival rule.
-    pub(crate) fn standing(&self) -> crate::arrival::Standing {
-        crate::arrival::Standing {
+    pub(crate) fn standing(&self) -> weft_core::arrival::Standing {
+        weft_core::arrival::Standing {
             status: self.status,
             accepting_fires: self.accepting_fires,
             fires_deadline_unix: self.fires_deadline_unix,
@@ -580,7 +377,7 @@ impl FireGateInfo {
 fn gate_select() -> String {
     format!(
         "SELECT s.token, s.project_id, s.tenant_id, s.surface_kind, s.auth_kind, \
-                s.is_resume, s.spec_json, \
+                s.is_resume, s.program_json->>'binary_hash' AS binary_hash, \
                 COALESCE(a.status, 'active') AS status, \
                 COALESCE(a.accepting_fires, TRUE) AS accepting_fires, \
                 a.fires_deadline_unix \
@@ -593,9 +390,6 @@ fn gate_select() -> String {
 fn gate_info(row: &sqlx::postgres::PgRow) -> Result<FireGateInfo, (StatusCode, String)> {
     let get_err = |e: sqlx::Error| (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}"));
     let status_str: String = row.try_get("status").map_err(get_err)?;
-    let spec_json: String = row.try_get("spec_json").map_err(get_err)?;
-    let spec: weft_core::primitive::SignalSpec = serde_json::from_str(&spec_json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("signal spec: {e}")))?;
     Ok(FireGateInfo {
         project_id: row.try_get("project_id").map_err(get_err)?,
         tenant_id: row.try_get("tenant_id").map_err(get_err)?,
@@ -606,7 +400,7 @@ fn gate_info(row: &sqlx::postgres::PgRow) -> Result<FireGateInfo, (StatusCode, S
         surface_kind: row.try_get("surface_kind").map_err(get_err)?,
         auth_kind: row.try_get("auth_kind").map_err(get_err)?,
         is_resume: row.try_get("is_resume").map_err(get_err)?,
-        limits: spec.limits.resolve(),
+        binary_hash: row.try_get("binary_hash").map_err(get_err)?,
     })
 }
 
@@ -623,279 +417,40 @@ pub(crate) async fn lookup_signal_routing(
     gate_info(&row)
 }
 
-/// The lifecycle of the activation governing `signal` (its entry
-/// trigger's, or the trigger's that fired its run), or a live one when
-/// none governs it. What route-time re-checks read.
-pub(crate) async fn signal_gate(
-    state: &DispatcherState,
-    signal: &crate::journal::SignalRegistration,
-) -> anyhow::Result<crate::activation_store::ActivationLifecycle> {
-    let Some(trigger) = &signal.activation_trigger else {
-        return Ok(crate::activation_store::ActivationLifecycle::active());
+
+/// Hand an entry's event to the worker's door of the program its trigger
+/// is armed on (`crate::worker_fire`). A worker out of reach is no loss:
+/// the fire waits in its trigger's queue, and the drain hands it over
+/// again.
+pub(crate) async fn fire_entry(state: &DispatcherState, routing: &FireGateInfo, fire: weft_core::door_fire::DoorFire) -> anyhow::Result<Landed> {
+    use weft_core::door_fire::Fired;
+    let project_id = routing.project_id;
+    let Some(binary_hash) = &routing.binary_hash else {
+        tracing::warn!(target: "weft_dispatcher::signal", token = %fire.token, "fire dropped: its trigger has no armed program; activate it again");
+        return Ok(Landed::Done);
     };
-    let key = weft_core::activation::ActivationKey::new(trigger.clone(), weft_core::instance::Owner::from_instance(signal.instance.clone()));
-    Ok(state
-        .activations
-        .list(signal.project_id)
-        .await?
-        .into_iter()
-        .find(|a| a.key == key)
-        .map(|a| a.lifecycle)
-        .unwrap_or_else(crate::activation_store::ActivationLifecycle::active))
-}
-
-/// The per-minute and at-once limits of one outside call to the entry
-/// `token`, checked before anything is started, so a refused call costs
-/// nothing. `caller` is who is calling, spelled as its key (the verified
-/// identity, or the address). A fire takes its slot when its run is born
-/// (`route_entry`), so here the entry is only checked for room; a live
-/// call is admitted with its birth instead (`connect_live`). A resume
-/// token answers one run already going and is not an entry: its callers
-/// never come here.
-pub(crate) async fn check_entry_limits(
-    state: &DispatcherState,
-    token: &str,
-    project_id: uuid::Uuid,
-    limits: &weft_core::signal::ResolvedLimits,
-    caller: &str,
-) -> Result<(), axum::response::Response> {
-    let admission = crate::entry_limits::Admission::call(&state.edge, None, token, caller, limits, None, crate::lease::now_unix());
-    match crate::entry_limits::admit(&state.pg_pool, &admission).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(refused)) => Err(refuse_call(token, project_id, refused)),
-        Err(e) => {
-            use axum::response::IntoResponse;
-            Err((StatusCode::INTERNAL_SERVER_ERROR, format!("rate limit: {e:#}")).into_response())
+    let reason = match crate::worker_fire::fire(state, &routing.tenant_id, project_id, binary_hash, &fire).await {
+        Ok(Fired::Started { .. } | Fired::AlreadyBorn) => return Ok(Landed::Done),
+        // The install hands over no fire under a holder's name, so a worker
+        // has nobody to refuse as no longer holding.
+        Ok(Fired::NotHeld) => anyhow::bail!("the worker answered that a fire's holder no longer holds the signal, for a fire handed over in no holder's name"),
+        Ok(Fired::Dropped { reason }) => {
+            tracing::info!(target: "weft_dispatcher::signal", token = %fire.token, %project_id, "fire dropped: {reason}");
+            return Ok(Landed::Done);
         }
-    }
-}
-
-/// The answer to a call an entry's limits refused, logged.
-fn refuse_call(token: &str, project_id: uuid::Uuid, refused: crate::entry_limits::Refused) -> axum::response::Response {
-    tracing::info!(
-        target: "weft_dispatcher::signal",
-        token = %token, project_id = %project_id,
-        "public call refused: {} is reached", refused.reason.describe()
-    );
-    crate::entry_limits::too_many(refused)
-}
-
-
-#[cfg(test)]
-mod park_backoff_tests {
-    use super::*;
-
-    /// 1, 2, 4, ... doubling from the first failed route, capped at five
-    /// minutes, and never overflowing on an absurd count.
-    #[test]
-    fn backoff_doubles_from_one_second_and_caps() {
-        assert_eq!(park_backoff_secs(0), 0);
-        assert_eq!(park_backoff_secs(1), 1);
-        assert_eq!(park_backoff_secs(2), 2);
-        assert_eq!(park_backoff_secs(5), 16);
-        assert_eq!(park_backoff_secs(9), 256);
-        assert_eq!(park_backoff_secs(10), 300);
-        assert_eq!(park_backoff_secs(40), 300);
-        assert_eq!(park_backoff_secs(u32::MAX), 300);
-    }
-
-    /// An element written before the backoff fields existed still
-    /// decodes: it reads as never retried and due now, so a queue
-    /// parked by an older dispatcher drains as before.
-    #[test]
-    fn a_parked_element_without_backoff_fields_reads_as_due_now() {
-        let old = serde_json::json!({
-            "id": "f1", "payload": {"x": 1}, "received_at_unix": 7
-        });
-        let fire: ParkedFire = serde_json::from_value(old).expect("old element decodes");
-        assert_eq!(fire.attempts, 0);
-        assert_eq!(fire.not_before_unix, 0);
-    }
-}
-
-/// The post-park-gate processor. Relays the payload to the
-/// listener's `/process`, then dispatches based on the returned
-/// `ProcessTarget`. This is THE shared "what does the dispatcher
-/// do with a fire" function: every path (external fire that
-/// passed the gate, drain replay of a parked payload, internal
-/// stateful callback) converges here. The dispatcher stays
-/// kind-unaware: the listener owns the resume-vs-entry decision
-/// (it stored is_resume + execution at register time).
-///
-/// `parked`: identifies one specific fire so a mid-flight crash between
-/// task-insert and the caller's commit can be safely retried without
-/// producing a duplicate execution. The drain pass supplies the per-fire
-/// UUID stamped at park time; live fires pass `None` (no retry path that
-/// could double-insert).
-pub(crate) async fn dispatch_listener_outcome(
-    state: &DispatcherState,
-    token: &str,
-    project_id: uuid::Uuid,
-    tenant: &str,
-    payload: Value,
-    // `Some` when a drain pops a parked element: its id is the fire's
-    // stable identity and its attempt count carries into the route
-    // task. `None` for a live fire, which mints a fresh id.
-    parked: Option<ParkedRef<'_>>,
-) -> Result<StatusCode, (StatusCode, String)> {
-    let token_owned = token.to_string();
-    let tenant_str = tenant.to_string();
-    let parked_id = parked.map(|p| p.id.to_string());
-    let attempts = parked.map(|p| p.attempts).unwrap_or(0);
-    let result: Result<StatusCode, anyhow::Error> = async {
-        // The listener answers for any signal whose row exists, whether
-        // it has it in memory or not (it loads the row on a miss), so a
-        // parked webhook firing long after the listener last saw it still
-        // finds it.
-        let outcome = state.listener.process(&token_owned, &payload).await?;
-        {
-                match outcome.target {
-                    ProcessTarget::Resume { execution_id, .. } => {
-                        let execution_id: weft_core::ExecutionId = execution_id
-                            .parse()
-                            .map_err(|e| anyhow::anyhow!("bad execution from listener: {e}"))?;
-                        // Order: journal SuspensionResolved, enqueue
-                        // the resume task, THEN drop the suspension
-                        // row. The DELETE is the only non-idempotent
-                        // step, so we run it last: a crash earlier
-                        // leaves the row in place, the next drain
-                        // re-pops the same parked element, and the
-                        // earlier steps collapse on their dedup keys:
-                        //   - journal write: `record_event_dedup`
-                        //     keyed on `suspension_resolved:{token}`,
-                        //     so a duplicate is rejected at the
-                        //     journal layer.
-                        //   - resume task: `enqueue_resume` uses
-                        //     dedup_key `{execution_id}:{TaskKind::Resume}`,
-                        //     so a re-call collapses to the same
-                        //     task row.
-                        // Without this ordering, a crash between
-                        // DELETE and enqueue would leave the
-                        // suspension token gone and the worker
-                        // waiting forever.
-                        let now = crate::lease::now_unix() as u64;
-                        state
-                            .journal
-                            .record_event_dedup(
-                                &weft_journal::ExecEvent::SuspensionResolved {
-                                    execution_id,
-                                    token: token_owned.clone(),
-                                    value: outcome.value,
-                                    at_unix: now,
-                                },
-                                &format!("suspension_resolved:{token_owned}"),
-                            )
-                            .await?;
-                        // CRITICAL: pull definition_hash from the
-                        // journal's ExecutionStarted event for THIS
-                        // execution, NOT from the project row's current
-                        // hash. If the user edited and re-registered
-                        // between when this execution suspended and now,
-                        // the project row holds the NEW hash but the
-                        // suspended execution must resume on the
-                        // SAME shape it was started with (the
-                        // journal state is bound to that shape).
-                        // Falling back to the row's hash would run
-                        // the fold on the OLD state then execute
-                        // against the NEW topology, which is
-                        // undefined behavior.
-                        let definition_hash = match state
-                            .journal
-                            .execution_definition_hash(execution_id)
-                            .await?
-                        {
-                            crate::journal::ExecutionIdLookup::Found(h) => h,
-                            crate::journal::ExecutionIdLookup::NotFound => anyhow::bail!(
-                                "no ExecutionStarted event for execution {execution_id}; \
-                                 cannot determine the definition_hash to \
-                                 resume against"
-                            ),
-                            crate::journal::ExecutionIdLookup::Corrupt => anyhow::bail!(
-                                "journal row for execution {execution_id} is corrupt; \
-                                 see dispatcher logs"
-                            ),
-                        };
-                        crate::task_kinds::execute::enqueue_resume(
-                            &state.pg_pool,
-                            project_id,
-                            execution_id,
-                            &definition_hash,
-                            &tenant_str,
-                        )
-                        .await?;
-                        // The row is gone now, so the listener only learns
-                        // of it from the row we just deleted.
-                        if let Some(consumed) = state.journal.consume_suspension(&token_owned).await? {
-                            state.listener.unregister_many(&[consumed]).await;
-                        }
-                        Ok(StatusCode::OK)
-                    }
-                    ProcessTarget::Entry => {
-                        // Every fire gets a STABLE fire id: a drain pop
-                        // already carries one (the ParkedFire id, passed
-                        // as the dedup nonce); a live fire mints a fresh
-                        // one. It is the RouteEntry dedup key, the
-                        // execution seed, and the ParkedFire id if
-                        // the fire is later re-parked, so one fire can
-                        // never spawn two executions across a park /
-                        // drain / lease-rescue interleaving. ALWAYS
-                        // enqueue_dedup (live fires too): the re-park path
-                        // IS a re-insert path, so a non-deduped live task
-                        // and its re-parked twin would otherwise both run.
-                        let fire_id = parked_id
-                            .clone()
-                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                        let task_payload = serde_json::to_value(
-                            crate::task_kinds::route_entry::RouteEntryPayload {
-                                token: token_owned.clone(),
-                                fire_id: fire_id.clone(),
-                                payload: outcome.value,
-                                tenant_id: tenant_str.clone(),
-                                attempts,
-                            },
-                        )?;
-                        let key = format!("entry:{token_owned}:{fire_id}");
-                        weft_task_store::tasks::enqueue_dedup(
-                            &state.pg_pool,
-                            weft_task_store::tasks::NewTask {
-                                kind: weft_task_store::TaskKind::RouteEntry.into(),
-                                target: weft_task_store::tasks::TaskTarget::Dispatcher,
-                                // Stamped so `running_count` can see
-                                // routed-but-unjournaled fires: the
-                                // deactivate fast-path CAS and the
-                                // drain-watcher must not flip a project
-                                // Inactive while one of these is in flight.
-                                project_id: Some(project_id),
-                                dedup_key: Some(key),
-                                execution_id: None,
-                                tenant_id: tenant_str.clone(),
-                                target_replica: None,
-                                binary_hash: None,
-                                payload: task_payload,
-                            },
-                        )
-                        .await?;
-                        Ok(StatusCode::OK)
-                    }
-                    ProcessTarget::Drop { reason } => {
-                        tracing::debug!(
-                            target: "weft_dispatcher::signal",
-                            token = %token_owned,
-                            reason = ?reason,
-                            "listener dropped fire"
-                        );
-                        Ok(StatusCode::OK)
-                    }
-                }
+        Ok(Fired::Refused { reason, retry_after_secs }) => return Ok(Landed::Refused { reason, retry_after_secs }),
+        // The worker put it in the queue itself.
+        Ok(Fired::Parked { reason, instance_gap }) => return Ok(Landed::Waits { reason, instance_gap }),
+        Err(e) => format!("its worker could not take it: {e:#}"),
+    };
+    let parked = weft_task_store::parked_fires::waiting(fire.fire_id, fire.payload, fire.caller, fire.attempts + 1, None);
+    match park(&state.pg_pool, &fire.token, &parked, None).await? {
+        ParkAppend::Parked | ParkAppend::Refused(ParkRefusal::AlreadyQueued) => {
+            tracing::warn!(target: "weft_dispatcher::signal", token = %fire.token, %project_id, "a fire waits in its trigger's queue: {reason}");
+            Ok(Landed::Waits { reason, instance_gap: false })
         }
+        ParkAppend::Refused(refusal) => anyhow::bail!("{reason}, and it could not be queued ({refusal:?})"),
     }
-    .await;
-    result.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("listener dispatch: {e}"),
-        )
-    })
 }
 
 // ---------- Signal-deletion helpers ----------
@@ -983,11 +538,8 @@ pub async fn cancel_signal(
     }
 
     if let Some(execution_id) = row.execution_id {
-        // cancel_execution_id, in one transaction, strips the execution's wake
-        // signals, journals NodeCancelled per non-terminal node plus
-        // ExecutionCancelled, and queues the cancel task for the process
-        // driving it (which flips the run's CancellationFlag); the
-        // journal bridge publishes each row onto the project SSE bus.
+        // The one cancel strips the run's wake signals and ends it, or asks
+        // the worker driving it to (`cancel_execution_id`).
         crate::api::execution::cancel_execution_id(&state, execution_id, &weft_core::exec::CancelCause::User)
             .await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("cancel: {e}")))?;
@@ -1409,7 +961,7 @@ pub async fn signals_visible_to(
            AND ($4::text IS NULL OR s.instance_id = $4) \
            AND ( \
              s.is_resume = FALSE \
-             OR jsonb_array_length(s.parked_fires) = 0 \
+             OR NOT EXISTS (SELECT 1 FROM parked_fire p WHERE p.token = s.token) \
            ) \
          ORDER BY s.is_resume ASC, s.created_at ASC"),
         join = weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
@@ -1431,12 +983,11 @@ pub async fn signals_visible_to(
 /// ApiPost, future public-form). Splits the tenant off the called
 /// path, MATCHES it against that tenant's registered patterns (a
 /// pattern like `cards/{id}` is not a string to compare), then reads
-/// the matched row and lets it through the park gate into
-/// `dispatch_listener_outcome`. Two calls it refuses rather than
-/// serves, both because the answer lives at `/connect`: a pattern
-/// that captured part of the path, and a row gated by a connection.
-/// So what fires here is always a bare, open address. Anything that
-/// matches nothing 404s.
+/// the matched row and hands the event to [`take_event`]. Two calls it
+/// refuses rather than serves, both because the answer lives at
+/// `/connect`: a pattern that captured part of the path, and a row gated
+/// by a connection. So what fires here is always a bare, open address.
+/// Anything that matches nothing 404s.
 pub async fn fire_public_entry(
     State(state): State<DispatcherState>,
     headers: HeaderMap,
@@ -1463,13 +1014,9 @@ pub async fn fire_public_entry(
         Ok(found) => found,
         Err(e) => return e.into_response(),
     };
-    // A bare-path fire is always an entry (a resume token has no mount).
-    if let Err(refused) =
-        check_entry_limits(&state, &token, routing.project_id, &routing.limits, &caller.key()).await
-    {
-        return refused;
-    }
-    apply_lifecycle_gate(&state, &token, &routing, payload, None).await.into_response()
+    // A bare-path fire is always an entry (a resume token has no mount);
+    // its caller is counted at the worker's door.
+    take_event(&state, &token, &routing, payload, Some(caller.key())).await.into_response()
 }
 
 /// Which open entry a bare-path fire reaches, with its gate info and
@@ -1541,123 +1088,6 @@ async fn public_entry_target(
     Ok((token, routing, payload))
 }
 
-/// The auth gate of a live route: who may open a connection on it.
-/// `none` admits everyone; `connection` asks the broker to check the
-/// caller against the connection the route names (the broker holds the
-/// connection's `verify` recipe and its material; the dispatcher never
-/// sees a secret). Answers the identity the check established, which
-/// rides the request as its `caller`; a refusal is the broker's flat
-/// `401`, and anything else that goes wrong is a `500` naming it.
-/// Generic in `auth_kind`: a new scheme is a new arm here and a new
-/// `SignalAuth` variant, never a node name.
-async fn caller_gate(
-    state: &DispatcherState,
-    auth_kind: &str,
-    auth_config: Option<&Value>,
-    tenant: &str,
-    // Whose route it is (its gate's connection is that instance's own).
-    for_instance: Option<weft_core::instance::InstanceScope>,
-    call: &CallerRequestParts<'_>,
-) -> Result<Option<Value>, (StatusCode, String)> {
-    match auth_kind {
-        "none" => Ok(None),
-        "connection" => {
-            let cfg = auth_config
-                .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "connection auth has no config".into()))?;
-            let field = |name: &str| -> Result<String, (StatusCode, String)> {
-                cfg.get(name).and_then(Value::as_str).map(str::to_string).ok_or((
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("connection auth config has no '{name}'"),
-                ))
-            };
-            let verify = weft_broker_client::protocol::CallerVerifyRequest {
-                tenant: tenant.to_string(),
-                for_instance,
-                access_id: field("access_id")?,
-                service: field("service")?,
-                method: call.method.to_string(),
-                path: call.path.to_string(),
-                headers: call.headers.clone(),
-                query: call.query.clone(),
-                body_b64: {
-                    use base64::Engine as _;
-                    base64::engine::general_purpose::STANDARD.encode(call.body)
-                },
-            };
-            let verdict: weft_broker_client::protocol::CallerVerified =
-                crate::broker_admin::forward_json(state, "/v1/caller/verify", &verify)
-                    .await
-                    .map_err(|(status, msg)| {
-                        // The broker's 401 IS the answer (flat, the reason in
-                        // its log); anything else is our problem, not the
-                        // caller's.
-                        if status == StatusCode::UNAUTHORIZED {
-                            (StatusCode::UNAUTHORIZED, "refused".to_string())
-                        } else {
-                            (StatusCode::INTERNAL_SERVER_ERROR, format!("caller verify: {msg}"))
-                        }
-                    })?;
-            Ok(Some(verdict.identity))
-        }
-        other => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("unknown auth_kind: {other}"),
-        )),
-    }
-}
-
-/// Who a call through a live route is for. An instance token
-/// ([`weft_core::instance::INSTANCE_TOKEN_HEADER`]) names its instance on any
-/// route of its one project; otherwise the Weft-Instance header names one,
-/// honoured only on a `gated` route. A token and a header that disagree
-/// are refused rather than one silently winning.
-async fn door_instance(
-    state: &DispatcherState,
-    headers: &std::collections::BTreeMap<String, String>,
-    gated: bool,
-    project_id: uuid::Uuid,
-) -> Result<Option<weft_core::instance::InstanceId>, (StatusCode, String)> {
-    let named = weft_core::instance::instance_from_header(headers, gated).map_err(|why| (StatusCode::BAD_REQUEST, why));
-    let presented = headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(weft_core::instance::INSTANCE_TOKEN_HEADER))
-        .map(|(_, value)| value.trim().to_string());
-    let Some(presented) = presented else { return named };
-    let token = require_scoped_signal_token(state, &presented).await?.row;
-    let Some((token_project, instance)) = token.instance_scope() else {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            format!("{} holds a token that is not an instance token", weft_core::instance::INSTANCE_TOKEN_HEADER),
-        ));
-    };
-    if token_project != project_id {
-        return Err((StatusCode::UNAUTHORIZED, "this instance token is for another project".into()));
-    }
-    // The header is checked only against the token here: a token is its
-    // own proof, so the open-route rule does not apply to it.
-    let header_instance = weft_core::instance::instance_from_header(headers, true).map_err(|why| (StatusCode::BAD_REQUEST, why))?;
-    if header_instance.as_ref().is_some_and(|m| m != instance) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            format!(
-                "the {} header names instance '{}', and the instance token is instance '{instance}'s",
-                weft_core::instance::INSTANCE_HEADER,
-                header_instance.expect("checked above"),
-            ),
-        ));
-    }
-    Ok(Some(instance.clone()))
-}
-
-/// The parts of a caller's opening request the gate hands the broker.
-struct CallerRequestParts<'a> {
-    method: &'a str,
-    path: &'a str,
-    headers: &'a std::collections::BTreeMap<String, String>,
-    query: &'a std::collections::BTreeMap<String, String>,
-    body: &'a [u8],
-}
-
 /// One public-entry row of the tenant, as the route matcher sees it.
 #[derive(Debug, Clone)]
 pub(crate) struct RouteRow {
@@ -1682,7 +1112,7 @@ pub(crate) fn resolve_route<'r>(
     path: &str,
 ) -> Result<ResolvedRoute<'r>, (StatusCode, String)> {
     let candidates = rows.iter().filter_map(|row| {
-        let pattern = crate::task_kinds::register_signal::pattern_of_mount_path(&row.mount_path, tenant);
+        let pattern = weft_core::route::pattern_of_mount_path(&row.mount_path, tenant);
         match weft_core::route::RoutePattern::parse(&pattern) {
             Ok(pattern) => Some((
                 weft_core::route::RouteKey { pattern, methods: row.mount_methods.clone() },
@@ -1725,37 +1155,21 @@ pub(crate) fn split_tenant(called: &str) -> Result<(&str, &str), (StatusCode, St
     Ok((tenant, rest))
 }
 
-// ----- Live caller connection handshake ------------------------------
-
-/// Routing-token lifetime. Generous: a call passed on in its own request
-/// needs only the hop to the worker, but a browser opens its socket at the
-/// URL it was handed afterwards, and a slow client (mobile, cold DNS)
-/// should not race it. The connection, once attached, is not
-/// re-validated against the token's expiry. 120 seconds in real time, at
-/// this install's pace (`weft_core::time_scale`).
-fn live_token_ttl_secs() -> i64 {
-    weft_core::time_scale::scaled_secs(120)
-}
+// ----- Live callers at a shared address -----------------------------
 
 /// Set by the install's door on a request that came for one project's API
-/// domain: the handshake then matches only that project's routes. The
-/// door drops any copy a caller sent; one that reaches the handshake some
-/// other way can only narrow what matches.
+/// domain: the relay then matches only that project's routes. The door
+/// drops any copy a caller sent; one that reaches the relay some other way
+/// can only narrow what matches.
 // SYNC: API_PROJECT_HEADER <-> crates/weft-dispatcher/src/door.rs (route)
 pub const API_PROJECT_HEADER: &str = "x-weft-api-project";
 
-/// `ANY /connect/{*path}`: a live call. Matches the call against the
-/// tenant's routes (pattern + method), checks the caller against the
-/// route's auth, gives birth to the run (`birth_live_run`), mints a signed
-/// routing token naming it, and passes the call to one of the project's
-/// workers in this same request (`live_relay::to_worker`), which claims
-/// the run and drives it with the caller on the line. A browser asking for
-/// a socket gets a `200` with a URL to open it at instead (see the
-/// handler's last step). The run is born here so that arriving costs the
-/// worker one claim and nothing else; a run whose caller never reaches a
-/// worker (no worker could be reached, or a browser that never opened its
-/// socket) is erased with its slot once the token expires
-/// (`reaper::sweep_orphaned_live_executions`).
+/// `ANY /connect/{*path}`: a live call at an address the install shares
+/// between its projects. The tenant's routes (pattern + method) pick the
+/// project and the program serving the route, and the call is passed on to
+/// that project's workers as the caller sent it (`live_relay`), whose door
+/// runs every check. A path no route serves is answered here, so a stray
+/// call wakes no worker.
 pub async fn connect_live(
     State(state): State<DispatcherState>,
     address: crate::api::CallerAddress,
@@ -1763,15 +1177,9 @@ pub async fn connect_live(
     RawQuery(raw_query): RawQuery,
     request: axum::extract::Request,
 ) -> Result<Response, (StatusCode, String)> {
-    let (parts, body) = request.into_parts();
-    let (method, headers) = (&parts.method, &parts.headers);
     let (tenant_segment, path) = split_tenant(&called_path)?;
     let (tenant_segment, path) = (tenant_segment.to_string(), path.to_string());
-    let method_name = method.as_str().to_string();
-
-    // The tenant's public entries, matched in Rust: a route is a pattern
-    // (`chat/{room}`), never an equality key.
-    let only_project = match headers.get(API_PROJECT_HEADER) {
+    let only_project = match request.headers().get(API_PROJECT_HEADER) {
         None => None,
         Some(v) => Some(
             v.to_str()
@@ -1780,305 +1188,66 @@ pub async fn connect_live(
                 .ok_or((StatusCode::BAD_REQUEST, format!("{API_PROJECT_HEADER} is not a project id")))?,
         ),
     };
-    // How long each step took, in the line that says the run was born:
-    // what to read first when a call is slow.
-    let began = std::time::Instant::now();
-    // A route whose trigger is parked holds the caller here until it is
-    // back on, then serves them as it is armed then (`crate::arrival`).
-    let (route, token, params) = route_taking_calls(&state, &tenant_segment, only_project, &method_name, &path).await?;
-    let ArmedRoute { project_id, node_id, protocol, live_config, auth_kind, auth_config, program, .. } = route.as_ref();
-
-    // Every header the caller sent, repeats included, less the one the
-    // install's door added for itself: what the gate checks, and what the
-    // run's trigger reads as the caller's opening request.
-    let headers_sent: Vec<(String, String)> = headers
-        .iter()
-        .filter(|(k, _)| k.as_str() != API_PROJECT_HEADER)
-        .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
-        .collect();
-    let header_map: std::collections::BTreeMap<String, String> = headers_sent.iter().cloned().collect();
-    let query = weft_core::route::parse_query(raw_query.as_deref().unwrap_or(""));
-    // The body is read here ONLY when the gate needs it (a signing scheme
-    // covers the bytes); otherwise it streams on to the worker untouched.
-    let (body_bytes, body) = if auth_kind == "connection" {
-        let limit = live_config.max_inbound_bytes as usize;
-        let bytes = axum::body::to_bytes(body, limit)
-            .await
-            .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, format!("request body exceeds {limit} bytes")))?;
-        (bytes.clone(), axum::body::Body::from(bytes))
-    } else {
-        (axum::body::Bytes::new(), body)
-    };
-    let routed = began.elapsed();
-    let caller = caller_gate(
-        &state,
-        auth_kind,
-        auth_config.as_ref(),
-        &tenant_segment,
-        route.instance.clone().map(|instance| weft_core::instance::InstanceScope { project_id: *project_id, instance }),
-        &CallerRequestParts {
-            method: &method_name,
-            path: &path,
-            headers: &header_map,
-            query: &query,
-            body: &body_bytes,
-        },
-    )
-    .await?;
-    // Who the run is for: an instance token, or the Weft-Instance header
-    // behind the gate that just passed (an open route refuses it).
-    let instance = door_instance(&state, &header_map, auth_kind != "none", *project_id).await?;
-    let gated = began.elapsed();
-
-    // What the gate approved, so the worker can hold the caller to it.
-    // Only when something was actually checked: an open route approves
-    // nobody, so there is nothing to hold the caller to.
-    let approved = (auth_kind != "none").then(|| {
-        weft_core::caller_token::RequestFingerprint::of(
-            &method_name,
-            &path,
-            raw_query.as_deref().unwrap_or(""),
-            &body_bytes,
-        )
-    });
-
-    // The entry's limits are checked as the run is born, in the same
-    // call to the database: the caller is who the gate established when
-    // the route has auth, else the instance the run is for, else the
-    // address. The slot is taken for the execution this call's run
-    // carries, and counts for as long as it runs; the ticket's life only
-    // matters for a run nobody ever claims.
-    let execution_id = uuid::Uuid::new_v4();
-    let caller_key = match (&caller, &instance) {
-        (Some(identity), _) => format!("id:{identity}"),
-        (None, Some(instance)) => format!("instance:{instance}"),
-        (None, None) => address.key(),
-    };
-    let issued_at = crate::lease::now_unix();
-    let expires_at = issued_at + live_token_ttl_secs();
-    let admission = crate::entry_limits::Admission::call(
-        &state.edge,
-        Some(address.0),
-        &token,
-        &caller_key,
-        &route.spec.limits.resolve(),
-        Some((&execution_id.to_string(), expires_at)),
-        issued_at,
-    );
-    let admitting = began.elapsed();
-
-    // The caller's opening request, as the trigger reads it: what they
-    // sent here, which is what reaches the worker.
-    let opening = weft_core::caller::LiveRequest {
-        method: method_name.clone(),
-        path: path.clone(),
-        params,
-        query,
-        base_url: weft_core::net::request_base_url_of(&headers_sent),
-        headers: headers_sent,
-        caller,
-    };
-    let admitted = birth_live_run(&state, &route, &opening, &tenant_segment, execution_id, expires_at, instance.as_ref(), &admission)
-        .await?;
-    if let Err(refused) = admitted {
-        return Ok(refuse_call(&token, *project_id, refused));
-    }
-    let born = began.elapsed();
-
-    // Mint the signed routing token: the run just born, its program (whose
-    // workers the call is passed to), and the request the worker holds the
-    // caller to.
-    let claims = weft_core::caller_token::CallerTokenClaims {
-        execution_id,
-        project_id: *project_id,
-        binary_hash: program.binary_hash.clone(),
-        approved,
-        // The same instant the slot's hold and the run's wait were
-        // computed from, so the ticket's life and theirs cannot drift
-        // apart.
-        exp: expires_at,
-    };
-    let routing = weft_core::caller_token::mint(&state.caller_token_secret, &claims);
-    // The path and query as the caller sent them, still percent-encoded:
-    // the decoded capture would turn an escaped `?`, `/` or `#` into a real
-    // one on the way to the worker.
-    let raw_path = parts
-        .uri
+    let (project_id, binary_hash) = relayed_route(&state, &tenant_segment, only_project, request.method().as_str(), &path).await?;
+    // The path as the caller sent it, still percent-encoded: the decoded
+    // capture would turn an escaped `?`, `/` or `#` into a real one on the
+    // way to the worker. A project's API domain serves its routes at its
+    // root; everything else sits under its tenant.
+    let mount = format!("/connect/{tenant_segment}");
+    let raw_path = request
+        .uri()
         .path()
-        .strip_prefix("/connect")
-        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, format!("a live call reached the handshake at {}, outside /connect", parts.uri.path())))?
-        .to_string();
-    let raw_query = raw_query.unwrap_or_default();
-    let ms = |d: std::time::Duration| d.as_millis() as u64;
-    tracing::info!(
-        target: "weft_dispatcher::signal",
-        execution_id = %execution_id, node = %node_id,
-        route_ms = ms(routed),
-        gate_ms = ms(gated - routed),
-        birth_ms = ms(born - admitting),
-        "live call: run born"
-    );
-
-    // A browser cannot put a credential on a socket's opening request, so
-    // it asks for its socket with a plain request and opens the socket at
-    // the URL this answers, which carries the ticket. Every other call,
-    // a socket opened by a client that can send headers included, is
-    // passed to the worker in this same request.
-    // SYNC: the ticket answer's shape <-> crates/weft-e2e/src/live.rs (ticket), packages/weft-connect/src/core/socket.ts (socketAddress)
-    if *protocol == weft_core::signal::Protocol::Websocket && !is_socket_opening(headers) {
-        let url = crate::live_relay::live_url(&live_door(headers, &state.public_base_url), *project_id, &raw_path, &raw_query, &routing);
-        let body = serde_json::json!({ "url": url, "protocol": "websocket" });
-        let mut answer = Response::builder()
-            .status(StatusCode::OK)
-            .header(axum::http::header::CONTENT_TYPE, "application/json")
-            .body(axum::body::Body::from(body.to_string()))
-            .expect("json response builds");
-        answer.extensions_mut().insert(crate::api::Admitted);
-        return Ok(answer);
-    }
-    let request = axum::extract::Request::from_parts(parts, body);
-    let mut answer = crate::live_relay::to_worker(&state, &claims, &routing, &raw_path, &raw_query, request).await;
-    tracing::info!(
-        target: "weft_dispatcher::signal",
-        execution_id = %execution_id, status = %answer.status(),
-        worker_ms = ms(began.elapsed() - born),
-        "live call: the worker answered (its body may still be streaming)"
-    );
-    // The admission checked the caller's address; the token guard leaves
-    // the answer alone.
-    answer.extensions_mut().insert(crate::api::Admitted);
-    Ok(answer)
+        .strip_prefix(&mount)
+        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, format!("a live call reached the relay at {}, outside {mount}", request.uri().path())))?;
+    let raw_path = if raw_path.is_empty() { "/".to_string() } else { raw_path.to_string() };
+    let prefix = if only_project.is_some() { String::new() } else { mount };
+    Ok(crate::live_relay::to_project(&state, project_id, &binary_hash, address.0, &prefix, &raw_path, raw_query.as_deref().unwrap_or(""), request).await)
 }
 
-/// Whether `headers` open a WebSocket (`Upgrade: websocket`), which every
-/// socket client sends, a browser's included.
-pub(crate) fn is_socket_opening(headers: &HeaderMap) -> bool {
-    headers
-        .get(axum::http::header::UPGRADE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
-}
-
-/// One public entry of a tenant as held in memory (`crate::held`): what
-/// the matcher needs, and how the row arms it (or why it is half-armed,
-/// answered only to a call that matches it).
+/// One public entry of a tenant as held in memory (`crate::held`): where
+/// it is mounted, whose it is, and the program it is armed for.
 pub(crate) struct HeldRoute {
     project_id: uuid::Uuid,
     row: RouteRow,
-    armed: Result<Arc<ArmedRoute>, (StatusCode, String)>,
+    binary_hash: String,
 }
 
-/// A matched live route: the route as it is armed, its token, and the
-/// path's captures.
-type LiveRoute = (Arc<ArmedRoute>, String, std::collections::BTreeMap<String, String>);
-
-/// The live route of `tenant` (of `only_project`, when the call came by a
-/// project's API domain) serving `method` on `path`, once it takes calls:
-/// the route as it is armed then, its token and the path's captures. A
-/// route whose trigger is parked (or hibernating within its grace window,
-/// or being set up) holds the caller until its trigger is back on, with
-/// no deadline of weft's own: the caller's own connection bounds the wait.
-/// One that takes no work is refused, in the caller's terms.
-async fn route_taking_calls(
+/// The project and the program serving `method` on `path` among
+/// `tenant`'s live routes (of `only_project`, when the call came by a
+/// project's API domain). Matched against the routes this dispatcher holds,
+/// and against the rows themselves before refusing: a route armed a moment
+/// ago may not have been heard yet.
+async fn relayed_route(
     state: &DispatcherState,
     tenant: &str,
     only_project: Option<uuid::Uuid>,
     method: &str,
     path: &str,
-) -> Result<LiveRoute, (StatusCode, String)> {
-    // Subscribed before the first read, so a route switched back on
-    // between the read and the wait still ends the wait.
-    let mut heard = state.signals.subscribe();
-    let mut found = live_route(state, tenant, only_project, method, path).await?;
-    let mut held_since: Option<std::time::Instant> = None;
-    loop {
-        let standing = found.0.standing();
-        match standing.arrival(crate::lease::now_unix()) {
-            crate::arrival::Arrival::Live => {
-                if let Some(since) = held_since {
-                    tracing::info!(target: "weft_dispatcher::signal", node = %found.0.node_id, held_ms = since.elapsed().as_millis() as u64, "a caller held while the route's trigger was off is served");
-                }
-                return Ok(found);
-            }
-            crate::arrival::Arrival::Refused => {
-                tracing::info!(
-                    target: "weft_dispatcher::signal",
-                    node = %found.0.node_id, status = %found.0.status.as_str(),
-                    "a caller refused: the route's trigger takes no work (`weft status` shows it; `weft activate` switches it back on)"
-                );
-                return Err((StatusCode::SERVICE_UNAVAILABLE, crate::arrival::REFUSED_FOR_CALLER.into()));
-            }
-            crate::arrival::Arrival::Wait => {}
-        }
-        if held_since.is_none() {
-            held_since = Some(std::time::Instant::now());
-            tracing::info!(target: "weft_dispatcher::signal", node = %found.0.node_id, status = %found.0.status.as_str(), "a caller held until the route's trigger is back on");
-        }
-        // Until the tenant's routes change, or the grace window ends.
-        let until = standing.waits_until().map_or_else(far_future, |deadline| {
-            let left = (deadline + 1 - crate::lease::now_unix()).max(0) as u64;
-            tokio::time::Instant::now() + std::time::Duration::from_secs(left)
-        });
-        heard
-            .woken_before(until, |channel, payload| channel == crate::held::ROUTES_CHANNEL && payload == tenant)
-            .await
-            .map_err(|e| {
-                tracing::error!(
-                    target: "weft_dispatcher::signal",
-                    node = %found.0.node_id, error = %format!("{e:#}"),
-                    "a caller held until the route's trigger is back on lost the wait: this dispatcher stopped hearing the database"
-                );
-                (StatusCode::SERVICE_UNAVAILABLE, crate::arrival::REFUSED_FOR_CALLER.to_string())
-            })?;
-        found = match_live_route(&fresh_tenant_routes(state, tenant).await?, tenant, only_project, method, path)?;
-    }
-}
-
-/// A deadline nothing reaches, for a wait that ends on a signal alone.
-fn far_future() -> tokio::time::Instant {
-    tokio::time::Instant::now() + std::time::Duration::from_secs(86_400 * 365)
-}
-
-/// The live route of `tenant` serving `method` on `path` as it is armed
-/// now, whether or not it takes calls. Matched against the routes this
-/// dispatcher holds; one that does not take calls there is read again from
-/// the rows, since a route activated a moment ago may not have been heard
-/// yet.
-async fn live_route(
-    state: &DispatcherState,
-    tenant: &str,
-    only_project: Option<uuid::Uuid>,
-    method: &str,
-    path: &str,
-) -> Result<LiveRoute, (StatusCode, String)> {
+) -> Result<(uuid::Uuid, String), (StatusCode, String)> {
     if let Some(held) = state.held.routes.held(&tenant.to_string()) {
-        if let Ok(found) = match_live_route(&held, tenant, only_project, method, path) {
-            if found.0.standing().arrival(crate::lease::now_unix()) == crate::arrival::Arrival::Live {
-                return Ok(found);
-            }
+        if let Ok(found) = match_relayed(&held, tenant, only_project, method, path) {
+            return Ok(found);
         }
     }
-    match_live_route(&fresh_tenant_routes(state, tenant).await?, tenant, only_project, method, path)
+    match_relayed(&fresh_tenant_routes(state, tenant).await?, tenant, only_project, method, path)
 }
 
-fn match_live_route(
+fn match_relayed(
     routes: &[HeldRoute],
     tenant: &str,
     only_project: Option<uuid::Uuid>,
     method: &str,
     path: &str,
-) -> Result<LiveRoute, (StatusCode, String)> {
+) -> Result<(uuid::Uuid, String), (StatusCode, String)> {
     let candidates: Vec<&HeldRoute> =
         routes.iter().filter(|route| only_project.is_none_or(|only| route.project_id == only)).collect();
     let rows: Vec<RouteRow> = candidates.iter().map(|route| route.row.clone()).collect();
-    let (matched, params) = resolve_route(&rows, tenant, method, path)?;
+    let (matched, _) = resolve_route(&rows, tenant, method, path)?;
     let route = candidates
         .iter()
         .find(|route| route.row.token == matched.token)
-        .expect("the matched route is one of the rows it was matched among")
-        .armed
-        .clone()?;
-    Ok((route, matched.token.clone(), params))
+        .expect("the matched route is one of the rows it was matched among");
+    Ok((route.project_id, route.binary_hash.clone()))
 }
 
 /// Every public entry of `tenant` as the rows say now, kept for the next
@@ -2088,259 +1257,26 @@ async fn fresh_tenant_routes(state: &DispatcherState, tenant: &str) -> Result<Ar
 }
 
 async fn read_tenant_routes(pool: &sqlx::PgPool, tenant: &str) -> Result<Vec<HeldRoute>, (StatusCode, String)> {
-    let rows = sqlx::query(&format!(
-        "SELECT s.token, s.mount_path, s.mount_methods, {ARMED_COLUMNS} \
+    // token, mount path, methods, project, the program's binary (an entry
+    // is armed with its program as it is captured)
+    type MountRow = (String, String, Vec<String>, uuid::Uuid, String);
+    let rows: Vec<MountRow> = sqlx::query_as(
+        "SELECT s.token, s.mount_path, s.mount_methods, s.project_id, s.program_json->>'binary_hash' \
          FROM signal s \
-         LEFT JOIN project p ON p.id = s.project_id \
-         {} \
          WHERE s.tenant_id = $1 AND s.surface_kind = 'public_entry' AND s.mount_path IS NOT NULL",
-        weft_broker_client::protocol::SIGNAL_ACTIVATION_JOIN,
-    ))
+    )
     .bind(tenant)
     .fetch_all(pool)
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("route lookup: {e}")))?;
-    rows.iter()
-        .map(|r| {
-            Ok(HeldRoute {
-                project_id: r.try_get("project_id").map_err(row_err)?,
-                row: RouteRow {
-                    token: r.try_get("token").map_err(row_err)?,
-                    mount_path: r.try_get("mount_path").map_err(row_err)?,
-                    mount_methods: r.try_get("mount_methods").map_err(row_err)?,
-                },
-                armed: armed_route_of(r).map(Arc::new),
-            })
+    Ok(rows
+        .into_iter()
+        .map(|(token, mount_path, mount_methods, project_id, binary_hash)| HeldRoute {
+            project_id,
+            row: RouteRow { token, mount_path, mount_methods },
+            binary_hash,
         })
-        .collect()
-}
-
-/// A public entry as its signal row arms it: the trigger, its spec, the
-/// gate's settings, and the program identity its runs are born under.
-/// Read at the handshake, which gates the caller and gives birth to the
-/// run.
-pub(crate) struct ArmedRoute {
-    project_id: uuid::Uuid,
-    node_id: String,
-    spec: weft_core::primitive::SignalSpec,
-    protocol: weft_core::signal::Protocol,
-    live_config: weft_core::signal::LiveConnectionConfig,
-    auth_kind: String,
-    auth_config: Option<Value>,
-    port_snapshot: Option<Value>,
-    program: weft_core::project::hash::ProgramIdentity,
-    source_version: String,
-    /// The status of the activation governing the route at the read.
-    status: crate::activation_store::ProjectStatus,
-    /// Whether that activation takes work while off, and until when
-    /// (`crate::arrival`).
-    accepting_fires: bool,
-    fires_deadline_unix: Option<i64>,
-    /// Whose route it is: the instance whose trigger registered it, `None`
-    /// for a shared one. Its gate's connection is that instance's.
-    instance: Option<weft_core::instance::InstanceId>,
-}
-
-impl ArmedRoute {
-    /// How the route's activation stands, for the arrival rule.
-    fn standing(&self) -> crate::arrival::Standing {
-        crate::arrival::Standing {
-            status: self.status,
-            accepting_fires: self.accepting_fires,
-            fires_deadline_unix: self.fires_deadline_unix,
-        }
-    }
-}
-
-/// The columns [`armed_route_of`] reads, over `signal s` joined to its
-/// project `p` and its governing activation `a`
-/// (`SIGNAL_ACTIVATION_JOIN`). The status is the governing activation's
-/// (the route's own trigger, for its owner); a project row gone reads as
-/// inactive.
-const ARMED_COLUMNS: &str = "s.project_id, s.node_id, s.spec_json, s.auth_kind, s.auth_config, \
-     s.port_snapshot, s.program_json, s.source_version, s.instance_id, \
-     CASE WHEN p.id IS NULL THEN 'inactive' ELSE COALESCE(a.status, 'active') END AS status, \
-     CASE WHEN p.id IS NULL THEN FALSE ELSE COALESCE(a.accepting_fires, TRUE) END AS accepting_fires, \
-     a.fires_deadline_unix";
-
-/// The armed route a signal row holds ([`ARMED_COLUMNS`]), or the HTTP
-/// answer when it is half-armed.
-fn armed_route_of(row: &sqlx::postgres::PgRow) -> Result<ArmedRoute, (StatusCode, String)> {
-    let project_id: uuid::Uuid = row.try_get("project_id").map_err(row_err)?;
-    let node_id: String = row.try_get("node_id").map_err(row_err)?;
-    let spec_json: String = row.try_get("spec_json").map_err(row_err)?;
-    let status: String = row.try_get("status").map_err(row_err)?;
-    let status = crate::activation_store::ProjectStatus::parse(&status)
-        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, format!("unknown activation status '{status}'")))?;
-    let accepting_fires: bool = row.try_get("accepting_fires").map_err(row_err)?;
-    let fires_deadline_unix: Option<i64> = row.try_get("fires_deadline_unix").map_err(row_err)?;
-    let auth_kind: String = row.try_get("auth_kind").map_err(row_err)?;
-    let auth_config: Option<Value> = row.try_get("auth_config").map_err(row_err)?;
-    let port_snapshot: Option<Value> = row.try_get("port_snapshot").map_err(row_err)?;
-    let program_json: Option<Value> = row.try_get("program_json").map_err(row_err)?;
-    let source_version: Option<String> = row.try_get("source_version").map_err(row_err)?;
-    let instance: Option<String> = row.try_get("instance_id").map_err(row_err)?;
-    let instance = instance
-        .map(weft_core::instance::InstanceId::new)
-        .transpose()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("corrupt signal.instance_id: {e}")))?;
-    let source_version = source_version.ok_or_else(|| (StatusCode::PRECONDITION_REQUIRED, format!("trigger '{node_id}' has no original source version; activate it again")))?;
-    let program: weft_core::project::hash::ProgramIdentity = serde_json::from_value(program_json
-        .ok_or_else(|| (StatusCode::PRECONDITION_REQUIRED, format!("trigger '{node_id}' has no armed code identity; activate it again")))?)
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("armed program identity: {error}")))?;
-
-    // The signal spec carries the kind tag + its config. The kind itself
-    // says whether it serves a caller on the line, the protocol they
-    // speak, and the connection's settings (`Signal::CALLER`); a kind
-    // that serves none is not a live route. The config travels to the
-    // worker verbatim in `spec.config`.
-    let spec: weft_core::primitive::SignalSpec = serde_json::from_str(&spec_json)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("spec parse: {e}")))?;
-    if weft_core::signal::caller_protocol(&spec.kind).is_none() {
-        return Err((StatusCode::BAD_REQUEST, format!("endpoint of '{node_id}' is not a live connection ({})", spec.kind)));
-    }
-    let (protocol, live_config) = weft_core::signal::live_connection(&spec)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live config: {e}")))?;
-    Ok(ArmedRoute {
-        project_id, node_id, spec, protocol, live_config, auth_kind, auth_config,
-        port_snapshot, program, source_version, status, accepting_fires, fires_deadline_unix, instance,
-    })
-}
-
-/// Give birth to the run a live caller's handshake is for: resolve the
-/// program, compute the fire from the caller's request, and admit it at
-/// the entry's limits and ATOMICALLY journal `ExecutionStarted` + the
-/// trigger kicks with the execute task, in one call to the database
-/// (`Journal::admit_and_start_execution`). The task waits for the caller
-/// (`LiveConnectionStart::arrive_by`, their token's expiry): the worker
-/// their connection reaches claims it. A refusal or a failure anywhere
-/// leaves NOTHING journaled or queued.
-async fn birth_live_run(
-    state: &DispatcherState,
-    route: &ArmedRoute,
-    request: &weft_core::caller::LiveRequest,
-    tenant: &str,
-    execution_id: uuid::Uuid,
-    arrive_by: i64,
-    instance: Option<&weft_core::instance::InstanceId>,
-    admission: &crate::entry_limits::Admission,
-) -> Result<Result<(), crate::entry_limits::Refused>, (StatusCode, String)> {
-    let project_id = route.project_id;
-    let definition_hash = &route.program.definition_hash;
-    let project_def = state
-        .program(project_id, definition_hash)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("def lookup: {e:#}")))?
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "no definition for hash".into()))?;
-
-    // The caller's request IS the trigger's wake payload: the trigger node
-    // reads it off `ctx.wake` and fans it onto its ports.
-    let payload = serde_json::to_value(request)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("request serialize: {e}")))?;
-    let crate::api::project::TriggerFire { kicks, subgraph } =
-        crate::api::project::compute_trigger_fire(&project_def, &route.node_id, &payload, route.port_snapshot.as_ref())
-            .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
-    // A run reaching something per instance runs for one, finds what that
-    // instance provides filled and valid, and finds that instance's infra up:
-    // refused here, to the caller standing at the door, rather than
-    // mid-run. The values read are the run's.
-    // The program's own connections, as this install picked them. The two
-    // reads go out together: neither needs the other.
-    let (instance_values, picks) = tokio::try_join!(
-        async {
-            crate::api::project::refuse_instance_gaps(state, project_id, &project_def, &subgraph, instance)
-                .await
-                .map_err(|gap| match gap {
-                    // Infra the run reads is down: the fix is the operator's
-                    // (logged), and the caller is told what is true for them.
-                    crate::api::project::RunGap::Other((StatusCode::PRECONDITION_REQUIRED, why)) => {
-                        tracing::info!(target: "weft_dispatcher::signal", %project_id, node = %route.node_id, "a caller refused: {why}");
-                        (StatusCode::SERVICE_UNAVAILABLE, crate::arrival::INFRA_DOWN_FOR_CALLER.to_string())
-                    }
-                    gap => gap.into(),
-                })
-        },
-        crate::api::project::picks_for_run(state, project_id, &project_def, &subgraph),
-    )?;
-
-    let now = crate::lease::now_unix() as u64;
-    // The fire's computed subgraph rides on ExecutionStarted: the
-    // boundary the engine holds the run to (see `TriggerFire`).
-    let (start, kick_events) = crate::api::project::execution_birth_events(crate::api::project::Birth {
-        execution_id,
-        project_id,
-        phase: weft_core::context::Phase::Fire,
-        entry_node: &route.node_id,
-        kicks: &kicks,
-        program: &route.program,
-        subgraph: Some(&subgraph),
-        seed: None,
-        source_version: Some(&route.source_version),
-        instance: instance.map(|instance| crate::api::project::RunFor { instance, values: &instance_values }),
-        picks: &picks,
-        fired_trigger: Some(&route.node_id),
-        run_kind: route.live_config.run_kind(),
-        // Driven inside the caller's own request (`validate_spec` refuses
-        // a live signal registered `long`).
-        run_class: weft_core::run_class::RunClass::Short,
-        at_unix: now,
-    });
-    // An unrecorded run's birth never reaches the journal: its rows ride
-    // the execute task, and the worker holds the run's journal in memory.
-    let unrecorded_birth: Option<Vec<weft_journal::ExecEvent>> = (!route.live_config.run_kind().journaled())
-        .then(|| std::iter::once(start.clone()).chain(kick_events.iter().cloned()).collect());
-    let live_start = weft_task_store::kinds::LiveConnectionStart {
-        spec: route.spec.clone(),
-        request: request.clone(),
-        arrive_by: Some(arrive_by),
-        // A real caller is coming, so the worker waits for their socket.
-        // Only a fired run serves its own body.
-        fired: None,
-    };
-    // The execute task, claimed by the worker the caller reaches, which
-    // drives it inside the caller's own request. `live_connection` carries
-    // the trigger's full signal spec (so the worker recovers the protocol
-    // + connection knobs and expects a caller) and the caller's request
-    // (so the connection carries it).
-    let task = crate::task_kinds::execute::execution_task_spec(crate::task_kinds::execute::ExecutionTask {
-        kind: weft_task_store::TaskKind::Execute,
-        project_id,
-        execution_id,
-        definition_hash,
-        binary_hash: &route.program.binary_hash,
-        tenant_id: tenant,
-        run_class: weft_core::run_class::RunClass::Short,
-        live_connection: Some(live_start),
-        unrecorded_birth: unrecorded_birth.as_deref(),
-    })
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live task spec: {e}")))?;
-
-    state
-        .journal
-        .admit_and_start_execution(admission, &start, &kick_events, task)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("live run birth: {e:#}")))
-}
-
-fn row_err(e: sqlx::Error) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("row: {e}"))
-}
-
-/// Which door the caller should be sent back through for the live hop.
-/// A request that passed a door carries `X-Forwarded-Proto` (Cloud Run's
-/// front end, or the load balancer in front of the install's domains,
-/// which terminated TLS; a local install's tunnel) and is answered at the
-/// address the caller used, so a caller on the internet is never sent to
-/// a loopback address and a local one never to the tunnel. A request that
-/// reached the dispatcher's own port directly (tooling on the machine)
-/// passed no door, and is sent to the install's configured base, which is
-/// one.
-fn live_door(headers: &HeaderMap, configured: &str) -> String {
-    let through_door = headers.contains_key("x-forwarded-proto") || headers.contains_key(weft_core::net::WEFT_FORWARDED_PROTO);
-    match weft_core::net::request_base_url(headers).filter(|_| through_door) {
-        Some(base) => base,
-        None => configured.trim_end_matches('/').to_string(),
-    }
+        .collect())
 }
 
 /// Project-token proxy: what a trigger node is showing. `{node}` is
@@ -2576,25 +1512,6 @@ mod public_url_tests {
 }
 
 
-
-#[cfg(test)]
-mod connect_url_tests {
-    use super::live_door;
-
-    /// Through a door, the caller comes back the way it came (the tunnel
-    /// host, the cloud's hostname); straight to the dispatcher's own
-    /// port, it is sent to the install's configured door.
-    #[test]
-    fn the_live_hop_goes_back_through_the_door_the_caller_used() {
-        let mut h = axum::http::HeaderMap::new();
-        h.insert("host", "abc.trycloudflare.com".parse().unwrap());
-        h.insert("x-forwarded-proto", "https".parse().unwrap());
-        assert_eq!(live_door(&h, "http://127.0.0.1:14112/"), "https://abc.trycloudflare.com");
-        let mut direct = axum::http::HeaderMap::new();
-        direct.insert("host", "127.0.0.1:14111".parse().unwrap());
-        assert_eq!(live_door(&direct, "http://127.0.0.1:14112/"), "http://127.0.0.1:14112");
-    }
-}
 
 /// Layer-1 tests for the `can_cancel` authorization gate (the C1 cross-tenant
 /// fix). The cancel path reaches sibling signals of the same execution, so the gate

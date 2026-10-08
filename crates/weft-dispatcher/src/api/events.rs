@@ -93,12 +93,12 @@ pub async fn execution_stream(
     Path(execution_id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, broadcast::error::RecvError>>>, StatusCode> {
     // Execution SSE: we don't index events by execution alone (an execution
-    // belongs to a project). Resolve project_id via the journal's
-    // execution row, then subscribe to the project's bus but filter
+    // belongs to a project). Resolve project_id via the run's row, then
+    // subscribe to the project's bus but filter
     // for this execution.
     //
     // A bad execution string is 400; a journal lookup failure is 500;
-    // an unknown execution (no execution row) is 404. The pre-Result
+    // an unknown execution (no run row) is 404. The pre-Result
     // shape papered over all three with empty-string project_id,
     // which silently routed events into a phantom bucket.
     let target_execution_id: uuid::Uuid = execution_id

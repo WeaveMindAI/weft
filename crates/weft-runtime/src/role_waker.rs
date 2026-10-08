@@ -242,9 +242,10 @@ mod tests {
             BTreeSet::from(["dispatcher_picker".to_string()])
         );
         assert_eq!(
-            woken_by(&dispatcher, weft_task_store::tasks::TASK_READY_CHANNEL, "worker:p"),
+            woken_by(&dispatcher, weft_task_store::runs::RUN_QUEUED_CHANNEL, &uuid::Uuid::nil().to_string()),
             BTreeSet::from(["delivery".to_string()])
         );
+
         let issued = format!("issued:{}", uuid::Uuid::nil());
         assert_eq!(woken_by(&loop_wakes(CoreRole::Supervisor), INFRA_COMMAND_CHANNEL, &issued), BTreeSet::from(["supervisor".to_string()]));
         assert!(woken_by(&loop_wakes(CoreRole::Supervisor), INFRA_COMMAND_CHANNEL, "done:7").is_empty(), "a command's end wakes nobody");

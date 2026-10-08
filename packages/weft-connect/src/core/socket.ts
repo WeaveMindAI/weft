@@ -151,7 +151,7 @@ export function openLiveSocket(options: LiveSocketOptions): LiveSocket {
  *  with `headers`, the address a plain `GET` carrying them answers. A 4xx
  *  answer is the route refusing this caller ([`Refused`]), but for the two
  *  that mean "not now"; anything else that fails is worth asking again.
- *  SYNC: the ticket answer's shape <-> crates/weft-dispatcher/src/api/signal.rs (connect_live), crates/weft-e2e/src/live.rs (ticket) */
+ *  SYNC: the ticket answer's shape <-> crates/weft-engine/src/door/mod.rs (the ticket answer), crates/weft-e2e/src/live.rs (ticket) */
 async function socketAddress(
 	url: string,
 	session: string,

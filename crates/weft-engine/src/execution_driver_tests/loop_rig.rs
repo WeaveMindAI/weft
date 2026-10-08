@@ -37,31 +37,8 @@
             self.events.lock().unwrap().push(event.clone());
             Ok(())
         }
-        /// Every captured row (whatever its execution), each numbered by its
-        /// place, serialized the way the real journal stores them so a
-        /// ferry-shaped consumer sees the same bytes. Never holds: the
-        /// rig drives no waits.
-        async fn raw_rows_after(
-            &self,
-            _execution_id: ExecutionId,
-            after_id: i64,
-            _wait: std::time::Duration,
-        ) -> anyhow::Result<Vec<weft_journal::RawJournalRow>> {
-            Ok(self
-                .events
-                .lock()
-                .unwrap()
-                .iter()
-                .enumerate()
-                .map(|(i, e)| weft_journal::RawJournalRow {
-                    id: i as i64 + 1,
-                    payload: serde_json::to_string(e).expect("serialize ExecEvent"),
-                })
-                .filter(|row| row.id > after_id)
-                .collect())
-        }
-        async fn has_terminal_event(&self, _execution_id: ExecutionId) -> anyhow::Result<bool> {
-            Ok(false)
+        async fn events_for_execution_id(&self, _execution_id: ExecutionId) -> anyhow::Result<Vec<ExecEvent>> {
+            unreachable!("the loop rig reads no other run")
         }
     }
 
@@ -191,7 +168,7 @@
             ],
             features: Default::default(),
             requires_infra: false, per_instance: None,
-            fires_with: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(),
             images: vec![],
             published_service: None,
             instance_service: None,
@@ -249,7 +226,7 @@
             }],
             features: Default::default(),
             requires_infra: false, per_instance: None,
-            fires_with: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(),
             images: vec![],
             published_service: None,
             instance_service: None,
@@ -294,7 +271,7 @@
             }],
             features: Default::default(),
             requires_infra: false, per_instance: None,
-            fires_with: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(),
             images: vec![],
             published_service: None,
             instance_service: None,
@@ -330,7 +307,7 @@
             outputs: vec![],
             features: Default::default(),
             requires_infra: false, per_instance: None,
-            fires_with: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(),
             images: vec![],
             published_service: None,
             instance_service: None,
@@ -409,7 +386,7 @@
         pulses: &mut PulseTable,
         journal: &CapturingJournal,
     ) {
-        let edge_idx = weft_core::project::EdgeIndex::build(&lp.project);
+        let program_idx = weft_core::project::ProgramIndex::build(&lp.project);
         let loop_in = lp.project.nodes.iter().find(|n| n.id == lp.loop_in_id).unwrap();
         let group = ReadyGroup {
             frames: Vec::new(),
@@ -426,7 +403,7 @@
         let mut stream_rt =
             crate::stream_runtime::StreamRuntime::new(crate::wait_tracker::WaitTracker::new());
         handle_loop_boundary_firing(
-            loop_in, &group, &lp.project, &edge_idx, pulses, journal,
+            loop_in, &group, &lp.project, &program_idx, pulses, journal,
             "test-instance", rt, &mut stream_rt, &mut std::collections::HashMap::new(),
         )
         .await
@@ -450,7 +427,7 @@
     ) {
         let execution_id = uuid::Uuid::nil();
         let frames = vec![Frame::Loop { index: iter }];
-        let edge_idx = weft_core::project::EdgeIndex::build(&lp.project);
+        let program_idx = weft_core::project::ProgramIndex::build(&lp.project);
         let loop_out = lp.project.nodes.iter().find(|n| n.id == lp.loop_out_id).unwrap();
         // The body firings that produced these writes: `writes` is
         // keyed by LoopOut input port, so each write is journaled as
@@ -509,7 +486,7 @@
         let mut stream_rt =
             crate::stream_runtime::StreamRuntime::new(crate::wait_tracker::WaitTracker::new());
         handle_loop_boundary_firing(
-            loop_out, &group, &lp.project, &edge_idx, pulses, journal,
+            loop_out, &group, &lp.project, &program_idx, pulses, journal,
             "test-instance", rt, &mut stream_rt, &mut std::collections::HashMap::new(),
         )
         .await
@@ -835,12 +812,12 @@
         )
         .await;
         // Mid-flight: no LoopOut firings happened. Cancel.
-        let edge_idx = weft_core::project::EdgeIndex::build(&lp.project);
+        let program_idx = weft_core::project::ProgramIndex::build(&lp.project);
         cancel_loop_instances(
             &mut rt,
             uuid::Uuid::nil(),
             &lp.project,
-            &edge_idx,
+            &program_idx,
             &mut pulses,
             &journal,
             "test-instance",
@@ -1084,7 +1061,7 @@
                 .collect(),
             features: Default::default(),
             requires_infra: false, per_instance: None,
-            fires_with: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(),
             images: vec![],
             published_service: None,
             instance_service: None,
@@ -1141,7 +1118,7 @@
                 PortDefinition { name: "acc".into(),   port_type: primitive(WeftPrimitive::String), required: false, description: None, synthesized_from_carry: false, declared_type: None },
                 PortDefinition { name: "index".into(), port_type: primitive(WeftPrimitive::Number), required: false, description: None, synthesized_from_carry: false, declared_type: None },
             ],
-            features: Default::default(), requires_infra: false, per_instance: None, images: vec![], fires_with: Default::default(),
+            features: Default::default(), requires_infra: false, per_instance: None, images: vec![], fires_with: Default::default(), baked_outputs: Default::default(),
             published_service: None,
             instance_service: None,
             instance_rules: None,
@@ -1166,7 +1143,7 @@
                 PortDefinition { name: "results".into(), port_type: list_of_nullable(primitive(WeftPrimitive::String)), required: false, description: None, synthesized_from_carry: false, declared_type: None },
                 PortDefinition { name: "acc".into(),     port_type: primitive(WeftPrimitive::String),                   required: false, description: None, synthesized_from_carry: false, declared_type: None },
             ],
-            features: Default::default(), requires_infra: false, per_instance: None, images: vec![], fires_with: Default::default(),
+            features: Default::default(), requires_infra: false, per_instance: None, images: vec![], fires_with: Default::default(), baked_outputs: Default::default(),
             published_service: None,
             instance_service: None,
             instance_rules: None,
@@ -1192,7 +1169,7 @@
                 PortDefinition { name: "acc".into(), port_type: primitive(WeftPrimitive::String), required: false, description: None, synthesized_from_carry: false, declared_type: None },
                 PortDefinition { name: "done".into(), port_type: primitive(WeftPrimitive::Boolean), required: false, description: None, synthesized_from_carry: false, declared_type: None },
             ],
-            features: Default::default(), requires_infra: false, per_instance: None, images: vec![], fires_with: Default::default(),
+            features: Default::default(), requires_infra: false, per_instance: None, images: vec![], fires_with: Default::default(), baked_outputs: Default::default(),
             published_service: None,
             instance_service: None,
             instance_rules: None,
@@ -1209,7 +1186,7 @@
                 PortDefinition { name: "data".into(),  port_type: list_of_nullable(primitive(WeftPrimitive::String)), required: true, description: None, synthesized_from_carry: false, declared_type: None },
                 PortDefinition { name: "final".into(), port_type: primitive(WeftPrimitive::String),                    required: true, description: None, synthesized_from_carry: false, declared_type: None },
             ]),
-            outputs: vec![], features: Default::default(), requires_infra: false, per_instance: None, images: vec![], fires_with: Default::default(),
+            outputs: vec![], features: Default::default(), requires_infra: false, per_instance: None, images: vec![], fires_with: Default::default(), baked_outputs: Default::default(),
             published_service: None,
             instance_service: None,
             instance_rules: None,
@@ -1451,7 +1428,7 @@
         pulses: &mut PulseTable,
         journal: &CapturingJournal,
     ) -> Result<(), String> {
-        let edge_idx = weft_core::project::EdgeIndex::build(&lp.project);
+        let program_idx = weft_core::project::ProgramIndex::build(&lp.project);
         let loop_out = lp.project.nodes.iter().find(|n| n.id == lp.loop_out_id).unwrap();
         let mut received = weft_core::exec::ready::FiringInput {
             input: bag(serde_json::json!({"results": "r"})),
@@ -1476,7 +1453,7 @@
         let mut stream_rt =
             crate::stream_runtime::StreamRuntime::new(crate::wait_tracker::WaitTracker::new());
         handle_loop_boundary_firing(
-            loop_out, &group, &lp.project, &edge_idx, pulses, journal,
+            loop_out, &group, &lp.project, &program_idx, pulses, journal,
             "test-instance", rt, &mut stream_rt, &mut std::collections::HashMap::new(),
         )
         .await

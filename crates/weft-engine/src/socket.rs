@@ -421,69 +421,10 @@ mod tests {
         assert!(err.contains("handshake cannot carry"), "{err}");
     }
 
-    // ---- Rig: a recording task store, a byte-priced session meter, an
-    // echo WS server ----
+    // ---- Rig: the run's recorded costs (`crate::metering`'s rig), a
+    // byte-priced session meter, an echo WS server ----
 
-    #[derive(Default)]
-    struct RecordingTaskStore {
-        pub enqueued: Mutex<Vec<weft_task_store::NewTask>>,
-    }
-
-    #[async_trait::async_trait]
-    impl weft_task_store::TaskStoreClient for RecordingTaskStore {
-        async fn cancels_asked(
-            &self,
-            _project_id: uuid::Uuid,
-            _execution_ids: Vec<String>,
-        ) -> anyhow::Result<Vec<weft_task_store::tasks::CancelAsked>> {
-            Ok(Vec::new())
-        }
-
-        async fn enqueue_dedup(
-            &self,
-            spec: weft_task_store::tasks::NewTask,
-        ) -> anyhow::Result<weft_task_store::tasks::DedupOutcome> {
-            self.enqueued.lock().unwrap().push(spec);
-            Ok(weft_task_store::tasks::DedupOutcome::Inserted(uuid::Uuid::new_v4()))
-        }
-        async fn wait_for_terminal(
-            &self,
-            _task_id: uuid::Uuid,
-            _timeout: std::time::Duration,
-        ) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
-            unreachable!("socket tests only enqueue")
-        }
-        async fn claim_execution(
-            &self,
-            _replica: &str,
-            _project_id: uuid::Uuid,
-            _execution_id: &str,
-        ) -> anyhow::Result<Option<weft_task_store::tasks::ClaimedExecution>> {
-            Ok(None)
-        }
-        async fn requeue(&self, _task_id: uuid::Uuid, _replica: &str) -> anyhow::Result<bool> {
-            Ok(true)
-        }
-        async fn heartbeat(&self, _task_id: uuid::Uuid, _replica: &str) -> anyhow::Result<bool> {
-            Ok(true)
-        }
-        async fn complete(
-            &self,
-            _task_id: uuid::Uuid,
-            _replica: &str,
-            _result: serde_json::Value,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn fail(
-            &self,
-            _task_id: uuid::Uuid,
-            _replica: &str,
-            _error: String,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
+    use crate::metering::tests::{recorded_payloads, test_writer, RecordedCosts};
 
     /// A meter whose session prices a dollar per byte SENT to the
     /// provider (and, when `inbound` is set, per byte received too).
@@ -507,9 +448,6 @@ mod tests {
             if self.inbound {
                 self.sent += payload.len() as u64;
             }
-        }
-        fn accrued_usd(&self) -> f64 {
-            self.sent as f64
         }
         fn end(self: Box<Self>, interrupted: bool) -> MeasuredCost {
             MeasuredCost {
@@ -596,15 +534,15 @@ mod tests {
     }
 
     fn sink(
-        tasks: Arc<RecordingTaskStore>,
+        tasks: Arc<RecordedCosts>,
         pending: Arc<crate::metering::PendingCostRecords>,
     ) -> Arc<CostSink> {
         Arc::new(CostSink {
-            tasks,
+            journal: tasks,
+            writer: test_writer(),
+            replica: "w".into(),
             pending,
             open_charges: crate::metering::OpenCharges::new(),
-            project_id: uuid::Uuid::from_u128(1),
-            tenant_id: "t1".into(),
             execution_id: uuid::Uuid::nil(),
             node_id: "node-x".into(),
             frames: weft_core::frames::LoopFrames::default(),
@@ -622,7 +560,7 @@ mod tests {
         let (base, _seen) = spawn_echo_ws().await;
         let base: &'static str = Box::leak(base.into_boxed_str());
         let meter: &'static ByteMeter = Box::leak(Box::new(ByteMeter { base, inbound: false }));
-        let tasks = Arc::new(RecordingTaskStore::default());
+        let tasks = Arc::new(RecordedCosts::default());
         let pending = crate::metering::PendingCostRecords::new();
         let mut sink_ours = sink(tasks.clone(), pending.clone());
         Arc::get_mut(&mut sink_ours).expect("sole owner").origin = weft_core::CredentialOwner::Platform;
@@ -662,7 +600,7 @@ mod tests {
             &[("key".to_string(), "sekrit".to_string())].into_iter().collect(),
         )
         .unwrap();
-        let tasks = Arc::new(RecordingTaskStore::default());
+        let tasks = Arc::new(RecordedCosts::default());
         let pending = crate::metering::PendingCostRecords::new();
         let dial = ConnectionSocketDial {
             steps,
@@ -687,14 +625,14 @@ mod tests {
 
         // The figure: 10 bytes sent ("hello" + "more!"), measured,
         // never billed, the author's own.
-        let enqueued = tasks.enqueued.lock().unwrap();
+        let enqueued = recorded_payloads(&tasks);
         assert_eq!(enqueued.len(), 1, "one session, one record");
-        let payload = &enqueued[0].payload;
-        assert_eq!(payload["amount_usd"], serde_json::json!(10.0));
-        assert_eq!(payload["billed"], serde_json::json!(false));
-        assert_eq!(payload["origin"], serde_json::json!("author"));
-        assert_eq!(payload["model"], serde_json::json!("byte-model"));
-        assert_eq!(payload["metadata"]["interrupted"], serde_json::json!(false));
+        let booked = &enqueued[0];
+        assert_eq!(booked.amount_usd, Some(10.0));
+        assert!(!booked.billed);
+        assert_eq!(booked.origin, weft_core::CredentialOwner::Author);
+        assert_eq!(booked.model.as_deref(), Some("byte-model"));
+        assert_eq!(booked.metadata["interrupted"], serde_json::json!(false));
     }
 
     /// A session on a route the meter does not price passes through
@@ -707,7 +645,7 @@ mod tests {
             let (base, _seen) = spawn_echo_ws().await;
             let base: &'static str = Box::leak(base.into_boxed_str());
             let meter: &'static ByteMeter = Box::leak(Box::new(ByteMeter { base, inbound: false }));
-            let tasks = Arc::new(RecordingTaskStore::default());
+            let tasks = Arc::new(RecordedCosts::default());
             let pending = crate::metering::PendingCostRecords::new();
             let dial = ConnectionSocketDial {
                 steps: Vec::new(),
@@ -719,14 +657,14 @@ mod tests {
             socket.send(SocketMessage::Text("x".into())).await.unwrap();
             socket.close().await.unwrap();
             pending.wait_zero().await;
-            assert!(tasks.enqueued.lock().unwrap().is_empty(), "unknown route = no record");
+            assert!(recorded_payloads(&tasks).is_empty(), "unknown route = no record");
         }
         // Dropped measured session.
         {
             let (base, _seen) = spawn_echo_ws().await;
             let base: &'static str = Box::leak(base.into_boxed_str());
             let meter: &'static ByteMeter = Box::leak(Box::new(ByteMeter { base, inbound: false }));
-            let tasks = Arc::new(RecordingTaskStore::default());
+            let tasks = Arc::new(RecordedCosts::default());
             let pending = crate::metering::PendingCostRecords::new();
             let dial = ConnectionSocketDial {
                 steps: Vec::new(),
@@ -738,11 +676,11 @@ mod tests {
             socket.send(SocketMessage::Text("abc".into())).await.unwrap();
             drop(socket);
             pending.wait_zero().await;
-            let enqueued = tasks.enqueued.lock().unwrap();
+            let enqueued = recorded_payloads(&tasks);
             assert_eq!(enqueued.len(), 1);
-            assert_eq!(enqueued[0].payload["amount_usd"], serde_json::json!(3.0));
+            assert_eq!(enqueued[0].amount_usd, Some(3.0));
             assert_eq!(
-                enqueued[0].payload["metadata"]["interrupted"],
+                enqueued[0].metadata["interrupted"],
                 serde_json::json!(true)
             );
         }
@@ -764,7 +702,7 @@ mod tests {
         });
         let base: &'static str = Box::leak(format!("http://{addr}").into_boxed_str());
         let meter: &'static ByteMeter = Box::leak(Box::new(ByteMeter { base, inbound: false }));
-        let tasks = Arc::new(RecordingTaskStore::default());
+        let tasks = Arc::new(RecordedCosts::default());
         let pending = crate::metering::PendingCostRecords::new();
         let dial = ConnectionSocketDial {
             steps: Vec::new(),
@@ -790,11 +728,10 @@ mod tests {
         assert!(failed, "the dead peer must surface as a send error");
         drop(socket);
         pending.wait_zero().await;
-        let enqueued = tasks.enqueued.lock().unwrap();
+        let enqueued = recorded_payloads(&tasks);
         assert_eq!(enqueued.len(), 1);
         assert_eq!(
-            enqueued[0].payload["amount_usd"],
-            serde_json::json!(accepted as f64),
+            enqueued[0].amount_usd, Some(accepted as f64),
             "the failed send's bytes are absent from the figure"
         );
     }
@@ -819,7 +756,7 @@ mod tests {
         });
         let base: &'static str = Box::leak(format!("http://{addr}").into_boxed_str());
         let meter: &'static ByteMeter = Box::leak(Box::new(ByteMeter { base, inbound: true }));
-        let tasks = Arc::new(RecordingTaskStore::default());
+        let tasks = Arc::new(RecordedCosts::default());
         let pending = crate::metering::PendingCostRecords::new();
         let dial = ConnectionSocketDial {
             steps: Vec::new(),
@@ -833,11 +770,11 @@ mod tests {
         // still feed "payload" to the observation.
         socket.close().await.unwrap();
         pending.wait_zero().await;
-        let enqueued = tasks.enqueued.lock().unwrap();
+        let enqueued = recorded_payloads(&tasks);
         assert_eq!(enqueued.len(), 1);
         // 2 bytes out ("go") + 7 in ("payload").
-        assert_eq!(enqueued[0].payload["amount_usd"], serde_json::json!(9.0));
-        assert_eq!(enqueued[0].payload["metadata"]["interrupted"], serde_json::json!(false));
+        assert_eq!(enqueued[0].amount_usd, Some(9.0));
+        assert_eq!(enqueued[0].metadata["interrupted"], serde_json::json!(false));
     }
 
     /// A peer that never answers the close (holds the line, sends
@@ -855,7 +792,7 @@ mod tests {
         });
         let base: &'static str = Box::leak(format!("http://{addr}").into_boxed_str());
         let meter: &'static ByteMeter = Box::leak(Box::new(ByteMeter { base, inbound: false }));
-        let tasks = Arc::new(RecordingTaskStore::default());
+        let tasks = Arc::new(RecordedCosts::default());
         let pending = crate::metering::PendingCostRecords::new();
         let dial = ConnectionSocketDial {
             steps: Vec::new(),
@@ -870,10 +807,10 @@ mod tests {
         // drain would hang this await forever.
         socket.close().await.unwrap();
         pending.wait_zero().await;
-        let enqueued = tasks.enqueued.lock().unwrap();
+        let enqueued = recorded_payloads(&tasks);
         assert_eq!(enqueued.len(), 1);
-        assert_eq!(enqueued[0].payload["amount_usd"], serde_json::json!(2.0));
-        assert_eq!(enqueued[0].payload["metadata"]["interrupted"], serde_json::json!(false));
+        assert_eq!(enqueued[0].amount_usd, Some(2.0));
+        assert_eq!(enqueued[0].metadata["interrupted"], serde_json::json!(false));
     }
 
     #[test]

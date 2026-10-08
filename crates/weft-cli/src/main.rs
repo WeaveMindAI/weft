@@ -272,14 +272,36 @@ enum Cmd {
         #[arg(long, value_name = "name")]
         save: Option<String>,
         /// Clear a saved setting before applying explicit flags: from,
-        /// emit, target, before, group, feed, fire, instance, or long.
+        /// emit, target, before, group, feed, fire, instance, keeping
+        /// (what `--durable` or `--fast` saved), keep_for or hold_secs.
         /// Repeatable.
         #[arg(long, value_name = "field")]
         clear: Vec<String>,
-        /// Run as a job of its own, which may run for days, instead of one
-        /// request to the project's workers (cut at an hour on a cloud).
+        /// Carry the run on in another worker if its worker dies (a step
+        /// caught halfway is failed, not run twice): what the run did is
+        /// written down before each step (except a node marked pure, which
+        /// does nothing outside the run), which makes the run slower. Unset, a run that fires a trigger is kept the way the
+        /// trigger says, and any other run is fast.
+        #[arg(long, conflicts_with = "fast")]
+        durable: bool,
+        /// Run fast even when the fired trigger is durable: the run waits
+        /// for its record only to pause or before it asks weft for
+        /// something on its behalf, and it ends if its worker dies.
         #[arg(long)]
-        long: bool,
+        fast: bool,
+        /// How long the run is kept once it ends: a whole number and a
+        /// unit (`30m`, `12h`, `7d`), or `forever`. Unset, the fired
+        /// trigger's `keepRunsFor`, else the project's `[runs] keep_for`
+        /// in weft.toml, else a week.
+        #[arg(long, value_name = "duration")]
+        keep_for: Option<weft_core::run_settings::KeepFor>,
+        /// How long, in seconds, a wait holds the run's worker while the
+        /// run cannot pause (a bus between its nodes is open), counted from
+        /// the last time anything moved in the run; then the waiting call
+        /// fails. 0 fails such a wait at once; at most 30 days. Unset, the
+        /// fired trigger's `holdSecs`, else 60.
+        #[arg(long, value_name = "seconds")]
+        hold_secs: Option<u32>,
     },
     /// Record the project's files as a version under head, with no run
     /// and no build: a point to branch back to.
@@ -400,6 +422,13 @@ enum Cmd {
         project: Option<String>,
         #[arg(long = "reactivate-choice", value_name = "choice")]
         reactivate_choice: Option<weft_core::activation::ReactivateChoice>,
+        /// On this machine, the port the project's own address opens on,
+        /// kept for later activates. If another program or project holds
+        /// it, nothing is activated. Unset, the project keeps the port it
+        /// has, or takes a free one when it has none or another program
+        /// took it.
+        #[arg(long, value_name = "port")]
+        port: Option<u16>,
         #[command(flatten)]
         running: RunningChoiceOpts,
         #[command(flatten)]
@@ -479,7 +508,8 @@ enum Cmd {
     Ps,
     /// Remove a project at the level you ask for. No flags → the
     /// cwd project is unregistered: the dispatcher deactivates it,
-    /// terminates its infrastructure, and reclaims its stored data.
+    /// terminates its infrastructure, erases its runs, and reclaims its
+    /// stored data.
     /// Add flags to escalate: `--journal` drops execution history,
     /// `--local` wipes this project's build artifacts, `--all`
     /// implies every flag. An explicit project id overrides the
@@ -708,15 +738,18 @@ enum Cmd {
         /// Only runs carrying this tag (`ctx.tag_execution`).
         #[arg(long)]
         tag: Option<String>,
-        /// Only runs in which this node fired, wherever it sits in the
-        /// program (`--node` is the node that started the run). Spelled
-        /// the way `weft events` names nodes.
+        /// Only finished runs in which this node fired, wherever it sits
+        /// in the program (`--node` is the node that started the run).
+        /// Spelled the way `weft events` names nodes. Like `--search`, it
+        /// finds a run a moment after it ends, and never one still going.
         #[arg(long, value_name = "node")]
         through: Option<String>,
         /// Only finished runs that carried every one of these words
         /// somewhere in what they recorded: the trigger's input, what
         /// every node sent on, an error, a log line. An email, an order
-        /// id, a phrase in quotes. A run still going is not searched yet.
+        /// id, a phrase in quotes. A run is searchable a moment after it
+        /// ends (longer while the install is busy writing records); one
+        /// still going is not searched yet.
         #[arg(long, value_name = "words")]
         search: Option<String>,
     },
@@ -768,10 +801,7 @@ enum Cmd {
     ///   --build-cache     drop the docker buildkit cache and the node-test cache
     ///   --all             with the journal subject: nuke every execution
     ///                     with --images: every project's images
-    ///   --project <id>    that project's runs, all of them. They
-    ///                     outlive the project, so this is how the
-    ///                     history of a project you already removed is
-    ///                     erased.
+    ///   --project <id>    that project's runs, all of them.
     #[command(verbatim_doc_comment)]
     Clean {
         /// Single execution UUID to delete. Mutually exclusive with --images / --build-cache.
@@ -785,11 +815,8 @@ enum Cmd {
         /// Wipe ALL executions (with no other flags) OR span every project (with --images).
         #[arg(long, default_value_t = false)]
         all: bool,
-        /// This project's executions. A project's runs outlive it
-        /// (removing a project leaves its history in the journal), so
-        /// this is how a removed project's history is erased. Takes
-        /// all of them, like naming one execution does; add
-        /// --keep-days to spare the recent ones.
+        /// This project's executions. Takes all of them, like naming
+        /// one execution does; add --keep-days to spare the recent ones.
         #[arg(long, value_name = "project-id")]
         project: Option<String>,
         /// Only runs for this instance.
@@ -879,7 +906,7 @@ enum TargetCmd {
         #[arg(long)]
         github: bool,
         /// The frontend server's own environment, a dotenv file (what
-        /// `weft infra env --on <target> --into <file>` writes, plus any
+        /// `weft infra env <node> --on <target> --into <file> --set ...` writes, plus any
         /// secret of the site's own), sent as the WEFT_FRONT_ENV secret.
         #[arg(long, value_name = "file")]
         front_env: Option<std::path::PathBuf>,
@@ -1090,9 +1117,9 @@ enum InfraAction {
         instance: Option<weft_core::instance::InstanceId>,
     },
     /// Re-apply against current images / sources (stop then start).
-    /// When the project is Active, triggers deactivate (same picker as
-    /// `weft deactivate`) for the duration. The project is left
-    /// deactivated afterward; click Activate when ready.
+    /// When the project is Active, the triggers that read this infra go
+    /// down for the duration and come back on by themselves once it runs
+    /// again.
     Upgrade {
         #[command(flatten)]
         opts: TriggerDeactivationOpts,
@@ -1181,6 +1208,21 @@ enum InfraAction {
         /// The button's action, as `weft infra show` prints it.
         #[arg(value_name = "action")]
         action: String,
+        /// That instance's copy of a `@per_instance` node (the shared
+        /// one when absent).
+        #[arg(long, value_name = "id")]
+        instance: Option<weft_core::instance::InstanceId>,
+    },
+    /// Make an infra node's baked outputs again: run its infra setup,
+    /// which restarts nothing that already matches its spec and runs its
+    /// body, whose values every fire reads from then on. For values that
+    /// changed where weft could not see (a password reset whose report to
+    /// weft never arrived). weft bakes again on its own whenever the infra is
+    /// applied, and writes what the infra itself says changed.
+    Rebake {
+        /// The infra node, named as `weft infra status` lists it.
+        #[arg(value_name = "node")]
+        node: String,
         /// That instance's copy of a `@per_instance` node (the shared
         /// one when absent).
         #[arg(long, value_name = "id")]
@@ -1354,13 +1396,16 @@ enum WorkersAction {
         /// The most copies at once.
         #[arg(long)]
         max_instances: Option<u32>,
-        /// Executions one copy serves at once.
+        /// How many calls Cloud Run sends one copy at once; a local
+        /// install does not use it.
         #[arg(long)]
         concurrency: Option<u32>,
-        /// CPUs per copy (`1`, `2`, `0.5`).
+        /// CPUs per copy on a cloud (`1`, `2`, `0.5`); a local install
+        /// does not cap a copy.
         #[arg(long)]
         cpu: Option<String>,
-        /// Memory per copy (`512Mi`, `2Gi`).
+        /// Memory per copy on a cloud (`512Mi`, `2Gi`); a local install
+        /// does not cap a copy.
         #[arg(long)]
         memory: Option<String>,
         /// Extra CPU while a copy starts, where the platform offers it.
@@ -1370,6 +1415,21 @@ enum WorkersAction {
         /// a program that keeps working after it answered a live caller.
         #[arg(long)]
         cpu_always_allocated: Option<bool>,
+        /// Seconds a copy holds a live thing its runs share (a pool of
+        /// database connections, ready Python processes) once nothing used
+        /// it.
+        #[arg(long)]
+        shared_idle_seconds: Option<u64>,
+        /// The most calls and events one copy takes at once; one past it
+        /// waits for a run to end. Unset, one per MiB of the copy's
+        /// memory (on your machine, the machine's memory), and never fewer
+        /// than 64.
+        #[arg(long)]
+        max_runs_at_once: Option<u32>,
+        /// How long, in seconds, a call waits for a run to end when its
+        /// copy is full, before it gets a busy `503` (30 unless set).
+        #[arg(long)]
+        max_queue_wait_seconds: Option<u64>,
     },
     /// Put levers back on the install's: the named ones, or every one.
     Reset { levers: Vec<String> },
@@ -1464,7 +1524,18 @@ impl From<DomainAction> for commands::domain::DomainAction {
 impl From<WorkersAction> for commands::workers::WorkersAction {
     fn from(value: WorkersAction) -> Self {
         match value {
-            WorkersAction::Set { min_instances, max_instances, concurrency, cpu, memory, startup_boost, cpu_always_allocated } => {
+            WorkersAction::Set {
+                min_instances,
+                max_instances,
+                concurrency,
+                cpu,
+                memory,
+                startup_boost,
+                cpu_always_allocated,
+                shared_idle_seconds,
+                max_runs_at_once,
+                max_queue_wait_seconds,
+            } => {
                 Self::Set(weft_platform_traits::WorkerOverrides {
                     min_instances,
                     max_instances,
@@ -1473,6 +1544,9 @@ impl From<WorkersAction> for commands::workers::WorkersAction {
                     memory,
                     startup_boost,
                     cpu_always_allocated,
+                    shared_idle_seconds,
+                    max_runs_at_once,
+                    max_queue_wait_seconds,
                 })
             }
             WorkersAction::Reset { levers } => Self::Reset(levers),
@@ -1488,6 +1562,7 @@ enum InfraRequest {
     Env(commands::infra_env::EnvArgs),
     Show(commands::infra_card::ShowArgs),
     Press(commands::infra_card::PressArgs),
+    Rebake { node: String, instance: Option<weft_core::instance::InstanceId> },
 }
 
 impl InfraAction {
@@ -1497,6 +1572,7 @@ impl InfraAction {
             InfraRequest::Env(args) => commands::infra_env::run(ctx, args).await,
             InfraRequest::Show(args) => commands::infra_card::run_show(ctx, args).await,
             InfraRequest::Press(args) => commands::infra_card::run_press(ctx, args).await,
+            InfraRequest::Rebake { node, instance } => commands::infra_card::run_rebake(ctx, &node, instance.as_ref()).await,
         }
     }
 
@@ -1553,6 +1629,7 @@ impl InfraAction {
             InfraAction::Press { node, action, instance } => {
                 return InfraRequest::Press(commands::infra_card::PressArgs { node, action, instance });
             }
+            InfraAction::Rebake { node, instance } => return InfraRequest::Rebake { node, instance },
         };
         InfraRequest::Lifecycle(verb, opts)
     }
@@ -1734,7 +1811,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             .await
         }
         Cmd::NodeTestHash { target } => commands::test_node::hash(ctx, target),
-        Cmd::Run { spec, detach, referenced, seed, seed_until, seed_before, root, from, target, before, group, feed, fire, emit, instance, save, clear, long } => {
+        Cmd::Run { spec, detach, referenced, seed, seed_until, seed_before, root, from, target, before, group, feed, fire, emit, instance, save, clear, durable, fast, keep_for, hold_secs } => {
             commands::run::run(
                 ctx,
                 commands::run::RunArgs {
@@ -1745,7 +1822,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     seed_until,
                     seed_before,
                     root,
-                    flags: commands::versions::RunFlags { from, target, before, group, feed, fire, emit, instance, clear, long },
+                    flags: commands::versions::RunFlags { from, target, before, group, feed, fire, emit, instance, clear, durable, fast, keep_for, hold_secs },
                     save,
                 },
             )
@@ -1776,11 +1853,12 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
             )
             .await
         }
-        Cmd::Activate { project, reactivate_choice, running, scope } => {
+        Cmd::Activate { project, reactivate_choice, port, running, scope } => {
             commands::activate::run(
                 ctx,
                 project,
                 reactivate_choice,
+                port,
                 running.running_policy,
                 running.drain_timeout,
                 scope.into(),

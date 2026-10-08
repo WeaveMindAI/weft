@@ -182,8 +182,7 @@ impl KindHandler for TimerHandler {
         _sig: &RegisteredSignal,
         payload: Value,
     ) -> ProcessOutcome {
-        // A timer tick (raised by a wake, delivered through the
-        // FireSignal broker task) routes to the entry trigger.
+        // A timer tick (raised by a wake) routes to the entry trigger.
         ProcessOutcome {
             value: payload,
             target: ProcessTarget::Entry,

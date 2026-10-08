@@ -22,7 +22,7 @@ use crate::state::DispatcherState;
 /// fire, `/connect/{*path}`, the `/{*mount_path}` public-entry catch-all). These
 /// accept a JSON payload from anyone who knows/guesses the URL; without a cap a
 /// caller could push arbitrarily large nested JSON (a parse-amplification vector,
-/// and it accumulates into a parked project's `parked_fires`). Sized to real
+/// and it accumulates into a parked trigger's queue, `parked_fire`). Sized to real
 /// webhook payloads. Trusted routes keep axum's default limit.
 const PUBLIC_FIRE_BODY_LIMIT: usize = 256 * 1024;
 
@@ -38,7 +38,7 @@ pub struct HoldQuery {
 
 /// Who is calling an outside door, as far as the network can tell: the
 /// address read off `X-Forwarded-For` through the trusted proxies in
-/// front of the listener the call came in on (`entry_limits::caller_address`).
+/// front of the listener the call came in on (`weft_core::net::caller_address`).
 pub struct CallerAddress(pub std::net::IpAddr);
 
 /// How many proxies in front of the listener a request came in on append
@@ -83,7 +83,7 @@ impl CallerAddress {
                 (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "no peer address on the request".to_string())
             })?;
         let forwarded = parts.headers.get("x-forwarded-for").and_then(|v| v.to_str().ok());
-        Ok(Self(crate::entry_limits::caller_address(forwarded, peer, hops)))
+        Ok(Self(weft_core::net::caller_address(forwarded, peer, hops)))
     }
 }
 
@@ -99,32 +99,20 @@ impl axum::extract::FromRequestParts<DispatcherState> for CallerAddress {
 }
 
 /// Whether a path is one of the token doors, where a refused answer
-/// means somebody presented a token that does not work.
+/// means somebody presented a token that does not work. A live call
+/// (`/connect/`) is not one here: the dispatcher passes it on to the
+/// worker, whose door counts the tokens it refuses itself
+/// (`weft_engine::door::limits`), and what comes back is the program's
+/// answer, whose 401 or 403 says nothing about a token.
 fn is_token_door(path: &str) -> bool {
-    ["/signal/", "/signal-token/", LIVE_CALL_DOOR, "/instance/"].iter().any(|p| path.starts_with(p))
+    ["/signal/", "/signal-token/", "/instance/"].iter().any(|p| path.starts_with(p))
 }
-
-/// Where live calls come in (`signal::connect_live`).
-const LIVE_CALL_DOOR: &str = "/connect/";
-
-/// Marks the answer to a live call that was admitted (its address checked
-/// for guessing tokens with its birth): what it says is the program's, or
-/// the socket address its run is reached at.
-#[derive(Clone, Copy)]
-pub(crate) struct Admitted;
 
 /// The layer over the outside-caller surface that stops token guessing:
 /// an address past the install's bound of refused tokens this minute is
 /// answered 429 on every token door until the minute ends, and each
 /// refusal a token door gives (401, 403, or a 404 for an unknown
 /// `/signal/` token) counts toward it.
-///
-/// A live call (`/connect/`) is not held up by a read of its own for this:
-/// a call that is let through is checked by its admission, in the one
-/// call to the database that admits and births its run (its answer is
-/// then marked [`Admitted`]), and any other answer, whatever its status,
-/// is checked here before it leaves. Either way a blocked address hears
-/// 429 and nothing else, so a right guess cannot be told from a wrong one.
 async fn guard_token_doors(
     axum::extract::State(state): axum::extract::State<DispatcherState>,
     request: axum::extract::Request,
@@ -142,41 +130,20 @@ async fn guard_token_doors(
         Err(e) => return e.into_response(),
     };
     let now = crate::lease::now_unix();
-    let blocked = || async {
-        crate::entry_limits::token_guessing_blocked(&state.pg_pool, &state.edge, address, now).await.map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("rate limit: {e:#}")).into_response()
-        })
-    };
-    let live_call = path.starts_with(LIVE_CALL_DOOR);
-    if !live_call {
-        match blocked().await {
-            Ok(Some(refused)) => return crate::entry_limits::too_many(refused),
-            Ok(None) => {}
-            Err(answer) => return answer,
-        }
+    match crate::entry_limits::token_guessing_blocked(&state.pg_pool, &state.edge, address, now).await {
+        Ok(Some(refused)) => return crate::entry_limits::too_many(refused),
+        Ok(None) => {}
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("rate limit: {e:#}")).into_response(),
     }
     let response = next.run(axum::extract::Request::from_parts(parts, body)).await;
     let status = response.status();
-    let admitted = response.extensions().get::<Admitted>().is_some();
-    // What the program answered is not a refused token, whatever it says.
-    let refused_token = !admitted
-        && (matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
-            || (status == StatusCode::NOT_FOUND && path.starts_with("/signal/")));
+    let refused_token = matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+        || (status == StatusCode::NOT_FOUND && path.starts_with("/signal/"));
     if refused_token {
-        // Counted and checked in one trip: a live call past the bound hears
-        // 429 like every other answer from a blocked address.
-        match crate::entry_limits::note_invalid_token(&state.pg_pool, &state.edge, address, now).await {
-            Ok(Some(refused)) if live_call => return crate::entry_limits::too_many(refused),
-            Ok(_) => {}
-            // A lost count only lets one more guess through, and the
-            // refusal is the answer either way.
-            Err(e) => tracing::warn!(target: "weft_dispatcher::api", error = %e, "could not count a refused token"),
-        }
-    } else if live_call && !admitted && status != StatusCode::TOO_MANY_REQUESTS {
-        match blocked().await {
-            Ok(Some(refused)) => return crate::entry_limits::too_many(refused),
-            Ok(None) => {}
-            Err(answer) => return answer,
+        // A lost count only lets one more guess through, and the refusal
+        // is the answer either way.
+        if let Err(e) = crate::entry_limits::note_invalid_token(&state.pg_pool, &state.edge, address, now).await {
+            tracing::warn!(target: "weft_dispatcher::api", error = %e, "could not count a refused token");
         }
     }
     response
@@ -308,6 +275,7 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         .route("/projects/{id}/infra/commands/{cmd_id}", get(infra::command_status))
         .route("/projects/{id}/infra/nodes/{node}/live", get(infra::live))
         .route("/projects/{id}/infra/nodes/{node}/action", post(infra::action))
+        .route("/projects/{id}/infra/nodes/{node}/rebake", post(infra::rebake))
         .route("/executions/resolve/{prefix}", get(execution::resolve_execution_id))
         .route("/executions/{execution_id}/cancel", post(execution::cancel))
         // Resolve a pure time wait now (`weft wake`).
@@ -465,11 +433,10 @@ fn outside_caller_routes(state: DispatcherState) -> Router<DispatcherState> {
         .route("/", get(public_page::index))
         .route("/index.html", get(public_page::index))
         .route("/logo.png", get(public_page::logo))
-        // A live call: an outside caller hits `/connect/<tenant>/<path>`.
-        // The handler matches the route (pattern + method), gates the
-        // caller, and passes the call to a worker in the same request
-        // (a browser asking for a socket is handed a URL on the live door
-        // below instead). ANY method:
+        // A live call at the install's shared address
+        // (`/connect/<tenant>/<path>`): the route (pattern + method) picks
+        // the project, and the call is passed on to its workers, whose door
+        // checks it (`live_relay`). ANY method:
         // a WS handshake is a GET and a route serves whatever verbs it
         // declared; the handler answers 405 itself. `/connect/*` is more
         // specific than the catch-all, so it never falls through to
@@ -478,12 +445,6 @@ fn outside_caller_routes(state: DispatcherState) -> Router<DispatcherState> {
             "/connect/{*path}",
             any(signal::connect_live).layer(DefaultBodyLimit::max(PUBLIC_FIRE_BODY_LIMIT)),
         )
-        // The live door: a browser's socket, opened at the URL its
-        // handshake answered with and passed to one of the project's
-        // workers (`live_relay`). The ticket in the URL is the credential.
-        .route(&format!("{}/{{project}}", crate::live_relay::LIVE_PREFIX), any(crate::live_relay::forward))
-        .route(&format!("{}/{{project}}/", crate::live_relay::LIVE_PREFIX), any(crate::live_relay::forward))
-        .route(&format!("{}/{{project}}/{{*rest}}", crate::live_relay::LIVE_PREFIX), any(crate::live_relay::forward))
         // The public endpoints of infra nodes (`Expose::Public`).
         .route(&format!("{}/{{project}}/{{instance}}", crate::infra_door::INFRA_PREFIX), any(crate::infra_door::forward))
         .route(&format!("{}/{{project}}/{{instance}}/{{*rest}}", crate::infra_door::INFRA_PREFIX), any(crate::infra_door::forward))
@@ -513,7 +474,7 @@ fn outside_caller_routes(state: DispatcherState) -> Router<DispatcherState> {
         // here when no more-specific route matches. The handler
         // looks up the signal row by `mount_path` (an open entry
         // only; a connection-gated one is a live route served at
-        // `/connect/...`), then forwards to dispatch_listener_outcome.
+        // `/connect/...`), then hands the event to `signal::take_event`.
         // Public-entry signals fire via this route. Methods other than
         // POST or unmatched paths fall to axum's default 404.
         .route(
@@ -562,10 +523,12 @@ pub fn outside_router(state: DispatcherState) -> Router {
 mod token_door_tests {
     #[test]
     fn only_the_token_doors_count_refusals() {
-        for door in ["/signal/abc", "/signal-token/signals", "/connect/local/chat"] {
+        for door in ["/signal/abc", "/signal-token/signals", "/instance/i1/runs"] {
             assert!(super::is_token_door(door), "{door}");
         }
-        for other in ["/public/files/x", "/events/slack/message", "/local/hook", "/signals"] {
+        // A live call's refusals are counted at the worker's door, and its
+        // 401 or 403 may be the program's own answer.
+        for other in ["/public/files/x", "/events/slack/message", "/local/hook", "/signals", "/connect/local/chat"] {
             assert!(!super::is_token_door(other), "{other}");
         }
     }

@@ -172,17 +172,27 @@ pub enum ServeError {
 /// (`None` once no domain is left). Callers hold the domains' lock
 /// (`crate::lease::DOMAINS_DOMAIN`), so the door serves what is stored.
 pub async fn serve_stored(pool: &PgPool, hosting: &dyn DomainHosting) -> Result<Option<IpAddr>, ServeError> {
-    let names: Vec<String> = list(pool).await.map_err(ServeError::Store)?.into_iter().map(|d| d.name).collect();
-    serve_names(pool, hosting, &names).await
+    let domains = list(pool).await.map_err(ServeError::Store)?;
+    serve_domains(pool, hosting, &domains).await
 }
 
-/// Put the door on exactly `names` (sorted), for a change a person made,
-/// and record what it did. The record is a hint the next pass reads, so
-/// failing to write it is logged and changes nothing about the answer the
-/// person gets; [`settle`] writes it strictly.
-async fn serve_names(pool: &PgPool, hosting: &dyn DomainHosting, names: &[String]) -> Result<Option<IpAddr>, ServeError> {
-    let (served, recorded) = match hosting.serve(names).await {
-        Ok(address) => (Ok(address), record_served(pool, names).await),
+/// What the door's record says it serves for `domain`: its name, and the
+/// project an API domain is sent to (the door routes it there itself).
+fn served_as(domain: &Domain) -> String {
+    match &domain.serves {
+        DomainServes::Api { project } => format!("{} api {project}", domain.name),
+        DomainServes::Install | DomainServes::Frontend { .. } => domain.name.clone(),
+    }
+}
+
+/// Put the door on exactly `domains` (sorted by name), for a change a
+/// person made, and record what it did. The record is a hint the next
+/// pass reads, so failing to write it is logged and changes nothing about
+/// the answer the person gets; [`settle`] writes it strictly.
+async fn serve_domains(pool: &PgPool, hosting: &dyn DomainHosting, domains: &[Domain]) -> Result<Option<IpAddr>, ServeError> {
+    let served_as: Vec<String> = domains.iter().map(served_as).collect();
+    let (served, recorded) = match hosting.serve(domains).await {
+        Ok(address) => (Ok(address), record_served(pool, &served_as).await),
         Err(refused) => {
             let recorded = record_refused(pool, &format!("{refused:#}")).await;
             (Err(ServeError::Door(refused)), recorded)
@@ -281,8 +291,8 @@ pub async fn serve_added(pool: &PgPool, hosting: &dyn DomainHosting, added: &str
 /// goes first: if it refuses, `name` stays stored and removing it again
 /// retries the whole step.
 pub async fn unserve(pool: &PgPool, hosting: &dyn DomainHosting, stored: &[Domain], name: &str) -> Result<(), ServeError> {
-    let rest: Vec<String> = stored.iter().filter(|d| d.name != name).map(|d| d.name.clone()).collect();
-    serve_names(pool, hosting, &rest).await?;
+    let rest: Vec<Domain> = stored.iter().filter(|d| d.name != name).cloned().collect();
+    serve_domains(pool, hosting, &rest).await?;
     remove(pool, name).await.map_err(ServeError::Store)?;
     Ok(())
 }
@@ -320,7 +330,8 @@ pub fn drain_loop(state: &DispatcherState) -> DrainLoop {
 /// what is stored unless it serves exactly that already, and answer when
 /// to look again.
 pub async fn settle(pool: &PgPool, hosting: &dyn DomainHosting) -> Result<DrainStep> {
-    let names: Vec<String> = list(pool).await?.into_iter().map(|d| d.name).collect();
+    let domains = list(pool).await?;
+    let names: Vec<String> = domains.iter().map(served_as).collect();
     let door = door_state(pool).await?;
     let just_served = door.refused.is_none()
         && door.served.as_ref().is_some_and(|(served, ago_ms)| {
@@ -333,7 +344,7 @@ pub async fn settle(pool: &PgPool, hosting: &dyn DomainHosting) -> Result<DrainS
     // The record decides the next pass here (the backoff, what `weft
     // domain list` says), so failing to write it fails the pass, which
     // the loop retries.
-    match hosting.serve(&names).await {
+    match hosting.serve(&domains).await {
         Ok(_) => {
             record_served(pool, &names).await?;
             Ok(DrainStep::Done)

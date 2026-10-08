@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::error::{WeftError, WeftResult};
 use crate::exec::emission::{pulse_id, PulseEmission};
 use crate::frames::LoopFrames;
-use crate::project::{Edge, EdgeIndex, ProjectDefinition};
+use crate::project::{Edge, ProgramIndex, ProjectDefinition};
 use crate::pulse::{Failure, Pulse, PulseTable};
 use crate::ExecutionId;
 
@@ -45,18 +45,18 @@ pub fn postprocess_output(
     frames: &LoopFrames,
     project: &ProjectDefinition,
     pulses: &mut PulseTable,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
     emissions: &mut Vec<PulseEmission>,
 ) -> WeftResult<HashSet<String>> {
     let mut mentioned = HashSet::new();
-    let Some(node) = project.nodes.iter().find(|n| n.id == node_id) else {
+    let Some(node) = program_idx.node(project, node_id) else {
         return Err(WeftError::NodeExecution(format!(
             "node '{node_id}' is not in the project at postprocess time; the project was \
              mutated between dispatch and postprocess",
         )));
     };
 
-    let outgoing = edge_idx.get_outgoing(project, node_id, frames);
+    let outgoing = program_idx.get_outgoing(project, node_id, frames);
 
     // What each wire DELIVERS, worked out BEFORE any pulse mutation. A
     // plain wire shares the emitted value (one `Arc` per port, however
@@ -117,11 +117,11 @@ pub fn postprocess_output(
     // repeated pulses by design (see `edge_targets_generator`).
     for d in &deliveries {
         let Some(value) = &d.value else { continue };
-        if super::ready::edge_targets_generator(project, d.edge) {
+        if super::ready::edge_targets_generator(program_idx, d.edge) {
             continue;
         }
         let target_handle = d.edge.target_handle.as_deref().unwrap_or("default");
-        let Some(landing_frames) = frames_across(project, d.edge, frames) else { continue };
+        let Some(landing_frames) = frames_across(project, program_idx, d.edge, frames) else { continue };
         let earlier_value_pending = pulses.get(&d.edge.target).is_some_and(|ps| {
             ps.iter().any(|p| {
                 p.status.is_pending()
@@ -149,10 +149,10 @@ pub fn postprocess_output(
     for d in deliveries {
         match d.value {
             Some(value) => emit_value_on_edge(
-                project, node_id, d.edge, d.port, value, emission_id, execution_id, frames, pulses, emissions,
+                project, program_idx, node_id, d.edge, d.port, value, emission_id, execution_id, frames, pulses, emissions,
             ),
             None => emit_closure_on_edge(
-                project, node_id, d.edge, d.port, emission_id, execution_id, frames, None, pulses, emissions,
+                project, program_idx, node_id, d.edge, d.port, emission_id, execution_id, frames, None, pulses, emissions,
             ),
         }
     }
@@ -198,10 +198,10 @@ struct Delivery<'a> {
 /// wired to every site that calls it; the frame says whose result this
 /// is). THE one place frames change on a wire, shared by values and
 /// closures, so the live engine and the journal fold agree.
-pub fn frames_across(project: &ProjectDefinition, edge: &Edge, frames: &LoopFrames) -> Option<LoopFrames> {
+pub fn frames_across(project: &ProjectDefinition, program_idx: &ProgramIndex, edge: &Edge, frames: &LoopFrames) -> Option<LoopFrames> {
     use crate::frames::Frame;
     use crate::project::boundary_types::{CALL_IN, CALL_OUT};
-    let node = |id: &str| project.nodes.iter().find(|n| n.id == id);
+    let node = |id: &str| program_idx.node(project, id);
     if let Some(source) = node(&edge.source).filter(|n| n.node_type == CALL_IN) {
         let site = source.group_boundary.as_ref().expect("a call site's In carries its site").group_id.clone();
         let mut out = frames.clone();
@@ -221,6 +221,7 @@ pub fn frames_across(project: &ProjectDefinition, edge: &Edge, frames: &LoopFram
 #[allow(clippy::too_many_arguments)]
 fn emit_value_on_edge(
     project: &ProjectDefinition,
+    program_idx: &ProgramIndex,
     source_node: &str,
     edge: &Edge,
     port: &str,
@@ -231,7 +232,7 @@ fn emit_value_on_edge(
     pulses: &mut PulseTable,
     emissions: &mut Vec<PulseEmission>,
 ) {
-    let Some(frames) = frames_across(project, edge, frames) else { return };
+    let Some(frames) = frames_across(project, program_idx, edge, frames) else { return };
     let frames = &frames;
     let target_handle = edge.target_handle.as_deref().unwrap_or("default");
     let id = pulse_id(emission_id, port, &edge.target, target_handle, false);
@@ -240,7 +241,7 @@ fn emit_value_on_edge(
     if bucket.iter().any(|p| p.id == id) {
         return;
     }
-    let already_present_same_value = !super::ready::edge_targets_generator(project, edge)
+    let already_present_same_value = !super::ready::edge_targets_generator(program_idx, edge)
         && bucket.iter().any(|p| {
             p.status.is_pending()
                 && p.execution_id == execution_id
@@ -296,12 +297,12 @@ pub fn close_unmentioned_downstream(
     frames: &LoopFrames,
     project: &ProjectDefinition,
     pulses: &mut PulseTable,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
     emissions: &mut Vec<PulseEmission>,
     failure: Option<&Failure>,
     closed: &HashSet<String>,
 ) -> WeftResult<()> {
-    let Some(node) = project.nodes.iter().find(|n| n.id == node_id) else {
+    let Some(node) = program_idx.node(project, node_id) else {
         // Same impossible state as `postprocess_output`'s node lookup;
         // silently skipping would leave every downstream consumer
         // waiting on ports that will never close.
@@ -310,14 +311,14 @@ pub fn close_unmentioned_downstream(
              was mutated between dispatch and termination",
         )));
     };
-    let outgoing = edge_idx.get_outgoing(project, node_id, frames);
+    let outgoing = program_idx.get_outgoing(project, node_id, frames);
     for port in &node.outputs {
         let is_generator = port.is_generator();
         if closed.contains(&port.name) || (mentioned.contains(&port.name) && !is_generator) {
             continue;
         }
         emit_closure_on_outgoing(
-            project, node_id, &port.name, emission_id, execution_id, frames, failure, &outgoing,
+            project, program_idx, node_id, &port.name, emission_id, execution_id, frames, failure, &outgoing,
             pulses, emissions,
         );
     }
@@ -337,7 +338,7 @@ pub fn emit_port_closure(
     frames: &LoopFrames,
     project: &ProjectDefinition,
     pulses: &mut PulseTable,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
     emissions: &mut Vec<PulseEmission>,
     failure: Option<&Failure>,
 ) -> WeftResult<()> {
@@ -362,9 +363,9 @@ pub fn emit_port_closure(
             )));
         }
     }
-    let outgoing = edge_idx.get_outgoing(project, node_id, frames);
+    let outgoing = program_idx.get_outgoing(project, node_id, frames);
     emit_closure_on_outgoing(
-        project, node_id, port_name, emission_id, execution_id, frames, failure, &outgoing, pulses, emissions,
+        project, program_idx, node_id, port_name, emission_id, execution_id, frames, failure, &outgoing, pulses, emissions,
     );
     Ok(())
 }
@@ -387,7 +388,7 @@ pub fn close_failed_then_unmentioned_downstream(
     frames: &LoopFrames,
     project: &ProjectDefinition,
     pulses: &mut PulseTable,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
     emissions: &mut Vec<PulseEmission>,
 ) -> WeftResult<()> {
     let declared: HashSet<&str> = project
@@ -402,13 +403,13 @@ pub fn close_failed_then_unmentioned_downstream(
             continue;
         }
         emit_port_closure(
-            node_id, port, emission_id, execution_id, frames, project, pulses, edge_idx, emissions,
+            node_id, port, emission_id, execution_id, frames, project, pulses, program_idx, emissions,
             Some(failure),
         )?;
         closed.insert(port.clone());
     }
     close_unmentioned_downstream(
-        node_id, mentioned, emission_id, execution_id, frames, project, pulses, edge_idx, emissions,
+        node_id, mentioned, emission_id, execution_id, frames, project, pulses, program_idx, emissions,
         None, &closed,
     )
 }
@@ -417,6 +418,7 @@ pub fn close_failed_then_unmentioned_downstream(
 #[allow(clippy::too_many_arguments)]
 fn emit_closure_on_outgoing(
     project: &ProjectDefinition,
+    program_idx: &ProgramIndex,
     node_id: &str,
     port_name: &str,
     emission_id: Uuid,
@@ -432,7 +434,7 @@ fn emit_closure_on_outgoing(
         .filter(|e| e.source_handle.as_deref() == Some(port_name))
     {
         emit_closure_on_edge(
-            project, node_id, edge, port_name, emission_id, execution_id, frames, failure, pulses,
+            project, program_idx, node_id, edge, port_name, emission_id, execution_id, frames, failure, pulses,
             emissions,
         );
     }
@@ -448,6 +450,7 @@ fn emit_closure_on_outgoing(
 #[allow(clippy::too_many_arguments)]
 fn emit_closure_on_edge(
     project: &ProjectDefinition,
+    program_idx: &ProgramIndex,
     node_id: &str,
     edge: &Edge,
     port_name: &str,
@@ -458,10 +461,10 @@ fn emit_closure_on_edge(
     pulses: &mut PulseTable,
     emissions: &mut Vec<PulseEmission>,
 ) {
-    let Some(frames) = frames_across(project, edge, frames) else { return };
+    let Some(frames) = frames_across(project, program_idx, edge, frames) else { return };
     let frames = &frames;
     let target_handle = edge.target_handle.as_deref().unwrap_or("default");
-    let generator_target = super::ready::edge_targets_generator(project, edge);
+    let generator_target = super::ready::edge_targets_generator(program_idx, edge);
     let id = pulse_id(emission_id, port_name, &edge.target, target_handle, true);
 
     let bucket = pulses.entry(edge.target.clone()).or_default();
@@ -540,7 +543,7 @@ mod fan_in_tests {
         let mut pulses = PulseTable::default();
         let mut emissions = Vec::new();
         let mentioned = postprocess_output("src", &OutputBag::from([("out".into(), Arc::new(json!(42)))]),
-            emission(), Uuid::nil(), &vec![], &project, &mut pulses, &EdgeIndex::build(&project), &mut emissions).unwrap();
+            emission(), Uuid::nil(), &vec![], &project, &mut pulses, &ProgramIndex::build(&project), &mut emissions).unwrap();
         assert_eq!(mentioned, HashSet::from(["out".into()]));
         assert!(pulses.is_empty());
         assert!(emissions.is_empty());
@@ -550,7 +553,7 @@ mod fan_in_tests {
     fn failed_scalar_closure_keeps_its_reason_to_prevent_backup_substitution() {
         let mut project = direct_project();
         project.edges.push(edge("out", "consumer", "in"));
-        let index = EdgeIndex::build(&project);
+        let index = ProgramIndex::build(&project);
         let refused = Failure { node: "src".into(), error: "refused output".into() };
         for explicit in [true, false] {
             let mut pulses = PulseTable::default();
@@ -572,7 +575,7 @@ mod fan_in_tests {
         project.nodes[0].outputs[0].port_type = serde_json::from_value(json!("Generator[Number]")).unwrap();
         project.nodes[1].inputs[0].port_type = serde_json::from_value(json!("Generator[Number]")).unwrap();
         project.edges.push(edge("out", "consumer", "in"));
-        let index = EdgeIndex::build(&project);
+        let index = ProgramIndex::build(&project);
         let mut pulses = PulseTable::default();
         let mut emissions = Vec::new();
         emit_port_closure("src", "out", emission(), Uuid::nil(), &vec![], &project, &mut pulses, &index, &mut emissions, None).unwrap();
@@ -595,8 +598,8 @@ mod fan_in_tests {
         let frames: LoopFrames = Vec::new();
 
         let project = direct_project();
-        emit_value_on_edge(&project, "src1", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), execution_id, &frames, &mut pulses, &mut emissions);
-        emit_value_on_edge(&project, "src2", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), execution_id, &frames, &mut pulses, &mut emissions);
+        emit_value_on_edge(&project, &ProgramIndex::build(&project), "src1", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), execution_id, &frames, &mut pulses, &mut emissions);
+        emit_value_on_edge(&project, &ProgramIndex::build(&project), "src2", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), execution_id, &frames, &mut pulses, &mut emissions);
 
         let consumer_bucket = pulses.get("consumer").expect("consumer bucket");
         let pending: Vec<_> = consumer_bucket
@@ -626,16 +629,16 @@ mod fan_in_tests {
             "updatedAt": "1970-01-01T00:00:00Z",
         }))
         .expect("stream project");
-        let edge_idx = EdgeIndex::build(&project);
+        let program_idx = ProgramIndex::build(&project);
         let mut pulses = PulseTable::default();
         let mut emissions = Vec::new();
         let same = emission();
         for _ in 0..2 {
-            postprocess_output("src", &bag(json!({"out": 1})), same, Uuid::nil(), &Vec::new(), &project, &mut pulses, &edge_idx, &mut emissions).expect("emit");
+            postprocess_output("src", &bag(json!({"out": 1})), same, Uuid::nil(), &Vec::new(), &project, &mut pulses, &program_idx, &mut emissions).expect("emit");
         }
         assert_eq!(pulses["consumer"].len(), 1, "one pulse for one emission, however often applied");
         let other = emission();
-        postprocess_output("src", &bag(json!({"out": 1})), other, Uuid::nil(), &Vec::new(), &project, &mut pulses, &edge_idx, &mut emissions).expect("emit");
+        postprocess_output("src", &bag(json!({"out": 1})), other, Uuid::nil(), &Vec::new(), &project, &mut pulses, &program_idx, &mut emissions).expect("emit");
         assert_eq!(pulses["consumer"].len(), 2, "a second emission of an equal item is a second item");
     }
 
@@ -650,10 +653,10 @@ mod fan_in_tests {
 
         let project = direct_project();
         emit_closure_on_outgoing(
-            &project, "src1", "out", emission(), execution_id, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
+            &project, &ProgramIndex::build(&project), "src1", "out", emission(), execution_id, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
         );
         emit_value_on_edge(
-            &project, "src2", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), execution_id, &frames, &mut pulses, &mut emissions,
+            &project, &ProgramIndex::build(&project), "src2", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), execution_id, &frames, &mut pulses, &mut emissions,
         );
 
         let consumer_bucket = pulses.get("consumer").expect("consumer bucket");
@@ -679,11 +682,11 @@ mod fan_in_tests {
 
         let project = direct_project();
         emit_value_on_edge(
-            &project, "src1", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), execution_id, &frames, &mut pulses, &mut emissions,
+            &project, &ProgramIndex::build(&project), "src1", outgoing_refs[0], "out", Arc::new(json!(42)), emission(), execution_id, &frames, &mut pulses, &mut emissions,
         );
         let emissions_before = emissions.len();
         emit_closure_on_outgoing(
-            &project, "src2", "out", emission(), execution_id, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
+            &project, &ProgramIndex::build(&project), "src2", "out", emission(), execution_id, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
         );
         assert_eq!(
             emissions.len(),
@@ -728,7 +731,7 @@ mod fan_in_tests {
             scope: Vec::new(),
             group_boundary: None,
             requires_infra: false, per_instance: None,
-            fires_with: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(),
             images: Vec::new(),
             published_service: None,
             instance_service: None,
@@ -788,9 +791,9 @@ mod fan_in_tests {
         pulses: &mut PulseTable,
         emissions: &mut Vec<PulseEmission>,
     ) -> WeftResult<HashSet<String>> {
-        let edge_idx = EdgeIndex::build(project);
+        let program_idx = ProgramIndex::build(project);
         postprocess_output(
-            "src", &bag(output), emission(), uuid::Uuid::nil(), &Vec::new(), project, pulses, &edge_idx, emissions,
+            "src", &bag(output), emission(), uuid::Uuid::nil(), &Vec::new(), project, pulses, &program_idx, emissions,
         )
     }
 
@@ -853,10 +856,10 @@ mod fan_in_tests {
 
         let project = direct_project();
         emit_closure_on_outgoing(
-            &project, "src1", "out", emission(), execution_id, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
+            &project, &ProgramIndex::build(&project), "src1", "out", emission(), execution_id, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
         );
         emit_closure_on_outgoing(
-            &project, "src2", "out", emission(), execution_id, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
+            &project, &ProgramIndex::build(&project), "src2", "out", emission(), execution_id, &frames, None, &outgoing_refs, &mut pulses, &mut emissions,
         );
 
         let consumer_bucket = pulses.get("consumer").expect("consumer bucket");
@@ -952,7 +955,7 @@ mod fan_in_tests {
     #[test]
     fn the_same_emission_yields_the_same_pulse_ids() {
         let project = deref_project();
-        let edge_idx = EdgeIndex::build(&project);
+        let program_idx = ProgramIndex::build(&project);
         let same = emission();
         let value = bag(json!({ "out": { "profile": { "wpm": 42 }, "id": "u1" } }));
         let ids = |pulses: &PulseTable| -> Vec<(String, Uuid)> {
@@ -961,9 +964,9 @@ mod fan_in_tests {
             v
         };
         let mut a = PulseTable::default();
-        postprocess_output("src", &value, same, Uuid::nil(), &Vec::new(), &project, &mut a, &edge_idx, &mut Vec::new()).expect("emit");
+        postprocess_output("src", &value, same, Uuid::nil(), &Vec::new(), &project, &mut a, &program_idx, &mut Vec::new()).expect("emit");
         let mut b = PulseTable::default();
-        postprocess_output("src", &value, same, Uuid::nil(), &Vec::new(), &project, &mut b, &edge_idx, &mut Vec::new()).expect("emit");
+        postprocess_output("src", &value, same, Uuid::nil(), &Vec::new(), &project, &mut b, &program_idx, &mut Vec::new()).expect("emit");
         assert_eq!(ids(&a), ids(&b));
         assert_eq!(ids(&a).len(), 4);
     }

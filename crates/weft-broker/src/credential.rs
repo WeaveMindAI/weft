@@ -21,7 +21,7 @@ use anyhow::Result;
 pub struct KeyRequest {
     pub tenant: String,
     /// The opening execution, verified against the tenant by the handler.
-    pub execution_id: String,
+    pub execution_id: weft_core::ExecutionId,
     pub project_id: uuid::Uuid,
     pub node_id: String,
     /// The opening firing's loop-frame coordinate: a source that books
@@ -319,6 +319,7 @@ mod tests {
             owner: weft_core::CredentialOwner::Platform,
             app_client_id: None,
             fresh_until: None,
+            published_by: None,
         }
     }
 

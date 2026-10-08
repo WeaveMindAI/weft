@@ -8,9 +8,9 @@ pub struct NoDomains;
 
 #[async_trait]
 impl DomainHosting for NoDomains {
-    async fn serve(&self, names: &[String]) -> anyhow::Result<Option<std::net::IpAddr>> {
+    async fn serve(&self, domains: &[weft_core::install::Domain]) -> anyhow::Result<Option<std::net::IpAddr>> {
         anyhow::ensure!(
-            names.is_empty(),
+            domains.is_empty(),
             "a local install has no door to point a domain at: the internet reaches it through its tunnel \
              (`weft daemon start --public-url`), at the tunnel's address; domains are for a cloud install"
         );

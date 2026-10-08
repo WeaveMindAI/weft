@@ -4,19 +4,21 @@
 //!
 //! The dispatcher holds the task and calls the test server directly,
 //! `POST /_weft/test`, and the server answers with the report once the
-//! test ran. A LIVE run is a real journaled execution
-//! (`ExecutionStarted` minted from the task id, `ExecutionCompleted`
-//! once the report is in), driven by a replica named after the task,
-//! so the test's connection resolution takes the exact production path
-//! through the broker, including a credential source that answers a
-//! relay instead of a raw key.
+//! test ran. A LIVE run is a real recorded run, its id the task's: the
+//! test server bears it, drives it under a replica named after the task
+//! (its lease kept by the server's own ticks) and ends it once the report
+//! is in (`weft_engine::test_rig::LiveTestRunner`), so the test's
+//! connection resolution takes the exact production path through the
+//! broker, including a credential source that answers a relay instead of
+//! a raw key. A server that goes away mid-test leaves its run to the
+//! lost-run sweep, which ends it.
 //!
 //! Task semantics: a FAILING test is a SUCCESSFUL task (the report says
 //! `passed: false`); the executor errors only when the run itself could
 //! not happen (image missing, the server refusing the request).
 //!
 //! Idempotency under re-claim (a surrendered lease requeues the task; a
-//! lapsed one is rescued by `claim_one`): the execution and the replica both
+//! lapsed one is rescued by `claim_one`): the run and the replica both
 //! derive from the task id. A report is persisted on the TASK row
 //! (`tasks::store_result_partial`) before anything else, so a re-claim
 //! reads it back and returns it with no call. A live test is called only
@@ -98,13 +100,11 @@ impl TaskExecutor<DispatcherState> for RunNodeTestExecutor {
         let execution_id: Option<weft_core::ExecutionId> = payload.live_connection.as_ref().map(|_| task.id);
 
         // Re-claim fast path: a prior claim already has the report on
-        // the TASK row. Close the execution (deduped) and return it.
+        // the TASK row.
         if let Some(report) = weft_task_store::tasks::stored_result(&state.pg_pool, task.id).await? {
-            close_execution_id(state, execution_id).await;
             return Ok(report);
         }
         if execution_id.is_some() && task.attempts > 1 {
-            close_execution_id(state, execution_id).await;
             anyhow::bail!(
                 "a prior claim of this live test task recorded no report; the test may or may \
                  not have run (and spent money), so it will not be re-run automatically. Re-run \
@@ -112,67 +112,10 @@ impl TaskExecutor<DispatcherState> for RunNodeTestExecutor {
             );
         }
 
-        // A LIVE run gets a REAL execution identity: journaled as a
-        // genuine `ExecutionStarted` (event + `execution` seed in
-        // one transaction, deduped), kind `node_test`, so cost
-        // attribution, broker scoping, and the journal bridge's terminal
-        // cleanup treat the execution like any execution, while the
-        // project-lifecycle machinery reads only `kind = 'execution'`
-        // executions and never touches it: THIS task owns the execution's whole
-        // lifecycle. The replica is appointed its driver, since it
-        // claims no task of its own.
-        if let Some(execution_id) = execution_id {
-            state
-                .journal
-                .record_event_dedup(
-                    &weft_journal::ExecEvent::ExecutionStarted {
-                        execution_id,
-                        project_id: payload.project_id,
-                        entry_node: format!("node-test:{}::{}", payload.node, payload.test),
-                        phase: weft_core::context::Phase::Fire,
-                        // A node test executes the task payload's
-                        // content-addressed image, never a project
-                        // definition; `None` makes a resume against
-                        // this execution fail loudly as an unknown hash.
-                        definition_hash: None,
-                        program: None,
-                        source_version: None,
-                        run_kind: weft_core::exec::RunKind::NodeTest,
-                        subgraph: None,
-                        seed: None,
-                        // No picks: a node test runs no program, and its
-                        // connections are the ones the test itself hands
-                        // the node, never the install's.
-                        instance: None,
-                        fired_trigger: None,
-                        instance_values: Default::default(),
-                        picks: Default::default(),
-                        run_class: weft_core::run_class::RunClass::Short,
-                        at_unix: crate::lease::now_unix() as u64,
-                    },
-                    &format!("node_test_started:{execution_id}"),
-                )
-                .await?;
-            if let Err(e) =
-                weft_task_store::tasks::bind_execution_id_owner(&state.pg_pool, &execution_id.to_string(), &replica).await
-            {
-                close_execution_id(state, Some(execution_id)).await;
-                return Err(e);
-            }
-        }
-
-        let report = call_test_server(state, &payload, &replica, execution_id).await;
-        let report = match report {
-            Ok(report) => report,
-            Err(e) => {
-                close_execution_id(state, execution_id).await;
-                return Err(e);
-            }
-        };
-        // Persist the report on the TASK row before closing the execution:
-        // a re-claim returns it through the fast path at the top.
+        let report = call_test_server(state, &payload, &replica, execution_id).await?;
+        // Persist the report on the TASK row: a re-claim returns it through
+        // the fast path at the top.
         weft_task_store::tasks::store_result_partial(&state.pg_pool, task.id, state.replica.as_str(), &report).await?;
-        close_execution_id(state, execution_id).await;
         Ok(report)
     }
 }
@@ -189,6 +132,7 @@ async fn call_test_server(
         tenant: payload.tenant.clone(),
         project: payload.project_id,
         image: payload.image_ref.clone(),
+        binary_hash: None,
         settings: state.worker_defaults.clone(),
     };
     // A test the user asked for waits out its worker's start, which ends
@@ -228,28 +172,6 @@ async fn call_test_server(
     let report = resp.json().await.map_err(|e| anyhow::anyhow!("read the test report: {e}"))?;
     drop(endpoint);
     Ok(report)
-}
-
-/// Write the execution's terminal `ExecutionCompleted` (deduped, so any
-/// number of writers agree). A bare `execution` row with no
-/// terminal journal event would read as a forever-non-terminal execution,
-/// so every exit path of the executor funnels through here.
-async fn close_execution_id(state: &DispatcherState, execution_id: Option<weft_core::ExecutionId>) {
-    let Some(execution_id) = execution_id else { return };
-    if let Err(e) = state
-        .journal
-        .record_event_dedup(
-            &weft_journal::ExecEvent::ExecutionCompleted { execution_id, at_unix: crate::lease::now_unix() as u64 },
-            &format!("node_test_execution_id_close:{execution_id}"),
-        )
-        .await
-    {
-        tracing::error!(
-            target: "weft_dispatcher::run_node_test",
-            %execution_id, error = %e,
-            "node-test execution close failed; the execution stays open until a re-claim re-runs it"
-        );
-    }
 }
 
 /// A fixture pair: the name must be a `WEFT_NODE_TEST_*` identifier (the

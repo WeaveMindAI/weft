@@ -1,49 +1,18 @@
-    //! Layer 3: an unrecorded run through the real loop. Its journal is the
-    //! worker's memory: a run that completes leaves nothing in the real
-    //! journal, one that fails is written there whole as a recorded run,
-    //! and a wait is refused at the call because there is nowhere to park.
+    //! Layer 3: an unrecorded run through the real loop. Its worker keeps
+    //! no history of it: a run that completes writes nothing, one that
+    //! fails writes its birth and its failure (marked as not recorded on
+    //! its row), and a wait holds in its node's call, since there is
+    //! nowhere to park it.
 
     use super::*;
-    use super::engine_test_rig::{catalog, clients, test_manifest, MemJournal};
-    use std::sync::Mutex as StdMutex;
+    use super::engine_test_rig::{born, catalog, clients, run_on, test_manifest, Answers, AwaitTasks, MemJournal};
     use async_trait::async_trait;
     use serde_json::json;
     use weft_core::error::WeftResult;
     use weft_core::exec::RunKind;
     use weft_core::node::{Node, NodeOutput};
     use weft_core::{ExecutionContext, ProjectDefinition};
-    use weft_journal::{ExecEvent, JournalClient, RawJournalRow, UnrecordedJournal};
-
-    /// The database side as an unrecorded run sees it: rows written as
-    /// they happen, the record written afterwards, and whether the run
-    /// was forgotten.
-    #[derive(Default)]
-    struct Durable {
-        rows: StdMutex<Vec<ExecEvent>>,
-        recorded: StdMutex<Option<Vec<ExecEvent>>>,
-        forgotten: StdMutex<bool>,
-    }
-    #[async_trait]
-    impl JournalClient for Durable {
-        async fn record_event(&self, event: &ExecEvent, _: Option<&str>) -> anyhow::Result<()> {
-            self.rows.lock().unwrap().push(event.clone());
-            Ok(())
-        }
-        async fn raw_rows_after(&self, _: ExecutionId, _: i64, _: std::time::Duration) -> anyhow::Result<Vec<RawJournalRow>> {
-            Ok(Vec::new())
-        }
-        async fn has_terminal_event(&self, _: ExecutionId) -> anyhow::Result<bool> {
-            Ok(false)
-        }
-        async fn record_retroactively(&self, events: &[ExecEvent], _: Option<&str>) -> anyhow::Result<()> {
-            *self.recorded.lock().unwrap() = Some(events.to_vec());
-            Ok(())
-        }
-        async fn forget_unrecorded(&self, _: ExecutionId, _: Option<&str>) -> anyhow::Result<()> {
-            *self.forgotten.lock().unwrap() = true;
-            Ok(())
-        }
-    }
+    use weft_journal::ExecEvent;
 
     struct Answer;
     test_manifest!(Answer, "Answer");
@@ -85,11 +54,17 @@
         .unwrap()
     }
 
-    /// Drive one unrecorded run of `node` and settle it the way the worker
-    /// does. Answers the outcome, the rows the run held, and the durable side.
-    async fn drive_unrecorded(node: Box<dyn Node>) -> (ExecutionOutcome, Vec<ExecEvent>, Arc<Durable>) {
+    /// Drive one unrecorded run of `node` the way the worker does. Answers
+    /// the outcome and what the record holds of it once its writer is done.
+    async fn drive_unrecorded(node: Box<dyn Node>) -> (ExecutionOutcome, Vec<ExecEvent>) {
+        drive_holding(node, weft_core::run_settings::DEFAULT_HOLD_SECS, AwaitTasks::new(), Arc::new(Answers::default())).await
+    }
+
+    /// [`drive_unrecorded`], the run holding its waits `hold_secs`, its
+    /// waits registered with `tasks` and answered through `answers`.
+    async fn drive_holding(node: Box<dyn Node>, hold_secs: u32, tasks: Arc<AwaitTasks>, answers: Arc<Answers>) -> (ExecutionOutcome, Vec<ExecEvent>) {
         let project = project();
-        let execution_id = uuid::Uuid::new_v4();
+        let execution_id = weft_core::new_execution_id();
         let birth = vec![
             ExecEvent::ExecutionStarted {
                 execution_id,
@@ -97,79 +72,92 @@
                 entry_node: "answer".into(),
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: Some(weft_core::project::hash::compute_definition_hash(&project).unwrap()),
-                program: None,
+                binary_hash: None,
                 source_version: None,
-                run_kind: RunKind::Unrecorded,
-                subgraph: None,
+                run_kind: RunKind::Execution,
+                selection: None,
                 seed: None,
                 instance: None,
                 fired_trigger: None,
+                stand_in: None,
                 instance_values: Default::default(), picks: Default::default(),
                 at_unix: 0,
-                run_class: weft_core::run_class::RunClass::Short,
+                settings: weft_core::run_settings::RunSettings::new(weft_core::run_settings::Keeping::Fast, false)
+                    .and_then(|settings| settings.holding_for(hold_secs))
+                    .unwrap(),
             },
             ExecEvent::NodeKicked { execution_id, node_id: "answer".into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0 },
         ];
-        let durable = Arc::new(Durable::default());
-        let journal = UnrecordedJournal::seeded(execution_id, birth, durable.clone()).unwrap();
-        let mut run_clients = clients(Arc::new(MemJournal::default()));
-        run_clients.journal = journal.clone();
-        let first_rows = journal.raw_rows_after(execution_id, 0, std::time::Duration::ZERO).await.unwrap();
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            run_one_execution(
-                Arc::new(project),
-                catalog(vec![("Answer", node)]),
-                execution_id,
-                run_clients,
-                "instance-test".into(),
-                "tenant-test".into(),
-                CancellationFlag::new_arc(),
-                None,
-                first_rows,
-            ),
-        )
-        .await
-        .expect("the drive hung")
-        .expect("the drive ends");
-        journal.settle(Some("instance-test")).await.expect("settle");
-        (outcome, journal.events(), durable)
+        let journal = Arc::new(MemJournal::default());
+        let run_clients = EngineClients { tasks, runs: answers, ..clients(journal.clone()) };
+        let run = born(&run_clients, execution_id, &birth).await;
+        let drove = run_on(Arc::new(project), catalog(vec![("Answer", node)]), &run_clients, execution_id, run, birth, CancellationFlag::new_arc(), None, None)
+            .await
+            .expect("the drive ends");
+        run_clients.writer.written().await;
+        (drove.outcome, journal.events_of(execution_id))
     }
 
     #[tokio::test]
-    async fn a_completed_run_leaves_nothing_durable() {
-        let (outcome, held, durable) = drive_unrecorded(Box::new(Answer)).await;
+    async fn a_completed_run_writes_nothing() {
+        let (outcome, written) = drive_unrecorded(Box::new(Answer)).await;
         assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
-        assert!(held.iter().any(|e| matches!(e, ExecEvent::NodeCompleted { .. })), "the run read its own rows");
-        assert!(durable.rows.lock().unwrap().is_empty(), "nothing was written as it ran");
-        assert!(durable.recorded.lock().unwrap().is_none(), "nothing was written afterwards");
-        assert!(*durable.forgotten.lock().unwrap());
+        assert!(written.is_empty(), "nothing was written: {written:?}");
     }
 
     #[tokio::test]
-    async fn a_failed_run_is_written_whole() {
-        let (outcome, held, durable) = drive_unrecorded(Box::new(Broken)).await;
+    async fn a_failed_run_leaves_its_failure_and_nothing_else() {
+        let (outcome, written) = drive_unrecorded(Box::new(Broken)).await;
         assert!(matches!(outcome, ExecutionOutcome::Failed { .. }), "{outcome:?}");
-        let recorded = durable.recorded.lock().unwrap().clone().expect("the failure is recorded");
-        assert_eq!(recorded.len(), held.len(), "every row it held, and no more");
-        assert!(matches!(recorded[0], ExecEvent::ExecutionStarted { run_kind: RunKind::Execution, .. }), "it lists as a run");
-        assert!(recorded.iter().any(|e| matches!(e, ExecEvent::NodeFailed { error, .. } if error.contains("status table"))));
-        assert!(matches!(recorded.last(), Some(ExecEvent::ExecutionFailed { .. })));
-        assert!(!*durable.forgotten.lock().unwrap());
+        assert_eq!(written.len(), 2, "its birth and its failure: {written:?}");
+        assert!(matches!(&written[0], ExecEvent::ExecutionStarted { settings, .. } if !settings.recorded()), "its row says it was not recorded: {written:?}");
+        assert!(
+            matches!(&written[1], ExecEvent::ExecutionFailed { error, .. } if error.contains("status table")),
+            "the failure names what failed: {written:?}"
+        );
     }
 
+    /// A wait holds in its node's call, and its answer carries the run on
+    /// in the same worker: nothing is written of it.
     #[tokio::test]
-    async fn a_wait_is_refused_at_the_call() {
-        let (outcome, _, durable) = drive_unrecorded(Box::new(Waits)).await;
+    async fn a_wait_holds_and_takes_its_answer() {
+        let (tasks, answers) = (AwaitTasks::new(), Arc::new(Answers::default()));
+        let answering = tokio::spawn({
+            let (tasks, answers) = (tasks.clone(), answers.clone());
+            async move { answers.answer(tasks.await_token().await, json!("now")) }
+        });
+        let (outcome, written) = drive_holding(Box::new(Waits), 60, tasks.clone(), answers).await;
+        answering.await.unwrap();
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
+        assert!(written.is_empty(), "nothing was written: {written:?}");
+        assert!(tasks.withdrawn.lock().unwrap().is_empty(), "an answered wait is not withdrawn");
+    }
+
+    /// A wait nothing answers is given up once the run was quiet for its
+    /// hold: the waiting call fails, naming why, and the wait is withdrawn.
+    #[tokio::test]
+    async fn a_wait_nothing_answers_is_given_up_after_its_hold() {
+        let tasks = AwaitTasks::new();
+        let (outcome, written) = drive_holding(Box::new(Waits), 1, tasks.clone(), Arc::new(Answers::default())).await;
         assert!(matches!(outcome, ExecutionOutcome::Failed { .. }), "{outcome:?}");
-        let recorded = durable.recorded.lock().unwrap().clone().expect("the refusal is a failure, so recorded");
-        let error = recorded
+        let error = written
             .iter()
             .find_map(|e| match e {
-                ExecEvent::NodeFailed { error, .. } => Some(error.clone()),
+                ExecEvent::ExecutionFailed { error, .. } => Some(error.clone()),
                 _ => None,
             })
-            .expect("the waiting node failed");
-        assert!(error.contains("`recorded`"), "{error}");
-        assert!(!recorded.iter().any(|e| matches!(e, ExecEvent::NodeSuspended { .. })), "nothing parked");
+            .expect("the waiting node failed, so its run leaves its failure");
+        assert!(error.contains("gave up its wait") && error.contains("`holdSecs`") && error.contains("`recorded: false`"), "{error}");
+        assert_eq!(*tasks.withdrawn.lock().unwrap(), vec![tasks.minted().expect("the wait was registered")]);
+        assert!(!written.iter().any(|e| matches!(e, ExecEvent::NodeSuspended { .. })), "nothing parked");
+    }
+
+    /// A hold of zero gives the wait up at once, through the one path a
+    /// wait given up takes: registered, then given up and withdrawn.
+    #[tokio::test]
+    async fn a_hold_of_zero_fails_the_wait_at_once() {
+        let tasks = AwaitTasks::new();
+        let (outcome, _) = drive_holding(Box::new(Waits), 0, tasks.clone(), Arc::new(Answers::default())).await;
+        assert!(matches!(&outcome, ExecutionOutcome::Failed { error } if error.contains("is 0")), "{outcome:?}");
+        assert_eq!(*tasks.withdrawn.lock().unwrap(), vec![tasks.minted().expect("the wait was registered")]);
     }

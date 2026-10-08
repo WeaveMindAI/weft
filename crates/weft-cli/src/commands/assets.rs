@@ -369,6 +369,13 @@ impl AssetStore for DispatcherStore<'_> {
         self.note_uploaded();
         Ok(key)
     }
+
+    fn interrupted(&self, error: &anyhow::Error) -> bool {
+        error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+            .any(|e| e.is_connect() || e.is_timeout() || e.is_request() || e.is_body())
+    }
 }
 
 impl DispatcherStore<'_> {

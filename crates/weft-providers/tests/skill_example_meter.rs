@@ -77,7 +77,9 @@ async fn the_skills_example_meter_compiles_and_prices() {
     assert_eq!(m.classify("POST", "anything-else"), RouteClass::Unknown);
 
     let http = follow_up();
-    let up = || FollowUp { http: &http, base_url: m.base_url() };
+
+    let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
+    let up = || FollowUp { http: &http, base_url: m.base_url(), shared: &shared };
     assert_eq!(m.resolve("generate", observed(200), up()).await.amount_usd, Some(0.01));
     // A refusal bills nothing, so zero is a fact.
     assert_eq!(m.resolve("generate", observed(400), up()).await.amount_usd, Some(0.0));
@@ -189,7 +191,9 @@ async fn the_skills_queued_snippet_pairs_a_submit_with_its_report() {
     assert_eq!(m.charge_reported_on("jobs/", &submit), None);
 
     let http = follow_up();
-    let up = || FollowUp { http: &http, base_url: m.base_url() };
+
+    let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
+    let up = || FollowUp { http: &http, base_url: m.base_url(), shared: &shared };
     let mut scratch = serde_json::json!({ "id": "job-1" });
 
     let running = ObservedCall {
@@ -312,6 +316,7 @@ impl ProviderMeter for CatalogMeter {
 async fn the_skills_metered_resolve_reads_the_providers_own_figure() {
     let m = CatalogMeter;
     let http = follow_up();
+    let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
     let observed = ObservedCall {
         interrupted: false,
         status: 200,
@@ -321,7 +326,7 @@ async fn the_skills_metered_resolve_reads_the_providers_own_figure() {
         }),
     };
     let cost = m
-        .resolve("generate", observed, FollowUp { http: &http, base_url: m.base_url() })
+        .resolve("generate", observed, FollowUp { http: &http, base_url: m.base_url(), shared: &shared })
         .await;
     assert_eq!(cost.amount_usd, Some(0.031));
     assert_eq!(cost.model.as_deref(), Some("acme-large"));
@@ -334,7 +339,7 @@ async fn the_skills_metered_resolve_reads_the_providers_own_figure() {
         data: serde_json::json!({ "model": "acme-large" }),
     };
     let cost = m
-        .resolve("generate", silent, FollowUp { http: &http, base_url: m.base_url() })
+        .resolve("generate", silent, FollowUp { http: &http, base_url: m.base_url(), shared: &shared })
         .await;
     assert_eq!(cost.amount_usd, None);
 }

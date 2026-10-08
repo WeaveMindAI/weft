@@ -65,6 +65,12 @@
 #                 not combine with the component flags, which already
 #                 pick what runs)
 #
+# Questions:
+#   --yes         answer yes to what an install asks before it wipes
+#                 something (run history stored in a shape this version
+#                 cannot read, an older weft on this machine), for
+#                 scripts and machines with no terminal.
+#
 # Escape hatch:
 #   --from-source compile the CLI and the VS Code extension locally
 #                 even when a published build matches this checkout
@@ -547,6 +553,8 @@ do_sign=1
 # --from-source: refuse the prebuilt CLI/.vsix fast path and compile
 # locally (the escape hatch when a published binary is broken).
 from_source=0
+# --yes: answer yes to every question asked before a wipe.
+assume_yes=0
 
 # Called the first time a --<component> flag is seen. Zeroes every
 # component so subsequent flags act as opt-ins. No-op after the
@@ -671,6 +679,7 @@ while [[ $# -gt 0 ]]; do
     --unrelated) migration_renames+=(--unrelated) ;;
 
     --from-source) from_source=1 ;;
+    --yes)         assume_yes=1 ;;
 
     -h|--help)
       # The whole leading comment block, however long it grows: from
@@ -701,9 +710,9 @@ done
 if [[ $do_uninstall -eq 1 || $do_purge -eq 1 ]]; then
   if [[ $do_bump -eq 1 || $do_sign -eq 0 || $target_flag_seen -eq 1 || -n "${write_migration}" \
     || -n "${public_url_flag}" || -n "${rebuild_flag}" \
-    || $from_source -eq 1 || "${profile}" != "release" \
+    || $from_source -eq 1 || "${profile}" != "release" || $assume_yes -eq 1 \
     || $component_flag_seen -eq 1 || $no_daemon_seen -eq 1 ]]; then
-    fail "an --uninstall / --purge run builds and refreshes nothing, so --bump, --no-sign, --migration, --public-url/--no-public-url, --rebuild, --debug, --from-source, the component flags (--cli/--daemon/--vscode/--browser), --no-daemon and the browser-target flags do not apply here"
+    fail "an --uninstall / --purge run builds and refreshes nothing, so --bump, --no-sign, --migration, --public-url/--no-public-url, --rebuild, --debug, --from-source, --yes, the component flags (--cli/--daemon/--vscode/--browser), --no-daemon and the browser-target flags do not apply here"
     exit 1
   fi
 else
@@ -951,6 +960,44 @@ acquire_prebuilt() {
   fi
   return 1
 }
+
+# ---- run history in a shape this version cannot read --------------------
+#
+# Runs are stored as a row each (`run`) and their records (`run_log`); the
+# shape before it (`exec_event`) is not carried over: the migration that
+# brings the database forward drops it. So an install whose database still
+# holds it says what goes and asks first, then wipes it before anything
+# else changes (a release of a migration runs it on that database too).
+if [[ $refresh_daemon -eq 1 || -n "${write_migration}" ]] && command -v docker >/dev/null 2>&1; then
+  if ! old_run_history="$(weft_old_run_history)"; then
+    fail "could not reach the install's Postgres (the weft-postgres container) to check how it stores runs; see: docker logs weft-postgres"
+    exit 1
+  fi
+  if [[ "${old_run_history}" == "yes" ]]; then
+    section "Run history"
+    warn "This upgrade changes how weft stores past runs, and the runs already"
+    warn "stored cannot be carried over. Upgrading wipes:"
+    warn "  - every past run, its events, logs and search entries"
+    warn "  - events waiting for a parked trigger"
+    warn "It keeps everything else: your projects and their code, their settings,"
+    warn "connections, installs, infra and its data."
+    if [[ $assume_yes -eq 0 ]]; then
+      if [[ ! -t 0 ]]; then
+        fail "no terminal to ask on; run ./setup.sh --yes to wipe the run history and upgrade"
+        exit 1
+      fi
+      # End of input (Ctrl-D) is a no: under set -e a failed read would
+      # otherwise end the run without a word.
+      read -r -p "  Wipe the run history and upgrade? [y/N] " answer || answer=n
+      if [[ "${answer}" != "y" && "${answer}" != "Y" ]]; then
+        hint "nothing changed; run ./setup.sh again when you are ready (--yes answers this for you)"
+        exit 1
+      fi
+    fi
+    weft_wipe_old_run_history || { fail "the run history could not be wiped; nothing changed (it is one transaction); see above"; exit 1; }
+    ok "the run history is wiped; upgrading"
+  fi
+fi
 
 # ---- --migration: write the migration, then carry on installing -------
 #
@@ -1429,16 +1476,18 @@ if [[ $build_cli -eq 1 || $refresh_daemon -eq 1 ]] && weft_old_install_present; 
   if [[ -n "${named_installs}" ]]; then
     warn "These named installs go too, with their databases: ${named_installs}."
   fi
-  if [[ ! -t 0 ]]; then
-    fail "no terminal to ask on; wipe it with ${C_BOLD}scripts/scrub-old-install.sh --yes${C_RESET}, then run ./setup.sh again"
-    exit 1
-  fi
-  # End of input (Ctrl-D) is a no: under set -e a failed read would
-  # otherwise end the run without a word.
-  read -r -p "  Do you want to proceed? [Y/n] " answer || answer=n
-  if [[ -n "${answer}" && "${answer}" != "y" && "${answer}" != "Y" ]]; then
-    hint "nothing wiped and nothing installed; run ./setup.sh again when you are ready"
-    exit 1
+  if [[ $assume_yes -eq 0 ]]; then
+    if [[ ! -t 0 ]]; then
+      fail "no terminal to ask on; run ./setup.sh --yes to wipe it and install"
+      exit 1
+    fi
+    # End of input (Ctrl-D) is a no: under set -e a failed read would
+    # otherwise end the run without a word.
+    read -r -p "  Do you want to proceed? [Y/n] " answer || answer=n
+    if [[ -n "${answer}" && "${answer}" != "y" && "${answer}" != "Y" ]]; then
+      hint "nothing wiped and nothing installed; run ./setup.sh again when you are ready"
+      exit 1
+    fi
   fi
   "${here}/scripts/scrub-old-install.sh" --yes || { fail "the wipe did not finish; see above, then run ./setup.sh again"; exit 1; }
   ok "the older weft is gone; installing this one"

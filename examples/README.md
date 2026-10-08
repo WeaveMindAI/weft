@@ -12,7 +12,7 @@ own connections on the access nodes.
 | Project | What it is |
 |---|---|
 | [`whatsapp-support-bot/`](whatsapp-support-bot/) | The README's program: a WhatsApp support bot that answers on its own and asks a person before sending anything sensitive. |
-| [`telegram-image-bot/`](telegram-image-bot/) | A Telegram bot that draws pictures with fal, charges a credit per image against its own Postgres, and refuses politely when the credits run out. It is walked through in [a bigger example](https://weavemindai.github.io/weft/start/a-bigger-example.html). |
+| [`telegram-image-bot/`](telegram-image-bot/) | A Telegram bot that draws pictures with fal, charges a credit per image against its own Postgres, and refuses politely when the credits run out. |
 
 If you copy an example out of this repo to build on it, run
 `weft catalog update` in the copy: it replaces the symlink with a real

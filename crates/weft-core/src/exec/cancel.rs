@@ -39,6 +39,20 @@ pub enum CancelCause {
     Runtime { detail: String },
 }
 
+impl CancelCause {
+    /// A fast run whose worker went away mid-run. Its record trails it,
+    /// so nothing can tell which of its steps already ran, and it ends
+    /// rather than repeat them. The dispatcher's sweep for runs whose
+    /// worker went away says it.
+    pub fn fast_run_lost() -> Self {
+        Self::Runtime {
+            detail: "the worker running this run went away; a fast run lives in its worker's memory, so it is \
+                     not run again (make its trigger durable for a run that survives its worker)"
+                .into(),
+        }
+    }
+}
+
 impl std::fmt::Display for CancelCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

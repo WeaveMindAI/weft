@@ -1,6 +1,13 @@
 //! Production `CallerConnection` (worker side of a live caller
-//! connection) plus the per-worker registry that attaches an accepted
-//! socket to the right execution.
+//! connection), and the server callers arrive at.
+//!
+//! A caller's connection object is made where its run is made: the door
+//! lets the call in, the run is born, and the run starts with its caller's
+//! connection in hand. A plain HTTP call answered in one piece runs on the
+//! very task that took the call ([`answer_http`]): the handler polls the
+//! run until the program decides the answer, returns the response, and
+//! spawns the run only when it has work left after answering. A streamed
+//! answer and a websocket keep one task that feeds the wire.
 //!
 //! Shape (one connection per execution):
 //!   - OUTBOUND: nodes call `send_chunk` / `terminate`; the connection
@@ -17,15 +24,18 @@
 //!   - HTTP request parts are captured once at attach and read via
 //!     `http_request`.
 //!   - The terminate-once latch + connected flag live behind one mutex.
-//!   - Every observable event (connect / inbound / outbound / error /
-//!     disconnect) is projected to a `Caller*` journal row through the
-//!     same kind of pump the bus uses, so the inspector replays it.
+//!   - The exchange is projected to `Caller*` journal rows (connect /
+//!     inbound / outbound / error / disconnect) through the same kind of
+//!     pump the bus uses, so the inspector replays it, for a websocket and
+//!     a streamed answer. A call answered in one piece records none but an
+//!     error: its request is the trigger's kick payload and its answer is
+//!     what the program answered with, both on record already.
 //!
-//! TLS terminates at the gateway; this server speaks plain HTTP/WS over
-//! the private install network and trusts the dispatcher-signed token
-//! (verified in `handle_connect`'s accept path) for authentication.
+//! This server speaks plain HTTP/WS. Every call is checked by the door
+//! (`crate::door`); a call weft's relay passed on is recognised by weft's
+//! hop credential, and a browser's socket shows the ticket a worker's door
+//! signed.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -44,7 +54,6 @@ use weft_core::caller::{
     CallerRuntimeConfig, CloseReason, DisconnectAction, HttpRequestParts, InboundMessage,
     LiveRequest, OutboundChunk, ResponseHead,
 };
-use weft_core::caller_token;
 use weft_core::signal::{Backpressure, DataType, Protocol};
 use weft_core::ExecutionId;
 
@@ -197,7 +206,7 @@ impl OutboundQueue {
 
     /// Drainer: pop the front, waiting when empty. Returns `None` once the
     /// queue is closed AND drained (socket task should then end).
-    async fn recv(&self) -> Option<Outbound> {
+    pub(crate) async fn recv(&self) -> Option<Outbound> {
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
@@ -250,10 +259,26 @@ pub struct LiveCallerConnection {
     /// Whether the caller is attached, as a watch so a hold waiting on
     /// the caller (`disconnected()`) wakes the moment it hangs up.
     connected: tokio::sync::watch::Sender<bool>,
-    /// Whether the disconnect row was handed to the journal: the
-    /// exactly-once guard, apart from `connected` so the row is written
-    /// BEFORE anyone waiting on `connected` wakes (see `mark_disconnected`).
+    /// Whether the disconnect was handed out: the exactly-once guard,
+    /// apart from `connected` so the row is written BEFORE anyone waiting
+    /// on `connected` wakes (see `mark_disconnected`).
     disconnect_recorded: AtomicBool,
+    /// Whether the caller's arrival is on the exchange's record: at once
+    /// for a socket; for an HTTP call only once it streams, since a call
+    /// answered in one piece records none of it ([`Self::caller_arrived`]).
+    arrival_recorded: AtomicBool,
+    /// A durable run's last word to its caller, waiting for the run's
+    /// record to hold everything before it ([`Self::release_answer`]). It
+    /// stays here until it is pushed, so the run's end always finds it.
+    held: Mutex<Option<Outbound>>,
+    /// Held across a chunk's record, commit and push, and across the last
+    /// word's latch and queueing: what the caller receives is in the order
+    /// its record says, and a chunk on its way out is never overtaken by
+    /// the last word.
+    sending: tokio::sync::Mutex<()>,
+    /// Told when a last word is held, so a drive waiting on something else
+    /// lets it go ([`Self::answer_held`]).
+    held_note: tokio::sync::Notify,
 }
 
 /// Stored inbound log with a wakeup and a BOUNDED in-RAM window. A
@@ -372,6 +397,12 @@ struct ConnInner {
 pub const PARKED: &str = "the run is waiting on a signal and carries on without this caller \
      (its route outlives its caller): no answer will come on this request";
 
+/// Why an exchange whose run was handed back ends here: the worker it
+/// reached is stopping, so the run carries on in another one, which this
+/// caller's connection does not reach. Said and recorded like [`PARKED`].
+pub const HANDED_BACK: &str = "the copy of the program serving this request is stopping, so the run \
+     carries on in another one without this caller: no answer will come on this request";
+
 impl ConnInner {
     /// An HTTP caller that has not heard a word yet: the run owes it an
     /// answer, and ending without one is a failure. The one rule,
@@ -388,6 +419,38 @@ impl LiveCallerConnection {
         self.record.sink()
     }
 
+    /// Resolves once a last word is held (a permit: one held before the
+    /// wait began counts).
+    pub(crate) async fn answer_held(&self) {
+        self.held_note.notified().await
+    }
+
+    /// Whether a last word waits for the run's record (see `held`).
+    pub(crate) fn holds_answer(&self) -> bool {
+        self.held.lock().expect("caller conn poisoned").is_some()
+    }
+
+    /// Let the held last word go once the run's record holds everything
+    /// before it. A record that cannot be written keeps it from leaving:
+    /// the caller hears why instead. The answer stays held while the
+    /// record is written, so a run ending meanwhile still sees it held and
+    /// releases it after its ending; whichever release takes it pushes it,
+    /// under the same lock it took it under, so whoever finds nothing held
+    /// knows the answer is queued (the hang-up that closes the queue comes
+    /// after).
+    pub(crate) async fn release_answer(&self) {
+        if !self.holds_answer() {
+            return;
+        }
+        let committed = self.record.sink.committed().await;
+        let mut held = self.held.lock().expect("caller conn poisoned");
+        let Some(answer) = held.take() else { return };
+        match committed {
+            Ok(()) => self.outbound.push_terminal(answer),
+            Err(why) => self.outbound.push_terminal(Outbound::Error(format!("the answer is not on the run's record, so it was not sent: {why}"))),
+        }
+    }
+
     /// The run is over and has said its last word: let the socket task
     /// send what is still queued, end the exchange, and record its
     /// `CallerDisconnected`, then return. The run's journal is closed
@@ -401,30 +464,33 @@ impl LiveCallerConnection {
         CallerConnection::disconnected(self).await;
     }
 
-    /// Journal the caller's arrival: the connect row at offset zero and,
-    /// for HTTP, the request body as the first inbound message (it arrives
-    /// with the connection rather than after it). Only
-    /// [`CallerRegistry::attach`] calls this, once the connection is the
-    /// exchange's one caller and before anyone else can reach it, so a
-    /// refused caller writes nothing into the run it was refused from and
-    /// no other row can take these offsets.
-    fn record_arrival(&self) {
+    /// Record the caller's arrival, once: the connect row at offset zero
+    /// and, for HTTP, the request body as the first inbound message (it
+    /// arrives with the connection rather than after it). A socket's is
+    /// recorded as it opens; an HTTP call's only once its answer streams
+    /// (its first `send_chunk`), since a call answered in one piece records
+    /// none of its exchange.
+    pub(crate) fn caller_arrived(&self) {
+        if self.arrival_recorded.swap(true, Ordering::SeqCst) {
+            return;
+        }
         self.record.connected(self.config.protocol);
         if let Some(http) = &self.http_request {
             self.record.inbound(&http.body);
         }
     }
 
-    /// The socket owns this connection even after execution cleanup removes
-    /// its registry entry. Record the disconnect exactly once on that owner.
-    /// The row goes to the journal first and `connected` flips after:
-    /// `hang_up` wakes on the flip and the run then closes the sink, so a
-    /// flip first could close it before the row was handed over. Only the
-    /// caller that wrote the row flips: a second one returning at once
+    /// The exchange is over, for `reason`: said exactly once. The row goes
+    /// to the journal first (when the exchange is recorded) and `connected`
+    /// flips after: `hang_up` wakes on the flip and the run then closes the
+    /// sink, so a flip first could close it before the row was handed over.
+    /// Only the first call writes and flips: a second one returning at once
     /// leaves the flip to the first, so it never lands ahead of the row.
-    fn mark_disconnected(&self, reason: &str) {
+    pub(crate) fn mark_disconnected(&self, reason: &str) {
         if !self.disconnect_recorded.swap(true, Ordering::SeqCst) {
-            self.record.disconnected(reason);
+            if self.arrival_recorded.load(Ordering::SeqCst) {
+                self.record.disconnected(reason);
+            }
             self.connected.send_replace(false);
         }
     }
@@ -435,16 +501,18 @@ impl LiveCallerConnection {
     /// after streaming started, or a WS close frame with the reason). Used
     /// by the execute path when a live-connection run fails with the
     /// caller still attached, so the caller learns why instead of seeing a
-    /// silently dropped socket.
+    /// silently dropped socket. A program that already answered keeps its
+    /// answer: the error is recorded and never pushed after it, whether
+    /// that answer already left or still waits for the run's record.
     pub async fn surface_error(&self, message: &str) {
+        self.record.errored(message);
+        // Tolerant streams: the chosen mode says swallow it.
         if self.config.error_mode == weft_core::signal::ErrorMode::DropChunk {
-            // Tolerant streams: the chosen mode says swallow it. Still
-            // journal it (observability), just don't push to the wire.
-            self.record.errored(message);
             return;
         }
-        self.record.errored(message);
-        self.outbound.push_terminal(Outbound::Error(message.to_string()));
+        if self.take_end(|_| ()).is_some() {
+            self.outbound.push_terminal(Outbound::Error(message.to_string()));
+        }
     }
 
     /// The run is over and the caller is still attached: end the
@@ -469,17 +537,17 @@ impl LiveCallerConnection {
         }
     }
 
-    /// The run parked on a wait and its worker is leaving (the drive
-    /// ended `Stalled`): the run has NOT ended, so this never says it
-    /// did. Whatever the exchange was doing, it stops here with
-    /// [`PARKED`]. A program that already terminated the exchange is
-    /// left alone.
-    pub async fn run_parked(&self) {
+    /// The run carries on without this caller (it parked on a wait,
+    /// [`PARKED`], or was handed back, [`HANDED_BACK`]): it has NOT ended,
+    /// so this never says it did. Whatever the exchange was doing, it
+    /// stops here with `why`. A program that already terminated the
+    /// exchange is left alone.
+    pub async fn run_carries_on(&self, why: &str) {
         if self.take_end(|_| ()).is_none() {
             return;
         }
-        self.record.errored(PARKED);
-        self.outbound.push_terminal(Outbound::Error(PARKED.to_string()));
+        self.record.errored(why);
+        self.outbound.push_terminal(Outbound::Error(why.to_string()));
     }
 
     /// Claim the exchange's end once: `None` when it was already
@@ -499,7 +567,7 @@ impl LiveCallerConnection {
     /// Resolve a gone-caller talk into the policy-correct outcome (cancel
     /// vs void), identical to the fake's contract.
     fn disconnected_outcome(&self) -> Result<(), CallerError> {
-        match resolve_disconnect(self.config.suspend) {
+        match resolve_disconnect(self.config.outlives_caller) {
             DisconnectAction::ContinueIntoVoid => Ok(()),
             DisconnectAction::CancelExecution => Err(CallerError::Disconnected),
         }
@@ -511,6 +579,10 @@ impl LiveCallerConnection {
     /// is dropped there (documented on the trait), never an error.
     fn commit_head(&self, head: Option<ResponseHead>) -> Result<(), CallerError> {
         let mut g = self.inner.lock().expect("caller conn poisoned");
+        // Nothing follows the exchange's last word: a write after it
+        // would reach the caller ahead of an answer still held for the
+        // run's record, or be recorded as said when nobody heard it.
+        try_terminate(g.terminated)?;
         if head.is_some() {
             try_send_head(g.wire_started)?;
         }
@@ -577,6 +649,7 @@ impl CallerConnection for LiveCallerConnection {
         if !self.is_connected() {
             return self.disconnected_outcome();
         }
+        let _sending = self.sending.lock().await;
         // The floor under every stream: a head that gives the worker
         // nothing to write while the feed is quiet leaves a caller who
         // hung up undetectable, and a run that was supposed to die with
@@ -591,7 +664,12 @@ impl CallerConnection for LiveCallerConnection {
         if let Some(why) = self.record.sink.degraded() {
             return Err(CallerError::JournalLost(why));
         }
+        // An answer that streams is recorded whole, its caller's arrival
+        // first.
+        self.caller_arrived();
         self.record.outbound(&chunk, false);
+        // A durable run's answer leaves only once it is on record.
+        self.record.sink.committed().await.map_err(CallerError::JournalLost)?;
         let chunk = Outbound::Chunk(chunk);
         match self.config.backpressure {
             // Await a free slot; only errors if the socket is gone.
@@ -610,6 +688,7 @@ impl CallerConnection for LiveCallerConnection {
         final_chunk: Option<OutboundChunk>,
         close: Option<CloseReason>,
     ) -> Result<(), CallerError> {
+        let _sending = self.sending.lock().await;
         {
             let mut g = self.inner.lock().expect("caller conn poisoned");
             try_terminate(g.terminated)?;
@@ -627,13 +706,26 @@ impl CallerConnection for LiveCallerConnection {
                 self.outbound.push_terminal(Outbound::Head(h));
             }
         }
-        if let Some(c) = &final_chunk {
+        // The last words of a recorded exchange; an HTTP answer in one
+        // piece records none of its exchange.
+        if let (Some(c), true) = (&final_chunk, self.arrival_recorded.load(Ordering::SeqCst)) {
             self.record.outbound(c, true);
+        }
+        let terminal = Outbound::Terminate(final_chunk, close);
+        if self.record.sink.waits_for_commit() {
+            // A durable run's answer leaves only once it is on record. It
+            // is held rather than waited for here: the drive lets it go
+            // once the record holds it, and when the answer is the run's
+            // last act, the run's ending is in that same write
+            // (`execution_driver`, `Self::release_answer`).
+            *self.held.lock().expect("caller conn poisoned") = Some(terminal);
+            self.held_note.notify_one();
+            return Ok(());
         }
         // The terminal always lands (subject to no capacity policy); if the
         // socket task already ended (caller gone), it is silently dropped
         // (the exchange is over anyway).
-        self.outbound.push_terminal(Outbound::Terminate(final_chunk, close));
+        self.outbound.push_terminal(terminal);
         Ok(())
     }
 
@@ -701,8 +793,7 @@ impl CallerConnection for LiveCallerConnection {
 /// message can legitimately wait minutes or hours (a chat user thinking),
 /// and Weft never times out a user-controlled wait. The only things that
 /// end this wait are a message arriving, the caller disconnecting, or the
-/// session-cap firing (which closes the log -> a disconnect here). The
-/// connect timeout bounds only `wait_for_attach`, never an inbound read.
+/// session-cap firing (which closes the log -> a disconnect here).
 async fn recv_from_log(
     log: &InboundLog,
     cursor: &std::sync::atomic::AtomicU64,
@@ -749,10 +840,10 @@ async fn recv_from_log(
 /// without a write) and the `session` cap. A caller that stops reading
 /// would otherwise hold the write, and the drainer and `hang_up` with it,
 /// past both. `Ok` carries whether the write went through.
-async fn write_or_end<S: std::future::Future<Output = ()>>(
+async fn write_or_end(
     write: impl std::future::Future<Output = bool>,
     gone: impl std::future::Future<Output = ()>,
-    session: std::pin::Pin<&mut S>,
+    session: &mut futures::future::BoxFuture<'static, ()>,
 ) -> Result<bool, ExchangeEnd> {
     tokio::select! {
         ok = write => Ok(ok),
@@ -761,12 +852,15 @@ async fn write_or_end<S: std::future::Future<Output = ()>>(
     }
 }
 
-async fn session_deadline(clock: &Arc<dyn weft_platform_traits::Clock>, cap_secs: u64) {
-    if cap_secs == 0 {
-        std::future::pending::<()>().await;
-    } else {
-        clock.sleep(std::time::Duration::from_secs(cap_secs)).await;
-    }
+fn session_deadline(clock: &Arc<dyn weft_platform_traits::Clock>, cap_secs: u64) -> futures::future::BoxFuture<'static, ()> {
+    let clock = clock.clone();
+    Box::pin(async move {
+        if cap_secs == 0 {
+            std::future::pending::<()>().await;
+        } else {
+            clock.sleep(std::time::Duration::from_secs(cap_secs)).await;
+        }
+    })
 }
 
 /// One exchange's record: the sink its `Caller*` rows go to and the
@@ -824,12 +918,11 @@ pub trait CallerJournalSink: Send + Sync {
     fn errored(&self, execution_id: ExecutionId, offset: u64, message: &str);
     fn disconnected(&self, execution_id: ExecutionId, offset: u64, reason: &str);
 
-    /// Stop taking rows: write what is held, and resolve once every row
-    /// handed over is in the journal. A run closes its caller's sink
-    /// before its own journal is settled (an unrecorded run's is read
-    /// once, then written or forgotten), so no row of the exchange is
-    /// still in flight when that happens.
-    fn close(&self) -> futures::future::BoxFuture<'static, ()>;
+    /// Stop taking rows, and hand over what is held. A run closes its
+    /// caller's sink once it is over, before it lets go of its record
+    /// (waiting for it when it carries on elsewhere, or is durable) and
+    /// before an unrecorded run's record is taken.
+    fn close(&self);
 
     /// Why this conversation has stopped being recorded, once it has.
     ///
@@ -843,117 +936,25 @@ pub trait CallerJournalSink: Send + Sync {
     fn degraded(&self) -> Option<String> {
         None
     }
-}
 
-/// Per-worker registry mapping an execution to its attached live
-/// connection. The connection server inserts on attach; the loop driver
-/// (`run_one_execution`) reads the connection for an execution to wire into
-/// `ctx.caller()`; removal happens when the socket task ends.
-///
-/// Cross-process note: this is process-local RAM, which is correct because a live
-/// connection is pinned to ONE process for its life (the routing token names
-/// the process), so the connection for an execution only ever exists on the one
-/// worker that accepted it.
-#[derive(Clone, Default)]
-pub struct CallerRegistry {
-    inner: Arc<Mutex<HashMap<ExecutionId, Arc<LiveCallerConnection>>>>,
-    /// Woken on every `attach`. The execute path awaits this when its
-    /// caller has not arrived yet (the dispatcher starts the execution
-    /// before, or racing with, the caller's socket attaching).
-    attached: Arc<tokio::sync::Notify>,
-}
-
-impl CallerRegistry {
-    pub fn new() -> Self {
-        Self::default()
+    /// Resolve once what was handed so far is on record, for a run whose
+    /// answer may not leave before it is (a durable run): the exchange's
+    /// open window is written and waited for. Resolves at once for a run
+    /// that does not wait (the default). `Err` is why it is not.
+    fn committed(&self) -> futures::future::BoxFuture<'static, Result<(), String>> {
+        Box::pin(async { Ok(()) })
     }
 
-    /// Attach the one connection for `execution_id`. `false` when this execution
-    /// already has one, and the caller must refuse rather than proceed.
-    ///
-    /// A routing token is good for one exchange, and the door it opens
-    /// takes ONE connection. Letting a second in silently replaced the
-    /// entry, which is worse than it sounds: the run keeps talking to
-    /// the first connection (it captured it once, at birth), the second
-    /// caller waits forever on a run that never answers them, and when
-    /// they give up, a route that cannot suspend reads their departure
-    /// as its own caller leaving and kills the run that was still
-    /// serving the first one. Both would also journal from offset zero,
-    /// so one exchange's rows would interleave with the other's: that is
-    /// why a connection journals its arrival here, on admission, and a
-    /// refused one never journals at all.
-    #[must_use]
-    pub fn attach(&self, execution_id: ExecutionId, conn: Arc<LiveCallerConnection>) -> bool {
-        let mut inner = self.inner.lock().expect("registry poisoned");
-        if inner.contains_key(&execution_id) {
-            return false;
-        }
-        // Journaled under the lock: nothing reaches this connection before
-        // its arrival rows are written.
-        conn.record_arrival();
-        inner.insert(execution_id, conn);
-        drop(inner);
-        // `notify_waiters` (not `notify_one`): several execute paths may be
-        // waiting for distinct executions; wake them all to re-check.
-        self.attached.notify_waiters();
-        true
+    /// Whether an answer waits for [`Self::committed`] before it leaves:
+    /// a durable run's (the default does not).
+    fn waits_for_commit(&self) -> bool {
+        false
     }
-
-    /// Await the connection for `execution_id` to attach, bounded by `timeout`.
-    /// Returns the connection once attached, or `None` on timeout (the
-    /// caller never arrived; the execute path treats that as "no caller"
-    /// and proceeds, and the caller handle's `ensure_connected()` then fails
-    /// loud if a node actually needs the caller). Arming the `Notify` future
-    /// BEFORE the map check closes the attach-between-check-and-wait race.
-    pub async fn wait_for_attach(
-        &self,
-        execution_id: ExecutionId,
-        timeout: std::time::Duration,
-    ) -> Option<Arc<LiveCallerConnection>> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let notified = self.attached.notified();
-            tokio::pin!(notified);
-            // Arm, THEN check: an attach landing now wakes the armed future.
-            notified.as_mut().enable();
-            if let Some(conn) = self.get(execution_id) {
-                return Some(conn);
-            }
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                return self.get(execution_id); // last check at deadline
-            }
-        }
-    }
-
-    pub fn get(&self, execution_id: ExecutionId) -> Option<Arc<LiveCallerConnection>> {
-        self.inner.lock().expect("registry poisoned").get(&execution_id).cloned()
-    }
-
-    /// Drop an execution's entry.
-    ///
-    /// Never panics: this runs from `ExecutionResidue`'s destructor,
-    /// which can itself run during an unwind, and a panic there aborts
-    /// the process. A poisoned registry is reported and the entry stays
-    /// (the process is already in trouble; taking it down is worse).
-    pub fn detach(&self, execution_id: ExecutionId) {
-        match self.inner.lock() {
-            Ok(mut inner) => {
-                inner.remove(&execution_id);
-            }
-            Err(_) => tracing::error!(
-                target: "weft_engine::caller_conn",
-                %execution_id,
-                "the caller registry is poisoned, so this execution's connection entry was not \
-                 dropped; it goes with the replica"
-            ),
-        }
-    }
-
 }
 
 /// Build a connection + the socket-facing channels. Returns the shared
-/// `Arc<LiveCallerConnection>` (registered + handed to the driver) and the
-/// halves the socket task drives: the outbound receiver (drain to wire)
+/// `Arc<LiveCallerConnection>` (handed to the run as its caller) and the
+/// halves the exchange's side drives: the outbound queue (drain to wire)
 /// and the inbound log (push decoded messages, close on socket end).
 #[allow(clippy::type_complexity)]
 pub(crate) fn new_connection(
@@ -987,10 +988,11 @@ pub(crate) fn new_connection(
         inner: Mutex::new(ConnInner { terminated: false, wire_started: false }),
         connected: tokio::sync::watch::Sender::new(true),
         disconnect_recorded: AtomicBool::new(false),
+        arrival_recorded: AtomicBool::new(false),
+        held: Mutex::new(None),
+        held_note: tokio::sync::Notify::new(),
+        sending: tokio::sync::Mutex::new(()),
     });
-    // The connect row is written on admission (`CallerRegistry::attach`),
-    // never here: a connection refused as a second caller must leave no
-    // row in the run it was refused from.
     (conn, outbound, inbound)
 }
 
@@ -1036,50 +1038,23 @@ fn decode_inbound(data_type: DataType, raw: &[u8]) -> Result<InboundMessage, Str
 
 // ----- The worker connection server ----------------------------------
 
-/// Shared state for the connection server: the registry it attaches into,
-/// the per-execution runtime config + journal factory, and the token secret.
+/// Shared state for the connection server: the door every call arrives at,
+/// and what bears its run.
 #[derive(Clone)]
 pub struct ConnServerState {
-    pub registry: CallerRegistry,
-    /// Verifies the dispatcher-signed routing token.
-    pub token_secret: Arc<Vec<u8>>,
-    /// The project this worker serves; a ticket for another project is
-    /// refused.
-    pub project_id: uuid::Uuid,
-    /// Claims and drives the run an arriving caller's ticket names.
+    /// Where every call is checked before its run is born (`crate::door`).
+    pub door: Arc<crate::door::Door>,
+    /// Weft's own credential on a hop: a call carrying it was passed on by
+    /// weft's relay, whose word on the caller's address is taken.
+    pub weft_hop: crate::worker::WeftCredential,
+    /// Gives birth to the run of a call the door let in.
     pub starter: Arc<dyn LiveStarter>,
-    /// Resolves the per-execution runtime config + journal sink. Set by the
-    /// worker's drive from the execution's signal config; the server needs the
-    /// config (protocol, caps, data type) to build the connection, and
-    /// the journal sink to record the exchange. Keyed by execution.
-    pub resolver: Arc<dyn ConnConfigResolver>,
     /// Worker clock (for the now()-based session deadline / heartbeat).
     pub clock: Arc<dyn weft_platform_traits::Clock>,
     /// Fires the per-execution cancel flag (cancel-on-disconnect for a
     /// caller-tied run). Looked up by execution.
     pub canceller: Arc<dyn ExecutionCanceller>,
 }
-
-/// What the server needs to build an execution's connection when its caller
-/// attaches: the runtime config, the heartbeat interval, the caller's
-/// opening request (from the execute task's start record), and the
-/// journal sink.
-pub struct ResolvedLiveStart {
-    pub config: CallerRuntimeConfig,
-    pub heartbeat_secs: u64,
-    pub request: Arc<LiveRequest>,
-    pub journal: Arc<dyn CallerJournalSink>,
-}
-
-/// How the server learns an execution's connection config + journal sink. The
-/// worker implements this over its per-execution state.
-pub trait ConnConfigResolver: Send + Sync {
-    /// `Some` when `execution_id` is a live execution expecting a caller; `None`
-    /// for an unknown/expired execution (the server rejects the connection
-    /// loud).
-    fn resolve(&self, execution_id: ExecutionId) -> Option<ResolvedLiveStart>;
-}
-
 
 /// Why an exchange ended. The one fact the drainers decide a cancel
 /// on: a caller-tied run (see `resolve_disconnect`) is cancelled when
@@ -1119,6 +1094,8 @@ enum ExchangeEnd {
     SessionErroredByProgram,
     /// The caller stopped answering pings (socket).
     CallerMissedHeartbeat,
+    /// The caller's socket upgrade never completed (socket).
+    SocketNeverOpened,
 }
 
 impl ExchangeEnd {
@@ -1139,6 +1116,7 @@ impl ExchangeEnd {
             Self::SessionClosedByProgram => "session closed by program",
             Self::SessionErroredByProgram => "session errored by program",
             Self::CallerMissedHeartbeat => "caller missed heartbeat",
+            Self::SocketNeverOpened => "the socket never opened",
         }
     }
 
@@ -1154,6 +1132,7 @@ impl ExchangeEnd {
             | Self::SocketTransportError
             | Self::SocketEnded
             | Self::CallerMissedHeartbeat
+            | Self::SocketNeverOpened
             | Self::InboundTooLarge
             | Self::InboundDecodeFailed
             | Self::SessionCapExceeded => true,
@@ -1171,77 +1150,105 @@ pub trait ExecutionCanceller: Send + Sync {
     fn cancel(&self, execution_id: ExecutionId, cause: weft_core::exec::CancelCause);
 }
 
-/// Claims the run an arriving caller's ticket names and starts driving it
-/// on this worker, detached from the connection. The run was born at the
-/// caller's handshake and waits for exactly this claim, which pins it
-/// here, where the caller's socket is.
+/// A run born for a caller: where its exchange is recorded, and its drive,
+/// which starts with the caller's connection in hand.
+pub struct Born {
+    pub execution_id: ExecutionId,
+    /// The sink the exchange is recorded through: the run's record.
+    pub sink: Arc<dyn CallerJournalSink>,
+    /// The run's drive, given its caller's exchange. Whoever holds the
+    /// future drives the run: the call's own task for an HTTP call, a task
+    /// of its own for a socket.
+    pub drive: Box<dyn FnOnce(crate::execution_driver::Exchange) -> futures::future::BoxFuture<'static, ()> + Send>,
+}
+
+/// Gives birth to the run of a caller the door let in.
 #[async_trait]
 pub trait LiveStarter: Send + Sync {
-    /// Claim the run and wait until its drive is ready for the caller (its
-    /// connection settings registered, [`ConnConfigResolver::resolve`]
-    /// answers). An error is why the run could not get that far.
-    async fn start(&self, execution_id: ExecutionId) -> anyhow::Result<LiveClaim>;
+    /// Bear the run (its plan, its birth handed to its record). The error
+    /// is the answer the caller gets instead; nothing started then.
+    async fn bear(&self, admitted: Box<crate::door::Admitted>) -> Result<Born, Response>;
 }
 
-/// What claiming an arriving caller's run came to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LiveClaim {
-    /// Claimed here and ready for the caller.
-    Ready,
-    /// Nothing here to claim: the ticket was already used (the caller's
-    /// client resent the request), or its run is over.
-    NotHere,
+/// The caller of `conn` is gone (their side ended the exchange, for
+/// `end`): the exchange stops, a run tied to its caller is cancelled, and
+/// the connection says the caller left. The cancel lands before the caller
+/// reads as gone, so whatever wakes on the caller leaving
+/// (`weft_engine::worker`'s move off a worker no call holds open) finds the
+/// run already cancelled.
+fn exchange_ended(conn: &LiveCallerConnection, outbound: &OutboundQueue, canceller: &dyn ExecutionCanceller, execution_id: ExecutionId, end: ExchangeEnd) {
+    outbound.close();
+    if end.caller_initiated() && matches!(resolve_disconnect(conn.config.outlives_caller), DisconnectAction::CancelExecution) {
+        canceller.cancel(execution_id, weft_core::exec::CancelCause::CallerGone);
+    }
+    conn.mark_disconnected(end.as_str());
 }
 
-/// A run claimed for a caller who is not attached to it yet. Dropped
-/// before [`Self::attaching`], it cancels the run: every refusal between the
-/// claim and the attach (a missing upgrade, a body over the cap, a socket
-/// upgrade that never completes) would otherwise leave the run waiting out
-/// its connect timeout and then running with nobody on the line, and the
-/// caller's retry would find it already taken.
-struct Unattached {
+/// A run its HTTP call drives on its own task ([`answer_http`]). Handed
+/// on to a task of its own once the answer leaves with work left
+/// ([`Self::carry_on`]); dropped with the call before that (the caller
+/// went away), it ends the exchange as the caller's and still goes on to
+/// its end on a task of its own, so a run never stops mid-step because
+/// its caller left.
+struct RunHere {
+    run: Option<futures::future::BoxFuture<'static, ()>>,
+    conn: Arc<LiveCallerConnection>,
+    outbound: Arc<OutboundQueue>,
+    canceller: Arc<dyn ExecutionCanceller>,
+    execution_id: ExecutionId,
+}
+
+impl RunHere {
+    /// Poll the run once more, and hand it to a task of its own when it
+    /// still has work left.
+    fn carry_on(mut self) {
+        if let Some(mut run) = self.run.take() {
+            if futures::FutureExt::now_or_never(&mut run).is_none() {
+                tokio::spawn(run);
+            }
+        }
+    }
+}
+
+impl Drop for RunHere {
+    fn drop(&mut self) {
+        if let Some(run) = self.run.take() {
+            exchange_ended(&self.conn, &self.outbound, self.canceller.as_ref(), self.execution_id, ExchangeEnd::CallerHungUp);
+            tokio::spawn(run);
+        }
+    }
+}
+
+/// A socket's run, started before its caller's socket opened. Dropped
+/// before [`Self::opened`] (the upgrade never completed), the caller never
+/// came: the exchange ends, and a run tied to its caller is cancelled
+/// instead of running with nobody on the line.
+struct Unopened {
+    conn: Arc<LiveCallerConnection>,
+    outbound: Arc<OutboundQueue>,
     canceller: Arc<dyn ExecutionCanceller>,
     execution_id: ExecutionId,
     armed: bool,
 }
 
-impl Unattached {
-    fn new(canceller: Arc<dyn ExecutionCanceller>, execution_id: ExecutionId) -> Self {
-        Self { canceller, execution_id, armed: true }
-    }
-
-    /// The caller is being attached; from here the connection owns what
-    /// happens to the run.
-    fn attaching(mut self) {
+impl Unopened {
+    /// The socket opened; from here the socket's task owns the exchange.
+    fn opened(mut self) {
         self.armed = false;
     }
 }
 
-impl Drop for Unattached {
+impl Drop for Unopened {
     fn drop(&mut self) {
         if self.armed {
-            // The caller was refused (the answer they got says why), or
-            // left before their connection opened: either way nobody is
-            // on the line, and it was not the caller who ended a running
-            // exchange.
-            self.canceller.cancel(
-                self.execution_id,
-                weft_core::exec::CancelCause::Runtime {
-                    detail: "the caller never attached: refused at the worker, or gone before the connection opened"
-                        .into(),
-                },
-            );
+            exchange_ended(&self.conn, &self.outbound, self.canceller.as_ref(), self.execution_id, ExchangeEnd::SocketNeverOpened);
         }
     }
 }
 
-/// Build the connection server router. The connection is identified by
-/// the signed ticket in [`caller_token::TICKET_HEADER`], NOT the path: the install's
-/// relay forwards the caller's ORIGINAL path under its tenant (e.g.
-/// `/local/chat`), so the worker accepts ANY path via a fallback handler (any
-/// method, so HTTP verbs and the WS upgrade GET all land here). The one
-/// reserved prefix is the worker's own, `/_weft/`
-/// (`weft_core::route::RESERVED_PREFIX`).
+/// Build the connection server router: every path but the worker's own
+/// (`/_weft/`, `weft_core::route::RESERVED_PREFIX`) is a caller arriving at
+/// the door, any method (HTTP verbs and the WS upgrade GET all land here).
 pub fn connection_router(state: ConnServerState) -> Router {
     Router::new().fallback(any(handle_connect)).with_state(state)
 }
@@ -1279,7 +1286,11 @@ const KEEPALIVE_SCHEDULE_SECS: u64 =
 /// stream itself belongs to hyper, and this only ever sets an option on
 /// it. Dropping this closes the duplicate, never the connection.
 #[derive(Clone)]
-struct CallerSocket(Option<std::sync::Arc<socket2::Socket>>);
+struct CallerSocket {
+    socket: Option<std::sync::Arc<socket2::Socket>>,
+    /// The address the connection came from.
+    peer: std::net::IpAddr,
+}
 
 /// How each connection's own handle reaches its handler, which is
 /// axum's supported route for per-connection data.
@@ -1294,7 +1305,7 @@ impl axum::extract::connect_info::Connected<
     fn connect_info(
         stream: axum::serve::IncomingStream<'_, tokio::net::TcpListener>,
     ) -> Self {
-        watch_for_a_vanished_caller(stream.io())
+        CallerSocket { socket: watch_for_a_vanished_caller(stream.io()), peer: stream.remote_addr().ip() }
     }
 }
 
@@ -1303,21 +1314,27 @@ impl CallerSocket {
     /// machine may leave what we send unacknowledged. `0` means leave
     /// the machine's own default, which is about fifteen minutes.
     fn bound_silence(&self, secs: u64) {
-        let Some(socket) = &self.0 else { return };
-        // A bound shorter than the schedule would end the connection
-        // part way through asking the caller whether it is there, so a
-        // quiet feed would be cut while it was still healthy. The
-        // schedule wins, and the route's wish is honoured from there up.
-        let secs = if secs > 0 { secs.max(KEEPALIVE_SCHEDULE_SECS) } else { 0 };
-        let timeout = (secs > 0).then(|| std::time::Duration::from_secs(secs));
-        if let Err(error) = socket.set_tcp_user_timeout(timeout) {
-            tracing::warn!(
-                target: "weft_engine::caller_conn",
-                %error, secs,
-                "could not set this route's caller-silence bound; the connection keeps \
-                 the server's default"
-            );
+        if let Some(socket) = &self.socket {
+            bound_silence(socket, secs);
         }
+    }
+}
+
+/// See [`CallerSocket::bound_silence`].
+fn bound_silence(socket: &socket2::Socket, secs: u64) {
+    // A bound shorter than the schedule would end the connection
+    // part way through asking the caller whether it is there, so a
+    // quiet feed would be cut while it was still healthy. The
+    // schedule wins, and the route's wish is honoured from there up.
+    let secs = if secs > 0 { secs.max(KEEPALIVE_SCHEDULE_SECS) } else { 0 };
+    let timeout = (secs > 0).then(|| std::time::Duration::from_secs(secs));
+    if let Err(error) = socket.set_tcp_user_timeout(timeout) {
+        tracing::warn!(
+            target: "weft_engine::caller_conn",
+            %error, secs,
+            "could not set this route's caller-silence bound; the connection keeps \
+             the server's default"
+        );
     }
 }
 
@@ -1371,13 +1388,13 @@ pub async fn serve(
 /// socket succeeds whether or not anybody is listening), it is the
 /// traffic that gives the far side something to acknowledge. Neither
 /// half works without the other.
-fn watch_for_a_vanished_caller(stream: &tokio::net::TcpStream) -> CallerSocket {
+fn watch_for_a_vanished_caller(stream: &tokio::net::TcpStream) -> Option<std::sync::Arc<socket2::Socket>> {
     // A filler line is twenty-odd bytes, and Nagle would hold it back
     // waiting for company that never comes. The write has to reach the
     // wire for the bound below to mean anything.
     let _ = stream.set_nodelay(true);
     let socket = match socket2::SockRef::from(stream).try_clone() {
-        Ok(socket) => CallerSocket(Some(std::sync::Arc::new(socket))),
+        Ok(socket) => std::sync::Arc::new(socket),
         Err(error) => {
             // Not fatal: the connection still serves, and a caller that
             // says goodbye is still noticed at once. What is lost is the
@@ -1388,7 +1405,7 @@ fn watch_for_a_vanished_caller(stream: &tokio::net::TcpStream) -> CallerSocket {
                 "could not watch this connection for a caller that vanishes; one that \
                  disappears without closing will hold its run until the machine gives up"
             );
-            return CallerSocket(None);
+            return None;
         }
     };
     // The other half, and the one that covers a stream with NOTHING to
@@ -1413,7 +1430,7 @@ fn watch_for_a_vanished_caller(stream: &tokio::net::TcpStream) -> CallerSocket {
         .with_time(std::time::Duration::from_secs(KEEPALIVE_IDLE_SECS))
         .with_interval(std::time::Duration::from_secs(KEEPALIVE_INTERVAL_SECS))
         .with_retries(KEEPALIVE_RETRIES);
-    if let Err(error) = socket.0.as_ref().expect("just built").set_tcp_keepalive(&probes) {
+    if let Err(error) = socket.set_tcp_keepalive(&probes) {
         tracing::warn!(
             target: "weft_engine::caller_conn",
             %error,
@@ -1425,439 +1442,387 @@ fn watch_for_a_vanished_caller(stream: &tokio::net::TcpStream) -> CallerSocket {
     // been read yet, so a caller that never names a valid route is
     // bounded too. A route with its own value replaces this once it
     // resolves.
-    socket.bound_silence(weft_core::signal::DEFAULT_CALLER_SILENCE_SECS);
-    socket
+    bound_silence(&socket, weft_core::signal::DEFAULT_CALLER_SILENCE_SECS);
+    Some(socket)
 }
 
-/// Single-extractor handler: takes the whole request and pulls method,
-/// headers, query, the optional WS upgrade, and the body manually. axum
-/// caps handler arity and forbids combining several query/body extractors,
-/// so one `Request` is the clean shape here.
+/// What weft's relay said about a call it passed on
+/// (`weft_core::net::relay_hop`).
+#[derive(Debug, PartialEq, Eq)]
+struct Relayed {
+    caller: std::net::IpAddr,
+    route_prefix: String,
+}
+
+/// Read what weft's relay said about this call, when the hop carries
+/// weft's own credential, and take every trace of the hop out of
+/// `headers`: weft's credential, the relay's headers (anybody else's word
+/// under those names is not taken), and the `Host` the hop replaced, put
+/// back as the caller sent it. What is left is the request its caller
+/// sent, which is what the door checks and the run reads.
+fn relayed_by_weft(weft_hop: &crate::worker::WeftCredential, headers: &mut axum::http::HeaderMap) -> Result<Option<Relayed>, Response> {
+    use weft_core::net::relay_hop;
+    let by_weft = weft_hop.admits_headers(headers);
+    let caller = headers.remove(relay_hop::CALLER_ADDRESS);
+    let host = headers.remove(relay_hop::CALLER_HOST);
+    let route_prefix = headers.remove(relay_hop::ROUTE_PREFIX);
+    headers.remove(weft_platform_traits::WORKER_AUTH_HEADER);
+    if !by_weft {
+        return Ok(None);
+    }
+    let Some(caller) = caller.as_ref().and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok()) else {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "weft's relay passed this call on without naming its caller").into_response());
+    };
+    if let Some(host) = host {
+        headers.insert(axum::http::header::HOST, host);
+    }
+    let route_prefix = route_prefix.as_ref().and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    Ok(Some(Relayed { caller, route_prefix }))
+}
+
+/// A caller at the door: the door checks the call
+/// ([`crate::door::Door::arrive`]), an HTTP call's body is read, the run it
+/// starts is born ([`LiveStarter::bear`]) and starts with the caller's
+/// connection in hand: on this very task for an HTTP call
+/// ([`answer_http`]), on a task of its own for a socket ([`pump_ws`]).
+/// Single-extractor: axum caps handler arity and forbids combining several
+/// query/body extractors, so one `Request` is the clean shape here.
 async fn handle_connect(
     State(state): State<ConnServerState>,
     request: axum::extract::Request,
 ) -> Response {
-    let raw_query = request.uri().query().unwrap_or("").to_string();
-
-    // 1. Verify the dispatcher-signed token, and that it is for this
-    //    worker's project.
-    let Some(token) = request
-        .headers()
-        .get(caller_token::TICKET_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
-    else {
-        return (StatusCode::UNAUTHORIZED, "missing routing token").into_response();
+    let socket = request.extensions().get::<axum::extract::ConnectInfo<CallerSocket>>().map(|info| info.0.clone());
+    let (mut parts, body) = request.into_parts();
+    let relayed = match relayed_by_weft(&state.weft_hop, &mut parts.headers) {
+        Ok(relayed) => relayed,
+        Err(refused) => return refused,
     };
-    let now = state.clock.now_unix();
-    let claims = match caller_token::validate(&state.token_secret, &token, now) {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::UNAUTHORIZED, caller_token::refusal(&e)).into_response(),
+    let Some(peer) = relayed.as_ref().map(|r| r.caller).or(socket.as_ref().map(|s| s.peer)) else {
+        // Every connection is served with its peer; one without is a
+        // wiring bug, refused rather than counted as nobody.
+        return (StatusCode::INTERNAL_SERVER_ERROR, "no peer address on the request").into_response();
     };
-    if claims.project_id != state.project_id {
-        return (StatusCode::FORBIDDEN, "this ticket is for another project's workers").into_response();
-    }
-    let execution_id = claims.execution_id;
-
-    // 1b. Hold the caller to the request the gate approved, when the
-    //     gate checked anything at all. The ticket carries the verdict,
-    //     not the request: a call is passed on in the request the gate
-    //     checked, but a browser's socket opens later at the URL it was
-    //     handed, so without this it could pass the gate with one request
-    //     and open its socket with another. For a password-shaped check that changes
-    //     nothing (the answer really was only about who they are); for
-    //     a signature it is the whole point, because a signature's
-    //     claim is about one exact request.
-    //
-    //     The body is read here rather than at the gate for an open
-    //     route, so it is only re-read when there is a fingerprint to
-    //     compare it against.
-    let request = if let Some(approved) = claims.approved.clone() {
-        let (parts, body) = request.into_parts();
-        // Read against the language's own ceiling rather than the
-        // route's: the route's cap is applied where the body is used,
-        // and this read only exists to fingerprint what arrived.
-        let bytes = match axum::body::to_bytes(
-            body,
-            weft_core::signal::live_connection::DEFAULT_MAX_INBOUND_BYTES as usize,
-        )
-        .await
-        {
-            Ok(b) => b,
-            Err(_) => {
-                return (StatusCode::PAYLOAD_TOO_LARGE, "request body exceeds the cap")
-                    .into_response()
+    let method = parts.method.as_str().to_string();
+    let raw_path = parts.uri.path().to_string();
+    let raw_query = parts.uri.query().unwrap_or("").to_string();
+    let call = crate::door::Call {
+        method: &method,
+        raw_path: &raw_path,
+        raw_query: &raw_query,
+        headers: &parts.headers,
+        peer,
+        relayed: relayed.is_some(),
+        route_prefix: relayed.as_ref().map_or("", |r| r.route_prefix.as_str()),
+    };
+    let (admitted, body) = match state.door.arrive(call, body).await {
+        crate::door::Arrived::Answer(answer) => return answer,
+        crate::door::Arrived::Run(admitted, body) => (admitted, body),
+    };
+    let config = CallerRuntimeConfig::from_config(&admitted.live_config, admitted.protocol);
+    let heartbeat_secs = admitted.live_config.heartbeat_interval_secs;
+    let handshake = Arc::new(admitted.opening.clone());
+    // What a call brings is read before its run is born: a socket's
+    // upgrade (a call without one starts nothing), an HTTP call's body
+    // (capped; a body the run could not read starts nothing).
+    let opening = match admitted.protocol {
+        Protocol::Websocket => match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
+            Ok(upgrade) => Opening::Socket(upgrade),
+            Err(e) => {
+                tracing::warn!(target: "weft_engine::caller_conn", error = ?e, "ws upgrade extraction failed");
+                return (StatusCode::BAD_REQUEST, "websocket trigger requires a WebSocket upgrade").into_response();
             }
-        };
-        // The path is not compared: it is signed into the claims, so it
-        // is the dispatcher's word either way, and the one on the wire
-        // carries the tenant (or, for a browser's socket, the live door's
-        // project) in front of it.
-        let arrived = caller_token::RequestFingerprint::of(
-            parts.method.as_str(),
-            &approved.path,
-            &raw_query,
-            &bytes,
-        );
-        if arrived != approved {
-            return (
-                StatusCode::FORBIDDEN,
-                "this is not the request that was approved: the door you were given opens for \
-                 the call you made, not another one",
-            )
-                .into_response();
-        }
-        axum::http::Request::from_parts(parts, axum::body::Body::from(bytes))
-    } else {
-        request
+        },
+        Protocol::Http => match read_body(&config, body).await {
+            Ok(body) => Opening::Http(body),
+            Err(refused) => return refused,
+        },
     };
-
-    // 2. The caller is here: claim the run their ticket names (born at
-    //    the handshake, waiting for them) and start driving it here.
-    match state.starter.start(execution_id).await {
-        Ok(LiveClaim::Ready) => {}
-        Ok(LiveClaim::NotHere) => {
-            return (StatusCode::CONFLICT, caller_token::refusal("it was already used, or its run is over")).into_response()
-        }
-        Err(e) => {
-            tracing::error!(target: "weft_engine::caller_conn", %execution_id, error = %format!("{e:#}"), "an arriving caller's run did not start");
-            return (StatusCode::SERVICE_UNAVAILABLE, format!("the run could not start: {e:#}")).into_response();
-        }
-    }
-    let unattached = Unattached::new(state.canceller.clone(), execution_id);
-
-    // 3. The execution's connection config (protocol, caps, data type) +
-    //    journal sink, registered by the drive before it said it was ready.
-    let Some(ResolvedLiveStart { config, heartbeat_secs, request: handshake, journal }) =
-        state.resolver.resolve(execution_id)
-    else {
-        tracing::error!(target: "weft_engine::caller_conn", %execution_id, "a run said it was ready for its caller but holds no connection settings");
-        return (StatusCode::INTERNAL_SERVER_ERROR, "the run is not ready for its caller").into_response();
+    drop(parts);
+    let born = match state.starter.bear(admitted).await {
+        Ok(born) => born,
+        Err(answer) => return answer,
     };
-
     // The route is known now, so its own answer to "how long may this
     // caller's machine go silent" replaces the floor put on at accept.
-    if let Some(socket) = request.extensions().get::<axum::extract::ConnectInfo<CallerSocket>>() {
-        socket.0.bound_silence(config.caller_silence_secs);
+    if let Some(socket) = &socket {
+        socket.bound_silence(config.caller_silence_secs);
     }
-
-    // 4. Branch on protocol. The connection layer is shared; only the
-    //    socket wiring differs. Split the request so we can both attempt
-    //    the WS upgrade (from the parts) and read the body (for HTTP).
-    let (mut parts, body) = request.into_parts();
-    match config.protocol {
-        Protocol::Websocket => {
-            // Try to extract the upgrade from the request parts. A
-            // websocket trigger hit without an upgrade header is a misuse.
-            match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
-                Ok(upgrade) => {
-                    tracing::info!(
-                        target: "weft_engine::caller_conn",
-                        execution_id = %execution_id, "ws upgrade accepted; attaching"
-                    );
-                    let st = state.clone();
-                    // Enforce the inbound size cap at the TRANSPORT so an
-                    // oversized frame is rejected before axum buffers it whole
-                    // (the per-message check in `drive_ws` is the loud surface,
-                    // not the RAM bound). `usize` cast is safe: the cap is a
-                    // byte count that fits the platform word on any real process.
-                    let cap = config.max_inbound_bytes as usize;
-                    let upgrade = upgrade.max_message_size(cap).max_frame_size(cap);
-                    // A socket that never completes its upgrade drops the
-                    // closure, and with it `unattached`, which cancels the run.
-                    upgrade.on_upgrade(move |socket| {
-                        drive_ws(socket, st, execution_id, config, heartbeat_secs, handshake, journal, unattached)
-                    })
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "weft_engine::caller_conn",
-                        execution_id = %execution_id, error = ?e, "ws upgrade extraction failed"
-                    );
-                    (
-                        StatusCode::BAD_REQUEST,
-                        "websocket trigger requires a WebSocket upgrade",
-                    )
-                        .into_response()
-                }
-            }
+    let execution_id = born.execution_id;
+    let http_body = match &opening {
+        Opening::Http(body) => Some(body.clone()),
+        Opening::Socket(_) => None,
+    };
+    let (conn, outbound, inbound) = new_connection(config.clone(), execution_id, handshake, http_body, born.sink);
+    let exchange = crate::execution_driver::Exchange { conn: conn.clone(), live: Some(conn.clone()), sink: conn.journal() };
+    let run = (born.drive)(exchange);
+    match opening {
+        Opening::Http(_) => {
+            let here = RunHere { run: Some(run), conn, outbound, canceller: state.canceller.clone(), execution_id };
+            answer_http(here, heartbeat_secs, state.clock.clone()).await
         }
-        Protocol::Http => {
-            // The method, headers and query were captured by the dispatcher
-            // at the handshake and ride in `request`; the worker only
-            // reads the body, which the dispatcher passes on as it arrives.
-            drop(parts);
-            drive_http(state, execution_id, config, heartbeat_secs, handshake, journal, body, unattached).await
+        Opening::Socket(upgrade) => {
+            let unopened = Unopened { conn: conn.clone(), outbound: outbound.clone(), canceller: state.canceller.clone(), execution_id, armed: true };
+            // A socket's run has a task of its own; the socket's task feeds
+            // the wire.
+            tokio::spawn(run);
+            let inbound = inbound.expect("a websocket connection has an inbound log");
+            // Enforce the inbound size cap at the TRANSPORT so an oversized
+            // frame is rejected before axum buffers it whole (the
+            // per-message check in `pump_ws` is the loud surface, not the
+            // RAM bound). `usize` cast is safe: the cap is a byte count
+            // that fits the platform word on any real process.
+            let cap = config.max_inbound_bytes as usize;
+            let upgrade = upgrade.max_message_size(cap).max_frame_size(cap);
+            // A socket that never completes its upgrade drops the closure,
+            // and with it `unopened`, which ends the exchange.
+            let pump = SocketPump { conn, outbound, inbound, config, heartbeat_secs, clock: state.clock.clone(), canceller: state.canceller.clone(), execution_id };
+            upgrade.on_upgrade(move |socket| pump_ws(socket, pump, unopened))
         }
     }
 }
 
-/// HTTP path: read the (capped) request body, build the connection with
-/// the handshake beside it, attach it, then answer with the head the
-/// program's FIRST outbound item decides and a chunked body fed by the
-/// rest. The node's `respond`/`write`/`close` drive what the caller
-/// receives; nothing goes out before the program speaks, so a route can
-/// answer 404, set a header, or stream. A program that never replies
-/// holds the caller only as long as it runs: when the run ends the
-/// worker closes the exchange with a `500` saying so (`run_ended`).
-#[allow(clippy::too_many_arguments)]
-async fn drive_http(
-    state: ConnServerState,
-    execution_id: ExecutionId,
-    config: CallerRuntimeConfig,
-    heartbeat_secs: u64,
-    request: Arc<LiveRequest>,
-    journal: Arc<dyn CallerJournalSink>,
-    body: axum::body::Body,
-    unattached: Unattached,
-) -> Response {
-    // Enforce the inbound size cap while reading the body (untrusted
-    // caller); fail loud past the cap.
+/// What a call brings besides its opening request.
+enum Opening {
+    Http(InboundMessage),
+    Socket(WebSocketUpgrade),
+}
+
+/// Read an HTTP call's body under the route's cap and decode it as the
+/// route's data type. A refusal is the caller's answer.
+async fn read_body(config: &CallerRuntimeConfig, body: axum::body::Body) -> Result<InboundMessage, Response> {
     let limit = config.max_inbound_bytes;
-    let bytes = match axum::body::to_bytes(body, limit as usize).await {
-        Ok(b) => b,
-        Err(_) => {
-            return (StatusCode::PAYLOAD_TOO_LARGE, format!("request body exceeds {limit} bytes"))
-                .into_response()
+    let bytes = axum::body::to_bytes(body, limit as usize)
+        .await
+        .map_err(|_| (StatusCode::PAYLOAD_TOO_LARGE, format!("request body exceeds {limit} bytes")).into_response())?;
+    weft_core::caller::check_inbound_size(bytes.len() as u64, limit).map_err(|e| (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()).into_response())?;
+    decode_inbound(config.data_type, &bytes).map_err(|e| (StatusCode::BAD_REQUEST, e).into_response())
+}
+
+/// An HTTP call's answer, on the call's own task: the run is polled here
+/// until the program decides the answer (its first item toward the
+/// caller). An answer in one piece (a `respond`, a bare close, an error, a
+/// run that ended without a word) is the response, built here, and the run
+/// goes on only if it has work left after answering; for a ping it ends in
+/// the poll that answered and nothing is spawned. An answer that streams
+/// (a first `write`) gets one task that feeds the response's body
+/// ([`stream_body`]), and the run goes on on a task of its own. Nothing goes
+/// out before the program speaks, so a route can answer 404, set a header,
+/// or stream; a program that never replies holds the caller only as long as
+/// it runs, and its end answers a `500` saying so (`run_ended`).
+async fn answer_http(mut here: RunHere, heartbeat_secs: u64, clock: Arc<dyn weft_platform_traits::Clock>) -> Response {
+    let outbound = here.outbound.clone();
+    let mut explicit: Option<ResponseHead> = None;
+    // The session cap (a configured `max_session_secs`; none never
+    // resolves) runs from the call's arrival: it bounds the wait for the
+    // answer, then the stream that follows it.
+    let mut session = session_deadline(&clock, here.conn.config.max_session_secs);
+    let first = loop {
+        let item = match here.run.as_mut() {
+            Some(run) => tokio::select! {
+                biased;
+                item = outbound.recv() => Waited::Item(item),
+                () = run => Waited::RunOver,
+                () = &mut session => Waited::SessionOver,
+            },
+            None => tokio::select! {
+                item = outbound.recv() => Waited::Item(item),
+                () = &mut session => Waited::SessionOver,
+            },
+        };
+        match item {
+            // The run ended (or paused) before it answered: its last words
+            // are in the queue, read on the next turn, and nothing is left
+            // to drive.
+            Waited::RunOver => here.run = None,
+            Waited::SessionOver => {
+                let end = ExchangeEnd::SessionCapExceeded;
+                exchange_ended(&here.conn, &outbound, here.canceller.as_ref(), here.execution_id, end);
+                here.carry_on();
+                return build_response(&error_head(), axum::body::Body::from(format!("no response from the program: {}", end.as_str())));
+            }
+            Waited::Item(Some(Outbound::Head(head))) => explicit = Some(head),
+            Waited::Item(decisive) => break decisive,
         }
     };
-    if let Err(e) = weft_core::caller::check_inbound_size(bytes.len() as u64, limit) {
-        return (StatusCode::PAYLOAD_TOO_LARGE, e.to_string()).into_response();
-    }
-    let decoded = match decode_inbound(config.data_type, &bytes) {
-        Ok(m) => m,
-        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+    let (conn, execution_id) = (here.conn.clone(), here.execution_id);
+    let response = match first {
+        Some(Outbound::Chunk(chunk)) => {
+            let head = committed_head(explicit, Some(&chunk));
+            let body = stream_body(StreamedAnswer {
+                conn: conn.clone(),
+                outbound: outbound.clone(),
+                canceller: here.canceller.clone(),
+                execution_id,
+                head: head.clone(),
+                first: chunk,
+                heartbeat_secs,
+                session,
+            });
+            build_response(&head, body)
+        }
+        Some(Outbound::Terminate(last, _close)) => {
+            let head = committed_head(explicit, last.as_ref());
+            conn.mark_disconnected(ExchangeEnd::ResponseComplete.as_str());
+            build_response(&head, axum::body::Body::from(last.as_ref().map(chunk_to_bytes).unwrap_or_default()))
+        }
+        // Before the first byte the status line is still ours to set: a
+        // real error status, the message as the body.
+        Some(Outbound::Error(message)) => {
+            conn.mark_disconnected(ExchangeEnd::ResponseErrored.as_str());
+            build_response(&error_head(), axum::body::Body::from(message))
+        }
+        Some(Outbound::Head(_)) => unreachable!("a head is held above, never decisive"),
+        None => {
+            conn.mark_disconnected(ExchangeEnd::OutboundQueueClosed.as_str());
+            build_response(&error_head(), axum::body::Body::from(format!("no response from the program: {}", ExchangeEnd::OutboundQueueClosed.as_str())))
+        }
     };
+    here.carry_on();
+    response
+}
 
-    // What the caller sent is journaled on admission, right after the
-    // connect row (`record_arrival`).
-    let (conn, outbound, _inb) =
-        new_connection(config.clone(), execution_id, request, Some(decoded), journal);
-    unattached.attaching();
-    if !state.registry.attach(execution_id, conn.clone()) {
-        return (StatusCode::CONFLICT, EXCHANGE_TAKEN).into_response();
+/// What the wait for an HTTP answer heard.
+enum Waited {
+    /// The run's next item toward its caller (`None`: the queue closed).
+    Item(Option<Outbound>),
+    /// The run ended or paused.
+    RunOver,
+    /// The session cap came first.
+    SessionOver,
+}
+
+/// The head an answer goes out under: the program's own, else the default
+/// for its first item (its content type), and `204` when it carries no
+/// body and set none.
+fn committed_head(explicit: Option<ResponseHead>, first: Option<&OutboundChunk>) -> ResponseHead {
+    match (explicit, first) {
+        (Some(head), Some(chunk)) => head.with_content_type_for(chunk),
+        (Some(head), None) => head,
+        (None, Some(chunk)) => ResponseHead::default().with_content_type_for(chunk),
+        (None, None) => ResponseHead::new(204),
     }
+}
 
-    // Stream the worker's outbound chunks as a chunked HTTP body. The
-    // first Terminate ends the stream.
-    //
-    // A caller who leaves is found two ways, neither of which needs the
-    // program to write. The body's receiver is dropped when the
-    // handler's response goes away (the connection reset under it, or
-    // the handler future dropped before the head), and `tx.closed()`
-    // says so at once. And on every heartbeat the drainer writes the
-    // head's `keepalive` filler (the bytes a reader of that framing
-    // ignores), because a proxy on the way may keep our side open
-    // after the far side hung up, and only a write finds that out.
-    // Before the head is committed there is nothing to write; a head
-    // with no filler (a raw stream) relies on the receiver alone.
-    let mut heartbeat = (heartbeat_secs != 0).then(|| {
-        let mut iv = tokio::time::interval(std::time::Duration::from_secs(heartbeat_secs));
-        iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        iv
-    });
-    let registry = state.registry.clone();
-    let canceller = state.canceller.clone();
-    let policy = config.suspend;
-    let clock = state.clock.clone();
-    let max_session_secs = config.max_session_secs;
-    let (head_tx, head_rx) = tokio::sync::oneshot::channel::<ResponseHead>();
+/// A `500` with a text body: the program failed (or ended silent) before
+/// the first byte, so the status line can still say so.
+fn error_head() -> ResponseHead {
+    ResponseHead::new(500).with_content_type_for(&OutboundChunk::Text(String::new()))
+}
+
+/// What feeds a streamed answer's body.
+struct StreamedAnswer {
+    conn: Arc<LiveCallerConnection>,
+    outbound: Arc<OutboundQueue>,
+    canceller: Arc<dyn ExecutionCanceller>,
+    execution_id: ExecutionId,
+    /// The head that went out: the body's framing (its keepalive filler,
+    /// how an error is written in-band).
+    head: ResponseHead,
+    first: OutboundChunk,
+    heartbeat_secs: u64,
+    /// The session cap, started when the call arrived.
+    session: futures::future::BoxFuture<'static, ()>,
+}
+
+/// A streamed answer's body, fed by one task from the run's outbound
+/// queue.
+///
+/// A caller who leaves is found two ways, neither of which needs the
+/// program to write. The body's receiver is dropped when the response goes
+/// away (the connection reset under it), and `tx.closed()` says so at once.
+/// And on every heartbeat the feeder writes the head's `keepalive` filler
+/// (the bytes a reader of that framing ignores), because a proxy on the way
+/// may keep our side open after the far side hung up, and only a write
+/// finds that out. A head with no filler (a raw stream) relies on the
+/// receiver alone.
+fn stream_body(answer: StreamedAnswer) -> axum::body::Body {
     let (tx, rx) = mpsc::channel::<Result<Vec<u8>, std::io::Error>>(16);
     tokio::spawn(async move {
-        let session = session_deadline(&clock, max_session_secs);
-        tokio::pin!(session);
-        let mut head = HeldHead::new(head_tx);
-        let reason = loop {
-            tokio::select! {
-                out = outbound.recv() => match out {
-                    Some(Outbound::Head(h)) => head.explicit(h),
-                    Some(Outbound::Chunk(c)) => {
-                        if !head.commit_for(Some(&c)) {
-                            break ExchangeEnd::CallerHungUp;
-                        }
-                        let sent = async { tx.send(Ok(chunk_to_bytes(&c))).await.is_ok() };
-                        match write_or_end(sent, tx.closed(), session.as_mut()).await {
-                            Ok(true) => {}
-                            Ok(false) => break ExchangeEnd::CallerHungUp,
-                            Err(end) => break end,
-                        }
-                    }
-                    Some(Outbound::Terminate(final_chunk, _close)) => {
-                        if !head.commit_for(final_chunk.as_ref()) {
-                            break ExchangeEnd::CallerHungUp;
-                        }
-                        if let Some(c) = final_chunk {
+        let StreamedAnswer { conn, outbound, canceller, execution_id, head, first, heartbeat_secs, mut session } = answer;
+        let mut heartbeat = (heartbeat_secs != 0).then(|| {
+            let mut iv = tokio::time::interval(std::time::Duration::from_secs(heartbeat_secs));
+            iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            iv
+        });
+        let end = 'feed: {
+            let sent = async { tx.send(Ok(chunk_to_bytes(&first))).await.is_ok() };
+            match write_or_end(sent, tx.closed(), &mut session).await {
+                Ok(true) => {}
+                Ok(false) => break 'feed ExchangeEnd::CallerHungUp,
+                Err(end) => break 'feed end,
+            }
+            loop {
+                tokio::select! {
+                    out = outbound.recv() => match out {
+                        // A head after the first item is refused at the
+                        // connection; one reaching the wire is a bug, loud
+                        // and skipped.
+                        Some(Outbound::Head(_)) => tracing::error!(
+                            target: "weft_engine::caller_conn",
+                            %execution_id, "a response head reached a stream already under way"
+                        ),
+                        Some(Outbound::Chunk(c)) => {
                             let sent = async { tx.send(Ok(chunk_to_bytes(&c))).await.is_ok() };
-                            // The program answered: a last write the caller no
-                            // longer reads still ends the exchange on the
-                            // program's side, never as a hang-up (which would
-                            // cancel a run that already answered).
-                            if let Err(end) = write_or_end(sent, tx.closed(), session.as_mut()).await {
-                                break end;
+                            match write_or_end(sent, tx.closed(), &mut session).await {
+                                Ok(true) => {}
+                                Ok(false) => break 'feed ExchangeEnd::CallerHungUp,
+                                Err(end) => break 'feed end,
                             }
                         }
-                        break ExchangeEnd::ResponseComplete;
-                    }
-                    Some(Outbound::Error(msg)) => {
-                        // Before the first byte the status line is still
-                        // ours to set: a real error status with the
-                        // message as the body (nothing is queued ahead of
-                        // it yet, so it never waits). After streaming
-                        // started the status is committed, so the error
-                        // goes in-band, then the stream closes.
-                        if head.is_pending() {
-                            head.commit_error();
-                            let _ = tx.try_send(Ok(msg.into_bytes()));
-                        } else {
-                            let line = head.in_band_error(&msg);
-                            let sent = async { tx.send(Ok(line)).await.is_ok() };
-                            // The program answered: a last write the caller no
-                            // longer reads still ends the exchange on the
-                            // program's side, never as a hang-up (which would
-                            // cancel a run that already answered).
-                            if let Err(end) = write_or_end(sent, tx.closed(), session.as_mut()).await {
-                                break end;
+                        Some(Outbound::Terminate(last, _close)) => {
+                            if let Some(c) = last {
+                                let sent = async { tx.send(Ok(chunk_to_bytes(&c))).await.is_ok() };
+                                // The program answered: a last write the
+                                // caller no longer reads still ends the
+                                // exchange on the program's side, never as
+                                // a hang-up (which would cancel a run that
+                                // already answered).
+                                if let Err(end) = write_or_end(sent, tx.closed(), &mut session).await {
+                                    break 'feed end;
+                                }
+                            }
+                            break 'feed ExchangeEnd::ResponseComplete;
+                        }
+                        // The status is committed, so the error goes
+                        // in-band, then the stream closes.
+                        Some(Outbound::Error(message)) => {
+                            let sent = async { tx.send(Ok(head.in_band_error(&message))).await.is_ok() };
+                            if let Err(end) = write_or_end(sent, tx.closed(), &mut session).await {
+                                break 'feed end;
+                            }
+                            break 'feed ExchangeEnd::ResponseErrored;
+                        }
+                        None => break 'feed ExchangeEnd::OutboundQueueClosed,
+                    },
+                    // The caller's side of the body is gone.
+                    _ = tx.closed() => break 'feed ExchangeEnd::CallerHungUp,
+                    // Quiet body: write the framing's filler, and a failed
+                    // write is the caller gone.
+                    _ = async { heartbeat.as_mut().expect("armed").tick().await }, if heartbeat.is_some() => {
+                        if let Some(filler) = head.keepalive.as_deref() {
+                            let sent = async { tx.send(Ok(filler.as_bytes().to_vec())).await.is_ok() };
+                            match write_or_end(sent, tx.closed(), &mut session).await {
+                                Ok(true) => {}
+                                Ok(false) => break 'feed ExchangeEnd::CallerHungUp,
+                                Err(end) => break 'feed end,
                             }
                         }
-                        break ExchangeEnd::ResponseErrored;
                     }
-                    None => break ExchangeEnd::OutboundQueueClosed,
-                },
-                // The caller's side of the body is gone: the connection
-                // dropped, or the handler was dropped before the head.
-                _ = tx.closed() => break ExchangeEnd::CallerHungUp,
-                // Quiet body: write the framing's filler, and a failed
-                // write is the caller gone.
-                _ = async { heartbeat.as_mut().unwrap().tick().await }, if heartbeat.is_some() => {
-                    if let Some(filler) = head.keepalive() {
-                        let sent = async { tx.send(Ok(filler.as_bytes().to_vec())).await.is_ok() };
-                        match write_or_end(sent, tx.closed(), session.as_mut()).await {
-                            Ok(true) => {}
-                            Ok(false) => break ExchangeEnd::CallerHungUp,
-                            Err(end) => break end,
-                        }
-                    }
+                    // Session cap: a configured `max_session_secs` ceiling
+                    // on the total exchange (0 = no cap, the future never
+                    // resolves). The ONLY deadline on a live exchange;
+                    // per-message waits are unbounded (a node may
+                    // legitimately wait hours).
+                    _ = &mut session => break 'feed ExchangeEnd::SessionCapExceeded,
                 }
-                // Session cap: a configured `max_session_secs` ceiling on the
-                // total exchange (0 = no cap, the future never resolves). The
-                // ONLY deadline on a live exchange; per-message waits are
-                // unbounded (a node may legitimately wait hours).
-                _ = &mut session => break ExchangeEnd::SessionCapExceeded,
             }
         };
-        // Ended with the head still held (the run finished, was cut, or
-        // the queue closed without a word to the caller): say so with a
-        // real status instead of hanging up mid-handshake. Nothing is
-        // queued ahead of it while the head is held, so it never waits.
-        if head.is_pending() {
-            head.commit_error();
-            let _ = tx.try_send(Ok(format!("no response from the program: {}", reason.as_str()).into_bytes()));
-        }
-        // The exchange ended: stop producers (a blocked send now errors) and
-        // mark the caller gone for this run. A tied run is cancelled only
-        // when the CALLER ended it; a run that answered finishes on its own.
-        outbound.close();
-        conn.mark_disconnected(reason.as_str());
-        registry.detach(execution_id);
-        if reason.caller_initiated()
-            && matches!(resolve_disconnect(policy), DisconnectAction::CancelExecution)
-        {
-            canceller.cancel(execution_id, weft_core::exec::CancelCause::CallerGone);
-        }
+        // The exchange ended: stop producers (a blocked send now errors);
+        // a tied run is cancelled only when the CALLER ended it, and a run
+        // that answered finishes on its own.
+        exchange_ended(&conn, &outbound, canceller.as_ref(), execution_id, end);
     });
-
-    // HOLD the response until the program's first item decides the head.
-    // A dropped sender means the drainer ended without committing one,
-    // which the drainer itself prevents above; answering 500 keeps that
-    // path loud rather than a hang.
-    let head = match head_rx.await {
-        Ok(h) => h,
-        Err(_) => ResponseHead::new(500)
-            .with_content_type_for(&OutboundChunk::Text(String::new())),
-    };
-    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    let body = axum::body::Body::from_stream(stream);
-    build_response(&head, body)
-}
-
-/// The response head while it is still the program's to decide: an
-/// explicit `Head` item parks here until the item it precedes arrives,
-/// and the first item on the wire commits it (with the defaults filled
-/// in) through the oneshot the handler is waiting on. Pure state machine
-/// over the drainer's items; `commit_for` reports whether the handler
-/// was still there to receive the head.
-struct HeldHead {
-    tx: Option<tokio::sync::oneshot::Sender<ResponseHead>>,
-    explicit: Option<ResponseHead>,
-    /// The head that went out, `None` until then. It names the body's
-    /// framing: the filler the drainer writes on a quiet heartbeat (see
-    /// `ResponseHead::keepalive`) and how an error is written in-band.
-    committed: Option<ResponseHead>,
-}
-
-impl HeldHead {
-    fn new(tx: tokio::sync::oneshot::Sender<ResponseHead>) -> Self {
-        Self { tx: Some(tx), explicit: None, committed: None }
-    }
-
-    fn is_pending(&self) -> bool {
-        self.tx.is_some()
-    }
-
-    fn keepalive(&self) -> Option<&str> {
-        self.committed.as_ref().and_then(|h| h.keepalive.as_deref())
-    }
-
-    /// The error written into a body already under way, in the
-    /// committed head's framing (see `ResponseHead::in_band_error`).
-    fn in_band_error(&self, message: &str) -> Vec<u8> {
-        match &self.committed {
-            Some(head) => head.in_band_error(message),
-            None => ResponseHead::default().in_band_error(message),
-        }
-    }
-
-    /// The program set the head explicitly; it goes out with the item
-    /// that follows. A head arriving after the commit is a connection
-    /// bug (the connection refuses it), reported loud and ignored.
-    fn explicit(&mut self, head: ResponseHead) {
-        if self.tx.is_none() {
-            tracing::error!(
-                target: "weft_engine::caller_conn",
-                "a response head reached the drainer after the head was committed; \
-                 the connection should have refused it"
-            );
-            return;
-        }
-        self.explicit = Some(head);
-    }
-
-    /// Commit the head for the first item on the wire. `chunk` is the
-    /// item's body when it has one: it supplies the content type the
-    /// head does not name. No chunk and no explicit head is `204`. A
-    /// later call is a no-op. Returns `false` when the handler already
-    /// went away (the caller hung up before the first byte).
-    fn commit_for(&mut self, chunk: Option<&OutboundChunk>) -> bool {
-        let Some(tx) = self.tx.take() else { return true };
-        let head = match (self.explicit.take(), chunk) {
-            (Some(h), Some(c)) => h.with_content_type_for(c),
-            (Some(h), None) => h,
-            (None, Some(c)) => ResponseHead::default().with_content_type_for(c),
-            (None, None) => ResponseHead::new(204),
-        };
-        self.committed = Some(head.clone());
-        tx.send(head).is_ok()
-    }
-
-    /// Commit a `500` with a text body: the program failed (or ended
-    /// silent) before the first byte, so the status line can still say so.
-    fn commit_error(&mut self) {
-        if let Some(tx) = self.tx.take() {
-            let _ = tx.send(
-                ResponseHead::new(500).with_content_type_for(&OutboundChunk::Text(String::new())),
-            );
-        }
-    }
+    axum::body::Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))
 }
 
 /// The axum response for a committed head: its status, its headers, and
@@ -1879,49 +1844,30 @@ fn build_response(head: &ResponseHead, body: axum::body::Body) -> Response {
     }
 }
 
-/// What a second HTTP caller on one exchange is told.
-const EXCHANGE_TAKEN: &str = "this exchange already has a caller: a routing token opens one connection, and \
-     using it twice does not make a second one. Call the route again.";
-
-/// WebSocket path: bridge the socket to the connection. Spawns the read
-/// pump (decode caller frames -> broadcast inbound), the write pump (drain
-/// outbound -> frames), and the heartbeat (ping on a timer).
-#[allow(clippy::too_many_arguments)]
-async fn drive_ws(
-    mut socket: WebSocket,
-    state: ConnServerState,
-    execution_id: ExecutionId,
+/// What a socket's task needs to bridge the socket to its connection.
+struct SocketPump {
+    conn: Arc<LiveCallerConnection>,
+    outbound: Arc<OutboundQueue>,
+    inbound: InboundLog,
     config: CallerRuntimeConfig,
     heartbeat_secs: u64,
-    request: Arc<LiveRequest>,
-    journal: Arc<dyn CallerJournalSink>,
-    unattached: Unattached,
-) {
-    let (conn, outbound, inbound) =
-        new_connection(config.clone(), execution_id, request, None, journal.clone());
-    let inbound = inbound.expect("websocket connection has an inbound channel");
-    unattached.attaching();
-    if !state.registry.attach(execution_id, conn.clone()) {
-        // The socket is already upgraded here, so the only way to say
-        // no is to close it. One exchange, one connection: the run is
-        // already talking to the first socket and would never answer
-        // this one. Nothing is journaled: this socket was never part of
-        // the run, and a disconnect row would read as its caller leaving.
-        let _ = socket
-            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                code: 1008, // policy violation
-                // A close reason carries at most 123 bytes: the short form.
-                reason: "this exchange already has a caller".into(),
-            })))
-            .await;
-        return;
-    }
+    clock: Arc<dyn weft_platform_traits::Clock>,
+    canceller: Arc<dyn ExecutionCanceller>,
+    execution_id: ExecutionId,
+}
+
+/// WebSocket path: bridge the socket to the connection, on the socket's
+/// one task: the read pump (decode caller frames -> broadcast inbound), the
+/// write pump (drain outbound -> frames), and the heartbeat (ping on a
+/// timer).
+async fn pump_ws(mut socket: WebSocket, pump: SocketPump, unopened: Unopened) {
+    let SocketPump { conn, outbound, inbound, config, heartbeat_secs, clock, canceller, execution_id } = pump;
+    unopened.opened();
+    conn.caller_arrived();
 
     let data_type = config.data_type;
     let max_inbound = config.max_inbound_bytes;
-    let policy = config.suspend;
-    let session = session_deadline(&state.clock, config.max_session_secs);
-    tokio::pin!(session);
+    let mut session = session_deadline(&clock, config.max_session_secs);
 
     // Single task owns the socket (recv + send are on one WebSocket).
     // Outbound chunks and heartbeat pings funnel through a select. Build the
@@ -1984,7 +1930,7 @@ async fn drive_ws(
                 // unacknowledged, or behind a closed window, that long.
                 Some(Outbound::Chunk(c)) => {
                     let sent = async { socket.send(chunk_to_ws(&c)).await.is_ok() };
-                    match write_or_end(sent, std::future::pending(), session.as_mut()).await {
+                    match write_or_end(sent, std::future::pending(), &mut session).await {
                         Ok(true) => {}
                         Ok(false) => break ExchangeEnd::CallerHungUpOnSend,
                         Err(end) => break end,
@@ -2003,7 +1949,7 @@ async fn drive_ws(
                     };
                     // The program ended it: a close the caller no longer
                     // reads is still the program's end, never a hang-up.
-                    if let Err(end) = write_or_end(sent, std::future::pending(), session.as_mut()).await {
+                    if let Err(end) = write_or_end(sent, std::future::pending(), &mut session).await {
                         break end;
                     }
                     break ExchangeEnd::SessionClosedByProgram;
@@ -2017,7 +1963,7 @@ async fn drive_ws(
                     };
                     // The program ended it: a close the caller no longer
                     // reads is still the program's end, never a hang-up.
-                    if let Err(end) = write_or_end(sent, std::future::pending(), session.as_mut()).await {
+                    if let Err(end) = write_or_end(sent, std::future::pending(), &mut session).await {
                         break end;
                     }
                     break ExchangeEnd::SessionErroredByProgram;
@@ -2029,7 +1975,7 @@ async fn drive_ws(
             // `Some`); otherwise it is permanently disabled.
             _ = async { heartbeat.as_mut().unwrap().tick().await }, if heartbeat.is_some() => {
                 let sent = async { socket.send(Message::Ping(Vec::new().into())).await.is_ok() };
-                match write_or_end(sent, std::future::pending(), session.as_mut()).await {
+                match write_or_end(sent, std::future::pending(), &mut session).await {
                     Ok(true) => {}
                     Ok(false) => break ExchangeEnd::CallerMissedHeartbeat,
                     Err(end) => break end,
@@ -2042,19 +1988,11 @@ async fn drive_ws(
     };
 
     // Wake any node parked in receive() so it unblocks (the log is now
-    // closed; a caught-up reader gets a disconnect) and any producer blocked
-    // on a full outbound queue (its send now errors).
+    // closed; a caught-up reader gets a disconnect); a tied run is cancelled
+    // only when the CALLER ended the exchange, and a socket the program
+    // closed leaves the run to finish.
     inbound.close();
-    outbound.close();
-    conn.mark_disconnected(reason.as_str());
-    state.registry.detach(execution_id);
-    // A tied run is cancelled only when the CALLER ended the exchange;
-    // a socket the program closed leaves the run to finish.
-    if reason.caller_initiated()
-        && matches!(resolve_disconnect(policy), DisconnectAction::CancelExecution)
-    {
-        state.canceller.cancel(execution_id, weft_core::exec::CancelCause::CallerGone);
-    }
+    exchange_ended(&conn, &outbound, canceller.as_ref(), execution_id, reason);
 }
 
 #[cfg(test)]
@@ -2062,26 +2000,22 @@ mod tests {
     use super::*;
     use weft_core::caller::CallerHandle;
     use weft_core::signal::DataType;
-    use weft_core::wait::SuspendPolicy;
 
-    const PROJECT: uuid::Uuid = uuid::Uuid::from_u128(1);
-
-    /// An error after the head went out is written in the framing that
-    /// head committed: a JSON line for a JSON-lines stream, a text line
-    /// for a text one.
+    /// The head an answer goes out under is the program's own, else the
+    /// default for its first item, and an error after it went out is
+    /// written in the framing it committed: a JSON line for a JSON-lines
+    /// stream, a text line for a text one.
     #[test]
-    fn held_head_writes_the_error_in_the_committed_framing() {
-        let (tx, _rx) = tokio::sync::oneshot::channel();
-        let mut ndjson = HeldHead::new(tx);
-        ndjson.explicit(ResponseHead::new(200).with_header("content-type", "application/x-ndjson").with_keepalive("\n"));
-        assert!(ndjson.commit_for(Some(&OutboundChunk::Text("{\"a\":1}\n".into()))));
+    fn the_committed_head_decides_the_framing() {
+        let ndjson = committed_head(
+            Some(ResponseHead::new(200).with_header("content-type", "application/x-ndjson").with_keepalive("\n")),
+            Some(&OutboundChunk::Text("{\"a\":1}\n".into())),
+        );
         assert_eq!(ndjson.in_band_error("boom"), b"\n{\"error\":\"boom\"}\n");
-        assert_eq!(ndjson.keepalive(), Some("\n"), "the filler still comes off the committed head");
-
-        let (tx, _rx) = tokio::sync::oneshot::channel();
-        let mut text = HeldHead::new(tx);
-        assert!(text.commit_for(Some(&OutboundChunk::Text("partial".into()))));
+        assert_eq!(ndjson.keepalive.as_deref(), Some("\n"), "the filler comes off the committed head");
+        let text = committed_head(None, Some(&OutboundChunk::Text("partial".into())));
         assert_eq!(text.in_band_error("boom"), b"\n[error] boom");
+        assert_eq!(committed_head(None, None).status, 204, "no body and no head is a 204");
     }
 
     /// Recording journal sink: appends every event so tests assert the
@@ -2112,9 +2046,8 @@ mod tests {
             self.events.lock().unwrap().push(format!("disconnected@{off}"));
         }
 
-        fn close(&self) -> futures::future::BoxFuture<'static, ()> {
+        fn close(&self) {
             // Every row above is written as it is handed over.
-            Box::pin(std::future::ready(()))
         }
     }
 
@@ -2124,24 +2057,22 @@ mod tests {
             data_type: DataType::Json,
             backpressure: Backpressure::Block,
             error_mode: weft_core::signal::ErrorMode::Surface,
-            connect_timeout_secs: 1,
             max_inbound_bytes: 1024,
             caller_silence_secs: weft_core::signal::DEFAULT_CALLER_SILENCE_SECS,
             max_session_secs: 0,
-            suspend: SuspendPolicy { can_suspend: false, default_hold_secs: 300 },
+            outlives_caller: false,
             inbound_window: 4,
             journal: weft_core::stream_journal::JournalPolicy::default(),
         }
     }
 
+    /// A socket's leaving is recorded once, however many sides say so.
     #[tokio::test]
-    async fn socket_disconnect_is_recorded_after_registry_cleanup() {
+    async fn a_sockets_disconnect_is_recorded_once() {
         let journal = Arc::new(RecordingSink::default());
         let (conn, _, _) = new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, journal.clone());
-        let registry = CallerRegistry::new();
-        assert!(registry.attach(ExecutionId::nil(), conn.clone()), "the first caller attaches");
+        conn.caller_arrived();
         conn.terminate(None, None, None).await.unwrap();
-        registry.detach(ExecutionId::nil());
         conn.mark_disconnected("socket closed");
         conn.mark_disconnected("socket closed again");
         assert_eq!(journal.events.lock().unwrap().iter().filter(|event| event.starts_with("disconnected@")).count(), 1);
@@ -2152,7 +2083,7 @@ mod tests {
         let sink = Arc::new(RecordingSink::default());
         let (conn, out_rx, _inb) =
             new_connection(ws_cfg(), ExecutionId::nil(), Arc::new(LiveRequest::default()), None, sink.clone());
-        assert!(CallerRegistry::new().attach(ExecutionId::nil(), conn.clone()), "admitted");
+        conn.caller_arrived();
         let handle = CallerHandle::from_connection(conn.clone());
         let CallerHandle::Websocket(ws) = handle else { unreachable!() };
         ws.send(OutboundChunk::Json(serde_json::json!("hi"))).await.unwrap();
@@ -2346,10 +2277,7 @@ mod tests {
     /// `receive()` is UNBOUNDED: no deadline ends it. A node parked on
     /// the next message waits indefinitely; the only ways out are a message
     /// arriving or the connection closing, which yields `Disconnected`.
-    /// Regression for the bug where `receive()` was bounded by
-    /// the connect timeout and a quiet caller killed the node.
-    /// A late message (arriving after the connect timeout would have fired)
-    /// is still delivered: proves the wait is genuinely unbounded, not just
+    /// A late message is still delivered: the wait is unbounded, not just
     /// "returns Disconnected eventually".
     #[tokio::test]
     async fn receive_delivers_a_late_message() {
@@ -2361,9 +2289,8 @@ mod tests {
         };
         let cursor = ws.cursor();
         let recv = tokio::spawn(async move { cursor.receive().await });
-        // Arrive "late" (well past the 1s connect timeout in real terms; we
-        // use a short sleep to keep the test fast while still ordering the
-        // push after the receive has parked).
+        // Arrive "late": a short sleep orders the push after the receive
+        // has parked.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         inbound.push(InboundMessage::Json(serde_json::json!("late")));
         let got = recv.await.expect("joins").expect("a message, not an error");
@@ -2378,31 +2305,10 @@ mod tests {
         use weft_platform_traits::{Clock, FakeClock};
         let clock: Arc<dyn Clock> = FakeClock::new();
         // cap=0 means no cap: the future must still be pending after a poll.
-        let never = session_deadline(&clock, 0);
-        tokio::pin!(never);
-        assert!(
-            futures_poll_pending(&mut never),
-            "cap=0 must never resolve (no session cap)"
-        );
+        let mut never = session_deadline(&clock, 0);
+        assert!(futures::FutureExt::now_or_never(&mut never).is_none(), "cap=0 must never resolve (no session cap)");
         // cap>0 resolves (FakeClock::sleep advances itself and returns).
         session_deadline(&clock, 30).await;
-    }
-
-    /// Poll a pinned future once; return true if it is still Pending. A tiny
-    /// helper so the no-cap test can assert "does not resolve" without a real
-    /// timeout race.
-    fn futures_poll_pending<F: std::future::Future>(
-        fut: &mut std::pin::Pin<&mut F>,
-    ) -> bool {
-        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-        fn noop(_: *const ()) {}
-        fn clone(_: *const ()) -> RawWaker {
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
-        let mut cx = Context::from_waker(&waker);
-        matches!(fut.as_mut().poll(&mut cx), Poll::Pending)
     }
 
     // ----- OutboundQueue backpressure policies (the real DropOldest) --------
@@ -2505,13 +2411,6 @@ mod tests {
 
     // ----- The held head: what the first outbound item decides ----------
 
-    struct NoResolver;
-    impl ConnConfigResolver for NoResolver {
-        fn resolve(&self, _execution_id: ExecutionId) -> Option<ResolvedLiveStart> {
-            None
-        }
-    }
-
     #[derive(Default)]
     struct RecordingCanceller {
         cancelled: Mutex<Vec<ExecutionId>>,
@@ -2526,345 +2425,162 @@ mod tests {
         CallerRuntimeConfig { protocol: Protocol::Http, ..ws_cfg() }
     }
 
-    /// Every run the server tried to claim, and whether the claim finds
-    /// one here (unless told otherwise, it does).
+    /// Every run the server was asked to bear: none is born here (it
+    /// records and refuses).
     #[derive(Default)]
     struct RecordingStarter {
-        started: Mutex<Vec<ExecutionId>>,
-        taken_elsewhere: std::sync::atomic::AtomicBool,
+        started: Mutex<Vec<String>>,
     }
     #[async_trait]
     impl LiveStarter for RecordingStarter {
-        async fn start(&self, execution_id: ExecutionId) -> anyhow::Result<LiveClaim> {
-            self.started.lock().unwrap().push(execution_id);
-            Ok(if self.taken_elsewhere.load(std::sync::atomic::Ordering::SeqCst) {
-                LiveClaim::NotHere
-            } else {
-                LiveClaim::Ready
-            })
+        async fn bear(&self, admitted: Box<crate::door::Admitted>) -> Result<Born, Response> {
+            self.started.lock().unwrap().push(admitted.trigger.token.clone());
+            Err((StatusCode::SERVICE_UNAVAILABLE, "recorded").into_response())
         }
     }
 
     fn server_state() -> (ConnServerState, Arc<RecordingCanceller>) {
         let canceller = Arc::new(RecordingCanceller::default());
+        let broker = crate::door::fake::FakeDoorBroker::new(vec![crate::door::fake::route("t1", "route", "chat/{room}")]);
         let state = ConnServerState {
-            registry: CallerRegistry::new(),
-            token_secret: Arc::new(Vec::new()),
-            project_id: PROJECT,
+            door: crate::door::fake::door(broker),
+            weft_hop: crate::worker::WeftCredential::of(&weft_core::caller_token::ProjectSecret::of(b"install", uuid::Uuid::from_u128(7))),
             starter: Arc::new(RecordingStarter::default()),
-            resolver: Arc::new(NoResolver),
             clock: weft_platform_traits::FakeClock::new(),
             canceller: canceller.clone(),
         };
         (state, canceller)
     }
 
-    /// `server_state`, with the starter it records into.
-    fn recording_server_state() -> (ConnServerState, Arc<RecordingStarter>) {
+    /// Weft's relay is believed about the caller only on a hop carrying
+    /// weft's credential, and every trace of the hop is gone from what the
+    /// door and the run read: the caller's own `Host` is back.
+    #[test]
+    fn only_weft_relay_names_the_caller_and_the_hop_leaves_no_trace() {
+        use weft_core::net::relay_hop;
+        let secret = weft_core::caller_token::ProjectSecret::of(b"install", uuid::Uuid::from_u128(7));
+        let weft = crate::worker::WeftCredential::of(&secret);
+        let key = secret.worker_door_key();
+        let hop = |credential: &str| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(weft_platform_traits::WORKER_AUTH_HEADER, format!("Bearer {credential}").parse().unwrap());
+            headers.insert(relay_hop::CALLER_ADDRESS, "203.0.113.9".parse().unwrap());
+            headers.insert(relay_hop::CALLER_HOST, "api.example.com".parse().unwrap());
+            headers.insert(relay_hop::ROUTE_PREFIX, "/connect/acme".parse().unwrap());
+            headers.insert("host", "127.0.0.1:49153".parse().unwrap());
+            headers.insert("authorization", "Bearer the-callers-own".parse().unwrap());
+            headers
+        };
+        let mut relayed = hop(&key);
+        assert_eq!(
+            relayed_by_weft(&weft, &mut relayed).unwrap(),
+            Some(Relayed { caller: "203.0.113.9".parse().unwrap(), route_prefix: "/connect/acme".into() })
+        );
+        let left: Vec<&str> = relayed.keys().map(|k| k.as_str()).collect();
+        assert_eq!(left, vec!["host", "authorization"], "{left:?}");
+        assert_eq!(relayed["host"], "api.example.com");
+        let mut forged = hop("00");
+        assert_eq!(relayed_by_weft(&weft, &mut forged).unwrap(), None);
+        assert_eq!(forged.keys().map(|k| k.as_str()).collect::<Vec<_>>(), vec!["host", "authorization"]);
+        assert_eq!(forged["host"], "127.0.0.1:49153", "a caller's word on its host is not taken either");
+        let mut unnamed = hop(&key);
+        unnamed.remove(relay_hop::CALLER_ADDRESS);
+        assert!(relayed_by_weft(&weft, &mut unnamed).is_err(), "weft's relay always names the caller");
+    }
+
+    /// A caller is checked at the door before anything starts, and a call
+    /// the door lets in is handed to the starter.
+    #[tokio::test]
+    async fn a_caller_goes_through_the_door_before_a_run_starts() {
+        use tower::ServiceExt as _;
         let (mut state, _) = server_state();
         let starter = Arc::new(RecordingStarter::default());
         state.starter = starter.clone();
-        (state, starter)
-    }
-
-    fn routing_token(secret: &[u8], project: uuid::Uuid, exp: i64) -> (String, ExecutionId) {
-        // An open route: the gate approved nobody, so there is no
-        // request to hold this caller to.
-        approving_token(secret, project, exp, None)
-    }
-
-    fn approving_token(
-        secret: &[u8],
-        project: uuid::Uuid,
-        exp: i64,
-        approved: Option<caller_token::RequestFingerprint>,
-    ) -> (String, ExecutionId) {
-        let execution_id = ExecutionId::new_v4();
-        let token = caller_token::mint(
-            secret,
-            &caller_token::CallerTokenClaims {
-                execution_id,
-                project_id: project,
-                binary_hash: "bin-1".into(),
-                approved,
-                exp,
-            },
-        );
-        (token, execution_id)
-    }
-
-    /// The door opens for the call that was made, and for no other.
-    ///
-    /// The gate runs at the dispatcher and the program runs on the
-    /// worker, and a browser's socket opens at the worker's door after
-    /// the gate checked its plain request, so without this the caller
-    /// could get a signature checked against one request and then open
-    /// its socket with a different one. The token
-    /// carries a fingerprint of what was approved; the worker takes the
-    /// fingerprint of what actually arrived and compares.
-    ///
-    /// The refusal comes BEFORE the run is claimed, which is the half
-    /// that matters: a rejected caller must start nothing.
-    #[tokio::test]
-    async fn a_door_opens_only_for_the_request_it_was_given_for() {
-        use tower::ServiceExt as _;
-        let approved = caller_token::RequestFingerprint::of(
-            "POST",
-            "chat/room7",
-            "verbose=1",
-            b"{\"say\":\"hi\"}",
-        );
-        // Each case is one thing changed against what was approved.
-        let cases: Vec<(&str, &str, &str, &str)> = vec![
-            ("the body", "POST", "verbose=1", "{\"say\":\"everything\"}"),
-            ("the method", "PUT", "verbose=1", "{\"say\":\"hi\"}"),
-            ("the query", "POST", "verbose=2", "{\"say\":\"hi\"}"),
-            ("a dropped query", "POST", "", "{\"say\":\"hi\"}"),
-        ];
-        for (changed, method, query, body) in cases {
-            let (state, starter) = recording_server_state();
-            let (token, _) = approving_token(
-                &[],
-                PROJECT,
-                state.clock.now_unix() + 60,
-                Some(approved.clone()),
-            );
-            let uri = if query.is_empty() { "/chat/room7".to_string() } else { format!("/chat/room7?{query}") };
-            let request = axum::http::Request::builder()
-                .method(method)
-                .uri(uri)
-                .header(caller_token::TICKET_HEADER, &token)
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(body.to_string()))
-                .unwrap();
-            let response = connection_router(state).oneshot(request).await.unwrap();
-            assert_eq!(
-                response.status(),
-                StatusCode::FORBIDDEN,
-                "changing {changed} must not open the door"
-            );
-            assert!(
-                starter.started.lock().unwrap().is_empty(),
-                "changing {changed} still started the run"
-            );
-        }
-    }
-
-    /// The same door, used for the request it was actually given for:
-    /// it opens, and the run is claimed. Without this the test above
-    /// would pass just as well on a worker that refused everything.
-    ///
-    /// The routing token rides a header of its own, so the query the
-    /// worker fingerprints is byte-exact the one the dispatcher hashed,
-    /// which is what this pins.
-    #[tokio::test]
-    async fn the_approved_request_is_let_through() {
-        use tower::ServiceExt as _;
-        let (state, starter) = recording_server_state();
-        let approved = caller_token::RequestFingerprint::of(
-            "POST",
-            "chat/room7",
-            "verbose=1&page=2",
-            b"{\"say\":\"hi\"}",
-        );
-        let (token, _) =
-            approving_token(&[], PROJECT, state.clock.now_unix() + 60, Some(approved));
-        let request = axum::http::Request::builder()
-            .method("POST")
-            .uri("/chat/room7?verbose=1&page=2")
-            .header(caller_token::TICKET_HEADER, &token)
-            .header("content-type", "application/json")
-            .body(axum::body::Body::from("{\"say\":\"hi\"}"))
-            .unwrap();
-        let response = connection_router(state).oneshot(request).await.unwrap();
-        assert_ne!(response.status(), StatusCode::FORBIDDEN, "the door was given for this call");
-        assert_eq!(starter.started.lock().unwrap().len(), 1, "the run was claimed");
-    }
-
-    /// One door, one connection. A routing token is spent when it is
-    /// used: a second caller holding a copy of it finds the exchange
-    /// taken, and the run keeps talking to the caller it already has
-    /// rather than being handed to whoever arrived last.
-    #[tokio::test]
-    async fn a_second_caller_cannot_take_over_an_exchange() {
-        let execution_id = ExecutionId::new_v4();
-        let sink = Arc::new(RecordingSink::default());
-        let (first, _, _) =
-            new_connection(ws_cfg(), execution_id, Arc::new(LiveRequest::default()), None, sink.clone());
-        let (second, _, _) =
-            new_connection(ws_cfg(), execution_id, Arc::new(LiveRequest::default()), None, sink.clone());
-        let registry = CallerRegistry::new();
-        assert!(registry.attach(execution_id, first.clone()), "the first caller is admitted");
-        assert!(!registry.attach(execution_id, second), "the second is refused");
-        assert!(
-            Arc::ptr_eq(&registry.get(execution_id).expect("the exchange still has its caller"), &first),
-            "the run keeps the caller it already had"
-        );
-        // The refused caller left nothing in the run: only the first
-        // caller's arrival is journaled, and no disconnect reads as the
-        // live caller leaving.
-        assert_eq!(sink.events(), vec!["connected@0".to_string()]);
-    }
-
-    /// A caller with a valid ticket, holding the request it was given for,
-    /// has the run it names claimed here: the run was born at their
-    /// handshake and waits for the worker their connection reaches.
-    #[tokio::test]
-    async fn an_arriving_caller_has_their_run_claimed_here() {
-        use tower::ServiceExt as _;
-        let (state, starter) = recording_server_state();
-        let (token, execution_id) = routing_token(&[], PROJECT, state.clock.now_unix() + 60);
-        let request = axum::http::Request::builder()
-            .method("POST")
-            .uri("/chat/room7")
-            .header(caller_token::TICKET_HEADER, &token)
-            .body(axum::body::Body::from("{}"))
-            .unwrap();
-        // No resolver answers here (the drive is a recording), so the
-        // connection itself is refused; what matters is the claim.
-        let _ = connection_router(state).oneshot(request).await.unwrap();
-        assert_eq!(*starter.started.lock().unwrap(), vec![execution_id]);
-    }
-
-    /// A caller refused after their run was claimed, before attaching
-    /// (here a body over the route's cap), cancels the run: otherwise it
-    /// would wait out its connect timeout and run with nobody there.
-    #[tokio::test]
-    async fn a_caller_refused_after_the_claim_cancels_the_run() {
-        let (state, canceller) = server_state();
-        let execution_id = ExecutionId::new_v4();
-        let cfg = CallerRuntimeConfig { max_inbound_bytes: 4, ..http_cfg() };
-        let response = drive_http(
-            state.clone(),
-            execution_id,
-            cfg,
-            0,
-            Arc::new(LiveRequest::default()),
-            Arc::new(RecordingSink::default()),
-            axum::body::Body::from("far more than four bytes"),
-            Unattached::new(state.canceller.clone(), execution_id),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(*canceller.cancelled.lock().unwrap(), vec![execution_id]);
-    }
-
-    /// A copy of the caller's request that the platform handed to another
-    /// worker finds the run already claimed by the first, and is told so
-    /// at once rather than left waiting for a run that is not here.
-    #[tokio::test]
-    async fn a_run_claimed_elsewhere_is_refused_here() {
-        use tower::ServiceExt as _;
-        let (state, starter) = recording_server_state();
-        starter.taken_elsewhere.store(true, std::sync::atomic::Ordering::SeqCst);
-        let (token, _) = routing_token(&[], PROJECT, state.clock.now_unix() + 60);
-        let request = axum::http::Request::builder()
-            .method("POST")
-            .uri("/chat/room7")
-            .header(caller_token::TICKET_HEADER, &token)
-            .body(axum::body::Body::from("{}"))
-            .unwrap();
-        let response = connection_router(state).oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("already used"), "{body:?}");
-    }
-
-    /// A caller who took too long gets told so, in words that say what
-    /// to do, and leaves no execution behind.
-    ///
-    /// A late caller reaches something that can read their ticket and
-    /// explain, instead of a socket that simply does not answer.
-    #[tokio::test]
-    async fn a_caller_whose_ticket_ran_out_is_told_to_ask_again() {
-        use tower::ServiceExt as _;
-        let (state, starter) = recording_server_state();
-        let (token, _) = routing_token(&[], PROJECT, state.clock.now_unix() - 1);
-        let request = axum::http::Request::builder()
-            .method("POST")
-            .uri("/chat/room7")
-            .header(caller_token::TICKET_HEADER, &token)
-            .body(axum::body::Body::from("{}"))
-            .unwrap();
-        let response = connection_router(state).oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body = String::from_utf8_lossy(&body);
-        assert!(body.contains("expired"), "the reason is named: {body}");
-        assert!(body.contains("Ask for a new one"), "and what to do about it: {body}");
+        let call = |uri: &str| {
+            let mut request = axum::http::Request::builder().method("POST").uri(uri).body(axum::body::Body::from("{}")).unwrap();
+            request.extensions_mut().insert(axum::extract::ConnectInfo(CallerSocket { socket: None, peer: "10.0.0.1".parse().unwrap() }));
+            request
+        };
+        let refused = connection_router(state.clone()).oneshot(call("/nowhere")).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
         assert!(starter.started.lock().unwrap().is_empty(), "a refused caller starts nothing");
+        let _ = connection_router(state).oneshot(call("/chat/room7")).await.unwrap();
+        assert_eq!(*starter.started.lock().unwrap(), vec!["t1".to_string()]);
     }
 
-    /// A token for another project, or a forged one, never claims a run.
+    /// What an HTTP call brings is read before its run is born: a body
+    /// the run could not read is the caller's answer, and nothing starts.
     #[tokio::test]
-    async fn a_token_for_another_project_claims_nothing() {
+    async fn a_body_the_run_cannot_read_starts_nothing() {
         use tower::ServiceExt as _;
-        let (state, starter) = recording_server_state();
-        let (token, _) = routing_token(&[], uuid::Uuid::from_u128(0xbad), state.clock.now_unix() + 60);
-        let request = axum::http::Request::builder()
-            .method("GET")
-            .uri("/feed")
-            .header(caller_token::TICKET_HEADER, &token)
-            .body(axum::body::Body::empty())
-            .unwrap();
-        let response = connection_router(state).oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(starter.started.lock().unwrap().is_empty());
+        let (mut state, canceller) = server_state();
+        let starter = Arc::new(RecordingStarter::default());
+        state.starter = starter.clone();
+        let mut request = axum::http::Request::builder().method("POST").uri("/chat/room7").body(axum::body::Body::from("not json")).unwrap();
+        request.extensions_mut().insert(axum::extract::ConnectInfo(CallerSocket { socket: None, peer: "10.0.0.1".parse().unwrap() }));
+        let refused = connection_router(state).oneshot(request).await.unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert!(starter.started.lock().unwrap().is_empty(), "no run is born for a body it could not read");
+        assert!(canceller.cancelled.lock().unwrap().is_empty(), "and none is left to cancel");
+        let cfg = CallerRuntimeConfig { max_inbound_bytes: 4, ..http_cfg() };
+        let over = read_body(&cfg, axum::body::Body::from("far more than four bytes")).await.expect_err("over the cap");
+        assert_eq!(over.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    /// Drive one HTTP exchange: attach with `body`, run `program` against
-    /// the attached connection from another task, and hand back the
-    /// response's status, headers and whole body.
-    async fn exchange<F, Fut>(
+    /// One HTTP call's run as the call's task holds it: `program` against
+    /// the connection, with the server state's clock and the canceller.
+    fn run_here<F, Fut>(
+        cfg: CallerRuntimeConfig,
+        request: LiveRequest,
         body: &str,
         program: F,
-    ) -> (StatusCode, Vec<(String, String)>, String)
+    ) -> (RunHere, Arc<dyn weft_platform_traits::Clock>, Arc<RecordingCanceller>)
     where
-        F: FnOnce(Arc<LiveCallerConnection>) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = ()> + Send,
+        F: FnOnce(Arc<LiveCallerConnection>) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        let (answer, _) = exchange_recording(body, program).await;
-        answer
+        let (state, canceller) = server_state();
+        let execution_id = ExecutionId::new_v4();
+        let body = decode_inbound(cfg.data_type, body.as_bytes()).expect("the test's body decodes");
+        let (conn, outbound, _) = new_connection(cfg, execution_id, Arc::new(request), Some(body), Arc::new(RecordingSink::default()));
+        let run: futures::future::BoxFuture<'static, ()> = Box::pin(program(conn.clone()));
+        let here = RunHere { run: Some(run), conn, outbound, canceller: state.canceller.clone(), execution_id };
+        (here, state.clock, canceller)
     }
 
-    /// [`exchange`], plus the canceller, so a test can assert whether the
-    /// exchange's end cancelled the run.
+    /// Drive one HTTP exchange the way the call's task does: [`run_here`]
+    /// polled by [`answer_http`] until it answers. Hands back the
+    /// response, the run's id and the canceller, so a test can read (or
+    /// drop) the body itself and assert whether the exchange's end
+    /// cancelled the run.
+    async fn open_exchange<F, Fut>(
+        cfg: CallerRuntimeConfig,
+        request: LiveRequest,
+        body: &str,
+        heartbeat_secs: u64,
+        program: F,
+    ) -> (Response, ExecutionId, Arc<RecordingCanceller>)
+    where
+        F: FnOnce(Arc<LiveCallerConnection>) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let (here, clock, canceller) = run_here(cfg, request, body, program);
+        let execution_id = here.execution_id;
+        (answer_http(here, heartbeat_secs, clock).await, execution_id, canceller)
+    }
+
+    /// [`open_exchange`] for a `POST chat/room7` carrying `body`, read
+    /// whole: the response's status, headers and body, and the canceller.
     async fn exchange_recording<F, Fut>(
         body: &str,
         program: F,
     ) -> ((StatusCode, Vec<(String, String)>, String), Arc<RecordingCanceller>)
     where
-        F: FnOnce(Arc<LiveCallerConnection>) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = ()> + Send,
+        F: FnOnce(Arc<LiveCallerConnection>) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        let (state, canceller) = server_state();
-        let execution_id = ExecutionId::new_v4();
-        let registry = state.registry.clone();
-        // The program side: wait for the attach, then talk.
-        tokio::spawn(async move {
-            let conn = registry
-                .wait_for_attach(execution_id, std::time::Duration::from_secs(5))
-                .await
-                .expect("the connection attaches");
-            program(conn).await;
-        });
-        let request = Arc::new(LiveRequest {
-            method: "POST".into(),
-            path: "chat/room7".into(),
-            ..Default::default()
-        });
-        let canceller_for_test = state.canceller.clone();
-        let response = drive_http(
-            state,
-            execution_id,
-            http_cfg(),
-            0,
-            request,
-            Arc::new(RecordingSink::default()),
-            axum::body::Body::from(body.to_string()),
-            Unattached::new(canceller_for_test, execution_id),
-        )
-        .await;
+        let request = LiveRequest { method: "POST".into(), path: "chat/room7".into(), ..Default::default() };
+        let (response, _, canceller) = open_exchange(http_cfg(), request, body, 0, program).await;
         let status = response.status();
         let headers = response
             .headers()
@@ -2873,6 +2589,15 @@ mod tests {
             .collect();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         ((status, headers, String::from_utf8(bytes.to_vec()).unwrap()), canceller)
+    }
+
+    /// [`exchange_recording`] without the canceller.
+    async fn exchange<F, Fut>(body: &str, program: F) -> (StatusCode, Vec<(String, String)>, String)
+    where
+        F: FnOnce(Arc<LiveCallerConnection>) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        exchange_recording(body, program).await.0
     }
 
     fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -2893,42 +2618,16 @@ mod tests {
         assert_eq!(body, r#"{"a":1}{"b":2}"#);
     }
 
-    /// Start one HTTP exchange the way a streaming caller does: the
-    /// response comes back as soon as the program commits the head, and
-    /// the test reads (or drops) its body itself. `heartbeat_secs` as
-    /// the worker would pass it.
-    async fn open_exchange<F, Fut>(
-        heartbeat_secs: u64,
-        program: F,
-    ) -> (Response, ExecutionId, Arc<RecordingCanceller>)
+    /// A streaming exchange: `GET feed`, its response handed back as soon
+    /// as the program commits the head. `heartbeat_secs` as the worker
+    /// would pass it.
+    async fn open_feed<F, Fut>(heartbeat_secs: u64, program: F) -> (Response, ExecutionId, Arc<RecordingCanceller>)
     where
-        F: FnOnce(Arc<LiveCallerConnection>) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = ()> + Send,
+        F: FnOnce(Arc<LiveCallerConnection>) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        let (state, canceller) = server_state();
-        let execution_id = ExecutionId::new_v4();
-        let registry = state.registry.clone();
-        tokio::spawn(async move {
-            let conn = registry
-                .wait_for_attach(execution_id, std::time::Duration::from_secs(5))
-                .await
-                .expect("the connection attaches");
-            program(conn).await;
-        });
-        let request = Arc::new(LiveRequest { method: "GET".into(), path: "feed".into(), ..Default::default() });
-        let canceller_for_test = state.canceller.clone();
-        let response = drive_http(
-            state,
-            execution_id,
-            http_cfg(),
-            heartbeat_secs,
-            request,
-            Arc::new(RecordingSink::default()),
-            axum::body::Body::empty(),
-            Unattached::new(canceller_for_test, execution_id),
-        )
-        .await;
-        (response, execution_id, canceller)
+        let request = LiveRequest { method: "GET".into(), path: "feed".into(), ..Default::default() };
+        open_exchange(http_cfg(), request, "", heartbeat_secs, program).await
     }
 
     /// A program that streams a first event under an SSE head and then
@@ -2948,7 +2647,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_quiet_stream_writes_its_filler_on_every_heartbeat() {
         use tokio_stream::StreamExt as _;
-        let (response, _, _) = open_exchange(2, quiet_feed).await;
+        let (response, _, _) = open_feed(2, quiet_feed).await;
         let mut body = response.into_body().into_data_stream();
         let first = body.next().await.unwrap().unwrap();
         assert_eq!(&first[..], b"data: first\n\n");
@@ -2965,7 +2664,7 @@ mod tests {
     #[tokio::test]
     async fn a_caller_leaving_a_quiet_stream_cancels_the_run_without_a_write() {
         use tokio_stream::StreamExt as _;
-        let (response, execution_id, canceller) = open_exchange(0, quiet_feed).await;
+        let (response, execution_id, canceller) = open_feed(0, quiet_feed).await;
         let mut body = response.into_body().into_data_stream();
         let first = body.next().await.unwrap().unwrap();
         assert_eq!(&first[..], b"data: first\n\n");
@@ -2980,49 +2679,29 @@ mod tests {
 
     /// A feed that has not said ANYTHING yet: the bus it watches was
     /// quiet from the moment the route opened, so no head has gone out
-    /// and the drainer has no filler to write. The caller is still owed
-    /// a response, so the handler is parked on the head. When that
-    /// caller goes, hyper drops the handler; nothing of ours is left
-    /// holding the body, and the run has to end there, because the
-    /// heartbeat has no way to find out on its own.
+    /// and there is no body to write filler into. The caller is still
+    /// owed a response, so the call's task is parked on the head. When
+    /// that caller goes, hyper drops the task with the run it was
+    /// polling, and the run has to end there, because the heartbeat has
+    /// no way to find out on its own.
     #[tokio::test]
     async fn a_caller_leaving_before_the_first_byte_still_ends_the_run() {
-        let (state, canceller) = server_state();
-        let execution_id = ExecutionId::new_v4();
-        let registry = state.registry.clone();
-        tokio::spawn(async move {
-            let conn = registry
-                .wait_for_attach(execution_id, std::time::Duration::from_secs(5))
-                .await
-                .expect("the connection attaches");
+        let request = LiveRequest { method: "GET".into(), path: "feed".into(), ..Default::default() };
+        let (here, clock, canceller) = run_here(http_cfg(), request, "", |conn| async move {
             let CallerHandle::Http(_http) = CallerHandle::from_connection(conn) else { unreachable!() };
             // Never writes: the watched table never changed.
             std::future::pending::<()>().await;
         });
-        let request = Arc::new(LiveRequest { method: "GET".into(), path: "feed".into(), ..Default::default() });
-        // The handler parks on the head, which is where a real one sits
-        // too; dropping the task is what hyper does to it when the
-        // connection goes.
-        let canceller_for_test = state.canceller.clone();
-        let handler = tokio::spawn(drive_http(
-            state,
-            execution_id,
-            http_cfg(),
-            1,
-            request,
-            Arc::new(RecordingSink::default()),
-            axum::body::Body::empty(),
-            Unattached::new(canceller_for_test, execution_id),
-        ));
+        let execution_id = here.execution_id;
+        // Dropping the task is what hyper does to it when the connection
+        // goes.
+        let handler = tokio::spawn(answer_http(here, 1, clock));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert!(!handler.is_finished(), "with nothing written the handler is still holding the head");
+        assert!(!handler.is_finished(), "with nothing written the call's task is still holding the head");
         handler.abort();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while canceller.cancelled.lock().unwrap().is_empty() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "a caller who left before the first byte never ended the run"
-            );
+            assert!(std::time::Instant::now() < deadline, "a caller who left before the first byte never ended the run");
             tokio::task::yield_now().await;
         }
         assert_eq!(canceller.cancelled.lock().unwrap().as_slice(), &[execution_id]);
@@ -3108,7 +2787,7 @@ mod tests {
     #[tokio::test]
     async fn a_run_that_parks_says_so_and_never_claims_it_ended() {
         let (status, _headers, body) = exchange("{}", |conn| async move {
-            conn.run_parked().await;
+            conn.run_carries_on(PARKED).await;
         })
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -3197,38 +2876,22 @@ mod tests {
         assert_eq!(body, "seen");
     }
 
-    /// A program that ends its exchange without ever answering (the queue
-    /// closes with the head still held) gets a loud `500` rather than a
-    /// caller hanging forever on a head that never comes.
+    /// A program that never answers holds its caller only up to the
+    /// session cap: the cap answers a loud `500` saying so, and the run,
+    /// tied to its caller, is cancelled.
     #[tokio::test]
     async fn a_silent_end_answers_500_with_the_reason() {
-        let (state, _canceller) = server_state();
-        let execution_id = ExecutionId::new_v4();
-        let registry = state.registry.clone();
-        let request = Arc::new(LiveRequest::default());
         let cfg = CallerRuntimeConfig { max_session_secs: 1, ..http_cfg() };
-        let (status, body) = {
-            // Nobody talks; the session cap (1s on the fake clock, which
-            // returns at once) ends the exchange with the head held.
-            let canceller_for_test = state.canceller.clone();
-            let response = drive_http(
-                state,
-                execution_id,
-                cfg,
-                0,
-                request,
-                Arc::new(RecordingSink::default()),
-                axum::body::Body::from("{}"),
-                Unattached::new(canceller_for_test, execution_id),
-            )
-            .await;
-            let status = response.status();
-            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
-            (status, String::from_utf8(bytes.to_vec()).unwrap())
-        };
+        // Nobody talks; the session cap (1s on the fake clock, which
+        // returns at once) ends the exchange with the head held.
+        let (response, execution_id, canceller) =
+            open_exchange(cfg, LiveRequest::default(), "{}", 0, |_conn| std::future::pending::<()>()).await;
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(body.contains("session cap exceeded"), "got: {body}");
-        assert!(registry.get(execution_id).is_none(), "the connection was detached");
+        assert_eq!(canceller.cancelled.lock().unwrap().as_slice(), &[execution_id]);
     }
 
     #[tokio::test]

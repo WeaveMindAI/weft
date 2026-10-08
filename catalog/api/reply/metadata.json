@@ -60,6 +60,7 @@
     }
   ],
   "features": {
+    "pure": true,
     "answersCaller": "whole"
   },
   "validate": [

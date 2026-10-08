@@ -1,0 +1,27 @@
+# Routes whose runs cannot pause, waiting on a timer. The rig calls each and
+# asserts what its caller hears.
+#
+#   GET tied        the caller is on the line and the route does not outlive
+#                   it: the wait holds in the worker, and the timer's answer
+#                   carries the run on to its reply
+#   GET unrecorded  the run keeps no record: the same, with nothing listed
+#   GET impatient   it holds for one second (`holdSecs: 1`), and the timer
+#                   is thirty: the wait is given up and the caller hears why
+
+tied = Route { path: "__E2E_PATH__/tied", method: "GET" }
+tied_pause = Wait { seconds: 1 }
+tied_pause.value = tied.method
+tied_answer = Reply { body: { "state": "waited" } }
+tied_answer._should_flow = tied_pause.value
+
+unrecorded = Route { path: "__E2E_PATH__/unrecorded", method: "GET", recorded: false }
+unrecorded_pause = Wait { seconds: 1 }
+unrecorded_pause.value = unrecorded.method
+unrecorded_answer = Reply { body: { "state": "waited" } }
+unrecorded_answer._should_flow = unrecorded_pause.value
+
+impatient = Route { path: "__E2E_PATH__/impatient", method: "GET", holdSecs: 1 }
+impatient_pause = Wait { seconds: 30 }
+impatient_pause.value = impatient.method
+impatient_answer = Reply { body: { "state": "too late" } }
+impatient_answer._should_flow = impatient_pause.value

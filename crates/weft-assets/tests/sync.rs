@@ -66,6 +66,10 @@ struct FakeStore {
     /// (hash, mime) of every upload, for the media-type contract.
     mimes: Mutex<Vec<(String, String)>>,
     fail_upload_of: Option<String>,
+    /// A hash whose first upload is cut off on the way.
+    cut_once_of: Option<String>,
+    /// Every upload asked of the store, landed or not.
+    tries: Mutex<Vec<String>>,
     /// A hash the store already holds when the upload starts: it reads
     /// nothing and answers the key it has (the begin verb's
     /// `already_stored`, which a concurrent build's completed upload
@@ -96,6 +100,15 @@ impl AssetStore for FakeStore {
             // answers the key it has, exactly as the begin verb does.
             return Ok(key_for(hash));
         }
+        let tried_before = {
+            let mut tries = self.tries.lock().unwrap();
+            let before = tries.iter().any(|h| h == hash);
+            tries.push(hash.to_string());
+            before
+        };
+        if self.cut_once_of.as_deref() == Some(hash) && !tried_before {
+            return Err(Cut.into());
+        }
         if self.fail_upload_of.as_deref() == Some(hash) {
             anyhow::bail!("store rejected upload of {hash}");
         }
@@ -109,6 +122,9 @@ impl AssetStore for FakeStore {
         self.existing.lock().unwrap().insert(hash.to_string(), key.clone());
         self.uploads.lock().unwrap().push(hash.to_string());
         Ok(key)
+    }
+    fn interrupted(&self, error: &anyhow::Error) -> bool {
+        error.downcast_ref::<Cut>().is_some()
     }
 }
 
@@ -275,6 +291,29 @@ async fn every_broken_ref_is_named_in_one_error() {
         .to_string();
     assert!(err.contains("gone1.png") && err.contains("gone2.png"), "both named: {err}");
     assert!(store.uploads.lock().unwrap().is_empty(), "nothing uploaded on a broken set");
+}
+
+/// The fake's dropped connection.
+#[derive(Debug)]
+struct Cut;
+impl std::fmt::Display for Cut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the connection dropped")
+    }
+}
+impl std::error::Error for Cut {}
+
+#[tokio::test(start_paused = true)]
+async fn an_upload_cut_off_is_sent_again_and_a_refused_one_is_not() {
+    let source = FakeSource(BTreeMap::from([("a.png".to_string(), png(b"A"))]));
+    let store = FakeStore { cut_once_of: Some(sha(&png(b"A"))), ..FakeStore::default() };
+    sync_assets(&[image_ref("a.png")], &source, &store).await.expect("the second try lands");
+    assert_eq!(store.tries.lock().unwrap().len(), 2);
+    assert!(store.existing.lock().unwrap().contains_key(&sha(&png(b"A"))));
+
+    let store = FakeStore { fail_upload_of: Some(sha(&png(b"A"))), ..FakeStore::default() };
+    sync_assets(&[image_ref("a.png")], &source, &store).await.unwrap_err();
+    assert_eq!(store.tries.lock().unwrap().len(), 1, "a refusal is the store's answer");
 }
 
 #[tokio::test]

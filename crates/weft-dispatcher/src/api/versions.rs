@@ -10,7 +10,6 @@
 //! plain `weft run` is this endpoint with no seed and no scope.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -149,63 +148,6 @@ pub(crate) async fn record_program_source_locked(
         .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
     let (version, _) = upsert_version(state, project, &manifest, None, false).await?;
     Ok(version.version)
-}
-
-/// The durable journal bridge records real fires from their immutable birth.
-/// A storage failure retries without firing the trigger again.
-pub(crate) async fn record_trigger_run(state: &DispatcherState, execution_id: ExecutionId) -> anyhow::Result<()> {
-    if state.versions.run(execution_id).await?.is_some() { return Ok(()); }
-    let rows = state.journal.events_log(execution_id).await?;
-    if let Some(run) = trigger_run_from_birth(execution_id, &rows)? {
-        if let Err(error) = state.versions.insert_run(&run).await {
-            return orphaned_run_is_recorded_nowhere(execution_id, error);
-        }
-    }
-    Ok(())
-}
-
-/// A run whose tree is gone (its project removed, or its version pruned,
-/// between the birth reaching the journal and the bridge reading it) has
-/// nothing left to be recorded in, and its history stays readable in the
-/// journal. That is not a failure: the bridge retries a failed row until
-/// it passes, so treating it as one parked the bridge on that row for
-/// good, with every event of every project behind it, and every
-/// activation waiting on those events with it. Any other failure (the
-/// database) stays an error, so the bridge retries it as designed.
-fn orphaned_run_is_recorded_nowhere(execution_id: ExecutionId, error: anyhow::Error) -> anyhow::Result<()> {
-    match error.downcast_ref::<crate::versions::VersionMissing>() {
-        Some(missing) => {
-            tracing::info!(
-                target: "weft_dispatcher::journal_bridge",
-                %execution_id,
-                project = %missing.project,
-                version = %missing.version,
-                "a fire's tree row has nowhere to go (its project or version is gone); its journal stays, nothing to record"
-            );
-            Ok(())
-        }
-        None => Err(error),
-    }
-}
-
-fn trigger_run_from_birth(execution_id: ExecutionId, rows: &[weft_journal::ExecEvent]) -> anyhow::Result<Option<RunRow>> {
-    let Some(weft_journal::ExecEvent::ExecutionStarted { project_id, source_version, definition_hash, at_unix, .. }) = rows.first() else {
-        anyhow::bail!("run {execution_id} has no birth");
-    };
-    let mut fires = rows.iter().filter_map(|row| match row {
-        weft_journal::ExecEvent::NodeKicked { node_id, firing: true, payload, .. } => Some((node_id.clone(), payload.clone().unwrap_or(Value::Null))),
-        _ => None,
-    });
-    let Some(fire) = fires.next() else { return Ok(None); };
-    anyhow::ensure!(fires.next().is_none(), "trigger run {execution_id} started from more than one trigger");
-    let version = source_version.clone().ok_or_else(|| anyhow::anyhow!("trigger run {execution_id} has no original source version"))?;
-    let definition_hash = definition_hash.clone().ok_or_else(|| anyhow::anyhow!("trigger run {execution_id} has no original definition"))?;
-    let mut spec = weft_core::run_spec::RunSpec::whole("");
-    spec.fire = Some(fire);
-    Ok(Some(RunRow {
-        execution_id, project_id: *project_id, version_id: version, seed_execution_id: None,
-        stale: Vec::new(), spec: Some(spec), definition_hash, example: None, created_at: *at_unix,
-    }))
 }
 
 /// Write the version row itself, under a head the caller has already
@@ -351,61 +293,30 @@ fn refused(refusal: &Refusal) -> ApiError {
     crate::api::project::refusal_error(refusal)
 }
 
-/// The runs of a project that are genuinely still going.
-///
-/// NOT simply "not settled": an execution the journal does not know at all
-/// (a tree row whose execution never started, which is what a failure
-/// between recording the run and journaling it leaves) has no terminal
-/// event, and calling that "in flight" made prune refuse the whole
-/// subtree for ever, with `weft stop` unable to reach it either. The
-/// journal's own non-terminal list only contains executions it knows, so a
-/// row it has never heard of is not in flight; it is nothing.
+/// The runs of a project that are still going: queued or being driven. A
+/// run the version tree names that has no run row is not going; it is
+/// nothing.
 async fn in_flight_execution_ids(
     state: &DispatcherState,
     project: uuid::Uuid,
 ) -> Result<std::collections::HashSet<ExecutionId>, ApiError> {
-    let mut live: std::collections::HashSet<ExecutionId> = state
+    Ok(state
         .journal
-        .list_non_terminal_execution_ids_for_project(project)
+        .going_execution_ids_for_project(project)
         .await
-        .map_err(|e| internal("non-terminal executions", e))?
+        .map_err(|e| internal("runs going", e))?
         .into_iter()
         .map(|(execution_id, _)| execution_id)
-        .collect();
-    // Parked on a person is not "still going": it is waiting, and
-    // prune's refusal is about work that could still write rows.
-    for parked in crate::api::project::suspended_execution_id_set(state, project)
-        .await
-        .map_err(|e| internal("suspended", e))?
-    {
-        live.remove(&parked);
-    }
-    Ok(live)
+        .collect())
 }
 
-/// Every settled execution of a project: terminal, or parked on a suspension.
-///
-/// Both halves are project-wide questions, so they are asked once. Asked
-/// per run instead, a project with a thousand recorded runs did two
-/// thousand round trips on every `weft run --seed` and every `weft
-/// prune`, re-fetching the same project-wide suspended set each time. The
-/// terminal half goes through the `Journal` trait rather than the raw
-/// pool, so the in-memory journal can answer it too.
+/// Every settled execution of a project: ended, or parked on a wait. Asked
+/// once per project, never per run.
 async fn settled_execution_ids(
     state: &DispatcherState,
     project: uuid::Uuid,
 ) -> Result<std::collections::HashSet<ExecutionId>, ApiError> {
-    let mut settled = state
-        .journal
-        .list_terminal_execution_ids_for_project(project)
-        .await
-        .map_err(|e| internal("terminal executions", e))?;
-    settled.extend(
-        crate::api::project::suspended_execution_id_set(state, project)
-            .await
-            .map_err(|e| internal("suspended", e))?,
-    );
-    Ok(settled)
+    state.journal.settled_execution_ids_for_project(project).await.map_err(|e| internal("settled runs", e))
 }
 
 /// The seed run folded, with its program: what the stale set reads.
@@ -432,7 +343,12 @@ async fn fold_seed(state: &DispatcherState, project: uuid::Uuid, run: &RunRow) -
             (source.snapshot(), source.project().as_ref())
         };
         if let std::collections::btree_map::Entry::Vacant(slot) = identities.entry(origin) {
-            let program = original.program.as_ref().ok_or_else(|| internal("seed identity", format!("run {origin} has no production code identity")))?;
+            let binary_hash = original.binary_hash.as_deref()
+                .ok_or_else(|| internal("seed identity", format!("run {origin} has no production code identity")))?;
+            let definition_hash = weft_core::project::hash::compute_definition_hash(graph).map_err(|e| internal("seed identity", e))?;
+            let program = state.projects.program_identity(project, &definition_hash, binary_hash).await
+                .map_err(|e| internal("seed identity", e))?
+                .ok_or_else(|| internal("seed identity", format!("run {origin} ran on worker {binary_hash}, which this project no longer records")))?;
             slot.insert(program.slice_hashes(graph).map_err(|e| internal("seed identity", e))?);
         }
         let mut used_backups = BTreeMap::new();
@@ -567,7 +483,11 @@ pub async fn run(
     };
 
     let spec = body.spec.clone().unwrap_or_else(|| RunSpec::whole("run"));
-    let mut resolved = resolve_spec(&spec, &project).map_err(|r| refused(&r))?;
+    // A run reads its infra's baked outputs as the dispatcher holds its
+    // copies; an infra node it reads nothing but saved values of does not
+    // run.
+    let saved = crate::api::project::saved_for_run(&state, id, &project, spec.instance.as_ref()).await?;
+    let mut resolved = resolve_spec(&spec, &project, &saved).map_err(|r| refused(&r))?;
     let bakes = if spec.fire.is_some() {
         // An instance's trigger was baked with that instance's values: the
         // fire replays the instance's bake.
@@ -584,9 +504,12 @@ pub async fn run(
     // knowledge of what a Route is: whether this trigger speaks to a
     // caller at all is the signal kind's own declaration
     // (`weft_core::signal::caller_protocol`).
-    let mut fired_caller: Option<weft_task_store::kinds::LiveConnectionStart> = None;
+    let mut stand_in: Option<weft_core::primitive::SignalSpec> = None;
     // The trigger `--fire` names, spelled: the run is that trigger's.
     let mut fired_trigger: Option<String> = None;
+    // How the run is kept: a fire starts the way its trigger says (the
+    // spec its bake captured), with what the run asks for by hand over it.
+    let mut kept_by_trigger = weft_core::run_settings::RunSettings::default();
     for kick in resolved.kicks.iter_mut().filter(|kick| kick.firing) {
         // A bake captures a trigger under its place (`one.door` for the
         // `door` an include site `one` reaches), so the kick is spelled
@@ -599,16 +522,15 @@ pub async fn run(
             .and_then(|bake| bake.captured.get(&address))
             .expect("validated bake contains this trigger for this program");
         kick.port_snapshot = Some(capture.ports.clone());
+        kept_by_trigger = capture.spec.settings;
         if weft_core::signal::caller_protocol(&capture.spec.kind).is_some() {
             let payload = spec
                 .fire
                 .as_ref()
                 .map(|(_, payload)| payload.clone())
                 .unwrap_or(serde_json::Value::Null);
-            fired_caller = Some(
-                stand_in_caller(&capture.spec, &payload, &address)
-                    .map_err(|why| refused(&weft_core::run_spec::Refusal::error(why)))?,
-            );
+            stand_in_caller(&capture.spec, &payload, &address).map_err(|why| refused(&weft_core::run_spec::Refusal::error(why)))?;
+            stand_in = Some(capture.spec.clone());
         }
     }
 
@@ -619,6 +541,7 @@ pub async fn run(
     // the whole-graph fact (it reports it, for the bar's unaimed button),
     // the way it leaves the trigger facts to `require_trigger_infra`.
     crate::api::project::require_run_infra(&state, id, &project, &resolved.selection, spec.instance.as_ref()).await?;
+    let settings = spec.settings.over(kept_by_trigger).map_err(|why| refused(&weft_core::run_spec::Refusal::error(why)))?;
 
     // What the run inherits and what it kicks.
     let mut starting_parameters = spec.clone();
@@ -672,9 +595,10 @@ pub async fn run(
     // pulses the worker folds in, and it fires the moment they settle
     // after the selected reuse boundary. Only a run with
     // nothing stale, nothing kicked and nothing provided has no work.
-    let execution_id = uuid::Uuid::new_v4();
+    let execution_id = weft_core::new_execution_id();
     let now = crate::lease::now_unix() as u64;
-    let birth_rows = supplied_output_events(&project, &spec, &resolved, execution_id, now);
+    let mut birth_rows = supplied_output_events(&project, &spec, &resolved, execution_id, now);
+    birth_rows.extend(weft_journal::birth::baked_rows(&project, execution_id, &resolved.baked, now));
     // An empty `entry_node` is the journal's marker for a row that no
     // longer decodes, and `weft executions` prints `?` for it. A
     // seeded re-run of a mid-graph node has no kick and no provided
@@ -724,6 +648,7 @@ pub async fn run(
     // stays outside it.
     // A group's boundaries spell as the group, so a set dedupes them.
     let stale_vec: Vec<String> = stale.iter().map(spell).collect::<BTreeSet<_>>().into_iter().collect();
+    let selection = weft_core::project::selection::RecordedSelection::new(resolved.selection.clone());
     let (version, moved) = with_tree_lock(&state, id, || async {
         // Head is read again in here. The one read outside chose the
         // seed, which is this run's own business; the version's PARENT
@@ -732,43 +657,35 @@ pub async fn run(
         // lineage.
         let head = state.versions.head(id).await.map_err(|e| internal("head", e))?;
         let version = commit_version(&state, id, &body.manifest, None, body.root, &head).await?;
-        state
-            .versions
-            .insert_run(&RunRow {
-                execution_id,
-                project_id: id,
-                version_id: version.version.clone(),
-                seed_execution_id: seed.as_ref().map(|s| s.parent),
-                stale: stale_vec.clone(),
-                spec: Some(starting_parameters.clone()),
-                definition_hash: definition_hash.clone(),
-                example: body.example.clone(),
-                created_at: now,
-            })
-            .await
-            .map_err(|e| internal("record run", e))?;
+        let spec_json = serde_json::to_value(&starting_parameters).map_err(|e| internal("the run's spec", e))?;
         crate::api::project::start_queued_execution_with(
             &state,
-            crate::api::project::Birth {
+            &project.defaults,
+            weft_journal::birth::Birth {
                 execution_id,
                 project_id: id,
                 phase: weft_core::context::Phase::Fire,
                 entry_node: &entry_node,
                 kicks: &kicks,
-                program: &program,
-                subgraph: Some(&resolved.selection),
+                definition_hash: &program.definition_hash,
+                binary_hash: &program.binary_hash,
+                selection: Some(&selection),
                 seed: seed.clone(),
                 source_version: Some(&version.version),
-                instance: spec.instance.as_ref().map(|instance| crate::api::project::RunFor { instance, values: &instance_values }),
+                instance: spec.instance.as_ref().map(|instance| weft_journal::birth::RunFor { instance, values: &instance_values }),
                 picks: &picks,
                 fired_trigger: fired_trigger.as_deref(),
-                run_kind: weft_core::exec::RunKind::Execution,
-                run_class: spec.run_class,
+                stand_in: stand_in.as_ref(),
+                settings,
                 at_unix: now,
             },
             &birth_rows,
-            false,
-            fired_caller.clone(),
+            crate::api::project::QueueAs {
+                stale: &stale_vec,
+                spec: Some(&spec_json),
+                example: body.example.as_deref(),
+                ..Default::default()
+            },
         )
         .await?;
         // Head moves LAST, and a lost race is reported, never refused.
@@ -839,11 +756,17 @@ pub async fn run(
 /// looks: NO stand-in means the trigger itself fails, asking to be
 /// triggered through a Route, which is the node the author is already
 /// looking at.
+/// The request a stand-in caller serves when a run is started by hand
+/// through a trigger that answers a caller: read out of the fire's
+/// payload, refused at the command when it is no request or the trigger
+/// is one nobody can stand in for. The run's birth carries the trigger's
+/// spec (`ExecutionStarted::stand_in`), and the worker that drives it
+/// serves this request from its firing kick.
 fn stand_in_caller(
     spec: &weft_core::primitive::SignalSpec,
     payload: &serde_json::Value,
     address: &str,
-) -> Result<weft_task_store::kinds::LiveConnectionStart, String> {
+) -> Result<weft_core::caller::LiveRequest, String> {
     // Refused HERE, at the command, rather than only in the worker that
     // would serve it: the engine keeps its own floor, but by then the
     // person has already waited for an execution to start just to be
@@ -862,23 +785,15 @@ fn stand_in_caller(
     // here and served back through the ordinary request call would mean
     // this tier holding a caller trigger's field name to make the
     // impersonation work.
-    let request: weft_core::caller::LiveRequest =
-        serde_json::from_value(payload.clone()).map_err(|e| {
-            format!(
-                "--fire {address}: this trigger answers a caller, so its payload is the \
-                 request to serve: {e}"
-            )
-        })?;
-    Ok(weft_task_store::kinds::LiveConnectionStart {
-        spec: spec.clone(),
-        request,
-        arrive_by: None,
-        fired: Some(weft_task_store::kinds::FiredExchange {}),
+    serde_json::from_value(payload.clone()).map_err(|e| {
+        format!(
+            "--fire {address}: this trigger answers a caller, so its payload is the \
+             request to serve: {e}"
+        )
     })
 }
 
 fn supplied_output_events(project: &weft_core::ProjectDefinition, spec: &RunSpec, resolved: &Resolved, execution_id: ExecutionId, at_unix: u64) -> Vec<weft_journal::ExecEvent> {
-    let mut events = Vec::new();
     // Seed suppliers carry their original events. Only authored emits create
     // new supplied facts, including closures for an explicit empty port map,
     // and only the emits the cut kept (`--before` can drop one).
@@ -898,32 +813,7 @@ fn supplied_output_events(project: &weft_core::ProjectDefinition, spec: &RunSpec
                 .or_insert_with(|| (place.frames(), Default::default()));
         }
     }
-    for (source, (frames, ports)) in by_source {
-        let node = project.nodes.iter().find(|node| node.id == source).expect("resolved source exists");
-        for port in &node.outputs {
-            let supplied = ports.get(port.name.as_str()).copied();
-            let generator = matches!(port.port_type, weft_core::weft_type::WeftType::Generator(_));
-            let values: Vec<&Value> = match supplied {
-                Some(value) if generator => value.as_array().expect("resolved stream is a list").iter().collect(),
-                Some(value) => vec![value],
-                None => vec![],
-            };
-            for (index, value) in values.into_iter().enumerate() {
-                events.push(weft_journal::ExecEvent::PortEmitted {
-                    execution_id, emission_id: uuid::Uuid::new_v5(&execution_id, format!("supplied\0{source}\0{}\0{index}", port.name).as_bytes()),
-                    node_id: source.to_string(), frames: frames.clone(), port: port.name.clone(), value: Arc::new(value.clone()),
-                    provided: true, at_unix,
-                });
-            }
-            if generator || supplied.is_none() {
-                events.push(weft_journal::ExecEvent::PortClosed {
-                    execution_id, emission_id: uuid::Uuid::new_v5(&execution_id, format!("supplied-end\0{source}\0{}", port.name).as_bytes()),
-                    node_id: source.to_string(), frames: frames.clone(), port: port.name.clone(), provided: true, at_unix,
-                });
-            }
-        }
-    }
-    events
+    weft_journal::birth::supplied_rows(project, execution_id, by_source.iter().map(|(source, (frames, ports))| (*source, frames, ports.clone())), at_unix)
 }
 
 /// Whose bakes a preview asks about: the shared triggers' by default.
@@ -992,6 +882,7 @@ pub async fn tree(
     let versions = state.versions.versions(id).await.map_err(|e| internal("versions", e))?;
     let runs = state.versions.runs(id).await.map_err(|e| internal("runs", e))?;
     let by_id: BTreeMap<&str, &VersionRow> = versions.iter().map(|v| (v.id.as_str(), v)).collect();
+    let trigger_runs = state.versions.trigger_runs(id).await.map_err(|e| internal("trigger runs", e))?;
     let version_summaries = versions
         .iter()
         .map(|v| VersionSummary {
@@ -1006,23 +897,23 @@ pub async fn tree(
                 .map(|p| manifest_diff(&p.manifest, &v.manifest))
                 .unwrap_or_default(),
             manifest: v.manifest.clone(),
+            trigger_runs: trigger_runs.get(&v.id).map_or(0, |fired| fired.runs),
+            last_trigger_run: trigger_runs.get(&v.id).map(|fired| fired.last),
         })
         .collect();
-    let suspended = crate::api::project::suspended_execution_id_set(&state, id)
-        .await
-        .map_err(|e| internal("suspended", e))?;
     // ONE read for every run's status. Asked per run, a project with a
-    // thousand recorded runs did a thousand point lookups on every `weft
-    // tree` and every refresh of the editor's version sidebar.
+    // thousand runs started by hand did a thousand point lookups on every
+    // `weft tree` and every refresh of the editor's version sidebar.
+    let run_ids: Vec<ExecutionId> = runs.iter().map(|r| r.execution_id).collect();
     let summaries = state
         .journal
-        .execution_summaries_for_project(id)
+        .execution_summaries(&run_ids)
         .await
         .map_err(|e| internal("execution summaries", e))?;
     let mut run_summaries = Vec::with_capacity(runs.len());
     for r in runs {
         let (status, started_at, completed_at, cancel_cause, skipped_nodes) = match summaries.get(&r.execution_id) {
-            Some(s) => (Some(s.status.parked(suspended.contains(&r.execution_id))), s.started_at, s.completed_at, s.cancel_cause.clone(), s.skipped_nodes),
+            Some(s) => (Some(s.status), s.started_at, s.completed_at, s.cancel_cause.clone(), s.skipped_nodes),
             None => (None, r.created_at, None, None, 0),
         };
         run_summaries.push(RunSummary {
@@ -1382,7 +1273,7 @@ mod fire_snapshot_tests {
         })).unwrap();
         let execution_id = ExecutionId::new_v4();
         let mut spec = RunSpec::whole("reuse");
-        let resolved = |spec: &RunSpec| resolve_spec(spec, &project).expect("one node resolves");
+        let resolved = |spec: &RunSpec| resolve_spec(spec, &project, &Default::default()).expect("one node resolves");
         assert!(supplied_output_events(&project, &spec, &resolved(&spec), execution_id, 0).is_empty());
         spec.emit.insert("source".into(), BTreeMap::new());
         let events = supplied_output_events(&project, &spec, &resolved(&spec), execution_id, 0);
@@ -1392,47 +1283,6 @@ mod fire_snapshot_tests {
         let events = supplied_output_events(&project, &spec, &resolved(&spec), execution_id, 0);
         assert!(matches!(&events[..], [weft_journal::ExecEvent::PortEmitted { value, provided: true, .. }]
             if **value == serde_json::json!("manual")));
-    }
-
-    #[test]
-    fn real_trigger_run_preserves_its_birth_version_and_single_wake() {
-        let execution_id = ExecutionId::new_v4();
-        let project = uuid::Uuid::new_v4();
-        let wake = serde_json::json!({"message": "original"});
-        let program = weft_core::project::hash::ProgramIdentity {
-            definition_hash: "original-graph".into(),
-            binary_hash: "original-binary".into(),
-            implementations: Default::default(),
-        };
-        let (birth, mut kicks) = crate::api::project::execution_birth_events(crate::api::project::Birth {
-            execution_id,
-            project_id: project,
-            phase: weft_core::context::Phase::Fire,
-            entry_node: "trigger",
-            kicks: &[Kick { node: "trigger".into(), frames: Vec::new(), firing: true, payload: Some(wake.clone()), port_snapshot: None }],
-            program: &program,
-            subgraph: None,
-            seed: None,
-            source_version: Some("original-source"),
-            instance: None,
-            picks: &Default::default(),
-            fired_trigger: Some("trigger"),
-            run_kind: weft_core::exec::RunKind::Execution,
-            run_class: weft_core::run_class::RunClass::Short,
-            at_unix: 42,
-        });
-        let mut rows = vec![birth];
-        rows.append(&mut kicks);
-        let run = trigger_run_from_birth(execution_id, &rows).unwrap().unwrap();
-        assert_eq!(run.version_id, "original-source");
-        assert_eq!(run.definition_hash, "original-graph");
-        assert_eq!(run.created_at, 42);
-        assert_eq!(run.spec.unwrap().fire, Some(("trigger".into(), wake)));
-        rows.push(weft_journal::ExecEvent::NodeKicked {
-            execution_id, node_id: "other-trigger".into(), frames: vec![], firing: true,
-            payload: None, port_snapshot: None, at_unix: 42,
-        });
-        assert!(trigger_run_from_birth(execution_id, &rows).unwrap_err().to_string().contains("more than one trigger"));
     }
 
     fn plan(node: &str, firing: bool) -> Kick {
@@ -1475,6 +1325,7 @@ mod fire_snapshot_tests {
             provided: vec![],
             crossings: vec![],
             warnings: vec![],
+            baked: Default::default(),
         };
         let stale: BTreeSet<Located> = [Located::top("ask")].into_iter().collect();
         let kicks = seeded_kicks(&resolved, &stale);
@@ -1505,28 +1356,10 @@ mod fire_snapshot_tests {
             fire: Some(("tick".into(), serde_json::json!({ "scheduledTime": "t" }))),
             ..RunSpec::whole("fire")
         };
-        let resolved = resolve_spec(&spec, &project).expect("graph selection needs no external facts");
+        let resolved = resolve_spec(&spec, &project, &Default::default()).expect("graph selection needs no external facts");
         assert!(resolved.kicks.iter().any(|k| k.node == "tick" && k.firing));
     }
 
-}
-
-#[cfg(test)]
-mod orphaned_run_tests {
-    use super::orphaned_run_is_recorded_nowhere;
-    use crate::versions::VersionMissing;
-
-    /// A run whose version is gone is recorded nowhere and that is fine;
-    /// any other failure keeps the bridge retrying the row.
-    #[test]
-    fn only_a_missing_version_is_forgiven() {
-        let execution_id = uuid::Uuid::new_v4();
-        let missing = VersionMissing { project: uuid::Uuid::new_v4(), version: "v7".into() };
-        orphaned_run_is_recorded_nowhere(execution_id, missing.into()).expect("nothing to record in is not a failure");
-        let storage = anyhow::anyhow!("connection reset by peer");
-        let err = orphaned_run_is_recorded_nowhere(execution_id, storage).expect_err("a storage failure retries");
-        assert!(err.to_string().contains("connection reset"));
-    }
 }
 
 #[cfg(test)]
@@ -1545,14 +1378,13 @@ mod stand_in_caller_tests {
     /// through a Route, which is the node they are already firing.
     #[test]
     fn a_get_with_no_body_still_gets_a_caller() {
-        let start = stand_in_caller(
+        let request = stand_in_caller(
             &route_spec(),
             &json!({ "method": "GET", "path": "cards" }),
             "list.door",
         )
         .expect("a request with no body is a request");
-        assert_eq!(start.request.method, "GET");
-        assert!(start.fired.is_some(), "no body key is still a caller, never a missing one");
+        assert_eq!(request.method, "GET");
     }
 
     /// A socket is a conversation over time and there is nothing
@@ -1583,10 +1415,9 @@ mod stand_in_caller_tests {
     #[test]
     fn the_payload_is_read_not_carved_up() {
         let payload = json!({ "method": "POST", "path": "hello", "body": { "name": "ada" } });
-        let start = stand_in_caller(&route_spec(), &payload, "hello").expect("a post with a body");
-        assert_eq!(start.request.path, "hello");
-        assert_eq!(start.request.method, "POST");
-        assert!(start.fired.is_some(), "a fired run has a stand-in");
+        let request = stand_in_caller(&route_spec(), &payload, "hello").expect("a post with a body");
+        assert_eq!(request.path, "hello");
+        assert_eq!(request.method, "POST");
     }
 
     /// A payload that is not a request at all is refused naming the

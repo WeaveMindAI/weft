@@ -6,12 +6,11 @@
 //! to (1) front the CLI verbs (the CLI authenticates to the dispatcher, which
 //! resolves the acting tenant and forwards to the broker as the control plane),
 //! and (2) durably drive the terminate sweep: a worker can stall-then-die before
-//! its eager sweep runs, so the journal bridge enqueues a row per terminated
-//! execution and this reaper drains it by asking the broker to sweep the execution's
-//! un-kept exec files.
+//! its eager sweep runs, so the write that ends a run that stored files of
+//! its own enqueues a row, and this reaper drains it by asking the broker to
+//! sweep the run's un-kept exec files.
 
 use anyhow::{Context, Result};
-use sqlx::PgPool;
 use weft_task_store::drain::{DrainStep, SAFETY_POLL_INTERVAL};
 
 use weft_core::storage::{
@@ -466,21 +465,25 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "storage_sweep",
     tables: &["storage_sweep"],
     ddl: &[r#"
-        -- Durable terminate-sweep queue: a row per terminated execution whose
-        -- un-kept exec files still need sweeping. Inserted by the journal
-        -- bridge (the durable observer of terminate), deleted by the sweep
+        -- Durable terminate-sweep queue: a row per ended run that stored
+        -- files of its own, whose un-kept exec files still need sweeping.
+        -- Inserted by the write that ends the run (`weft_record_batch`,
+        -- `weft_journal::record::append_locked_in`), deleted by the sweep
         -- reaper once the broker confirmed the sweep.
         CREATE TABLE IF NOT EXISTS storage_sweep (
-            execution_id TEXT PRIMARY KEY,
+            execution_id UUID PRIMARY KEY,
             tenant_id TEXT NOT NULL,
             enqueued_at_unix BIGINT NOT NULL
         );
         "#,
-        // Wake the sweep reaper when an execution is queued.
+        // Wake the sweep reaper when an execution is queued, through the
+        // announcement outbox like every other wake (`weft_task_store::announce`):
+        // sent once the write commits, one wake for every row a flush
+        // takes, since the reaper reads the whole queue.
         // SYNC: 'weft_storage_sweep' <-> crate::reaper::STORAGE_SWEEP_CHANNEL
         r#"CREATE OR REPLACE FUNCTION storage_sweep_notify() RETURNS trigger AS $$
             BEGIN
-                PERFORM pg_notify('weft_storage_sweep', NEW.execution_id);
+                PERFORM weft_announce('weft_storage_sweep', '');
                 RETURN NULL;
             END;
             $$ LANGUAGE plpgsql"#,
@@ -493,28 +496,6 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     seed: &[],
 };
 
-/// Enqueue a terminate sweep for `execution_id`. Called by the journal bridge when it
-/// observes a terminal exec event; idempotent.
-pub async fn enqueue_sweep(pool: &PgPool, tenant: &str, execution_id: &str) -> Result<()> {
-    let mut conn = pool.acquire().await?;
-    enqueue_sweep_in(&mut conn, tenant, execution_id).await
-}
-
-/// [`enqueue_sweep`] on the caller's connection, for a writer that queues
-/// the sweep in the same transaction as the run's ending.
-pub async fn enqueue_sweep_in(conn: &mut sqlx::PgConnection, tenant: &str, execution_id: &str) -> Result<()> {
-    sqlx::query(
-        "INSERT INTO storage_sweep (execution_id, tenant_id, enqueued_at_unix) \
-         VALUES ($1, $2, $3) ON CONFLICT (execution_id) DO NOTHING",
-    )
-    .bind(execution_id)
-    .bind(tenant)
-    .bind(crate::lease::now_unix())
-    .execute(&mut *conn)
-    .await?;
-    Ok(())
-}
-
 /// Sweep-queue reaper: ask the broker to sweep each pending execution's un-kept
 /// exec files. A row is removed only after the broker confirmed; a TRANSIENT
 /// broker error (unreachable, 5xx) leaves the row, and the answer asks for
@@ -525,13 +506,13 @@ pub async fn enqueue_sweep_in(conn: &mut sqlx::PgConnection, tenant: &str, execu
 /// user can neither see nor clear, so the row is dropped with an error log
 /// naming the execution (the files, if any, remain reclaimable via `weft files`).
 pub async fn process_sweep_queue(state: DispatcherState) -> Result<DrainStep> {
-    let rows: Vec<(String, String)> =
+    let rows: Vec<(weft_core::ExecutionId, String)> =
         sqlx::query_as("SELECT execution_id, tenant_id FROM storage_sweep ORDER BY enqueued_at_unix")
             .fetch_all(&state.pg_pool)
             .await?;
     let mut deferred = false;
     for (execution_id, tenant) in rows {
-        match sweep_exec(&state, &tenant, &execution_id).await {
+        match sweep_exec(&state, &tenant, &execution_id.to_string()).await {
             Ok(out) => {
                 if out.swept > 0 || out.lingering > 0 {
                     tracing::info!(
@@ -542,7 +523,7 @@ pub async fn process_sweep_queue(state: DispatcherState) -> Result<DrainStep> {
                     );
                 }
                 sqlx::query("DELETE FROM storage_sweep WHERE execution_id = $1")
-                    .bind(&execution_id)
+                    .bind(execution_id)
                     .execute(&state.pg_pool)
                     .await?;
             }
@@ -556,7 +537,7 @@ pub async fn process_sweep_queue(state: DispatcherState) -> Result<DrainStep> {
                     "terminate sweep found nothing to remove; clearing the queue row"
                 );
                 sqlx::query("DELETE FROM storage_sweep WHERE execution_id = $1")
-                    .bind(&execution_id)
+                    .bind(execution_id)
                     .execute(&state.pg_pool)
                     .await?;
             }
@@ -574,7 +555,7 @@ pub async fn process_sweep_queue(state: DispatcherState) -> Result<DrainStep> {
                      the storage API)"
                 );
                 sqlx::query("DELETE FROM storage_sweep WHERE execution_id = $1")
-                    .bind(&execution_id)
+                    .bind(execution_id)
                     .execute(&state.pg_pool)
                     .await?;
             }

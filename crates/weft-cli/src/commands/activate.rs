@@ -24,6 +24,7 @@ pub async fn run(
     ctx: Ctx,
     project: Option<String>,
     reactivate_choice_flag: Option<ReactivateChoice>,
+    port: Option<u16>,
     running_policy: Option<String>,
     drain_timeout: Option<u64>,
     scope: weft_core::activation::ActivationScope,
@@ -35,6 +36,7 @@ pub async fn run(
             &progress,
             project,
             reactivate_choice_flag,
+            port,
             running_policy,
             drain_timeout,
             scope,
@@ -49,6 +51,7 @@ async fn run_inner(
     progress: &crate::progress::Progress,
     project: Option<String>,
     reactivate_choice_flag: Option<ReactivateChoice>,
+    port: Option<u16>,
     running_policy: Option<String>,
     drain_timeout: Option<u64>,
     scope: weft_core::activation::ActivationScope,
@@ -92,6 +95,7 @@ async fn run_inner(
         target: ActivationTarget { reactivate_choice, ..target },
         running: running_choice(running_policy, drain_timeout),
         scope,
+        port,
     };
     // The one line that says the call may now sit for a while (only
     // under a wait), so a quiet terminal is a wait and not a hang.
@@ -106,24 +110,39 @@ async fn run_inner(
         progress.warn(note);
     }
     let left_out = answer.per_instance_left_out;
-    if let Some(note) = left_out_note(&left_out) {
+    if let Some(note) = left_out_note(&left_out, ctx.on()) {
         progress.warn(&note);
     }
-    progress.complete_with(&format!("activated {name} ({id})"), serde_json::json!({ "per_instance_left_out": left_out }));
+    let summary = match &answer.address {
+        Some(weft_core::projects::ProjectAddress::Serving { url }) => format!("activated {name} ({id}); its routes answer at {url}"),
+        // A port the person asked for, checked free before activating,
+        // that another program took as the project activated fails the
+        // command, like any server refused its port.
+        Some(weft_core::projects::ProjectAddress::Unavailable { why }) if port.is_some() => {
+            anyhow::bail!("activated {name} ({id}), and its own address could not open: {why}")
+        }
+        Some(weft_core::projects::ProjectAddress::Unavailable { why }) => {
+            progress.warn(&format!("the project's own address is unavailable: {why}"));
+            format!("activated {name} ({id})")
+        }
+        None => format!("activated {name} ({id})"),
+    };
+    progress.complete_with(&summary, serde_json::json!({ "per_instance_left_out": left_out, "address": answer.address }));
     Ok(())
 }
 
 /// What a person is told about the per-instance triggers a plain activate
 /// left off: each exists once per instance, so an instance has to be named.
-fn left_out_note(left_out: &[String]) -> Option<String> {
+fn left_out_note(left_out: &[String], on: Option<&str>) -> Option<String> {
     if left_out.is_empty() {
         return None;
     }
     Some(format!(
         "left off: {} run once per instance, so they stay off until an instance is named. \
-         Switch one instance's on with `weft activate --instance <id>`, or have the program switch \
+         Switch one instance's on with `{}`, or have the program switch \
          them on itself once it knows the instance (a node like ActivateInstanceTriggers does it)",
-        left_out.iter().map(|t| format!("'{t}'")).collect::<Vec<_>>().join(", ")
+        left_out.iter().map(|t| format!("'{t}'")).collect::<Vec<_>>().join(", "),
+        super::weft_on(on, "activate --instance <id>")
     ))
 }
 

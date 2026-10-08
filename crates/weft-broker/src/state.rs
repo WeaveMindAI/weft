@@ -6,7 +6,6 @@ use std::sync::Arc;
 use anyhow::Context;
 use sqlx::postgres::PgPool;
 
-use weft_journal::{JournalClient, PostgresJournalClient};
 use weft_task_store::pg_signal::PgSignalWatch;
 use weft_task_store::{PostgresInfraReader, PostgresTaskStoreClient, TaskStoreClient};
 
@@ -25,12 +24,15 @@ use crate::scope::ScopeCache;
 pub const BROKER_CHANNELS: &[&str] = &[
     weft_task_store::tasks::TASK_READY_CHANNEL,
     weft_task_store::terminal::TERMINAL_CHANNEL,
-    weft_journal::EXEC_EVENT_CHANNEL,
+    // What a worker holding for the answers of a run it drives waits on
+    // (`crate::records`).
+    weft_task_store::parked_fires::PARKED_FIRE_CHANNEL,
     weft_broker_client::lifecycle_command::INFRA_COMMAND_CHANNEL,
     // What a line pushes to the workers following it (`crate::line`).
     weft_broker_client::line::INFRA_STATUS_CHANNEL,
     weft_broker_client::line::ACCESS_CHANNEL,
     weft_broker_client::line::CANCEL_CHANNEL,
+    weft_broker_client::line::TRIGGERS_CHANNEL,
 ];
 
 pub struct BrokerState {
@@ -38,10 +40,15 @@ pub struct BrokerState {
     /// A pool for locks held across a slow call (a provider round trip),
     /// whose connections do no work while they hold one.
     pub lock_pool: PgPool,
+    /// The pool workers' batches of records are written on
+    /// (`crate::records`): a burst of records never starves the broker's
+    /// other work of connections.
+    pub record_pool: PgPool,
+    /// What the broker tells the dispatcher once a batch commits.
+    pub notices: Arc<crate::notices::Notices>,
     /// The process's one Postgres `LISTEN` connection, on (at least)
     /// [`BROKER_CHANNELS`]; every held request sleeps on it.
     pub signals: Arc<PgSignalWatch>,
-    pub journal: Arc<dyn JournalClient>,
     pub tasks: Arc<dyn TaskStoreClient>,
     pub infra: Arc<PostgresInfraReader>,
     pub auth: AuthConfig,
@@ -118,11 +125,17 @@ impl BrokerState {
 
     /// Build the broker state over the process's pool and signal watch,
     /// applying the broker's own schema group (the runtime-file table).
-    pub async fn new(pool: PgPool, lock_pool: PgPool, signals: Arc<PgSignalWatch>, settings: BrokerSettings) -> anyhow::Result<Arc<Self>> {
+    pub async fn new(
+        pool: PgPool,
+        lock_pool: PgPool,
+        record_pool: PgPool,
+        signals: Arc<PgSignalWatch>,
+        settings: BrokerSettings,
+    ) -> anyhow::Result<Arc<Self>> {
         for channel in BROKER_CHANNELS {
             signals.require(channel)?;
         }
-        let journal: Arc<dyn JournalClient> = Arc::new(PostgresJournalClient::new(pool.clone(), signals.clone())?);
+        let notices = crate::notices::Notices::start(pool.clone());
         let verifiers = weft_task_store::held_copy::HeldCopy::follow(
             &signals,
             weft_broker_client::line::ACCESS_CHANNEL,
@@ -148,8 +161,9 @@ impl BrokerState {
         Ok(Arc::new(Self {
             pool,
             lock_pool,
+            record_pool,
+            notices,
             signals,
-            journal,
             tasks,
             infra,
             auth: settings.auth,

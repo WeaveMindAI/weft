@@ -6,9 +6,9 @@
 //! through `process_entry` (held connections are not the
 //! read-body-return model).
 //!
-//! The connection itself is held by the worker, reached through the
-//! install's live door after the dispatcher's control handshake; the
-//! listener's role is purely registration. The two kinds differ only by protocol (which the
+//! The connection itself is held by the worker, reached at its door (the
+//! dispatcher only passes `/connect/...` calls on); the listener's role is
+//! purely registration. The two kinds differ only by protocol (which the
 //! dispatcher derives from the tag), so ONE handler impl serves both,
 //! registered once per tag.
 
@@ -56,15 +56,14 @@ impl KindHandler for LiveCallerHandler {
         payload: Value,
     ) -> ProcessOutcome {
         // A live connection is never fired through the stateless
-        // read-body-return path; the control handshake on the dispatcher
-        // drives it. Drop loud rather than silently spawning a caller-less
-        // run.
+        // read-body-return path; the worker's door serves it. Drop loud
+        // rather than silently spawning a caller-less run.
         ProcessOutcome {
             value: payload,
             target: ProcessTarget::Drop {
                 reason: Some(
-                    "live-caller kinds are driven by the dispatcher control \
-                     handshake (/connect/...), not the stateless fire path"
+                    "live-caller kinds are served at the worker's door \
+                     (/connect/...), not the stateless fire path"
                         .into(),
                 ),
             },
@@ -98,8 +97,7 @@ mod tests {
                 path: path.into(),
                 methods: methods.iter().map(|m| m.to_string()).collect(),
                 auth,
-                suspend: Default::default(),
-                connect_timeout_secs: 30,
+                outlives_caller: false,
                 heartbeat_interval_secs: 25,
                 max_inbound_bytes: 1024,
                 max_session_secs: 0,
@@ -110,7 +108,6 @@ mod tests {
                 journal_mode: Default::default(),
                 journal_window_secs: None,
                 window: None,
-                recorded: true,
             },
         })
     }

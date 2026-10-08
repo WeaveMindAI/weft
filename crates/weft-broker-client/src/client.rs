@@ -13,8 +13,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use weft_core::ExecutionId;
-use weft_journal::{ExecEvent, JournalClient, RawJournalRow};
-use weft_task_store::tasks::{CancelAsked, ClaimedExecution, DedupOutcome, NewTask, TaskOutcome};
+use weft_journal::{BatchError, RecordClient};
+use weft_task_store::tasks::{DedupOutcome, NewTask, TaskOutcome};
 use weft_task_store::{InfraReader, TaskStoreClient};
 
 use crate::line::{Answer, BrokerLink, CallWait, LineError, DEFAULT_CALL_WAIT};
@@ -132,6 +132,16 @@ pub struct BrokerRefused {
     pub body: String,
 }
 
+impl BrokerRefused {
+    /// The broker, or the database behind it, could not answer for now
+    /// (`503`, or a gateway in front of it saying the same): asking
+    /// again later may land. Any other status is the broker's answer to
+    /// this call, which asking again repeats.
+    pub fn is_outage(&self) -> bool {
+        matches!(self.status, reqwest::StatusCode::BAD_GATEWAY | reqwest::StatusCode::SERVICE_UNAVAILABLE | reqwest::StatusCode::GATEWAY_TIMEOUT)
+    }
+}
+
 /// Outcome of a fenced lifecycle write. `Applied(_)`: the write
 /// landed and the caller can rely on its effect. The two stale
 /// outcomes are deliberately distinct because the caller must do
@@ -179,14 +189,6 @@ where
             return Ok(answer);
         }
     }
-}
-
-/// Whether a failed broker call never reached the broker: the line was
-/// down for the call's whole wait, so it was never written. Only such a
-/// write is safe to send again; a write that went out and failed some
-/// other way may have landed, and sending it twice would apply it twice.
-fn never_sent(e: &anyhow::Error) -> bool {
-    e.chain().any(|cause| matches!(cause.downcast_ref::<LineError>(), Some(LineError::NotSent { .. })))
 }
 
 /// Whether the broker answered that the call did nothing at all
@@ -283,112 +285,63 @@ where
     }
 }
 
-// ---------- Journal ----------
+// ---------- Records ----------
 
-pub struct BrokerJournalClient {
+/// A worker's writer lanes' way to the record, and its reads of it.
+pub struct BrokerRecordClient {
     http: HttpCore,
 }
 
-impl BrokerJournalClient {
+impl BrokerRecordClient {
     pub fn new(link: BrokerLink) -> Arc<Self> {
         Arc::new(Self { http: HttpCore::new(link) })
     }
 }
 
 #[async_trait]
-impl JournalClient for BrokerJournalClient {
-    /// The broker takes a body of at most [`JOURNAL_RECORD_BODY_LIMIT`].
-    fn parts<'e>(&self, events: &'e [ExecEvent]) -> Result<Vec<&'e [ExecEvent]>> {
-        record_chunks(events)
-    }
-
-    fn never_reached(&self, error: &anyhow::Error) -> bool {
-        never_sent(error) || did_nothing(error)
-    }
-
-    async fn record_event(
-        &self,
-        event: &ExecEvent,
-        replica: Option<&str>,
-    ) -> Result<()> {
-        self.record_events(std::slice::from_ref(event), replica).await
-    }
-
-    /// One request per run of events that fits the broker's body limit,
-    /// sent in order: usually one for all of them.
-    async fn record_events(&self, events: &[ExecEvent], replica: Option<&str>) -> Result<()> {
-        // The broker journal path is worker-only: every write is
-        // fenced by the writer's process. A `None` here is a contract
-        // violation (only the dispatcher's in-process writer is
-        // process-less, and it never goes through the broker), so fail
-        // loud rather than send a process-less write the broker rejects.
-        let replica = replica.ok_or_else(|| {
-            anyhow::anyhow!("broker journal write requires the writing replica (worker-only path)")
-        })?;
-        for chunk in record_chunks(events)? {
-            let req = JournalRecordRequest { events: chunk.to_vec(), replica: replica.to_string() };
-            let _: JournalRecordResponse = self.http.post("/v1/journal/record", &req).await?;
+impl RecordClient for BrokerRecordClient {
+    /// The batch's bytes are the call's body as they are: a batch is
+    /// framed once, by its lane (`weft_journal::frame`), never as JSON.
+    async fn record_batch(&self, batch: Vec<u8>) -> std::result::Result<weft_journal::frame::BatchAnswer, BatchError> {
+        let answer = self
+            .http
+            .link
+            .call_bytes(JOURNAL_RECORD_PATH, batch, DEFAULT_CALL_WAIT)
+            .await
+            .map_err(BatchError::Unanswered)?;
+        if answer.status.is_success() {
+            return serde_json::from_slice(&answer.body)
+                .map_err(|e| BatchError::Refused(format!("the broker's answer to a batch does not read: {e}")));
         }
-        Ok(())
-    }
-
-    async fn record_retroactively(&self, events: &[ExecEvent], replica: Option<&str>) -> Result<()> {
-        let replica = replica.ok_or_else(|| {
-            anyhow::anyhow!("broker journal write requires the writing replica (worker-only path)")
-        })?;
-        let req = JournalRecordRetroactiveRequest { events: events.to_vec(), replica: replica.to_string() };
-        let _: JournalRecordResponse = self.http.post("/v1/journal/record_retroactive", &req).await?;
-        Ok(())
-    }
-
-    async fn forget_unrecorded(&self, execution_id: ExecutionId, replica: Option<&str>) -> Result<()> {
-        let replica = replica.ok_or_else(|| {
-            anyhow::anyhow!("broker journal write requires the writing replica (worker-only path)")
-        })?;
-        let req = JournalForgetUnrecordedRequest { execution_id: execution_id.to_string(), replica: replica.to_string() };
-        let _: JournalRecordResponse = self.http.post("/v1/journal/forget_unrecorded", &req).await?;
-        Ok(())
-    }
-
-    async fn raw_rows_after(
-        &self,
-        execution_id: ExecutionId,
-        after_id: i64,
-        wait: Duration,
-    ) -> Result<Vec<RawJournalRow>> {
-        // The broker ferries raw bytes; the trait's `rows_after` decodes
-        // on THIS side, so a field the broker's build does not know can
-        // never be silently stripped in transit, and an undecodable row
-        // fails the fold loudly (same contract as the direct-postgres
-        // client).
-        held(
-            wait,
-            |hold| async move {
-                let req = JournalWaitRequest {
-                    execution_id: execution_id.to_string(),
-                    after_id,
-                    wait_ms: hold.as_millis() as u64,
-                };
-                let resp: JournalWaitResponse = read_until_answered("/v1/journal/wait", || {
-                    self.http.post_held("/v1/journal/wait", &req, hold)
-                })
-                .await?;
-                Ok(resp.rows)
-            },
-            |rows| !rows.is_empty(),
-        )
-        .await
-    }
-
-    async fn has_terminal_event(&self, execution_id: ExecutionId) -> Result<bool> {
-        let req = JournalHasTerminalRequest {
-            execution_id: execution_id.to_string(),
+        let refused = BrokerRefused {
+            path: JOURNAL_RECORD_PATH.to_string(),
+            status: answer.status,
+            body: String::from_utf8_lossy(&answer.body).into_owned(),
         };
-        let resp: JournalHasTerminalResponse = read_until_answered("/v1/journal/has_terminal", || {
-            self.http.post("/v1/journal/has_terminal", &req)
-        })
-        .await?;
-        Ok(resp.terminal)
+        // An outage answered nothing about the batch; any other status is
+        // the broker's answer to it, which sending it again repeats.
+        Err(if refused.is_outage() { BatchError::Unanswered(refused.into()) } else { BatchError::Refused(refused.to_string()) })
+    }
+
+    async fn record_of(&self, execution_id: ExecutionId) -> Result<weft_journal::record::RawRecord> {
+        let path = "/v1/journal/record_of";
+        let req = RecordOfRequest { execution_id };
+        let resp: RecordOfResponse = read_until_answered(path, || self.http.post(path, &req)).await?;
+        Ok(resp.record)
+    }
+
+    async fn give_up(&self, execution_id: ExecutionId, why: String) -> std::result::Result<(), BatchError> {
+        let path = "/v1/run/give_up";
+        let answer = self
+            .http
+            .post_raw(path, &RunGiveUpRequest { execution_id, error: why }, DEFAULT_CALL_WAIT)
+            .await
+            .map_err(BatchError::Unanswered)?;
+        if answer.status.is_success() {
+            return Ok(());
+        }
+        let refused = BrokerRefused { path: path.to_string(), status: answer.status, body: String::from_utf8_lossy(&answer.body).into_owned() };
+        Err(if refused.is_outage() { BatchError::Unanswered(refused.into()) } else { BatchError::Refused(refused.to_string()) })
     }
 }
 
@@ -426,59 +379,6 @@ impl TaskStoreClient for BrokerTaskStoreClient {
         )
         .await
     }
-
-    async fn claim_execution(&self, replica: &str, project_id: Uuid, execution_id: &str) -> Result<Option<ClaimedExecution>> {
-        let req = TaskClaimExecutionRequest { replica: replica.to_string(), project_id, execution_id: execution_id.to_string() };
-        let path = "/v1/task/claim_execution";
-        let resp: TaskClaimExecutionResponse = until_done(path, || self.http.post(path, &req)).await?;
-        Ok(resp.claimed)
-    }
-
-    async fn heartbeat(&self, task_id: Uuid, replica: &str) -> Result<bool> {
-        let req = TaskHeartbeatRequest {
-            task_id,
-            replica: replica.to_string(),
-        };
-        let resp: TaskHeartbeatResponse = self.http.post("/v1/task/heartbeat", &req).await?;
-        Ok(resp.renewed)
-    }
-
-    async fn requeue(&self, task_id: Uuid, replica: &str) -> Result<bool> {
-        let req = TaskRequeueRequest {
-            task_id,
-            replica: replica.to_string(),
-        };
-        let resp: TaskRequeueResponse = self.http.post("/v1/task/requeue", &req).await?;
-        Ok(resp.requeued)
-    }
-
-    async fn complete(&self, task_id: Uuid, replica: &str, result: Value) -> Result<()> {
-        let req = TaskCompleteRequest {
-            task_id,
-            replica: replica.to_string(),
-            result,
-        };
-        let path = "/v1/task/complete";
-        let _: TaskCompleteResponse = until_done(path, || self.http.post(path, &req)).await?;
-        Ok(())
-    }
-
-    async fn fail(&self, task_id: Uuid, replica: &str, error: String) -> Result<()> {
-        let req = TaskFailRequest {
-            task_id,
-            replica: replica.to_string(),
-            error,
-        };
-        let path = "/v1/task/fail";
-        let _: TaskFailResponse = until_done(path, || self.http.post(path, &req)).await?;
-        Ok(())
-    }
-
-    async fn cancels_asked(&self, project_id: Uuid, execution_ids: Vec<String>) -> Result<Vec<CancelAsked>> {
-        let req = TaskCancelsAskedRequest { project_id, execution_ids };
-        let resp: TaskCancelsAskedResponse = self.http.post("/v1/task/cancels_asked", &req).await?;
-        Ok(resp.cancels)
-    }
 }
 
 // ---------- Signals (listener-only rehydrate) ----------
@@ -498,6 +398,20 @@ impl BrokerSignalClient {
         let resp: SignalListHeldResponse =
             self.http.post("/v1/signal/list_held", &SignalListHeldRequest { project }).await?;
         Ok(resp.rows)
+    }
+
+    /// Put an entry's event in its trigger's queue: its worker could not be
+    /// reached (`/v1/door/park_fire`). `held_by`: the holder it was picked
+    /// up under.
+    pub async fn park_fire(&self, token: &str, fire: &weft_task_store::parked_fires::Waiting, held_by: Option<&str>) -> Result<DoorParked> {
+        self.http
+            .post("/v1/door/park_fire", &DoorParkRequest { token: token.to_string(), fire: fire.clone(), held_by: held_by.map(str::to_string) })
+            .await
+    }
+
+    /// Where an event of the signal `token` goes; `None` when it is gone.
+    pub async fn fire_target(&self, token: &str) -> Result<Option<SignalFireTarget>> {
+        self.http.post("/v1/signal/fire_target", &SignalFireTargetRequest { token: token.to_string() }).await
     }
 
     /// One held signal by token, `None` when none is held under it.
@@ -594,6 +508,14 @@ impl BrokerInfraClient {
         let _: InfraLookResponse = self.http.post("/v1/infra/look", &InfraLookRequest { project_id: project }).await?;
         Ok(())
     }
+
+    /// What changed of this copy's values (`/v1/infra/pushed`), from the
+    /// agent beside it: the link's identity names the copy. A refusal comes
+    /// back as `BrokerRefused`, carrying the broker's reason.
+    pub async fn push_values(&self, values: &weft_core::infra::bake::PushedValues) -> Result<()> {
+        let _: serde_json::Value = self.http.post("/v1/infra/pushed", values).await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -608,6 +530,18 @@ impl InfraReader for BrokerInfraClient {
         let resp: InfraEndpointUrlResponse =
             self.http.post("/v1/infra/endpoint_url", &req).await?;
         Ok(resp.address)
+    }
+
+    async fn baked_outputs(
+        &self,
+        execution_id: weft_core::ExecutionId,
+        _run_instance: Option<&weft_core::instance::InstanceId>,
+        place: &str,
+        copy: Option<&weft_core::instance::InstanceId>,
+    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>> {
+        let req = InfraBakedRequest { execution_id, place: place.to_string(), instance: copy.cloned() };
+        let resp: InfraBakedResponse = self.http.post("/v1/infra/baked", &req).await?;
+        Ok(resp.saved)
     }
 }
 
@@ -661,6 +595,118 @@ impl BrokerAccessClient {
     }
 }
 
+// ---------- The worker's door ----------
+
+/// What a worker's door asks the broker (`/v1/door/*`, and the caller
+/// check of a gated route).
+pub struct BrokerDoorClient {
+    http: HttpCore,
+}
+
+impl BrokerDoorClient {
+    pub fn new(link: BrokerLink) -> Arc<Self> {
+        Arc::new(Self { http: HttpCore::new(link) })
+    }
+
+    pub async fn triggers(&self) -> Result<DoorTriggers> {
+        self.http.post("/v1/door/triggers", &DoorTriggersRequest::default()).await
+    }
+
+    pub async fn run_facts(&self, instance: Option<&weft_core::instance::InstanceId>) -> Result<DoorRunFacts> {
+        self.http.post("/v1/door/run_facts", &DoorRunFactsRequest { instance: instance.cloned() }).await
+    }
+
+    /// Put `fire` in the queue of the trigger `token`; `held_by`: the
+    /// holder it was picked up under.
+    pub async fn park_fire(&self, token: &str, fire: &weft_task_store::parked_fires::Waiting, held_by: Option<&str>) -> Result<DoorParked> {
+        self.http
+            .post("/v1/door/park_fire", &DoorParkRequest { token: token.to_string(), fire: fire.clone(), held_by: held_by.map(str::to_string) })
+            .await
+    }
+
+    /// The instance an instance token names; `Ok(None)` when the broker
+    /// refuses it (it names nobody of this project).
+    pub async fn instance_token(&self, token: &str) -> Result<Option<DoorInstanceToken>> {
+        let answer = self
+            .http
+            .post_raw("/v1/door/instance_token", &DoorInstanceTokenRequest { token: token.to_string() }, DEFAULT_CALL_WAIT)
+            .await?;
+        if answer.status == reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(None);
+        }
+        HttpCore::parse_success(answer, "/v1/door/instance_token").map(Some)
+    }
+
+    pub async fn tick(&self, request: &DoorTickRequest) -> Result<DoorTick> {
+        self.http.post("/v1/door/tick", request).await
+    }
+
+    /// What a caller of a gated route proved; `Ok(None)` when the broker
+    /// refused them (the reason is in its log).
+    pub async fn verify_caller(&self, request: &CallerVerifyRequest) -> Result<Option<CallerVerified>> {
+        let answer = self.http.post_raw("/v1/caller/verify", request, DEFAULT_CALL_WAIT).await?;
+        if answer.status == reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(None);
+        }
+        HttpCore::parse_success::<CallerVerified>(answer, "/v1/caller/verify").map(Some)
+    }
+}
+
+// ---------- A worker's runs ----------
+
+/// What a worker asks the broker about the runs it drives: claiming one it
+/// was handed, letting one go, the answers and cancels waiting for them.
+pub struct BrokerRunClient {
+    http: HttpCore,
+}
+
+impl BrokerRunClient {
+    pub fn new(link: BrokerLink) -> Arc<Self> {
+        Arc::new(Self { http: HttpCore::new(link) })
+    }
+
+    /// Claim queued run `execution_id` (`RunClaimRequest`); `None` when it
+    /// is not queued. A claim the broker could not even start is sent
+    /// again.
+    pub async fn claim(&self, execution_id: ExecutionId) -> Result<Option<weft_journal::record::Claimed>> {
+        let path = "/v1/run/claim";
+        let req = RunClaimRequest { execution_id };
+        let resp: RunClaimResponse = until_done(path, || self.http.post(path, &req)).await?;
+        Ok(resp.claimed)
+    }
+
+    /// This worker no longer drives `execution_id`, its whole record
+    /// written, for `why` (`DoorLetGoRequest`).
+    pub async fn let_go(&self, execution_id: ExecutionId, why: LetGo) -> Result<()> {
+        let _: DoorLetGo = self.http.post("/v1/door/let_go", &DoorLetGoRequest { execution_id, why }).await?;
+        Ok(())
+    }
+
+    /// The answers waiting for `execution_id`'s waits, but the waits in
+    /// `taken`, held up to `wait` until one is there (`RunAnswersRequest`).
+    pub async fn answers(&self, execution_id: ExecutionId, taken: &[String], wait: Duration) -> Result<Vec<RunAnswer>> {
+        let path = "/v1/run/answers";
+        held(
+            wait,
+            |hold| async move {
+                let req = RunAnswersRequest { execution_id, wait_ms: hold.as_millis() as u64, taken: taken.to_vec() };
+                let resp: RunAnswersResponse = read_until_answered(path, || self.http.post_held(path, &req, hold)).await?;
+                Ok(resp.answers)
+            },
+            |answers| !answers.is_empty(),
+        )
+        .await
+    }
+
+    /// The cancels waiting for the runs this worker drives (`RunCancelsRequest`).
+    pub async fn cancels(&self) -> Result<Vec<RunCancel>> {
+        let path = "/v1/run/cancels";
+        let req = RunCancelsRequest::default();
+        let resp: RunCancelsResponse = read_until_answered(path, || self.http.post(path, &req)).await?;
+        Ok(resp.cancels)
+    }
+}
+
 // ---------- Execution steering (worker tags/stops runs) ----------
 
 /// The worker's door to steering executions: tag its own run, stop
@@ -678,17 +724,8 @@ impl BrokerExecutionClient {
     /// Tag `execution_id` with `tags`. Synchronous: on return the tag rows
     /// exist (or the call failed), which is what lets a following
     /// `stop_tagged` anchor on them.
-    pub async fn tag_execution(
-        &self,
-        execution_id: ExecutionId,
-        tags: Vec<String>,
-        replica: &str,
-    ) -> Result<()> {
-        let req = ExecutionTagRequest {
-            execution_id: execution_id.to_string(),
-            tags,
-            replica: replica.to_string(),
-        };
+    pub async fn tag_execution(&self, execution_id: ExecutionId, tags: Vec<String>) -> Result<()> {
+        let req = ExecutionTagRequest { execution_id, tags };
         let _: ExecutionTagResponse = self.http.post("/v1/execution/tag", &req).await?;
         Ok(())
     }
@@ -696,19 +733,8 @@ impl BrokerExecutionClient {
     /// Ask that every live execution of `execution_id`'s project carrying
     /// `tag` be stopped. Returns once the stop is durably queued; the
     /// dispatcher carries it out.
-    pub async fn stop_tagged(
-        &self,
-        execution_id: ExecutionId,
-        tag: String,
-        stop_self: weft_core::StopSelf,
-        replica: &str,
-    ) -> Result<ExecutionStopTaggedResponse> {
-        let req = ExecutionStopTaggedRequest {
-            execution_id: execution_id.to_string(),
-            tag,
-            stop_self,
-            replica: replica.to_string(),
-        };
+    pub async fn stop_tagged(&self, execution_id: ExecutionId, tag: String, stop_self: weft_core::StopSelf) -> Result<ExecutionStopTaggedResponse> {
+        let req = ExecutionStopTaggedRequest { execution_id, tag, stop_self };
         self.http.post("/v1/execution/stop_tagged", &req).await
     }
 }
@@ -987,16 +1013,6 @@ impl BrokerSupervisorClient {
         Ok(resp.cancel_requested)
     }
 
-    pub async fn running_count(&self, project_id: Uuid, copies: &weft_core::instance::Copies) -> Result<i64> {
-        let req = SupervisorRunningCountRequest {
-            project_id,
-            copies: copies.clone(),
-        };
-        let resp: SupervisorRunningCountResponse =
-            self.http.post("/v1/supervisor/running_count", &req).await?;
-        Ok(resp.running_count)
-    }
-
     /// The project's uncompleted supervisor commands (apply / stop /
     /// terminate), each as the copies it acts on. The health loop stands
     /// down for those copies while they are here, so it never fights the
@@ -1158,6 +1174,20 @@ impl BrokerInfraStateClient {
         Ok(resp.command_id)
     }
 
+    /// Save what the infra setup `execution_id` sent out on the baked
+    /// outputs of its node at `place` (`InfraBakeRequest`).
+    pub async fn save_bake(
+        &self,
+        execution_id: weft_core::ExecutionId,
+        place: &str,
+        copy: Option<&weft_core::instance::InstanceId>,
+        values: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        let req = InfraBakeRequest { execution_id, place: place.to_string(), instance: copy.cloned(), values };
+        let _: serde_json::Value = self.http.post("/v1/infra/bake", &req).await?;
+        Ok(())
+    }
+
     /// The apply command's state, holding up to `wait` for it to
     /// complete.
     pub async fn wait_apply(
@@ -1263,67 +1293,5 @@ mod read_retry_tests {
         .await;
         assert!(answer.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-    }
-}
-
-/// `events` cut, in order, into runs whose request bodies stay under
-/// [`JOURNAL_RECORD_BODY_LIMIT`]: each one request of
-/// [`BrokerJournalClient::record_events`], and the parts a writer that
-/// sends a write again sends one at a time (`JournalClient::parts`). An event too big on its own goes alone,
-/// and the broker refuses it (`413`): the engine refuses an output that
-/// big at the node first, so reaching that refusal is a broken contract.
-fn record_chunks(events: &[ExecEvent]) -> Result<Vec<&[ExecEvent]>> {
-    // Room for the request's own fields around the events.
-    const ENVELOPE: usize = 1024;
-    let mut chunks = Vec::new();
-    let (mut start, mut size) = (0, ENVELOPE);
-    for (i, event) in events.iter().enumerate() {
-        let weight = serde_json::to_vec(event)?.len() + 1;
-        if i > start && size + weight > JOURNAL_RECORD_BODY_LIMIT {
-            chunks.push(&events[start..i]);
-            (start, size) = (i, ENVELOPE);
-        }
-        size += weight;
-    }
-    if start < events.len() {
-        chunks.push(&events[start..]);
-    }
-    Ok(chunks)
-}
-
-#[cfg(test)]
-mod record_chunk_tests {
-    use super::*;
-
-    fn emitted(execution_id: ExecutionId, bytes: usize) -> ExecEvent {
-        ExecEvent::LogLine {
-            execution_id,
-            node_id: "n".into(),
-            frames: Vec::new(),
-            level: "info".into(),
-            message: "x".repeat(bytes),
-            at_unix_ms: None,
-            seq: None,
-            at_unix: 0,
-        }
-    }
-
-    /// Small rows go in one request; rows that would overflow the broker's
-    /// limit start the next one, in order, and one too big alone still
-    /// goes, by itself, for the broker to refuse by name.
-    #[test]
-    fn rows_are_cut_under_the_body_limit_in_order() {
-        let run = ExecutionId::new_v4();
-        let small: Vec<ExecEvent> = (0..10).map(|_| emitted(run, 10)).collect();
-        assert_eq!(record_chunks(&small).unwrap().len(), 1);
-
-        let half = JOURNAL_RECORD_BODY_LIMIT / 2;
-        let big = vec![emitted(run, half), emitted(run, half), emitted(run, 10)];
-        let chunks = record_chunks(&big).unwrap();
-        assert_eq!(chunks.iter().map(|c| c.len()).collect::<Vec<_>>(), [1, 2]);
-
-        let huge = vec![emitted(run, JOURNAL_RECORD_BODY_LIMIT * 2)];
-        assert_eq!(record_chunks(&huge).unwrap().len(), 1);
-        assert!(record_chunks(&[]).unwrap().is_empty());
     }
 }

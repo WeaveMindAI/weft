@@ -123,9 +123,8 @@ pub trait BrokerSupervisorOps: Send + Sync {
         cancelled: bool,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorCommandCompleteResponse>>;
     /// Whether the user requested cancellation of a claimed command.
-    /// Polled between platform steps and inside readiness/drain waits.
+    /// Polled between platform steps and inside the readiness wait.
     async fn command_cancel_requested(&self, command_id: i64) -> Result<bool>;
-    async fn running_count(&self, project_id: uuid::Uuid, copies: &weft_core::instance::Copies) -> Result<i64>;
     /// The project's uncompleted supervisor commands (apply / stop /
     /// terminate), each as the copies it acts on. The health loop stands
     /// down for those copies so it never races a user action.
@@ -286,9 +285,6 @@ impl BrokerSupervisorOps for BrokerSupervisorClient {
 
     async fn command_cancel_requested(&self, command_id: i64) -> Result<bool> {
         BrokerSupervisorClient::command_cancel_requested(self, command_id).await
-    }
-    async fn running_count(&self, project_id: uuid::Uuid, copies: &weft_core::instance::Copies) -> Result<i64> {
-        BrokerSupervisorClient::running_count(self, project_id, copies).await
     }
     async fn infra_commands_in_flight(
         &self,

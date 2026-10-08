@@ -42,22 +42,6 @@
 //! `fal-ai/flux/dev` is a quarter of a megapixel by the request and one
 //! whole megapixel by fal's own count, so pricing it off the request
 //! under-reports the call four times over.
-//!
-//! The pre-call ceiling is the one place a quantity IS derived from the
-//! request body, per unit kind (images, megapixels, seconds, videos),
-//! and a unit it cannot turn into a quantity refuses loudly. It rounds
-//! UP at every step, which is what makes it a ceiling: whole megapixels
-//! rather than the geometric figure, the resolution multiplier on every
-//! unit it applies to, and a refusal rather than a clamp for a duration
-//! past what it can bound. That
-//! ceiling also accounts for fal's platform convention of billing high
-//! resolutions above the unit price (2K at 1.5x, 4K at 2x), read from
-//! the request's `resolution` field so the estimate leans where fal
-//! actually charges.
-
-use std::collections::BTreeMap;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -70,32 +54,9 @@ use crate::{
 /// authenticates both.
 const FAL_PRICING_URL: &str = "https://api.fal.ai/v1/models/pricing";
 
-/// How long one fetched price serves before it is re-asked. Prices move
-/// on the timescale of product launches, not requests; an hour keeps the
-/// catalog off the hot path without letting a price change linger.
-const PRICE_TTL: Duration = Duration::from_secs(3600);
+pub struct FalMeter;
 
-/// fal caps `num_images` at 16 per request across its image models.
-const MAX_IMAGES_PER_REQUEST: f64 = 16.0;
-
-/// The longest single video fal's generation models produce; bounds a
-/// `duration` a caller could inflate.
-const MAX_VIDEO_SECONDS: f64 = 60.0;
-
-struct CachedPrice {
-    unit_price: f64,
-    unit: String,
-    fetched: Instant,
-}
-
-pub struct FalMeter {
-    /// Fetched catalog prices per endpoint id, TTL-refreshed. Shared
-    /// process-wide (the meter is a `static`), so one fetch serves every
-    /// call on the model until the TTL lapses.
-    prices: Mutex<BTreeMap<String, CachedPrice>>,
-}
-
-pub static FAL: FalMeter = FalMeter { prices: Mutex::new(BTreeMap::new()) };
+pub static FAL: FalMeter = FalMeter;
 
 crate::register_meter!(FAL);
 
@@ -118,125 +79,28 @@ fn parse_price(model: &str, body: &Value) -> anyhow::Result<(f64, String)> {
     Ok((unit_price, unit.to_string()))
 }
 
-/// Megapixels of one output image for a fal `image_size` value (fal's
-/// documented preset dimensions, or an explicit {width,height}), leaning
-/// high for anything unrecognized.
-fn image_size_megapixels(size: &Value) -> f64 {
-    let geometric = if let (Some(w), Some(h)) = (size["width"].as_f64(), size["height"].as_f64()) {
-        w * h / 1_000_000.0
-    } else {
-        match size.as_str().unwrap_or("landscape_4_3") {
-            "square" => 0.27,               // 512 x 512
-            "square_hd" => 1.05,            // 1024 x 1024
-            "portrait_4_3" | "landscape_4_3" => 0.79,   // 768 x 1024
-            "portrait_16_9" | "landscape_16_9" => 0.59, // 576 x 1024
-            _ => 1.05,
-        }
-    };
-    // Rounded UP to a whole megapixel, because this feeds a CEILING and
-    // fal's own count is not the geometric one: measured on
-    // `fal-ai/flux/dev` (2026-09-10), a 512x512 image is a quarter of a
-    // megapixel by the request and one whole megapixel billed. Using the
-    // geometric figure put the ceiling nearly four times UNDER what the
-    // call would cost, and a ceiling that rounds the wrong way is not a
-    // ceiling: it is what a prepaid balance reserves against.
-    geometric.max(0.01).ceil().max(1.0)
-}
-
-/// A request's seconds of video: the `duration` field as a number or a
-/// `"<n>s"` string. `None` when the request names none (fal applies the
-/// model's own default, and this meter does not keep per-model
-/// defaults; the caller is asked to pass one).
-fn requested_seconds(parsed: &Value) -> Option<f64> {
-    match &parsed["duration"] {
-        Value::Number(n) => n.as_f64(),
-        Value::String(s) => s.trim_end_matches('s').parse().ok(),
-        _ => None,
-    }
-}
-
-/// The rate multiplier for the request's `resolution`, per fal's platform
-/// convention (0.5K at 0.75x, 1K at 1x, 2K at 1.5x, 4K at 2x; absent means
-/// the default 1K). An unrecognized value is refused, never priced at 1x.
-fn resolution_multiplier(parsed: &Value) -> anyhow::Result<f64> {
-    let Some(res) = parsed["resolution"].as_str() else { return Ok(1.0) };
-    match res.to_ascii_uppercase().as_str() {
-        "0.5K" | "512P" => Ok(0.75),
-        "1K" => Ok(1.0),
-        "2K" => Ok(1.5),
-        "4K" => Ok(2.0),
-        other => anyhow::bail!(
-            "resolution '{other}' is not one this meter can price (0.5K/1K/2K/4K)"
-        ),
-    }
-}
-
-/// The number of images a submit asks for (fal's default is 1).
-fn requested_images(parsed: &Value) -> f64 {
-    parsed["num_images"].as_f64().unwrap_or(1.0).clamp(1.0, MAX_IMAGES_PER_REQUEST)
-}
-
-/// The billed quantity of one submit, per the catalog's `unit` (the
-/// vocabulary observed on fal's live catalog: "images", "megapixels",
-/// "seconds", "videos"; "compute seconds" and "units" also exist but
-/// cannot be read from a request). Unit kinds are interpreted
-/// generically from the request body; a unit this match does not know
-/// is a loud error naming it, so covering a new fal billing unit is one
-/// arm here, never a per-model table.
-fn quantity_for_unit(unit: &str, parsed: &Value) -> anyhow::Result<f64> {
-    match unit {
-        "images" => Ok(requested_images(parsed) * resolution_multiplier(parsed)?),
-        // The resolution multiplier counts here too: a megapixel-priced
-        // model asked at 4K with no explicit `image_size` was bounded at
-        // the 1K default, which is half the rate fal charges for it.
-        "megapixels" => Ok(requested_images(parsed)
-            * image_size_megapixels(&parsed["image_size"])
-            * resolution_multiplier(parsed)?),
-        "seconds" => {
-            let seconds = requested_seconds(parsed).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "this model bills per second and the request names no `duration`; \
-                     pass an explicit duration so the cost is known"
-                )
-            })?;
-            // A ceiling may round UP and never down. Clamping into a
-            // range took a requested two minutes down to one and bounded
-            // the call at half what it will be billed, so a duration past
-            // the range is refused instead: the request is either priced
-            // honestly or not admitted.
-            if seconds > MAX_VIDEO_SECONDS {
-                anyhow::bail!(
-                    "this request asks for {seconds} seconds of video, past the {MAX_VIDEO_SECONDS} \
-                     this meter bounds a call at; nothing here can put an honest ceiling on it"
-                );
-            }
-            Ok(seconds.max(1.0))
-        }
-        "videos" => Ok(1.0),
-        // "compute seconds" (GPU time) and "units" (an opaque fraction)
-        // are only knowable after the run; a request cannot bound them.
-        other => anyhow::bail!(
-            "fal bills this model per '{other}', a quantity that cannot be read from \
-             the request"
-        ),
-    }
-}
-
 impl FalMeter {
-    /// The model's (unit_price, unit) from fal's pricing catalog, cached
-    /// with a TTL. `http` is the meter's signed side-query lane (the same
+    /// The model's (unit_price, unit) from fal's pricing catalog, asked
+    /// once per worker (`follow_up.shared`): prices move on the timescale
+    /// of product launches, and a worker that goes idle lets its copy go.
+    /// The query rides the meter's signed side-query lane (the same
     /// credential the call rides authenticates the catalog; the query
     /// itself is free).
-    async fn price_for(
-        &self,
-        model: &str,
-        http: &reqwest_middleware::ClientWithMiddleware,
-    ) -> anyhow::Result<(f64, String)> {
-        if let Some(hit) = self.prices.lock().expect("fal price cache lock").get(model) {
-            if hit.fetched.elapsed() < PRICE_TTL {
-                return Ok((hit.unit_price, hit.unit.clone()));
-            }
-        }
+    async fn price_for(&self, model: &str, follow_up: &FollowUp<'_>) -> anyhow::Result<(f64, String)> {
+        let price = follow_up
+            .shared
+            .named(&format!("fal-price:{model}"), || async {
+                Self::fetch_price(model, follow_up.http)
+                    .await
+                    .map_err(|e| weft_core::error::WeftError::NodeExecution(format!("{e:#}")))
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok((*price).clone())
+    }
+
+    /// The model's price, asked of fal's pricing catalog now.
+    async fn fetch_price(model: &str, http: &reqwest_middleware::ClientWithMiddleware) -> anyhow::Result<(f64, String)> {
         let resp = http
             .get(FAL_PRICING_URL)
             .query(&[("endpoint_id", model)])
@@ -251,12 +115,7 @@ impl FalMeter {
         if !status.is_success() {
             anyhow::bail!("fal's pricing catalog refused the price lookup ({status}): {body}");
         }
-        let (unit_price, unit) = parse_price(model, &body)?;
-        self.prices.lock().expect("fal price cache lock").insert(
-            model.to_string(),
-            CachedPrice { unit_price, unit: unit.clone(), fetched: Instant::now() },
-        );
-        Ok((unit_price, unit))
+        parse_price(model, &body)
     }
 
 }
@@ -288,20 +147,6 @@ fn model_and_tail(path: &str) -> Option<(&str, &str)> {
 /// <https://fal.ai/docs/documentation/model-apis/common-parameters>
 const BILLABLE_UNITS_HEADER: &str = "x-fal-billable-units";
 
-/// One submit's per-call tap.
-///
-/// A submit is a queue enqueue: it answers a request id before anything
-/// has been generated, so it carries no cost figure at all and none is
-/// read here. All this observation keeps is the request id, which is what
-/// lets [`FalMeter::resolve`] go and ask fal what the finished job was
-/// billed.
-///
-/// The request's own quantity is deliberately NOT a fallback anywhere in
-/// this meter, even though [`quantity_for_unit`] can compute one for the
-/// ceiling. Measured against fal: a single 512x512 image asked of
-/// `fal-ai/flux/dev` is a quarter of a megapixel by the request and one
-/// whole megapixel by fal's own count, so the request-derived figure
-/// under-reported that call four times over.
 /// The request id inside a `requests/<id>[/status]` tail.
 fn request_id_in(tail: &str) -> Option<&str> {
     tail.strip_prefix("requests/")?.split('/').next().filter(|s| !s.is_empty())
@@ -336,20 +181,6 @@ impl ProviderMeter for FalMeter {
         }
     }
 
-
-    async fn ceiling_usd(
-        &self,
-        path: &str,
-        body: &[u8],
-        follow_up: FollowUp<'_>,
-    ) -> anyhow::Result<f64> {
-        let model = model_and_tail(path).map(|(m, _)| m).unwrap_or_default();
-        let (unit_price, unit) = self.price_for(model, follow_up.http).await?;
-        let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-        let quantity = quantity_for_unit(&unit, &parsed)
-            .map_err(|e| anyhow::anyhow!("cannot bound '{model}': {e}"))?;
-        Ok(unit_price * quantity)
-    }
 
     fn observe(&self, path: &str, _query: &str, _request_body: &[u8]) -> Box<dyn CallObservation> {
         // The model is all the request contributes. What the call cost
@@ -389,7 +220,7 @@ impl ProviderMeter for FalMeter {
         // exists, so a model it does not list can never be priced,
         // whatever fal answers afterwards. Refuse before spending.
         let model = model_and_tail(path).map(|(m, _)| m).unwrap_or_default();
-        self.price_for(model, follow_up.http).await.map(|_| ()).map_err(|e| {
+        self.price_for(model, &follow_up).await.map(|_| ()).map_err(|e| {
             anyhow::anyhow!(
                 "fal's pricing catalog does not price '{model}', so what a call on it \
                  costs could never be measured: {e:#}"
@@ -457,7 +288,7 @@ impl ProviderMeter for FalMeter {
 
         let mut metadata = scratch.clone();
         let model = scratch["model"].as_str().unwrap_or_default().to_string();
-        let (unit_price, unit) = match self.price_for(&model, follow_up.http).await {
+        let (unit_price, unit) = match self.price_for(&model, &follow_up).await {
             Ok(price) => price,
             Err(e) => {
                 // The rate card is the only place a unit price exists, so
@@ -590,50 +421,6 @@ mod tests {
     }
 
     #[test]
-    fn quantities_read_per_unit_from_the_request() {
-        let q = |unit: &str, body: serde_json::Value| quantity_for_unit(unit, &body);
-        // Per image: count times the resolution multiplier.
-        assert_eq!(q("images", json!({})).unwrap(), 1.0);
-        assert_eq!(q("images", json!({ "num_images": 3 })).unwrap(), 3.0);
-        assert_eq!(q("images", json!({ "num_images": 2, "resolution": "4K" })).unwrap(), 4.0);
-        assert_eq!(q("images", json!({ "resolution": "2K" })).unwrap(), 1.5);
-        assert!(q("images", json!({ "resolution": "8K" })).is_err());
-        // Per megapixel: whole megapixels per image, never the
-        // geometric figure. fal's own count for a 512x512 image is one
-        // megapixel where the request implies a quarter of one, so a
-        // ceiling built on the geometric figure sat four times under the
-        // real charge.
-        assert_eq!(q("megapixels", json!({ "num_images": 2, "image_size": "square_hd" })).unwrap(), 4.0);
-        assert_eq!(q("megapixels", json!({ "image_size": "square" })).unwrap(), 1.0);
-        assert_eq!(
-            q("megapixels", json!({ "image_size": { "width": 1000, "height": 500 } })).unwrap(),
-            1.0,
-            "under a megapixel still bills as one"
-        );
-        assert_eq!(
-            q("megapixels", json!({ "image_size": { "width": 2000, "height": 1100 } })).unwrap(),
-            3.0,
-            "2.2 megapixels rounds up, never down"
-        );
-        // And the resolution multiplier applies here too: asking for 4K
-        // with no explicit size used to be bounded at the 1K default.
-        assert_eq!(q("megapixels", json!({ "resolution": "4K" })).unwrap(), 2.0);
-        // Per second: the explicit duration, either wire spelling; a
-        // request naming none refuses rather than guessing a default,
-        // and one past what the meter can bound refuses rather than
-        // being clamped DOWN to it (a ceiling may only round up).
-        assert_eq!(q("seconds", json!({ "duration": "6s" })).unwrap(), 6.0);
-        assert_eq!(q("seconds", json!({ "duration": 10 })).unwrap(), 10.0);
-        assert!(q("seconds", json!({})).is_err());
-        assert!(q("seconds", json!({ "duration": 120 })).is_err(), "past the bound, refused");
-        // Flat per video.
-        assert_eq!(q("videos", json!({})).unwrap(), 1.0);
-        // Units a request cannot bound refuse loudly.
-        assert!(q("compute seconds", json!({})).is_err());
-        assert!(q("units", json!({})).is_err());
-    }
-
-    #[test]
     fn the_pricing_catalog_answer_parses() {
         let body = json!({
             "has_more": false,
@@ -754,12 +541,13 @@ mod tests {
 
         let mut scratch = json!({ "model": "fal-ai/flux/dev" });
         let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         let cost = FAL
             .fold_report(
                 "fal-ai/flux/requests/req-1/status",
                 observed,
                 &mut scratch,
-                FollowUp { http: &http, base_url: FAL.base_url() },
+                FollowUp { http: &http, base_url: FAL.base_url(), shared: &shared },
             )
             .await;
 
@@ -816,6 +604,7 @@ mod live_fal {
     /// report the figure that closes it.
     async fn priced(model: &str, payload: Value) -> MeasuredCost {
         let http = signed_client();
+        let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         let base = FAL.base_url();
 
         // The submit, observed as a billable call.
@@ -831,7 +620,7 @@ mod live_fal {
         let mut scratch = submitted.data;
 
         let app: String = model.split('/').take(2).collect::<Vec<_>>().join("/");
-        let follow = FollowUp { http: &http, base_url: base };
+        let follow = FollowUp { http: &http, base_url: base, shared: &shared };
 
         // Poll the status route, folding each read in, exactly as the
         // node's own polling would drive it.
@@ -845,14 +634,14 @@ mod live_fal {
             obs.on_chunk(&bytes);
             let observed = obs.end(false);
             let done = observed.data["jobStatus"].as_str() == Some("COMPLETED");
-            let follow = FollowUp { http: &http, base_url: base };
+            let follow = FollowUp { http: &http, base_url: base, shared: &shared };
             if let Some(cost) = FAL.fold_report(&path, observed, &mut scratch, follow).await {
                 return cost;
             }
             if done {
                 break;
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
 
         // The result fetch: the read that states fal's own count.
@@ -889,7 +678,8 @@ mod live_fal {
     #[ignore = "queries fal's live catalog"]
     async fn the_gate_admits_a_priced_model_and_refuses_an_unpriced_one() {
         let http = signed_client();
-        let follow = || FollowUp { http: &http, base_url: FAL.base_url() };
+        let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
+        let follow = || FollowUp { http: &http, base_url: FAL.base_url(), shared: &shared };
 
         FAL.priceable("fal-ai/flux/dev", follow())
             .await

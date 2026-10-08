@@ -39,6 +39,7 @@
       "weft options*": "allow",
       "weft infra press*": "allow",
       "weft infra env*": "allow",
+      "weft infra rebake*": "allow",
       "weft test-node*": "allow",
       "weft node-test-hash*": "allow",
       "weft files ls*": "allow",

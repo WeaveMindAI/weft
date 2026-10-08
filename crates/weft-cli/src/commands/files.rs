@@ -118,7 +118,7 @@ pub async fn inspect(ctx: Ctx, key: String) -> anyhow::Result<()> {
     // The user types the scope key; match it against each wire key's
     // scope portion (tenant stripped).
     let Some(meta) = files.into_iter().find(|f| scope_key(&f.key) == key) else {
-        anyhow::bail!("no stored file with key '{key}' (see `weft files ls`)");
+        anyhow::bail!("no stored file with key '{key}' (see `{}`)", ctx.weft("files ls"));
     };
     println!("{}", serde_json::to_string_pretty(&meta)?);
     Ok(())

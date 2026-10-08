@@ -5,7 +5,7 @@
 
 import { specScopedTo, type RunSpec } from '../../../packages/weft-graph/src/run-spec';
 import type { CancelCause } from '../../../packages/weft-graph/src/protocol';
-import type { SummaryStatus } from './executions';
+import type { RunStatus } from './executions';
 import { describeOutcome } from './outcome';
 
 // SYNC: TreeJson, VersionSummary, RunSummary <-> crates/weft-core/src/versions.rs VersionTree, Head, VersionSummary, RunSummary (the shape `weft tree --json` prints, with `disk_version` added by crates/weft-cli/src/commands/tree.rs)
@@ -24,6 +24,10 @@ export interface VersionSummary {
   created_at: number;
   diff: { added: string[]; removed: string[]; changed: string[] };
   manifest: Record<string, string>;
+  /** How many runs the project's triggers started on this version (too
+   *  many to list one by one), and the newest. */
+  trigger_runs?: number;
+  last_trigger_run?: string | null;
 }
 
 export interface RunSummary {
@@ -36,7 +40,7 @@ export interface RunSummary {
   example: string | null;
   /** The run's listing status, or null when its journal is gone. */
   // SYNC: RunSummary.status <-> crates/weft-core/src/versions.rs RunSummary.status
-  status: SummaryStatus | null;
+  status: RunStatus | null;
   started_at: number;
   completed_at: number | null;
   /** For a cancelled run: who or what stopped it. */
@@ -178,6 +182,8 @@ export function versionMarks(node: VersionTreeNode): string[] {
   if (node.isHead) marks.push('HEAD');
   if (node.isDisk) marks.push('on disk');
   if (node.isActivated) marks.push('activated');
+  const fired = node.version.trigger_runs ?? 0;
+  if (fired > 0) marks.push(`${fired} trigger run${fired === 1 ? '' : 's'}`);
   return marks;
 }
 

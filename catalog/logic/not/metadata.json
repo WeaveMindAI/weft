@@ -25,5 +25,8 @@
       "type": "Boolean",
       "description": "The opposite."
     }
-  ]
+  ],
+  "features": {
+    "pure": true
+  }
 }

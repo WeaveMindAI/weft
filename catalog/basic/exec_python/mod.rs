@@ -1,5 +1,5 @@
-//! ExecPython: run a user-supplied Python snippet inside the
-//! worker using an embedded CPython interpreter (PyO3).
+//! ExecPython: run a user-supplied Python snippet in a `python3`
+//! process beside the worker, from a pool the worker keeps.
 //!
 //! Wiring:
 //!
@@ -17,12 +17,17 @@
 //!   optional input with a plain `if problem is None`. `return
 //!   <dict>` in the user code supplies the output pulses.
 //!
-//! - Inputs are converted serde_json → Python via `json_to_py`. A
-//!   recursive walk over the JSON tree keeps types straightforward:
-//!   strings to `str`, numbers to `int`/`float`, nulls to `None`,
-//!   arrays to `list`, objects to `dict`. No custom classes leak
-//!   across the boundary; we round-trip through JSON twice per
-//!   call but the shape is simple and predictable.
+//! - The script runs in a Python process of its own, one of a few the
+//!   worker holds for its runs to share (`ctx.shared`), as many as
+//!   the worker has CPUs, started the first time a script needs one:
+//!   scripts run side by side. Each script's own names start fresh (its
+//!   own scope), but the process is shared on purpose: a module a script
+//!   imported stays imported for the next, and so does whatever it set on
+//!   a module, the environment, the working directory and files it
+//!   wrote. Inputs go to it as JSON and the answer comes
+//!   back as JSON: strings to `str`, numbers to `int`/`float`, nulls to
+//!   `None`, arrays to `list`, objects to `dict`, and back. No custom
+//!   class leaks across. What a script prints goes to the worker's log.
 //!
 //! - A file arrives UNWRAPPED on a port DECLARED as one (the same
 //!   question the way out asks, so a dict that happens to carry a
@@ -58,37 +63,30 @@
 //!   keys, a string on a number port). `error` is weft's, so a script
 //!   that wants to fail on purpose raises.
 //!
-//! - A cancelled run stops its script. Python offers one way to stop
-//!   code running on another thread: `PyThreadState_SetAsyncExc`
-//!   raises an exception in that thread at its next bytecode. The
-//!   script's thread records its id in an [`Interrupt`] while it runs,
-//!   and the guard the node body holds raises `KeyboardInterrupt` there
-//!   when the body ends early (the run was cancelled, or the engine
-//!   dropped the body). A script inside one long C call (a `time.sleep`,
-//!   a blocking socket read) stops when that call returns, the earliest
-//!   moment Python checks. `KeyboardInterrupt` is outside `Exception`,
-//!   so a script's `except Exception` does not swallow it.
+//! - A cancelled run stops its script at once: its process is killed
+//!   (a script inside one long C call, a `time.sleep`, a blocking read,
+//!   included), and the next script that needs one starts a fresh one.
+//!   The same happens when the engine drops the node body.
 //!
 //! Isolation: the worker the node runs in IS the isolation boundary;
 //! the Python executes there with the same access that worker already
-//! has, and is not sandboxed further. Running a project therefore runs
+//! has, and is not sandboxed further (a process of its own keeps a
+//! script that crashes Python from taking the worker with it, nothing
+//! more). Running a project therefore runs
 //! its ExecPython code with that worker's privileges, the same trust
 //! model as running the project's own program.
 
 use async_trait::async_trait;
-use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyFloat, PyList, PyString};
-use pyo3::ToPyObject;
-use serde_json::{Map, Number, Value};
+use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 use weft::node::NodeOutput;
 use weft::storage::media::{media_slots, substitute_media};
 use weft::weft_type::FileKind;
 use weft::context::ERROR_PORT;
-use weft::{node_error, ExecutionContext, Node, NodeErrExt, NodeManifest, StoredFile, WeftError, WeftResult, WeftType};
+use weft::{node_error, ExecutionContext, Node, NodeManifest, StoredFile, WeftError, WeftResult, WeftType};
 
 #[derive(NodeManifest)]
 pub struct ExecPythonNode;
@@ -134,19 +132,8 @@ impl Node for ExecPythonNode {
             })
             .collect();
 
-        // PyO3 needs the GIL which it acquires on whatever sync
-        // thread we call from. Hop off the async executor for the
-        // blocking call so we don't stall other node invocations.
-        // `_stop` interrupts the script when this body ends before it
-        // does (see the module doc).
-        let interrupt = Arc::new(Interrupt::default());
-        let _stop = StopOnDrop(interrupt.clone());
-        let task = tokio::task::spawn_blocking(move || run_python(&code, inputs, &interrupt));
-        let cancel = ctx.cancellation();
-        let result = tokio::select! {
-            err = cancel.cancelled_err() => return Err(err),
-            joined = task => joined.node_err("ExecPython blocking task panicked")??,
-        };
+        let interpreters = ctx.shared("exec_python", |()| async { Ok(Interpreters::new()) }).await?;
+        let result = run_python(&interpreters, &code, inputs, &ctx.cancellation()).await?;
 
         // Check the whole answer before anything goes out, so a wrong
         // key or type refuses the firing as the program mistake it is
@@ -264,165 +251,203 @@ fn wrap_files(value: &Value, ty: &WeftType) -> WeftResult<Value> {
     Ok(substitute_media(value, ty, &replacements))
 }
 
+/// The script's process: what it reads, one request a line on the stdin
+/// it keeps for that, and what it answers, one a line on the stdout it
+/// keeps for that. A script never touches either: what it prints goes to
+/// stderr, the worker's log, and what it reads from stdin is empty, so an
+/// `input()` cannot eat the next request. Each
+/// request is `{"names", "body", "args"}`: the input names, the script
+/// indented under the function it becomes, and the inputs in that order.
+const SERVER: &str = r#"
+import json, os, sys, traceback
+_answers = os.fdopen(os.dup(1), "w", buffering=1)
+os.dup2(2, 1)
+_requests = os.fdopen(os.dup(0), "r")
+os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
+sys.stdin = open(os.devnull)
+
+def _described(e):
+    tb = "".join(traceback.format_exception(type(e), e, e.__traceback__)).rstrip()
+    return f"{type(e).__name__}: {e}\n{tb}"
+
+def _plain(v):
+    if v is None or isinstance(v, (bool, str, int)):
+        return v
+    if isinstance(v, float):
+        if v != v or v in (float("inf"), float("-inf")):
+            raise TypeError(f"{v}, a float JSON cannot carry")
+        return v
+    if isinstance(v, list):
+        return [_plain(x) for x in v]
+    if isinstance(v, dict):
+        out = {}
+        for k, x in v.items():
+            if not isinstance(k, str):
+                raise TypeError(f"a dict with a `{type(k).__name__}` key, which has no value on a port (its keys must be strings)")
+            out[k] = _plain(x)
+        return out
+    raise TypeError(f"a `{type(v).__name__}`, which has no value on a port (return None, bool, int, float, str, list or dict)")
+
+def _answer(request):
+    source = "def __weft_user_fn(" + ", ".join(request["names"]) + "):\n" + request["body"] + "\n"
+    scope = {}
+    try:
+        exec(compile(source, "<script>", "exec"), scope)
+    except BaseException as e:
+        return {"compile": _described(e)}
+    try:
+        ret = scope["__weft_user_fn"](*request["args"])
+    except BaseException as e:
+        return {"raised": _described(e)}
+    if ret is None:
+        return {"type": "none"}
+    if not isinstance(ret, dict):
+        return {"type": "not_dict", "got": type(ret).__name__}
+    out = []
+    for k, v in ret.items():
+        if not isinstance(k, str):
+            return {"type": "key", "got": type(k).__name__}
+        try:
+            out.append([k, _plain(v)])
+        except TypeError as e:
+            return {"type": "value", "key": k, "why": str(e)}
+    return {"ok": out}
+
+for line in _requests:
+    _answers.write(json.dumps(_answer(json.loads(line))) + "\n")
+"#;
+
+/// The script's answer, as its process wrote it.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum Answer {
+    Ok {
+        ok: Vec<(String, Value)>,
+    },
+    Compile {
+        compile: String,
+    },
+    Raised {
+        raised: String,
+    },
+    Type {
+        #[serde(rename = "type")]
+        kind: String,
+        #[serde(default)]
+        got: Option<String>,
+        #[serde(default)]
+        key: Option<String>,
+        #[serde(default)]
+        why: Option<String>,
+    },
+}
+
+/// The Python processes a worker keeps for its scripts (see the module
+/// doc): idle ones waiting, and room for as many as the worker has CPUs.
+pub(crate) struct Interpreters {
+    idle: Mutex<Vec<Interpreter>>,
+    room: Arc<tokio::sync::Semaphore>,
+}
+
+/// One Python process serving [`SERVER`].
+struct Interpreter {
+    child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    answers: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+}
+
+impl Interpreters {
+    pub(crate) fn new() -> Self {
+        let cpus = std::thread::available_parallelism().map(usize::from).unwrap_or(1);
+        Self { idle: Mutex::new(Vec::new()), room: Arc::new(tokio::sync::Semaphore::new(cpus)) }
+    }
+
+    fn start() -> WeftResult<Interpreter> {
+        let mut child = tokio::process::Command::new("python3")
+            .args(["-u", "-c", SERVER])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| node_error(format!("could not start Python (`python3`): {e}")))?;
+        let stdin = child.stdin.take().expect("stdin is piped");
+        let stdout = child.stdout.take().expect("stdout is piped");
+        Ok(Interpreter { child, stdin, answers: tokio::io::BufReader::new(stdout).lines() })
+    }
+}
+
 /// Execute `code` with the given input bindings and return the raw
 /// key-value pairs the script returned. Each way it can go wrong has
 /// its own kind: code that does not compile is an input error, an
 /// answer that is not a dict of plain values is a type error (both are
 /// the program's own mistakes), and an exception the script raises while
-/// it runs is a node failure, the one kind `error` catches.
-fn run_python(code: &str, inputs: Vec<(String, Value)>, interrupt: &Interrupt) -> WeftResult<Vec<(String, Value)>> {
-    Python::with_gil(|py| -> WeftResult<Vec<(String, Value)>> {
-        // Build the wrapper source once per call. Wrapping in a
-        // function lets the user write `return {...}` naturally.
-        // The signature lists every input port so Python's scope
-        // rules do the right thing (closures, shadowing, etc).
-        let param_names: Vec<String> =
-            inputs.iter().map(|(k, _)| k.clone()).collect();
-        let wrapper_source = format!(
-            "def __weft_user_fn({params}):\n{body}\n",
-            params = param_names.join(", "),
-            body = indent_block(code, "    "),
-        );
-
-        // Running the wrapper only defines the function, so what fails
-        // here is the code not compiling (a syntax or indentation error).
-        let globals = PyDict::new_bound(py);
-        py.run_bound(&wrapper_source, Some(&globals), None)
-            .map_err(|err| WeftError::Input(format!("the code does not compile: {}", python_error(py, &err))))?;
-        let user_fn = globals
-            .get_item("__weft_user_fn")
-            .map_err(|err| node_error(format!("locating __weft_user_fn: {}", python_error(py, &err))))?
-            .node_err("internal: ExecPython wrapper did not define __weft_user_fn")?;
-
-        // Convert each input into a Python value and call the
-        // wrapper as a positional-arg tuple matching the signature.
-        let args = PyList::empty_bound(py);
-        for (_, v) in &inputs {
-            let py_val = json_to_py(py, v)
-                .map_err(|err| node_error(format!("converting an input to Python: {}", python_error(py, &err))))?;
-            args.append(py_val)
-                .map_err(|err| node_error(format!("building the argument list: {}", python_error(py, &err))))?;
-        }
-        let ret = interrupt
-            .run(py, || user_fn.call1(args.to_tuple()))?
-            .map_err(|err| node_error(format!("the script raised {}", python_error(py, &err))))?;
-
-        // Falling off the end, a bare `return` and `return None` are one
-        // thing to Python, and none of them says which ports get what.
-        if ret.is_none() {
-            return Err(WeftError::Type(
-                "the script ended without returning a dict; end it with `return {...}` keyed by \
-                 output port (`return {}` emits nothing)"
-                    .into(),
-            ));
-        }
-
-        let dict = ret.downcast::<PyDict>().map_err(|_| {
-            WeftError::Type(format!(
-                "the script returned {}; it must return a dict keyed by output port",
-                python_type_name(&ret)
-            ))
-        })?;
-
-        let mut out: Vec<(String, Value)> = Vec::new();
-        for (k, v) in dict.iter() {
-            let key: String = k.extract().map_err(|_| {
-                WeftError::Type(format!(
-                    "the script returned a dict with a {} key; its keys are output port names",
-                    python_type_name(&k)
-                ))
-            })?;
-            let json_val = py_to_json(py, &v).map_err(|err| {
-                WeftError::Type(format!("the script returned '{key}' as {}", err.value_bound(py)))
-            })?;
-            out.push((key, json_val));
-        }
-        Ok(out)
-    })
-}
-
-/// The thread a script runs on, for stopping it from another thread
-/// (see the module doc). `thread` is the Python thread id while the
-/// script runs and 0 otherwise; it is only written with the GIL held,
-/// so a reader holding the GIL sees the script either running or done.
-#[derive(Default)]
-struct Interrupt {
-    thread: AtomicU64,
-    stopped: AtomicBool,
-}
-
-impl Interrupt {
-    /// Run the script's call on this thread, stoppable by [`Self::stop_now`].
-    /// `Err(Cancelled)` when the stop came first or interrupted it.
-    fn run<T>(&self, py: Python<'_>, call: impl FnOnce() -> PyResult<T>) -> WeftResult<PyResult<T>> {
-        let ident: u64 = py
-            .import_bound("threading")
-            .and_then(|threading| threading.call_method0("get_ident"))
-            .and_then(|ident| ident.extract())
-            .map_err(|err| node_error(format!("reading the script's thread id: {}", python_error(py, &err))))?;
-        // Written before `stopped` is read (see `StopOnDrop`).
-        self.thread.store(ident, Ordering::SeqCst);
-        if self.stopped.load(Ordering::SeqCst) {
-            self.thread.store(0, Ordering::SeqCst);
-            return Err(WeftError::Cancelled);
-        }
-        let out = call();
-        self.thread.store(0, Ordering::SeqCst);
-        // A stop that landed after the script's last bytecode is still
-        // pending on this thread's state, and the next script this
-        // pooled thread runs would raise it: clear it.
-        // SAFETY: the GIL is held (`py`); a null exception clears.
-        unsafe { pyo3::ffi::PyThreadState_SetAsyncExc(ident as std::os::raw::c_long, std::ptr::null_mut()) };
-        if self.stopped.load(Ordering::SeqCst) {
-            return Err(WeftError::Cancelled);
-        }
-        Ok(out)
-    }
-
-    /// Stop the script: one that has not started never starts, one that
-    /// runs raises `KeyboardInterrupt` at its next bytecode. Takes the
-    /// GIL, so it waits for the script's thread to hand it over (Python
-    /// does every few milliseconds): never call it on the async executor.
-    fn stop_now(&self) {
-        self.stopped.store(true, Ordering::SeqCst);
-        Python::with_gil(|_py| {
-            let ident = self.thread.load(Ordering::SeqCst);
-            if ident != 0 {
-                // SAFETY: the GIL is held, and `PyExc_KeyboardInterrupt`
-                // is a static the interpreter owns. The id is Python's
-                // unsigned thread id, which this binding takes as signed.
-                unsafe {
-                    pyo3::ffi::PyThreadState_SetAsyncExc(
-                        ident as std::os::raw::c_long,
-                        pyo3::ffi::PyExc_KeyboardInterrupt,
-                    )
-                };
+/// it runs is a node failure, the one kind `error` catches. A cancel
+/// kills the script's process.
+pub(crate) async fn run_python(
+    interpreters: &Interpreters,
+    code: &str,
+    inputs: Vec<(String, Value)>,
+    cancel: &weft::CancellationFlag,
+) -> WeftResult<Vec<(String, Value)>> {
+    let _room = tokio::select! {
+        biased;
+        err = cancel.cancelled_err() => return Err(err),
+        room = interpreters.room.clone().acquire_owned() => room.map_err(|_| node_error("the Python processes were closed".to_string()))?,
+    };
+    let mut interpreter = loop {
+        let idle = interpreters.idle.lock().expect("interpreters poisoned").pop();
+        match idle {
+            // A process that exited since it answered (a thread of the last
+            // script ended it) serves nobody: it is dropped, never handed
+            // to the next script.
+            Some(mut interpreter) => {
+                if matches!(interpreter.child.try_wait(), Ok(None)) {
+                    break interpreter;
+                }
             }
-        });
-    }
-}
-
-/// Stops the script when the node body ends, whichever way it ends: a
-/// script that already finished is untouched.
-struct StopOnDrop(Arc<Interrupt>);
-
-impl Drop for StopOnDrop {
-    fn drop(&mut self) {
-        // Written before `thread` is read, and the script's thread writes
-        // `thread` before reading this: whichever runs second sees the
-        // other, so a script that has not started yet never starts.
-        self.0.stopped.store(true, Ordering::SeqCst);
-        if self.0.thread.load(Ordering::SeqCst) == 0 {
-            return;
+            None => break Interpreters::start()?,
         }
-        let interrupt = self.0.clone();
-        tokio::task::spawn_blocking(move || interrupt.stop_now());
+    };
+    let (names, args): (Vec<String>, Vec<Value>) = inputs.into_iter().unzip();
+    let request = serde_json::json!({ "names": names, "body": indent_block(code, "    "), "args": args });
+    let mut line = serde_json::to_string(&request).map_err(|e| node_error(format!("the script's inputs as JSON: {e}")))?;
+    line.push('\n');
+    let asked = async {
+        interpreter.stdin.write_all(line.as_bytes()).await?;
+        interpreter.stdin.flush().await?;
+        interpreter.answers.next_line().await
+    };
+    let answered = tokio::select! {
+        biased;
+        // The process goes with the run: dropping it kills it.
+        err = cancel.cancelled_err() => return Err(err),
+        answered = asked => answered,
+    };
+    let line = match answered {
+        Ok(Some(line)) => line,
+        Ok(None) | Err(_) => {
+            let status = interpreter.child.wait().await.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
+            return Err(node_error(format!("the script's Python process stopped before answering ({status})")));
+        }
+    };
+    let answer: Answer = serde_json::from_str(&line)
+        .map_err(|e| node_error(format!("the script's Python process answered '{}': {e}", weft::truncate_user_string(&line, 200))))?;
+    // The process is well: it serves the next script.
+    interpreters.idle.lock().expect("interpreters poisoned").push(interpreter);
+    match answer {
+        Answer::Ok { ok } => Ok(ok),
+        Answer::Compile { compile } => Err(WeftError::Input(format!("the code does not compile: {compile}"))),
+        Answer::Raised { raised } => Err(node_error(format!("the script raised {raised}"))),
+        Answer::Type { kind, got, key, why } => Err(WeftError::Type(match kind.as_str() {
+            "none" => "the script ended without returning a dict; end it with `return {...}` keyed by output port \
+                       (`return {}` emits nothing)"
+                .to_string(),
+            "not_dict" => format!("the script returned {}; it must return a dict keyed by output port", got.unwrap_or_default()),
+            "key" => format!("the script returned a dict with a {} key; its keys are output port names", got.unwrap_or_default()),
+            _ => format!("the script returned '{}' as {}", key.unwrap_or_default(), why.unwrap_or_default()),
+        })),
     }
-}
-
-/// A Python object's type name, for a message.
-fn python_type_name(obj: &Bound<'_, PyAny>) -> String {
-    obj.get_type().name().map(|n| n.to_string()).unwrap_or_else(|_| "<unknown>".to_string())
 }
 
 /// Indent every line of `s` with `prefix`. Used so the user's code
@@ -431,118 +456,5 @@ fn indent_block(s: &str, prefix: &str) -> String {
     if s.is_empty() {
         return format!("{prefix}pass");
     }
-    s.lines()
-        .map(|line| format!("{prefix}{line}"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// A Python exception as a person debugging their script needs it: the
-/// exception's type and message, then the traceback with line numbers
-/// when there is one.
-fn python_error(py: Python<'_>, err: &PyErr) -> String {
-    let traceback = err
-        .traceback_bound(py)
-        .and_then(|tb| tb.format().ok())
-        .unwrap_or_default();
-    let kind = err.get_type_bound(py).name().map(|n| n.to_string()).unwrap_or_else(|_| "Exception".to_string());
-    let summary = format!("{kind}: {}", err.value_bound(py));
-    if traceback.trim().is_empty() {
-        summary
-    } else {
-        format!("{summary}\n{}", traceback.trim_end())
-    }
-}
-
-/// Convert a serde_json Value to a Python object. Types:
-/// - Null → None
-/// - Bool → bool
-/// - Number → int if it's an exact int, else float
-/// - String → str
-/// - Array → list of converted items
-/// - Object → dict of (String key → converted value)
-fn json_to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny>> {
-    match v {
-        Value::Null => Ok(py.None().into_bound(py)),
-        Value::Bool(b) => Ok(PyBool::new_bound(py, *b).to_owned().into_any()),
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(i.to_object(py).into_bound(py))
-            } else if let Some(u) = n.as_u64() {
-                Ok(u.to_object(py).into_bound(py))
-            } else if let Some(f) = n.as_f64() {
-                Ok(PyFloat::new_bound(py, f).into_any())
-            } else {
-                // serde_json's Number should always be one of the
-                // above. Kept for completeness.
-                Ok(py.None().into_bound(py))
-            }
-        }
-        Value::String(s) => Ok(PyString::new_bound(py, s.as_str()).into_any()),
-        Value::Array(items) => {
-            let list = PyList::empty_bound(py);
-            for item in items {
-                list.append(json_to_py(py, item)?)?;
-            }
-            Ok(list.into_any())
-        }
-        Value::Object(obj) => {
-            let dict = PyDict::new_bound(py);
-            for (k, val) in obj {
-                dict.set_item(k, json_to_py(py, val)?)?;
-            }
-            Ok(dict.into_any())
-        }
-    }
-}
-
-/// Convert a Python object back to serde_json. Supported: None, bool,
-/// int, float, str, list, dict. Anything else (sets, custom classes,
-/// bytes, tuples) raises `PyTypeError`: a downstream port expecting a
-/// Dict surfaces a structured failure instead of receiving a stringified
-/// `repr()` that pretends to be data.
-fn py_to_json(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Value> {
-    if obj.is_none() {
-        return Ok(Value::Null);
-    }
-    if let Ok(b) = obj.extract::<bool>() {
-        return Ok(Value::Bool(b));
-    }
-    if let Ok(i) = obj.extract::<i64>() {
-        return Ok(Value::Number(i.into()));
-    }
-    if let Ok(u) = obj.extract::<u64>() {
-        return Ok(Value::Number(u.into()));
-    }
-    if let Ok(f) = obj.extract::<f64>() {
-        return Number::from_f64(f)
-            .map(Value::Number)
-            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err(format!("{f}, a float JSON cannot carry")));
-    }
-    if let Ok(s) = obj.extract::<String>() {
-        return Ok(Value::String(s));
-    }
-    if let Ok(list) = obj.downcast::<PyList>() {
-        let mut out = Vec::with_capacity(list.len());
-        for item in list.iter() {
-            out.push(py_to_json(py, &item)?);
-        }
-        return Ok(Value::Array(out));
-    }
-    if let Ok(dict) = obj.downcast::<PyDict>() {
-        let mut map = Map::new();
-        for (k, v) in dict.iter() {
-            let key: String = k.extract()?;
-            map.insert(key, py_to_json(py, &v)?);
-        }
-        return Ok(Value::Object(map));
-    }
-    // Unsupported Python type: refuse to silently downgrade to a
-    // stringified `repr()`. A user wiring a downstream port expecting
-    // a Dict gets a structured failure instead of a `"<set {...}>"`
-    // string that pretends to be data.
-    let type_name = python_type_name(obj);
-    Err(pyo3::exceptions::PyTypeError::new_err(format!(
-        "a `{type_name}`, which has no value on a port (return None, bool, int, float, str, list or dict)"
-    )))
+    s.lines().map(|line| format!("{prefix}{line}")).collect::<Vec<_>>().join("\n")
 }

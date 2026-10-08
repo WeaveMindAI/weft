@@ -42,23 +42,6 @@
       "description": "Auth access node (ApiKeyAuth, JwtAuth, HmacAuth), checked on the opening request. Unwired, anyone with the URL may connect. The identity comes out on `caller`."
     },
     {
-      "name": "outlivesCaller",
-      "type": "Boolean",
-      "label": "May outlive the caller",
-      "description": "Off (default): the caller leaving cancels the run, and a long durable wait is killed instead of parked. On: the run is its own, so whatever it still does must end by itself; anything that watches or loops needs `maxSessionSecs` or a TagRun/StopTagged pair."
-    },
-    {
-      "name": "defaultHoldSecs",
-      "type": "Number",
-      "widget": {
-        "kind": "number",
-        "min": 1,
-        "step": 1
-      },
-      "label": "Hold seconds before giving up on a wait",
-      "description": "Caller-tied run only: how long a node's wait holds the worker (and the connection) before giving up. Per-wait overrides win. Never unbounded."
-    },
-    {
       "name": "maxSessionSecs",
       "type": "Number",
       "widget": {

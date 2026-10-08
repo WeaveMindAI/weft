@@ -70,7 +70,7 @@ pub enum LifecycleWrite {
 pub enum SignalsGoing {
     /// None, and the listener keeps holding them: a parked or
     /// hibernating trigger goes on listening, and what it hears waits for
-    /// it to be back on (`crate::arrival`). Once a hibernation's grace
+    /// it to be back on (`weft_core::arrival`). Once a hibernation's grace
     /// window ends, the listener lets go of them (`crate::reaper`'s
     /// `hibernations`), and the holders of its held ones already have
     /// (their claims read the window).
@@ -218,7 +218,7 @@ pub trait ActivationStoreOps: Send + Sync {
 
 /// Whether a `trigger_activation` row (`a`) is a hibernation still in its
 /// grace window: going or gone down, taking work until a deadline.
-// SYNC: IN_GRACE_WINDOW_SQL <-> crate::arrival::Standing::arrival, weft_broker_client::protocol::ACTIVATION_LISTENS
+// SYNC: IN_GRACE_WINDOW_SQL <-> weft_core::arrival::Standing::arrival, weft_broker_client::protocol::ACTIVATION_LISTENS
 const IN_GRACE_WINDOW_SQL: &str =
     "a.accepting_fires AND a.fires_deadline_unix IS NOT NULL AND a.status IN ('inactive', 'deactivating')";
 
@@ -319,14 +319,6 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- When it went down so: a copy it reads that was applied after
             -- this has come back up since, which is what brings it back.
             went_down_at_unix BIGINT,
-            -- What `went_down_with` replaced, read by nothing here: it stays
-            -- for the release that stopped reading it, kept equal to
-            -- `went_down_with = 'health'` on every write, so a replica still
-            -- on the release before reads the health loop's parks right
-            -- while the new one rolls out (the seed below carries the parks
-            -- it made before the other way). Dropped in the release after,
-            -- with the seed.
-            deactivated_by_health BOOLEAN NOT NULL DEFAULT FALSE,
             -- The trigger-setup run of the activation in flight; one run
             -- sets up every activation a verb names, so rows share it.
             activating_execution_id UUID,
@@ -361,7 +353,7 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // An activation's status, whether it takes work while off and until
         // when, are part of how its routes read (an active one serves a
         // caller, a parked one holds them, until its grace window ends:
-        // `crate::arrival`), so a change tells every dispatcher to read its
+        // `weft_core::arrival`), so a change tells every dispatcher to read its
         // tenant's routes again (`crate::held::Held::routes`), and wakes the
         // callers held there.
         // SYNC: 'weft_routes' <-> crate::held::ROUTES_CHANNEL
@@ -391,48 +383,39 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             AFTER INSERT OR DELETE ON trigger_activation
             FOR EACH ROW
             EXECUTE FUNCTION trigger_activation_routes_notify()"#,
-        // While a release rolls out, a replica on the release before writes
-        // `deactivated_by_health` and never the cause columns: its activate
-        // leaves an old cause behind, its health park sets none, and a park
-        // after this release's health park clears only the old column. This
-        // keeps the cause in step with what such a replica writes, the old
-        // column being right about the health loop's parks either way. Goes
-        // with the old column.
-        r#"CREATE OR REPLACE FUNCTION trigger_activation_old_health_flag() RETURNS trigger AS $$
+        // The same changes tell the project's workers, whose copy of its
+        // triggers (`weft_engine::door`) carries how each one stands.
+        // SYNC: 'weft_triggers' <-> weft_broker_client::line::TRIGGERS_CHANNEL
+        r#"CREATE OR REPLACE FUNCTION trigger_activation_triggers_notify() RETURNS trigger AS $$
             BEGIN
-                IF NEW.status = 'activating' THEN
-                    NEW.went_down_with := NULL;
-                    NEW.went_down_at_unix := NULL;
-                ELSIF NEW.deactivated_by_health AND NEW.went_down_with IS NULL THEN
-                    NEW.went_down_with := 'health';
-                    NEW.went_down_at_unix := EXTRACT(EPOCH FROM NOW())::BIGINT;
-                ELSIF NOT NEW.deactivated_by_health AND NEW.went_down_with = 'health' THEN
-                    NEW.went_down_with := NULL;
-                    NEW.went_down_at_unix := NULL;
+                IF TG_OP = 'DELETE' THEN
+                    PERFORM pg_notify('weft_triggers', OLD.project_id::text);
+                ELSE
+                    PERFORM pg_notify('weft_triggers', NEW.project_id::text);
                 END IF;
-                RETURN NEW;
+                RETURN NULL;
             END;
             $$ LANGUAGE plpgsql"#,
-        r#"DROP TRIGGER IF EXISTS trigger_activation_old_health_flag ON trigger_activation"#,
-        r#"CREATE TRIGGER trigger_activation_old_health_flag
-            BEFORE INSERT OR UPDATE ON trigger_activation
+        r#"DROP TRIGGER IF EXISTS trigger_activation_triggers_on_status ON trigger_activation"#,
+        r#"CREATE TRIGGER trigger_activation_triggers_on_status
+            AFTER UPDATE OF status, accepting_fires, fires_deadline_unix ON trigger_activation
             FOR EACH ROW
-            EXECUTE FUNCTION trigger_activation_old_health_flag()"#,
+            WHEN (NEW.status IS DISTINCT FROM OLD.status
+                  OR NEW.accepting_fires IS DISTINCT FROM OLD.accepting_fires
+                  OR NEW.fires_deadline_unix IS DISTINCT FROM OLD.fires_deadline_unix)
+            EXECUTE FUNCTION trigger_activation_triggers_notify()"#,
+        r#"DROP TRIGGER IF EXISTS trigger_activation_triggers_on_row ON trigger_activation"#,
+        r#"CREATE TRIGGER trigger_activation_triggers_on_row
+            AFTER INSERT OR DELETE ON trigger_activation
+            FOR EACH ROW
+            EXECUTE FUNCTION trigger_activation_triggers_notify()"#,
         r#"DROP TRIGGER IF EXISTS trigger_activation_held_on_row ON trigger_activation"#,
         r#"CREATE TRIGGER trigger_activation_held_on_row
             AFTER INSERT OR DELETE ON trigger_activation
             FOR EACH ROW
             EXECUTE FUNCTION signal_held_notify()"#,
     ],
-    seed: &[
-        // A health-loop park the release before wrote sets only the old
-        // column: carried to the cause this release reads (its moment
-        // unknown, so the row's last write) by the boot that applies this
-        // release, so the health loop's auto-recover still brings it back.
-        // Goes with the old column.
-        r#"UPDATE trigger_activation SET went_down_with = 'health', went_down_at_unix = updated_at
-            WHERE deactivated_by_health AND went_down_with IS NULL"#,
-    ],
+    seed: &[],
 };
 
 #[derive(Clone)]
@@ -596,7 +579,6 @@ impl ActivationStoreOps for PostgresActivationStore {
                  drain_deadline_unix = NULL, \
                  went_down_with = NULL, \
                  went_down_at_unix = NULL, \
-                 deactivated_by_health = FALSE, \
                  activating_execution_id = EXCLUDED.activating_execution_id, \
                  heartbeat_unix = EXCLUDED.heartbeat_unix, \
                  activation_program = NULL, \
@@ -644,7 +626,7 @@ impl ActivationStoreOps for PostgresActivationStore {
             "UPDATE trigger_activation \
              SET status = $1, accepting_fires = $2, fires_visible_to_consumers = $3, \
                  fires_deadline_unix = $4, went_down_with = $5, drain_deadline_unix = $6, \
-                 went_down_at_unix = $10, deactivated_by_health = ($5::text IS NOT DISTINCT FROM 'health'), \
+                 went_down_at_unix = $10, \
                  activating_execution_id = NULL, \
                  activation_program = CASE WHEN $1 = 'active' THEN activation_program ELSE NULL END, \
                  activation_version = CASE WHEN $1 = 'active' THEN activation_version ELSE NULL END, \
@@ -702,7 +684,6 @@ impl ActivationStoreOps for PostgresActivationStore {
                 "UPDATE trigger_activation \
                  SET status = $1, accepting_fires = $2, fires_visible_to_consumers = $3, \
                      fires_deadline_unix = $4, went_down_with = $5, drain_deadline_unix = $6, went_down_at_unix = $14, \
-                     deactivated_by_health = ($5::text IS NOT DISTINCT FROM 'health'), \
                      activating_execution_id = NULL, activation_program = $7, activation_version = $8, updated_at = $9 \
                  WHERE project_id = $10 AND activating_execution_id = $11 AND status = 'activating' \
                    AND trigger = $12 AND instance_id IS NOT DISTINCT FROM $13",
@@ -807,7 +788,6 @@ impl ActivationStoreOps for PostgresActivationStore {
             "UPDATE trigger_activation a \
              SET status = $4, accepting_fires = $5, fires_visible_to_consumers = $6, \
                  fires_deadline_unix = $7, went_down_with = $8, drain_deadline_unix = $9, went_down_at_unix = $11, \
-                 deactivated_by_health = ($8::text IS NOT DISTINCT FROM 'health'), \
                  activating_execution_id = NULL, \
                  activation_program = CASE WHEN $4 IN ('inactive', 'deactivating') THEN NULL ELSE activation_program END, \
                  activation_version = CASE WHEN $4 IN ('inactive', 'deactivating') THEN NULL ELSE activation_version END, \

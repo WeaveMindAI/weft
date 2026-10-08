@@ -110,6 +110,27 @@ pub fn tls_config() -> Result<Arc<rustls::ClientConfig>, String> {
 // SYNC: WEFT_FORWARDED_PROTO <-> packages/weft-connect/src/server/passthrough.ts WEFT_FORWARDED_PROTO
 pub const WEFT_FORWARDED_PROTO: &str = "x-weft-forwarded-proto";
 
+/// What weft's relay tells a project's worker about a call it passed on
+/// from an address the install shares (`/connect/<tenant>/...`, an API
+/// domain, a local project's port): where the caller stood, which the
+/// worker cannot see past the relay. A worker reads these only on a hop
+/// that carries weft's own credential, and removes them (with that
+/// credential) before anything else reads the request, so a run sees the
+/// call as its caller sent it.
+pub mod relay_hop {
+    /// The caller's address, as the relay read it.
+    pub const CALLER_ADDRESS: &str = "x-weft-caller-address";
+    /// The `Host` the caller sent the relay, which the hop to the worker
+    /// replaces with the worker's own.
+    pub const CALLER_HOST: &str = "x-weft-caller-host";
+    /// The path the project's routes sit under at that address
+    /// (`/connect/<tenant>`, or empty at a project's own address): what a
+    /// browser's socket URL is built on.
+    pub const ROUTE_PREFIX: &str = "x-weft-route-prefix";
+    /// Every one of them.
+    pub const ALL: [&str; 3] = [CALLER_ADDRESS, CALLER_HOST, ROUTE_PREFIX];
+}
+
 /// The absolute base URL a client used to reach this service, from the
 /// request's own `Host` (and `X-Forwarded-Proto` when a proxy fronted
 /// it), or `None` when the request carries no usable host.
@@ -199,21 +220,21 @@ pub fn request_base_url(headers: &http::HeaderMap) -> Option<String> {
     Some(format!("{}{prefix}", parsed.origin().ascii_serialization()))
 }
 
-/// [`request_base_url`] over a request's headers carried as name/value
-/// pairs (how a request that already crossed a process boundary holds
-/// them, `crate::caller::LiveRequest::headers`). A pair that is not a
-/// valid header is skipped, as the HTTP stack would have refused it.
-pub fn request_base_url_of(headers: &[(String, String)]) -> Option<String> {
-    let map: http::HeaderMap = headers
-        .iter()
-        .filter_map(|(name, value)| {
-            Some((
-                http::HeaderName::from_bytes(name.as_bytes()).ok()?,
-                http::HeaderValue::from_str(value).ok()?,
-            ))
-        })
+/// The caller's address: the `X-Forwarded-For` entries followed by the
+/// peer the listener saw, read `trusted_hops` from the right. Every
+/// trusted proxy appends the address it received from, so the entries a
+/// caller sent itself sit further left and are never read. A request
+/// that passed fewer proxies than that (straight to the listener's own
+/// port) has a shorter list, and its leftmost entry is the caller.
+pub fn caller_address(forwarded_for: Option<&str>, peer: std::net::IpAddr, trusted_hops: usize) -> std::net::IpAddr {
+    let mut chain: Vec<std::net::IpAddr> = forwarded_for
+        .unwrap_or("")
+        .split(',')
+        .filter_map(|entry| entry.trim().parse::<std::net::IpAddr>().ok())
         .collect();
-    request_base_url(&map)
+    chain.push(peer);
+    let index = chain.len().saturating_sub(1).saturating_sub(trusted_hops);
+    chain[index]
 }
 
 /// The first value of a header a chain of proxies may list comma-separated.
@@ -269,16 +290,12 @@ mod request_base_url_tests {
         h
     }
 
-    /// A request carried as pairs (a live caller's, on its way to the
-    /// run) yields the same base the live request would: the door's
-    /// forwarded host and scheme, not the worker's own address.
+    /// A request a door relayed yields the door's forwarded host and
+    /// scheme, not the worker's own address.
     #[test]
-    fn a_carried_request_yields_the_door_it_came_through() {
-        let pairs = |list: &[(&str, &str)]| -> Vec<(String, String)> {
-            list.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
-        };
+    fn a_relayed_request_yields_the_door_it_came_through() {
         assert_eq!(
-            super::request_base_url_of(&pairs(&[
+            request_base_url(&headers(&[
                 ("host", "10.10.0.2:14113"),
                 ("x-forwarded-host", "127.0.0.1:14111"),
                 ("x-forwarded-proto", "http"),
@@ -287,7 +304,7 @@ mod request_base_url_tests {
             Some("http://127.0.0.1:14111")
         );
         assert_eq!(
-            super::request_base_url_of(&pairs(&[
+            request_base_url(&headers(&[
                 ("host", "10.10.0.2:14113"),
                 ("x-forwarded-host", "weft.example.com"),
                 ("x-forwarded-proto", "https"),
@@ -295,7 +312,6 @@ mod request_base_url_tests {
             .as_deref(),
             Some("https://weft.example.com")
         );
-        assert_eq!(super::request_base_url_of(&pairs(&[("bad header", "x")])), None);
     }
 
     /// The caller's own host is the base, and a fronting proxy's
@@ -442,5 +458,29 @@ mod tests {
         ] {
             assert!(!is_loopback_url(public), "{public}");
         }
+    }
+}
+
+#[cfg(test)]
+mod caller_address_tests {
+    use super::caller_address;
+
+    fn ip(s: &str) -> std::net::IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn the_caller_is_read_trusted_hops_from_the_right() {
+        // Through the tunnel and the front door on kind: the caller, the
+        // tunnel's process, then the peer the listener saw (the proxy).
+        assert_eq!(caller_address(Some("203.0.113.9, 10.244.0.7"), ip("10.244.0.9"), 2), ip("203.0.113.9"));
+        // A forged entry sent by the caller sits further left and is
+        // never read.
+        assert_eq!(caller_address(Some("1.1.1.1, 203.0.113.9, 10.244.0.7"), ip("10.244.0.9"), 2), ip("203.0.113.9"));
+        // Straight to the listener's own port: the peer is the caller.
+        assert_eq!(caller_address(None, ip("127.0.0.1"), 2), ip("127.0.0.1"));
+        // Garbage entries are skipped, never read as an address.
+        assert_eq!(caller_address(Some("not-an-ip, 203.0.113.9"), ip("10.0.0.1"), 1), ip("203.0.113.9"));
+        assert_eq!(caller_address(Some("203.0.113.9"), ip("10.0.0.1"), 0), ip("10.0.0.1"));
     }
 }

@@ -6,7 +6,7 @@
 parks on a wait, and a fresh worker folds the journal to resume. That is what
 makes parking thousands of cheap flows free. It fails a node that holds
 in-process state too expensive to rebuild: a browser session with thousands of
-cookies, a loaded local model, a warm connection pool. The plan is an opt-in
+cookies, a loaded local model. The plan is an opt-in
 primitive, `ctx.hold_signal`, where the await happens in place and the worker
 stays alive. Die-and-resume stays the default, and the language makes the cost
 visible, because holding keeps a worker up for the whole wait.

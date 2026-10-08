@@ -19,28 +19,18 @@ use weft_listener::ListenerConfig;
 
 // ---------- Fakes ----------
 
-/// Records every fire the listener enqueued; no business logic.
-struct FakeTasks {
-    enqueued: Mutex<Vec<weft_task_store::tasks::NewTask>>,
-}
+/// The task store: an entry's event never becomes a task, so nothing
+/// here is asked to enqueue one.
+struct FakeTasks;
 
 #[async_trait::async_trait]
 impl weft_task_store::TaskStoreClient for FakeTasks {
-    async fn cancels_asked(
-        &self,
-        _project_id: uuid::Uuid,
-        _execution_ids: Vec<String>,
-    ) -> anyhow::Result<Vec<weft_task_store::tasks::CancelAsked>> {
-        Ok(Vec::new())
-    }
 
     async fn enqueue_dedup(
         &self,
-        spec: weft_task_store::tasks::NewTask,
+        _: weft_task_store::tasks::NewTask,
     ) -> anyhow::Result<weft_task_store::tasks::DedupOutcome> {
-        let id = uuid::Uuid::new_v4();
-        self.enqueued.lock().unwrap().push(spec);
-        Ok(weft_task_store::tasks::DedupOutcome::Inserted(id))
+        unreachable!("an entry's event never becomes a task")
     }
     async fn wait_for_terminal(
         &self,
@@ -48,26 +38,6 @@ impl weft_task_store::TaskStoreClient for FakeTasks {
         _: std::time::Duration,
     ) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
         unreachable!("not used by the serving side")
-    }
-    async fn claim_execution(
-        &self,
-        _: &str,
-        _: uuid::Uuid,
-        _: &str,
-    ) -> anyhow::Result<Option<weft_task_store::tasks::ClaimedExecution>> {
-        unreachable!()
-    }
-    async fn heartbeat(&self, _: uuid::Uuid, _: &str) -> anyhow::Result<bool> {
-        unreachable!()
-    }
-    async fn requeue(&self, _: uuid::Uuid, _: &str) -> anyhow::Result<bool> {
-        unreachable!()
-    }
-    async fn complete(&self, _: uuid::Uuid, _: &str, _: Value) -> anyhow::Result<()> {
-        unreachable!()
-    }
-    async fn fail(&self, _: uuid::Uuid, _: &str, _: String) -> anyhow::Result<()> {
-        unreachable!()
     }
 }
 
@@ -169,7 +139,13 @@ async fn spawn_broker() -> String {
     .route(
         "/v1/infra/listener-address",
         post(|axum::Json(req): axum::Json<Value>| async move { axum::Json(json!({ "authority": req["authority"] })) }),
-    );
+    )
+    // An entry's event goes straight to its project's worker
+    // (`FakeDoors`).
+    .route(
+            "/v1/signal/fire_target",
+            post(|| async { axum::Json(json!({ "project_id": uuid::Uuid::nil(), "is_resume": false, "address": "http://worker.test" })) }),
+        );
     tokio::spawn(async move { axum::serve(listener, weft_broker_client::line::server::with_line(app)).await.unwrap() });
     format!("http://{addr}")
 }
@@ -208,7 +184,8 @@ async fn run_scenario() {
     let peer = spawn_peer().await;
     let broker_base = spawn_broker().await;
 
-    let tasks = Arc::new(FakeTasks { enqueued: Mutex::new(Vec::new()) });
+    let tasks = Arc::new(FakeTasks);
+    let doors = Arc::new(FakeDoors::default());
     let state = ListenerState::new(
         ListenerConfig {
             replica: format!("test-listener-{run_id}"),
@@ -226,6 +203,7 @@ async fn run_scenario() {
             ),
         ),
         Arc::new(weft_platform_traits::FakeAlarm::new()),
+        doors.clone(),
     );
 
     let access = Access::new(uuid::Uuid::new_v4().to_string(), "email", None);
@@ -265,26 +243,44 @@ async fn run_scenario() {
     // A line matching the fire pattern fires; the greeting and the
     // dialogue answers never did (nothing enqueued yet).
     assert!(
-        tasks.enqueued.lock().unwrap().is_empty(),
+        doors.fired.lock().unwrap().is_empty(),
         "dialogue chatter must not fire"
     );
     peer.downlink.send("* 4 EXISTS".into()).await.unwrap();
-    wait_until(|| !tasks.enqueued.lock().unwrap().is_empty(), "the fire").await;
+    wait_until(|| !doors.fired.lock().unwrap().is_empty(), "the fire").await;
     {
-        let fires = tasks.enqueued.lock().unwrap();
+        let fires = doors.fired.lock().unwrap();
         assert_eq!(fires.len(), 1);
-        assert_eq!(fires[0].payload["payload"], Value::String("* 4 EXISTS".into()));
-        assert_eq!(fires[0].tenant_id, "tenant-a");
-        assert_eq!(fires[0].payload["token"], Value::String(sig_token.clone()));
+        assert_eq!(fires[0].payload, Value::String("* 4 EXISTS".into()));
+        assert_eq!(fires[0].token, Value::String(sig_token.clone()));
     }
 
     // A steady-state line that does not match stays quiet.
     peer.downlink.send("* OK still here".into()).await.unwrap();
     peer.downlink.send("* 5 RECENT".into()).await.unwrap();
-    wait_until(|| tasks.enqueued.lock().unwrap().len() >= 2, "the second fire").await;
+    wait_until(|| doors.fired.lock().unwrap().len() >= 2, "the second fire").await;
     assert_eq!(
-        tasks.enqueued.lock().unwrap().len(),
+        doors.fired.lock().unwrap().len(),
         2,
         "the non-matching line must not have fired"
     );
+}
+
+/// The project's worker, as the listener hands it events: records each
+/// one, and, while `failing`, cannot be reached.
+#[derive(Default)]
+struct FakeDoors {
+    fired: Mutex<Vec<weft_core::door_fire::DoorFire>>,
+    failing: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl weft_listener::fire_sink::WorkerDoors for FakeDoors {
+    async fn fire(&self, _: uuid::Uuid, address: &str, fire: &weft_core::door_fire::DoorFire) -> anyhow::Result<weft_core::door_fire::Fired> {
+        if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("no worker answers at {address}");
+        }
+        self.fired.lock().unwrap().push(fire.clone());
+        Ok(weft_core::door_fire::Fired::Started { execution_id: weft_core::door_fire::run_of_fire(fire.fire_id) })
+    }
 }

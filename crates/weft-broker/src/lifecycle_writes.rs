@@ -16,7 +16,7 @@ use weft_broker_client::lifecycle_command::{
     pending_supervisor_command,
 };
 use weft_broker_client::protocol::{
-    InfraLifecycleVerb, LifecycleOutcome, ProjectStatus, RunningPolicy,
+    InfraLifecycleVerb, LifecycleOutcome, ProjectStatus,
     SupervisorCommandCompleteRequest, SupervisorCommandRow, SupervisorProject,
     SupervisorSetStatusRequest, SupervisorSetWaitingRequest, SupervisorSyncOwnershipResponse,
 };
@@ -248,17 +248,20 @@ where
 ///
 /// Only the supervisor's verbs: `deactivate` and `reactivate` are the
 /// dispatcher's, claimed by dispatchers under their own
-/// `claimed_by_replica` lease.
+/// `claimed_by_replica` lease. A stop or terminate still waiting for the
+/// running work it reaches (`drain_by_unix`) is the dispatcher's until
+/// that wait is over; it still holds back the younger commands that
+/// overlap it.
 pub async fn next_command(
     pool: &PgPool,
     claimer_replica: &str,
     busy_commands: &[i64],
 ) -> anyhow::Result<Option<SupervisorCommandRow>> {
     let sql = format!(
-        "SELECT c.id, c.project_id, c.node_id, c.verb, c.running_policy, c.spec_json, c.force, \
-                c.drain_timeout_secs, c.instance_id, c.every_copy \
+        "SELECT c.id, c.project_id, c.node_id, c.verb, c.spec_json, c.force, c.instance_id, c.every_copy \
          FROM infra_lifecycle_command c \
          WHERE {pending} \
+           AND c.drain_by_unix IS NULL \
            AND NOT (c.id = ANY($2)) \
            AND {owns} \
            AND NOT EXISTS ( \
@@ -303,7 +306,6 @@ pub struct IssuedCommand<'a> {
     /// Which copies of the node it acts on.
     pub copies: &'a weft_core::instance::Copies,
     pub verb: InfraLifecycleVerb,
-    pub running_policy: Option<RunningPolicy>,
     pub spec_json: Option<&'a serde_json::Value>,
     pub issued_by_replica: &'a str,
 }
@@ -329,9 +331,9 @@ pub async fn issue_command(pool: &PgPool, cmd: &IssuedCommand<'_>) -> anyhow::Re
     let (instance_id, every_copy) = cmd.copies.columns();
     sqlx::query_scalar(
         "INSERT INTO infra_lifecycle_command \
-         (tenant_id, project_id, node_id, verb, running_policy, \
+         (tenant_id, project_id, node_id, verb, \
           spec_json, issued_by_replica, issued_at_unix, instance_id, every_copy) \
-         SELECT $1, p.id, $3, $4, $5, $6, $7, EXTRACT(EPOCH FROM NOW())::BIGINT, $8, $9 \
+         SELECT $1, p.id, $3, $4, $5, $6, EXTRACT(EPOCH FROM NOW())::BIGINT, $7, $8 \
          FROM project p WHERE p.id = $2 \
          FOR KEY SHARE OF p \
          ON CONFLICT (project_id, node_id, instance_id) \
@@ -343,7 +345,6 @@ pub async fn issue_command(pool: &PgPool, cmd: &IssuedCommand<'_>) -> anyhow::Re
     .bind(cmd.project_id)
     .bind(cmd.node_id)
     .bind(cmd.verb.as_str())
-    .bind(cmd.running_policy.map(|p| p.as_str()))
     .bind(cmd.spec_json)
     .bind(cmd.issued_by_replica)
     .bind(instance_id)
@@ -385,8 +386,7 @@ pub async fn record_event(
 
 /// Decode one `infra_lifecycle_command` row into the typed
 /// `SupervisorCommandRow` wire shape. EVERY column read propagates
-/// errors; unknown enum values (verb / running_policy) become 500s
-/// rather than silent fallbacks.
+/// errors; an unknown verb becomes a 500 rather than a silent fallback.
 fn decode_command(r: &sqlx::postgres::PgRow) -> anyhow::Result<SupervisorCommandRow> {
     use sqlx::Row;
     let id: i64 = r.try_get("id")?;
@@ -395,16 +395,6 @@ fn decode_command(r: &sqlx::postgres::PgRow) -> anyhow::Result<SupervisorCommand
     let verb_str: String = r.try_get("verb")?;
     let verb = InfraLifecycleVerb::parse(&verb_str)
         .ok_or_else(|| anyhow::anyhow!("infra_lifecycle_command.id={id}: unknown verb '{verb_str}'"))?;
-    // Nullable: dispatcher verbs (deactivate / reactivate) carry
-    // policy inside spec_json; Apply ignores it. Stop / Terminate
-    // populate it.
-    let running_policy_str: Option<String> = r.try_get("running_policy")?;
-    let running_policy = match running_policy_str.as_deref() {
-        None => None,
-        Some(s) => Some(RunningPolicy::parse(s).ok_or_else(|| {
-            anyhow::anyhow!("infra_lifecycle_command.id={id}: unknown running_policy '{s}'")
-        })?),
-    };
     let spec_json: Option<serde_json::Value> =
         r.try_get::<Option<serde_json::Value>, _>("spec_json")?;
     let force: bool = r.try_get("force")?;
@@ -412,17 +402,14 @@ fn decode_command(r: &sqlx::postgres::PgRow) -> anyhow::Result<SupervisorCommand
     let every_copy: bool = r.try_get("every_copy")?;
     let copies = weft_core::instance::Copies::from_columns(instance_id, every_copy)
         .map_err(|e| anyhow::anyhow!("infra_lifecycle_command.id={id}: {e}"))?;
-    let drain_timeout_secs: i64 = r.try_get("drain_timeout_secs")?;
     Ok(SupervisorCommandRow {
         id,
         project_id,
         node_id,
         copies,
         verb,
-        running_policy,
         spec_json,
         force,
-        drain_timeout_secs: drain_timeout_secs.max(0) as u64,
     })
 }
 
@@ -696,35 +683,4 @@ pub async fn complete_command(
         Some(project_id) => stale_answer(pool, &req.replica, project_id).await,
         None => Ok(FencedWrite::Gone),
     }
-}
-
-/// How many of `project`'s runs the copies `copies` serve are live:
-/// started, not terminal, and not parked on a resume. A parked run (a
-/// form waiting for input, a timer waiting to fire) holds no worker and
-/// does nothing until it resumes; counting it would deadlock
-/// `running_policy=wait` against any project with a long-lived parked
-/// trigger fire. An instance's copy serves only that instance's runs; the
-/// shared copy (and every copy together) serves every run of the project.
-pub async fn live_run_count(pool: &PgPool, project: uuid::Uuid, copies: &weft_core::instance::Copies) -> anyhow::Result<i64> {
-    let live = |instance_clause: &str| {
-        format!(
-            "SELECT COUNT(*)::bigint \
-             FROM execution ec \
-             WHERE ec.project_id = $1 \
-               {instance_clause} \
-               AND {} \
-               AND NOT {}",
-            weft_journal::unrecorded::LIVE_RUN_SQL,
-            weft_journal::RUN_PARKED_SQL
-        )
-    };
-    let count = match copies {
-        weft_core::instance::Copies::Instance(instance) => {
-            sqlx::query_scalar(&live("AND ec.instance_id = $2")).bind(project).bind(instance.as_str()).fetch_one(pool).await?
-        }
-        weft_core::instance::Copies::Shared | weft_core::instance::Copies::Every => {
-            sqlx::query_scalar(&live("")).bind(project).fetch_one(pool).await?
-        }
-    };
-    Ok(count)
 }

@@ -88,11 +88,12 @@ fn request(
     }
 }
 
-fn refused(r: Result<serde_json::Value, CallerRefusal>) -> String {
+fn refused(r: Result<weft_broker_client::protocol::CallerVerified, CallerRefusal>) -> String {
     match r {
         Err(CallerRefusal::Refused(why)) => why,
         Err(CallerRefusal::Failed(e)) => panic!("expected a refusal, got a failure: {e:#}"),
-        Ok(identity) => panic!("expected a refusal, got {identity}"),
+        Err(CallerRefusal::Malformed(why)) => panic!("expected a refusal, got a malformed ask: {why}"),
+        Ok(verified) => panic!("expected a refusal, got {}", verified.identity),
     }
 }
 
@@ -107,11 +108,12 @@ async fn a_stored_key_admits_and_names_which_one(pool: PgPool) {
     let ok = verify_caller(&verifiers(),&pool, &request(TENANT, &id, "api_key_auth", &[("x-api-key", "second-key")], b""), 0)
         .await
         .expect("the second key verifies");
-    assert_eq!(ok, json!({ "key": 1 }));
+    assert_eq!(ok.identity, json!({ "key": 1 }));
+    assert_eq!(ok.credential_headers, ["X-Api-Key", "authorization"], "the run never writes the key down");
     let ok = verify_caller(&verifiers(),&pool, &request(TENANT, &id, "api_key_auth", &[("authorization", "Bearer first-key")], b""), 0)
         .await
         .expect("the bearer slot works");
-    assert_eq!(ok, json!({ "key": 0 }));
+    assert_eq!(ok.identity, json!({ "key": 0 }));
 
     let why = refused(verify_caller(&verifiers(),&pool, &request(TENANT, &id, "api_key_auth", &[("x-api-key", "nope")], b""), 0).await);
     assert!(why.contains("does not match"), "{why}");
@@ -156,7 +158,7 @@ async fn a_signed_body_admits_with_the_stored_secret(pool: PgPool) {
     let ok = verify_caller(&verifiers(),&pool, &request(TENANT, &id, "hmac_auth", &headers, body), now)
         .await
         .expect("a genuine signature verifies");
-    assert_eq!(ok, json!({}));
+    assert_eq!(ok.identity, json!({}));
     let why = refused(verify_caller(&verifiers(),&pool, &request(TENANT, &id, "hmac_auth", &headers, b"{}"), now).await);
     assert!(why.contains("does not match"), "{why}");
 }
@@ -188,7 +190,7 @@ async fn the_wall_the_service_and_a_missing_scheme_all_refuse(pool: PgPool) {
     assert!(why.contains("no `verify` block"), "{why}");
 
     match verify_caller(&verifiers(),&pool, &request(TENANT, "not-a-uuid", "api_key_auth", &headers, b""), 0).await {
-        Err(CallerRefusal::Failed(_)) => {}
-        other => panic!("a malformed id is a loud failure, got {other:?}"),
+        Err(CallerRefusal::Malformed(why)) => assert!(why.contains("not-a-uuid"), "{why}"),
+        other => panic!("a malformed id is the asker's mistake, got {other:?}"),
     }
 }

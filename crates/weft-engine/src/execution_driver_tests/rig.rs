@@ -60,103 +60,205 @@
         })
     }
 
-    /// In-memory recording journal: stores every event and replays them
-    /// for the boot fold. Unlike the Noop journals in `replay_tests`,
-    /// this actually drives a live execution. A row's id is its place in
-    /// the log, and a held read wakes on the next write, as the real
-    /// journal's does.
+    /// The record in memory, as a worker's writer lanes see it: every
+    /// batch is taken whole, in order, and every event kept in one log
+    /// across runs (a seed's runs and the run it seeds), each run's read
+    /// back on its own. Its selections are kept by digest, as the record
+    /// keeps them.
     #[derive(Default)]
     pub(crate) struct MemJournal {
         pub(super) events: StdMutex<Vec<ExecEvent>>,
-        written: tokio::sync::Notify,
+        selections: StdMutex<HashMap<String, weft_core::project::selection::RecordedSelection>>,
+        /// How many batches the writer sent.
+        pub(crate) batches: std::sync::atomic::AtomicUsize,
     }
     impl MemJournal {
-        fn rows_after_now(&self, execution_id: ExecutionId, after_id: i64) -> Vec<weft_journal::RawJournalRow> {
-            self.events
-                .lock()
-                .unwrap()
-                .iter()
-                .enumerate()
-                .map(|(i, e)| (i as i64 + 1, e))
-                .filter(|(id, e)| *id > after_id && e.execution_id() == execution_id)
-                .map(|(id, e)| weft_journal::RawJournalRow {
-                    id,
-                    payload: serde_json::to_string(e).expect("serialize ExecEvent"),
-                })
-                .collect()
+        /// Put `events` on record as they are: a run's record (or a seed's)
+        /// before a test drives it.
+        pub(crate) fn seed(&self, events: &[ExecEvent]) {
+            for event in events {
+                if let ExecEvent::ExecutionStarted { selection: Some(selection), .. } = event {
+                    self.selections.lock().unwrap().insert(selection.digest().to_string(), selection.clone());
+                }
+            }
+            self.events.lock().unwrap().extend(events.iter().cloned());
+        }
+
+        /// Every event on record of `execution_id`, in order.
+        pub(crate) fn events_of(&self, execution_id: ExecutionId) -> Vec<ExecEvent> {
+            self.events.lock().unwrap().iter().filter(|event| event.execution_id() == execution_id).cloned().collect()
+        }
+    }
+    /// Straight onto the record, as a test puts a run's record (or a
+    /// seed's) there before it drives it.
+    #[async_trait]
+    impl JournalClient for MemJournal {
+        async fn record_event(&self, event: &ExecEvent, _replica: Option<&str>) -> anyhow::Result<()> {
+            self.seed(std::slice::from_ref(event));
+            Ok(())
+        }
+        async fn events_for_execution_id(&self, execution_id: ExecutionId) -> anyhow::Result<Vec<ExecEvent>> {
+            Ok(self.events_of(execution_id))
         }
     }
     #[async_trait]
-    impl JournalClient for MemJournal {
-        async fn record_event(&self, event: &ExecEvent, _instance: Option<&str>) -> anyhow::Result<()> {
-            self.events.lock().unwrap().push(event.clone());
-            self.written.notify_waiters();
-            Ok(())
-        }
-        async fn raw_rows_after(
-            &self,
-            execution_id: ExecutionId,
-            after_id: i64,
-            wait: std::time::Duration,
-        ) -> anyhow::Result<Vec<weft_journal::RawJournalRow>> {
-            let deadline = tokio::time::Instant::now() + wait;
-            loop {
-                let written = self.written.notified();
-                tokio::pin!(written);
-                written.as_mut().enable();
-                let rows = self.rows_after_now(execution_id, after_id);
-                if !rows.is_empty() || tokio::time::timeout_at(deadline, written).await.is_err() {
-                    return Ok(rows);
-                }
+    impl weft_journal::RecordClient for MemJournal {
+        async fn record_batch(&self, batch: Vec<u8>) -> Result<weft_journal::frame::BatchAnswer, weft_journal::BatchError> {
+            self.batches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (head, runs) = crate::test_record::decode_batch(&batch);
+            for stored in head.selections {
+                let selection = weft_core::project::selection::RecordedSelection::read(stored.digest.clone(), stored.selection);
+                self.selections.lock().unwrap().insert(stored.digest, selection);
             }
+            let fates = runs.iter().map(|_| weft_journal::record::Fate::Accepted).collect();
+            self.events.lock().unwrap().extend(runs.into_iter().flat_map(|(_, events)| events));
+            Ok(weft_journal::frame::BatchAnswer { fates })
         }
-        async fn has_terminal_event(&self, execution_id: ExecutionId) -> anyhow::Result<bool> {
-            Ok(self.events.lock().unwrap().iter().any(|e| matches!(
-                e,
-                ExecEvent::ExecutionCompleted { execution_id: c, .. }
-                    | ExecEvent::ExecutionFailed { execution_id: c, .. }
-                    | ExecEvent::ExecutionCancelled { execution_id: c, .. } if *c == execution_id
-            )))
+        async fn record_of(&self, execution_id: ExecutionId) -> anyhow::Result<weft_journal::record::RawRecord> {
+            let events = self.events_of(execution_id);
+            let selection = events.iter().find_map(|event| match event {
+                ExecEvent::ExecutionStarted { selection: Some(selection), .. } => Some(weft_journal::record::StoredSelection::of(selection)),
+                _ => None,
+            });
+            Ok(weft_journal::record::RawRecord {
+                selection,
+                rows: vec![weft_journal::record::RunLogRow { seq: 0, events: weft_journal::stored::encode(&events) }],
+            })
+        }
+        /// The record writes the ending of a run its worker gave up on.
+        async fn give_up(&self, execution_id: ExecutionId, why: String) -> Result<(), weft_journal::BatchError> {
+            self.events.lock().unwrap().push(ExecEvent::ExecutionFailed { execution_id, error: why, at_unix: 0 });
+            Ok(())
         }
     }
 
     pub(super) struct NoopTasks;
     #[async_trait]
     impl weft_task_store::TaskStoreClient for NoopTasks {
-        async fn cancels_asked(
-            &self,
-            _project_id: uuid::Uuid,
-            _execution_ids: Vec<String>,
-        ) -> anyhow::Result<Vec<weft_task_store::tasks::CancelAsked>> {
-            Ok(Vec::new())
-        }
-
         async fn enqueue_dedup(&self, _s: weft_task_store::tasks::NewTask) -> anyhow::Result<weft_task_store::tasks::DedupOutcome> {
             unreachable!("rig tests enqueue no tasks")
         }
         async fn wait_for_terminal(&self, _t: uuid::Uuid, _to: std::time::Duration) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
             unreachable!()
         }
-        async fn claim_execution(&self, _p: &str, _project: uuid::Uuid, _execution: &str) -> anyhow::Result<Option<weft_task_store::tasks::ClaimedExecution>> { Ok(None) }
-        async fn heartbeat(&self, _t: uuid::Uuid, _p: &str) -> anyhow::Result<bool> { Ok(true) }
-        async fn requeue(&self, _t: uuid::Uuid, _p: &str) -> anyhow::Result<bool> { Ok(true) }
-        async fn complete(&self, _t: uuid::Uuid, _p: &str, _r: Value) -> anyhow::Result<()> { Ok(()) }
-        async fn fail(&self, _t: uuid::Uuid, _p: &str, _e: String) -> anyhow::Result<()> { Ok(()) }
+    }
+    /// Tasks fake for await_signal tests. `enqueue_dedup` of a
+    /// RegisterSignal mints a deterministic token (recording it so the
+    /// test can give the matching answer) and `wait_for_terminal` hands
+    /// back a registered signal result; a WithdrawSignal is recorded.
+    /// Every other task kind is unreachable in these tests.
+    pub(crate) struct AwaitTasks {
+        // (task_id -> token) so wait_for_terminal returns the same token
+        // enqueue minted, and the test can read the token to resolve it.
+        tokens: StdMutex<std::collections::HashMap<uuid::Uuid, String>>,
+        // The most-recently-minted token, for the test to resolve.
+        last_token: StdMutex<Option<String>>,
+        /// The waits withdrawn, by token.
+        pub(crate) withdrawn: StdMutex<Vec<String>>,
+    }
+    impl AwaitTasks {
+        pub(crate) fn new() -> Arc<Self> {
+            Arc::new(Self { tokens: Default::default(), last_token: Default::default(), withdrawn: Default::default() })
+        }
+        /// Block (test-side) until a token has been minted, then return
+        /// it. Buses race the worker; the await may not have registered
+        /// the instant the test wants to resolve it.
+        pub(crate) async fn await_token(&self) -> String {
+            for _ in 0..2000 {
+                if let Some(t) = self.last_token.lock().unwrap().clone() {
+                    return t;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            panic!("no register_signal token minted within timeout");
+        }
+        /// The token minted last, if any.
+        pub(crate) fn minted(&self) -> Option<String> {
+            self.last_token.lock().unwrap().clone()
+        }
+    }
+    #[async_trait]
+    impl weft_task_store::TaskStoreClient for AwaitTasks {
+        async fn enqueue_dedup(&self, t: weft_task_store::tasks::NewTask) -> anyhow::Result<weft_task_store::tasks::DedupOutcome> {
+            let id = uuid::Uuid::new_v4();
+            if t.kind == weft_task_store::TaskKind::WithdrawSignal.as_str() {
+                let withdraw: weft_task_store::WithdrawSignalPayload = serde_json::from_value(t.payload)?;
+                self.withdrawn.lock().unwrap().push(withdraw.token);
+                return Ok(weft_task_store::tasks::DedupOutcome::Inserted(id));
+            }
+            assert_eq!(t.kind, weft_task_store::TaskKind::RegisterSignal.as_str(), "await tests only register and withdraw waits");
+            // Deterministic token derived from the task id.
+            let token = format!("tok-{id}");
+            self.tokens.lock().unwrap().insert(id, token.clone());
+            *self.last_token.lock().unwrap() = Some(token);
+            Ok(weft_task_store::tasks::DedupOutcome::Inserted(id))
+        }
+        async fn wait_for_terminal(&self, t: uuid::Uuid, _to: std::time::Duration) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
+            let token = self.tokens.lock().unwrap().get(&t).cloned().expect("token for task id");
+            Ok(weft_task_store::tasks::TaskOutcome {
+                status: weft_task_store::tasks::TaskStatus::Complete,
+                result: Some(serde_json::json!({ "kind": "registered", "token": token })),
+                error: None,
+            })
+        }
     }
     pub(super) struct NoopSteering;
     #[async_trait]
     impl crate::context::ExecutionSteeringClient for NoopSteering {
-        async fn tag_execution(&self, _c: ExecutionId, _t: Vec<String>, _p: &str) -> anyhow::Result<()> {
+        async fn tag_execution(&self, _c: ExecutionId, _t: Vec<String>) -> anyhow::Result<()> {
             unreachable!("rig tests steer no executions")
         }
-        async fn stop_tagged(&self, _c: ExecutionId, _t: String, _s: weft_core::StopSelf, _p: &str) -> anyhow::Result<bool> {
+        async fn stop_tagged(&self, _c: ExecutionId, _t: String, _s: weft_core::StopSelf) -> anyhow::Result<bool> {
             unreachable!("rig tests steer no executions")
+        }
+    }
+    /// The broker's side of the runs a rig drives: the answers a test
+    /// gives, handed to whoever asks next (held until one comes, or the
+    /// hold runs out), and the runs let go of.
+    #[derive(Default)]
+    pub(crate) struct Answers {
+        waiting: StdMutex<Vec<weft_broker_client::protocol::RunAnswer>>,
+        came: tokio::sync::Notify,
+        pub(crate) let_go: StdMutex<Vec<(ExecutionId, weft_broker_client::protocol::LetGo)>>,
+    }
+    impl Answers {
+        /// An answer to the wait `token`, as the install parks one for the
+        /// run's worker to take.
+        pub(crate) fn answer(&self, token: impl Into<String>, value: Value) {
+            self.waiting.lock().unwrap().push(weft_broker_client::protocol::RunAnswer { token: token.into(), value });
+            self.came.notify_waiters();
+        }
+    }
+    #[async_trait]
+    impl crate::context::RunClient for Answers {
+        async fn claim(&self, _execution_id: ExecutionId) -> anyhow::Result<Option<weft_journal::record::Claimed>> {
+            Ok(None)
+        }
+        async fn let_go(&self, execution_id: ExecutionId, why: weft_broker_client::protocol::LetGo) -> anyhow::Result<()> {
+            self.let_go.lock().unwrap().push((execution_id, why));
+            Ok(())
+        }
+        async fn answers(&self, _execution_id: ExecutionId, _taken: &[String], wait: std::time::Duration) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>> {
+            let deadline = tokio::time::Instant::now() + wait;
+            loop {
+                let came = self.came.notified();
+                tokio::pin!(came);
+                came.as_mut().enable();
+                let answers = std::mem::take(&mut *self.waiting.lock().unwrap());
+                if !answers.is_empty() || tokio::time::timeout_at(deadline, came).await.is_err() {
+                    return Ok(answers);
+                }
+            }
+        }
+        async fn cancels(&self) -> anyhow::Result<Vec<weft_broker_client::protocol::RunCancel>> {
+            Ok(Vec::new())
         }
     }
     pub(super) struct NoopInfra;
     #[async_trait]
     impl InfraReader for NoopInfra {
         async fn endpoint_address(&self, _c: weft_core::ExecutionId, _r: Option<&weft_core::instance::InstanceId>, _i: &weft_core::infra::InfraHandle) -> anyhow::Result<Option<weft_core::infra::EndpointAddress>> { Ok(None) }
+        async fn baked_outputs(&self, _c: weft_core::ExecutionId, _r: Option<&weft_core::instance::InstanceId>, _p: &str, _m: Option<&weft_core::instance::InstanceId>) -> anyhow::Result<std::collections::BTreeMap<String, serde_json::Value>> { Ok(Default::default()) }
     }
     pub(super) struct NoopInfraState;
     #[async_trait]
@@ -169,6 +271,7 @@
                 outcome_message: None,
             })
         }
+        async fn save_bake(&self, _x: weft_core::ExecutionId, _p: &str, _m: Option<&weft_core::instance::InstanceId>, _v: std::collections::BTreeMap<String, serde_json::Value>) -> anyhow::Result<()> { Ok(()) }
     }
     pub(super) struct NoopProject;
     #[async_trait]
@@ -234,7 +337,7 @@
 
     /// `drive_scoped` for a TRIGGER FIRE: `firing` names the kick that
     /// is the fired trigger (journaled with `firing: true`, the way the
-    /// dispatcher's route_entry writes it), and `subgraph` is the fire's
+    /// worker's door writes a fire's birth), and `subgraph` is the fire's
     /// computed set. The shape every two-programs test drives.
     pub(super) async fn drive_fire(
         project: ProjectDefinition,
@@ -246,18 +349,6 @@
         drive_kicked(project, catalog, kicks, Some(firing), subgraph, CancellationFlag::new_arc()).await
     }
 
-    /// `drive` for an execution whose journal ALREADY holds a terminal
-    /// (cancelled before the worker claimed it): the shape of a cancel
-    /// landing in the dispatcher's route window, or a late second
-    /// execute task for a finished execution.
-    pub(super) async fn drive_settled(
-        project: ProjectDefinition,
-        catalog: Arc<dyn NodeCatalog>,
-        kicks: &[&str],
-    ) -> (ExecutionOutcome, Vec<ExecEvent>) {
-        drive_kicked_settled(project, catalog, kicks, None, None, CancellationFlag::new_arc(), true).await
-    }
-
     async fn drive_kicked(
         project: ProjectDefinition,
         catalog: Arc<dyn NodeCatalog>,
@@ -266,31 +357,19 @@
         subgraph: Option<&[&str]>,
         cancellation: Arc<CancellationFlag>,
     ) -> (ExecutionOutcome, Vec<ExecEvent>) {
-        drive_kicked_settled(project, catalog, kicks, firing, subgraph, cancellation, false).await
-    }
-
-    async fn drive_kicked_settled(
-        project: ProjectDefinition,
-        catalog: Arc<dyn NodeCatalog>,
-        kicks: &[&str],
-        firing: Option<&str>,
-        subgraph: Option<&[&str]>,
-        cancellation: Arc<CancellationFlag>,
-        already_cancelled: bool,
-    ) -> (ExecutionOutcome, Vec<ExecEvent>) {
-        let execution_id = uuid::Uuid::new_v4();
+        let execution_id = weft_core::new_execution_id();
         let mut rows = vec![ExecEvent::ExecutionStarted {
             execution_id,
             project_id: project.id,
             entry_node: kicks[0].to_string(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some(weft_core::project::hash::compute_definition_hash(&project).unwrap()),
-            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
-            subgraph: subgraph.map(|s| weft_core::project::selection::RunSelection::restricted(
-                &project, s.iter().map(|n| weft_core::frames::Located::top(*n)).collect()).expect("valid test selection")),
+            binary_hash: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
+            selection: subgraph.map(|s| weft_core::project::selection::RecordedSelection::new(weft_core::project::selection::RunSelection::restricted(
+                &project, s.iter().map(|n| weft_core::frames::Located::top(*n)).collect()).expect("valid test selection"))),
             seed: None,
-            instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-            run_class: weft_core::run_class::RunClass::Short,
+            instance: None, fired_trigger: None, stand_in: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+            settings: Default::default(),
         }];
         for kick in kicks {
             rows.push(ExecEvent::NodeKicked {
@@ -302,27 +381,8 @@
                 at_unix: 0,
             });
         }
-        if already_cancelled {
-            rows.push(ExecEvent::ExecutionCancelled {
-                execution_id,
-                reason: "cancelled in the route window".into(),
-                cause: Some(weft_core::exec::CancelCause::User),
-                at_unix: 0,
-            });
-        }
         let (drove, events) = drive_journal_observed(project, catalog, execution_id, rows, cancellation).await;
-        let drove = drove.expect("run_one_execution ok");
-        // An execution already settled before the worker claimed it drove
-        // nothing: its tables are asserted empty (the fold of the same
-        // rows holds the kicks, so the two are not compared).
-        if already_cancelled {
-            assert!(matches!(drove.outcome, ExecutionOutcome::AlreadySettled), "{:?}", drove.outcome);
-            assert!(
-                drove.pulses.is_empty() && drove.executions.is_empty() && drove.loop_runtime.iter().next().is_none(),
-                "a settled execution drives nothing"
-            );
-        }
-        (drove.outcome, events)
+        (drove.expect("run_one_execution ok").outcome, events)
     }
 
     /// THE property this engine rests on: the rows the run wrote,
@@ -527,10 +587,18 @@
         rows: Vec<ExecEvent>,
         cancellation: Arc<CancellationFlag>,
     ) -> (anyhow::Result<Drove>, Vec<ExecEvent>) {
+        drive_rows(project, catalog, execution_id, rows, cancellation).await
+    }
+
+    async fn drive_rows(
+        project: ProjectDefinition,
+        catalog: Arc<dyn NodeCatalog>,
+        execution_id: ExecutionId,
+        rows: Vec<ExecEvent>,
+        cancellation: Arc<CancellationFlag>,
+    ) -> (anyhow::Result<Drove>, Vec<ExecEvent>) {
         let journal = Arc::new(MemJournal::default());
-        for row in &rows {
-            journal.record_event(row, None).await.unwrap();
-        }
+        journal.seed(&rows);
         let project = Arc::new(project);
         let drove = drive_on(project, catalog, execution_id, journal.clone(), clients(journal.clone()), cancellation, None).await;
         let events = journal.events.lock().unwrap().clone();
@@ -549,9 +617,8 @@
         rows: Vec<ExecEvent>,
     ) -> (ExecutionOutcome, Vec<ExecEvent>) {
         let journal = Arc::new(MemJournal::default());
-        for row in ancestor_rows.iter().chain(rows.iter()) {
-            journal.record_event(row, None).await.unwrap();
-        }
+        journal.seed(&ancestor_rows);
+        journal.seed(&rows);
         let project = Arc::new(project);
         let mut clients = clients(journal.clone());
         clients.project = Arc::new(ProjectHistory(definitions.into_iter().map(|definition| {
@@ -561,27 +628,115 @@
         let drove = drive_on(project, catalog, execution_id, journal.clone(), clients, CancellationFlag::new_arc(), None)
             .await
             .expect("run_one_execution ok");
-        let events = journal.events_for_execution_id(execution_id).await.expect("mem journal");
-        (drove.outcome, events)
+        (drove.outcome, journal.events_of(execution_id))
     }
 
     /// The rig's fake clients over `journal`.
     pub(crate) fn clients(journal: Arc<MemJournal>) -> EngineClients {
+        clients_writing(journal, Default::default())
+    }
+
+    /// [`clients`], their writer batching as `settings` say, its lanes on
+    /// the process's own io runtime as a worker's are.
+    pub(crate) fn clients_writing(journal: Arc<MemJournal>, settings: crate::journal_writer::WriterSettings) -> EngineClients {
         EngineClients {
-            journal,
+            writer: crate::journal_writer::WorkerJournal::start(journal, settings, &crate::context::io_runtime().expect("the io runtime starts")),
+            runs: Arc::new(Answers::default()),
             tasks: Arc::new(NoopTasks),
-            costs: Arc::new(NoopTasks),
             infra: Arc::new(NoopInfra),
             infra_state: Arc::new(NoopInfraState),
             project: Arc::new(NoopProject),
             clock: Arc::new(weft_platform_traits::clock::SystemClock),
             storage: crate::storage::FakeWorkerStorage::new(),
             access_broker: crate::context::FakeAccessBroker::new(),
-            pending_costs: crate::metering::PendingCostRecords::new(),
             open_charges: crate::metering::OpenCharges::new(),
             line: crate::context::TestLine::new(),
+            door_broker: crate::door::fake::FakeDoorBroker::new(Vec::new()),
+            shared: weft_core::shared::Shared::new(std::time::Duration::MAX),
             steering: Arc::new(NoopSteering),
         }
+    }
+
+    /// The handle `clients`' writer writes `execution_id`'s record through,
+    /// kept as its birth in `events` says; `next_seq` 0 for a run born now,
+    /// past 0 for one whose record is already there.
+    pub(crate) fn handle(
+        clients: &EngineClients,
+        execution_id: ExecutionId,
+        events: &[ExecEvent],
+        next_seq: i32,
+        redaction: weft_core::caller::Redaction,
+    ) -> Arc<crate::journal_writer::DriveJournal> {
+        let settings = events
+            .iter()
+            .find_map(|event| match event {
+                ExecEvent::ExecutionStarted { settings, .. } => Some(*settings),
+                _ => None,
+            })
+            .unwrap_or_default();
+        clients.writer.run(crate::journal_writer::RunSpec {
+            execution_id,
+            settings,
+            keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT,
+            epoch: 1,
+            next_seq,
+            redaction,
+        })
+    }
+
+    /// A run born now, the way a worker's door bears one: its handle, its
+    /// birth handed to it first.
+    pub(crate) async fn born(clients: &EngineClients, execution_id: ExecutionId, birth: &[ExecEvent]) -> Arc<crate::journal_writer::DriveJournal> {
+        let run = handle(clients, execution_id, birth, 0, Default::default());
+        run.record_events(birth, Some("instance-test")).await.expect("a birth is handed");
+        run
+    }
+
+    /// A caller's exchange for a test's fake caller, its record kept
+    /// nowhere.
+    pub(crate) fn exchange(conn: Arc<dyn weft_core::caller::CallerConnection>) -> crate::execution_driver::Exchange {
+        struct Unkept;
+        impl crate::caller_conn::CallerJournalSink for Unkept {
+            fn connected(&self, _: ExecutionId, _: u64, _: weft_core::signal::Protocol) {}
+            fn inbound(&self, _: ExecutionId, _: u64, _: &weft_core::caller::InboundMessage) {}
+            fn outbound(&self, _: ExecutionId, _: u64, _: &weft_core::caller::OutboundChunk, _: bool) {}
+            fn errored(&self, _: ExecutionId, _: u64, _: &str) {}
+            fn disconnected(&self, _: ExecutionId, _: u64, _: &str) {}
+            fn close(&self) {}
+        }
+        crate::execution_driver::Exchange { conn, live: None, sink: Arc::new(Unkept) }
+    }
+
+    /// Drive `execution_id` from `first` through `journal`, the way a worker
+    /// does, bounded by a failsafe deadline: a regression into a hang must
+    /// FAIL the test by name, never wedge the whole test process.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn run_on(
+        project: Arc<ProjectDefinition>,
+        catalog: Arc<dyn NodeCatalog>,
+        clients: &EngineClients,
+        execution_id: ExecutionId,
+        journal: Arc<crate::journal_writer::DriveJournal>,
+        first: Vec<ExecEvent>,
+        cancellation: Arc<CancellationFlag>,
+        caller: Option<Arc<dyn weft_core::caller::CallerConnection>>,
+        hand_back: Option<&HandBack>,
+    ) -> anyhow::Result<Drove> {
+        // The tables a worker's claim builds for the run: the program and
+        // the part of it its birth names.
+        let selection = first.iter().find_map(|event| match event {
+            ExecEvent::ExecutionStarted { selection, .. } => selection.clone(),
+            _ => None,
+        });
+        let program = Arc::new(crate::plan::ProgramTables::new(project, selection));
+        let starts_from = crate::execution_driver::StartsFrom::Record(first);
+        let run = RunDrive { execution_id, journal, program, starts_from, cancellation, exchange: caller.map(exchange), hand_back };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_one_execution_observed(catalog, clients, run, "instance-test", "tenant-test"),
+        )
+        .await
+        .expect("the drive hung: a loud-failure contract regressed into a hang")
     }
 
     /// Drive `execution_id` over what `journal` already holds (`clients` is
@@ -589,8 +744,8 @@
     /// test swaps one fake), and check the rows the run wrote fold
     /// back into the tables it held (`assert_fold_matches_live`).
     /// Every engine test drives through here, so no run escapes that
-    /// check. A run that found its execution already settled drove
-    /// nothing and holds nothing to compare.
+    /// check.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn drive_on(
         project: Arc<ProjectDefinition>,
         catalog: Arc<dyn NodeCatalog>,
@@ -601,39 +756,27 @@
         caller: Option<Arc<dyn weft_core::caller::CallerConnection>>,
     ) -> anyhow::Result<Drove> {
         let projects = clients.project.clone();
-        // What a worker's claim would hand the drive: the run's rows so far.
-        let first_rows = clients.journal.raw_rows_after(execution_id, 0, std::time::Duration::ZERO).await?;
-        let drove = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            run_one_execution_observed(
-                project.clone(),
-                catalog,
-                execution_id,
-                clients,
-                "instance-test".into(),
-                "tenant-test".into(),
-                cancellation,
-                caller,
-                first_rows,
-            ),
-        )
-        .await
-        .expect("the drive hung: a loud-failure contract regressed into a hang")?;
-        if !matches!(drove.outcome, ExecutionOutcome::AlreadySettled) {
-            // The run's own rows, folded over what it inherits (the
-            // journal may hold the seed's rows under another execution).
-            let events = journal.events_for_execution_id(execution_id).await.expect("mem journal");
-            let chain = weft_journal::seed_chain(&events, |c| journal.events_for_execution_id(c), |id, hash| {
-                let projects = projects.clone();
-                async move {
-                    projects.fetch_definition(id, &hash).await?.map(Arc::new)
-                        .ok_or_else(|| anyhow::anyhow!("test seed program {id}/{hash} was not registered"))
-                }
-            })
-                .await
-                .expect("the seed chain reads");
-            assert_fold_matches_live(&project, &events, &chain, &drove);
-        }
+        // What a worker's claim would hand the drive: the run's record so far.
+        let first = journal.events_of(execution_id);
+        let run = handle(&clients, execution_id, &first, 1, Default::default());
+        let drove = run_on(project.clone(), catalog, &clients, execution_id, run, first, cancellation, caller, None).await;
+        // A fast run lets go of its record once its ending is handed over;
+        // the checks below read the record whole, as the next reader does.
+        clients.writer.written().await;
+        let drove = drove?;
+        // The run's own rows, folded over what it inherits (the journal
+        // may hold the seed's rows under another execution).
+        let events = journal.events_of(execution_id);
+        let chain = weft_journal::seed_chain(&events, |c| { let events = journal.events_of(c); async move { Ok(events) } }, |id, hash| {
+            let projects = projects.clone();
+            async move {
+                projects.fetch_definition(id, &hash).await?.map(Arc::new)
+                    .ok_or_else(|| anyhow::anyhow!("test seed program {id}/{hash} was not registered"))
+            }
+        })
+            .await
+            .expect("the seed chain reads");
+        assert_fold_matches_live(&project, &events, &chain, &drove);
         Ok(drove)
     }
 

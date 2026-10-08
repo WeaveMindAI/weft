@@ -30,10 +30,11 @@
 //! written yet goes out on the next line if that opens within the call's
 //! wait to send, and fails [`LineError::NotSent`] otherwise. One that had
 //! been written is answered [`LineError::Dropped`], since it may have
-//! landed. The callers decide what is safe to make again: a journal write
-//! that was never sent is sent again (`client::never_sent`), a read of a
-//! run's history is asked again on either (`client::read_until_answered`),
-//! and any other call fails the way a request whose connection reset does.
+//! landed. The callers decide what is safe to make again: a batch of
+//! records is sent again on either, since the record takes a batch sent
+//! twice once (`weft_journal::record::Fate`), a read of a run's history is
+//! asked again on either (`client::read_until_answered`), and any other
+//! call fails the way a request whose connection reset does.
 //!
 //! A caller that stops waiting for a call it already wrote tells the
 //! broker (`Notice::Forget`), which stops working on it, the way a request
@@ -210,8 +211,22 @@ pub fn unframe<H: for<'de> Deserialize<'de>>(bytes: &[u8]) -> anyhow::Result<(H,
 
 /// The notification channels a line may carry, by name: what turns a
 /// name the broker sent back into the `&'static str` a [`Heard`] holds.
-// SYNC: LINE_CHANNELS <-> crates/weft-broker/src/line.rs (audience), crates/weft-task-store/src/tasks.rs (task_ready_notify), crates/weft-dispatcher/src/infra_node.rs (infra_node_status_notify), crates/weft-dispatcher/src/project_store.rs (project_declared_infra_notify), crates/weft-access-store/src/lib.rs (access_notify)
-pub const LINE_CHANNELS: &[&str] = &[INFRA_STATUS_CHANNEL, ACCESS_CHANNEL, CANCEL_CHANNEL];
+// SYNC: LINE_CHANNELS <-> crates/weft-broker/src/line.rs (audience), crates/weft-task-store/src/runs.rs (CANCEL_CHANNEL), triggers_notify_project, crates/weft-dispatcher/src/infra_node.rs (infra_node_status_notify), crates/weft-dispatcher/src/project_store.rs (project_declared_infra_notify), crates/weft-access-store/src/lib.rs (access_notify)
+pub const LINE_CHANNELS: &[&str] = &[INFRA_STATUS_CHANNEL, ACCESS_CHANNEL, CANCEL_CHANNEL, TRIGGERS_CHANNEL];
+
+/// Announced with a tenant's id when one of its routes changes: a public
+/// entry armed, re-armed or taken down, or how its activation stands (the
+/// signal, project and activation groups' triggers). The dispatchers read
+/// the tenant's routes again (`weft_dispatcher::held`); it rides no line.
+// SYNC: ROUTES_CHANNEL <-> crates/weft-dispatcher/src/journal/postgres.rs (routes_notify_tenant), crates/weft-dispatcher/src/activation_store.rs (trigger_activation_routes_notify)
+pub const ROUTES_CHANNEL: &str = "weft_routes";
+
+/// Announced with a project's id when one of its triggers changes: armed,
+/// re-armed or taken down, its holder changed, or how its activation stands
+/// (the signal and activation groups' triggers). Its workers read
+/// the project's triggers again (`/v1/door/triggers`).
+// SYNC: TRIGGERS_CHANNEL <-> crates/weft-dispatcher/src/journal/postgres.rs (triggers_notify_project), crates/weft-dispatcher/src/activation_store.rs (trigger_activation_triggers_notify)
+pub const TRIGGERS_CHANNEL: &str = "weft_triggers";
 
 /// Announced with a project's id when one of its infra copies comes,
 /// goes, changes status or answers at another address, and when the
@@ -225,9 +240,9 @@ pub const INFRA_STATUS_CHANNEL: &str = "weft_infra_status";
 pub const ACCESS_CHANNEL: &str = "weft_access";
 
 /// Announced with `<project id> <execution id>` when a running execution
-/// is asked to stop: the worker driving it asks for the cancel
-/// (`weft_task_store::tasks::cancels_asked`).
-pub use weft_task_store::tasks::CANCEL_CHANNEL;
+/// is asked to stop: the worker driving it fires its flag
+/// (`weft_task_store::runs`).
+pub use weft_task_store::runs::CANCEL_CHANNEL;
 
 /// A process's way to the broker. Every broker client of the process
 /// holds the same one, so the process has one line, opened on the first
@@ -245,6 +260,9 @@ struct LinkInner {
     line: OnceLock<Arc<Line>>,
     /// How long the line stays open with nothing to do ([`LINE_IDLE`]).
     idle_after: Duration,
+    /// Where the line's task runs ([`BrokerLink::on_runtime`]); the
+    /// runtime of its first call when `None`.
+    runtime: Option<tokio::runtime::Handle>,
     /// Dropped with the last [`BrokerLink`], which tells the line's task
     /// to close the line: nothing will call on it again.
     _closing: tokio::sync::watch::Sender<()>,
@@ -265,6 +283,7 @@ impl BrokerLink {
                 http,
                 line: OnceLock::new(),
                 idle_after: weft_core::time_scale::scaled(LINE_IDLE),
+                runtime: None,
                 _closing: closing,
                 closed,
             }),
@@ -275,6 +294,15 @@ impl BrokerLink {
     /// [`LINE_IDLE`]. Only on a link no clone of which was made yet.
     pub fn closing_when_idle_after(mut self, after: Duration) -> Self {
         Arc::get_mut(&mut self.inner).expect("set before the link is shared").idle_after = after;
+        self
+    }
+
+    /// Run the line's task on `runtime`: a worker keeps its line and its
+    /// writer lanes on a small runtime of their own, so their wake-ups
+    /// never land on the threads serving calls. Only on a link no clone of
+    /// which was made yet.
+    pub fn on_runtime(mut self, runtime: tokio::runtime::Handle) -> Self {
+        Arc::get_mut(&mut self.inner).expect("set before the link is shared").runtime = Some(runtime);
         self
     }
 
@@ -294,10 +322,20 @@ impl BrokerLink {
 
     /// Call `path` with the JSON `body`, waiting as `wait` says.
     pub async fn call(&self, path: &str, body: Vec<u8>, wait: CallWait) -> Result<Answer, anyhow::Error> {
+        self.call_as(path, "application/json", body, wait).await
+    }
+
+    /// Call `path` with `body` as raw bytes (a batch of records,
+    /// `weft_journal::frame`), waiting as `wait` says.
+    pub async fn call_bytes(&self, path: &str, body: Vec<u8>, wait: CallWait) -> Result<Answer, anyhow::Error> {
+        self.call_as(path, "application/octet-stream", body, wait).await
+    }
+
+    async fn call_as(&self, path: &str, content_type: &str, body: Vec<u8>, wait: CallWait) -> Result<Answer, anyhow::Error> {
         let bearer = self.inner.token.read(&self.inner.base_url).await?;
         let mut headers = vec![
             ("authorization".to_string(), format!("Bearer {bearer}")),
-            ("content-type".to_string(), "application/json".to_string()),
+            ("content-type".to_string(), content_type.to_string()),
         ];
         headers.extend(self.inner.token.headers().into_iter().map(|(k, v)| (k.to_string(), v)));
         Ok(self.line().call(path, headers, body, wait).await?)
@@ -323,7 +361,7 @@ impl BrokerLink {
     fn line(&self) -> &Arc<Line> {
         self.inner
             .line
-            .get_or_init(|| Line::open(Arc::downgrade(&self.inner), self.inner.closed.clone(), self.inner.idle_after))
+            .get_or_init(|| Line::open(Arc::downgrade(&self.inner), self.inner.closed.clone(), self.inner.idle_after, self.inner.runtime.as_ref()))
     }
 }
 
@@ -388,7 +426,7 @@ struct Line {
 }
 
 impl Line {
-    fn open(link: Weak<LinkInner>, closed: tokio::sync::watch::Receiver<()>, idle_after: Duration) -> Arc<Self> {
+    fn open(link: Weak<LinkInner>, closed: tokio::sync::watch::Receiver<()>, idle_after: Duration, runtime: Option<&tokio::runtime::Handle>) -> Arc<Self> {
         let (outbox, ids) = mpsc::unbounded_channel();
         let (notices, _) = broadcast::channel(NOTICE_CAPACITY);
         let line = Arc::new(Self {
@@ -400,7 +438,11 @@ impl Line {
             listening: Arc::new(AtomicBool::new(false)),
             down: Mutex::new(Some("not opened yet".into())),
         });
-        tokio::spawn(keep_open(link, Arc::downgrade(&line), ids, closed, idle_after));
+        let task = keep_open(link, Arc::downgrade(&line), ids, closed, idle_after);
+        match runtime {
+            Some(runtime) => drop(runtime.spawn(task)),
+            None => drop(tokio::spawn(task)),
+        }
         line
     }
 

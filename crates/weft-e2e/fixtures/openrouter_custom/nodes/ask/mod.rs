@@ -93,9 +93,6 @@ impl ProviderMeter for OpenRouterCustomMeter {
         // caller's media metadata), so this delegation stays.
         OPENROUTER.prepare(path, body)
     }
-    async fn ceiling_usd(&self, path: &str, body: &[u8], follow_up: FollowUp<'_>) -> anyhow::Result<f64> {
-        OPENROUTER.ceiling_usd(path, body, follow_up).await
-    }
     fn observe(&self, path: &str, query: &str, request_body: &[u8]) -> Box<dyn CallObservation> {
         OPENROUTER.observe(path, query, request_body)
     }

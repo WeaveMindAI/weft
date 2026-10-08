@@ -110,9 +110,6 @@ pub struct DispatcherState {
     /// unit's `/live` and `/action`, and a worker's `/_weft/...`. Follows
     /// no redirect (see `app.rs`): every peer answers in place.
     pub http: reqwest::Client,
-    /// HMAC secret the dispatcher signs live-caller routing tickets with
-    /// (the worker verifies with the same secret).
-    pub caller_token_secret: Arc<Vec<u8>>,
     /// Programs already read and parsed, by project and definition hash
     /// (see [`DispatcherState::program`]): a definition never changes
     /// under its hash, so a busy route stops reading and parsing its
@@ -121,6 +118,9 @@ pub struct DispatcherState {
     /// The rows every live call reads, held in memory and read again when
     /// they change (`crate::held`).
     pub held: Arc<crate::held::Held>,
+    /// Each project's own port, on a local install
+    /// (`crate::project_ports`); `None` on a platform that gives none.
+    pub project_ports: Option<Arc<crate::project_ports::ProjectPorts>>,
 }
 
 impl DispatcherState {
@@ -149,6 +149,30 @@ impl DispatcherState {
             Arc::new(serde_json::from_str(&json).map_err(|e| UnreadableProgram(e.to_string()))?);
         self.programs.put((project, hash.to_string()), program.clone());
         Ok(Some(program))
+    }
+
+    /// The program identity of the run whose rows are `events`: read
+    /// from the project's stored code for the binary its birth names. A
+    /// run never copies the implementation fingerprints, so this is the
+    /// way back to them.
+    pub async fn run_program_identity(
+        &self,
+        events: &[weft_journal::ExecEvent],
+    ) -> anyhow::Result<weft_core::project::hash::ProgramIdentity> {
+        let Some(weft_journal::ExecEvent::ExecutionStarted {
+            execution_id,
+            project_id,
+            definition_hash: Some(definition_hash),
+            binary_hash: Some(binary_hash),
+            ..
+        }) = events.first()
+        else {
+            anyhow::bail!("the run's history does not start with a birth naming its program");
+        };
+        self.projects
+            .program_identity(*project_id, definition_hash, binary_hash)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("run {execution_id} ran on worker {binary_hash}, which its project no longer records"))
     }
 }
 

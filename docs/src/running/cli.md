@@ -61,9 +61,21 @@ Flags on `weft run`:
 | `--seed-until <node>` / `--seed-before <node>` | Where reuse stops. Both need `--seed` |
 | `--root` | Start a new version tree, parented on nothing |
 | `--save <name>` | Write these settings to `examples/<name>.json` before running |
-| `--clear <field>` | Clear a saved setting before applying flags: `from`, `emit`, `target`, `before`, `group`, `feed`, `fire`, `instance`, `long` |
-| `--long` | Gives the run a worker of its own, for a run that may take longer than an hour on a cloud install (Cloud Run cuts an ordinary request at an hour). A trigger's `longRuns` field does the same for every run it starts |
+| `--clear <field>` | Clear a saved setting before applying flags: `from`, `emit`, `target`, `before`, `group`, `feed`, `fire`, `instance`, `keeping` (what `--durable` or `--fast` saved), `keep_for`, `hold_secs` |
+| `--durable` | If the run has to carry on after its worker dies: another worker picks it up where it stopped, and a step caught halfway is failed rather than run twice. For what that costs in speed,, go and read [when a run waits for its writes](the-journal.md#when-a-run-waits-for-its-writes) |
+| `--fast` | If the run fires a durable trigger and you want it fast anyway: it lives in its worker's memory and ends if that worker dies |
+| `--keep-for <duration>` | If you want this run kept longer or shorter after it ends than its trigger or project says: `30m`, `12h`, `7d`, or `forever`. For the project and trigger settings, go and read [how long a run is kept](the-journal.md#how-long-a-run-is-kept) |
+| `--hold-secs <seconds>` | If a wait in this run should hold longer or shorter than its trigger's `holdSecs` while the run cannot pause (a bus between its nodes is open): `0` fails such a wait at once, at most 30 days. For when a run cannot pause, go and read [triggers and routes](../language/triggers-and-routes.md#when-a-run-cannot-pause) |
 | `--instance <id>` | Run for this instance of the program. Needed when the run reaches a step that exists once per instance (see [programs with instances](instances.md)) |
+
+A run that fires a trigger (`--fire`) follows the trigger's `durable`,
+`keepRunsFor` and `holdSecs`, and `--durable`, `--fast`, `--keep-for` and
+`--hold-secs` override them for that run; a run
+that fires nothing is fast unless a flag says otherwise. A run you start by
+hand is always recorded, even when its trigger has `recorded` off, so you can
+always find it in `weft executions`. For what each of these does when you set it on a
+trigger, go and read [how a run is
+kept](../language/triggers-and-routes.md#how-a-run-is-kept).
 
 If you want to hand a run a file its real source cannot give you here (a
 WhatsApp voice note needs a paired phone), write it in any `--from`,
@@ -87,10 +99,10 @@ reads the file again.
 
 | Command | What it does |
 |---|---|
-| `weft executions` | Past runs, newest first. `--limit` (50), `--offset`, `--project`, `--phase`, `--node` (the node that started the run), `--since 2h`, `--status`, `--instance`, `--tag`. `--through <node>` keeps the runs in which that node fired, wherever it sits. `--search <words>` keeps the finished runs that carried every one of those words somewhere in what they recorded (the trigger's input, what a node sent on, an error, a log line): an email, an order id, a phrase in quotes. A run of a `Route` with `recorded: false` shows only if it failed |
+| `weft executions` | Past runs, newest first. `--limit` (50), `--offset`, `--project`, `--phase`, `--node` (the node that started the run), `--since 2h`, `--status`, `--instance`, `--tag`. `--through <node>` keeps the runs in which that node fired, wherever it sits. `--search <words>` keeps the finished runs that carried every one of those words somewhere in what they recorded (the trigger's input, what a node sent on, an error, a log line): an email, an order id, a phrase in quotes. `--through` and `--search` only find recorded runs that have ended: a run shows up in them a few seconds after it ends, or longer while the install is busy. On a cloud install whose dispatcher had scaled to zero, the runs that ended meanwhile are found a few seconds after it wakes, so the first search after a quiet stretch can miss them. In the plain list, a run that a trigger with `recorded: false` started shows only if weft wrote it down after all (for when, go and read [how a run is kept](../language/triggers-and-routes.md#how-a-run-is-kept)), and `--through` and `--search` never find it. A run you start by hand is always recorded, so it always shows |
 | `weft events <execution-id>` | One run's events in order. `--node`, `--kind`, `--full` for whole values. If you want one time round a loop, `--iteration 3` keeps the fourth (they count from 0), and `3.0` the first time round a loop inside it |
 | `weft logs [<execution-id>]` | What the nodes wrote, plus every failure. A run that wrote nothing lists what it skipped and why (under `skipped` with `--json`). `--limit` |
-| `weft status` | The cwd project: registration, listener, every infra node the program declares (one never started says `not started`, a `@per_instance` one how many instances have a copy), each trigger and the version of the source it fires (with the events an instance's trigger holds until a field is filled), recent runs, what drifted, and what you can do next. While the install builds, it names each image building and where its log is; while infra starts, how long it has been going and what it waits on |
+| `weft status` | The cwd project: registration, listener, every infra node the program declares (one never started says `not started`, a `@per_instance` one how many instances have a copy), each trigger and the version of the source it fires (with the events an instance's trigger holds until a field is filled), recent runs, how many runs each trigger started in the last minute or two and how many of those failed (for a trigger with `recorded: false`, often the only sign its runs happen), what drifted, and what you can do next. It also shows the project's own address (its routes at the root), or why that address is unavailable. While the install builds, it names each image building and where its log is; while infra starts, how long it has been going and what it waits on |
 | `weft ps` | Every project the dispatcher knows |
 
 `--phase fire` hides the setup runs that an activate or a resync makes, so it
@@ -112,7 +124,7 @@ answers "has my trigger fired since I changed it".
 
 | Command | What it does |
 |---|---|
-| `weft activate` | Sets up every shared trigger and starts the listeners. Builds and registers first if it has to. A trigger that runs once per instance is left off and named in a warning, with the way to switch it on: `--instance <id>`, or an `ActivateInstanceTriggers` node in the program. It refuses while a connection the program needs is not picked on this install, naming each step, and while infra a trigger reads is not running (it never starts infra: `weft infra start` does). A worker still up from an older build is replaced on the way: `--running-policy cancel` (the default) cancels what it runs, `wait` lets that land first, up to `--drain-timeout`. If some triggers are on and others off (an infra stop took down the ones reading it), it turns on the ones that are off and leaves the rest as they are; if every trigger is on and you changed the source, it tells you to run `weft resync` |
+| `weft activate` | Sets up every shared trigger and starts the listeners, and prints the project's own address, where its routes answer at the root (on your machine a local port, on a cloud install its Cloud Run address). On your machine, if you want that address on a port of your choosing, `--port <n>` opens it there and the project keeps it for later activates. If another program or another of your projects holds that port, the command fails and nothing is activated. Without `--port`, the project keeps the port it has, or takes a free one when it has none or another program took it. Builds and registers first if it has to. A trigger that runs once per instance is left off and named in a warning, with the way to switch it on: `--instance <id>`, or an `ActivateInstanceTriggers` node in the program. It refuses while a connection the program needs is not picked on this install, naming each step, and while infra a trigger reads is not running (it never starts infra: `weft infra start` does). A worker still up from an older build is replaced on the way: `--running-policy cancel` (the default) cancels what it runs, `wait` lets that land first, up to `--drain-timeout`. If some triggers are on and others off (an infra stop took down the ones reading it), it turns on the ones that are off and leaves the rest as they are; if every trigger is on and you changed the source, it tells you to run `weft resync` |
 | `weft deactivate` | Stops the program's own triggers listening, and tells you how many instances still have theirs on. `--instance <id>` stops one instance's, `--all-instances` stops every instance's and leaves the program's own alone |
 | `weft resync` | Deactivate and re-activate in one shot against your current program. With no flag it does every trigger that is on, the program's own and every instance's, and prints whose it did. It only touches triggers that are on; for ones that are off, use `weft activate` |
 | `weft cancel-activate` | Cancels an activate in flight |
@@ -154,6 +166,7 @@ Every trigger verb (`activate`, `deactivate`, `resync`, `bake`,
 | `weft infra node-terminate <node>` | One piece, deleted. Asks first like `terminate`, and needs `--yes` off a terminal or with `--json`. The same running-policy rule |
 | `weft infra show <node>` | The node's card: every item (label, kind, value) and every button, with the action to hand `press` and what it asks before pressing. A `secret` item's value is never printed, `--json` included |
 | `weft infra press <node> <action>` | Presses the card's button with that action, without asking: naming the action is the choice. Prints what the node answered, and the button's warning if it has one |
+| `weft infra rebake <node>` | If an infra node's baked outputs no longer match the real thing (say its password was reset outside weft), this applies the node again, leaving alone anything already running the way the node asks, and saves its [baked outputs](../nodes/infrastructure.md#outputs-saved-with-the-infrastructure-baking) anew. `--instance <id>` rebakes one instance's copy of a `@per_instance` node. If a `weft infra start`, `upgrade` or another rebake is already working on the same copies (the shared ones, or that instance's), it waits for that to finish first |
 | `weft infra env <node> --into <file> --set NAME=Label ...` | Writes what the node's card shows into an env file, every name in one go: `--set DATABASE_USER=User --set DATABASE_PASSWORD=Password` takes each item by its label as `show` prints it, and `--as <NAME>` is the short form for the card's only secret. A secret's value is never printed; the other values are, in the line confirming what it wrote. A new file is yours only; an existing one gets those lines set and keeps the rest. If a secret was handed over already, it refuses, quoting what the card says there: press the card's button with `weft infra press`, then run it again |
 
 If you want to act on one instance's copies of the nodes marked
@@ -202,8 +215,8 @@ all take `--instance <id>`.
 | `weft domain add <name>` | Makes a cloud install answer at a domain you own: prints the DNS record to set and waits until it points there. `--for api` serves the project's routes there instead, `--for frontend --to <address>` its frontend. `--no-wait` returns after printing the record. The first domain makes a load balancer that is billed while any domain exists, so it needs `--accept-cost` ([your own domain](cloud.md#your-own-domain)) |
 | `weft domain list` | Every domain, with its DNS record |
 | `weft domain rm <name>` | Stops answering at it; the last one takes the load balancer down |
-| `weft workers` | The project's worker settings: copies kept warm, the most copies, runs per copy, CPU, memory. It shows which the project sets and which come from the install |
-| `weft workers set --min-instances 1 ...` | Changes settings for this project; the change reaches its running workers at once |
+| `weft workers` | The project's worker settings: copies kept warm, the most copies, how many calls Cloud Run sends one copy at once (`concurrency`), CPU, memory, how long a copy holds on to things its runs share, such as a database pool, after nothing uses them (`shared_idle_seconds`), how many calls and events one copy takes at once (`max_runs_at_once`) and how long a call waits when it is full (`max_queue_wait_seconds`; for both, go and read [when a worker is full](architecture.md#when-a-worker-is-full)). It shows which the project sets and which come from the install. CPU and memory only apply on a cloud install, where an unset CPU means one CPU; on your machine no worker is capped |
+| `weft workers set --min-instances 1 ...` | Changes settings for this project. Calls after the change go to workers that have them. On a cloud install, a worker started before finishes what it runs and then stops. On your machine, the worker at the project's own address is stopped and the new one takes its port. A run that can pause moves to the new worker, a run that cannot keeps running on the old one, and whatever is still running after 10 seconds is killed. For the full rule, go and read [how a run is kept](../language/triggers-and-routes.md#how-a-run-is-kept) |
 | `weft workers reset [<setting>...]` | Puts settings back to the install's values |
 
 ## Stored files
@@ -260,12 +273,12 @@ Other flags: `--test <name>` for one test, `--key <service>` and
 | `weft clean` | Deletes runs older than `--keep-days`, 30 by default |
 | `weft clean <execution-id>` | Deletes one run |
 | `weft clean --all` | Deletes every run |
-| `weft clean --project <id>` | Deletes that project's whole history, which outlives the project |
+| `weft clean --project <id>` | Deletes that project's whole history |
 | `weft clean --instance <id>`, `--tag <tag>`, `--status <how>`, `--node <node>` | Deletes only the runs these name, across the projects you name (or every one). Naming an instance or a tag takes all their runs; add `--keep-days` to spare recent ones. A run still going is left to finish unless you pass `--cancel-running` |
 | `weft clean --images` | Reclaims worker images nothing references. `--all` spans every project |
 | `weft clean --build-cache` | Drops the docker build cache and the node-test cache. The next build compiles cold |
-| `weft rm` | Unregisters a project: signals wiped, runs cancelled, infra terminated, stored data reclaimed |
-| `weft rm --journal` | Also drops its runs and logs |
+| `weft rm` | Unregisters a project: signals wiped, runs cancelled and erased, infra terminated, stored data reclaimed |
+| `weft rm --journal` | Erases its runs one by one before unregistering it; `weft rm` erases them on its own too |
 | `weft rm --local` | Also wipes its build artifacts here |
 | `weft rm --all` | Both of those |
 
@@ -300,8 +313,8 @@ when needed and ignored otherwise.
 
 | Command | What goes |
 |---|---|
-| `weft rm` | The project's registration, its signals, its running executions, its infra **including disks**, its stored data |
-| `weft rm --journal` | Also every run and log row |
+| `weft rm` | The project's registration, its signals, its runs, its infra **including disks**, its stored data |
+| `weft rm --journal` | The same runs, erased before the registration goes |
 | `weft rm --local` | Also `.weft/target/` and its slice of the node-test cache |
 | `weft prune <version>` | That version, every version under it, and every run beneath them |
 | `weft clean <execution-id>` | One run, for good |

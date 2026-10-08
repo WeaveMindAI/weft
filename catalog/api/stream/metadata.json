@@ -83,6 +83,7 @@
     }
   ],
   "features": {
+    "pure": true,
     "answersCaller": "stream"
   },
   "validate": [

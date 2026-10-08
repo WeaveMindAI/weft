@@ -262,7 +262,8 @@ every domain with its record.
 A domain can also serve one project instead of the whole install:
 `--for api` answers that project's routes at the root of the domain
 (`https://api.example.com/users/42`, as well as
-`https://<the install's address>/connect/local/users/42`), and
+`https://<the install's address>/connect/local/users/42`), sending its calls
+straight to the project's own Cloud Run service, and
 `--for frontend --to <address>` passes visitors on to the project's
 frontend on Cloud Run, at the address `weft frontend ls --on prod` shows for
 it.
@@ -324,11 +325,11 @@ down and brings them back up on the new version.
 weft resync --on prod --mode park
 ```
 
-On prod, pick `park` or `hibernate`, because the calls arriving while the
-triggers are down can be real people's: `park` holds them (a caller on a
-route stays on the line) and runs them on the new version once the triggers
-are back, `hibernate` does the same for a grace window (`--grace`, in
-minutes). `wipe` drops them and cancels the work waiting on the triggers,
+On prod, pick `park` or `hibernate`, because the events arriving while the
+triggers are down can be real people's: `park` keeps them and runs them on
+the new version once the triggers are back, `hibernate` does the same for a
+grace window (`--grace`, in minutes). A caller on a route is not kept: it is
+answered `503` with a `Retry-After`, and its client tries again. `wipe` drops them and cancels the work waiting on the triggers,
 which is fine on a dev install.
 
 Only the change is uploaded, and only the image it touches is rebuilt. If
@@ -475,17 +476,27 @@ frontend builds differently, edit the workflow's "build the frontend" step.
 
 A `Route` answers at `https://<the install's address>/connect/local/<path>`,
 where `<path>` is the route's `path`. The `local` in that path is the same on every install, prod included, so a
-route's address on prod differs from your machine's only in the host.
-If a route keeps a connection open, the caller is moved to a
-`/live/...` address on the same host, so one address and certificate cover it.
+route's address on prod differs from your machine's only in the host. The
+project also answers at its own Cloud Run address (`weft status --on prod`
+shows it), where the call reaches your program with nothing of weft's in
+between: give that one, or a `--for api` domain, to a client that cares how
+fast it is answered.
+A browser opening a socket on a route that checks its callers is handed an
+address under the same path on the same host, carrying a ticket, so one
+address and certificate cover it.
 
 If you want to stop a flood of calls from costing you money, each route has
 its own limits, set on the node:
 `callsPerMinutePerCaller` (60 by default), `callsPerMinute` for everybody
 together (none by default), and `callsAtOnce` (100 by default); set any of
 them to `0` to turn it off. A call past a limit gets `429` with
-`Retry-After` before any run starts, and `weft status --on prod` lists, under
-"refused calls", which route refused, how often, and by which limit.
+`Retry-After` before any run starts. `weft status --on prod` shows the refusals
+of the last minute or two under "refused calls": which route, how often, and by
+which limit. If the
+program runs on several copies of its worker, each copy counts calls itself
+and hears the others' counts once a second, so a per-minute limit can let
+through about one second's worth of extra calls, and `callsAtOnce` is shared
+out between the copies that are up.
 
 ## When something goes wrong
 

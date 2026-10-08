@@ -94,6 +94,18 @@ where
         key_of: fn(&str) -> Changed<K, V>,
         keep: fn(&V) -> bool,
     ) -> Arc<Self> {
+        Self::following_any(subscription, &[channel], capacity, key_of, keep)
+    }
+
+    /// [`Self::following`] several channels at once, for rows a change on
+    /// any of them makes stale: `key_of` reads every one's payloads.
+    pub fn following_any(
+        subscription: Subscription,
+        channels: &[&'static str],
+        capacity: usize,
+        key_of: fn(&str) -> Changed<K, V>,
+        keep: fn(&V) -> bool,
+    ) -> Arc<Self> {
         let copy = Arc::new(Self {
             entries: ContentCache::new(capacity),
             generation: Mutex::new(0),
@@ -103,7 +115,7 @@ where
             follower: Mutex::new(None),
             keep,
         });
-        let follower = tokio::spawn(follow(Arc::downgrade(&copy), subscription, channel, key_of));
+        let follower = tokio::spawn(follow(Arc::downgrade(&copy), subscription, channels.to_vec(), key_of));
         *copy.follower.lock().expect("held copy follower") = Some(follower);
         copy
     }
@@ -187,7 +199,7 @@ where
     }
 }
 
-async fn follow<K, V>(copy: Weak<HeldCopy<K, V>>, mut subscription: Subscription, channel: &'static str, key_of: fn(&str) -> Changed<K, V>)
+async fn follow<K, V>(copy: Weak<HeldCopy<K, V>>, mut subscription: Subscription, channels: Vec<&'static str>, key_of: fn(&str) -> Changed<K, V>)
 where
     K: Hash + Eq + Clone + Send + Sync + 'static,
     V: Send + Sync + 'static,
@@ -196,7 +208,7 @@ where
         let heard = subscription.next().await;
         let Some(copy) = copy.upgrade() else { return };
         match heard {
-            Ok(Heard::Signal { channel: heard_on, payload }) if heard_on == channel => copy.drop_changed(key_of(&payload)),
+            Ok(Heard::Signal { channel: heard_on, payload }) if channels.contains(&heard_on) => copy.drop_changed(key_of(&payload)),
             Ok(Heard::Signal { .. }) => {}
             // A recheck can also mean this copy fell behind and missed what
             // was said, a lost connection included: whether the watch
@@ -206,7 +218,7 @@ where
             Err(e) => {
                 tracing::error!(
                     target: "weft_task_store::held_copy",
-                    channel, error = %format!("{e:#}"),
+                    channels = ?channels, error = %format!("{e:#}"),
                     "the copy of rows on this channel stopped following them; every read goes to the database from now on"
                 );
                 copy.stop_following();

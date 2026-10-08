@@ -18,7 +18,12 @@ exists once per instance is turned on separately for each instance. The command 
 written back to.
 
 **Bake.** A trigger's settings, prepared and saved without anything listening.
-`weft bake`. What you want while building.
+The command is `weft bake`, and it is what you want while building.
+
+**Baked output.** An output of an infrastructure node that weft makes when the
+infrastructure is applied and then saves. A run that reads nothing else from
+the node uses the saved value instead of running it. `weft infra rebake
+<node>` makes it again. Unrelated to `weft bake`.
 
 **Broker.** The scoped front door to the database that every tenant-side
 process uses. Workers, listeners and supervisors ask it; only it and the
@@ -44,8 +49,15 @@ and answers every request about a project or a run.
 **Drift.** Your source having moved ahead of what is running. `weft status`
 names which kind and which verb fixes it.
 
+**Durable run.** A run whose trigger has `durable` on: each step is written
+down before the next starts, so if its worker dies another one picks it up.
+
 **Example.** A run's starting parameters, saved as `examples/<name>.json`. A
 **frozen** example also holds the outputs you accept as right.
+
+**Fast run.** A run whose trigger has `durable` off, the default: it goes as
+fast as the program and its record follows behind it. If its worker dies, it
+ends cancelled and is not run again.
 
 **Firing.** One go at one step, identified by its run, its step and its
 frames.
@@ -80,8 +92,9 @@ instance, and every run is for one instance or for none. See
 program and can do nothing else: it starts that instance's runs, answers its
 waits, shows its displays and connects its accounts. It always expires.
 
-**Journal.** The append-only record of a run, one row per event. It is what the
-graph shows you and what rebuilds a run that was interrupted.
+**Journal.** The append-only record of a run, written in rows that each hold
+one or more of its events. It is what the graph shows you, and what a worker
+reads to pick up a durable run or one that was waiting.
 
 **Keep.** Marking a file to survive the sweep that clears a run's storage.
 Additive, and there is no un-keep.

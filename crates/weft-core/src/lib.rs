@@ -14,9 +14,11 @@ pub mod caller;
 pub mod content_cache;
 pub mod access;
 pub mod activation;
+pub mod arrival;
 pub mod builds;
 #[cfg(feature = "runtime")]
 pub mod caller_token;
+pub mod door_fire;
 pub mod comma_list;
 #[cfg(feature = "runtime")]
 pub mod cancellation;
@@ -34,6 +36,8 @@ pub mod generator;
 pub mod images;
 #[cfg(feature = "runtime")]
 pub mod in_flight;
+#[cfg(feature = "runtime")]
+pub mod shared;
 pub mod infra;
 pub mod install;
 pub mod instance;
@@ -57,7 +61,7 @@ pub mod projects;
 pub mod pulse;
 pub mod route;
 pub mod rules;
-pub mod run_class;
+pub mod run_settings;
 pub mod run_spec;
 pub mod running_policy;
 #[cfg(feature = "runtime")]
@@ -84,7 +88,6 @@ pub mod stream_journal;
 pub mod tag;
 pub mod task;
 pub mod time_scale;
-pub mod wait;
 pub mod versions;
 pub mod weft_type;
 
@@ -213,7 +216,7 @@ pub use primitive::{
     SignalSurface, SuspensionInfo,
 };
 pub use project::{
-    has_infra, Edge, EdgeIndex, GroupBoundary, GroupBoundaryRole, GroupDefinition, GroupKind,
+    has_infra, Edge, ProgramIndex, GroupBoundary, GroupBoundaryRole, GroupDefinition, GroupKind,
     InputDefinition, NodeDefinition, PortDefinition, Position, ProjectDefinition,
 };
 pub use pulse::Pulse;
@@ -237,6 +240,15 @@ pub use weft_type::{WeftPrimitive, WeftType};
 /// one-worker-per-execution invariant keeps that execution's journal a single
 /// coherent stream); there is nothing to retry "across executions".
 pub type ExecutionId = uuid::Uuid;
+
+/// A new run's id. Time-ordered (UUIDv7), so a run born now lands at the
+/// right edge of every index keyed by it instead of on a random page; every
+/// birth of a new run mints it here. A fire's run is the exception: its id
+/// comes from the fire's (`door_fire::run_of_fire`), so an event sent twice
+/// is born once.
+pub fn new_execution_id() -> ExecutionId {
+    uuid::Uuid::now_v7()
+}
 
 #[cfg(test)]
 mod helper_tests {

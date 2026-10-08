@@ -27,6 +27,7 @@ fn definition(id: Uuid) -> ProjectDefinition {
         groups: vec![],
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        defaults: Default::default(),
     }
 }
 
@@ -295,11 +296,11 @@ fn started(execution_id: Uuid, project_id: uuid::Uuid) -> weft_journal::ExecEven
         entry_node: "entry".to_string(),
         phase: weft_core::context::Phase::Fire,
         definition_hash: Some("h".to_string()),
-        program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
-        subgraph: None,
+        binary_hash: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
+        selection: None,
         seed: None,
-        instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-        run_class: weft_core::run_class::RunClass::Short,
+        instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+        settings: Default::default(),
     }
 }
 

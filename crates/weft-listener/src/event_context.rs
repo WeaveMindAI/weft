@@ -136,9 +136,17 @@ impl FireContext {
             );
             return FireOutcome::Filtered;
         }
-        use weft_task_store::tasks::DedupOutcome;
+        let not_held = || {
+            info!(
+                target: "weft_listener::event_context",
+                kind = target, token = %self.token,
+                "this copy no longer holds the signal; the event is left to the one that does"
+            );
+            FireOutcome::NotHeld
+        };
         match self.sink.fire(&self.token, &self.tenant_id, self.held_by.as_deref(), payload, identity).await {
-            Ok(DedupOutcome::Inserted(_)) | Ok(DedupOutcome::AlreadyLive(_)) => FireOutcome::Fired,
+            Ok(crate::fire_sink::Delivered::Taken) => FireOutcome::Fired,
+            Ok(crate::fire_sink::Delivered::NotHeld) => not_held(),
             Err(e) if e
                 .downcast_ref::<weft_broker_client::BrokerRefused>()
                 .is_some_and(|r| r.status == reqwest::StatusCode::CONFLICT) =>

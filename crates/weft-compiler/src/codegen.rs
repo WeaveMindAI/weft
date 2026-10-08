@@ -265,7 +265,7 @@ pub fn collect_node_types(project: &ProjectDefinition) -> BTreeSet<String> {
 /// tracing, uuid), and one path dep per referenced package crate
 /// under `pkg_<name>/`. Per-package and per-node cargo deps live
 /// inside each package crate's own `Cargo.toml`, NOT here: a node
-/// that pulls in pyo3 stays a recompile-target of its OWN crate,
+/// that pulls in a heavy dependency stays a recompile-target of its OWN crate,
 /// while the worker keeps cache-hitting on every other build.
 /// The binary crate's build-script contribution. A package may ship a
 /// `build.rs` at its root (declaring `pub fn main()`) plus
@@ -1100,11 +1100,16 @@ fn baked_type_decls(catalog: &FsCatalog) -> String {
 }
 
 fn write_main_rs(src_dir: &Path, catalog: &FsCatalog) -> CompileResult<()> {
-    let type_decls = baked_type_decls(catalog);
-    let contents = format!(
+    std::fs::write(src_dir.join("main.rs"), worker_main_source(&baked_type_decls(catalog))).map_err(CompileError::Io)?;
+    Ok(())
+}
+
+/// The worker binary's `main.rs`, around the project's baked type
+/// declarations (`type_decls`, one registry entry per line).
+fn worker_main_source(type_decls: &str) -> String {
+    format!(
         r#"//! Project worker binary. Weft calls it once per execution
-//! (`weft_engine::worker`): it serves HTTP, or with `--run <execution_id>` runs
-//! one execution as a job of its own and exits.
+//! (`weft_engine::worker`): it serves HTTP until it is told to stop.
 
 use std::sync::Arc;
 
@@ -1115,6 +1120,12 @@ use weft_core::NodeCatalog;
 use weft_engine::EngineClients;
 
 mod registry;
+
+// jemalloc hands freed memory back to the system, so a worker past a
+// burst reads as using what it uses (glibc's allocator kept it, and the
+// worker turned every call away as full while idle).
+#[global_allocator]
+static GLOBAL: weft_engine::Jemalloc = weft_engine::Jemalloc;
 
 // SYNC: the worker's environment <-> crates/weft-platform-local/src/runner.rs,
 //       crates/weft-platform-gcp/src/runner.rs (what each sets)
@@ -1140,19 +1151,19 @@ struct Args {{
     #[arg(long, env = "PORT", default_value = "8080")]
     port: u16,
 
-    /// The secret live-caller routing tickets are signed with (hex).
-    /// Empty: this worker takes no live callers.
-    #[arg(long, env = "WEFT_CALLER_TOKEN_SECRET", default_value = "")]
-    caller_token_secret: String,
+    /// The binary hash of this worker's image: its door serves the routes
+    /// armed for it.
+    #[arg(long, env = "WEFT_BINARY_HASH")]
+    binary_hash: String,
 
-    /// The platform's hard cap on one short run, in seconds, when it
-    /// has one.
-    #[arg(long, env = "WEFT_SHORT_RUN_CAP_SECS")]
-    short_run_cap_secs: Option<u64>,
+    /// The platform's hard cap on one run, in seconds, when it has one.
+    #[arg(long, env = "WEFT_RUN_CAP_SECS")]
+    run_cap_secs: Option<u64>,
 
-    /// Run this one execution as a job of its own (a long run) and exit.
-    #[arg(long)]
-    run: Option<uuid::Uuid>,
+    /// The platform may stop a worker no call holds open: a run that outlives
+    /// its caller is handed back once it leaves, to carry on under weft's call.
+    #[arg(long, env = "WEFT_RESUME_WHEN_CALLER_LEAVES")]
+    resume_when_caller_leaves: bool,
 }}
 
 #[tokio::main]
@@ -1168,6 +1179,8 @@ async fn main() -> anyhow::Result<()> {{
         .init();
 
     let args = Args::parse();
+    // A CPU profile of this worker, when `WEFT_PROFILE` asks for one.
+    weft_engine::profile::start_from_env()?;
 
     // The project's type declarations, baked at codegen time. Installed
     // before anything parses node metadata (embedded metadata holds
@@ -1184,32 +1197,29 @@ async fn main() -> anyhow::Result<()> {{
     // The engine composes its own client bundle from the broker address and
     // the worker's identity, so this generated binary never names the
     // bundle's fields.
-    let clients = EngineClients::from_broker(&weft_broker_client::BrokerLink::new(args.broker_url.clone(), token));
+    let clients = EngineClients::from_broker(
+        &args.broker_url,
+        token,
+        args.project_id,
+        weft_engine::ProcessSettings::from_env()?,
+    )?;
     let catalog = Arc::new(CatalogRef) as Arc<dyn NodeCatalog>;
 
-    // An empty HMAC key would validate forgeable tickets (fail-open), so
-    // "empty" structurally means "no live callers", never an empty key.
-    let caller_token_secret = if args.caller_token_secret.is_empty() {{
-        None
-    }} else {{
-        Some(
-            hex::decode(&args.caller_token_secret)
-                .map_err(|e| anyhow::anyhow!("WEFT_CALLER_TOKEN_SECRET is not valid hex: {{e}}"))?,
-        )
-    }};
+    // This project's secret: what everything this worker signs or checks
+    // is keyed from.
+    let secret = weft_core::caller_token::ProjectSecret::from_env().map_err(anyhow::Error::msg)?;
     let config = weft_engine::WorkerConfig {{
         project_id: args.project_id,
         tenant_id: args.tenant_id,
         replica,
-        door: weft_engine::WorkerDoor::from_env()?,
-        caller_token_secret,
+        binary_hash: args.binary_hash,
+        edge: weft_engine::door::Edge::from_env()?,
+        secret,
         port: args.port,
-        short_run_cap: args.short_run_cap_secs.map(std::time::Duration::from_secs),
+        run_cap: args.run_cap_secs.map(std::time::Duration::from_secs),
+        resume_when_caller_leaves: args.resume_when_caller_leaves,
     }};
-    match args.run {{
-        Some(execution) => weft_engine::run_long(catalog, clients, config, execution).await?,
-        None => weft_engine::serve(catalog, clients, config).await?,
-    }}
+    weft_engine::serve(catalog, clients, config).await?;
     tracing::info!(target: "weft_project_worker", "worker exit");
     Ok(())
 }}
@@ -1225,9 +1235,7 @@ impl NodeCatalog for CatalogRef {{
     }}
 }}
 "#,
-    );
-    std::fs::write(src_dir.join("main.rs"), contents).map_err(CompileError::Io)?;
-    Ok(())
+    )
 }
 
 
@@ -1554,7 +1562,7 @@ mod tests {
             group_boundary: None,
             requires_infra: false, per_instance: None,
             images: Vec::new(),
-            fires_with: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(),
             published_service: None,
             instance_service: None,
             instance_rules: None,
@@ -1592,6 +1600,7 @@ mod tests {
             groups: Vec::new(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            defaults: Default::default(),
         };
         let types = collect_node_types(&project);
         assert!(types.contains("Text"), "user catalog type included: {types:?}");
@@ -1676,6 +1685,27 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(feats, vec!["derive", "rc"]);
+    }
+
+    /// The worker binary runs on jemalloc, declared by its own `main`
+    /// through the engine's re-export, so a project's manifest names
+    /// nothing new and nothing else linking the engine changes allocator.
+    #[test]
+    fn the_worker_main_declares_jemalloc_as_its_allocator() {
+        let main = super::worker_main_source("");
+        assert!(
+            main.contains("#[global_allocator]\nstatic GLOBAL: weft_engine::Jemalloc = weft_engine::Jemalloc;"),
+            "{main}"
+        );
+    }
+
+    /// The worker main starts the CPU profile `WEFT_PROFILE` asks for, before
+    /// anything else of the worker runs.
+    #[test]
+    fn the_worker_main_starts_the_profile_its_environment_asks_for() {
+        let main = super::worker_main_source("");
+        let profile = main.find("weft_engine::profile::start_from_env()?").expect("the profile starts");
+        assert!(profile < main.find("EngineClients::from_broker").unwrap(), "{main}");
     }
 
     #[test]

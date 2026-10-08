@@ -5,11 +5,13 @@
 //! database while it commits, and holds it until its commit is on disk,
 //! because Postgres hands notifications out in commit order. Every write
 //! that announces itself therefore commits one after another, whatever
-//! rows they touch. A run writes several (its birth, its journal rows, its
-//! task's end), so under load the database spent most of its time with
-//! writes queued on that one lock.
+//! rows they touch, and under load the database spends most of its time
+//! with writes queued on that one lock.
 //!
-//! So the writes a run makes do not notify. Their triggers put what they
+//! So the frequent writes do not notify. A worker's records are announced
+//! by the broker once their batch commits (`weft_broker::notices`); the
+//! rest (an answer written into a waiting run, a run queued again) go
+//! through here. Their triggers put what they
 //! would have announced in [`TABLE`] (`weft_announce(channel, payload)`),
 //! a row like any other that commits with the write or not at all, and
 //! takes no shared lock. After the write commits, its writer pokes this

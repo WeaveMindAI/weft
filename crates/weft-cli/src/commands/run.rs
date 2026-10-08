@@ -131,13 +131,13 @@ async fn run_inner(ctx: &Ctx, progress: &crate::progress::Progress, args: RunArg
     if args.detach || ctx.json() {
         return Ok(());
     }
-    super::follow::follow_execution_id(&handle.client, &execution_id.to_string(), Some(&definition)).await?;
+    super::follow::follow_execution_id(&handle.client, ctx.on(), &execution_id.to_string(), Some(&definition)).await?;
     Ok(())
 }
 
 fn validate_run(definition: &weft_core::ProjectDefinition, spec: Option<&RunSpec>, args: &RunArgs) -> anyhow::Result<()> {
     if let Some(spec) = spec {
-        let resolved = weft_core::run_spec::resolve_spec(spec, definition)
+        let resolved = weft_core::run_spec::resolve_spec(spec, definition, &Default::default())
             .map_err(|error| anyhow::anyhow!("the run cannot start:\n{error}"))?;
         // A seeded run can feed a crossing from history, which only the
         // dispatcher reads; it refuses an unfed input after that.

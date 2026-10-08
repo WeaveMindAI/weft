@@ -121,6 +121,18 @@
     }
 
     fn birth(execution_id: ExecutionId, project: &ProjectDefinition, subgraph: Option<&[&str]>, seed: Option<Seed>) -> ExecEvent {
+        birth_given(execution_id, project, subgraph, seed, |_| {})
+    }
+
+    /// [`birth`], its selection changed by `given` first (a value given by
+    /// hand, say).
+    fn birth_given(
+        execution_id: ExecutionId,
+        project: &ProjectDefinition,
+        subgraph: Option<&[&str]>,
+        seed: Option<Seed>,
+        given: impl FnOnce(&mut weft_core::project::selection::RunSelection),
+    ) -> ExecEvent {
         let mut selection = match subgraph {
             Some(nodes) => weft_core::project::selection::RunSelection::restricted(project, nodes.iter().map(|node| weft_core::frames::Located::top(*node)).collect()).unwrap(),
             None => weft_core::project::selection::RunSelection::whole(project),
@@ -129,17 +141,18 @@
             selection.nodes.retain(|node| !seed.origins.contains_key(node));
             selection.suppliers.extend(seed.origins.keys().cloned());
         }
+        given(&mut selection);
         ExecEvent::ExecutionStarted {
             execution_id,
             project_id: project.id,
             entry_node: "a".into(),
             phase: weft_core::context::Phase::Fire,
             definition_hash: Some(weft_core::project::hash::compute_definition_hash(project).unwrap()),
-            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
-            subgraph: Some(selection),
+            binary_hash: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
+            selection: Some(weft_core::project::selection::RecordedSelection::new(selection)),
             seed,
-            instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-            run_class: weft_core::run_class::RunClass::Short,
+            instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+            settings: Default::default(),
         }
     }
 
@@ -332,9 +345,9 @@
         let ran: Ran = Default::default();
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let child = uuid::Uuid::new_v4();
-        let mut start = birth(child, &program, Some(&["b", "c"]), None);
-        let ExecEvent::ExecutionStarted { subgraph: Some(selection), .. } = &mut start else { unreachable!() };
-        selection.input.insert(weft_core::frames::Located::top("b"), [("value".into(), json!("by hand"))].into());
+        let start = birth_given(child, &program, Some(&["b", "c"]), None, |selection| {
+            selection.input.insert(weft_core::frames::Located::top("b"), [("value".into(), json!("by hand"))].into());
+        });
         let rows = vec![start, kick(child, "b", None)];
         let (outcome, child_rows) = drive_seeded(program, cat(&ran, &seen), child, Vec::new(), Vec::new(), rows).await;
         assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");

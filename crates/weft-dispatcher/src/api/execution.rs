@@ -12,7 +12,6 @@ use axum::{extract::{Path, Query, State}, http::StatusCode, Json};
 use serde::Deserialize;
 
 use weft_core::exec::CancelCause;
-use weft_core::program::SummaryStatus;
 use weft_core::ExecutionId;
 
 use crate::authenticator::{authorize_execution, authorize_project, CallerTenant};
@@ -100,14 +99,22 @@ pub async fn cancel(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// A `500` for a handler that answers a bare status, with why it failed in
+/// the log: the answer carries no body to say it in.
+fn failed(what: &'static str) -> impl FnOnce(anyhow::Error) -> StatusCode {
+    move |e| {
+        tracing::error!(target: "weft_dispatcher::api", error = %format!("{e:#}"), "could not {what}");
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
 /// The status word to answer a cancel of a run that is over with, or
-/// `None` while the run can still be cancelled (running, or a corrupt
-/// row whose terminal nobody can read: cancelling it is the safe side).
-fn already_ended(status: SummaryStatus) -> Option<&'static str> {
+/// `None` while the run can still be cancelled.
+fn already_ended(status: weft_core::program::RunStatus) -> Option<&'static str> {
     use weft_core::program::RunStatus;
     match status {
-        SummaryStatus::Run(RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled) => Some(status.as_str()),
-        SummaryStatus::Run(RunStatus::Running | RunStatus::WaitingForInput) | SummaryStatus::Corrupt => None,
+        RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled => Some(status.as_str()),
+        RunStatus::Running | RunStatus::WaitingForInput => None,
     }
 }
 
@@ -146,30 +153,25 @@ pub async fn cancel_execution_ids(
 }
 
 /// Cancel a single execution, for `cause`. THE cancel: every caller
-/// (`weft stop`, the sweeps, a sibling run's `stop_tagged`) goes
-/// through here and says why, and the cause lands on every terminal
-/// row this writes AND on the `cancel_execution` task, so the owning
-/// worker's own write (if it gets there first) names the same cause.
+/// (`weft stop`, the sweeps, a sibling run's `stop_tagged`, a drain at its
+/// deadline) goes through here and says why.
 ///
-/// The durable part is ONE transaction (`Journal::cancel_execution`):
-/// strip the wake signals, journal the terminals, queue the cancel
-/// task for the alive owner process. Either all of it lands or none does,
-/// so a database failure mid-cancel leaves the run exactly as it was
-/// and the next attempt succeeds; nothing can strip a run's wakes and
-/// then fail to end it. Two paths then converge on the one observable
-/// outcome (the journal reads `ExecutionCancelled`):
+/// The durable part is ONE transaction (`Journal::cancel_execution`),
+/// under the run's row lock: its wake signals go, and then
 ///
-///   - When a worker is alive and driving this execution, the task
-///     fires the per-execution `CancellationFlag` (~50ms), the loop driver
-///     exits, and the worker's own terminal write finds the rows
-///     already there and skips (idempotent).
-///   - With no worker driving it (a suspended run, no process at all), the
-///     rows written here ARE the terminal.
+///   - a run a worker drives gets its `cancel_requested` set and the
+///     cancel announced (`weft_task_store::runs::CANCEL_CHANNEL`): the
+///     broker pushes it down the worker's line, the worker fires the
+///     run's flag and writes its ending with this cause, and a worker
+///     that claims the run later reads the cancel with its claim;
+///   - a run nobody drives (parked, queued) is ended here, its per-node
+///     cancels and its `ExecutionCancelled` written at `last_seq + 1`.
 ///
-/// After the commit the listener forgets the stripped signals in RAM
-/// (the durable row is already gone, so a late fire finds nothing),
-/// and the journal bridge publishes the new rows onto the project's
-/// SSE bus so the frontend exits "Cancelling...".
+/// Either all of it lands or none does, so a database failure mid-cancel
+/// leaves the run exactly as it was and the next attempt succeeds. After
+/// the commit the listener forgets the stripped signals (the rows are
+/// already gone, so a late fire finds nothing), and the live view paints
+/// the ending for whoever watches.
 pub async fn cancel_execution_id(
     state: &DispatcherState,
     execution_id: ExecutionId,
@@ -192,35 +194,25 @@ pub async fn cancel_execution_id(
         target: "weft_dispatcher::cancel",
         execution_id = %execution_id,
         signals_removed = write.removed.len(),
-        task_enqueued = write.task_enqueued,
+        asked_its_worker = write.requested,
         node_cancellations = ?write.node_cancellations,
         "cancel committed"
     );
     Ok(())
 }
 
-/// THE definition of a dispatcher-side cancel write: the ordered
-/// `(event, dedup_key)` list that flips an execution terminal. Pure, so
-/// every transactional cancel writer emits IDENTICAL rows and can
-/// never drift on the ordering rule, the dedup-key format, or the
-/// closure-emission policy.
-///
-/// Per-node cancellations come BEFORE `ExecutionCancelled` (always the last
-/// entry). Otherwise a partial run that journaled the terminal event first
-/// would set has-terminal=true, and a retry would skip the per-node writes
-/// forever, leaving node UI states stuck on "running". Each per-node write is
-/// dedup-keyed on (execution, node, frame-stack) so a partial failure + retry
-/// (e.g. the orphan sweep's retry-next-tick loop) collapses instead of
-/// stacking a duplicate NodeCancelled row (which would also republish a
-/// duplicate UI event); the terminal's key makes the row-level write safe even
-/// if two cancels for the same execution race past their has-terminal checks.
+/// THE definition of a dispatcher-side cancel of a run nobody drives: the
+/// ordered events that end it, `NodeCancelled` per open node, then
+/// `ExecutionCancelled` (always the last). Pure, so every cancel writer
+/// writes IDENTICAL rows. They are written in one row under the run's row
+/// lock, so the ending never lands without its per-node cancels.
 pub fn cancel_terminal_events(
     execution_id: ExecutionId,
     events: &[weft_journal::ExecEvent],
     program: Option<&ProjectDefinition>,
     cause: &CancelCause,
     now: u64,
-) -> anyhow::Result<Vec<(weft_journal::ExecEvent, String)>> {
+) -> anyhow::Result<Vec<weft_journal::ExecEvent>> {
     use weft_journal::ExecEvent;
     let reason = cause.to_string();
     let mut writes = Vec::new();
@@ -240,18 +232,13 @@ pub fn cancel_terminal_events(
                     if e.status.is_terminal() {
                         continue;
                     }
-                    let frames_key: String =
-                        weft_core::frames::frames_text(&e.frames);
-                    writes.push((
-                        ExecEvent::NodeCancelled {
-                            execution_id,
-                            node_id: node_id.clone(),
-                            frames: e.frames.clone(),
-                            reason: reason.clone(),
-                            at_unix: now,
-                        },
-                        format!("cancel:{execution_id}:{node_id}:{frames_key}"),
-                    ));
+                    writes.push(ExecEvent::NodeCancelled {
+                        execution_id,
+                        node_id: node_id.clone(),
+                        frames: e.frames.clone(),
+                        reason: reason.clone(),
+                        at_unix: now,
+                    });
                 }
             }
         }
@@ -274,10 +261,7 @@ pub fn cancel_terminal_events(
             }
         }
     }
-    writes.push((
-        ExecEvent::ExecutionCancelled { execution_id, reason, cause: Some(cause.clone()), at_unix: now },
-        format!("execution_cancelled:{execution_id}"),
-    ));
+    writes.push(ExecEvent::ExecutionCancelled { execution_id, reason, cause: Some(cause.clone()), at_unix: now });
     Ok(writes)
 }
 
@@ -306,58 +290,21 @@ pub async fn program_for_cancel(
     Ok(lookup.program())
 }
 
-/// Is anything actually WORKING on this execution?
-///
-/// An execution advances because a task carries it: a `pending` one a
-/// worker will claim, or a `claimed` one a worker holds. With neither,
-/// the run is recorded as going and nothing is going to move it, which
-/// is a different state from "still in flight" and has to be told apart
-/// from it. A caller that waits on the first forever is waiting on a
-/// run that is already over.
-///
-/// Deliberately a question about WORK, not about time: nothing here
-/// ages a run out, because a legitimate setup may take as long as the
-/// nodes inside it take. Only the absence of any task says nobody is
-/// coming.
-pub(crate) async fn execution_is_being_worked_on(
-    pool: &sqlx::PgPool,
-    execution_id: ExecutionId,
-) -> anyhow::Result<bool> {
-    // `task.execution_id` is TEXT, so the execution goes in as its string form;
-    // binding the uuid itself matches nothing and would read as "no
-    // task", which here means "declare every run dead".
-    let row: Option<(i64,)> = sqlx::query_as(
-        "SELECT count(*) FROM task \
-         WHERE execution_id = $1 AND status IN ('pending', 'claimed')",
-    )
-    .bind(execution_id.to_string())
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|(n,)| n > 0).unwrap_or(false))
-}
-
-/// The terminal outcome recorded for an execution, if any. The journal is
-/// the authoritative source: `Completed`/`Failed`/`Cancelled` are the
-/// three terminal `exec_event` kinds. `None` means the execution is
+/// The terminal outcome recorded for an execution, if any: its run row's
+/// `outcome`, stamped by the write that records its ending. `None` means the execution is
 /// still in flight. Used both for cancel-dedup and as the source of
 /// truth when the in-RAM event bus drops events (broadcast `Lagged`).
 pub(crate) async fn terminal_outcome(
     pool: &sqlx::PgPool,
     execution_id: ExecutionId,
 ) -> anyhow::Result<Option<TerminalOutcome>> {
-    let row: Option<(String,)> = sqlx::query_as(concat!(
-        "SELECT kind FROM exec_event \
-         WHERE execution_id = $1 \
-           AND kind IN ",
-        weft_journal::execution_terminal_kinds_sql!(),
-        " LIMIT 1",
-    ))
-    .bind(execution_id.to_string())
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(|(kind,)| match kind.as_str() {
-        "execution_completed" => TerminalOutcome::Completed,
-        "execution_cancelled" => TerminalOutcome::Cancelled,
+    let outcome: Option<Option<String>> = sqlx::query_scalar("SELECT outcome FROM run WHERE execution_id = $1")
+        .bind(execution_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(outcome.flatten().map(|outcome| match outcome.as_str() {
+        "completed" => TerminalOutcome::Completed,
+        "cancelled" => TerminalOutcome::Cancelled,
         _ => TerminalOutcome::Failed,
     }))
 }
@@ -367,41 +314,6 @@ pub(crate) enum TerminalOutcome {
     Completed,
     Failed,
     Cancelled,
-}
-
-/// Overlay the honest `waiting_for_input` status onto a batch of
-/// execution summaries. The journal fold only knows started/terminal, so
-/// a suspended execution (waiting on a human / an external resume,
-/// holding NO worker) folds to `running`, which misreads as active work.
-/// The dispatcher's resume-signal rows are the source of truth for
-/// suspension (the same set `running_count` and the drain wait exclude),
-/// so every status read that serves clients routes through this overlay
-/// and the three surfaces (list, point-get, latest) can never disagree.
-/// The value reuses the per-node vocabulary (`waiting_for_input`, the
-/// word that replaced the ghost `suspended` variant) so clients style
-/// one concept, and it is NON-terminal: pollers keep waiting through it,
-/// exactly as they did when it read `running`.
-async fn overlay_suspended(
-    state: &DispatcherState,
-    summaries: &mut [weft_core::program::ExecutionSummary],
-) -> Result<(), StatusCode> {
-    use std::collections::HashMap;
-    let mut sets: HashMap<uuid::Uuid, std::collections::HashSet<ExecutionId>> = HashMap::new();
-    for s in summaries.iter_mut() {
-        if s.status != SummaryStatus::Run(weft_core::program::RunStatus::Running) {
-            continue;
-        }
-        let set = match sets.entry(s.project_id) {
-            std::collections::hash_map::Entry::Occupied(known) => known.into_mut(),
-            std::collections::hash_map::Entry::Vacant(slot) => slot.insert(
-                crate::api::project::suspended_execution_id_set(state, s.project_id)
-                    .await
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
-            ),
-        };
-        s.status = s.status.parked(set.contains(&s.execution_id));
-    }
-    Ok(())
 }
 
 pub async fn get(
@@ -420,18 +332,15 @@ pub async fn get(
         .journal
         .execution_summary(execution_id)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(failed("read the run's summary"))?
         .ok_or(StatusCode::NOT_FOUND)?;
-    let mut batch = [summary];
-    overlay_suspended(&state, &mut batch).await?;
-    let [summary] = batch;
     // The waits ride with the status they produced: a run reads as
     // `waiting_for_input` because these rows exist, and they exist
     // before the journal's `NodeSuspended` lands (the node registers
     // its wait, then returns), so a client that learns the run is
     // parked learns from the same read what it is parked on.
-    let waiting = if summary.status == SummaryStatus::Run(weft_core::program::RunStatus::WaitingForInput) {
-        parked_waits(&state, execution_id).await.map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    let waiting = if summary.status == weft_core::program::RunStatus::WaitingForInput {
+        parked_waits(&state, execution_id).await.map_err(failed("read the run's waits"))?
     } else {
         Vec::new()
     };
@@ -553,8 +462,8 @@ pub async fn replay(
     // replay's event attribution.
     let project_id =
         authorize_execution(&*state.journal, &caller.0, execution_id).await.map_err(|(s, _)| s)?.project_id;
-    // The full ExecEvent log, folded over the run's program through
-    // the SAME projection the live `journal_bridge` runs, so replay and
+    // The full record, folded over the run's program through the SAME
+    // projection the live view runs (`crate::live_view`), so replay and
     // live cannot drift; bus and caller events ride along.
     // Lossy read: the inspector renders what exists, and every row
     // that no longer decodes lands below as its own JournalCorruption
@@ -652,10 +561,11 @@ pub struct ListExecutionsParams {
     pub instance: Option<weft_core::instance::InstanceId>,
     /// Only runs carrying this tag.
     pub tag: Option<String>,
-    /// Only runs in which this node fired.
+    /// Only finished runs in which this node fired, once their search
+    /// entry is built (`crate::search_index`).
     pub node: Option<String>,
-    /// Only finished runs whose recorded values carry every word of this
-    /// (`crate::run_search`).
+    /// Only finished runs whose recorded values carry every word of this,
+    /// once their search entry is built (`crate::search_index`).
     pub search: Option<String>,
     /// The page after the run that started at `before_started` with id
     /// `before_execution` (the last run of the page before): a walk that
@@ -693,12 +603,11 @@ pub async fn list_executions(
         search: params.search.filter(|s| !s.trim().is_empty()),
         below,
     };
-    let mut page = state
+    let page = state
         .journal
         .list_executions(caller.0.as_str(), &query)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    overlay_suspended(&state, &mut page.executions).await?;
+        .map_err(failed("list runs"))?;
     Ok(Json(page))
 }
 
@@ -730,12 +639,11 @@ pub async fn latest_for_project(
         search: None,
         below: None,
     };
-    let mut page = state
+    let page = state
         .journal
         .list_executions(caller.0.as_str(), &query)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    overlay_suspended(&state, &mut page.executions).await?;
+        .map_err(failed("list runs"))?;
     page.executions.into_iter().next().map(Json).ok_or(StatusCode::NOT_FOUND)
 }
 
@@ -855,7 +763,7 @@ pub(crate) async fn clean_runs(
             if Some(run.execution_id) == asked_by {
                 continue;
             }
-            if run.status == SummaryStatus::Run(weft_core::program::RunStatus::Running) {
+            if run.status == weft_core::program::RunStatus::Running {
                 match running {
                     weft_core::running_policy::RunningPolicy::Cancel => {
                         cancel_execution_id(state, run.execution_id, &weft_core::exec::CancelCause::User)
@@ -867,10 +775,6 @@ pub(crate) async fn clean_runs(
                 }
                 continue;
             }
-            // The listing's status clause is SQL and cannot see a row
-            // that no longer decodes, so it lists one as `corrupt`; a
-            // filtered clean deletes only the runs the filter reaches,
-            // never those. An unfiltered clean still removes them.
             if filter.status.is_some_and(|status| !status.reaches(run.status)) {
                 continue;
             }
@@ -935,14 +839,11 @@ pub(crate) async fn list_runs(
         return Err((StatusCode::BAD_REQUEST, format!("a runs listing takes 1 to {MAX_PAGE} runs, not {limit}")));
     }
     let query = run_query(Some(project), filter, limit, crate::lease::now_unix() as u64);
-    let mut page = state
+    let page = state
         .journal
         .list_executions(tenant.as_str(), &query)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("list runs: {e:#}")))?;
-    overlay_suspended(state, &mut page.executions)
-        .await
-        .map_err(|status| (status, "mark the runs parked on a wait".to_string()))?;
     Ok(page)
 }
 
@@ -1026,23 +927,13 @@ pub(crate) async fn clean_execution(
             );
             StatusCode::SERVICE_UNAVAILABLE
         })?;
-    // The version tree's row for this run goes first, dropped by the
-    // store that owns that table.
-    //
-    // Before the journal, because the journal row is what makes this
-    // call REACHABLE: `authorize_execution` reads `execution`,
-    // which `delete_execution` removes. Deleting the journal first and
-    // failing here left a tree row with no journal, and then `weft
-    // clean` answered 404 for ever (no owner row to authorize against)
-    // while every later prune refused the subtree because a run with no
-    // terminal row reads as still in flight. This way round, a failure
-    // leaves everything reachable and the same command retries: the
-    // tree delete is idempotent.
-    state.versions.delete_run(execution_id).await.map_err(|e| {
+    // Head stops pointing at the run first: a failure after it leaves
+    // the run whole and reachable, and the same command retries.
+    state.versions.forget_head_run(execution_id).await.map_err(|e| {
         tracing::error!(
             target: "weft_dispatcher::versions",
             %execution_id, error = %e,
-            "could not drop this run from the version tree; nothing was deleted, retry"
+            "could not move head off this run; nothing was deleted, retry"
         );
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
@@ -1050,7 +941,7 @@ pub(crate) async fn clean_execution(
         .journal
         .delete_execution(execution_id)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(failed("delete the run"))?;
     // The questions the run was parked on went with its rows, and the
     // listener holding each one still serves it until told: a
     // client with a signal token could list and answer a form
@@ -1184,13 +1075,13 @@ mod cancel_tests {
         let execution_id = ExecutionId::new_v4();
         let program = program();
         let with = cancel_terminal_events(execution_id, &open_firing(execution_id), Some(&program), &CancelCause::User, 9).unwrap();
-        let kinds: Vec<&str> = with.iter().map(|(e, _)| e.kind_str()).collect();
+        let kinds: Vec<&str> = with.iter().map(ExecEvent::kind_str).collect();
         assert_eq!(kinds, vec!["node_cancelled", "execution_cancelled"]);
-        assert_eq!(with[0].1, format!("cancel:{execution_id}:wait:"));
+        assert!(matches!(&with[0], ExecEvent::NodeCancelled { node_id, .. } if node_id == "wait"));
         let without = cancel_terminal_events(execution_id, &open_firing(execution_id), None, &CancelCause::User, 9).unwrap();
-        let kinds: Vec<&str> = without.iter().map(|(e, _)| e.kind_str()).collect();
+        let kinds: Vec<&str> = without.iter().map(ExecEvent::kind_str).collect();
         assert_eq!(kinds, vec!["execution_cancelled"]);
-        assert!(matches!(&without[0].0, ExecEvent::ExecutionCancelled { cause: Some(CancelCause::User), .. }));
+        assert!(matches!(&without[0], ExecEvent::ExecutionCancelled { cause: Some(CancelCause::User), .. }));
     }
 }
 

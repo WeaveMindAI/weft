@@ -61,9 +61,9 @@ pub async fn run(ctx: Ctx, step_name: &str, field: &str, search: Option<&str>) -
             let grant = grants.into_iter().find(|g| g.id == id).with_context(|| {
                 format!(
                     "'{}' is picked on a connection that no longer exists ({id}); pick \
-                     another with `weft connect --node {} --list`, then `--grant <id>`",
+                     another with `{}`, then `--grant <id>`",
                     target.spelling(),
-                    target.spelling()
+                    ctx.weft(&format!("connect --node {} --list", target.spelling()))
                 )
             })?;
             Some(Signing { access_id: id, service: grant.service, scopes: grant.scopes })
@@ -106,7 +106,7 @@ pub async fn run(ctx: Ctx, step_name: &str, field: &str, search: Option<&str>) -
         let Some(ResourceSource::List { lookup, .. }) =
             usable.iter().find(|s| matches!(s, ResourceSource::List { .. }))
         else {
-            bail!("{}", nothing_to_list(&step, field, &access, own_widget, &sources, signing.is_some(), query));
+            bail!("{}", nothing_to_list(&step, field, &access, own_widget, &sources, signing.is_some(), query, ctx.on()));
         };
         let mut cursor: Option<String> = None;
         // Every cursor the service has handed out: one coming back is a
@@ -285,6 +285,7 @@ fn narrow(lookup: &Lookup, query: &str, items: Vec<LookupItem>) -> Vec<LookupIte
 
 /// Why nothing could be listed, naming the fix. Reached when no usable
 /// `list` source is left and the granted choices (if any) gave nothing.
+#[allow(clippy::too_many_arguments)]
 fn nothing_to_list(
     step: &Step,
     field: &str,
@@ -293,8 +294,10 @@ fn nothing_to_list(
     sources: &[ResourceSource],
     connected: bool,
     query: &str,
+    on: Option<&str>,
 ) -> String {
     let at = format!("'{}.{field}'", step.spelling);
+    let weft = |verb: &str| super::weft_on(on, verb);
     let has_list = sources.iter().any(|s| matches!(s, ResourceSource::List { .. }));
     let has_granted = sources.iter().any(|s| matches!(s, ResourceSource::Granted { .. }));
     if !has_list && !has_granted {
@@ -306,15 +309,14 @@ fn nothing_to_list(
     if !connected {
         return if own_widget {
             format!(
-                "{at} needs a connection first: pick one on this step with `weft connect --node {} \
-                 --list`, then `--grant <id>`",
-                step.spelling
+                "{at} needs a connection first: pick one on this step with `{}`, then `--grant <id>`",
+                weft(&format!("connect --node {} --list", step.spelling))
             )
         } else {
             format!(
                 "{at} needs a connection first: wire its `{access}` input to an access node, then \
-                 pick that node's connection with `weft connect --node <access node> --list`, then \
-                 `--grant <id>`"
+                 pick that node's connection with `{}`, then `--grant <id>`",
+                weft("connect --node <access node> --list")
             )
         };
     }
@@ -323,7 +325,8 @@ fn nothing_to_list(
         // are not all held.
         return format!(
             "{at} can only be listed with permissions the picked connection does not hold; \
-             connect one that has them with `weft connect --node <access node>`"
+             connect one that has them with `{}`",
+            weft("connect --node <access node>")
         );
     }
     // Only the choices recorded on the connection when it was made.
@@ -335,7 +338,8 @@ fn nothing_to_list(
     }
     format!(
         "{at} offers only the choices recorded on the connection when it was made, and it \
-         recorded none; connect it again with `weft connect --node <access node>` to record them"
+         recorded none; connect it again with `{}` to record them",
+        weft("connect --node <access node>")
     )
 }
 

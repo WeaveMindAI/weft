@@ -1,131 +1,59 @@
 //! Bridge between `infra_event` rows (written by the supervisor)
 //! and the dispatcher's `EventBus` SSE fanout.
 //!
-//! Mirrors `journal_bridge`: drain a cursor, publish each event for
-//! SSE consumers, advance the cursor. The bridge is SSE-only.
-//! Control-plane actions (deactivate / reactivate) flow through
-//! `infra_lifecycle_command` rows that `lifecycle_claimer` picks up,
-//! so there's no at-least-once retry burden here: missing an SSE
-//! publish is cosmetic (clients reconnect and re-poll), losing a
-//! control-plane action is not, and that path has its own queue.
-//!
-//! Multi-process concurrency: a drain holds a session advisory lock on its
-//! own connection, taken with `pg_try_advisory_lock`, so only one
-//! dispatcher drains at a time and the others skip rather than wait,
-//! looking again shortly (the holder may have read before the write they
-//! heard about). No transaction
-//! stays open across the publishes: an open one would hold back the
-//! settled horizon every cursor reads against (`crate::settled`).
+//! Every row is announced as it commits, naming its project and its id
+//! (`INFRA_EVENT_CHANNEL`). Every dispatcher process hears it, and the
+//! ones where somebody follows that project read the row and publish it to
+//! their own subscribers. The bridge is SSE-only: control-plane actions
+//! (deactivate / reactivate) flow through `infra_lifecycle_command` rows
+//! that `lifecycle_claimer` picks up, so a lost announcement only leaves
+//! a screen behind until the next event or a reload, while the action
+//! itself has its own queue.
+
+use weft_task_store::pg_signal::Heard;
 
 use crate::events::DispatcherEvent;
-use crate::infra_event::{self, InfraEvent};
-use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn, LOCK_HELD_RETRY, SAFETY_POLL_INTERVAL};
-use crate::settled::{Position, SettledReader};
+use crate::infra_event::InfraEvent;
 use crate::state::DispatcherState;
 
-const CURSOR_KEY: &str = "infra_event_bridge";
-
-/// Per-iteration row limit. A burst of >FETCH_LIMIT events is handled
-/// by the drain loop's "loop until empty" semantics: the body
-/// returns `DrainStep::More` when it filled the batch, and the
-/// runner re-invokes immediately.
-const FETCH_LIMIT: i64 = 500;
-
-/// The channel every `infra_event` row notifies on when it commits, from
-/// the `infra_event_notify_on_insert` trigger in `infra_event::GROUP`.
-/// The bridge listens; the safety tick catches a lost notification.
+/// The channel every `infra_event` row is announced on when it commits,
+/// from the `infra_event_notify_on_insert` trigger in
+/// `infra_event::GROUP`: `"<project id> <row id>"`.
 pub const INFRA_EVENT_CHANNEL: &str = "weft_infra_event";
 
-/// Seed this bridge's cursor row in `dispatcher_cursor` (the table is
-/// `journal_bridge::GROUP`'s; seeds run after every group's DDL, so
-/// list order carries no constraint). Creates no table of its own, so
-/// `tables` is empty. The seed row's key literal is `CURSOR_KEY`
-/// (static DDL cannot bind).
-pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
-    name: "infra_event_bridge_cursor",
-    tables: &[],
-    ddl: &[],
-    seed: &[
-        "INSERT INTO dispatcher_cursor (key, last_id) VALUES ('infra_event_bridge', 0) \
-         ON CONFLICT (key) DO NOTHING",
-    ],
-};
-
-pub(crate) static ON_INFRA_EVENT: &[WakeOn] = &[WakeOn::any(INFRA_EVENT_CHANNEL)];
-
-/// The advisory lock key only one process's drain holds at a time.
-// SYNC: 'infra_event_bridge' <-> CURSOR_KEY (the lock is keyed like the cursor row)
-const DRAIN_LOCK_SQL: &str = "hashtextextended('infra_event_bridge', 0)";
-
-pub fn drain_loop(state: DispatcherState) -> DrainLoop {
-    let reader = std::sync::Arc::new(tokio::sync::Mutex::new(SettledReader::new("infra_event_bridge")));
-    DrainLoop::new("infra_event_bridge", ON_INFRA_EVENT, SAFETY_POLL_INTERVAL, move || {
-        let state = state.clone();
-        let reader = reader.clone();
-        async move { drain(&state, &mut *reader.lock().await).await }
-    })
+/// Publish the infra events of the projects followed on this process, for
+/// the process's whole life.
+pub async fn run(state: DispatcherState) {
+    let mut heard = state.signals.subscribe();
+    loop {
+        match heard.next().await {
+            Ok(Heard::Signal { channel, payload }) if channel == INFRA_EVENT_CHANNEL => {
+                if let Err(e) = publish(&state, &payload).await {
+                    tracing::warn!(target: "weft_dispatcher::infra_event_bridge", %payload, error = %format!("{e:#}"), "could not publish an infra event");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(target: "weft_dispatcher::infra_event_bridge", error = %e, "the infra event bridge stopped hearing new events");
+                return;
+            }
+        }
+    }
 }
 
-async fn drain(state: &DispatcherState, reader: &mut SettledReader) -> anyhow::Result<DrainStep> {
-    let mut conn = state.pg_pool.acquire().await?;
-    let locked: bool = sqlx::query_scalar(&format!("SELECT pg_try_advisory_lock({DRAIN_LOCK_SQL})"))
-        .fetch_one(&mut *conn)
-        .await?;
-    if !locked {
-        // A sibling is draining, but it may have read before the write
-        // this wake is for, so look again shortly.
-        return Ok(DrainStep::RetryIn(LOCK_HELD_RETRY));
+/// Publish the row an announcement names, when its project is followed
+/// here.
+async fn publish(state: &DispatcherState, payload: &str) -> anyhow::Result<()> {
+    let (project, id) = payload.split_once(' ').ok_or_else(|| anyhow::anyhow!("an infra event announcement is '<project> <id>'"))?;
+    let project_id: uuid::Uuid = project.parse()?;
+    if !state.events.watched(project_id).await {
+        return Ok(());
     }
-    let step = drain_locked(state, reader, &mut conn).await;
-    let unlocked = sqlx::query(&format!("SELECT pg_advisory_unlock({DRAIN_LOCK_SQL})"))
-        .execute(&mut *conn)
-        .await;
-    if step.is_err() || unlocked.is_err() {
-        // Never hand a connection that may still hold the lock back to
-        // the pool: closing it is what releases the lock for certain.
-        conn.close_on_drop();
+    let Some(row) = crate::infra_event::read(&state.pg_pool, id.parse()?).await? else { return Ok(()) };
+    if let Some(event) = to_dispatcher_event(&row) {
+        state.events.publish_local(crate::events::IdentifiedEvent::transient(event)).await;
     }
-    let step = step?;
-    unlocked?;
-    Ok(step)
-}
-
-async fn drain_locked(
-    state: &DispatcherState,
-    reader: &mut SettledReader,
-    conn: &mut sqlx::PgConnection,
-) -> anyhow::Result<DrainStep> {
-    let (xid, id): (i64, i64) = sqlx::query_as(
-        "SELECT last_xid::text::bigint, last_id FROM dispatcher_cursor WHERE key = $1",
-    )
-    .bind(CURSOR_KEY)
-    .fetch_one(&mut *conn)
-    .await?;
-    let batch = reader
-        .read(&mut *conn, "infra_event", infra_event::READ_COLUMNS, Position { xid, id }, FETCH_LIMIT)
-        .await?;
-    let Some(last) = batch.rows.last().map(Position::of).transpose()? else {
-        return Ok(batch.next);
-    };
-    let rows = infra_event::parse_rows(batch.rows)?;
-
-    // Publish BEFORE the cursor advances. SSE consumers are idempotent
-    // (they de-dupe by (project_id, execution, step) on the client), so a
-    // crash after publish and before the advance just re-publishes the
-    // same events on the next drain, while a crash after an advance and
-    // before publish would drop them for good. The lock is a session
-    // lock, so a crash anywhere releases it with the connection.
-    for de in rows.iter().filter_map(to_dispatcher_event) {
-        state.events.publish(de).await;
-    }
-
-    sqlx::query("UPDATE dispatcher_cursor SET last_xid = $1::text::xid8, last_id = $2 WHERE key = $3")
-        .bind(last.xid.to_string())
-        .bind(last.id)
-        .bind(CURSOR_KEY)
-        .execute(&mut *conn)
-        .await?;
-    Ok(batch.next)
+    Ok(())
 }
 
 /// Pure mapping from a fetched `infra_event` row to the

@@ -28,8 +28,6 @@ use crate::client::{poll_until, Dispatcher};
 pub enum Role {
     /// Serves the project's program.
     Worker,
-    /// Runs one long run of the program to its end.
-    Long,
     /// Part of an infra node's unit.
     Infra,
 }
@@ -39,7 +37,6 @@ impl Role {
         use weft_platform_local::docker::roles;
         match self {
             Self::Worker => roles::WORKER,
-            Self::Long => roles::LONG,
             Self::Infra => roles::INFRA,
         }
     }
@@ -102,16 +99,15 @@ impl Platform {
         .context("count public file links")
     }
 
-    /// The worker replica that currently OWNS an execution (stamped
-    /// by the claim trigger), or None while unclaimed.
-    pub async fn execution_owner(&self, execution_id: &Uuid) -> Result<Option<String>> {
-        let row: Option<(Option<String>,)> =
-            sqlx::query_as("SELECT owner_replica FROM execution WHERE execution_id = $1")
-                .bind(execution_id.to_string())
-                .fetch_optional(&self.pool)
-                .await
-                .context("read execution owner")?;
-        Ok(row.and_then(|(p,)| p))
+    /// The replica that wrote the last row of a run's record: for an ended
+    /// run, the worker that ended it (`run.owner` is cleared once a run
+    /// ends). None for a run nothing wrote yet.
+    pub async fn execution_writer(&self, execution_id: &Uuid) -> Result<Option<String>> {
+        sqlx::query_scalar("SELECT writer FROM run_log WHERE execution_id = $1 ORDER BY seq DESC LIMIT 1")
+            .bind(execution_id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("read the writer of a run's record")
     }
 
     /// How many IN-FLIGHT (pending) runtime-file uploads exist under an execution's
@@ -196,6 +192,22 @@ impl Platform {
                 .await
                 .with_context(|| format!("docker rm -f {name}"))?;
             anyhow::ensure!(out.status.success(), "docker rm -f {name} failed: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        Ok(running)
+    }
+
+    /// Tell every worker container of `project_id` to stop the way a
+    /// platform does (`SIGTERM`), leaving it to wind down on its own.
+    /// Returns the ones it told; an empty answer means nothing was running.
+    pub async fn stop_workers(&self, project_id: &Uuid) -> Result<Vec<String>> {
+        let running = self.workers_for_project(project_id).await?;
+        for name in &running {
+            let out = tokio::process::Command::new("docker")
+                .args(["kill", "--signal", "TERM", name])
+                .output()
+                .await
+                .with_context(|| format!("docker kill --signal TERM {name}"))?;
+            anyhow::ensure!(out.status.success(), "docker kill --signal TERM {name} failed: {}", String::from_utf8_lossy(&out.stderr));
         }
         Ok(running)
     }

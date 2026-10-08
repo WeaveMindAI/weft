@@ -6,17 +6,25 @@
 //! the broker).
 
 pub(crate) mod caller_conn;
+pub(crate) mod busy;
 pub(crate) mod context;
+pub mod door;
 pub(crate) mod execution_driver;
 pub(crate) mod fired_caller;
 pub(crate) mod held;
-pub(crate) mod memory_guard;
+pub(crate) mod held_waits;
+pub(crate) mod journal_writer;
 pub(crate) mod metering;
+pub(crate) mod plan;
+pub mod profile;
+pub(crate) mod record_first;
 pub(crate) mod socket;
 pub(crate) mod stream_runtime;
 pub(crate) mod wait_tracker;
 pub mod worker;
 pub mod storage;
+#[cfg(test)]
+pub(crate) mod test_record;
 // The node-test rig + runner. Feature-gated so ONLY the emitted
 // per-package test crate compiles them; a worker binary carries no
 // test machinery.
@@ -26,9 +34,15 @@ pub mod test_rig;
 pub mod test_runner;
 
 pub use context::EngineClients;
+pub use context::ProcessSettings;
+pub use journal_writer::WriterSettings;
 pub use weft_platform_traits::identity::mint_replica_id;
-pub use worker::{identity_from_env, run_long, serve, RunAnswer, WorkerConfig, WorkerDoor};
+pub use worker::{identity_from_env, serve, WorkerConfig, WeftCredential};
 pub use storage::{WorkerStorage, WorkerStorageOps};
+/// The worker binary's global allocator, which the generated `main`
+/// declares (`weft_compiler::codegen`): it hands freed memory back to the
+/// system, so the memory a worker reads as used (`busy`) is what it uses.
+pub use tikv_jemallocator::Jemalloc;
 
 /// Wall-clock seconds since the UNIX epoch, for `at_unix` event
 /// timestamps (observational metadata, not control-flow deadlines:

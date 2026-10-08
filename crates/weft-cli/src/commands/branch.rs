@@ -23,9 +23,10 @@ pub async fn run(ctx: Ctx, reference: String, discard: bool) -> anyhow::Result<(
             let dirty = dirty_files(&head.manifest, &local);
             if !dirty.is_empty() {
                 bail!(
-                    "the tree has changes since head {}:\n  {}\n`weft checkpoint` keeps them as a version, or `--discard` throws them away",
+                    "the tree has changes since head {}:\n  {}\n`{}` keeps them as a version, or `--discard` throws them away",
                     short(&head.id),
-                    dirty.join("\n  ")
+                    dirty.join("\n  "),
+                    ctx.weft("checkpoint")
                 );
             }
         }
@@ -59,9 +60,9 @@ pub async fn run(ctx: Ctx, reference: String, discard: bool) -> anyhow::Result<(
     // finishes the job.
     restore(&client, project, &manifest).await.with_context(|| {
         format!(
-            "the tree is part way to version {}; `weft branch {} --discard` finishes restoring it",
+            "the tree is part way to version {}; `{}` finishes restoring it",
             short(&version_id),
-            short(&version_id)
+            ctx.weft(&format!("branch {} --discard", short(&version_id)))
         )
     })?;
     let resp = client
@@ -70,13 +71,15 @@ pub async fn run(ctx: Ctx, reference: String, discard: bool) -> anyhow::Result<(
         .with_context(|| {
             format!(
                 "the files on disk ARE version {} now, but head could not be moved there. \
-                 `weft branch {reference} --discard` finishes the job, and it names {reference} \
+                 `{}` finishes the job, and it names {reference} \
                  again rather than the version, because that is what you asked for and an execution \
-                 also sets head's run. Plain `weft branch {reference}` will refuse, because head \
+                 also sets head's run. Plain `{}` will refuse, because head \
                  is still the old version and reads the restored files as your own uncommitted \
                  changes; `--discard` overwrites the files with this version, which is what they \
                  already are unless you have edited them since",
-                short(&version_id)
+                short(&version_id),
+                ctx.weft(&format!("branch {reference} --discard")),
+                ctx.weft(&format!("branch {reference}"))
             )
         })?;
     // The answer's version is what is printed, never the one we ASKED

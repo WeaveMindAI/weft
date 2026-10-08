@@ -105,11 +105,11 @@ impl ScriptedDoor {
 
 #[async_trait::async_trait]
 impl weft_platform_traits::DomainHosting for ScriptedDoor {
-    async fn serve(&self, names: &[String]) -> anyhow::Result<Option<std::net::IpAddr>> {
-        self.asked.lock().unwrap().push(names.to_vec());
+    async fn serve(&self, domains: &[Domain]) -> anyhow::Result<Option<std::net::IpAddr>> {
+        self.asked.lock().unwrap().push(domains.iter().map(|d| d.name.clone()).collect());
         let refuse = self.refuse.lock().unwrap().pop_front().expect("the script names every serve");
         anyhow::ensure!(!refuse, "the platform refused");
-        Ok((!names.is_empty()).then_some(weft_platform_traits::domains::fake::FAKE_DOOR))
+        Ok((!domains.is_empty()).then_some(weft_platform_traits::domains::fake::FAKE_DOOR))
     }
 
     async fn address(&self) -> anyhow::Result<Option<std::net::IpAddr>> {

@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use weft_e2e::client::poll_until;
 use weft_e2e::{ensure, infra, project::Project, run, SettledRun};
 
 #[tokio::test]
@@ -17,7 +18,14 @@ async fn a_trigger_listens_to_the_programs_own_infra() -> anyhow::Result<()> {
     project.activate().await?;
     let before = run::executions(&disp, &pid).await?;
 
-    let execution_id = run::wait_for_triggered_execution(&disp, &pid, &before, Duration::from_secs(60)).await?;
+    // The unit ticks every second and each tick fires a run, so more than
+    // one may have started by the time the listing is read: the first is
+    // the one to follow (run ids grow with time).
+    let execution_id = poll_until("a tick to fire a run", Duration::from_secs(60), Duration::from_millis(300), || {
+        let (disp, before) = (disp.clone(), before.clone());
+        async move { Ok(run::executions(&disp, &pid).await?.difference(&before).min().copied()) }
+    })
+    .await?;
     let settled = SettledRun::observe(&disp, execution_id).await?;
     settled.completed()?;
     let value = settled.input_of("out").and_then(|i| i.get("data").cloned());

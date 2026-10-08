@@ -632,6 +632,7 @@ pub fn enrich_collecting(
         node.requires_infra = meta.requires_infra;
         node.images = meta.images.clone();
         node.fires_with = meta.fires_with.clone();
+        node.baked_outputs = meta.outputs.iter().filter(|o| o.baked).map(|o| o.name.clone()).collect();
         // A node that hands out a connection to something it runs
         // itself carries that service's recipe from here on. Resolved
         // now, against the WHOLE catalog, because the built worker

@@ -51,8 +51,7 @@ impl Node for PostgresInsertRowNode {
         let params: Vec<Value> = obj.values().cloned().collect();
         let sql = insert_sql(&table, &columns)?;
 
-        let conn = ctx.open(&account).await?;
-        let client = connect(&ctx, &conn).await?;
+        let client = connect(&ctx, &account).await?;
         // No port names: this node writes the SQL itself, so its `$1`
         // is nothing the author typed and there is no cast they could
         // add to it.

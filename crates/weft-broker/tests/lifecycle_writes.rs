@@ -586,7 +586,6 @@ async fn nothing_is_issued_or_recorded_for_a_deleted_project(pool: PgPool) {
         node_id: Some(NODE),
         copies: &weft_core::instance::Copies::Shared,
         verb: InfraLifecycleVerb::Apply,
-        running_policy: None,
         spec_json: Some(&spec),
         issued_by_replica: "worker-1",
     };
@@ -682,7 +681,6 @@ async fn an_instances_copy_is_stamped_and_commanded_on_its_own(pool: PgPool) {
         node_id: Some(NODE),
         copies: &copies,
         verb: InfraLifecycleVerb::Apply,
-        running_policy: None,
         spec_json: Some(&spec),
         issued_by_replica: "worker-1",
     };
@@ -693,57 +691,22 @@ async fn an_instances_copy_is_stamped_and_commanded_on_its_own(pool: PgPool) {
     assert_eq!((claimed.id, claimed.copies), (id, Copies::Instance(ada)));
 }
 
-
-/// What `running_policy=wait` waits on: the live runs a copy serves. A
-/// finished run and a run parked on a resume hold nothing; an instance's
-/// copy counts only that instance's runs, the shared copy every run.
+/// A take-down that drains first is the dispatcher's until its running
+/// work is done: the supervisor is handed it only once the drain hands it
+/// over, and a command on the same copy behind it waits for it.
 #[sqlx::test]
-async fn the_running_count_is_the_live_runs_a_copy_serves(pool: PgPool) {
-    use weft_core::instance::{Copies, InstanceId};
+async fn a_command_still_draining_is_not_handed_to_the_supervisor(pool: PgPool) {
     schema(&pool).await;
-    let run = |execution_id: &'static str, instance: Option<&'static str>| {
-        let pool = pool.clone();
-        async move {
-            sqlx::query(
-                "INSERT INTO execution (execution_id, project_id, tenant_id, started_at_unix, phase, instance_id) \
-                 VALUES ($1, $2, $3, 0, 'fire', $4)",
-            )
-            .bind(execution_id)
-            .bind(PROJECT)
-            .bind(TENANT)
-            .bind(instance)
-            .execute(&pool)
-            .await
-            .unwrap();
-        }
-    };
-    run("11111111-1111-1111-1111-111111111111", None).await;
-    run("22222222-2222-2222-2222-222222222222", Some("ada")).await;
-    run("33333333-3333-3333-3333-333333333333", Some("ada")).await;
-    let count = |copies: Copies| {
-        let pool = pool.clone();
-        async move { weft_broker::lifecycle_writes::live_run_count(&pool, PROJECT, &copies).await.unwrap() }
-    };
-    assert_eq!(count(Copies::Shared).await, 3);
-    assert_eq!(count(Copies::Instance(InstanceId::new("ada").unwrap())).await, 2);
-
-    // One of ada's runs ends, the other parks on a form.
-    sqlx::query(
-        "INSERT INTO exec_event (execution_id, kind, payload_json, created_at) \
-         VALUES ('22222222-2222-2222-2222-222222222222', 'execution_completed', '{}', 1)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO signal (token, tenant_id, project_id, node_id, execution_id, is_resume, spec_json, created_at) \
-         VALUES ('form', $1, $2, 'ask', '33333333-3333-3333-3333-333333333333', TRUE, '{}', 1)",
-    )
-    .bind(TENANT)
-    .bind(PROJECT)
-    .execute(&pool)
-    .await
-    .unwrap();
-    assert_eq!(count(Copies::Instance(InstanceId::new("ada").unwrap())).await, 0);
-    assert_eq!(count(Copies::Every).await, 1, "the shared copy's run is still live");
+    lease(&pool, OWNER).await;
+    let draining = command(&pool).await;
+    let behind = command(&pool).await;
+    sqlx::query("UPDATE infra_lifecycle_command SET drain_by_unix = EXTRACT(EPOCH FROM NOW())::BIGINT + 60 WHERE id = $1")
+        .bind(draining)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(next_command(&pool, OWNER, &[]).await.unwrap().is_none(), "draining, and the one behind it waits");
+    sqlx::query("UPDATE infra_lifecycle_command SET drain_by_unix = NULL WHERE id = $1").bind(draining).execute(&pool).await.unwrap();
+    assert_eq!(next_command(&pool, OWNER, &[]).await.unwrap().map(|c| c.id), Some(draining));
+    assert_eq!(next_command(&pool, OWNER, &[draining]).await.unwrap().map(|c| c.id), None, "{behind} waits for it");
 }

@@ -67,10 +67,3 @@ resource "google_secret_manager_secret_iam_member" "core_reads" {
   member    = "serviceAccount:${google_service_account.core.email}"
 }
 
-# The core grants each project's own account the ticket secret (its
-# workers check a live caller's ticket with it), and nothing else.
-resource "google_secret_manager_secret_iam_member" "core_shares_ticket_secret" {
-  secret_id = google_secret_manager_secret.install["WEFT_CALLER_TOKEN_SECRET"].id
-  role      = "roles/secretmanager.admin"
-  member    = "serviceAccount:${google_service_account.core.email}"
-}

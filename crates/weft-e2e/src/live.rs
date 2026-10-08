@@ -1,20 +1,18 @@
 //! The live-caller path: an outside party holds an HTTP stream or a two-way
 //! WebSocket against a running program.
 //!
-//! A call is `/connect/<tenant>/{path}` on the dispatcher, any method, and
-//! is answered in that one request: the dispatcher checks the caller,
-//! starts the run and passes the call to one of the project's workers. A
-//! socket is opened there the same way, by a client that sends the
+//! A call is `/connect/<tenant>/{path}` on the install's shared address,
+//! any method, and is answered in that one request: the install passes it
+//! on to the project's workers, whose door checks the caller and starts the
+//! run. A socket is opened there the same way, by a client that sends the
 //! upgrade itself.
 //!
 //! A browser cannot put a credential on a socket's opening request, so
 //! the route offers it two steps instead, which [`ticket`] and
 //! [`open_socket_at`] take: a plain GET answers
-//! `200 { "url": "...", "protocol": "websocket" }`, a URL on the live door
-//! (`/live/<project>/...`) carrying a signed ticket, and the socket is
-//! opened there. That URL points at the front door (the install's
-//! configured base when the call came straight to the dispatcher's port),
-//! so these helpers hit absolute URLs.
+//! `200 { "url": "...", "protocol": "websocket" }`, the route's own URL
+//! at the address the caller used, carrying a signed ticket, and the socket
+//! is opened there. These helpers hit absolute URLs.
 
 use anyhow::{bail, Context, Result};
 use futures::{SinkExt, StreamExt};
@@ -320,7 +318,7 @@ pub struct SilentCaller {
 ///
 /// This half is the one the gate sees, so a route with auth is checked
 /// here.
-// SYNC: the ticket answer's shape <-> crates/weft-dispatcher/src/api/signal.rs (connect_live), packages/weft-connect/src/core/socket.ts (socketAddress)
+// SYNC: the ticket answer's shape <-> crates/weft-engine/src/door/mod.rs (the ticket answer), packages/weft-connect/src/core/socket.ts (socketAddress)
 pub async fn ticket(disp: &Dispatcher, mount_path: &str, headers: &[(&str, &str)]) -> Result<String> {
     let url = format!("{}/connect/{}", disp.base(), mount_path.trim_start_matches('/'));
     let mut req = reqwest::Client::new().get(&url);

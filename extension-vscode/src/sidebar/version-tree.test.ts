@@ -128,6 +128,13 @@ describe('version tree', () => {
     expect(versionMarks(root.children[1])).toEqual(['on disk']);
   });
 
+  it("counts a version's trigger runs among its marks", () => {
+    const fired: TreeJson = { ...tree, versions: [{ ...version('v1', null, 1), trigger_runs: 1200 }], runs: [] };
+    expect(versionMarks(buildVersionTree(fired)[0])).toEqual(['activated', '1200 trigger runs']);
+    const once: TreeJson = { ...tree, versions: [{ ...version('v1', null, 1), trigger_runs: 1 }], runs: [] };
+    expect(versionMarks(buildVersionTree(once)[0])).toEqual(['activated', '1 trigger run']);
+  });
+
   it('a version whose parent was pruned is a root', () => {
     const orphaned: TreeJson = { ...tree, versions: [version('v9', 'gone', 9)], runs: [] };
     expect(buildVersionTree(orphaned).map((r) => r.version.id)).toEqual([id('v9')]);

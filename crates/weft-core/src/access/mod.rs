@@ -191,6 +191,12 @@ impl OpenedConnection {
         })
     }
 
+    /// Every stored value, for what is built from the whole connection
+    /// and must change when any of them does (`crate::keep`).
+    pub(crate) fn values(&self) -> &std::collections::BTreeMap<String, String> {
+        &self.values
+    }
+
     /// One stored value by name, or `None` when the connection does
     /// not hold it. For a genuinely optional field (an alias to send
     /// as); use [`Self::value`] for one the node cannot work without.

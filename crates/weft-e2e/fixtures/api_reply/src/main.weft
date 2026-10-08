@@ -8,6 +8,8 @@
 #   DELETE gone       a bodiless answer through Close, ordered by a decision
 #   DELETE sweep/{w}  the "if it did not work, stop here" shape: a Switch on the
 #                     outcome, a Reply on one case, a Close with a reason on the other
+#   GET  slow         an answer that takes a few seconds, for taking the triggers
+#                     down while a call is running
 
 hello = Route -> (name: String) { path: "__E2E_PATH__/hello", method: "POST" }
 greet = ExecPython(name: String, path: String, headers: Dict[String, String]) -> (body: JsonDict) {
@@ -73,3 +75,9 @@ tag = ExecPython(method: String) -> (head: Dict[String, String]) {
 tag.method = fresh.method
 unchanged = Close { status: 304 }
 unchanged.headers = tag.head
+
+slow = Route { path: "__E2E_PATH__/slow", method: "GET" }
+nap = ExecPython(path: String) -> (body: JsonDict) { code: "import time\ntime.sleep(4)\nreturn {'body': {'slept': True}}" }
+nap.path = slow.path
+rested = Reply
+rested.body = nap.body

@@ -64,7 +64,7 @@ pub async fn forward(State(state): State<DispatcherState>, request: Request) -> 
         None => under,
     };
     let upstream = crate::proxy::Upstream { what: "the infra endpoint", base_url, auth: None, hold: None };
-    crate::proxy::forward(&state.http, upstream, path_and_query, request).await
+    crate::proxy::forward(&state.http, upstream, path_and_query, request, crate::proxy::Forwarding::Proxied).await
 }
 
 #[cfg(test)]

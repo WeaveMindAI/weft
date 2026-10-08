@@ -61,9 +61,7 @@ pub enum RouteClass {
     Reports,
     /// A long-lived two-way channel (a WebSocket) whose cost accrues from
     /// the frames that travel it, with no total knowable up front. Measured
-    /// by a [`SessionObservation`] fed every frame both directions; admitted
-    /// on a prepaid balance in slices ([`ProviderMeter::session_slice_usd`])
-    /// topped up as cost accrues, never by one pre-call ceiling.
+    /// by a [`SessionObservation`] fed every frame both directions.
     BillableSession,
     /// Not a route this meter knows, so not one it can measure. Whether an
     /// unknown route is refused or passed through unmeasured is the
@@ -107,14 +105,18 @@ pub struct ObservedCall {
 /// is exactly what makes the same meter work on a pasted key and on a
 /// sign-in. Two consumers: a resolve follow-up when the provider only
 /// reports cost out-of-band (e.g. OpenRouter's `/generation?id=...`),
-/// and a ceiling's rate-catalog lookup when the provider publishes its
-/// prices behind its own authenticated API (e.g. fal's pricing catalog).
-/// Either way the query is the METER's call, on a provider route that
-/// bills nothing; it may address any of the provider's own origins, but
-/// never anything a caller could influence.
+/// and a rate-catalog lookup when the provider publishes its prices
+/// behind its own authenticated API (e.g. fal's pricing catalog). Either
+/// way the query is the METER's call, on a provider route that bills
+/// nothing; it may address any of the provider's own origins, but never
+/// anything a caller could influence.
 pub struct FollowUp<'a> {
     pub http: &'a reqwest_middleware::ClientWithMiddleware,
     pub base_url: &'a str,
+    /// What the worker holds for its runs to share (`ctx.shared`): what a
+    /// meter looked up once and every call after reads (fal's price for a
+    /// model), kept by name ([`weft_core::shared::Shared::named`]).
+    pub shared: &'a weft_core::shared::Shared,
 }
 
 /// A meter's verdict on what one call cost.
@@ -173,15 +175,11 @@ pub trait CallObservation: Send {
 /// [`RouteClass::BillableSession`] route. The meter mints one per session;
 /// the caller feeds it every frame's payload in BOTH directions as it
 /// passes (a tap, never a buffer) and ends it when the socket closes.
-/// `accrued_usd` may be read at any moment between frames; a prepaid
-/// admission uses it to decide when to reserve the next slice.
 pub trait SessionObservation: Send {
     /// One frame from the caller to the provider (e.g. an audio chunk).
     fn on_frame_to_provider(&mut self, payload: &[u8]);
     /// One frame from the provider to the caller (e.g. a transcript).
     fn on_frame_to_caller(&mut self, payload: &[u8]);
-    /// Dollars accrued so far. Monotone; exact for what has passed.
-    fn accrued_usd(&self) -> f64;
     /// The session ended (cleanly or cut). The figure is final: a session
     /// is measured from its own frames, so unlike a one-shot call there is
     /// nothing out-of-band left to ask.
@@ -224,41 +222,6 @@ pub trait ProviderMeter: Send + Sync {
         Ok(None)
     }
 
-    /// The worst-case price this provider could charge for the Billable call
-    /// described by `body`: computed BEFORE the call goes out, from the
-    /// request bytes ALONE (the model, the output bound, the provider's own
-    /// rate card) and nothing a caller could hand over separately. Errors
-    /// when the request cannot be priced (unknown model, no output bound);
-    /// never guesses. It is the pre-call twin of [`Self::resolve`] (which
-    /// prices the call after the fact from the response): the same provider
-    /// cost math asked forward instead of backward.
-    ///
-    /// OPTIONAL to implement; the default refuses. A provider is fully usable
-    /// on the user's OWN key without it (a caller paying from their own
-    /// provider account bounds nothing up front). Implementing it correctly
-    /// is the bar to have the provider promoted to run on the platform keys
-    /// in app.weavemind.ai: a prepaid balance can only admit a call whose
-    /// worst case it can bound first, so a provider that will not price ahead
-    /// of time cannot spend the platform's money. Until it is promoted, keep
-    /// the default; the refusal is what keeps an unbounded call off a
-    /// platform key. (A future weft feature may also consume it to PREDICT a
-    /// run's cost up front: a second consumer, not a second reason to
-    /// implement it.)
-    async fn ceiling_usd(
-        &self,
-        _path: &str,
-        _body: &[u8],
-        _follow_up: FollowUp<'_>,
-    ) -> anyhow::Result<f64> {
-        anyhow::bail!(
-            "service '{}' does not price calls ahead of time, so it cannot run on the \
-             app.weavemind.ai platform keys; implement `ceiling_usd` to have it promoted, or \
-             connect your own '{}' credential on the node to use it now",
-            self.service(),
-            self.service(),
-        )
-    }
-
     /// A fresh observer for one Billable call's response, on `path`
     /// (relative, as [`Self::classify`] receives it). `query` is the
     /// request URL's raw query string (no leading '?') and
@@ -288,39 +251,6 @@ pub trait ProviderMeter: Send + Sync {
         )
     }
 
-    /// The pre-carve amount a prepaid admission reserves per slice for a
-    /// session on this route (e.g. one minute of audio worth). Reserved
-    /// once at admission and again every time the accrued cost approaches
-    /// the reserved total, until the balance refuses (the session is then
-    /// cut and settled at the accrued figure). Like [`Self::ceiling_usd`],
-    /// implementing it is the bar for the route to run on the platform
-    /// keys in app.weavemind.ai; the default refuses, and a session on the
-    /// caller's OWN credential needs only [`Self::observe_session`].
-    fn session_slice_usd(&self, path: &str) -> anyhow::Result<f64> {
-        anyhow::bail!(
-            "service '{}' does not price sessions ahead of time on '{path}', so a session \
-             cannot be paid for with the platform key; connect your own '{}' credential \
-             on the node to use it now",
-            self.service(),
-            self.service(),
-        )
-    }
-
-    /// The largest single frame a session admission should accept on this
-    /// route, sized so one frame can never accrue more than one admission
-    /// slice: one slice's worth of payload at the route's dearest per-byte
-    /// rate, in its wire form (base64 expansion and envelope included).
-    /// Implemented alongside [`Self::session_slice_usd`]; the default
-    /// refuses so an admitted session without a frame bound is a loud
-    /// meter bug, never an unbounded accrual.
-    fn session_max_frame_bytes(&self, path: &str) -> anyhow::Result<usize> {
-        anyhow::bail!(
-            "meter for '{}' declares no per-frame size bound on '{path}', so a session \
-             admission cannot cap what one frame may accrue; this is a meter bug",
-            self.service(),
-        )
-    }
-
     /// Price one observed call on `path` (relative, as
     /// [`Self::classify`] received it). The route arrives as a FACT so
     /// a meter never infers it from the response's shape; a multi-route
@@ -338,11 +268,6 @@ pub trait ProviderMeter: Send + Sync {
 
     /// Whether a call on this route can be priced at all once it comes
     /// back, asked BEFORE it is sent.
-    ///
-    /// Separate from [`Self::ceiling_usd`], which asks a different
-    /// question: what the worst case costs. A call can be perfectly
-    /// priceable afterwards and still have no bound before (a model
-    /// billed by GPU time), and the two must not gate each other.
     ///
     /// This is the gate for the case nothing downstream can recover
     /// from: a call the meter could never put a figure on, no matter

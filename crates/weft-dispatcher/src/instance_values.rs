@@ -25,7 +25,7 @@
 //! whichever door the change came through.
 //!
 //! Once a change is stored, the instance's fires that parked waiting on a
-//! value they had not given (`ParkedFire::instance_gap`) are routed again,
+//! value they had not given (`parked_fire.instance_gap`) are routed again,
 //! through the same drain every parked fire takes: each is held to what is
 //! stored now, and parks again, naming what is still missing, if a gap is
 //! left. Those fires are never retried on a timer, since only a change
@@ -251,7 +251,7 @@ async fn route_waiting_fires(state: &DispatcherState, project_id: uuid::Uuid, in
         }
     };
     for token in tokens {
-        if let Err(e) = crate::api::project::drain_one_token(state, project_id, &token).await {
+        if let Err(e) = crate::parked_drain::drain_token(state, &token, crate::parked_drain::Due::Now).await {
             tracing::error!(
                 target: "weft_dispatcher::instance_values",
                 %project_id, instance = %instance, token = %token, error = %e,

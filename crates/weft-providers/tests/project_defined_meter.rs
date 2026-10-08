@@ -33,15 +33,6 @@ impl ProviderMeter for ProjectMeter {
         }
     }
 
-    async fn ceiling_usd(
-        &self,
-        _path: &str,
-        _body: &[u8],
-        _follow_up: FollowUp<'_>,
-    ) -> anyhow::Result<f64> {
-        Ok(0.01)
-    }
-
     fn observe(&self, _path: &str, _query: &str, _request_body: &[u8]) -> Box<dyn CallObservation> {
         Box::new(NoopObservation)
     }

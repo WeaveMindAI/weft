@@ -1,6 +1,8 @@
-//! Trigger setup captures SignalSpec and input ports in the journal without
-//! contacting a listener. Activation arms the completed capture. Suspensions
-//! arm immediately and return the token the worker waits on. Both arming paths
+//! Trigger setup captures a trigger's SignalSpec and input ports without
+//! contacting a listener: this checks the capture and answers the place it
+//! is for, and the worker writes it into its run's record. Activation arms
+//! the completed capture. Suspensions arm immediately and return the token
+//! the worker waits on, which the worker records as its wait. Both arming paths
 //! have the listener compute the signal's row (`prepare`, which starts
 //! nothing), write it, then have the listener bring the signal up
 //! (`start`), so whatever the signal starts always finds its row.
@@ -27,17 +29,16 @@ use crate::state::DispatcherState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterSignalPayload {
-    pub execution_id: String,
+    pub execution_id: weft_core::ExecutionId,
     pub node_id: String,
     pub frames: LoopFrames,
     pub spec: SignalSpec,
     pub is_resume: bool,
     /// 0-based ordinal of the `await_signal` call within this
-    /// (execution, node_id, frames). Set by the worker; the dispatcher
-    /// stamps it on the SuspensionRegistered event so replay can
-    /// rebuild the per-(node, frames) sequence in order. Must not
-    /// vary across replays of the same body, so the dedup key
-    /// includes it. Required: a missing field would silently default
+    /// (execution, node_id, frames). Set by the worker, which stamps it on
+    /// the `SuspensionRegistered` it records, so replay can rebuild the
+    /// per-(node, frames) sequence in order. Must not vary across replays
+    /// of the same body, so the dedup key and the resume token include it. Required: a missing field would silently default
     /// to 0 and collide every await on the same frame stack.
     pub call_index: u32,
     /// The trigger's delivered port values at registration time (an
@@ -91,15 +92,6 @@ fn mount_methods_for(surface: &weft_core::primitive::SignalSurface) -> Vec<Strin
         weft_core::primitive::SignalSurface::TaskCallback
         | weft_core::primitive::SignalSurface::Internal => Vec::new(),
     }
-}
-
-/// The pattern under the tenant prefix a stored mount path carries
-/// (`/alice/chat/{room}` -> `chat/{room}`, `/alice` -> ``). Every row of a
-/// tenant is prefixed the same way, so the strip is exact.
-pub(crate) fn pattern_of_mount_path(mount_path: &str, tenant: &str) -> String {
-    let prefix = format!("/{tenant}");
-    let rest = mount_path.strip_prefix(&prefix).unwrap_or(mount_path);
-    rest.trim_start_matches('/').to_string()
 }
 
 /// One other public entry of the tenant, as the overlap check sees it.
@@ -201,21 +193,20 @@ impl TaskExecutor<DispatcherState> for RegisterSignalExecutor {
         let payload: RegisterSignalPayload = serde_json::from_value(task.payload.clone())?;
         if !payload.is_resume {
             core_signal::validate_spec(&payload.spec).map_err(anyhow::Error::msg)?;
-            let execution_id = payload.execution_id.parse()?;
-            let rows = state.journal.events_log(execution_id).await?;
-            anyhow::ensure!(matches!(rows.first(), Some(weft_journal::ExecEvent::ExecutionStarted {
-                phase: weft_core::context::Phase::TriggerSetup, program: Some(_), ..
-            })), "entry capture requires a trigger-setup run with a pinned program");
+            let execution_id = payload.execution_id;
+            let owner = state.journal.execution_owner(execution_id).await?.context("entry capture has no run")?;
+            anyhow::ensure!(
+                owner.phase == weft_core::context::Phase::TriggerSetup && owner.binary_hash.is_some(),
+                "entry capture requires a trigger-setup run with a pinned program"
+            );
             let found = crate::projection::execution_program(state, execution_id).await?;
             let project = found.program().context("entry capture has no original program")?;
             let node_id = captured_trigger_address(&project, &payload.node_id, &payload.frames, payload.call_index)?;
-            let ports = payload.port_snapshot.context("entry capture requires its input port snapshot")?;
+            let ports = payload.port_snapshot.as_ref().context("entry capture requires its input port snapshot")?;
             anyhow::ensure!(ports.is_object(), "entry capture ports must be an object");
-            state.journal.record_event_dedup(&weft_journal::ExecEvent::TriggerCaptured {
-                execution_id, node_id: node_id.clone(), spec: payload.spec, port_snapshot: ports,
-                at_unix: crate::lease::now_unix() as u64,
-            }, &format!("trigger_capture:{execution_id}:{node_id}")).await?;
-            return Ok(serde_json::to_value(weft_core::primitive::RegisterSignalResult::Captured)?);
+            // The worker writes the capture into its run's record: nobody
+            // else writes a run its worker drives.
+            return Ok(serde_json::to_value(weft_core::primitive::RegisterSignalResult::Captured { node_id })?);
         }
         let token = Self::arm(state, payload).await?.token;
         Ok(serde_json::to_value(weft_core::primitive::RegisterSignalResult::Registered { token })?)
@@ -226,11 +217,8 @@ impl RegisterSignalExecutor {
     /// Arm a captured entry or a live suspension through the same path.
     /// The answer says what the arm did to the row, so a caller whose
     /// later step fails can take it back ([`disarm`]).
-    pub(crate) async fn arm(state: &DispatcherState, payload: RegisterSignalPayload) -> Result<Armed> {
-        let execution_id: weft_core::ExecutionId = payload
-            .execution_id
-            .parse()
-            .map_err(|e| anyhow::anyhow!("bad execution: {e}"))?;
+    pub(crate) async fn arm(state: &DispatcherState, mut payload: RegisterSignalPayload) -> Result<Armed> {
+        let execution_id = payload.execution_id;
 
         // Per-kind validation: each `Signal` impl owns its rules
         // (cron parses, path well-formed, url is http(s), etc).
@@ -245,7 +233,7 @@ impl RegisterSignalExecutor {
         // registration stable across reactivates; resume rows always mint
         // fresh.
         let Some(owner) = state.journal.execution_owner(execution_id).await? else {
-            anyhow::bail!("no execution row for execution {execution_id}")
+            anyhow::bail!("no run row for execution {execution_id}")
         };
         let project_id = owner.project_id;
         // The tenant stamped on the execution, not one re-derived from
@@ -254,8 +242,8 @@ impl RegisterSignalExecutor {
         let tenant = owner.tenant;
         // Whose signal: the run's instance (an instance's trigger setup arms
         // that instance's copy; an instance's run waits as that instance).
-        let instance = owner.instance;
-        let fired_by = owner.fired_by;
+        let instance = owner.instance.clone();
+        let fired_by = owner.fired_by.clone();
 
         // The place this registration is for, spelled: the row's key.
         // Read off the original program, the one this registration's
@@ -268,6 +256,15 @@ impl RegisterSignalExecutor {
         // Tags drive the signal-token enumeration filter; charset
         // already validated at parse time.
         let tags = node.tags();
+        // An entry takes its project's defaults where its trigger's own
+        // inputs left them unset (`weft.toml` `[runs]`, `[triggers]`), so
+        // the worker's door and every run it starts read them off the one
+        // spec.
+        if !payload.is_resume {
+            let defaults = &project_def.defaults;
+            payload.spec.limits = payload.spec.limits.under(&defaults.triggers);
+            payload.spec.settings = payload.spec.settings.keeping_for(Some(payload.spec.settings.kept_for(defaults.keep_for())));
+        }
 
         // Resume tokens derive from the suspension identity so a retry of
         // this task converges on the same token. The identity (execution,
@@ -292,14 +289,20 @@ impl RegisterSignalExecutor {
             uuid::Uuid::from_bytes(buf).to_string()
         });
 
-        let resume_execution_id = payload.is_resume.then(|| execution_id.to_string());
+        let resume_execution_id = payload.is_resume.then_some(execution_id);
         let spec_json = serde_json::to_string(&payload.spec)?;
 
-        let events = state.journal.events_log(execution_id).await?;
-        let (program, source_version) = match events.first() {
-            Some(weft_journal::ExecEvent::ExecutionStarted { program, source_version, .. }) => (program.clone(), source_version.clone()),
-            _ => anyhow::bail!("register_signal: execution has no birth"),
+        let program = match (&owner.definition_hash, &owner.binary_hash) {
+            (Some(definition_hash), Some(binary_hash)) => Some(
+                state
+                    .projects
+                    .program_identity(project_id, definition_hash, binary_hash)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("run {execution_id} ran on worker {binary_hash}, which its project no longer records"))?,
+            ),
+            _ => None,
         };
+        let source_version = owner.source_version.clone();
 
         // From the overlap check to the signal row's insert, this tenant's
         // registrations run one at a time install-wide: the check reads the
@@ -335,7 +338,7 @@ impl RegisterSignalExecutor {
                         spec: payload.spec.clone(),
                         node_id: place.clone(),
                         is_resume: payload.is_resume,
-                        execution_id: resume_execution_id.clone(),
+                        execution_id: resume_execution_id,
                         source: weft_core::signal::listener_protocol::PrepareSource {
                             prior_kind_state,
                             asked_at_unix_ms: payload.asked_at_unix_ms,
@@ -444,45 +447,6 @@ impl RegisterSignalExecutor {
                     )
                 })?;
                 return Err(e);
-            }
-
-            if payload.is_resume {
-                // Suspension state lives on the signal row; we also
-                // journal SuspensionRegistered so the engine's fold can
-                // rebuild the awaited-sequence replay structure on
-                // worker restart. Sequenced AFTER signal_insert so the
-                // signal row exists by the time anything reads the
-                // journal entry. Dedup key collapses retries on the
-                // same (execution, node_id, frames, call_index); a failure
-                // here triggers the task framework to retry, and the
-                // registration above converges on the same row.
-                let now = crate::lease::now_unix() as u64;
-                let frames_key = payload
-                    .frames
-                    .iter()
-                    .map(weft_core::frames::Frame::text)
-                    .collect::<Vec<_>>()
-                    .join("/");
-                state
-                    .journal
-                    .record_event_dedup(
-                        &weft_journal::ExecEvent::SuspensionRegistered {
-                            execution_id,
-                            node_id: payload.node_id.clone(),
-                            frames: payload.frames.clone(),
-                            token: token.clone(),
-                            spec: payload.spec.clone(),
-                            call_index: payload.call_index,
-                            at_unix: now,
-                        },
-                        &format!(
-                            "register_signal:{execution_id}:{node_id}:{frames_key}:{call_index}",
-                            execution_id = execution_id,
-                            node_id = payload.node_id,
-                            call_index = payload.call_index
-                        ),
-                    )
-                    .await?;
             }
 
             Ok(Armed { token, undo })
@@ -709,7 +673,7 @@ async fn refuse_unarmable_route(
     .await?
     .into_iter()
     .map(|(mp, ms, project_id, node_id)| RegisteredRoute {
-        pattern: pattern_of_mount_path(&mp, tenant),
+        pattern: weft_core::route::pattern_of_mount_path(&mp, tenant),
         methods: ms,
         project_id,
         node_id,
@@ -743,7 +707,7 @@ async fn refuse_unarmable_route(
 mod tests {
     use super::{
         ambiguous_route, captured_trigger_address, mount_methods_for, mount_path_for, registered_place,
-        pattern_of_mount_path, RegisteredRoute,
+        RegisteredRoute,
     };
     use weft_core::frames::Frame;
     use weft_core::primitive::SignalSurface;
@@ -850,8 +814,8 @@ mod tests {
         let s = SignalSurface::PublicEntry { path: "chat/{room}".into(), methods: vec!["POST".into()] };
         let stored = mount_path_for(&s, "alice").unwrap();
         assert_eq!(stored, "/alice/chat/{room}");
-        assert_eq!(pattern_of_mount_path(&stored, "alice"), "chat/{room}");
-        assert_eq!(pattern_of_mount_path("/alice", "alice"), "");
+        assert_eq!(weft_core::route::pattern_of_mount_path(&stored, "alice"), "chat/{room}");
+        assert_eq!(weft_core::route::pattern_of_mount_path("/alice", "alice"), "");
         assert_eq!(mount_methods_for(&s), vec!["POST".to_string()]);
         assert!(mount_methods_for(&SignalSurface::TaskCallback).is_empty());
     }

@@ -30,7 +30,6 @@ use weft_core::access::verify::{
 };
 use weft_broker_client::protocol::{CallerVerified, CallerVerifyRequest};
 
-use crate::handlers::internal;
 use crate::state::BrokerState;
 
 type ApiError = (StatusCode, String);
@@ -40,17 +39,27 @@ pub fn routes() -> Router<Arc<BrokerState>> {
 }
 
 /// POST /v1/caller/verify: check one caller of a live route against the
-/// connection the route is gated by. Dispatcher-forwarded (control-plane
-/// gate); the caller of the ROUTE never reaches this door.
+/// connection the route is gated by. Asked by the worker whose door the
+/// caller reached, for its own tenant's connections and its own project's
+/// instances; the caller of the ROUTE never reaches this door.
 async fn caller_verify(
     State(state): State<Arc<BrokerState>>,
     headers_in: HeaderMap,
     Json(req): Json<CallerVerifyRequest>,
 ) -> Result<Json<CallerVerified>, ApiError> {
-    crate::auth::control_plane(&state, &headers_in).await?;
+    match crate::auth::verified_principal(&state, &headers_in).await? {
+        weft_platform_traits::identity::Principal::Worker { tenant, project } => {
+            let own = tenant == req.tenant && req.for_instance.as_ref().is_none_or(|scope| scope.project_id == project);
+            if !own {
+                return Err((StatusCode::FORBIDDEN, "a worker checks callers of its own project's routes only".into()));
+            }
+        }
+        weft_platform_traits::identity::Principal::Core => crate::auth::control_plane(&state, &headers_in).await?,
+        weft_platform_traits::identity::Principal::InfraCopy { .. } => return Err(crate::auth::infra_copy_refused()),
+    }
     let now = chrono::Utc::now().timestamp();
     match verify_caller(&state.verifiers, &state.pool, &req, now).await {
-        Ok(identity) => Ok(Json(CallerVerified { identity })),
+        Ok(verified) => Ok(Json(verified)),
         Err(CallerRefusal::Refused(e)) => {
             tracing::warn!(
                 target: "weft_broker::caller_auth",
@@ -60,16 +69,19 @@ async fn caller_verify(
             );
             Err((StatusCode::UNAUTHORIZED, "refused".into()))
         }
-        Err(CallerRefusal::Failed(e)) => Err(internal(e)),
+        Err(CallerRefusal::Malformed(why)) => Err((StatusCode::BAD_REQUEST, why)),
+        Err(CallerRefusal::Failed(e)) => Err(crate::handlers::unavailable_or_internal(e.context("verify a caller"))),
     }
 }
 
 /// Why a caller was not verified: a refusal (the request did not prove
-/// what the scheme demands, or the connection cannot verify anyone),
-/// or a failure of ours (the store, a malformed id).
+/// what the scheme demands, or the connection cannot verify anyone), an
+/// ask that is not one (a malformed id or body, the asking worker's
+/// fault), or a failure of ours (the store).
 #[derive(Debug)]
 pub enum CallerRefusal {
     Refused(String),
+    Malformed(String),
     Failed(anyhow::Error),
 }
 
@@ -121,18 +133,19 @@ fn names(payload: &str, key: &VerifierKey) -> bool {
 
 /// The check itself: load the connection's scheme and values (kept in
 /// `verifiers` until they change), resolve the scheme's templates against
-/// the values, run it. Answers the identity the scheme established.
+/// the values, run it. Answers the identity the scheme established, and
+/// the headers it read the credential from.
 /// Separate from the route so the db-tests exercise it directly.
 pub async fn verify_caller(
     verifiers: &HeldVerifiers,
     pool: &PgPool,
     req: &CallerVerifyRequest,
     now_unix: i64,
-) -> Result<Value, CallerRefusal> {
+) -> Result<CallerVerified, CallerRefusal> {
     let access_id: uuid::Uuid = req
         .access_id
         .parse()
-        .map_err(|_| CallerRefusal::Failed(anyhow::anyhow!("malformed connection id '{}'", req.access_id)))?;
+        .map_err(|_| CallerRefusal::Malformed(format!("malformed connection id '{}'", req.access_id)))?;
     let key = VerifierKey {
         tenant: req.tenant.clone(),
         for_instance: req.for_instance.as_ref().map(|scope| (scope.project_id, scope.instance.clone())),
@@ -160,14 +173,15 @@ pub async fn verify_caller(
         )));
     };
     let kind = kind.resolved(&verifier.values).map_err(CallerRefusal::Refused)?;
+    let verified = |identity: Value| CallerVerified { identity, credential_headers: kind.credential_headers() };
     let secrets = secrets_from_values(&verifier.values);
     let body = base64::engine::general_purpose::STANDARD
         .decode(&req.body_b64)
-        .map_err(|e| CallerRefusal::Failed(anyhow::anyhow!("body_b64: {e}")))?;
+        .map_err(|e| CallerRefusal::Malformed(format!("body_b64: {e}")))?;
     let push = PushParts { body: &body, headers: &req.headers, url: None, method: &req.method };
 
     if !needs_issuer_keys(&kind) {
-        return Ok(verify_push(&kind, &push, &secrets, now_unix)?);
+        return Ok(verified(verify_push(&kind, &push, &secrets, now_unix)?));
     }
     let VerifyKind::Oidc { issuers, jwks_url } = &kind else {
         unreachable!("needs_issuer_keys is true for the oidc scheme only");
@@ -185,7 +199,7 @@ pub async fn verify_caller(
         None => validation.validate_aud = false,
     }
     let claims: Value = crate::events::decode_jwt(token, &validation, &jwks_url.0).await?;
-    Ok(claims)
+    Ok(verified(claims))
 }
 
 #[cfg(test)]

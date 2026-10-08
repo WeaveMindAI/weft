@@ -93,15 +93,16 @@ pub struct ProjectHandle {
 
 /// What a person is told when a build moved infra places onto a new
 /// image: only a copy started from now on gets it.
-fn replaced_infra_images_note(places: &[String]) -> Option<String> {
+fn replaced_infra_images_note(places: &[String], on: Option<&str>) -> Option<String> {
     if places.is_empty() {
         return None;
     }
     Some(format!(
         "this build changed the image of infra {}: a copy started from now on gets the new image, \
-         and a copy already running keeps its own until you run `weft infra upgrade` \
+         and a copy already running keeps its own until you run `{}` \
          (with `--instance <id>` for one instance's copy)",
-        places.join(", ")
+        places.join(", "),
+        super::weft_on(on, "infra upgrade")
     ))
 }
 
@@ -316,14 +317,15 @@ pub async fn build_compiled(
     progress.build_start(&project.manifest.package.name);
     progress.dispatcher_call_start(&path);
     let body = serde_json::to_value(&body)?;
+    let started = std::time::Instant::now();
+    // Each image once, and again when its log's address arrives: its
+    // build, whether its log was said, and when it was first seen.
+    let mut building: std::collections::BTreeMap<String, Seen> = std::collections::BTreeMap::new();
     let (status, text) = {
         // While the install builds, name each image it is building and
         // where its log is, say when each is done, and say every
         // `BUILD_SAY_EVERY` that it goes on: a build can take minutes,
         // and a quiet terminal reads as a hang.
-        // Each image once, and again when its log's address arrives: its
-        // build, whether its log was said, and when it was first seen.
-        let mut building: std::collections::BTreeMap<String, Seen> = std::collections::BTreeMap::new();
         let mut said = std::time::Duration::ZERO;
         // A status that cannot be read is said once, not every look; the
         // same for an image's own state.
@@ -395,9 +397,17 @@ pub async fn build_compiled(
         );
     }
     let built: BuiltProgram = serde_json::from_str(&text).context("read the build's answer")?;
+    // The last images to finish (the worker's, always among them) finish as
+    // the build answers, so no look saw them leave: they are said built
+    // here.
+    for (image, seen) in &building {
+        if built.built_images.contains(image) {
+            progress.build_image_done(image, started.elapsed().saturating_sub(seen.since).as_secs());
+        }
+    }
     progress.dispatcher_call_done(serde_json::json!({ "project_id": id }));
     progress.build_done(&project.manifest.package.name, &built.built_images);
-    if let Some(note) = replaced_infra_images_note(&built.replaced_infra_images) {
+    if let Some(note) = replaced_infra_images_note(&built.replaced_infra_images, ctx.on()) {
         progress.warn(&note);
     }
 

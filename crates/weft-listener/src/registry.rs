@@ -48,7 +48,7 @@ pub struct RegisteredSignal {
     pub is_resume: bool,
     /// Execution of the suspended execution to resume. Set iff
     /// `is_resume`. Echoed back into `ProcessTarget::Resume`.
-    pub execution_id: Option<String>,
+    pub execution_id: Option<weft_core::ExecutionId>,
     /// Background task for kinds that hold a connection
     /// (`BetweenFires::Holds`). Dropping the handle via `.abort()`
     /// cancels the loop. `None` for every other kind.
@@ -209,10 +209,15 @@ impl Registry {
 /// reaches one copy of the listener, and a sibling that had cached the
 /// signal would keep answering `/process` for it.
 pub async fn held(state: &crate::ListenerState, token: &str) -> anyhow::Result<Option<RegisteredSignal>> {
-    if let Some(sig) = state.registry.get(token) {
+    held_in(&state.registry, &state.signals, token).await
+}
+
+/// [`held`], from the registry and the signal rows themselves.
+pub async fn held_in(registry: &Registry, signals: &weft_broker_client::BrokerSignalClient, token: &str) -> anyhow::Result<Option<RegisteredSignal>> {
+    if let Some(sig) = registry.get(token) {
         return Ok(Some(sig));
     }
-    let Some(row) = state.signals.get_held(token).await? else {
+    let Some(row) = signals.get_held(token).await? else {
         return Ok(None);
     };
     let spec: SignalSpec = serde_json::from_str(&row.spec_json)
@@ -227,7 +232,7 @@ pub async fn held(state: &crate::ListenerState, token: &str) -> anyhow::Result<O
         node_id: row.node_id.clone(),
         tenant_id: row.tenant_id.clone(),
         is_resume: row.is_resume,
-        execution_id: row.execution_id.clone(),
+        execution_id: row.execution_id,
         task: None,
         // A held connection's task owns its state while it runs.
         kind_state: (!row.holds).then(|| row.kind_state.clone()),

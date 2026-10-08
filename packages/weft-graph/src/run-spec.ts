@@ -50,9 +50,32 @@ export interface RunSpec {
   /// Which instance of the program the run is for. Needed only when the
   /// run reaches something that exists once per instance.
   instance?: string;
-  /// How long the run may run (`weft run --long`); absent means `short`.
-  run_class?: 'short' | 'long';
+  /// How the run asks to be kept (`weft run --durable --fast
+  /// --keep-for`); each part absent follows the trigger it fires, or the
+  /// default (fast, as long as the project keeps runs) for a run that
+  /// fires nothing. A run started by hand is always recorded.
+  settings?: RunSettings;
 }
+
+// SYNC: RunSettings <-> crates/weft-core/src/run_settings.rs SettingsChoice
+export interface RunSettings {
+  keeping?: 'fast' | 'durable';
+  /** How long the run is kept once it ended: a whole number and a unit
+   *  (`30m`, `12h`, `7d`), or `forever`. */
+  keep_for?: string;
+  /** How long, in seconds, a wait holds the run's worker while the run
+   *  cannot pause, from the last time anything moved in it. */
+  hold_secs?: number;
+}
+
+/// The longest hold a run may ask for: 30 days.
+// SYNC: MAX_HOLD_SECS <-> crates/weft-core/src/run_settings.rs MAX_HOLD_SECS
+const MAX_HOLD_SECS = 30 * 24 * 3600;
+
+/// How long to keep a run, as written: a whole number and a unit, or
+/// `forever`.
+// SYNC: KEEP_FOR_PATTERN <-> crates/weft-core/src/run_settings.rs KeepFor::from_str
+const KEEP_FOR_PATTERN = /^(forever|[0-9]+[mhd])$/;
 
 /// An instance id: the grammar of one storage key segment.
 // SYNC: INSTANCE_ID_PATTERN <-> crates/weft-core/src/storage/key.rs valid_segment, crates/weft-core/src/instance.rs InstanceId::new
@@ -88,10 +111,22 @@ export function parseRunSpec(value: unknown): RunSpec {
     }
   };
   const spec = object(value, 'spec');
-  fields(spec, ['name', 'from', 'target', 'before', 'feed', 'group', 'emit', 'fire', 'answers', 'caller', 'frozen_from', 'expected', 'instance', 'run_class'], 'spec');
+  fields(spec, ['name', 'from', 'target', 'before', 'feed', 'group', 'emit', 'fire', 'answers', 'caller', 'frozen_from', 'expected', 'instance', 'settings'], 'spec');
   string(spec.name, 'name');
-  if (spec.run_class != null && spec.run_class !== 'short' && spec.run_class !== 'long') {
-    throw new Error(`run_class: '${String(spec.run_class)}' is not a run class; use 'short' or 'long'`);
+  if (spec.settings !== undefined) {
+    const settings = object(spec.settings, 'settings');
+    fields(settings, ['keeping', 'keep_for', 'hold_secs'], 'settings');
+    // A key left out (or null, which the runtime reads as left out) follows
+    // the fired trigger.
+    if (settings.keeping != null && settings.keeping !== 'fast' && settings.keeping !== 'durable') {
+      throw new Error(`settings.keeping: '${String(settings.keeping)}' is neither 'fast' nor 'durable'`);
+    }
+    if (settings.keep_for != null && (typeof settings.keep_for !== 'string' || !KEEP_FOR_PATTERN.test(settings.keep_for.trim()))) {
+      throw new Error(`settings.keep_for: '${String(settings.keep_for)}' is not how long to keep a run (\`30m\`, \`12h\`, \`7d\`, or \`forever\`)`);
+    }
+    if (settings.hold_secs != null && (!Number.isInteger(settings.hold_secs) || (settings.hold_secs as number) < 0 || (settings.hold_secs as number) > MAX_HOLD_SECS)) {
+      throw new Error(`settings.hold_secs: '${String(settings.hold_secs)}' is not a whole number of seconds from 0 to ${MAX_HOLD_SECS} (30 days)`);
+    }
   }
   if (spec.instance != null) {
     string(spec.instance, 'instance');
@@ -151,6 +186,13 @@ export function parseRunSpec(value: unknown): RunSpec {
   }
   const normalized = { ...spec };
   for (const key of ['group', 'fire', 'frozen_from', 'expected', 'instance']) if (normalized[key] === null) delete normalized[key];
+  // A null setting is left out, on a copy: the caller's spec is never
+  // changed by reading it.
+  if (normalized.settings !== undefined) {
+    const settings = { ...(normalized.settings as Record<string, unknown>) };
+    for (const key of ['keeping', 'keep_for', 'hold_secs']) if (settings[key] === null) delete settings[key];
+    normalized.settings = settings;
+  }
   return normalized as unknown as RunSpec;
 }
 
@@ -278,6 +320,11 @@ export function specToRunArgs(spec: RunSpec, seeded = false): string[] {
   if (spec.group) args.push('--group', Object.keys(spec.group[1]).length ? `${spec.group[0]}=${JSON.stringify(spec.group[1])}` : spec.group[0]);
   if (spec.fire) args.push('--fire', `${spec.fire[0]}=${JSON.stringify(spec.fire[1])}`);
   for (const [node, ports] of Object.entries(spec.emit ?? {})) args.push('--emit', `${node}=${JSON.stringify(ports)}`);
+  if (spec.instance) args.push('--instance', spec.instance);
+  if (spec.settings?.keeping === 'durable') args.push('--durable');
+  if (spec.settings?.keeping === 'fast') args.push('--fast');
+  if (spec.settings?.keep_for) args.push('--keep-for', spec.settings.keep_for);
+  if (spec.settings?.hold_secs != null) args.push('--hold-secs', String(spec.settings.hold_secs));
   return args;
 }
 

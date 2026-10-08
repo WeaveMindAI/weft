@@ -27,7 +27,7 @@ use axum::Router;
 use tokio::sync::mpsc;
 
 use weft_broker_client::line::server::{self, Follower};
-use weft_broker_client::line::{Notice, ACCESS_CHANNEL, CANCEL_CHANNEL, INFRA_STATUS_CHANNEL, LINE_PATH};
+use weft_broker_client::line::{Notice, ACCESS_CHANNEL, CANCEL_CHANNEL, INFRA_STATUS_CHANNEL, LINE_PATH, TRIGGERS_CHANNEL};
 use weft_platform_traits::identity::Principal;
 use weft_task_store::pg_signal::{Heard, PgSignalWatch};
 
@@ -104,7 +104,8 @@ fn follower(fanout: Arc<LineFanout>, principal: Principal) -> Follower {
 /// copy's change is its project's; a connection's is its project's, or its
 /// tenant's when it is shared across the tenant's projects
 /// (`tenant:<tenant>`); a cancel is its run's project's
-/// (`<project> <execution>`). Every other channel is for nobody on a line.
+/// (`<project> <execution>`); a trigger's change is its project's. Every other
+/// channel is for nobody on a line.
 // SYNC: the channels and payloads <-> weft_broker_client::line::LINE_CHANNELS, crates/weft-dispatcher/src/infra_node.rs (infra_node_status_notify), crates/weft-dispatcher/src/project_store.rs (project_declared_infra_notify), crates/weft-access-store/src/lib.rs (access_notify), crates/weft-task-store/src/tasks.rs (task_ready_notify, cancel_payload), crates/weft-broker/src/caller_auth.rs (names), crates/weft-dispatcher/src/held.rs (access_changed)
 fn audience<'a>(channel: &str, payload: &'a str) -> Option<Audience<'a>> {
     match channel {
@@ -114,6 +115,7 @@ fn audience<'a>(channel: &str, payload: &'a str) -> Option<Audience<'a>> {
             Some(tenant) => Audience::Tenant(tenant),
             None => Audience::Project(payload),
         }),
+        TRIGGERS_CHANNEL => Some(Audience::Project(payload)),
         _ => None,
     }
 }
@@ -312,9 +314,12 @@ mod tests {
     /// stopped waiting is never sent at all.
     #[tokio::test]
     async fn a_call_waits_out_a_broker_that_is_not_up_yet() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
+        // The port is held, bound and not listening, so a call to it is
+        // refused until the broker comes up on it, and no other test can
+        // take it meanwhile (a port let go of is anyone's).
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = socket.local_addr().unwrap();
         let link = link(address);
         let never = link.call("/v1/echo", b"x".to_vec(), CallWait::within(Duration::from_millis(300))).await.unwrap_err();
         assert!(
@@ -328,7 +333,7 @@ mod tests {
             async move { link.call("/v1/echo", b"late".to_vec(), CallWait::within(Duration::from_secs(20))).await }
         });
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+        let listener = socket.listen(1024).unwrap();
         let counted = StdArc::new(std::sync::atomic::AtomicUsize::new(0));
         let api = api(StdArc::default()).route(
             "/v1/count",

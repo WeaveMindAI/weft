@@ -1,28 +1,33 @@
 //! Live caller connections: making a weft program a real live endpoint.
-//! An outside caller hits a stable public URL, the dispatcher matches the
-//! route, checks the caller against the route's auth, points the caller
-//! at a worker through the shared gateway, and any node in the running
-//! program talks back over the held connection (reply once, stream, or
-//! hold a two-way conversation).
+//! An outside caller calls a stable public URL, the install passes the
+//! call on to the project's workers, whose door matches the route, checks
+//! the caller against its auth and limits and bears the run with the
+//! caller on the line, and any node in the running program talks back
+//! over the held connection (reply once, stream, or hold a two-way
+//! conversation).
 //!
 //! TWO user-facing signal kinds, because a node developer programs against
 //! two genuinely different talk surfaces:
 //!   - [`Route`]: inbound HTTP. The caller makes one request; the node
 //!     replies once or streams a response (`HttpCaller`: respond / write /
-//!     close). The caller is pointed at the worker by a `307` redirect.
+//!     close), in that same request.
 //!   - [`Socket`]: inbound WebSocket. Full two-way conversation
-//!     (`WsCaller`: send / receive / request / close). The caller fetches
-//!     the worker URL then opens the real socket to it (WS cannot be
-//!     redirected).
+//!     (`WsCaller`: send / receive / request / close). A browser, which
+//!     cannot send credentials on a socket, asks first with a plain GET and
+//!     opens its socket at the ticketed URL it gets back.
 //!
 //! Both share their entire config body ([`LiveConnectionConfig`], flattened)
-//! and the entire transport engine behind them (control handshake, gateway
-//! routing, connect barrier, disconnect policy, reconciliation, heartbeat,
-//! caps, journaling). The ONLY thing the kind distinction carries is the
+//! and the entire transport engine behind them (the door,
+//! disconnect policy, reconciliation, heartbeat, caps, journaling). The ONLY thing the kind distinction carries is the
 //! wire [`Protocol`], which the runtime derives from the kind's TAG, never
 //! from node identity, so the language stays generic.
 
 use serde::{Deserialize, Serialize};
+
+/// The live-caller input that says the run may outlive its caller: the
+/// language gives it to every trigger holding a caller on the line
+/// (`crate::run_settings::RunSettings::node_inputs`).
+pub use crate::run_settings::OUTLIVES_CALLER_FIELD;
 
 use super::Signal;
 
@@ -147,11 +152,6 @@ pub const DEFAULT_HEARTBEAT_INTERVAL_SECS: u64 = 25;
 /// payloads, loud for accidental uploads. Untrusted-caller abuse vector.
 pub const DEFAULT_MAX_INBOUND_BYTES: u64 = 16 * 1_048_576;
 
-/// Default how long the connect barrier waits for the caller to actually
-/// arrive after the worker is woken. Worker-clock driven so a vanished
-/// caller cannot pin a worker.
-pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
-
 /// Default how long the caller's machine may leave what we sent it
 /// unacknowledged before the connection is called dead.
 ///
@@ -176,9 +176,6 @@ fn default_caller_silence_secs() -> u64 {
 fn default_max_inbound_bytes() -> u64 {
     DEFAULT_MAX_INBOUND_BYTES
 }
-fn default_connect_timeout_secs() -> u64 {
-    DEFAULT_CONNECT_TIMEOUT_SECS
-}
 
 /// The shared config body for both live-caller kinds. Flattened into
 /// [`Route`] and [`Socket`] so the two user-facing kinds stay distinct
@@ -199,24 +196,18 @@ pub struct LiveConnectionConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub methods: Vec<String>,
 
-    /// Auth policy at the control handshake. `None` = anyone with the URL
+    /// Auth policy the worker's door applies. `None` = anyone with the URL
     /// can connect, `Connection` = the caller is verified against a
     /// stored connection's `verify` recipe before a run starts.
     #[serde(default)]
     pub auth: super::PublicEntryAuth,
 
-    /// Reusable suspension defaults (`can_suspend` + `default_hold_secs`),
-    /// flattened so the wire shape stays flat. The generic `await`
-    /// machinery resolves the effective wait policy from it. When absent,
-    /// the inner fields' serde defaults apply (not suspendable,
-    /// language-default hold), the right default for an interactive endpoint.
-    #[serde(flatten)]
-    pub suspend: crate::wait::SuspendPolicy,
-
-    /// How long the connect barrier waits for the caller to arrive before
-    /// failing loud. Worker-clock driven.
-    #[serde(default = "default_connect_timeout_secs")]
-    pub connect_timeout_secs: u64,
+    /// Whether the run goes on once its caller has left (the trigger's
+    /// `outlivesCaller`). Off, the default for an interactive endpoint,
+    /// the caller leaving cancels the run, and the run cannot pause while
+    /// the caller is on the line.
+    #[serde(default)]
+    pub outlives_caller: bool,
 
     /// Worker-side heartbeat interval. `0` disables (opt-out only). WS =
     /// protocol ping/pong; HTTP = chunked keep-alive trickle.
@@ -278,17 +269,6 @@ pub struct LiveConnectionConfig {
     /// `weft_core::caller::DEFAULT_INBOUND_WINDOW`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<usize>,
-
-    /// Whether the runs this trigger starts are recorded. Off, a run's
-    /// journal lives in the worker's memory
-    /// ([`crate::exec::RunKind::Unrecorded`]): nothing lists it unless
-    /// it fails, and it can neither wait nor outlive its caller.
-    #[serde(default = "default_recorded")]
-    pub recorded: bool,
-}
-
-fn default_recorded() -> bool {
-    true
 }
 
 impl LiveConnectionConfig {
@@ -309,8 +289,8 @@ impl LiveConnectionConfig {
 
     /// Build the shared body from a catalog node's config field map (the
     /// common authoring fields both live-caller nodes expose: `path`,
-    /// `method`, `dataType`, `auth`, `outlivesCaller`, `defaultHoldSecs`,
-    /// `maxSessionSecs`, `callerSilenceSecs`, `maxInboundMb`).
+    /// `method`, `dataType`, `auth`, `outlivesCaller`, `maxSessionSecs`,
+    /// `callerSilenceSecs`, `maxInboundMb`).
     /// Centralized here so the two nodes (`Route`, `Socket`) do NOT each
     /// re-implement field parsing; every non-exposed knob keeps its
     /// default. `fields` is the node's `ctx.inputs.object()` map.
@@ -318,16 +298,6 @@ impl LiveConnectionConfig {
         fields: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<Self, String> {
         let path = fields.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        // A flag is absent or a boolean. Anything else is refused: read
-        // as false, "may outlive the caller" would quietly change what a
-        // disconnect does to the run.
-        let flag = |name: &str| -> Result<bool, String> {
-            match fields.get(name) {
-                None | Some(serde_json::Value::Null) => Ok(false),
-                Some(serde_json::Value::Bool(b)) => Ok(*b),
-                Some(other) => Err(format!("{name} is yes or no, got {other}")),
-            }
-        };
         // One method on the node (`method: "POST"`), stored as the
         // one-element list the routing keeps; absent or empty = any.
         let methods = match fields.get("method") {
@@ -356,10 +326,9 @@ impl LiveConnectionConfig {
                 }
             }
         };
-        // The author-facing name says what the flag DECIDES (the run
-        // outlives its caller); `can_suspend` inside is the mechanism
-        // that follows from it (a wait may park instead of being killed).
-        let can_suspend = flag("outlivesCaller")?;
+        // Read the way the run's settings read it (refused rather than read
+        // as off: "may outlive the caller" decides what a disconnect does).
+        let outlives_caller = crate::run_settings::read_switch(fields, OUTLIVES_CALLER_FIELD, false)?;
         // Absent, the given default; present, a whole non-negative
         // number of seconds (a JSON `60.0` is one), anything else a
         // refusal rather than a silent fall back to the default.
@@ -372,7 +341,6 @@ impl LiveConnectionConfig {
                 },
             }
         };
-        let default_hold_secs = seconds("defaultHoldSecs", crate::wait::LANGUAGE_DEFAULT_HOLD_SECS)?;
         // The only ceiling on a live exchange, and off unless the author
         // asks for one: weft puts no deadline on a wait a person
         // controls. It is here for the feed nothing else can watch, a
@@ -411,20 +379,11 @@ impl LiveConnectionConfig {
                 return Err(format!("journalEphemeral must be true or false, got {v}"));
             }
         };
-        // Whether the runs are recorded: absent is yes, the default every
-        // run starts from; anything but a boolean is refused, for the
-        // same reason as `journalEphemeral` just above.
-        let recorded = match fields.get("recorded") {
-            None | Some(serde_json::Value::Null) => true,
-            Some(serde_json::Value::Bool(b)) => *b,
-            Some(v) => return Err(format!("recorded must be true or false, got {v}")),
-        };
         Ok(Self {
             path,
             methods,
             auth,
-            suspend: crate::wait::SuspendPolicy { can_suspend, default_hold_secs },
-            connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
+            outlives_caller,
             heartbeat_interval_secs: DEFAULT_HEARTBEAT_INTERVAL_SECS,
             caller_silence_secs,
             max_inbound_bytes,
@@ -435,17 +394,7 @@ impl LiveConnectionConfig {
             journal_mode,
             journal_window_secs: None,
             window: None,
-            recorded,
         })
-    }
-
-    /// The kind of run this trigger's firing starts.
-    pub fn run_kind(&self) -> crate::exec::RunKind {
-        if self.recorded {
-            crate::exec::RunKind::Execution
-        } else {
-            crate::exec::RunKind::Unrecorded
-        }
     }
 
     /// Shared validation for both kinds. `kind_tag` only flavors the error
@@ -465,20 +414,6 @@ impl LiveConnectionConfig {
                     "{kind_tag} method '{m}' must be stored uppercase ('{normalized}')"
                 ));
             }
-        }
-        if self.connect_timeout_secs == 0 {
-            return Err(format!(
-                "{kind_tag} connect_timeout_secs must be > 0: an unbounded wait for \
-                 the caller would let a vanished caller pin a worker"
-            ));
-        }
-        if self.suspend.default_hold_secs == 0 {
-            return Err(format!(
-                "{kind_tag} default_hold_secs must be > 0: a zero hold means a wait \
-                 that holds would give up instantly; set it to a real bound (a wait \
-                 that wants to suspend immediately uses a per-call override, not a \
-                 zero hold)"
-            ));
         }
         if self.max_inbound_bytes == 0 {
             return Err(format!(
@@ -563,9 +498,7 @@ mod tests {
         assert_eq!(c.path, "chat");
         assert!(c.methods.is_empty());
         assert!(matches!(c.auth, PublicEntryAuth::None));
-        assert!(!c.suspend.can_suspend);
-        assert_eq!(c.suspend.default_hold_secs, crate::wait::LANGUAGE_DEFAULT_HOLD_SECS);
-        assert_eq!(c.connect_timeout_secs, DEFAULT_CONNECT_TIMEOUT_SECS);
+        assert!(!c.outlives_caller);
         assert_eq!(c.heartbeat_interval_secs, DEFAULT_HEARTBEAT_INTERVAL_SECS);
         assert_eq!(c.max_inbound_bytes, DEFAULT_MAX_INBOUND_BYTES);
         assert_eq!(c.max_session_secs, 0);
@@ -574,30 +507,6 @@ mod tests {
         assert_eq!(c.error_mode, ErrorMode::Surface);
         assert_eq!(c.journal_mode, JournalMode::Journaled);
         assert_eq!(c.window, None);
-        assert!(c.recorded, "runs are recorded unless the author says otherwise");
-    }
-
-    /// `recorded` reads off the node's field (absent is on) and decides the
-    /// run kind. It sits fine with `outlivesCaller`: a caller leaving does
-    /// not park the run, it keeps going in memory, and the waits that
-    /// would park it are refused in an unrecorded run anyway.
-    #[test]
-    fn recorded_decides_the_run_kind_and_may_outlive_the_caller() {
-        let fields = |extra: serde_json::Value| {
-            let mut all = serde_json::json!({ "path": "status" });
-            all.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-            all.as_object().unwrap().clone()
-        };
-        let on = LiveConnectionConfig::from_node_fields(&fields(serde_json::json!({}))).unwrap();
-        assert_eq!(on.run_kind(), crate::exec::RunKind::Execution);
-        let off = LiveConnectionConfig::from_node_fields(&fields(serde_json::json!({ "recorded": false }))).unwrap();
-        assert_eq!(off.run_kind(), crate::exec::RunKind::Unrecorded);
-        assert!(off.validate("Route").is_ok());
-        let err = LiveConnectionConfig::from_node_fields(&fields(serde_json::json!({ "recorded": "no" }))).unwrap_err();
-        assert!(err.contains("recorded"), "{err}");
-        let both = LiveConnectionConfig::from_node_fields(&fields(serde_json::json!({ "recorded": false, "outlivesCaller": true }))).unwrap();
-        assert!(both.validate("Route").is_ok());
-        assert_eq!(both.run_kind(), crate::exec::RunKind::Unrecorded);
     }
 
     /// Both kinds share the body, so a config valid for one parses for the
@@ -612,20 +521,12 @@ mod tests {
         assert_eq!(super::super::caller_protocol("api_endpoint"), None, "the old tags are gone");
     }
 
-    /// The suspend block round-trips FLAT on the wire (no nesting), next to
-    /// the other flattened common fields.
+    /// The common body round-trips FLAT on the wire (no nesting).
     #[test]
-    fn suspend_block_is_flat_on_the_wire() {
-        let ep = Route {
-            common: LiveConnectionConfig {
-                suspend: crate::wait::SuspendPolicy { can_suspend: true, default_hold_secs: 42 },
-                ..bare()
-            },
-        };
+    fn common_body_is_flat_on_the_wire() {
+        let ep = Route { common: LiveConnectionConfig { outlives_caller: true, ..bare() } };
         let v = serde_json::to_value(&ep).expect("serialize");
-        assert_eq!(v.get("can_suspend").and_then(|x| x.as_bool()), Some(true));
-        assert_eq!(v.get("default_hold_secs").and_then(|x| x.as_u64()), Some(42));
-        assert!(v.get("suspend").is_none(), "must be flattened");
+        assert_eq!(v.get("outlives_caller").and_then(|x| x.as_bool()), Some(true));
         assert!(v.get("common").is_none(), "common must be flattened, not nested");
         assert!(v.get("protocol").is_none(), "protocol is the kind, not a field");
         assert!(v.get("methods").is_none(), "an any-method route omits the list");
@@ -641,8 +542,7 @@ mod tests {
                     access_id: "acc-1".into(),
                     service: "api_key_auth".into(),
                 },
-                suspend: crate::wait::SuspendPolicy { can_suspend: true, default_hold_secs: 600 },
-                connect_timeout_secs: 10,
+                outlives_caller: true,
                 heartbeat_interval_secs: 15,
                 caller_silence_secs: 45,
                 max_inbound_bytes: 1024,
@@ -653,7 +553,6 @@ mod tests {
                 journal_mode: JournalMode::Ephemeral,
                 journal_window_secs: Some(5),
                 window: Some(128),
-                recorded: true,
             },
         };
         let spec = crate::signal::to_spec(sock.clone());
@@ -666,8 +565,7 @@ mod tests {
             PublicEntryAuth::Connection { ref access_id, ref service }
                 if access_id == "acc-1" && service == "api_key_auth"
         ));
-        assert!(back.common.suspend.can_suspend);
-        assert_eq!(back.common.suspend.default_hold_secs, 600);
+        assert!(back.common.outlives_caller);
         assert_eq!(back.common.data_type, DataType::Bytes);
         assert_eq!(back.common.backpressure, Backpressure::DropOldest);
         assert_eq!(back.common.error_mode, ErrorMode::DropChunk);
@@ -754,7 +652,6 @@ mod tests {
             "dataType": "text",
             "auth": access,
             "outlivesCaller": true,
-            "defaultHoldSecs": 120,
             "maxSessionSecs": 900,
             "callerSilenceSecs": 90,
             "maxInboundMb": 64,
@@ -768,8 +665,7 @@ mod tests {
             PublicEntryAuth::Connection { ref access_id, ref service }
                 if access_id == "acc-9" && service == "jwt_auth"
         ));
-        assert!(cfg.suspend.can_suspend);
-        assert_eq!(cfg.suspend.default_hold_secs, 120);
+        assert!(cfg.outlives_caller);
         assert_eq!(cfg.max_session_secs, 900, "the ceiling the author asked for");
         assert_eq!(cfg.max_inbound_bytes, 64 * 1_048_576, "the body cap the author asked for");
         assert_eq!(
@@ -795,7 +691,6 @@ mod tests {
             ("dataType", serde_json::json!("xml")),
             ("auth", serde_json::json!("not-a-connection")),
             ("outlivesCaller", serde_json::json!("yes")),
-            ("defaultHoldSecs", serde_json::json!(1.5)),
             ("maxSessionSecs", serde_json::json!(1.5)),
             ("maxSessionSecs", serde_json::json!("forever")),
             ("maxInboundMb", serde_json::json!(0)),
@@ -826,25 +721,6 @@ mod tests {
     }
 
     #[test]
-    fn zero_connect_timeout_rejected() {
-        let ep = Route { common: LiveConnectionConfig { connect_timeout_secs: 0, ..bare() } };
-        let err = ep.validate().expect_err("zero timeout should fail");
-        assert!(err.contains("connect_timeout_secs"), "got: {err}");
-    }
-
-    #[test]
-    fn zero_default_hold_rejected() {
-        let ep = Route {
-            common: LiveConnectionConfig {
-                suspend: crate::wait::SuspendPolicy { can_suspend: false, default_hold_secs: 0 },
-                ..bare()
-            },
-        };
-        let err = ep.validate().expect_err("zero hold should fail");
-        assert!(err.contains("default_hold_secs"), "got: {err}");
-    }
-
-    #[test]
     fn zero_window_rejected() {
         let sock = Socket { common: LiveConnectionConfig { window: Some(0), ..bare() } };
         let err = sock.validate().expect_err("zero window should fail");
@@ -858,8 +734,7 @@ mod tests {
             path: "chat".into(),
             methods: Vec::new(),
             auth: PublicEntryAuth::None,
-            suspend: crate::wait::SuspendPolicy::default(),
-            connect_timeout_secs: DEFAULT_CONNECT_TIMEOUT_SECS,
+            outlives_caller: false,
             heartbeat_interval_secs: DEFAULT_HEARTBEAT_INTERVAL_SECS,
             caller_silence_secs: DEFAULT_CALLER_SILENCE_SECS,
             max_inbound_bytes: DEFAULT_MAX_INBOUND_BYTES,
@@ -870,7 +745,6 @@ mod tests {
             journal_mode: JournalMode::Journaled,
             journal_window_secs: None,
             window: None,
-            recorded: true,
         }
     }
 }

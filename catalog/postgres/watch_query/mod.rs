@@ -30,7 +30,7 @@ use weft::signal::poll_endpoint::MIN_POLL_INTERVAL_SECS;
 use weft::{Access, ExecutionContext, Node, NodeErrExt, NodeManifest, WeftResult};
 
 use super::postgres::{
-    connect, connect_listening, mistake, plan, query_json, refuse_shadowed_columns,
+    connect_alone, connect_listening, mistake, plan, query_json, refuse_shadowed_columns,
     refuse_unanswered_ports, ListenEvent, Plan,
 };
 
@@ -94,7 +94,7 @@ impl Node for PostgresWatchQueryNode {
                 let (client, rx) = connect_listening(&ctx, &conn, channel).await?;
                 (client, Some(rx))
             }
-            None => (connect(&ctx, &conn).await?, None),
+            None => (connect_alone(&ctx, &conn).await?, None),
         };
 
         let bus = ctx.open_bus("rows", BusOptions::default(), "watch").await?;

@@ -14,7 +14,6 @@ use weft_core::ExecutionId;
 
 use crate::events::{ExecEvent, Seed};
 use crate::fold::{Fold, FoldEffects};
-use crate::traits::JournalRow;
 
 /// Full original context, including the birth row and unselected history.
 #[derive(Debug, Clone)]
@@ -143,70 +142,49 @@ pub fn fold_seeded(
     Ok(fold.into_snapshot())
 }
 
-/// A run's fold kept current as its journal grows: built once from the
-/// rows so far (on top of its seed chain), then fed only the rows after
-/// the last one it applied. `Fold::apply` takes rows one at a time, so a
-/// prefix and then the rest land exactly where all of them at once do,
-/// and a long chatty run costs each new row once instead of refolding
-/// the whole log on every wake.
+/// A run's fold kept current as its drive goes: built once from the
+/// record it starts from (on top of its seed chain), then caught up with
+/// the record as it stands later (once the drive took an answer to a
+/// wait, its record holds everything the run did since, the answer last).
+/// `Fold::apply` takes events one at a time, so a start and then the rest
+/// land exactly where all of them at once do.
 pub struct LiveFold {
     fold: Fold,
-    last_id: i64,
+    /// How many of the run's events are folded: the record's first ones.
+    folded: usize,
 }
 
 impl LiveFold {
-    /// Fold `rows` (the run's log from its birth row) over `project`.
+    /// Fold `events` (the run's record from its birth) over `project`.
     pub fn start(
         execution_id: ExecutionId,
         project: Arc<ProjectDefinition>,
         chain: &SeedChain,
-        rows: &[JournalRow],
+        events: &[ExecEvent],
     ) -> Result<Self> {
         let sources = chain.materialize()?;
         let mut fold = Fold::new(execution_id, project);
-        apply_history(&mut fold, rows.iter().map(|row| &row.event), &sources)?;
-        let mut live = Self { fold, last_id: 0 };
-        live.last_id = live.checked_last_id(rows)?;
-        Ok(live)
+        apply_history(&mut fold, events.iter(), &sources)?;
+        Ok(Self { fold, folded: events.len() })
     }
 
-    /// Fold the rows that came after the last one applied. A row at or
-    /// before it would be folded twice, which no reader of an execution's log
-    /// can produce, so it is refused rather than applied.
-    pub fn apply(&mut self, rows: &[JournalRow]) -> Result<()> {
-        let last_id = self.checked_last_id(rows)?;
-        for row in rows {
-            self.fold.apply(&row.event);
+    /// Fold what `record`, the run's whole record as it stands now, holds
+    /// past what is folded already. A record shorter than what was folded
+    /// is not this run's record.
+    pub fn catch_up(&mut self, record: &[ExecEvent]) -> Result<()> {
+        let Some(new) = record.get(self.folded..) else {
+            anyhow::bail!("the run's record holds {} events, fewer than the {} its fold already took", record.len(), self.folded);
+        };
+        for event in new {
+            self.fold.apply(event);
         }
-        self.last_id = last_id;
+        self.folded = record.len();
         Ok(())
     }
 
-    /// The id of the last row folded in; the next read resumes after it.
-    pub fn last_id(&self) -> i64 {
-        self.last_id
-    }
-
-    /// The run's state as the rows so far say.
+    /// The run's state as the events so far say.
     pub fn snapshot(&self) -> ExecutionSnapshot {
         self.fold.current_snapshot()
-    }
-
-    /// The last id of `rows`, once they are shown to follow the rows
-    /// already folded, each after the one before.
-    fn checked_last_id(&self, rows: &[JournalRow]) -> Result<i64> {
-        let mut last = self.last_id;
-        for row in rows {
-            anyhow::ensure!(
-                row.id > last,
-                "journal row {} of run {} arrived after row {last}; the run's log is read in order, \
-                 so this is a reader bug, not the journal's",
-                row.id,
-                self.fold.execution_id()
-            );
-            last = row.id;
-        }
-        Ok(last)
     }
 }
 
@@ -245,7 +223,7 @@ mod tests {
         ExecEvent::ExecutionStarted {
             execution_id, project_id: Uuid::nil(), entry_node: from.into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some(weft_core::project::hash::compute_definition_hash(&program()).unwrap()),
-            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: Some(selection), seed, instance: None, fired_trigger: None, run_class: weft_core::run_class::RunClass::Short, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+            binary_hash: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, selection: Some(weft_core::project::selection::RecordedSelection::new(selection)), seed, instance: None, stand_in: None, fired_trigger: None, settings: Default::default(), instance_values: Default::default(), picks: Default::default(), at_unix: 0,
         }
     }
 
@@ -344,15 +322,11 @@ mod tests {
         })
     }
 
-    fn rows_of(events: Vec<ExecEvent>) -> Vec<crate::traits::JournalRow> {
-        events.into_iter().enumerate().map(|(i, event)| crate::traits::JournalRow { id: 10 * (i as i64 + 1), event }).collect()
-    }
-
-    /// Folding a prefix and then the tail lands exactly where folding
-    /// every row at once does, whatever the split, on a fresh run and on
+    /// Folding a start and then the rest lands exactly where folding
+    /// every event at once does, whatever the split, on a fresh run and on
     /// a seeded one.
     #[tokio::test]
-    async fn a_prefix_then_the_tail_folds_like_the_whole_log() {
+    async fn a_start_then_the_rest_folds_like_the_whole_record() {
         let parent = execution_id(1);
         let mut parent_rows = vec![birth(parent, None, "a")];
         parent_rows.extend(result(parent, "a", "A"));
@@ -374,29 +348,12 @@ mod tests {
             let run = events[0].execution_id();
             let chain = chain(&events, &runs).await.unwrap();
             let whole = said(&fold_seeded(run, program(), &chain, &events).unwrap());
-            let rows = rows_of(events);
-            for split in 1..=rows.len() {
-                let mut live = LiveFold::start(run, program(), &chain, &rows[..split]).unwrap();
-                live.apply(&rows[split..]).unwrap();
+            for split in 1..=events.len() {
+                let mut live = LiveFold::start(run, program(), &chain, &events[..split]).unwrap();
+                live.catch_up(&events).unwrap();
                 assert_eq!(said(&live.snapshot()), whole, "split at {split}");
-                assert_eq!(live.last_id(), rows.last().unwrap().id);
             }
         }
     }
 
-    /// A row that does not come after the last one folded is refused
-    /// whole: folding it would count it twice.
-    #[tokio::test]
-    async fn a_row_already_folded_is_refused() {
-        let mut events = vec![birth(execution_id(2), None, "a")];
-        events.extend(result(execution_id(2), "a", "A"));
-        let rows = rows_of(events);
-        let chain = SeedChain::default();
-        let mut live = LiveFold::start(execution_id(2), program(), &chain, &rows[..2]).unwrap();
-        let before = said(&live.snapshot());
-        assert!(live.apply(&rows[1..]).is_err(), "row 2 again");
-        assert_eq!(said(&live.snapshot()), before, "nothing of a refused batch is folded");
-        assert_eq!(live.last_id(), rows[1].id);
-        live.apply(&rows[2..]).unwrap();
-    }
 }

@@ -40,7 +40,6 @@ locals {
       deployerServiceAccount   = google_service_account.deployer.email
       frontendServiceAccount   = google_service_account.frontend.email
       workloadIdentityProvider = google_iam_workload_identity_pool_provider.github.name
-      callerTokenSecret        = google_secret_manager_secret.install["WEFT_CALLER_TOKEN_SECRET"].secret_id
       infraNetworkTag          = local.infra_tag
       buildMachine             = var.build_machine == "" ? null : var.build_machine
     }
@@ -310,8 +309,19 @@ resource "google_cloud_run_v2_worker_pool" "holder" {
         name  = "WEFT_CONFIG"
         value = "/etc/weft/config.json"
       }
-      # A holder reaches nothing but the broker, as the core account, so it
-      # reads the install config and no other secret.
+      # A holder reaches the broker, as the core account, and hands an
+      # entry's event to its project's worker, with the worker key derived
+      # from the caller-ticket secret: it reads the install config and that
+      # secret, and no other.
+      env {
+        name = "WEFT_CALLER_TOKEN_SECRET"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.install["WEFT_CALLER_TOKEN_SECRET"].secret_id
+            version = "latest"
+          }
+        }
+      }
 
       volume_mounts {
         name       = "config"
@@ -328,5 +338,7 @@ resource "google_cloud_run_v2_worker_pool" "holder" {
   depends_on = [
     google_secret_manager_secret_version.config,
     google_secret_manager_secret_iam_member.core_reads_config,
+    google_secret_manager_secret_version.install,
+    google_secret_manager_secret_iam_member.core_reads,
   ]
 }

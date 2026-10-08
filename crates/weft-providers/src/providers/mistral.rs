@@ -16,10 +16,6 @@ use crate::{
     CallObservation, FollowUp, MeasuredCost, ObservedCall, Pricing, ProviderMeter, RouteClass,
 };
 
-/// The dearest OCR page rate across the model family: what the ceiling
-/// estimate assumes, since the model only becomes known in the answer.
-const MAX_USD_PER_PAGE: f64 = 0.004;
-
 /// USD per OCR page for the model the RESPONSE reports (mistral.ai
 /// pricing page, checked 2026-08): the ocr-4 family at $4 per 1k
 /// pages, ocr-3 at $2, the original ocr-2 releases (2503/2505) at $1.
@@ -36,10 +32,6 @@ fn usd_per_page(model: &str) -> Option<f64> {
         None
     }
 }
-
-/// Mistral caps one OCR document at 1,000 pages, which bounds the
-/// worst case of a single call.
-const MAX_PAGES_PER_DOC: f64 = 1000.0;
 
 pub struct MistralMeter;
 
@@ -67,50 +59,6 @@ impl ProviderMeter for MistralMeter {
             ("DELETE", p) if p.starts_with("files/") => RouteClass::Free,
             _ => RouteClass::Unknown,
         }
-    }
-
-    async fn ceiling_usd(
-        &self,
-        _path: &str,
-        body: &[u8],
-        follow_up: FollowUp<'_>,
-    ) -> anyhow::Result<f64> {
-        // Estimate, never a blanket cap: (1) an explicit `pages`
-        // selection bounds the call exactly; (2) else the document's
-        // byte size (a HEAD on its URL, which for the weft node is
-        // Mistral's own signed upload URL) at a dense-PDF worst case
-        // of one page per 15 KB; (3) only when neither is knowable,
-        // the provider's own per-document cap.
-        let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-        if let Some(pages) = parsed.get("pages").and_then(Value::as_array) {
-            let n = (pages.len() as f64).clamp(1.0, MAX_PAGES_PER_DOC);
-            return Ok(n * MAX_USD_PER_PAGE);
-        }
-        // The HEAD only ever goes to the provider's own hosts (the weft
-        // node passes Mistral's signed upload URL); any other document
-        // URL falls through to the per-document cap instead of being
-        // fetched from inside the metering client.
-        let own_host = |url: &str| {
-            reqwest::Url::parse(url)
-                .ok()
-                .and_then(|u| u.host_str().map(str::to_string))
-                .is_some_and(|h| h == "api.mistral.ai" || h.ends_with(".mistral.ai"))
-        };
-        if let Some(url) = parsed
-            .pointer("/document/document_url")
-            .and_then(Value::as_str)
-            .filter(|u| own_host(u))
-        {
-            if let Ok(resp) = follow_up.http.head(url).send().await {
-                if let Some(bytes) = resp.content_length().filter(|b| *b > 0) {
-                    const WORST_BYTES_PER_PAGE: f64 = 15.0 * 1024.0;
-                    let pages =
-                        (bytes as f64 / WORST_BYTES_PER_PAGE).ceil().clamp(1.0, MAX_PAGES_PER_DOC);
-                    return Ok(pages * MAX_USD_PER_PAGE);
-                }
-            }
-        }
-        Ok(MAX_PAGES_PER_DOC * MAX_USD_PER_PAGE)
     }
 
     fn observe(&self, _path: &str, _query: &str, _request_body: &[u8]) -> Box<dyn CallObservation> {
@@ -213,13 +161,14 @@ mod tests {
     #[tokio::test]
     async fn resolve_refuses_to_price_a_non_ocr_route() {
         let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         let observed = ObservedCall {
             interrupted: false,
             status: 200,
             data: json!({"usage_info": {"pages_processed": 3}}),
         };
         let cost = MISTRAL
-            .resolve("files", observed, FollowUp { http: &http, base_url: "http://unused.test" })
+            .resolve("files", observed, FollowUp { http: &http, base_url: "http://unused.test", shared: &shared })
             .await;
         assert_eq!(cost.amount_usd, None);
 
@@ -229,7 +178,7 @@ mod tests {
             data: json!({"model": "mistral-ocr-2505", "usage_info": {"pages_processed": 3}}),
         };
         let cost = MISTRAL
-            .resolve("ocr", observed, FollowUp { http: &http, base_url: "http://unused.test" })
+            .resolve("ocr", observed, FollowUp { http: &http, base_url: "http://unused.test", shared: &shared })
             .await;
         assert_eq!(cost.amount_usd, Some(3.0 * 0.001));
     }
@@ -241,13 +190,14 @@ mod tests {
     #[tokio::test]
     async fn resolve_prices_by_the_reported_model() {
         let http = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         let resolve = |model: Value| {
             let observed = ObservedCall {
                 interrupted: false,
                 status: 200,
                 data: json!({"model": model, "usage_info": {"pages_processed": 10}}),
             };
-            MISTRAL.resolve("ocr", observed, FollowUp { http: &http, base_url: "http://unused.test" })
+            MISTRAL.resolve("ocr", observed, FollowUp { http: &http, base_url: "http://unused.test", shared: &shared })
         };
         assert_eq!(resolve(json!("mistral-ocr-4106")).await.amount_usd, Some(10.0 * 0.004));
         assert_eq!(resolve(json!("mistral-ocr-3210")).await.amount_usd, Some(10.0 * 0.002));

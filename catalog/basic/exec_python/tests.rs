@@ -1,20 +1,29 @@
-//! ExecPython self-tests: the pure interpreter bridge (`run_python`)
+//! ExecPython self-tests: the script's Python process (`run_python`)
 //! at the basic tier, the full node body (custom ports in, pulses out)
 //! at the fake tier.
 
 use serde_json::{json, Value};
 
-use weft::{FakeRig, NodeTest, WeftError, WeftResult, WeftType};
+use weft::{CancellationFlag, FakeRig, NodeTest, WeftError, WeftResult, WeftType};
 
-use super::{run_python, ExecPythonNode, Interrupt};
+use super::{run_python, ExecPythonNode, Interpreters};
+
+/// `run_python` on processes of its own, to its end.
+fn python(code: &str, inputs: Vec<(String, Value)>) -> WeftResult<Vec<(String, Value)>> {
+    let interpreters = Interpreters::new();
+    on_a_runtime(run_python(&interpreters, code, inputs, &CancellationFlag::new()))
+}
+
+fn on_a_runtime<T>(future: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("a test runtime").block_on(future)
+}
 
 pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::basic("returned_dict_maps_ports_to_values", || {
-            let out = run_python(
+            let out = python(
                 "return {'sum': a + b, 'label': f'{a}+{b}'}",
                 vec![("a".into(), json!(2)), ("b".into(), json!(3))],
-                &Interrupt::default(),
             )?;
             assert_eq!(
                 out,
@@ -26,62 +35,96 @@ pub fn tests() -> Vec<NodeTest> {
             Ok(())
         }),
         NodeTest::basic("an_empty_dict_yields_no_pulses", || {
-            let out = run_python("return {}", Vec::new(), &Interrupt::default())?;
+            let out = python("return {}", Vec::new())?;
             assert!(out.is_empty());
             Ok(())
         }),
         NodeTest::basic("a_missing_return_is_a_type_error", || {
             for code in ["x = 1", "return", "return None"] {
-                let err = run_python(code, Vec::new(), &Interrupt::default()).expect_err("no dict, no answer");
+                let err = python(code, Vec::new()).expect_err("no dict, no answer");
                 assert!(matches!(&err, WeftError::Type(m) if m.contains("without returning a dict")), "{code}: {err}");
             }
             Ok(())
         }),
         NodeTest::basic("an_exception_is_a_node_failure_carrying_the_traceback", || {
-            let err = run_python("raise ValueError('boom')", Vec::new(), &Interrupt::default()).expect_err("a raise must fail the run");
+            let err = python("raise ValueError('boom')", Vec::new()).expect_err("a raise must fail the run");
             let WeftError::NodeExecution(message) = &err else { panic!("a raise is catchable: {err}") };
             assert!(message.contains("ValueError: boom"), "{message}");
             assert!(message.contains("Traceback"), "{message}");
             Ok(())
         }),
         NodeTest::basic("a_syntax_error_is_an_input_error", || {
-            let err = run_python("return {'a': 1", Vec::new(), &Interrupt::default()).expect_err("code that does not compile");
+            let err = python("return {'a': 1", Vec::new()).expect_err("code that does not compile");
             assert!(matches!(&err, WeftError::Input(m) if m.contains("does not compile") && m.contains("SyntaxError")), "{err}");
             Ok(())
         }),
         NodeTest::basic("a_non_dict_return_is_a_type_error", || {
-            let err = run_python("return 3", Vec::new(), &Interrupt::default()).expect_err("a scalar return must fail");
+            let err = python("return 3", Vec::new()).expect_err("a scalar return must fail");
             assert!(matches!(&err, WeftError::Type(m) if m.contains("must return a dict")), "{err}");
             Ok(())
         }),
         NodeTest::basic("a_value_with_no_json_form_is_a_type_error", || {
-            let err = run_python("return {'s': {1, 2}}", Vec::new(), &Interrupt::default()).expect_err("a set has no port value");
+            let err = python("return {'s': {1, 2}}", Vec::new()).expect_err("a set has no port value");
             assert!(matches!(&err, WeftError::Type(m) if m.contains("'s'") && m.contains("set")), "{err}");
             Ok(())
         }),
         NodeTest::basic("json_round_trips_through_python", || {
             let value = json!({ "s": "x", "n": 1.5, "b": true, "z": Value::Null,
                                 "l": [1, 2], "o": { "k": "v" } });
-            let out = run_python("return {'echo': data}", vec![("data".into(), value.clone())], &Interrupt::default())?;
+            let out = python("return {'echo': data}", vec![("data".into(), value.clone())])?;
             assert_eq!(out, vec![("echo".to_string(), value)]);
             Ok(())
         }),
-        NodeTest::basic("a_stop_interrupts_a_running_script", || {
-            let interrupt = std::sync::Arc::new(Interrupt::default());
-            let running = interrupt.clone();
-            let script = std::thread::spawn(move || run_python("while True:\n    pass", Vec::new(), &running));
-            while interrupt.thread.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            interrupt.stop_now();
-            let result = script.join().expect("the script thread does not panic");
-            assert!(matches!(result, Err(WeftError::Cancelled)), "{result:?}");
+        NodeTest::basic("what_a_script_prints_stays_out_of_its_answer", || {
+            let out = python("print('hello')\nreturn {'ok': True}", Vec::new())?;
+            assert_eq!(out, vec![("ok".to_string(), json!(true))]);
             Ok(())
         }),
-        NodeTest::basic("a_stopped_script_never_starts", || {
-            let interrupt = Interrupt::default();
-            interrupt.stop_now();
-            let result = run_python("return {'ran': True}", Vec::new(), &interrupt);
+        NodeTest::basic("a_script_reading_stdin_reads_nothing_and_the_next_request_still_lands", || {
+            let interpreters = Interpreters::new();
+            let flag = CancellationFlag::new();
+            let (read, next) = on_a_runtime(async {
+                let read = run_python(&interpreters, "import sys\nreturn {'read': sys.stdin.read()}", Vec::new(), &flag).await;
+                (read, run_python(&interpreters, "return {'ok': True}", Vec::new(), &flag).await)
+            });
+            assert_eq!(read?, vec![("read".to_string(), json!(""))]);
+            assert_eq!(next?, vec![("ok".to_string(), json!(true))]);
+            Ok(())
+        }),
+        NodeTest::basic("scripts_share_processes_and_run_side_by_side", || {
+            let interpreters = Interpreters::new();
+            let flag = CancellationFlag::new();
+            let (a, b) = on_a_runtime(async {
+                tokio::join!(
+                    run_python(&interpreters, "import time\ntime.sleep(0.2)\nreturn {'a': 1}", Vec::new(), &flag),
+                    run_python(&interpreters, "import time\ntime.sleep(0.2)\nreturn {'b': 2}", Vec::new(), &flag),
+                )
+            });
+            assert_eq!(a?, vec![("a".to_string(), json!(1))]);
+            assert_eq!(b?, vec![("b".to_string(), json!(2))]);
+            Ok(())
+        }),
+        NodeTest::basic("a_cancel_stops_a_running_script_and_the_next_one_runs", || {
+            let interpreters = Interpreters::new();
+            on_a_runtime(async {
+                let flag = std::sync::Arc::new(CancellationFlag::new());
+                let stopping = flag.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    stopping.cancel_because(weft::exec::CancelCause::User);
+                });
+                let result = run_python(&interpreters, "while True:\n    pass", Vec::new(), &flag).await;
+                assert!(matches!(result, Err(WeftError::Cancelled)), "{result:?}");
+                let next = run_python(&interpreters, "return {'ran': True}", Vec::new(), &CancellationFlag::new()).await;
+                assert_eq!(next?, vec![("ran".to_string(), json!(true))]);
+                Ok(())
+            })
+        }),
+        NodeTest::basic("a_cancelled_script_never_starts", || {
+            let interpreters = Interpreters::new();
+            let flag = CancellationFlag::new();
+            flag.cancel_because(weft::exec::CancelCause::User);
+            let result = on_a_runtime(run_python(&interpreters, "return {'ran': True}", Vec::new(), &flag));
             assert!(matches!(result, Err(WeftError::Cancelled)), "{result:?}");
             Ok(())
         }),

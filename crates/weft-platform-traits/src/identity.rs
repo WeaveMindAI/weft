@@ -30,6 +30,11 @@ pub enum Principal {
     /// A worker of exactly one project. Runs the user's compiled
     /// program, so it acts for that project and nothing else.
     Worker { tenant: String, project: uuid::Uuid },
+    /// The agent beside one copy of an infra node
+    /// (`crate::unit_agent::VALUES_PATH`). Runs weft's code, next to the
+    /// user's containers, so it may tell weft what changed of that copy's
+    /// values and do nothing else.
+    InfraCopy { tenant: String, project: uuid::Uuid, copy_id: String },
 }
 
 /// Why a token was not accepted. Always a 401 to the caller: the
@@ -129,6 +134,7 @@ mod tests {
         for p in [
             Principal::Core,
             Principal::Worker { tenant: "local".into(), project: uuid::Uuid::from_u128(7) },
+            Principal::InfraCopy { tenant: "local".into(), project: uuid::Uuid::from_u128(7), copy_id: "wn-1".into() },
         ] {
             let v = serde_json::to_value(&p).unwrap();
             assert_eq!(serde_json::from_value::<Principal>(v).unwrap(), p);

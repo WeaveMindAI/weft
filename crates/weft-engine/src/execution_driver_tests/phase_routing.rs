@@ -148,7 +148,7 @@
         // Mirror the dispatcher's birth row: a setup phase carries the
         // selection that bounds it (its triggers' or infra nodes'
         // dependencies), and the engine refuses a setup row without one.
-        let subgraph = match phase {
+        let selection = match phase {
             weft_core::context::Phase::TriggerSetup => Some(
                 weft_core::project::selection::RunSelection::setup(project, &weft_core::project::trigger_places(project))
                     .expect("setup selection"),
@@ -158,7 +158,8 @@
                     .expect("setup selection"),
             ),
             weft_core::context::Phase::Fire => None,
-        };
+        }
+        .map(weft_core::project::selection::RecordedSelection::new);
         journal
             .record_event(
                 &ExecEvent::ExecutionStarted {
@@ -167,11 +168,11 @@
                     entry_node: kicks[0].to_string(),
                     phase,
                     definition_hash: Some("test-hash".into()),
-                    program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
-                    subgraph,
+                    binary_hash: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
+                    selection,
                     seed: None,
-                    instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-                    run_class: weft_core::run_class::RunClass::Short,
+                    instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+                    settings: Default::default(),
                 },
                 None,
             )
@@ -439,11 +440,11 @@
                     entry_node: "trig".into(),
                     phase: weft_core::context::Phase::Fire,
                     definition_hash: Some("test-hash".into()),
-                    program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
-                    subgraph: None,
+                    binary_hash: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
+                    selection: None,
                     seed: None,
-                    instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-                    run_class: weft_core::run_class::RunClass::Short,
+                    instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+                    settings: Default::default(),
                 },
                 None,
             )

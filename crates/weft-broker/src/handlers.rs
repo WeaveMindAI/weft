@@ -5,7 +5,8 @@
 //!
 //! Steps 2 and 3 are intentionally separate calls per handler so the
 //! audit log records the exact `(caller, scope-kind, requested,
-//! resource-tenant)` tuple.
+//! resource-tenant)` tuple. A worker's records and the runs it drives are
+//! `crate::records`'s.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,7 +18,7 @@ use axum::{
 };
 use weft_broker_client::lifecycle_command::{InfraCommandSignal, INFRA_COMMAND_CHANNEL, ISSUED_WAKE};
 use weft_broker_client::protocol::*;
-use weft_task_store::tasks::{DedupOutcome, TaskTarget};
+use weft_task_store::tasks::DedupOutcome;
 use weft_task_store::TaskKind;
 
 use crate::auth::{AuthedCaller, CallerIdentity, Role};
@@ -30,183 +31,44 @@ pub async fn health() -> &'static str {
     "ok"
 }
 
-// ---------- Journal ----------
-
-/// A worker's journal rows, all of one execution, written in one
-/// statement that also fences them: they go in only while the asking
-/// replica owns the execution's claim (see
-/// [`require_worker_owns_execution_id`] for why). The owner is read in the
-/// write itself, so the common case costs one round trip; only a refused
-/// write reads it again, to say why.
-pub async fn journal_record(
-    State(state): State<Arc<BrokerState>>,
-    AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<JournalRecordRequest>,
-) -> Resp<JournalRecordResponse> {
-    if caller.role != Role::Worker {
-        return Err((StatusCode::FORBIDDEN, "only workers journal events".into()));
-    }
-    let Some(first) = req.events.first() else {
-        return Ok(Json(JournalRecordResponse {}));
-    };
-    let execution_id = first.execution_id();
-    require_worker_execution_scope(&state, &caller, execution_id, &req.replica).await?;
-    let written = weft_journal::record_events(&state.pool, &req.events, Some(&req.replica), Some(&req.replica))
-        .await
-        .map_err(|e| match e {
-            weft_journal::RecordError::MixedExecutions { .. } => (StatusCode::BAD_REQUEST, e.to_string()),
-            other => unavailable_or_internal(other.into()),
-        })?;
-    if written == 0 {
-        require_owner(&state, &caller, execution_id, &req.replica).await?;
-        // The owner read again says the replica owns it: it took the
-        // claim between the write and this read. The rows did not go in.
-        return Err((
-            StatusCode::CONFLICT,
-            "the execution's claim changed hands during the write; nothing was journaled".into(),
-        ));
-    }
-    Ok(Json(JournalRecordResponse {}))
-}
-
-/// A failed unrecorded run's whole record, written at once: the run
-/// becomes a recorded run (`weft_journal::unrecorded`). Same gate as
-/// `journal_record`: the worker may only write the execution it owns.
-pub async fn journal_record_retroactive(
-    State(state): State<Arc<BrokerState>>,
-    AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<JournalRecordRetroactiveRequest>,
-) -> Resp<JournalRecordResponse> {
-    if caller.role != Role::Worker {
-        return Err((StatusCode::FORBIDDEN, "only workers journal events".into()));
-    }
-    let Some(first) = req.events.first() else {
-        return Err((StatusCode::BAD_REQUEST, "an unrecorded run's record has at least its birth".into()));
-    };
-    require_worker_owns_execution_id(&state, &caller, first.execution_id(), &req.replica).await?;
-    state
-        .journal
-        .record_retroactively(&req.events, Some(req.replica.as_str()))
-        .await
-        .map_err(internal)?;
-    Ok(Json(JournalRecordResponse {}))
-}
-
-/// An unrecorded run ended without failing: its execution row goes (unless
-/// its costs keep it) and its un-kept run files start their linger, the
-/// same sweep a recorded run's ending queues.
-pub async fn journal_forget_unrecorded(
-    State(state): State<Arc<BrokerState>>,
-    AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<JournalForgetUnrecordedRequest>,
-) -> Resp<JournalRecordResponse> {
-    if caller.role != Role::Worker {
-        return Err((StatusCode::FORBIDDEN, "only workers journal events".into()));
-    }
-    let execution_id: weft_core::ExecutionId =
-        req.execution_id.parse().map_err(|e| (StatusCode::BAD_REQUEST, format!("bad execution: {e}")))?;
-    let scope = require_worker_owns_execution_id(&state, &caller, execution_id, &req.replica).await?;
-    // Files first: a failed sweep leaves the row, so the worker's error
-    // names a run that is still there to look at.
-    state.runtime_store.sweep_exec(&scope.tenant, &req.execution_id).await.map_err(internal)?;
-    state
-        .journal
-        .forget_unrecorded(execution_id, Some(req.replica.as_str()))
-        .await
-        .map_err(internal)?;
-    Ok(Json(JournalRecordResponse {}))
-}
-
-/// The gate every write a worker makes ABOUT an execution passes: the execution
-/// is in the caller's scope, the caller is the replica it says it is,
-/// and that replica is the execution's current owner. Returns the execution's scope
-/// (tenant + project) so the handler can act inside it.
-///
-/// Replica binding: the caller can only act under the replica its
-/// request names (`caller.replica`, from the replica header). Without
-/// it, a worker could write under a sibling's replica id and slip past
-/// the owner check or poison attribution. The replica is self-asserted;
-/// the platform identity underneath already pins the caller to its
-/// project, so this only orders writers inside one project.
-///
-/// Cross-execution sabotage gate: the execution's owning replica (stamped at
-/// first task_claim_execution) must match the caller's. A compromised worker
-/// can act only on executions it legitimately owns, not
-/// arbitrary sibling executions in the same tenant. `owner_replica IS
-/// NULL` means the execution has not been claimed yet (e.g. a
-/// dispatcher-orchestrated phase still in flight); workers shouldn't be
-/// writing in that state anyway, so we refuse.
-async fn require_worker_owns_execution_id(
+/// The gate every call a worker makes ABOUT a run it drives passes: the
+/// run is in the caller's scope and the calling replica drives it now
+/// (`run.owner`, while it runs). A worker acts only on the runs it drives,
+/// never on a sibling's in the same project. Returns the run's scope
+/// (tenant, project, instance) so the handler can act inside it.
+pub(crate) async fn require_worker_drives(
     state: &BrokerState,
     caller: &CallerIdentity,
     execution_id: weft_core::ExecutionId,
-    claimed_replica: &str,
 ) -> Result<scope::ExecutionScope, (StatusCode, String)> {
-    let execution_id_scope = require_worker_execution_scope(state, caller, execution_id, claimed_replica).await?;
-    require_owner(state, caller, execution_id, claimed_replica).await?;
-    Ok(execution_id_scope)
-}
-
-/// The execution is in the caller's scope and the caller is the replica
-/// it says it is: the half of [`require_worker_owns_execution_id`] that
-/// needs no read of the execution's owner.
-async fn require_worker_execution_scope(
-    state: &BrokerState,
-    caller: &CallerIdentity,
-    execution_id: weft_core::ExecutionId,
-    claimed_replica: &str,
-) -> Result<scope::ExecutionScope, (StatusCode, String)> {
-    let execution_id_scope =
-        scope::require_execution_id_scope(&state.scope_cache, &state.pool, caller, &execution_id.to_string())
-            .await?;
-    require_replica_matches(caller, claimed_replica)?;
-    Ok(execution_id_scope)
-}
-
-/// `claimed_replica` owns `execution_id`'s claim, read from the execution
-/// row; the refusal names which way it does not.
-async fn require_owner(
-    state: &BrokerState,
-    caller: &CallerIdentity,
-    execution_id: weft_core::ExecutionId,
-    claimed_replica: &str,
-) -> Result<(), (StatusCode, String)> {
-    // SYNC: execution.owner_replica <-> weft_bind_execution_id_owner, bind_execution_id_owner (crates/weft-task-store/src/tasks.rs)
-    let owner: Option<(Option<String>,)> = sqlx::query_as(
-        "SELECT owner_replica FROM execution WHERE execution_id = $1",
-    )
-    .bind(execution_id.to_string())
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("execution owner lookup")))?;
-    let owner_replica = owner.and_then(|(p,)| p).ok_or((
-        StatusCode::FORBIDDEN,
-        "execution has no owning replica yet; worker may not act on it".into(),
-    ))?;
-    if owner_replica != claimed_replica {
+    let replica = caller.replica.as_deref().ok_or((StatusCode::FORBIDDEN, "a worker names its replica".to_string()))?;
+    let scope = scope::require_execution_id_scope(&state.scope_cache, &state.pool, caller, execution_id).await?;
+    let driven: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM run WHERE execution_id = $1 AND owner = $2 AND state = 'running')")
+        .bind(execution_id)
+        .bind(replica)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read a run's owner")))?;
+    if !driven {
         tracing::warn!(
             target: "weft_broker::scope",
             caller_tenant = ?caller.scope.pinned_tenant(),
-            caller_replica = %claimed_replica,
-            execution_id = %execution_id,
-            owner_replica = %owner_replica,
-            "broker rejected cross-execution worker write"
+            caller_replica = %replica,
+            %execution_id,
+            "broker refused a worker acting on a run it does not drive"
         );
-        return Err((
-            StatusCode::FORBIDDEN,
-            "execution owned by a different worker replica".into(),
-        ));
+        return Err((StatusCode::FORBIDDEN, "the run is not driven by the calling replica".into()));
     }
-    Ok(())
+    Ok(scope)
 }
 
 // ---------- Execution steering ----------
 
-/// `ctx.tag_execution`: journal `ExecutionTagged` and write the
-/// `execution_tag` rows in ONE transaction, synchronously, so the tag
-/// rows exist by the time the node's call returns (a following
-/// `stop_tagged` anchors on them). Same gate as `journal_record`: the
-/// worker may only tag the execution it owns.
+/// `ctx.tag_execution`: write the `execution_tag` rows, synchronously, so
+/// they exist by the time the node's call returns (a following
+/// `stop_tagged` anchors on them). The run's own `ExecutionTagged` is on
+/// record already: its worker writes it before any call that names the
+/// run. Only the worker driving the run tags it.
 pub async fn execution_tag(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,
@@ -215,31 +77,24 @@ pub async fn execution_tag(
     if caller.role != Role::Worker {
         return Err((StatusCode::FORBIDDEN, "only workers tag executions".into()));
     }
-    let execution_id: weft_core::ExecutionId = req
-        .execution_id
-        .parse()
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad execution: {e}")))?;
     if req.tags.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "tag_execution needs at least one tag".into()));
     }
     // The ctx validated already; the broker trusts no worker, so again.
     weft_core::tag::validate_tags(&req.tags)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    require_worker_owns_execution_id(&state, &caller, execution_id, &req.replica).await?;
-    let at_unix = unix_now_secs();
-    let mut tx = state.pool.begin().await.map_err(internal)?;
-    weft_journal::tags::tag_execution_in(&mut tx, execution_id, &req.tags, at_unix, Some(&req.replica))
+    require_worker_drives(&state, &caller, req.execution_id).await?;
+    let mut conn = state.pool.acquire().await.map_err(|e| unavailable_or_internal(e.into()))?;
+    weft_journal::tags::tag_execution_in(&mut conn, req.execution_id, &req.tags, unix_now_secs())
         .await
-        .map_err(internal)?;
-    tx.commit().await.map_err(internal)?;
-    weft_task_store::announce::committed(&state.pool);
+        .map_err(|e| unavailable_or_internal(e.into()))?;
     Ok(Json(ExecutionTagResponse {}))
 }
 
 /// `ctx.stop_tagged`: queue a `stop_tagged` task for the dispatcher,
 /// with the ordering anchor resolved NOW. The project the stop runs in
-/// is the asking execution's own (from its `execution` row); the
-/// request never names a project, so a stop cannot cross one.
+/// is the asking run's own (from its row); the request never names a
+/// project, so a stop cannot cross one.
 ///
 /// The anchor rule, THE place it is decided:
 ///   - `Keep`: the asker's own `seq` for the tag, or, if it never
@@ -258,13 +113,10 @@ pub async fn execution_stop_tagged(
     if caller.role != Role::Worker {
         return Err((StatusCode::FORBIDDEN, "only workers stop executions by tag".into()));
     }
-    let execution_id: weft_core::ExecutionId = req
-        .execution_id
-        .parse()
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad execution: {e}")))?;
+    let execution_id = req.execution_id;
     weft_core::tag::validate_tag(&req.tag)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let execution_id_scope = require_worker_owns_execution_id(&state, &caller, execution_id, &req.replica).await?;
+    let execution_id_scope = require_worker_drives(&state, &caller, execution_id).await?;
     let own_seq = weft_journal::tags::tag_seq(&state.pool, execution_id, &req.tag)
         .await
         .map_err(internal)?;
@@ -294,30 +146,26 @@ pub async fn execution_stop_tagged(
     let payload = weft_task_store::StopTaggedPayload {
         project_id: execution_id_scope.project,
         tag: req.tag,
-        by: execution_id.to_string(),
+        by: execution_id,
         before_seq,
         stop_self: req.stop_self,
     };
     // Every ask is its own task: a second stop for the same tag from
     // the same run is a new decision with a new anchor, never a
-    // duplicate to collapse, so the dedup key is fresh per call.
+    // duplicate to collapse, so it has no dedup key.
     let task = weft_task_store::tasks::NewTask {
         kind: TaskKind::StopTagged.into(),
-        target: TaskTarget::Dispatcher,
         project_id: Some(execution_id_scope.project),
-        dedup_key: Some(format!("stop_tagged:{}", uuid::Uuid::new_v4())),
-        execution_id: Some(execution_id.to_string()),
+        dedup_key: None,
+        execution_id: Some(execution_id),
         tenant_id: execution_id_scope.tenant,
-        target_replica: None,
-        binary_hash: None,
         payload: serde_json::to_value(&payload).map_err(internal)?,
     };
     state.tasks.enqueue_dedup(task).await.map_err(internal)?;
     Ok(Json(ExecutionStopTaggedResponse { stops_asker }))
 }
 
-/// Seconds since the unix epoch, the stamp every broker-side write
-/// puts on a journal row.
+/// Seconds since the unix epoch.
 fn unix_now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -329,44 +177,6 @@ fn unix_now_secs() -> u64 {
 /// for, never more than `MAX_HOLD` (a process that wants longer asks again).
 fn held(wait_ms: u64) -> Duration {
     Duration::from_millis(wait_ms).min(weft_task_store::pg_signal::MAX_HOLD)
-}
-
-/// The rows of one execution after the last one the worker applied,
-/// held open until one lands (woken by the row's own notification) or
-/// the hold ends.
-pub async fn journal_wait(
-    State(state): State<Arc<BrokerState>>,
-    AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<JournalWaitRequest>,
-) -> Resp<JournalWaitResponse> {
-    scope::require_execution_id_scope(&state.scope_cache, &state.pool, &caller, &req.execution_id).await?;
-    let execution_id: weft_core::ExecutionId = req
-        .execution_id
-        .parse()
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad execution: {e}")))?;
-    // RAW rows, never decode-and-re-encode: the broker only ferries
-    // these, and a typed hop would silently strip any event field this
-    // build predates. The worker decodes them, loudly.
-    let rows = state
-        .journal
-        .raw_rows_after(execution_id, req.after_id, held(req.wait_ms))
-        .await
-        .map_err(unavailable_or_internal)?;
-    Ok(Json(JournalWaitResponse { rows }))
-}
-
-pub async fn journal_has_terminal(
-    State(state): State<Arc<BrokerState>>,
-    AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<JournalHasTerminalRequest>,
-) -> Resp<JournalHasTerminalResponse> {
-    scope::require_execution_id_scope(&state.scope_cache, &state.pool, &caller, &req.execution_id).await?;
-    let execution_id: weft_core::ExecutionId = req
-        .execution_id
-        .parse()
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad execution: {e}")))?;
-    let terminal = state.journal.has_terminal_event(execution_id).await.map_err(unavailable_or_internal)?;
-    Ok(Json(JournalHasTerminalResponse { terminal }))
 }
 
 // ---------- Tasks ----------
@@ -402,67 +212,26 @@ pub async fn task_enqueue_dedup(
     Json(req): Json<TaskEnqueueDedupRequest>,
 ) -> Resp<TaskEnqueueDedupResponse> {
     let kind = req.spec.kind.clone();
-    let target = req.spec.target;
 
     // Per-role allow list of kinds. Anything else is a 403.
     match caller.role {
         Role::Worker => {
-            // Workers enqueue control-plane work for the dispatcher
-            // to handle: register a wake signal, provision infra,
-            // and durable side-effect records (cost + log) that must
-            // survive the worker dying.
-            if ![
-                TaskKind::RegisterSignal.as_str(),
-                TaskKind::RecordCost.as_str(),
-                TaskKind::RecordLog.as_str(),
-                TaskKind::ProgramCall.as_str(),
-            ]
-            .contains(&kind.as_str())
+            // Workers enqueue control-plane work for the dispatcher to
+            // handle: register a wake signal, withdraw one it gave up, or a
+            // call a program makes on its own project.
+            if ![TaskKind::RegisterSignal.as_str(), TaskKind::WithdrawSignal.as_str(), TaskKind::ProgramCall.as_str()]
+                .contains(&kind.as_str())
             {
                 return Err((
                     StatusCode::FORBIDDEN,
                     format!("worker may not enqueue task kind {kind}"),
                 ));
             }
-            // RecordCost payload validation at enqueue time, so a
-            // malicious worker can't submit a bad row and die before the
-            // dispatcher's executor would catch it:
-            //   - amount_usd is null (a meter's honest unknown) or a
-            //     finite non-negative number; never negative or NaN.
-            //   - billed must be false: a worker-side record is a
-            //     MEASUREMENT. Only the runtime's own billing path may
-            //     mark a record billed, and it does not come through here.
-            if kind == TaskKind::RecordCost.as_str() {
-                match req.spec.payload.get("amount_usd") {
-                    None | Some(serde_json::Value::Null) => {}
-                    Some(v) => {
-                        let amount = v.as_f64().ok_or((
-                            StatusCode::BAD_REQUEST,
-                            "record_cost amount_usd must be null or a number".to_string(),
-                        ))?;
-                        if !(amount.is_finite() && amount >= 0.0) {
-                            return Err((
-                                StatusCode::BAD_REQUEST,
-                                format!(
-                                    "record_cost amount_usd must be a finite non-negative \
-                                     number; got {amount}"
-                                ),
-                            ));
-                        }
-                    }
-                }
-                if req.spec.payload.get("billed").and_then(|v| v.as_bool()) != Some(false) {
-                    return Err((
-                        StatusCode::BAD_REQUEST,
-                        "record_cost from a worker must carry billed: false (a worker \
-                         records measurements, never charges)"
-                            .to_string(),
-                    ));
-                }
-            }
         }
         Role::Listener => {
-            // Listeners enqueue exactly one kind: a held-event fire.
+            // Listeners enqueue exactly one kind: an answer to a waiting
+            // run (an entry's event goes to its worker, or waits in its
+            // trigger's queue).
             if kind != TaskKind::FireSignal.as_str() {
                 return Err((
                     StatusCode::FORBIDDEN,
@@ -479,24 +248,6 @@ pub async fn task_enqueue_dedup(
         }
     }
 
-    if target != TaskTarget::Dispatcher {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "worker-enqueued tasks must target dispatcher".into(),
-        ));
-    }
-    // `target_replica` is meaningful only for cancel-style tasks
-    // claimed by a specific worker replica. Workers never enqueue
-    // those (the dispatcher emits cancels itself), so any
-    // wire-set value is either confused or hostile. Refuse to
-    // persist a value the caller has no legitimate use for.
-    if req.spec.target_replica.is_some() {
-        return Err((
-            StatusCode::FORBIDDEN,
-            "workers may not set target_replica".into(),
-        ));
-    }
-
     // Resolve the task's authoritative tenant from the resource it
     // names, enforcing the caller's scope on every named resource. A
     // worker (tenant-scoped) may only act for its own tenant; a pooled
@@ -506,9 +257,8 @@ pub async fn task_enqueue_dedup(
     // control-plane caller (which has no single tenant) still yields a
     // correctly-tenanted task. When several resources are named they
     // MUST agree: `merge_anchor_tenant` rejects a task that names
-    // resources in two different tenants (e.g. project P in tenant A and
-    // execution C in tenant B) rather than silently picking one, so the
-    // stamped tenant is never ambiguous.
+    // resources in two different tenants rather than silently picking
+    // one, so the stamped tenant is never ambiguous.
     let mut anchor_tenant: Option<String> = None;
     if let Some(project_id) = req.spec.project_id {
         let t =
@@ -516,18 +266,38 @@ pub async fn task_enqueue_dedup(
                 .await?;
         merge_anchor_tenant(&mut anchor_tenant, t)?;
     }
-    if let Some(execution_id) = req.spec.execution_id.as_deref() {
-        let scope =
-            scope::require_execution_id_scope(&state.scope_cache, &state.pool, &caller, execution_id).await?;
+    if let Some(execution_id) = req.spec.execution_id {
+        // A worker acts only for a run it drives; the listener names the
+        // run an answer resolves.
+        let scope = match caller.role {
+            Role::Worker => require_worker_drives(&state, &caller, execution_id).await?,
+            _ => scope::require_execution_id_scope(&state.scope_cache, &state.pool, &caller, execution_id).await?,
+        };
         merge_anchor_tenant(&mut anchor_tenant, scope.tenant)?;
     }
     if kind == TaskKind::FireSignal.as_str() {
-        // Listener held-event fire: the signal token is the tenant
-        // anchor. Pull it from the payload and resolve.
+        // A listener's answer to a waiting run: the signal token is the
+        // tenant anchor, and the signal must be the wait of the run the
+        // answer names.
         let fire: weft_task_store::kinds::FireSignalPayload = serde_json::from_value(req.spec.payload.clone())
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("malformed fire_signal payload: {e}")))?;
         let t = scope::require_signal_owned_by(&state.scope_cache, &state.pool, &caller, &fire.token).await?;
         merge_anchor_tenant(&mut anchor_tenant, t)?;
+        let wait: Option<(bool, Option<weft_core::ExecutionId>)> = sqlx::query_as("SELECT is_resume, execution_id FROM signal WHERE token = $1")
+            .bind(&fire.token)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read a signal")))?;
+        match wait {
+            Some((true, Some(run))) if run == fire.execution_id => {}
+            Some((false, _)) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "an entry's event goes to its worker or waits in its trigger's queue (`/v1/door/park_fire`), never as a fire_signal task".into(),
+                ));
+            }
+            _ => return Err((StatusCode::BAD_REQUEST, format!("signal {} is no wait of run {}", fire.token, fire.execution_id))),
+        }
         // A held connection fires under its holder's claim: only the
         // holder itself may name it, and only while the row is still held
         // under it (another holder took it, or it was registered again to
@@ -547,25 +317,48 @@ pub async fn task_enqueue_dedup(
         }
     }
 
-    // These kinds act on the run their PAYLOAD names (the dispatcher's
-    // executor reads `payload.execution_id` and takes the tenant and
-    // project from that run), so the payload's run must be the one the
-    // task names and the scope check above just proved is the worker's
-    // own. Otherwise a worker could name its own run on the task and
-    // another tenant's run in the payload.
-    if caller.role == Role::Worker
-        && [TaskKind::RegisterSignal.as_str(), TaskKind::RecordCost.as_str(), TaskKind::RecordLog.as_str()]
-            .contains(&kind.as_str())
-    {
-        let named = req.spec.execution_id.as_deref().ok_or((
+    // A wait a worker registers acts on the run its PAYLOAD names (the
+    // dispatcher's executor reads `payload.execution_id` and takes the
+    // tenant and project from that run), so the payload's run must be the
+    // one the task names and the scope check above just proved is the
+    // worker's own.
+    if caller.role == Role::Worker && kind == TaskKind::RegisterSignal.as_str() {
+        let named = req.spec.execution_id.ok_or((
             StatusCode::BAD_REQUEST,
             format!("a {kind} task names the run it is for (execution_id)"),
         ))?;
-        if req.spec.payload.get("execution_id").and_then(|v| v.as_str()) != Some(named) {
+        if req.spec.payload.get("execution_id").and_then(|v| v.as_str()) != Some(named.to_string().as_str()) {
             return Err((
                 StatusCode::FORBIDDEN,
                 format!("a {kind} task's payload names the same run as the task"),
             ));
+        }
+    }
+
+    // A wait a worker withdraws is one of the run the task names, which
+    // the scope check above proved is the worker's own.
+    if kind == TaskKind::WithdrawSignal.as_str() {
+        let named = req.spec.execution_id.ok_or((
+            StatusCode::BAD_REQUEST,
+            format!("a {kind} task names the run it is for (execution_id)"),
+        ))?;
+        let withdraw: weft_task_store::WithdrawSignalPayload = serde_json::from_value(req.spec.payload.clone())
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("malformed {kind} payload: {e}")))?;
+        let signal: Option<(bool, Option<weft_core::ExecutionId>)> =
+            sqlx::query_as("SELECT is_resume, execution_id FROM signal WHERE token = $1")
+                .bind(&withdraw.token)
+                .fetch_optional(&state.pool)
+                .await
+                .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read a signal")))?;
+        // A wait already answered or withdrawn has no signal left, and
+        // withdrawing it again removes nothing. Anything else the token
+        // names (an entry trigger, another run's wait) is refused.
+        let a_wait_of_the_run = match signal {
+            None => true,
+            Some((is_resume, run)) => is_resume && run == Some(named),
+        };
+        if withdraw.execution_id != named || !a_wait_of_the_run {
+            return Err((StatusCode::FORBIDDEN, format!("a {kind} task withdraws a wait of the run it names")));
         }
     }
 
@@ -574,11 +367,11 @@ pub async fn task_enqueue_dedup(
     // and the payload's asker is that same run. Nothing else is taken on
     // the worker's word.
     if kind == TaskKind::ProgramCall.as_str() {
-        let execution_id = req.spec.execution_id.as_deref().ok_or((
+        let execution_id = req.spec.execution_id.ok_or((
             StatusCode::BAD_REQUEST,
             "a program call names the asking run (execution)".to_string(),
         ))?;
-        let run = scope::require_execution_id_scope(&state.scope_cache, &state.pool, &caller, execution_id).await?;
+        let run = require_worker_drives(&state, &caller, execution_id).await?;
         if req.spec.project_id != Some(run.project) {
             return Err((
                 StatusCode::FORBIDDEN,
@@ -587,7 +380,7 @@ pub async fn task_enqueue_dedup(
         }
         let payload: weft_core::program::ProgramCallPayload = serde_json::from_value(req.spec.payload.clone())
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("program_call payload: {e}")))?;
-        if payload.by.to_string() != execution_id {
+        if payload.by != execution_id {
             return Err((
                 StatusCode::FORBIDDEN,
                 "a program call's asker is the run that sends it".into(),
@@ -638,120 +431,6 @@ pub async fn task_wait_terminal(
         .await
         .map_err(internal)?;
     Ok(Json(TaskWaitTerminalResponse::from_outcome(outcome)))
-}
-
-pub async fn task_claim_execution(
-    State(state): State<Arc<BrokerState>>,
-    AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<TaskClaimExecutionRequest>,
-) -> Resp<TaskClaimExecutionResponse> {
-    require_worker(&caller)?;
-    require_replica_matches(&caller, &req.replica)?;
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id).await?;
-    // The worker's next asks are scoped by the execution, so its scope is
-    // read while the claim runs rather than after it, on that first ask.
-    let (claimed, ()) = tokio::join!(
-        state.tasks.claim_execution(&req.replica, req.project_id, &req.execution_id),
-        scope::warm_execution_id_scope(&state.scope_cache, &state.pool, &req.execution_id),
-    );
-    let claimed = claimed.map_err(unavailable_or_internal)?;
-    // Latest-claim-wins execution ownership is bound IN the claim's own
-    // transaction by the `task_claim_binds_execution_id_owner` DB trigger:
-    // claiming an execution-bearing task atomically stamps
-    // execution.owner_replica to the claiming replica. The broker
-    // does NOT stamp it here, so "claimed by X" and "owned by X" can never
-    // disagree. The journal_record owner check reads what the trigger
-    // wrote.
-    Ok(Json(TaskClaimExecutionResponse { claimed }))
-}
-
-pub async fn task_heartbeat(
-    State(state): State<Arc<BrokerState>>,
-    AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<TaskHeartbeatRequest>,
-) -> Resp<TaskHeartbeatResponse> {
-    require_worker(&caller)?;
-    require_replica_matches(&caller, &req.replica)?;
-    require_task_owned_by(&state, &caller, req.task_id).await?;
-    let renewed = state
-        .tasks
-        .heartbeat(req.task_id, &req.replica)
-        .await
-        .map_err(internal)?;
-    Ok(Json(TaskHeartbeatResponse { renewed }))
-}
-
-pub async fn task_requeue(
-    State(state): State<Arc<BrokerState>>,
-    AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<TaskRequeueRequest>,
-) -> Resp<TaskRequeueResponse> {
-    require_worker(&caller)?;
-    require_replica_matches(&caller, &req.replica)?;
-    require_task_owned_by(&state, &caller, req.task_id).await?;
-    let requeued = state
-        .tasks
-        .requeue(req.task_id, &req.replica)
-        .await
-        .map_err(internal)?;
-    Ok(Json(TaskRequeueResponse { requeued }))
-}
-
-pub async fn task_complete(
-    State(state): State<Arc<BrokerState>>,
-    AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<TaskCompleteRequest>,
-) -> Resp<TaskCompleteResponse> {
-    require_worker(&caller)?;
-    require_replica_matches(&caller, &req.replica)?;
-    require_task_owned_by(&state, &caller, req.task_id).await?;
-    state
-        .tasks
-        .complete(req.task_id, &req.replica, req.result)
-        .await
-        .map_err(unavailable_or_internal)?;
-    Ok(Json(TaskCompleteResponse {}))
-}
-
-pub async fn task_fail(
-    State(state): State<Arc<BrokerState>>,
-    AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<TaskFailRequest>,
-) -> Resp<TaskFailResponse> {
-    require_worker(&caller)?;
-    require_replica_matches(&caller, &req.replica)?;
-    require_task_owned_by(&state, &caller, req.task_id).await?;
-    state
-        .tasks
-        .fail(req.task_id, &req.replica, req.error)
-        .await
-        .map_err(unavailable_or_internal)?;
-    Ok(Json(TaskFailResponse {}))
-}
-
-pub async fn task_cancels_asked(
-    State(state): State<Arc<BrokerState>>,
-    AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<TaskCancelsAskedRequest>,
-) -> Resp<TaskCancelsAskedResponse> {
-    require_worker(&caller)?;
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id).await?;
-    // Only the executions the calling replica drives. One it asks about and
-    // no longer drives (its claim moved to another worker, or its drive is
-    // ending) is answered nothing, without failing the ask for the others.
-    let replica = caller.replica.as_deref().ok_or((StatusCode::FORBIDDEN, "a worker names its replica".into()))?;
-    // SYNC: execution.owner_replica <-> weft_bind_execution_id_owner, bind_execution_id_owner (crates/weft-task-store/src/tasks.rs)
-    let owned: Vec<String> = sqlx::query_scalar(
-        "SELECT execution_id FROM execution WHERE execution_id = ANY($1) AND project_id = $2 AND owner_replica = $3",
-    )
-    .bind(&req.execution_ids)
-    .bind(req.project_id)
-    .bind(replica)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("owned executions")))?;
-    let cancels = state.tasks.cancels_asked(req.project_id, owned).await.map_err(internal)?;
-    Ok(Json(TaskCancelsAskedResponse { cancels }))
 }
 
 // ---------- Infra ----------
@@ -849,14 +528,24 @@ fn require_declared_infra(
 /// A machine running `project_id`'s infra says how its units stand
 /// changed: announce it, which wakes a supervisor that scales to zero to
 /// look at the project's health (`lifecycle_command::LOOK_WAKE`). The
-/// machine runs as its project's own account, so a project asks only
-/// about itself; weft's own roles may ask about any.
+/// machine's token names the copy it runs, so it asks only about that
+/// copy's project; a worker asks about its own, weft's own roles about
+/// any.
 pub async fn infra_look(
     State(state): State<Arc<BrokerState>>,
-    AuthedCaller(caller): AuthedCaller,
+    headers: axum::http::HeaderMap,
     Json(req): Json<InfraLookRequest>,
 ) -> Resp<InfraLookResponse> {
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id).await?;
+    match crate::auth::verified_principal(&state, &headers).await? {
+        weft_platform_traits::identity::Principal::InfraCopy { project, .. } if project == req.project_id => {}
+        weft_platform_traits::identity::Principal::InfraCopy { .. } => {
+            return Err((StatusCode::FORBIDDEN, "an infra machine asks for a look at its own project only".into()))
+        }
+        _ => {
+            let caller = crate::auth::extract_identity(&state, &headers).await?;
+            scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id).await?;
+        }
+    }
     sqlx::query("SELECT pg_notify($1, $2)")
         .bind(weft_broker_client::lifecycle_command::INFRA_COMMAND_CHANNEL)
         .bind(weft_broker_client::lifecycle_command::look_payload(req.project_id))
@@ -878,7 +567,7 @@ pub async fn infra_endpoint_url(
     // that instance's runs may reach; one naming none is the shared copy,
     // and a per-instance node has no shared row to find.
     require_worker(&caller)?;
-    let run = scope::require_execution_id_scope(&state.scope_cache, &state.pool, &caller, &req.execution_id.to_string())
+    let run = scope::require_execution_id_scope(&state.scope_cache, &state.pool, &caller, req.execution_id)
         .await?;
     let instance = req.infra.instance();
     if instance.is_some() && instance != run.instance.as_ref() {
@@ -906,6 +595,62 @@ pub async fn infra_endpoint_url(
         .await
         .map_err(internal)?;
     Ok(Json(InfraEndpointUrlResponse { address }))
+}
+
+/// `POST /v1/infra/baked`: what an infra node's copy saved for its baked
+/// outputs, for a run of the node (`InfraReader::baked_outputs`). The run
+/// is the caller's own, and the copy is the shared one or the run's own
+/// instance's, like an endpoint's.
+pub async fn infra_baked(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<weft_broker_client::protocol::InfraBakedRequest>,
+) -> Resp<weft_broker_client::protocol::InfraBakedResponse> {
+    require_worker(&caller)?;
+    let run = scope::require_execution_id_scope(&state.scope_cache, &state.pool, &caller, req.execution_id)
+        .await?;
+    if req.instance.is_some() && req.instance != run.instance {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("{}'s copy belongs to another instance than the run asking for it; a run reads only its own instance's infra", req.place),
+        ));
+    }
+    let saved = state.infra.baked_outputs(run.project, &req.place, req.instance.as_ref()).await.map_err(internal)?;
+    Ok(Json(weft_broker_client::protocol::InfraBakedResponse { saved }))
+}
+
+/// `POST /v1/infra/bake`: see [`weft_broker_client::protocol::InfraBakeRequest`].
+pub async fn infra_bake(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<weft_broker_client::protocol::InfraBakeRequest>,
+) -> Resp<serde_json::Value> {
+    require_worker(&caller)?;
+    let run = scope::require_execution_id_scope(&state.scope_cache, &state.pool, &caller, req.execution_id)
+        .await?;
+    if req.instance.is_some() && req.instance != run.instance {
+        return Err((StatusCode::FORBIDDEN, format!("{}'s copy belongs to another instance than the run saving it", req.place)));
+    }
+    let phase: Option<String> = sqlx::query_scalar("SELECT phase FROM run WHERE execution_id = $1")
+        .bind(req.execution_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read the run's phase")))?;
+    if phase.as_deref() != Some(weft_core::context::Phase::InfraSetup.as_str()) {
+        return Err((StatusCode::FORBIDDEN, "only an infra setup saves what an infra node bakes".into()));
+    }
+    let written = sqlx::query("UPDATE infra_node SET baked_json = baked_json || $4 WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3")
+        .bind(run.project)
+        .bind(&req.place)
+        .bind(req.instance.as_ref().map(|i| i.as_str()))
+        .bind(sqlx::types::Json(&req.values))
+        .execute(&state.pool)
+        .await
+        .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("save what an infra node baked")))?;
+    if written.rows_affected() == 0 {
+        return Err((StatusCode::CONFLICT, format!("{} has no infra copy here to save what it baked with", req.place)));
+    }
+    Ok(Json(serde_json::json!({})))
 }
 
 /// Worker fetches a project definition at execution claim time,
@@ -968,7 +713,7 @@ pub async fn project_fetch_definition(
 async fn worker_execution_scope(
     state: &BrokerState,
     caller: &crate::auth::CallerIdentity,
-    execution_id: &str,
+    execution_id: weft_core::ExecutionId,
 ) -> Result<scope::ExecutionScope, (StatusCode, String)> {
     if caller.role != Role::Worker {
         return Err((StatusCode::FORBIDDEN, "worker only".into()));
@@ -994,7 +739,7 @@ pub async fn resolve_connection(
     AuthedCaller(caller): AuthedCaller,
     Json(req): Json<ResolveConnectionRequest>,
 ) -> Resp<ResolveConnectionResponse> {
-    let owner = worker_execution_scope(&state, &caller, &req.execution_id).await?;
+    let owner = worker_execution_scope(&state, &caller, req.execution_id).await?;
     let tenant = owner.tenant.clone();
     let connection_id: uuid::Uuid = req.connection_id.parse().map_err(|_| {
         (StatusCode::BAD_REQUEST, format!("malformed connection id '{}'", req.connection_id))
@@ -1031,6 +776,7 @@ pub async fn resolve_connection(
             relay_url: None,
             owner: resolved.owner,
             keep_until_unix: Some(resolved.fresh_until.map_or(i64::MAX, |at| at.timestamp())),
+            published_by: resolved.published_by,
         },
         weft_core::CredentialOwner::Platform => {
             // The row's service (already matched against the request)
@@ -1040,7 +786,7 @@ pub async fn resolve_connection(
                 .map_err(internal)?;
             let key_req = crate::credential::KeyRequest {
                 tenant,
-                execution_id: req.execution_id.clone(),
+                execution_id: req.execution_id,
                 project_id: owner.project,
                 node_id: req.node_id,
                 frames: req.frames,
@@ -1062,6 +808,7 @@ pub async fn resolve_connection(
                         owner: resolved.owner,
                         // Leased per firing: never kept.
                         keep_until_unix: None,
+                        published_by: resolved.published_by,
                     }
                 }
                 crate::credential::KeyResolution::NotConfigured => {
@@ -1097,7 +844,7 @@ pub async fn release_connection(
     AuthedCaller(caller): AuthedCaller,
     Json(req): Json<ReleaseConnectionRequest>,
 ) -> Resp<ReleaseConnectionResponse> {
-    let tenant = worker_execution_scope(&state, &caller, &req.execution_id).await?.tenant;
+    let tenant = worker_execution_scope(&state, &caller, req.execution_id).await?.tenant;
     for value in req.values.values() {
         state.credentials.close(&state.pool, value, &tenant).await.map_err(internal)?;
     }
@@ -1120,7 +867,7 @@ pub async fn publish_access(
     AuthedCaller(caller): AuthedCaller,
     Json(mut req): Json<PublishAccessRequest>,
 ) -> Resp<PublishAccessResponse> {
-    let owner = publisher_scope(&state, &caller, &req.execution_id, &mut req.node_id).await?;
+    let owner = publisher_scope(&state, &caller, req.execution_id, &mut req.node_id).await?;
     if req.spec.service != req.service {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1157,7 +904,7 @@ pub async fn published_access(
     AuthedCaller(caller): AuthedCaller,
     Json(mut req): Json<PublishedAccessRequest>,
 ) -> Resp<PublishedAccessResponse> {
-    let owner = publisher_scope(&state, &caller, &req.execution_id, &mut req.node_id).await?;
+    let owner = publisher_scope(&state, &caller, req.execution_id, &mut req.node_id).await?;
     let found = weft_access_store::published_connection(
         &state.pool,
         &owner.tenant,
@@ -1184,7 +931,7 @@ pub async fn published_access(
 async fn publisher_scope(
     state: &BrokerState,
     caller: &crate::auth::CallerIdentity,
-    execution_id: &str,
+    execution_id: weft_core::ExecutionId,
     node_id: &mut String,
 ) -> Result<scope::ExecutionScope, (StatusCode, String)> {
     let owner = worker_execution_scope(state, caller, execution_id).await?;
@@ -1598,7 +1345,11 @@ async fn write_apply_row(
     // row snapshot. Every variable is a bind: no SQL built by string
     // interpolation. `applied_at_unix` uses the DB clock (consistent
     // with every other timestamp write in this file), gated on the
-    // bound `$6` flag via CASE.
+    // bound `$6` flag via CASE. A row still `terminating` is a copy whose
+    // terminate never finished, which this apply finished and replaces:
+    // what it saved for its baked outputs is the dead copy's, so it goes
+    // (a bake only writes the outputs its setup sent on, over what is
+    // there).
     let res = sqlx::query(
         &format!("INSERT INTO infra_node \
          (project_id, node_id, instance_id, copy_id, status, \
@@ -1618,6 +1369,8 @@ async fn write_apply_row(
            AND completed_at_unix IS NULL \
            AND {owns} \
          ON CONFLICT (project_id, node_id, instance_id) DO UPDATE SET \
+            baked_json         = CASE WHEN infra_node.status = 'terminating' \
+                                      THEN '{{}}'::jsonb ELSE infra_node.baked_json END, \
             copy_id            = EXCLUDED.copy_id, \
             status             = EXCLUDED.status, \
             failure_stage      = NULL, \
@@ -1774,10 +1527,8 @@ pub async fn supervisor_enqueue_lifecycle(
     }
     // The typed `LifecycleSpec` only constructs `Deactivate(...)` /
     // `Reactivate(...)`, so a caller can't enqueue a supervisor-owned
-    // verb here. `into_row_columns()` returns running_policy =
-    // None for both variants (Deactivate carries it inside
-    // spec_json; Reactivate has no policy). Bind NULL.
-    let (verb, running_policy, spec_json) = req.spec.into_row_columns();
+    // verb here.
+    let (verb, spec_json) = req.spec.into_row_columns();
     let issued_by_replica = caller.replica.as_deref().ok_or_else(|| {
         (
             StatusCode::FORBIDDEN,
@@ -1794,7 +1545,6 @@ pub async fn supervisor_enqueue_lifecycle(
             // copies; the column stays at its shared default.
             copies: &weft_core::instance::Copies::Shared,
             verb,
-            running_policy,
             spec_json: spec_json.as_ref(),
             issued_by_replica,
         },
@@ -1855,6 +1605,29 @@ pub async fn supervisor_project_image_tags(
     Ok(Json(SupervisorProjectImageTagsResponse { tags }))
 }
 
+/// `POST /v1/infra/pushed`: what changed of the values one infra copy's
+/// node handed weft (`weft_core::infra::bake::PushedValues`), from the
+/// agent beside that copy (`weft_platform_traits::unit_agent::VALUES_PATH`).
+/// The agent's identity names its copy, and that copy is the only one it
+/// can write.
+pub async fn infra_pushed(
+    State(state): State<Arc<BrokerState>>,
+    headers: axum::http::HeaderMap,
+    Json(values): Json<weft_core::infra::bake::PushedValues>,
+) -> Resp<serde_json::Value> {
+    let weft_platform_traits::identity::Principal::InfraCopy { project, copy_id, .. } = crate::auth::verified_principal(&state, &headers).await? else {
+        return Err((StatusCode::FORBIDDEN, "only the agent beside an infra copy pushes that copy's values".into()));
+    };
+    weft_access_store::write_pushed_values(&state.pool, project, &copy_id, &values).await.map_err(|e| {
+        match e.downcast_ref::<weft_access_store::AccessError>() {
+            // The values name nothing the node handed weft: the infra's fault.
+            Some(weft_access_store::AccessError::Invalid(why)) => (StatusCode::UNPROCESSABLE_ENTITY, why.clone()),
+            _ => unavailable_or_internal(e.context("write what an infra said changed")),
+        }
+    })?;
+    Ok(Json(serde_json::json!({})))
+}
+
 /// Worker-callable: enqueue an Apply lifecycle command after the
 /// engine's local skip/fresh/replace decision. The owning supervisor's
 /// held claim wakes on the row's own notification and picks it up.
@@ -1881,8 +1654,6 @@ pub async fn infra_enqueue_apply(
             "worker token missing replica claim".to_string(),
         )
     })?;
-    // Apply doesn't carry a running_policy (no in-flight executions
-    // to drain; the supervisor just applies).
     let command_id = crate::lifecycle_writes::issue_command(
         &state.pool,
         &crate::lifecycle_writes::IssuedCommand {
@@ -1891,7 +1662,6 @@ pub async fn infra_enqueue_apply(
             node_id: Some(&req.node_id),
             copies: &weft_core::instance::Copies::of(req.instance.clone()),
             verb: weft_broker_client::protocol::InfraLifecycleVerb::Apply,
-            running_policy: None,
             spec_json: Some(&req.spec_json),
             issued_by_replica,
         },
@@ -2150,20 +1920,6 @@ pub async fn supervisor_trigger_deps(
     Ok(Json(SupervisorTriggerDepsResponse { deps }))
 }
 
-pub async fn supervisor_running_count(
-    State(state): State<Arc<BrokerState>>,
-    AuthedCaller(caller): AuthedCaller,
-    Json(req): Json<SupervisorRunningCountRequest>,
-) -> Resp<SupervisorRunningCountResponse> {
-    require_supervisor(&caller)?;
-    scope::require_project_owned_by(&state.scope_cache, &state.pool, &caller, req.project_id)
-        .await?;
-    let running_count = crate::lifecycle_writes::live_run_count(&state.pool, req.project_id, &req.copies)
-        .await
-        .map_err(internal)?;
-    Ok(Json(SupervisorRunningCountResponse { running_count }))
-}
-
 /// The project's uncompleted supervisor commands (apply / stop /
 /// terminate), each as the copies it acts on. The supervisor's health
 /// loop stands down for exactly those copies, so an autonomous health
@@ -2325,6 +2081,37 @@ pub async fn signal_list_held(
     // project's when an activation asks.
     let out = crate::held_signals::signals_held(&state.pool, req.project).await.map_err(internal)?;
     Ok(Json(SignalListHeldResponse { rows: out }))
+}
+
+/// Where an event of a signal goes (`SignalFireTarget`): its project, and
+/// the address of the project's front, which the listener hands an
+/// entry's event to.
+pub async fn signal_fire_target(
+    State(state): State<Arc<BrokerState>>,
+    AuthedCaller(caller): AuthedCaller,
+    Json(req): Json<weft_broker_client::protocol::SignalFireTargetRequest>,
+) -> Resp<Option<weft_broker_client::protocol::SignalFireTarget>> {
+    if caller.role != Role::Listener {
+        return Err((StatusCode::FORBIDDEN, "listener only".into()));
+    }
+    let row: Option<(uuid::Uuid, bool, Option<serde_json::Value>)> = sqlx::query_as(
+        "SELECT s.project_id, s.is_resume, p.api_address FROM signal s LEFT JOIN project p ON p.id = s.project_id WHERE s.token = $1",
+    )
+    .bind(&req.token)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| unavailable_or_internal(anyhow::Error::from(e).context("read a signal's project")))?;
+    let Some((project_id, is_resume, address)) = row else { return Ok(Json(None)) };
+    // Only an address that serves: one the project's front could not open
+    // says why instead.
+    let address = match address.map(serde_json::from_value::<weft_core::projects::ProjectAddress>).transpose() {
+        Ok(Some(weft_core::projects::ProjectAddress::Serving { url })) => Some(url),
+        Ok(Some(weft_core::projects::ProjectAddress::Unavailable { .. }) | None) => None,
+        Err(e) => {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("project {project_id}'s stored address does not read back: {e}")));
+        }
+    };
+    Ok(Json(Some(weft_broker_client::protocol::SignalFireTarget { project_id, is_resume, address })))
 }
 
 /// One held signal by token: what the listener loads a signal it has not
@@ -2507,7 +2294,7 @@ pub(crate) fn unavailable_or_internal(e: anyhow::Error) -> (StatusCode, String) 
     }
     if causes().any(database_unreachable) {
         tracing::warn!(target: "weft_broker", "could not reach the database: {e:#}");
-        return (StatusCode::SERVICE_UNAVAILABLE, "the database is unavailable; ask again".into());
+        return (StatusCode::SERVICE_UNAVAILABLE, "the database connection dropped, or the database is unavailable; ask again".into());
     }
     internal(e)
 }
