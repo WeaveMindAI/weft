@@ -243,6 +243,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # svelte-check reads the connect library's own sources and its
+      # svelte.config, whose packages live in the editor's workspace:
+      # the library borrows that install, as it does locally.
+      - uses: ./.github/actions/setup-node-workspace
+        with:
+          workspace: extension-vscode
+          borrow-packages: packages/weft-connect
       - uses: ./.github/actions/setup-node-workspace
         with:
           workspace: extension-browser
