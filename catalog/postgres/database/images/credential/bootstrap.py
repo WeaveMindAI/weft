@@ -275,7 +275,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # until weft is told the new one.
         unheard = push_password(password)
         if unheard is not None:
-            sys.stderr.write(f"credential: weft was not told the new password: {unheard}\n")
             self._send(200, {"result": {"error": (
                 f"the database has a new password, but weft could not be told ({unheard}), so the "
                 "program still signs in with the old one. Run `weft infra rebake` on this node: "
