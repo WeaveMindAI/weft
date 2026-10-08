@@ -149,6 +149,53 @@ async fn guard_token_doors(
     response
 }
 
+/// The layer that tells a CLI built from another weft commit than the
+/// install runs: its answer carries one sentence the CLI prints as a
+/// warning ([`weft_core::install::VERSION_NOTE_HEADER`]). Never a refusal:
+/// the install compiles projects itself, so such a CLI usually works.
+async fn note_cli_version(
+    axum::extract::State(state): axum::extract::State<DispatcherState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let cli_commit = request
+        .headers()
+        .get(weft_core::install::CLI_COMMIT_HEADER)
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+    let mut response = next.run(request).await;
+    let note = cli_commit.and_then(|commit| version_note(state.install_info.source.as_ref(), &commit));
+    if let Some(note) = note {
+        match axum::http::HeaderValue::from_str(&note) {
+            Ok(value) => {
+                response.headers_mut().insert(weft_core::install::VERSION_NOTE_HEADER, value);
+            }
+            // The note quotes what the CLI sent, so a commit with bytes a
+            // header cannot carry is not a real one: the answer goes out
+            // without a note, and the log says why.
+            Err(e) => tracing::warn!(target: "weft_dispatcher::api", error = %e, "a version note is not a valid header value"),
+        }
+    }
+    response
+}
+
+/// What to tell a CLI built from `cli_commit` about the weft the install
+/// runs: a sentence when the two differ, `None` when they agree or the
+/// install does not know its own source (a local install).
+fn version_note(source: Option<&weft_core::install::WeftSource>, cli_commit: &str) -> Option<String> {
+    let source = source?;
+    let cli_commit = cli_commit.trim();
+    if cli_commit == source.commit {
+        return None;
+    }
+    let short = |commit: &str| commit.chars().take(12).collect::<String>();
+    Some(format!(
+        "this weft CLI was built from {}, but the install runs {} at {}; if a command misbehaves, use the install's CLI",
+        short(cli_commit),
+        source.repository,
+        short(&source.commit),
+    ))
+}
+
 impl HoldQuery {
     pub fn hold(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.wait_ms).min(weft_task_store::pg_signal::MAX_HOLD)
@@ -507,7 +554,9 @@ pub fn permissive_cors() -> CorsLayer {
 /// surface (see [`core_routes`]).
 pub fn router(state: DispatcherState, cors: CorsLayer) -> Router {
     let hops = TrustedHops(state.edge.trusted_proxy_hops.public);
-    with_hops(core_routes(cors, state.clone()), hops).with_state(state)
+    let routes = core_routes(cors, state.clone())
+        .layer(axum::middleware::from_fn_with_state(state.clone(), note_cli_version));
+    with_hops(routes, hops).with_state(state)
 }
 
 /// Only the doors outside callers use (the public trigger surface, the
@@ -531,5 +580,25 @@ mod token_door_tests {
         for other in ["/public/files/x", "/events/slack/message", "/local/hook", "/signals", "/connect/local/chat"] {
             assert!(!super::is_token_door(other), "{other}");
         }
+    }
+}
+
+#[cfg(test)]
+mod version_note_tests {
+    use weft_core::install::WeftSource;
+
+    #[test]
+    fn only_a_cli_from_another_commit_of_a_known_source_is_told() {
+        let source = WeftSource { repository: "me/weft".into(), commit: "0123456789abcdef0123".into() };
+        assert_eq!(super::version_note(Some(&source), "0123456789abcdef0123"), None);
+        assert_eq!(
+            super::version_note(Some(&source), "fedcba9876543210fedc").as_deref(),
+            Some(
+                "this weft CLI was built from fedcba987654, but the install runs me/weft at 0123456789ab; \
+                 if a command misbehaves, use the install's CLI"
+            )
+        );
+        // A local install does not know its source, so it has nothing to compare.
+        assert_eq!(super::version_note(None, "fedcba9876543210fedc"), None);
     }
 }

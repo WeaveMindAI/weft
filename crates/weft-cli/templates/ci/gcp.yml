@@ -44,16 +44,31 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The source of the exact weft the install runs (the CLI compiles the
-      # project against its nodes), and its CLI: a project compiled by
-      # another weft is refused there. The CLI weft's release built from
-      # that source (waited for when the release is still being built),
-      # otherwise built here from a cache that keeps the dependencies
-      # between runs, so a newer weft compiles only what changed in it.
+      # The weft the install runs, asked of the install itself on every run,
+      # so an install upgraded since `weft target export` is followed here
+      # with no setting to change. The CLI below is that weft's own (it
+      # reads the project's nodes from this source), so what it sends is
+      # what the install expects. weft's release of that CLI is downloaded
+      # (waited for while it is still being built), otherwise it is built
+      # here from a cache that keeps the dependencies between runs, so a
+      # newer weft compiles only what changed in it.
+      - name: ask the install which weft it runs
+        id: source
+        run: |
+          install=$(curl -fsS -H "Authorization: Bearer $WEFT_OPERATOR_KEY" "${{ vars.WEFT_PUBLIC_URL }}/install")
+          repository=$(jq -r '.source.repository // empty' <<<"$install")
+          commit=$(jq -r '.source.commit // empty' <<<"$install")
+          if [ -z "$repository" ] || [ -z "$commit" ]; then
+            echo "::error::${{ vars.WEFT_PUBLIC_URL }} does not say which weft it runs, so there is no CLI to deploy with; run its install workflow again"
+            exit 1
+          fi
+          echo "repository=$repository" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+
       - uses: actions/checkout@v7
         with:
-          repository: ${{ vars.WEFT_SOURCE_REPOSITORY }}
-          ref: ${{ vars.WEFT_SOURCE_COMMIT }}
+          repository: ${{ steps.source.outputs.repository }}
+          ref: ${{ steps.source.outputs.commit }}
           path: .weft
 
       - name: download the weft CLI
@@ -76,6 +91,8 @@ jobs:
         if: steps.download.outputs.found != 'yes'
         with:
           workspaces: .weft -> target
+          # A run that fails after compiling keeps its compile for the next run.
+          cache-on-failure: true
       - name: build the weft CLI
         if: steps.download.outputs.found != 'yes'
         working-directory: .weft

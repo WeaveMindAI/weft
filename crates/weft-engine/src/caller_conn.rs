@@ -830,11 +830,6 @@ async fn recv_from_log(
     }
 }
 
-/// A future that resolves once the session cap elapses, or NEVER when the
-/// cap is `0` (no cap). The single legitimate deadline on a live exchange:
-/// per-message waits are unbounded, but the author can bound the TOTAL
-/// session via `max_session_secs` to cap a multiplexing process's RAM/abuse.
-/// Uses the injected clock so the rig can advance it deterministically.
 /// One write to the caller, raced against the exchange ending under it:
 /// `gone` (the caller's side going away, where the transport says so
 /// without a write) and the `session` cap. A caller that stops reading
@@ -852,6 +847,11 @@ async fn write_or_end(
     }
 }
 
+/// A future that resolves once the session cap elapses, or NEVER when the
+/// cap is `0` (no cap). The single legitimate deadline on a live exchange:
+/// per-message waits are unbounded, but the author can bound the TOTAL
+/// session via `max_session_secs` to cap a multiplexing process's RAM/abuse.
+/// Uses the injected clock so the rig can advance it deterministically.
 fn session_deadline(clock: &Arc<dyn weft_platform_traits::Clock>, cap_secs: u64) -> futures::future::BoxFuture<'static, ()> {
     let clock = clock.clone();
     Box::pin(async move {
@@ -861,6 +861,41 @@ fn session_deadline(clock: &Arc<dyn weft_platform_traits::Clock>, cap_secs: u64)
             clock.sleep(std::time::Duration::from_secs(cap_secs)).await;
         }
     })
+}
+
+/// The heartbeat of a live exchange: fires once the exchange has sent the
+/// caller nothing for a whole period, and again for each further quiet
+/// period. It starts one period late and [`QuietTimer::sent`] starts the
+/// period over, so a stream that is talking never gets a heartbeat between
+/// its own items. A period of `0` (no heartbeat) never fires.
+struct QuietTimer(Option<tokio::time::Interval>);
+
+impl QuietTimer {
+    fn new(period_secs: u64) -> Self {
+        Self((period_secs != 0).then(|| {
+            let period = std::time::Duration::from_secs(period_secs);
+            let mut iv = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            iv
+        }))
+    }
+
+    /// Something real reached the caller: the quiet period starts over.
+    fn sent(&mut self) {
+        if let Some(iv) = &mut self.0 {
+            iv.reset();
+        }
+    }
+
+    /// Resolves once the exchange has been quiet for a whole period.
+    async fn quiet(&mut self) {
+        match &mut self.0 {
+            Some(iv) => {
+                iv.tick().await;
+            }
+            None => std::future::pending().await,
+        }
+    }
 }
 
 /// One exchange's record: the sink its `Caller*` rows go to and the
@@ -1730,8 +1765,9 @@ struct StreamedAnswer {
 /// A caller who leaves is found two ways, neither of which needs the
 /// program to write. The body's receiver is dropped when the response goes
 /// away (the connection reset under it), and `tx.closed()` says so at once.
-/// And on every heartbeat the feeder writes the head's `keepalive` filler
-/// (the bytes a reader of that framing ignores), because a proxy on the way
+/// And once the body has carried nothing for a whole heartbeat, the feeder
+/// writes the head's `keepalive` filler (the bytes a reader of that framing
+/// ignores), because a proxy on the way
 /// may keep our side open after the far side hung up, and only a write
 /// finds that out. A head with no filler (a raw stream) relies on the
 /// receiver alone.
@@ -1739,15 +1775,11 @@ fn stream_body(answer: StreamedAnswer) -> axum::body::Body {
     let (tx, rx) = mpsc::channel::<Result<Vec<u8>, std::io::Error>>(16);
     tokio::spawn(async move {
         let StreamedAnswer { conn, outbound, canceller, execution_id, head, first, heartbeat_secs, mut session } = answer;
-        let mut heartbeat = (heartbeat_secs != 0).then(|| {
-            let mut iv = tokio::time::interval(std::time::Duration::from_secs(heartbeat_secs));
-            iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            iv
-        });
+        let mut heartbeat = QuietTimer::new(heartbeat_secs);
         let end = 'feed: {
             let sent = async { tx.send(Ok(chunk_to_bytes(&first))).await.is_ok() };
             match write_or_end(sent, tx.closed(), &mut session).await {
-                Ok(true) => {}
+                Ok(true) => heartbeat.sent(),
                 Ok(false) => break 'feed ExchangeEnd::CallerHungUp,
                 Err(end) => break 'feed end,
             }
@@ -1764,7 +1796,7 @@ fn stream_body(answer: StreamedAnswer) -> axum::body::Body {
                         Some(Outbound::Chunk(c)) => {
                             let sent = async { tx.send(Ok(chunk_to_bytes(&c))).await.is_ok() };
                             match write_or_end(sent, tx.closed(), &mut session).await {
-                                Ok(true) => {}
+                                Ok(true) => heartbeat.sent(),
                                 Ok(false) => break 'feed ExchangeEnd::CallerHungUp,
                                 Err(end) => break 'feed end,
                             }
@@ -1796,9 +1828,10 @@ fn stream_body(answer: StreamedAnswer) -> axum::body::Body {
                     },
                     // The caller's side of the body is gone.
                     _ = tx.closed() => break 'feed ExchangeEnd::CallerHungUp,
-                    // Quiet body: write the framing's filler, and a failed
-                    // write is the caller gone.
-                    _ = async { heartbeat.as_mut().expect("armed").tick().await }, if heartbeat.is_some() => {
+                    // A body quiet for a whole heartbeat: write the
+                    // framing's filler, and a failed write is the caller
+                    // gone.
+                    () = heartbeat.quiet() => {
                         if let Some(filler) = head.keepalive.as_deref() {
                             let sent = async { tx.send(Ok(filler.as_bytes().to_vec())).await.is_ok() };
                             match write_or_end(sent, tx.closed(), &mut session).await {
@@ -1870,14 +1903,8 @@ async fn pump_ws(mut socket: WebSocket, pump: SocketPump, unopened: Unopened) {
     let mut session = session_deadline(&clock, config.max_session_secs);
 
     // Single task owns the socket (recv + send are on one WebSocket).
-    // Outbound chunks and heartbeat pings funnel through a select. Build the
-    // heartbeat ticker ONLY when a heartbeat is configured; with none, the
-    // arm is disabled and no phantom ticker is constructed.
-    let mut heartbeat = (heartbeat_secs != 0).then(|| {
-        let mut iv = tokio::time::interval(std::time::Duration::from_secs(heartbeat_secs));
-        iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        iv
-    });
+    // Outbound chunks and heartbeat pings funnel through a select.
+    let mut heartbeat = QuietTimer::new(heartbeat_secs);
 
     let reason = loop {
         tokio::select! {
@@ -1931,7 +1958,7 @@ async fn pump_ws(mut socket: WebSocket, pump: SocketPump, unopened: Unopened) {
                 Some(Outbound::Chunk(c)) => {
                     let sent = async { socket.send(chunk_to_ws(&c)).await.is_ok() };
                     match write_or_end(sent, std::future::pending(), &mut session).await {
-                        Ok(true) => {}
+                        Ok(true) => heartbeat.sent(),
                         Ok(false) => break ExchangeEnd::CallerHungUpOnSend,
                         Err(end) => break end,
                     }
@@ -1970,10 +1997,9 @@ async fn pump_ws(mut socket: WebSocket, pump: SocketPump, unopened: Unopened) {
                 }
                 None => break ExchangeEnd::OutboundQueueClosed,
             },
-            // Keep-alive ping (worker-side; browsers can't ping us). The arm
-            // only exists when a heartbeat is configured (`heartbeat` is
-            // `Some`); otherwise it is permanently disabled.
-            _ = async { heartbeat.as_mut().unwrap().tick().await }, if heartbeat.is_some() => {
+            // Keep-alive ping on a socket quiet for a whole heartbeat
+            // (worker-side; browsers can't ping us).
+            () = heartbeat.quiet() => {
                 let sent = async { socket.send(Message::Ping(Vec::new().into())).await.is_ok() };
                 match write_or_end(sent, std::future::pending(), &mut session).await {
                     Ok(true) => {}
@@ -2655,6 +2681,56 @@ mod tests {
             let filler = body.next().await.unwrap().unwrap();
             assert_eq!(&filler[..], b": keepalive\n\n");
         }
+    }
+
+    /// A program that streams three ndjson rows under a head whose filler
+    /// is a bare newline, 1.5 seconds apart (each gap shorter than a
+    /// 2-second heartbeat), and then says nothing.
+    async fn talking_feed(conn: Arc<LiveCallerConnection>) {
+        let CallerHandle::Http(http) = CallerHandle::from_connection(conn) else { unreachable!() };
+        let head = ResponseHead::new(200).with_header("content-type", "application/x-ndjson").with_keepalive("\n");
+        let gap = std::time::Duration::from_millis(1500);
+        http.write_with(head, OutboundChunk::Text("{\"i\":1}\n".into())).await.unwrap();
+        tokio::time::sleep(gap).await;
+        http.write(OutboundChunk::Text("{\"i\":2}\n".into())).await.unwrap();
+        tokio::time::sleep(gap).await;
+        http.write(OutboundChunk::Text("{\"i\":3}\n".into())).await.unwrap();
+        std::future::pending::<()>().await;
+    }
+
+    /// A stream that keeps talking gets no filler between its rows: the
+    /// heartbeat starts one period after a write, and every row starts the
+    /// period over. An ndjson filler there is an empty line in the
+    /// caller's data.
+    #[tokio::test(start_paused = true)]
+    async fn a_talking_stream_gets_no_filler_between_its_items() {
+        use tokio_stream::StreamExt as _;
+        let (response, _, _) = open_feed(2, talking_feed).await;
+        let mut body = response.into_body().into_data_stream();
+        for row in [&b"{\"i\":1}\n"[..], b"{\"i\":2}\n", b"{\"i\":3}\n"] {
+            let got = body.next().await.unwrap().unwrap();
+            assert_eq!(&got[..], row, "a filler went out between the stream's own rows");
+        }
+    }
+
+    /// Once the stream stops talking, the filler comes a whole heartbeat
+    /// after its last row, and not before.
+    #[tokio::test(start_paused = true)]
+    async fn a_filler_follows_a_full_quiet_period_after_the_last_item() {
+        use tokio_stream::StreamExt as _;
+        let (response, _, _) = open_feed(2, talking_feed).await;
+        let mut body = response.into_body().into_data_stream();
+        for _ in 0..3 {
+            body.next().await.unwrap().unwrap();
+        }
+        let last_row = tokio::time::Instant::now();
+        let filler = body.next().await.unwrap().unwrap();
+        assert_eq!(&filler[..], b"\n");
+        let quiet = last_row.elapsed();
+        assert!(
+            quiet >= std::time::Duration::from_secs(2) && quiet < std::time::Duration::from_millis(2100),
+            "the filler came {quiet:?} after the last row, not one heartbeat"
+        );
     }
 
     /// The caller hangs up while the feed is quiet: the body's receiver

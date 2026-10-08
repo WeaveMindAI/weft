@@ -238,17 +238,17 @@ fn repository_settings(
             info.public_url
         );
     };
-    let source = info.source.as_ref().with_context(|| {
-        format!(
-            "{} does not say which weft it runs; run its install workflow again",
-            info.public_url
-        )
-    })?;
+    // The workflow asks the install which weft it runs on every run and
+    // builds that weft's CLI, so an install that cannot say would fail
+    // every deploy.
+    anyhow::ensure!(
+        info.source.is_some(),
+        "{} does not say which weft it runs, so its deploy workflow would have no CLI to deploy with; run its install workflow again",
+        info.public_url
+    );
     Ok(RepositorySettings {
         variables: vec![
             ("WEFT_TARGET", target.to_string()),
-            ("WEFT_SOURCE_REPOSITORY", source.repository.clone()),
-            ("WEFT_SOURCE_COMMIT", source.commit.clone()),
             ("WEFT_PUBLIC_URL", info.public_url.clone()),
             ("GCP_PROJECT_ID", gcp.project.clone()),
             ("GCP_REGION", gcp.region.clone()),
@@ -813,7 +813,7 @@ mod tests {
         };
         let settings = repository_settings("prod", &info, keys()).unwrap();
         assert!(settings.variables.contains(&("WEFT_TARGET", "prod".into())));
-        assert!(settings.variables.contains(&("WEFT_SOURCE_COMMIT", "abc".into())));
+        assert!(!settings.variables.iter().any(|(k, _)| k.starts_with("WEFT_SOURCE")), "the workflow asks the install which weft it runs");
         assert!(settings.secrets.contains(&("WEFT_FRONTEND_TOKEN", "fr".into())));
         assert!(settings.variables.contains(&("WEFT_FRONTEND_SERVICE", "fe-svc".into())));
         let alone = repository_settings("prod", &info, CiKeys { frontend: None, ..keys() }).unwrap();

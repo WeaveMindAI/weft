@@ -153,7 +153,12 @@ the user asks for one.
 
 Upgrading weft on the cloud is merging upstream into the fork
 (`gh repo sync <fork>`) and running the workflow again, then rebuilding the
-user's CLI from that commit (`./setup.sh --cli`). Sizing (how many triggers
+user's CLI from that commit (`./setup.sh --cli`). Each program on it with
+infrastructure then needs `weft infra upgrade --on prod`, through the
+deployer: the new weft builds each piece's image anew, and `weft status --on
+prod` shows `infra: source has changed` until it is done. A program's deploy
+workflow needs nothing: it asks the install which weft it runs on every run.
+Sizing (how many triggers
 one holder takes, a holder's CPU and memory, how many builds run at once,
 the machine builds compile on) is a default in
 `deploy/terraform/gcp/variables.tf` in the fork: change it there, commit,

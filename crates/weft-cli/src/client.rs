@@ -70,7 +70,10 @@ impl DispatcherClient {
     /// is not `send`, and it still cannot leave without the key.
     pub fn event_stream(&self, path: &str) -> anyhow::Result<eventsource_client::ClientBuilder> {
         let url = format!("{}{}", self.base, path);
-        let builder = eventsource_client::ClientBuilder::for_url(&url).context("build sse client")?;
+        let mut builder = eventsource_client::ClientBuilder::for_url(&url).context("build sse client")?;
+        if let Some(commit) = CLI_COMMIT {
+            builder = builder.header(weft_core::install::CLI_COMMIT_HEADER, commit).context("build sse client")?;
+        }
         match self.current_bearer()? {
             Some(key) => builder.header("Authorization", &format!("Bearer {key}")).context("build sse client"),
             None => Ok(builder),
@@ -91,12 +94,17 @@ impl DispatcherClient {
         if let Some(key) = self.current_bearer()? {
             builder = builder.bearer_auth(key);
         }
+        if let Some(commit) = CLI_COMMIT {
+            builder = builder.header(weft_core::install::CLI_COMMIT_HEADER, commit);
+        }
         builder = match body {
             Some(body) => builder.json(body),
             None if [reqwest::Method::POST, reqwest::Method::PUT, reqwest::Method::PATCH].contains(&method) => builder.empty_body(),
             None => builder,
         };
-        builder.send().await.with_context(|| format!("{method} {url}"))
+        let resp = builder.send().await.with_context(|| format!("{method} {url}"))?;
+        warn_once_on_version_note(&resp);
+        Ok(resp)
     }
 
     /// The ONE place any client method turns an HTTP failure into an
@@ -105,8 +113,9 @@ impl DispatcherClient {
     /// already activating; wait or weft deactivate") rather than
     /// reqwest's stock "HTTP status client error (...) for url (...)"
     /// line, which buries the reason behind URL noise. Falls back to
-    /// the bare status only when the body is empty. Every verb routes
-    /// through this so they all get the same message quality.
+    /// the bare status only when the body is empty, and names an HTML
+    /// page rather than printing it (see `failure_text`). Every verb
+    /// routes through this so they all get the same message quality.
     async fn check(resp: reqwest::Response) -> anyhow::Result<reqwest::Response> {
         let status = resp.status();
         if status.is_success() {
@@ -114,8 +123,13 @@ impl DispatcherClient {
         }
         let completing = status == reqwest::StatusCode::CONFLICT
             && resp.headers().contains_key(weft_core::storage::COMPLETING_HEADER);
-        let body = resp.text().await.unwrap_or_default();
-        let msg = refusal_text(&body).unwrap_or_else(|| format!("dispatcher returned {status}"));
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body = resp.text().await.with_context(|| format!("read the body of a {status} answer"))?;
+        let msg = failure_text(status, content_type.as_deref(), &body);
         if completing {
             return Err(anyhow::Error::new(StoreCompleting).context(msg));
         }
@@ -260,6 +274,46 @@ impl DispatcherClient {
     }
 }
 
+/// The commit this CLI was built from (`build.rs`), when the build knew it.
+const CLI_COMMIT: Option<&str> = option_env!("WEFT_CLI_COMMIT");
+
+/// Print the install's version note (the CLI and the install run
+/// different weft commits) on stderr, once per process however many
+/// answers carry it. Never on stdout, which `--json` keeps for its output.
+fn warn_once_on_version_note(resp: &reqwest::Response) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    let Some(note) = resp.headers().get(weft_core::install::VERSION_NOTE_HEADER) else {
+        return;
+    };
+    let note = String::from_utf8_lossy(note.as_bytes()).into_owned();
+    WARNED.call_once(|| eprintln!("warning: {note}"));
+}
+
+/// The error a failed answer turns into. An HTML page did not come from
+/// weft (which answers in text or JSON) but from something in front of it,
+/// a load balancer or a proxy, so it is named with its title rather than
+/// printed whole. Any other body is the refusal weft wrote.
+fn failure_text(status: reqwest::StatusCode, content_type: Option<&str>, body: &str) -> String {
+    let html = content_type.is_some_and(|t| t.trim_start().to_ascii_lowercase().starts_with("text/html"));
+    if html {
+        let title = html_title(body).map(|t| format!(" (\"{t}\")")).unwrap_or_default();
+        return format!(
+            "the install's address answered {status} with an HTML page{title}, which comes from something in front of weft, not from weft itself"
+        );
+    }
+    refusal_text(body).unwrap_or_else(|| format!("dispatcher returned {status}"))
+}
+
+/// The text of an HTML page's `<title>`, with its whitespace folded;
+/// `None` when it has none or it is empty.
+fn html_title(body: &str) -> Option<String> {
+    let lower = body.to_ascii_lowercase();
+    let open = lower.find("<title")?;
+    let start = open + lower[open..].find('>')? + 1;
+    let end = start + lower[start..].find("</title")?;
+    let title = body[start..end].split_whitespace().collect::<Vec<_>>().join(" ");
+    (!title.is_empty()).then_some(title)
+}
 
 /// What a refusal's body says, as lines a person reads: a structured
 /// refusal (`{"errors": [...]}`, the shape every validation answers
@@ -278,7 +332,7 @@ pub(crate) fn refusal_text(body: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::refusal_text;
+    use super::{failure_text, refusal_text};
 
     #[test]
     fn a_structured_refusal_reads_as_its_errors() {
@@ -289,5 +343,25 @@ mod tests {
         assert_eq!(refusal_text("project is already activating").as_deref(), Some("project is already activating"));
         assert_eq!(refusal_text(r#"{"errors":[]}"#).as_deref(), Some(r#"{"errors":[]}"#));
         assert_eq!(refusal_text("  \n"), None);
+    }
+
+    #[test]
+    fn an_html_page_is_named_by_its_title_and_never_printed() {
+        let length_required = reqwest::StatusCode::LENGTH_REQUIRED;
+        let page = "<!DOCTYPE html><html><head><TITLE>Error 411 (Length Required)!!1</TITLE><style>body{}</style></head><body><p>long page</p></body></html>";
+        assert_eq!(
+            failure_text(length_required, Some("text/html; charset=UTF-8"), page),
+            "the install's address answered 411 Length Required with an HTML page (\"Error 411 (Length Required)!!1\"), \
+             which comes from something in front of weft, not from weft itself"
+        );
+        assert_eq!(
+            failure_text(reqwest::StatusCode::BAD_GATEWAY, Some("text/html"), "<html><title>\n </title>oops</html>"),
+            "the install's address answered 502 Bad Gateway with an HTML page, which comes from something in front of weft, not from weft itself"
+        );
+        assert_eq!(
+            failure_text(reqwest::StatusCode::CONFLICT, Some("text/plain; charset=utf-8"), "project is already activating"),
+            "project is already activating"
+        );
+        assert_eq!(failure_text(reqwest::StatusCode::NOT_FOUND, None, ""), "dispatcher returned 404 Not Found");
     }
 }
