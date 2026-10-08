@@ -6,6 +6,16 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The request header carrying the commit the calling weft CLI was built
+/// from, sent on every call when the build knew it.
+pub const CLI_COMMIT_HEADER: &str = "x-weft-cli-commit";
+
+/// The response header an install adds when the calling CLI was built
+/// from another commit than the weft the install runs: one sentence the
+/// CLI prints as a warning. The install never refuses a CLI for it, since
+/// it compiles projects itself and a CLI from another commit usually works.
+pub const VERSION_NOTE_HEADER: &str = "x-weft-version-note";
+
 // SYNC: InstallInfo <-> crates/weft-dispatcher/src/app.rs (install_info)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -17,8 +27,9 @@ pub struct InstallInfo {
     /// The cloud the install runs on, `None` on a local one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cloud: Option<CloudInstall>,
-    /// The weft source the install runs, so a project's CI builds the
-    /// same CLI (a project version compiled by another weft is refused).
+    /// The weft source the install runs. A project's deploy workflow reads
+    /// it on every run and deploys with that weft's CLI, and the install
+    /// compares it with the commit a CLI sends ([`CLI_COMMIT_HEADER`]).
     /// `None` on a local install, whose CLI is the one beside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<WeftSource>,

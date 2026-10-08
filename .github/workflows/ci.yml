@@ -134,13 +134,30 @@ jobs:
       # connect-a-credential diagnostics a fresh checkout produces.
       - run: scripts/validate-examples.sh
 
+  # The install's Terraform, checked against the provider versions it
+  # allows: an argument the provider does not know fails here instead of
+  # in every install. No backend and no credentials: validate reads only
+  # the files and the provider's schema.
+  terraform:
+    name: terraform validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_wrapper: false
+      - working-directory: deploy/terraform/gcp
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate
+
   # The name the main ruleset requires: green only when every Rust check
-  # above is. It runs whatever happened above (unless the run was
+  # above is, and the Terraform the install runs validates. It runs whatever happened above (unless the run was
   # cancelled), so a failure there shows here as a failure, never as a
   # skip the ruleset would wait on.
   rust:
     name: cargo test + clippy
-    needs: [test, doc, clippy, parse-only, examples]
+    needs: [test, doc, clippy, parse-only, examples, terraform]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     env:

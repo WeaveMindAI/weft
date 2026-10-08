@@ -51,8 +51,9 @@ pub struct InstallConfig {
     pub edge: EdgeConfig,
     #[serde(rename = "objectStore")]
     pub object_store: ObjectStoreSettings,
-    /// The weft source the install runs (`owner/name` and commit), so a
-    /// project's CI builds the same CLI. Absent on a local install.
+    /// The weft source the install runs (`owner/name` and commit), which a
+    /// project's CI asks for to build the same CLI, and a CLI from another
+    /// commit is warned against. Absent on a local install.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<weft_core::install::WeftSource>,
 }

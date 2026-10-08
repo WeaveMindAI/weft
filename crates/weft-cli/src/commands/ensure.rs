@@ -321,6 +321,9 @@ pub async fn build_compiled(
     // Each image once, and again when its log's address arrives: its
     // build, whether its log was said, and when it was first seen.
     let mut building: std::collections::BTreeMap<String, Seen> = std::collections::BTreeMap::new();
+    // The images this wait saw finish, in the order they did: between two
+    // images nothing is building, and the heartbeat says what is done.
+    let mut built_so_far: Vec<String> = Vec::new();
     let (status, text) = {
         // While the install builds, name each image it is building and
         // where its log is, say when each is done, and say every
@@ -345,6 +348,7 @@ pub async fn build_compiled(
                             Ok(Some(BuildState::Running)) => continue,
                             Ok(Some(BuildState::Succeeded)) => {
                                 progress.build_image_done(&image, elapsed.saturating_sub(seen.since).as_secs());
+                                built_so_far.push(image.clone());
                             }
                             Ok(Some(BuildState::Failed | BuildState::Cancelled) | None) => {}
                             // Not said built, nor listed as building any more:
@@ -384,7 +388,7 @@ pub async fn build_compiled(
             }
             if elapsed.saturating_sub(said) >= BUILD_SAY_EVERY {
                 said = elapsed;
-                progress.build_wait(elapsed, &building.keys().cloned().collect::<Vec<_>>());
+                progress.build_wait(elapsed, &building.keys().cloned().collect::<Vec<_>>(), &built_so_far);
             }
         })
         .await

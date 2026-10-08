@@ -15,6 +15,7 @@
 use anyhow::Result;
 
 use super::Ctx;
+use weft_core::infra::InfraNodeStatus;
 use weft_core::infra::wire::{
     CommandOutcome, CommandStatus, CopyRef, DoorsResponse, InfraLogs, InfraStatus, LifecycleCommandIssued, LogBlock,
     PerNodeRequest, StopRequest, SyncRequest, UpgradeRequest,
@@ -344,7 +345,7 @@ async fn infra_sync(
         let answer = crate::progress::while_waiting(
             handle.client.post_json(&path, &body),
             std::time::Duration::from_secs(10),
-            async |elapsed| progress.infra_wait("start", elapsed.as_secs(), &starting_now(&handle.client, &handle.id).await),
+            async |elapsed| progress.infra_wait("start", elapsed.as_secs(), &changing_now(&handle.client, &handle.id).await),
         )
         .await?;
         progress.dispatcher_call_done(serde_json::json!({ "project_id": handle.id }));
@@ -494,7 +495,7 @@ async fn wait_for_command(
         }
         let now = std::time::Instant::now();
         if now >= next_breadcrumb {
-            progress.infra_wait(verb, (now - start).as_secs(), &starting_now(client, project_id).await);
+            progress.infra_wait(verb, (now - start).as_secs(), &changing_now(client, project_id).await);
             next_breadcrumb = now + breadcrumb_every;
         }
     }
@@ -630,9 +631,13 @@ async fn infra_status(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// What each copy still starting is doing, one line each, for a wait's
-/// breadcrumb, after each of weft's own calls that keeps failing; a status that cannot be read is that one line instead.
-async fn starting_now(client: &crate::client::DispatcherClient, project_id: &str) -> Vec<String> {
+/// What each copy being changed is doing, one line each, for a wait's
+/// breadcrumb, after each of weft's own calls that keeps failing; a
+/// status that cannot be read is that one line instead. A copy whose
+/// start reports progress says what it waits on; a copy stopping,
+/// terminating, or provisioning before the host reports anything says
+/// only its status, so a stop or an upgrade still names what it is on.
+async fn changing_now(client: &crate::client::DispatcherClient, project_id: &str) -> Vec<String> {
     let status = match infra_status_of(client, project_id).await {
         Ok(status) => status,
         Err(e) => return vec![format!("cannot read what each copy is doing ({e:#}); the wait goes on")],
@@ -642,12 +647,18 @@ async fn starting_now(client: &crate::client::DispatcherClient, project_id: &str
     let now = crate::progress::now_unix() as i64;
     let unanswered = status.unanswered.iter().map(|u| u.describe(now));
     let copies = status.nodes.iter().filter_map(|n| {
-        let progress = n.progress.as_ref()?;
         let node = match &n.instance {
             Some(instance) => format!("{} (instance {instance})", n.node),
             None => n.node.clone(),
         };
-        Some(format!("{node}: {} {}", n.status, progress.describe_now()))
+        if let Some(progress) = &n.progress {
+            return Some(format!("{node}: {} {}", n.status, progress.describe_now()));
+        }
+        let changing = matches!(
+            InfraNodeStatus::parse(&n.status),
+            Some(InfraNodeStatus::Stopping | InfraNodeStatus::Terminating | InfraNodeStatus::Provisioning)
+        );
+        changing.then(|| format!("{node}: {}", n.status))
     });
     unanswered.chain(copies).collect()
 }

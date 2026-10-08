@@ -43,7 +43,7 @@ job, so they run side by side. The main ruleset requires four names:
 `extension versions bumped` (PRs only), `cargo test --features
 db-tests`, and two gates that are green only when every job under them
 is: `cargo test + clippy` (nextest, doc tests, clippy, the parse-only
-build, the examples) and `graph + editor` (each JS package, the VS Code
+build, the examples, the install's `terraform validate`) and `graph + editor` (each JS package, the VS Code
 extension, the WhatsApp bridge, the browser extension). The docs book
 builds beside them. On `main`, `release.yml` runs the same suite as its
 gate, and starts the builds (binaries, .vsix, browser zips) beside it;
@@ -71,6 +71,9 @@ read them for the current list. At the time of writing:
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`
 - `cargo check -p weft-compiler --no-default-features --locked`
 - `scripts/validate-examples.sh`
+- the install's Terraform, validated in a container (no Terraform needed
+  here, nothing written to the checkout):
+  `docker run --rm -v "$PWD/deploy/terraform/gcp:/w:ro" --entrypoint sh hashicorp/terraform:latest -c 'cp -r /w /tmp/w && cd /tmp/w && terraform init -backend=false -input=false >/dev/null && terraform validate'`
 - `scripts/run-db-tests.sh` (every crate, no filter)
 - `pnpm -C packages/weft-graph test`, `pnpm -C packages/weft-connect test`,
   `pnpm -C packages/weft-syntax test`, `pnpm -C extension-vscode test`,

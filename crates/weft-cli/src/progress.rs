@@ -88,7 +88,8 @@ pub enum Phase {
     /// carries `{ "image", "seconds" }`: about how long it took.
     BuildImageDone,
     /// Periodic heartbeat while the install builds. Detail carries
-    /// `{ "elapsedSeconds", "images": [...] }`: the images still building.
+    /// `{ "elapsedSeconds", "images": [...], "built": [...] }`: the images
+    /// still building, and the ones this build has finished so far.
     BuildWait,
     /// HTTP request to the dispatcher started.
     DispatcherCallStart,
@@ -309,9 +310,13 @@ impl Progress {
         self.emit(Phase::BuildImageDone, Some(serde_json::json!({ "image": image, "seconds": seconds })));
     }
 
-    /// The build goes on: `images` still building, `elapsed` since it began.
-    pub fn build_wait(&self, elapsed: std::time::Duration, images: &[String]) {
-        self.emit(Phase::BuildWait, Some(serde_json::json!({ "elapsedSeconds": elapsed.as_secs(), "images": images })));
+    /// The build goes on: `images` still building, `built` finished so
+    /// far, `elapsed` since it began.
+    pub fn build_wait(&self, elapsed: std::time::Duration, images: &[String], built: &[String]) {
+        self.emit(
+            Phase::BuildWait,
+            Some(serde_json::json!({ "elapsedSeconds": elapsed.as_secs(), "images": images, "built": built })),
+        );
     }
 
     /// `built`: the image refs the install had to build (empty when every
@@ -430,6 +435,24 @@ impl Progress {
     }
 }
 
+/// The build's heartbeat: what is building, what is built, and, between
+/// images, that the next one has not reached the builder yet (the line
+/// never names nothing).
+fn build_wait_line(elapsed: u64, building: &[&str], built: &[&str]) -> String {
+    let so_far = elapsed_text(elapsed);
+    match (building, built) {
+        ([], []) => format!("  still building ({so_far} so far): the first image has not started on the builder yet"),
+        ([], built) => format!(
+            "  still building ({so_far} so far): built {}, the next has not started on the builder yet",
+            built.join(", ")
+        ),
+        (building, []) => format!("  still building {} ({so_far} so far)", building.join(", ")),
+        (building, built) => {
+            format!("  still building {} ({so_far} so far); built: {}", building.join(", "), built.join(", "))
+        }
+    }
+}
+
 /// `seconds` as a person reads a wait: `45s`, `1m51s`.
 fn elapsed_text(seconds: u64) -> String {
     if seconds >= 60 {
@@ -474,16 +497,14 @@ fn human_line(ev: &Event<'_>) -> Option<String> {
         }
         Phase::BuildWait => {
             let elapsed = ev.detail.and_then(|d| d.get("elapsedSeconds")).and_then(|v| v.as_u64()).unwrap_or(0);
-            let images: Vec<&str> = ev
-                .detail
-                .and_then(|d| d.get("images"))
-                .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                .unwrap_or_default();
-            match images.as_slice() {
-                [] => format!("  still building ({} so far)", elapsed_text(elapsed)),
-                images => format!("  still building {} ({} so far)", images.join(", "), elapsed_text(elapsed)),
-            }
+            let list = |k: &'static str| -> Vec<&str> {
+                ev.detail
+                    .and_then(|d| d.get(k))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default()
+            };
+            build_wait_line(elapsed, &list("images"), &list("built"))
         }
         Phase::InfraProvisionStart => "provisioning infra".to_string(),
         Phase::DrainWait => {
@@ -567,8 +588,17 @@ pub async fn while_waiting<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::error_detail;
+    use super::{build_wait_line, error_detail};
     use crate::commands::deactivate::NeedsTriggerChoice;
+
+    /// The wait line names what it knows in every state, never just the time.
+    #[test]
+    fn a_build_wait_says_what_is_building_and_what_is_done() {
+        assert_eq!(build_wait_line(160, &[], &[]), "  still building (2m40s so far): the first image has not started on the builder yet");
+        assert_eq!(build_wait_line(30, &[], &["worker"]), "  still building (30s so far): built worker, the next has not started on the builder yet");
+        assert_eq!(build_wait_line(30, &["db"], &[]), "  still building db (30s so far)");
+        assert_eq!(build_wait_line(30, &["db"], &["worker"]), "  still building db (30s so far); built: worker");
+    }
 
     /// The dispatcher's needs-a-choice refusal reaches the error event
     /// as a flag, even under a context, and keeps its message; any

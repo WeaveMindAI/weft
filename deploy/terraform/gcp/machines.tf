@@ -32,12 +32,11 @@ resource "google_logging_project_sink" "machine_events" {
 # grant to the sink's writer can name an account that does not exist yet.
 # So the agent is asked for before the sink, the way Google's docs say to
 # for infrastructure as code. All it needs here is to publish to the topic,
-# granted below. Another install in the same project shares the agent, so
-# a destroy leaves it.
+# granted below. Another install in the same project shares the agent; the
+# provider never deletes one, so a destroy leaves it.
 resource "google_workload_identity_service_agent" "logging" {
-  parent          = "projects/${data.google_project.this.number}/locations/global/serviceProducers/logging.googleapis.com"
-  deletion_policy = "ABANDON"
-  depends_on      = [google_project_service.apis]
+  parent     = "projects/${data.google_project.this.number}/locations/global/serviceProducers/logging.googleapis.com"
+  depends_on = [google_project_service.apis]
 }
 
 resource "google_pubsub_topic_iam_member" "machine_events_published_by_the_sink" {

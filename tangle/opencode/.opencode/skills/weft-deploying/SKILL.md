@@ -92,8 +92,8 @@ folder:
    it into the chat. For any other key, the user runs `weft login prod`
    themselves and types it into its hidden prompt.
 3. `weft ci add --cloud gcp`: writes `.github/workflows/deploy.yml`. The
-   workflow, run by hand from the repository's Actions tab, builds the CLI
-   of the exact weft the install runs, deploys the program (`weft activate
+   workflow, run by hand from the repository's Actions tab, asks the
+   install which weft it runs and builds that CLI, deploys the program (`weft activate
    --on <target>` when it is off, `weft resync --on <target> --mode park`
    when it is on), then, when the install hosts a frontend for the
    repository, builds `front/` with Docker and runs it on that frontend's

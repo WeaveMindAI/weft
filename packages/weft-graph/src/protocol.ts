@@ -1507,8 +1507,8 @@ export type CliPhase =
   | 'build_image'
   /// One image finished building; detail `image` and `seconds`.
   | 'build_image_done'
-  /// The build goes on; detail `elapsedSeconds` and `images`, the ones
-  /// still building.
+  /// The build goes on; detail `elapsedSeconds`, `images`, the ones
+  /// still building, and `built`, the ones done during this wait.
   | 'build_wait'
   | 'dispatcher_call_start'
   | 'dispatcher_call_done'
