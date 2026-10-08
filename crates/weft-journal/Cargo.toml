@@ -18,6 +18,8 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid
 tokio = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+zstd = { workspace = true }
+base64 = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
 

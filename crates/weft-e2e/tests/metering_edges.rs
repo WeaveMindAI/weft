@@ -135,14 +135,14 @@ async fn a_panicking_node_fails_its_run_and_leaves_the_worker_healthy() -> anyho
     // worker that refuses to retire.
     let platform = weft_e2e::platform::Platform::connect(&disp).await?;
     let pid = project.id();
-    let before = platform.execution_owner(&settled.execution_id).await?
-        .ok_or_else(|| anyhow::anyhow!("the panicking run has no recorded worker owner"))?;
+    let before = platform.execution_writer(&settled.execution_id).await?
+        .ok_or_else(|| anyhow::anyhow!("the panicking run's record names no worker"))?;
 
     project.set_node_config("boom", "explode", "false")?;
     let ok = run::run_and_settle(&mut project).await?;
     ok.completed()?;
     ok.assert_completed("after")?;
-    let owner = platform.execution_owner(&ok.execution_id).await?;
+    let owner = platform.execution_writer(&ok.execution_id).await?;
     anyhow::ensure!(owner.as_deref() == Some(before.as_str()), "the second run used {owner:?}, but the panicking run used {before}");
 
     let running = platform.workers_for_project(&pid).await?;

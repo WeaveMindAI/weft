@@ -1,14 +1,13 @@
-//! Journal abstraction. Single source of truth for execution state.
+//! The dispatcher's side of the run record. A run's whole life is its
+//! `run` row and its record (`run_log`, `weft_journal::record`): the
+//! worker that drives a run writes both, and the dispatcher reads them
+//! (the listing, a summary, the inspector's replay, logs) and writes only
+//! a run nobody drives (a run it queues, the ending of a parked or queued
+//! run it cancels, an answer to a parked run).
 //!
-//! Every state change the dispatcher cares about is an `ExecEvent`
-//! row in the `exec_event` table. Readers fold the log on demand:
-//! logs, node events, execution list, etc. See
-//! `journal::events::fold_to_snapshot`.
-//!
-//! Separate tables still exist for lookups that aren't state
-//! changes: entry tokens (webhook→project routing), suspension
-//! tokens (form URL→execution lookup), extension tokens (reviewer
-//! auth). Those are indexes, not duplicates.
+//! Beside the record, the tables of what is not a run: signals (what wakes
+//! a trigger or answers a wait), signal tokens, trigger setups and their
+//! bakes.
 
 pub mod postgres;
 
@@ -77,12 +76,16 @@ impl TriggerBake {
 
     /// Only a successful setup can replace saved settings. A closed group gate
     /// leaves its trigger absent from this capture, including on a refresh.
-    pub fn from_events(events: &[ExecEvent]) -> anyhow::Result<Option<Self>> {
-        let Some(ExecEvent::ExecutionStarted { execution_id, project_id, program: Some(program), definition_hash, source_version: Some(source_version),
+    /// `program` is the setup's program identity, read from the project's
+    /// stored code for the binary its birth names
+    /// (`ProjectStore::program_identity`): the birth carries only the two
+    /// hashes, which must be this identity's.
+    pub fn from_events(events: &[ExecEvent], program: &weft_core::project::hash::ProgramIdentity) -> anyhow::Result<Option<Self>> {
+        let Some(ExecEvent::ExecutionStarted { execution_id, project_id, binary_hash, definition_hash, source_version: Some(source_version),
             phase: weft_core::context::Phase::TriggerSetup, instance, .. }) = events.first() else {
             anyhow::bail!("trigger setup has no original program or source identity");
         };
-        anyhow::ensure!(definition_hash.as_ref() == Some(&program.definition_hash),
+        anyhow::ensure!(definition_hash.as_ref() == Some(&program.definition_hash) && binary_hash.as_ref() == Some(&program.binary_hash),
             "trigger setup {execution_id} has conflicting program identities");
         anyhow::ensure!(events.iter().all(|event| event.execution_id() == *execution_id),
             "trigger setup {execution_id} contains another run's history");
@@ -106,23 +109,6 @@ impl TriggerBake {
     }
 }
 
-/// Outcome of looking up a value derived from an execution's first
-/// `ExecutionStarted` row. `NotFound` = no such row (the execution is
-/// unknown). `Corrupt` = the row exists but its stored JSON no
-/// longer decodes: a PERMANENT poison, so callers must word their
-/// failure honestly ("journal row for execution X is corrupt; see
-/// dispatcher logs") and must NOT retry (retrying cannot fix it;
-/// pollers that would loop on an `Err` skip instead). The one
-/// producer of `Corrupt` is `execution_definition_hash`: the
-/// project/tenant lookups read the `execution` mirror and
-/// answer `Option` instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecutionIdLookup<T> {
-    Found(T),
-    NotFound,
-    Corrupt,
-}
-
 #[async_trait]
 pub trait Journal: Send + Sync {
     async fn is_trigger_setup_pending(&self, execution_id: ExecutionId) -> anyhow::Result<bool>;
@@ -135,35 +121,35 @@ pub trait Journal: Send + Sync {
     /// instance's for `Some`.
     async fn trigger_bakes(&self, project_id: uuid::Uuid, instance: Option<&weft_core::instance::InstanceId>) -> anyhow::Result<Vec<TriggerBake>>;
 
-    // ----- Event log (state source of truth) -------------------------
+    // ----- The record -------------------------------------------------
 
-    /// Append one event to the execution's log. Append-only; only
-    /// user-initiated `weft clean` removes events.
-    async fn record_event(&self, event: &ExecEvent) -> anyhow::Result<()>;
-
-    /// Idempotent variant: a retry with the same `dedup_key` is a
-    /// no-op via a partial UNIQUE index. Used by dispatcher tasks
-    /// (e.g. route_entry) that may re-execute after a crash.
-    async fn record_event_dedup(
+    /// Write `events` into the record of `execution_id`, a run nobody
+    /// drives, after its last row, and move it as `then` says (an ending
+    /// in `events` ends it). Its row is locked for the write, the one
+    /// serialization point of a run every writer but its owner goes
+    /// through. Nothing is written to a run a worker drives (its owner
+    /// writes its record), one that ended, or one there is no row of
+    /// (`weft_journal::record::Appended`).
+    async fn append(
         &self,
-        event: &ExecEvent,
-        dedup_key: &str,
-    ) -> anyhow::Result<()>;
+        execution_id: ExecutionId,
+        events: &[ExecEvent],
+        then: weft_journal::record::Then,
+    ) -> anyhow::Result<weft_journal::record::Appended>;
 
-    /// Full ordered event log for an execution, for DISPLAY: undecodable
-    /// rows come back as their error text instead of failing the read,
-    /// so the inspector renders what exists and names the rows it
-    /// cannot. The one required read; [`Journal::events_log`] is
-    /// derived from it.
+    /// A run's whole record for DISPLAY: a row that does not decode comes
+    /// back as its error text instead of failing the read, so the
+    /// inspector renders what exists and names the rows it cannot. The
+    /// one required read; [`Journal::events_log`] is derived from it.
     async fn events_log_lossy(
         &self,
         execution_id: ExecutionId,
     ) -> anyhow::Result<(Vec<crate::events::IdentifiedEvent<ExecEvent>>, Vec<String>)>;
 
-    /// The same log for STATE-REBUILDING (the cancel writers, stall
-    /// re-folds): a row that no longer decodes fails the WHOLE read,
-    /// naming the execution and `weft clean`, because a fold over a
-    /// partial log rebuilds a state that never existed.
+    /// The same record for STATE-REBUILDING (a cancel's per-node rows, a
+    /// setup's bake): a row that no longer decodes fails the WHOLE read,
+    /// naming the run and `weft clean`, because a fold over a partial
+    /// record rebuilds a state that never existed.
     async fn events_log(&self, execution_id: ExecutionId) -> anyhow::Result<Vec<ExecEvent>> {
         let (events, bad) = self.events_log_lossy(execution_id).await?;
         match bad.into_iter().next() {
@@ -172,60 +158,29 @@ pub trait Journal: Send + Sync {
         }
     }
 
-    // ----- Atomic execution birth / teardown --------------------------
-    //
-    // An execution's birth is ONE atomic fact: the `ExecutionStarted` event,
-    // its `execution` seed, the entry kicks, AND the work item a worker
-    // will claim. Committing them together is what makes a "ghost" (a
-    // journaled live execution with no work item, which nothing would ever
-    // run or reclaim and which would wedge a later drain) impossible by
-    // construction, instead of something a failure path must remember to
-    // clean up.
+    /// Queue a run the dispatcher starts (`weft run`, a setup run) for a
+    /// worker to claim: its row, its record's first row, its selection and
+    /// its version count, and delivery woken, in one transaction. A trigger
+    /// setup is recorded as in flight, and one an activation asked for
+    /// (`for_activation`: the activation is the setup's own run) is queued
+    /// only while that activation still owns its rows. `false` when the run
+    /// is already on record (a retried start, by its id).
+    async fn queue_run(&self, queued: weft_journal::record::Queued<'_>, for_activation: bool) -> anyhow::Result<bool>;
 
-    /// ATOMICALLY journal an execution's birth together with its queued work
-    /// item. Either everything commits or nothing does. `start` must be
-    /// `ExecEvent::ExecutionStarted`; `kicks` are its `NodeKicked` events.
-    /// `for_activation`: a trigger setup an activation asked for (the
-    /// activation is the setup's own execution), born only while that
-    /// activation still owns its rows.
-    async fn start_execution(
-        &self,
-        start: &ExecEvent,
-        kicks: &[ExecEvent],
-        task: weft_task_store::tasks::NewTask,
-        for_activation: bool,
-    ) -> anyhow::Result<()>;
-
-    /// [`Self::start_execution`] behind the entry's limits, in the SAME
-    /// commit: the run is admitted (`admission`, counted and given its
-    /// slot) and born together, or refused and not born. The answer to a
-    /// caller waiting at the door costs one round trip this way. A run
-    /// already born is left as it is, with the slot it took.
-    async fn admit_and_start_execution(
-        &self,
-        admission: &crate::entry_limits::Admission,
-        start: &ExecEvent,
-        kicks: &[ExecEvent],
-        task: weft_task_store::tasks::NewTask,
-    ) -> anyhow::Result<Result<(), crate::entry_limits::Refused>>;
-
-    /// THE dispatcher-side cancel of an execution, in ONE transaction:
-    /// strip the execution's wake signals (the parked form, the timer, the
-    /// webhook, so nothing can revive it), journal its cancel terminals
-    /// (`NodeCancelled` per non-terminal node + `ExecutionCancelled`,
-    /// skipped when a terminal already exists), and queue the
-    /// `cancel_execution` task for the process driving it (skipped when no
-    /// alive process owns it). Atomic so a failure leaves the run exactly as
-    /// it was and the next attempt succeeds; the old three-step shape
-    /// could strip the signals and then fail, leaving a run that could
-    /// neither wake nor finish. An execution with no `execution` row
-    /// (never started) has its signals stripped and nothing else.
+    /// THE dispatcher-side cancel of a run, in ONE transaction: strip its
+    /// wake signals (the parked form, the timer, the webhook, so nothing
+    /// can revive it), then end it. A run a worker drives is asked to stop
+    /// (`run.cancel_requested`, announced to its worker on `weft_cancel`
+    /// in the same transaction), and its worker writes its ending. A run
+    /// nobody drives (parked, queued) is ended here: `NodeCancelled` per
+    /// open node, then `ExecutionCancelled`, after its last row. A run that
+    /// ended already, or that has no row, only loses its signals.
     ///
     /// The listener still holds the stripped signals in RAM: the caller
     /// unregisters them there after the commit (`CancelWrite::removed`).
     /// `program` is the run's definition (the per-node cancels come off
-    /// the fold); `None` for an execution with no program, which has no
-    /// nodes to cancel.
+    /// the fold); `None` for a run with no program, which has no nodes to
+    /// cancel.
     async fn cancel_execution(
         &self,
         execution_id: ExecutionId,
@@ -233,13 +188,24 @@ pub trait Journal: Send + Sync {
         cause: &weft_core::exec::CancelCause,
     ) -> anyhow::Result<CancelWrite>;
 
-    /// Drop the signal row for a single-use resume token. Called
-    /// when a suspension's fire is consumed (the engine has handed
-    /// the value back to the waiting firing). Returns the deleted row
-    /// so the caller can unregister it from the process that held it.
-    /// Entry-trigger rows (`is_resume=false`) stay untouched; the
-    /// deactivate path manages those separately.
-    async fn consume_suspension(&self, token: &str) -> anyhow::Result<Option<SignalRegistration>>;
+    /// Let go of `execution_id` when it is running and its owner's lease
+    /// ran out before `lapsed_before` (unix seconds): its owner is cleared
+    /// and its epoch raised, so a late batch from the old owner is
+    /// refused. A durable run is queued again, carried on from its record
+    /// by the next worker that claims it; a fast run lived in its worker's
+    /// memory and ends, cancelled for `CancelCause::fast_run_lost`, its
+    /// per-node cancels folded with `program`. All under the run's row
+    /// lock, in one transaction.
+    async fn let_go_of_lost(
+        &self,
+        execution_id: ExecutionId,
+        lapsed_before: i64,
+        program: Option<&weft_core::ProjectDefinition>,
+    ) -> anyhow::Result<Lost>;
+
+    /// Answer the wait `token` with `value` (`answer_in`, on a
+    /// transaction of its own).
+    async fn answer(&self, token: &str, value: &serde_json::Value) -> anyhow::Result<Answered>;
 
     /// Persist a signal token (token-scoped enumeration credential).
     /// Record a freshly minted signal token. The api layer generates the token
@@ -270,97 +236,65 @@ pub trait Journal: Send + Sync {
     /// whether it was recorded.
     async fn seed_operator_token(&self, token: &SignalToken) -> anyhow::Result<bool>;
 
-    // ----- Derived views over the event log --------------------------
+    // ----- What the run rows say -----------------------------------------
     //
-    // An execution OUTLIVES its project on purpose: the journal is the
-    // record of what ran, and it stays readable after the project is
-    // removed. So everything about ownership is read from the
-    // `execution` row, stamped in the same transaction as
-    // `ExecutionStarted` and never rewritten, and NEVER re-derived
-    // from the project store (which the user can delete out from under
-    // it, once leaving 216 executions listed and undeletable because
-    // authorization asked a table that no longer had the answer).
+    // A run OUTLIVES its project on purpose: the record is the record of
+    // what ran, and it stays readable after the project is removed. So
+    // everything about ownership is read from the `run` row, written when
+    // the run is born and never rewritten, and NEVER re-derived from the
+    // project store (which the user can delete out from under it).
 
-    /// Who an execution belongs to, read from its `execution`
-    /// row: BOTH fields in one lookup, because they are one fact about
-    /// one row and reading them apart is how they drift. `None` if the
-    /// execution is unknown.
+    /// Who a run belongs to, read from its `run` row: every field in one
+    /// lookup, because they are one fact about one row and reading them
+    /// apart is how they drift. `None` if the run is unknown.
     async fn execution_owner(&self, execution_id: ExecutionId) -> anyhow::Result<Option<ExecutionOwner>>;
 
-    /// Look up the `definition_hash` an execution was STARTED with.
-    /// Resume task producers use this to stamp the resume payload,
-    /// so a suspended execution always resumes against the SAME
-    /// project shape it was started on (not the project row's
-    /// CURRENT hash, which may have moved if the user edited and
-    /// re-registered between suspend and webhook-fire). Reads the
-    /// first `ExecutionStarted` event of the execution. `NotFound` if
-    /// the execution is unknown; `Corrupt` if the row no longer decodes.
-    async fn execution_definition_hash(
-        &self,
-        execution_id: ExecutionId,
-    ) -> anyhow::Result<ExecutionIdLookup<String>>;
-
-    /// Every program version the runs this journal still holds were
-    /// started against, for one project. What a project removal (and
-    /// the last `weft clean` after it) reads to know which recorded
-    /// programs are still needed: the journal outlives the project, so
-    /// the programs its runs point at have to as well, or the rows are
-    /// there and unreadable.
+    /// Every program version the runs still on record were started
+    /// against, for one project. What a project removal (and the last
+    /// `weft clean` after it) reads to know which recorded programs are
+    /// still needed: the record outlives the project, so the programs its
+    /// runs point at have to as well, or the rows are there and
+    /// unreadable.
     async fn definition_hashes_in_use(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<String>>;
 
-    /// The LAST `limit` log lines of an execution, oldest first: every
-    /// event `LogEntry::from_event` projects (node log lines and the
-    /// failures the journal recorded), in the order they were written
-    /// (`LogEntry::tail`). The tail, not the head: a run that wrote
-    /// more lines than the limit went wrong at the END, and a head
-    /// would cut off exactly the failure the reader came for. A
-    /// DISPLAY read, like `events_log_lossy`: a row that no longer
-    /// decodes is an `error` line naming it and `weft clean`
-    /// (`LogEntry::corrupt_row`), so the lines that survive still
-    /// read.
+    /// The LAST `limit` log lines of a run, oldest first: every event
+    /// `LogEntry::from_event` projects (node log lines and the failures
+    /// its record holds), in the order they were written
+    /// (`LogEntry::tail`). The tail, not the head: a run that wrote more
+    /// lines than the limit went wrong at the END, and a head would cut
+    /// off exactly the failure the reader came for. A DISPLAY read, like
+    /// `events_log_lossy`: a row that no longer decodes is an `error` line
+    /// naming it and `weft clean` (`LogEntry::corrupt_row`), so the lines
+    /// that survive still read.
     async fn logs_for(&self, execution_id: ExecutionId, limit: u32) -> anyhow::Result<Vec<LogEntry>>;
 
-    /// A page of `tenant`'s executions, newest first, matching `query`'s filters
-    /// (project + start-time range) with limit/offset paging, plus the total
-    /// matching count. Scoping is in the query (via the `execution` table's
-    /// `tenant_id`, seeded on every start), so one tenant never sees another's
-    /// executions or their count; every filter stays inside that wall.
+    /// A page of `tenant`'s runs, newest first, matching `query`'s filters
+    /// with limit/offset paging, plus the total matching count. Scoping is
+    /// in the query (`run.tenant_id`), so one tenant never sees another's
+    /// runs or their count; every filter stays inside that wall.
     async fn list_executions(
         &self,
         tenant: &str,
         query: &ExecutionQuery,
     ) -> anyhow::Result<ExecutionPage>;
 
-    /// The summary for one execution, looked up directly by execution (no window
-    /// scan). `None` when no `execution_started` row exists for `execution_id`. The
-    /// caller authorizes the execution against the tenant separately; this is the
-    /// pure read.
+    /// The summary of one run, from its row. `None` for an unknown run.
+    /// The caller authorizes the run against the tenant separately; this
+    /// is the pure read.
     async fn execution_summary(
         &self,
         execution_id: ExecutionId,
     ) -> anyhow::Result<Option<ExecutionSummary>>;
 
-    /// Every execution `project_id` ever started.
-    ///
-    /// The question retirement asks: a version-tree row whose execution is
-    /// not in here describes a run nothing can read. Separate from
-    /// [`Self::execution_summaries_for_project`] because that one decodes
-    /// every birth payload, every terminal payload and every tag array to
-    /// build a status nobody here looks at, and the reaper asks this
-    /// hourly for every removed project it still holds rows for.
+    /// Every run of `project_id` still on record.
     async fn execution_ids_for_project(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<ExecutionId>>;
 
-    /// Every execution of `project_id`, by execution, in ONE read.
-    ///
-    /// `weft tree` and the editor's version sidebar need a status per
-    /// recorded run, and asking `execution_summary` per run meant a
-    /// round trip each: a project with a thousand runs did a thousand
-    /// point lookups on every refresh. An execution the journal has never
-    /// heard of is simply absent from the map, which is the same answer
-    /// `execution_summary` gives as `None`.
-    async fn execution_summaries_for_project(
+    /// The summaries of `execution_ids`, by id, in ONE read: what `weft
+    /// tree` and the editor's version sidebar read a status per run started
+    /// by hand from. A run not on record is left out.
+    async fn execution_summaries(
         &self,
-        project_id: uuid::Uuid,
+        execution_ids: &[ExecutionId],
     ) -> anyhow::Result<std::collections::HashMap<ExecutionId, ExecutionSummary>>;
 
     /// Every execution of `tenant`'s that starts with `prefix`
@@ -370,38 +304,31 @@ pub trait Journal: Send + Sync {
     /// match, the way they never list.
     async fn execution_ids_with_prefix(&self, tenant: &str, prefix: &str) -> anyhow::Result<Vec<ExecutionId>>;
 
-    /// Every execution belonging to `project_id` whose journal has no
-    /// terminal event yet, each with its phase (a run, or the setup an
-    /// `infra start` or an activation runs, which the editor shows as
-    /// that verb working rather than as a run to stop). Used by
-    /// wipe / cancel_running / the activation sweep to enumerate what
-    /// needs cancelling without the limit-truncation problem of
-    /// `list_executions`. Single SQL roundtrip, no per-execution fold.
+    /// Every run of `project_id` going right now (queued for a worker, or
+    /// being driven), each with its phase (a run, or the setup an `infra
+    /// start` or an activation runs, which the editor shows as that verb
+    /// working rather than as a run to stop). A run parked on a wait is not
+    /// going.
     ///
     /// Oldest first, so the LAST one is the most recently started. The
     /// editor's action bar follows "the latest run" and the wire
     /// carries no other way to tell which that is, so the order is part
     /// of the contract rather than an accident of the query. Ties break
     /// on the execution, so the answer is stable across calls.
-    async fn list_non_terminal_execution_ids_for_project(
+    async fn going_execution_ids_for_project(
         &self,
         project_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<(ExecutionId, weft_core::context::Phase)>>;
 
-    /// Every execution belonging to `project_id` whose journal HAS a
-    /// terminal event (completed / failed / cancelled). The exact
-    /// complement of `list_non_terminal_execution_ids_for_project` over the
-    /// project's known executions. `running_count` uses it to make sure a
-    /// stray `pending`/`claimed` task row can never resurrect an execution
-    /// whose execution is already finished.
-    async fn list_terminal_execution_ids_for_project(
+    /// Every run of `project_id` that ended or is parked on a wait: the
+    /// runs that write nothing until something answers them.
+    async fn settled_execution_ids_for_project(
         &self,
         project_id: uuid::Uuid,
     ) -> anyhow::Result<std::collections::HashSet<ExecutionId>>;
 
-    /// Every live (non-terminal, project-kind) execution of `project_id`
-    /// carrying `tag`, with the sequence its tag row got, oldest tag
-    /// first. The read behind `ctx.stop_tagged`; the ordering and
+    /// Every live run of `project_id` carrying `tag`, with the sequence its
+    /// tag row got, oldest tag first. The read behind `ctx.stop_tagged`; the ordering and
     /// self rules are applied on top by the pure
     /// `weft_journal::tags::select_stop_targets`.
     async fn live_tagged_executions(
@@ -457,6 +384,12 @@ pub trait Journal: Send + Sync {
         tokens: &[String],
     ) -> anyhow::Result<Vec<SignalRegistration>>;
 
+    /// Delete the wait `token` of run `execution_id`, given up by its run,
+    /// and return it for the listener to let go of. A token that is no
+    /// wait of that run (an entry trigger, another run's wait, a wait
+    /// already answered) is left alone: `None`.
+    async fn signal_withdraw(&self, execution_id: ExecutionId, token: &str) -> anyhow::Result<Option<SignalRegistration>>;
+
     /// The RESUME registrations of one execution: what that execution is
     /// parked on.
     ///
@@ -488,7 +421,7 @@ pub trait Journal: Send + Sync {
 
     // ----- Administrative ---------------------------------------------
 
-    /// Delete all data for an execution. Called only by `weft clean`.
+    /// Delete all data of a run. Called only by `weft clean`.
     ///
     /// Answers the resume signals the run was parked on, which went
     /// with it: a listener process still holds each one in RAM and keeps
@@ -496,21 +429,8 @@ pub trait Journal: Send + Sync {
     /// unregisters it there (`unregister_many`), the way a cancel does.
     async fn delete_execution(&self, execution_id: ExecutionId) -> anyhow::Result<Vec<SignalRegistration>>;
 
-    /// Erase a live run no worker claimed, in ONE transaction: its execute
-    /// task, only while it still is one of the runs `which` names, then
-    /// everything its birth wrote and the entry slot it held. `false`, with
-    /// nothing touched, when the task was claimed after all (the caller
-    /// arrived) or is already gone. Run by the reaper for a caller who
-    /// never came (`tasks::callers_never_arrived`), and by the handshake
-    /// for a call it could not pass to a worker.
-    async fn erase_unclaimed_live_run(
-        &self,
-        execution_id: ExecutionId,
-        which: weft_task_store::tasks::UnclaimedLiveRun,
-    ) -> anyhow::Result<bool>;
-
-    /// Delete all data for every execution of a project, and say how
-    /// many went. Called by `weft rm`.
+    /// Delete all data of every run of a project, and say how many went.
+    /// Called by `weft rm`.
     ///
     /// Removing a project erases its history rather than orphaning it.
     /// Keeping the runs sounded kind and was not: the project row that
@@ -520,8 +440,8 @@ pub trait Journal: Send + Sync {
     /// still has: their files on disk.
     async fn delete_project_executions(&self, project_id: uuid::Uuid) -> anyhow::Result<u64>;
 
-    /// Every project id that still has executions while the project
-    /// itself is gone. What the reaper sweeps.
+    /// Every project id that still has runs while the project itself is
+    /// gone. What the reaper sweeps.
     ///
     /// The erase at removal is best-effort, because a project is
     /// already gone by then and failing the answer would say the
@@ -530,6 +450,13 @@ pub trait Journal: Send + Sync {
     /// `weft clean` needs a project), so without this one transient
     /// failure would keep them for good.
     async fn projects_with_orphan_executions(&self) -> anyhow::Result<Vec<uuid::Uuid>>;
+
+    /// Erase up to `limit` ended runs whose time to be kept ran out before
+    /// `now` (unix seconds), oldest first, with everything of theirs (the
+    /// same one list a `weft clean` erases). Answers how many, and the
+    /// resume signals that went with them for the listener to let go of.
+    /// A parked or queued run has no end, so it is never erased.
+    async fn erase_expired(&self, now: i64, limit: i64) -> anyhow::Result<(usize, Vec<SignalRegistration>)>;
 }
 
 /// Durable replacement for the in-RAM `SignalTracker` row.
@@ -705,37 +632,74 @@ impl SignalRegistration {
 
 // ----- Public types -----------------------------------------------
 
-/// Who an execution belongs to: the project it ran for, and the tenant
-/// that owns it. Both are stamped on the `execution` row when the
-/// execution is born and frozen for its life (a project cannot change
-/// tenant: re-registering is guarded to the same one).
+/// Who a run belongs to: the project it ran for, and the tenant that owns
+/// it. Both are written on the `run` row when the run is born and frozen
+/// for its life (a project cannot change tenant: re-registering is guarded
+/// to the same one).
 ///
-/// The TENANT is the authority. It keys the execution's storage prefix,
-/// it decides who may read or delete the execution, and unlike the
-/// project row it cannot be deleted out from under the execution. The
+/// The TENANT is the authority. It keys the run's storage prefix, it
+/// decides who may read or delete the run, and unlike the project row it
+/// cannot be deleted out from under the run. The
 /// project id rides along for attribution (which project's event stream
 /// a replay belongs on) and may name a project that no longer exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionOwner {
+    pub project_id: uuid::Uuid,
+    pub tenant: String,
+    /// Who the run is for (`run.instance_id`).
+    pub instance: Option<weft_core::instance::InstanceId>,
+    /// The trigger that fired the run (`run.fired_by`).
+    pub fired_by: Option<String>,
+    /// What the run is for (`run.phase`): an infra setup's ending saves
+    /// its infra's baked outputs.
+    pub phase: weft_core::context::Phase,
+    /// The program it was STARTED with (`run.definition_hash`), so it is
+    /// always read against the shape it ran on (not the project's CURRENT
+    /// hash, which may have moved since). `None` for a run of no program
+    /// (a node test).
+    pub definition_hash: Option<String>,
+    /// The worker binary it runs on (`run.binary_hash`); `None` for a run
+    /// of no program.
+    pub binary_hash: Option<String>,
+    /// The version of the project's source it ran (`run.source_version`).
+    pub source_version: Option<String>,
+}
+
+/// What became of an answer to a wait (`Journal::answer`).
+#[derive(Debug)]
+pub enum Answered {
+    /// It reached its run: written into its record (the run is queued to
+    /// carry on), or handed to the worker that drives it. The wait's
+    /// signal is gone; the listener still holds it in memory.
+    Reached { consumed: SignalRegistration },
+    /// The run had ended: the wait's signal is gone, nothing was written.
+    RunEnded { consumed: SignalRegistration },
+    /// No such wait: it was answered already, or never existed.
+    Gone,
+}
+
+/// What `Journal::let_go_of_lost` did with a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lost {
+    /// Its owner is alive (or it is not running any more): left as it is.
+    NotLost,
+    /// A durable run, queued again.
+    Requeued,
+    /// A fast run, ended.
+    Ended,
+}
+
 /// What `Journal::cancel_execution` committed.
 #[derive(Debug, Default)]
 pub struct CancelWrite {
     /// The wake signals stripped, for the listener's in-RAM unregister.
     pub removed: Vec<SignalRegistration>,
-    /// Whether a `cancel_execution` task was queued for an alive owner
-    /// process (false: no process is driving this execution, nothing to flag).
-    pub task_enqueued: bool,
-    /// Per-node cancel rows written; `None` when the journal already
-    /// held a terminal and nothing was written.
+    /// A worker drives the run: it was asked to stop, and writes the
+    /// run's ending itself.
+    pub requested: bool,
+    /// The run nobody drove was ended here, with this many per-node cancel
+    /// rows; `None` when nothing was ended here.
     pub node_cancellations: Option<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExecutionOwner {
-    pub project_id: uuid::Uuid,
-    pub tenant: String,
-    /// Who the run is for (`execution.instance_id`).
-    pub instance: Option<weft_core::instance::InstanceId>,
-    /// The trigger that fired the run (`execution.fired_by`).
-    pub fired_by: Option<String>,
 }
 
 /// The query for a page of a tenant's executions: pagination plus optional
@@ -768,11 +732,13 @@ pub struct ExecutionQuery {
     pub instance: Option<weft_core::instance::InstanceId>,
     /// Only runs carrying this tag (`ctx.tag_execution`).
     pub tag: Option<String>,
-    /// Only runs in which this node fired (it started at least once),
-    /// spelled the way the journal names it.
+    /// Only finished runs in which this node fired (it started at least
+    /// once), spelled the way the record names it, once their search entry
+    /// is built (`crate::search_index`).
     pub node: Option<String>,
     /// Only finished runs whose recorded values carry every word of this
-    /// (`crate::run_search`; a quoted phrase as written).
+    /// (a quoted phrase as written), once their search entry is built
+    /// (`crate::search_index`).
     pub search: Option<String>,
     /// Keyset cursor: only runs strictly after this `(started_at,
     /// execution)` in the listing's order (newest first, then execution
@@ -894,35 +860,30 @@ pub struct LogEntry {
     pub frames: weft_core::LoopFrames,
     pub message: String,
     /// When the line was written, in milliseconds, the key the log is
-    /// ordered by: the worker's clock for a node's line, and for a row
-    /// without one (a failure the journal wrote, a line from before
-    /// the clock was carried) the end of its second.
+    /// ordered by: the worker's clock for a node's line, and for a
+    /// failure (which carries no milliseconds) the end of its second.
     pub written_at_ms: u64,
-    /// A node's line carries its place among the firing's side
-    /// effects, from the worker; the journal's own rows (a failure)
-    /// have none. Breaks the tie between lines of one millisecond.
+    /// A node's line carries its place among the firing's lines, from the
+    /// worker; a failure has none. Breaks the tie between lines of one
+    /// millisecond.
     pub seq: Option<u64>,
 }
 
 impl LogEntry {
-    /// The lines as the run wrote them. A node's log line reaches the
-    /// journal through a task a dispatcher drains later, eight at
-    /// a time, so the journal's row order is the drain's, not the
-    /// run's: the read sorts by the worker's clock, to the
-    /// millisecond, then by the firing's own sequence. A row the
-    /// journal wrote itself (a failure) has no clock of its own and
-    /// sorts at the end of its second. Stable, so what neither key
-    /// separates keeps its journal order.
+    /// The lines as the run wrote them: by the worker's clock, to the
+    /// millisecond, then by the firing's own sequence (parallel firings
+    /// hand their lines over in whatever order they ran). A failure has
+    /// no clock of its own and sorts at the end of its second. Stable, so
+    /// what neither key separates keeps its record order.
     pub fn in_written_order(mut entries: Vec<LogEntry>) -> Vec<LogEntry> {
         entries.sort_by_key(|e| (e.written_at_ms, e.seq.unwrap_or(u64::MAX)));
         entries
     }
 
     /// The last `limit` lines in written order: THE `logs_for` answer,
-    /// the same code for both journals, so what a fake-backed test
-    /// pins is what the real read does. The cut is made after the
-    /// sort, so it is the last lines the run wrote and never the last
-    /// rows a process happened to drain.
+    /// the same code for both journals, so what a fake-backed test pins is
+    /// what the real read does. The cut is made after the sort, so it is
+    /// the last lines the run wrote.
     pub fn tail(entries: Vec<LogEntry>, limit: u32) -> Vec<LogEntry> {
         let mut entries = Self::in_written_order(entries);
         if entries.len() > limit as usize {
@@ -937,10 +898,10 @@ impl LogEntry {
         at_unix * 1000 + 999
     }
 
-    /// The line a journal row that no longer decodes reads as: the
-    /// decode error, which names the execution and `weft clean`. Its own
-    /// clock is unreadable, so it is stamped with when the row was
-    /// written and sorted last, where the tail always holds it.
+    /// The line a record row that no longer decodes reads as: the decode
+    /// error, which names the run and `weft clean`. Its own clock is
+    /// unreadable, so it is stamped with when the row was written and
+    /// sorted last, where the tail always holds it.
     pub fn corrupt_row(written_at_unix: u64, error: String) -> LogEntry {
         LogEntry {
             at_unix: written_at_unix,
@@ -960,13 +921,9 @@ impl LogEntry {
     /// Postgres and fake journals so `weft logs` reads the same thing
     /// against both.
     pub fn from_event(event: &ExecEvent) -> Option<LogEntry> {
-        // `KINDS` is the one gate, for both journals: the SQL read
-        // fetches those rows and nothing else, and this projection
-        // answers for those kinds and nothing else, so a kind the
-        // match knows and the list omits is unprojected everywhere
-        // rather than reaching the log from the fake alone. A kind
-        // the list carries and the match does not is a bug the tests
-        // pin (`every_listed_kind_projects`), never a quiet `None`.
+        // `KINDS` is the one gate: a kind the list carries and the match
+        // does not is a bug the tests pin (`every_listed_kind_projects`),
+        // never a quiet `None`.
         if !Self::KINDS.contains(&event.kind_str()) {
             return None;
         }
@@ -1032,8 +989,7 @@ impl LogEntry {
         })
     }
 
-    /// The `exec_event.kind` values the log is made of: what the SQL
-    /// read fetches, and what `from_event` answers for.
+    /// The event kinds the log is made of: what `from_event` answers for.
     pub const KINDS: &'static [&'static str] = &[
         "log_line",
         "node_failed",
@@ -1054,39 +1010,43 @@ mod bake_tests {
                 execution_id, project_id: uuid::Uuid::from_u128(0x100), entry_node: "trigger".into(),
                 phase: weft_core::context::Phase::TriggerSetup,
                 definition_hash: Some("graph".into()),
-                program: Some(weft_core::project::hash::ProgramIdentity {
-                    definition_hash: "graph".into(), binary_hash: "binary".into(), implementations: Default::default(),
-                }),
-                source_version: Some("source".into()), run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 1,
-                run_class: weft_core::run_class::RunClass::Short,
+                binary_hash: Some("binary".into()),
+                source_version: Some("source".into()), run_kind: weft_core::exec::RunKind::Execution, selection: None, seed: None, instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 1,
+                settings: weft_core::run_settings::RunSettings::bookkeeping(),
             },
             ExecEvent::ExecutionCompleted { execution_id, at_unix: 2 },
         ]
     }
 
+    fn program() -> weft_core::project::hash::ProgramIdentity {
+        weft_core::project::hash::ProgramIdentity {
+            definition_hash: "graph".into(), binary_hash: "binary".into(), implementations: Default::default(),
+        }
+    }
+
     #[test]
     fn closed_gates_publish_an_empty_bake_but_incomplete_setups_do_not() {
         let rows = completed();
-        let bake = TriggerBake::from_events(&rows).unwrap().unwrap();
+        let bake = TriggerBake::from_events(&rows, &program()).unwrap().unwrap();
         assert!(bake.captured.is_empty());
-        assert!(TriggerBake::from_events(&rows[..1]).is_err());
+        assert!(TriggerBake::from_events(&rows[..1], &program()).is_err());
         let mut failed = rows;
         failed[1] = ExecEvent::ExecutionCancelled {
             execution_id: bake.execution_id, reason: "cancelled".into(), cause: Some(weft_core::exec::CancelCause::User), at_unix: 2,
         };
-        assert!(TriggerBake::from_events(&failed).unwrap().is_none());
+        assert!(TriggerBake::from_events(&failed, &program()).unwrap().is_none());
     }
 
     #[test]
     fn bake_refuses_mixed_run_history_and_conflicting_program_identity() {
         let mut rows = completed();
         rows[1] = ExecEvent::ExecutionCompleted { execution_id: ExecutionId::new_v4(), at_unix: 2 };
-        assert!(TriggerBake::from_events(&rows).unwrap_err().to_string().contains("another run"));
+        assert!(TriggerBake::from_events(&rows, &program()).unwrap_err().to_string().contains("another run"));
         let mut rows = completed();
         if let ExecEvent::ExecutionStarted { definition_hash, .. } = &mut rows[0] {
             *definition_hash = Some("another graph".into());
         }
-        assert!(TriggerBake::from_events(&rows).unwrap_err().to_string().contains("conflicting program"));
+        assert!(TriggerBake::from_events(&rows, &program()).unwrap_err().to_string().contains("conflicting program"));
     }
 }
 

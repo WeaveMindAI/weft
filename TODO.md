@@ -518,3 +518,186 @@ line rather than a failed read; and whether a rate limit belongs per
 token or per (token, node), given that one client legitimately watches
 one bridge closely and has no reason to sweep every display it can see.
 
+
+## A stream writes two journal rows per item
+
+**Problem.** Every item a stream produces writes one `PortEmitted` row
+and one `PulsesConsumed` row (`crates/weft-journal/src/events.rs`, the
+TODO on `PulsesConsumed`). That is fine for the streams people run
+today, but a stream of ten million items would write about twenty
+million rows.
+
+**Direction.** Write stream items in windows, the way a bus already
+batches its appends. This belongs with the packed record format of the
+current performance work (one write per step for a durable run, one
+compact row per run for a fast one), which cuts the rows per item for
+the same reason it cuts them per run.
+
+[Update Notice Warning] If we touch `PulsesConsumed`, the stream
+runtime (`crates/weft-engine/src/stream_runtime.rs`) or the journal's
+record format, revisit this entry.
+
+## The engine interprets the wiring: precompile its plan, or compile the wiring
+
+**When.** After the current round of performance work (fast and durable
+runs, callers straight to the worker, one journal writer per worker),
+with numbers measured then.
+
+**Problem.** Node bodies are compiled Rust, but the wiring between them
+is interpreted at run time, the way Python is. The program is a data
+structure (`ProjectDefinition`), and the execution loop
+(`crates/weft-engine/src/execution_driver.rs`) walks it:
+
+```
+TODAY: node bodies are compiled Rust, the wiring is interpreted
+───────────────────────────────────────────────────────────────────────
+loop:  scan every node of the program ─► "who has all its inputs?"
+       (weft_core::exec::ready::find_ready_nodes)
+       └► for each ready node: build a context, start a task for it,
+          wait for its message back, file its outputs in a table keyed
+          by node and port NAMES (text), write its records ─► scan again
+
+COMPILED: the wiring becomes Rust code too
+───────────────────────────────────────────────────────────────────────
+async fn ping(request) {
+    let fired = route.run(request).await?;        // a wire is a variable
+    let body  = json_object.run(fired).await?;
+    reply.run(body).await
+}
+```
+
+**Measured on 2026-10-08**, after the performance round (fast and durable
+runs, callers straight to the worker, one journal writer per worker, the
+program's facts worked out once per program, a step that ends at once run on
+the drive's own task). The bench project (40 nodes, `bench/weft-project`),
+its unrecorded ping (`Route` to `JsonObject` to `Reply`):
+
+- In a test process (release build, records in memory, no network or
+  database), one run costs about 73 µs of CPU, down from 172 µs before the
+  round.
+- In the local install under 50 callers, the worker spends about 365 µs of
+  CPU per call (axum in Docker: about 50 µs). A profile of that worker,
+  taken before unrecorded runs stopped keeping their history, put about
+  half of its CPU in the drive loop (readiness, settling boundaries,
+  building each step's input bag, applying emissions) and the rest around
+  it: serving the call, the door, the run's birth, the record.
+- Throughput: 23,181 unrecorded and 12,092 fast pings a second, against
+  axum's 36,996 behind Docker's port relay; 0.6 ms and 0.7 ms at one caller
+  against axum's 0.3 ms.
+
+So the loop is now the largest single cost, about half of the worker's own,
+and it grows with the size of the graph. The rest (the record, the door,
+the call) is ordinary code that can be trimmed on its own. The probe was a
+throwaway test driving `run_one_execution_observed` over `engine_test_rig`
+with the bench project's definition and stand-in nodes; rebuild it to
+measure again (`bench/README.md` has the worker-side profile).
+
+**Direction, two levels.**
+
+1. **Keep the interpreter, precompile its plan.** Everything the loop
+   works out at run time (who feeds whom, which inputs are required,
+   which ports are wired) becomes plain numbers decided at compile time:
+   no name lookups, no scan of every node each step, and a straight
+   chain runs in place instead of starting a task per node. Pausing and
+   resuming do not change.
+2. **Compile the wiring fully**, as in the sketch: a wire costs what a
+   Rust variable costs, and the compiler, which already produces a
+   native binary per program, generates it. The hard part is pausing
+   and resuming. Today a paused run is rebuilt by folding its records
+   back into the tables; compiled code would resume the way Restate and
+   Temporal do, by running the function again from the top while every
+   node that already finished hands back its recorded output instead of
+   running again. Loops, streams, buses, `_should_flow` skip cascades,
+   `catchErrors` and suspensions all have to be expressed in that model,
+   so this is a rewrite of the engine and of how runs resume.
+
+**Why deferred.** The language work comes first. Choose between the two
+levels with numbers measured then, and before choosing the second, list
+what it needs feature by feature.
+
+[Update Notice Warning] If we touch `crates/weft-engine/src/execution_driver.rs`'s
+dispatch loop or `weft_core::exec::ready`, revisit this entry.
+
+## "At once" is a share per copy, never the project's true count
+
+**Problem.** An entry's `callsAtOnce` is held at each worker's door, and
+each copy takes its share: the limit divided by the copies alive at the
+last tick, at least one (`crates/weft-engine/src/door/limits.rs`). Two
+things follow. A copy whose share is full refuses a caller while another
+copy has room, so under uneven routing the entry runs fewer at once than
+its limit. And with more copies than the limit, every copy still gets
+one, so together they run more at once than the limit allows.
+
+**Direction.** Count what is going across copies the way the per-minute
+counts are: each copy states how many of an entry's runs it has going on
+its tick, and admits against the copies' total. That is exact to about a
+second, like the minute counts. A run born on a dead copy has to stop
+counting, which the tick's "copies alive" already tells.
+
+**Why deferred.** Low impact for now: the share is wrong only with
+several copies under uneven load, and the per-minute limits stay exact
+to a second.
+
+[Update Notice Warning] If we touch `crates/weft-engine/src/door/limits.rs`
+or `/v1/door/tick`, revisit this entry.
+
+## Every copy sends every caller's count every second
+
+**Problem.** A worker's tick (`/v1/door/tick`, once a second) states its
+counts of the minute, and the per-caller ones are keyed by entry and
+caller. An entry called by many different callers in one minute makes
+every copy send one count per caller, every second, and hear every other
+copy's. The tick grows with the number of distinct callers, not with the
+traffic that matters for the limit.
+
+**Direction.** Send what changed since the last tick instead of the whole
+minute, or keep per-caller counts on the copy the caller reached (one
+caller mostly lands on one copy) and only exchange the entry-wide counts.
+
+**Why deferred.** Only matters with thousands of distinct callers a
+minute on one project.
+
+[Update Notice Warning] If we touch `crates/weft-engine/src/door/limits.rs`
+or `/v1/door/tick`, revisit this entry.
+
+## Several workers of a project can open more Postgres connections than the database takes
+
+**Problem.** The Postgres node keeps one pool per worker and database
+(`catalog/postgres/postgres.rs`, `MOST_AT_ONCE`), held to 20 connections
+so a few workers together stay under Postgres's default limit of 100.
+That is a guess about how many workers there are. A project scaled to
+many workers can still open more connections than the database accepts,
+and the runs past it fail to connect.
+
+**Direction.** Put a connection pooler (PgBouncer, in transaction mode)
+in front of the database inside the Postgres node's own infra, so every
+worker talks to the pooler and the pooler holds the few real
+connections. The worker's own limit can then be generous again. The open
+question is a database the user brings, which has no infra of ours to
+put the pooler in.
+
+[Update Notice Warning] If we touch `catalog/postgres/postgres.rs`'s
+pool or the Postgres node's infra, revisit this entry.
+
+## A Python process runs one script at a time
+
+**Problem.** `ExecPython` keeps as many `python3` processes as the worker
+has CPUs (`catalog/basic/exec_python/mod.rs`), and each runs one script at
+a time. A script that mostly waits (an HTTP call, a `sleep`) holds its
+process while it uses no CPU, so with every process busy waiting, the next
+script queues for nothing.
+
+**Direction.** Each process runs several scripts at once on threads: a
+waiting script releases Python's lock, so the others go on, and scripts
+that compute still share the CPUs. Cap the scripts at once per process (a
+setting) and benchmark `burn` and a waiting script at a few values to
+find the best. On a Python built without the lock (supported since 3.14,
+not the default build), the same threads compute in parallel too. Scripts
+on threads of one process share its module state more directly than
+today, so the node's docs would say so.
+
+**Why deferred.** A node's own optimisation, apart from the language
+work around it.
+
+[Update Notice Warning] If we touch `catalog/basic/exec_python/mod.rs`'s
+process pool, revisit this entry.

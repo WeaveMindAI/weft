@@ -504,14 +504,32 @@ fn config_matches_rule_fires_only_when_pattern_matches() {
     );
 }
 
-/// A Route may both skip recording and outlive its caller: a caller
-/// leaving does not park the run, and an unrecorded run refuses every
-/// wait at the call, so nothing about the pair needs a journal.
+/// A Route that outlives its caller must be recorded: once its caller
+/// leaves, the run carries on from its record (on a cloud install it is
+/// handed to another call), and the refusal says which to turn back.
 #[test]
-fn an_unrecorded_route_may_outlive_its_caller() {
+fn an_unrecorded_route_that_outlives_its_caller_is_refused() {
     let both = parse_enrich("t = Route { path: \"status\", recorded: false, outlivesCaller: true }\n");
     let d = validate(&both, &catalog());
-    assert!(!d.iter().any(|x| x.message.contains("`recorded`")), "{d:?}");
+    let hit = errors(&d).into_iter().find(|x| x.code.as_deref() == Some("run-settings")).unwrap_or_else(|| panic!("{d:?}"));
+    assert!(hit.message.contains("outlivesCaller") && hit.message.contains("recorded"), "{}", hit.message);
+}
+
+/// Every trigger states how its runs are kept through the inputs the
+/// language gives it, and a durable run that is not recorded is refused
+/// where it is written, on any kind of trigger.
+#[test]
+fn a_durable_trigger_that_is_not_recorded_is_refused() {
+    for source in [
+        "t = Route { path: \"pay\", durable: true, recorded: false }\n",
+        "t = Cron { cron: \"0 * * * *\", durable: true, recorded: false }\n",
+    ] {
+        let d = validate(&parse_enrich(source), &catalog());
+        let hit = errors(&d).into_iter().find(|x| x.code.as_deref() == Some("run-settings")).unwrap_or_else(|| panic!("{source}: {d:?}"));
+        assert!(hit.message.contains("durable") && hit.message.contains("recorded"), "{}", hit.message);
+    }
+    let fine = parse_enrich("t = Route { path: \"pay\", durable: true }\n");
+    assert!(!validate(&fine, &catalog()).iter().any(|x| x.code.as_deref() == Some("run-settings")));
 }
 
 /// `LlmInference`'s added output ports only fire with `parseJson: true`:

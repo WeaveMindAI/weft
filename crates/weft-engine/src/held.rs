@@ -40,16 +40,24 @@ use crate::context::AccessBroker;
 /// recently used go and are asked for again.
 const KEPT: usize = 1024;
 
-/// The infra reader that keeps addresses (see the module doc).
+/// The infra reader that keeps addresses and saved values (see the
+/// module doc).
 pub struct HeldInfra {
     inner: Arc<dyn InfraReader>,
     addresses: Arc<HeldCopy<InfraHandle, Option<EndpointAddress>>>,
+    /// By (place, copy): a change of a saved value is heard like a change
+    /// of an address.
+    saved: Arc<HeldCopy<(String, Option<InstanceId>), SavedValues>>,
 }
+
+/// A copy's saved values, port to value (`weft_core::infra::bake`).
+type SavedValues = std::collections::BTreeMap<String, serde_json::Value>;
 
 impl HeldInfra {
     pub fn new(inner: Arc<dyn InfraReader>, link: &BrokerLink) -> Arc<Self> {
         let addresses = HeldCopy::following(link.subscribe(), INFRA_STATUS_CHANNEL, KEPT, everything, |_| true);
-        Arc::new(Self { inner, addresses })
+        let saved = HeldCopy::following(link.subscribe(), INFRA_STATUS_CHANNEL, KEPT, everything, |_| true);
+        Arc::new(Self { inner, addresses, saved })
     }
 }
 
@@ -71,6 +79,24 @@ impl InfraReader for HeldInfra {
             .get_or_load(infra.clone(), || self.inner.endpoint_address(execution_id, run_instance, infra))
             .await?;
         Ok((*address).clone())
+    }
+
+    async fn baked_outputs(
+        &self,
+        execution_id: weft_core::ExecutionId,
+        run_instance: Option<&InstanceId>,
+        place: &str,
+        copy: Option<&InstanceId>,
+    ) -> anyhow::Result<std::collections::BTreeMap<String, serde_json::Value>> {
+        // Another instance's copy is the broker's to refuse, every time.
+        if copy.is_some() && copy != run_instance {
+            return self.inner.baked_outputs(execution_id, run_instance, place, copy).await;
+        }
+        let saved = self
+            .saved
+            .get_or_load((place.to_string(), copy.cloned()), || self.inner.baked_outputs(execution_id, run_instance, place, copy))
+            .await?;
+        Ok((*saved).clone())
     }
 }
 
@@ -239,13 +265,27 @@ mod tests {
             self.reads.fetch_add(1, Ordering::SeqCst);
             Ok(None)
         }
+
+        async fn baked_outputs(
+            &self,
+            _execution_id: weft_core::ExecutionId,
+            _run_instance: Option<&InstanceId>,
+            _place: &str,
+            _copy: Option<&InstanceId>,
+        ) -> anyhow::Result<std::collections::BTreeMap<String, serde_json::Value>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(Default::default())
+        }
     }
 
     fn held_over(inner: Arc<Counting>) -> (HeldInfra, broadcast::Sender<Heard>) {
         let (tx, rx) = broadcast::channel(16);
-        let subscription = Subscription::with_listening(rx, Arc::new(AtomicBool::new(true)));
-        let addresses = HeldCopy::following(subscription, INFRA_STATUS_CHANNEL, KEPT, everything, |_| true);
-        (HeldInfra { inner, addresses }, tx)
+        let listening = Arc::new(AtomicBool::new(true));
+        let saved_rx = tx.subscribe();
+        let addresses =
+            HeldCopy::following(Subscription::with_listening(rx, listening.clone()), INFRA_STATUS_CHANNEL, KEPT, everything, |_| true);
+        let saved = HeldCopy::following(Subscription::with_listening(saved_rx, listening), INFRA_STATUS_CHANNEL, KEPT, everything, |_| true);
+        (HeldInfra { inner, addresses, saved }, tx)
     }
 
     /// An address is asked for once and kept; a change heard drops it; a
@@ -300,6 +340,7 @@ mod tests {
                 relay_url: None,
                 owner: weft_core::CredentialOwner::Author,
                 keep_until_unix: self.keep_until,
+                published_by: None,
             })
         }
         async fn release_connection(
@@ -341,7 +382,7 @@ mod tests {
 
     fn resolve() -> ResolveConnectionRequest {
         ResolveConnectionRequest {
-            execution_id: "e".into(),
+            execution_id: uuid::Uuid::nil(),
             node_id: "n".into(),
             frames: Default::default(),
             node_type: "T".into(),
@@ -389,7 +430,7 @@ mod tests {
         }))
         .unwrap();
         let publish = |password: &str| PublishAccessRequest {
-            execution_id: "e".into(),
+            execution_id: uuid::Uuid::nil(),
             node_id: "db".into(),
             service: "postgres".into(),
             spec: spec.clone(),

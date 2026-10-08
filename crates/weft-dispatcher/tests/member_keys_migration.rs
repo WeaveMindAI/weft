@@ -21,13 +21,9 @@ use weft_core::activation::ActivationScope;
 use weft_core::instance::{InstanceId, PerInstance};
 use weft_core::program::{CostRecord, InfraCopy, InstanceHoldings, PaidBy, ProgramCall, ProgramCallOutcome, ProgramCallPayload};
 use weft_core::project::ProjectDefinition;
-use weft_core::run_spec::RunSpec;
 use weft_core::CredentialOwner;
-use weft_dispatcher::api::signal::ParkedFire;
 use weft_dispatcher::journal::TriggerBake;
-use weft_journal::ExecEvent;
 use weft_task_store::schema_guard::{replay_migrations, replay_origins};
-use weft_task_store::{ExecutionPayload, RecordCostPayload};
 
 /// The first release of the rename: everything before it is the database
 /// the old build wrote into.
@@ -49,16 +45,6 @@ fn old_grant() -> Value {
         "member": "ada", "identity": "ada@example.com", "label": null, "scopes": ["email"],
         "permissions_verified": true, "value_names": [], "owner": { "member": "ada" },
         "door": "own", "expires_at": null, "has_credential": true
-    })
-}
-
-/// A birth as the old `ExecEvent::ExecutionStarted` serialized it.
-fn old_birth() -> Value {
-    json!({
-        "kind": "execution_started", "execution_id": RUN, "project_id": PROJECT,
-        "entry_node": "n", "phase": "fire", "definition_hash": null,
-        "program": null, "source_version": null, "at_unix": 1,
-        "member": "ada", "member_values": { "b": { "in": "hello" } }
     })
 }
 
@@ -92,12 +78,6 @@ async fn insert(pool: &PgPool, sql: &str, binds: &[Value]) {
     query.execute(pool).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
 }
 
-fn assert_birth(event: &ExecEvent) {
-    let ExecEvent::ExecutionStarted { instance, instance_values, .. } = event else { panic!("a birth, got {event:?}") };
-    assert_eq!(instance.as_ref(), Some(&ada()));
-    assert_eq!(instance_values.get("b").and_then(|p| p.get("in")), Some(&json!("hello")));
-}
-
 fn assert_grant(grant: &GrantSummary) {
     assert_eq!(grant.instance.as_ref(), Some(&ada()));
     assert_eq!(grant.owner, CredentialOwner::Instance(ada()));
@@ -109,51 +89,11 @@ async fn rows_written_before_the_rename_read_after_it(pool: PgPool) {
     replay_origins(&pool, groups).await.expect("origins");
     replay_migrations(&pool, groups, |m| !m.draft && m.id < RENAME).await.expect("history before the rename");
 
-    assert!(serde_json::from_value::<ExecEvent>(old_birth()).is_err(), "the old birth does not read today");
-
-    // The journal: a birth, a cost on the member's credential, and three
-    // program calls journaled for a resume (one infra copy, the holdings
-    // under the journal name that moved, the member's connections).
-    let journal = [
-        old_birth(),
-        json!({
-            "kind": "cost_reported", "execution_id": RUN, "node_id": "n", "frames": [],
-            "cost_id": "c1", "service": "openrouter", "model": null, "amount_usd": 0.5,
-            "billed": false, "origin": { "member": "ada" }, "metadata": {}, "at_unix": 1
-        }),
-        json!({
-            "kind": "run_output", "execution_id": RUN, "node_id": "n", "frames": [], "call_index": 0,
-            "name": "weft.infra.status",
-            "value": { "node": "blender", "member": "ada", "status": "running" }, "at_unix": 1
-        }),
-        json!({
-            "kind": "run_output", "execution_id": RUN, "node_id": "n", "frames": [], "call_index": 1,
-            "name": "weft.members.list",
-            "value": [{ "member": "ada", "values": 1, "connections": 1, "tokens": 0,
-                        "copies": [{ "node": "blender", "member": "ada", "status": "running" }], "triggers": [] }],
-            "at_unix": 1
-        }),
-        json!({
-            "kind": "run_output", "execution_id": RUN, "node_id": "n", "frames": [], "call_index": 2,
-            "name": "weft.connections.list", "value": [old_grant()], "at_unix": 1
-        }),
-        json!({
-            "kind": "run_output", "execution_id": RUN, "node_id": "n", "frames": [], "call_index": 3,
-            "name": "weft.costs.list", "value": [old_cost()], "at_unix": 1
-        }),
-        json!({
-            "kind": "run_output", "execution_id": RUN, "node_id": "n", "frames": [], "call_index": 4,
-            "name": "weft.infra.copies", "value": [{ "node": "blender", "member": "ada", "status": "running" }], "at_unix": 1
-        }),
-    ];
-    for row in &journal {
-        insert(
-            &pool,
-            "INSERT INTO exec_event (execution_id, kind, payload_json, created_at) VALUES ($1, $2, $3, 1)",
-            &[json!(RUN), row["kind"].clone(), json!(row.to_string())],
-        )
-        .await;
-    }
+    // What the old build's program calls answered, as its queued work
+    // kept them (its run history is wiped by a later release, and is not
+    // read here).
+    let holdings = json!([{ "member": "ada", "values": 1, "connections": 1, "tokens": 0,
+                            "copies": [{ "node": "blender", "member": "ada", "status": "running" }], "triggers": [] }]);
 
     insert(
         &pool,
@@ -166,35 +106,17 @@ async fn rows_written_before_the_rename_read_after_it(pool: PgPool) {
     )
     .await;
 
-    insert(
-        &pool,
-        "INSERT INTO signal (token, tenant_id, project_id, node_id, is_resume, spec_json, created_at, parked_fires) \
-         VALUES ('t1', 'local', $1::uuid, 'n', false, '{}', 1, $2::jsonb)",
-        &[json!(PROJECT), json!([{ "id": "f1", "payload": {}, "received_at_unix": 1, "member_gap": "b.in" }])],
-    )
-    .await;
-
     // Queued work, as the old payloads and answers serialized.
     let tasks = [
-        ("record_cost", json!({
-            "execution_id": RUN, "node_id": "n", "frames": [], "service": "openrouter", "model": null,
-            "amount_usd": 0.5, "billed": false, "origin": { "member": "ada" }, "metadata": {}
-        }), Value::Null),
-        ("live_arrival", json!({ "token": "tok", "instance": "worker-a", "method": "GET", "query": {}, "headers": [] }),
-         json!({ "outcome": "born", "execution_id": RUN, "instance": "worker-a" })),
         ("program_call", json!({ "by": RUN, "stop_self": "keep", "call": { "call": "infra_status", "node": "blender", "member": "ada" } }),
          json!({ "value": { "node": "blender", "member": "ada", "status": "running" }, "stops_asker": false })),
         ("program_call", json!({ "by": RUN, "stop_self": "keep", "call": { "call": "members_list" } }),
-         json!({ "value": journal[3]["value"], "stops_asker": false })),
+         json!({ "value": holdings, "stops_asker": false })),
         ("program_call", json!({ "by": RUN, "stop_self": "keep", "call": { "call": "connections_list", "member": "ada" } }),
          json!({ "value": [old_grant()], "stops_asker": false })),
         ("program_call", json!({ "by": RUN, "stop_self": "keep", "call": { "call": "costs_list",
             "filter": { "member": "ada", "paid_by": "member" } } }),
          json!({ "value": [old_cost()], "stops_asker": false })),
-        ("execute", json!({
-            "project_id": PROJECT, "execution_id": RUN, "definition_hash": HASH,
-            "unrecorded_birth": [old_birth()], "run_class": "short"
-        }), Value::Null),
         // Every other call that named a member: on the call, in its scope,
         // in a run filter with no `paid_by`, and the copies answer.
         call_task(json!({ "call": "trigger_activate", "scope": { "triggers": ["t"], "member": "ada" } })),
@@ -221,15 +143,6 @@ async fn rows_written_before_the_rename_read_after_it(pool: PgPool) {
         )
         .await;
     }
-
-    insert(&pool, "INSERT INTO project_version (id, project_id, manifest, created_at) VALUES ('v1', $1::uuid, '{}', 1)", &[json!(PROJECT)]).await;
-    insert(
-        &pool,
-        "INSERT INTO version_run (execution_id, project_id, version_id, spec, definition_hash, created_at) \
-         VALUES ($1::uuid, $2::uuid, 'v1', $3::jsonb, $4, 1)",
-        &[json!(RUN), json!(PROJECT), json!({ "name": "for-ada", "member": "ada" }), json!(HASH)],
-    )
-    .await;
 
     // A health take-down and a recovery, each naming the member's broken copy.
     for (verb, spec) in [
@@ -293,73 +206,42 @@ async fn rows_written_before_the_rename_read_after_it(pool: PgPool) {
     replay_migrations(&pool, groups, |m| !m.draft && m.id >= RENAME).await.expect("the rename and everything after");
 
     // Every row now reads with today's types, carrying what it carried.
-    let rows: Vec<(String,)> = sqlx::query_as("SELECT payload_json FROM exec_event ORDER BY id").fetch_all(&pool).await.unwrap();
-    let events: Vec<ExecEvent> = rows.iter().map(|(t,)| serde_json::from_str(t).expect("an event reads")).collect();
-    assert_birth(&events[0]);
-    let ExecEvent::CostReported { origin, .. } = &events[1] else { panic!("a cost") };
-    assert_eq!(origin, &CredentialOwner::Instance(ada()));
-    let ExecEvent::RunOutput { value, .. } = &events[2] else { panic!("an answer") };
-    let copy: Option<InfraCopy> = serde_json::from_value(value.clone()).unwrap();
-    assert_eq!(copy.and_then(|c| c.instance), Some(ada()));
-    let ExecEvent::RunOutput { name, value, .. } = &events[3] else { panic!("an answer") };
-    assert_eq!(name, "weft.instances.list");
-    let held: Vec<InstanceHoldings> = serde_json::from_value(value.clone()).unwrap();
-    assert_eq!((&held[0].instance, held[0].copies[0].instance.as_ref()), (&ada(), Some(&ada())));
-    let ExecEvent::RunOutput { value, .. } = &events[4] else { panic!("an answer") };
-    assert_grant(&serde_json::from_value::<Vec<GrantSummary>>(value.clone()).unwrap()[0]);
-    let ExecEvent::RunOutput { value, .. } = &events[5] else { panic!("an answer") };
-    assert_cost(&serde_json::from_value::<Vec<CostRecord>>(value.clone()).unwrap()[0]);
-    let ExecEvent::RunOutput { value, .. } = &events[6] else { panic!("an answer") };
-    assert_eq!(serde_json::from_value::<Vec<InfraCopy>>(value.clone()).unwrap()[0].instance, Some(ada()));
-
     let (bake,): (String,) = sqlx::query_as("SELECT bake_json FROM trigger_bake").fetch_one(&pool).await.unwrap();
     assert_eq!(serde_json::from_str::<TriggerBake>(&bake).unwrap().instance, Some(ada()));
-
-    let (parked,): (Value,) = sqlx::query_as("SELECT parked_fires FROM signal").fetch_one(&pool).await.unwrap();
-    assert_eq!(serde_json::from_value::<Vec<ParkedFire>>(parked).unwrap()[0].instance_gap.as_deref(), Some("b.in"));
 
     let tasks: Vec<(Value, Option<Value>)> =
         sqlx::query_as("SELECT payload, result FROM task ORDER BY id").fetch_all(&pool).await.unwrap();
     let call = |i: usize| serde_json::from_value::<ProgramCallPayload>(tasks[i].0.clone()).unwrap().call;
     let answer = |i: usize| serde_json::from_value::<ProgramCallOutcome>(tasks[i].1.clone().unwrap()).unwrap().value;
-    assert_eq!(serde_json::from_value::<RecordCostPayload>(tasks[0].0.clone()).unwrap().origin, CredentialOwner::Instance(ada()));
-    // A task kind since retired: the rename still reaches its rows.
-    assert_eq!(tasks[1].0["replica"], "worker-a");
-    assert_eq!(tasks[1].1.clone().unwrap(), json!({ "outcome": "born", "execution_id": RUN, "replica": "worker-a" }));
-    assert_eq!(call(2), ProgramCall::InfraStatus { node: "blender".into(), instance: Some(ada()) });
-    assert_eq!(serde_json::from_value::<Option<InfraCopy>>(answer(2)).unwrap().and_then(|c| c.instance), Some(ada()));
-    assert_eq!(call(3), ProgramCall::InstancesList);
-    assert_eq!(serde_json::from_value::<Vec<InstanceHoldings>>(answer(3)).unwrap()[0].instance, ada());
-    assert_eq!(call(4), ProgramCall::ConnectionsList { instance: ada() });
-    assert_grant(&serde_json::from_value::<Vec<GrantSummary>>(answer(4)).unwrap()[0]);
-    let ProgramCall::CostsList { filter } = call(5) else { panic!("a costs call") };
+    assert_eq!(call(0), ProgramCall::InfraStatus { node: "blender".into(), instance: Some(ada()) });
+    assert_eq!(serde_json::from_value::<Option<InfraCopy>>(answer(0)).unwrap().and_then(|c| c.instance), Some(ada()));
+    assert_eq!(call(1), ProgramCall::InstancesList);
+    assert_eq!(serde_json::from_value::<Vec<InstanceHoldings>>(answer(1)).unwrap()[0].instance, ada());
+    assert_eq!(call(2), ProgramCall::ConnectionsList { instance: ada() });
+    assert_grant(&serde_json::from_value::<Vec<GrantSummary>>(answer(2)).unwrap()[0]);
+    let ProgramCall::CostsList { filter } = call(3) else { panic!("a costs call") };
     assert_eq!((filter.instance, filter.paid_by), (Some(ada()), Some(PaidBy::Instance)));
-    assert_cost(&serde_json::from_value::<Vec<CostRecord>>(answer(5)).unwrap()[0]);
-    let execute: ExecutionPayload = serde_json::from_value(tasks[6].0.clone()).unwrap();
-    assert_birth(&serde_json::from_value(execute.unrecorded_birth.unwrap()[0].clone()).unwrap());
+    assert_cost(&serde_json::from_value::<Vec<CostRecord>>(answer(3)).unwrap()[0]);
     let scoped = ActivationScope { triggers: vec!["t".into()], instance: Some(ada()) };
-    assert_eq!(call(7), ProgramCall::TriggerActivate { scope: scoped });
-    let ProgramCall::TriggerDeactivate { scope, .. } = call(8) else { panic!("a deactivate") };
+    assert_eq!(call(4), ProgramCall::TriggerActivate { scope: scoped });
+    let ProgramCall::TriggerDeactivate { scope, .. } = call(5) else { panic!("a deactivate") };
     assert_eq!(scope.instance, Some(ada()));
-    let ProgramCall::RunsClean { filter, .. } = call(9) else { panic!("a clean") };
+    let ProgramCall::RunsClean { filter, .. } = call(6) else { panic!("a clean") };
     assert_eq!(filter.instance, Some(ada()));
-    assert_eq!(call(10), ProgramCall::ValuesGet { instance: ada() });
-    let ProgramCall::ValuesChange { instance, .. } = call(11) else { panic!("a values change") };
+    assert_eq!(call(7), ProgramCall::ValuesGet { instance: ada() });
+    let ProgramCall::ValuesChange { instance, .. } = call(8) else { panic!("a values change") };
     assert_eq!(instance, ada());
-    assert_eq!(call(12), ProgramCall::ValuesForget { instance: ada() });
-    assert_eq!(call(13), ProgramCall::TokensRevoke { instance: ada(), id: None });
-    assert_eq!(call(14), ProgramCall::InfraStart { node: "blender".into(), instance: Some(ada()) });
-    let ProgramCall::InfraStop { instance, .. } = call(15) else { panic!("a stop") };
+    assert_eq!(call(9), ProgramCall::ValuesForget { instance: ada() });
+    assert_eq!(call(10), ProgramCall::TokensRevoke { instance: ada(), id: None });
+    assert_eq!(call(11), ProgramCall::InfraStart { node: "blender".into(), instance: Some(ada()) });
+    let ProgramCall::InfraStop { instance, .. } = call(12) else { panic!("a stop") };
     assert_eq!(instance, Some(ada()));
-    let ProgramCall::InfraTerminate { instance, .. } = call(16) else { panic!("a terminate") };
+    let ProgramCall::InfraTerminate { instance, .. } = call(13) else { panic!("a terminate") };
     assert_eq!(instance, Some(ada()));
-    assert_eq!(call(17), ProgramCall::InfraCopies { node: "blender".into() });
-    assert_eq!(serde_json::from_value::<Vec<InfraCopy>>(answer(17)).unwrap()[0].instance, Some(ada()));
-    assert_eq!(call(18), ProgramCall::InfraStatus { node: "blender".into(), instance: None });
-    assert_eq!(serde_json::from_value::<Option<InfraCopy>>(answer(18)).unwrap(), None);
-
-    let (spec,): (Value,) = sqlx::query_as("SELECT spec FROM version_run").fetch_one(&pool).await.unwrap();
-    assert_eq!(serde_json::from_value::<RunSpec>(spec).unwrap().instance, Some(ada()));
+    assert_eq!(call(14), ProgramCall::InfraCopies { node: "blender".into() });
+    assert_eq!(serde_json::from_value::<Vec<InfraCopy>>(answer(14)).unwrap()[0].instance, Some(ada()));
+    assert_eq!(call(15), ProgramCall::InfraStatus { node: "blender".into(), instance: None });
+    assert_eq!(serde_json::from_value::<Option<InfraCopy>>(answer(15)).unwrap(), None);
 
     let commands: Vec<(String, Value)> =
         sqlx::query_as("SELECT verb, spec_json FROM infra_lifecycle_command ORDER BY id").fetch_all(&pool).await.unwrap();

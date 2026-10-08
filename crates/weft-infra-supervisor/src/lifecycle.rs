@@ -149,8 +149,8 @@ const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const READINESS_BREADCRUMB_INTERVAL: Duration = Duration::from_secs(30);
 
 /// How often the executing supervisor polls the command's
-/// `cancel_requested` flag while inside a wait loop (readiness /
-/// drain). Between discrete host steps the check is per-step.
+/// `cancel_requested` flag while inside the readiness wait. Between
+/// discrete host steps the check is per-step.
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Marker error: the command was HALTED because the user requested
@@ -182,41 +182,6 @@ async fn check_cancel(
 ) -> Result<()> {
     if state.broker.command_cancel_requested(command_id).await? {
         return Err(anyhow::Error::new(CancelledByUser { at }));
-    }
-    Ok(())
-}
-
-/// Drain the project's running executions before a stop/terminate,
-/// via THE shared drain loop (`weft_platform_traits::drain_until_zero`,
-/// the same mechanism the dispatcher's worker-replacement drain uses).
-/// The cap comes from the command row (the user picked it with the
-/// wait choice); on timeout the op proceeds with a loud warning. The
-/// user's infra-cancel rides inside the count closure so a cancel
-/// landing mid-drain aborts promptly.
-async fn wait_for_drain(
-    state: &SupervisorState,
-    command_id: i64,
-    drain_timeout_secs: u64,
-    project_id: uuid::Uuid,
-    copies: &weft_core::instance::Copies,
-) -> Result<()> {
-    let outcome = weft_platform_traits::drain_until_zero(
-        state.clock.as_ref(),
-        Duration::from_secs(drain_timeout_secs),
-        "infra lifecycle op",
-        || async {
-            check_cancel(state, command_id, "waiting for running executions to drain").await?;
-            state.broker.running_count(project_id, copies).await
-        },
-    )
-    .await?;
-    if let weft_platform_traits::DrainOutcome::TimedOut { still_running } = outcome {
-        tracing::warn!(
-            %project_id,
-            still_running,
-            drain_timeout_secs,
-            "running_policy=wait drain timeout; proceeding with lifecycle op"
-        );
     }
     Ok(())
 }
@@ -517,13 +482,11 @@ async fn wait_for_readiness(
     // this wait is NOT capped by a fixed hard-fail deadline. The user
     // interrupts a unit that will never come up via cancel (polled at
     // CANCEL_POLL_INTERVAL); a periodic breadcrumb makes a stuck readiness
-    // legible in the logs rather than a silent hang.
-    //
-    // The sibling drain wait IS capped, and differently on purpose: there
-    // the person says how long they are willing to hold
-    // (`drain_timeout_secs`) and what is still running past it is
-    // cancelled. Here there is nothing to cancel INSTEAD of waiting: the
-    // unit either comes up or the user stops it.
+    // legible in the logs rather than a silent hang. Unlike the wait for
+    // running work a stop does first (the dispatcher's, capped by the
+    // person's deadline, `weft_dispatcher::drain`), there is nothing to
+    // cancel instead of waiting: the unit either comes up or the user
+    // stops it.
     let mut next_cancel_check = state.clock.now();
     let mut next_breadcrumb = state.clock.now() + READINESS_BREADCRUMB_INTERVAL;
     // What the row says it waits on, rewritten only when it changes.
@@ -581,20 +544,15 @@ async fn execute(
     state: &SupervisorState,
     cmd: &weft_broker_client::protocol::SupervisorCommandRow,
 ) -> Result<()> {
-    use weft_broker_client::protocol::{InfraLifecycleVerb, RunningPolicy};
+    use weft_broker_client::protocol::InfraLifecycleVerb;
     // Apply is the only verb that doesn't operate on existing
     // infra_node rows; it creates / updates one. Route early.
     if cmd.verb == InfraLifecycleVerb::Apply {
         return execute_apply(state, cmd).await;
     }
-
-    // Honor running_policy. `wait`: poll the broker's running-count
-    // endpoint until 0 (or timeout). `cancel`: skip; the dispatcher
-    // already cancelled the running executions when it issued the
-    // command, so any executions still alive are draining naturally.
-    if cmd.running_policy == Some(RunningPolicy::Wait) {
-        wait_for_drain(state, cmd.id, cmd.drain_timeout_secs, cmd.project_id, &cmd.copies).await?;
-    }
+    // What runs on these copies was settled before the command reached
+    // a supervisor: cancelled by the dispatcher as it issued it, or waited
+    // for by the dispatcher's claimer (`weft_dispatcher::drain`).
     // What a terminate does with the disks its nodes keep is the
     // command's answer (a person's terminate keeps them, an instance's
     // wipe deletes them), read before anything is touched so a row without it

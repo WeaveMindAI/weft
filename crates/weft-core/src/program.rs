@@ -302,7 +302,7 @@ impl InstanceHoldings {
 crate::wire_enum! {
     /// Where a run stands, as a filter asks for it: each word is the
     /// [`ExecutionSummary::status`] a run reads in a listing.
-    // SYNC: RunStatus <-> crates/weft-dispatcher/src/journal/postgres.rs list_executions (status clause), extension-vscode/src/sidebar/runSearch.ts STATUSES
+    // SYNC: RunStatus <-> crates/weft-dispatcher/src/journal/postgres.rs list_executions (status clause), extension-vscode/src/sidebar/runSearch.ts STATUSES, extension-vscode/src/sidebar/executions.ts RunStatus
     pub enum RunStatus {
         /// Not ended: no terminal event yet. A run parked on a wait has
         /// not ended either, so it is here too.
@@ -317,92 +317,14 @@ crate::wire_enum! {
 }
 
 impl RunStatus {
-    /// Whether a run whose decoded status is `status` (the honest one, a
-    /// parked run already `waiting_for_input`) is one this filter
-    /// reaches. This decides what a filtered `weft clean` may delete, not
-    /// what a listing shows: the listing filters in SQL, which cannot see
-    /// a row that no longer decodes, so such a row lists under the filter
-    /// as `corrupt`. A corrupt row is reached by no filter, so a filtered
-    /// clean never deletes it.
-    pub fn reaches(self, status: SummaryStatus) -> bool {
-        let SummaryStatus::Run(status) = status else { return false };
+    /// Whether a run that reads `status` (a parked run reads
+    /// `waiting_for_input`) is one this filter reaches: `running` reaches
+    /// a run parked on a wait too, since it has not ended.
+    pub fn reaches(self, status: RunStatus) -> bool {
         match self {
             Self::Running => matches!(status, Self::Running | Self::WaitingForInput),
             other => status == other,
         }
-    }
-}
-
-/// What a listing says about one run: where it stands ([`RunStatus`]),
-/// or `corrupt` when its row no longer decodes. Separate from
-/// [`RunStatus`] because a filter can never ask for a corrupt row (SQL
-/// cannot select a row by failing to decode it). On the wire it is the
-/// one flat word, `running` .. `cancelled` or `corrupt`.
-// SYNC: SummaryStatus <-> extension-vscode/src/sidebar/executions.ts ExecutionSummary['status']
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SummaryStatus {
-    Run(RunStatus),
-    Corrupt,
-}
-
-impl SummaryStatus {
-    pub const CORRUPT: &'static str = "corrupt";
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Run(status) => status.as_str(),
-            Self::Corrupt => Self::CORRUPT,
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        if s == Self::CORRUPT {
-            return Some(Self::Corrupt);
-        }
-        RunStatus::parse(s).map(Self::Run)
-    }
-
-    /// The status a listing shows, given whether the run is parked on a
-    /// wait (a resume signal is registered for it): a running run that
-    /// is parked reads `waiting_for_input`; every other status is kept.
-    // SYNC: SummaryStatus::parked <-> crates/weft-journal/src/events.rs run_parked_sql
-    pub fn parked(self, parked: bool) -> Self {
-        match self {
-            Self::Run(RunStatus::Running) if parked => Self::Run(RunStatus::WaitingForInput),
-            other => other,
-        }
-    }
-}
-
-impl From<RunStatus> for SummaryStatus {
-    fn from(status: RunStatus) -> Self {
-        Self::Run(status)
-    }
-}
-
-impl std::fmt::Display for SummaryStatus {
-    /// Padded, so a listing column (`{status:<9}`) lines up.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.pad(self.as_str())
-    }
-}
-
-impl Serialize for SummaryStatus {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for SummaryStatus {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let word = String::deserialize(deserializer)?;
-        Self::parse(&word).ok_or_else(|| {
-            serde::de::Error::custom(format!(
-                "unknown run status `{word}` (expected one of {}, {})",
-                RunStatus::accepted(),
-                Self::CORRUPT
-            ))
-        })
     }
 }
 
@@ -479,11 +401,9 @@ pub struct ExecutionSummary {
     pub execution_id: crate::ExecutionId,
     pub project_id: uuid::Uuid,
     pub entry_node: String,
-    /// Where the run stands ([`RunStatus`]: a running run parked on a
-    /// wait reads `waiting_for_input`), or `corrupt` (the row no longer
-    /// decodes; `entry_node` is empty then, and the row is listed so it
-    /// can be inspected via replay and deleted).
-    pub status: SummaryStatus,
+    /// Where the run stands: a running run parked on a wait reads
+    /// `waiting_for_input`.
+    pub status: RunStatus,
     /// What kind of run this was: a `fire` (a trigger fired or a
     /// manual run), or one of the two setup phases an activate /
     /// resync / infra start runs. The listing mixes all three, and
@@ -681,35 +601,9 @@ mod tests {
 
     #[test]
     fn running_reaches_a_run_parked_on_a_wait_and_waiting_only_that() {
-        let run = SummaryStatus::Run;
-        assert!(RunStatus::Running.reaches(run(RunStatus::Running)) && RunStatus::Running.reaches(run(RunStatus::WaitingForInput)));
-        assert!(RunStatus::WaitingForInput.reaches(run(RunStatus::WaitingForInput)) && !RunStatus::WaitingForInput.reaches(run(RunStatus::Running)));
-        assert!(RunStatus::Failed.reaches(run(RunStatus::Failed)) && !RunStatus::Failed.reaches(run(RunStatus::Running)));
-        assert!(RunStatus::VARIANTS.iter().all(|f| !f.reaches(SummaryStatus::Corrupt)));
-    }
-
-    /// A summary status is the one flat word on the wire, both ways,
-    /// `corrupt` included, and an unknown word is refused.
-    #[test]
-    fn summary_status_round_trips_as_one_flat_word() {
-        let every = RunStatus::VARIANTS.iter().map(|s| SummaryStatus::Run(*s)).chain([SummaryStatus::Corrupt]);
-        for status in every {
-            let json = serde_json::to_string(&status).unwrap();
-            assert_eq!(json, format!("\"{}\"", status.as_str()));
-            assert_eq!(serde_json::from_str::<SummaryStatus>(&json).unwrap(), status);
-        }
-        assert_eq!(serde_json::to_string(&SummaryStatus::Corrupt).unwrap(), "\"corrupt\"");
-        assert!(serde_json::from_str::<SummaryStatus>("\"unknown\"").is_err());
-    }
-
-    #[test]
-    fn only_a_running_run_that_is_parked_reads_waiting() {
-        let running = SummaryStatus::Run(RunStatus::Running);
-        assert_eq!(running.parked(true), SummaryStatus::Run(RunStatus::WaitingForInput));
-        assert_eq!(running.parked(false), running);
-        let done = SummaryStatus::Run(RunStatus::Completed);
-        assert_eq!(done.parked(true), done);
-        assert_eq!(SummaryStatus::Corrupt.parked(true), SummaryStatus::Corrupt);
+        assert!(RunStatus::Running.reaches(RunStatus::Running) && RunStatus::Running.reaches(RunStatus::WaitingForInput));
+        assert!(RunStatus::WaitingForInput.reaches(RunStatus::WaitingForInput) && !RunStatus::WaitingForInput.reaches(RunStatus::Running));
+        assert!(RunStatus::Failed.reaches(RunStatus::Failed) && !RunStatus::Failed.reaches(RunStatus::Running));
     }
 
     fn spec() -> DeactivateSpec {

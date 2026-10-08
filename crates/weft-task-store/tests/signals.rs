@@ -17,26 +17,20 @@ use sqlx::PgPool;
 
 use weft_task_store::pg_signal::{Heard, Subscription};
 use weft_task_store::tasks::{self, claim_one, TASK_READY_CHANNEL};
-use weft_task_store::{PostgresTaskStoreClient, TaskStoreClient, TaskTarget};
 
 use support::{setup, signals};
-
-const PROJECT: uuid::Uuid = uuid::Uuid::from_u128(0xa);
 
 /// Long enough for a notification that was sent to arrive on a loaded
 /// machine, so "nothing arrived" means nothing was sent.
 const QUIET: Duration = Duration::from_millis(700);
 
-fn task(target: TaskTarget, dedup: &str) -> tasks::NewTask {
+fn task(dedup: &str) -> tasks::NewTask {
     tasks::NewTask {
         kind: "register_signal".to_string(),
-        target,
-        project_id: (target == TaskTarget::Worker).then_some(PROJECT),
+        project_id: None,
         dedup_key: Some(dedup.to_string()),
         execution_id: None,
         tenant_id: "tenant-1".to_string(),
-        target_replica: None,
-        binary_hash: None,
         payload: json!({}),
     }
 }
@@ -110,56 +104,19 @@ async fn a_task_is_announced_exactly_when_it_becomes_claimable(pool: PgPool) {
     let watch = signals(&pool).await;
     let mut heard = watch.subscribe();
 
-    let dispatcher = tasks::enqueue(&pool, task(TaskTarget::Dispatcher, "d")).await.unwrap();
-    tasks::enqueue_dedup(&pool, task(TaskTarget::Worker, "w")).await.unwrap();
-    // Sent in one batch or two (`announce`), in no promised order.
-    let mut ready = on(&drain(&mut heard).await, TASK_READY_CHANNEL);
-    ready.sort();
-    assert_eq!(ready, vec!["dispatcher".to_string(), format!("worker:{PROJECT}")]);
+    let work = tasks::enqueue(&pool, task("d")).await.unwrap();
+    assert!(!on(&drain(&mut heard).await, TASK_READY_CHANNEL).is_empty(), "new work wakes the pickers");
 
-    claim_one(&pool, "disp-1").await.unwrap().expect("claimed");
-    tasks::heartbeat(&pool, dispatcher, "disp-1").await.unwrap();
+    assert_eq!(claim_one(&pool, "disp-1").await.unwrap().expect("claimed").id, work);
+    tasks::heartbeat(&pool, work, "disp-1").await.unwrap();
     assert!(on(&drain(&mut heard).await, TASK_READY_CHANNEL).is_empty(), "claim and heartbeat are silent");
 
-    assert!(tasks::requeue(&pool, dispatcher, "disp-1").await.unwrap());
-    assert_eq!(on(&drain(&mut heard).await, TASK_READY_CHANNEL), vec!["dispatcher".to_string()]);
+    assert!(tasks::surrender(&pool, work, "disp-1").await.unwrap());
+    assert_eq!(on(&drain(&mut heard).await, TASK_READY_CHANNEL), vec![String::new()]);
 
-    claim_one(&pool, "disp-1").await.unwrap().expect("claimed");
-    tasks::complete(&pool, dispatcher, "disp-1", json!(1)).await.unwrap();
+    assert_eq!(claim_one(&pool, "disp-1").await.unwrap().expect("claimed").id, work);
+    tasks::complete(&pool, work, "disp-1", json!(1)).await.unwrap();
     assert!(on(&drain(&mut heard).await, TASK_READY_CHANNEL).is_empty(), "completing is silent");
-}
-
-fn cancel(execution_id: &str) -> tasks::NewTask {
-    tasks::NewTask {
-        kind: "cancel_execution".to_string(),
-        target: TaskTarget::Worker,
-        project_id: Some(PROJECT),
-        dedup_key: Some(format!("{execution_id}:cancel")),
-        execution_id: Some(execution_id.to_string()),
-        tenant_id: "tenant-1".to_string(),
-        target_replica: None,
-        binary_hash: None,
-        payload: json!({ "project_id": PROJECT, "execution_id": execution_id, "cause": { "kind": "user" } }),
-    }
-}
-
-/// A cancel is announced to the workers of its project with the
-/// execution it stops, never as work to claim.
-#[sqlx::test]
-async fn a_cancel_is_announced_with_its_execution(pool: PgPool) {
-    setup(&pool).await;
-    let watch = signals(&pool).await;
-    let mut heard = watch.subscribe();
-    let client = PostgresTaskStoreClient::new(pool.clone(), watch.clone()).expect("client");
-
-    tasks::enqueue_dedup(&pool, cancel("c1")).await.unwrap();
-    let heard = drain(&mut heard).await;
-    assert_eq!(on(&heard, tasks::CANCEL_CHANNEL), vec![tasks::cancel_payload(PROJECT, "c1")]);
-    assert!(on(&heard, TASK_READY_CHANNEL).is_empty(), "a cancel is no work for a picker");
-    assert_eq!(tasks::parse_cancel_payload(&tasks::cancel_payload(PROJECT, "c1")), Some((PROJECT, "c1")));
-
-    assert!(client.cancels_asked(PROJECT, vec!["other".into()]).await.unwrap().is_empty());
-    assert_eq!(client.cancels_asked(PROJECT, vec!["c1".into()]).await.unwrap().len(), 1);
 }
 
 /// What a write leaves in the outbox goes out once it commits and its

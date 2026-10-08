@@ -43,7 +43,7 @@ A broken node or package never breaks the catalog: it is left out, and only a pr
 
 Top-level keys: `type`, `label`, `description`, `tags`, `icon`, `color`, `inputs`, `outputs`, `types`, `requires_infra`, `images`, `publishes`, `service`, `portsFromConfig`, `features`, `display`, `validate`.
 
-An input entry: `name`, `type`, `required`, `accepts`, `widget`, `default`, `label`, `placeholder`, `description`, and for `Access`-typed inputs `requiresScopes` / `requiresValues`. An output entry: `name`, `type`, `description`.
+An input entry: `name`, `type`, `required`, `accepts`, `widget`, `default`, `label`, `placeholder`, `description`, and for `Access`-typed inputs `requiresScopes` / `requiresValues`. An output entry: `name`, `type`, `description`, and on an [infra node] `baked` (what that means is under the infra node shape below).
 
 `accepts` lists the drivers the port takes: `literal` (a value written in the source, in the braces or on its own line, `@file`/`@asset` included) and `wire` (a value another node produces). Absent means both; `["wire"]` means only a real node fills it (an LLM's `provider`, `params`, `historyFile`, `tools`; a consumer's `Access` handle). The list named in `portsFromConfig` is compiler-read: an inline typed value only, never a wire, never a marker. The access picker holds nothing in the source at all: its connection is picked on the install (`weft connect`). Exactly one driver per port.
 
@@ -83,8 +83,7 @@ from memory.
 container running for, with a disk that survives restarts. It emits whatever
 its consumers need to reach it (a connection, an address), and you wire that
 out exactly like an [access node]'s. `weft infra start` / `stop` run them,
-`weft infra status` reports them, and a run cannot start while an [infra node]
-it touches is not running.
+`weft infra status` reports them, and a run cannot start while an [infra node] it touches is not running. An output marked `"baked": true` (the Postgres node's `access`, the WhatsApp bridge's `bridge`) is made when the infra is applied and saved, and the infra itself tells weft when a value in it changes (a password reset): a run that reads nothing else from the node uses the saved value instead of running it, and `weft infra rebake <node>` makes it again by hand (`weft bake` is unrelated: it prepares a trigger's settings).
 
 Such a node also carries a **card in the graph**: readouts of its live state,
 and a button for every state it can sit in, so a stuck one always has a way out

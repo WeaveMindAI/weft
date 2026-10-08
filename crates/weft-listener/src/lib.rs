@@ -17,8 +17,9 @@
 //!   POST /prepare, /start, /unregister, /process, /match_push,
 //!   /wake_by_hand, /live, /rehydrate, /wake; GET /signals, /health.
 //! A fire the listener raises itself (a timer's tick, an event on a held
-//! connection) is enqueued as a `FireSignal` task through the broker; the
-//! dispatcher runs it back through `/process` like any other fire.
+//! connection) goes straight to its project's worker door when it is an
+//! entry's, and as a `FireSignal` task through the broker otherwise
+//! (`fire_sink`).
 
 pub mod config;
 pub mod event_context;
@@ -69,13 +70,15 @@ impl ListenerState {
         tasks: Arc<dyn TaskStoreClient>,
         link: BrokerLink,
         alarm: Arc<dyn Alarm>,
+        doors: Arc<dyn fire_sink::WorkerDoors>,
     ) -> Self {
         let signals = BrokerSignalClient::new(link.clone());
-        let fire_sink = FireSignalSink::new(tasks, signals.clone());
+        let registry = Arc::new(Registry::new());
+        let fire_sink = FireSignalSink::new(tasks, signals.clone(), registry.clone(), doors);
         let events_broker = weft_broker_client::BrokerEventsClient::new(link);
         Self {
             config: Arc::new(config),
-            registry: Arc::new(Registry::new()),
+            registry,
             fire_sink,
             signals,
             events_broker,

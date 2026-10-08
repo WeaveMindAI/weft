@@ -301,7 +301,7 @@ async fn handle_request(req: ServerRequest, catalogs: &mut HashMap<PathBuf, FsCa
                             });
                         }
                     }
-                    let resolved = weft_core::run_spec::resolve_spec(&spec, &definition)
+                    let resolved = weft_core::run_spec::resolve_spec(&spec, &definition, &Default::default())
                         .and_then(|mut resolved| {
                             if let Some((node, _)) = &spec.fire {
                                 let program = preview_program(&definition, project.as_ref(), catalogs)

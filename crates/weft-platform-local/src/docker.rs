@@ -86,14 +86,16 @@ pub mod labels {
     pub const COPY: &str = "weft.copy";
     pub const UNIT: &str = "weft.unit";
     pub const UNIT_HASH: &str = "weft.unit-hash";
+    /// On a worker container: which life of the process that started it
+    /// (`LocalRunner`), so a restarted process tells its own workers from
+    /// the ones an earlier life left running.
+    pub const LIFE: &str = "weft.life";
 }
 
 /// The values of [`labels::ROLE`]: what a container is for.
 pub mod roles {
     /// Serves a project's program.
     pub const WORKER: &str = "worker";
-    /// Runs one long run of a project's program to its end.
-    pub const LONG: &str = "long";
     /// Part of an infra node's unit.
     pub const INFRA: &str = "infra";
 }
@@ -168,6 +170,49 @@ pub async fn remove_containers(docker: &dyn Docker, names: &[String]) -> anyhow:
     } else {
         out.ok(&args).map(|_| ())
     }
+}
+
+/// Stop the named containers the way a platform replaces a process: told
+/// to stop (`SIGTERM`), given `grace_secs` to exit on their own, killed
+/// after that. One already gone is no error.
+pub async fn stop(docker: &dyn Docker, names: &[String], grace_secs: u64) -> anyhow::Result<()> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec!["stop".to_string(), "--time".into(), grace_secs.to_string()];
+    args.extend(names.iter().cloned());
+    let out = docker.exec(&args).await?;
+    if out.success() || out.stderr.contains("No such container") {
+        Ok(())
+    } else {
+        out.ok(&args).map(|_| ())
+    }
+}
+
+/// Tell the named running containers to stop, as a platform tells a
+/// process it is about to replace (`SIGTERM`), and leave them to exit in
+/// their own time: a worker hands its durable runs back and lets its fast
+/// runs end first. One already gone, or already stopped, is not an error.
+pub async fn ask_to_stop(docker: &dyn Docker, names: &[String]) -> anyhow::Result<()> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let mut args = vec!["kill".to_string(), "--signal".into(), "TERM".into()];
+    args.extend(names.iter().cloned());
+    let out = docker.exec(&args).await?;
+    if out.success() || out.stderr.contains("No such container") || out.stderr.contains("is not running") {
+        Ok(())
+    } else {
+        out.ok(&args).map(|_| ())
+    }
+}
+
+/// `--add-host` naming the machine `host.docker.internal`: what a container
+/// that calls weft's internal port (a worker, the agent beside an infra
+/// unit) reaches it under. Docker Desktop knows the name on its own; a
+/// Linux engine only through this.
+pub fn host_gateway_args() -> [String; 2] {
+    ["--add-host".into(), "host.docker.internal:host-gateway".into()]
 }
 
 /// The network every container weft starts joins, so a worker reaches an

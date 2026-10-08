@@ -617,33 +617,6 @@
         assert!(text.contains("theirs has value, still waiting on go"), "{text}");
     }
 
-    /// An execution whose journal already holds a terminal when the worker
-    /// boots (cancelled in the dispatcher's route window, or a late
-    /// second execute task for an execution that already ran) is not driven:
-    /// no body runs, and nothing is journaled on top of the terminal.
-    #[tokio::test]
-    async fn a_execution_id_with_a_terminal_is_not_driven_again() {
-        use super::engine_test_rig::drive_settled;
-        let ran: Ran = Arc::new(StdMutex::new(Vec::new()));
-        let (outcome, events) =
-            drive_settled(guarded_project(), branch_catalog(Some(json!(true)), &ran), &["source"]).await;
-        assert!(matches!(outcome, ExecutionOutcome::AlreadySettled), "{outcome:?}");
-        assert!(ran.lock().unwrap().is_empty(), "no body may run: {:?}", ran.lock().unwrap());
-        let terminals = events
-            .iter()
-            .filter(|e| {
-                matches!(
-                    e,
-                    ExecEvent::ExecutionCompleted { .. }
-                        | ExecEvent::ExecutionFailed { .. }
-                        | ExecEvent::ExecutionCancelled { .. }
-                )
-            })
-            .count();
-        assert_eq!(terminals, 1, "the pre-existing terminal stays the only one: {events:?}");
-        assert!(!touched(&events, "source") && !touched(&events, "guarded"));
-    }
-
     /// An out-of-scope node fed by only SOME of its parents (its other
     /// parent is an unkicked entry node outside the subgraph) is
     /// absorbed immediately instead of parking its pulse forever waiting

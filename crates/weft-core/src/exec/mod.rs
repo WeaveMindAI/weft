@@ -27,6 +27,6 @@ pub use execution::{
 };
 pub use postprocess::{close_unmentioned_downstream, postprocess_output, OutputBag};
 pub use ready::{find_ready_nodes, InputBag, ReadyGroup};
-pub use run_kind::{unrecorded_wait_error, RunKind};
+pub use run_kind::RunKind;
 pub use skip::check_should_skip;
 pub use stuck::{stuck_report, StuckFiring, StuckReport};

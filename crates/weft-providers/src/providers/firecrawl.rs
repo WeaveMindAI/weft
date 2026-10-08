@@ -16,7 +16,8 @@
 //!
 //! Credits price by subscription tier; the constant below prices one
 //! credit at the Standard tier (~$0.00083, firecrawl.dev/pricing,
-//! checked 2026-08), rounded up to stay a ceiling-side figure.
+//! checked 2026-08), rounded up so a booked figure never understates the
+//! spend.
 //!
 //! Everything else is Unknown.
 
@@ -108,28 +109,6 @@ impl ProviderMeter for FirecrawlMeter {
             // rather than running a second poll of its own.
             ("GET", p) if p.starts_with("v2/crawl/") => RouteClass::Reports,
             _ => RouteClass::Unknown,
-        }
-    }
-
-    async fn ceiling_usd(
-        &self,
-        path: &str,
-        body: &[u8],
-        _follow_up: FollowUp<'_>,
-    ) -> anyhow::Result<f64> {
-        let parsed: Value = serde_json::from_slice(body)?;
-        let options = multiplying_options(&parsed);
-        anyhow::ensure!(options.is_empty(), "Firecrawl cannot price-bound these requested options: {}", options.join(", "));
-        if path == "v2/scrape" {
-            return Ok(USD_PER_CREDIT);
-        }
-        // A crawl's worst case is its own page limit, one credit each;
-        // a request without a limit cannot be bounded and is refused.
-        match parsed.get("limit").and_then(Value::as_f64) {
-            Some(limit) if limit >= 1.0 => Ok(limit * USD_PER_CREDIT),
-            _ => anyhow::bail!(
-                "a crawl without a page `limit` cannot be price-bounded; set one"
-            ),
         }
     }
 
@@ -444,7 +423,8 @@ mod tests {
     #[tokio::test]
     async fn scrape_resolve_books_by_confirmed_outcome() {
         let http = follow_up_stub();
-        let fu = || FollowUp { http: &http, base_url: "http://unused.test" };
+        let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
+        let fu = || FollowUp { http: &http, base_url: "http://unused.test", shared: &shared };
 
         let ok = ObservedCall {
             interrupted: false,
@@ -472,15 +452,6 @@ mod tests {
             None,
             "an unreadable outcome is unknown, never a guess"
         );
-    }
-
-    #[tokio::test]
-    async fn a_ceiling_refuses_options_without_a_known_upper_price() {
-        let http = follow_up_stub();
-        let follow = || FollowUp { http: &http, base_url: "http://unused.test" };
-        assert_eq!(FIRECRAWL.ceiling_usd("v2/scrape", br#"{"url":"https://example.test"}"#, follow()).await.unwrap(), USD_PER_CREDIT);
-        assert!(FIRECRAWL.ceiling_usd("v2/scrape", br#"{"proxy":"stealth"}"#, follow()).await.is_err());
-        assert!(FIRECRAWL.ceiling_usd("v2/crawl", br#"{"limit":10,"scrapeOptions":{"formats":["json"]}}"#, follow()).await.is_err());
     }
 }
 
@@ -530,13 +501,14 @@ mod crawl_charge_tests {
         let m = &FIRECRAWL;
         let mut scratch = json!({ "id": "job-1" });
         let http = http();
+        let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
 
         let still_going = m
             .fold_report(
                 "v2/crawl/job-1",
                 observed(200, json!({ "status": "scraping", "creditsUsed": 4.0 })),
                 &mut scratch,
-                FollowUp { http: &http, base_url: m.base_url() },
+                FollowUp { http: &http, base_url: m.base_url(), shared: &shared },
             )
             .await;
         assert!(still_going.is_none(), "a running crawl must leave the charge open");
@@ -546,7 +518,7 @@ mod crawl_charge_tests {
                 "v2/crawl/job-1",
                 observed(200, json!({ "status": "completed", "creditsUsed": 12.0 })),
                 &mut scratch,
-                FollowUp { http: &http, base_url: m.base_url() },
+                FollowUp { http: &http, base_url: m.base_url(), shared: &shared },
             )
             .await
             .expect("a stopped crawl must close the charge");
@@ -562,12 +534,13 @@ mod crawl_charge_tests {
         let m = &FIRECRAWL;
         let mut scratch = json!({ "id": "job-1" });
         let http = http();
+        let shared = weft_core::shared::Shared::new(std::time::Duration::MAX);
         let done = m
             .fold_report(
                 "v2/crawl/job-1",
                 observed(200, json!({ "status": "failed" })),
                 &mut scratch,
-                FollowUp { http: &http, base_url: m.base_url() },
+                FollowUp { http: &http, base_url: m.base_url(), shared: &shared },
             )
             .await
             .expect("a stopped crawl must close the charge");

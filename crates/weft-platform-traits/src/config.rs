@@ -60,7 +60,7 @@ pub struct InstallConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PlatformConfig {
-    Local(LocalPlatform),
+    Local(Box<LocalPlatform>),
     Gcp(Box<GcpPlatform>),
 }
 
@@ -87,6 +87,12 @@ pub struct LocalPlatform {
     pub worker_idle_stop_seconds: Option<u64>,
     /// The ports the install's one process serves.
     pub listen: Listen,
+    /// The ports the install gives its projects, one each, on the public
+    /// port's address: a project's own address, serving its routes at its
+    /// root. Unset, each project's port is a free one the machine picks
+    /// the first time (an install beside another, whose block is taken).
+    #[serde(default, rename = "projectPorts", skip_serializing_if = "Option::is_none")]
+    pub project_ports: Option<PortRange>,
     /// Where the internal port is reached from the machine itself
     /// (`http://127.0.0.1:14113`): the base every role answers under, each
     /// at its own prefix, for a caller in the same process. A container
@@ -165,10 +171,6 @@ pub struct GcpPlatform {
     /// authenticates through.
     #[serde(rename = "workloadIdentityProvider")]
     pub workload_identity_provider: String,
-    /// The Secret Manager secret holding `WEFT_CALLER_TOKEN_SECRET`, which
-    /// every project's workers read to check a live caller's ticket.
-    #[serde(rename = "callerTokenSecret")]
-    pub caller_token_secret: String,
     /// The network tag every infra machine carries: the firewall opens its
     /// ports to the install's workers, roles and other infra machines, and
     /// to nothing else.
@@ -208,6 +210,20 @@ pub struct Listen {
     /// public port).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outside: Option<SocketAddr>,
+}
+
+/// A block of ports, both ends included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortRange {
+    pub first: u16,
+    pub last: u16,
+}
+
+impl PortRange {
+    pub fn ports(self) -> std::ops::RangeInclusive<u16> {
+        self.first..=self.last
+    }
 }
 
 /// How the holders in a pool share the held connections
@@ -267,6 +283,13 @@ pub struct EdgeConfig {
     /// from reading a missing `Option` as `None`).
     #[serde(rename = "invalidTokensPerMinute", deserialize_with = "Option::deserialize")]
     pub invalid_tokens_per_minute: Option<u32>,
+}
+
+/// The bound on refused tokens as a worker's environment spells it
+/// (`WEFT_INVALID_TOKENS_PER_MINUTE`): a count, or `none`.
+// SYNC: the spelling <-> crates/weft-engine/src/door/mod.rs (Edge::from_env)
+pub fn invalid_tokens_env(bound: Option<u32>) -> String {
+    bound.map_or_else(|| "none".to_string(), |n| n.to_string())
 }
 
 /// The trusted proxy hops in front of each listener that serves outside
@@ -500,14 +523,15 @@ pub(crate) mod tests {
     pub fn local() -> InstallConfig {
         InstallConfig {
             install: Install::default_install(),
-            platform: PlatformConfig::Local(LocalPlatform {
+            platform: PlatformConfig::Local(Box::new(LocalPlatform {
                 data_dir: "/home/u/.local/share/weft".into(),
                 container_internal_url: "http://host.docker.internal:14113".into(),
                 runtime_image: "weft-runtime:dev".into(),
                 worker_idle_stop_seconds: None,
                 listen: Listen { public: "127.0.0.1:14111".parse().unwrap(), internal: "127.0.0.1:14113".parse().unwrap(), outside: None },
+                project_ports: Some(PortRange { first: 14200, last: 14999 }),
                 internal_url: "http://127.0.0.1:14113".into(),
-            }),
+            })),
             auth: AuthMode::Local,
             public_url: "http://127.0.0.1:14111".into(),
             internet_url: None,
@@ -551,7 +575,6 @@ pub(crate) mod tests {
             deployer_service_account: "deployer@p".into(),
             frontend_service_account: "frontend@p".into(),
             workload_identity_provider: "w".into(),
-            caller_token_secret: "c".into(),
             infra_network_tag: "it".into(),
             build_machine: None,
         }));

@@ -363,7 +363,7 @@ export function createActionRouter(bridge, messageStore) {
       } else {
         console.log(`[action] ${action} ok`);
       }
-      // SYNC: the /action envelope <-> crates/weft-dispatcher/src/api/infra.rs (infra_action_result), catalog/postgres/database/images/credential/bootstrap.py
+      // SYNC: the /action envelope <-> crates/weft-core/src/infra/action.rs, catalog/postgres/database/images/credential/bootstrap.py
       res.json({ result });
     } catch (err) {
       // The action name is caller-supplied, so it goes in as an argument,

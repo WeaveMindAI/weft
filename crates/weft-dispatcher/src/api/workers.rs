@@ -1,7 +1,7 @@
 //! `GET/PUT /projects/{id}/workers`: the project's own worker levers.
 //!
 //! Every lever the install sets for workers (copies kept warm, the most
-//! copies, runs per copy, CPU, memory) a project can set for itself; what
+//! copies, calls Cloud Run sends one copy at once, CPU, memory) a project can set for itself; what
 //! it leaves unset follows the install. A change applies at once: the
 //! platform is told to run the project's current image with the new
 //! levers (a new Cloud Run revision; a warm local worker started or left
@@ -55,6 +55,15 @@ pub async fn put(
         state.runner.prepare(&target).await.map_err(|e| {
             (StatusCode::BAD_GATEWAY, format!("the levers are saved, and the platform refused them for the running workers: {e:#}"))
         })?;
+        // A project that takes calls has its front started again with the
+        // new levers (a container's or a revision's are fixed at its start).
+        if crate::front::address(&state, id).await.map_err(internal)?.is_some() {
+            let unserved = |e: &anyhow::Error| (StatusCode::BAD_GATEWAY, format!("the levers are saved, and the project's front could not start with them: {e:#}"));
+            let served = crate::front::serve(&state, id, None).await.map_err(|e| unserved(&e))?;
+            if let Some(e) = &served.failed {
+                return Err(unserved(e));
+            }
+        }
     }
     Ok(Json(answer(&state, id).await?))
 }

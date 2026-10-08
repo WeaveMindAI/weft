@@ -732,8 +732,9 @@ impl WeftType {
     /// truth for "is this primitive a stored-file reference". Derived
     /// from the `File` alias so adding a file primitive in `named_union`
     /// updates every membership check (references_file, detection).
-    pub fn file_primitives() -> Vec<WeftPrimitive> {
-        match Self::file() {
+    /// Worked out once: every port's type asks it on every firing.
+    pub fn file_primitives() -> &'static [WeftPrimitive] {
+        static FILE_PRIMITIVES: std::sync::LazyLock<Vec<WeftPrimitive>> = std::sync::LazyLock::new(|| match WeftType::file() {
             WeftType::Union(types) => types
                 .into_iter()
                 .filter_map(|t| match t {
@@ -743,7 +744,8 @@ impl WeftType {
                 .collect(),
             WeftType::Primitive(p) => vec![p],
             _ => Vec::new(),
-        }
+        });
+        &FILE_PRIMITIVES
     }
 
     pub fn type_var(name: &str) -> Self {

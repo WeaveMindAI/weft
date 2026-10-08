@@ -1,0 +1,1 @@
+CREATE INDEX idx_task_deliverable ON task USING btree (created_at_unix) WHERE ((target = 'worker'::text) AND (kind = ANY (ARRAY['execute'::text, 'resume'::text])) AND (target_replica IS NULL) AND (status = ANY (ARRAY['pending'::text, 'claimed'::text])));

@@ -15,6 +15,7 @@ resume inside your `await`. It starts over.
 | | On a replay |
 |---|---|
 | `ctx.await_signal` that was answered | Returns the answer straight away, without waiting |
+| `ctx.await_signal` that was given up | Fails the same way again, without waiting |
 | `ctx.run("name", ...)` that finished | Returns what it returned last time, without running the closure |
 | Anything else in your body | **Runs again** |
 | Anything you emitted | Runs again, which is why emitting before an await is refused |
@@ -85,6 +86,29 @@ Write the filters as "not one of the in-flight statuses" rather than "one of
 the finished ones", the way the example does. A status you did not expect then
 ends the wait, and your code can fail on it, instead of waiting for ever.
 
+## When the run cannot pause
+
+Some runs cannot let go of their worker: a route's run while its caller is on
+the line (and the route does not outlive it), an unrecorded run, a run with a
+bus open. There, `ctx.await_signal` does not suspend. It holds in your call,
+on the same worker, and returns the answer when it comes, without replaying
+anything. If the run stays quiet for its trigger's `holdSecs`, the call fails
+with `WeftError::WaitGaveUp`, saying why. That is an outcome of your step
+like any other: if your node can do something sensible without the answer,
+match it and carry on.
+
+```rust
+let approved = match ctx.await_signal(Form::approval("Send this?")).await {
+    Ok(answer) => answer,
+    Err(WeftError::WaitGaveUp(_)) => json!(false),
+    Err(other) => return Err(other),
+};
+```
+
+For what holds and when the clock runs, go and read [when a run cannot
+pause](../language/triggers-and-routes.md#when-a-run-cannot-pause). To test
+it, `rig.signal_given_up()` makes the next wait fail this way.
+
 ## Two things weft refuses
 
 **Emitting, then awaiting.** A replay would emit again, and the value already
@@ -125,9 +149,18 @@ goes inside a `ctx.run` so the decision is remembered rather than remade.
 
 ## When the worker dies mid-step
 
-If the worker goes away while a body is running (a crash, a lost machine),
-nobody can tell how much of the body's work already happened, so the next
-worker fails the step and says why:
+What happens depends on the trigger's `durable` setting. For what that setting
+does, go and read [how a run is
+kept](../language/triggers-and-routes.md#how-a-run-is-kept).
+
+**A fast run (the default) ends cancelled with its worker**, and is not run
+again (go and read [what happens when something
+dies](../running/architecture.md#what-happens-when-something-dies)).
+
+**A durable run carries on in another worker.** Each step's start (except a
+pure node's, below) is on record before its body runs, so the next worker
+knows exactly which steps were running when the first one went away. weft cannot tell how much of such a
+step's work already happened, so the next worker fails it and says why:
 
 ```text
 the worker running 'billing' went away while it was running; it was not run
@@ -135,21 +168,32 @@ again, because it may have partly happened. Re-run from here once you have
 checked what it did.
 ```
 
-If the node sets `catchErrors` and you wired its `error` output, this failure
-goes there like any other, and that branch carries on.
+A step that was reading a stream says `went away while it was reading a
+stream` instead: the items it had read are gone from the stream, so the
+message tells you to run the whole run again to start the stream over.
 
-A step's start is written down in the background, as the step begins (go and
-read [the journal](../running/the-journal.md#a-run-does-not-wait-for-its-writes)).
-If the worker goes away in the moment before that write lands, nothing says the
-step ever started, and the next worker runs it as a step that never did. That
-moment is one write to the database long.
+If you want to run that step again once you have checked, `weft run --from
+<node>=<json>` starts a run there with the inputs you hand it. If the node
+sets `catchErrors` and you wired its `error` output, this failure goes there
+like any other, and that branch carries on; otherwise the run fails.
 
-If the body was waiting on `ctx.await_signal` when the worker went away, it is
-not failed: when its answer comes, it replays from the top, and its `ctx.run`
-calls give back their saved results instead of doing the work again.
+If the step that was running belongs to a pure node that does not read a
+stream, and had not passed a value on yet, the next worker runs it again instead of failing it. A
+pure node does nothing outside the run (for what that means, go and read the `pure` flag in
+[metadata.json](metadata.md#features)), so running it twice changes nothing. One that had passed a value on
+is failed like any step, because running it again would pass that value a
+second time.
 
-If a step emitted a value before the crash and the step reading it had not
-started yet, that value is still delivered and the reading step runs.
+A run parked whole on `ctx.await_signal` survives its worker even when it is
+fast, unless a caller is still on the line and its trigger leaves
+`outlivesCaller` off, or a bus between its nodes is open (for why, go and read [how a run is
+kept](../language/triggers-and-routes.md#how-a-run-is-kept)). When its answer comes, the waiting step replays from the top, and its
+`ctx.run` calls give back their saved results. A fast run with one branch
+waiting while another still ran ends cancelled like any other fast run.
+
+In a durable run, if a step emitted a value before the crash and the step
+reading it had not started yet, that value is still delivered and the reading
+step runs.
 
 ## When ctx.run cannot save its result
 

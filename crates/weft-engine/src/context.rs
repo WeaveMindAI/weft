@@ -48,8 +48,8 @@ use weft_task_store::{InfraReader, TaskKind, TaskStoreClient};
 const SELF_STOP_BREADCRUMB: Duration = Duration::from_secs(60);
 
 /// Serialize a frame stack into the canonical string used in task dedup keys.
-/// One definition so the side-effect-task and register-signal-task
-/// dedup keys can't drift, and so a serialization failure is surfaced
+/// One definition so the register-signal and program-call task dedup
+/// keys can't drift, and so a serialization failure is surfaced
 /// (a swallowed `unwrap_or_default()` would collapse distinct firings to
 /// the same empty key and silently drop a task). Frame-stack
 /// serialization shouldn't fail in practice, which is exactly why a
@@ -62,14 +62,14 @@ fn frames_dedup_key(frames: &weft_core::frames::LoopFrames) -> Result<String, se
 /// Each handle clones cheaply (every field is `Arc<dyn _>`).
 #[derive(Clone)]
 pub struct EngineClients {
-    pub journal: Arc<dyn JournalClient>,
+    /// The process's writer lanes (`crate::journal_writer`): every run's
+    /// record goes through them, and the clients below that name a run
+    /// write its record first through them (`crate::record_first`).
+    pub writer: Arc<crate::journal_writer::WorkerJournal>,
+    /// The runs this worker drives, as the broker holds them: a queued run
+    /// claimed, let go, its answers and its cancels.
+    pub runs: Arc<dyn RunClient>,
     pub tasks: Arc<dyn TaskStoreClient>,
-    /// Where a node's spend is recorded (`metering::CostSink`): the task
-    /// store, never behind a drive's journal ([`JournalFirst`]). A cost
-    /// has no place in the run's order, can be recorded after its run's
-    /// drive ended, and money already spent is recorded even when the
-    /// run's journal failed.
-    pub costs: Arc<dyn TaskStoreClient>,
     pub infra: Arc<dyn InfraReader>,
     /// Broker client for infra applied-state reads + apply enqueue.
     /// Used by the loop driver during `Phase::InfraSetup` to make the
@@ -79,10 +79,9 @@ pub struct EngineClients {
     /// Broker client for fetching the project's `ProjectDefinition`
     /// at execution claim time. The worker no longer carries the
     /// definition baked into the binary; it asks the broker, keyed
-    /// by `(project_id, definition_hash)` (hash from the task
-    /// payload). Same call per execution; the worker caches
-    /// across executions by hash so consecutive claims of the same
-    /// shape pay only one round trip per shape.
+    /// by `(project_id, definition_hash)`. The worker caches across
+    /// executions by hash so consecutive runs of the same shape pay
+    /// only one round trip per shape.
     pub project: Arc<dyn ProjectClient>,
     /// Clock the engine uses for every time-related decision
     /// (deadlines, polling intervals). Production passes the
@@ -100,17 +99,39 @@ pub struct EngineClients {
     /// Steering other runs (`ctx.tag_execution` / `ctx.stop_tagged`).
     /// Production: the broker-backed client; tests inject a fake.
     pub steering: Arc<dyn ExecutionSteeringClient>,
-    /// Cost resolutions still in flight (a metered call's figure being
-    /// resolved + recorded after its response ended). The process's exit paths
-    /// refuse to die while this is non-zero, so money is never dropped by
-    /// a shutdown racing a resolve.
-    pub pending_costs: Arc<crate::metering::PendingCostRecords>,
     /// Charges opened by a call whose amount only a later response
     /// states, held process-wide until that response lands.
     pub open_charges: Arc<crate::metering::OpenCharges>,
     /// What the process's line to the broker pushes, which is how a worker
     /// hears that a run it drives is asked to stop.
     pub line: Arc<dyn WorkerLine>,
+    /// What the worker's door asks the broker (`crate::door`).
+    pub door_broker: Arc<dyn crate::door::DoorBroker>,
+    /// What the worker holds for its runs to share (`weft_core::shared`).
+    pub shared: Arc<weft_core::shared::Shared>,
+}
+
+/// How this worker process runs, read from its environment
+/// ([`ProcessSettings::from_env`]).
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessSettings {
+    pub writer: crate::journal_writer::WriterSettings,
+    /// How long a thing its runs share (`ctx.shared`) stays once nothing
+    /// uses it: the project's `shared_idle_seconds` worker lever.
+    pub shared_idle: std::time::Duration,
+}
+
+impl ProcessSettings {
+    /// The writer's settings (`WriterSettings::from_env`) and the shared
+    /// idle window, which every platform sets
+    /// (`weft_platform_traits::SHARED_IDLE_ENV`): a worker started
+    /// without it was started wrong, and says so.
+    pub fn from_env() -> anyhow::Result<Self> {
+        let env = weft_platform_traits::SHARED_IDLE_ENV;
+        let raw = std::env::var(env).map_err(|_| anyhow::anyhow!("{env} is not set; the platform that started this worker sets it from the project's shared_idle_seconds"))?;
+        let seconds: u64 = raw.trim().parse().map_err(|e| anyhow::anyhow!("{env} is not a whole number of seconds: {e}"))?;
+        Ok(Self { writer: crate::journal_writer::WriterSettings::from_env()?, shared_idle: std::time::Duration::from_secs(seconds) })
+    }
 }
 
 /// What a worker reads off its line to the broker besides answers: the
@@ -166,81 +187,140 @@ impl WorkerLine for TestLine {
 
 impl EngineClients {
     /// The production bundle: every client speaks on the process's one line
-    /// to the broker, and the clock is the real one. The worker binary is
-    /// GENERATED, so it cannot be typechecked with the engine; keeping the
-    /// composition here means a field added or renamed on `EngineClients` is a
-    /// compile error in this crate rather than a silent break in generated
-    /// code.
-    pub fn from_broker(link: &weft_broker_client::BrokerLink) -> Self {
+    /// to the broker at `broker_url`, and the clock is the real one. The
+    /// line and the writer lanes run on a runtime of their own, one thread
+    /// started here, so their wake-ups never land on the threads serving
+    /// calls. The worker binary is GENERATED, so it cannot be typechecked
+    /// with the engine; keeping the composition here means a field added or
+    /// renamed on `EngineClients` is a compile error in this crate rather
+    /// than a silent break in generated code.
+    pub fn from_broker(
+        broker_url: &str,
+        token: weft_broker_client::TokenSource,
+        project_id: uuid::Uuid,
+        settings: ProcessSettings,
+    ) -> anyhow::Result<Self> {
+        let io = io_runtime()?;
+        let link = weft_broker_client::BrokerLink::new(broker_url, token).on_runtime(io.clone());
+        let record: Arc<dyn weft_journal::RecordClient> = weft_broker_client::BrokerRecordClient::new(link.clone());
+        let writer = crate::journal_writer::WorkerJournal::start(record, settings.writer, &io);
         let tasks: Arc<dyn TaskStoreClient> = weft_broker_client::BrokerTaskStoreClient::new(link.clone());
-        Self {
-            journal: weft_broker_client::BrokerJournalClient::new(link.clone()),
-            costs: tasks.clone(),
-            tasks,
+        let broker_infra: Arc<dyn InfraReader> = weft_broker_client::BrokerInfraClient::new(link.clone());
+        let broker_access: Arc<dyn AccessBroker> = weft_broker_client::BrokerAccessClient::new(link.clone());
+        let broker_storage: Arc<dyn crate::storage::WorkerStorageOps> =
+            crate::storage::WorkerStorage::new(link.base_url().to_string(), link.token().clone());
+        let steering: Arc<dyn ExecutionSteeringClient> = weft_broker_client::BrokerExecutionClient::new(link.clone());
+        Ok(Self {
+            shared: weft_core::shared::Shared::new(settings.shared_idle),
+            runs: weft_broker_client::BrokerRunClient::new(link.clone()),
+            tasks: crate::record_first::RecordFirst::new(tasks, writer.clone()),
             // What the run reads of its infra and its connections is kept
             // between runs, and dropped when the broker says it changed.
-            infra: crate::held::HeldInfra::new(weft_broker_client::BrokerInfraClient::new(link.clone()), link),
+            infra: crate::held::HeldInfra::new(crate::record_first::RecordFirst::new(broker_infra, writer.clone()), &link),
             infra_state: weft_broker_client::BrokerInfraStateClient::new(link.clone()),
             project: weft_broker_client::BrokerProjectClient::new(link.clone()),
             clock: Arc::new(weft_platform_traits::clock::SystemClock),
-            storage: crate::storage::WorkerStorage::new(link.base_url().to_string(), link.token().clone()),
-            access_broker: crate::held::HeldAccess::new(weft_broker_client::BrokerAccessClient::new(link.clone()), link),
-            steering: weft_broker_client::BrokerExecutionClient::new(link.clone()),
-            pending_costs: crate::metering::PendingCostRecords::new(),
+            storage: crate::record_first::RecordFirst::new(broker_storage, writer.clone()),
+            access_broker: crate::held::HeldAccess::new(crate::record_first::RecordFirst::new(broker_access, writer.clone()), &link),
+            steering: crate::record_first::RecordFirst::new(steering, writer.clone()),
             open_charges: crate::metering::OpenCharges::new(),
             line: Arc::new(link.clone()),
-        }
+            door_broker: crate::door::HeldDoorBroker::new(
+                weft_broker_client::BrokerDoorClient::new(link.clone()),
+                Arc::new(link.clone()),
+                project_id,
+            ),
+            writer,
+        })
     }
 }
 
+/// The process's own small runtime, one thread, for the broker lines and
+/// the writer lanes, started the first time it is asked for. It lives as
+/// long as the process: its thread drives it until the process exits.
+pub(crate) fn io_runtime() -> anyhow::Result<tokio::runtime::Handle> {
+    static IO: Mutex<Option<tokio::runtime::Handle>> = Mutex::new(None);
+    let mut io = IO.lock().expect("the io runtime");
+    if let Some(handle) = io.as_ref() {
+        return Ok(handle.clone());
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| anyhow::anyhow!("start the worker's io runtime: {e}"))?;
+    let handle = runtime.handle().clone();
+    std::thread::Builder::new()
+        .name("weft-io".into())
+        .spawn(move || runtime.block_on(std::future::pending::<()>()))
+        .map_err(|e| anyhow::anyhow!("start the worker's io thread: {e}"))?;
+    Ok(io.insert(handle).clone())
+}
+
+/// The runs a worker drives, as the broker holds them
+/// (`weft_broker_client::BrokerRunClient`); a trait so tests drive a
+/// worker against a fake.
+#[async_trait]
+pub trait RunClient: Send + Sync {
+    /// Claim queued run `execution_id`: it is this worker's, under a
+    /// raised epoch. `None` when it is not queued.
+    async fn claim(&self, execution_id: ExecutionId) -> anyhow::Result<Option<weft_journal::record::Claimed>>;
+    /// This worker no longer drives `execution_id`, its whole record
+    /// written, for `why`.
+    async fn let_go(&self, execution_id: ExecutionId, why: weft_broker_client::protocol::LetGo) -> anyhow::Result<()>;
+    /// The answers waiting for `execution_id`'s waits, but the waits in
+    /// `taken`, held up to `wait` until one is there.
+    async fn answers(&self, execution_id: ExecutionId, taken: &[String], wait: Duration) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>>;
+    /// The cancels waiting for the runs this worker drives.
+    async fn cancels(&self) -> anyhow::Result<Vec<weft_broker_client::protocol::RunCancel>>;
+}
+
+#[async_trait]
+impl RunClient for weft_broker_client::BrokerRunClient {
+    async fn claim(&self, execution_id: ExecutionId) -> anyhow::Result<Option<weft_journal::record::Claimed>> {
+        weft_broker_client::BrokerRunClient::claim(self, execution_id).await
+    }
+    async fn let_go(&self, execution_id: ExecutionId, why: weft_broker_client::protocol::LetGo) -> anyhow::Result<()> {
+        weft_broker_client::BrokerRunClient::let_go(self, execution_id, why).await
+    }
+    async fn answers(&self, execution_id: ExecutionId, taken: &[String], wait: Duration) -> anyhow::Result<Vec<weft_broker_client::protocol::RunAnswer>> {
+        weft_broker_client::BrokerRunClient::answers(self, execution_id, taken, wait).await
+    }
+    async fn cancels(&self) -> anyhow::Result<Vec<weft_broker_client::protocol::RunCancel>> {
+        weft_broker_client::BrokerRunClient::cancels(self).await
+    }
+}
+
+/// What a firing writes about its run: the run's one handle on its record
+/// (its `crate::journal_writer::DriveJournal` on a worker, nothing around
+/// a node test, which has no run), and the spend still being worked out,
+/// which the run waits for before it ends (`crate::metering`).
+#[derive(Clone)]
+pub struct RunRecord {
+    pub journal: Arc<dyn JournalClient>,
+    pub costs: Arc<crate::metering::PendingCostRecords>,
+}
+
 /// Trait surface over `BrokerExecutionClient` so tests can inject a
-/// recording fake. Production has one impl: the broker-backed HTTP
-/// client. Both calls are worker-only and process-bound on the broker
-/// side, so the process name rides along.
+/// recording fake. Production has one impl: the broker-backed client;
+/// both calls are worker-only, and the broker checks the run is the
+/// asking worker's.
 #[async_trait]
 pub trait ExecutionSteeringClient: Send + Sync {
     /// Tag `execution_id` with `tags`, synchronously (the rows exist on
     /// return).
-    async fn tag_execution(
-        &self,
-        execution_id: ExecutionId,
-        tags: Vec<String>,
-        replica: &str,
-    ) -> anyhow::Result<()>;
+    async fn tag_execution(&self, execution_id: ExecutionId, tags: Vec<String>) -> anyhow::Result<()>;
     /// Queue a stop of every live sibling of `execution_id` carrying `tag`.
     /// `true` when the stop reaches `execution_id` itself.
-    async fn stop_tagged(
-        &self,
-        execution_id: ExecutionId,
-        tag: String,
-        stop_self: weft_core::StopSelf,
-        replica: &str,
-    ) -> anyhow::Result<bool>;
+    async fn stop_tagged(&self, execution_id: ExecutionId, tag: String, stop_self: weft_core::StopSelf) -> anyhow::Result<bool>;
 }
 
 #[async_trait]
 impl ExecutionSteeringClient for weft_broker_client::BrokerExecutionClient {
-    async fn tag_execution(
-        &self,
-        execution_id: ExecutionId,
-        tags: Vec<String>,
-        replica: &str,
-    ) -> anyhow::Result<()> {
-        <weft_broker_client::BrokerExecutionClient>::tag_execution(self, execution_id, tags, replica)
-            .await
+    async fn tag_execution(&self, execution_id: ExecutionId, tags: Vec<String>) -> anyhow::Result<()> {
+        <weft_broker_client::BrokerExecutionClient>::tag_execution(self, execution_id, tags).await
     }
-    async fn stop_tagged(
-        &self,
-        execution_id: ExecutionId,
-        tag: String,
-        stop_self: weft_core::StopSelf,
-        replica: &str,
-    ) -> anyhow::Result<bool> {
-        Ok(<weft_broker_client::BrokerExecutionClient>::stop_tagged(
-            self, execution_id, tag, stop_self, replica,
-        )
-        .await?
-        .stops_asker)
+    async fn stop_tagged(&self, execution_id: ExecutionId, tag: String, stop_self: weft_core::StopSelf) -> anyhow::Result<bool> {
+        Ok(<weft_broker_client::BrokerExecutionClient>::stop_tagged(self, execution_id, tag, stop_self).await?.stops_asker)
     }
 }
 
@@ -292,9 +372,10 @@ impl ProjectClient for weft_broker_client::BrokerProjectClient {
 /// no-op (or recording) implementation. Production has one impl: the
 /// broker-backed HTTP client.
 ///
-/// The trait has two operations: `enqueue_apply` (ship a fresh spec
-/// to the supervisor) and `wait_apply` (wait on the resulting command
-/// row until it is terminal). The supervisor owns every other concern
+/// The trait has three operations: `enqueue_apply` (ship a fresh spec
+/// to the supervisor), `wait_apply` (wait on the resulting command
+/// row until it is terminal), and `save_bake` (what the setup's run of
+/// the node made for its baked outputs). The supervisor owns every other concern
 /// end-to-end: read prior `infra_node`, compile + hash, decide
 /// skip / fresh / replace, apply to the install, update the row. The worker
 /// just hands off the spec and waits.
@@ -315,6 +396,19 @@ pub trait InfraStateClient: Send + Sync {
         command_id: i64,
         wait: Duration,
     ) -> anyhow::Result<weft_broker_client::protocol::InfraWaitApplyResponse>;
+
+    /// Save `values` as what the copy of the infra node at `place`
+    /// (spelled; `copy` `None` for the shared one) holds for its baked
+    /// outputs (`weft_core::infra::bake`): what the infra setup
+    /// `execution_id` sent out on them, written over what it held port by
+    /// port (a port it sent nothing on keeps its value).
+    async fn save_bake(
+        &self,
+        execution_id: ExecutionId,
+        place: &str,
+        copy: Option<&weft_core::instance::InstanceId>,
+        values: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> anyhow::Result<()>;
 }
 
 #[async_trait]
@@ -335,6 +429,15 @@ impl InfraStateClient for weft_broker_client::client::BrokerInfraStateClient {
         wait: Duration,
     ) -> anyhow::Result<weft_broker_client::protocol::InfraWaitApplyResponse> {
         self.wait_apply(project_id, command_id, wait).await
+    }
+    async fn save_bake(
+        &self,
+        execution_id: ExecutionId,
+        place: &str,
+        copy: Option<&weft_core::instance::InstanceId>,
+        values: std::collections::BTreeMap<String, serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        self.save_bake(execution_id, place, copy, values).await
     }
 }
 
@@ -489,6 +592,7 @@ impl FakeAccessBroker {
             relay_url: None,
             owner,
             keep_until_unix: None,
+            published_by: None,
         });
     }
 }
@@ -619,21 +723,60 @@ pub struct BusCoordinator {
     /// `drop(coordinator)` race that could leave the pump parked
     /// forever on a multi-thread runtime.
     pump_should_exit: std::sync::atomic::AtomicBool,
+    /// Where a recorded run's bus rows go ([`Self::recorded`]); `None` for
+    /// a coordinator whose pump, if any, its owner runs.
+    pump: Option<BusPump>,
+}
+
+/// A run's bus pump ([`run_bus_journal_task`]): started by the run's first
+/// bus, so a run that mints none never has one.
+struct BusPump {
+    execution_id: ExecutionId,
+    journal: Arc<dyn JournalClient>,
+    replica: String,
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl BusCoordinator {
-    /// Construct the per-execution coordinator. The pump task is spun
-    /// up by the loop driver, not here, because the loop owns the
-    /// journal client. `waits` is the execution's shared wait tracker,
-    /// owned by the execution (the bus is just one of its clients).
+    /// A coordinator whose buses nothing records (a node test's rig; a
+    /// test that runs the pump itself). `waits` is the execution's shared
+    /// wait tracker, owned by the execution (the bus is just one of its
+    /// clients).
+    #[cfg(any(test, feature = "node-tests"))]
     pub fn new(waits: Arc<WaitTracker>) -> Arc<Self> {
+        Self::with_pump(waits, None)
+    }
+
+    /// The coordinator of a run whose buses go on its record through
+    /// `journal`: the pump starts with the run's first bus.
+    pub fn recorded(waits: Arc<WaitTracker>, execution_id: ExecutionId, journal: Arc<dyn JournalClient>, replica: String) -> Arc<Self> {
+        Self::with_pump(waits, Some(BusPump { execution_id, journal, replica, task: Mutex::new(None) }))
+    }
+
+    fn with_pump(waits: Arc<WaitTracker>, pump: Option<BusPump>) -> Arc<Self> {
         Arc::new(Self {
             registry: BusRegistry::new(),
             waits,
             journal_pump_notify: Arc::new(tokio::sync::Notify::new()),
             drain_complete_notify: Arc::new(tokio::sync::Notify::new()),
             pump_should_exit: std::sync::atomic::AtomicBool::new(false),
+            pump,
         })
+    }
+
+    /// Start the run's pump if it has not started. Its first pass drains
+    /// whatever landed before it ran.
+    fn start_pump(self: &Arc<Self>) {
+        let Some(pump) = &self.pump else { return };
+        let mut task = pump.task.lock().expect("bus pump poisoned");
+        if task.is_none() {
+            *task = Some(tokio::spawn(run_bus_journal_task(
+                Arc::downgrade(self),
+                pump.execution_id,
+                pump.journal.clone(),
+                pump.replica.clone(),
+            )));
+        }
     }
 
     /// Handle on the per-execution drain-complete notify. Cloned by
@@ -659,6 +802,7 @@ impl BusCoordinator {
         let pump_notify_weak = Arc::downgrade(&self.journal_pump_notify);
         let bus = BusHandle::create_with_engine(opts, weak, pump_notify_weak, Some(node))?;
         self.registry.insert(&bus);
+        self.start_pump();
         Ok(bus)
     }
 
@@ -711,50 +855,23 @@ impl BusCoordinator {
         self.journal_pump_notify.notify_waiters();
     }
 
-    /// True when the pump has journaled every entry on every live
-    /// bus. A `journal_degraded` bus is treated as drained: the pump
-    /// can't drain it by definition, the node author already saw the
-    /// failure as `SendError::JournalDegraded`, and waiting for it
-    /// would just chew through the shutdown deadline before the same
-    /// loud panic fires.
+    /// True when the pump has handed every entry on every live bus to the
+    /// run's record. A `journal_degraded` bus is treated as drained: the
+    /// pump can't drain it by definition, and the node author already saw
+    /// the failure as `SendError::JournalDegraded`.
     fn fully_drained(&self) -> bool {
         self.registry.live_bus_arcs().iter().all(|b| {
             b.is_journal_degraded() || b.journaled_through() >= b.log_len()
         })
     }
 
-    /// Panic with a diagnostic listing every bus still draining.
-    /// Single source of truth for the deadline-miss message so the
-    /// "immediate zero-remaining" branch and the "timeout fired"
-    /// branch report the same thing.
-    fn panic_shutdown_deadline_miss(&self, deadline: std::time::Duration) -> ! {
-        let stuck = self
-            .registry
-            .live_bus_arcs()
-            .iter()
-            .filter(|b| !b.is_journal_degraded() && b.journaled_through() < b.log_len())
-            .map(|b| {
-                format!(
-                    "bus {} ({} entries unjournaled)",
-                    b.id(),
-                    b.log_len() - b.journaled_through()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        panic!(
-            "bus pump did not drain within {}ms; journal writes are stuck or too slow. \
-             Buses still draining: {}",
-            deadline.as_millis(),
-            if stuck.is_empty() { "<none>".to_string() } else { stuck },
-        );
-    }
-
     /// Run the full bus shutdown sequence:
     ///   1. Append a `Closed` entry to every live bus AND wake the
     ///      pump.
-    ///   2. Wait (notify-driven, no polling) for the pump to journal
-    ///      every entry on every bus, bounded by `deadline`.
+    ///   2. Wait (notify-driven, no polling) for the pump to hand every
+    ///      entry on every bus to the run's record. No deadline: the
+    ///      pump waits only on the record, which answers or fails each
+    ///      write in bounded time, and a failed write degrades its bus.
     ///   3. Release the `Arc<BusInner>` refs the coordinator pins, so
     ///      buses whose only other Arc is gone free immediately.
     ///   4. Set the pump's exit sentinel AND wake it. The pump's next
@@ -764,14 +881,17 @@ impl BusCoordinator {
     ///      coordinator) had a race where the pump could win the
     ///      upgrade, finish an empty drain, and re-park on a notify
     ///      no one will fire again.
-    ///
-    /// Panics on deadline-miss: a wedged journal client means replay
-    /// is permanently incomplete, and the worker should crash so the
-    /// dispatcher surfaces the failure rather than swallowing it.
-    pub async fn shutdown(&self, deadline: std::time::Duration) {
+    ///   5. For a recorded run, wait for its pump to end.
+    pub async fn shutdown(&self) {
+        let pump = self.pump.as_ref().map(|pump| (pump.execution_id, pump.task.lock().expect("bus pump poisoned").take()));
+        if let Some((_, None)) = pump {
+            // A recorded run whose pump never started minted no bus:
+            // there is nothing to hand over.
+            self.pump_should_exit.store(true, std::sync::atomic::Ordering::Release);
+            return;
+        }
         self.close_all();
         let drain = self.drain_complete_notify.clone();
-        let start = std::time::Instant::now();
         loop {
             // Arm the wake BEFORE the predicate check so a drain pass
             // that fires between the check and the await is not lost.
@@ -781,19 +901,7 @@ impl BusCoordinator {
             if self.fully_drained() {
                 break;
             }
-            let remaining = deadline.saturating_sub(start.elapsed());
-            if remaining.is_zero() {
-                self.panic_shutdown_deadline_miss(deadline);
-            }
-            match tokio::time::timeout(remaining, notified.as_mut()).await {
-                Ok(_) => continue,
-                Err(_) => {
-                    if self.fully_drained() {
-                        break;
-                    }
-                    self.panic_shutdown_deadline_miss(deadline);
-                }
-            }
+            notified.await;
         }
         self.registry.clear();
         // Tell the pump to exit on its next iteration, THEN wake it.
@@ -805,6 +913,16 @@ impl BusCoordinator {
         self.pump_should_exit
             .store(true, std::sync::atomic::Ordering::Release);
         self.journal_pump_notify.notify_waiters();
+        if let Some((execution_id, Some(task))) = pump {
+            if let Err(e) = task.await {
+                tracing::error!(
+                    target: "weft_engine::execution_driver",
+                    %execution_id,
+                    error = %e,
+                    "bus journal task ended abnormally; bus replay for this execution is degraded"
+                );
+            }
+        }
     }
 }
 
@@ -838,8 +956,8 @@ impl Drop for BusCoordinator {
 // the bus shares it with every other in-process wait source
 // (generator pulls, emission-delivery waits).
 
-/// Bus-journal pump. One task per execution, spawned by
-/// `run_one_execution` around the whole drive and shut down after it,
+/// Bus-journal pump. One task per execution, started by its first bus
+/// ([`BusCoordinator::recorded`]) and shut down after the drive,
 /// whether the drive ended in an outcome or an error. Awaits the per-execution
 /// notify; on every wake, walks every live bus, drains its
 /// unjournaled tail, ships the entries to the journal, and ack-bumps
@@ -1225,8 +1343,10 @@ pub enum TaskMsg {
 /// How a node's `execute` ended. The driver turns each into the
 /// firing's terminal lifecycle event.
 pub enum NodeTaskOutcome {
-    /// `execute` returned `Ok(())`.
-    Completed,
+    /// `execute` returned `Ok(())`. `saved` is what its copy saved for
+    /// its baked outputs (`weft_core::infra::bake`), read for a node that
+    /// has any: each one the body emitted nothing on carries it.
+    Completed { saved: std::collections::BTreeMap<String, serde_json::Value> },
     /// The step failed. `message` is what the run's failure reads;
     /// `catchable` is what the step's `error` output carries if the
     /// failure is caught (`weft_core::context::catchable_message`),
@@ -1279,405 +1399,6 @@ pub async fn record_from_replica(journal: &dyn JournalClient, event: ExecEvent, 
     }
 }
 
-/// The journal a drive writes through: every row it is handed goes to the
-/// database in the background, in the order handed, and nothing on the
-/// run's path waits for it.
-///
-/// **Order and batching.** One task per drive sends the rows: whatever has
-/// queued while the previous write was on its way goes out as the next
-/// write, so a burst of rows is one round trip and a quiet run sends each
-/// row as it comes. The driver's rows and its nodes' own (through their
-/// ctx) share the queue, so the journal's order is the order things
-/// happened.
-///
-/// **Waiting for it.** [`Self::flush`] answers once everything handed so
-/// far is on record. Only three kinds of place ask: before the run ends or
-/// parks (its terminal, a stall, a cancel walk), since what comes after
-/// reads the journal from another worker; before a read (a read never runs
-/// past rows the drive wrote); and before a task goes out, since a task
-/// has another writer act on the run ([`JournalFirst`]). A live call never waits on its own bookkeeping: a run
-/// with a live caller is never resumed elsewhere, and a crash fails it
-/// whatever the journal holds. A run that is resumed redoes the steps whose
-/// rows a crash lost, which is the at-least-once rule every step already
-/// runs under (`ctx.run`).
-///
-/// **Poison.** A failed write means the journal is now behind what the
-/// live worker believes happened. Continuing to drive on that divergence
-/// makes every later refold (stall refetch, crash resume) rebuild a
-/// different world: a body whose `NodeStarted` was lost but whose
-/// `PortEmitted` rows landed re-runs and double-spends. So the first
-/// failed write stops all sending, every later [`Self::flush`] and write
-/// fails naming it, and the drive loop checks [`Self::is_poisoned`] every
-/// iteration and stops with an error, which `run_one_execution` journals as
-/// the run's Failed terminal; a drive idling on a long node hears it at
-/// once ([`Self::poisoned`]). A part of a write that never reached the
-/// broker (the connection could not be made) is sent again, part by part
-/// and for a minute at most each, since it cannot have landed; any other
-/// failure poisons at once, since sending a row twice would record it
-/// twice.
-///
-/// The bus pump deliberately keeps the UNwrapped client: bus rows are
-/// the inspector's replay trail, and their failures already degrade
-/// per-bus without killing the worker.
-pub struct DriveJournal {
-    inner: Arc<dyn JournalClient>,
-    queue: tokio::sync::mpsc::UnboundedSender<Queued>,
-    /// Why the drive is poisoned, once it is (see the type's docs).
-    failure: Arc<Poison>,
-    /// The replica the drive writes under, fixed by its first row.
-    replica: std::sync::Mutex<Option<Option<String>>>,
-}
-
-/// Why a drive's journal can no longer be trusted, once it can't: the
-/// first reason is kept, and whoever waits for it hears it at once.
-struct Poison {
-    why: std::sync::Mutex<Option<String>>,
-    heard: tokio::sync::watch::Sender<bool>,
-}
-
-impl Poison {
-    fn new() -> Self {
-        Self { why: std::sync::Mutex::new(None), heard: tokio::sync::watch::Sender::new(false) }
-    }
-
-    fn set(&self, why: String) {
-        self.why.lock().expect("drive journal").get_or_insert(why);
-        self.heard.send_replace(true);
-    }
-
-    fn get(&self) -> Option<String> {
-        self.why.lock().expect("drive journal").clone()
-    }
-
-    async fn wait(&self) {
-        let _ = self.heard.subscribe().wait_for(|poisoned| *poisoned).await;
-    }
-}
-
-/// What the sending task is handed, in order.
-enum Queued {
-    Rows(Vec<ExecEvent>, Option<String>),
-    /// Answered once every row queued before it is on record.
-    Written(tokio::sync::oneshot::Sender<Result<(), String>>),
-}
-
-
-impl DriveJournal {
-    /// The drive journal over `inner`, its sending task started. The task
-    /// ends once every handle to the queue is gone, after sending what was
-    /// left in it.
-    pub fn wrap(inner: Arc<dyn JournalClient>) -> Arc<Self> {
-        let (queue, pending) = tokio::sync::mpsc::unbounded_channel();
-        let failure = Arc::new(Poison::new());
-        tokio::spawn(send_in_order(inner.clone(), pending, failure.clone()));
-        Arc::new(Self { inner, queue, failure, replica: std::sync::Mutex::new(None) })
-    }
-
-    /// The view the driver writes through. Its writes are this journal's;
-    /// its reads go straight to the journal beneath (see [`Deferring`]).
-    pub fn deferring(self: &Arc<Self>) -> Deferring {
-        Deferring(self.clone())
-    }
-
-    /// A write failed since the drive began.
-    pub fn is_poisoned(&self) -> bool {
-        self.failure.get().is_some()
-    }
-
-    /// Answers once a write of this drive failed: what a drive waiting on
-    /// something else (a long node, news) also waits on, so it stops at
-    /// once.
-    pub async fn poisoned(&self) {
-        self.failure.wait().await
-    }
-
-    fn poisoned_error(&self) -> Option<anyhow::Error> {
-        self.failure.get().map(|why| anyhow::anyhow!("an earlier journal write of this drive failed: {why}"))
-    }
-
-    /// Answer once every row handed so far is on record. Refused once the
-    /// drive is poisoned: a drive whose journal is already behind starts
-    /// nothing more.
-    pub async fn flush(&self) -> anyhow::Result<()> {
-        if let Some(e) = self.poisoned_error() {
-            return Err(e);
-        }
-        let (answered, answer) = tokio::sync::oneshot::channel();
-        self.queue
-            .send(Queued::Written(answered))
-            .map_err(|_| anyhow::anyhow!("the drive journal's sending task is gone"))?;
-        answer
-            .await
-            .map_err(|_| anyhow::anyhow!("the drive journal's sending task ended before answering"))?
-            .map_err(|why| anyhow::anyhow!("an earlier journal write of this drive failed: {why}"))
-    }
-
-    /// Hand `events` to the sending task, at once.
-    fn enqueue(&self, events: &[ExecEvent], replica: Option<&str>) -> anyhow::Result<()> {
-        if let Some(e) = self.poisoned_error() {
-            return Err(e);
-        }
-        {
-            let mut fixed = self.replica.lock().expect("drive journal");
-            match fixed.as_ref() {
-                Some(first) if first.as_deref() != replica => {
-                    drop(fixed);
-                    let why = "one drive wrote under two replicas; its journal can no longer be trusted";
-                    self.failure.set(why.to_string());
-                    anyhow::bail!(why);
-                }
-                Some(_) => {}
-                None => *fixed = Some(replica.map(str::to_string)),
-            }
-        }
-        if events.is_empty() {
-            return Ok(());
-        }
-        self.queue
-            .send(Queued::Rows(events.to_vec(), replica.map(str::to_string)))
-            .map_err(|_| anyhow::anyhow!("the drive journal's sending task is gone"))
-    }
-
-    /// The journal this one writes to. The run's terminal goes straight
-    /// there, once everything handed has gone out: it is retried on its
-    /// own, and its failing is the terminal's, never a lost row that would
-    /// poison the drive and make a run that completed read as failed.
-    pub fn beneath(&self) -> &dyn JournalClient {
-        self.inner.as_ref()
-    }
-}
-
-/// The drive journal's sending task: everything queued while the previous
-/// write was on its way goes out as one write, in order, and each
-/// `Written` is answered once the rows ahead of it are on record.
-async fn send_in_order(
-    inner: Arc<dyn JournalClient>,
-    mut pending: tokio::sync::mpsc::UnboundedReceiver<Queued>,
-    failure: Arc<Poison>,
-) {
-    while let Some(first) = pending.recv().await {
-        let mut batch: Vec<ExecEvent> = Vec::new();
-        let mut replica: Option<String> = None;
-        let mut waiting = Vec::new();
-        let mut next = Some(first);
-        while let Some(item) = next {
-            match item {
-                Queued::Rows(rows, r) => {
-                    replica = r;
-                    batch.extend(rows);
-                }
-                Queued::Written(answer) => waiting.push(answer),
-            }
-            next = pending.try_recv().ok();
-        }
-        if failure.get().is_none() && !batch.is_empty() {
-            if let Err(why) = send(inner.as_ref(), &batch, replica.as_deref()).await {
-                tracing::error!(target: "weft_engine::journal", error = %why, "a drive's journal write failed; the run stops");
-                failure.set(why);
-            }
-        }
-        let outcome = failure.get().map_or(Ok(()), Err);
-        for answer in waiting {
-            let _ = answer.send(outcome.clone());
-        }
-    }
-}
-
-/// How long a part of a write that never reached the journal is sent
-/// again, at first and at most between tries, and in all for that part:
-/// the broker is the install's own service, and one out of reach this
-/// long is down, so the run stops on it like on any failed write.
-const RESEND_FIRST: Duration = Duration::from_millis(100);
-const RESEND_LONGEST: Duration = Duration::from_secs(5);
-const RESEND_FOR: Duration = Duration::from_secs(60);
-
-/// Write `batch`, one part at a time, cut the way the journal sends it
-/// (`JournalClient::parts`): a part that never reached the journal
-/// (`JournalClient::never_reached`) is sent again, since it cannot have
-/// landed, for up to [`RESEND_FOR`] each; any other failure is final,
-/// since the part may have landed and sending it twice would record its
-/// rows twice. Sending part by part is what keeps a part that landed from
-/// being sent again with the rest.
-async fn send(inner: &dyn JournalClient, batch: &[ExecEvent], replica: Option<&str>) -> Result<(), String> {
-    let not_written = |rows: &[ExecEvent], e: &anyhow::Error| {
-        let kinds: Vec<&str> = rows.iter().map(ExecEvent::kind_str).collect();
-        format!("{} journal row(s) were not written ({}): {e:#}", rows.len(), kinds.join(", "))
-    };
-    let chunks = inner.parts(batch).map_err(|e| not_written(batch, &e))?;
-    for chunk in chunks {
-        let started = tokio::time::Instant::now();
-        let mut wait = RESEND_FIRST;
-        loop {
-            match inner.record_events(chunk, replica).await {
-                Ok(()) => break,
-                Err(e) if inner.never_reached(&e) && started.elapsed() < RESEND_FOR => {
-                    tracing::warn!(
-                        target: "weft_engine::journal",
-                        error = %format!("{e:#}"), rows = chunk.len(), retry_in_ms = wait.as_millis() as u64,
-                        "a journal write did not reach the broker; sending it again"
-                    );
-                    tokio::time::sleep(wait).await;
-                    wait = (wait * 2).min(RESEND_LONGEST);
-                }
-                Err(e) => return Err(not_written(chunk, &e)),
-            }
-        }
-    }
-    Ok(())
-}
-
-#[async_trait::async_trait]
-impl JournalClient for DriveJournal {
-    async fn record_event(&self, event: &ExecEvent, replica: Option<&str>) -> anyhow::Result<()> {
-        self.enqueue(std::slice::from_ref(event), replica)
-    }
-
-    async fn record_events(&self, events: &[ExecEvent], replica: Option<&str>) -> anyhow::Result<()> {
-        self.enqueue(events, replica)
-    }
-
-    async fn raw_rows_after(
-        &self,
-        execution_id: ExecutionId,
-        after_id: i64,
-        wait: Duration,
-    ) -> anyhow::Result<Vec<weft_journal::RawJournalRow>> {
-        self.flush().await?;
-        self.inner.raw_rows_after(execution_id, after_id, wait).await
-    }
-
-    async fn has_terminal_event(&self, execution_id: ExecutionId) -> anyhow::Result<bool> {
-        self.flush().await?;
-        self.inner.has_terminal_event(execution_id).await
-    }
-
-    async fn record_retroactively(&self, events: &[ExecEvent], replica: Option<&str>) -> anyhow::Result<()> {
-        self.flush().await?;
-        self.inner.record_retroactively(events, replica).await
-    }
-
-    async fn forget_unrecorded(&self, execution_id: ExecutionId, replica: Option<&str>) -> anyhow::Result<()> {
-        self.flush().await?;
-        self.inner.forget_unrecorded(execution_id, replica).await
-    }
-}
-
-/// A client a drive and its nodes reach another writer through (the task
-/// store, the steering of runs), wrapped so every journal row handed to
-/// the drive so far is on record before the other writer is asked to act.
-/// A task hands the run to the dispatcher (a signal it registers and
-/// journals, a call it makes), a tag is written beside the run's own rows,
-/// and a stop by tag may cancel this very run: none of them may land a
-/// row of this run ahead of ones the drive was handed first.
-pub struct JournalFirst<C: ?Sized> {
-    pub inner: Arc<C>,
-    pub journal: Arc<DriveJournal>,
-}
-
-#[async_trait::async_trait]
-impl ExecutionSteeringClient for JournalFirst<dyn ExecutionSteeringClient> {
-    async fn tag_execution(&self, execution_id: ExecutionId, tags: Vec<String>, replica: &str) -> anyhow::Result<()> {
-        self.journal.flush().await?;
-        self.inner.tag_execution(execution_id, tags, replica).await
-    }
-
-    async fn stop_tagged(
-        &self,
-        execution_id: ExecutionId,
-        tag: String,
-        stop_self: weft_core::StopSelf,
-        replica: &str,
-    ) -> anyhow::Result<bool> {
-        self.journal.flush().await?;
-        self.inner.stop_tagged(execution_id, tag, stop_self, replica).await
-    }
-}
-
-#[async_trait::async_trait]
-impl TaskStoreClient for JournalFirst<dyn TaskStoreClient> {
-    async fn enqueue_dedup(&self, spec: task_store::NewTask) -> anyhow::Result<task_store::DedupOutcome> {
-        self.journal.flush().await?;
-        self.inner.enqueue_dedup(spec).await
-    }
-
-    async fn wait_for_terminal(&self, task_id: uuid::Uuid, timeout: Duration) -> anyhow::Result<task_store::TaskOutcome> {
-        self.inner.wait_for_terminal(task_id, timeout).await
-    }
-
-
-    async fn claim_execution(
-        &self,
-        replica: &str,
-        project_id: uuid::Uuid,
-        execution_id: &str,
-    ) -> anyhow::Result<Option<task_store::ClaimedExecution>> {
-        self.inner.claim_execution(replica, project_id, execution_id).await
-    }
-
-    async fn heartbeat(&self, task_id: uuid::Uuid, replica: &str) -> anyhow::Result<bool> {
-        self.inner.heartbeat(task_id, replica).await
-    }
-
-    async fn requeue(&self, task_id: uuid::Uuid, replica: &str) -> anyhow::Result<bool> {
-        self.inner.requeue(task_id, replica).await
-    }
-
-    async fn complete(&self, task_id: uuid::Uuid, replica: &str, result: Value) -> anyhow::Result<()> {
-        self.inner.complete(task_id, replica, result).await
-    }
-
-    async fn fail(&self, task_id: uuid::Uuid, replica: &str, error: String) -> anyhow::Result<()> {
-        self.inner.fail(task_id, replica, error).await
-    }
-
-    async fn cancels_asked(
-        &self,
-        project_id: uuid::Uuid,
-        execution_ids: Vec<String>,
-    ) -> anyhow::Result<Vec<task_store::CancelAsked>> {
-        self.inner.cancels_asked(project_id, execution_ids).await
-    }
-}
-
-/// [`DriveJournal`] as the driver holds it: its writes are the drive
-/// journal's, and its reads go straight to the journal beneath without
-/// waiting for what is still being sent. The driver's idle read follows
-/// the run from its own last row, so its own rows arriving later read as
-/// rows it already applied; waiting there would only hold the loop.
-pub struct Deferring(Arc<DriveJournal>);
-
-#[async_trait::async_trait]
-impl JournalClient for Deferring {
-    async fn record_event(&self, event: &ExecEvent, replica: Option<&str>) -> anyhow::Result<()> {
-        self.0.enqueue(std::slice::from_ref(event), replica)
-    }
-
-    async fn record_events(&self, events: &[ExecEvent], replica: Option<&str>) -> anyhow::Result<()> {
-        self.0.enqueue(events, replica)
-    }
-
-    async fn raw_rows_after(
-        &self,
-        execution_id: ExecutionId,
-        after_id: i64,
-        wait: Duration,
-    ) -> anyhow::Result<Vec<weft_journal::RawJournalRow>> {
-        self.0.inner.raw_rows_after(execution_id, after_id, wait).await
-    }
-
-    async fn has_terminal_event(&self, execution_id: ExecutionId) -> anyhow::Result<bool> {
-        self.0.inner.has_terminal_event(execution_id).await
-    }
-
-    async fn record_retroactively(&self, events: &[ExecEvent], replica: Option<&str>) -> anyhow::Result<()> {
-        self.0.record_retroactively(events, replica).await
-    }
-
-    async fn forget_unrecorded(&self, execution_id: ExecutionId, replica: Option<&str>) -> anyhow::Result<()> {
-        self.0.forget_unrecorded(execution_id, replica).await
-    }
-}
-
 /// What one firing has done to its output ports, under ONE lock (see
 /// the `port_claims` field doc): the ports it mentioned (emitted or
 /// closed) and the generator ports it explicitly ENDED (`close_port`,
@@ -1692,9 +1413,9 @@ struct PortClaims {
 pub struct RunnerHandle {
     project_id: uuid::Uuid,
     execution_id: ExecutionId,
-    /// What the run is (its `ExecutionStarted`'s kind). An unrecorded
-    /// run keeps no journal to park in, so its waits are refused.
-    run_kind: weft_core::exec::RunKind,
+    /// How the run is kept (its `ExecutionStarted`'s settings): whether it
+    /// can pause, and how long a wait it cannot pause on holds.
+    settings: weft_core::run_settings::RunSettings,
     /// Whether this node exists once per instance: its infra is then the
     /// run instance's own copy, never the shared one.
     per_instance: Option<weft_core::instance::PerInstance>,
@@ -1708,6 +1429,14 @@ pub struct RunnerHandle {
     /// The node declares `features.catchErrors`, so its `error` output
     /// is the runtime's to fill (`ContextHandle::catches_errors`).
     catch_errors: bool,
+    /// The node's baked outputs (`weft_core::infra::bake`), and what the
+    /// body emitted on them this firing: what an infra setup saves.
+    baked_outputs: std::collections::BTreeSet<String>,
+    baked_emitted: std::sync::Mutex<std::collections::BTreeMap<String, serde_json::Value>>,
+    /// The infra nodes whose infra setup made a connection this firing
+    /// opened (`ResolveConnectionResponse::published_by`): what a failure
+    /// of the step names the way out for.
+    infra_made: std::sync::Mutex<std::collections::BTreeSet<String>>,
     node_id: String,
     /// The PLACE this firing runs at, spelled the way a person writes
     /// the node (`store`, or `one.store` inside the file the site `one`
@@ -1724,9 +1453,11 @@ pub struct RunnerHandle {
     /// node kind asking.
     node_type: String,
     node_frames: weft_core::frames::LoopFrames,
-    /// Broker-backed clients: journal writes, task enqueue, and
-    /// infra reads (infra endpoint lookup) all flow through here.
+    /// Broker-backed clients: task enqueue, infra reads (infra endpoint
+    /// lookup), connections, storage.
     clients: EngineClients,
+    /// What this firing writes about its run (see [`RunRecord`]).
+    record: RunRecord,
     /// The recipe for the service THIS node publishes a connection to,
     /// resolved by the compiler and carried on the node's definition.
     /// `None` for the overwhelming majority of nodes, which publish
@@ -1743,10 +1474,11 @@ pub struct RunnerHandle {
     /// (node, frames), seeded by the loop driver from the journal
     /// fold on every dispatch. Each `await_signal` call inside the
     /// node body pops the next entry:
-    ///   - resolved=Some(value): return it instantly (replay path).
-    ///   - resolved=None (the still-pending tail): suspend with
-    ///     this token (we're being re-dispatched but our fire
-    ///     hasn't arrived for THIS call yet).
+    ///   - ended: return its value instantly, or fail the way it
+    ///     failed when given up (replay path).
+    ///   - not ended (the still-pending tail): wait on this token
+    ///     (we're being re-dispatched but our fire hasn't arrived for
+    ///     THIS call yet).
     ///   - exhausted: this is a fresh await; enqueue register_signal
     ///     with the next call_index.
     /// The `Mutex` is just for interior mutability across the
@@ -1758,13 +1490,10 @@ pub struct RunnerHandle {
     /// with the per-(node, frames) sequence above, it determines
     /// whether the call replays or registers fresh.
     next_call_index: AtomicU32,
-    /// 0-based ordinal of the NEXT side-effect call (`log`)
-    /// within this (node, frames). Separate counter from
-    /// `next_call_index` so side effects don't shift the replay
-    /// alignment of `await_signal` / `run_step`. Used to form
-    /// stable dedup keys on the broker task table: under replay,
-    /// the body re-runs and emits the same side-effect calls in
-    /// the same order, so the dedup keys collapse to the same row.
+    /// 0-based ordinal of the NEXT log line within this (node, frames):
+    /// its place among its firing's lines (`ExecEvent::LogLine::seq`).
+    /// Separate counter from `next_call_index` so log lines don't shift
+    /// the replay alignment of `await_signal` / `run_step`.
     next_side_effect_index: AtomicU32,
     /// Number of `register_signal` (entry trigger) calls this node
     /// has made on this invocation. Entry triggers are a one-shot
@@ -1831,8 +1560,8 @@ pub struct RunnerHandle {
     /// the TYPE of each emitted value against the port's declared type
     /// (an incompatible value fails the call, which fails the firing
     /// unless the node's code catches it).
-    declared_outputs: HashMap<String, WeftType>,
-    declared_inputs: HashMap<String, WeftType>,
+    declared_outputs: Arc<HashMap<String, WeftType>>,
+    declared_inputs: Arc<HashMap<String, WeftType>>,
     /// The output ports with at least one wire out of them in this
     /// run, read off the compiled graph (`ctx.is_output_wired`).
     wired_outputs: std::collections::HashSet<String>,
@@ -1876,30 +1605,35 @@ impl RunnerHandle {
         node_type: String,
         node_frames: weft_core::frames::LoopFrames,
         clients: EngineClients,
+        record: RunRecord,
         published_service: Option<weft_core::AccessSpec>,
         worker_replica: String,
         tenant_id: String,
         cancellation: Arc<CancellationFlag>,
         waits: Arc<WaitTracker>,
         bus_coordinator: Arc<BusCoordinator>,
-        declared_outputs: HashMap<String, WeftType>,
-        declared_inputs: HashMap<String, WeftType>,
+        declared_outputs: Arc<HashMap<String, WeftType>>,
+        declared_inputs: Arc<HashMap<String, WeftType>>,
         wired_outputs: std::collections::HashSet<String>,
         has_generator_input: bool,
     ) -> Self {
         Self {
             project_id,
             execution_id,
-            run_kind: weft_core::exec::RunKind::Execution,
+            settings: weft_core::run_settings::RunSettings::default(),
             per_instance: None,
             run_instance: None,
             declared_infra: Arc::new(weft_core::project::DeclaredInfra::default()),
             catch_errors: false,
+            baked_outputs: Default::default(),
+            baked_emitted: Default::default(),
+            infra_made: Default::default(),
             place,
             node_id,
             node_type,
             node_frames,
             clients,
+            record,
             published_service,
             worker_replica,
             tenant_id,
@@ -1974,7 +1708,7 @@ impl RunnerHandle {
         let mut failures = Vec::new();
         for (grant, values) in opened {
             let req = weft_broker_client::protocol::ReleaseConnectionRequest {
-                execution_id: self.execution_id.to_string(),
+                execution_id: self.execution_id,
                 values,
             };
             if let Err(e) = self.clients.access_broker.release_connection(&req).await {
@@ -2019,10 +1753,10 @@ impl RunnerHandle {
         self
     }
 
-    /// The kind of run this firing belongs to, stamped by the loop
+    /// How the run this firing belongs to is kept, stamped by the loop
     /// driver from the run's `ExecutionStarted`.
-    pub fn with_run_kind(mut self, run_kind: weft_core::exec::RunKind) -> Self {
-        self.run_kind = run_kind;
+    pub fn with_settings(mut self, settings: weft_core::run_settings::RunSettings) -> Self {
+        self.settings = settings;
         self
     }
 
@@ -2053,6 +1787,34 @@ impl RunnerHandle {
         self
     }
 
+    pub fn with_baked_outputs(mut self, baked_outputs: std::collections::BTreeSet<String>) -> Self {
+        self.baked_outputs = baked_outputs;
+        self
+    }
+
+    /// What the body emitted on its baked outputs this firing.
+    pub fn baked_emitted(&self) -> std::collections::BTreeMap<String, serde_json::Value> {
+        self.baked_emitted.lock().expect("baked emissions poisoned").clone()
+    }
+
+    /// `failure`, and when the firing used a connection an infra node's
+    /// setup made, the way out if that connection's values went stale: a
+    /// change the infra never reported is nothing weft saw, and running the
+    /// node's setup again makes the connection again.
+    pub fn with_infra_hint(&self, failure: String) -> String {
+        let made = self.infra_made.lock().expect("infra connections poisoned");
+        if made.is_empty() {
+            return failure;
+        }
+        let nodes: Vec<&str> = made.iter().map(String::as_str).collect();
+        format!(
+            "{failure}\n(this step used a connection the infra of {} made; if its values changed where weft could not see, \
+             such as a password reset whose report never arrived, `weft infra rebake {}` makes it again)",
+            nodes.join(", "),
+            nodes[0],
+        )
+    }
+
     /// Wait for this run's own cancel, which something this run asked for
     /// (`what`) already issued, warning every [`SELF_STOP_BREADCRUMB`] so a
     /// stop that never lands reads as stuck in the logs (`weft stop` ends
@@ -2079,76 +1841,6 @@ impl RunnerHandle {
 
     fn next_side_effect_index(&self) -> u32 {
         self.next_side_effect_index.fetch_add(1, Ordering::SeqCst)
-    }
-
-    /// Enqueue a durable side-effect task (a log line) on the broker.
-    /// The broker's INSERT into `task` is the durable commit; once `Ok`
-    /// returns, the dispatcher will journal the event regardless of
-    /// whether this worker survives.
-    ///
-    /// `dedup_prefix` is the human-readable label used in the dedup
-    /// key (`"log"`); the rest of the key keys to (execution, node, frames,
-    /// side-effect-index) so distinct calls in one node body produce
-    /// distinct tasks while a retry of the same call (e.g. supervisor
-    /// reconnect, body replay) collapses to one. Replay is honest
-    /// because the body re-runs in the same order and emits the same
-    /// side-effect sequence.
-    async fn enqueue_side_effect_task<P: serde::Serialize>(
-        &self,
-        dedup_prefix: &str,
-        kind: weft_task_store::TaskKind,
-        payload: impl FnOnce(u64) -> P,
-    ) -> WeftResult<()> {
-        // The effect's index is minted once and goes both into the
-        // dedup key and to the payload builder, so what the journal
-        // orders by is exactly what the broker dedups on.
-        let seq = u64::from(self.next_side_effect_index());
-        let payload_json = serde_json::to_value(payload(seq)).map_err(|e| {
-            WeftError::Config(format!("{dedup_prefix} payload: {e}"))
-        })?;
-        let dedup_key = self.side_effect_dedup_key(dedup_prefix, seq)?;
-        let project_id = self.project_id;
-        self.clients
-            .tasks
-            .enqueue_dedup(weft_task_store::NewTask {
-                kind: kind.into(),
-                target: weft_task_store::TaskTarget::Dispatcher,
-                project_id: Some(project_id),
-                dedup_key: Some(dedup_key),
-                execution_id: Some(self.execution_id.to_string()),
-                tenant_id: self.tenant_id.clone(),
-                target_replica: None,
-                binary_hash: None,
-                payload: payload_json,
-            })
-            .await
-            .map_err(|e| WeftError::Config(format!("{dedup_prefix} enqueue: {e}")))?;
-        Ok(())
-    }
-
-    /// One idempotency key per side effect: retries of the SAME effect
-    /// reuse the key (broker dedups), distinct effects of one firing get
-    /// distinct indices.
-    ///
-    /// The index counts up from 0 and RESETS to 0 when the body is
-    /// replayed after a durable wait (a resumed park runs it again from
-    /// the top). So a FULL replay from the top
-    /// re-emits each side effect at the same index and lands on the same
-    /// key (dedup collapses it). This holds only while the body runs the
-    /// same sequence of side effects on a replay as on the first run. A
-    /// node that PAUSES mid-body (`await_signal` / `ctx.run`) and emits a
-    /// DIFFERENT number of log lines before vs after the pause across runs
-    /// would shift these indices and mis-key one (double-write or wrongly
-    /// suppress). `log` is the only side effect keyed this way, and log
-    /// output is observational, so a mis-keyed line is harmless.
-    fn side_effect_dedup_key(&self, prefix: &str, idx: u64) -> WeftResult<String> {
-        let frames_key = frames_dedup_key(&self.node_frames)
-            .map_err(|e| WeftError::Config(format!("{prefix} frames key: {e}")))?;
-        Ok(format!(
-            "{prefix}:{execution_id}:{node}:{frames_key}:{idx}",
-            execution_id = self.execution_id,
-            node = self.node_id,
-        ))
     }
 
     /// Seed the per-(node, frames) await-call sequence the loop
@@ -2241,6 +1933,90 @@ impl RunnerHandle {
         self.awaited_sequence
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Why the run cannot pause right now, if it cannot.
+    fn unsuspendable(&self) -> Option<crate::held_waits::Unsuspendable> {
+        crate::held_waits::unsuspendable(self.caller_connection.as_ref(), &self.bus_coordinator, self.settings)
+    }
+
+    /// The error a wait of this node given up for `why` fails its call with.
+    fn gave_up(&self, why: &str) -> WeftError {
+        WeftError::WaitGaveUp(format!("node '{}' gave up its wait: {why}", self.place))
+    }
+
+    /// Suspend on the wait `token`, or, while the run cannot pause, hold it
+    /// in this call until the drive ends it (`crate::held_waits`): its
+    /// answer goes on the run's record and is the call's value, the run
+    /// able to pause again suspends
+    /// it after all, and a wait given up fails the call. A wait given up
+    /// goes on the run's record, so a replay of this body fails the same
+    /// call the same way, and is withdrawn, so nobody is still asked to
+    /// answer it.
+    async fn hold_or_suspend(&self, token: String) -> WeftResult<Value> {
+        use crate::held_waits::HeldEnd;
+        let Some(why) = self.unsuspendable() else {
+            return Err(WeftError::Suspended { token });
+        };
+        let end = match self.settings.hold_secs() {
+            0 => {
+                self.waits.held().gave_up(&token);
+                HeldEnd::GaveUp(crate::held_waits::gave_up_because(why, 0))
+            }
+            _ => {
+                let liveness = Arc::downgrade(&self.waits) as std::sync::Weak<dyn WaitLiveness>;
+                let here = FiringLocation::new(self.node_id.clone(), self.node_frames.clone());
+                self.waits.held().hold(&liveness, here, &token).await
+            }
+        };
+        let why = match end {
+            HeldEnd::Answered(value) => {
+                self.record
+                    .journal
+                    .record_event(
+                        &ExecEvent::SuspensionResolved {
+                            execution_id: self.execution_id,
+                            token,
+                            value: value.clone(),
+                            at_unix: now_unix(),
+                        },
+                        Some(&self.worker_replica),
+                    )
+                    .await
+                    .map_err(|e| WeftError::Suspension(format!("recording the answer to a held wait failed: {e:#}")))?;
+                return Ok(value);
+            }
+            HeldEnd::Pause => return Err(WeftError::Suspended { token }),
+            HeldEnd::GaveUp(why) => why,
+        };
+        let error = self.gave_up(&why);
+        self.record
+            .journal
+            .record_event(
+                &ExecEvent::SuspensionGaveUp {
+                    execution_id: self.execution_id,
+                    token: token.clone(),
+                    error: error.to_string(),
+                    at_unix: now_unix(),
+                },
+                Some(&self.worker_replica),
+            )
+            .await
+            .map_err(|e| WeftError::Suspension(format!("{error}; and recording that failed: {e:#}")))?;
+        self.clients
+            .tasks
+            .enqueue_dedup(task_store::NewTask {
+                kind: TaskKind::WithdrawSignal.into(),
+                project_id: None,
+                dedup_key: Some(format!("withdraw/{token}")),
+                execution_id: Some(self.execution_id),
+                tenant_id: self.tenant_id.clone(),
+                payload: serde_json::to_value(weft_task_store::WithdrawSignalPayload { execution_id: self.execution_id, token })
+                    .map_err(|e| WeftError::Suspension(format!("{error}; and withdrawing it failed: {e}")))?,
+            })
+            .await
+            .map_err(|e| WeftError::Suspension(format!("{error}; and withdrawing it failed: {e:#}")))?;
+        Err(error)
     }
 
     /// Ship an `EmitMsg` to the loop driver. Errors loud if the handle
@@ -2473,33 +2249,23 @@ impl ContextHandle for RunnerHandle {
     /// On every dispatch, the runtime pre-loads the per-(node, frames)
     /// awaited sequence from the journal fold:
     ///
-    /// 1. **Replay path** (entry has `resolved=Some`): the call's
-    ///    fire arrived in a prior cycle; return the stored value
-    ///    instantly. Body keeps running.
-    /// 2. **Suspend path** (entry has `resolved=None`): the call's
-    ///    suspension is the still-pending tail of the sequence;
-    ///    propagate `WeftError::Suspended` to release the worker.
-    /// 3. **Fresh path** (sequence exhausted): no past entry for
-    ///    this call_index; this is the first time this await runs.
-    ///    Enqueue `register_signal` with is_resume=true and the
-    ///    current call_index, then propagate `Suspended`. The next
-    ///    re-dispatch after the fire will see this entry resolved.
+    /// 1. **Replay path** (the entry ended): the call's answer arrived
+    ///    in a prior cycle; return the stored value instantly, or fail
+    ///    the way the call failed when its wait was given up.
+    /// 2. **Wait path** (the entry has not ended): the call's wait is
+    ///    the still-pending tail of the sequence.
+    /// 3. **Fresh path** (sequence exhausted): no past entry for this
+    ///    call_index; this is the first time this await runs. Enqueue
+    ///    `register_signal` with is_resume=true and the current
+    ///    call_index, and record the wait.
+    ///
+    /// A wait then suspends (`WeftError::Suspended`, the worker lets go
+    /// and the answer has the run carried on), or, while the run cannot
+    /// pause, holds in this call ([`Self::hold_or_suspend`]).
     ///
     /// The author writes `let x = ctx.await_signal(...).await?;` N
     /// times in a row; each call is replay-instant on resume.
     async fn await_signal(&self, spec: SignalSpec) -> WeftResult<Value> {
-        // Reconcile the two execution worlds. The wait policy (hold vs
-        // suspend + hold time) resolves from the run's SuspendPolicy
-        // through the general `wait` machinery; a live caller only supplies
-        // that policy. We do NOT fail here on a non-suspendable run that
-        // wants to suspend: other branches may still be running and talking
-        // to the caller, so the kill/disconnect fires ONCE later, at the
-        // true suspension point (the loop driver, when every branch is
-        // parked), never when one branch reaches a wait. The driver also
-        // owns the "hold the worker warm" decision (it treats an attached
-        // caller like a live bus). So there is nothing to special-case in
-        // this per-await path; the suspend path below runs unchanged.
-
         // A durable suspension replays the whole node body on resume.
         // Emitting (`pulse_downstream`) before a durable await is
         // unsound: the replay would re-run the body and re-emit the
@@ -2512,11 +2278,6 @@ impl ContextHandle for RunnerHandle {
                 weft_core::context::emitted_then_await_signal_error(&self.place),
             ));
         }
-        // An unrecorded run has no journal to park in, so it can never
-        // wait: refused at the call, naming the setting that decides it.
-        if !self.run_kind.journaled() {
-            return Err(WeftError::NodeExecution(weft_core::exec::unrecorded_wait_error(&self.place)));
-        }
         // A stream CONSUMER cannot durably suspend either: the resume
         // replays the body from the top, and the items its earlier
         // pulls consumed were delivered live and cannot be replayed.
@@ -2528,28 +2289,17 @@ impl ContextHandle for RunnerHandle {
         let call_index = self.next_call_index.fetch_add(1, Ordering::SeqCst);
 
         // Pop the next pre-loaded entry (if any) through the ONE replay
-        // reading (shared with the node-test rig). Replay vs suspend
-        // depends on whether its fire already arrived.
+        // reading (shared with the node-test rig).
         let replayed = weft_core::primitive::replay_await(&mut self.lock_awaited_sequence(), call_index)?;
         match replayed {
             Some(weft_core::primitive::ReplayedAwait::Resolved(value)) => return Ok(value),
-            Some(weft_core::primitive::ReplayedAwait::Pending { token }) => {
-                // Pending tail: fire hasn't arrived. Suspend with the
-                // existing token so the dispatcher doesn't re-register.
-                // If a bus is holding the worker alive, the driver's
-                // in-loop resume poll picks up this token's
-                // SuspensionResolved row when it lands and re-dispatches
-                // in process; if not, the worker exits and respawns on
-                // the fire.
-                return Err(WeftError::Suspended { token });
-            }
+            Some(weft_core::primitive::ReplayedAwait::Pending { token }) => return self.hold_or_suspend(token).await,
             None => {}
         }
 
-        // Sequence exhausted: this is a fresh await.
-        // Enqueue a register_signal task carrying our call_index so
-        // the dispatcher journals SuspensionRegistered with the right
-        // ordinal. Body propagates Suspended afterwards.
+        // Sequence exhausted: this is a fresh await. Enqueue the
+        // register_signal task that arms the wait; this call records its
+        // own SuspensionRegistered, with the right ordinal, below.
         let reply = enqueue_register_signal_task(
             self.clients.tasks.as_ref(),
             self.execution_id,
@@ -2568,15 +2318,33 @@ impl ContextHandle for RunnerHandle {
         let weft_core::primitive::RegisterSignalResult::Registered { token } = reply else {
             return Err(WeftError::Suspension("await_signal was captured instead of registered".into()));
         };
+        // The wait is the run's to record: a fold rebuilds the firing's
+        // await sequence from it.
+        self.record
+            .journal
+            .record_event(
+                &ExecEvent::SuspensionRegistered {
+                    execution_id: self.execution_id,
+                    node_id: self.node_id.clone(),
+                    frames: self.node_frames.clone(),
+                    token: token.clone(),
+                    spec,
+                    call_index,
+                    at_unix: now_unix(),
+                },
+                Some(&self.worker_replica),
+            )
+            .await
+            .map_err(|e| WeftError::Suspension(format!("record the wait: {e:#}")))?;
         tracing::info!(
             target: "weft_engine::suspend",
             node = %self.node_id,
             execution_id = %self.execution_id,
             call_index = call_index,
             token = %token,
-            "await_signal: registered; returning Suspended",
+            "await_signal: registered",
         );
-        Err(WeftError::Suspended { token })
+        self.hold_or_suspend(token).await
     }
 
     /// Replay-side of `ctx.run`. Pops the next entry in the
@@ -2595,7 +2363,7 @@ impl ContextHandle for RunnerHandle {
         // call_index is the value run_step returned, passed in so
         // run_step and run_record agree on the index explicitly
         // rather than via a shared counter both sides read.
-        self.clients.journal.record_event(
+        self.record.journal.record_event(
             &ExecEvent::RunOutput {
                 execution_id: self.execution_id,
                 node_id: self.node_id.clone(),
@@ -2807,11 +2575,11 @@ impl ContextHandle for RunnerHandle {
     }
 
     async fn record_file_edit(&self, edit: weft_core::storage::FileEdit) -> WeftResult<()> {
-        if !self.run_kind.journaled() {
+        if !self.settings.recorded() {
             return Ok(());
         }
         record_from_replica(
-            self.clients.journal.as_ref(),
+            self.record.journal.as_ref(),
             ExecEvent::FileEdited {
                 execution_id: self.execution_id,
                 node_id: self.node_id.clone(),
@@ -2862,6 +2630,10 @@ impl ContextHandle for RunnerHandle {
             }
         };
         Ok(weft_core::infra::InfraHandle::new(self.place.clone(), name, instance))
+    }
+
+    fn shared(&self) -> Arc<weft_core::shared::Shared> {
+        self.clients.shared.clone()
     }
 
     async fn endpoint_address(
@@ -2962,8 +2734,8 @@ impl ContextHandle for RunnerHandle {
     /// register_signal task and waits for the dispatcher to ack.
     /// Worker keeps executing; the signal stays armed and
     /// persistent until the project is deactivated. Each external
-    /// fire spawns a fresh execution (the dispatcher's relay path
-    /// enqueues route_entry instead of resuming this firing).
+    /// fire spawns a fresh execution at the worker's door instead of
+    /// resuming this firing.
     /// Distinct from await_signal: no suspend-then-resume cycle.
     async fn register_signal(&self, spec: SignalSpec, port_snapshot: Value) -> WeftResult<()> {
         // Entry triggers are one-shot per node per TriggerSetup.
@@ -2989,13 +2761,22 @@ impl ContextHandle for RunnerHandle {
             false,
             &self.tenant_id,
             0,
-            Some(port_snapshot),
+            Some(port_snapshot.clone()),
         )
         .await
         .map_err(|e| WeftError::Suspension(format!("register_signal: {e}")))?;
-        if !matches!(reply, weft_core::primitive::RegisterSignalResult::Captured) {
+        let weft_core::primitive::RegisterSignalResult::Captured { node_id } = reply else {
             return Err(WeftError::Suspension("trigger setup armed a listener instead of capturing its parameters".into()));
-        }
+        };
+        // The capture is the run's to record: its setup's ending reads it.
+        self.record
+            .journal
+            .record_event(
+                &ExecEvent::TriggerCaptured { execution_id: self.execution_id, node_id, spec, port_snapshot, at_unix: now_unix() },
+                Some(&self.worker_replica),
+            )
+            .await
+            .map_err(|e| WeftError::Suspension(format!("register_signal: record the capture: {e:#}")))?;
         tracing::info!(
             target: "weft_engine::register",
             node = %self.node_id,
@@ -3016,7 +2797,7 @@ impl ContextHandle for RunnerHandle {
         // placement that call brought up, and the connection list names
         // it the way a person writes that call.
         let req = weft_broker_client::protocol::PublishAccessRequest {
-            execution_id: self.execution_id.to_string(),
+            execution_id: self.execution_id,
             node_id: self.place.clone(),
             service: service.clone(),
             spec,
@@ -3037,7 +2818,7 @@ impl ContextHandle for RunnerHandle {
     async fn published_access(&self) -> WeftResult<Option<weft_core::access::Access>> {
         let service = self.published_spec()?.service.clone();
         let req = weft_broker_client::protocol::PublishedAccessRequest {
-            execution_id: self.execution_id.to_string(),
+            execution_id: self.execution_id,
             // By place, the key `publish_access` wrote under.
             node_id: self.place.clone(),
             service: service.clone(),
@@ -3060,7 +2841,7 @@ impl ContextHandle for RunnerHandle {
     ) -> WeftResult<weft_core::access::OpenedConnection> {
         let service = access.service().to_string();
         let req = weft_broker_client::protocol::ResolveConnectionRequest {
-            execution_id: self.execution_id.to_string(),
+            execution_id: self.execution_id,
             node_id: self.node_id.clone(),
             frames: self.node_frames.clone(),
             node_type: self.node_type.clone(),
@@ -3078,6 +2859,9 @@ impl ContextHandle for RunnerHandle {
         // Ours-owned connection is remembered: a release retires a
         // runtime-supplied credential, and a their-own connection's
         // stored values are the user's own and never travel back.
+        if let Some(node) = &resp.published_by {
+            self.infra_made.lock().expect("infra connections poisoned").insert(node.clone());
+        }
         if resp.owner.is_platform() {
             self.opened_accesses
                 .lock()
@@ -3092,11 +2876,11 @@ impl ContextHandle for RunnerHandle {
                 ))
             })?;
         let sink = Arc::new(crate::metering::CostSink {
-            tasks: self.clients.costs.clone(),
-            pending: self.clients.pending_costs.clone(),
+            journal: self.record.journal.clone(),
+            writer: self.clients.writer.clone(),
+            replica: self.worker_replica.clone(),
+            pending: self.record.costs.clone(),
             open_charges: self.clients.open_charges.clone(),
-            project_id: self.project_id,
-            tenant_id: self.tenant_id.clone(),
             execution_id: self.execution_id,
             node_id: self.node_id.clone(),
             frames: self.node_frames.clone(),
@@ -3108,6 +2892,7 @@ impl ContextHandle for RunnerHandle {
             steps.clone(),
             resp.relay_url.as_deref(),
             sink.clone(),
+            self.clients.shared.clone(),
         )?;
         let dialer = Arc::new(crate::socket::ConnectionSocketDial::new(
             steps,
@@ -3139,18 +2924,24 @@ impl ContextHandle for RunnerHandle {
             level = level_str,
             "{message}"
         );
-        self.enqueue_side_effect_task("log", weft_task_store::TaskKind::RecordLog, |seq| {
-            weft_task_store::RecordLogPayload {
-                execution_id: self.execution_id.to_string(),
-                node_id: self.node_id.clone(),
-                frames: self.node_frames.clone(),
-                level: level_str.to_string(),
-                message,
-                at_unix_ms: Some(crate::now_unix_ms()),
-                seq: Some(seq),
-            }
-        })
-        .await
+        let at_unix_ms = crate::now_unix_ms();
+        self.record
+            .journal
+            .record_event(
+                &ExecEvent::LogLine {
+                    execution_id: self.execution_id,
+                    node_id: self.node_id.clone(),
+                    frames: self.node_frames.clone(),
+                    level: level_str.to_string(),
+                    message,
+                    at_unix_ms: Some(at_unix_ms),
+                    seq: Some(u64::from(self.next_side_effect_index())),
+                    at_unix: at_unix_ms / 1000,
+                },
+                Some(&self.worker_replica),
+            )
+            .await
+            .map_err(|e| WeftError::Config(format!("log: {e:#}")))
     }
 
     /// Synchronous through the broker (the tag rows exist on return),
@@ -3161,16 +2952,28 @@ impl ContextHandle for RunnerHandle {
         // A tag is a row in the journal about this run, and an
         // unrecorded run writes none: it is not listed, and a stop by
         // tag selects only recorded runs.
-        if !self.run_kind.journaled() {
+        if !self.settings.recorded() {
             return Err(WeftError::Config(format!(
-                "node '{}' tags this run, and the run is not recorded (its Route has `recorded` \
+                "node '{}' tags this run, and the run is not recorded (its trigger has `recorded` \
                  off), so there is no run to find by that tag. Turn `recorded` back on to tag it",
                 self.place
             )));
         }
+        // The act goes on the run's record first: the broker's call below
+        // names the run, so the record so far (this row with it) is
+        // written before the call goes out (`crate::record_first`), and the
+        // tag rows it writes never exist without the act they select by.
+        self.record
+            .journal
+            .record_event(
+                &ExecEvent::ExecutionTagged { execution_id: self.execution_id, tags: tags.clone(), at_unix: now_unix() },
+                Some(&self.worker_replica),
+            )
+            .await
+            .map_err(|e| WeftError::Config(format!("tag_execution: record the tag: {e:#}")))?;
         self.clients
             .steering
-            .tag_execution(self.execution_id, tags, &self.worker_replica)
+            .tag_execution(self.execution_id, tags)
             .await
             .map_err(|e| WeftError::Config(format!("tag_execution: {e}")))
     }
@@ -3187,7 +2990,7 @@ impl ContextHandle for RunnerHandle {
         let stops_self = self
             .clients
             .steering
-            .stop_tagged(self.execution_id, tag, stop_self, &self.worker_replica)
+            .stop_tagged(self.execution_id, tag, stop_self)
             .await
             .map_err(|e| WeftError::Config(format!("stop_tagged: {e}")))?;
         if !stops_self {
@@ -3219,13 +3022,10 @@ impl ContextHandle for RunnerHandle {
             .tasks
             .enqueue_dedup(task_store::NewTask {
                 kind: TaskKind::ProgramCall.into(),
-                target: task_store::TaskTarget::Dispatcher,
                 project_id: Some(self.project_id),
                 dedup_key: Some(format!("program_call/{}/{}/{frames}/{call_index}", self.execution_id, self.node_id)),
-                execution_id: Some(self.execution_id.to_string()),
+                execution_id: Some(self.execution_id),
                 tenant_id: self.tenant_id.clone(),
-                target_replica: None,
-                binary_hash: None,
                 payload: serde_json::to_value(&payload)
                     .map_err(|e| WeftError::NodeExecution(format!("{name}: {e}")))?,
             })
@@ -3279,7 +3079,7 @@ impl ContextHandle for RunnerHandle {
             .access_broker
             .mint_instance_token(&weft_broker_client::protocol::ProgramMintInstanceTokenRequest {
                 id,
-                execution_id: self.execution_id.to_string(),
+                execution_id: self.execution_id,
                 instance: instance.clone(),
                 expires_in_secs,
                 displays,
@@ -3380,6 +3180,12 @@ impl ContextHandle for RunnerHandle {
         // The call is now known to proceed: claim every touched port
         // (the one-emission-per-port rule).
         self.mention_or_err(&ports)?;
+        if !self.baked_outputs.is_empty() {
+            let mut baked = self.baked_emitted.lock().expect("baked emissions poisoned");
+            for (port, value) in kept.outputs.iter().filter(|(port, _)| self.baked_outputs.contains(*port)) {
+                baked.insert(port.clone(), value.clone());
+            }
+        }
         if !wait_delivered {
             if !kept.outputs.is_empty() {
                 self.send_emission(EmitKind::Values(kept), None)?;
@@ -3530,13 +3336,10 @@ async fn enqueue_register_signal_task(
     let id = tasks
         .enqueue_dedup(task_store::NewTask {
             kind: TaskKind::RegisterSignal.into(),
-            target: task_store::TaskTarget::Dispatcher,
             project_id: None,
             dedup_key: Some(dedup_key),
-            execution_id: Some(execution_id.to_string()),
+            execution_id: Some(execution_id),
             tenant_id: tenant_id.to_string(),
-            target_replica: None,
-            binary_hash: None,
             payload,
         })
         .await?
@@ -3762,7 +3565,7 @@ mod type_check_tests {
 #[cfg(test)]
 mod replay_tests {
     use super::*;
-    use super::test_journal::CaptureJournal;
+    use super::test_journal::{test_clients, test_record, CaptureJournal};
     use weft_core::context::ContextHandle;
     use weft_core::primitive::{AwaitedEntry, AwaitedEntryKind};
 
@@ -3770,21 +3573,7 @@ mod replay_tests {
         // These tests only exercise run_step which never touches the
         // store. The no-op clients below let the trait objects exist
         // without any IO.
-        let clients = EngineClients {
-            journal: Arc::new(NoopJournal),
-            tasks: Arc::new(NoopTaskStore),
-            costs: Arc::new(NoopTaskStore),
-            infra: Arc::new(NoopInfra),
-            infra_state: Arc::new(NoopInfraState),
-            project: Arc::new(NoopProject),
-            clock: Arc::new(weft_platform_traits::clock::SystemClock),
-            storage: crate::storage::FakeWorkerStorage::new(),
-            access_broker: FakeAccessBroker::new(),
-            pending_costs: crate::metering::PendingCostRecords::new(),
-            open_charges: crate::metering::OpenCharges::new(),
-            line: TestLine::new(),
-            steering: Arc::new(NoopSteering),
-        };
+        let clients = test_clients(FakeAccessBroker::new());
         RunnerHandle::new(
             uuid::Uuid::nil(),
             uuid::Uuid::nil(),
@@ -3793,14 +3582,15 @@ mod replay_tests {
             "TestNode".into(),
             weft_core::frames::LoopFrames::default(),
             clients,
+            test_record(Arc::new(NoopJournal)),
             None,
             "instance-1".into(),
             "tenant-1".into(),
             std::sync::Arc::new(CancellationFlag::new()),
             crate::wait_tracker::WaitTracker::new(),
             BusCoordinator::new(crate::wait_tracker::WaitTracker::new()),
-            HashMap::new(),
-            HashMap::new(),
+            Default::default(),
+            Default::default(),
             std::collections::HashSet::new(),
             false,
         )
@@ -3812,7 +3602,7 @@ mod replay_tests {
         let journal = Arc::new(CaptureJournal::default());
         *journal.fail_count.lock().unwrap() = 1;
         let mut handle = handle_with_sequence(Vec::new());
-        handle.clients.journal = journal.clone();
+        handle.record = test_record(journal.clone());
         let ctx = ctx_over(handle);
         let mut reached_followup = false;
         let result: WeftResult<()> = async {
@@ -3831,7 +3621,7 @@ mod replay_tests {
     async fn run_returns_a_result_after_recording_it() {
         let journal = Arc::new(CaptureJournal::default());
         let mut handle = handle_with_sequence(Vec::new());
-        handle.clients.journal = journal.clone();
+        handle.record = test_record(journal.clone());
         let ctx = ctx_over(handle);
         let result = ctx.run("request-id", || async { Ok(serde_json::json!("saved-id")) }).await.unwrap();
         let events = journal.events.lock().unwrap();
@@ -3842,21 +3632,7 @@ mod replay_tests {
     /// Same rig as `handle_with_sequence` but with a caller-supplied
     /// `PaidCallClient` fake, for the access/provision/settle tests.
     fn handle_with_access_broker(access_broker: Arc<FakeAccessBroker>) -> RunnerHandle {
-        let clients = EngineClients {
-            journal: Arc::new(NoopJournal),
-            tasks: Arc::new(NoopTaskStore),
-            costs: Arc::new(NoopTaskStore),
-            infra: Arc::new(NoopInfra),
-            infra_state: Arc::new(NoopInfraState),
-            project: Arc::new(NoopProject),
-            clock: Arc::new(weft_platform_traits::clock::SystemClock),
-            storage: crate::storage::FakeWorkerStorage::new(),
-            access_broker,
-            pending_costs: crate::metering::PendingCostRecords::new(),
-            open_charges: crate::metering::OpenCharges::new(),
-            line: TestLine::new(),
-            steering: Arc::new(NoopSteering),
-        };
+        let clients = test_clients(access_broker);
         RunnerHandle::new(
             uuid::Uuid::nil(),
             uuid::Uuid::nil(),
@@ -3865,14 +3641,15 @@ mod replay_tests {
             "TestNode".into(),
             weft_core::frames::LoopFrames::default(),
             clients,
+            test_record(Arc::new(NoopJournal)),
             None,
             "instance-1".into(),
             "tenant-1".into(),
             std::sync::Arc::new(CancellationFlag::new()),
             crate::wait_tracker::WaitTracker::new(),
             BusCoordinator::new(crate::wait_tracker::WaitTracker::new()),
-            HashMap::new(),
-            HashMap::new(),
+            Default::default(),
+            Default::default(),
             std::collections::HashSet::new(),
             false,
         )
@@ -4109,21 +3886,7 @@ mod replay_tests {
 
         // (1) The WORKER path: a plain RunnerHandle opens the connection.
         let worker_broker = make_broker();
-        let worker_clients = EngineClients {
-            journal: Arc::new(NoopJournal),
-            tasks: Arc::new(NoopTaskStore),
-            costs: Arc::new(NoopTaskStore),
-            infra: Arc::new(NoopInfra),
-            infra_state: Arc::new(NoopInfraState),
-            project: Arc::new(NoopProject),
-            clock: Arc::new(weft_platform_traits::clock::SystemClock),
-            storage: crate::storage::FakeWorkerStorage::new(),
-            access_broker: worker_broker.clone(),
-            pending_costs: crate::metering::PendingCostRecords::new(),
-            open_charges: crate::metering::OpenCharges::new(),
-            line: TestLine::new(),
-            steering: Arc::new(NoopSteering),
-        };
+        let worker_clients = test_clients(worker_broker.clone());
         let execution_id = uuid::Uuid::from_u128(0xC0);
         let worker_handle = Arc::new(RunnerHandle::new(
             uuid::Uuid::from_u128(0x108),
@@ -4133,14 +3896,15 @@ mod replay_tests {
             "OpensConnection".into(),
             weft_core::frames::LoopFrames::default(),
             worker_clients,
+            test_record(Arc::new(NoopJournal)),
             None,
             "worker-instance-1".into(),
             "tenant-1".into(),
             std::sync::Arc::new(CancellationFlag::new()),
             crate::wait_tracker::WaitTracker::new(),
             BusCoordinator::new(crate::wait_tracker::WaitTracker::new()),
-            HashMap::new(),
-            HashMap::new(),
+            Default::default(),
+            Default::default(),
             std::collections::HashSet::new(),
             false,
         ));
@@ -4150,29 +3914,18 @@ mod replay_tests {
         // node, going through the production `open_connection` under its
         // capture layer, over the same clients composition.
         let test_broker = make_broker();
-        let test_clients = EngineClients {
-            journal: Arc::new(NoopJournal),
-            tasks: Arc::new(NoopTaskStore),
-            costs: Arc::new(NoopTaskStore),
-            infra: Arc::new(NoopInfra),
-            infra_state: Arc::new(NoopInfraState),
-            project: Arc::new(NoopProject),
-            clock: Arc::new(weft_platform_traits::clock::SystemClock),
-            storage: crate::storage::FakeWorkerStorage::new(),
-            access_broker: test_broker.clone(),
-            pending_costs: crate::metering::PendingCostRecords::new(),
-            open_charges: crate::metering::OpenCharges::new(),
-            line: TestLine::new(),
-            steering: Arc::new(NoopSteering),
-        };
-        let runner = crate::test_rig::LiveTestRunner::new(
+        let test_clients = test_clients(test_broker.clone());
+        let runner = crate::test_rig::LiveTestRunner::start(
             test_clients,
             test_catalog(),
             "test-instance-1".into(),
             "tenant-1".into(),
             uuid::Uuid::from_u128(0x108),
-            Some(execution_id),
-        );
+            execution_id,
+            "OpensConnection".into(),
+        )
+        .await
+        .expect("the test's run is born");
         let rig = runner.rig("id-1", "openrouter", Default::default());
         rig.run(&OpensConnection, serde_json::json!({})).await.ok().expect("rig opens");
 
@@ -4337,125 +4090,6 @@ mod replay_tests {
 
     use weft_journal::NoopJournal;
 
-    struct NoopSteering;
-    #[async_trait]
-    impl ExecutionSteeringClient for NoopSteering {
-        async fn tag_execution(&self, _: ExecutionId, _: Vec<String>, _: &str) -> anyhow::Result<()> {
-            unreachable!("these tests steer no executions")
-        }
-        async fn stop_tagged(
-            &self,
-            _: ExecutionId,
-            _: String,
-            _: weft_core::StopSelf,
-            _: &str,
-        ) -> anyhow::Result<bool> {
-            unreachable!("these tests steer no executions")
-        }
-    }
-
-    struct NoopTaskStore;
-    #[async_trait]
-    impl TaskStoreClient for NoopTaskStore {
-        async fn cancels_asked(
-            &self,
-            _project_id: uuid::Uuid,
-            _execution_ids: Vec<String>,
-        ) -> anyhow::Result<Vec<weft_task_store::tasks::CancelAsked>> {
-            Ok(Vec::new())
-        }
-
-        async fn enqueue_dedup(
-            &self,
-            _spec: weft_task_store::tasks::NewTask,
-        ) -> anyhow::Result<weft_task_store::tasks::DedupOutcome> {
-            unreachable!("replay tests do not enqueue")
-        }
-        async fn wait_for_terminal(
-            &self,
-            _task_id: uuid::Uuid,
-            _timeout: std::time::Duration,
-        ) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
-            unreachable!("replay tests do not wait")
-        }
-        async fn claim_execution(
-            &self,
-            _replica: &str,
-            _project_id: uuid::Uuid,
-            _execution_id: &str,
-        ) -> anyhow::Result<Option<weft_task_store::tasks::ClaimedExecution>> {
-            Ok(None)
-        }
-        async fn heartbeat(
-            &self,
-            _task_id: uuid::Uuid,
-            _replica: &str,
-        ) -> anyhow::Result<bool> {
-            Ok(true)
-        }
-        async fn requeue(
-            &self,
-            _task_id: uuid::Uuid,
-            _replica: &str,
-        ) -> anyhow::Result<bool> {
-            Ok(true)
-        }
-        async fn complete(
-            &self,
-            _task_id: uuid::Uuid,
-            _replica: &str,
-            _result: Value,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn fail(
-            &self,
-            _task_id: uuid::Uuid,
-            _replica: &str,
-            _error: String,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
-    struct NoopInfra;
-    #[async_trait]
-    impl InfraReader for NoopInfra {
-        async fn endpoint_address(
-            &self,
-            _execution_id: weft_core::ExecutionId,
-            _run_instance: Option<&weft_core::instance::InstanceId>,
-            _infra: &weft_core::infra::InfraHandle,
-        ) -> anyhow::Result<Option<weft_core::infra::EndpointAddress>> {
-            Ok(None)
-        }
-    }
-
-    struct NoopInfraState;
-    #[async_trait]
-    impl InfraStateClient for NoopInfraState {
-        async fn enqueue_apply(
-            &self,
-            _project_id: uuid::Uuid,
-            _node_id: &str,
-            _instance: Option<&weft_core::instance::InstanceId>,
-            _spec_json: serde_json::Value,
-        ) -> anyhow::Result<i64> {
-            Ok(0)
-        }
-        async fn wait_apply(
-            &self,
-            _project_id: uuid::Uuid,
-            _command_id: i64,
-            _wait: Duration,
-        ) -> anyhow::Result<weft_broker_client::protocol::InfraWaitApplyResponse> {
-            Ok(weft_broker_client::protocol::InfraWaitApplyResponse {
-                completed: true,
-                outcome: Some(weft_broker_client::protocol::LifecycleOutcome::Succeeded),
-                outcome_message: None,
-            })
-        }
-    }
-
     /// A catalog with no nodes: these tests never publish, and a node
     /// it cannot find declares nothing, which is the honest answer for
     /// an empty catalog.
@@ -4474,21 +4108,6 @@ mod replay_tests {
             }
         }
         &Empty
-    }
-
-    struct NoopProject;
-    #[async_trait]
-    impl crate::context::ProjectClient for NoopProject {
-        async fn fetch_definition(
-            &self,
-            _project_id: uuid::Uuid,
-            _expected_hash: &str,
-        ) -> anyhow::Result<Option<weft_core::ProjectDefinition>> {
-            // Replay tests don't take this path (they exercise
-            // RunnerHandle directly, never spawning a worker);
-            // if a test somehow calls this, fail loud.
-            anyhow::bail!("NoopProject::fetch_definition not implemented")
-        }
     }
 
     /// Replay path: a Run entry at the next call_index returns
@@ -4531,7 +4150,7 @@ mod replay_tests {
             call_index: 0,
             kind: AwaitedEntryKind::Await {
                 token: "tok-0".into(),
-                resolved: Some(serde_json::json!("from-fire")),
+                ended: Some(weft_core::primitive::AwaitEnd::Answered { value: serde_json::json!("from-fire") }),
             },
         }];
         let handle = handle_with_sequence(seq);
@@ -4593,7 +4212,7 @@ mod replay_tests {
                 call_index: 0,
                 kind: AwaitedEntryKind::Await {
                     token: "tok-0".into(),
-                    resolved: Some(serde_json::json!("answer")),
+                    ended: Some(weft_core::primitive::AwaitEnd::Answered { value: serde_json::json!("answer") }),
                 },
             },
             AwaitedEntry {
@@ -4632,19 +4251,16 @@ mod replay_tests {
 
     use weft_core::caller::{CallerRuntimeConfig, FakeCallerConnection};
     use weft_core::signal::{Backpressure, DataType, ErrorMode, Protocol};
-    use weft_core::wait::SuspendPolicy;
-
-    fn caller_cfg(protocol: Protocol, can_suspend: bool) -> CallerRuntimeConfig {
+    fn caller_cfg(protocol: Protocol, outlives_caller: bool) -> CallerRuntimeConfig {
         CallerRuntimeConfig {
             protocol,
             data_type: DataType::Json,
             backpressure: Backpressure::Block,
             error_mode: ErrorMode::Surface,
-            connect_timeout_secs: 5,
             max_inbound_bytes: 1024,
             caller_silence_secs: weft_core::signal::DEFAULT_CALLER_SILENCE_SECS,
             max_session_secs: 0,
-            suspend: SuspendPolicy { can_suspend, default_hold_secs: 300 },
+            outlives_caller,
             inbound_window: weft_core::caller::DEFAULT_INBOUND_WINDOW,
             journal: weft_core::stream_journal::JournalPolicy::default(),
         }
@@ -4670,30 +4286,62 @@ mod replay_tests {
         assert_eq!(ws.caller_connection().unwrap().config().protocol, Protocol::Websocket);
     }
 
+    fn pending_wait() -> Vec<AwaitedEntry> {
+        vec![AwaitedEntry { call_index: 0, kind: AwaitedEntryKind::Await { token: "tok-pending".into(), ended: None } }]
+    }
+
+    fn timer() -> SignalSpec {
+        weft_core::signal::to_spec(weft_core::signal::Timer { spec: weft_core::signal::TimerSpec::After { duration_ms: 1000 } })
+    }
+
+    /// A wait in a run tied to its caller cannot pause: it holds in the
+    /// call, and its answer is the call's value, on the run's record.
     #[tokio::test]
-    async fn await_signal_does_not_fail_at_the_call_in_a_tied_run() {
-        // A durable wait in a caller-tied run does NOT fail at the await
-        // call: other branches may still be running and talking to the
-        // caller, so the reconciliation (hold-then-kill) is deferred to the
-        // true suspension point in the loop driver. At the call, the await
-        // suspends as normal (returns Suspended), it does NOT raise a
-        // policy error. Use the pending-tail replay path (a pre-loaded
-        // unresolved await) so the suspend is reached without the broker.
-        let seq = vec![AwaitedEntry {
-            call_index: 0,
-            kind: AwaitedEntryKind::Await { token: "tok-pending".into(), resolved: None },
-        }];
-        let handle = handle_with_sequence(seq).with_caller_connection(Some(
+    async fn a_wait_holds_in_a_tied_run_and_takes_its_answer() {
+        let journal = Arc::new(CaptureJournal::default());
+        let mut handle = handle_with_sequence(pending_wait()).with_caller_connection(Some(
             FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, false)),
         ));
-        let spec = weft_core::signal::to_spec(weft_core::signal::Timer {
-            spec: weft_core::signal::TimerSpec::After { duration_ms: 1000 },
+        handle.record = test_record(journal.clone());
+        let handle = Arc::new(handle);
+        let waiting = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.await_signal(timer()).await }
         });
-        let err = handle.await_signal(spec).await.expect_err("a pending await suspends");
-        assert!(
-            matches!(err, WeftError::Suspended { ref token } if token == "tok-pending"),
-            "tied-run await must suspend at the call, not fail; got: {err:?}"
-        );
+        while !handle.waits.held().pending() {
+            tokio::task::yield_now().await;
+        }
+        handle.waits.held().answer("tok-pending", serde_json::json!("approved"));
+        assert_eq!(waiting.await.unwrap().expect("the answer"), serde_json::json!("approved"));
+        let events = journal.events.lock().unwrap();
+        assert!(matches!(events.as_slice(), [ExecEvent::SuspensionResolved { token, value, .. }]
+            if token == "tok-pending" && *value == serde_json::json!("approved")), "{events:?}");
+    }
+
+    /// A run that outlives its caller can pause: the same wait suspends.
+    #[tokio::test]
+    async fn a_wait_suspends_in_a_run_that_outlives_its_caller() {
+        let handle = handle_with_sequence(pending_wait()).with_caller_connection(Some(
+            FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, true)),
+        ));
+        let err = handle.await_signal(timer()).await.expect_err("a pending await suspends");
+        assert!(matches!(err, WeftError::Suspended { ref token } if token == "tok-pending"), "{err:?}");
+    }
+
+    /// A wait given up fails its call with the error a node can handle, and
+    /// a replay of the body fails the same call the same way.
+    #[tokio::test]
+    async fn a_wait_given_up_replays_as_the_same_failure() {
+        let given_up = vec![AwaitedEntry {
+            call_index: 0,
+            kind: AwaitedEntryKind::Await {
+                token: "tok".into(),
+                ended: Some(weft_core::primitive::AwaitEnd::GaveUp { error: "node 'node-x' gave up its wait: quiet".into() }),
+            },
+        }];
+        let err = handle_with_sequence(given_up).await_signal(timer()).await.expect_err("given up");
+        assert!(matches!(&err, WeftError::WaitGaveUp(error) if error.contains("quiet")), "{err:?}");
+        assert!(weft_core::context::catchable_message(&err).is_some(), "a node may catch it");
     }
 
     /// A program where `node-x` has infra once per instance.
@@ -4834,6 +4482,15 @@ mod infra_apply_tests {
             self.clock.advance(Duration::from_secs(3600));
             Ok(self.responses.lock().unwrap().pop_front().expect("unexpected extra poll"))
         }
+        async fn save_bake(
+            &self,
+            _: ExecutionId,
+            _: &str,
+            _: Option<&weft_core::instance::InstanceId>,
+            _: std::collections::BTreeMap<String, Value>,
+        ) -> anyhow::Result<()> {
+            unreachable!("an apply test saves no bake")
+        }
     }
 
     #[tokio::test]
@@ -4877,44 +4534,37 @@ mod infra_apply_tests {
 //      serializes both with the `closed` flag.
 
 #[cfg(test)]
-mod test_journal {
+pub(crate) mod test_journal {
     use super::*;
     use async_trait::async_trait;
     use std::sync::Mutex as StdMutex;
     use weft_journal::ExecEvent;
 
-    /// A write that could not reach the journal at all.
-    #[derive(Debug)]
-    pub(super) struct Unreachable;
-    impl std::fmt::Display for Unreachable {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("the journal could not be reached")
+    /// The engine rig's fake clients (`engine_test_rig::clients`), with
+    /// `access_broker` as their connection desk.
+    pub(crate) fn test_clients(access_broker: Arc<FakeAccessBroker>) -> EngineClients {
+        EngineClients {
+            access_broker,
+            ..crate::execution_driver::engine_test_rig::clients(Arc::new(crate::execution_driver::engine_test_rig::MemJournal::default()))
         }
     }
-    impl std::error::Error for Unreachable {}
+
+    /// A firing's record over `journal`, its spend counted on its own.
+    pub(crate) fn test_record(journal: Arc<dyn weft_journal::JournalClient>) -> RunRecord {
+        RunRecord { journal, costs: crate::metering::PendingCostRecords::new() }
+    }
 
     /// Capturing journal client. Stores every `record_event` payload
     /// so context and bus tests can assert what was saved. `fail_count`
-    /// rejects that many following writes before accepting them again;
-    /// `unreachable` fails a row's write as if the journal could not be
-    /// reached.
+    /// rejects that many following writes before accepting them again.
     #[derive(Default)]
-    pub(super) struct CaptureJournal {
-        pub(super) events: StdMutex<Vec<ExecEvent>>,
-        pub(super) fail_count: StdMutex<usize>,
-        /// Rows (by node) whose write still fails, as many more times, as
-        /// if the journal could not be reached.
-        pub(super) unreachable: StdMutex<HashMap<String, usize>>,
+    pub(crate) struct CaptureJournal {
+        pub(crate) events: StdMutex<Vec<ExecEvent>>,
+        pub(crate) fail_count: StdMutex<usize>,
     }
     #[async_trait]
     impl weft_journal::JournalClient for CaptureJournal {
         async fn record_event(&self, event: &ExecEvent, _instance: Option<&str>) -> anyhow::Result<()> {
-            if let ExecEvent::NodeStarted { node_id, .. } = event {
-                if let Some(left) = self.unreachable.lock().unwrap().get_mut(node_id).filter(|left| **left > 0) {
-                    *left -= 1;
-                    return Err(Unreachable.into());
-                }
-            }
             {
                 let mut fc = self.fail_count.lock().unwrap();
                 if *fc > 0 {
@@ -4925,212 +4575,9 @@ mod test_journal {
             self.events.lock().unwrap().push(event.clone());
             Ok(())
         }
-        /// One part per row, so a write of several rows can fail part way.
-        fn parts<'e>(&self, events: &'e [ExecEvent]) -> anyhow::Result<Vec<&'e [ExecEvent]>> {
-            Ok(events.chunks(1).collect())
-        }
-        fn never_reached(&self, error: &anyhow::Error) -> bool {
-            error.downcast_ref::<Unreachable>().is_some()
-        }
         /// Captures are for asserting writes; nothing reads them back.
-        async fn raw_rows_after(
-            &self,
-            _execution_id: ExecutionId,
-            _after_id: i64,
-            wait: Duration,
-        ) -> anyhow::Result<Vec<weft_journal::RawJournalRow>> {
-            tokio::time::sleep(wait).await;
-            Ok(Vec::new())
-        }
-        async fn has_terminal_event(&self, _execution_id: ExecutionId) -> anyhow::Result<bool> {
-            Ok(false)
-        }
-    }
-}
-
-#[cfg(test)]
-mod drive_journal_tests {
-    use super::*;
-    use super::test_journal::CaptureJournal;
-    use std::sync::Mutex as StdMutex;
-
-    fn started(execution_id: ExecutionId, node: &str) -> ExecEvent {
-        ExecEvent::NodeStarted { execution_id, node_id: node.into(), frames: Vec::new(), at_unix: 0 }
-    }
-
-    fn nodes(capture: &CaptureJournal) -> Vec<String> {
-        capture
-            .events
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|e| match e {
-                ExecEvent::NodeStarted { node_id, .. } => node_id.clone(),
-                other => panic!("unexpected row {other:?}"),
-            })
-            .collect()
-    }
-
-    /// Writes answer at once and reach the journal in the order handed,
-    /// the driver's and its nodes' alike; a flush answers once they all
-    /// have.
-    #[tokio::test]
-    async fn rows_go_out_in_the_background_in_order() {
-        let capture = Arc::new(CaptureJournal::default());
-        let drive = DriveJournal::wrap(capture.clone());
-        let driver = drive.deferring();
-        let run = ExecutionId::new_v4();
-        driver.record_event(&started(run, "a"), Some("w")).await.unwrap();
-        drive.record_event(&started(run, "node-write"), Some("w")).await.unwrap();
-        driver.record_event(&started(run, "b"), Some("w")).await.unwrap();
-        drive.flush().await.unwrap();
-        assert_eq!(nodes(&capture), ["a", "node-write", "b"]);
-        assert!(!drive.is_poisoned());
-    }
-
-    /// A read never runs past rows the drive wrote.
-    #[tokio::test]
-    async fn a_read_waits_for_what_was_handed_first() {
-        let capture = Arc::new(CaptureJournal::default());
-        let drive = DriveJournal::wrap(capture.clone());
-        let run = ExecutionId::new_v4();
-        drive.deferring().record_event(&started(run, "a"), Some("w")).await.unwrap();
-        drive.has_terminal_event(run).await.unwrap();
-        assert_eq!(nodes(&capture), ["a"]);
-    }
-
-    /// A task goes out only once every row handed before it is on record.
-    #[tokio::test]
-    async fn a_task_waits_for_the_rows_handed_before_it() {
-        let capture = Arc::new(CaptureJournal::default());
-        let drive = DriveJournal::wrap(capture.clone());
-        let run = ExecutionId::new_v4();
-        drive.record_event(&started(run, "a"), Some("w")).await.unwrap();
-        let seen = Arc::new(StdMutex::new(Vec::new()));
-        let inner: Arc<dyn TaskStoreClient> = Arc::new(SeeingTasks { capture: capture.clone(), seen: seen.clone() });
-        let tasks = JournalFirst { inner, journal: drive.clone() };
-        tasks.enqueue_dedup(task_store::NewTask {
-            kind: "noop".into(),
-            target: task_store::TaskTarget::Dispatcher,
-            project_id: None,
-            dedup_key: None,
-            execution_id: None,
-            tenant_id: "t".into(),
-            target_replica: None,
-            binary_hash: None,
-            payload: Value::Null,
-        })
-        .await
-        .unwrap();
-        assert_eq!(*seen.lock().unwrap(), vec![1], "the task saw the row already written");
-    }
-
-    /// A failed write poisons the drive: the journal is now behind what
-    /// the worker did, and the loop stops on it.
-    #[tokio::test]
-    async fn a_failed_write_poisons_the_drive() {
-        let capture = Arc::new(CaptureJournal::default());
-        *capture.fail_count.lock().unwrap() = 1;
-        let drive = DriveJournal::wrap(capture.clone());
-        drive.deferring().record_event(&started(ExecutionId::new_v4(), "a"), Some("w")).await.unwrap();
-        assert!(drive.flush().await.is_err());
-        assert!(drive.is_poisoned());
-        assert!(
-            drive.deferring().record_event(&started(ExecutionId::new_v4(), "b"), Some("w")).await.is_err(),
-            "a poisoned drive takes nothing more"
-        );
-        assert!(drive.flush().await.is_err());
-        assert!(capture.events.lock().unwrap().is_empty());
-    }
-
-    /// A part of a write that never reached the broker is sent again, and
-    /// lands once, in order, without the parts before it going again (one
-    /// that reached it and failed is never sent again:
-    /// `a_failed_write_poisons_the_drive`).
-    #[tokio::test(start_paused = true)]
-    async fn only_a_write_that_never_reached_the_broker_is_sent_again() {
-        let capture = Arc::new(CaptureJournal::default());
-        let drive = DriveJournal::wrap(capture.clone());
-        let run = ExecutionId::new_v4();
-        // One write of three parts: the first lands, the second cannot
-        // reach the journal twice and then does, and the first is never
-        // sent again.
-        capture.unreachable.lock().unwrap().insert("b".into(), 2);
-        drive.deferring().record_events(&[started(run, "a"), started(run, "b"), started(run, "c")], Some("w")).await.unwrap();
-        drive.flush().await.expect("sent once the journal could be reached");
-        assert_eq!(nodes(&capture), ["a", "b", "c"], "each row once, in order");
-    }
-
-    /// A broker out of reach for longer than the resend window stops the
-    /// run, like any failed write.
-    #[tokio::test(start_paused = true)]
-    async fn a_broker_out_of_reach_too_long_stops_the_run() {
-        let capture = Arc::new(CaptureJournal::default());
-        capture.unreachable.lock().unwrap().insert("a".into(), usize::MAX);
-        let drive = DriveJournal::wrap(capture.clone());
-        drive.deferring().record_event(&started(ExecutionId::new_v4(), "a"), Some("w")).await.unwrap();
-        assert!(drive.flush().await.is_err());
-        assert!(drive.is_poisoned());
-    }
-
-    /// A drive waiting on something else hears its journal fail at once.
-    #[tokio::test]
-    async fn a_waiting_drive_hears_a_failed_write() {
-        let capture = Arc::new(CaptureJournal::default());
-        *capture.fail_count.lock().unwrap() = 1;
-        let drive = DriveJournal::wrap(capture.clone());
-        let waiting = {
-            let drive = drive.clone();
-            tokio::spawn(async move { drive.poisoned().await })
-        };
-        drive.deferring().record_event(&started(ExecutionId::new_v4(), "a"), Some("w")).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), waiting).await.expect("heard the failure").unwrap();
-        assert!(drive.is_poisoned());
-    }
-
-    /// A write under another replica poisons the drive.
-    #[tokio::test]
-    async fn a_mismatched_replica_poisons_the_drive() {
-        let capture = Arc::new(CaptureJournal::default());
-        let drive = DriveJournal::wrap(capture.clone());
-        let run = ExecutionId::new_v4();
-        drive.deferring().record_event(&started(run, "a"), Some("w")).await.unwrap();
-        assert!(drive.record_event(&started(run, "b"), Some("other")).await.is_err());
-        assert!(drive.is_poisoned());
-    }
-
-    /// Counts the journal's rows at each enqueue.
-    struct SeeingTasks {
-        capture: Arc<CaptureJournal>,
-        seen: Arc<StdMutex<Vec<usize>>>,
-    }
-
-    #[async_trait::async_trait]
-    impl TaskStoreClient for SeeingTasks {
-        async fn enqueue_dedup(&self, _spec: task_store::NewTask) -> anyhow::Result<task_store::DedupOutcome> {
-            self.seen.lock().unwrap().push(self.capture.events.lock().unwrap().len());
-            Ok(task_store::DedupOutcome::Inserted(uuid::Uuid::nil()))
-        }
-        async fn wait_for_terminal(&self, _: uuid::Uuid, _: Duration) -> anyhow::Result<task_store::TaskOutcome> {
-            unimplemented!("not asked")
-        }
-        async fn claim_execution(&self, _: &str, _: uuid::Uuid, _: &str) -> anyhow::Result<Option<task_store::ClaimedExecution>> {
-            unimplemented!("not asked")
-        }
-        async fn heartbeat(&self, _: uuid::Uuid, _: &str) -> anyhow::Result<bool> {
-            unimplemented!("not asked")
-        }
-        async fn requeue(&self, _: uuid::Uuid, _: &str) -> anyhow::Result<bool> {
-            unimplemented!("not asked")
-        }
-        async fn complete(&self, _: uuid::Uuid, _: &str, _: Value) -> anyhow::Result<()> {
-            unimplemented!("not asked")
-        }
-        async fn fail(&self, _: uuid::Uuid, _: &str, _: String) -> anyhow::Result<()> {
-            unimplemented!("not asked")
-        }
-        async fn cancels_asked(&self, _: uuid::Uuid, _: Vec<String>) -> anyhow::Result<Vec<task_store::CancelAsked>> {
-            unimplemented!("not asked")
+        async fn events_for_execution_id(&self, _execution_id: ExecutionId) -> anyhow::Result<Vec<ExecEvent>> {
+            unreachable!("a capture is never read back")
         }
     }
 }
@@ -5185,7 +4632,7 @@ mod bus_pump_tests {
     /// the coordinator and join the pump task. Bounded by 2s so a
     /// regression fails fast instead of hanging the suite.
     async fn shutdown_and_join(coord: Arc<BusCoordinator>, pump: tokio::task::JoinHandle<()>) {
-        coord.shutdown(std::time::Duration::from_secs(2)).await;
+        coord.shutdown().await;
         drop(coord);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), pump).await;
     }
@@ -5225,6 +4672,26 @@ mod bus_pump_tests {
                 }
             }
         }
+    }
+
+    /// A recorded run's pump starts with its first bus: a run that mints
+    /// none shuts down at once with nothing written, and one that mints a
+    /// bus has its rows on record by the end of `shutdown`.
+    #[tokio::test]
+    async fn a_recorded_runs_pump_starts_with_its_first_bus() {
+        let journal = Arc::new(CaptureJournal::default());
+        let quiet = BusCoordinator::recorded(crate::wait_tracker::WaitTracker::new(), uuid::Uuid::new_v4(), journal.clone(), "instance".into());
+        tokio::time::timeout(std::time::Duration::from_secs(2), quiet.shutdown()).await.expect("no bus, nothing to wait for");
+        assert!(journal.events.lock().unwrap().is_empty());
+
+        let coord = BusCoordinator::recorded(crate::wait_tracker::WaitTracker::new(), uuid::Uuid::new_v4(), journal.clone(), "instance".into());
+        let mut bus = new_bus(&coord, BusOptions::default());
+        bus.register("alice").unwrap();
+        drop(bus);
+        tokio::time::timeout(std::time::Duration::from_secs(2), coord.shutdown()).await.expect("the pump drains and ends");
+        let events = journal.events.lock().unwrap();
+        assert!(events.iter().any(|e| matches!(e, ExecEvent::BusJoined { .. })), "{events:?}");
+        assert!(events.iter().any(|e| matches!(e, ExecEvent::BusClosed { .. })), "{events:?}");
     }
 
     /// The pump journals BusJoined / BusWindow / BusClosed in offset
@@ -5469,7 +4936,7 @@ mod bus_pump_tests {
         // Snapshot the weak ref BEFORE shutdown so we can verify
         // post-shutdown collection. shutdown() drains then releases
         // the coordinator's Arc; no other Arc remains.
-        coord.shutdown(std::time::Duration::from_secs(2)).await;
+        coord.shutdown().await;
         drop(coord);
         assert!(
             weak_after_drop.upgrade().is_none(),

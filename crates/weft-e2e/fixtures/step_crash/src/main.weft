@@ -1,5 +1,6 @@
-# Two steps the worker dies in the middle of. Neither may run again:
-# the next worker fails both, because each may have partly happened.
+# Two steps the worker dies in the middle of. Neither may run again: in
+# a durable run the next worker fails both, because each may have partly
+# happened, and a fast run ends cancelled.
 # `caught` catches its failures and its `error` is wired, so its failure
 # goes there and `handler` receives the message; `plain` has nothing
 # wired on `error`, so its failure fails the run.

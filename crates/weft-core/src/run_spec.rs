@@ -95,9 +95,12 @@ pub struct RunSpec {
     /// per instance ([`refuse_instanceless`]), unused otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance: Option<crate::instance::InstanceId>,
-    /// How long the run may run (`weft run --long`; `crate::run_class`).
-    #[serde(default, skip_serializing_if = "crate::run_class::RunClass::is_default")]
-    pub run_class: crate::run_class::RunClass,
+    /// How the run asks to be kept (`weft run --durable --fast --recorded
+    /// --unrecorded`): what it names goes over the fired trigger's own
+    /// settings, or over the defaults for a run that fires nothing
+    /// (`crate::run_settings::SettingsChoice`).
+    #[serde(default, skip_serializing_if = "crate::run_settings::SettingsChoice::is_empty")]
+    pub settings: crate::run_settings::SettingsChoice,
 }
 
 fn deserialize_unique<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned>(deserializer: D) -> Result<T, D::Error> {
@@ -368,6 +371,111 @@ impl KickPlan {
     }
 }
 
+/// What one trigger fire runs: the roots to kick and the node set they
+/// were computed from, the fire's PROGRAM. The set is journaled on
+/// `ExecutionStarted` as the execution's subgraph, so the engine holds
+/// the run to it and absorbs, silently, a pulse into anything outside.
+/// Both come out of one `RunSubgraph`, so "what runs" and "what gets
+/// kicked" cannot disagree.
+///
+/// Why the boundary matters for a fire: emission is scope-blind, so a
+/// node shared by two programs in one file (a database, a provider)
+/// pushes a pulse into the OTHER program's consumers too. Unbounded,
+/// those consumers hold a partial input set forever and the run ends
+/// Stuck after all its real work completed. Bounded, they never appear.
+#[derive(Debug)]
+pub struct TriggerFire {
+    pub kicks: Vec<KickPlan>,
+    pub subgraph: crate::project::selection::RunSelection,
+    /// The infra places the fire reads only baked outputs of, with their
+    /// saved values (`crate::infra::bake::covered`): they do not run, and
+    /// the run is born with their values.
+    pub baked: crate::infra::bake::Saved,
+}
+
+/// Kicks for a trigger fire.
+///
+/// Rule: from the FIRING trigger, walk downstream: everything it
+/// reaches is the fire's. Then walk back up from all of that for what
+/// it needs, treating every trigger node as a terminator. Triggers
+/// themselves are included as kicks: the firing trigger carries the
+/// payload and its setup-time port snapshot; any other trigger in the
+/// subgraph is kicked payload-less, which the engine turns into "close
+/// all its
+/// output ports" (the skip cascade prunes its exclusive branches).
+///
+/// Why terminators: at fire time a trigger's outputs are the payload,
+/// not a function of its inputs (its ports replay the setup-time
+/// snapshot). Nodes that exist only to produce inputs for triggers
+/// must not re-run every time the trigger fires. If a node also feeds
+/// non-trigger paths that reach a targeted output, it re-runs via
+/// those paths.
+///
+/// Why start from the fired trigger: an output with no path from it
+/// (a sibling branch fed by another trigger or by static sources
+/// alone) is someone else's work; this fire must not re-run it.
+///
+/// The trigger itself runs even when it has no downstream consumer.
+///
+/// `saved` is what the infra places the run may read have saved
+/// (`crate::infra::bake::saved_for_run`): one the fire reads only baked
+/// outputs of does not run ([`carve_reading_baked`]).
+pub fn compute_trigger_fire(
+    project: &ProjectDefinition,
+    firing_node_id: &str,
+    payload: &Value,
+    port_snapshot: Option<&Value>,
+    saved: &crate::infra::bake::Saved,
+) -> Result<TriggerFire, String> {
+    // All trigger nodes register signals during TriggerSetup; that set
+    // is what fires route to. A fire names the trigger by its address
+    // (`door`, or `one.door` for the `door` inside the file the site
+    // `one` includes), which resolves to the node and the call path
+    // its kick runs under.
+    let (fired, path) = crate::project::resolve_address(project, firing_node_id);
+    if !project.nodes.iter().any(|node| node.id == fired && node.features.is_trigger) {
+        return Err(format!("'{firing_node_id}' is not a trigger"));
+    }
+
+    // Targets = everything the FIRED trigger reaches downstream (the
+    // trigger itself included, so a trigger with nothing behind it
+    // still fires and runs alone).
+
+    // Upstream closure from all of that, stopping at triggers (include
+    // the trigger but do not walk through its incoming edges). Only the
+    // firing trigger's kick carries the wake payload and the snapshot.
+    let (selection, baked) = carve_reading_baked(
+        project,
+        crate::project::selection::SelectionBounds { fire: Some(firing_node_id.into()), ..Default::default() },
+        saved,
+        &BTreeSet::from([fired.clone()]),
+    )?;
+    let kicks = KickPlan::for_selection(project, &selection, Some((&Located::new(fired, path), payload)), port_snapshot);
+    Ok(TriggerFire { kicks, subgraph: selection, baked })
+}
+
+/// Carve the run `bounds` describes, then once more without the infra
+/// places it reads only baked, saved outputs of
+/// (`crate::infra::bake::covered`; a place in `named` always runs):
+/// those become suppliers of their saved values, and what only fed them
+/// leaves the run. Answers the run and the places it reads baked.
+pub fn carve_reading_baked(
+    project: &ProjectDefinition,
+    mut bounds: SelectionBounds,
+    saved: &crate::infra::bake::Saved,
+    named: &BTreeSet<String>,
+) -> Result<(RunSelection, crate::infra::bake::Saved), String> {
+    let first = RunSelection::carve(project, &bounds)?;
+    let covered = crate::infra::bake::covered(project, saved, &first.nodes, named);
+    if covered.is_empty() {
+        return Ok((first, covered));
+    }
+    bounds.baked = covered.keys().cloned().collect();
+    let selection = RunSelection::carve(project, &bounds)?;
+    let baked = covered.into_iter().filter(|(place, _)| selection.suppliers.contains(place)).collect();
+    Ok((selection, baked))
+}
+
 /// A value handed to a wire, as the emission its source would have
 /// made: journaled as `PortEmitted { node: source, port: source_port,
 /// provided: true }` and fanned out over the source port's wires.
@@ -393,6 +501,10 @@ pub struct Resolved {
     pub provided: Vec<ProvidedEmission>,
     pub crossings: Vec<CrossingPort>,
     pub warnings: Vec<String>,
+    /// The infra places the run reads only baked outputs of, with their
+    /// saved values (`crate::infra::bake::covered`): they do not run, and
+    /// the run is born with their values.
+    pub baked: crate::infra::bake::Saved,
 }
 
 /// A selected input whose wire's source does not execute in this run.
@@ -456,8 +568,24 @@ impl std::error::Error for Refusal {}
 
 /// Resolve only immutable graph/spec facts. Bake validation attaches the
 /// captured trigger ports to the returned firing kick before execution birth.
-pub fn resolve_spec(spec: &RunSpec, project: &ProjectDefinition) -> Result<Resolved, Refusal> {
-    let mut selection = RunSelection::carve(project, &SelectionBounds {
+///
+/// `saved` is what the infra places the run may read have saved
+/// (`crate::infra::bake::saved_for_run`): one the run reads only baked
+/// outputs of does not run ([`carve_reading_baked`]), unless the spec
+/// names it.
+pub fn resolve_spec(spec: &RunSpec, project: &ProjectDefinition, saved: &crate::infra::bake::Saved) -> Result<Resolved, Refusal> {
+    let named: BTreeSet<String> = spec
+        .from
+        .keys()
+        .chain(spec.emit.keys())
+        .chain(&spec.target)
+        .chain(&spec.before)
+        .chain(spec.feed.iter())
+        .chain(spec.group.iter().map(|(group, _)| group))
+        .chain(spec.fire.iter().map(|(node, _)| node))
+        .map(|spelled| crate::project::resolve_address(project, spelled).0)
+        .collect();
+    let (mut selection, baked) = carve_reading_baked(project, SelectionBounds {
         from: spec.from.keys().cloned().collect(), emit: spec.emit.keys().cloned().collect(),
         target: spec.target.clone(), before: spec.before.clone(), group: spec.group.as_ref().map(|(id, _)| id.clone()),
         fire: spec.fire.as_ref().map(|(node, _)| node.clone()),
@@ -468,7 +596,8 @@ pub fn resolve_spec(spec: &RunSpec, project: &ProjectDefinition) -> Result<Resol
                 .map(|ports| ports.keys().cloned().collect()).unwrap_or_default();
             (start.clone(), handed)
         }).collect(),
-    }).map_err(Refusal::error)?;
+        ..Default::default()
+    }, saved, &named).map_err(Refusal::error)?;
     let starting_inputs = spec.starting_inputs(project);
     selection.input = starting_inputs.clone();
     // Emits are spelled from the top too (`triage.up`); the rows they
@@ -606,7 +735,7 @@ pub fn resolve_spec(spec: &RunSpec, project: &ProjectDefinition) -> Result<Resol
         warnings.push(format!("{}.{} gets nothing in this run ({}.{} is outside it), so it closes; nothing that runs goes without it.",
             crossing.node, crossing.port, crossing.source_node, crossing.source_port));
     }
-    Ok(Resolved { selection, kicks, provided, crossings, warnings })
+    Ok(Resolved { selection, kicks, provided, crossings, warnings, baked })
 }
 
 /// The inputs of the run whose wire comes from a place that does not
@@ -1044,7 +1173,7 @@ mod tests {
         for value in [json!(false), json!(true), json!("go")] {
             let spec = RunSpec { from: BTreeMap::from([("a".into(),
                 BTreeMap::from([("_should_flow".into(), value.clone())]))]), ..RunSpec::whole("x") };
-            let resolved = resolve_spec(&spec, &project).unwrap();
+            let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
             assert_eq!(resolved.selection.input[&Located::top("a")]["_should_flow"], value);
         }
     }
@@ -1052,7 +1181,7 @@ mod tests {
     #[test]
     fn an_unfed_required_crossing_is_refused_and_a_backup_feeds_it() {
         let mut spec = RunSpec { from: BTreeMap::from([("b".into(), BTreeMap::new())]), ..RunSpec::whole("x") };
-        let resolved = resolve_spec(&spec, &program()).unwrap();
+        let resolved = resolve_spec(&spec, &program(), &Default::default()).unwrap();
         assert!(!resolved.selection.nodes.contains(&Located::top("a")));
         assert_eq!(resolved.crossings.len(), 1);
         assert!(!resolved.crossings[0].supplied);
@@ -1060,7 +1189,7 @@ mod tests {
         let refusal = refuse_unfed(&program(), &resolved.selection, &spec).unwrap_err().to_string();
         assert!(refusal.contains("b.in gets nothing in this run: a.out is outside it"), "{refusal}");
         spec.from.insert("b".into(), BTreeMap::from([("in".into(), json!("backup"))]));
-        let resolved = resolve_spec(&spec, &program()).unwrap();
+        let resolved = resolve_spec(&spec, &program(), &Default::default()).unwrap();
         assert!(resolved.crossings[0].supplied);
         refuse_unfed(&program(), &resolved.selection, &spec).expect("the backup feeds it");
         assert!(!resolved.selection.nodes.contains(&Located::top("a")));
@@ -1072,7 +1201,7 @@ mod tests {
         let mut project = program();
         project.nodes[1].inputs[0].port.required = false;
         let spec = RunSpec { from: BTreeMap::from([("b".into(), BTreeMap::new())]), ..RunSpec::whole("x") };
-        let resolved = resolve_spec(&spec, &project).unwrap();
+        let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
         assert!(resolved.crossings[0].needed_by.is_none());
         refuse_unfed(&project, &resolved.selection, &spec).expect("nothing needs it");
         assert!(resolved.warnings.iter().any(|w| w.contains("b.in gets nothing in this run")), "{:?}", resolved.warnings);
@@ -1116,7 +1245,7 @@ mod tests {
             "edges": [wire("bridge", "url", "hear", "url"), wire("hear", "text", "after", "text")],
         })).unwrap();
         let spec = RunSpec { target: vec!["after".into()], ..RunSpec::whole("x") };
-        let resolved = resolve_spec(&spec, &project).unwrap();
+        let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
         assert!(resolved.selection.nodes.contains(&Located::top("hear")), "the walk stops at the trigger, taking it along");
         refuse_unfed(&project, &resolved.selection, &spec).expect("the trigger does not read its input in this run");
     }
@@ -1146,13 +1275,13 @@ mod tests {
             "groups": [group("o", None, &["o.i"]), group("o.i", Some("o"), &[])],
         })).unwrap();
         let spec = RunSpec { group: Some(("o.i".into(), BTreeMap::new())), ..RunSpec::whole("x") };
-        let resolved = resolve_spec(&spec, &project).unwrap();
+        let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
         let refusal = refuse_unfed(&project, &resolved.selection, &spec).unwrap_err().to_string();
         assert!(refusal.contains("o.i.x gets nothing in this run"), "named at the door started at: {refusal}");
         assert!(!refusal.contains("o.x "), "{refusal}");
 
         let spec = RunSpec { group: Some(("o.i".into(), BTreeMap::from([("x".into(), json!("hi"))]))), ..RunSpec::whole("x") };
-        let resolved = resolve_spec(&spec, &project).unwrap();
+        let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
         refuse_unfed(&project, &resolved.selection, &spec).expect("the value handed at the inner door feeds it");
     }
 
@@ -1169,12 +1298,12 @@ mod tests {
             "edges": [wire("src", "out", "n", "p")],
         })).unwrap();
         let spec = RunSpec { from: BTreeMap::from([("n".into(), BTreeMap::new())]), ..RunSpec::whole("x") };
-        let resolved = resolve_spec(&spec, &project).unwrap();
+        let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
         let refusal = refuse_unfed(&project, &resolved.selection, &spec).unwrap_err().to_string();
         assert!(refusal.contains("n.p gets nothing in this run") && refusal.contains("--from n="), "{refusal}");
 
         let spec = RunSpec { from: BTreeMap::from([("n".into(), BTreeMap::from([("q".into(), json!("hi"))]))]), ..RunSpec::whole("x") };
-        let resolved = resolve_spec(&spec, &project).unwrap();
+        let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
         refuse_unfed(&project, &resolved.selection, &spec).expect("q is handed, so p may close");
     }
 
@@ -1199,7 +1328,7 @@ mod tests {
             "groups": [group("g", None, &[])],
         })).unwrap();
         let spec = RunSpec { group: Some(("g".into(), BTreeMap::new())), ..RunSpec::whole("x") };
-        let resolved = resolve_spec(&spec, &project).unwrap();
+        let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
         let refusal = refuse_unfed(&project, &resolved.selection, &spec).unwrap_err();
         assert_eq!(refusal.errors.len(), 1, "{refusal}");
         assert!(refusal.errors[0].contains("--group g='{\"a\": ...}'"), "{refusal}");
@@ -1245,13 +1374,13 @@ mod tests {
                         "parentGroupId": null, "childGroupIds": [], "nodeIds": ["g.need", "g.maybe"]}]
         })).unwrap();
         let spec = RunSpec { group: Some(("g".into(), BTreeMap::new())), ..RunSpec::whole("x") };
-        let resolved = resolve_spec(&spec, &project).unwrap();
+        let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
         let refusal = refuse_unfed(&project, &resolved.selection, &spec).unwrap_err();
         assert_eq!(refusal.errors.len(), 1, "only the port a required input needs: {refusal}");
         assert!(refusal.errors[0].contains(".a gets nothing") && refusal.errors[0].contains("g.need.in"), "{refusal}");
 
         let spec = RunSpec { group: Some(("g".into(), BTreeMap::from([("a".into(), json!("hi"))]))), ..RunSpec::whole("x") };
-        let resolved = resolve_spec(&spec, &project).unwrap();
+        let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
         refuse_unfed(&project, &resolved.selection, &spec).expect("the handed value feeds it");
     }
 
@@ -1259,7 +1388,7 @@ mod tests {
     fn simulation_excludes_body_and_allows_unused_declared_output() {
         let spec = RunSpec { emit: BTreeMap::from([("c".into(), BTreeMap::from([("out".into(), json!("x"))]))]),
             ..RunSpec::whole("x") };
-        let resolved = resolve_spec(&spec, &program()).unwrap();
+        let resolved = resolve_spec(&spec, &program(), &Default::default()).unwrap();
         assert!(resolved.selection.nodes.is_empty());
         assert_eq!(resolved.provided.len(), 1);
     }
@@ -1267,9 +1396,9 @@ mod tests {
     #[test]
     fn disconnected_or_empty_cuts_are_refused_before_execution() {
         let spec = RunSpec { from: [("c".into(), BTreeMap::new())].into(), before: vec!["b".into()], ..RunSpec::whole("empty") };
-        assert!(resolve_spec(&spec, &program()).unwrap_err().to_string().contains("selection is empty"));
+        assert!(resolve_spec(&spec, &program(), &Default::default()).unwrap_err().to_string().contains("selection is empty"));
         let spec = RunSpec { emit: [("c".into(), [("out".into(), json!("x"))].into())].into(), before: vec!["b".into()], ..RunSpec::whole("empty") };
-        assert!(resolve_spec(&spec, &program()).unwrap_err().to_string().contains("selection is empty"));
+        assert!(resolve_spec(&spec, &program(), &Default::default()).unwrap_err().to_string().contains("selection is empty"));
     }
 
     #[test]
@@ -1330,7 +1459,7 @@ mod tests {
             RunSpec { fire: Some(("missing".into(), Value::Null)), ..RunSpec::whole("x") },
             RunSpec { emit: BTreeMap::from([("missing".into(), BTreeMap::new())]), ..RunSpec::whole("x") },
         ] {
-            assert!(resolve_spec(&spec, &program()).unwrap_err().to_string().contains("missing"));
+            assert!(resolve_spec(&spec, &program(), &Default::default()).unwrap_err().to_string().contains("missing"));
         }
     }
 
@@ -1339,7 +1468,7 @@ mod tests {
         let spec = RunSpec { from: BTreeMap::from([("b".into(), BTreeMap::from([
             ("missing".into(), json!("old value")), ("in".into(), json!("backup"))
         ]))]), ..RunSpec::whole("x") };
-        let resolved = resolve_spec(&spec, &program()).unwrap();
+        let resolved = resolve_spec(&spec, &program(), &Default::default()).unwrap();
         assert_eq!(resolved.selection.nodes, BTreeSet::from([Located::top("b"), Located::top("c")]));
         assert_eq!(resolved.selection.input[&Located::top("b")], BTreeMap::from([("in".into(), json!("backup"))]));
         assert!(resolved.warnings.iter().any(|warning| warning.contains("ignored supplied input 'b.missing'")));
@@ -1351,7 +1480,7 @@ mod tests {
         let spec = RunSpec { from: BTreeMap::from([("b".into(), BTreeMap::new())]),
             emit: BTreeMap::from([("b".into(), BTreeMap::from([("out".into(), json!("x"))]))]),
             ..RunSpec::whole("x") };
-        assert!(resolve_spec(&spec, &program()).unwrap_err().to_string().contains("cannot both run"));
+        assert!(resolve_spec(&spec, &program(), &Default::default()).unwrap_err().to_string().contains("cannot both run"));
     }
 
     #[test]
@@ -1360,17 +1489,17 @@ mod tests {
         project.nodes[0].features.is_trigger = true;
         let spec = RunSpec { from: BTreeMap::from([("a".into(), BTreeMap::from([("in".into(), json!("x"))]))]),
             ..RunSpec::whole("x") };
-        assert!(resolve_spec(&spec, &project).unwrap_err().to_string().contains("cannot be a from start"));
+        assert!(resolve_spec(&spec, &project, &Default::default()).unwrap_err().to_string().contains("cannot be a from start"));
     }
 
     #[test]
     fn fire_requires_trigger_and_cannot_be_excluded_by_end_bound() {
         let mut project = program();
         let spec = RunSpec { fire: Some(("a".into(), json!({}))), ..RunSpec::whole("x") };
-        assert!(resolve_spec(&spec, &project).unwrap_err().to_string().contains("not a trigger"));
+        assert!(resolve_spec(&spec, &project, &Default::default()).unwrap_err().to_string().contains("not a trigger"));
         project.nodes[0].features.is_trigger = true;
         let spec = RunSpec { before: vec!["a".into()], ..spec };
-        assert!(resolve_spec(&spec, &project).unwrap_err().to_string().contains("outside"));
+        assert!(resolve_spec(&spec, &project, &Default::default()).unwrap_err().to_string().contains("outside"));
     }
 
     #[test]
@@ -1382,7 +1511,7 @@ mod tests {
         let mut project = program();
         project.nodes[1].features.is_trigger = true;
         let spec = RunSpec { fire: Some(("b".into(), json!({}))), ..RunSpec::whole("x") };
-        let resolved = resolve_spec(&spec, &project).unwrap();
+        let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
         assert!(!resolved.selection.nodes.contains(&Located::top("a")), "{:?}", resolved.selection.nodes);
         assert!(resolved.warnings.iter().any(|w| w.contains("a.out not delivered to trigger 'b'") && w.contains("weft bake")),
             "{:?}", resolved.warnings);
@@ -1392,23 +1521,23 @@ mod tests {
     fn a_run_started_by_hand_says_which_trigger_stays_quiet_and_who_skips_for_it() {
         let mut project = program();
         project.nodes[1].features.is_trigger = true;
-        let resolved = resolve_spec(&RunSpec::whole("x"), &project).unwrap();
+        let resolved = resolve_spec(&RunSpec::whole("x"), &project, &Default::default()).unwrap();
         let warning = resolved.warnings.iter().find(|w| w.starts_with("trigger 'b' does not fire")).expect("a warning for the quiet trigger");
         assert!(warning.contains("fires no trigger") && warning.contains("c skip") && warning.contains("--fire b="), "{warning}");
         // With another trigger fired, the quiet one is explained by that fire.
         project.nodes[0].features.is_trigger = true;
         let spec = RunSpec { fire: Some(("a".into(), json!({}))), ..RunSpec::whole("x") };
-        let resolved = resolve_spec(&spec, &project).unwrap();
+        let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
         assert!(resolved.warnings.iter().any(|w| w.starts_with("trigger 'b' does not fire: only 'a' fires")), "{:?}", resolved.warnings);
     }
 
     #[test]
     fn inclusive_and_exclusive_cuts_preserve_the_authored_path() {
         let spec = RunSpec { from: BTreeMap::from([("b".into(), BTreeMap::new())]), target: vec!["c".into()], ..RunSpec::whole("x") };
-        assert_eq!(resolve_spec(&spec, &program()).unwrap().selection.nodes, BTreeSet::from([Located::top("b"), Located::top("c")]));
+        assert_eq!(resolve_spec(&spec, &program(), &Default::default()).unwrap().selection.nodes, BTreeSet::from([Located::top("b"), Located::top("c")]));
         let spec = RunSpec { before: vec!["c".into()], ..spec };
-        assert_eq!(resolve_spec(&spec, &program()).unwrap().selection.nodes, BTreeSet::from([Located::top("b")]));
-        assert!(resolve_spec(&spec, &program()).unwrap().warnings.iter().all(|w| !w.contains("continues to the end")));
+        assert_eq!(resolve_spec(&spec, &program(), &Default::default()).unwrap().selection.nodes, BTreeSet::from([Located::top("b")]));
+        assert!(resolve_spec(&spec, &program(), &Default::default()).unwrap().warnings.iter().all(|w| !w.contains("continues to the end")));
     }
 
     /// `b` fills `in` from each instance (no fallback, required), and its

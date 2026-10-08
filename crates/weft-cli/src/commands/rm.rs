@@ -6,8 +6,8 @@
 //! | flag        | action                                                  |
 //! |-------------|---------------------------------------------------------|
 //! | (none)      | unregister: the dispatcher deactivates the project,     |
-//! |             | terminates its infra containers and disks, reclaims its     |
-//! |             | stored data, and drops the row                          |
+//! |             | terminates its infra containers and disks, erases its   |
+//! |             | runs, reclaims its stored data, and drops the row       |
 //! | `--journal` | also drop this project's execution + log rows           |
 //! | `--local`   | also wipe this project's build artifacts on the host    |
 //! | `--all`     | implies the two levels above                            |
@@ -64,12 +64,13 @@ pub async fn run(ctx: Ctx, args: RmArgs) -> Result<()> {
     }
 
     // The base verb is already the big one: triggers wiped, runs
-    // cancelled, infra processes terminated, stored data reclaimed. Nothing
+    // cancelled and erased, infra processes terminated, stored data
+    // reclaimed. Nothing
     // that irreversible runs on a bare command: a terminal is asked,
     // and a script has to say `--yes`.
     let project_id = resolve_project_id(&ctx, project)?;
     if !yes {
-        let mut levels = vec!["unregister it (triggers wiped, runs cancelled, infra terminated, stored data reclaimed)"];
+        let mut levels = vec!["unregister it (triggers wiped, runs cancelled and erased, infra terminated, stored data reclaimed)"];
         if journal {
             levels.push("drop its execution and log rows");
         }

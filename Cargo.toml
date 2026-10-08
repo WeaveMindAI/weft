@@ -35,6 +35,11 @@ members = [
 doc_lazy_continuation = "allow"
 doc_overindented_list_items = "allow"
 too_many_arguments = "allow"
+# An HTTP handler's refusal is the response itself (axum's `Response`, 128
+# bytes), returned as the `Err` of the helpers that build it: boxing every
+# refusal to please the size lint buys nothing on a path that answers a
+# request.
+result_large_err = "allow"
 
 # Dev/test binaries carry line tables only, not full variable
 # debuginfo. This workspace's test binaries are enormous with full
@@ -113,6 +118,9 @@ toml_edit = "0.22"
 # (weft-platform-gcp `images`).
 tar = "0.4"
 flate2 = "1"
+# A run's record, compressed by whoever writes it (`weft_journal::stored`):
+# a ping's events are about 2 KB of JSON, which Postgres leaves as it is.
+zstd = "0.13"
 
 # lossless concrete syntax tree (the .weft CST: parse, edit, byte-exact round-trip)
 rowan = "0.16"
@@ -131,7 +139,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # utils
-uuid = { version = "1", features = ["v4", "v5", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "v7", "fast-rng", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 # IANA time zones, for a cron schedule that means "nine in Paris".
 chrono-tz = "0.10"
@@ -163,6 +171,15 @@ tempfile = "3"
 parking_lot = "0.12"
 filetime = "0.2"
 base64 = "0.22"
+# The project worker's allocator (`weft_engine::Jemalloc`, declared by the
+# generated worker `main`): glibc's kept a burst's freed memory for good,
+# so a worker past one read as full while idle. Background threads purge
+# what was freed even while nothing allocates (an idle worker), the way
+# Restate's server runs it.
+tikv-jemallocator = { version = "0.7", features = ["background_threads"] }
+# The worker's own CPU profile (`weft_engine::profile`, `WEFT_PROFILE`):
+# sampled with signals, so a machine without `perf` profiles too.
+pprof = { version = "0.15", features = ["flamegraph"] }
 
 # internal workspace crates
 weft-core = { path = "crates/weft-core" }

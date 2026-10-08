@@ -24,6 +24,13 @@ pub enum WeftError {
     #[error("suspension setup failed: {0}")]
     Suspension(String),
 
+    /// A wait the run could not pause on, held in its worker, ran out of
+    /// its hold (`holdSecs`) with nothing moving in the run, or was asked
+    /// for where the hold is zero. Returned by the waiting `ctx` call, so
+    /// the node may handle it like any outcome of its step.
+    #[error("{0}")]
+    WaitGaveUp(String),
+
     #[error("cancelled")]
     Cancelled,
 

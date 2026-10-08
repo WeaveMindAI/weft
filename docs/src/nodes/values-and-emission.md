@@ -144,8 +144,8 @@ errors with `?` as usual. If the program wires `error`, the failure's message co
 the step counts as done, and every output the body had not sent yet closes. If
 nobody wired it, the failure fails the run.
 
-If a step fails because its worker went away, that failure goes to `error` too
-(go and read [surviving a restart](durable-execution.md#when-the-worker-dies-mid-step)).
+In a durable run, a step that failed because its worker went away goes to `error`
+too (go and read [surviving a restart](durable-execution.md#when-the-worker-dies-mid-step)).
 
 weft owns `error`: your node cannot declare it, and a body that emits on it
 fails. If your node only shapes values (a cast, a switch, a template), leave

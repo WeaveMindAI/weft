@@ -157,10 +157,12 @@ fn map_err(e: RuntimeStoreError) -> ApiError {
         RuntimeStoreError::Lost(m) => (StatusCode::GONE, m),
         // SYNC: replace outcome statuses <-> crates/weft-engine/src/storage.rs WorkerStorage::replace
         RuntimeStoreError::Stale(m) => (StatusCode::PRECONDITION_FAILED, m),
-        RuntimeStoreError::Other(e) => {
-            tracing::error!(target: "weft_broker::runtime_storage", error = format!("{e:#}"), "runtime-store op failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_STORAGE_ERROR_BODY.to_string())
-        }
+        // A dropped database connection is said as one (logged with its
+        // cause): asking again is the fix. Anything else is the generic body.
+        RuntimeStoreError::Other(e) => match crate::handlers::unavailable_or_internal(e.context("runtime-store op failed")) {
+            (StatusCode::INTERNAL_SERVER_ERROR, _) => (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_STORAGE_ERROR_BODY.to_string()),
+            unavailable => unavailable,
+        },
     };
     ApiError { status, message, completing }
 }

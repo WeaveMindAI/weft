@@ -35,7 +35,7 @@ use crate::exec::skip::{SkipReason, SHOULD_FLOW_PORT};
 use crate::frames::{FiringLocation, Located, LoopFrames};
 use crate::primitive::KickedNode;
 use crate::project::{
-    boundary_in_id, boundary_out_id, scope_body_roots, scope_members, EdgeIndex, GroupBoundaryRole,
+    boundary_in_id, boundary_out_id, scope_body_roots, scope_members, ProgramIndex, GroupBoundaryRole,
     NodeDefinition, ProjectDefinition,
 };
 use crate::pulse::{Failure, Pulse, PulseStatus, PulseTable};
@@ -67,6 +67,7 @@ pub enum ScopePermission {
 /// A kick and an arriving value obey the same enclosing group gates.
 pub fn scope_permission(
     project: &ProjectDefinition,
+    program_idx: &ProgramIndex,
     node: &NodeDefinition,
     frames: &LoopFrames,
     executions: &NodeExecutionTable,
@@ -82,8 +83,7 @@ pub fn scope_permission(
     // and the walk continues from there.
     let mut depth = 0;
     for scope in &node.scope {
-        let boundary = project.nodes.iter().find(|n| n.id == boundary_in_id(scope))
-            .expect("compiled node scope has an In boundary");
+        let boundary = program_idx.scope_in(project, scope).expect("compiled node scope has an In boundary");
         if boundary.node_type == crate::project::boundary_types::LOOP_IN {
             depth += 1;
             continue;
@@ -141,16 +141,6 @@ pub enum BoundaryOutcome {
     },
 }
 
-/// Fire every `Passthrough` whose inputs are ready (a pulse-driven
-/// group at its exact frames, or a kick not yet dispatched), and keep
-/// going while a firing makes another one ready (a group nested in a
-/// group), until none is. THE one boundary pass: the live engine runs
-/// it every scheduler turn before it dispatches ordinary nodes, and
-/// the journal fold runs it after every row it applies, so both hold
-/// the same boundary records without a journal row for any of them.
-/// `dispatchable` is the run's node set (`None` = the whole graph),
-/// `now` stamps the records.
-#[allow(clippy::too_many_arguments)]
 /// What one pass over the table did with no row behind it: see
 /// [`settle_table`].
 #[derive(Default)]
@@ -170,7 +160,7 @@ pub struct TablePass {
 #[allow(clippy::too_many_arguments)]
 pub fn settle_table(
     project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
     phase: Phase,
     dispatchable: Option<&HashSet<Located>>,
     execution_id: ExecutionId,
@@ -181,9 +171,9 @@ pub fn settle_table(
 ) -> TablePass {
     let mut boundaries = Vec::new();
     loop {
-        let mut changed = settle_supplied_gates(project, edge_idx, pulses, executions);
-        changed |= settle_input_streams(project, edge_idx, execution_id, pulses, executions, kicked);
-        let fired = fire_ready_passthroughs(project, edge_idx, dispatchable, execution_id, now, pulses, executions, kicked);
+        let mut changed = settle_supplied_gates(project, program_idx, pulses, executions);
+        changed |= settle_input_streams(project, program_idx, execution_id, pulses, executions, kicked);
+        let fired = fire_ready_passthroughs(project, program_idx, dispatchable, execution_id, now, pulses, executions, kicked);
         let settled = fired.is_empty();
         boundaries.extend(fired);
         if settled && !changed { break; }
@@ -197,59 +187,58 @@ pub fn settle_table(
 /// Both the driver and journal derive these same identities before routing.
 fn settle_input_streams(
     project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
     execution_id: ExecutionId,
     pulses: &mut PulseTable,
     executions: &NodeExecutionTable,
     kicked: &HashMap<FiringLocation, KickedNode>,
 ) -> bool {
-    let Some(selection) = edge_idx.selection() else { return false };
+    let Some(selection) = program_idx.selection() else { return false };
     let mut changed = false;
-    for node in project.nodes.iter().filter(|n| selection.nodes.iter().any(|place| place.id == n.id)) {
-        let ports = crate::exec::ready::generator_inputs(node);
-        if ports.is_empty() { continue; }
+    for (node, ports) in program_idx.stream_consumers(project) {
+        if !selection.nodes.iter().any(|place| place.id == node.id) { continue; }
         let mut frames: HashSet<LoopFrames> = pulses.get(&node.id).into_iter().flatten()
             .filter(|p| p.execution_id == execution_id).map(|p| p.frames.clone()).collect();
         frames.extend(kicked.keys().filter(|loc| loc.node_id == node.id).map(|loc| loc.frames.clone()));
         // A node under no loop fires once per place it is at, whether or
         // not anything has reached it there yet.
-        if node.scope.iter().all(|scope| project.nodes.iter()
-            .find(|n| n.id == boundary_in_id(scope)).is_some_and(|n| !crate::project::boundary_types::opens_frame(&n.node_type)))
+        if node.scope.iter().all(|scope| program_idx.scope_in(project, scope)
+            .is_some_and(|n| !crate::project::boundary_types::opens_frame(&n.node_type)))
         { frames.extend(selection.nodes.iter().filter(|place| place.id == node.id).map(Located::frames)); }
         for frames in frames {
             let at = Located::at(&node.id, &frames);
             if !selection.nodes.contains(&at) { continue; }
-            if scope_permission(project, node, &frames, executions) != ScopePermission::Allowed { continue; }
-            for port in &ports {
+            if scope_permission(project, program_idx, node, &frames, executions) != ScopePermission::Allowed { continue; }
+            for port in ports.iter().map(String::as_str) {
                 if pulses.stream_was_consumed(execution_id, &node.id, port, &frames) { continue; }
                 let bucket = pulses.entry(node.id.clone()).or_default();
                 let history: Vec<_> = bucket.iter().filter(|p|
-                    p.execution_id == execution_id && p.frames == frames && p.target_port == *port).collect();
+                    p.execution_id == execution_id && p.frames == frames && p.target_port == port).collect();
                 if history.iter().any(|p| p.backup || !p.closed || p.failure.is_some()) { continue; }
                 let ended = history.iter().any(|p| p.closed);
                 if !ended && selection.has_supplier(project, &at, port) { continue; }
-                let backup = selection.input.get(&at).and_then(|values| values.get(*port));
-                let origin = selection.input_origins.get(&at).and_then(|ports| ports.get(*port)).copied();
+                let backup = selection.input.get(&at).and_then(|values| values.get(port));
+                let origin = selection.input_origins.get(&at).and_then(|ports| ports.get(port)).copied();
                 if ended && backup.is_none() { continue; }
                 let identity = serde_json::to_vec(&(&node.id, port, &frames)).expect("stream location serializes");
                 let base = Uuid::new_v5(&execution_id, &identity);
                 let end_id = Uuid::new_v5(&base, b"backup-end");
                 if history.iter().any(|p| p.id == end_id) { continue; }
                 for pulse in bucket.iter_mut().filter(|p|
-                    p.execution_id == execution_id && p.frames == frames && p.target_port == *port && p.closed)
+                    p.execution_id == execution_id && p.frames == frames && p.target_port == port && p.closed)
                 { pulse.absorb(); }
                 if let Some(value) = backup {
                     let items = value.as_array().expect("resolved generator backup is an item list");
                     for (index, value) in items.iter().enumerate() {
                         let id = Uuid::new_v5(&base, &(index as u64).to_be_bytes());
-                        let mut pulse = Pulse::new(id, execution_id, frames.clone(), &node.id, *port, Arc::new(value.clone()));
+                        let mut pulse = Pulse::new(id, execution_id, frames.clone(), &node.id, port, Arc::new(value.clone()));
                         pulse.provided = true;
                         pulse.backup = true;
                         pulse.inherited_from = origin;
                         bucket.push(pulse);
                     }
                 }
-                let mut end = Pulse::closure(end_id, execution_id, frames.clone(), &node.id, *port);
+                let mut end = Pulse::closure(end_id, execution_id, frames.clone(), &node.id, port);
                 end.provided = backup.is_some();
                 end.backup = backup.is_some();
                 end.inherited_from = origin;
@@ -263,17 +252,17 @@ fn settle_input_streams(
 
 fn settle_supplied_gates(
     project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
     pulses: &mut PulseTable,
     executions: &NodeExecutionTable,
 ) -> bool {
     let mut changed = false;
     for pulse in pulses.values_mut().flatten().filter(|p| p.provided && !p.backup && matches!(p.status, PulseStatus::Pending | PulseStatus::Gated)) {
-        let edge = edge_idx.get_incoming(project, &pulse.target_node, &pulse.frames).into_iter()
+        let edge = program_idx.get_incoming(project, &pulse.target_node, &pulse.frames).into_iter()
             .find(|edge| edge.target_handle.as_deref().unwrap_or("default") == pulse.target_port)
             .expect("a supplied pulse belongs to an original selected wire");
-        let source = project.nodes.iter().find(|node| node.id == edge.source).expect("wire source exists");
-        let next = match scope_permission(project, source, &pulse.frames, executions) {
+        let source = program_idx.node(project, &edge.source).expect("wire source exists");
+        let next = match scope_permission(project, program_idx, source, &pulse.frames, executions) {
             ScopePermission::Pending => PulseStatus::Gated,
             ScopePermission::Allowed => PulseStatus::Pending,
             ScopePermission::Skipped(_) if pulse.closed => PulseStatus::Pending,
@@ -297,9 +286,18 @@ fn settle_supplied_gates(
     changed
 }
 
+/// Fire every `Passthrough` whose inputs are ready (a pulse-driven
+/// group at its exact frames, or a kick not yet dispatched), and keep
+/// going while a firing makes another one ready (a group nested in a
+/// group), until none is. THE one boundary pass: the live engine runs
+/// it every scheduler turn before it dispatches ordinary nodes, and
+/// the journal fold runs it after every row it applies, so both hold
+/// the same boundary records without a journal row for any of them.
+/// `dispatchable` is the run's node set (`None` = the whole graph),
+/// `now` stamps the records.
 pub fn fire_ready_passthroughs(
     project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
     dispatchable: Option<&HashSet<Located>>,
     execution_id: ExecutionId,
     now: u64,
@@ -311,10 +309,8 @@ pub fn fire_ready_passthroughs(
     // boundaries alone: this pass runs after every journal row on the
     // fold side, and a whole-program scan there would cost a full
     // readiness walk per row.
-    let boundaries: HashMap<&str, &NodeDefinition> =
-        project.nodes.iter().filter(|n| is_passthrough(n)).map(|n| (n.id.as_str(), n)).collect();
     let mut fired = Vec::new();
-    if boundaries.is_empty() {
+    if program_idx.passthroughs(project).next().is_none() {
         return fired;
     }
     loop {
@@ -323,14 +319,14 @@ pub fn fire_ready_passthroughs(
         // the same location lets the pulses dispatch it (the kick is
         // consumed either way), matching the scheduler's kick rule.
         let pulse_driven =
-            find_ready_among(project, boundaries.values().copied(), pulses, edge_idx, dispatchable);
+            find_ready_among(project, program_idx.passthroughs(project), pulses, program_idx, dispatchable);
         let mut covered: HashSet<FiringLocation> = HashSet::new();
         // Every group readiness forms is dispatched here, whatever its
         // execution: a pulse table holds one execution, and a group this
         // pass declined would reach the ordinary dispatch loop, which
         // must never see a boundary.
         for (def, mut group) in pulse_driven {
-            match scope_permission(project, def, &group.frames, executions) {
+            match scope_permission(project, program_idx, def, &group.frames, executions) {
                 ScopePermission::Pending => continue,
                 ScopePermission::Allowed => {}
                 ScopePermission::Skipped(scope) => group.skip = Some(SkipReason::ScopeSkipped { scope }),
@@ -340,17 +336,17 @@ pub fn fire_ready_passthroughs(
         }
         let mut kick_locations: Vec<FiringLocation> = kicked
             .iter()
-            .filter(|(loc, info)| !info.dispatched && boundaries.contains_key(loc.node_id.as_str()))
+            .filter(|(loc, info)| !info.dispatched && program_idx.passthrough(project, &loc.node_id).is_some())
             .map(|(loc, _)| loc.clone())
             .collect();
         kick_locations.sort_by(|a, b| a.node_id.cmp(&b.node_id).then(frames_key(&a.frames).cmp(&frames_key(&b.frames))));
         for loc in kick_locations {
-            let def = boundaries[loc.node_id.as_str()];
+            let def = program_idx.passthrough(project, &loc.node_id).expect("listed as a passthrough above");
             if dispatchable.is_some_and(|s| !s.contains(&Located::at(&def.id, &loc.frames))) {
                 kicked.get_mut(&loc).expect("listed from this map").dispatched = true;
                 continue;
             }
-            let permission = scope_permission(project, def, &loc.frames, executions);
+            let permission = scope_permission(project, program_idx, def, &loc.frames, executions);
             if permission == ScopePermission::Pending { continue; }
             let info = kicked.get_mut(&loc).expect("listed from this map");
             if let ScopePermission::Skipped(scope) = permission { info.scope_skipped = Some(scope); }
@@ -358,7 +354,7 @@ pub fn fire_ready_passthroughs(
             if covered.contains(&loc) {
                 continue;
             }
-            ready.push((def, kicked_group(def, info, &loc.frames, execution_id, project, edge_idx)));
+            ready.push((def, kicked_group(def, info, &loc.frames, execution_id, project, program_idx)));
         }
         if ready.is_empty() {
             return fired;
@@ -368,7 +364,7 @@ pub fn fire_ready_passthroughs(
         ready.sort_by(|(a, ga), (b, gb)| a.id.cmp(&b.id).then(frames_key(&ga.frames).cmp(&frames_key(&gb.frames))));
         for (def, group) in ready {
             fired.push(dispatch_passthrough(
-                def, group, project, edge_idx, now, pulses, executions, kicked,
+                def, group, project, program_idx, now, pulses, executions, kicked,
             ));
         }
     }
@@ -389,7 +385,7 @@ fn dispatch_passthrough(
     node_def: &NodeDefinition,
     group: ReadyGroup,
     project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
     now: u64,
     pulses: &mut PulseTable,
     executions: &mut NodeExecutionTable,
@@ -460,7 +456,7 @@ fn dispatch_passthrough(
     let status = if let Some(reason) = &group.skip {
         if let Some(group_id) = &in_scope {
             emissions.extend(tear_down_scope(
-                project, edge_idx, pulses, kicked, emission_id, execution_id, group_id, &frames, Some(reason),
+                project, program_idx, pulses, kicked, emission_id, execution_id, group_id, &frames, Some(reason),
                 reason.inherited_failure(),
             ));
         }
@@ -469,7 +465,7 @@ fn dispatch_passthrough(
         // A pre-dispatch failure (a port refused its value): nothing
         // was forwarded, so every output closes.
         let failure = Failure::at(project, &node_id, &frames, err.as_str());
-        sweep_all_outputs(&node_id, emission_id, execution_id, &frames, project, edge_idx, pulses, &mut emissions, &failure);
+        sweep_all_outputs(&node_id, emission_id, execution_id, &frames, project, program_idx, pulses, &mut emissions, &failure);
         // And the scope never starts, which the INSIDE has to be told
         // as well. Closing only the In boundary's own outputs left
         // every scope root (a member no wire feeds) never started,
@@ -479,7 +475,7 @@ fn dispatch_passthrough(
         // gated-off path does; only the reason differs.
         if let Some(group_id) = &in_scope {
             emissions.extend(tear_down_scope(
-                project, edge_idx, pulses, kicked, emission_id, execution_id, group_id, &frames, None, Some(&failure),
+                project, program_idx, pulses, kicked, emission_id, execution_id, group_id, &frames, None, Some(&failure),
             ));
         }
         NodeExecutionStatus::Failed
@@ -491,7 +487,7 @@ fn dispatch_passthrough(
         forwarded.remove(SHOULD_FLOW_PORT);
         forwarded.remove(crate::exec::skip::SHOULD_NOT_FLOW_PORT);
         match postprocess_output(
-            &node_id, &forwarded, emission_id, execution_id, &frames, project, pulses, edge_idx,
+            &node_id, &forwarded, emission_id, execution_id, &frames, project, pulses, program_idx,
             &mut emissions,
         ) {
             Ok(mentioned) => {
@@ -504,7 +500,7 @@ fn dispatch_passthrough(
                 // `_should_not_flow` outside the scope would run on.
                 if let Err(e) = close_failed_then_unmentioned_downstream(
                     &node_id, &group.received.closed_failures, &mentioned, emission_id, execution_id,
-                    &frames, project, pulses, edge_idx, &mut emissions,
+                    &frames, project, pulses, program_idx, &mut emissions,
                 ) {
                     tracing::error!(
                         target: "weft_core::exec::boundary",
@@ -519,7 +515,7 @@ fn dispatch_passthrough(
                 // wired to its edges or not. Its own roots are kicked at
                 // the scope's frames.
                 if let Some(group_id) = &in_scope {
-                    let roots = scope_body_roots(project, edge_idx, group_id, &frames);
+                    let roots = scope_body_roots(project, program_idx, group_id, &frames);
                     kick_scope(kicked, &roots, &frames, None);
                 }
                 NodeExecutionStatus::Completed
@@ -533,10 +529,10 @@ fn dispatch_passthrough(
                 // Stuck (the pre-dispatch branch above says why).
                 let err = e.to_string();
                 let failure = Failure::at(project, &node_id, &frames, err.as_str());
-                sweep_all_outputs(&node_id, emission_id, execution_id, &frames, project, edge_idx, pulses, &mut emissions, &failure);
+                sweep_all_outputs(&node_id, emission_id, execution_id, &frames, project, program_idx, pulses, &mut emissions, &failure);
                 if let Some(group_id) = &in_scope {
                     emissions.extend(tear_down_scope(
-                        project, edge_idx, pulses, kicked, emission_id, execution_id, group_id, &frames, None, Some(&failure),
+                        project, program_idx, pulses, kicked, emission_id, execution_id, group_id, &frames, None, Some(&failure),
                     ));
                 }
                 error = Some(err);
@@ -587,13 +583,13 @@ fn sweep_all_outputs(
     execution_id: ExecutionId,
     frames: &LoopFrames,
     project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
     pulses: &mut PulseTable,
     emissions: &mut Vec<PulseEmission>,
     failure: &Failure,
 ) {
     if let Err(e) = close_unmentioned_downstream(
-        node_id, &HashSet::new(), emission_id, execution_id, frames, project, pulses, edge_idx, emissions,
+        node_id, &HashSet::new(), emission_id, execution_id, frames, project, pulses, program_idx, emissions,
         Some(failure), &HashSet::new(),
     ) {
         tracing::error!(
@@ -619,7 +615,7 @@ fn sweep_all_outputs(
 #[allow(clippy::too_many_arguments)]
 pub fn tear_down_scope(
     project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
     pulses: &mut PulseTable,
     kicked: &mut HashMap<FiringLocation, KickedNode>,
     emission_id: Uuid,
@@ -629,7 +625,7 @@ pub fn tear_down_scope(
     reason: Option<&SkipReason>,
     failure: Option<&Failure>,
 ) -> Vec<PulseEmission> {
-    let refused = refused_scope(project, edge_idx, group_id, frames);
+    let refused = refused_scope(project, program_idx, group_id, frames);
     if refused.owed_by_the_enclosing_pass(reason) {
         return Vec::new();
     }
@@ -639,11 +635,11 @@ pub fn tear_down_scope(
     // telling below, its outward closures do not.
     let taken_down_above = matches!(reason, Some(SkipReason::ScopeSkipped { .. }));
     let mut emissions = if taken_down_above { Vec::new() } else {
-        close_scope_outward(project, edge_idx, pulses, emission_id, execution_id, group_id, frames, failure)
+        close_scope_outward(project, program_idx, pulses, emission_id, execution_id, group_id, frames, failure)
     };
     let RefusedScope { scope, frames, members, .. } = refused;
     let frames = &frames;
-    let mut exits = edge_idx.selection().cloned()
+    let mut exits = program_idx.selection().cloned()
         .unwrap_or_else(|| crate::project::selection::RunSelection::whole(project));
     // The exits: wires leaving the scope, minus the ones into its own
     // Out and, for a call, into the site's Out (both were closed
@@ -658,7 +654,7 @@ pub fn tear_down_scope(
         &crate::frames::call_path(frames).into_iter().map(str::to_string).collect::<Vec<_>>()).into_iter().collect();
     exits.edges.retain(|wire| crate::project::selection::wire_ends(project, wire).is_some_and(|(_, target)|
         target.id != boundary_out_id(&scope) && target.id != boundary_out_id(group_id) && !inside.contains(&target)));
-    let exit_index = EdgeIndex::selected(project, exits);
+    let exit_index = program_idx.reselected(exits);
     // A member's exits close the way the scope ended: with the failure
     // that took the scope down, or plainly when it was gated off.
     for member in &members {
@@ -726,7 +722,7 @@ impl RefusedScope {
     }
 }
 
-pub fn refused_scope(project: &ProjectDefinition, edge_idx: &EdgeIndex, group_id: &str, frames: &LoopFrames) -> RefusedScope {
+pub fn refused_scope(project: &ProjectDefinition, program_idx: &ProgramIndex, group_id: &str, frames: &LoopFrames) -> RefusedScope {
     // A call site holds no member of its own: the scope it gates is the
     // body it calls, one call frame deeper, boundaries included.
     let body = project.groups.iter().find(|g| g.id == group_id).and_then(|g| match &g.kind {
@@ -746,7 +742,7 @@ pub fn refused_scope(project: &ProjectDefinition, edge_idx: &EdgeIndex, group_id
     if scope != group_id {
         members.extend(project.nodes.iter().filter(|n| n.id == boundary_in_id(&scope) || n.id == boundary_out_id(&scope)));
     }
-    let members = members.into_iter().filter(|node| edge_idx.admits(&node.id, &frames)).map(|n| n.id.clone()).collect();
+    let members = members.into_iter().filter(|node| program_idx.admits(&node.id, &frames)).map(|n| n.id.clone()).collect();
     RefusedScope { scope, frames, members, calls_a_body }
 }
 
@@ -764,7 +760,7 @@ pub fn refused_scope(project: &ProjectDefinition, edge_idx: &EdgeIndex, group_id
 #[allow(clippy::too_many_arguments)]
 pub fn close_scope_outward(
     project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
+    program_idx: &ProgramIndex,
     pulses: &mut PulseTable,
     emission_id: Uuid,
     execution_id: ExecutionId,
@@ -773,7 +769,7 @@ pub fn close_scope_outward(
     failure: Option<&Failure>,
 ) -> Vec<PulseEmission> {
     let out_id = boundary_out_id(group_id);
-    let Some(out_node) = project.nodes.iter().find(|n| n.id == out_id) else {
+    let Some(out_node) = program_idx.node(project, &out_id) else {
         tracing::error!(
             target: "weft_core::exec::boundary",
             group_id = %group_id,
@@ -788,7 +784,7 @@ pub fn close_scope_outward(
         // declared outputs), but teardown cannot propagate, so log
         // loud rather than unwrap.
         if let Err(e) = emit_port_closure(
-            &out_id, &port.name, emission_id, execution_id, frames, project, pulses, edge_idx,
+            &out_id, &port.name, emission_id, execution_id, frames, project, pulses, program_idx,
             &mut emissions, failure,
         ) {
             tracing::error!(
@@ -893,11 +889,11 @@ mod tests {
         .expect("grouped project")
     }
 
-    fn emit_src(project: &ProjectDefinition, edge_idx: &EdgeIndex, pulses: &mut PulseTable, flow: bool) {
+    fn emit_src(project: &ProjectDefinition, program_idx: &ProgramIndex, pulses: &mut PulseTable, flow: bool) {
         let mut bag = OutputBag::new();
         bag.insert("out".into(), Arc::new(json!(7)));
         bag.insert("flow".into(), Arc::new(json!(flow)));
-        postprocess_output("src", &bag, Uuid::new_v4(), Uuid::nil(), &Vec::new(), project, pulses, edge_idx, &mut Vec::new())
+        postprocess_output("src", &bag, Uuid::new_v4(), Uuid::nil(), &Vec::new(), project, pulses, program_idx, &mut Vec::new())
             .expect("src emits");
     }
 
@@ -912,7 +908,7 @@ mod tests {
         sink.inputs[0].port_type = crate::weft_type::WeftType::Generator(Box::new(sink.inputs[0].port_type.clone()));
         let mut selection = crate::project::selection::RunSelection::whole(&project);
         selection.input.entry(Located::top("sink")).or_default().insert("in".into(), json!([1, 2]));
-        let index = EdgeIndex::selected(&project, selection);
+        let index = ProgramIndex::selected(&project, selection);
         let mut pulses = PulseTable::new();
         let executions = NodeExecutionTable::new();
         let kicked = HashMap::new();
@@ -955,7 +951,7 @@ mod tests {
             selection.suppliers.insert(Located::top("lonely"));
             selection.edges.insert(Located::top("direct"));
             let dispatchable = selection.dispatchable_nodes();
-            let index = EdgeIndex::selected(&project, selection);
+            let index = ProgramIndex::selected(&project, selection);
             let mut supplied = Pulse::new(Uuid::new_v4(), Uuid::nil(), vec![], "sink", "in", Arc::new(json!(42)));
             supplied.provided = true;
             let mut pulses = PulseTable::from([("sink".into(), vec![supplied])]);
@@ -983,10 +979,10 @@ mod tests {
         let selection = crate::project::selection::RunSelection::restricted(&project,
             [Located::top("lonely")].into_iter().collect()).unwrap();
         let dispatchable = selection.dispatchable_nodes();
-        let index = EdgeIndex::selected(&project, selection);
+        let index = ProgramIndex::selected(&project, selection);
         let trigger = project.nodes.iter().find(|n| n.id == "lonely").unwrap();
         let mut executions = NodeExecutionTable::new();
-        assert_eq!(scope_permission(&project, trigger, &vec![], &executions), ScopePermission::Pending);
+        assert_eq!(scope_permission(&project, &index, trigger, &vec![], &executions), ScopePermission::Pending);
         let loc = FiringLocation::new("lonely", vec![]);
         let wake = json!({"event": "wake"});
         let mut kicked = HashMap::from([(loc.clone(), KickedNode {
@@ -997,7 +993,7 @@ mod tests {
         emit_src(&project, &index, &mut pulses, false);
         settle_table(&project, &index, Phase::Fire, Some(&dispatchable), Uuid::nil(), 0,
             &mut pulses, &mut executions, &mut kicked);
-        assert_eq!(scope_permission(&project, trigger, &vec![], &executions), ScopePermission::Skipped("g".into()));
+        assert_eq!(scope_permission(&project, &index, trigger, &vec![], &executions), ScopePermission::Skipped("g".into()));
         assert_eq!(kicked[&loc].payload, Some(wake));
         assert!(kicked[&loc].firing);
         assert_eq!(kicked[&loc].scope_skipped.as_deref(), Some("g"));
@@ -1008,15 +1004,15 @@ mod tests {
     #[test]
     fn an_in_boundary_forwards_shares_the_value_and_kicks_the_scope_roots() {
         let project = grouped_project();
-        let edge_idx = EdgeIndex::build(&project);
+        let program_idx = ProgramIndex::build(&project);
         let mut pulses = PulseTable::default();
         let mut executions = NodeExecutionTable::default();
         let mut kicked = HashMap::new();
-        emit_src(&project, &edge_idx, &mut pulses, true);
+        emit_src(&project, &program_idx, &mut pulses, true);
         let src_value = pending(&pulses, "g__in").iter().find(|p| p.target_port == "x").unwrap().value.clone();
 
         let fired = fire_ready_passthroughs(
-            &project, &edge_idx, None, Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked,
+            &project, &program_idx, None, Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked,
         );
         assert_eq!(fired.len(), 1);
         let BoundaryOutcome::Fired { status, output, closed_ports, .. } = &fired[0].outcome else {
@@ -1041,14 +1037,14 @@ mod tests {
     #[test]
     fn a_gated_off_in_boundary_closes_the_scope_and_kicks_every_member_into_a_skip() {
         let project = grouped_project();
-        let edge_idx = EdgeIndex::build(&project);
+        let program_idx = ProgramIndex::build(&project);
         let mut pulses = PulseTable::default();
         let mut executions = NodeExecutionTable::default();
         let mut kicked = HashMap::new();
-        emit_src(&project, &edge_idx, &mut pulses, false);
+        emit_src(&project, &program_idx, &mut pulses, false);
 
         let fired = fire_ready_passthroughs(
-            &project, &edge_idx, None, Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked,
+            &project, &program_idx, None, Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked,
         );
         assert_eq!(fired.len(), 1);
         let BoundaryOutcome::Fired { status, skip_reason, output, .. } = &fired[0].outcome else {
@@ -1075,17 +1071,17 @@ mod tests {
     #[test]
     fn the_pass_runs_to_a_fixpoint_and_the_out_boundary_forwards() {
         let project = grouped_project();
-        let edge_idx = EdgeIndex::build(&project);
+        let program_idx = ProgramIndex::build(&project);
         let mut pulses = PulseTable::default();
         let mut executions = NodeExecutionTable::default();
         let mut kicked = HashMap::new();
-        emit_src(&project, &edge_idx, &mut pulses, true);
-        fire_ready_passthroughs(&project, &edge_idx, None, Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked);
+        emit_src(&project, &program_idx, &mut pulses, true);
+        fire_ready_passthroughs(&project, &program_idx, None, Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked);
         // `inner` runs and emits into the Out boundary.
         let mut bag = OutputBag::new();
         bag.insert("out".into(), Arc::new(json!(8)));
-        postprocess_output("inner", &bag, Uuid::new_v4(), Uuid::nil(), &Vec::new(), &project, &mut pulses, &edge_idx, &mut Vec::new()).unwrap();
-        let fired = fire_ready_passthroughs(&project, &edge_idx, None, Uuid::nil(), 6, &mut pulses, &mut executions, &mut kicked);
+        postprocess_output("inner", &bag, Uuid::new_v4(), Uuid::nil(), &Vec::new(), &project, &mut pulses, &program_idx, &mut Vec::new()).unwrap();
+        let fired = fire_ready_passthroughs(&project, &program_idx, None, Uuid::nil(), 6, &mut pulses, &mut executions, &mut kicked);
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].node_id, "g__out");
         let sink = pending(&pulses, "sink");
@@ -1155,10 +1151,10 @@ mod tests {
     fn a_skipped_call_site_takes_its_body_down_under_the_call() {
         use crate::frames::Frame;
         let project = called_project();
-        let edge_idx = EdgeIndex::build(&project);
+        let program_idx = ProgramIndex::build(&project);
         let mut pulses = PulseTable::default();
         let mut kicked = HashMap::new();
-        let emissions = tear_down_scope(&project, &edge_idx, &mut pulses, &mut kicked, Uuid::new_v4(), Uuid::nil(), "a", &vec![], Some(&SkipReason::DidNotFlow), None);
+        let emissions = tear_down_scope(&project, &program_idx, &mut pulses, &mut kicked, Uuid::new_v4(), Uuid::nil(), "a", &vec![], Some(&SkipReason::DidNotFlow), None);
         let at = vec![Frame::Call { site: "a".into() }];
         for member in ["B__in", "B.n", "B__out"] {
             let kick = kicked.get(&FiringLocation::new(member, at.clone())).unwrap_or_else(|| panic!("{member} kicked under the call: {kicked:?}"));
@@ -1170,7 +1166,7 @@ mod tests {
         // A site skipped by an enclosing scope still takes its body down,
         // one call deeper, and closes nothing outward a second time.
         let mut kicked = HashMap::new();
-        let emissions = tear_down_scope(&project, &edge_idx, &mut pulses, &mut kicked, Uuid::new_v4(), Uuid::nil(), "b",
+        let emissions = tear_down_scope(&project, &program_idx, &mut pulses, &mut kicked, Uuid::new_v4(), Uuid::nil(), "b",
             &vec![], Some(&SkipReason::ScopeSkipped { scope: "outer".into() }), None);
         let at_b = vec![Frame::Call { site: "b".into() }];
         assert!(kicked.contains_key(&FiringLocation::new("B.n", at_b.clone())), "{kicked:?}");
@@ -1201,14 +1197,14 @@ mod tests {
         project.edges.retain(|e| !(e.source == "src" && e.target == "a__in"));
         project.edges.push(serde_json::from_value(json!({ "id": "g__in.x->a__in.x", "source": "g__in", "sourceHandle": "x", "target": "a__in", "targetHandle": "x" })).unwrap());
         project.groups.push(serde_json::from_value(json!({ "id": "g", "kind": "group", "nodeIds": ["a__in", "a__out"] })).unwrap());
-        let edge_idx = EdgeIndex::build(&project);
+        let program_idx = ProgramIndex::build(&project);
         let mut pulses = PulseTable::default();
         let mut kicked = HashMap::new();
-        let emissions = tear_down_scope(&project, &edge_idx, &mut pulses, &mut kicked, Uuid::new_v4(), Uuid::nil(), "g", &vec![], Some(&SkipReason::DidNotFlow), None);
+        let emissions = tear_down_scope(&project, &program_idx, &mut pulses, &mut kicked, Uuid::new_v4(), Uuid::nil(), "g", &vec![], Some(&SkipReason::DidNotFlow), None);
         assert!(!emissions.iter().any(|e| e.pulse.target_node == "B__in"), "the body's In is under the group, not past it: {emissions:?}");
         assert!(kicked.contains_key(&FiringLocation::new("a__in", vec![])), "{kicked:?}");
         // The site's own skip then takes the body down under the call.
-        let emissions = tear_down_scope(&project, &edge_idx, &mut pulses, &mut kicked, Uuid::new_v4(), Uuid::nil(), "a", &vec![], Some(&SkipReason::ScopeSkipped { scope: "g".into() }), None);
+        let emissions = tear_down_scope(&project, &program_idx, &mut pulses, &mut kicked, Uuid::new_v4(), Uuid::nil(), "a", &vec![], Some(&SkipReason::ScopeSkipped { scope: "g".into() }), None);
         assert!(kicked.contains_key(&FiringLocation::new("B__in", vec![Frame::Call { site: "a".into() }])), "{kicked:?}");
         assert!(!emissions.iter().any(|e| e.pulse.target_node == "B__in"), "{emissions:?}");
     }
@@ -1217,16 +1213,16 @@ mod tests {
     fn a_shared_body_fires_once_per_call_site_and_answers_the_right_one() {
         use crate::frames::Frame;
         let project = called_project();
-        let edge_idx = EdgeIndex::build(&project);
+        let program_idx = ProgramIndex::build(&project);
         let mut pulses = PulseTable::default();
         let mut executions = NodeExecutionTable::default();
         let mut kicked = HashMap::new();
         let mut bag = OutputBag::new();
         bag.insert("a".into(), Arc::new(json!(1)));
         bag.insert("b".into(), Arc::new(json!(2)));
-        postprocess_output("src", &bag, Uuid::new_v4(), Uuid::nil(), &Vec::new(), &project, &mut pulses, &edge_idx, &mut Vec::new()).unwrap();
+        postprocess_output("src", &bag, Uuid::new_v4(), Uuid::nil(), &Vec::new(), &project, &mut pulses, &program_idx, &mut Vec::new()).unwrap();
 
-        let fired = fire_ready_passthroughs(&project, &edge_idx, None, Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked);
+        let fired = fire_ready_passthroughs(&project, &program_idx, None, Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked);
         let mut names: Vec<(String, LoopFrames)> = fired.iter().map(|f| (f.node_id.clone(), f.frames.clone())).collect();
         names.sort();
         let at = |site: &str| vec![Frame::Call { site: site.into() }];
@@ -1241,15 +1237,15 @@ mod tests {
         // The body's gate is its In record under the call frame, so a
         // member is allowed under a site that fired and pending under one that did not.
         let member = project.nodes.iter().find(|n| n.id == "B.n").unwrap();
-        assert_eq!(scope_permission(&project, member, &at("a"), &executions), ScopePermission::Allowed);
-        assert_eq!(scope_permission(&project, member, &at("zzz"), &executions), ScopePermission::Pending);
+        assert_eq!(scope_permission(&project, &program_idx, member, &at("a"), &executions), ScopePermission::Allowed);
+        assert_eq!(scope_permission(&project, &program_idx, member, &at("zzz"), &executions), ScopePermission::Pending);
 
         // The member runs for call `a` and answers: the body's Out fires at
         // `a`'s frame, pops it, and only `a`'s site takes the result.
         let mut out = OutputBag::new();
         out.insert("out".into(), Arc::new(json!(10)));
-        postprocess_output("B.n", &out, Uuid::new_v4(), Uuid::nil(), &at("a"), &project, &mut pulses, &edge_idx, &mut Vec::new()).unwrap();
-        let fired = fire_ready_passthroughs(&project, &edge_idx, None, Uuid::nil(), 6, &mut pulses, &mut executions, &mut kicked);
+        postprocess_output("B.n", &out, Uuid::new_v4(), Uuid::nil(), &at("a"), &project, &mut pulses, &program_idx, &mut Vec::new()).unwrap();
+        let fired = fire_ready_passthroughs(&project, &program_idx, None, Uuid::nil(), 6, &mut pulses, &mut executions, &mut kicked);
         let mut names: Vec<(String, LoopFrames)> = fired.iter().map(|f| (f.node_id.clone(), f.frames.clone())).collect();
         names.sort();
         assert_eq!(names, vec![("B__out".to_string(), at("a")), ("a__out".to_string(), vec![])]);
@@ -1291,12 +1287,13 @@ mod tests {
             "createdAt": "1970-01-01T00:00:00Z", "updatedAt": "1970-01-01T00:00:00Z",
         })).unwrap();
         let member = project.nodes.iter().find(|n| n.id == "B.L2.n").unwrap();
+        let program_idx = ProgramIndex::build(&project);
         let outer = Frame::Loop { index: 0 };
         let call = Frame::Call { site: "L1.site".into() };
         let inner = Frame::Loop { index: 1 };
         let frames = vec![outer.clone(), call.clone(), inner];
         let mut executions = NodeExecutionTable::default();
-        assert_eq!(scope_permission(&project, member, &frames, &executions), ScopePermission::Pending, "the body has not started");
+        assert_eq!(scope_permission(&project, &program_idx, member, &frames, &executions), ScopePermission::Pending, "the body has not started");
         executions.entry("B__in".into()).or_default().push(NodeExecution {
             id: Uuid::new_v4(), received: Default::default(), skip_reason: None, node_id: "B__in".into(),
             status: NodeExecutionStatus::Completed, pulses_absorbed: vec![], ordinal: 0, error: None,
@@ -1304,23 +1301,23 @@ mod tests {
             mentioned_ports: Default::default(), closed_output_ports: Default::default(),
             execution_id: Uuid::nil(), frames: vec![outer, call], inherited_from: None,
         });
-        assert_eq!(scope_permission(&project, member, &frames, &executions), ScopePermission::Allowed);
+        assert_eq!(scope_permission(&project, &program_idx, member, &frames, &executions), ScopePermission::Allowed);
         let other_call = vec![Frame::Loop { index: 0 }, Frame::Call { site: "L1.other".into() }, Frame::Loop { index: 1 }];
-        assert_eq!(scope_permission(&project, member, &other_call, &executions), ScopePermission::Pending, "another site's call has its own gate");
+        assert_eq!(scope_permission(&project, &program_idx, member, &other_call, &executions), ScopePermission::Pending, "another site's call has its own gate");
     }
 
     #[test]
     fn a_second_pass_over_a_settled_table_is_a_no_op() {
         let project = grouped_project();
-        let edge_idx = EdgeIndex::build(&project);
+        let program_idx = ProgramIndex::build(&project);
         let mut pulses = PulseTable::default();
         let mut executions = NodeExecutionTable::default();
         let mut kicked = HashMap::new();
-        emit_src(&project, &edge_idx, &mut pulses, true);
-        fire_ready_passthroughs(&project, &edge_idx, None, Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked);
+        emit_src(&project, &program_idx, &mut pulses, true);
+        fire_ready_passthroughs(&project, &program_idx, None, Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked);
         let ids: Vec<Uuid> = pulses["inner"].iter().map(|p| p.id).collect();
         let records = executions["g__in"].len();
-        let again = fire_ready_passthroughs(&project, &edge_idx, None, Uuid::nil(), 6, &mut pulses, &mut executions, &mut kicked);
+        let again = fire_ready_passthroughs(&project, &program_idx, None, Uuid::nil(), 6, &mut pulses, &mut executions, &mut kicked);
         assert!(again.is_empty(), "nothing is ready twice");
         assert_eq!(pulses["inner"].iter().map(|p| p.id).collect::<Vec<_>>(), ids);
         assert_eq!(executions["g__in"].len(), records);
@@ -1329,13 +1326,13 @@ mod tests {
     #[test]
     fn an_out_of_scope_boundary_absorbs_silently() {
         let project = grouped_project();
-        let edge_idx = EdgeIndex::build(&project);
+        let program_idx = ProgramIndex::build(&project);
         let mut pulses = PulseTable::default();
         let mut executions = NodeExecutionTable::default();
         let mut kicked = HashMap::new();
-        emit_src(&project, &edge_idx, &mut pulses, true);
+        emit_src(&project, &program_idx, &mut pulses, true);
         let scope: HashSet<Located> = [Located::top("src")].into_iter().collect();
-        let fired = fire_ready_passthroughs(&project, &edge_idx, Some(&scope), Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked);
+        let fired = fire_ready_passthroughs(&project, &program_idx, Some(&scope), Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked);
         assert_eq!(fired.len(), 1);
         assert!(matches!(fired[0].outcome, BoundaryOutcome::OutOfScope));
         assert!(executions.is_empty(), "no record for an out-of-scope boundary");
@@ -1349,19 +1346,19 @@ mod tests {
     #[test]
     fn a_second_firing_at_one_location_gets_the_next_ordinal_and_new_ids() {
         let project = grouped_project();
-        let edge_idx = EdgeIndex::build(&project);
+        let program_idx = ProgramIndex::build(&project);
         let mut pulses = PulseTable::default();
         let mut executions = NodeExecutionTable::default();
         let mut kicked = HashMap::new();
-        emit_src(&project, &edge_idx, &mut pulses, true);
-        fire_ready_passthroughs(&project, &edge_idx, None, Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked);
+        emit_src(&project, &program_idx, &mut pulses, true);
+        fire_ready_passthroughs(&project, &program_idx, None, Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked);
         let first: Vec<Uuid> = pulses["inner"].iter().map(|p| p.id).collect();
         // `inner` takes the first delivery, then `src` fires again.
         for p in pulses.get_mut("inner").unwrap().iter_mut() {
             p.absorb();
         }
-        emit_src(&project, &edge_idx, &mut pulses, true);
-        let fired = fire_ready_passthroughs(&project, &edge_idx, None, Uuid::nil(), 6, &mut pulses, &mut executions, &mut kicked);
+        emit_src(&project, &program_idx, &mut pulses, true);
+        let fired = fire_ready_passthroughs(&project, &program_idx, None, Uuid::nil(), 6, &mut pulses, &mut executions, &mut kicked);
         assert_eq!(fired.len(), 1);
         let records = &executions["g__in"];
         assert_eq!(records.iter().map(|e| e.ordinal).collect::<Vec<_>>(), vec![0, 1]);
@@ -1381,15 +1378,15 @@ mod tests {
     #[test]
     fn a_refused_value_fails_the_boundary_and_closes_every_output() {
         let project = grouped_project();
-        let edge_idx = EdgeIndex::build(&project);
+        let program_idx = ProgramIndex::build(&project);
         let mut pulses = PulseTable::default();
         let mut executions = NodeExecutionTable::default();
         let mut kicked = HashMap::new();
         let mut bag = OutputBag::new();
         bag.insert("out".into(), Arc::new(json!("not a number")));
         bag.insert("flow".into(), Arc::new(json!(true)));
-        postprocess_output("src", &bag, Uuid::new_v4(), Uuid::nil(), &Vec::new(), &project, &mut pulses, &edge_idx, &mut Vec::new()).unwrap();
-        let fired = fire_ready_passthroughs(&project, &edge_idx, None, Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked);
+        postprocess_output("src", &bag, Uuid::new_v4(), Uuid::nil(), &Vec::new(), &project, &mut pulses, &program_idx, &mut Vec::new()).unwrap();
+        let fired = fire_ready_passthroughs(&project, &program_idx, None, Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked);
         assert_eq!(fired.len(), 1);
         let BoundaryOutcome::Fired { status, error, output, .. } = &fired[0].outcome else { panic!("in scope") };
         assert_eq!(*status, NodeExecutionStatus::Failed);
@@ -1419,15 +1416,15 @@ mod tests {
     fn a_boundary_that_cannot_forward_fails_and_tells_its_scope() {
         let mut project = grouped_project();
         project.edges.iter_mut().find(|edge| edge.id == "e2").expect("e2").path = vec!["speed".into()];
-        let edge_idx = EdgeIndex::build(&project);
+        let program_idx = ProgramIndex::build(&project);
         let mut pulses = PulseTable::default();
         let mut executions = NodeExecutionTable::default();
         let mut kicked = HashMap::new();
         let mut bag = OutputBag::new();
         bag.insert("out".into(), Arc::new(json!(7)));
         bag.insert("flow".into(), Arc::new(json!(true)));
-        postprocess_output("src", &bag, Uuid::new_v4(), Uuid::nil(), &Vec::new(), &project, &mut pulses, &edge_idx, &mut Vec::new()).unwrap();
-        let fired = fire_ready_passthroughs(&project, &edge_idx, None, Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked);
+        postprocess_output("src", &bag, Uuid::new_v4(), Uuid::nil(), &Vec::new(), &project, &mut pulses, &program_idx, &mut Vec::new()).unwrap();
+        let fired = fire_ready_passthroughs(&project, &program_idx, None, Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked);
         assert_eq!(fired.len(), 1);
         let BoundaryOutcome::Fired { status, error, output, .. } = &fired[0].outcome else { panic!("in scope") };
         assert_eq!(*status, NodeExecutionStatus::Failed);
@@ -1450,17 +1447,17 @@ mod tests {
         let g_in = project.nodes.iter_mut().find(|n| n.id == "g__in").unwrap();
         g_in.inputs.clear();
         g_in.outputs.clear();
-        let edge_idx = EdgeIndex::build(&project);
+        let program_idx = ProgramIndex::build(&project);
         let mut pulses = PulseTable::default();
         let mut executions = NodeExecutionTable::default();
         let mut kicked = HashMap::new();
         kick_scope(&mut kicked, &["g__in".to_string()], &Vec::new(), None);
-        let fired = fire_ready_passthroughs(&project, &edge_idx, None, Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked);
+        let fired = fire_ready_passthroughs(&project, &program_idx, None, Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked);
         assert_eq!(fired.len(), 1);
         assert_eq!(executions["g__in"][0].status, NodeExecutionStatus::Completed);
         assert!(kicked[&FiringLocation::new("g__in", Vec::new())].dispatched);
         assert!(kicked.contains_key(&FiringLocation::new("lonely", Vec::new())), "the scope's roots start");
-        let again = fire_ready_passthroughs(&project, &edge_idx, None, Uuid::nil(), 6, &mut pulses, &mut executions, &mut kicked);
+        let again = fire_ready_passthroughs(&project, &program_idx, None, Uuid::nil(), 6, &mut pulses, &mut executions, &mut kicked);
         assert!(again.is_empty(), "a consumed kick fires nothing more");
     }
 
@@ -1505,12 +1502,12 @@ mod tests {
             "updatedAt": "1970-01-01T00:00:00Z",
         }))
         .expect("nested project");
-        let edge_idx = EdgeIndex::build(&project);
+        let program_idx = ProgramIndex::build(&project);
         let mut pulses = PulseTable::default();
         let mut executions = NodeExecutionTable::default();
         let mut kicked = HashMap::new();
-        emit_src(&project, &edge_idx, &mut pulses, false);
-        let fired = fire_ready_passthroughs(&project, &edge_idx, None, Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked);
+        emit_src(&project, &program_idx, &mut pulses, false);
+        let fired = fire_ready_passthroughs(&project, &program_idx, None, Uuid::nil(), 5, &mut pulses, &mut executions, &mut kicked);
         let ids: Vec<&str> = fired.iter().map(|f| f.node_id.as_str()).collect();
         assert_eq!(ids, vec!["g__in", "h__in", "h__out"], "the outer skip kicks the nested boundaries, which fire in the same pass");
         for nested in &fired[1..] {

@@ -29,7 +29,7 @@ pub use flows::{
     instance_connection_counts, instance_value_counts, instance_values, publish_grant, published_connection, sweep_expired_connects,
     ConnectionValue, InstanceValueWrite,
     take_connect_result, BeginPicker, GrantOwnerScope, OAuthComplete, PickerSession,
-    PublishAccess,
+    PublishAccess, write_pushed_values,
 };
 pub use picks::{change_install_picks, install_picks, move_stored, stored_fields, PickWrite};
 pub use subscriptions::{

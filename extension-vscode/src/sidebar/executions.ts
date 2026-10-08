@@ -27,17 +27,16 @@ import type { CancelCause, ExecutionPhase } from '../../../packages/weft-graph/s
 
 export type ExecutionsMode = 'flat' | 'byVersion';
 
-/** Where a run stands, or `corrupt` when its journal row no longer
- *  decodes (then `entry_node` is empty). */
-// SYNC: SummaryStatus <-> crates/weft-core/src/program.rs SummaryStatus (and RunStatus)
-export type SummaryStatus = 'running' | 'waiting_for_input' | 'completed' | 'failed' | 'cancelled' | 'corrupt';
+/** Where a run stands. */
+// SYNC: RunStatus <-> crates/weft-core/src/program.rs RunStatus
+export type RunStatus = 'running' | 'waiting_for_input' | 'completed' | 'failed' | 'cancelled';
 
 // SYNC: ExecutionSummary <-> crates/weft-core/src/program.rs (ExecutionSummary), weavemind/website/src/routes/(app)/executions/+page.ts (Execution)
 export interface ExecutionSummary {
   execution_id: string;
   project_id: string;
   entry_node: string;
-  status: SummaryStatus;
+  status: RunStatus;
   /** A trigger fire or manual run (`fire`), or one of the two setup
    *  runs an activate / resync / infra start makes. */
   phase: ExecutionPhase;
@@ -594,12 +593,9 @@ interface ExecutionPage {
 export class ExecutionNode extends vscode.TreeItem {
   constructor(public readonly summary: ExecutionSummary) {
     const started = new Date(summary.started_at * 1000).toLocaleString();
-    // A corrupt row has no entry node (its journal payload no longer
-    // decodes); it is listed so the user can see and delete it. The
-    // icon is `iconPath` below, never text in the label (a codicon
+    // The icon is `iconPath` below, never text in the label (a codicon
     // reference in a label renders as its literal `$(name)`).
-    const name = summary.status === 'corrupt' ? '(corrupt journal)' : summary.entry_node;
-    super(`${name} (${started})`, vscode.TreeItemCollapsibleState.None);
+    super(`${summary.entry_node} (${started})`, vscode.TreeItemCollapsibleState.None);
     this.id = summary.execution_id;
     const tags = summary.tags;
     const tagged = tags.length > 0 ? `  ·  ${tags.join(', ')}` : '';

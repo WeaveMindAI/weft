@@ -201,6 +201,13 @@ pub struct ActivateRequest {
     /// sends nothing, which is every shared trigger.
     #[serde(default)]
     pub scope: ActivationScope,
+    /// The port the project's own address opens on, on an install that
+    /// gives projects one (a machine), when the person asked for that one
+    /// (`weft activate --port`): another program holding it is an error.
+    /// Unset, the project keeps the port it had, and moves to a free one
+    /// when another program took it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
 }
 
 /// What an activate points the project at: the hashes of the version
@@ -268,6 +275,10 @@ pub struct ActivateResponse {
     /// an instance named (`ActivationScope::per_instance_left_out`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub per_instance_left_out: Vec<String>,
+    /// The project's own address, serving its routes at its root, when
+    /// the install gives it one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<crate::projects::ProjectAddress>,
 }
 
 /// One address a listener answers on, for the trigger at `node_id`.
@@ -298,6 +309,7 @@ mod tests {
             },
             running: RunningChoice { running_policy: Some(crate::RunningPolicy::Wait), drain_timeout_secs: Some(9) },
             scope: ActivationScope::default(),
+            port: None,
         };
         let wire = serde_json::to_value(&body).unwrap();
         assert_eq!(wire["binaryHash"], "b");

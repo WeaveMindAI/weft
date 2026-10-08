@@ -32,6 +32,25 @@ pub struct ProbeAnswer {
     pub why: Option<String>,
 }
 
+/// Where a unit's own containers tell weft that something its infra node
+/// handed weft changed, with no node running: `POST` a
+/// `weft_core::infra::bake::PushedValues` (a password the container
+/// changed itself goes in `connection`, a baked output in `outputs`). The
+/// agent passes it straight on to the broker as its copy
+/// (`identity::Principal::InfraCopy`), which writes it over that copy's
+/// values only, and answers with what the broker said: `200` once it
+/// landed, the broker's refusal (naming what it could not write)
+/// otherwise. The agent holds the unit's network, so a container reaches
+/// it at `127.0.0.1` on the agent's port (`weft_core::ports::UNIT_AGENT`).
+pub const VALUES_PATH: &str = "/values";
+
+/// Where the agent reaches the broker, set by whoever starts it.
+pub const AGENT_BROKER_URL_ENV: &str = "WEFT_BROKER_URL";
+
+/// The agent's identity (`token:<token>`, minted for its copy, or
+/// `gcp-metadata`, the machine it runs on), set by whoever starts it.
+pub const AGENT_IDENTITY_ENV: &str = "WEFT_AGENT_IDENTITY";
+
 /// What a cloud machine runs: one unit of one copy.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UnitAssignment {

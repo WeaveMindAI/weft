@@ -135,7 +135,7 @@ describe('openLiveSocket', () => {
 		const asked: { url: string; headers: HeadersInit | undefined }[] = [];
 		const fetcher = (async (url: string, init?: RequestInit) => {
 			asked.push({ url, headers: init?.headers });
-			return new Response(JSON.stringify({ url: 'https://w.example/live/p/chat?session=s2&wct=t', protocol: 'websocket' }));
+			return new Response(JSON.stringify({ url: 'https://w.example/connect/local/chat?session=s2&wct=t', protocol: 'websocket' }));
 		}) as unknown as typeof fetch;
 		openLiveSocket({
 			url: 'https://w.example/connect/local/chat',
@@ -147,6 +147,6 @@ describe('openLiveSocket', () => {
 		});
 		await vi.waitFor(() => expect(FakeSocket.made.length).toBe(1));
 		expect(asked).toEqual([{ url: 'https://w.example/connect/local/chat?session=s2', headers: { 'Weft-Instance-Token': 'wft-1' } }]);
-		expect(FakeSocket.made[0].url).toBe('wss://w.example/live/p/chat?session=s2&wct=t');
+		expect(FakeSocket.made[0].url).toBe('wss://w.example/connect/local/chat?session=s2&wct=t');
 	});
 });

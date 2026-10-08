@@ -44,7 +44,7 @@ const CACHE_TTL: Duration = Duration::from_secs(300);
 #[derive(Clone)]
 pub struct ScopeCache {
     project_to_tenant: Arc<Mutex<LruCache<uuid::Uuid, (String, Instant)>>>,
-    execution_id_to_scope: Arc<Mutex<LruCache<String, (ExecutionScope, Instant)>>>,
+    execution_id_to_scope: Arc<Mutex<LruCache<weft_core::ExecutionId, (ExecutionScope, Instant)>>>,
     signal_to_scope: Arc<Mutex<LruCache<String, (ProjectScope, Instant)>>>,
 }
 
@@ -113,8 +113,8 @@ pub struct ProjectScope {
 }
 
 /// WHOSE an execution is, and who it is for: its project scope, plus the
-/// instance its run was started for (`execution.instance_id`, born with
-/// the execution and never changed). What every worker call about a run
+/// instance its run was started for (`run.instance_id`, born with the run
+/// and never changed). What every worker call about a run
 /// resolves to, so an instance's pick, copy or storage is found from the
 /// run itself and never from anything the worker says.
 #[derive(Debug, Clone)]
@@ -131,15 +131,17 @@ impl ExecutionScope {
 }
 
 /// Resolve who `execution_id` belongs to, enforcing ownership. See
-/// `require_project_owned_by` for the tenant-vs-control-plane rule.
+/// `require_project_owned_by` for the tenant-vs-control-plane rule. A
+/// worker writes a run's record before any call that names it, so a run
+/// the broker cannot find is no run of the caller's.
 pub async fn require_execution_id_scope(
     cache: &ScopeCache,
     pool: &PgPool,
     caller: &CallerIdentity,
-    execution_id: &str,
+    execution_id: weft_core::ExecutionId,
 ) -> Result<ExecutionScope, (StatusCode, String)> {
     let scope = lookup_execution_id_scope(cache, pool, execution_id).await?;
-    enforce_scope(caller, "execution_id", execution_id, &scope.project_scope())?;
+    enforce_scope(caller, "execution_id", &execution_id.to_string(), &scope.project_scope())?;
     Ok(scope)
 }
 
@@ -236,37 +238,27 @@ async fn lookup_project_tenant(
     Ok(tenant)
 }
 
-/// Read `execution_id`'s scope into the cache ahead of the asks that
-/// need it. Only a head start: an execution that cannot be read here is
-/// read again, and refused with the reason, by the first ask that needs
-/// it, so nothing is lost by not answering here.
-pub async fn warm_execution_id_scope(cache: &ScopeCache, pool: &PgPool, execution_id: &str) {
-    if let Err((_, why)) = lookup_execution_id_scope(cache, pool, execution_id).await {
-        tracing::debug!(target: "weft_broker::scope", execution_id, why, "could not read an execution's scope ahead of its asks");
-    }
-}
-
 async fn lookup_execution_id_scope(
     cache: &ScopeCache,
     pool: &PgPool,
-    execution_id: &str,
+    execution_id: weft_core::ExecutionId,
 ) -> Result<ExecutionScope, (StatusCode, String)> {
-    if let Some(scope) = cache_get(&cache.execution_id_to_scope, execution_id).await {
+    if let Some(scope) = cache_get(&cache.execution_id_to_scope, &execution_id).await {
         return Ok(scope);
     }
     let row: Option<(String, uuid::Uuid, Option<String>)> =
-        sqlx::query_as("SELECT tenant_id, project_id, instance_id FROM execution WHERE execution_id = $1")
+        sqlx::query_as("SELECT tenant_id, project_id, instance_id FROM run WHERE execution_id = $1")
             .bind(execution_id)
             .fetch_optional(pool)
             .await
-            .map_err(|e| crate::handlers::unavailable_or_internal(anyhow::Error::from(e).context("execution lookup")))?;
+            .map_err(|e| crate::handlers::unavailable_or_internal(anyhow::Error::from(e).context("run lookup")))?;
     let (tenant, project, instance) = row.ok_or((StatusCode::NOT_FOUND, "unknown execution".into()))?;
     let instance = instance
         .map(weft_core::instance::InstanceId::new)
         .transpose()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("corrupt execution.instance_id: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("corrupt run.instance_id: {e}")))?;
     let scope = ExecutionScope { tenant, project, instance };
-    cache_put(&cache.execution_id_to_scope, execution_id.to_string(), scope.clone()).await;
+    cache_put(&cache.execution_id_to_scope, execution_id, scope.clone()).await;
     Ok(scope)
 }
 

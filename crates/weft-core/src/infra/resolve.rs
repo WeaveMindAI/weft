@@ -142,6 +142,9 @@ pub enum ResolveError {
     DiskShared { node: String, volume: String, first: String, second: String },
     #[error("infra node '{node}': unit '{unit}' runs no container")]
     EmptyUnit { node: String, unit: String },
+    #[error("infra node '{node}': container '{container}' sets {name}, which weft sets itself on \
+             every container (where to push the values that changed); read it instead of setting it")]
+    ReservedEnv { node: String, container: String, name: &'static str },
     #[error("infra node '{node}': endpoint '{endpoint}' is public at path '{path}', which is not \
              a plain path. It must start with '/', and every segment between slashes must be \
              non-empty, not '.' or '..', and use only letters, digits, '-', '_', '.' and '~'")]
@@ -253,6 +256,12 @@ fn check_endpoint(node: &str, spec: &InfraSpec, ep: &Endpoint) -> Result<(), Res
     Ok(())
 }
 
+/// The variable every container of an infra unit finds the address it
+/// pushes changed values to in (`weft_platform_traits::unit_agent::VALUES_PATH`
+/// on the agent beside it): set by the host, never by a spec.
+// SYNC: VALUES_URL_ENV <-> catalog/postgres/database/images/credential/bootstrap.py (WEFT_VALUES_URL)
+pub const VALUES_URL_ENV: &str = "WEFT_VALUES_URL";
+
 /// Check `spec` and resolve its images for the copy `node`.
 pub fn resolve(spec: &InfraSpec, node: &NodeRef, tags: &BTreeMap<String, String>) -> Result<ResolvedNode, ResolveError> {
     let id = node.node.as_str();
@@ -265,6 +274,9 @@ pub fn resolve(spec: &InfraSpec, node: &NodeRef, tags: &BTreeMap<String, String>
             return Err(ResolveError::EmptyUnit { node: plain(id), unit: u.name.clone() });
         }
         unique(id, "container", u.containers.iter().chain(u.init_containers.iter()).map(|c| c.name.as_str()))?;
+        if let Some(c) = u.containers.iter().chain(u.init_containers.iter()).find(|c| c.env.iter().any(|e| e.name == VALUES_URL_ENV)) {
+            return Err(ResolveError::ReservedEnv { node: plain(id), container: c.name.clone(), name: VALUES_URL_ENV });
+        }
     }
     for v in &spec.volumes {
         check_name(id, "volume", &v.name, MAX_VOLUME)?;

@@ -49,6 +49,7 @@
       "Bash(weft infra show:*)",
       "Bash(weft infra press:*)",
       "Bash(weft infra env:*)",
+      "Bash(weft infra rebake:*)",
       "Bash(weft infra --json:*)",
       "Bash(weft infra logs:*)",
       "Bash(weft infra list-doors:*)",

@@ -3582,6 +3582,7 @@ fn flatten(state: ParseState, bodies: Bodies, project_id: Uuid) -> ProjectDefini
         groups,
         created_at: now,
         updated_at: now,
+        defaults: Default::default(),
     }
 }
 
@@ -3871,7 +3872,7 @@ fn flatten_group(
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::In }),
         requires_infra: false, per_instance: None,
         images: Vec::new(),
-        fires_with: Default::default(),
+        fires_with: Default::default(), baked_outputs: Default::default(),
         published_service: None,
         instance_service: None,
         instance_rules: None,
@@ -3963,7 +3964,7 @@ fn flatten_group(
         group_boundary: Some(GroupBoundary { group_id: group.id.clone(), role: GroupBoundaryRole::Out }),
         requires_infra: false, per_instance: None,
         images: Vec::new(),
-        fires_with: Default::default(),
+        fires_with: Default::default(), baked_outputs: Default::default(),
         published_service: None,
         instance_service: None,
         instance_rules: None,
@@ -4084,7 +4085,7 @@ fn parsed_to_node_def(pn: &ParsedNode) -> NodeDefinition {
         // propagation adds every node that reads from one.
         per_instance: pn.per_instance.then_some(weft_core::instance::PerInstance::Marked),
         images: Vec::new(),
-        fires_with: Default::default(),
+        fires_with: Default::default(), baked_outputs: Default::default(),
         published_service: None,
         instance_service: None,
         instance_rules: None,

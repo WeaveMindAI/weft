@@ -129,7 +129,12 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- While an apply is under way: what it waits on, in the
             -- host's words, and when it began. Cleared when it lands.
             waiting_on          TEXT,
-            provisioning_since_unix BIGINT
+            provisioning_since_unix BIGINT,
+            -- The node's baked outputs (`weft_core::infra::bake`), port
+            -- to value: what its infra setup sent out on them, or the
+            -- infra pushed since. A run that reads only these does not
+            -- run the node.
+            baked_json          JSONB NOT NULL DEFAULT '{}'::jsonb
         )"#,
         r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_infra_node_copy
              ON infra_node(project_id, node_id, instance_id) NULLS NOT DISTINCT"#,
@@ -156,38 +161,16 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             EXECUTE FUNCTION infra_node_status_notify()"#,
         r#"DROP TRIGGER IF EXISTS infra_node_status_on_change ON infra_node"#,
         r#"CREATE TRIGGER infra_node_status_on_change
-            AFTER UPDATE OF status, endpoints_json, public_paths_json ON infra_node
+            AFTER UPDATE OF status, endpoints_json, public_paths_json, baked_json ON infra_node
             FOR EACH ROW
             WHEN (NEW.status IS DISTINCT FROM OLD.status
                   OR NEW.endpoints_json IS DISTINCT FROM OLD.endpoints_json
-                  OR NEW.public_paths_json IS DISTINCT FROM OLD.public_paths_json)
+                  OR NEW.public_paths_json IS DISTINCT FROM OLD.public_paths_json
+                  OR NEW.baked_json IS DISTINCT FROM OLD.baked_json)
             EXECUTE FUNCTION infra_node_status_notify()"#,
     ],
     seed: &[],
 };
-
-/// Update just the status column. Idempotent: identical writes
-/// produce no observable effect. Used by the supervisor and the
-/// stop/terminate API handlers for transient states like Stopping.
-pub async fn set_status(
-    pool: &PgPool,
-    project_id: uuid::Uuid,
-    node_id: &str,
-    instance: Option<&weft_core::instance::InstanceId>,
-    status: InfraNodeStatus,
-) -> Result<()> {
-    sqlx::query(
-        "UPDATE infra_node SET status = $1 \
-         WHERE project_id = $2 AND node_id = $3 AND instance_id IS NOT DISTINCT FROM $4",
-    )
-    .bind(status.as_str())
-    .bind(project_id)
-    .bind(node_id)
-    .bind(instance.map(|m| m.as_str()))
-    .execute(pool)
-    .await?;
-    Ok(())
-}
 
 /// The columns every read decodes (`parse_row`).
 const ROW_COLUMNS: &str = "project_id, node_id, instance_id, copy_id, status, \
@@ -218,37 +201,7 @@ pub async fn get(
     }
 }
 
-/// One copy of an infra node and whether it is up: what a run checks
-/// before it starts.
-#[derive(Debug, Clone)]
-pub struct CopyStatus {
-    pub node_id: String,
-    pub instance: Option<weft_core::instance::InstanceId>,
-    pub status: InfraNodeStatus,
-    /// When its last apply landed (a start, an upgrade), if one did.
-    pub applied_at_unix: Option<i64>,
-}
-
-/// Every copy of `project_id`'s infra nodes and its status.
-pub async fn statuses(pool: &PgPool, project_id: uuid::Uuid) -> Result<Vec<CopyStatus>> {
-    let rows: Vec<(String, Option<String>, String, Option<i64>)> =
-        sqlx::query_as("SELECT node_id, instance_id, status, applied_at_unix FROM infra_node WHERE project_id = $1")
-            .bind(project_id)
-            .fetch_all(pool)
-            .await?;
-    rows.into_iter()
-        .map(|(node_id, instance, status, applied_at_unix)| {
-            let instance = instance
-                .map(weft_core::instance::InstanceId::new)
-                .transpose()
-                .map_err(|e| anyhow::anyhow!("infra_node.instance_id for project={project_id} node={node_id}: {e}"))?;
-            let status = InfraNodeStatus::parse(&status).ok_or_else(|| {
-                anyhow::anyhow!("infra_node.status='{status}' for project={project_id} node={node_id} is not a status this dispatcher knows")
-            })?;
-            Ok(CopyStatus { node_id, instance, status, applied_at_unix })
-        })
-        .collect()
-}
+pub use weft_task_store::infra_copies::{statuses, CopyStatus};
 
 /// List every row for a project. Drives the project status response.
 pub async fn list_for_project(
@@ -490,38 +443,24 @@ pub async fn pending_ops(
             .map_err(|e| anyhow::anyhow!("infra_lifecycle_command {id}: {e}"))?;
         ops.push(PendingOp { kind, node, copies, order: id, setup: None });
     }
-    // A setup run still being worked on brings up the infra places its
-    // selection holds, for its instance. One recorded but abandoned (no
-    // task left) starts nothing, and the next start ends it.
+    // A setup run that has not ended brings up the infra places its
+    // selection holds, for its instance.
     let infra: std::collections::BTreeSet<String> = weft_core::project::infra_place_spellings(project);
-    let setups: Vec<(String, Option<String>, String)> = sqlx::query_as(concat!(
-        "SELECT ec.execution_id, ec.instance_id, e.payload_json FROM execution ec \
-         JOIN exec_event e ON e.execution_id = ec.execution_id AND e.kind = 'execution_started' \
-         WHERE ec.project_id = $1 AND ec.phase = 'infra_setup' \
-           AND NOT EXISTS ( \
-             SELECT 1 FROM exec_event t WHERE t.execution_id = ec.execution_id \
-               AND t.kind IN ",
-        weft_journal::execution_terminal_kinds_sql!(),
-        ")",
-    ))
-    .bind(project_id)
-    .fetch_all(pool)
-    .await?;
-    for (execution_id, instance, payload) in setups {
-        let execution_id: weft_core::ExecutionId = execution_id.parse().map_err(|e| anyhow::anyhow!("infra setup execution '{execution_id}': {e}"))?;
-        if !crate::api::execution::execution_is_being_worked_on(pool, execution_id).await? {
-            continue;
-        }
+    let setups: Vec<(weft_core::ExecutionId, Option<String>, Option<sqlx::types::Json<weft_core::project::selection::RunSelection>>)> =
+        sqlx::query_as(
+            "SELECT r.execution_id, r.instance_id, s.selection FROM run r \
+             LEFT JOIN run_selection s ON s.digest = r.selection \
+             WHERE r.project_id = $1 AND r.phase = 'infra_setup' AND r.state <> 'ended'",
+        )
+        .bind(project_id)
+        .fetch_all(pool)
+        .await?;
+    for (execution_id, instance, subgraph) in setups {
         let instance = instance
             .map(weft_core::instance::InstanceId::new)
             .transpose()
             .map_err(|e| anyhow::anyhow!("infra setup {execution_id} instance: {e}"))?;
-        let weft_journal::ExecEvent::ExecutionStarted { subgraph, .. } =
-            weft_journal::decode_event(execution_id, &payload).map_err(anyhow::Error::msg)?
-        else {
-            anyhow::bail!("infra setup {execution_id}: its execution_started row holds another event");
-        };
-        let Some(subgraph) = subgraph else {
+        let Some(sqlx::types::Json(subgraph)) = subgraph else {
             anyhow::bail!("infra setup {execution_id} was born without its selection; it cannot say what it brings up");
         };
         for place in &subgraph.nodes {

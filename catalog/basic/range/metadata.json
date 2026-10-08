@@ -37,5 +37,8 @@
         "port": "step"
       }
     }
-  ]
+  ],
+  "features": {
+    "pure": true
+  }
 }

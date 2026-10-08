@@ -10,8 +10,9 @@
 //!   session's negotiated audio format, IS a duration. Frames from the
 //!   provider (transcripts) cost nothing.
 //!
-//! Everything else is Unknown: the platform key refuses it, and a caller's
-//! own key passes it through unmeasured, exactly like any unknown route.
+//! Everything else is Unknown: the install's key never travels on it, and a
+//! caller's own key passes it through unmeasured, exactly like any unknown
+//! route.
 //!
 //! The audio format (and with it bytes-per-second) is read from the
 //! session URL's query string, the same parameters the provider itself
@@ -38,13 +39,6 @@ const REALTIME_STT: &str = "speech-to-text/realtime";
 const REALTIME_STT_USD_PER_HOUR: f64 = 0.39;
 const ENTITY_DETECTION_USD_PER_HOUR: f64 = 0.07;
 const KEYTERMS_USD_PER_HOUR: f64 = 0.05;
-
-/// One admission slice: one minute of audio worth at the session's rate.
-const SECONDS_OF_AUDIO_PER_SLICE: f64 = 60.0;
-
-/// The dearest bytes-per-second any format this meter knows can carry
-/// (pcm_48000, 16-bit mono), for sizing worst-case per-frame bounds.
-const DEAREST_BYTES_PER_SECOND: f64 = 96_000.0;
 
 /// Bytes per second of audio for a declared format, or `None` for a format
 /// this meter does not know (refused at session start rather than guessed).
@@ -144,18 +138,19 @@ fn tts_rate_of(model: Option<&str>) -> f64 {
     }
 }
 
-/// One admission slice / max frame for the streaming TTS session: a
-/// 4 KB text frame carries at most ~4k characters, well under the
-/// slice's worth at the dearest rate.
-const STREAMING_TTS_SLICE_USD: f64 = 0.50;
-const STREAMING_TTS_MAX_FRAME_BYTES: usize = 4096;
-
 /// The streaming TTS session tap: characters of text the CALLER
 /// sends accrue at the model's rate; audio frames back cost nothing.
 struct StreamingTtsSession {
     usd_per_1k_chars: f64,
     model: Option<String>,
     chars: u64,
+}
+
+impl StreamingTtsSession {
+    /// Dollars accrued so far.
+    fn accrued_usd(&self) -> f64 {
+        self.chars as f64 / 1000.0 * self.usd_per_1k_chars
+    }
 }
 
 impl SessionObservation for StreamingTtsSession {
@@ -170,10 +165,6 @@ impl SessionObservation for StreamingTtsSession {
     }
 
     fn on_frame_to_caller(&mut self, _payload: &[u8]) {}
-
-    fn accrued_usd(&self) -> f64 {
-        self.chars as f64 / 1000.0 * self.usd_per_1k_chars
-    }
 
     fn end(self: Box<Self>, interrupted: bool) -> MeasuredCost {
         MeasuredCost {
@@ -264,13 +255,7 @@ fn batch_route(method: &str, path: &str) -> Option<BatchRoute> {
 fn tts_usd(body: &[u8]) -> f64 {
     let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     let chars = parsed["text"].as_str().map(|t| t.chars().count()).unwrap_or(0) as f64;
-    let model = parsed["model_id"].as_str().unwrap_or("");
-    let rate = if model.contains("flash") || model.contains("turbo") {
-        TTS_FLASH_USD_PER_1K_CHARS
-    } else {
-        TTS_USD_PER_1K_CHARS
-    };
-    chars / 1000.0 * rate
+    chars / 1000.0 * tts_rate_of(parsed["model_id"].as_str())
 }
 
 /// A lean-high minutes bound for an input-priced route, from the
@@ -314,6 +299,9 @@ enum BatchPricing {
 /// small JSON envelope in `end` is what `resolve` reads.
 struct BatchObservation {
     pricing: BatchPricing,
+    /// The model the request named (a JSON request's `model_id`), booked
+    /// with the cost as a session's is.
+    model: Option<String>,
     status: u16,
     /// Collected body, only for `DubbedMinutes` (a small JSON answer).
     body: Vec<u8>,
@@ -363,6 +351,7 @@ impl CallObservation for BatchObservation {
             status: self.status,
             data: json!({
                 "usd": usd,
+                "model": self.model,
                 "outputBytes": self.body_bytes,
                 "interrupted": interrupted,
             }),
@@ -375,6 +364,14 @@ struct RealtimeSttSession {
     usd_per_hour: f64,
     model: Option<String>,
     audio_bytes: u64,
+}
+
+impl RealtimeSttSession {
+    /// Dollars accrued so far.
+    fn accrued_usd(&self) -> f64 {
+        let audio_seconds = self.audio_bytes as f64 / self.bytes_per_second;
+        audio_seconds / 3600.0 * self.usd_per_hour
+    }
 }
 
 impl SessionObservation for RealtimeSttSession {
@@ -393,11 +390,6 @@ impl SessionObservation for RealtimeSttSession {
     }
 
     fn on_frame_to_caller(&mut self, _payload: &[u8]) {}
-
-    fn accrued_usd(&self) -> f64 {
-        let audio_seconds = self.audio_bytes as f64 / self.bytes_per_second;
-        audio_seconds / 3600.0 * self.usd_per_hour
-    }
 
     fn end(self: Box<Self>, interrupted: bool) -> MeasuredCost {
         let audio_seconds = self.audio_bytes as f64 / self.bytes_per_second;
@@ -434,40 +426,6 @@ impl ProviderMeter for ElevenLabsMeter {
         }
     }
 
-    async fn ceiling_usd(
-        &self,
-        path: &str,
-        body: &[u8],
-        _follow_up: FollowUp<'_>,
-    ) -> anyhow::Result<f64> {
-        // Every billable batch route prices off its REQUEST; the same
-        // math the observer runs is the ceiling (plus the output-priced
-        // routes' generous size-based bound).
-        match batch_route("POST", path) {
-            Some(BatchRoute::Tts) => Ok(tts_usd(body)),
-            Some(BatchRoute::SoundEffect) => {
-                let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-                let secs = parsed["duration_seconds"].as_f64().unwrap_or(30.0).clamp(0.5, 30.0);
-                Ok(secs / 60.0 * SOUND_EFFECT_USD_PER_MINUTE)
-            }
-            Some(BatchRoute::Music) => {
-                let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-                let secs = parsed["music_length_ms"]
-                    .as_f64()
-                    .map(|ms| ms / 1000.0)
-                    .unwrap_or(600.0)
-                    .clamp(3.0, 600.0);
-                Ok(secs / 60.0 * MUSIC_USD_PER_MINUTE)
-            }
-            Some(BatchRoute::Sts) => Ok(input_minutes(body) * VOICE_CHANGER_USD_PER_MINUTE),
-            Some(BatchRoute::Isolation) => Ok(input_minutes(body) * ISOLATOR_USD_PER_MINUTE),
-            Some(BatchRoute::Dub) => Ok(input_minutes(body) * DUBBING_USD_PER_MINUTE),
-            Some(BatchRoute::Align) => Ok(input_minutes(body) / 60.0 * ALIGN_USD_PER_HOUR),
-            Some(BatchRoute::Stt) => Ok(input_minutes(body) / 60.0 * STT_USD_PER_HOUR),
-            _ => anyhow::bail!("'{path}' has no pre-call price on this meter"),
-        }
-    }
-
     fn observe(&self, path: &str, query: &str, request_body: &[u8]) -> Box<dyn CallObservation> {
         let pricing = match batch_route("POST", path) {
             // The whole cost is a function of the request: settled the
@@ -500,7 +458,8 @@ impl ProviderMeter for ElevenLabsMeter {
             },
             _ => unreachable!("observe is only minted for Billable routes"),
         };
-        Box::new(BatchObservation { pricing, status: 0, body: Vec::new(), body_bytes: 0 })
+        let model = serde_json::from_slice::<Value>(request_body).ok().and_then(|request| request["model_id"].as_str().map(str::to_string));
+        Box::new(BatchObservation { pricing, model, status: 0, body: Vec::new(), body_bytes: 0 })
     }
 
     fn observe_session(
@@ -529,33 +488,6 @@ impl ProviderMeter for ElevenLabsMeter {
         }))
     }
 
-    fn session_slice_usd(&self, path: &str) -> anyhow::Result<f64> {
-        if streaming_tts_voice(path).is_some() {
-            return Ok(STREAMING_TTS_SLICE_USD);
-        }
-        anyhow::ensure!(path == REALTIME_STT, "'{path}' is not a session route");
-        // One minute of audio worth, at the dearest rate the session could
-        // negotiate (both add-ons on): a slice must never under-carve.
-        let dearest =
-            REALTIME_STT_USD_PER_HOUR + ENTITY_DETECTION_USD_PER_HOUR + KEYTERMS_USD_PER_HOUR;
-        Ok(SECONDS_OF_AUDIO_PER_SLICE / 3600.0 * dearest)
-    }
-
-    fn session_max_frame_bytes(&self, path: &str) -> anyhow::Result<usize> {
-        if streaming_tts_voice(path).is_some() {
-            // A text frame's characters are at most its bytes, so this
-            // bound keeps one frame's accrual under the slice at the
-            // dearest per-character rate.
-            return Ok(STREAMING_TTS_MAX_FRAME_BYTES);
-        }
-        anyhow::ensure!(path == REALTIME_STT, "'{path}' is not a session route");
-        // One slice of audio at the dearest format's byte rate, expanded
-        // to its base64 wire form, plus a small JSON envelope allowance:
-        // a single admitted frame can never accrue more than one slice.
-        let raw = SECONDS_OF_AUDIO_PER_SLICE * DEAREST_BYTES_PER_SECOND;
-        Ok((raw * 4.0 / 3.0).ceil() as usize + 1024)
-    }
-
     async fn resolve(
         &self,
         _path: &str,
@@ -569,7 +501,8 @@ impl ProviderMeter for ElevenLabsMeter {
         MeasuredCost {
             amount_usd: amount,
             model: observed.data["model"].as_str().map(str::to_string),
-            metadata: observed.data.clone(),
+            // The amount and the model are the cost's own fields.
+            metadata: json!({ "outputBytes": observed.data["outputBytes"], "interrupted": observed.data["interrupted"] }),
         }
     }
 }
@@ -596,11 +529,9 @@ mod tests {
             .unwrap();
         obs.on_frame_to_provider(&chunk(32_000 * 60));
         let expected = 60.0 / 3600.0 * 0.39;
-        assert!((obs.accrued_usd() - expected).abs() < 1e-9, "{}", obs.accrued_usd());
         // Transcripts back cost nothing; junk frames cost nothing.
         obs.on_frame_to_caller(br#"{"message_type":"partial_transcript","text":"hi"}"#);
         obs.on_frame_to_provider(b"not json");
-        assert!((obs.accrued_usd() - expected).abs() < 1e-9);
         let cost = obs.end(false);
         assert_eq!(cost.amount_usd, Some(expected));
         assert_eq!(cost.model.as_deref(), Some("scribe_v2_realtime"));
@@ -635,33 +566,21 @@ mod tests {
     }
 
     #[test]
-    fn the_max_frame_bound_covers_one_slice_of_the_dearest_format() {
-        // 60s * 96000 B/s, base64-expanded, plus the envelope allowance:
-        // just under 8 MB. Pin the order of magnitude, not the digits.
-        let bound = ELEVENLABS.session_max_frame_bytes(REALTIME_STT).unwrap();
-        assert!((7_000_000..9_000_000).contains(&bound), "{bound}");
-        assert!(ELEVENLABS.session_max_frame_bytes("user").is_err());
-    }
-
-    #[test]
-    fn addons_raise_the_rate_and_the_slice_covers_the_dearest() {
+    fn addons_raise_the_rate() {
         let obs = |q: &str| ELEVENLABS.observe_session(REALTIME_STT, q).unwrap();
         let base = {
             let mut o = obs("");
             o.on_frame_to_provider(&chunk(32_000 * 60));
-            o.accrued_usd()
+            o.end(false).amount_usd.unwrap()
         };
         // One minute of audio, at the hourly rates.
         assert!((base - 0.39 / 60.0).abs() < 1e-9);
         let with_addons = {
             let mut o = obs("entity_detection=true&keyterms=alpha");
             o.on_frame_to_provider(&chunk(32_000 * 60));
-            o.accrued_usd()
+            o.end(false).amount_usd.unwrap()
         };
         assert!((with_addons - 0.51 / 60.0).abs() < 1e-9);
-        // The slice pre-carves one minute at the dearest possible rate.
-        let slice = ELEVENLABS.session_slice_usd(REALTIME_STT).unwrap();
-        assert!((slice - 0.51 / 60.0).abs() < 1e-9);
     }
 
     #[test]
@@ -779,17 +698,9 @@ mod tests {
         // Audio back costs nothing; junk frames cost nothing.
         obs.on_frame_to_caller(br#"{"audio":"aGk=","isFinal":false}"#);
         obs.on_frame_to_provider(b"not json");
-        assert!((obs.accrued_usd() - 0.05).abs() < 1e-9, "{}", obs.accrued_usd());
         let cost = obs.end(false);
+        assert!((cost.amount_usd.unwrap() - 0.05).abs() < 1e-9, "{cost:?}");
         assert_eq!(cost.model.as_deref(), Some("eleven_flash_v2_5"));
-        // The slice covers the biggest admissible frame at the
-        // dearest rate: max_frame_bytes chars at $0.10/1k.
-        let slice =
-            ELEVENLABS.session_slice_usd("text-to-speech/v1/stream-input").unwrap();
-        let max = ELEVENLABS
-            .session_max_frame_bytes("text-to-speech/v1/stream-input")
-            .unwrap();
-        assert!(max as f64 / 1000.0 * 0.10 <= slice, "one frame never outruns a slice");
     }
 
     #[test]
@@ -807,7 +718,7 @@ mod tests {
             .observe_session(REALTIME_STT, "audio_format=ulaw_8000")
             .unwrap();
         o.on_frame_to_provider(&chunk(8_000 * 60));
-        assert!((o.accrued_usd() - 0.39 / 60.0).abs() < 1e-9);
+        assert!((o.end(false).amount_usd.unwrap() - 0.39 / 60.0).abs() < 1e-9);
         assert!(ELEVENLABS.observe_session(REALTIME_STT, "audio_format=opus").is_err());
     }
 }

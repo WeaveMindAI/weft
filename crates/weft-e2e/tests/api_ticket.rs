@@ -2,13 +2,13 @@
 //! how long.
 //!
 //! A browser cannot put a credential on a WebSocket's opening request, so
-//! it asks with a plain request first. That checks the caller, gives birth
-//! to their run and hands back a URL on the live door carrying a signed
-//! ticket: which run, which program to reach and until when. The run waits
-//! for the caller that long; one whose caller never came is erased once the
-//! ticket expires. When the caller does come, the door starts a worker of
-//! that program if none is running and passes the socket to it, and that
-//! worker claims the run.
+//! it asks with a plain request first. That request is checked at a
+//! worker's door and answered with the route's URL carrying a signed
+//! ticket: which project, route and program, and until when. Nothing is
+//! born yet. When the socket opens at that URL, the install starts a
+//! worker of that program if none is running and passes the socket to it,
+//! and whichever copy it reaches checks the ticket and bears the run
+//! there.
 //!
 //! Elapsed time against a live install is the thing under test, so it runs
 //! in a cell whose clock runs four times faster: the ticket's life and the
@@ -31,8 +31,8 @@ use weft_e2e::{live, project::Project, Cell};
 ///     that say to ask again.
 ///
 /// The minutes below are the cell's: three of them pass in 45 real
-/// seconds. The rule it rests on is pinned fast in the dispatcher's
-/// database tests; this proves the whole path.
+/// seconds. The rule it rests on is pinned fast in `weft_core::caller_token`'s
+/// unit tests; this proves the whole path.
 #[tokio::test]
 async fn a_late_caller_is_served_and_a_much_later_one_is_told_to_ask_again() -> anyhow::Result<()> {
     let cell = Cell::start(0.25).await?;

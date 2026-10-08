@@ -9,6 +9,10 @@
 //! its root; the install's own domains and any other name reach the
 //! public API itself.
 //!
+//! A project's API answers one path of the install's besides its routes:
+//! the file links its callers are handed (`/public/files/{token}`), which
+//! are built on the address the caller used (`crate::storage::LinkBase`).
+//!
 //! The domains are held in memory and read again when one comes or goes
 //! (`crate::held`), so routing a request costs no trip to the database.
 
@@ -88,14 +92,14 @@ fn without_port(host: &str) -> &str {
     }
 }
 
-/// Where the path of an API domain's request goes on the install: the
-/// live door stays as it is (the handshake sent the caller there), and
-/// everything else is one of the project's routes, reached through the
-/// handshake under its tenant.
+/// The install's file links (`/public/files/{token}`), which a project's
+/// API answers too: they are built on the address a caller used, a
+/// project's own among them.
+const FILE_LINKS: &str = "/public/files/";
+
+/// Where the path of an API domain's request goes on the install: one of
+/// the project's routes, passed on through the relay under its tenant.
 pub fn api_path(tenant: &str, path_and_query: &str) -> String {
-    if path_and_query == crate::live_relay::LIVE_PREFIX || path_and_query.starts_with(&format!("{}/", crate::live_relay::LIVE_PREFIX)) {
-        return path_and_query.to_string();
-    }
     format!("/connect/{tenant}/{}", path_and_query.trim_start_matches('/'))
 }
 
@@ -153,7 +157,10 @@ async fn route(State(door): State<Door>, mut request: Request) -> Response {
             }
             let path_and_query = request.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
             let upstream = crate::proxy::Upstream { what: "the frontend", base_url: upstream, auth: None, hold: None };
-            crate::proxy::forward(&door.state.http, upstream, path_and_query, request).await
+            crate::proxy::forward(&door.state.http, upstream, path_and_query, request, crate::proxy::Forwarding::Proxied).await
+        }
+        Destination::Api { .. } if request.uri().path().starts_with(FILE_LINKS) => {
+            door.inner.oneshot(request).await.unwrap_or_else(|never| match never {})
         }
         Destination::Api { project } => {
             let tenant = match door.state.projects.tenant_for(project).await {
@@ -234,10 +241,9 @@ mod tests {
     }
 
     #[test]
-    fn an_api_domain_serves_the_projects_routes_at_its_root_and_the_live_door_as_is() {
+    fn an_api_domain_serves_the_projects_routes_at_its_root() {
         assert_eq!(api_path("local", "/users/42?x=1"), "/connect/local/users/42?x=1");
         assert_eq!(api_path("local", "/"), "/connect/local/");
-        assert_eq!(api_path("local", "/live/p/chat?wct=t"), "/live/p/chat?wct=t");
-        assert_eq!(api_path("local", "/lively"), "/connect/local/lively");
+        assert_eq!(api_path("local", "/chat?a=1&wct=t"), "/connect/local/chat?a=1&wct=t");
     }
 }

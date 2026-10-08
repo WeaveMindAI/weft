@@ -7,19 +7,19 @@
 //!   - `db`: connecting to the database; every pool comes from here.
 //!   - `alarm`: the wakes a local install has set and not yet
 //!     delivered.
-//!   - `tasks`: the `task` table (enqueue, claim, heartbeat,
-//!     complete, fail, sweep), and the trigger that makes an execution's
-//!     owner follow its task's claim.
-//!   - `executor`: `TaskExecutor` and `WorkerTaskKind` traits, the
-//!     dispatcher's picker loop, and the worker's run of one claimed
-//!     task.
+//!   - `tasks`: the `task` table, the dispatcher's work queue
+//!     (enqueue, claim, heartbeat, complete, fail, sweep).
+//!   - `executor`: the `TaskExecutor` trait and the dispatcher's picker
+//!     loop.
+//!   - `runs`: the one rule for a run being worked on, and how a cancel
+//!     reaches the worker driving a run.
 //!   - `drain`: the wake-and-drain loop every role's background work
 //!     runs, on the machine or, scaled to zero, once per tick.
 //!   - `pg_signal`: the process's one Postgres `LISTEN` connection,
 //!     which every wait on a row sleeps on (`terminal` is the task
 //!     waiter built on it).
-//!   - `announce`: how the writes a run makes announce themselves without
-//!     every commit waiting on every other (an outbox, flushed in batches).
+//!   - `announce`: how a write announces itself without every commit
+//!     waiting on every other (an outbox, flushed in batches).
 //!   - `held_copy`: a process's copy of rows read on every request,
 //!     dropped the moment a notification says they changed.
 //!   - `schema_guard`: the schema runner every boot routes its
@@ -33,27 +33,24 @@ pub mod db;
 pub mod drain;
 pub mod executor;
 pub mod held_copy;
-pub mod journal_rows;
+pub mod infra_copies;
 pub mod kinds;
 pub mod locks;
+pub mod parked_fires;
 pub mod pg_signal;
+pub mod runs;
 pub mod schema_guard;
 pub mod tasks;
 pub mod terminal;
 pub mod traits;
+pub mod worker_door;
 
 pub use schema_guard::{apply_groups, Migration, SchemaGroup};
 
-pub use executor::{
-    dispatcher_picker_loop, run_claimed_worker_task, TaskEnd, TaskExecutor, TaskRegistry, TaskRegistryBuilder,
-};
-pub use kinds::{
-    CancelExecutionPayload, ExecutionPayload, FireSignalPayload, RecordCostPayload,
-    RecordLogPayload, StopTaggedPayload, TaskKind,
-};
+pub use executor::{dispatcher_picker_loop, TaskExecutor, TaskRegistry, TaskRegistryBuilder};
+pub use kinds::{FireSignalPayload, StopTaggedPayload, TaskKind, WithdrawSignalPayload};
 pub use tasks::{
-    bind_execution_id_owner, claim_one, complete, enqueue, enqueue_dedup, fail, heartbeat, sweep_terminal, take_deliveries,
-    CancelAsked, ClaimedExecution, DedupOutcome, Delivery, NewTask, Task, TaskOutcome, TaskStatus,
-    TaskTarget, claim_duration_secs, claim_heartbeat_interval, TERMINAL_RETENTION_SECS,
+    claim_duration_secs, claim_heartbeat_interval, claim_one, complete, enqueue, enqueue_dedup, fail, heartbeat, sweep_terminal,
+    DedupOutcome, NewTask, Task, TaskOutcome, TaskStatus, TERMINAL_RETENTION_SECS,
 };
 pub use traits::{InfraReader, PostgresInfraReader, PostgresTaskStoreClient, TaskStoreClient};

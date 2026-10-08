@@ -33,7 +33,7 @@ impl FollowTarget<'_> {
 
 pub async fn run(ctx: Ctx, project: String) -> anyhow::Result<()> {
     let client = ctx.client()?;
-    follow_sse(&client, FollowTarget::Project(&project), |event| {
+    follow_sse(&client, ctx.on(), FollowTarget::Project(&project), |event| {
         print_event(&serde_json::to_value(event)?);
         Ok(())
     })
@@ -42,9 +42,15 @@ pub async fn run(ctx: Ctx, project: String) -> anyhow::Result<()> {
 
 /// Follow one run to its end, each event printed the way the program
 /// reads (`one.strip`, `gate`) when the project's definition is at
-/// hand; ids otherwise.
-pub async fn follow_execution_id(client: &crate::client::DispatcherClient, execution_id: &str, definition: Option<&weft_core::ProjectDefinition>) -> anyhow::Result<()> {
-    follow_sse(client, FollowTarget::Execution(execution_id), |event| {
+/// hand; ids otherwise. `on` is the target the command was run `--on`,
+/// which the hints carry.
+pub async fn follow_execution_id(
+    client: &crate::client::DispatcherClient,
+    on: Option<&str>,
+    execution_id: &str,
+    definition: Option<&weft_core::ProjectDefinition>,
+) -> anyhow::Result<()> {
+    follow_sse(client, on, FollowTarget::Execution(execution_id), |event| {
         let row = serde_json::to_value(event)?;
         match definition {
             Some(definition) => if let Some(spelled) = super::executions::spell_node(row, definition) { print_event(&spelled) },
@@ -60,6 +66,7 @@ fn print_event(event: &Value) {
 
 async fn follow_sse(
     client: &crate::client::DispatcherClient,
+    on: Option<&str>,
     target: FollowTarget<'_>,
     mut emit: impl FnMut(&LiveEvent) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
@@ -74,7 +81,14 @@ async fn follow_sse(
     // a seen-event cache for the lifetime of a potentially unbounded run.
     let mut history_ids = HashSet::new();
     while let Some(ev) = stream.next().await {
-        match ev.context("live updates interrupted; the run may still be running. Inspect it with `weft executions` and `weft events <execution_id>`")? {
+        let inspect = || {
+            format!(
+                "the run may still be running. Inspect it with `{}` and `{}`",
+                super::weft_on(on, "executions"),
+                super::weft_on(on, "events <execution_id>")
+            )
+        };
+        match ev.with_context(|| format!("live updates interrupted; {}", inspect()))? {
             eventsource_client::SSE::Event(event) => {
                 let event: LiveEvent = serde_json::from_str(&event.data).context("decode execution event")?;
                 if history_ids.contains(event_identity(&event)?) { continue; }
@@ -100,7 +114,11 @@ async fn follow_sse(
             }
         }
     }
-    anyhow::bail!("live updates ended before following was finished; inspect the run with `weft executions` and `weft events <execution_id>`")
+    anyhow::bail!(
+        "live updates ended before following was finished; inspect the run with `{}` and `{}`",
+        super::weft_on(on, "executions"),
+        super::weft_on(on, "events <execution_id>")
+    )
 }
 
 fn event_identity(event: &LiveEvent) -> anyhow::Result<&str> {
@@ -235,7 +253,7 @@ mod tests {
             let server = server(vec![terminal], vec![], true).await;
             let mut seen = Vec::new();
             tokio::time::timeout(Duration::from_secs(5), follow_sse(
-                &server.client, FollowTarget::Execution("a"), |raw| { seen.push(raw.clone()); Ok(()) },
+                &server.client, None, FollowTarget::Execution("a"), |raw| { seen.push(raw.clone()); Ok(()) },
             )).await.expect("completed history must finish follow").unwrap();
             assert_eq!(ids(&seen), vec!["done"]);
             assert_eq!(*server.requests.lock().unwrap(), vec!["subscribe", "history"]);
@@ -252,7 +270,7 @@ mod tests {
             let server = server(vec![started], vec![terminal], true).await;
             let mut seen = Vec::new();
             tokio::time::timeout(Duration::from_secs(5), follow_sse(
-                &server.client, FollowTarget::Execution("a"), |raw| { seen.push(raw.clone()); Ok(()) },
+                &server.client, None, FollowTarget::Execution("a"), |raw| { seen.push(raw.clone()); Ok(()) },
             )).await.expect("live completion must finish follow").unwrap();
             assert_eq!(ids(&seen), vec!["start", "done"]);
         }
@@ -267,7 +285,7 @@ mod tests {
             let server = server(vec![], events, false).await;
             let mut seen = Vec::new();
             let err = tokio::time::timeout(Duration::from_secs(5), follow_sse(
-                &server.client, FollowTarget::Project("p"), |raw| { seen.push(raw.clone()); Ok(()) },
+                &server.client, None, FollowTarget::Project("p"), |raw| { seen.push(raw.clone()); Ok(()) },
             )).await.expect("a closed stream must stop following").unwrap_err();
             assert!(err.to_string().contains("live updates"), "{err}");
             assert_eq!(ids(&seen), vec!["done:a", "done:b"]);
@@ -286,7 +304,7 @@ mod tests {
             let server = server(vec![first.clone()], vec![first, second, terminal], true).await;
             let mut seen = Vec::new();
             tokio::time::timeout(Duration::from_secs(5), follow_sse(
-                &server.client, FollowTarget::Execution("a"), |event| { seen.push(event.clone()); Ok(()) },
+                &server.client, None, FollowTarget::Execution("a"), |event| { seen.push(event.clone()); Ok(()) },
             )).await.expect("completed follow must return").unwrap();
             assert_eq!(ids(&seen), vec!["row:1", "row:2", "row:3"]);
         }

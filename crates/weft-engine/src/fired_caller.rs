@@ -48,12 +48,6 @@ pub struct FiredCaller {
 }
 
 impl FiredCaller {
-    /// The sink the exchange is recorded through, for the run to close
-    /// once it is over.
-    pub fn journal(&self) -> Arc<dyn CallerJournalSink> {
-        self.record.sink()
-    }
-
     /// Build one for a fired run and record that the exchange opened.
     ///
     /// The request is the one the fire payload described. There is no
@@ -228,9 +222,8 @@ mod tests {
             self.0.lock().unwrap().push(format!("{at} disconnected {reason}"));
         }
 
-        fn close(&self) -> futures::future::BoxFuture<'static, ()> {
+        fn close(&self) {
             // Every row above is written as it is handed over.
-            Box::pin(std::future::ready(()))
         }
     }
 

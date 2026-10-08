@@ -185,8 +185,8 @@ async fn run(catalog: &'static dyn NodeCatalog, args: Args) -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            let door = match crate::worker::WorkerDoor::from_env() {
-                Ok(d) => d,
+            let door = match weft_core::caller_token::ProjectSecret::from_env() {
+                Ok(secret) => crate::worker::WeftCredential::of(&secret),
                 Err(e) => {
                     eprintln!("{e:#}");
                     return ExitCode::from(2);
@@ -313,11 +313,11 @@ pub struct TestRequest {
 pub struct LiveRequest {
     /// The connection (grant) id resolving the test's declared service.
     pub connection: String,
-    /// The execution the run's cost attributes to, registered by
-    /// the install with `replica` as its driver.
+    /// The run the test is: this process bears it, and its cost
+    /// attributes to it.
     pub execution_id: uuid::Uuid,
-    /// The replica id this run names itself with on the broker: the
-    /// driver the install appointed for `execution_id`.
+    /// The replica id this process names itself with on the broker: the
+    /// run's driver.
     pub replica: String,
     /// `WEFT_NODE_TEST_*` values the test reads (`LiveRig::fixture`).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -359,14 +359,23 @@ async fn run_one(catalog: &'static dyn NodeCatalog, request: TestRequest, live_e
             let env = live_env.ok_or_else(|| "a live test runs only in the install's test server".to_string())?;
             let service = declared.service.expect("NodeTest::live always carries its service");
             let token = weft_broker_client::TokenSource::worker(env.identity.clone(), live.replica.clone());
-            let runner = LiveTestRunner::new(
-                crate::EngineClients::from_broker(&weft_broker_client::BrokerLink::new(env.broker_url.clone(), token)),
+            let clients = crate::EngineClients::from_broker(
+                &env.broker_url,
+                token,
+                env.project_id,
+                crate::ProcessSettings::from_env().map_err(|e| format!("{e:#}"))?,
+            )
+            .map_err(|e| format!("{e:#}"))?;
+            let runner = LiveTestRunner::start(
+                clients,
                 catalog,
                 live.replica,
                 env.tenant_id.clone(),
                 env.project_id,
-                Some(live.execution_id),
-            );
+                live.execution_id,
+                format!("node-test:{node}::{}", declared.name),
+            )
+            .await?;
             let rig = runner.rig(&live.connection, service, live.fixtures);
             let result = declared.run_live(rig).await;
             // Release leased connections + wait out in-flight cost records
@@ -394,7 +403,7 @@ async fn run_one(catalog: &'static dyn NodeCatalog, request: TestRequest, live_e
 /// `GET /_weft/tests`, until the platform stops the process. A test's
 /// answer is the report as JSON (200), or the reason the request could
 /// not run (422).
-async fn serve(catalog: &'static dyn NodeCatalog, live: LiveEnv, door: crate::worker::WorkerDoor, port: u16) -> anyhow::Result<()> {
+async fn serve(catalog: &'static dyn NodeCatalog, live: LiveEnv, door: crate::worker::WeftCredential, port: u16) -> anyhow::Result<()> {
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::IntoResponse;
@@ -402,7 +411,7 @@ async fn serve(catalog: &'static dyn NodeCatalog, live: LiveEnv, door: crate::wo
     struct Served {
         catalog: &'static dyn NodeCatalog,
         live: std::sync::Arc<LiveEnv>,
-        door: crate::worker::WorkerDoor,
+        door: crate::worker::WeftCredential,
     }
     async fn test(State(s): State<Served>, headers: HeaderMap, axum::Json(req): axum::Json<TestRequest>) -> axum::response::Response {
         if !s.door.admits_headers(&headers) {

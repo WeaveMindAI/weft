@@ -1,7 +1,7 @@
 {
   "type": "Wait",
   "label": "Wait",
-  "description": "Pause this branch for a number of seconds, counted from when the node starts waiting; the run parks on a timer at no cost. `value` passes through unchanged. To wait for a date, use WaitUntil.",
+  "description": "Pause this branch for a number of seconds, counted from when the node starts waiting; the run parks on a timer at no cost (a run that cannot pause, such as a route still answering its caller, holds its worker instead, up to its trigger's `holdSecs`). `value` passes through unchanged. To wait for a date, use WaitUntil.",
   "tags": [
     "wait",
     "delay",

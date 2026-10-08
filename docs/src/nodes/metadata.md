@@ -58,6 +58,7 @@ Three keys are required: `type`, `label` and `description`.
 | `name` | String | **required** | The port name |
 | `type` | type string | **required** | What it emits |
 | `description` | String | none | A sentence next to the port |
+| `baked` | Boolean | `false` | On an infrastructure node: the value is worked out when the node's infra is applied, and saved, so a run that reads nothing else from the node uses the saved value instead of running the node. For how, go and read [baking](infrastructure.md#outputs-saved-with-the-infrastructure-baking) |
 
 An output has no `required`. A firing that emits nothing on a port closes it,
 which is what downstream reads.
@@ -66,11 +67,12 @@ which is what downstream reads.
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `isTrigger` | Boolean | `false` | This node starts executions from outside instead of running inside one. Weft gives it `callsPerMinute` and `callsAtOnce`, and unless it is a `liveConnection` trigger a `longRuns` input, so do not declare those |
-| `liveConnection` | `"http"` or `"websocket"` | none | On a trigger whose run answers a caller holding the connection open: `"http"` for a request waiting on its response (a route), `"websocket"` for a socket. It also gets `callsPerMinutePerCaller`, and does not get `longRuns` |
+| `isTrigger` | Boolean | `false` | This node starts executions from outside instead of running inside one. Weft gives it `callsPerMinute`, `callsAtOnce`, `durable`, `recorded` and `keepRunsFor` inputs (and `outlivesCaller` too when it sets `liveConnection`), so do not declare those |
+| `liveConnection` | `"http"` or `"websocket"` | none | On a trigger whose run answers a caller holding the connection open: `"http"` for a request waiting on its response (a route), `"websocket"` for a socket. It also gets `callsPerMinutePerCaller` |
 | `answersCaller` | `"whole"`, `"stream"` or `"end"` | none | This node answers its run's live caller. `"whole"`: the response in one go (a Reply). `"stream"`: the response head, then the body piece by piece (a Stream). `"end"`: the end of the exchange (a Close). Set it on your own node too if it answers through the ctx, so a route's "never answers its caller" warning counts it |
 | `calledFromOutside` | Boolean | `false` | On a trigger somebody outside calls whose call ends there (a form somebody submits). It also gets `callsPerMinutePerCaller`. A `liveConnection` trigger is called from outside already, so it never sets this; a trigger that picks its events up itself (a schedule, a feed, a provider's push) has no caller and does not either |
 | `catchErrors` | Boolean | `false` | Set it when the node reaches outside and a program may want to handle its failures. Weft gives it an `error` output, and when that output is wired the failure's message goes there; unwired, the failure stops the run. The node needs no error handling of its own. Declaring its own `error` output is refused when the node loads. For the details, go and read [letting the program handle a failure](values-and-emission.md#letting-the-program-handle-a-failure) |
+| `pure` | Boolean | `false` | Set it when the node's body does nothing outside its run that weft does not put on record first: no network, no connection, no `ctx.run`, no `ctx.await_signal`, no tag, no storage beyond the run's own files. It may answer its caller (a durable run's answer leaves only once its record is written), read stored files, store files for this run alone, hand its caller links to them, and use a bus to another node of the run. A durable run then starts its step without waiting for the database, and may run it again after a crash (for when, go and read [surviving a restart](durable-execution.md#when-the-worker-dies-mid-step)). A pure node that reaches outside through the ctx anyway fails at that call, naming this flag; weft cannot see a body that opens a socket or a file on its own, so if you mark one of those pure, a durable run may do what it does twice after a crash. `Text`, `JsonObject`, `Switch`, `Route` and `Reply` are pure; `HttpRequest` and `PostgresExecuteQuery` are not, because each one reaches outside the run on its own |
 | `oneOfRequired` | List[List[String]] | `[]` | Each inner list is a group where at least one port must arrive, or the node skips |
 | `canAddInputPorts` | Boolean | `false` | Source may declare extra inputs on it |
 | `canAddOutputPorts` | Boolean | `false` | Source may declare extra outputs |

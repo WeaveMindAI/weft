@@ -241,10 +241,7 @@ impl Ctx {
     /// named one, so the command a person copies acts where they were
     /// looking.
     pub fn weft(&self, verb: &str) -> String {
-        match &self.on {
-            Some(on) => format!("weft {verb} --on {on}"),
-            None => format!("weft {verb}"),
-        }
+        weft_on(self.on.as_deref(), verb)
     }
 
     /// The address and operator key a request from this command carries
@@ -550,6 +547,16 @@ pub fn utc_time(unix_secs: u64) -> String {
     match i64::try_from(unix_secs).ok().and_then(|s| chrono::DateTime::<chrono::Utc>::from_timestamp(s, 0)) {
         Some(t) => t.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
         None => unix_secs.to_string(),
+    }
+}
+
+/// A `weft` command as a hint names it: `weft <verb>`, carrying the `--on
+/// <target>` the running command was given, so the hint acts on the same
+/// install (`Ctx::weft` for a caller holding the context).
+pub fn weft_on(on: Option<&str>, verb: &str) -> String {
+    match on {
+        Some(on) => format!("weft {verb} --on {on}"),
+        None => format!("weft {verb}"),
     }
 }
 

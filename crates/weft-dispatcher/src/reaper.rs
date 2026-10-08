@@ -21,26 +21,13 @@ use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn};
 
 use crate::state::DispatcherState;
 
-/// The channel a signal row notifies on when a fire is parked on it,
-/// with its project id as the payload, from the
-/// `signal_parked_fire_notify_on_grow` trigger in `journal::postgres::GROUP`.
-pub const PARKED_FIRE_CHANNEL: &str = "weft_parked_fire";
-
-/// The channel a queued terminate sweep notifies on, with its execution as
-/// the payload, from the `storage_sweep_notify_on_insert` trigger in
-/// `storage::GROUP`.
+/// The channel a queued terminate sweep announces on (no payload: the
+/// reaper reads the whole queue), from the `storage_sweep_notify_on_insert`
+/// trigger in `storage::GROUP`.
 pub const STORAGE_SWEEP_CHANNEL: &str = "weft_storage_sweep";
 
-/// The longest the parked-fire sweep sleeps between looks, whatever the
-/// queues say: it also releases the drain claims a dead copy left, which
-/// nothing announces. 30 seconds in real time, at this install's pace
-/// (`weft_core::time_scale`).
-fn parked_fire_longest_sleep() -> Duration {
-    weft_core::time_scale::scaled(Duration::from_secs(30))
-}
-
 const NOTHING: &[WakeOn] = &[];
-pub(crate) static ON_PARKED_FIRE: &[WakeOn] = &[WakeOn::any(PARKED_FIRE_CHANNEL)];
+pub(crate) static ON_PARKED_FIRE: &[WakeOn] = &[WakeOn::any(weft_task_store::parked_fires::PARKED_FIRE_CHANNEL)];
 pub(crate) static ON_STORAGE_SWEEP: &[WakeOn] = &[WakeOn::any(STORAGE_SWEEP_CHANNEL)];
 /// A trigger's activation changing status, whether it takes work, or until
 /// when: a hibernation starting has a grace window to end.
@@ -55,25 +42,19 @@ fn woken_reaper_safety() -> Duration {
     weft_core::time_scale::scaled(Duration::from_secs(60))
 }
 
-/// Whether anything in the install is in motion: a claim held, work
-/// waiting for a worker (a cancel waiting for the worker driving its run
-/// is not: that drive's own claim counts), an activation or a build under way, a slot at an
-/// entry for a run that has not started yet, a lifecycle command not
-/// finished. While nothing is, no lease can lapse and no driver can die
-/// mid-way, so the loops that watch for that have nothing to watch.
-///
-/// Only a not-yet-started run's slot needs a timed cleanup (it stops
-/// counting once its `unborn_until` passes). A started run's slot is
-/// released when the run ends (`journal_bridge`), so a run waiting days on
-/// a person does not keep the install awake.
+/// Whether anything in the install is in motion: a task of the
+/// dispatcher's claimed, a run queued for a worker or being driven by one,
+/// an activation or a build under way, a lifecycle command not finished.
+/// While nothing is, no lease can lapse and no driver can die mid-way, so
+/// the loops that watch for that have nothing to watch. A run parked on a
+/// person keeps nothing here, so it does not keep the install awake.
 pub async fn in_motion(pool: &sqlx::PgPool) -> anyhow::Result<bool> {
     Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM task WHERE status = 'claimed' \
-                                OR (status = 'pending' AND target = 'worker' AND kind <> 'cancel_execution')) \
+        "SELECT EXISTS (SELECT 1 FROM task WHERE status = 'claimed') \
+             OR EXISTS (SELECT 1 FROM run WHERE state = 'running') \
+             OR EXISTS (SELECT 1 FROM run WHERE state = 'queued') \
              OR EXISTS (SELECT 1 FROM trigger_activation WHERE status IN ('activating', 'deactivating')) \
              OR EXISTS (SELECT 1 FROM project WHERE transition <> 'none') \
-             OR EXISTS (SELECT 1 FROM entry_slot s \
-                        WHERE NOT EXISTS (SELECT 1 FROM execution ec WHERE ec.execution_id = s.execution_id)) \
              OR EXISTS (SELECT 1 FROM infra_lifecycle_command WHERE completed_at_unix IS NULL)",
     )
     .fetch_one(pool)
@@ -99,20 +80,12 @@ pub fn while_in_motion(state: &DispatcherState, inner: DrainLoop) -> DrainLoop {
 
 /// Every reaper, as the loops the dispatcher runs.
 pub fn drain_loops(state: &DispatcherState) -> Vec<DrainLoop> {
-    vec![
+    let mut loops = vec![
         // Silence detectors: nothing announces a lease that lapsed.
         timed(state, Duration::from_secs(30), "removed_projects", |s| async move { sweep_removed_projects(&s).await }),
         timed(state, Duration::from_secs(3600), "tasks", sweep_tasks),
         while_in_motion(state, timed(state, Duration::from_secs(30), "stuck_transitions", sweep_stuck_transitions)),
         timed(state, Duration::from_secs(3600), "retired_rows", sweep_retired_rows),
-        while_in_motion(state, timed(state, Duration::from_secs(30), "orphaned_live_executions", sweep_orphaned_live_executions)),
-        timed(state, Duration::from_secs(60), "stale_cancels", |s| async move {
-            let dropped = weft_task_store::tasks::drop_stale_cancels(&s.pg_pool).await?;
-            if dropped > 0 {
-                tracing::info!(target: "weft_dispatcher::reaper", dropped, "dropped cancels whose execution nothing drives any more");
-            }
-            Ok(())
-        }),
         timed(state, Duration::from_secs(300), "ghost_infra_leases", |s| async move {
             crate::infra_owner::release_ghost_leases(&s.pg_pool).await
         }),
@@ -121,22 +94,23 @@ pub fn drain_loops(state: &DispatcherState) -> Vec<DrainLoop> {
         while_in_motion(
             state,
             timed(state, Duration::from_secs(60), "entry_rate", |s| async move {
-                crate::entry_limits::sweep(&s.pg_pool, crate::lease::now_unix()).await
+                let now = crate::lease::now_unix();
+                crate::entry_limits::sweep(&s.pg_pool, now).await?;
+                crate::worker_door::sweep(&s.pg_pool, now).await
             }),
         ),
-        // Re-parked fires (a route that failed) retry with a backoff stamp
-        // on the element; this is what drives the retry once the stamp is
-        // due. A newly parked fire wakes it at once; otherwise it sleeps
-        // until the earliest head is due.
-        woken(state, ON_PARKED_FIRE, "parked_fires", |s| async move {
-            crate::api::project::drain_due_parked_fires(&s).await?;
-            let now = crate::lease::now_unix();
-            Ok(match crate::api::project::next_parked_fire_due(&s.pg_pool).await? {
-                // Nothing parked: the next park wakes it.
-                None => DrainStep::Done,
-                Some(due) => DrainStep::RetryIn(parked_fire_sleep(now, due)),
-            })
-        }),
+        // A run whose worker went away: nothing announces a lease that
+        // lapsed.
+        while_in_motion(
+            state,
+            timed(state, Duration::from_secs(15), "lost_runs", |s| async move {
+                crate::worker_door::sweep_lost_runs(&s, crate::lease::now_unix()).await
+            }),
+        ),
+        // Queued events whose trigger takes them (a hand-over that failed
+        // retries after its backoff stamp): a newly parked event wakes it
+        // at once; otherwise it sleeps until the earliest head is due.
+        woken(state, ON_PARKED_FIRE, "parked_fires", |s| async move { crate::parked_drain::drain_due(&s).await }),
         // Storage plane: the durable terminate sweep (un-kept exec files of
         // a terminated execution). The queue deletes an execution's row only after
         // the broker confirms the sweep; a transient broker failure leaves
@@ -149,7 +123,14 @@ pub fn drain_loops(state: &DispatcherState) -> Vec<DrainLoop> {
         // An infra copy running again: the triggers its stop took down
         // with it come back.
         woken(state, ON_INFRA_STATUS, "infra_returns", crate::api::infra::bring_back_triggers_whose_infra_returned),
-    ]
+    ];
+    // A machine's fronts are its own containers: one that went down is put
+    // back, on a free port when another program took its own (and the
+    // project's address follows). A cloud's front is the platform's to keep.
+    if state.project_ports.is_some() {
+        loops.push(timed(state, Duration::from_secs(30), "fronts", |s| async move { crate::front::serve_all(&s, crate::front::Say::Changes).await }));
+    }
+    loops
 }
 
 /// End every hibernation whose grace window has passed: the listener lets
@@ -186,6 +167,8 @@ async fn end_hibernations(state: DispatcherState) -> anyhow::Result<DrainStep> {
                 %project_id, triggers = ended,
                 "a hibernation's grace window ended: its triggers stopped listening and take no more work"
             );
+            // Nothing of the project may take work any more: its front goes.
+            crate::front::let_go_if_idle(&state, project_id).await?;
         }
     }
     if kept_any {
@@ -241,14 +224,6 @@ where
                 .unwrap_or(DrainStep::RetryIn(weft_task_store::drain::LOCK_HELD_RETRY)))
         }
     })
-}
-
-/// How long the parked-fire sweep sleeps while a fire is parked: until
-/// the earliest queued head is due, at least a second (a head due now that
-/// did not drain was re-stamped, or is claimed by a live drain) and at most
-/// [`parked_fire_longest_sleep`].
-fn parked_fire_sleep(now_unix: i64, next_due_unix: i64) -> Duration {
-    Duration::from_secs((next_due_unix - now_unix).max(1) as u64).min(parked_fire_longest_sleep())
 }
 
 /// Drop what a removed project left behind that no surviving run needs.
@@ -318,8 +293,8 @@ async fn sweep_retired_rows(state: DispatcherState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Clear what removed projects left behind: the work queued for their
-/// workers, and the signals the listener still holds for them (a
+/// Clear what removed projects left behind: the dispatcher's work queued
+/// for them, and the signals the listener still holds for them (a
 /// registration no project can fire or take down). None of it can do
 /// anything once the project row is gone. `weft rm` runs this as soon as
 /// the row is gone; the loop catches work queued in the moment of the
@@ -345,12 +320,12 @@ pub(crate) async fn sweep_removed_projects(state: &DispatcherState) -> anyhow::R
     Ok(())
 }
 
-/// Delete the pending worker tasks of projects that no longer exist;
-/// returns how many.
+/// Delete the pending tasks of projects that no longer exist; returns how
+/// many.
 pub async fn drop_work_of_removed_projects(pool: &sqlx::PgPool) -> anyhow::Result<u64> {
     Ok(sqlx::query(
         "DELETE FROM task t \
-         WHERE t.status = 'pending' AND t.target = 'worker' AND t.project_id IS NOT NULL \
+         WHERE t.status = 'pending' AND t.project_id IS NOT NULL \
            AND NOT EXISTS (SELECT 1 FROM project p WHERE p.id = t.project_id)",
     )
     .execute(pool)
@@ -359,14 +334,18 @@ pub async fn drop_work_of_removed_projects(pool: &sqlx::PgPool) -> anyhow::Resul
 }
 
 /// Run one sweep while holding the reaper's install-wide lock, or skip
-/// it (`None`) while a sibling replica holds it.
+/// it (`None`) while a sibling replica holds it. The lock is held on the
+/// lock pool: every sweep starts at once when the process boots, and with
+/// the locks on the work pool, more sweeps than it has connections each
+/// held one and waited for another, until every request of the process
+/// timed out.
 async fn sweep_alone<T, F, Fut>(state: &DispatcherState, name: &str, sweep: F) -> anyhow::Result<Option<T>>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<T>>,
 {
     crate::lease::with_advisory_lock(
-        &state.pg_pool,
+        &state.lock_pool,
         crate::lease::advisory_key(crate::lease::REAPER_DOMAIN, name),
         sweep,
     )
@@ -387,11 +366,6 @@ where
 ///   - stuck `building` / `cancelling_build` -> clear the marker; the
 ///     build died with its dispatcher (or keeps running harmlessly to
 ///     a content-addressed tag); the next verb rebuilds or cache-hits.
-///   - `deactivating` -> re-drive the drain-watcher CAS: a
-///     deactivation whose terminal events were missed (dispatcher
-///     restart between the last execution finishing and the CAS)
-///     lands at Inactive here. No heartbeat needed: the check itself
-///     is idempotent and cheap.
 async fn sweep_stuck_transitions(state: DispatcherState) -> anyhow::Result<()> {
     let stale_before = crate::lease::now_unix() - crate::transition::heartbeat_stale_secs();
     for stuck in state.projects.list_stuck_transitions(stale_before).await? {
@@ -436,142 +410,6 @@ async fn sweep_stuck_transitions(state: DispatcherState) -> anyhow::Result<()> {
         }
         crate::transition::publish_transition_changed(&state, stuck.project_id).await;
     }
-    // Deactivating landings. Two steps, both idempotent, both the
-    // SAME building blocks every other drain path uses:
-    //   1. If the user's drain cap expired ("wait at most N, then
-    //      proceed"), cancel what the activation still waits on via the
-    //      ONE cancel helper (`cancel_running_for`).
-    //   2. Re-drive the ONE landing CAS (`try_finish_drain`); it flips
-    //      Deactivating -> Inactive iff nothing it waits on runs. This
-    //      also covers deactivations whose terminal events were missed
-    //      across a restart.
-    let now = crate::lease::now_unix();
-    for (project_id, key) in state.activations.list_deactivating().await? {
-        let deadline = state
-            .activations
-            .list(project_id)
-            .await?
-            .into_iter()
-            .find(|a| a.key == key)
-            .and_then(|a| a.lifecycle.drain_deadline_unix);
-        if deadline.is_some_and(|deadline| now >= deadline) {
-            tracing::warn!(
-                target: "weft_dispatcher::reaper",
-                %project_id,
-                trigger = %key,
-                "deactivation drain cap expired; cancelling remaining executions"
-            );
-            if let Err((code, msg)) = crate::api::project::cancel_running_for(
-                &state,
-                project_id,
-                std::slice::from_ref(&key),
-                weft_core::exec::CancelCause::User,
-            )
-            .await
-            {
-                tracing::warn!(
-                    target: "weft_dispatcher::reaper",
-                    %project_id,
-                    code = %code,
-                    error = %msg,
-                    "drain-cap cancel failed; retrying next sweep"
-                );
-                continue;
-            }
-        }
-        crate::journal_bridge::try_finish_drain(&state, project_id, &key, None).await?;
-    }
-    Ok(())
-}
-
-/// Live runs that will never be driven. One whose caller never came
-/// (`tasks::callers_never_arrived`) is erased whole. One whose worker went
-/// away (`tasks::orphaned_live_executions`) had its caller on THAT worker's
-/// connection, so it cannot resume anywhere else, and its execution is
-/// terminally cancelled. The task row is the durable retry handle: anything
-/// not fully recovered this tick is re-found next tick.
-async fn sweep_orphaned_live_executions(state: DispatcherState) -> anyhow::Result<()> {
-    // A run born at a handshake whose caller never reached a worker: no
-    // one saw it run and no one ever will, so it goes entirely.
-    let now = crate::lease::now_unix();
-    for gone in weft_task_store::tasks::callers_never_arrived(&state.pg_pool, now).await? {
-        let Ok(execution_id) = gone.execution_id.parse::<weft_core::ExecutionId>() else {
-            tracing::error!(
-                target: "weft_dispatcher::reaper",
-                execution_id = %gone.execution_id, task = %gone.task_id,
-                "a live run whose caller never came has an unparseable execution; leaving its task for inspection"
-            );
-            continue;
-        };
-        match state
-            .journal
-            .erase_unclaimed_live_run(execution_id, weft_task_store::tasks::UnclaimedLiveRun::PastDeadline { now })
-            .await
-        {
-            Ok(true) => tracing::info!(
-                target: "weft_dispatcher::reaper",
-                execution_id = %execution_id,
-                "erased a live run whose caller never reached a worker"
-            ),
-            Ok(false) => {}
-            Err(e) => tracing::warn!(
-                target: "weft_dispatcher::reaper",
-                execution_id = %execution_id, error = %format!("{e:#}"),
-                "could not erase a live run whose caller never came; next tick retries"
-            ),
-        }
-    }
-    let orphans = weft_task_store::tasks::orphaned_live_executions(&state.pg_pool).await?;
-    for orphan in orphans {
-        let Ok(execution_id) = orphan.execution_id.parse::<weft_core::ExecutionId>() else {
-            // Corrupt execution: leave the task as evidence, surface loud.
-            tracing::error!(
-                target: "weft_dispatcher::reaper",
-                execution_id = %orphan.execution_id, task = %orphan.task_id,
-                "orphaned live execution has an unparseable execution; leaving its task for inspection"
-            );
-            continue;
-        };
-        // Record the cancel through THE cancel, THEN delete the task. It
-        // skips the terminal if one already exists for the execution (the
-        // worker wrote its ending, then died before its task flipped),
-        // writes `NodeCancelled` per still-running node, and queues no
-        // task. On failure the task stays, so the next tick retries (the
-        // write is idempotent).
-        if let Err(e) = crate::api::execution::cancel_execution_id(
-            &state,
-            execution_id,
-            &weft_core::exec::CancelCause::Runtime {
-                detail: "the worker running this live execution went away before it completed; the \
-                         caller's connection was on that worker and is gone, so the run cannot resume \
-                         elsewhere"
-                    .into(),
-            },
-        )
-        .await
-        {
-            tracing::warn!(
-                target: "weft_dispatcher::reaper",
-                execution_id = %execution_id, error = %e,
-                "failed to record cancel terminal for orphan; task kept, will retry next tick"
-            );
-            continue;
-        }
-        tracing::warn!(
-            target: "weft_dispatcher::reaper",
-            execution_id = %execution_id,
-            "live execution orphaned by a worker that went away; recorded ExecutionCancelled (caller is gone)"
-        );
-        if let Err(e) = weft_task_store::tasks::delete_task(&state.pg_pool, orphan.task_id).await {
-            // The cancel is durably recorded, so a leftover task only means
-            // a harmless retry next tick (re-record is a no-op).
-            tracing::warn!(
-                target: "weft_dispatcher::reaper",
-                execution_id = %execution_id, error = %e,
-                "failed to delete cancelled orphan task; harmless, next tick retries"
-            );
-        }
-    }
     Ok(())
 }
 
@@ -587,17 +425,4 @@ async fn sweep_tasks(state: DispatcherState) -> anyhow::Result<()> {
         );
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_parked_fire_sweep_sleeps_until_the_next_head_is_due_within_bounds() {
-        assert_eq!(parked_fire_sleep(100, 107), Duration::from_secs(7));
-        assert_eq!(parked_fire_sleep(100, 100), Duration::from_secs(1), "due now: look again shortly");
-        assert_eq!(parked_fire_sleep(100, 50), Duration::from_secs(1));
-        assert_eq!(parked_fire_sleep(100, 10_000), parked_fire_longest_sleep());
-    }
 }

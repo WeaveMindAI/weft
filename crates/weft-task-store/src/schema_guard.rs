@@ -206,10 +206,16 @@ fn declared_in<'a>(sqls: impl Iterator<Item = &'a str>) -> Vec<String> {
 /// fires on), its name is one the group's CREATE statements declare.
 fn owned_by(group: &SchemaGroup, thing: &Thing) -> bool {
     if thing.table.is_empty() || thing.kind == "trigger" {
-        declared_names(group).iter().any(|n| n == &thing.name)
+        declared_names(group).iter().any(|n| n == bare_name(&thing.name))
     } else {
         group.tables.contains(&thing.table.as_str())
     }
+}
+
+/// A thing's name as a CREATE statement declares it: a function's without
+/// the arguments it is read with (`weft_door_tick(text, uuid)`).
+fn bare_name(name: &str) -> &str {
+    name.split_once('(').map_or(name, |(bare, _)| bare)
 }
 
 /// This group's migrations, out of every migration there is.
@@ -985,7 +991,11 @@ const THING_QUERIES: &[&str] = &[
      FROM pg_trigger t JOIN pg_class rel ON rel.oid = t.tgrelid \
      JOIN pg_namespace n ON n.oid = rel.relnamespace \
      WHERE n.nspname = $1 AND NOT t.tgisinternal",
-    "SELECT 'function' AS kind, '' AS \"table\", p.proname AS name, \
+    // Named with the arguments that tell one overload from another, so a
+    // function whose arguments changed is the old one dropped and the new
+    // one made, never two of one name the plan cannot tell apart.
+    "SELECT 'function' AS kind, '' AS \"table\", \
+         p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' AS name, \
          pg_get_functiondef(p.oid) AS body \
      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = $1",
     "SELECT 'type' AS kind, '' AS \"table\", t.typname AS name, \
@@ -1027,7 +1037,7 @@ fn owner_of(thing: &Thing) -> Owner {
     // group owning the table it fires on: a group may attach a trigger
     // to another group's table, and the change is the declaring group's.
     if thing.table.is_empty() || thing.kind == "trigger" {
-        Owner::Named(thing.name.clone())
+        Owner::Named(bare_name(&thing.name).to_string())
     } else {
         Owner::Table(thing.table.clone())
     }
@@ -1113,6 +1123,11 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename]) -> anyho
     let new_tables: std::collections::HashSet<&str> =
         new.iter().map(|t| t.table.as_str()).collect();
     let mut dropped: std::collections::HashSet<&str> = Default::default();
+    // Removals go in three passes: triggers first (one firing on a column,
+    // `UPDATE OF` it or `WHEN` it, holds that column, so the column's DROP
+    // would fail while it stands), then everything else, then functions.
+    let mut dropped_triggers: Vec<Planned> = Vec::new();
+    let mut dropped_rest: Vec<Planned> = Vec::new();
     let mut dropped_functions: Vec<Planned> = Vec::new();
     for thing in old {
         if backs_constraint(thing) {
@@ -1145,12 +1160,15 @@ pub fn plan_migration(old: &[Thing], new: &[Thing], renames: &[Rename]) -> anyho
                 }
             }
         }
-        if thing.kind == "function" {
-            dropped_functions.push(Planned { owner: owner_of(thing), stmt: removed(thing) });
-            continue;
+        let planned = Planned { owner: owner_of(thing), stmt: removed(thing) };
+        match thing.kind.as_str() {
+            "trigger" => dropped_triggers.push(planned),
+            "function" => dropped_functions.push(planned),
+            _ => dropped_rest.push(planned),
         }
-        plan.push(Planned { owner: owner_of(thing), stmt: removed(thing) });
     }
+    plan.extend(dropped_triggers);
+    plan.extend(dropped_rest);
     // A function goes after every trigger the plan drops: its CASCADE
     // would take a trigger still hanging off it, and the trigger's own
     // DROP would then fail on a trigger that is gone.
@@ -2196,6 +2214,21 @@ mod tests {
         let plan: Vec<String> = plan_migration(&old, &[kept], &[]).unwrap().into_iter().map(|p| p.stmt).collect();
         assert_eq!(plan, ["DROP TRIGGER check_on_insert ON exec_event;", "DROP FUNCTION check CASCADE;"]);
     }
+    /// A trigger that fires on a column holds it: the trigger goes before the
+    /// column, whatever order the old schema lists them in.
+    #[cfg(feature = "db-tests")]
+    #[test]
+    fn a_plan_drops_a_trigger_before_the_column_it_fires_on() {
+        use super::{plan_migration, Thing};
+        let thing = |kind: &str, name: &str, body: &str| Thing { kind: kind.into(), table: "signal".into(), name: name.into(), body: body.into() };
+        let kept = thing("column", "token", "text null=NO default=-");
+        let old = vec![kept.clone(), thing("column", "parked_fires", "jsonb null=NO default=-"), thing("trigger", "notify_on_grow", "")];
+        let plan: Vec<String> = plan_migration(&old, &[kept], &[]).unwrap().into_iter().map(|p| p.stmt).collect();
+        let trigger = plan.iter().position(|s| s.starts_with("DROP TRIGGER notify_on_grow")).expect("the trigger goes");
+        let column = plan.iter().position(|s| s.contains("DROP COLUMN parked_fires")).expect("the column goes");
+        assert!(trigger < column, "{plan:?}");
+    }
+
     #[cfg(feature = "db-tests")]
     #[test]
     fn a_renamed_column_keeps_its_rows_and_its_constraint_and_index_follow() {

@@ -1,6 +1,7 @@
 //! `weft tree`: the version tree, one line per version (id prefix,
-//! label, what changed against its parent) with its runs beneath
-//! (execution prefix, status, seed, scope, example). Head is marked.
+//! label, what changed against its parent, how many runs its triggers
+//! started) with its runs started by hand beneath (execution prefix,
+//! status, seed, scope, example). Head is marked.
 
 use std::collections::BTreeMap;
 
@@ -122,7 +123,12 @@ fn render_version<'a>(
     } else {
         format!(" {}", changed.join(" "))
     };
-    out.push(format!("{indent}{} {}{label}{change}{mark}", short(&v.id), when(v.created_at)));
+    let fired = match (v.trigger_runs, v.last_trigger_run) {
+        (0, _) => String::new(),
+        (runs, Some(last)) => format!(" [{runs} trigger run{}, last {}]", if runs == 1 { "" } else { "s" }, short(&last.to_string())),
+        (runs, None) => format!(" [{runs} trigger run{}]", if runs == 1 { "" } else { "s" }),
+    };
+    out.push(format!("{indent}{} {}{label}{change}{fired}{mark}", short(&v.id), when(v.created_at)));
     for r in runs.get(v.id.as_str()).cloned().unwrap_or_default() {
         let head = if tree.head.head_run == Some(r.execution_id) { " <- HEAD run" } else { "" };
         let seed = r.seed_execution_id.map(|s| format!(" seed {} ({} stale)", short(&s.to_string()), r.stale.len())).unwrap_or_default();
@@ -178,6 +184,8 @@ mod tests {
             created_at: 0,
             diff: ManifestDiff { added: vec![], removed: vec![], changed: changed.iter().map(|s| s.to_string()).collect() },
             manifest: Default::default(),
+            trigger_runs: 0,
+            last_trigger_run: None,
         }
     }
 
@@ -196,7 +204,7 @@ mod tests {
             stale: vec!["b".into()],
             spec: None,
             example: None,
-            status: weft_core::program::SummaryStatus::parse(status),
+            status: weft_core::program::RunStatus::parse(status),
             started_at: 0,
             completed_at: if status == "completed" { Some(9) } else { None },
             // A cancelled run in this fixture says a person did it, so
@@ -223,6 +231,22 @@ mod tests {
                 "    run c2000000 t0 running seed c1000000 (1 stale) <- HEAD run",
                 "  v3000000 t0 ~prompts/p.txt",
             ]
+        );
+    }
+
+    /// A trigger's runs are counted on their version, never listed one by
+    /// one.
+    #[test]
+    fn a_versions_trigger_runs_are_counted_on_its_line() {
+        let mut fired = version("v1", None, None, &[]);
+        fired.trigger_runs = 1200;
+        fired.last_trigger_run = Some(run_id("f9"));
+        let mut once = version("v2", Some("v1"), None, &["main.weft"]);
+        once.trigger_runs = 1;
+        let tree = VersionTree { head: Head::default(), versions: vec![fired, once], runs: vec![] };
+        assert_eq!(
+            render(&tree, &|t| format!("t{t}")),
+            vec!["v1000000 t0 root [1200 trigger runs, last f9000000]", "  v2000000 t0 ~main.weft [1 trigger run]"]
         );
     }
 

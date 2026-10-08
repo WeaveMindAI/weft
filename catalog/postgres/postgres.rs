@@ -109,7 +109,12 @@ type Connection = tokio_postgres::Connection<
 /// Dial the wired database: the one handshake behind `connect` and
 /// `connect_listening`, each of which drives the connection its own way.
 async fn dial(conn: &OpenedConnection) -> WeftResult<(tokio_postgres::Client, Connection)> {
-    let config = dial_config(conn)?;
+    dial_with(&dial_config(conn)?).await
+}
+
+/// [`dial`] with the place and the sign-in already read off the
+/// connection.
+async fn dial_with(config: &Config) -> WeftResult<(tokio_postgres::Client, Connection)> {
     // The runtime's own trust settings, not a second opinion: one
     // answer to "which certificates does weft trust", and it pins the
     // crypto provider, which building a config here would leave to
@@ -137,17 +142,128 @@ async fn dial(conn: &OpenedConnection) -> WeftResult<(tokio_postgres::Client, Co
     })
 }
 
-/// Dial the wired database. The connection task is spawned; dropping
-/// the client ends it.
-pub async fn connect(
-    ctx: &ExecutionContext,
-    conn: &OpenedConnection,
-) -> WeftResult<tokio_postgres::Client> {
-    let (client, connection) = dial(conn).await?;
+/// The most runs of one worker that hold a connection to one database at
+/// once. Kept low on purpose: Postgres takes 100 connections by default,
+/// and several workers of a project share them, so 20 each lets a few
+/// workers run side by side without the database refusing anyone. A run
+/// past it waits for one to finish. A proper fix is a pooler in front of
+/// the database (TODO.md, "Several workers of a project can open more
+/// Postgres connections than the database takes").
+const MOST_AT_ONCE: usize = 20;
+
+/// Connections to one database, signed in once and held by the worker for
+/// its runs to share (`ctx.shared`), instead of dialed and signed in again
+/// by every run. Built from the connection's values, so a changed
+/// password builds a fresh pool.
+pub struct Pool {
+    config: Config,
+    idle: std::sync::Mutex<Vec<tokio_postgres::Client>>,
+}
+
+impl Pool {
+    fn new(conn: &OpenedConnection) -> WeftResult<Self> {
+        Ok(Self { config: dial_config(conn)?, idle: std::sync::Mutex::new(Vec::new()) })
+    }
+}
+
+/// A client of the pool, for one run's use. It goes back to the pool when
+/// dropped, once whatever the run left on its session is cleared
+/// ([`clear_session`]), unless the connection broke or the run was
+/// cancelled with it in hand (a statement may still be running on it;
+/// closing the connection is what stops it).
+pub struct Pooled {
+    client: Option<tokio_postgres::Client>,
+    /// Held until the client is back in the pool or let go, so its place
+    /// under the pool's limit stays taken while its session is cleared.
+    pool: Option<weft::shared::SharedHandle<Pool>>,
+    cancel: std::sync::Arc<weft::CancellationFlag>,
+}
+
+impl std::ops::Deref for Pooled {
+    type Target = tokio_postgres::Client;
+    fn deref(&self) -> &Self::Target {
+        self.client.as_ref().expect("a pooled client is held until it is dropped")
+    }
+}
+
+impl std::ops::DerefMut for Pooled {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.client.as_mut().expect("a pooled client is held until it is dropped")
+    }
+}
+
+impl Drop for Pooled {
+    fn drop(&mut self) {
+        let (Some(client), Some(pool)) = (self.client.take(), self.pool.take()) else { return };
+        if client.is_closed() || self.cancel.is_cancelled() {
+            return;
+        }
+        tokio::spawn(async move {
+            match clear_session(&client).await {
+                Ok(()) => pool.idle.lock().expect("pool poisoned").push(client),
+                Err(e) => tracing::warn!("postgres: a pooled connection is let go, its session could not be cleared: {e}"),
+            }
+        });
+    }
+}
+
+/// Clear what a run left on a connection's session, so the next run gets
+/// it as a fresh one would be: an open transaction, settings, temporary
+/// tables, cursors, listens, advisory locks, and statements it prepared
+/// in SQL. Everything `DISCARD ALL` does but drop the statements the
+/// driver itself prepared, which it would then find gone.
+async fn clear_session(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
+    client.batch_execute("ROLLBACK").await?;
+    let prepared = client.simple_query("SELECT name FROM pg_prepared_statements WHERE from_sql").await?;
+    let mut reset = String::from(
+        "CLOSE ALL; SET SESSION AUTHORIZATION DEFAULT; RESET ALL; UNLISTEN *; \
+         SELECT pg_advisory_unlock_all(); DISCARD PLANS; DISCARD TEMP; DISCARD SEQUENCES;",
+    );
+    for message in prepared {
+        if let tokio_postgres::SimpleQueryMessage::Row(row) = message {
+            if let Some(name) = row.get(0) {
+                reset.push_str(&format!(" DEALLOCATE \"{}\";", name.replace('"', "\"\"")));
+            }
+        }
+    }
+    client.batch_execute(&reset).await
+}
+
+/// A client of the database `access` connects to, from the pool this
+/// worker holds for it: an idle one, or a new one dialed when none is
+/// idle. The connection task of a new one lives as long as the client
+/// does.
+pub async fn connect(ctx: &ExecutionContext, access: &weft::access::Access) -> WeftResult<Pooled> {
+    let pool = ctx.shared(access, |opened| async move { Pool::new(&opened) }).with_limit(MOST_AT_ONCE).await?;
+    loop {
+        let idle = pool.idle.lock().expect("pool poisoned").pop();
+        match idle {
+            Some(client) if !client.is_closed() => {
+                return Ok(Pooled { client: Some(client), pool: Some(pool), cancel: ctx.cancellation() });
+            }
+            // A connection the server or the network closed since.
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    let (client, connection) = dial_with(&pool.config).await?;
     // The connection future must be driven for the client to work; it
-    // ends when the client drops. A mid-run connection failure
-    // surfaces on the next query as a loud error, so the task only
-    // logs.
+    // ends when the client drops. A connection failure surfaces on the
+    // next query as a loud error, so the task only logs.
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            tracing::warn!("postgres connection ended: {e}");
+        }
+    });
+    Ok(Pooled { client: Some(client), pool: Some(pool), cancel: ctx.cancellation() })
+}
+
+/// A connection of its own to the wired database, for a run that holds
+/// one for as long as it watches (it would hold a pooled one away from
+/// every other run). Its task ends when the client drops or the run is
+/// cancelled.
+pub async fn connect_alone(ctx: &ExecutionContext, conn: &OpenedConnection) -> WeftResult<tokio_postgres::Client> {
+    let (client, connection) = dial(conn).await?;
     let cancel = ctx.cancellation();
     tokio::spawn(async move {
         tokio::select! {

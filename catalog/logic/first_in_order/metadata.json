@@ -20,6 +20,7 @@
     }
   ],
   "features": {
+    "pure": true,
     "canAddInputPorts": true,
     "optionalCustomInputs": true,
     "customInputType": "T"

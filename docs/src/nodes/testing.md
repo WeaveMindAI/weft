@@ -118,6 +118,7 @@ Setting the run up:
 | `respond_with_headers(&self, method: &str, path: &str, status: u16, content_type: &str, headers: &[(&str, &str)], body: impl Into<Bytes>)` | The same plus response headers. The content type is its own argument, never a header here |
 | `fail_connection(&self, method: &str, path: &str)` | A matching request fails before any response, like a server that is down |
 | `signal(&self, payload: Value)` | Queues the answer to the node's next `ctx.await_signal`, in order |
+| `signal_given_up(&self)` | Queues a wait given up instead: the node's next `ctx.await_signal` fails with `WeftError::WaitGaveUp`, the way it does when a run that cannot pause holds the wait past its `holdSecs` |
 | `wake(&self, payload: Value)` | The next run's `ctx.wake`: what a firing trigger received |
 | `instance(&self, id: &str)` | Makes every run on the rig a run for that instance |
 | `attach_caller(&self, conn: Arc<FakeCallerConnection>)` | Puts a scripted live caller on the runs, what a Route or Socket run carries |

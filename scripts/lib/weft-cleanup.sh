@@ -137,6 +137,51 @@ weft_old_install_present() {
   [[ -n "$(docker ps -aq --filter name=^weft-local-control-plane$ 2>/dev/null)" ]]
 }
 
+# Whether the install's database still holds run history in the shape
+# weft stored it in before runs moved to `run` / `run_log`: its
+# `exec_event` table. A Postgres container that is stopped is started to
+# look (the install starts it next anyway); no container, no history.
+# Prints `yes` or `no`; fails when the database cannot be asked, which
+# the caller must not read as "nothing to wipe".
+# SYNC: weft-postgres, weft, weft <-> crates/weft-cli/src/commands/daemon.rs (postgres_container, PG_USER, PG_DB)
+weft_old_run_history() {
+  if ! docker container inspect weft-postgres >/dev/null 2>&1; then
+    echo no
+    return 0
+  fi
+  if [[ "$(docker inspect -f '{{.State.Running}}' weft-postgres 2>/dev/null)" != "true" ]]; then
+    docker start weft-postgres >/dev/null 2>&1 || return 1
+  fi
+  local waited=0
+  until docker exec weft-postgres pg_isready -U weft -d weft >/dev/null 2>&1; do
+    [[ ${waited} -ge 30 ]] && return 1
+    sleep 1
+    waited=$((waited + 1))
+  done
+  local found
+  found="$(docker exec weft-postgres psql -U weft -d weft -tAc "SELECT to_regclass('public.exec_event') IS NOT NULL")" || return 1
+  if [[ "${found}" == "t" ]]; then echo yes; else echo no; fi
+}
+
+# Wipe the run history [weft_old_run_history] found, in one transaction,
+# before the migration that drops its tables runs: what the old shape
+# kept about runs in the tables that stay (their tags, their waits, the
+# setups in flight, the queued work naming them, a version tree's head
+# run) goes with it, so nothing left points at a run that is gone.
+# Projects, their code, settings, connections, installs and infra stay.
+# SYNC: the tables <-> crates/weft-task-store/migrations/ (the release that drops exec_event)
+weft_wipe_old_run_history() {
+  docker exec -i weft-postgres psql -U weft -d weft -v ON_ERROR_STOP=1 -q <<'SQL'
+BEGIN;
+TRUNCATE exec_event, execution, version_run, execution_tag, trigger_setup;
+DELETE FROM signal WHERE is_resume;
+UPDATE signal SET parked_fires = '[]'::jsonb WHERE parked_fires <> '[]'::jsonb;
+DELETE FROM task;
+UPDATE project SET head_run = NULL WHERE head_run IS NOT NULL;
+COMMIT;
+SQL
+}
+
 # The named installs on this machine (test cells, say), comma separated,
 # empty when there are none. A wipe takes them too, so its question
 # names them.

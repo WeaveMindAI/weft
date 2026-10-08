@@ -22,5 +22,8 @@
       "name": "value",
       "type": "String"
     }
-  ]
+  ],
+  "features": {
+    "pure": true
+  }
 }

@@ -270,7 +270,7 @@ pub async fn authorize_project(
 /// equally strict, because a project cannot change tenant, and it
 /// cannot be deleted out from under the row.
 ///
-/// An execution with no `execution` row is `NOT_FOUND`, the same
+/// An execution with no `run` row is `NOT_FOUND`, the same
 /// answer as a cross-tenant execution, so neither leaks the other's
 /// existence.
 /// Takes the JOURNAL, not the whole state: the execution's own row is

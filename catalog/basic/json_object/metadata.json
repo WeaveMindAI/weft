@@ -22,6 +22,7 @@
     }
   ],
   "features": {
+    "pure": true,
     "canAddInputPorts": true
   }
 }

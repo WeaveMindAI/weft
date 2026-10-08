@@ -4,7 +4,9 @@
 //! upgrade can wait on a drain for hours). The complementary
 //! supervisor-owned verbs (`apply` / `stop` / `terminate`) are
 //! claimed by the pooled supervisor process that owns the project, via the
-//! broker.
+//! broker; a stop or terminate that first waits for the running work its
+//! copies reach (`drain_by_unix`) is claimed here for that wait
+//! (`crate::drain`), and handed on to its supervisor once it is over.
 //!
 //! Why a separate loop rather than reusing the supervisor's claim
 //! path: trigger-state deactivate/reactivate touches the signal
@@ -81,6 +83,9 @@ async fn claim_and_run_one(state: &DispatcherState) -> Result<bool> {
 /// for a whole lease and another process took the command over), the run
 /// stops here and the new holder answers for it.
 async fn run_and_complete(state: &DispatcherState, row: ClaimedCommand) {
+    if let Some(drain) = row.drain {
+        return drain_then_hand_over(state, &row, drain).await;
+    }
     let replica = state.replica.as_str();
     let outcome = tokio::select! {
         outcome = run_claimed(state, &row) => outcome.unwrap_or_else(|e| RunOutcome::Failed(format!("{e:#}"))),
@@ -120,6 +125,71 @@ async fn run_and_complete(state: &DispatcherState, row: ClaimedCommand) {
             reason = %reason,
             "command cancelled"
         ),
+    }
+}
+
+/// How often a command's drain looks whether the person cancelled it.
+const DRAIN_CANCEL_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The wait a stop or terminate does before its supervisor takes it: the
+/// running work its copies reach, through the one drain, cancelled at its
+/// deadline (sparing the run that asked). Once over, the command is handed
+/// on: its drain cleared and its claim let go, which announces it to the
+/// supervisors. A cancel of the command ends it here, cancelled. A
+/// database failure lets the claim go with the drain still to do, for the
+/// next pass.
+async fn drain_then_hand_over(state: &DispatcherState, row: &ClaimedCommand, drain: crate::infra_lifecycle_command::DrainFirst) {
+    let replica = state.replica.as_str();
+    let scope = crate::drain::DrainScope {
+        project_id: row.project_id,
+        reaching: crate::drain::Reaching::Copies(&row.copies),
+        except: drain.asked_by,
+    };
+    let left = u64::try_from(drain.by_unix - crate::lease::now_unix()).unwrap_or(0);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(left);
+    let cancelled = async {
+        loop {
+            tokio::time::sleep(DRAIN_CANCEL_POLL).await;
+            match crate::infra_lifecycle_command::cancel_requested(&state.pg_pool, row.id).await {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    target: "weft_dispatcher::lifecycle_claimer",
+                    command_id = row.id, error = %format!("{e:#}"),
+                    "could not read whether this command was cancelled; looking again"
+                ),
+            }
+        }
+    };
+    let ended = tokio::select! {
+        drained = crate::drain::drain(state, &scope, Some(deadline), crate::infra_lifecycle_command::RunningPolicy::Wait) => drained,
+        () = cancelled => {
+            let outcome = RunOutcome::Cancelled("cancelled while waiting for the running work".into());
+            if let Err(e) = complete(&state.pg_pool, row.id, replica, &outcome).await {
+                tracing::error!(target: "weft_dispatcher::lifecycle_claimer", command_id = row.id, error = %format!("{e:#}"), "could not record a cancelled command; its claim lapses and the next pass looks again");
+            }
+            return;
+        }
+        () = hold_claim(&state.pg_pool, row.id, replica) => {
+            tracing::warn!(target: "weft_dispatcher::lifecycle_claimer", command_id = row.id, "the claim on this command's drain was taken over by another replica; it answers for it now");
+            return;
+        }
+    };
+    let handed = match ended {
+        Ok(_) => sqlx::query(
+            "UPDATE infra_lifecycle_command SET drain_by_unix = NULL, claimed_by_replica = NULL, claimed_at_unix = NULL \
+             WHERE id = $1 AND claimed_by_replica = $2 AND completed_at_unix IS NULL",
+        )
+        .bind(row.id)
+        .bind(replica)
+        .execute(&state.pg_pool)
+        .await
+        .map(|_| ())
+        .map_err(anyhow::Error::from),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = handed {
+        tracing::warn!(target: "weft_dispatcher::lifecycle_claimer", command_id = row.id, error = %format!("{e:#}"), "the wait before this take-down failed; it is looked at again once its claim lapses");
     }
 }
 
@@ -195,6 +265,10 @@ pub struct ClaimedCommand {
     spec_json: Option<serde_json::Value>,
     /// Whose copies an upgrade cycles (`None`: the shared ones).
     instance: Option<weft_core::instance::InstanceId>,
+    /// The copies a take-down acts on.
+    copies: weft_core::instance::Copies,
+    /// A stop or terminate claimed for the wait it does first.
+    drain: Option<crate::infra_lifecycle_command::DrainFirst>,
 }
 
 /// Atomic claim: UPDATE the row AND parse its typed columns in one
@@ -224,7 +298,7 @@ pub async fn claim_one(pool: &PgPool, claimer_replica: &str) -> Result<Option<Cl
          SET claimed_by_replica = $1, claimed_at_unix = EXTRACT(EPOCH FROM NOW())::BIGINT \
          WHERE id = ( \
             SELECT c.id FROM infra_lifecycle_command c \
-            WHERE c.verb IN ({verbs}) \
+            WHERE (c.verb IN ({verbs}) OR c.drain_by_unix IS NOT NULL) \
               AND {predicate} \
               AND NOT (c.verb IN ({health}) AND EXISTS ( \
                 SELECT 1 FROM infra_lifecycle_command o \
@@ -236,7 +310,7 @@ pub async fn claim_one(pool: &PgPool, claimer_replica: &str) -> Result<Option<Cl
             FOR UPDATE SKIP LOCKED \
             LIMIT 1 \
          ) \
-         RETURNING id, project_id, verb, spec_json, instance_id",
+         RETURNING id, project_id, verb, spec_json, instance_id, every_copy, drain_by_unix, asked_by",
         verbs = weft_broker_client::lifecycle_command::DISPATCHER_VERBS_SQL,
         predicate = weft_broker_client::lifecycle_command::claimable_predicate(),
         health = format!(
@@ -280,17 +354,26 @@ fn decode_row(r: &sqlx::postgres::PgRow) -> Result<ClaimedCommand> {
         .ok_or_else(|| anyhow::anyhow!("unknown verb '{verb_str}' on id={id}"))?;
     let spec_json: Option<serde_json::Value> =
         r.try_get::<Option<serde_json::Value>, _>("spec_json")?;
-    let instance = r
-        .try_get::<Option<String>, _>("instance_id")?
+    let instance_id: Option<String> = r.try_get("instance_id")?;
+    let every_copy: bool = r.try_get("every_copy")?;
+    let copies = weft_core::instance::Copies::from_columns(instance_id.clone(), every_copy)
+        .map_err(|e| anyhow::anyhow!("corrupt copies on id={id}: {e}"))?;
+    let instance = instance_id
         .map(weft_core::instance::InstanceId::new)
         .transpose()
         .map_err(|e| anyhow::anyhow!("corrupt instance_id on id={id}: {e}"))?;
+    let drain = r
+        .try_get::<Option<i64>, _>("drain_by_unix")?
+        .map(|by_unix| -> Result<_> { Ok(crate::infra_lifecycle_command::DrainFirst { by_unix, asked_by: r.try_get("asked_by")? }) })
+        .transpose()?;
     Ok(ClaimedCommand {
         id,
         project_id,
         verb,
         spec_json,
         instance,
+        copies,
+        drain,
     })
 }
 

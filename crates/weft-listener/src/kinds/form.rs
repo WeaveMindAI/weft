@@ -154,7 +154,7 @@ mod tests {
             node_id: "node-7".into(),
             tenant_id: "t".into(),
             is_resume: true,
-            execution_id: Some("c".into()),
+            execution_id: Some(uuid::Uuid::nil()),
             task: None,
             kind_state: None,
             routing: SignalRouting {

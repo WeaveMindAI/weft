@@ -17,6 +17,7 @@ use std::time::Duration;
 use common::execution_id_of;
 
 use serde_json::{json, Value};
+use weft_e2e::access::{catalog_spec, connect_direct, set_account};
 use weft_e2e::client::poll_until;
 use weft_e2e::{display, ensure, run, project::Project};
 
@@ -116,6 +117,12 @@ async fn each_call_holds_its_own_wait_and_is_woken_on_its_own() -> anyhow::Resul
 async fn each_call_registers_its_own_trigger_with_its_own_display() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let mut project = Project::prepare("include_twice", disp.clone()).await?;
+    // An activation needs every connection the program names picked on the
+    // install, and each call's access node is its own place to pick.
+    let key = connect_direct(&disp, catalog_spec("api", "api_key_auth")?, "own", json!({ "keys": "k-include" })).await?;
+    for place in ["one.key", "two.key"] {
+        set_account(&project, place, key.handle()).await?;
+    }
     project.activate().await?;
     let pid = project.id();
 
@@ -150,6 +157,7 @@ async fn each_call_registers_its_own_trigger_with_its_own_display() -> anyhow::R
         "a grant for one call must not open the other, got {status}"
     );
 
+    key.finish().await?;
     project.finish().await
 }
 

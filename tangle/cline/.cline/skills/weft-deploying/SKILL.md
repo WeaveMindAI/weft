@@ -53,15 +53,11 @@ serves that project's routes at the root of the domain
 https address>` passes the domain on to the project's frontend (`weft
 frontend ls --on prod` shows that address).
 
-## Workers and long runs
+## Workers and run length
 
-`weft workers` shows a project's worker settings (copies kept warm, the most
-copies, runs per copy, CPU, memory) and which come from the install. Before you run `weft workers set --min-instances 1`, tell the user: it keeps
+`weft workers` shows a project's worker settings and which come from the install: copies kept warm (`min_instances`), the most copies (`max_instances`), how many calls Cloud Run sends one copy at once (`concurrency`, 80), CPU (unset is one CPU on a cloud install), memory, how long a copy keeps a pool its runs share once nothing uses it (`shared_idle_seconds`), how many runs one copy takes at once (`max_runs_at_once`, unset is one per MiB of memory and never fewer than 64), and how long a call waits for room before it is turned away (`max_queue_wait_seconds`, 30). Before you run `weft workers set --min-instances 1`, tell the user: it keeps
 one copy warm so the first call never waits for a start, and on a cloud
-install that copy is billed all the time. A run that may take longer
-than an hour on a cloud install (Cloud Run cuts a request there) runs with
-`weft run --long`, or with `longRuns` on the trigger that starts it, and gets
-a worker of its own for up to seven days.
+install that copy is billed all the time. On a cloud install one stretch of a run lasts an hour at most (Cloud Run cuts a request there, and the run stops itself a minute before): a run that pauses whole (every branch waiting on a timer or a form) starts a fresh hour when it picks back up, so split work that can take longer with a pause. A pause does not help while a caller is still on the line (a route with `outlivesCaller` off) or while a bus between its nodes is open: such a run's wait holds its copy, and it stops at 59 minutes, telling the client to reconnect. A route with `outlivesCaller` whose caller has gone moves its run off the caller's copy once the steps it was running end, and carries it on with a fresh hour; a run with a bus open between its nodes cannot move, so it keeps running on that copy for as long as the copy stays up. A run whose trigger leaves `durable` off (the default) ends cancelled if its copy dies mid-run, and is not run again; if a trigger's runs have to carry on after that (they move money, say), set `durable: true` on it.
 
 A trigger that holds a connection open (a stream or a socket it listens to,
 an event subscription that dials out) runs on a holder, which weft starts
@@ -123,13 +119,14 @@ folder:
 7. `weft target export prod --github`: needs step 2 first, and the
    repository already on GitHub. It sets the variables and secrets the
    workflow reads, with `gh` (logged in, run inside the repo): it mints
-   an operator key for CI, and gives the frontend the install hosts for
-   this repository a new token (the old one works until the workflow's next
-   run deploys the new one and retires it) and names its service. Every run mints new ones, so it runs once per setup, or again
-   when a CI credential was lost. Without `--github` it prints them, and
-   the secrets are shown only that once. It also lists every connection the
-   program needs that prod still has no pick for: the workflow cannot turn
+   an operator key for CI. If the install hosts a frontend for this repository, it also gives that frontend a new token and names its Cloud Run service; the old token keeps working until the workflow's next run deploys the new one and retires it. Every run mints new ones, so it runs once per setup, or again
+   when a CI credential was lost. Without `--github` it prints the variables and writes the secrets to a file only you can read, which the user copies into the repository's secrets and then deletes. It also lists every connection the program needs that prod still has no pick for (or says every one is picked): the workflow cannot turn
    the program on until those are picked (step 5).
+   If the project has a frontend, its server's own settings go out with
+   this same export: the user writes them into `front/.env.prod` first
+   ([The frontend on a cloud install](#the-frontend-on-a-cloud-install)
+   says what goes in it), and the export runs as `weft target export prod
+   --github --front-env front/.env.prod`.
 
 Then the user runs the workflow from the repository's Actions tab: about a
 minute and a half for the program, plus however long the frontend's build
@@ -222,10 +219,10 @@ running, activate refuses with "these triggers' infra is not running:
 `weft activate` is for a program that is off. Once its triggers are on, it
 refuses, and a change goes live with `weft resync --on prod --mode <mode>`,
 which takes the triggers down and brings them back on the new version. On
-prod, pick `park` (calls that arrive meanwhile wait, a caller on a route
-kept on the line, and run on the new version once the triggers are back) or
-`hibernate` (the same for a grace window), because those calls can be real
-people's. `wipe` drops them and
+prod, pick `park` (events that arrive meanwhile wait and run on the new
+version once the triggers are back, while a caller on a route is told to
+try again in a moment) or `hibernate` (the same for a grace window),
+because those events can be real people's. `wipe` drops them and
 cancels the work waiting on the triggers: fine on a dev install, and on
 prod only when the user says so.
 
@@ -254,7 +251,8 @@ another one, `~/.local/share/weft/ports.json` has it (`public`).
 What else the server reads (the program's database from `weft infra env`,
 `BETTER_AUTH_SECRET`) goes to Cloud Run as one dotenv file: the user writes
 it on their machine with `weft infra env <node> --on prod --into
-front/.env.prod` plus the door's address from `weft infra list-doors --on
+front/.env.prod --set NAME=Label` (one `--set` per value, each label as
+`weft infra show <node> --on prod` prints it) plus the door's address from `weft infra list-doors --on
 prod`, and `weft target export prod --github --front-env front/.env.prod`
 stores it as the `WEFT_FRONT_ENV` secret. The deployer only runs the
 export; the file holds secrets the user writes.
@@ -302,5 +300,12 @@ site, as they do here.
   `weft login prod` again; in CI, `weft target export prod --github` again.
 - **429 on a route**: one of the route's limits turned the call away.
   `weft status --on prod` lists, under "refused calls", which node refused,
-  how often in the last two minutes, and by which limit; each limit is a
-  setting on the route's node.
+  how often in the last minute or two, and by which limit. The per-minute
+  and at-once limits are settings on the route's node (`callsPerMinutePerCaller`,
+  `callsPerMinute`, `callsAtOnce`); "refused tokens from this address" is the
+  install's `invalidTokensPerMinute` (30 by default), which blocks an address
+  after that many bad tokens in a minute.
+- **503 `This worker is busy right now; try again in a moment.`**: a copy was
+  full, or its memory was over 90%. It is not under "refused calls". Raise
+  `--max-instances` or `--memory`, or lower `--concurrency` (`weft workers
+  set`); a lower `--max-runs-at-once` only helps if it is below `--concurrency`.

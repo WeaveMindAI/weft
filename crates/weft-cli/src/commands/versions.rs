@@ -478,8 +478,15 @@ pub struct RunFlags {
     /// Which instance the run is in (`--instance`).
     pub instance: Option<weft_core::instance::InstanceId>,
     pub clear: Vec<String>,
-    /// Run as a job of its own (`--long`).
-    pub long: bool,
+    /// Write each step before the next (`--durable`).
+    pub durable: bool,
+    /// Never wait for the record except to pause (`--fast`), over a
+    /// durable trigger.
+    pub fast: bool,
+    /// How long the run is kept once it ends (`--keep-for`).
+    pub keep_for: Option<weft_core::run_settings::KeepFor>,
+    /// How long a wait holds while the run cannot pause (`--hold-secs`).
+    pub hold_secs: Option<u32>,
 }
 
 impl RunFlags {
@@ -493,7 +500,10 @@ impl RunFlags {
             && self.emit.is_empty()
             && self.instance.is_none()
             && self.clear.is_empty()
-            && !self.long
+            && !self.durable
+            && !self.fast
+            && self.keep_for.is_none()
+            && self.hold_secs.is_none()
     }
 }
 
@@ -548,8 +558,10 @@ pub fn apply_run_flags(base: &RunSpec, flags: &RunFlags) -> Result<RunSpec> {
             "feed" => spec.feed.clear(),
             "fire" => spec.fire = None,
             "instance" => spec.instance = None,
-            "long" => spec.run_class = weft_core::run_class::RunClass::Short,
-            _ => bail!("--clear: unknown setting '{field}'; use from, emit, target, before, group, feed, fire, instance, or long"),
+            "keeping" => spec.settings.keeping = None,
+            "keep_for" => spec.settings.keep_for = None,
+            "hold_secs" => spec.settings.hold_secs = None,
+            _ => bail!("--clear: unknown setting '{field}'; use from, emit, target, before, group, feed, fire, instance, keeping, keep_for, or hold_secs"),
         }
     }
     if !flags.from.is_empty() { spec.from = parse_port_flags(&flags.from, "--from", true)?; }
@@ -563,8 +575,23 @@ pub fn apply_run_flags(base: &RunSpec, flags: &RunFlags) -> Result<RunSpec> {
     if let Some(instance) = &flags.instance {
         spec.instance = Some(instance.clone());
     }
-    if flags.long {
-        spec.run_class = weft_core::run_class::RunClass::Long;
+    // What the run asks for by hand goes over the trigger it fires.
+    if flags.durable && flags.fast {
+        bail!("--durable and --fast ask for opposite things; pass one");
+    }
+    use weft_core::run_settings::Keeping;
+    if flags.durable {
+        spec.settings.keeping = Some(Keeping::Durable);
+    }
+    if flags.fast {
+        spec.settings.keeping = Some(Keeping::Fast);
+    }
+    if flags.keep_for.is_some() {
+        spec.settings.keep_for = flags.keep_for;
+    }
+    if let Some(secs) = flags.hold_secs {
+        weft_core::run_settings::RunSettings::default().holding_for(secs).map_err(anyhow::Error::msg)?;
+        spec.settings.hold_secs = Some(secs);
     }
     for (node, ports) in parse_port_flags(&flags.emit, "--emit", false)? {
         spec.emit.entry(node).or_default().extend(ports);
@@ -804,6 +831,8 @@ mod tests {
             created_at: 0,
             diff: ManifestDiff::default(),
             manifest: Default::default(),
+            trigger_runs: 0,
+            last_trigger_run: None,
         }
     }
 
@@ -1071,13 +1100,37 @@ mod tests {
     }
 
     #[test]
-    fn long_is_saved_with_the_spec_and_cleared_on_request() {
-        let spec = spec_from_flags("case", &RunFlags { long: true, ..Default::default() }).unwrap();
-        assert_eq!(spec.run_class, weft_core::run_class::RunClass::Long);
+    fn durable_is_saved_with_the_spec_and_cleared_on_request() {
+        let spec = spec_from_flags("case", &RunFlags { durable: true, ..Default::default() }).unwrap();
+        assert_eq!(spec.settings.keeping, Some(weft_core::run_settings::Keeping::Durable));
         let saved: RunSpec = serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
-        assert_eq!(saved.run_class, spec.run_class, "a saved example keeps it");
-        let cleared = apply_run_flags(&saved, &RunFlags { clear: vec!["long".into()], ..Default::default() }).unwrap();
-        assert_eq!(cleared.run_class, weft_core::run_class::RunClass::Short);
+        assert_eq!(saved.settings, spec.settings, "a saved example keeps it");
+        let cleared = apply_run_flags(&saved, &RunFlags { clear: vec!["keeping".into()], ..Default::default() }).unwrap();
+        assert!(cleared.settings.is_empty(), "cleared, the run follows its trigger again");
+        assert!(spec_from_flags("case", &RunFlags { durable: true, fast: true, ..Default::default() }).is_err());
+    }
+
+    #[test]
+    fn keep_for_is_saved_with_the_spec_and_cleared_on_request() {
+        let forever = Some(weft_core::run_settings::KeepFor::Forever);
+        let spec = spec_from_flags("case", &RunFlags { keep_for: forever, ..Default::default() }).unwrap();
+        assert_eq!(spec.settings.keep_for, forever);
+        let saved: RunSpec = serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(saved.settings, spec.settings, "a saved example keeps it");
+        let cleared = apply_run_flags(&saved, &RunFlags { clear: vec!["keep_for".into()], ..Default::default() }).unwrap();
+        assert!(cleared.settings.is_empty(), "cleared, the run is kept as its trigger or project says");
+    }
+
+    #[test]
+    fn hold_secs_is_saved_with_the_spec_checked_and_cleared_on_request() {
+        let spec = spec_from_flags("case", &RunFlags { hold_secs: Some(0), ..Default::default() }).unwrap();
+        assert_eq!(spec.settings.hold_secs, Some(0));
+        let saved: RunSpec = serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(saved.settings, spec.settings, "a saved example keeps it");
+        let cleared = apply_run_flags(&saved, &RunFlags { clear: vec!["hold_secs".into()], ..Default::default() }).unwrap();
+        assert!(cleared.settings.is_empty(), "cleared, the run holds as its trigger says");
+        let too_long = weft_core::run_settings::MAX_HOLD_SECS + 1;
+        assert!(spec_from_flags("case", &RunFlags { hold_secs: Some(too_long), ..Default::default() }).is_err());
     }
 
     #[test]

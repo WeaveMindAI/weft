@@ -456,12 +456,18 @@ pub fn check_fire_payload(
     fires_with: &std::collections::BTreeMap<String, String>,
     payload: Option<&serde_json::Value>,
 ) -> Result<(), String> {
-    let Some(ty) = fire_payload_type(fires_with)? else {
-        return Ok(());
-    };
+    match fire_payload_type(fires_with)? {
+        Some(shape) => check_fire_payload_against(&shape, payload),
+        None => Ok(()),
+    }
+}
+
+/// [`check_fire_payload`] against a shape [`fire_payload_type`] already
+/// read.
+pub fn check_fire_payload_against(shape: &crate::weft_type::WeftType, payload: Option<&serde_json::Value>) -> Result<(), String> {
     let payload = payload.unwrap_or(&serde_json::Value::Null);
-    ty.validate_value(payload).map_err(|why| {
-        format!("the fire payload does not match what this trigger wakes with: {why}. It wants {ty}")
+    shape.validate_value(payload).map_err(|why| {
+        format!("the fire payload does not match what this trigger wakes with: {why}. It wants {shape}")
     })
 }
 
@@ -767,10 +773,10 @@ impl NodeMetadata {
     /// trigger gets the per-minute and at-once limits; one somebody
     /// outside calls ([`NodeFeatures::has_outside_caller`]) also gets the
     /// per-caller limit, the only one that needs a caller to count
-    /// ([`crate::signal::EntryLimits::node_inputs`]). A trigger whose run
-    /// does not answer a live caller (no `features.liveConnection`) also
-    /// gets the long-runs switch
-    /// ([`crate::run_class::RunClass::node_input`]). A trigger that
+    /// ([`crate::signal::EntryLimits::node_inputs`]). Every trigger also
+    /// gets how its runs are kept, and one that holds a caller on the line
+    /// (`features.liveConnection`) whether its run may outlive that caller
+    /// ([`crate::run_settings::RunSettings::node_inputs`]). A trigger that
     /// declares one of the names it receives is refused, so each setting
     /// has exactly one spelling; a node that receives none of them may
     /// use those names for its own inputs. A node with
@@ -791,9 +797,7 @@ impl NodeMetadata {
         let mut added: Vec<InputSpec> = Vec::new();
         if features.is_trigger {
             added.extend(crate::signal::EntryLimits::node_inputs(features.has_outside_caller()));
-            if features.live_connection.is_none() {
-                added.push(crate::run_class::RunClass::node_input());
-            }
+            added.extend(crate::run_settings::RunSettings::node_inputs(features.live_connection.is_some()));
         }
         for name in added.iter().map(|i| &i.name) {
             if self.inputs.iter().any(|i| i.name == *name) {
@@ -819,6 +823,7 @@ impl NodeMetadata {
                     "Why the step failed, when this output is wired. Unwired, a failure stops the run."
                         .to_string(),
                 ),
+                baked: false,
             });
         }
         Ok(())
@@ -834,6 +839,14 @@ impl NodeMetadata {
     /// `publishes` a service names it the way a service is named, and
     /// declares the `Access` output it hands the connection out on.
     pub fn validate_semantics(&self) -> Result<(), String> {
+        if !self.requires_infra {
+            if let Some(output) = self.outputs.iter().find(|o| o.baked) {
+                return Err(format!(
+                    "output '{}' is baked, and only an infra node's outputs are: they are made when its infra is applied",
+                    output.name
+                ));
+            }
+        }
         if let Some(display) = &self.display {
             let port = match (&display.input, &display.output) {
                 (Some(name), None) => {
@@ -2053,13 +2066,25 @@ pub struct NodeFeatures {
     /// code writes no error handling.
     #[serde(default, rename = "catchErrors", skip_serializing_if = "std::ops::Not::not")]
     pub catch_errors: bool,
+    /// The node's body does nothing outside the run that weft does not put
+    /// on record first: no network, no connection, no wait, no `ctx.run`,
+    /// no tag, no storage beyond this run's own files. It may answer its
+    /// caller (a durable run's answer leaves only once it is on record) and
+    /// read and store the run's files. So running it twice changes nothing
+    /// anybody can see: a
+    /// durable run starts its body without first putting what came before
+    /// on record, and a step of it whose worker died runs again instead of
+    /// failing. Every ctx call that reaches outside fails on a pure node,
+    /// naming this flag, so a wrong `pure` cannot quietly break that.
+    #[serde(default, rename = "pure", skip_serializing_if = "std::ops::Not::not")]
+    pub pure: bool,
     /// The trigger's run answers a caller who holds the connection
     /// open for it, over the named wire (`"http"` for a route,
     /// `"websocket"` for a socket), so the run is always one request
     /// long and the caller's own traffic is what needs bounding.
     /// Decides which settings the language gives the trigger
-    /// ([`NodeMetadata::add_language_ports`]): the entry limits, and
-    /// never the long-runs switch. The wire is what a rule asks when
+    /// ([`NodeMetadata::add_language_ports`]): the per-caller limit, and
+    /// whether its run may outlive the caller. The wire is what a rule asks when
     /// its advice depends on it (`run_reaches` with `liveConnection`).
     /// Backend-only: the editor never reads it, it only sees the
     /// inputs it produces.
@@ -2845,6 +2870,14 @@ pub struct OutputSpec {
     /// The webview reads it; the compiler treats it as opaque.
     #[serde(default)]
     pub description: Option<String>,
+    /// An infra node's output whose value is made once, when its infra
+    /// is applied, and saved: a fire reads the saved value instead of
+    /// running the node, and a node whose every wired output is saved
+    /// does not run at a fire at all. For a value that holds as long as
+    /// the infra does (an address, a connection); one that changes on
+    /// its own (a status) is not baked. The infra node only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub baked: bool,
 }
 
 /// The languages a code widget can highlight. Closed: a metadata file
@@ -4035,6 +4068,22 @@ mod input_semantics_tests {
     use crate::weft_type::{WeftPrimitive, WeftType};
     use serde_json::json;
 
+    /// Only an infra node's output is made when its infra is applied, so
+    /// only one may be baked.
+    #[test]
+    fn only_an_infra_nodes_output_may_be_baked() {
+        let mut m = metadata_with(vec![]);
+        m.outputs.push(OutputSpec { name: "access".into(), port_type: WeftType::Access, description: None, baked: true });
+        assert!(m.validate_semantics().unwrap_err().contains("only an infra node's outputs are"));
+        m.requires_infra = true;
+        m.validate_semantics().expect("an infra node bakes");
+        let back: OutputSpec = serde_json::from_value(serde_json::json!({ "name": "a", "type": "Access", "baked": true })).unwrap();
+        assert!(back.baked);
+        let plain: OutputSpec = serde_json::from_value(serde_json::json!({ "name": "a", "type": "Access" })).unwrap();
+        assert!(!plain.baked);
+        assert!(serde_json::to_value(&plain).unwrap().get("baked").is_none(), "an output that is not baked says nothing");
+    }
+
     fn metadata_with(inputs: Vec<InputSpec>) -> NodeMetadata {
         serde_json::from_str::<NodeMetadata>(
             r#"{ "type": "T", "label": "T", "description": "" }"#,
@@ -4046,11 +4095,12 @@ mod input_semantics_tests {
         .unwrap()
     }
 
-    /// The language owns the long-runs switch and the entry limits:
-    /// every trigger gets the per-minute and at-once limits, one called
-    /// from outside also the per-caller one, a non-live one also the
-    /// long-runs switch, a plain node none of them. A trigger declaring a name it receives is
-    /// refused; a plain node may use those names for its own inputs.
+    /// The language owns how runs are kept and the entry limits: every
+    /// trigger gets the per-minute and at-once limits and the durable and
+    /// recorded switches, one called from outside also the per-caller
+    /// limit, a non-live one also the long-runs switch, a plain node none
+    /// of them. A trigger declaring a name it receives is refused; a plain
+    /// node may use those names for its own inputs.
     #[test]
     fn a_trigger_gets_the_settings_the_language_owns() {
         let names = |m: &NodeMetadata| m.inputs.iter().map(|i| i.name.clone()).collect::<Vec<_>>();
@@ -4062,8 +4112,9 @@ mod input_semantics_tests {
         trigger.features.is_trigger = true;
         trigger.add_language_ports().unwrap();
         // Nobody calls a schedule: no per-caller limit.
-        let mut expected: Vec<&str> = crate::signal::EntryLimits::NODE_FIELDS[1..].to_vec();
-        expected.push(crate::run_class::LONG_RUNS_FIELD);
+        let settings = || crate::run_settings::RunSettings::node_inputs(false).into_iter().map(|i| i.name);
+        let mut expected: Vec<String> = crate::signal::EntryLimits::NODE_FIELDS[1..].iter().map(|s| s.to_string()).collect();
+        expected.extend(settings());
         assert_eq!(names(&trigger), expected);
         trigger.validate_semantics().expect("the added inputs pass the semantic rules");
 
@@ -4071,8 +4122,8 @@ mod input_semantics_tests {
         form.features.is_trigger = true;
         form.features.called_from_outside = true;
         form.add_language_ports().unwrap();
-        let mut expected: Vec<&str> = crate::signal::EntryLimits::NODE_FIELDS.to_vec();
-        expected.push(crate::run_class::LONG_RUNS_FIELD);
+        let mut expected: Vec<String> = crate::signal::EntryLimits::NODE_FIELDS.iter().map(|s| s.to_string()).collect();
+        expected.extend(settings());
         assert_eq!(names(&form), expected);
 
         let mut both = metadata_with(vec![]);
@@ -4085,7 +4136,10 @@ mod input_semantics_tests {
         live.features.is_trigger = true;
         live.features.live_connection = Some(LiveWire::Http);
         live.add_language_ports().unwrap();
-        assert_eq!(names(&live), crate::signal::EntryLimits::NODE_FIELDS);
+        let mut expected: Vec<String> = crate::signal::EntryLimits::NODE_FIELDS.iter().map(|s| s.to_string()).collect();
+        // A trigger holding a caller also gets whether its run may outlive them.
+        expected.extend(crate::run_settings::RunSettings::node_inputs(true).into_iter().map(|i| i.name));
+        assert_eq!(names(&live), expected);
         live.validate_semantics().expect("the added inputs pass the semantic rules");
 
         let mut not_a_trigger = metadata_with(vec![]);
@@ -4095,10 +4149,11 @@ mod input_semantics_tests {
         not_a_trigger.features.called_from_outside = true;
         assert!(not_a_trigger.add_language_ports().is_err());
 
-        let mut declares_it = metadata_with(vec![crate::run_class::RunClass::node_input()]);
+        let durable = || crate::run_settings::RunSettings::node_inputs(false).remove(0);
+        let mut declares_it = metadata_with(vec![durable()]);
         declares_it.features.is_trigger = true;
         let e = declares_it.add_language_ports().unwrap_err();
-        assert!(e.contains("longRuns"), "{e}");
+        assert!(e.contains("durable"), "{e}");
 
         let mut declares_a_limit = metadata_with(vec![input("callsAtOnce", WeftType::primitive(WeftPrimitive::Number))]);
         declares_a_limit.features.is_trigger = true;
@@ -4107,11 +4162,8 @@ mod input_semantics_tests {
         assert!(e.contains("callsAtOnce"), "{e}");
 
         // A rate limiter is no trigger: its own `callsPerMinute` and
-        // `longRuns` inputs are its own.
-        let own = vec![
-            input("callsPerMinute", WeftType::primitive(WeftPrimitive::Number)),
-            crate::run_class::RunClass::node_input(),
-        ];
+        // `durable` inputs are its own.
+        let own = vec![input("callsPerMinute", WeftType::primitive(WeftPrimitive::Number)), durable()];
         let mut limiter = metadata_with(own.clone());
         limiter.add_language_ports().expect("a plain node keeps its own names");
         assert_eq!(limiter.inputs.len(), own.len());
@@ -4126,6 +4178,7 @@ mod input_semantics_tests {
             name: ERROR_PORT.into(),
             port_type: WeftType::primitive(WeftPrimitive::String),
             description: None,
+            baked: false,
         };
         let mut catching = metadata_with(vec![]);
         catching.features.catch_errors = true;
@@ -4354,6 +4407,7 @@ mod input_semantics_tests {
             name: "access".into(),
             port_type: WeftType::Access,
             description: None,
+            baked: false,
         };
 
         publishing("postgres", vec![access_out()])
@@ -4660,6 +4714,7 @@ mod input_semantics_tests {
                 name: "file".into(),
                 port_type: WeftType::primitive(WeftPrimitive::Image),
                 description: None,
+                baked: false,
             });
             m.display = Some(d);
             m

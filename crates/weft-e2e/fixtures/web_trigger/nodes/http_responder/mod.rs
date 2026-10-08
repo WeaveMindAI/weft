@@ -10,8 +10,7 @@
 //! plumbing; the connection layer owns framing, backpressure, heartbeat.
 //!
 //! Flow:
-//!   1. `ctx.http_caller()` (caller present, HTTP, connected; the
-//!      barrier is bounded by the trigger-declared connect timeout).
+//!   1. `ctx.http_caller()` (caller present, HTTP, connected).
 //!   2. Read the request (method, path, the decoded body), stream two
 //!      progress chunks, respond with a final JSON body that echoes what
 //!      the caller sent and what the trigger delivered on its port.

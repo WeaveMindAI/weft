@@ -10,8 +10,8 @@ use uuid::Uuid;
 // beside the other connect wire types; the store's read-back query
 // answers the same struct, so publish and read-back cannot drift.
 use weft_core::access::wire::PublishedConnection;
-use weft_journal::ExecEvent;
-use weft_task_store::tasks::{ClaimedExecution, NewTask, TaskOutcome, TaskStatus};
+use weft_core::ExecutionId;
+use weft_task_store::tasks::{NewTask, TaskOutcome, TaskStatus};
 
 /// The longest the broker holds any request open (every `wait_ms`
 /// field is capped at it). A client that wants to wait longer asks
@@ -118,63 +118,124 @@ wire_enum! {
 // SYNC: NOT_DONE <-> crates/weft-broker/src/handlers.rs (unavailable_or_internal), crates/weft-broker-client/src/client.rs (did_nothing)
 pub const NOT_DONE: &str = "the broker could not get a connection to its database, so nothing was done; send it again";
 
-// ---------- Journal ----------
+// ---------- Records ----------
 
-/// The most one `/v1/journal/record` body may weigh. The heaviest event
-/// is an emission, one value per output port, each under
-/// `MAX_WIRE_VALUE_BYTES` (the engine refuses more at the node, which is
-/// the refusal a user sees): room for sixty-four such ports, so no run
-/// that obeyed the wire rule ever dies on its journal write. A client
-/// sending several events splits them into requests under this.
+/// `POST /v1/journal/record`: one batch of a worker's writer lane, its
+/// body the bytes `weft_journal::frame` encodes (not JSON), answered with
+/// `weft_journal::frame::BatchAnswer`. Worker-only: every run of the batch
+/// is fenced on the calling replica.
+// SYNC: JOURNAL_RECORD_PATH <-> crates/weft-broker/src/lib.rs (routes)
+pub const JOURNAL_RECORD_PATH: &str = "/v1/journal/record";
+
+/// The most one batch body may weigh. A lane closes a batch at a mebibyte;
+/// a run's next row alone may weigh more (one emission, one value per
+/// output port, each under `MAX_WIRE_VALUE_BYTES`, which the engine refuses
+/// past at the node), and goes alone, so this leaves room for sixty-four
+/// such ports.
 pub const JOURNAL_RECORD_BODY_LIMIT: usize = 64 * weft_core::storage::MAX_WIRE_VALUE_BYTES;
 
-/// `POST /v1/journal/record`: rows of ONE execution, in order, written in
-/// one statement.
+/// `POST /v1/journal/record_of`: the whole record of a run of the calling
+/// worker's project, raw, for a worker folding a run it reads (a seed
+/// ancestor).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JournalRecordRequest {
-    pub events: Vec<ExecEvent>,
-    /// The writing worker's replica id: the broker takes the write only
-    /// from the replica that owns the execution's claim. Always present: only
-    /// workers write through this request (every caller passes its own), and the dispatcher's own in-process writes
-    /// bypass this struct entirely.
-    pub replica: String,
+pub struct RecordOfRequest {
+    pub execution_id: ExecutionId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JournalRecordResponse {}
-
-/// `POST /v1/journal/record_retroactive`: a failed unrecorded run's whole
-/// record, written at once, which turns it into a recorded run. Worker-only
-/// and process-bound like `journal_record`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JournalRecordRetroactiveRequest {
-    pub events: Vec<ExecEvent>,
-    pub replica: String,
+pub struct RecordOfResponse {
+    pub record: weft_journal::record::RawRecord,
 }
 
-/// `POST /v1/journal/forget_unrecorded`: an unrecorded run ended without
-/// failing; drop what is left of it. Worker-only and process-bound.
+// ---------- Runs ----------
+
+/// `POST /v1/run/claim`: the calling worker claims a queued run of its
+/// project, the one it was handed (`weft_journal::record::claim`), and
+/// reads its record in the same trip. `None` when it is not queued.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JournalForgetUnrecordedRequest {
-    pub execution_id: String,
-    pub replica: String,
+pub struct RunClaimRequest {
+    pub execution_id: ExecutionId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunClaimResponse {
+    pub claimed: Option<weft_journal::record::Claimed>,
+}
+
+/// `POST /v1/run/answers`: the answers waiting for the waits of a run the
+/// calling worker drives, held open up to `wait_ms` (capped at
+/// [`MAX_HOLD`]) until one is there. Only the worker driving a run writes
+/// its record, so an answer to a run being driven waits for its worker to
+/// take it (`weft_task_store::parked_fires::answers_for`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunAnswersRequest {
+    pub execution_id: ExecutionId,
+    pub wait_ms: u64,
+    /// The waits whose answers the worker already took. An answer stays
+    /// waiting until the run's record holds it, which an unrecorded run's
+    /// never does, so these are left out rather than handed again.
+    pub taken: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunAnswersResponse {
+    pub answers: Vec<RunAnswer>,
+}
+
+/// One answer waiting for a run: the wait it resolves, and the value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunAnswer {
+    pub token: String,
+    pub value: Value,
+}
+
+/// `POST /v1/run/cancels`: the cancels waiting for the runs the calling
+/// worker drives (`run.cancel_requested`): what a worker reads when it may
+/// have missed one announced on its line (the line came back).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RunCancelsRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunCancelsResponse {
+    pub cancels: Vec<RunCancel>,
+}
+
+/// `POST /v1/run/give_up`: end a run the calling worker drives but whose
+/// record it can no longer write (`weft_journal::record::give_up_in`).
+/// Answered 409 when the worker does not drive it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunGiveUpRequest {
+    pub execution_id: ExecutionId,
+    /// Why, as the run's failure says it.
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunGiveUpResponse {
+    /// The `seq` its ending was written at.
+    pub ended_at_seq: i32,
+}
+
+/// One cancel waiting for a run, and why.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunCancel {
+    pub execution_id: ExecutionId,
+    pub cause: weft_core::exec::CancelCause,
 }
 
 // ---------- Execution steering (`ctx.tag_execution` / `ctx.stop_tagged`) ----------
 
 /// `POST /v1/execution/tag`: the worker tags the execution it is
-/// driving. Worker-only, process-bound exactly like `journal_record`: the
-/// broker journals `ExecutionTagged` and writes the `execution_tag`
-/// rows in one transaction, synchronously, so by the time the node's
-/// call returns its tag row exists and a following `stop_tagged` can
-/// anchor on it.
+/// driving, its `ExecutionTagged` already on record. Worker-only: the
+/// broker writes the `execution_tag` rows synchronously, so by the time
+/// the node's call returns its tag row exists and a following
+/// `stop_tagged` can anchor on it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionTagRequest {
-    pub execution_id: String,
+    pub execution_id: ExecutionId,
     /// Already validated by the ctx (`weft_core::tag`); the broker
     /// validates again, because it trusts no process.
     pub tags: Vec<String>,
-    pub replica: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,14 +247,13 @@ pub struct ExecutionTagResponse {}
 /// seq, or one past the newest row) and enqueues the dispatcher's
 /// `stop_tagged` task with it, so a stop that runs late can never reach
 /// a sibling that tagged itself after the ask. The project is the
-/// execution's, read from `execution`; the request never names one.
+/// run's, read from its row; the request never names one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionStopTaggedRequest {
     /// The asking execution.
-    pub execution_id: String,
+    pub execution_id: ExecutionId,
     pub tag: String,
     pub stop_self: weft_core::StopSelf,
-    pub replica: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,37 +264,6 @@ pub struct ExecutionStopTaggedResponse {
     /// a moment later, and a node that returned first would let the run
     /// go past its own stop.
     pub stops_asker: bool,
-}
-
-/// The rows of one execution after `after_id`, held open up to
-/// `wait_ms` (the broker caps it at `pg_signal::MAX_HOLD`) until at
-/// least one exists. `after_id: 0` reads the whole log.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JournalWaitRequest {
-    pub execution_id: String,
-    pub after_id: i64,
-    pub wait_ms: u64,
-}
-
-/// RAW payload strings, exactly as journaled, never re-encoded typed
-/// events: the broker only ferries these rows, and a typed hop would
-/// silently STRIP any field its own build predates (a stale broker
-/// once erased `ExecutionStarted.subgraph` this way, and the worker
-/// ran an aimed run unbounded). The consumer decodes, loudly. Empty
-/// when the hold ended with nothing new.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JournalWaitResponse {
-    pub rows: Vec<weft_journal::RawJournalRow>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JournalHasTerminalRequest {
-    pub execution_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JournalHasTerminalResponse {
-    pub terminal: bool,
 }
 
 // ---------- Tasks ----------
@@ -284,78 +313,6 @@ impl TaskWaitTerminalResponse {
     }
 }
 
-/// `POST /v1/task/claim_execution`: a worker claims the execution it was
-/// handed, and reads its journal in the same trip
-/// (`weft_task_store::tasks::claim_execution`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskClaimExecutionRequest {
-    pub replica: String,
-    pub project_id: Uuid,
-    pub execution_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskClaimExecutionResponse {
-    pub claimed: Option<ClaimedExecution>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskHeartbeatRequest {
-    pub task_id: Uuid,
-    pub replica: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskHeartbeatResponse {
-    pub renewed: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskCompleteRequest {
-    pub task_id: Uuid,
-    pub replica: String,
-    pub result: Value,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskCompleteResponse {}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskRequeueRequest {
-    pub task_id: Uuid,
-    pub replica: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskRequeueResponse {
-    /// True when the surrender landed (the row was still ours and is
-    /// now pending again); false when the row had already moved on.
-    pub requeued: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskFailRequest {
-    pub task_id: Uuid,
-    pub replica: String,
-    pub error: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskFailResponse {}
-
-/// The cancels asked for any of `execution_ids` of `project_id`, answered
-/// for those the asking worker drives; asking only reads.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskCancelsAskedRequest {
-    pub project_id: Uuid,
-    pub execution_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TaskCancelsAskedResponse {
-    pub cancels: Vec<weft_task_store::tasks::CancelAsked>,
-}
-
 // ---------- Infra ----------
 
 /// A machine running `project_id`'s infra asking for its health to be
@@ -378,6 +335,38 @@ pub struct InfraEndpointUrlRequest {
     /// `InfraEnqueueApplyRequest`), the endpoint's name, and the instance
     /// whose copy it is (absent for a shared copy).
     pub infra: weft_core::infra::InfraHandle,
+}
+
+/// `POST /v1/infra/baked`: what an infra node's copy saved for its baked
+/// outputs, for the run that runs the node (`InfraReader::baked_outputs`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfraBakedRequest {
+    pub execution_id: weft_core::ExecutionId,
+    /// The node's place, spelled.
+    pub place: String,
+    /// Whose copy: absent for the shared one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<weft_core::instance::InstanceId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfraBakedResponse {
+    pub saved: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// `POST /v1/infra/bake`: what an infra setup's run of an infra node sent
+/// out on its baked outputs, which its copy holds from then on, merged
+/// port by port over what it held (`weft_core::infra::bake`). Only a setup
+/// run saves, and only for a copy it may read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InfraBakeRequest {
+    pub execution_id: weft_core::ExecutionId,
+    /// The node's place, spelled.
+    pub place: String,
+    /// Whose copy: absent for the shared one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<weft_core::instance::InstanceId>,
+    pub values: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,7 +393,7 @@ pub struct ResolveConnectionRequest {
     /// AND project from it and enforces both, so neither is taken from
     /// this request: a credential policy that decides per project must
     /// not be deciding on a name the worker chose.
-    pub execution_id: String,
+    pub execution_id: ExecutionId,
     pub node_id: String,
     /// The opening firing's loop-frame coordinate, so anything the
     /// runtime later books against this connection (a measured cost)
@@ -443,7 +432,7 @@ pub struct ResolveConnectionRequest {
 pub struct PublishAccessRequest {
     /// The publishing execution. The broker resolves the owning tenant
     /// AND project from it, so neither is taken from this request.
-    pub execution_id: String,
+    pub execution_id: ExecutionId,
     /// The publishing node's PLACE, spelled the way a person writes it
     /// (`db`, or `one.db` inside the file the site `one` includes). Its
     /// connection: publishing again updates that one row, and
@@ -472,7 +461,7 @@ pub struct PublishAccessResponse {
 /// "Which connection did this node publish for this service, if any?"
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishedAccessRequest {
-    pub execution_id: String,
+    pub execution_id: ExecutionId,
     pub node_id: String,
     pub service: String,
     /// As on [`PublishAccessRequest::per_instance`].
@@ -489,7 +478,7 @@ pub struct ProgramMintInstanceTokenRequest {
     /// that token (a new value, the old one dead) instead of leaving a
     /// second one behind.
     pub id: uuid::Uuid,
-    pub execution_id: String,
+    pub execution_id: ExecutionId,
     pub instance: weft_core::instance::InstanceId,
     /// How long it works, in seconds; required, a year at most.
     pub expires_in_secs: u64,
@@ -550,12 +539,11 @@ pub struct ResolveConnectionResponse {
     /// `i64::MAX` for stored values that never expire.
     #[serde(default)]
     pub keep_until_unix: Option<i64>,
+    /// The infra node (spelled) whose infra setup made this connection,
+    /// when one did (`weft_access_store::ResolvedAccess::published_by`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_by: Option<String>,
 }
-
-// A measured call's cost record rides the generic task rail (a
-// `TaskKind::RecordCost` enqueued like any worker side effect), so there is
-// no dedicated cost endpoint or wire type: `weft_task_store::RecordCostPayload`
-// is the whole contract.
 
 /// The firing that resolved a connection finished: release the lease
 /// NOW rather than leaving a runtime-supplied credential usable to its
@@ -565,7 +553,7 @@ pub struct ResolveConnectionResponse {
 /// theirs and never travel back. Nothing node-facing makes this call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseConnectionRequest {
-    pub execution_id: String,
+    pub execution_id: ExecutionId,
     /// The resolved values being given back; the runtime's credential
     /// source retires the ones it recognizes.
     pub values: std::collections::BTreeMap<String, String>,
@@ -819,14 +807,6 @@ pub struct SupervisorCommandRow {
     #[serde(default)]
     pub copies: weft_core::instance::Copies,
     pub verb: InfraLifecycleVerb,
-    /// Whether the supervisor should wait for the project's
-    /// running-execution count to reach 0 before performing the
-    /// lifecycle op. `Some` for Stop / Terminate (populated by
-    /// `issue_lifecycle`); `None` for Apply (irrelevant) and for
-    /// dispatcher-owned verbs that don't reach the supervisor's
-    /// claim path.
-    #[serde(default)]
-    pub running_policy: Option<RunningPolicy>,
     /// Set for `verb = apply`: `InfraSpec` serialized as JSON. The
     /// supervisor reads the prior `infra_node` row itself to decide
     /// skip / fresh / replace; the worker doesn't pass a mode.
@@ -838,11 +818,6 @@ pub struct SupervisorCommandRow {
     /// "take it all down so I can update it" override.
     #[serde(default)]
     pub force: bool,
-    /// Cap on the `running_policy = wait` drain before the op proceeds
-    /// anyway. Carried per command (the user picks it with the wait
-    /// choice); defaults to `DEFAULT_DRAIN_TIMEOUT_SECS`.
-    #[serde(default = "default_drain_timeout_secs")]
-    pub drain_timeout_secs: u64,
 }
 
 impl SupervisorCommandRow {
@@ -1301,23 +1276,19 @@ impl LifecycleSpec {
         }
     }
 
-    /// Project the typed spec onto the (verb, running_policy,
-    /// spec_json) columns the `infra_lifecycle_command` schema
-    /// stores. `running_policy` is `None` for dispatcher-owned
-    /// verbs: Deactivate carries it inside `spec_json` (single
-    /// source of truth); Reactivate has no running-fires concept, and
-    /// carries its still-broken copies in `spec_json`.
-    /// Supervisor-owned verbs (Stop / Terminate) populate the
-    /// column directly through `issue_lifecycle`; Apply ignores it.
-    pub fn into_row_columns(self) -> (InfraLifecycleVerb, Option<RunningPolicy>, Option<Value>) {
+    /// Project the typed spec onto the (verb, spec_json) columns the
+    /// `infra_lifecycle_command` schema stores: Deactivate carries its
+    /// running policy inside `spec_json` (single source of truth);
+    /// Reactivate carries its still-broken copies there.
+    pub fn into_row_columns(self) -> (InfraLifecycleVerb, Option<Value>) {
         match self {
             Self::Deactivate(take_down) => {
                 let payload = serde_json::to_value(take_down).expect("TakeDownReaders serializes");
-                (InfraLifecycleVerb::Deactivate, None, Some(payload))
+                (InfraLifecycleVerb::Deactivate, Some(payload))
             }
             Self::Reactivate(restore) => {
                 let payload = serde_json::to_value(restore).expect("RestoreReaders serializes");
-                (InfraLifecycleVerb::Reactivate, None, Some(payload))
+                (InfraLifecycleVerb::Reactivate, Some(payload))
             }
         }
     }
@@ -1602,23 +1573,6 @@ pub struct SupervisorTriggerDepsResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SupervisorRunningCountRequest {
-    pub project_id: Uuid,
-    /// Whose runs: an instance's copy going waits on that instance's runs
-    /// only; the shared copies wait on every run.
-    #[serde(default)]
-    pub copies: weft_core::instance::Copies,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SupervisorRunningCountResponse {
-    /// Count of non-suspended in-flight executions for this
-    /// project. Drives the supervisor's `running_policy=wait`
-    /// readiness check before scaling / deleting.
-    pub running_count: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorInfraCommandInFlightRequest {
     pub project_id: Uuid,
 }
@@ -1662,7 +1616,7 @@ impl InFlightCommand {
 /// hibernation past its grace window stops listening. What a starting
 /// listener rehydrates, what holders claim, and how many holders run all
 /// read this.
-// SYNC: ACTIVATION_LISTENS <-> crates/weft-dispatcher/src/arrival.rs (Standing::arrival), crates/weft-dispatcher/src/activation_store.rs (IN_GRACE_WINDOW_SQL)
+// SYNC: ACTIVATION_LISTENS <-> weft_core::arrival::Standing::arrival, crates/weft-dispatcher/src/activation_store.rs (IN_GRACE_WINDOW_SQL)
 pub const ACTIVATION_LISTENS: &str = "(a.status IS NULL OR a.status IN ('activating', 'active') \
     OR (a.status IN ('deactivating', 'inactive') AND a.accepting_fires \
         AND (a.fires_deadline_unix IS NULL OR a.fires_deadline_unix >= EXTRACT(EPOCH FROM NOW())::BIGINT)))";
@@ -1693,6 +1647,25 @@ pub struct SignalListHeldRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalListHeldResponse {
     pub rows: Vec<SignalRowWire>,
+}
+
+/// Where an event of the signal `token` goes: what the listener asks
+/// before handing an event to the worker's door of its project.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalFireTargetRequest {
+    pub token: String,
+}
+
+/// See [`SignalFireTargetRequest`]. `None` when the signal is gone.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalFireTarget {
+    pub project_id: uuid::Uuid,
+    /// It answers one waiting run: the install hands it the answer.
+    pub is_resume: bool,
+    /// Where the project's front answers (`project.api_address`), `None`
+    /// while nothing of the project takes work there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
 }
 
 /// One held signal by token.
@@ -1816,7 +1789,7 @@ pub struct SignalRowWire {
     pub node_id: String,
     pub spec_json: String,
     pub is_resume: bool,
-    pub execution_id: Option<String>,
+    pub execution_id: Option<ExecutionId>,
     pub surface_kind: SignalSurfaceKind,
     pub mount_path: Option<String>,
     /// The HTTP methods a `PublicEntry` serves, uppercase; empty = any
@@ -2058,6 +2031,229 @@ pub struct CallerVerifyRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallerVerified {
     pub identity: Value,
+    /// The request headers the scheme read a credential from, which the
+    /// run never writes down.
+    #[serde(default)]
+    pub credential_headers: Vec<String>,
+}
+
+// ---------- The worker's door (`weft_engine::door`) ----------
+
+/// `POST /v1/door/park_fire`: put a fire in the queue of a trigger
+/// (`weft_task_store::parked_fires`): one of the asking worker's project's,
+/// or, for the listener, the trigger of an event whose worker it could not
+/// reach.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoorParkRequest {
+    pub token: String,
+    pub fire: weft_task_store::parked_fires::Waiting,
+    /// The holder a held connection picked the event up under: it is
+    /// kept only while the signal is still held under that name, and once
+    /// kept it is the trigger's, whoever holds the signal by the time it is
+    /// handed over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_by: Option<String>,
+}
+
+/// What became of a [`DoorParkRequest`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoorParked {
+    /// Queued (or queued already under its id).
+    Parked,
+    /// The queue is at its cap: the fire is not kept.
+    QueueFull,
+    /// The signal is gone.
+    Gone,
+    /// The trigger takes no work (wiped, past its hibernation): the fire
+    /// is not kept.
+    TakesNoWork,
+    /// The holder it was picked up under no longer holds the signal: it is
+    /// not kept, and the holder hears so.
+    NotHeld,
+}
+
+/// `POST /v1/door/triggers`: every trigger of the asking worker's project
+/// (its entries: a waiting run's wait is no trigger), as it is armed and as
+/// its activation stands: what the worker's door admits callers and
+/// events by. A worker keeps them and reads them again when its line says
+/// they changed (`line::TRIGGERS_CHANNEL`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DoorTriggersRequest {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoorTriggers {
+    pub triggers: Vec<DoorTrigger>,
+}
+
+/// One trigger of the project.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoorTrigger {
+    /// Its signal token: names it in a fire, and in the limits' counts.
+    pub token: String,
+    /// Its place, spelled the way the program reads it (`door`, `one.door`).
+    pub node_id: String,
+    /// Where it is mounted, for a route somebody calls: `None` for every
+    /// other trigger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<DoorMount>,
+    pub entry: DoorEntry,
+    /// The holder serving it, for a signal a holder holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_by: Option<String>,
+}
+
+/// Where a route is mounted under the project.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoorMount {
+    /// The path pattern under the project (`chat/{room}`, `` for its root).
+    pub pattern: String,
+    /// The methods it serves; empty serves any.
+    pub methods: Vec<String>,
+}
+
+/// A trigger as its row arms it, or why work for it cannot be served (a
+/// row half written by an older install: activating again re-arms it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum DoorEntry {
+    Armed(Box<ArmedEntry>),
+    Unservable {
+        /// The HTTP status a caller is answered with.
+        status: u16,
+        why: String,
+    },
+}
+
+/// What a worker needs to admit a caller and give birth to the run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArmedEntry {
+    /// The trigger's signal spec: its kind and config, its limits, how its
+    /// runs are kept.
+    pub spec: weft_core::primitive::SignalSpec,
+    /// `none`, or `connection` with its `{access_id, service}` in
+    /// `auth_config`.
+    pub auth_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_config: Option<Value>,
+    /// What the trigger registered at activation, replayed by a fire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port_snapshot: Option<Value>,
+    /// The program the route's runs are born under. A worker serves only
+    /// the routes armed for its own binary.
+    pub definition_hash: String,
+    pub binary_hash: String,
+    /// The version its runs are prepared from.
+    pub source_version: String,
+    /// How the route's activation stands (`weft_core::arrival`).
+    pub standing: weft_core::arrival::Standing,
+    /// Whose route it is: the instance whose trigger armed it, `None` for
+    /// a shared one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<weft_core::instance::InstanceId>,
+}
+
+/// `POST /v1/door/run_facts`: what a run of the asking worker's project
+/// for `instance` (or for nobody) starts with besides its caller: whether
+/// the infra it reads is up, what the instance provides, and the install's
+/// picks. Kept by the worker until its line says one of them changed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DoorRunFactsRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<weft_core::instance::InstanceId>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DoorRunFacts {
+    /// Every copy of the project's infra nodes, and whether it is up.
+    pub infra: Vec<InfraCopyUp>,
+    /// What the instance stores for the fields its program leaves to
+    /// instances; `None` for a run for nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_values: Option<weft_core::instance::InstanceValues>,
+    /// The connections this install picked for the project.
+    #[serde(default)]
+    pub picks: weft_core::picks::Picks,
+}
+
+pub use weft_core::infra::run_gate::InfraCopyUp;
+
+/// `POST /v1/door/instance_token`: who an instance token
+/// (`weft_core::instance::INSTANCE_TOKEN_HEADER`) presented at the door
+/// names. A token that names nobody, or is not an instance token, is the
+/// door's `401`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoorInstanceTokenRequest {
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoorInstanceToken {
+    pub project_id: Uuid,
+    pub instance: weft_core::instance::InstanceId,
+}
+
+/// `POST /v1/door/let_go`: the asking worker no longer drives this run of
+/// its project, its whole record written, and whoever resumes it owns it
+/// next.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoorLetGoRequest {
+    pub execution_id: ExecutionId,
+    pub why: LetGo,
+}
+
+/// Why a worker lets go of a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LetGo {
+    /// It is parked on a wait: the signal it waits on resumes it.
+    Parked,
+    /// It was asked to let go of this worker (the worker is stopping, or
+    /// its caller left on a platform that stops a worker no call holds
+    /// open): it is queued for another worker as it is let go of.
+    /// Refused (`409`) when the run is not the asking worker's.
+    HandedBack,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoorLetGo {}
+
+/// `POST /v1/door/tick`: once a second, a worker says it is alive (its
+/// `worker_lease`) and how many runs it drives per trigger, states what it
+/// counted at its door this minute, and hears what the project's other
+/// copies counted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoorTickRequest {
+    /// The image it runs (the program's binary hash): a drain of the runs
+    /// on older images counts what the workers of those images drive.
+    /// `None` for a process that runs no program (a node test's).
+    pub binary_hash: Option<String>,
+    /// How many runs it drives right now, per trigger token: what a drain
+    /// of those triggers waits for.
+    #[serde(default)]
+    pub in_flight: std::collections::BTreeMap<String, u32>,
+    /// The minute the counts are of (unix seconds at its start).
+    pub window_start: i64,
+    /// This copy's counts this minute, each its total so far.
+    #[serde(default)]
+    pub counts: Vec<DoorCount>,
+    /// The route tokens whose counts it reads back.
+    #[serde(default)]
+    pub tokens: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DoorCount {
+    pub key: String,
+    pub hits: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoorTick {
+    /// What the other copies counted this minute, summed per key.
+    pub others: Vec<DoorCount>,
+    /// How many copies of the project are alive, this one included.
+    pub copies: u32,
 }
 
 /// One raw push, as the dispatcher forwards it to the broker: the
@@ -2149,7 +2345,7 @@ mod supervisor_protocol_tests {
         }))
         .unwrap();
         let req = PublishAccessRequest {
-            execution_id: "c1".into(),
+            execution_id: uuid::Uuid::from_u128(0xc1),
             node_id: "db".into(),
             service: "postgres".into(),
             spec,
@@ -2159,7 +2355,7 @@ mod supervisor_protocol_tests {
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["per_instance"], true, "whose copy published it rides as a flag; the instance is the run's");
-        assert_eq!(v["execution_id"], "c1");
+        assert_eq!(v["execution_id"], json!(uuid::Uuid::from_u128(0xc1)));
         assert_eq!(v["node_id"], "db");
         assert_eq!(v["values"]["host"], "db.svc");
         assert!(v.get("project_id").is_none(), "the project is never on the wire");
@@ -2257,10 +2453,8 @@ mod supervisor_protocol_tests {
             node_id: Some("db".into()),
             copies: weft_core::instance::Copies::Instance(weft_core::instance::InstanceId::new("user-42").unwrap()),
             verb: InfraLifecycleVerb::Apply,
-            running_policy: None,
             spec_json: None,
             force: false,
-            drain_timeout_secs: 300,
         };
         for claim in [SupervisorClaim::Command(command), SupervisorClaim::UnownedWork, SupervisorClaim::Nothing] {
             let back: SupervisorClaim =
@@ -2419,7 +2613,7 @@ mod supervisor_protocol_tests {
     #[test]
     fn resolve_connection_request_round_trip() {
         let req = ResolveConnectionRequest {
-            execution_id: "c1".into(),
+            execution_id: uuid::Uuid::from_u128(0xc1),
             node_id: "ask".into(),
             frames: vec![weft_core::frames::Frame::Loop { index: 3 }],
             node_type: "openrouter.inference".into(),
@@ -2438,7 +2632,7 @@ mod supervisor_protocol_tests {
             json!({
                 // No project: the broker resolves it from the execution,
                 // so a worker never names one.
-                "execution_id": "c1", "node_id": "ask",
+                "execution_id": uuid::Uuid::from_u128(0xc1), "node_id": "ask",
                 "frames": [{"index": 3}], "node_type": "openrouter.inference",
                 "connection_id": "11111111-2222-3333-4444-555555555555",
                 "service": "openrouter",
@@ -2466,6 +2660,7 @@ mod supervisor_protocol_tests {
                 relay_url: relay_url.clone(),
                 owner: weft_core::CredentialOwner::Platform,
                 keep_until_unix: None,
+                published_by: None,
             };
             // Field names pinned literally (a symmetric rename would
             // round-trip but break the peer).
@@ -2492,14 +2687,14 @@ mod supervisor_protocol_tests {
     #[test]
     fn release_connection_request_round_trip() {
         let req = ReleaseConnectionRequest {
-            execution_id: "c1".into(),
+            execution_id: uuid::Uuid::from_u128(0xc1),
             values: [("token".to_string(), "cred".to_string())].into_iter().collect(),
         };
         let v = serde_json::to_value(&req).unwrap();
-        assert_eq!(v, json!({ "execution_id": "c1", "values": { "token": "cred" } }));
+        assert_eq!(v, json!({ "execution_id": uuid::Uuid::from_u128(0xc1), "values": { "token": "cred" } }));
         let back: ReleaseConnectionRequest = serde_json::from_value(v).unwrap();
         assert_eq!(back.values["token"], "cred");
-        assert_eq!(back.execution_id, "c1");
+        assert_eq!(back.execution_id, uuid::Uuid::from_u128(0xc1));
     }
 
     #[test]
@@ -2544,16 +2739,13 @@ mod supervisor_protocol_tests {
     }
 
     #[test]
-    fn command_row_running_policy_default() {
-        // A row that omits `running_policy` deserializes to None
-        // (dispatcher verbs + Apply leave the column NULL).
+    fn command_row_reads_with_its_defaults() {
         let v = json!({
             "id": 1,
             "project_id": "00000000-0000-0000-0000-0000000000a1",
             "verb": "stop"
         });
         let row: SupervisorCommandRow = serde_json::from_value(v).unwrap();
-        assert_eq!(row.running_policy, None);
         assert_eq!(row.verb, InfraLifecycleVerb::Stop);
         assert_eq!(row.node_id, None);
     }
@@ -2657,22 +2849,12 @@ mod supervisor_protocol_tests {
             node_id: Some("n".into()),
             copies: weft_core::instance::Copies::Shared,
             verb: InfraLifecycleVerb::Terminate,
-            running_policy: Some(RunningPolicy::Cancel),
             spec_json: None,
             force: false,
-            drain_timeout_secs: 120,
         };
         let v = serde_json::to_value(&row).unwrap();
         assert_eq!(v["node_id"], "n");
         assert_eq!(v["verb"], "terminate");
-        assert_eq!(v["running_policy"], "cancel");
-        assert_eq!(v["drain_timeout_secs"], 120);
-        // A payload WITHOUT the field (an older writer) decodes to the
-        // shared default, never zero.
-        let mut old = v.clone();
-        old.as_object_mut().unwrap().remove("drain_timeout_secs");
-        let back: SupervisorCommandRow = serde_json::from_value(old).unwrap();
-        assert_eq!(back.drain_timeout_secs, DEFAULT_DRAIN_TIMEOUT_SECS);
         // A terminate issued without its work is a writer bug, refused.
         assert!(row.terminate_work().is_err());
     }
@@ -2685,10 +2867,8 @@ mod supervisor_protocol_tests {
             node_id: None,
             copies: weft_core::instance::Copies::Shared,
             verb: InfraLifecycleVerb::Terminate,
-            running_policy: Some(RunningPolicy::Cancel),
             spec_json: Some(spec_json),
             force: false,
-            drain_timeout_secs: 60,
         };
         let wipe = row(json!({ "disks": "delete_all" })).terminate_work().unwrap();
         assert_eq!(wipe.disks, weft_core::infra::TerminateDisks::DeleteAll);
@@ -2697,25 +2877,20 @@ mod supervisor_protocol_tests {
         assert!(row(json!({ "disks": "some" })).terminate_work().is_err());
     }
 
-    /// `LifecycleSpec::into_row_columns` no longer populates the
-    /// running_policy column for dispatcher verbs (it's NULL in
-    /// the DB; Deactivate carries policy inside spec_json). Pin
-    /// the property so a future re-add of the column-as-SoT
-    /// for these verbs breaks CI.
+    /// A dispatcher verb's spec rides whole in `spec_json` (Deactivate
+    /// carries its running policy there) and reads back as written.
     #[test]
-    fn into_row_columns_returns_none_policy_for_dispatcher_verbs() {
+    fn a_dispatcher_verbs_spec_rides_in_its_row() {
         let d = LifecycleSpec::Deactivate(take_down(vec![ada_svc()]));
-        let (verb, policy, spec_json) = d.clone().into_row_columns();
+        let (verb, spec_json) = d.clone().into_row_columns();
         assert_eq!(verb, InfraLifecycleVerb::Deactivate);
-        assert_eq!(policy, None);
         // The row columns carry the whole take-down, broken copies too,
         // and read back as what was written.
         assert_eq!(LifecycleSpec::from_row_columns(verb, spec_json).unwrap(), d);
 
         let r = LifecycleSpec::Reactivate(RestoreReaders { still_broken: vec![ada_svc()] });
-        let (verb, policy, spec_json) = r.clone().into_row_columns();
+        let (verb, spec_json) = r.clone().into_row_columns();
         assert_eq!(verb, InfraLifecycleVerb::Reactivate);
-        assert_eq!(policy, None);
         assert_eq!(LifecycleSpec::from_row_columns(verb, spec_json).unwrap(), r);
         assert!(matches!(
             LifecycleSpec::from_row_columns(InfraLifecycleVerb::Reactivate, None),
@@ -2790,13 +2965,6 @@ mod supervisor_protocol_tests {
         let back: SupervisorEventRecordRequest = serde_json::from_value(v).unwrap();
         assert_eq!(back.kind, InfraEventKind::Flaky);
         assert_eq!(back.payload["desired"], 3);
-    }
-
-    #[test]
-    fn running_count_response_round_trip() {
-        let v = json!({ "running_count": 3 });
-        let r: SupervisorRunningCountResponse = serde_json::from_value(v).unwrap();
-        assert_eq!(r.running_count, 3);
     }
 
     #[test]
@@ -3246,11 +3414,14 @@ mod supervisor_protocol_tests {
         .unwrap();
         assert!(bare.headers.is_empty() && bare.query.is_empty() && bare.body_b64.is_empty());
 
-        let ok = CallerVerified { identity: json!({ "key": 2 }) };
+        let ok = CallerVerified { identity: json!({ "key": 2 }), credential_headers: vec!["x-api-key".into()] };
         let v = serde_json::to_value(&ok).unwrap();
-        assert_eq!(v, json!({ "identity": { "key": 2 } }));
+        assert_eq!(v, json!({ "identity": { "key": 2 }, "credential_headers": ["x-api-key"] }));
         let back: CallerVerified = serde_json::from_value(v).unwrap();
         assert_eq!(back.identity["key"], 2);
+        assert_eq!(back.credential_headers, vec!["x-api-key".to_string()]);
+        let older: CallerVerified = serde_json::from_value(json!({ "identity": null })).unwrap();
+        assert!(older.credential_headers.is_empty());
     }
 
 }

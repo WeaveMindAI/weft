@@ -159,11 +159,11 @@
                     entry_node: "producer".into(),
                     phase: weft_core::context::Phase::Fire,
                     definition_hash: Some("test-hash".into()),
-                    program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
-                    subgraph: None,
+                    binary_hash: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
+                    selection: None,
                     seed: None,
-                    instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-                    run_class: weft_core::run_class::RunClass::Short,
+                    instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+                    settings: Default::default(),
                 },
                 None,
             )
@@ -305,8 +305,8 @@
         journal.record_event(&ExecEvent::ExecutionStarted {
             execution_id, project_id: project.id, entry_node: "waiter".into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
-            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-            run_class: weft_core::run_class::RunClass::Short,
+            binary_hash: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, selection: None, seed: None, instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+            settings: Default::default(),
         }, None).await.unwrap();
         journal.record_event(&ExecEvent::NodeKicked {
             execution_id, node_id: "waiter".into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
@@ -483,11 +483,9 @@
     /// waiter has inbound edges, its resume goes through the
     /// `pulses_absorbed` un-absorb path (not the kicked `dispatched=false`
     /// reset). Two required ports means a re-dispatch only forms when BOTH
-    /// ports carry a pending pulse, which is the lever the regression test
-    /// uses: if a resume-absorbed pulse on `in2` is not recorded into
-    /// `pulses_absorbed`, the next resume cannot re-satisfy `in2` and the
-    /// waiter never re-fires. The creator+peer bus keeps the worker alive
-    /// across the awaits exactly as in the kicked variant.
+    /// ports carry a pending pulse again, which the un-absorb has to put
+    /// back. The creator+peer bus keeps the worker alive across the awaits
+    /// exactly as in the kicked variant.
     fn bus_plus_pulse_fed_waiter_topology() -> ProjectDefinition {
         serde_json::from_value(json!({
             "id": uuid::Uuid::new_v4(), "name": "bus-plus-pulse-fed-waiter", "description": null,
@@ -521,13 +519,6 @@
                     "requiresInfra": false, "images": []
                 },
                 {
-                    "id": "feeder3", "nodeType": "Configurable", "label": null, "config": null,
-                    "position": { "x": 2.0, "y": 1.0 },
-                    "inputs": [], "outputs": [{ "name": "out", "portType": "String", "required": false }],
-                    "features": {}, "scope": [], "groupBoundary": null,
-                    "requiresInfra": false, "images": []
-                },
-                {
                     "id": "waiter", "nodeType": "Configurable", "label": null, "config": null,
                     "position": { "x": 0.0, "y": 2.0 },
                     "inputs": [
@@ -541,8 +532,7 @@
             "edges": [
                 { "id": "e0", "source": "creator", "target": "peer", "sourceHandle": "ch", "targetHandle": "ch" },
                 { "id": "e1", "source": "feeder1", "target": "waiter", "sourceHandle": "out", "targetHandle": "in1" },
-                { "id": "e2", "source": "feeder2", "target": "waiter", "sourceHandle": "out", "targetHandle": "in2" },
-                { "id": "e3", "source": "feeder3", "target": "waiter", "sourceHandle": "out", "targetHandle": "in2" }
+                { "id": "e2", "source": "feeder2", "target": "waiter", "sourceHandle": "out", "targetHandle": "in2" }
             ],
             "groups": []
         }))
@@ -558,8 +548,8 @@
         journal.record_event(&ExecEvent::ExecutionStarted {
             execution_id, project_id: project.id, entry_node: creator.into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
-            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-            run_class: weft_core::run_class::RunClass::Short,
+            binary_hash: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, selection: None, seed: None, instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+            settings: Default::default(),
         }, None).await.unwrap();
         journal.record_event(&ExecEvent::NodeKicked {
             execution_id, node_id: creator.into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
@@ -1043,8 +1033,8 @@
             journal.record_event(&ExecEvent::ExecutionStarted {
                 execution_id, project_id: pid, entry_node: "payer".into(),
                 phase: weft_core::context::Phase::Fire, definition_hash: Some("test-hash".into()),
-            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-            run_class: weft_core::run_class::RunClass::Short,
+            binary_hash: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, selection: None, seed: None, instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+            settings: Default::default(),
             }, None).await.unwrap();
             journal.record_event(&ExecEvent::NodeKicked {
                 execution_id, node_id: "payer".into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 0,
@@ -1171,112 +1161,16 @@
     // alive but must be TRANSPARENT to the signal machinery: a node can
     // await_signal while a bus is open; the worker stays alive (bus
     // holds it) and the resume is delivered IN PROCESS the moment the
-    // fire's `SuspensionResolved` lands. When no bus holds the worker, a
+    // fire's answer comes. When no bus holds the worker, a
     // parked await falls through to the normal stall -> die -> respawn
     // path. These tests pin the whole matrix.
     // ─────────────────────────────────────────────────────────────────
 
-    /// Tasks fake for await_signal tests. `enqueue_dedup` of a
-    /// RegisterSignal mints a deterministic token (recording it so the
-    /// test can inject the matching `SuspensionResolved`) and
-    /// `wait_for_terminal` hands back a registered signal result.
-    /// Every other task kind is unreachable in these tests.
-    struct AwaitTasks {
-        // (task_id -> token) so wait_for_terminal returns the same token
-        // enqueue minted, and the test can read the token to resolve it.
-        tokens: StdMutex<std::collections::HashMap<uuid::Uuid, String>>,
-        // The most-recently-minted token, for the test to resolve.
-        last_token: StdMutex<Option<String>>,
-    }
-    impl AwaitTasks {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                tokens: StdMutex::new(std::collections::HashMap::new()),
-                last_token: StdMutex::new(None),
-            })
-        }
-        /// Block (test-side) until a token has been minted, then return
-        /// it. Buses race the worker; the await may not have registered
-        /// the instant the test wants to resolve it.
-        async fn await_token(&self) -> String {
-            for _ in 0..2000 {
-                if let Some(t) = self.last_token.lock().unwrap().clone() {
-                    return t;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-            }
-            panic!("no register_signal token minted within timeout");
-        }
-    }
-    #[async_trait]
-    impl weft_task_store::TaskStoreClient for AwaitTasks {
-        async fn cancels_asked(
-            &self,
-            _project_id: uuid::Uuid,
-            _execution_ids: Vec<String>,
-        ) -> anyhow::Result<Vec<weft_task_store::tasks::CancelAsked>> {
-            Ok(Vec::new())
-        }
+    use super::engine_test_rig::AwaitTasks;
 
-        async fn enqueue_dedup(
-            &self,
-            t: weft_task_store::tasks::NewTask,
-        ) -> anyhow::Result<weft_task_store::tasks::DedupOutcome> {
-            assert_eq!(
-                t.kind,
-                weft_task_store::TaskKind::RegisterSignal.as_str(),
-                "await tests only enqueue RegisterSignal"
-            );
-            let id = uuid::Uuid::new_v4();
-            // Deterministic token derived from the task id.
-            let token = format!("tok-{id}");
-            self.tokens.lock().unwrap().insert(id, token.clone());
-            *self.last_token.lock().unwrap() = Some(token);
-            Ok(weft_task_store::tasks::DedupOutcome::Inserted(id))
-        }
-        async fn wait_for_terminal(
-            &self,
-            t: uuid::Uuid,
-            _to: std::time::Duration,
-        ) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
-            let token = self
-                .tokens
-                .lock()
-                .unwrap()
-                .get(&t)
-                .cloned()
-                .expect("token for task id");
-            Ok(weft_task_store::tasks::TaskOutcome {
-                status: weft_task_store::tasks::TaskStatus::Complete,
-                result: Some(serde_json::json!({ "kind": "registered", "token": token })),
-                error: None,
-            })
-        }
-        async fn claim_execution(
-            &self,
-            _p: &str,
-            _project: uuid::Uuid,
-            _execution: &str,
-        ) -> anyhow::Result<Option<weft_task_store::tasks::ClaimedExecution>> {
-            Ok(None)
-        }
-        async fn heartbeat(&self, _t: uuid::Uuid, _p: &str) -> anyhow::Result<bool> {
-            Ok(true)
-        }
-        async fn requeue(&self, _t: uuid::Uuid, _p: &str) -> anyhow::Result<bool> {
-            Ok(true)
-        }
-        async fn complete(&self, _t: uuid::Uuid, _p: &str, _r: Value) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn fail(&self, _t: uuid::Uuid, _p: &str, _e: String) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// Spawn `run_one_execution` with the given tasks fake + journal so a
-    /// test can inject a `SuspensionResolved` into the journal while the
-    /// worker runs. Every node in `kicked` is seeded as an entry root
+    /// Spawn `run_one_execution` with the given tasks fake, journal and
+    /// answers, so a test can give an answer to a wait while the worker
+    /// runs. Every node in `kicked` is seeded as an entry root
     /// (so a bus-holder and an independent await-node can both start).
     /// Returns the join handle and the execution.
     fn spawn_run(
@@ -1284,8 +1178,21 @@
         kicked: &[&str],
         journal: Arc<MemJournal>,
         tasks: Arc<dyn weft_task_store::TaskStoreClient>,
+        answers: Arc<super::engine_test_rig::Answers>,
     ) -> (tokio::task::JoinHandle<anyhow::Result<ExecutionOutcome>>, ExecutionId) {
-        let execution_id = uuid::Uuid::new_v4();
+        spawn_run_holding(project, kicked, journal, tasks, answers, weft_core::run_settings::DEFAULT_HOLD_SECS)
+    }
+
+    /// [`spawn_run`], the run holding a wait it cannot pause on `hold_secs`.
+    fn spawn_run_holding(
+        project: ProjectDefinition,
+        kicked: &[&str],
+        journal: Arc<MemJournal>,
+        tasks: Arc<dyn weft_task_store::TaskStoreClient>,
+        answers: Arc<super::engine_test_rig::Answers>,
+        hold_secs: u32,
+    ) -> (tokio::task::JoinHandle<anyhow::Result<ExecutionOutcome>>, ExecutionId) {
+        let execution_id = weft_core::new_execution_id();
         let entry = kicked[0].to_string();
         let kicked: Vec<String> = kicked.iter().map(|s| s.to_string()).collect();
         let pid = project.id;
@@ -1298,11 +1205,11 @@
                     entry_node: entry,
                     phase: weft_core::context::Phase::Fire,
                     definition_hash: Some("test-hash".into()),
-                    program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
-                    subgraph: None,
+                    binary_hash: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
+                    selection: None,
                     seed: None,
-                    instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-                    run_class: weft_core::run_class::RunClass::Short,
+                    instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+                    settings: weft_core::run_settings::RunSettings::default().holding_for(hold_secs).unwrap(),
                 },
                 None,
             )
@@ -1323,7 +1230,7 @@
                 .await
                 .unwrap();
             }
-            let clients = EngineClients { tasks, ..clients(j.clone()) };
+            let clients = EngineClients { tasks, runs: answers, ..clients(j.clone()) };
             run_checked(Arc::new(project), configurable_catalog(), execution_id, j, clients, CancellationFlag::new_arc(), None)
                 .await
         });
@@ -1351,8 +1258,9 @@
         );
         let journal = Arc::new(MemJournal::default());
         let tasks = AwaitTasks::new();
+        let answers = Arc::new(super::engine_test_rig::Answers::default());
         let (handle, _execution_id) =
-            spawn_run(project, &["waiter"], journal.clone(), tasks.clone());
+            spawn_run(project, &["waiter"], journal.clone(), tasks.clone(), answers.clone());
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
             .await
             .expect("must not hang")
@@ -1364,14 +1272,13 @@
         );
     }
 
-    /// IN-FLIGHT RESUME (bus alive): a `creator`+`peer` keep a bus
-    /// conversation open (holding the worker alive), while an independent
-    /// `waiter` node parks on `await_signal`. The test injects
-    /// `SuspensionResolved` mid-flight; the waiter resumes IN PROCESS on
-    /// the live worker (no respawn), and once it resumes it tells the
-    /// creator to wrap up so the bus closes and the execution completes.
-    /// Proves the bus is transparent to the signal: the resume happens on
-    /// the running worker exactly as it would without a bus.
+    /// IN-FLIGHT RESUME (bus opened after the wait suspended): an
+    /// independent `waiter` node suspends on `await_signal` while nothing
+    /// keeps the worker, then `creator`+`peer` open a bus conversation
+    /// (holding the worker alive). The test answers the wait mid-flight;
+    /// the suspended waiter resumes IN PROCESS on the live worker (no
+    /// respawn), and once it resumes it tells the creator to wrap up so
+    /// the bus closes and the execution completes.
     #[tokio::test]
     async fn await_with_live_bus_resumes_in_process() {
         let project = bus_plus_waiter_topology();
@@ -1380,14 +1287,19 @@
         // on the bus and closes once set. (A plain Arc<AtomicBool> is the
         // cross-node signal; the bus just keeps the worker warm.)
         let resumed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The creator opens its bus only once the waiter has suspended.
+        let open = Arc::new(tokio::sync::Notify::new());
 
         let r_creator = resumed.clone();
+        let o_creator = open.clone();
         install_body(
             pid,
             "creator",
             std::sync::Arc::new(move |ctx| {
                 let resumed = r_creator.clone();
+                let open = o_creator.clone();
                 Box::pin(async move {
+                    open.notified().await;
                     let (mut bus, marker) = ctx.create_bus(Default::default())?;
                     bus.register("creator").expect("register creator");
                     emit_bus_marker(&ctx, "ch", marker).await?;
@@ -1435,45 +1347,20 @@
 
         let journal = Arc::new(MemJournal::default());
         let tasks = AwaitTasks::new();
-        let (handle, execution_id) =
-            spawn_run(project, &["creator", "waiter"], journal.clone(), tasks.clone());
+        let answers = Arc::new(super::engine_test_rig::Answers::default());
+        let (handle, _) =
+            spawn_run(project, &["creator", "waiter"], journal.clone(), tasks.clone(), answers.clone());
 
         // Wait until the waiter's await registered (token minted), give it
-        // a beat to reach the suspended state, then write the journal
-        // rows the dispatcher would on a real fire: SuspensionRegistered
-        // (the fold builds the awaited sequence from THIS) followed by
-        // SuspensionResolved carrying the value. Both land while the
-        // worker is alive (bus open); the in-loop resume poll picks them
-        // up and resumes the waiter in process.
+        // a beat to reach the suspended state, have the bus open, then
+        // answer its wait the way the install does on a real fire. It lands
+        // while the worker is alive (bus open); the in-loop ask takes it
+        // and resumes the waiter in process.
         let token = tasks.await_token().await;
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-        journal
-            .record_event(
-                &ExecEvent::SuspensionRegistered {
-                    execution_id,
-                    node_id: "waiter".into(),
-                    frames: vec![],
-                    token: token.clone(),
-                    spec: weft_core::signal::to_spec(human_form()),
-                    call_index: 0,
-                    at_unix: 0,
-                },
-                None,
-            )
-            .await
-            .unwrap();
-        journal
-            .record_event(
-                &ExecEvent::SuspensionResolved {
-                    execution_id,
-                    token,
-                    value: serde_json::json!({ "answer": 42 }),
-                    at_unix: 0,
-                },
-                None,
-            )
-            .await
-            .unwrap();
+        open.notify_one();
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        answers.answer(token, serde_json::json!({ "answer": 42 }));
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
             .await
@@ -1561,33 +1448,14 @@
 
         let journal = Arc::new(MemJournal::default());
         let tasks = AwaitTasks::new();
-        let (handle, execution_id) =
-            spawn_run(project, &["creator", "waiter"], journal.clone(), tasks.clone());
+        let answers = Arc::new(super::engine_test_rig::Answers::default());
+        let (handle, _) =
+            spawn_run(project, &["creator", "waiter"], journal.clone(), tasks.clone(), answers.clone());
 
         // Resolve the FIRST await (call_index 0).
         let token0 = tasks.await_token().await;
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-        journal
-            .record_event(
-                &ExecEvent::SuspensionRegistered {
-                    execution_id, node_id: "waiter".into(), frames: vec![],
-                    token: token0.clone(), spec: weft_core::signal::to_spec(human_form()),
-                    call_index: 0, at_unix: 0,
-                },
-                None,
-            )
-            .await
-            .unwrap();
-        journal
-            .record_event(
-                &ExecEvent::SuspensionResolved {
-                    execution_id, token: token0.clone(),
-                    value: serde_json::json!({ "answer": 1 }), at_unix: 0,
-                },
-                None,
-            )
-            .await
-            .unwrap();
+        answers.answer(token0.clone(), serde_json::json!({ "answer": 1 }));
 
         // Wait for the SECOND await to register a NEW token (distinct from
         // the first), then resolve it (call_index 1). `await_token` returns
@@ -1599,27 +1467,7 @@
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         };
-        journal
-            .record_event(
-                &ExecEvent::SuspensionRegistered {
-                    execution_id, node_id: "waiter".into(), frames: vec![],
-                    token: token1.clone(), spec: weft_core::signal::to_spec(human_form()),
-                    call_index: 1, at_unix: 0,
-                },
-                None,
-            )
-            .await
-            .unwrap();
-        journal
-            .record_event(
-                &ExecEvent::SuspensionResolved {
-                    execution_id, token: token1,
-                    value: serde_json::json!({ "answer": 2 }), at_unix: 0,
-                },
-                None,
-            )
-            .await
-            .unwrap();
+        answers.answer(token1, serde_json::json!({ "answer": 2 }));
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
             .await
@@ -1630,54 +1478,41 @@
             matches!(outcome, ExecutionOutcome::Completed),
             "both resumes must land in process and the execution complete; got {outcome:?}"
         );
-        // Exactly TWO NodeResumed for the waiter: one per await. A single
-        // one would mean the second resume never fired (the hang).
         let events = journal.events.lock().unwrap().clone();
-        let resumed_count = events
-            .iter()
-            .filter(|e| matches!(e, ExecEvent::NodeResumed { node_id, .. } if node_id == "waiter"))
-            .count();
-        assert_eq!(
-            resumed_count, 2,
-            "waiter must resume TWICE in process (one NodeResumed per await); got {resumed_count} in {events:?}"
-        );
+        // Both answers reached the waiter in process: each is on the
+        // record, whether its wait had suspended (no bus open yet) or was
+        // held in the call (a bus open).
+        let answered = events.iter().filter(|e| matches!(e, ExecEvent::SuspensionResolved { .. })).count();
+        assert_eq!(answered, 2, "one answer per await, both taken in process: {events:?}");
     }
 
-    /// PULSE-FED waiter, two in-place resumes. The waiter has two required
-    /// inbound ports (`in1`, `in2`). `feeder1` emits `in1` once, `feeder2`
-    /// emits `in2` once before the first await, and `feeder3` emits a second
-    /// `in2` pulse after the first resume. Unlike the kicked variant, this
-    /// waiter re-fires through the `pulses_absorbed` UN-ABSORB path (it has
-    /// inbound edges, so its resume cannot use the `dispatched=false` kick
-    /// reset). It pins that the pulse-fed double-resume path completes and
-    /// emits exactly two `NodeResumed` events.
-    ///
-    /// NOTE: this test does NOT pin the `is_resume` `pulses_absorbed`
-    /// extension fix (it passes whether that loop is present or reverted).
-    /// That extension keeps the live RAM record equal to a journal refold,
-    /// but reverting it has no reachable behavioral effect: a re-fire
-    /// un-absorbs the ORIGINAL `pulses_absorbed` recorded at `NodeStarted`,
-    /// and the first fire already proved every wired port had a pulse there,
-    /// so every wired port is always re-satisfied on every resume. A pulse a
-    /// resume absorbs on top of that is never the sole satisfier of any
-    /// port, so dropping it never starves a re-fire. The full engine suite
-    /// passes with that loop reverted; the fix is a defensive RAM==refold
-    /// consistency guard, not a fix for a reachable hang.
+    /// PULSE-FED waiter, resumed in place. The waiter has two required
+    /// inbound ports (`in1`, `in2`), each fed once. Its first await
+    /// suspends while nothing keeps the worker; then the bus opens, and its
+    /// answer re-fires the waiter IN PROCESS through the `pulses_absorbed`
+    /// UN-ABSORB path (it has inbound edges, so its resume cannot use the
+    /// kicked `dispatched=false` reset). Its second await, made while the
+    /// bus is open, holds in the call and takes its answer there.
     #[tokio::test]
     async fn two_awaits_pulse_fed_waiter_both_resume() {
         let project = bus_plus_pulse_fed_waiter_topology();
         let pid = project.id;
         // 0 -> first await parked, 1 -> first resume done, 2 -> second
-        // resume done. feeder2 uses it to time its second emit.
+        // answer taken.
         let resumes = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        // The creator opens its bus only once the waiter has suspended.
+        let open = Arc::new(tokio::sync::Notify::new());
 
         let c_resumes = resumes.clone();
+        let o_creator = open.clone();
         install_body(
             pid,
             "creator",
             std::sync::Arc::new(move |ctx| {
                 let resumes = c_resumes.clone();
+                let open = o_creator.clone();
                 Box::pin(async move {
+                    open.notified().await;
                     let (mut bus, marker) = ctx.create_bus(Default::default())?;
                     bus.register("creator").expect("register creator");
                     emit_bus_marker(&ctx, "ch", marker).await?;
@@ -1725,27 +1560,6 @@
                 })
             }),
         );
-        // feeder3: a SECOND in2 pulse, emitted only AFTER the first resume
-        // (resumes >= 1). A port may be emitted at most once per firing, so
-        // this must be a distinct node, not a re-emit by feeder2. This pulse
-        // is the one the first resume dispatch absorbs; if the fix does not
-        // record it into the waiter's live `pulses_absorbed`, the second
-        // resume cannot re-satisfy `in2`.
-        let f3_resumes = resumes.clone();
-        install_body(
-            pid,
-            "feeder3",
-            std::sync::Arc::new(move |ctx| {
-                let resumes = f3_resumes.clone();
-                Box::pin(async move {
-                    while resumes.load(std::sync::atomic::Ordering::Acquire) < 1 {
-                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                    }
-                    ctx.pulse_downstream(NodeOutput::new().set("out", json!("b2"))).await?;
-                    Ok(())
-                })
-            }),
-        );
         let w_resumes = resumes.clone();
         install_body(
             pid,
@@ -1764,39 +1578,24 @@
 
         let journal = Arc::new(MemJournal::default());
         let tasks = AwaitTasks::new();
+        let answers = Arc::new(super::engine_test_rig::Answers::default());
         // The waiter is pulse-fed, so it is NOT kicked: the feeders are the
         // kicked roots that produce its input pulses.
-        let (handle, execution_id) = spawn_run(
+        let (handle, _) = spawn_run(
             project,
-            &["creator", "feeder1", "feeder2", "feeder3"],
+            &["creator", "feeder1", "feeder2"],
             journal.clone(),
             tasks.clone(),
+            answers.clone(),
         );
 
-        // Resolve the FIRST await (call_index 0).
+        // Resolve the FIRST await (call_index 0) once it suspended and the
+        // bus is open.
         let token0 = tasks.await_token().await;
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-        journal
-            .record_event(
-                &ExecEvent::SuspensionRegistered {
-                    execution_id, node_id: "waiter".into(), frames: vec![],
-                    token: token0.clone(), spec: weft_core::signal::to_spec(human_form()),
-                    call_index: 0, at_unix: 0,
-                },
-                None,
-            )
-            .await
-            .unwrap();
-        journal
-            .record_event(
-                &ExecEvent::SuspensionResolved {
-                    execution_id, token: token0.clone(),
-                    value: serde_json::json!({ "answer": 1 }), at_unix: 0,
-                },
-                None,
-            )
-            .await
-            .unwrap();
+        open.notify_one();
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        answers.answer(token0.clone(), serde_json::json!({ "answer": 1 }));
 
         // Resolve the SECOND await (call_index 1) once its token appears.
         let token1 = loop {
@@ -1806,38 +1605,7 @@
             }
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         };
-        // Resolve the second await only once b2 is in the run: the driver
-        // journals feeder3's `PortEmitted` after routing its pulse, and a
-        // resume wakes the moment its row lands, so resolving earlier
-        // would re-fire the waiter before b2 exists.
-        loop {
-            let events = journal.events_for_execution_id(execution_id).await.unwrap();
-            if events.iter().any(|e| matches!(e, ExecEvent::PortEmitted { node_id, .. } if node_id == "feeder3")) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        journal
-            .record_event(
-                &ExecEvent::SuspensionRegistered {
-                    execution_id, node_id: "waiter".into(), frames: vec![],
-                    token: token1.clone(), spec: weft_core::signal::to_spec(human_form()),
-                    call_index: 1, at_unix: 0,
-                },
-                None,
-            )
-            .await
-            .unwrap();
-        journal
-            .record_event(
-                &ExecEvent::SuspensionResolved {
-                    execution_id, token: token1,
-                    value: serde_json::json!({ "answer": 2 }), at_unix: 0,
-                },
-                None,
-            )
-            .await
-            .unwrap();
+        answers.answer(token1, serde_json::json!({ "answer": 2 }));
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
             .await
@@ -1849,14 +1617,13 @@
             "both resumes must land in process and the execution complete; got {outcome:?}"
         );
         let events = journal.events.lock().unwrap().clone();
-        let resumed_count = events
-            .iter()
-            .filter(|e| matches!(e, ExecEvent::NodeResumed { node_id, .. } if node_id == "waiter"))
-            .count();
-        assert_eq!(
-            resumed_count, 2,
-            "pulse-fed waiter must resume TWICE in process; got {resumed_count} in {events:?}"
-        );
+        // Both answers reached the waiter in process: each is on the
+        // record, whether its wait had suspended (no bus open yet) or was
+        // held in the call (a bus open).
+        let answered = events.iter().filter(|e| matches!(e, ExecEvent::SuspensionResolved { .. })).count();
+        assert_eq!(answered, 2, "one answer per await, both taken in process: {events:?}");
+        let resumed = events.iter().filter(|e| matches!(e, ExecEvent::NodeResumed { node_id, .. } if node_id == "waiter")).count();
+        assert_eq!(resumed, 1, "the suspended first await resumed in place, the second held: {events:?}");
     }
 
     /// BUS CLOSES BEFORE THE FIRE: the `creator`+`peer` bus conversation
@@ -1864,7 +1631,7 @@
     /// `await_signal` and the fire has NOT arrived. Once the bus is gone
     /// nothing holds the worker, so the await must fall through to the
     /// normal stall -> exit path (the dispatcher respawns on the eventual
-    /// fire). No `SuspensionResolved` is injected, proving the worker
+    /// fire). No answer is given, proving the worker
     /// exits rather than waiting forever on the dead bus.
     #[tokio::test]
     async fn bus_closes_before_fire_then_worker_exits_normally() {
@@ -1912,10 +1679,11 @@
 
         let journal = Arc::new(MemJournal::default());
         let tasks = AwaitTasks::new();
+        let answers = Arc::new(super::engine_test_rig::Answers::default());
         let (handle, _execution_id) =
-            spawn_run(project, &["creator", "waiter"], journal.clone(), tasks.clone());
+            spawn_run(project, &["creator", "waiter"], journal.clone(), tasks.clone(), answers.clone());
 
-        // No SuspensionResolved is injected. The worker must exit Stalled
+        // No answer is given. The worker must exit Stalled
         // (bus closed, nothing holds it, await unresolved) rather than
         // hang.
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
@@ -1994,7 +1762,8 @@
 
             let journal = Arc::new(MemJournal::default());
             let tasks = AwaitTasks::new();
-            let (handle, execution_id) = spawn_run(project, &["producer"], journal.clone(), tasks);
+            let answers = Arc::new(super::engine_test_rig::Answers::default());
+            let (handle, execution_id) = spawn_run(project, &["producer"], journal.clone(), tasks, answers);
             tokio::time::timeout(std::time::Duration::from_secs(10), handle)
                 .await
                 .expect("must not hang")
@@ -2037,21 +1806,19 @@
         InboundMessage, OutboundChunk,
     };
     use weft_core::signal::{Backpressure, DataType, ErrorMode, Protocol};
-    use weft_core::wait::SuspendPolicy;
 
-    /// Runtime config for a fake caller. `can_suspend = false` is the
+    /// Runtime config for a fake caller. `outlives_caller = false` is the
     /// caller-tied default (disconnect cancels); `true` is the survives case.
-    fn caller_cfg(protocol: Protocol, can_suspend: bool) -> CallerRuntimeConfig {
+    fn caller_cfg(protocol: Protocol, outlives_caller: bool) -> CallerRuntimeConfig {
         CallerRuntimeConfig {
             protocol,
             data_type: DataType::Json,
             backpressure: Backpressure::Block,
             error_mode: ErrorMode::Surface,
-            connect_timeout_secs: 5,
             max_inbound_bytes: 1_048_576,
             caller_silence_secs: weft_core::signal::DEFAULT_CALLER_SILENCE_SECS,
             max_session_secs: 0,
-            suspend: SuspendPolicy { can_suspend, default_hold_secs: 60 },
+            outlives_caller,
             inbound_window: weft_core::caller::DEFAULT_INBOUND_WINDOW,
             journal: weft_core::stream_journal::JournalPolicy::default(),
         }
@@ -2060,6 +1827,11 @@
     /// Seed a journal with ExecutionStarted(Fire) + a NodeKicked on
     /// `entry`, the minimal state to make a no-input node ready.
     async fn seed(journal: &MemJournal, execution_id: ExecutionId, project: &ProjectDefinition, entry: &str) {
+        seed_holding(journal, execution_id, project, entry, weft_core::run_settings::DEFAULT_HOLD_SECS).await
+    }
+
+    /// [`seed`], the run holding a wait it cannot pause on `hold_secs`.
+    async fn seed_holding(journal: &MemJournal, execution_id: ExecutionId, project: &ProjectDefinition, entry: &str, hold_secs: u32) {
         journal
             .record_event(
                 &ExecEvent::ExecutionStarted {
@@ -2068,11 +1840,11 @@
                     entry_node: entry.into(),
                     phase: weft_core::context::Phase::Fire,
                     definition_hash: Some("test-hash".into()),
-                    program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
-                    subgraph: None,
+                    binary_hash: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
+                    selection: None,
                     seed: None,
-                    instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-                    run_class: weft_core::run_class::RunClass::Short,
+                    instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+                    settings: weft_core::run_settings::RunSettings::default().holding_for(hold_secs).unwrap(),
                 },
                 None,
             )
@@ -2401,8 +2173,8 @@
         journal.record_event(&ExecEvent::ExecutionStarted {
             execution_id, project_id: project.id, entry_node: "ra".into(),
             phase: weft_core::context::Phase::Fire, definition_hash: Some("h".into()),
-            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-            run_class: weft_core::run_class::RunClass::Short,
+            binary_hash: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, selection: None, seed: None, instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+            settings: Default::default(),
         }, None).await.unwrap();
         for n in ["ra", "rb"] {
             journal.record_event(&ExecEvent::NodeKicked {
@@ -2450,7 +2222,7 @@
         assert!(calls.iter().any(|c| matches!(c, CallerCall::Terminate { .. })), "sent the final body / terminated: {calls:?}");
     }
 
-    /// Caller-tied (can_suspend = false): a node that sends to a
+    /// Caller-tied (`outlivesCaller` off): a node that sends to a
     /// disconnected caller surfaces an error, which cancels the execution.
     #[tokio::test]
     async fn caller_tied_disconnect_cancels() {
@@ -2473,7 +2245,7 @@
         );
     }
 
-    /// Survives (can_suspend = true): a send to a disconnected caller is a
+    /// Survives (`outlivesCaller` on): a send to a disconnected caller is a
     /// no-op into the void; the node still completes normally.
     #[tokio::test]
     async fn survives_disconnect_continues() {
@@ -2516,17 +2288,9 @@
 
     // ----- await_signal × caller (hold-then-kill) + non-durability -------
 
-    /// Caller config with an explicit short hold, for the suspension tests
-    /// (the caller-tied hold is real wall-time, so keep it ~1s).
-    fn caller_cfg_hold(can_suspend: bool, hold_secs: u64) -> CallerRuntimeConfig {
-        let mut c = caller_cfg(Protocol::Websocket, can_suspend);
-        c.suspend.default_hold_secs = hold_secs;
-        c
-    }
-
     /// A node that parks on `await_signal` (a human form), the durable-wait
     /// primitive. Its interaction with a live caller is the whole point: a
-    /// caller-tied run must NOT durably suspend here.
+    /// caller-tied run cannot durably suspend here, so the wait holds.
     struct AwaiterNode;
     test_manifest!(AwaiterNode, "Awaiter");
     #[async_trait]
@@ -2537,51 +2301,157 @@
         }
     }
 
-    /// Caller-tied (can_suspend = false) run hits a durable `await_signal`
-    /// with no resolving signal arriving: it holds the worker warm for the
-    /// hold window, then is KILLED (cancelled), because a tied run cannot
-    /// degrade into a caller-less background job. This is ALSO the
-    /// non-durability proof: a live tied run does not produce a resumable
-    /// suspension.
+    /// A node that handles a wait given up itself: what a node may do with
+    /// the error its call fails with.
+    struct RecoversNode;
+    test_manifest!(RecoversNode, "Recovers");
+    #[async_trait]
+    impl Node for RecoversNode {
+        async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
+            let answered = match ctx.await_signal(human_form()).await {
+                Ok(_) => true,
+                Err(weft_core::error::WeftError::WaitGaveUp(_)) => false,
+                Err(other) => return Err(other),
+            };
+            ctx.pulse_downstream(NodeOutput::new().set("done", Value::Bool(answered))).await
+        }
+    }
+
+    /// Caller-tied run hits a wait no answer comes to: the wait holds in
+    /// its call while the run is quiet, then is given up, failing the call
+    /// (the run with it, as the node does not handle it), and is
+    /// withdrawn. It never becomes a resumable suspension.
     #[tokio::test]
-    async fn caller_tied_run_at_await_signal_is_killed_not_suspended() {
+    async fn caller_tied_run_gives_up_a_wait_nothing_answers() {
         let catalog: Arc<dyn NodeCatalog> =
             Arc::new(OneNodeCatalog { node: Box::leak(Box::new(AwaiterNode)) });
         let project = single_node_project("Awaiter");
         let execution_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
-        seed(&journal, execution_id, &project, "entry").await;
-        // Tied + connected + a 1s hold: no fire ever arrives, so it must
-        // cancel after the hold (not Stall, not Complete).
-        let fake = FakeCallerConnection::connected(caller_cfg_hold(false, 1));
+        seed_holding(&journal, execution_id, &project, "entry", 1).await;
+        let fake = FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, false));
+        let tasks = AwaitTasks::new();
 
         let outcome = run_with_caller_tasks(
             project, catalog, journal.clone(), execution_id,
-            Some(fake.clone() as Arc<dyn CallerConnection>), AwaitTasks::new(),
+            Some(fake.clone() as Arc<dyn CallerConnection>), tasks.clone(),
         ).await;
         assert!(
-            matches!(outcome, ExecutionOutcome::Cancelled { .. }),
-            "a caller-tied run at a durable wait with no fire must be killed, not suspended; got {outcome:?}"
+            matches!(&outcome, ExecutionOutcome::Failed { error } if error.contains("gave up its wait") && error.contains("`outlivesCaller`")),
+            "a caller-tied run gives up a wait nothing answers; got {outcome:?}"
         );
-        // Non-durability: the terminal journal event is a cancellation, NOT
-        // a clean suspension that a later fire could resume.
-        let has_cancel = journal.events.lock().unwrap().iter().any(|e| matches!(
-            e, ExecEvent::ExecutionCancelled { execution_id: c, .. } if *c == execution_id));
-        assert!(has_cancel, "tied live run must journal a cancellation (non-durable)");
+        let token = tasks.minted().expect("the wait was registered");
+        assert_eq!(*tasks.withdrawn.lock().unwrap(), vec![token.clone()], "the wait given up is withdrawn");
+        let events = journal.events.lock().unwrap().clone();
+        assert!(events.iter().any(|e| matches!(e, ExecEvent::SuspensionGaveUp { token: t, .. } if *t == token)), "{events:?}");
+        assert!(!events.iter().any(|e| matches!(e, ExecEvent::NodeSuspended { .. })), "nothing parked: {events:?}");
     }
 
-    /// A caller hanging up mid-hold ends the warm hold at once: the hold
-    /// wakes on the disconnect itself, not when a row lands or the (here
-    /// ten minute) hold runs out.
+    /// The node may handle a wait given up like any outcome of its step,
+    /// and the run goes on.
     #[tokio::test]
-    async fn caller_hang_up_ends_the_warm_hold_promptly() {
+    async fn a_node_handles_a_wait_given_up() {
+        let catalog: Arc<dyn NodeCatalog> =
+            Arc::new(OneNodeCatalog { node: Box::leak(Box::new(RecoversNode)) });
+        let project = single_node_project("Recovers");
+        let execution_id = uuid::Uuid::new_v4();
+        let journal = Arc::new(MemJournal::default());
+        seed_holding(&journal, execution_id, &project, "entry", 1).await;
+        let fake = FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, false));
+
+        let outcome = run_with_caller_tasks(
+            project, catalog, journal, execution_id,
+            Some(fake.clone() as Arc<dyn CallerConnection>), AwaitTasks::new(),
+        ).await;
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "{outcome:?}");
+    }
+
+    /// The hold clock runs only while the run is quiet: a run whose other
+    /// step keeps talking holds its wait past `holdSecs`, and the answer
+    /// that comes then is taken.
+    #[tokio::test]
+    async fn a_wait_holds_while_the_run_is_busy() {
+        let project = bus_plus_waiter_topology();
+        let pid = project.id;
+        let answered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let a_creator = answered.clone();
+        install_body(
+            pid,
+            "creator",
+            std::sync::Arc::new(move |ctx| {
+                let answered = a_creator.clone();
+                Box::pin(async move {
+                    let (mut bus, marker) = ctx.create_bus(Default::default())?;
+                    bus.register("creator").expect("register creator");
+                    emit_bus_marker(&ctx, "ch", marker).await?;
+                    bus.wait_for("peer").await.expect("peer joins");
+                    // Talk every 200 ms until the waiter has its answer.
+                    while !answered.load(std::sync::atomic::Ordering::Acquire) {
+                        bus.send("tick", json!(null)).expect("send");
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                    bus.close();
+                    Ok(())
+                })
+            }),
+        );
+        install_body(
+            pid,
+            "peer",
+            std::sync::Arc::new(|ctx| {
+                Box::pin(async move {
+                    let mut bus = ctx.bus_from_input("ch")?;
+                    bus.register("peer").expect("register peer");
+                    let mut cursor = bus.cursor();
+                    while cursor.next().await.is_some() {}
+                    Ok(())
+                })
+            }),
+        );
+        let a_waiter = answered.clone();
+        install_body(
+            pid,
+            "waiter",
+            std::sync::Arc::new(move |ctx| {
+                let answered = a_waiter.clone();
+                Box::pin(async move {
+                    let _ = ctx.await_signal(human_form()).await?;
+                    answered.store(true, std::sync::atomic::Ordering::Release);
+                    Ok(())
+                })
+            }),
+        );
+
+        let journal = Arc::new(MemJournal::default());
+        let tasks = AwaitTasks::new();
+        let answers = Arc::new(super::engine_test_rig::Answers::default());
+        let (handle, _) = spawn_run_holding(project, &["creator", "waiter"], journal, tasks.clone(), answers.clone(), 1);
+        // Three seconds of a busy run: three times its hold.
+        let token = tasks.await_token().await;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        answers.answer(token, json!({ "answer": 42 }));
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("must not hang")
+            .expect("join")
+            .expect("run ok");
+        assert!(matches!(outcome, ExecutionOutcome::Completed), "a busy run keeps its wait; got {outcome:?}");
+        assert!(tasks.withdrawn.lock().unwrap().is_empty(), "nothing was given up");
+    }
+
+    /// A caller hanging up mid-hold ends the hold at once: the run is no
+    /// longer tied, so the wait it held suspends after all (the real
+    /// connection also cancels a tied run whose caller left; the fake
+    /// leaves that to the run).
+    #[tokio::test]
+    async fn caller_hang_up_ends_the_hold_promptly() {
         let catalog: Arc<dyn NodeCatalog> =
             Arc::new(OneNodeCatalog { node: Box::leak(Box::new(AwaiterNode)) });
         let project = single_node_project("Awaiter");
         let execution_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
-        seed(&journal, execution_id, &project, "entry").await;
-        let fake = FakeCallerConnection::connected(caller_cfg_hold(false, 600));
+        seed_holding(&journal, execution_id, &project, "entry", 600).await;
+        let fake = FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, false));
         let hang_up = fake.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -2596,15 +2466,15 @@
             ),
         )
         .await
-        .expect("a hang-up must end the warm hold, not wait out the 600s hold");
+        .expect("a hang-up must end the hold, not wait out the 600s hold");
         assert!(
             matches!(outcome, ExecutionOutcome::Stalled),
-            "with the caller gone the run leaves the hold on the not-warm path; got {outcome:?}"
+            "with the caller gone the held wait suspends; got {outcome:?}"
         );
     }
 
-    /// Survivable (can_suspend = true) run hits the SAME durable wait and
-    /// cleanly STALLS (suspends): the worker exits, a later fire resumes it
+    /// A run that outlives its caller hits the SAME wait and cleanly
+    /// STALLS (suspends): the worker exits, a later fire resumes it
     /// caller-less. The contrast with the tied case above is the lifetime
     /// axis doing its job.
     #[tokio::test]
@@ -2614,8 +2484,8 @@
         let project = single_node_project("Awaiter");
         let execution_id = uuid::Uuid::new_v4();
         let journal = Arc::new(MemJournal::default());
-        seed(&journal, execution_id, &project, "entry").await;
-        let fake = FakeCallerConnection::connected(caller_cfg_hold(true, 1));
+        seed_holding(&journal, execution_id, &project, "entry", 1).await;
+        let fake = FakeCallerConnection::connected(caller_cfg(Protocol::Websocket, true));
 
         let outcome = run_with_caller_tasks(
             project, catalog, journal, execution_id,

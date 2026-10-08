@@ -65,11 +65,13 @@ pub fn advisory_key(domain: &str, scope: &str) -> i64 {
 /// a live `Transaction` (its connection is the lock holder) while `body`
 /// runs its own work on SEPARATE pool connections, then drop the
 /// transaction to release. No `catch_unwind`, no orphaned lock.
+/// `lock_pool` is never the pool `body` works through, for the reason
+/// [`with_lock_waiting`] gives.
 ///
 /// The lock lives in Postgres, so it serializes across N dispatcher
 /// replicas.
 pub async fn with_advisory_lock<T, F, Fut>(
-    pg_pool: &sqlx::postgres::PgPool,
+    lock_pool: &sqlx::postgres::PgPool,
     key: i64,
     body: F,
 ) -> anyhow::Result<Option<T>>
@@ -81,7 +83,7 @@ where
     // transaction is alive. We never write through `tx`; `body` uses the
     // pool. Dropping `tx` (normal end OR panic unwind) rolls back and
     // releases the lock.
-    let mut tx = pg_pool.begin().await?;
+    let mut tx = lock_pool.begin().await?;
     let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
         .bind(key)
         .fetch_one(&mut *tx)

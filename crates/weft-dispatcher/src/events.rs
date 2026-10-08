@@ -11,13 +11,15 @@
 //!     broadcast. Use `publish_local` when the caller knows the event
 //!     is process-local (no cross-process fanout needed).
 //!
-//! The split is deliberate: ExecEvent flows through `journal_bridge`
-//! which polls `exec_event` independently on every process (so each process
-//! ends up publishing the same events to its local broadcast). The
-//! NOTIFY channel only carries the smaller cross-cutting events that
-//! don't sit on the journal path: ProjectRegistered, ProjectActivated,
-//! ProjectDeactivated, TriggerUrlChanged, ExecutionDeleted. These fit inside Postgres
-//! NOTIFY's 8000-byte payload cap with room to spare.
+//! The split is deliberate: a run's events and the infra's reach every
+//! process from the database itself (`crate::live_view` reads each run's
+//! new record rows, `crate::infra_event_bridge` each new `infra_event`
+//! row, on every process that has somebody following the project), so
+//! each process publishes them to its own broadcast. The NOTIFY channel
+//! only carries the smaller cross-cutting events that have no row to read:
+//! ProjectRegistered, ProjectActivated, ProjectDeactivated,
+//! TriggerUrlChanged, ExecutionDeleted. These fit inside Postgres NOTIFY's
+//! 8000-byte payload cap with room to spare.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -79,9 +81,15 @@ impl EventBus {
             .subscribe()
     }
 
-    /// Push to local subscribers only. Used by `journal_bridge`,
-    /// where every process's bridge polls the journal independently
-    /// (the cross-process fanout for ExecEvent is the journal itself).
+    /// Whether anybody on this process follows `project_id`'s events right
+    /// now: what the live view paints a run for.
+    pub async fn watched(&self, project_id: uuid::Uuid) -> bool {
+        self.inner.read().await.get(&project_id).is_some_and(|sender| sender.receiver_count() > 0)
+    }
+
+    /// Push to local subscribers only. Used by the live view and the infra
+    /// event bridge, which every process runs for its own subscribers (the
+    /// cross-process fanout for them is the database itself).
     pub async fn publish_local(&self, event: LiveEvent) {
         self.publish_local_inner(&event).await;
     }
@@ -89,9 +97,9 @@ impl EventBus {
     /// Push locally AND issue NOTIFY so sibling processes receive it.
     /// Used for the events that don't ride the journal:
     /// ProjectRegistered/Activated/Deactivated, TriggerUrlChanged and
-    /// ExecutionDeleted (the one execution event with no journal row
-    /// to ride, the journal being what was deleted). Every other
-    /// execution event uses only the journal bridge, preserving its
+    /// ExecutionDeleted (the one execution event with no record row
+    /// to ride, the record being what was deleted). Every other
+    /// execution event comes only through the live view, keeping its
     /// identity across history and live delivery.
     pub async fn publish(&self, event: DispatcherEvent) {
         let event = IdentifiedEvent::transient(event);

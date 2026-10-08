@@ -511,13 +511,13 @@ mod tests {
             (RunSpec { from: [("b".into(), [("in".into(), json!("backup"))].into())].into(), target: vec!["c".into()], ..RunSpec::whole("case") }, "a", "b"),
             (RunSpec { group: Some(("l".into(), BTreeMap::new())), ..RunSpec::whole("case") }, "c", "l__in"),
         ] {
-            let authored = crate::run_spec::resolve_spec(&spec, &project).unwrap().selection;
+            let authored = crate::run_spec::resolve_spec(&spec, &project, &Default::default()).unwrap().selection;
             let planned = SeedPlan { origins: [(top(source), ExecutionId::nil())].into(), selection: authored.clone(), warnings: vec![] };
             let history = vec![OutputWire { node: source.into(), port: "out".into(), value: json!("original input"), ..Default::default() }];
             let saved = starting_parameters(&project, &spec, &authored, &planned, &outcomes(&project), &history).unwrap();
             assert_eq!(saved.starting_inputs(&project)[&top(entry)]["in"], json!("original input"));
             assert_eq!(saved.target, spec.target);
-            assert_eq!(crate::run_spec::resolve_spec(&saved, &project).unwrap().selection.nodes, authored.nodes);
+            assert_eq!(crate::run_spec::resolve_spec(&saved, &project, &Default::default()).unwrap().selection.nodes, authored.nodes);
         }
         let whole = RunSpec::whole("whole");
         let authored = RunSelection::whole(&project);
@@ -533,7 +533,7 @@ mod tests {
             crate::weft_type::WeftType::parse("{ field: String }").unwrap();
         project.edges[0].path = vec!["field".into()];
         let spec = RunSpec { from: [("b".into(), BTreeMap::new())].into(), ..RunSpec::whole("projected") };
-        let authored = crate::run_spec::resolve_spec(&spec, &project).unwrap().selection;
+        let authored = crate::run_spec::resolve_spec(&spec, &project, &Default::default()).unwrap().selection;
         let planned = SeedPlan { origins: [(top("a"), ExecutionId::nil())].into(), selection: authored.clone(), warnings: vec![] };
         let history = vec![OutputWire { node: "a".into(), port: "out".into(), value: json!({"field":"delivered"}), ..Default::default() }];
         let saved = starting_parameters(&project, &spec, &authored, &planned, &outcomes(&project), &history).unwrap();
@@ -635,7 +635,7 @@ mod tests {
             } else {
                 assert_eq!(saved.from["a"]["in"], json!("original input"));
             }
-            let fresh = crate::run_spec::resolve_spec(&saved, &project).unwrap();
+            let fresh = crate::run_spec::resolve_spec(&saved, &project, &Default::default()).unwrap();
             assert_eq!(fresh.selection.nodes, authored.nodes);
             assert!(fresh.selection.nodes.contains(&top("a")) && fresh.selection.nodes.contains(&top("b")) && fresh.selection.nodes.contains(&top("d")));
         }
@@ -666,7 +666,7 @@ mod tests {
         let saved = starting_parameters(&project, &spec, &authored, &planned, &previous, &[]).unwrap();
         assert_eq!(saved.from["l"]["in"], json!("saved group input"));
         assert!(!saved.from.contains_key("l__in"));
-        let fresh = crate::run_spec::resolve_spec(&saved, &project).unwrap().selection;
+        let fresh = crate::run_spec::resolve_spec(&saved, &project, &Default::default()).unwrap().selection;
         assert_eq!(fresh.nodes, authored.nodes);
         assert!(fresh.nodes.contains(&top("x")));
     }
@@ -680,7 +680,7 @@ mod tests {
         let mut previous = outcomes(&project);
         previous.get_mut(&top("a")).unwrap().fire = Some(json!({"old": "event"}));
         let spec = RunSpec { fire: Some(("x".into(), json!({"new": "event"}))), ..RunSpec::whole("case") };
-        let selected = crate::run_spec::resolve_spec(&spec, &project).unwrap().selection;
+        let selected = crate::run_spec::resolve_spec(&spec, &project, &Default::default()).unwrap().selection;
         let planned = seed_plan(&project, &identity(&project), &selected, &spec, &previous, &[], &[]).unwrap();
         assert!(planned.origins.is_empty());
         assert_eq!(starting_parameters(&project, &spec, &selected, &planned, &previous, &[]).unwrap(), spec);
@@ -745,7 +745,7 @@ mod tests {
         let mut old = outcomes(&p);
         let mut spec = RunSpec::whole("test");
         spec.from.insert("b".into(), BTreeMap::from([("in".into(), Value::String("new".into()))]));
-        let selected = crate::run_spec::resolve_spec(&spec, &p).unwrap().selection;
+        let selected = crate::run_spec::resolve_spec(&spec, &p, &Default::default()).unwrap().selection;
         let result = seed_plan(&p, &identity(&p), &selected, &spec, &old, &[], &[]).unwrap();
         assert!(result.origins.contains_key(&top("b")), "an unused backup does not change the effective input");
         assert!(result.origins.contains_key(&top("a")), "upstream history remains reusable");
@@ -845,7 +845,7 @@ mod tests {
         old.get_mut(&top("b")).unwrap().used_backups.insert("in".into(), json!("old"));
         old.get_mut(&top("c")).unwrap().used_backups.insert("in".into(), json!("interior"));
         let spec = RunSpec { from: BTreeMap::from([("b".into(), BTreeMap::new())]), ..RunSpec::whole("test") };
-        let selection = crate::run_spec::resolve_spec(&spec, &p).unwrap().selection;
+        let selection = crate::run_spec::resolve_spec(&spec, &p, &Default::default()).unwrap().selection;
         let result = seed_plan(&p, &identity(&p), &selection, &spec, &old, &[], &[]).unwrap();
         assert_eq!(result.selection.input[&top("b")]["in"], json!("old"));
         assert_eq!(result.selection.input_origins[&top("b")]["in"], old[&top("b")].origin);
@@ -898,7 +898,7 @@ mod tests {
             RunSpec { fire: Some(("a".into(), json!({}))), ..RunSpec::whole("fire") },
             RunSpec { emit: BTreeMap::from([("a".into(), BTreeMap::from([("out".into(), json!("new"))]))]), ..RunSpec::whole("emit") },
         ] {
-            let selection = crate::run_spec::resolve_spec(&spec, &p).unwrap().selection;
+            let selection = crate::run_spec::resolve_spec(&spec, &p, &Default::default()).unwrap().selection;
             let result = seed_plan(&p, &identity(&p), &selection, &spec, &old, &[], &[]).unwrap();
             assert!(!result.origins.contains_key(&top("a")));
             assert!(!result.origins.contains_key(&top("b")));

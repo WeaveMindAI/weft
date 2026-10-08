@@ -34,6 +34,38 @@ pub struct ProjectDefinition {
     pub created_at: DateTime<Utc>,
     #[serde(rename = "updatedAt", default = "Utc::now")]
     pub updated_at: DateTime<Utc>,
+    /// What the project's `weft.toml` says for every run and trigger that
+    /// does not say otherwise (`[runs]`, `[triggers]`).
+    #[serde(default, skip_serializing_if = "ProjectDefaults::is_default")]
+    pub defaults: ProjectDefaults,
+}
+
+/// What a project says once, in `weft.toml`, for all its runs and
+/// triggers: how long an ended run is kept (`[runs] keep_for`), and the
+/// limits a trigger has when its own inputs leave them unset
+/// (`[triggers] calls_per_minute_per_caller`, `calls_per_minute`,
+/// `calls_at_once`). Carried in the program's definition, so the runs and
+/// the triggers of a version read the defaults that version was built
+/// with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProjectDefaults {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_for: Option<crate::run_settings::KeepFor>,
+    #[serde(default, skip_serializing_if = "crate::signal::EntryLimits::is_default")]
+    pub triggers: crate::signal::EntryLimits,
+}
+
+impl ProjectDefaults {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// How long the project keeps an ended run when what started it says
+    /// nothing: its `[runs] keep_for`, else weft's own.
+    pub fn keep_for(&self) -> crate::run_settings::KeepFor {
+        self.keep_for.unwrap_or(crate::run_settings::KeepFor::WEFT_DEFAULT)
+    }
 }
 
 /// What kind of grouping construct this is. The visual editor uses
@@ -326,6 +358,12 @@ pub struct NodeDefinition {
     /// is not a trigger, and on a trigger that declares nothing.
     #[serde(default, rename = "firesWith", skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub fires_with: std::collections::BTreeMap<String, String>,
+    /// The outputs this INFRA node makes once, when its infra is applied,
+    /// and a fire reads saved (`crate::infra::bake`): mirrored from the
+    /// outputs its metadata marks `baked` at enrich time. Empty on every
+    /// other node.
+    #[serde(default, rename = "bakedOutputs", skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub baked_outputs: std::collections::BTreeSet<String>,
     /// The recipe for the service this node publishes a connection to
     /// (`ctx.publish_access`), resolved from the catalog at enrich
     /// time from the node metadata's `publishes` name. Carried on the
@@ -558,14 +596,20 @@ pub enum GroupBoundaryRole {
 /// the convention cannot drift.
 // SYNC: boundary_in_id, boundary_out_id <-> packages/weft-graph/src/webview/host-bridge.ts BOUNDARY_IN, BOUNDARY_OUT
 pub fn boundary_in_id(group_id: &str) -> String {
-    format!("{group_id}__in")
+    format!("{group_id}{BOUNDARY_IN_SUFFIX}")
 }
+
+/// What [`boundary_in_id`] puts after a group's id.
+const BOUNDARY_IN_SUFFIX: &str = "__in";
 
 /// THE derivation of a group's OUT-boundary node id; see
 /// [`boundary_in_id`].
 pub fn boundary_out_id(group_id: &str) -> String {
-    format!("{group_id}__out")
+    format!("{group_id}{BOUNDARY_OUT_SUFFIX}")
 }
+
+/// What [`boundary_out_id`] puts after a group's id.
+const BOUNDARY_OUT_SUFFIX: &str = "__out";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupBoundary {
@@ -755,18 +799,36 @@ pub struct Edge {
     pub source_file: Option<String>,
 }
 
-/// Pre-indexed edge lookups. Build once per compiled project, use
-/// many times during execution. Under a run selection the lookups
+/// What a run reads of its program on every turn, worked out once per
+/// compiled project: its wires by node, each node by id, the inputs each
+/// node reads as a stream, the In boundary of each scope, and the shape
+/// each trigger fires with. Under a run selection the wire lookups
 /// answer for a PLACE (a node under the call frames it fires at): a
 /// wire between two nodes of an included file is in the run under one
 /// call and not under another, so the frames pick which wires exist.
-pub struct EdgeIndex {
+#[derive(Clone)]
+pub struct ProgramIndex {
     outgoing: std::collections::HashMap<String, Vec<usize>>,
     incoming: std::collections::HashMap<String, Vec<usize>>,
     selection: Option<selection::RunSelection>,
+    /// Each node's position in `project.nodes`, by id.
+    nodes: std::collections::HashMap<String, usize>,
+    /// Per node, by position: the inputs it reads as a stream
+    /// ([`crate::exec::ready::generator_inputs`]).
+    stream_inputs: Vec<Vec<String>>,
+    /// The positions of the nodes that read a stream.
+    stream_consumers: Vec<usize>,
+    /// The positions of the passthroughs: the boundaries that forward
+    /// what reaches them ([`crate::exec::boundary::is_passthrough`]).
+    passthroughs: Vec<usize>,
+    /// Each scope's In boundary ([`boundary_in_id`]), by scope id.
+    scope_in: std::collections::HashMap<String, usize>,
+    /// Per node, by position: the shape its `firesWith` declares
+    /// ([`crate::node::fire_payload_type`]), or why it is no shape.
+    fire_payload: Vec<Result<Option<crate::weft_type::WeftType>, String>>,
 }
 
-impl EdgeIndex {
+impl ProgramIndex {
     pub fn build(project: &ProjectDefinition) -> Self {
         let mut outgoing: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
         let mut incoming: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
@@ -774,13 +836,35 @@ impl EdgeIndex {
             outgoing.entry(edge.source.clone()).or_default().push(i);
             incoming.entry(edge.target.clone()).or_default().push(i);
         }
-        Self { outgoing, incoming, selection: None }
+        let nodes = project.nodes.iter().enumerate().map(|(at, node)| (node.id.clone(), at)).collect();
+        let stream_inputs: Vec<Vec<String>> = project
+            .nodes
+            .iter()
+            .map(|node| crate::exec::ready::generator_inputs(node).into_iter().map(str::to_string).collect())
+            .collect();
+        let stream_consumers = stream_inputs.iter().enumerate().filter(|(_, ports)| !ports.is_empty()).map(|(at, _)| at).collect();
+        let scope_in = project
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.group_boundary.as_ref().is_some_and(|boundary| boundary.role == GroupBoundaryRole::In))
+            .filter_map(|(at, node)| node.id.strip_suffix(BOUNDARY_IN_SUFFIX).map(|scope| (scope.to_string(), at)))
+            .collect();
+        let passthroughs =
+            project.nodes.iter().enumerate().filter(|(_, node)| crate::exec::boundary::is_passthrough(node)).map(|(at, _)| at).collect();
+        let fire_payload = project.nodes.iter().map(|node| crate::node::fire_payload_type(&node.fires_with)).collect();
+        Self { outgoing, incoming, selection: None, nodes, stream_inputs, stream_consumers, passthroughs, scope_in, fire_payload }
     }
 
     pub fn selected(project: &ProjectDefinition, selection: selection::RunSelection) -> Self {
         let mut index = Self::build(project);
         index.selection = Some(selection);
         index
+    }
+
+    /// This index under `selection` instead of its own.
+    pub fn reselected(&self, selection: selection::RunSelection) -> Self {
+        Self { selection: Some(selection), ..self.clone() }
     }
 
     pub fn selection(&self) -> Option<&selection::RunSelection> {
@@ -795,6 +879,53 @@ impl EdgeIndex {
     /// whole run).
     pub fn admits(&self, node_id: &str, frames: &LoopFrames) -> bool {
         self.selection.as_ref().is_none_or(|selection| selection.nodes.contains(&Located::at(node_id, frames)))
+    }
+
+    /// The position of the node `id` in `project.nodes`.
+    pub fn position(&self, id: &str) -> Option<usize> {
+        self.nodes.get(id).copied()
+    }
+
+    /// The node whose id is `id`.
+    pub fn node<'a>(&self, project: &'a ProjectDefinition, id: &str) -> Option<&'a NodeDefinition> {
+        self.nodes.get(id).map(|&at| &project.nodes[at])
+    }
+
+    /// The inputs of the node `id` that read a stream; none for a node
+    /// that reads none, or one the program does not have.
+    pub fn stream_inputs(&self, id: &str) -> &[String] {
+        self.nodes.get(id).map_or(&[], |&at| &self.stream_inputs[at])
+    }
+
+    /// The nodes that read a stream, with the inputs each reads one on.
+    pub fn stream_consumers<'a>(&'a self, project: &'a ProjectDefinition) -> impl Iterator<Item = (&'a NodeDefinition, &'a [String])> {
+        self.stream_consumers.iter().map(move |&at| (&project.nodes[at], self.stream_inputs[at].as_slice()))
+    }
+
+    /// The passthroughs, in the program's order.
+    pub fn passthroughs<'a>(&'a self, project: &'a ProjectDefinition) -> impl Iterator<Item = &'a NodeDefinition> + Clone {
+        self.passthroughs.iter().map(move |&at| &project.nodes[at])
+    }
+
+    /// The node `id` when it is a passthrough.
+    pub fn passthrough<'a>(&self, project: &'a ProjectDefinition, id: &str) -> Option<&'a NodeDefinition> {
+        self.node(project, id).filter(|node| crate::exec::boundary::is_passthrough(node))
+    }
+
+    /// The In boundary of the scope `scope`.
+    pub fn scope_in<'a>(&self, project: &'a ProjectDefinition, scope: &str) -> Option<&'a NodeDefinition> {
+        self.scope_in.get(scope).map(|&at| &project.nodes[at])
+    }
+
+    /// The shape the trigger `id` fires with: `None` when it declares
+    /// none (or the program has no such node), `Err` naming why its
+    /// declaration is no shape.
+    pub fn fire_payload(&self, id: &str) -> Result<Option<&crate::weft_type::WeftType>, &str> {
+        match self.nodes.get(id).map(|&at| &self.fire_payload[at]) {
+            None | Some(Ok(None)) => Ok(None),
+            Some(Ok(Some(shape))) => Ok(Some(shape)),
+            Some(Err(why)) => Err(why),
+        }
     }
 
     /// The wires out of `node_id` that exist at `frames`.
@@ -895,6 +1026,7 @@ mod address_tests {
             groups: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            defaults: Default::default(),
         };
         let (node, path) = resolve_address(&project, "");
         assert_eq!(node, "");
@@ -1017,7 +1149,10 @@ pub fn plain_id(id: &str) -> String {
 /// because the editor never addresses a boundary.
 // SYNC: address_of <-> packages/weft-graph/src/run-spec.ts addressOf
 pub fn address_of(project: &ProjectDefinition, id: &str, call_path: &[String]) -> String {
-    if let Some(group) = project.groups.iter().find(|g| id == boundary_in_id(&g.id) || id == boundary_out_id(&g.id)) {
+    // A group's boundary, read off its id rather than spelled for every
+    // group: every firing asks this.
+    let boundary_of = id.strip_suffix(BOUNDARY_IN_SUFFIX).or_else(|| id.strip_suffix(BOUNDARY_OUT_SUFFIX));
+    if let Some(group) = boundary_of.and_then(|group| project.groups.iter().find(|g| g.id == group)) {
         return group_address(project, &group.id, call_path);
     }
     let Some((first, rest)) = call_path.split_first() else { return id.to_string() };
@@ -1117,7 +1252,7 @@ pub fn scope_members<'a>(project: &'a ProjectDefinition, group_id: &str) -> Vec<
 /// read by the group launcher and the loop launcher alike.
 pub fn scope_body_roots(
     project: &ProjectDefinition,
-    edge_idx: &EdgeIndex,
+    edge_idx: &ProgramIndex,
     group_id: &str,
     frames: &LoopFrames,
 ) -> Vec<String> {
@@ -1344,7 +1479,7 @@ mod infra_triggers_depend_on_tests {
             file_refs: Default::default(),
             include_path: None,
             include_contents: None,
-            fires_with: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(),
             source_file: None,
         }
     }
@@ -1370,6 +1505,7 @@ mod infra_triggers_depend_on_tests {
             groups: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            defaults: Default::default(),
         }
     }
 
@@ -1612,6 +1748,7 @@ mod project_wire_tests {
             groups: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            defaults: Default::default(),
         };
         let v = serde_json::to_value(&p).unwrap();
         assert!(v.get("name").is_none(), "name must not serialize: {v}");
@@ -1664,7 +1801,7 @@ mod project_wire_tests {
             features: Default::default(),
             requires_infra: false, per_instance: None,
             images: vec![],
-            fires_with: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(),
             published_service: None,
             instance_service: None,
             instance_rules: None,
@@ -1713,6 +1850,7 @@ mod project_wire_tests {
             groups: vec![group],
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            defaults: Default::default(),
         };
         let v = serde_json::to_value(&p).unwrap();
         assert_eq!(v["groups"][0]["portLiterals"]["_should_flow"], false, "portLiterals key: {v}");
@@ -1764,7 +1902,7 @@ mod project_wire_tests {
             requires_infra,
             per_instance: None,
             images: vec![],
-            fires_with: Default::default(),
+            fires_with: Default::default(), baked_outputs: Default::default(),
             published_service: None,
             instance_service: None,
             instance_rules: None,
@@ -1789,6 +1927,7 @@ mod project_wire_tests {
             groups: vec![],
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            defaults: Default::default(),
         }
     }
 

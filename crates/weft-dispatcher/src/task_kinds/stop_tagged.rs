@@ -33,12 +33,8 @@ pub struct StopTaggedExecutor;
 impl TaskExecutor<DispatcherState> for StopTaggedExecutor {
     async fn execute(&self, state: &DispatcherState, task: &Task) -> Result<Value> {
         let payload: StopTaggedPayload = serde_json::from_value(task.payload.clone())?;
-        let by: weft_core::ExecutionId = payload
-            .by
-            .parse()
-            .map_err(|e| anyhow::anyhow!("bad `by` execution in stop_tagged payload: {e}"))?;
         let stopped = stop_tagged(
-            state, payload.project_id, &payload.tag, by, payload.before_seq, payload.stop_self,
+            state, payload.project_id, &payload.tag, payload.by, payload.before_seq, payload.stop_self,
         )
         .await?;
         Ok(serde_json::json!({ "stopped": stopped.len() }))

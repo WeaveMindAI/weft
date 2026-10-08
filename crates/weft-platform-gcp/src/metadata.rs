@@ -127,6 +127,25 @@ impl MetadataTokens {
     }
 }
 
+/// The identity a process weft started presents to the broker, from the
+/// variable `var` its starter set: `token:<token>` (a token the install
+/// signed and handed it, the local platform) or `gcp-metadata` (the
+/// service account it runs as, asked of the metadata server, on Google
+/// Cloud).
+pub fn identity_from_env(var: &str) -> anyhow::Result<std::sync::Arc<dyn IdentityTokens>> {
+    let raw = std::env::var(var).with_context(|| format!("{var} is required: `token:<token>` or `gcp-metadata`"))?;
+    match raw.trim() {
+        "gcp-metadata" => Ok(std::sync::Arc::new(MetadataTokens::new())),
+        other => {
+            let token = other
+                .strip_prefix("token:")
+                .filter(|t| !t.is_empty())
+                .with_context(|| format!("{var} is `token:<token>` or `gcp-metadata`"))?;
+            Ok(std::sync::Arc::new(weft_platform_traits::FixedToken(token.to_string())))
+        }
+    }
+}
+
 #[async_trait]
 impl IdentityTokens for MetadataTokens {
     async fn token_for(&self, audience: &str) -> anyhow::Result<String> {

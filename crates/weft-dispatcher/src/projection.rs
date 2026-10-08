@@ -133,17 +133,9 @@ impl ExecutionProjector {
 
     /// Whether this projection folds at all. One that does not costs
     /// nothing to keep, and rebuilding it would republish its
-    /// corruption, so the bridge keeps it until the run's terminal.
+    /// corruption, so the live view keeps it until the run's ending.
     pub fn folds(&self) -> bool {
         self.fold.is_some()
-    }
-
-    /// Whether `ev` paints the same with or without the run's program:
-    /// the birth, the terminals, the money and log trail, the bus and
-    /// caller exchanges. A reader with no projection open for the
-    /// execution paints such a row without opening one.
-    pub fn paints_without_program(ev: &ExecEvent) -> bool {
-        !needs_program(ev)
     }
 
     /// Apply one row and answer the events it paints. One row can
@@ -220,12 +212,12 @@ impl ExecutionProjector {
                 })
                 .collect()
         } else { match ev {
-            ExecEvent::ExecutionStarted { entry_node, subgraph, seed, phase, instance, .. } => {
+            ExecEvent::ExecutionStarted { entry_node, selection, seed, phase, instance, .. } => {
                 vec![DispatcherEvent::ExecutionStarted {
                     execution_id, instance: instance.clone(), at_unix,
                     entry_node: entry_node.clone(),
                     phase: *phase,
-                    subgraph: subgraph.as_ref().map(|s| s.nodes.iter().cloned().collect()),
+                    subgraph: selection.as_ref().map(|s| s.selection().nodes.iter().cloned().collect()),
                     seed: seed.clone(),
                     project_id,
                 }]
@@ -322,11 +314,10 @@ impl ExecutionProjector {
                 vec![DispatcherEvent::ExecutionCompleted { execution_id, at_unix, outputs, project_id }]
             }
             ExecEvent::ExecutionFailed { error, .. } => {
-                // No truncation: journal_bridge fans out via
-                // `publish_local` (no NOTIFY hop); the full error is
-                // what the operator wants for debugging. Truncation
-                // belongs at NOTIFY producer sites (api/project.rs,
-                // infra_event_bridge.rs), not here.
+                // No truncation: the live view publishes it on this
+                // process only (no NOTIFY hop); the full error is what
+                // the operator wants for debugging. Truncation belongs at
+                // NOTIFY producer sites (api/project.rs), not here.
                 vec![DispatcherEvent::ExecutionFailed {
                     execution_id, at_unix,
                     error: error.clone(),
@@ -787,13 +778,6 @@ fn sniff_bus_participants(
     out
 }
 
-/// The program an execution runs, for the readers that fold its
-/// journal to SHOW or to END it: the definition recorded under the
-/// hash its `ExecutionStarted` pinned. `Err` only for the database
-/// itself (a retry can succeed); everything permanent is a
-/// `ProgramLookup` variant, so no reader wedges on one execution. A RESUME
-/// never comes through here: a worker that cannot find its program
-/// fails loudly (`route_entry::definition_for`).
 /// What a seeded run inherits, read off its birth row and the seeds'
 /// journals: the chain the projector paints before the run's own rows.
 /// Empty for a run with no seed or no program. A seed that cannot be
@@ -861,25 +845,22 @@ pub async fn reconstruct_execution(
     chain.materialize()
 }
 
+/// The program an execution runs, for the readers that fold its
+/// journal to SHOW or to END it: the definition recorded under the
+/// hash its run row pinned. `Err` only for the database
+/// itself (a retry can succeed); everything permanent is a
+/// `ProgramLookup` variant, so no reader wedges on one execution. A RESUME
+/// never comes through here: a worker that cannot find its program
+/// fails loudly.
 pub async fn execution_program(
     state: &crate::state::DispatcherState,
     execution_id: weft_core::ExecutionId,
 ) -> anyhow::Result<ProgramLookup> {
-    use crate::journal::ExecutionIdLookup;
-    let hash = match state.journal.execution_definition_hash(execution_id).await? {
-        ExecutionIdLookup::Found(hash) => hash,
-        ExecutionIdLookup::NotFound => return Ok(ProgramLookup::NoProgram),
-        ExecutionIdLookup::Corrupt => {
-            return Ok(ProgramLookup::Unreadable(format!(
-                "the birth row of execution {execution_id} no longer decodes; its program cannot be found. \
-                 `weft clean {execution_id}` removes it."
-            )))
-        }
-    };
     let Some(owner) = state.journal.execution_owner(execution_id).await? else {
-        return Ok(ProgramLookup::Unreadable(format!(
-            "execution {execution_id} has a definition hash but no owner row. `weft clean {execution_id}` removes it."
-        )));
+        return Ok(ProgramLookup::NoProgram);
+    };
+    let Some(hash) = owner.definition_hash.clone() else {
+        return Ok(ProgramLookup::NoProgram);
     };
     let read = match state.program(owner.project_id, &hash).await {
         Err(e) => match e.downcast::<crate::state::UnreadableProgram>() {
@@ -1032,11 +1013,11 @@ mod tests {
                 entry_node: "src".into(),
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: Some("h".into()),
-                program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
-                subgraph: None,
+                binary_hash: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
+                selection: None,
                 seed: None,
-                instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-                run_class: weft_core::run_class::RunClass::Short,
+                instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+                settings: Default::default(),
             },
             ExecEvent::NodeKicked { execution_id: execution_id(), node_id: "src".into(), frames: vec![], firing: true, payload: None, port_snapshot: None, at_unix: 0 },
             started("src", 1),
@@ -1260,11 +1241,11 @@ mod tests {
                 entry_node: "probe".into(),
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: None,
-                program: None, source_version: None, run_kind: weft_core::exec::RunKind::NodeTest,
-                subgraph: None,
+                binary_hash: None, source_version: None, run_kind: weft_core::exec::RunKind::NodeTest,
+                selection: None,
                 seed: None,
-                instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-                run_class: weft_core::run_class::RunClass::Short,
+                instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+                settings: Default::default(),
             },
             started("probe", 1),
             ExecEvent::ExecutionCompleted { execution_id: execution_id(), at_unix: 2 },

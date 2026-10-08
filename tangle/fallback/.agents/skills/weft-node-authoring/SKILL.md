@@ -54,17 +54,15 @@ You never trust a report you can re-verify for the cost of one command. If you c
 - **stale versions**: an API or dependency version taken from memory or an old example instead of the service's current docs, or one the service no longer serves; the rule is under deps.toml.
 - **empty rig**: `tests()` returns an empty vec, or `tests.rs` does not exist, and [the report] did not say so. An access node is the one exception: its body is the `access_node!` macro, there is nothing of the smith's to test, and it ships with no `tests.rs` at all.
 - **flaky-dismissed**: an intermittently failing test waved off as flaky instead of chased to its race. A race in the node is the node's bug; a test made tolerant of it (a retry, a sleep, a longer timeout) fails [the review] on both counts.
-- **body smells**: `.ok()` discarding an error, a default value standing in for a missing input, a retry loop, orchestration inside the node.
+- **body smells**: `.ok()` discarding an error, a default value standing in for a missing input, a retry loop, orchestration inside the node, a database client or a process opened fresh on every run where `ctx.shared` would hold one.
+- **an infra output left unbaked**: an infra node's output that holds as long as the infra does (an address, a connection, a handle) with no `"baked": true`, so every run that reads it runs the node to make it again.
 - **a dead end in an image**: a state an infra container can sit in (a dead pairing, a lost credential, a revoked session) with no button on its display that leaves it, so the user's only way out is restarting or terminating the infra. Every such state gets an action, offered in every state; the rule is under Infra node.
 - **a marker in an outbound payload**: a `__weft_<kind>__` wrapper handed to a provider, a bridge, a form spec or a live item, instead of the plain URL, `data:` URL or `{ url, mimeType, filename }` that consumer reads; the rule is under A file input.
 - **silent failure in an image**: a service inside an infra image that fails a step without writing a line to its log, or answers the node with a success when the thing asked for did not fully happen; the two rules are under Infra node.
 
 ## The manual
 
-A node does one thing: calls an API, transcribes audio, writes a row. It
-never orchestrates (looping, retrying, branching, waiting for a person are
-the graph's job, and the engine gives journaling, resumability and
-cancellation for free) and never does plumbing (transport, credentials,
+A node does one thing: calls an API, transcribes audio, writes a row. It never orchestrates: looping, retrying, branching and waiting for a person are the graph's job. It never does plumbing (transport, credentials,
 acknowledgement protocols, subscriptions, retry bookkeeping are the
 language's).
 
@@ -119,7 +117,7 @@ Unknown keys are a loud parse error. Top level:
 | `inputs` | one list for wired data and design-time config |
 | `outputs` | output ports |
 | `types` | named type declarations, e.g. `"ChatHistory": "List[ChatMessage]"` |
-| `features` | flags: `catchErrors` (the node reaches outside; weft adds the `error` output and catches the body's failures onto it), `isTrigger`, `canAddInputPorts` (an open-ended set of values arrives as ports the author declares inline; the body reads `ctx.inputs.custom()`), `canAddOutputPorts`, `optionalCustomInputs`, `customInputType`, `oneOfRequired`, `showDebugPreview`, `liveEndpoint` (the endpoint serving this infra node's display, see [The display](#the-display)), `castPorts`, `hidden`, `answersCaller` (`"whole"`, `"stream"` or `"end"`: this node answers a live caller the way `Reply`, `Stream` or `Close` does; any custom node that answers the caller declares it, so the compiler counts it), `liveConnection` (`"http"` or `"websocket"`: this trigger holds a caller, as `Route` and `Socket` do) |
+| `features` | flags: `catchErrors` (the node reaches outside; weft adds the `error` output and catches the body's failures onto it), `pure` (the body does nothing outside its run beyond answering its caller and the run's own files: no network, connection, `ctx.run`, wait, tag, or storage beyond this run; a durable run starts it without waiting for the database and runs it again after a crash if it had sent nothing on and reads no stream. `Text`, `Switch` and `Reply` are pure, `HttpRequest` is not; an outside ctx call on a pure node fails, naming the flag), `isTrigger`, `canAddInputPorts` (an open-ended set of values arrives as ports the author declares inline; the body reads `ctx.inputs.custom()`), `canAddOutputPorts`, `optionalCustomInputs`, `customInputType`, `oneOfRequired`, `showDebugPreview`, `liveEndpoint` (the endpoint serving this infra node's display, see [The display](#the-display)), `castPorts`, `hidden`, `answersCaller` (`"whole"`, `"stream"` or `"end"`: this node answers a live caller the way `Reply`, `Stream` or `Close` does; any custom node that answers the caller declares it, so the compiler counts it), `liveConnection` (`"http"` or `"websocket"`: this trigger holds a caller, as `Route` and `Socket` do) |
 | `portsFromConfig` | ports derived from a config list: `{ "field", "matchInput", "specs": [{kind, keyField, catchAll?, addsInputs, addsOutputs}] }` |
 | `firesWith` | trigger only: EVERY field a firing can carry, name to weft type, `?` on the name for sometimes-present (`{"scheduledTime": "String", "caller?": "JsonDict"}`). Checked exactly: a firing missing a required field is refused, and so is one carrying a field you did not name |
 | `display` | inline render: `{ "kind": "media" \| "link", "output" \| "input": "<port>" }` |
@@ -141,7 +139,7 @@ any other word fails to load. `json` also fits a `JsonDict` input
 (edited as JSON text); the others edit a `String`. A `number` widget with a whole `step`
 (`"step": 1`) takes whole numbers only: the compiler checks a written value
 and the runtime a wired one, so your body can cast it to an integer.
-Output entry: `name`, `type`, `description` (an output has no optionality).
+Output entry: `name`, `type`, `description` (an output has no `required`), and on an infra node `baked` (see Infra node).
 
 A `validate` rule's `when` is a closed set of conditions, combined with
 `all`, `any` and `not`: the input and config checks (`input_satisfied`,
@@ -316,14 +314,12 @@ stdlib's `nodes/base_catalog/ai/fal/fal.rs` (`run_queued`) for a whole worked ca
 
 You emit only through `ctx.pulse_downstream(NodeOutput::new().set(port, value))`;
 ports you did not emit are closed, which is the skip signal downstream. For
-user-added output ports use `ctx.fan_declared(...)`. A step whose start is on
-record never runs twice by itself: if the worker dies while a body runs, the
-step is failed (and that failure goes to `error` like any other). Its start is
-written as it begins, so only a worker dying in that one write's time runs it
-again as new. The one body that runs again
-is one parked on `ctx.await_signal`, which replays from the top when its
-answer comes, so the work before the wait goes through `ctx.run(...)`, which
-gives back the recorded result.
+user-added output ports use `ctx.fan_declared(...)`.
+
+**Share what is slow to build**: a client pool, a process. `ctx.shared(&access, |opened| async move { .. })` builds it the first time a run asks and hands every later run on that worker the same one; it is built again when the connection's values change, or after nobody used it for the project's idle window (300 seconds by default, `weft workers set --shared-idle-seconds`). The closure returns a `WeftResult` of the thing and you get a handle you use as the thing. `ctx.shared("name", |()| async { .. })` is the same when nothing is built from a connection, and `.with_limit(n)` before the `.await` lets at most `n` runs of a worker hold it at once (a pool kept under a database's connection limit). A database client opened on every run pays the connection each time; for a worked pool, go and read `nodes/base_catalog/postgres/postgres.rs`.
+
+If the worker dies while your body runs, a fast run (the default) ends cancelled, and a durable run fails the step: its start was on record before the body began, so the next worker knows it was running and fails it rather than start it again. With `catchErrors` and `error` wired, that failure goes to `error` like any other. A node marked `pure` is the exception: a step of it that had sent nothing on and read no stream runs again, since it did nothing anyone could see. The one other body weft starts again on purpose is one parked on `ctx.await_signal`, which replays from the top when its answer comes, so the work before the wait goes through `ctx.run(...)`, which
+gives back the recorded result. In a run that cannot pause (a route's caller on the line, `recorded: false`, a bus open), `ctx.await_signal` holds in your call instead and returns the answer without a replay; if the run stays quiet for its trigger's `holdSecs`, the call fails with `WeftError::WaitGaveUp`, which your node may match and handle (test it with `rig.signal_given_up()`).
 
 **Stopping is cooperative, and a node that ignores it cannot be stopped.**
 Nothing kills a node mid-call: a cancelled execution (the caller left, a
@@ -419,7 +415,11 @@ returns `None` when nothing is picked.
 Dockerfile the CLI builds) and `publishes` (the service name it hands out).
 Implement `async fn provision_infra(&self, ctx, input) -> WeftResult<InfraSpec>`
 returning the desired-state spec; the engine applies it, then calls `run`.
-Every field of that spec (the machine and its GPU, containers, probes, disks,
+
+**Bake every output that holds as long as the infra does** (an address, a
+connection, a handle): `"baked": true` on the output in `metadata.json`. A baked output is made when the infra is applied, and a run that reads nothing from your node but baked outputs uses the saved values instead of running it, so a route that queries a database never calls the database's side container. A run that also reads an output that moves on its own (a status, a phone number a bridge pairs later) runs your node, and a baked output your `run` sends nothing on then carries the saved value. weft bakes again every time the infra is applied, and on `weft infra rebake <node>`. In between, the container itself tells weft when a value changes (a reset button, a rotated password): it `POST`s `{"connection": {"password": "..."}}` to `$WEFT_VALUES_URL`, which weft sets on every container of the unit (`connection` changes values inside the connection your node published, `outputs` changes baked outputs by name). Only what your node already handed weft can change. The push answers `200` once weft has written the value, or `422` with a body naming the key or output it could not change. If the push came from a button and failed, answer the press with `{ "result": { "error": "..." } }` telling the person to run `weft infra rebake <node>`. The value itself never goes in the press's answer. The Postgres node's reset is the worked example (`nodes/base_catalog/postgres/database/images/credential/bootstrap.py`). Changing what `run` emits on a baked output is not noticed on its own: run `weft infra upgrade`, which rebuilds the infra against your current source and bakes again. A step that fails using a connection an infra node made says to run `weft infra rebake` on that node; your node's own error says only what the driver said.
+
+Every field of the `InfraSpec` (the machine and its GPU, containers, probes, disks,
 endpoints), long jobs, kept files and the rig calls for all of it are in
 [Infra node reference](#infra-node-reference) below.
 A container that serves `/live` (named by `features.liveEndpoint`) has a
@@ -598,8 +598,7 @@ network error or a body that is not JSON is an error. The call has no
 timeout of its own, so a call that waits on slow work never returns while a
 person presses stop: that is what the shape below is for.
 
-An infra node's `run` runs on every run that reaches it, so behind a route it
-runs once per call. The worker keeps what `ctx.endpoint`, `ctx.published_access`,
+The worker keeps what `ctx.endpoint`, `ctx.published_access`,
 `ctx.publish_access` and `ctx.open` answered from one run to the next (weft
 tells it when any of that changes), so those cost nothing after the first run,
 but every `call(...)` to the service is a trip there on every run: quick
@@ -898,7 +897,7 @@ no display. Two routes on that endpoint, both called by weft itself:
   sent, so do not answer `{}` or a bare array.
 - `POST /action` receives a press as `{ "action": "<actionKind>", "payload": ... }`
   and answers `{ "result": { ... } }`. Put a refusal in
-  `{ "result": { "error": "why" } }`; the reader sees that text as it is.
+  `{ "result": { "error": "why" } }`; the reader sees that text as it is. A press that changed a value weft holds pushes it to `$WEFT_VALUES_URL` first (see Infra node, the bake paragraph). If that push fails, it answers with `{ "result": { "error": "..." } }` and tells the person to run `weft infra rebake <node>`.
   Weft reads `/live` again right after the press, so whatever it changed
   shows at once.
 

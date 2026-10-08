@@ -43,10 +43,9 @@ impl std::fmt::Display for TenantId {
 /// not resolve to a sentinel that would silently mis-key or strand state. Every
 /// caller already runs in a `Result` context and propagates with `?`.
 ///
-/// The ONE caller that must tolerate a deleted project (the journal bridge
-/// draining a stale terminal event) checks project existence FIRST and skips the
-/// whole event, so it never reaches this lookup (keeping this method uniformly
-/// loud rather than forking it into optional/required variants).
+/// A caller that must tolerate a deleted project reads the tenant off the
+/// run's own row instead (`ExecutionOwner::tenant`, frozen at its birth), so
+/// it never reaches this lookup, which stays uniformly loud.
 #[async_trait]
 pub trait TenantRouter: Send + Sync {
     async fn tenant_for_project(&self, project_id: uuid::Uuid) -> Result<TenantId>;

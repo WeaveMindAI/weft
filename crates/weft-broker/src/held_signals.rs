@@ -170,13 +170,19 @@ pub enum HeldFire {
     NoLongerHeld,
 }
 
+/// Whether an event naming the holder `held_by` comes from that holder: a
+/// copy speaks only for the claims it holds.
+pub fn sent_by_its_holder(sender: Option<&str>, held_by: &str) -> bool {
+    sender == Some(held_by)
+}
+
 pub async fn judge_held_fire(
     pool: &PgPool,
     sender: Option<&str>,
     fire: &weft_task_store::kinds::FireSignalPayload,
 ) -> anyhow::Result<HeldFire> {
     let Some(held_by) = fire.held_by.as_deref() else { return Ok(HeldFire::Taken) };
-    if sender != Some(held_by) {
+    if !sent_by_its_holder(sender, held_by) {
         return Ok(HeldFire::NotItsSender);
     }
     Ok(match still_held_by(pool, &fire.token, held_by).await? {

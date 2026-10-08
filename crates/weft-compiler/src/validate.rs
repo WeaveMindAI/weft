@@ -81,7 +81,27 @@ fn validate_scoped(
     check_route_claims(project, catalog, &mut d);
     check_per_instance(project, catalog, &mut d);
     check_instance_filled(project, &mut d);
+    check_run_settings(project, &mut d);
     d
+}
+
+/// run-settings: how a trigger's runs are kept, read off the inputs the
+/// language gives every trigger (`durable`, `recorded`), with the same
+/// reading the ctx makes when the trigger registers. Refused here when the
+/// written values cannot be (a durable run that is not recorded, one that
+/// may outlive its caller and is not recorded, a switch that is not a
+/// boolean); a value arriving on a wire is checked when the trigger
+/// registers.
+fn check_run_settings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
+    for node in project.nodes.iter().filter(|n| n.features.is_trigger) {
+        // The constants written for the trigger's inputs (`enrich` moved
+        // them out of `config`); a wired input is not among them.
+        let config: serde_json::Map<String, serde_json::Value> =
+            node.port_literals.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        if let Err(refused) = weft_core::run_settings::RunSettings::from_node_fields(&config) {
+            cfg_push(d, node, refused.field, Severity::Error, "run-settings", format!("'{}': {refused}", author_name(node)));
+        }
+    }
 }
 
 /// per-instance-ineligible: `@per_instance` marks a node that RUNS something

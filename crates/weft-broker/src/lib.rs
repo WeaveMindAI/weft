@@ -20,12 +20,15 @@ pub mod program_tokens;
 pub mod access_admin;
 pub mod app_provider;
 pub mod caller_auth;
+pub mod door;
 pub mod events;
 pub mod runtime_storage;
 pub mod runtime_store;
 pub mod scope;
 pub mod held_signals;
 pub mod line;
+pub mod notices;
+pub mod records;
 pub mod state;
 
 use std::sync::Arc;
@@ -74,14 +77,6 @@ pub fn drain_loops(state: Arc<BrokerState>) -> Vec<weft_task_store::drain::Drain
     ]
 }
 
-pub use weft_broker_client::protocol::JOURNAL_RECORD_BODY_LIMIT;
-
-/// The cap on a failed unrecorded run's whole record
-/// (`/v1/journal/record_retroactive`): sixteen of the largest single
-/// rows. An unrecorded run is a short request answered in one go, so a
-/// record past this is refused by name rather than read into memory.
-pub const JOURNAL_RETROACTIVE_BODY_LIMIT: usize = 16 * JOURNAL_RECORD_BODY_LIMIT;
-
 pub fn router(state: Arc<BrokerState>) -> Router {
     line::routes(api(state.clone()), state)
 }
@@ -90,24 +85,6 @@ pub fn router(state: Arc<BrokerState>) -> Router {
 fn api(state: Arc<BrokerState>) -> Router {
     Router::new()
         .route("/health", axum::routing::get(handlers::health))
-        // Journal
-        .route(
-            "/v1/journal/record",
-            post(handlers::journal_record).layer(axum::extract::DefaultBodyLimit::max(JOURNAL_RECORD_BODY_LIMIT)),
-        )
-        // A whole failed run at once, so it may carry many rows of the
-        // size `record` takes one of.
-        .route(
-            "/v1/journal/record_retroactive",
-            post(handlers::journal_record_retroactive)
-                .layer(axum::extract::DefaultBodyLimit::max(JOURNAL_RETROACTIVE_BODY_LIMIT)),
-        )
-        .route("/v1/journal/forget_unrecorded", post(handlers::journal_forget_unrecorded))
-        .route("/v1/journal/wait", post(handlers::journal_wait))
-        .route(
-            "/v1/journal/has_terminal",
-            post(handlers::journal_has_terminal),
-        )
         // Execution steering (`ctx.tag_execution` / `ctx.stop_tagged`)
         .route("/v1/execution/tag", post(handlers::execution_tag))
         .route(
@@ -120,18 +97,13 @@ fn api(state: Arc<BrokerState>) -> Router {
             "/v1/task/wait_terminal",
             post(handlers::task_wait_terminal),
         )
-        .route("/v1/task/claim_execution", post(handlers::task_claim_execution))
-        .route("/v1/task/heartbeat", post(handlers::task_heartbeat))
-        .route("/v1/task/requeue", post(handlers::task_requeue))
-        .route("/v1/task/complete", post(handlers::task_complete))
-        .route("/v1/task/fail", post(handlers::task_fail))
-        // The cancels for the executions a worker drives.
-        .route("/v1/task/cancels_asked", post(handlers::task_cancels_asked))
         // Infra reads
         .route(
             "/v1/infra/endpoint_url",
             post(handlers::infra_endpoint_url),
         )
+        .route("/v1/infra/baked", post(handlers::infra_baked))
+        .route("/v1/infra/bake", post(handlers::infra_bake))
         // A machine running a project's infra asking for a look at it.
         .route("/v1/infra/look", post(handlers::infra_look))
         // Project (worker fetches its own ProjectDefinition)
@@ -139,9 +111,7 @@ fn api(state: Arc<BrokerState>) -> Router {
             "/v1/project/fetch_definition",
             post(handlers::project_fetch_definition),
         )
-        // Connections (worker data path). Cost records ride the generic
-        // task rail (`/v1/task/enqueue_dedup`, kind `record_cost`).
-        // One resolve for every connection: the worker sends a
+        // Connections (worker data path). One resolve for every connection: the worker sends a
         // connection id and the row decides everything (whose
         // credential, lazy refresh store-side, or the runtime's
         // credential source for an ours-owned row).
@@ -157,6 +127,7 @@ fn api(state: Arc<BrokerState>) -> Router {
         // Signals (the listener's rehydrate read)
         .route("/v1/signal/list_held", post(handlers::signal_list_held))
         .route("/v1/signal/get_held", post(handlers::signal_get_held))
+        .route("/v1/signal/fire_target", post(handlers::signal_fire_target))
         .route("/v1/signal/hold", post(handlers::signal_hold))
         .route("/v1/signal/let_go", post(handlers::signal_let_go))
         .route("/v1/signal/set_holds", post(handlers::signal_set_holds))
@@ -211,10 +182,6 @@ fn api(state: Arc<BrokerState>) -> Router {
             post(handlers::supervisor_command_cancel_requested),
         )
         .route(
-            "/v1/supervisor/running_count",
-            post(handlers::supervisor_running_count),
-        )
-        .route(
             "/v1/supervisor/infra_command_in_flight",
             post(handlers::supervisor_infra_command_in_flight),
         )
@@ -242,6 +209,7 @@ fn api(state: Arc<BrokerState>) -> Router {
             "/v1/infra/enqueue_apply",
             post(handlers::infra_enqueue_apply),
         )
+        .route("/v1/infra/pushed", post(handlers::infra_pushed))
         .route(
             "/v1/infra/wait_apply",
             post(handlers::infra_wait_apply),
@@ -260,5 +228,9 @@ fn api(state: Arc<BrokerState>) -> Router {
         // receive-side verification the dispatcher forwards to.
         .merge(events::routes())
         .merge(caller_auth::routes())
+        // The worker's door: its routes, its runs' facts, its limits.
+        .merge(door::routes())
+        // A worker's records, and the runs it drives.
+        .merge(records::routes())
         .with_state(state)
 }

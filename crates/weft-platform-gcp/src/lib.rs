@@ -40,7 +40,7 @@ pub mod runner;
 #[cfg(feature = "control")]
 pub mod storage;
 
-pub use metadata::MetadataTokens;
+pub use metadata::{identity_from_env, MetadataTokens};
 #[cfg(feature = "control")]
 pub use {
     alarm::CloudTasksAlarm, api::Google, domains::LoadBalancerDomains, frontends::CloudRunFrontends, holders::WorkerPoolHolders,

@@ -11,7 +11,6 @@ use weft::caller::{
     CallerRuntimeConfig, FakeCallerConnection, InboundMessage, LiveRequest, DEFAULT_INBOUND_WINDOW,
 };
 use weft::signal::{Backpressure, DataType, ErrorMode, Protocol};
-use weft::wait::SuspendPolicy;
 
 fn config(protocol: Protocol, data_type: DataType) -> CallerRuntimeConfig {
     CallerRuntimeConfig {
@@ -19,13 +18,12 @@ fn config(protocol: Protocol, data_type: DataType) -> CallerRuntimeConfig {
         data_type,
         backpressure: Backpressure::Block,
         error_mode: ErrorMode::Surface,
-        connect_timeout_secs: 5,
         max_inbound_bytes: 1 << 20,
         // The fake caller is never a socket, so nothing here reads this;
         // the default keeps it honest against the real config.
         caller_silence_secs: weft::signal::DEFAULT_CALLER_SILENCE_SECS,
         max_session_secs: 0,
-        suspend: SuspendPolicy::default(),
+        outlives_caller: false,
         inbound_window: DEFAULT_INBOUND_WINDOW,
         // A fake run writes no journal, so the default is here to keep
         // this config the same shape as the real one.

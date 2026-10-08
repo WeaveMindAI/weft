@@ -27,5 +27,5 @@ pub use frontends::NoFrontendHosting;
 pub use holders::OneProcessHolds;
 pub use identity::LocalIdentity;
 pub use images::{bound_build_cache, DockerImageBuilder};
-pub use infra_host::{DiskBacking, GpuAccess, LocalInfraHost, LocalInfraHostConfig, Publish};
+pub use infra_host::{AgentBroker, AgentIdentity, DiskBacking, GpuAccess, LocalInfraHost, LocalInfraHostConfig, Publish};
 pub use runner::{LocalRunner, LocalRunnerConfig};

@@ -61,12 +61,12 @@ fn starts(names: &[&str]) -> BTreeMap<String, BTreeMap<String, serde_json::Value
 fn a_start_still_cuts_what_feeds_it_under_a_target() {
     let project = program();
     let spec = RunSpec { from: starts(&["hear.note"]), target: vec!["hear.note".into()], ..RunSpec::whole("x") };
-    let resolved = resolve_spec(&spec, &project).unwrap();
+    let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
     assert!(!resolved.selection.nodes.contains(&Located::top("db")), "what feeds the start stays out");
     assert!(refuse_unfed(&project, &resolved.selection, &spec).is_err());
 
     let spec = RunSpec { feed: vec!["hear.note".into()], ..spec };
-    let resolved = resolve_spec(&spec, &project).unwrap();
+    let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
     assert!(resolved.selection.nodes.contains(&Located::top("db")), "fed: one level up");
     refuse_unfed(&project, &resolved.selection, &spec).expect("fed");
 }
@@ -78,7 +78,7 @@ fn a_start_still_cuts_what_feeds_it_under_a_target() {
 fn a_start_upstream_of_another_start_stays_in_the_cut() {
     let project = program();
     let spec = RunSpec { from: starts(&["db", "words.w", "hear.note"]), target: vec!["hear.note".into()], ..RunSpec::whole("x") };
-    let resolved = resolve_spec(&spec, &project).unwrap();
+    let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
     for kept in ["db", "words.w"] {
         assert!(resolved.selection.nodes.contains(&Located::top(kept)), "{kept} is a start and stays");
     }
@@ -93,7 +93,7 @@ fn a_start_upstream_of_another_start_stays_in_the_cut() {
 fn feed_runs_what_feeds_a_start_and_nothing_else() {
     let project = program();
     let spec = RunSpec { from: starts(&["hear.note"]), feed: vec!["hear.note".into()], ..RunSpec::whole("x") };
-    let resolved = resolve_spec(&spec, &project).unwrap();
+    let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
     for fed in ["db", "words.w"] {
         assert!(resolved.selection.nodes.contains(&Located::top(fed)), "{fed} feeds the start and runs");
     }
@@ -110,7 +110,7 @@ fn feed_leaves_a_handed_port_to_its_value() {
     let project = program();
     let from = BTreeMap::from([("hear.note".to_string(), BTreeMap::from([("db".to_string(), serde_json::json!("by hand"))]))]);
     let spec = RunSpec { from, feed: vec!["hear.note".into()], target: vec!["hear.note".into()], ..RunSpec::whole("x") };
-    let resolved = resolve_spec(&spec, &project).unwrap();
+    let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
     assert!(!resolved.selection.nodes.contains(&Located::top("db")), "db was handed, not fed");
     assert!(resolved.selection.nodes.contains(&Located::top("words.w")), "fed out through the group's door");
     refuse_unfed(&project, &resolved.selection, &spec).expect("db by hand, text by its feeder");
@@ -121,12 +121,12 @@ fn feed_leaves_a_handed_port_to_its_value() {
 fn feed_on_a_group_start_and_only_on_starts() {
     let project = program();
     let spec = RunSpec { group: Some(("hear.note".into(), BTreeMap::new())), feed: vec!["hear.note".into()], ..RunSpec::whole("x") };
-    let resolved = resolve_spec(&spec, &project).unwrap();
+    let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
     assert!(resolved.selection.nodes.contains(&Located::top("db")));
     refuse_unfed(&project, &resolved.selection, &spec).expect("the group run is fed");
 
     let spec = RunSpec { target: vec!["hear.note".into()], feed: vec!["hear.note".into()], ..RunSpec::whole("x") };
-    let refusal = resolve_spec(&spec, &project).unwrap_err().to_string();
+    let refusal = resolve_spec(&spec, &project, &Default::default()).unwrap_err().to_string();
     assert!(refusal.contains("only a start can be fed"), "{refusal}");
 }
 
@@ -160,7 +160,7 @@ d = Debug { data: use.o }
     let catalog = weft_catalog::FsCatalog::discover(&weft_catalog::stdlib_root().unwrap()).unwrap();
     weft_compiler::enrich::enrich(&mut project, &catalog).expect("enrich");
     let spec = RunSpec { from: starts(&["use"]), feed: vec!["use".into()], target: vec!["use".into()], ..RunSpec::whole("x") };
-    let resolved = resolve_spec(&spec, &project).expect("the loop comes whole, so the cut is allowed");
+    let resolved = resolve_spec(&spec, &project, &Default::default()).expect("the loop comes whole, so the cut is allowed");
     for fed in ["outer.inner.w", "l.e"] {
         assert!(resolved.selection.nodes.contains(&Located::top(fed)), "{fed} feeds `use` and runs");
     }
@@ -188,12 +188,12 @@ d = Debug { data: note.o }
     let handed = |ports: serde_json::Value| -> BTreeMap<String, serde_json::Value> { serde_json::from_value(ports).unwrap() };
 
     let spec = RunSpec { group: Some(("note".into(), handed(serde_json::json!({"a": "hi"})))), ..RunSpec::whole("x") };
-    let resolved = resolve_spec(&spec, &project).unwrap();
+    let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
     let refusal = weft_core::run_spec::refuse_unrunnable(&project, &resolved.selection, &spec).unwrap_err().to_string();
     assert!(refusal.contains("note would skip") && refusal.contains("tick"), "{refusal}");
 
     let spec = RunSpec { group: Some(("note".into(), handed(serde_json::json!({"a": "hi", "_should_flow": true})))), ..RunSpec::whole("x") };
-    let resolved = resolve_spec(&spec, &project).unwrap();
+    let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
     weft_core::run_spec::refuse_unrunnable(&project, &resolved.selection, &spec).expect("the handed gate opens it");
 
     let spec = RunSpec {
@@ -201,7 +201,7 @@ d = Debug { data: note.o }
         fire: Some(("tick".into(), serde_json::json!({"scheduledTime": "t", "actualTime": "t"}))),
         ..RunSpec::whole("x")
     };
-    let resolved = resolve_spec(&spec, &project).unwrap();
+    let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
     weft_core::run_spec::refuse_unrunnable(&project, &resolved.selection, &spec).expect("the fired trigger can open it");
 }
 
@@ -235,11 +235,11 @@ d = Debug { data: outer.o }
         group: Some(("outer.inner".into(), ports(serde_json::json!({"a": "hi", "_should_flow": true})))),
         ..RunSpec::whole("x")
     };
-    let resolved = resolve_spec(&spec, &project).unwrap();
+    let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
     let refusal = weft_core::run_spec::refuse_unrunnable(&project, &resolved.selection, &spec).unwrap_err().to_string();
     assert!(refusal.contains("the group outer around it is shut") && refusal.contains("--group outer="), "{refusal}");
 
     let spec = RunSpec { from: BTreeMap::from([("outer".to_string(), ports(serde_json::json!({"a": "hi", "_should_flow": true})))]), ..RunSpec::whole("x") };
-    let resolved = resolve_spec(&spec, &project).unwrap();
+    let resolved = resolve_spec(&spec, &project, &Default::default()).unwrap();
     weft_core::run_spec::refuse_unrunnable(&project, &resolved.selection, &spec).expect("the group's own gate is handed");
 }

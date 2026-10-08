@@ -1,8 +1,8 @@
 //! Server-Sent Events handler. Opens a long-lived GET to the
 //! configured URL with `Accept: text/event-stream`, parses SSE
 //! message blocks per https://html.spec.whatwg.org/multipage/server-sent-events.html,
-//! enqueues a `FireSignal` task via the broker for every matching
-//! event. Reconnects with exponential backoff up to 60s on failures.
+//! and hands every matching event to the fire sink
+//! (`crate::fire_sink`). Reconnects with exponential backoff up to 60s on failures.
 
 
 use anyhow::Result;
@@ -60,8 +60,7 @@ impl KindHandler for SseSubscribeHandler {
         payload: Value,
     ) -> ProcessOutcome {
         // An SSE event (raised internally by spawn_loop via
-        // `sink.fire`, delivered through the FireSignal broker task)
-        // routes to the entry trigger.
+        // `sink.fire`) routes to the entry trigger.
         ProcessOutcome {
             value: payload,
             target: ProcessTarget::Entry,

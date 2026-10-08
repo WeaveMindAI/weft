@@ -639,7 +639,7 @@ pub fn stage_builder_base_context(weft_root: &Path) -> CompileResult<PathBuf> {
 /// ```
 ///
 /// The base precompiles the STOCK PROJECT'S WORKER, not a deps-only stand-in:
-/// the package crates pull in dependencies of their own (`sqlx`, `pyo3`,
+/// the package crates pull in dependencies of their own (`sqlx`, `reqwest`,
 /// `tungstenite`, ...) and change how cargo unifies the features of the
 /// shared ones, so a base that had compiled only the engine's dependencies
 /// left every first build on a host recompiling the engine, most of the
@@ -1160,9 +1160,6 @@ mod tests {
         assert!(!dockerfile.contains("{{"), "every token rendered: {dockerfile}");
         assert!(dockerfile.contains(&format!("/work {}", sanitize_crate_name(super::WORKER_CRATE_NAME))));
         assert!(dockerfile.contains("COPY project-nodes /weft/project-nodes"));
-        // The stdlib's own build packages are installed in the base (the
-        // Python node needs the interpreter's headers to compile pyo3).
-        assert!(dockerfile.contains("libpython3-dev"), "{dockerfile}");
     }
 
     /// The names cargo/docker/staging key on must never collide: every

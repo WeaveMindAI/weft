@@ -394,7 +394,7 @@ pub struct SignalIdentity {
     /// True iff this is a mid-execution resume (HumanQuery, etc).
     pub is_resume: bool,
     /// Execution of the suspended execution to resume. Set iff `is_resume`.
-    pub execution_id: Option<String>,
+    pub execution_id: Option<weft_core::ExecutionId>,
     pub spec: SignalSpec,
 }
 
@@ -810,7 +810,17 @@ fn now_unix_ms() -> i64 {
 /// the kind's `process_entry`. A signal with no held row drops the fire,
 /// saying why.
 pub async fn process(state: &crate::ListenerState, token: &str, payload: Value) -> Result<ProcessOutcome> {
-    let Some(signal) = crate::registry::held(state, token).await? else {
+    process_in(&state.registry, &state.signals, token, payload).await
+}
+
+/// [`process`], from the registry and the signal rows themselves.
+pub async fn process_in(
+    registry: &crate::registry::Registry,
+    signals: &weft_broker_client::BrokerSignalClient,
+    token: &str,
+    payload: Value,
+) -> Result<ProcessOutcome> {
+    let Some(signal) = crate::registry::held_in(registry, signals, token).await? else {
         return Ok(ProcessOutcome {
             value: payload,
             target: ProcessTarget::Drop { reason: Some("no signal is held under this token".into()) },
@@ -818,19 +828,9 @@ pub async fn process(state: &crate::ListenerState, token: &str, payload: Value) 
     };
 
     if signal.is_resume {
-        let Some(execution_id) = signal.execution_id.clone() else {
-            tracing::warn!(
-                target: "weft_listener::kinds",
-                %token,
-                "is_resume signal has no execution; dropping"
-            );
-            return Ok(ProcessOutcome {
-                value: payload,
-                target: ProcessTarget::Drop {
-                    reason: Some("is_resume signal missing execution".into()),
-                },
-            });
-        };
+        // The signal table holds no wait without its run (a check on the
+        // row), so a held one without it is a broken invariant.
+        let execution_id = signal.execution_id.ok_or_else(|| anyhow::anyhow!("the wait {token} names no run"))?;
         return Ok(ProcessOutcome {
             value: payload,
             target: ProcessTarget::Resume { execution_id },
@@ -1152,7 +1152,7 @@ mod tests {
                 access: None,
                 match_predicates: Vec::new(),
                 limits: Default::default(),
-                run_class: Default::default(),
+                settings: Default::default(),
             },
             node_id: "ask".into(),
             tenant_id: "t".into(),
@@ -1376,7 +1376,7 @@ mod tests {
                 access: None,
                 match_predicates: predicates,
                 limits: Default::default(),
-                run_class: Default::default(),
+                settings: Default::default(),
             },
             node_id: "n1".into(),
             tenant_id: "t1".into(),

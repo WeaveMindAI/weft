@@ -36,6 +36,15 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// A key of its own for `purpose`, derived from `secret` (HMAC-SHA256 of the
+/// purpose under the secret): whoever holds the secret can derive it, and
+/// the key gives away nothing about the secret.
+pub fn derive_key(secret: &[u8], purpose: &str) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(purpose.as_bytes());
+    mac.finalize().into_bytes().to_vec()
+}
+
 /// Mint a signed token for `claims`. `secret` is the install's signing key.
 pub fn mint<C: SignedClaims>(secret: &[u8], claims: &C) -> String {
     let payload = B64.encode(serde_json::to_vec(claims).expect("claims serialize"));

@@ -37,10 +37,10 @@ pub async fn start(project: &mut Project) -> Result<Uuid> {
     start_with(project, &[]).await
 }
 
-/// [`start`], as a LONG run (`weft run --long`): the run gets a worker of
-/// its own that lives until the run ends.
-pub async fn start_long(project: &mut Project) -> Result<Uuid> {
-    start_with(project, &["--long"]).await
+/// [`start`], as a DURABLE run (`weft run --durable`): each step is on
+/// record before the next starts, so another worker carries it on.
+pub async fn start_durable(project: &mut Project) -> Result<Uuid> {
+    start_with(project, &["--durable"]).await
 }
 
 async fn start_with(project: &mut Project, flags: &[&str]) -> Result<Uuid> {

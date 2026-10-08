@@ -248,7 +248,7 @@ async fn infra_node_verb(
     // up means the node never reaches "stopped", so the command
     // outcome is the honest done signal (and a force-stop completing
     // is what we actually want to wait for).
-    wait_for_command(progress, &client, &project_id, command_id, verb).await?;
+    wait_for_command(progress, ctx.on(), &client, &project_id, command_id, verb).await?;
     if !ctx.json() {
         print_status(&name, &project_id, &infra_status_of(&client, &project_id).await?);
     }
@@ -335,7 +335,7 @@ async fn infra_sync(
         .await?;
         progress.dispatcher_call_done(serde_json::json!({ "project_id": handle.id }));
         let issued = issued_command(answer, "upgrade")?;
-        wait_for_command(progress, &handle.client, &handle.id, issued.command_id, "upgrade").await?;
+        wait_for_command(progress, ctx.on(), &handle.client, &handle.id, issued.command_id, "upgrade").await?;
         infra_status_of(&handle.client, &handle.id).await?
     } else {
         // The sync answers once every copy is up, which on a cloud install
@@ -420,7 +420,7 @@ async fn infra_destroy(
             .await?;
     progress.dispatcher_call_done(serde_json::json!({ "project_id": id }));
     let issued = issued_command(answer, verb)?;
-    wait_for_command(progress, &client, &id, issued.command_id, verb).await?;
+    wait_for_command(progress, ctx.on(), &client, &id, issued.command_id, verb).await?;
     if !ctx.json() {
         print_status(&name, &id, &infra_status_of(&client, &id).await?);
     }
@@ -442,6 +442,7 @@ async fn infra_destroy(
 /// bubble loudly.
 async fn wait_for_command(
     progress: &Progress,
+    on: Option<&str>,
     client: &crate::client::DispatcherClient,
     project_id: &str,
     command_id: i64,
@@ -477,9 +478,11 @@ async fn wait_for_command(
                     anyhow::bail!("infra {verb} failed: {msg}");
                 }
                 Some(CommandOutcome::Cancelled) => anyhow::bail!(
-                    "infra {verb} cancelled (`weft infra cancel`): the operation was halted \
-                     between steps and did NOT complete; infra is left as-is (check `weft infra \
-                     status`), re-run the verb to finish or act per node"
+                    "infra {verb} cancelled (`{}`): the operation was halted \
+                     between steps and did NOT complete; infra is left as-is (check `{}`), \
+                     re-run the verb to finish or act per node",
+                    super::weft_on(on, "infra cancel"),
+                    super::weft_on(on, "infra status")
                 ),
                 // Treating a done command with no outcome as success
                 // would hide a failed one.
@@ -572,16 +575,17 @@ async fn list_doors(ctx: &Ctx) -> Result<()> {
         return Ok(());
     }
     let answer: DoorsResponse = serde_json::from_value(body).context("read the doors")?;
-    print!("{}", format_doors(&answer));
+    print!("{}", format_doors(&answer, ctx.on()));
     Ok(())
 }
 
-fn format_doors(answer: &DoorsResponse) -> String {
+fn format_doors(answer: &DoorsResponse, on: Option<&str>) -> String {
     if answer.doors.is_empty() && answer.applying.is_empty() {
-        return "no doors: nothing this project runs is reachable from outside its instances. A node \
-                opens one by declaring it on an endpoint of its own spec; `weft infra status` \
-                lists what is running.\n"
-            .to_string();
+        return format!(
+            "no doors: nothing this project runs is reachable from outside its instances. A node \
+             opens one by declaring it on an endpoint of its own spec; `{}` lists what is running.\n",
+            super::weft_on(on, "infra status")
+        );
     }
     let mut out = String::new();
     for door in &answer.doors {
@@ -704,7 +708,7 @@ mod tests {
             ],
             applying: vec![CopyRef { node: "cache".into(), instance: None }],
         };
-        let out = format_doors(&answer);
+        let out = format_doors(&answer, None);
         assert!(out.contains("db.pg  10.0.0.2:5432"), "{out}");
         assert!(out.contains("db.pg (instance ann)  10.0.0.3:5432"), "{out}");
         assert!(out.contains("cache  (still being applied"), "{out}");

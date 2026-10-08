@@ -5,7 +5,11 @@
 //! for that account is `Principal::Core`. A project's workers run as the
 //! project's own account (`names::project_account_email`), whose name
 //! holds the start of the project's id; the project it names is looked up
-//! once and remembered.
+//! once and remembered. A project's infra machines run as that account
+//! too, and a machine's token also names the machine (Google's
+//! `compute_engine` claims, asked for with `format=full`): its name starts
+//! with the resource base of the copy it runs (`NodeRef::resource_base`),
+//! so the token is that copy's agent, `Principal::InfraCopy`.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -46,6 +50,21 @@ struct Claims {
     email: Option<String>,
     #[serde(default)]
     email_verified: bool,
+    /// Present on a Compute Engine machine's token.
+    #[serde(default)]
+    google: Option<GoogleClaims>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleClaims {
+    #[serde(default)]
+    compute_engine: Option<ComputeEngine>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ComputeEngine {
+    instance_name: String,
+    project_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,6 +145,36 @@ impl GoogleIdentity {
             _ => Err(IdentityRefused::Stranger(format!("{email} names several projects"))),
         }
     }
+
+    /// The copy whose machine `machine` is, of the project `worker` names.
+    async fn infra_copy(&self, worker: Principal, machine: &str) -> Result<Principal, IdentityRefused> {
+        let (Principal::Worker { tenant, project }, Some(pool)) = (worker, &self.pool) else {
+            return Err(IdentityRefused::Stranger(format!("machine {machine}")));
+        };
+        let copies: Vec<(String, String)> = sqlx::query_as("SELECT node_id, copy_id FROM infra_node WHERE project_id = $1")
+            .bind(project)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| IdentityRefused::Unavailable(e.to_string()))?;
+        copy_of_machine(&tenant, project, &copies, machine)
+            .ok_or_else(|| IdentityRefused::Stranger(format!("machine {machine} runs no infra copy of project {project}")))
+    }
+}
+
+/// Which of `copies` (node, copy id) of `project` the machine named
+/// `machine` runs: its name is the copy's resource base and a unit. A
+/// node can be named so that one copy's base starts with another's
+/// (`a` and `a-<another copy's suffix>`), so the longest base that fits
+/// is the machine's.
+fn copy_of_machine(tenant: &str, project: uuid::Uuid, copies: &[(String, String)], machine: &str) -> Option<Principal> {
+    copies
+        .iter()
+        .filter_map(|(node, copy_id)| {
+            let base = weft_core::infra::NodeRef { tenant: tenant.to_string(), project, node: node.clone(), copy_id: copy_id.clone() }.resource_base();
+            machine.strip_prefix(&base).is_some_and(|unit| unit.starts_with('-')).then_some((base.len(), copy_id))
+        })
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, copy_id)| Principal::InfraCopy { tenant: tenant.to_string(), project, copy_id: copy_id.clone() })
 }
 
 /// `max-age` from a `Cache-Control` header.
@@ -164,9 +213,14 @@ impl CallerIdentity for GoogleIdentity {
         if email == self.core_account {
             return Ok(Principal::Core);
         }
-        match names::project_prefix_of(&email, &self.gcp_project) {
-            Some(prefix) => self.worker(&email, &prefix).await,
-            None => Err(IdentityRefused::Stranger(email)),
+        let Some(prefix) = names::project_prefix_of(&email, &self.gcp_project) else {
+            return Err(IdentityRefused::Stranger(email));
+        };
+        let worker = self.worker(&email, &prefix).await?;
+        match claims.google.and_then(|g| g.compute_engine) {
+            Some(machine) if machine.project_id == self.gcp_project => self.infra_copy(worker, &machine.instance_name).await,
+            Some(machine) => Err(IdentityRefused::Stranger(format!("machine {} of another Google project", machine.instance_name))),
+            None => Ok(worker),
         }
     }
 }
@@ -189,6 +243,30 @@ mod tests {
         assert_eq!(max_age(Some("public, max-age=21600, must-revalidate")), Some(Duration::from_secs(21600)));
         assert_eq!(max_age(Some("no-store")), None);
         assert_eq!(max_age(None), None);
+    }
+
+    #[test]
+    fn a_machine_is_the_copy_whose_resource_base_starts_its_name() {
+        let project = uuid::Uuid::from_u128(9);
+        let copies = vec![("db".to_string(), "wn-1".to_string()), ("cache".to_string(), "wn-2".to_string())];
+        let base = weft_core::infra::NodeRef { tenant: "t".into(), project, node: "cache".into(), copy_id: "wn-2".into() }.resource_base();
+        assert_eq!(
+            copy_of_machine("t", project, &copies, &format!("{base}-main")),
+            Some(Principal::InfraCopy { tenant: "t".into(), project, copy_id: "wn-2".into() })
+        );
+        assert_eq!(copy_of_machine("t", project, &copies, &format!("{base}main")), None, "a unit follows a dash");
+        assert_eq!(copy_of_machine("t", project, &copies, "wi-other-000000000000-main"), None);
+    }
+
+    #[test]
+    fn a_machine_token_carries_its_name() {
+        let claims: Claims = serde_json::from_value(serde_json::json!({
+            "email": "wp-x@acme.iam.gserviceaccount.com",
+            "email_verified": true,
+            "google": { "compute_engine": { "instance_name": "wi-db-1-main", "project_id": "acme", "zone": "z" } }
+        }))
+        .unwrap();
+        assert_eq!(claims.google.and_then(|g| g.compute_engine).map(|m| m.instance_name).as_deref(), Some("wi-db-1-main"));
     }
 
     #[tokio::test]

@@ -132,8 +132,9 @@
         let mut kicked = HashMap::new();
         let mut awaited = HashMap::new();
         let mut loops = LoopRuntime::new();
+        let program = crate::plan::ProgramTables::new(project.clone(), None);
         let crashed = apply_snapshot(
-            &project, snap, &mut pulses, &mut executions, &mut kicked, &mut awaited, &mut loops,
+            &program, snap, &mut pulses, &mut executions, &mut kicked, &mut awaited, &mut loops,
         );
         (pulses, executions, kicked, crashed.into_iter().map(|step| step.loc).collect())
     }
@@ -206,7 +207,7 @@
         let mut pulses = PulseTable::default();
         let mut executions = NodeExecutionTable::default();
         apply_snapshot(
-            &project, snap, &mut pulses, &mut executions,
+            &crate::plan::ProgramTables::new(project.clone(), None), snap, &mut pulses, &mut executions,
             &mut HashMap::new(), &mut HashMap::new(), &mut LoopRuntime::new(),
         )
         .into_iter()
@@ -227,11 +228,11 @@
                 entry_node: "src".into(),
                 phase: weft_core::context::Phase::Fire,
                 definition_hash: Some("test-hash".into()),
-                program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
-                subgraph: None,
+                binary_hash: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
+                selection: None,
                 seed: None,
-                instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-                run_class: weft_core::run_class::RunClass::Short,
+                instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
+                settings: Default::default(),
             },
             // A resume of a firing the journal never opened.
             ExecEvent::NodeResumed { execution_id: execution_id(), node_id: "n".into(), frames: vec![], token: None, at_unix: 0 },

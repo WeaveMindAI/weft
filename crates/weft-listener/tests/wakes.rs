@@ -17,51 +17,20 @@ use weft_platform_traits::FakeAlarm;
 
 // ---------- Fakes ----------
 
-/// Records every fire the listener enqueued.
+/// The task store: records every answer to a waiting run the listener
+/// enqueued (an entry's event never becomes a task).
 #[derive(Default)]
 struct FakeTasks {
-    enqueued: Mutex<Vec<weft_task_store::tasks::NewTask>>,
-    /// While set, every enqueue fails (the broker is down).
-    failing: std::sync::atomic::AtomicBool,
+    answers: Mutex<Vec<weft_task_store::tasks::NewTask>>,
 }
 
 #[async_trait::async_trait]
 impl weft_task_store::TaskStoreClient for FakeTasks {
-    async fn cancels_asked(
-        &self,
-        _project_id: uuid::Uuid,
-        _execution_ids: Vec<String>,
-    ) -> anyhow::Result<Vec<weft_task_store::tasks::CancelAsked>> {
-        Ok(Vec::new())
-    }
     async fn enqueue_dedup(&self, spec: weft_task_store::tasks::NewTask) -> anyhow::Result<weft_task_store::tasks::DedupOutcome> {
-        if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
-            anyhow::bail!("the broker is down");
-        }
-        self.enqueued.lock().unwrap().push(spec);
+        self.answers.lock().unwrap().push(spec);
         Ok(weft_task_store::tasks::DedupOutcome::Inserted(uuid::Uuid::new_v4()))
     }
     async fn wait_for_terminal(&self, _: uuid::Uuid, _: std::time::Duration) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
-        unreachable!()
-    }
-    async fn claim_execution(
-        &self,
-        _: &str,
-        _: uuid::Uuid,
-        _: &str,
-    ) -> anyhow::Result<Option<weft_task_store::tasks::ClaimedExecution>> {
-        unreachable!()
-    }
-    async fn heartbeat(&self, _: uuid::Uuid, _: &str) -> anyhow::Result<bool> {
-        unreachable!()
-    }
-    async fn requeue(&self, _: uuid::Uuid, _: &str) -> anyhow::Result<bool> {
-        unreachable!()
-    }
-    async fn complete(&self, _: uuid::Uuid, _: &str, _: Value) -> anyhow::Result<()> {
-        unreachable!()
-    }
-    async fn fail(&self, _: uuid::Uuid, _: &str, _: String) -> anyhow::Result<()> {
         unreachable!()
     }
 }
@@ -83,7 +52,15 @@ struct GetHeld {
     reads: std::sync::atomic::AtomicUsize,
 }
 
-async fn spawn_broker(rows: Rows, landing: Landing, get_held: Arc<GetHeld>) -> String {
+/// The events put in their trigger's queue (`/v1/door/park_fire`), and,
+/// while `down`, the queue cannot be reached either.
+#[derive(Default)]
+struct Queue {
+    parked: Mutex<Vec<Value>>,
+    down: std::sync::atomic::AtomicBool,
+}
+
+async fn spawn_broker(rows: Rows, landing: Landing, get_held: Arc<GetHeld>, queue: Arc<Queue>) -> String {
     use axum::routing::post;
     use std::sync::atomic::Ordering;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -92,7 +69,35 @@ async fn spawn_broker(rows: Rows, landing: Landing, get_held: Arc<GetHeld>) -> S
     let list_rows = rows.clone();
     let hold_rows = rows.clone();
     let let_go_rows = rows.clone();
+    let target_rows = rows.clone();
     let app = axum::Router::new()
+        // An entry's event goes straight to its project's worker
+        // (`FakeDoors`); an answer to a waiting run is a task.
+        .route(
+            "/v1/signal/fire_target",
+            post(move |axum::Json(req): axum::Json<Value>| {
+                let rows = target_rows.clone();
+                async move {
+                    let is_resume = rows.lock().unwrap().get(req["token"].as_str().unwrap()).is_some_and(|row| row["is_resume"] == true);
+                    axum::Json(json!({ "project_id": uuid::Uuid::nil(), "is_resume": is_resume, "address": "http://worker.test" }))
+                }
+            }),
+        )
+        // An event whose worker could not be reached waits in its
+        // trigger's queue.
+        .route(
+            "/v1/door/park_fire",
+            post(move |axum::Json(req): axum::Json<Value>| {
+                let queue = queue.clone();
+                async move {
+                    if queue.down.load(Ordering::SeqCst) {
+                        return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE);
+                    }
+                    queue.parked.lock().unwrap().push(req);
+                    Ok(axum::Json(json!("parked")))
+                }
+            }),
+        )
         // A holder giving up its claims, as `held_signals::let_go` does.
         .route(
             "/v1/signal/let_go",
@@ -224,6 +229,8 @@ async fn spawn_broker(rows: Rows, landing: Landing, get_held: Arc<GetHeld>) -> S
 struct Rig {
     state: ListenerState,
     tasks: Arc<FakeTasks>,
+    doors: Arc<FakeDoors>,
+    queue: Arc<Queue>,
     alarm: Arc<FakeAlarm>,
     rows: Rows,
     landing: Landing,
@@ -248,16 +255,19 @@ async fn rig(holds_here: bool) -> Rig {
     let rows: Rows = Arc::default();
     let landing: Landing = Arc::default();
     let get_held: Arc<GetHeld> = Arc::default();
-    let broker = spawn_broker(rows.clone(), landing.clone(), get_held.clone()).await;
+    let queue = Arc::new(Queue::default());
+    let broker = spawn_broker(rows.clone(), landing.clone(), get_held.clone(), queue.clone()).await;
     let tasks = Arc::new(FakeTasks::default());
+    let doors = Arc::new(FakeDoors::default());
     let alarm = Arc::new(FakeAlarm::new());
     let state = ListenerState::new(
         ListenerConfig { replica: "test-listener".into(), holds_here, prefer_push: false },
         tasks.clone(),
         link(&broker),
         alarm.clone(),
+        doors.clone(),
     );
-    Rig { state, tasks, alarm, rows, landing, get_held, broker }
+    Rig { state, tasks, doors, queue, alarm, rows, landing, get_held, broker }
 }
 
 fn identity(token: &str, spec: weft_core::primitive::SignalSpec) -> SignalIdentity {
@@ -336,10 +346,10 @@ async fn a_timer_wake_fires_once_however_often_it_is_delivered() {
 
     wake(&rig.state, body()).await.unwrap();
     wake(&rig.state, body()).await.unwrap();
-    let fires = rig.tasks.enqueued.lock().unwrap();
+    let fires = rig.doors.fired.lock().unwrap();
     assert_eq!(fires.len(), 1, "one tick, whatever the deliveries");
-    assert_eq!(fires[0].payload["token"], "tok");
-    assert!(fires[0].payload["payload"]["scheduledTime"].is_string());
+    assert_eq!(fires[0].token, "tok");
+    assert!(fires[0].payload["scheduledTime"].is_string());
     let stored = rig.rows.lock().unwrap()["tok"].clone();
     assert_eq!(stored["kind_state"], json!({}), "a one-shot has nothing left");
     assert_eq!(stored["kind_state_seq"], 2);
@@ -354,7 +364,7 @@ async fn a_wake_for_a_signal_that_is_gone_does_nothing() {
     let now = now_ms();
     wake(&rig.state, WakeBody { token: "gone".into(), due_at_ms: now }).await.unwrap();
     assert!(rig.alarm.wakes_for("signal:gone").is_empty());
-    assert!(rig.tasks.enqueued.lock().unwrap().is_empty());
+    assert!(rig.doors.fired.lock().unwrap().is_empty());
 }
 
 /// A registration that rewrote the row (a reactivate, a new schedule)
@@ -386,26 +396,49 @@ async fn a_serverless_listener_prepares_a_held_kind_for_a_holder() {
     assert!(rig.state.registry.get("sse").is_none());
 }
 
-/// A tick that could not be enqueued fails the wake and leaves the moment
-/// unclaimed, so the alarm's retry fires it: a one-shot is never lost to
-/// a broker that was down for a moment.
+/// A tick whose worker could not be reached, nor its trigger's queue, fails
+/// the wake and leaves the moment unclaimed, so the alarm's retry fires it:
+/// a one-shot is never lost to a worker and a broker down for a moment.
 #[tokio::test]
-async fn a_tick_that_could_not_be_enqueued_is_fired_by_the_retried_wake() {
+async fn a_tick_that_could_not_be_delivered_is_fired_by_the_retried_wake() {
     let rig = rig(false).await;
     let asked = now_ms() - 5_000;
     let spec = to_spec(Timer { spec: TimerSpec::After { duration_ms: 1_000 } });
     register(&rig, "tok", &spec, asked).await.unwrap();
     let body = || WakeBody { token: "tok".into(), due_at_ms: asked + 1_000 };
 
-    rig.tasks.failing.store(true, std::sync::atomic::Ordering::SeqCst);
+    rig.doors.failing.store(true, std::sync::atomic::Ordering::SeqCst);
+    rig.queue.down.store(true, std::sync::atomic::Ordering::SeqCst);
     wake(&rig.state, body()).await.expect_err("a lost tick fails the wake so the alarm retries");
     assert_eq!(rig.rows.lock().unwrap()["tok"]["kind_state_seq"], 1, "the moment is not claimed");
 
-    rig.tasks.failing.store(false, std::sync::atomic::Ordering::SeqCst);
+    rig.doors.failing.store(false, std::sync::atomic::Ordering::SeqCst);
+    rig.queue.down.store(false, std::sync::atomic::Ordering::SeqCst);
     wake(&rig.state, body()).await.unwrap();
-    let fires = rig.tasks.enqueued.lock().unwrap();
+    let fires = rig.doors.fired.lock().unwrap();
     assert_eq!(fires.len(), 1, "the retry fires the tick");
     assert_eq!(rig.rows.lock().unwrap()["tok"]["kind_state_seq"], 2);
+}
+
+/// A tick whose worker cannot be reached waits in its trigger's queue,
+/// already processed, under the fire's own id: the install hands it over
+/// once the worker is back, and one the worker did take is born once.
+#[tokio::test]
+async fn a_tick_whose_worker_is_down_waits_in_its_triggers_queue() {
+    let rig = rig(false).await;
+    let asked = now_ms() - 5_000;
+    let spec = to_spec(Timer { spec: TimerSpec::After { duration_ms: 1_000 } });
+    register(&rig, "tok", &spec, asked).await.unwrap();
+    rig.doors.failing.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    wake(&rig.state, WakeBody { token: "tok".into(), due_at_ms: asked + 1_000 }).await.unwrap();
+    assert!(rig.doors.fired.lock().unwrap().is_empty());
+    let parked = rig.queue.parked.lock().unwrap();
+    assert_eq!(parked.len(), 1);
+    assert_eq!(parked[0]["token"], "tok");
+    assert!(parked[0]["fire"]["payload"]["scheduledTime"].is_string(), "parked processed by its kind");
+    assert!(parked[0]["fire"]["fire_id"].as_str().unwrap().parse::<uuid::Uuid>().is_ok());
+    assert_eq!(rig.rows.lock().unwrap()["tok"]["kind_state_seq"], 2, "the moment is claimed: the tick is kept");
 }
 
 /// A far wake a platform delivered early (Cloud Tasks cannot schedule past
@@ -419,7 +452,7 @@ async fn a_wake_that_arrives_before_its_moment_is_set_again_for_it() {
     register(&rig, "tok", &spec, asked).await.unwrap();
 
     wake(&rig.state, WakeBody { token: "tok".into(), due_at_ms: far }).await.unwrap();
-    assert!(rig.tasks.enqueued.lock().unwrap().is_empty(), "nothing fires early");
+    assert!(rig.doors.fired.lock().unwrap().is_empty(), "nothing fires early");
     assert_eq!(rig.rows.lock().unwrap()["tok"]["kind_state_seq"], 1);
     let wakes = rig.alarm.wakes_for("signal:tok");
     assert_eq!(wakes.len(), 2, "armed, then set again");
@@ -452,7 +485,7 @@ async fn spawn_feed(failing: Arc<std::sync::atomic::AtomicBool>) -> String {
 /// Another copy of the listener, as a serverless platform starts one per
 /// request: nothing in memory, the same broker, task store and alarm.
 fn fresh_listener(rig: &Rig) -> ListenerState {
-    ListenerState::new((*rig.state.config).clone(), rig.tasks.clone(), link(&rig.broker), rig.alarm.clone())
+    ListenerState::new((*rig.state.config).clone(), rig.tasks.clone(), link(&rig.broker), rig.alarm.clone(), rig.doors.clone())
 }
 
 /// What a signal's display says, as one string.
@@ -497,7 +530,7 @@ async fn a_poll_failure_streak_survives_fresh_listeners_and_priming_is_explicit(
     let copy = fresh_listener(&first);
     let now = now_ms();
     wake(&copy, WakeBody { token: "poll".into(), due_at_ms: now }).await.unwrap();
-    assert!(first.tasks.enqueued.lock().unwrap().is_empty(), "the first good poll primes, it fires nothing");
+    assert!(first.doors.fired.lock().unwrap().is_empty(), "the first good poll primes, it fires nothing");
     let stored = first.rows.lock().unwrap()["poll"]["kind_state"].clone();
     assert_eq!(stored, json!({ "delta": { "cursor": 7 } }), "primed, and the streak is cleared");
     assert!(shown(&copy, "poll").await.contains("polling"));
@@ -529,6 +562,9 @@ async fn spawn_status(script: Vec<(u16, Value)>) -> (String, Arc<std::sync::atom
     (format!("http://{addr}/status"), hits)
 }
 
+/// The run a registered wait belongs to.
+const WAITING_RUN: &str = "00000000-0000-0000-0000-0000000000e1";
+
 /// A wait on a job: resumes on the first answer whose `status` says done.
 fn job_wait(url: &str) -> weft_core::primitive::SignalSpec {
     to_spec(weft_core::signal::PollEndpoint {
@@ -543,11 +579,11 @@ fn job_wait(url: &str) -> weft_core::primitive::SignalSpec {
 async fn register_wait(rig: &Rig, token: &str, spec: &weft_core::primitive::SignalSpec, asked_at_unix_ms: i64) -> anyhow::Result<()> {
     let mut who = identity(token, spec.clone());
     who.is_resume = true;
-    who.execution_id = Some("exec-1".into());
+    who.execution_id = Some(WAITING_RUN.parse().unwrap());
     let prepared = prepare_signal(&rig.state, who, None, None, asked_at_unix_ms).await?;
     let mut written = row(token, spec, prepared.kind_state, 1);
     written["is_resume"] = json!(true);
-    written["execution_id"] = json!("exec-1");
+    written["execution_id"] = json!(WAITING_RUN);
     rig.rows.lock().unwrap().insert(token.into(), written.clone());
     weft_listener::registry::hold(&rig.state, serde_json::from_value(written)?, StartMode::New).await
 }
@@ -568,16 +604,16 @@ async fn a_wait_on_a_job_already_done_resumes_at_once() {
 
     wake(&rig.state, WakeBody { token: "wait".into(), due_at_ms: asked }).await.unwrap();
     {
-        let fires = rig.tasks.enqueued.lock().unwrap();
+        let fires = rig.tasks.answers.lock().unwrap();
         assert_eq!(fires.len(), 1);
-        assert_eq!(fires[0].payload["payload"]["url"], "https://cdn/x.mp4");
+        assert_eq!(fires[0].payload["value"]["url"], "https://cdn/x.mp4");
     }
     assert_eq!(rig.alarm.wakes_for("signal:wait").len(), 1, "answered: no further poll is set");
     assert!(shown(&rig.state, "wait").await.contains("answered"));
 
     let outcome = weft_listener::kinds::process(&rig.state, "wait", json!({ "status": "COMPLETED" })).await.unwrap();
     assert!(
-        matches!(&outcome.target, weft_core::signal::listener_protocol::ProcessTarget::Resume { execution_id } if execution_id == "exec-1"),
+        matches!(&outcome.target, weft_core::signal::listener_protocol::ProcessTarget::Resume { execution_id } if execution_id.to_string() == WAITING_RUN),
         "the fire resumes the parked run: {:?}",
         outcome.target
     );
@@ -585,7 +621,7 @@ async fn a_wait_on_a_job_already_done_resumes_at_once() {
     // A wake that was already set when the answer went out polls nothing.
     wake(&rig.state, WakeBody { token: "wait".into(), due_at_ms: now_ms() }).await.unwrap();
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
-    assert_eq!(rig.tasks.enqueued.lock().unwrap().len(), 1);
+    assert_eq!(rig.tasks.answers.lock().unwrap().len(), 1);
 }
 
 /// A job still running is not an answer: the filter drops it and the wait
@@ -607,7 +643,7 @@ async fn a_wait_polls_until_the_job_is_done_and_resumes_once() {
 
     for _ in 0..3 {
         wake(&rig.state, WakeBody { token: "wait".into(), due_at_ms: now_ms() }).await.unwrap();
-        assert!(rig.tasks.enqueued.lock().unwrap().is_empty(), "not done yet: nothing fires");
+        assert!(rig.tasks.answers.lock().unwrap().is_empty(), "not done yet: nothing fires");
     }
     let stored = rig.rows.lock().unwrap()["wait"]["kind_state"].clone();
     assert_eq!(stored, json!({}), "the failure streak cleared on the good poll after it");
@@ -617,9 +653,9 @@ async fn a_wait_polls_until_the_job_is_done_and_resumes_once() {
 
     wake(&rig.state, WakeBody { token: "wait".into(), due_at_ms: now_ms() }).await.unwrap();
     {
-        let fires = rig.tasks.enqueued.lock().unwrap();
+        let fires = rig.tasks.answers.lock().unwrap();
         assert_eq!(fires.len(), 1);
-        assert_eq!(fires[0].payload["payload"], json!({ "status": "FAILED", "error": "nsfw" }));
+        assert_eq!(fires[0].payload["value"], json!({ "status": "FAILED", "error": "nsfw" }));
     }
     assert_eq!(rig.alarm.wakes_for("signal:wait").len(), 4, "answered: no further poll is set");
     assert_eq!(rig.rows.lock().unwrap()["wait"]["kind_state"], json!({ "resumed": true }));
@@ -634,7 +670,7 @@ async fn a_wait_whose_status_endpoint_fails_keeps_polling_and_says_so() {
     let (url, _) = spawn_status(vec![(404, json!({ "error": "no such job" }))]).await;
     register_wait(&rig, "wait", &job_wait(&url), now_ms()).await.unwrap();
     wake(&rig.state, WakeBody { token: "wait".into(), due_at_ms: now_ms() }).await.unwrap();
-    assert!(rig.tasks.enqueued.lock().unwrap().is_empty());
+    assert!(rig.doors.fired.lock().unwrap().is_empty());
     assert!(shown(&rig.state, "wait").await.contains("404"), "{}", shown(&rig.state, "wait").await);
     assert_eq!(rig.alarm.wakes_for("signal:wait").len(), 2, "it polls again");
 }
@@ -932,7 +968,7 @@ fn recording_spec(test: &str, n: u32) -> weft_core::primitive::SignalSpec {
         access: None,
         match_predicates: Vec::new(),
         limits: Default::default(),
-        run_class: Default::default(),
+        settings: Default::default(),
     }
 }
 
@@ -1042,7 +1078,7 @@ async fn a_wake_for_a_signal_that_no_longer_wakes_ends_quietly() {
     let rig = rig(false).await;
     rig.rows.lock().unwrap().insert("sse".into(), row("sse", &sse_spec(), json!({}), 1));
     wake(&rig.state, WakeBody { token: "sse".into(), due_at_ms: now_ms() }).await.unwrap();
-    assert!(rig.tasks.enqueued.lock().unwrap().is_empty());
+    assert!(rig.doors.fired.lock().unwrap().is_empty());
     assert!(rig.alarm.wakes_for("signal:sse").is_empty());
 }
 
@@ -1102,7 +1138,7 @@ async fn a_wake_body_that_can_never_be_read_is_dropped_with_a_success_and_logged
     }
     let written = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
     assert!(written.contains("ERROR") && written.contains("not json at all"), "{written}");
-    assert!(rig.tasks.enqueued.lock().unwrap().is_empty());
+    assert!(rig.doors.fired.lock().unwrap().is_empty());
 }
 
 /// A readable wake whose processing fails answers 500, so the alarm tries
@@ -1115,4 +1151,23 @@ async fn a_readable_wake_that_fails_answers_500_for_a_retry() {
     let call = json!({ "at_unix_ms": now_ms(), "body": { "token": "tok", "due_at_ms": now_ms() } });
     let answer = reqwest::Client::new().post(format!("{base}/wake")).json(&call).send().await.unwrap();
     assert_eq!(answer.status(), 500);
+}
+
+/// The project's worker, as the listener hands it events: records each
+/// one, and, while `failing`, cannot be reached.
+#[derive(Default)]
+struct FakeDoors {
+    fired: Mutex<Vec<weft_core::door_fire::DoorFire>>,
+    failing: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl weft_listener::fire_sink::WorkerDoors for FakeDoors {
+    async fn fire(&self, _: uuid::Uuid, address: &str, fire: &weft_core::door_fire::DoorFire) -> anyhow::Result<weft_core::door_fire::Fired> {
+        if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("no worker answers at {address}");
+        }
+        self.fired.lock().unwrap().push(fire.clone());
+        Ok(weft_core::door_fire::Fired::Started { execution_id: weft_core::door_fire::run_of_fire(fire.fire_id) })
+    }
 }

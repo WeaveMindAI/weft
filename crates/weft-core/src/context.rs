@@ -15,6 +15,7 @@ use crate::ExecutionId;
 pub use crate::primitive::Phase;
 
 mod program_calls;
+mod pure;
 pub use program_calls::{
     ConnectionCalls, CostQuery, InfraCalls, InstanceConnections, InstanceTokens, InstanceValueCalls, RunQuery, TokenCalls,
     TriggerCalls, ValueCalls,
@@ -68,7 +69,7 @@ pub struct ExecutionContext {
     /// non-object payload has no named fields; the whole-record read
     /// ([`ValueBag::object`]) fails loud on it.
     pub wake: ValueBag,
-    handle: Arc<dyn ContextHandle>,
+    pub(crate) handle: Arc<dyn ContextHandle>,
 }
 
 /// How long a link minted for a node body stays fetchable. A body
@@ -81,8 +82,9 @@ pub use crate::node::ERROR_PORT;
 
 /// The message a failed body hands to [`ERROR_PORT`] if it is caught,
 /// or `None` for a failure that is never caught. An outcome of the
-/// step (a [`WeftError::NodeExecution`] or [`WeftError::Runtime`]) may
-/// be caught; a bad config, input or type, a suspension and a cancel
+/// step (a [`WeftError::NodeExecution`], a [`WeftError::Runtime`], or a
+/// wait it gave up, [`WeftError::WaitGaveUp`]) may be caught; a bad
+/// config, input or type, a suspension and a cancel
 /// never are: those are the program's own shape or the runtime's
 /// control flow, never an outcome to route around. A failure that
 /// never came from a body (a panic, an infra apply that failed) is not
@@ -92,7 +94,7 @@ pub use crate::node::ERROR_PORT;
 /// infra apply), and `handle_node_failure` routes it like any other.
 pub fn catchable_message(error: &WeftError) -> Option<String> {
     match error {
-        WeftError::NodeExecution(message) => Some(message.clone()),
+        WeftError::NodeExecution(message) | WeftError::WaitGaveUp(message) => Some(message.clone()),
         WeftError::Runtime(error) => Some(format!("{error:#}")),
         WeftError::Config(_)
         | WeftError::Input(_)
@@ -231,6 +233,18 @@ impl ExecutionContext {
         }
     }
 
+    /// The same context for a node whose metadata says `features.pure`:
+    /// every call that reaches outside the run fails, naming the flag
+    /// (`context::pure`). Whoever runs a body marks its context when its
+    /// node is pure, a run and a node test alike, so a wrong flag fails
+    /// in both at the same call.
+    pub fn marked_pure(mut self, pure: bool) -> Self {
+        if pure {
+            self.handle = Arc::new(pure::PureHandle { inner: self.handle, node_id: self.node_id.clone() });
+        }
+        self
+    }
+
     /// Which instance this run is for: the one whatever started it named
     /// (a firing through an instance's own infra, an instance token, the
     /// `Weft-Instance` header on a gated route, `weft run --instance`),
@@ -291,10 +305,10 @@ impl ExecutionContext {
     ///
     /// The settings the language gives the trigger
     /// (`NodeMetadata::add_language_ports`) are read here from the
-    /// node's inputs, never by the node: the run class (`longRuns`)
-    /// and the trigger's entry limits (`callsPerMinutePerCaller` on a
-    /// trigger called from outside, `callsPerMinute`, `callsAtOnce`),
-    /// which the dispatcher enforces. A trigger without one of them
+    /// node's inputs, never by the node: how its runs are kept
+    /// (`durable`, `recorded`) and its entry limits
+    /// (`callsPerMinutePerCaller` on a trigger called from outside,
+    /// `callsPerMinute`, `callsAtOnce`). A trigger without one of them
     /// gets its default.
     pub async fn register_signal<K: crate::signal::Signal>(
         &self,
@@ -309,7 +323,7 @@ impl ExecutionContext {
         let mut spec = crate::signal::to_spec(kind);
         spec.config = crate::storage::media::strip_links(&spec.config);
         spec.limits = crate::signal::EntryLimits::from_node_fields(&self.inputs.values).map_err(crate::node_error)?;
-        spec.run_class = crate::run_class::RunClass::from_node_fields(&self.inputs.values).map_err(crate::node_error)?;
+        spec.settings = crate::run_settings::RunSettings::from_node_fields(&self.inputs.values).map_err(crate::node_error)?;
         self.handle.register_signal(spec, port_snapshot).await
     }
 
@@ -707,6 +721,30 @@ impl ExecutionContext {
         self.handle.open_connection(access, window).await
     }
 
+    /// Something live this worker holds for its runs to share
+    /// (`crate::shared`): a pool of database connections instead of dialing
+    /// and signing in on every run, a set of ready interpreter processes.
+    ///
+    /// ```ignore
+    /// let pool = ctx.shared(&access, |opened| async move { make_pool(opened).await }).with_limit(100).await?;
+    /// let python = ctx.shared("python", |()| async { Ok(Interpreters::new()) }).await?;
+    /// ```
+    ///
+    /// The first run that asks builds it; every run after that gets the
+    /// same one, until nothing used it for the project's
+    /// `shared_idle_seconds`, or the worker stops. The key says what it is
+    /// built from: a connection hands its build the opened connection, and
+    /// once the connection's values change (a new password) the next run
+    /// builds a fresh one and the old one is let go; a name hands it
+    /// nothing. `with_limit(n)` lets at most `n` runs of this worker use it
+    /// at once, the others waiting their turn; with none, nobody waits.
+    /// What comes back derefs to the thing and gives its place back when
+    /// dropped. Never shared with another project, never held past the
+    /// worker.
+    pub fn shared<K, F>(&self, key: K, build: F) -> crate::shared::SharedAsk<'_, K, F> {
+        crate::shared::SharedAsk { ctx: self, key, build, limit: None }
+    }
+
     /// Sugar for the overwhelmingly common case: open the connection
     /// and hand back its signed-in client. Accepts an ABSENT connection
     /// (`None`) and answers a plain client then, for nodes whose access
@@ -901,8 +939,8 @@ impl ExecutionContext {
     /// if this run has no live caller (a durable run, or any worker that
     /// did not receive the request). The handle's talk methods are
     /// protocol-specific (HTTP: respond/write/close; WS:
-    /// send/receive/request/close); both share `is_connected` and the one
-    /// `ensure_connected` barrier. A node that needs the caller but may
+    /// send/receive/request/close); both share `is_connected` and
+    /// `ensure_connected`. A node that needs the caller but may
     /// run without one checks `is_api_call`/`is_websocket` first, or
     /// handles `None`.
     pub fn caller(&self) -> Option<crate::caller::CallerHandle> {
@@ -913,8 +951,7 @@ impl ExecutionContext {
 
     /// The live HTTP caller, attached and connected, for nodes that only
     /// make sense behind an HTTP trigger (Route). One call folds the
-    /// whole chain: caller present, protocol is HTTP, connection barrier
-    /// passed. A node that may serve BOTH protocols branches on
+    /// whole chain: caller present, protocol is HTTP, caller still there. A node that may serve BOTH protocols branches on
     /// [`Self::caller`] instead.
     pub async fn http_caller(&self) -> WeftResult<crate::caller::HttpCaller> {
         match self.caller() {
@@ -978,9 +1015,8 @@ impl ExecutionContext {
 
     /// What the caller sent to open the exchange (method, path, route
     /// parameters, query, headers, the gate's identity), for either
-    /// protocol, without waiting on the connect barrier: the handshake
-    /// is known the moment the run starts. Fails loud when this run has
-    /// no live caller.
+    /// protocol: the handshake is known the moment the run starts. Fails
+    /// loud when this run has no live caller.
     pub fn caller_request(&self) -> WeftResult<Arc<crate::caller::LiveRequest>> {
         self.handle
             .caller_connection()
@@ -1752,6 +1788,7 @@ impl EndpointHandle {
     /// [`crate::infra::action`]), and hand back its `result`. A refusal
     /// the service answers with a 200 (`result.error`) fails just as
     /// loudly as a non-2xx.
+    ///
     pub async fn action(&self, name: &str, payload: Value) -> WeftResult<Value> {
         use crate::infra::action::{action_request, action_result, ACTION_PATH};
         let answer = self
@@ -2430,6 +2467,8 @@ pub trait ContextHandle: Send + Sync {
         &self,
         infra: &crate::infra::InfraHandle,
     ) -> WeftResult<crate::infra::EndpointAddress>;
+    /// What this worker holds for its runs to share (`crate::shared`).
+    fn shared(&self) -> Arc<crate::shared::Shared>;
     /// HTTP call against a pre-resolved endpoint URL. Used
     /// internally by [`EndpointHandle::call`]; nodes shouldn't
     /// call this directly. Takes the URL the handle cached at
@@ -2961,6 +3000,7 @@ mod value_bag_tests {
         async fn register_signal(&self, _: SignalSpec, _: Value) -> WeftResult<()> { unreachable!() }
         fn own_infra(&self, _: &str, _: Option<&crate::instance::InstanceId>) -> WeftResult<crate::infra::InfraHandle> { unreachable!() }
         async fn endpoint_address(&self, _: &crate::infra::InfraHandle) -> WeftResult<crate::infra::EndpointAddress> { unreachable!() }
+        fn shared(&self) -> Arc<crate::shared::Shared> { unreachable!() }
         async fn endpoint_call(&self, _: &str, _: EndpointMethod, _: &str, _: Option<Value>) -> WeftResult<Value> { unreachable!() }
         async fn run_step(&self, _: &str) -> WeftResult<(u32, Option<Value>)> { unreachable!() }
         async fn run_record(&self, _: &str, _: u32, _: &Value) -> WeftResult<()> { unreachable!() }
@@ -3024,6 +3064,7 @@ mod value_bag_tests {
         async fn register_signal(&self, _: SignalSpec, _: Value) -> WeftResult<()> { unreachable!() }
         fn own_infra(&self, _: &str, _: Option<&crate::instance::InstanceId>) -> WeftResult<crate::infra::InfraHandle> { unreachable!() }
         async fn endpoint_address(&self, _: &crate::infra::InfraHandle) -> WeftResult<crate::infra::EndpointAddress> { unreachable!() }
+        fn shared(&self) -> Arc<crate::shared::Shared> { unreachable!() }
         async fn endpoint_call(&self, _: &str, _: EndpointMethod, _: &str, _: Option<Value>) -> WeftResult<Value> { unreachable!() }
         async fn run_step(&self, _: &str) -> WeftResult<(u32, Option<Value>)> { unreachable!() }
         async fn run_record(&self, _: &str, _: u32, _: &Value) -> WeftResult<()> { unreachable!() }
@@ -3095,6 +3136,27 @@ mod value_bag_tests {
         }
         fn wake_payload(&self) -> Option<&Value> { None }
         fn caller_connection(&self) -> Option<Arc<dyn crate::caller::CallerConnection>> { None }
+    }
+
+    /// A pure node keeps to its run: it stores files for this run alone and
+    /// hands links to its own caller; storing beyond the run, keeping a
+    /// file past it, or linking a file for anybody else is refused, naming
+    /// the flag.
+    #[tokio::test]
+    async fn a_pure_node_keeps_to_its_runs_files_and_its_caller() {
+        let probe = Arc::new(StorageProbeHandle { public_link: Some("http://caller/f".into()), presign_fails: true, puts: Default::default() });
+        let pure = super::pure::PureHandle { inner: probe.clone(), node_id: "n".into() };
+        let bytes = || crate::storage::bytes_stream(bytes::Bytes::from_static(b"x"));
+        let run = crate::storage::StorageScope::Execution;
+        pure.storage_put(&run, None, bytes(), "text/plain", "a.txt", None, None).await.expect("this run's own file");
+        for (scope, keep) in [(crate::storage::StorageScope::Project, None), (run.clone(), Some(crate::storage::KeepTtl::Never))] {
+            let refused = pure.storage_put(&scope, None, bytes(), "text/plain", "a.txt", keep, None).await.expect_err("beyond the run");
+            assert!(refused.to_string().contains("features.pure"), "{refused}");
+        }
+        assert_eq!(probe.puts.lock().unwrap().len(), 1, "only the run's own file was stored");
+        let linked = pure.storage_public_link("k", None, crate::storage::LinkReach::Caller { base: None }).await.unwrap();
+        assert_eq!(linked.as_deref(), Some("http://caller/f"));
+        assert!(pure.storage_public_link("k", None, crate::storage::LinkReach::Internet).await.is_err());
     }
 
     /// A link the storage cannot mint is the firing's error, not a

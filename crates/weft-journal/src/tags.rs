@@ -1,15 +1,15 @@
 //! Execution tags: the selectable copy of `ctx.tag_execution`.
 //!
-//! A tag is journaled as an `ExecutionTagged` event (the record of the
-//! act) AND written to `execution_tag`, one row per (execution, tag), in the
-//! same transaction. The table exists because `ctx.stop_tagged` has to
-//! answer "which live executions of this project carry tag T" on every
-//! inbound message, and folding every open execution's journal to find out
-//! would be O(all history). Every piece of SQL that touches the table
-//! lives here (write, read-back, live selector, delete) so the
-//! dispatcher and the broker, which both act on it, can never disagree
-//! on it. The one exception is the DDL itself, which the dispatcher
-//! owns in its journal schema group.
+//! A tag is recorded as an `ExecutionTagged` event (the record of the act,
+//! written by the run's own worker) AND kept in `execution_tag`, one row per
+//! (execution, tag), which the broker writes once the event is on record.
+//! The table exists because `ctx.stop_tagged` has to answer "which live
+//! executions of this project carry tag T" on every inbound message, and
+//! folding every open run's record to find out would be O(all history).
+//! Every piece of SQL that touches the table lives here (write, read-back,
+//! live selector, delete) so the dispatcher and the broker, which both act
+//! on it, can never disagree on it. The one exception is the DDL itself,
+//! which the dispatcher owns in its journal schema group.
 //!
 //! `seq` is a `BIGSERIAL`: the order tags were written, gap-tolerant,
 //! never tied. It is what the last-one-wins rule compares. Two runs of
@@ -20,9 +20,6 @@
 
 use weft_core::ExecutionId;
 
-use crate::events::ExecEvent;
-use crate::write::{record_event_in, RecordError};
-
 /// One live execution carrying a tag, as the selector reads it: which
 /// run, and the sequence its tag row got.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,52 +28,38 @@ pub struct TaggedExecution {
     pub seq: i64,
 }
 
-/// Journal `ExecutionTagged` and insert the tag rows, on the caller's
-/// transaction. Re-tagging an existing (execution, tag) keeps the original
-/// row (and its `seq`): a body replayed after a durable wait lands on
-/// the same state, and a tag's position in the order is the FIRST time the run
-/// claimed it. `replica` stamps the event with the writing replica,
-/// exactly like every other worker-originated write. The journal row
-/// is this function's first write; a caller that writes before it takes
-/// [`crate::lock_execution_ids`] first (the ordering invariant on `write`).
-pub async fn tag_execution_in(
-    tx: &mut sqlx::PgConnection,
-    execution_id: ExecutionId,
-    tags: &[String],
-    at_unix: u64,
-    replica: Option<&str>,
-) -> Result<(), RecordError> {
-    let event = ExecEvent::ExecutionTagged { execution_id, tags: tags.to_vec(), at_unix };
-    record_event_in(&mut *tx, &event, replica, None).await?;
-    for tag in tags {
-        sqlx::query(
-            "INSERT INTO execution_tag (execution_id, tag, tagged_at_unix) VALUES ($1, $2, $3) \
-             ON CONFLICT (execution_id, tag) DO NOTHING",
-        )
-        .bind(execution_id.to_string())
-        .bind(tag)
-        .bind(at_unix as i64)
-        .execute(&mut *tx)
-        .await?;
-    }
+/// Insert `execution_id`'s tag rows, on the caller's connection.
+/// Re-tagging an existing (execution, tag) keeps the original row (and its
+/// `seq`): a body replayed after a durable wait lands on the same state,
+/// and a tag's position in the order is the FIRST time the run claimed it.
+pub async fn tag_execution_in(conn: &mut sqlx::PgConnection, execution_id: ExecutionId, tags: &[String], at_unix: u64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO execution_tag (execution_id, tag, tagged_at_unix) SELECT $1, t, $3 FROM unnest($2::text[]) AS t \
+         ON CONFLICT (execution_id, tag) DO NOTHING",
+    )
+    .bind(execution_id)
+    .bind(tags)
+    .bind(at_unix as i64)
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 
 /// The tag column every execution-summary read selects: the run's tags
 /// in the order it claimed them, `{}` for an untagged run, so
 /// `Vec<String>` decodes straight off the row. Spliced into queries
-/// that already have the execution in scope as `execution ec`.
+/// that already have the run in scope as `run r`.
 pub const TAGS_LATERAL: &str =
-    "(SELECT COALESCE(array_agg(tag ORDER BY seq), '{}') FROM execution_tag WHERE execution_id = ec.execution_id)";
+    "(SELECT COALESCE(array_agg(tag ORDER BY seq), '{}') FROM execution_tag WHERE execution_id = r.execution_id)";
 
-/// Delete `execution_id`'s tag rows. Runs on the caller's transaction, inside
-/// `delete_execution`'s one-shot clean of the execution's whole footprint:
-/// tag rows must never outlive the journal they select on, or a
-/// half-applied clean leaves exactly the row set `live_tagged_executions`
-/// matches for a run whose history is gone.
-pub async fn delete_for_execution_id(tx: &mut sqlx::PgConnection, execution_id: ExecutionId) -> Result<u64, sqlx::Error> {
-    let res = sqlx::query("DELETE FROM execution_tag WHERE execution_id = $1")
-        .bind(execution_id.to_string())
+/// Delete the tag rows of `execution_ids`. Runs on the caller's
+/// transaction, inside the one-shot delete of the runs' whole footprint:
+/// tag rows must never outlive the run they select on, or a half-applied
+/// delete leaves exactly the row set `live_tagged_executions` matches for
+/// a run that is gone.
+pub async fn delete_for_execution_ids(tx: &mut sqlx::PgConnection, execution_ids: &[ExecutionId]) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM execution_tag WHERE execution_id = ANY($1)")
+        .bind(execution_ids)
         .execute(&mut *tx)
         .await?;
     Ok(res.rows_affected())
@@ -90,7 +73,7 @@ pub async fn tag_seq<'e, E: sqlx::PgExecutor<'e>>(
 ) -> Result<Option<i64>, sqlx::Error> {
     let row: Option<(i64,)> =
         sqlx::query_as("SELECT seq FROM execution_tag WHERE execution_id = $1 AND tag = $2")
-            .bind(execution_id.to_string())
+            .bind(execution_id)
             .bind(tag)
             .fetch_optional(executor)
             .await?;
@@ -109,42 +92,25 @@ pub async fn max_tag_seq<'e, E: sqlx::PgExecutor<'e>>(executor: E) -> Result<i64
 }
 
 /// Every LIVE execution of `project_id` carrying `tag`, with its tag
-/// row's `seq`. Live is [`crate::unrecorded::LIVE_RUN_SQL`]: a project
-/// run still going, recorded or not (never a node test). The ordering and self rules are
-/// applied afterwards by [`select_stop_targets`], which is pure, so the
-/// SQL stays a plain read and the rule has a layer-1 test.
+/// row's `seq`: a project run that has not ended (never a node test). The
+/// ordering and self rules are applied afterwards by
+/// [`select_stop_targets`], which is pure, so the SQL stays a plain read
+/// and the rule has a layer-1 test.
 pub async fn live_tagged_executions<'e, E: sqlx::PgExecutor<'e>>(
     executor: E,
     project_id: uuid::Uuid,
     tag: &str,
 ) -> Result<Vec<TaggedExecution>, sqlx::Error> {
-    // Live is the one rule every sweep shares
-    // (`crate::unrecorded::LIVE_RUN_SQL`, which holds the terminal list).
-    let query = format!(
-        "SELECT et.execution_id, et.seq \
-         FROM execution_tag et \
-         JOIN execution ec ON ec.execution_id = et.execution_id \
-         WHERE ec.project_id = $1 \
-           AND et.tag = $2 \
-           AND {} \
+    let rows: Vec<(ExecutionId, i64)> = sqlx::query_as(
+        "SELECT et.execution_id, et.seq FROM execution_tag et JOIN run r ON r.execution_id = et.execution_id \
+         WHERE r.project_id = $1 AND et.tag = $2 AND r.kind = 'execution' AND r.state <> 'ended' \
          ORDER BY et.seq ASC",
-        crate::unrecorded::LIVE_RUN_SQL
-    );
-    let rows: Vec<(String, i64)> = sqlx::query_as(&query)
+    )
     .bind(project_id)
     .bind(tag)
     .fetch_all(executor)
     .await?;
-    rows.into_iter()
-        .map(|(execution_id, seq)| {
-            let execution_id: ExecutionId = execution_id.parse().map_err(|e: uuid::Error| {
-                sqlx::Error::Decode(
-                    format!("execution_tag row holds a non-uuid execution '{execution_id}': {e}").into(),
-                )
-            })?;
-            Ok(TaggedExecution { execution_id, seq })
-        })
-        .collect()
+    Ok(rows.into_iter().map(|(execution_id, seq)| TaggedExecution { execution_id, seq }).collect())
 }
 
 /// THE stop rule, pure. Out of the live executions carrying the tag,

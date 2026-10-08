@@ -21,19 +21,18 @@ storage, the only way bytes travel a wire.
 
 ## The URL is known before anything runs
 
-A [route] answers at `<install>/connect/local/<path>`, and every piece is
-fixed by the install, not minted at activation. On this machine the install
+A [route] answers at `<install>/connect/local/<path>`, and every part of that address is fixed by the install before the route is ever activated. On this machine the install
 is `http://127.0.0.1:14111`, so `hello = Route { path: "hello" }` answers at
 `http://127.0.0.1:14111/connect/local/hello`, and a socket at the same
 address with `ws://`. On a cloud install it is the target's `url` in
 `weft.toml` (`https://weft-role-dispatcher-123456789.us-central1.run.app/connect/local/hello`,
 and `wss://`). You write those URLs into the frontend-builder's
 [the brief] the moment the routes are shaped, while the graph is still being
-built; `weft activate` prints the same URLs afterwards and only turns them on.
+built; `weft activate` only turns them on.
 
-`127.0.0.1:14111` answers only on this machine. When the install has a public
-address (a tunnel), `weft activate` and `weft token mint` print URLs on that
-address instead, and both reach the same dispatcher. A frontend that runs
+Each project also has an address of its own where the program answers its routes at the root with nothing of weft's in between, which is the fastest way in: on this machine a free port it gets the first time it is activated (14200 or above) and keeps, moving to another free one if a program took it (`http://127.0.0.1:14200/hello`; `weft activate --port <n>` opens a chosen one and keeps it; if another program or project holds it, the command fails and nothing is activated), on a cloud install the project's own Cloud Run address. `weft activate` prints it and `weft status` shows it, or says why it is unavailable. While a route's trigger is parked or still coming on, a call is answered `503` with `Retry-After: 5`, so tell the frontend to retry on a 503; once the project is switched off (wiped), its own port is closed and `/connect/local/<path>` answers 404. When you brief a frontend, give it the `/connect/local/` address: it has the same shape on every install, so the frontend's code runs unchanged on a cloud.
+
+Both local addresses, the project's own port and `127.0.0.1:14111`, answer only on this machine. When the install has a public address (a tunnel), `weft daemon status` prints it, and each route answers there at `<public address>/connect/local/<path>`, reaching the same program. A frontend that runs
 anywhere else (a hosted site, a phone, a browser on another machine) uses the
 public one; a server on this same machine may use either.
 
@@ -173,18 +172,29 @@ calls) never sits in one call the caller waits on. Answer early (a `202`
 with an id), run the work after the answer with `outlivesCaller: true`, and
 show progress: on the infra node's display when the work runs in a container
 (the `weft-node-authoring` skill has the display), or as a status the caller
-polls. For the polled status, the route that answered writes the job's state
+polls. On a cloud install one stretch of a run lasts an hour at most, so a job
+that can run longer is split with a pause (a timer), which gives it a fresh
+hour. For the polled status, the route that answered writes the job's state
 to the project's Postgres, the work updates it as it goes, and a second route
 reads it back. Two routes and a table, no new node.
 
 If a page asks a route for a status every few seconds, set `recorded: false`
-on the `Route` so each call does not leave a run behind. A run that succeeds or
-is cancelled then leaves nothing but what it cost, and one that fails is written
-down whole afterwards, so you still find it in `weft executions` and inspect it
-like any other. An unrecorded run keeps its steps in the worker's memory, which
-means it cannot wait (a timer or a form fails at the call) and is lost if the
-worker dies mid-call. With `outlivesCaller` on too, it keeps running after the
-caller leaves, still unable to wait.
+on the `Route` so each call does not leave a run behind. weft keeps no history
+of such a run: one that fails is listed in `weft executions` with the step that
+failed and why, one that reported a cost, or asked weft for something its
+worker does not already hold (a stored file, a new connection or infrastructure
+address, starting its infra, a stop by tag, a wait on a timer or a form), is
+listed with its costs and how it ended, and any other leaves nothing. An
+unrecorded run keeps no record to pause on, and it cannot be tagged.
+
+A run that cannot pause (an unrecorded one, or one whose caller is still on
+the line with `outlivesCaller` off) still waits on a timer or a form: the wait
+holds the worker and the call open, and the answer carries the run on. If
+nothing moves in the run for the route's `holdSecs` (60 by default, `0` to
+never wait), the waiting node fails saying it gave up, and the caller hears
+that.
+
+A route also has `durable`, off by default, and it cannot be combined with `recorded: false`. With it off, a run whose worker dies ends cancelled. With it on, another worker carries the run on from its finished steps, but the caller's connection died with the old worker, so a step that answers the caller after that fails and the caller has to call again. For the details, go and read How a run is kept in the `weft-language` skill.
 
 ## Pictures in and out
 
@@ -564,7 +574,7 @@ You reach for `ctx` only when the graph cannot say it.
 ## Trying it
 
 ```bash
-weft activate                      # prints the live URL (/connect/local/<path>)
+weft activate                      # prints <url>, the project's own address (on a cloud install, its Cloud Run address)
 curl -X POST "<url>/hello" -H 'content-type: application/json' -d '{"name":"ada"}'
 curl -i "<url>/users/42?verbose=1"
 curl -N "<url>/feed"               # a Stream route: -N shows each frame as it lands
@@ -613,5 +623,5 @@ but firing is now the faster way to watch a route work end to end.
 
 A request answered `500 execution failed: the run ended without answering`
 is a failed run that reached no [answer], with that error, in `weft follow`
-and in `weft executions`, even on a `recorded: false` route (a failed run is
-always written down whole). The fix is in the graph, never in a retry.
+and in `weft executions`, even on a `recorded: false` route (a failed run
+always leaves its failure on record). The fix is in the graph, never in a retry.

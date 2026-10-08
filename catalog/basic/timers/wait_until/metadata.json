@@ -1,7 +1,7 @@
 {
   "type": "WaitUntil",
   "label": "Wait until",
-  "description": "Pause this branch until a date and time; the run parks on a timer at no cost. `value` passes through unchanged. To wait a duration, use Wait.",
+  "description": "Pause this branch until a date and time; the run parks on a timer at no cost (a run that cannot pause, such as a route still answering its caller, holds its worker instead, up to its trigger's `holdSecs`). `value` passes through unchanged. To wait a duration, use Wait.",
   "tags": [
     "wait",
     "until",

@@ -21,6 +21,14 @@ pub struct ProjectManifest {
     pub targets: BTreeMap<String, TargetSection>,
     #[serde(default)]
     pub build: BuildSection,
+    /// `[runs]`: what holds for every run of the project that does not say
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "RunsSection::is_empty")]
+    pub runs: RunsSection,
+    /// `[triggers]`: the limits every trigger of the project has unless its
+    /// own inputs set them.
+    #[serde(default, skip_serializing_if = "TriggersSection::is_empty")]
+    pub triggers: TriggersSection,
     /// The one-target spelling `[targets]` replaced. Read only to refuse
     /// it by name at load: ignored, a `url` in it would silently send
     /// every command to the local install instead.
@@ -39,6 +47,58 @@ pub struct PackageSection {
     pub version: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+}
+
+/// `[runs]` in weft.toml.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunsSection {
+    /// How long an ended run is kept: a whole number and a unit (`30m`,
+    /// `12h`, `7d`), or `forever`. Unset, a week. A trigger's own
+    /// `keepRunsFor` and `weft run --keep-for` say otherwise for their runs.
+    #[serde(default)]
+    pub keep_for: Option<weft_core::run_settings::KeepFor>,
+}
+
+/// `[triggers]` in weft.toml: the project's default for each of a
+/// trigger's limits (`0` is no limit). Unset, weft's own: 60 calls a
+/// minute per caller, no limit per minute, 100 runs at once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TriggersSection {
+    #[serde(default)]
+    pub calls_per_minute_per_caller: Option<u32>,
+    #[serde(default)]
+    pub calls_per_minute: Option<u32>,
+    #[serde(default)]
+    pub calls_at_once: Option<u32>,
+}
+
+impl RunsSection {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl TriggersSection {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl ProjectManifest {
+    /// What the project says once for all its runs and triggers, as its
+    /// program carries it (`ProjectDefinition::defaults`).
+    pub fn defaults(&self) -> weft_core::project::ProjectDefaults {
+        weft_core::project::ProjectDefaults {
+            keep_for: self.runs.keep_for,
+            triggers: weft_core::signal::EntryLimits {
+                per_caller_per_minute: self.triggers.calls_per_minute_per_caller,
+                per_minute: self.triggers.calls_per_minute,
+                at_once: self.triggers.calls_at_once,
+            },
+        }
+    }
 }
 
 /// One `[targets.<name>]` entry: where that install's dispatcher answers.
@@ -368,6 +428,8 @@ pub fn scaffold_files(name: &str, id: Uuid) -> CompileResult<Vec<(String, Vec<u8
         },
         targets: BTreeMap::new(),
         build: BuildSection::default(),
+        runs: RunsSection::default(),
+        triggers: TriggersSection::default(),
         dispatcher: None,
     };
     let toml = toml::to_string_pretty(&manifest)
@@ -415,6 +477,22 @@ mod find_tests {
             "http://127.0.0.1:19999",
             "a trailing slash is dropped so paths join cleanly"
         );
+    }
+
+    /// `[runs]` and `[triggers]` become the program's defaults; a duration
+    /// that reads as none is refused at load.
+    #[test]
+    fn the_projects_run_and_trigger_defaults_are_read() {
+        let (_d, p) = project_with("[runs]\nkeep_for = \"30d\"\n[triggers]\ncalls_per_minute_per_caller = 0\ncalls_at_once = 500\n");
+        let defaults = p.unwrap().manifest.defaults();
+        assert_eq!(defaults.keep_for(), weft_core::run_settings::KeepFor::Seconds(30 * 24 * 3600));
+        assert_eq!(defaults.triggers.per_caller_per_minute, Some(0));
+        assert_eq!(defaults.triggers.per_minute, None);
+        assert_eq!(defaults.triggers.at_once, Some(500));
+        let (_d, bare) = project_with("");
+        assert!(bare.unwrap().manifest.defaults().is_default(), "nothing said, nothing carried");
+        let (_d, bad) = project_with("[runs]\nkeep_for = \"a week\"\n");
+        assert!(bad.unwrap_err().to_string().contains("keep a run"));
     }
 
     #[test]

@@ -1,10 +1,8 @@
 //! Running claimed tasks under their lease.
 //!
-//! The dispatcher claims its own tasks in a picker loop
+//! The dispatcher claims its tasks in a picker loop
 //! ([`dispatcher_picker_loop`]) and runs each through a registry keyed by
-//! kind. A worker never picks: it is called for one execution, claims
-//! that execution's task, and runs it through [`run_claimed_worker_task`].
-//! Both share one lease guard: the claim is renewed while the work runs,
+//! kind, under a lease guard: the claim is renewed while the work runs,
 //! and the task ends `complete`, `failed`, or back to `pending` when the
 //! lease could not be renewed.
 
@@ -17,11 +15,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::FutureExt;
 use serde_json::Value;
+use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 
 use crate::tasks::{claim_duration_secs, claim_heartbeat_interval, Task};
-
-use crate::traits::TaskStoreClient;
 
 #[async_trait]
 pub trait TaskExecutor<Ctx: Send + Sync>: Send + Sync {
@@ -99,11 +96,8 @@ impl<Ctx: Send + Sync> TaskRegistryBuilder<Ctx> {
 /// that we don't open arbitrarily many DB connections at once.
 pub const DISPATCHER_PICKER_CONCURRENCY: usize = 8;
 
-/// A dispatcher task that became claimable.
-pub static DISPATCHER_READY: &[crate::drain::WakeOn] = &[crate::drain::WakeOn {
-    channel: crate::tasks::TASK_READY_CHANNEL,
-    concerns: |payload| payload == "dispatcher",
-}];
+/// A task that became claimable.
+pub static DISPATCHER_READY: &[crate::drain::WakeOn] = &[crate::drain::WakeOn::any(crate::tasks::TASK_READY_CHANNEL)];
 
 /// The dispatcher's picker as a drain loop: each pass claims one task and
 /// runs it on a task of its own (under the concurrency cap), until none
@@ -130,7 +124,7 @@ where
                 Some(task) => {
                     tokio::spawn(async move {
                         let _slot = slot;
-                        run_dispatcher_task(store as Arc<dyn TaskStoreClient>, ctx, registry, replica, task).await;
+                        run_dispatcher_task(store.pool().clone(), ctx, registry, replica, task).await;
                     });
                     Ok(crate::drain::DrainStep::More)
                 }
@@ -142,7 +136,7 @@ where
 
 /// Run one claimed dispatcher task through its executor, under its lease.
 async fn run_dispatcher_task<Ctx>(
-    store: Arc<dyn TaskStoreClient>,
+    pool: PgPool,
     ctx: Ctx,
     registry: TaskRegistry<Ctx>,
     replica: String,
@@ -157,7 +151,7 @@ async fn run_dispatcher_task<Ctx>(
             id = %task.id, kind = %task.kind, error = %err,
             "rejecting unknown task kind"
         );
-        if let Err(e) = store.fail(task.id, &replica, err).await {
+        if let Err(e) = crate::tasks::fail(&pool, task.id, &replica, err).await {
             tracing::warn!(
                 target: "weft_task_store::executor",
                 id = %task.id, error = %e,
@@ -170,7 +164,7 @@ async fn run_dispatcher_task<Ctx>(
     let kind = task.kind.clone();
     let lease = LeaseSignal::new();
     let heartbeat = spawn_claim_heartbeat(
-        store.clone(),
+        pool.clone(),
         task_id,
         replica.clone(),
         lease.clone(),
@@ -183,7 +177,7 @@ async fn run_dispatcher_task<Ctx>(
     )
     .await;
     drop(heartbeat);
-    finalize_task(store.as_ref(), task_id, &replica, &kind, outcome).await;
+    finalize_task(&pool, task_id, &replica, &kind, outcome).await;
 }
 
 /// Why the heartbeat task told the executor to stop. Typed so the
@@ -197,8 +191,8 @@ enum LeaseLoss {
     Stolen,
     /// The heartbeat could not REACH the store past the lease window.
     /// The work did not fail, WE lost the ability to prove liveness,
-    /// so the task is surrendered: requeued to `pending` for any process
-    /// (including us) to claim again.
+    /// so the task is surrendered (`tasks::surrender`): back to
+    /// `pending` for any process (including us) to claim again.
     Unrenewable,
 }
 
@@ -274,7 +268,7 @@ where
     }
 }
 
-/// Persist the verdict for one task. Used by both pickers.
+/// Persist the verdict for one task.
 ///
 ///   - `Finished(Ok(Ok(value)))`: → `tasks::complete`.
 ///   - `Finished(Ok(Err(e)))`: → `tasks::fail` with the error message.
@@ -283,19 +277,19 @@ where
 ///     layering, a panicking executor would ride the spawned task's
 ///     JoinError up and get discarded by `try_join_next`, and the row
 ///     would sit `claimed` until the lease expired.
-///   - `LeaseLost(Unrenewable)`: → `tasks::requeue` (guarded on our
-///     claim), putting the row back to `pending` for the next claim.
-///     A transient store outage must never terminalize work that did
-///     not fail.
+///   - `LeaseLost(Unrenewable)`: → `tasks::surrender`
+///     (guarded on our claim, tried until it lands), putting the row back
+///     to `pending` for the next claim. A transient store outage must
+///     never terminalize work that did not fail.
 ///   - `LeaseLost(Stolen)`: → nothing. The re-claimer owns the row;
 ///     any write from us would race its run.
 async fn finalize_task(
-    store: &dyn TaskStoreClient,
+    pool: &PgPool,
     task_id: uuid::Uuid,
     replica: &str,
     kind: &str,
     outcome: ExecOutcome,
-) -> TaskEnd {
+) {
     let outcome = match outcome {
         ExecOutcome::Finished(finished) => finished,
         ExecOutcome::LeaseLost(LeaseLoss::Stolen) => {
@@ -304,52 +298,62 @@ async fn finalize_task(
                 id = %task_id, kind = %kind,
                 "lease stolen by another claimant; it owns the task, standing down"
             );
-            return TaskEnd::LeaseLost;
+            return;
         }
         ExecOutcome::LeaseLost(LeaseLoss::Unrenewable) => {
-            match store.requeue(task_id, replica).await {
-                Ok(true) => tracing::warn!(
-                    target: "weft_task_store::executor",
-                    id = %task_id, kind = %kind,
-                    "surrendered task requeued; the next claim re-runs it"
-                ),
-                Ok(false) => tracing::warn!(
-                    target: "weft_task_store::executor",
-                    id = %task_id, kind = %kind,
-                    "surrender found the row no longer ours (already re-claimed); \
-                     the claimer owns it"
-                ),
-                Err(e) => tracing::error!(
-                    target: "weft_task_store::executor",
-                    id = %task_id, kind = %kind, error = %e,
-                    "surrender requeue failed; the row sits claimed until its lease \
-                     expires, then claim_one rescues it"
-                ),
+            // Until the surrender lands, this process still holds the task,
+            // so nothing else may pick it up: it is tried again for as long
+            // as the store does not answer.
+            loop {
+                match crate::tasks::surrender(pool, task_id, replica).await {
+                    Ok(true) => {
+                        tracing::warn!(
+                            target: "weft_task_store::executor",
+                            id = %task_id, kind = %kind,
+                            "claim surrendered; the task goes back for the next claim"
+                        );
+                        break;
+                    }
+                    Ok(false) => {
+                        tracing::warn!(
+                            target: "weft_task_store::executor",
+                            id = %task_id, kind = %kind,
+                            "surrender found the row no longer ours (already re-claimed); the claimer owns it"
+                        );
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            target: "weft_task_store::executor",
+                            id = %task_id, kind = %kind, error = %e,
+                            "surrender failed; trying again"
+                        );
+                        tokio::time::sleep(crate::tasks::claim_heartbeat_interval()).await;
+                    }
+                }
             }
-            return TaskEnd::LeaseLost;
+            return;
         }
     };
     match outcome {
         Ok(Ok(result)) => {
-            if let Err(e) = store.complete(task_id, replica, result).await {
+            if let Err(e) = crate::tasks::complete(pool, task_id, replica, result).await {
                 tracing::warn!(
                     target: "weft_task_store::executor",
                     id = %task_id, kind = %kind, error = %e,
                     "complete write failed; row may have been re-claimed"
                 );
             }
-            TaskEnd::Completed
         }
         Ok(Err(e)) => {
             let msg = format!("{e:#}");
-            if let Err(e2) = store.fail(task_id, replica, msg.clone()).await {
+            if let Err(e2) = crate::tasks::fail(pool, task_id, replica, msg).await {
                 tracing::warn!(
                     target: "weft_task_store::executor",
                     id = %task_id, kind = %kind, error = %e2,
                     "fail write failed"
                 );
             }
-            TaskEnd::Failed(msg)
         }
         Err(panic) => {
             let panic_msg = panic_message(&panic);
@@ -359,28 +363,15 @@ async fn finalize_task(
                 "task panicked; writing tasks::fail"
             );
             let msg = format!("panic: {panic_msg}");
-            if let Err(e) = store.fail(task_id, replica, msg.clone()).await {
+            if let Err(e) = crate::tasks::fail(pool, task_id, replica, msg).await {
                 tracing::warn!(
                     target: "weft_task_store::executor",
                     id = %task_id, kind = %kind, error = %e,
                     "fail write after panic also failed"
                 );
             }
-            TaskEnd::Failed(msg)
         }
     }
-}
-
-/// How a claimed task ended, as its claimant saw it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TaskEnd {
-    Completed,
-    /// The work failed (or panicked); the task was failed with this.
-    Failed(String),
-    /// The claim was lost mid-work: taken by another claimant, or given
-    /// back because it could not be renewed. Whoever claims it next runs
-    /// it again.
-    LeaseLost,
 }
 
 fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
@@ -408,7 +399,7 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
 /// A stalled executor is NOT an exit: the heartbeat keeps renewing,
 /// the executor keeps running, no leak.
 fn spawn_claim_heartbeat(
-    store: Arc<dyn TaskStoreClient>,
+    pool: PgPool,
     task_id: uuid::Uuid,
     replica: String,
     lease: LeaseSignal,
@@ -420,7 +411,7 @@ fn spawn_claim_heartbeat(
         let mut consecutive_errors: u32 = 0;
         loop {
             tokio::time::sleep(interval).await;
-            match store.heartbeat(task_id, &replica).await {
+            match crate::tasks::heartbeat(&pool, task_id, &replica).await {
                 Ok(true) => {
                     consecutive_errors = 0;
                 }
@@ -465,27 +456,4 @@ impl Drop for Heartbeat {
     fn drop(&mut self) {
         self.0.abort();
     }
-}
-
-/// Run one task a worker claimed for the execution it was called for,
-/// under the same lease guard the dispatcher's tasks run under: the claim
-/// is renewed while `work` runs, and the task ends `complete`, `failed`,
-/// or back to `pending` when the claim could not be renewed. Answers how
-/// it ended, for the worker to tell whoever called it.
-pub async fn run_claimed_worker_task<F>(
-    store: Arc<dyn TaskStoreClient>,
-    replica: &str,
-    task: &Task,
-    work: F,
-) -> TaskEnd
-where
-    F: std::future::Future<Output = Result<()>>,
-{
-    let lease = LeaseSignal::new();
-    let heartbeat = spawn_claim_heartbeat(store.clone(), task.id, replica.to_string(), lease.clone());
-    let kind = task.kind.clone();
-    let result = serde_json::json!({ "kind": kind });
-    let outcome = run_with_lease_guard(async { work.await.map(|()| result) }, lease, task.id, &kind).await;
-    drop(heartbeat);
-    finalize_task(store.as_ref(), task.id, replica, &kind, outcome).await
 }

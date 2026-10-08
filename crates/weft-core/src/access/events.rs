@@ -298,6 +298,19 @@ fn default_true() -> bool {
 }
 
 impl VerifyKind {
+    /// The request headers this scheme reads a credential from: what a run
+    /// it admits never writes down (`crate::caller::Redaction`).
+    pub fn credential_headers(&self) -> Vec<String> {
+        match self {
+            VerifyKind::Hmac { signature_header, .. } | VerifyKind::Signature { signature_header, .. } => {
+                vec![signature_header.clone()]
+            }
+            VerifyKind::ApiKeys { header, .. } => vec![header.clone(), "authorization".to_string()],
+            VerifyKind::Oidc { .. } => vec!["authorization".to_string()],
+            VerifyKind::TokenEcho => Vec::new(),
+        }
+    }
+
     /// The scheme's wire tag (`hmac`, `oidc`, ...), for messages.
     pub fn tag(&self) -> &'static str {
         match self {

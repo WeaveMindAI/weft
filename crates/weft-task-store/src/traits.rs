@@ -26,7 +26,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::pg_signal::PgSignalWatch;
-use crate::tasks::{CancelAsked, ClaimedExecution, DedupOutcome, NewTask, Task, TaskOutcome};
+use crate::tasks::{DedupOutcome, NewTask, Task, TaskOutcome};
 
 #[async_trait]
 pub trait TaskStoreClient: Send + Sync {
@@ -36,30 +36,6 @@ pub trait TaskStoreClient: Send + Sync {
     /// back its outcome either way. Ends the moment the task does (see
     /// [`crate::terminal`]), never on a polling tick.
     async fn wait_for_terminal(&self, task_id: Uuid, timeout: Duration) -> Result<TaskOutcome>;
-
-    /// Claim the execute or resume task of the execution this worker was
-    /// handed, with the execution's journal (see
-    /// [`crate::tasks::claim_execution`]). `None` when there is nothing
-    /// here to claim.
-    async fn claim_execution(&self, replica: &str, project_id: Uuid, execution_id: &str) -> Result<Option<ClaimedExecution>>;
-
-    async fn heartbeat(&self, task_id: Uuid, replica: &str) -> Result<bool>;
-
-    /// Surrender a claim back to `pending` (no claimant), guarded on
-    /// `claimed_by = replica` so a row already re-claimed elsewhere is
-    /// never clobbered. Returns true when the requeue landed. See
-    /// `tasks::requeue`.
-    async fn requeue(&self, task_id: Uuid, replica: &str) -> Result<bool>;
-
-    async fn complete(&self, task_id: Uuid, replica: &str, result: Value) -> Result<()>;
-
-    async fn fail(&self, task_id: Uuid, replica: &str, error: String) -> Result<()>;
-
-    /// The cancels asked for any of `execution_ids` of `project_id` (the
-    /// executions the asking worker drives); asking only reads, so asking
-    /// again finds them again. A worker asks when it hears one announced
-    /// ([`crate::tasks::CANCEL_CHANNEL`]) and when it may have missed some.
-    async fn cancels_asked(&self, project_id: Uuid, execution_ids: Vec<String>) -> Result<Vec<CancelAsked>>;
 }
 
 // ---------- Postgres impls ----------
@@ -89,6 +65,10 @@ impl PostgresTaskStoreClient {
     pub async fn claim_dispatcher_task(&self, replica: &str) -> Result<Option<Task>> {
         crate::tasks::claim_one(&self.pool, replica).await
     }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
 }
 
 #[async_trait]
@@ -99,30 +79,6 @@ impl TaskStoreClient for PostgresTaskStoreClient {
 
     async fn wait_for_terminal(&self, task_id: Uuid, timeout: Duration) -> Result<TaskOutcome> {
         crate::terminal::wait_for_terminal(&self.pool, &self.signals, task_id, timeout).await
-    }
-
-    async fn claim_execution(&self, replica: &str, project_id: Uuid, execution_id: &str) -> Result<Option<ClaimedExecution>> {
-        crate::tasks::claim_execution(&self.pool, replica, project_id, execution_id).await
-    }
-
-    async fn heartbeat(&self, task_id: Uuid, replica: &str) -> Result<bool> {
-        crate::tasks::heartbeat(&self.pool, task_id, replica).await
-    }
-
-    async fn requeue(&self, task_id: Uuid, replica: &str) -> Result<bool> {
-        crate::tasks::requeue(&self.pool, task_id, replica).await
-    }
-
-    async fn complete(&self, task_id: Uuid, replica: &str, result: Value) -> Result<()> {
-        crate::tasks::complete(&self.pool, task_id, replica, result).await
-    }
-
-    async fn fail(&self, task_id: Uuid, replica: &str, error: String) -> Result<()> {
-        crate::tasks::fail(&self.pool, task_id, replica, error).await
-    }
-
-    async fn cancels_asked(&self, project_id: Uuid, execution_ids: Vec<String>) -> Result<Vec<CancelAsked>> {
-        crate::tasks::cancels_asked(&self.pool, project_id, &execution_ids).await
     }
 }
 
@@ -146,6 +102,19 @@ pub trait InfraReader: Send + Sync {
         run_instance: Option<&weft_core::instance::InstanceId>,
         infra: &weft_core::infra::InfraHandle,
     ) -> Result<Option<weft_core::infra::EndpointAddress>>;
+
+    /// What the copy of the infra node at `place` (spelled) saved for its
+    /// baked outputs (`weft_core::infra::bake`), port to value, for the
+    /// run `execution_id` that runs it: the shared copy (`copy` `None`) or
+    /// the run's own instance's. Empty when it saved nothing. The broker
+    /// checks the copy against the run, like an endpoint's.
+    async fn baked_outputs(
+        &self,
+        execution_id: weft_core::ExecutionId,
+        run_instance: Option<&weft_core::instance::InstanceId>,
+        place: &str,
+        copy: Option<&weft_core::instance::InstanceId>,
+    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>>;
 }
 
 pub struct PostgresInfraReader {
@@ -163,6 +132,25 @@ impl PostgresInfraReader {
 }
 
 impl PostgresInfraReader {
+    /// [`InfraReader::baked_outputs`] once the broker has resolved the
+    /// run: empty when the copy saved nothing or has no row.
+    pub async fn baked_outputs(
+        &self,
+        project_id: Uuid,
+        node_id: &str,
+        instance: Option<&weft_core::instance::InstanceId>,
+    ) -> Result<std::collections::BTreeMap<String, serde_json::Value>> {
+        let saved: Option<sqlx::types::Json<std::collections::BTreeMap<String, serde_json::Value>>> = sqlx::query_scalar(
+            "SELECT baked_json FROM infra_node WHERE project_id = $1 AND node_id = $2 AND instance_id IS NOT DISTINCT FROM $3",
+        )
+        .bind(project_id)
+        .bind(node_id)
+        .bind(instance.map(|i| i.as_str()))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(saved.map(|saved| saved.0).unwrap_or_default())
+    }
+
     /// [`InfraReader::endpoint_address`] once the broker has resolved
     /// the run: `instance` is which copy (`None` for a shared node).
     pub async fn endpoint_address(

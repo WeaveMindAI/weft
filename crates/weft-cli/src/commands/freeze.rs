@@ -24,16 +24,17 @@ pub async fn run(ctx: Ctx, name: String, execution_id: Option<String>, expect: V
         Some(c) => resolve_run(&tree, &c)?.clone(),
         None => {
             let head = tree.head.head_run.ok_or_else(|| {
-                anyhow::anyhow!("head has no run to freeze; name an execution (`weft tree` lists them) or run first")
+                anyhow::anyhow!("head has no run to freeze; name an execution (`{}` lists them) or run first", ctx.weft("tree"))
             })?;
             resolve_run(&tree, &head.to_string())?.clone()
         }
     };
-    if run.status != Some(weft_core::program::RunStatus::Completed.into()) {
+    if run.status != Some(weft_core::program::RunStatus::Completed) {
         bail!(
-            "run {} is {}; only a completed run freezes (`weft stop`, fix, run again)",
+            "run {} is {}; only a completed run freezes (`{}`, fix, run again)",
             short(&run.execution_id.to_string()),
-            run.status.map_or("unknown", |s| s.as_str())
+            run.status.map_or("unknown", |s| s.as_str()),
+            ctx.weft("stop")
         );
     }
     let rows = super::versions::replay_rows(&client, &run.execution_id.to_string()).await?;

@@ -24,7 +24,7 @@ pub async fn mint_instance_token(
     if caller.role != Role::Worker {
         return Err((StatusCode::FORBIDDEN, "worker only".into()));
     }
-    let run = crate::scope::require_execution_id_scope(&state.scope_cache, &state.pool, &caller, &req.execution_id).await?;
+    let run = crate::scope::require_execution_id_scope(&state.scope_cache, &state.pool, &caller, req.execution_id).await?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before unix epoch")

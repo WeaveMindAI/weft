@@ -37,10 +37,11 @@ one node's body where nobody can.
 **V. Thou shalt not save your own state.**
 
 No file on the side, no table of your own, no "I'll just keep this in memory
-between runs". If the worker dies, a fresh one rebuilds the execution from the
-journal and keeps going (a step that was half way through is failed, since it
-may have partly happened), and `ctx.run` is how a step that waited reuses its
-recorded results when it picks back up.
+between runs" for anything a run has to remember. The journal is the run's
+memory: a durable run whose worker dies is rebuilt from it by another worker,
+and `ctx.run` is how a step that waited reuses its recorded results when it
+picks back up. A connection pool or a process the runs only share for
+speed is different: `ctx.shared` holds one for them, and losing it loses nothing.
 
 **VI. Thou shalt not carry files around.**
 
@@ -70,9 +71,10 @@ one fails before it reaches your code.
 **X. Thou shalt not write down what happened.**
 
 No log file, no print so you can work out later what went on, no audit trail of
-your own. Every event is journaled as it happens, and that journal is what the
-runtime replays to bring an execution back, so a record you keep on the side is
-one the runtime cannot restore from anyway.
+your own. Every event of a run is journaled (unless its trigger turned
+`recorded` off), and that journal is what
+the runtime reads to pick up a durable run or one that waited, so a record you
+keep on the side is one the runtime cannot restore from anyway.
 
 **XI. Thou shalt not report to the human.**
 

@@ -79,6 +79,18 @@ pub trait ProjectStoreOps: Send + Sync {
     /// Read graph and worker identity from one database snapshot.
     async fn running_program_identity(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_core::project::hash::ProgramIdentity>>;
 
+    /// The program identity a run names by its two hashes (its
+    /// `ExecutionStarted`'s `definition_hash` and `binary_hash`): the
+    /// implementation fingerprints are stored once per worker binary with
+    /// the project, never copied into a run. `None` when this project
+    /// never registered that binary.
+    async fn program_identity(
+        &self,
+        id: uuid::Uuid,
+        definition_hash: &str,
+        binary_hash: &str,
+    ) -> anyhow::Result<Option<weft_core::project::hash::ProgramIdentity>>;
+
     // Every reader returns `Result<Option<T>>` or `Result<Vec<T>>`:
     // `Ok(None)` / `Ok(vec![])` means "no such row" (legal), `Err`
     // means "DB failure" (callers MUST surface). Earlier this trait
@@ -363,9 +375,22 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 -- version). Moved by checkpoint, run and branch; nothing
                 -- lives on disk.
                 head_version TEXT,
-                head_run UUID
+                head_run UUID,
+                -- The project's own port on a local install
+                -- (`crate::project_ports`): given at its first activation,
+                -- or named with `weft activate --port`, and kept, moved to a free one when another program took
+                -- it. NULL until then, and on a platform that gives
+                -- projects no port.
+                api_port INTEGER,
+                -- Where the project's front answers its callers, or why it
+                -- cannot (`weft_core::projects::ProjectAddress`, written by
+                -- `crate::front`): what `weft status` shows and where the
+                -- listener hands the project's events. NULL while nothing
+                -- of the project takes work.
+                api_address JSONB
             )"#,
         "CREATE INDEX IF NOT EXISTS idx_project_tenant ON project(tenant_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_project_api_port ON project(api_port) WHERE api_port IS NOT NULL",
         // A project coming or going changes how its tenant's routes read
         // (a route whose project is gone is inactive); the function is the
         // journal group's, which applies first.
@@ -663,6 +688,29 @@ impl ProjectStoreOps for PostgresProjectStore {
         row.map(|(definition_hash, binary_hash, implementations)| Ok(weft_core::project::hash::ProgramIdentity {
             definition_hash, binary_hash, implementations: serde_json::from_value(implementations)?,
         })).transpose()
+    }
+
+    async fn program_identity(
+        &self,
+        id: uuid::Uuid,
+        definition_hash: &str,
+        binary_hash: &str,
+    ) -> anyhow::Result<Option<weft_core::project::hash::ProgramIdentity>> {
+        let row: Option<(serde_json::Value,)> = sqlx::query_as(
+            "SELECT implementations FROM project_code WHERE project_id = $1 AND binary_hash = $2",
+        )
+        .bind(id)
+        .bind(binary_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(implementations,)| {
+            Ok(weft_core::project::hash::ProgramIdentity {
+                definition_hash: definition_hash.to_string(),
+                binary_hash: binary_hash.to_string(),
+                implementations: serde_json::from_value(implementations)?,
+            })
+        })
+        .transpose()
     }
 
     async fn tenant_for(&self, id: uuid::Uuid) -> anyhow::Result<Option<String>> {
@@ -1101,6 +1149,21 @@ impl ProjectStoreOps for FakeProjectStore {
         let Some(definition_hash) = self.definition_hashes.read().await.get(&id).cloned() else { return Ok(None) };
         let Some(implementations) = self.implementations.read().await.get(&(id, binary_hash.clone())).cloned() else { return Ok(None) };
         Ok(Some(weft_core::project::hash::ProgramIdentity { definition_hash, binary_hash, implementations }))
+    }
+
+    async fn program_identity(
+        &self,
+        id: uuid::Uuid,
+        definition_hash: &str,
+        binary_hash: &str,
+    ) -> anyhow::Result<Option<weft_core::project::hash::ProgramIdentity>> {
+        Ok(self.implementations.read().await.get(&(id, binary_hash.to_string())).cloned().map(|implementations| {
+            weft_core::project::hash::ProgramIdentity {
+                definition_hash: definition_hash.to_string(),
+                binary_hash: binary_hash.to_string(),
+                implementations,
+            }
+        }))
     }
 
     async fn program_source(&self, id: uuid::Uuid, program: &weft_core::project::hash::ProgramIdentity) -> anyhow::Result<weft_core::project::hash::Manifest> {

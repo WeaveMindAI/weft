@@ -229,6 +229,15 @@ impl RouteKey {
     }
 }
 
+/// The pattern under the tenant prefix a stored mount path carries
+/// (`/alice/chat/{room}` -> `chat/{room}`, `/alice` -> ``). Every row of a
+/// tenant is prefixed the same way, so the strip is exact.
+pub fn pattern_of_mount_path(mount_path: &str, tenant: &str) -> String {
+    let prefix = format!("/{tenant}");
+    let rest = mount_path.strip_prefix(&prefix).unwrap_or(mount_path);
+    rest.trim_start_matches('/').to_string()
+}
+
 /// What a lookup found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteMatch<T> {
@@ -254,14 +263,15 @@ pub enum RouteMatch<T> {
 /// given rather than guessing. A path match with no method match is
 /// [`RouteMatch::WrongMethod`] so the gateway can answer 405 with the
 /// allowed list.
-pub fn find_route<T>(
-    candidates: impl IntoIterator<Item = (RouteKey, T)>,
+pub fn find_route<K: std::borrow::Borrow<RouteKey>, T>(
+    candidates: impl IntoIterator<Item = (K, T)>,
     method: &str,
     path: &str,
 ) -> RouteMatch<T> {
     let mut best: Option<(usize, T, BTreeMap<String, String>)> = None;
     let mut allowed: Vec<String> = Vec::new();
     for (key, tag) in candidates {
+        let key = key.borrow();
         let Some(params) = key.pattern.match_path(path) else { continue };
         if !key.serves_method(method) {
             for m in &key.methods {

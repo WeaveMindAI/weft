@@ -32,7 +32,7 @@ These paths, and nothing else. Everything else on that address answers 404.
 | `POST /signal-token/displays/<project>/<node>/action` | That client pressing a button on it |
 | `/instance/...` | Somebody holding an instance token for one of your programs: that instance's fields, its connections, its runs |
 | `GET /public/files/<token>` | Somebody fetching a file link your program handed out |
-| `/connect/<tenant>/<path>`, `/live/<project>/...` | A caller of one of your routes or sockets |
+| `/connect/<tenant>/<path>` | A caller of one of your routes or sockets |
 | `/infra/<project>/<copy>/...` | A caller of an infrastructure endpoint your node opened to the public |
 | `GET /access/oauth/callback` | A provider sending you back after you approve a connection |
 | `/access/picker/<state>` | The page where you pick files for a connection, and its answer |

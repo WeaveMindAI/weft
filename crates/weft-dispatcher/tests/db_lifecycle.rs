@@ -27,11 +27,12 @@ use weft_core::ProjectDefinition;
 use weft_dispatcher::activation_store::{
     ActivationLifecycle, ActivationStoreOps, LifecycleWrite, PostgresActivationStore, ProjectStatus, SignalsGoing,
 };
-use weft_dispatcher::api::project::{due_parked_tokens, owners_with_triggers_on, release_stale_drain_claims};
-use weft_dispatcher::api::signal::{
-    append_parked_fire, instance_gap_tokens, instance_waits, restamp_parked_fire, signals_visible_to, ParkAppend,
-    ParkedFire, ParkRefusal,
-};
+use weft_dispatcher::api::project::owners_with_triggers_on;
+use weft_dispatcher::api::signal::{instance_gap_tokens, instance_waits, signals_visible_to};
+use weft_dispatcher::parked_drain::{due_tokens, next_due};
+use weft_journal::record::{Queued, Then};
+use weft_journal::ExecEvent;
+use weft_task_store::parked_fires::{park, ParkAppend, ParkRefusal, Waiting};
 use weft_dispatcher::journal::postgres::PostgresJournal;
 use weft_dispatcher::journal::{Journal, SignalRegistration};
 use weft_dispatcher::versions::VersionStoreOps;
@@ -80,25 +81,53 @@ async fn seed_project(
         .expect("register project");
 }
 
-/// The execute task of `execution_id`'s birth, on image `binary_hash`.
-fn execute_task(
-    project_id: Uuid,
-    execution_id: weft_core::ExecutionId,
-    binary_hash: &str,
-    unrecorded_birth: Option<&[weft_journal::ExecEvent]>,
-) -> weft_task_store::tasks::NewTask {
-    weft_dispatcher::task_kinds::execute::execution_task_spec(weft_dispatcher::task_kinds::execute::ExecutionTask {
-        kind: weft_task_store::TaskKind::Execute,
-        project_id,
-        execution_id,
-        definition_hash: "def-1",
-        binary_hash,
-        tenant_id: TENANT,
-        run_class: weft_core::run_class::RunClass::Short,
-        live_connection: None,
-        unrecorded_birth,
-    })
-    .unwrap()
+/// The birth of run `execution_id` of `project_id`, in `phase`, on image
+/// `binary_hash`.
+fn birth(execution_id: weft_core::ExecutionId, project_id: Uuid, phase: weft_core::context::Phase, binary_hash: &str) -> ExecEvent {
+    ExecEvent::ExecutionStarted {
+        execution_id, project_id, entry_node: "entry".into(), phase,
+        definition_hash: Some("def-1".into()), binary_hash: Some(binary_hash.into()),
+        source_version: (phase == weft_core::context::Phase::TriggerSetup).then(|| "source".into()),
+        run_kind: weft_core::exec::RunKind::Execution, selection: None, seed: None, instance: None, stand_in: None,
+        fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 1,
+        settings: Default::default(),
+    }
+}
+
+/// Queue the run `events` start (`events[0]` its birth), the way the
+/// dispatcher starts a run by hand or a setup run.
+async fn queue(journal: &PostgresJournal, events: &[ExecEvent], for_activation: bool) -> anyhow::Result<bool> {
+    journal.queue_run(Queued {
+        events, tenant: TENANT, keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT, watch_end: false,
+        stale: &[], spec: None, example: None,
+    }, for_activation).await
+}
+
+/// A fire run of `project_id`, queued.
+async fn queued_run(journal: &PostgresJournal, project_id: Uuid) -> weft_core::ExecutionId {
+    let execution_id = weft_core::new_execution_id();
+    assert!(queue(journal, &[birth(execution_id, project_id, weft_core::context::Phase::Fire, "bin-A")], false).await.unwrap());
+    execution_id
+}
+
+/// End run `execution_id`, which nobody drives, completed.
+async fn complete(journal: &PostgresJournal, execution_id: weft_core::ExecutionId) -> ExecEvent {
+    let completed = ExecEvent::ExecutionCompleted { execution_id, at_unix: 2 };
+    let written = journal.append(execution_id, std::slice::from_ref(&completed), Then::Stays).await.unwrap();
+    assert!(matches!(written, weft_journal::record::Appended::At(_)), "{written:?}");
+    completed
+}
+
+/// One column of run `execution_id`'s row.
+async fn run_column<T>(pool: &PgPool, column: &str, execution_id: weft_core::ExecutionId) -> Option<T>
+where
+    T: for<'r> sqlx::Decode<'r, sqlx::Postgres> + sqlx::Type<sqlx::Postgres> + Send + Unpin,
+{
+    sqlx::query_scalar(&format!("SELECT {column} FROM run WHERE execution_id = $1"))
+        .bind(execution_id)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
 }
 
 /// A minimal entry-signal registration.
@@ -132,46 +161,22 @@ fn entry_signal(token: &str, project_id: Uuid) -> SignalRegistration {
     }
 }
 
-// ----- task stamping (the enqueue reads the project row) -------------------
+// ----- a run keeps its image -----------------------------------------------
 
-/// Birth and resume retain the original image across project edits.
+/// A run keeps the image it was born on across project edits: delivery
+/// reads its row, and so does every claim that carries it on after an
+/// answer.
 #[sqlx::test]
-async fn execution_birth_and_resume_pin_the_original_image(pool: PgPool) {
+async fn a_queued_run_keeps_the_image_it_was_born_on(pool: PgPool) {
     let (journal, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
-
-    let execution_id = weft_core::ExecutionId::new_v4();
-    let program = weft_core::project::hash::ProgramIdentity {
-        definition_hash: "def-1".into(), binary_hash: "bin-A".into(), implementations: Default::default(),
-    };
-    let start = weft_journal::ExecEvent::ExecutionStarted {
-        execution_id, project_id: id, entry_node: "entry".into(),
-        phase: weft_core::context::Phase::Fire, definition_hash: Some("def-1".into()),
-        program: Some(program), source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 1,
-        run_class: weft_core::run_class::RunClass::Short,
-    };
-    let task = execute_task(id, execution_id, "bin-A", None);
+    let execution_id = weft_core::new_execution_id();
+    let start = birth(execution_id, id, weft_core::context::Phase::Fire, "bin-A");
     seed_project(&projects, id, "bin-B").await;
-    journal.start_execution(&start, &[], task, false).await.unwrap();
-
-    let (kind, binary_hash): (String, Option<String>) = sqlx::query_as(
-        "SELECT kind, binary_hash FROM task WHERE execution_id = $1",
-    )
-    .bind(execution_id.to_string())
-    .fetch_one(&pool)
-    .await
-    .expect("task row");
-    assert_eq!(kind, "execute");
-    assert_eq!(
-        binary_hash.as_deref(),
-        Some("bin-A"),
-        "the execute task must carry the image it was enqueued for"
-    );
-    weft_dispatcher::task_kinds::execute::enqueue_resume(&pool, id, execution_id, "def-1", TENANT).await.unwrap();
-    let resume_hash: String = sqlx::query_scalar("SELECT binary_hash FROM task WHERE execution_id = $1 AND kind = 'resume'")
-        .bind(execution_id.to_string()).fetch_one(&pool).await.unwrap();
-    assert_eq!(resume_hash, "bin-A");
+    assert!(queue(&journal, &[start], false).await.unwrap());
+    assert_eq!(run_column::<String>(&pool, "binary_hash", execution_id).await.as_deref(), Some("bin-A"));
+    assert_eq!(run_column::<String>(&pool, "state", execution_id).await.as_deref(), Some("queued"));
 }
 
 // ----- atomic execution birth ------------------------------------------
@@ -195,18 +200,17 @@ async fn registered_sources_belong_to_the_exact_program(pool: PgPool) {
     assert!(projects.program_source(id, &changed).await.is_err(), "changing code cannot relabel old sources");
 }
 
-fn trigger_setup_birth(id: Uuid, execution_id: Uuid) -> (weft_journal::ExecEvent, weft_task_store::tasks::NewTask) {
-    let program = weft_core::project::hash::ProgramIdentity {
+/// The program identity every setup birth here names (`trigger_setup_birth`).
+fn setup_program() -> weft_core::project::hash::ProgramIdentity {
+    weft_core::project::hash::ProgramIdentity {
         definition_hash: "def-1".into(), binary_hash: "bin-A".into(), implementations: Default::default(),
-    };
-    let start = weft_journal::ExecEvent::ExecutionStarted {
-        execution_id, project_id: id, entry_node: "entry".into(),
-        phase: weft_core::context::Phase::TriggerSetup, definition_hash: Some("def-1".into()),
-        program: Some(program), source_version: Some("source".into()), run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 1,
-        run_class: weft_core::run_class::RunClass::Short,
-    };
-    let task = execute_task(id, execution_id, "bin-A", None);
-    (start, task)
+    }
+}
+
+/// The birth of trigger setup `execution_id` of project `id`, from
+/// version `source`.
+fn trigger_setup_birth(id: Uuid, execution_id: Uuid) -> ExecEvent {
+    birth(execution_id, id, weft_core::context::Phase::TriggerSetup, "bin-A")
 }
 
 #[sqlx::test]
@@ -218,13 +222,12 @@ async fn pruning_a_source_waits_for_setup_and_removes_its_unused_bake(pool: PgPo
     sqlx::query("INSERT INTO project_version (project_id, id, manifest, created_at) VALUES ($1, 'source', '{}', 0)")
         .bind(id).execute(&pool).await.unwrap();
     let execution_id = Uuid::new_v4();
-    let (birth, task) = trigger_setup_birth(id, execution_id);
-    journal.start_execution(&birth, &[], task, false).await.unwrap();
+    let birth = trigger_setup_birth(id, execution_id);
+    queue(&journal, std::slice::from_ref(&birth), false).await.unwrap();
     assert!(versions.delete_versions(id, &["source".into()]).await.is_err());
-    let complete = weft_journal::ExecEvent::ExecutionCompleted { execution_id, at_unix: 2 };
-    journal.record_event(&complete).await.unwrap();
+    let complete = complete(&journal, execution_id).await;
     assert!(versions.delete_versions(id, &["source".into()]).await.is_err(), "publication still owns this source");
-    let bake = weft_dispatcher::journal::TriggerBake::from_events(&[birth, complete]).unwrap().unwrap();
+    let bake = weft_dispatcher::journal::TriggerBake::from_events(&[birth, complete], &setup_program()).unwrap().unwrap();
     journal.finish_trigger_setup(execution_id, Some(&bake)).await.unwrap();
     versions.delete_versions(id, &["source".into()]).await.unwrap();
     assert!(journal.trigger_bakes(id, None).await.unwrap().is_empty());
@@ -364,8 +367,7 @@ async fn activation_cleanup_cannot_finish_or_wipe_a_newer_activation(pool: PgPoo
     assert_eq!(removed.len(), 1);
     assert_eq!(removed[0].token, "old-entry");
     assert!(journal.signal_get("old-entry").await.unwrap().is_none());
-    let (late_birth, late_task) = trigger_setup_birth(id, first);
-    assert!(journal.start_execution(&late_birth, &[], late_task, true).await.is_err(),
+    assert!(queue(&journal, &[trigger_setup_birth(id, first)], true).await.is_err(),
         "a cancelled activation cannot later start its setup");
     assert!(journal.events_log(first).await.unwrap().is_empty());
 
@@ -597,20 +599,17 @@ async fn trigger_bake_ownership_publication_and_project_cleanup(pool: PgPool) {
     sqlx::query("INSERT INTO project_version (project_id, id, manifest, created_at) VALUES ($1, 'source', '{}', 0)")
         .bind(id).execute(&pool).await.unwrap();
     let first = Uuid::new_v4();
-    let (birth, task) = trigger_setup_birth(id, first);
-    journal.start_execution(&birth, &[], task, false).await.unwrap();
-    let complete = weft_journal::ExecEvent::ExecutionCompleted { execution_id: first, at_unix: 2 };
-    journal.record_event(&complete).await.unwrap();
-    let bake = weft_dispatcher::journal::TriggerBake::from_events(&[birth.clone(), complete]).unwrap().unwrap();
+    let birth = trigger_setup_birth(id, first);
+    queue(&journal, std::slice::from_ref(&birth), false).await.unwrap();
+    let complete = complete(&journal, first).await;
+    let bake = weft_dispatcher::journal::TriggerBake::from_events(&[birth, complete], &setup_program()).unwrap().unwrap();
     journal.finish_trigger_setup(first, Some(&bake)).await.unwrap();
 
     let second = Uuid::new_v4();
     assert!(activations.try_begin_activating(id, &[feed_key()], second, None).await.unwrap().is_ok());
-    let (second_birth, second_task) = trigger_setup_birth(id, second);
-    let (other_birth, other_task) = trigger_setup_birth(id, Uuid::new_v4());
-    assert!(journal.start_execution(&other_birth, &[], other_task, true).await.is_err(),
+    assert!(queue(&journal, &[trigger_setup_birth(id, Uuid::new_v4())], true).await.is_err(),
         "a setup no activation is setting up is never born as one");
-    journal.start_execution(&second_birth, &[], second_task, true).await.unwrap();
+    queue(&journal, &[trigger_setup_birth(id, second)], true).await.unwrap();
     let mut entry = governed_entry("baked-entry", id, first);
     entry.program = Some(bake.program.clone());
     entry.source_version = Some(bake.source_version.clone());
@@ -632,383 +631,223 @@ async fn trigger_bake_ownership_publication_and_project_cleanup(pool: PgPool) {
     assert!(journal.trigger_bakes(id, None).await.unwrap().is_empty());
 }
 
-/// The birth of an execution (`ExecutionStarted` + `execution` seed +
-/// kicks + the execute task) is ONE transaction: a failure anywhere rolls
-/// everything back. Witness: starting for a project with NO row fails the
-/// seed's project check AFTER the ExecutionStarted insert already ran in the
-/// same transaction; nothing may survive (no journal row, no execution, no task).
-/// Before the atomic birth, this exact failure left a journaled "ghost"
-/// execution with no task, which nothing would ever run or reclaim.
-#[sqlx::test]
-async fn start_execution_birth_is_atomic(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
-    let missing_project = Uuid::new_v4(); // never registered
-    let execution_id = weft_core::ExecutionId::new_v4();
-    let now = 1_700_000_000u64;
-    let start = weft_journal::ExecEvent::ExecutionStarted {
-        execution_id,
-        project_id: missing_project,
-        entry_node: "entry".into(),
-        phase: weft_core::context::Phase::Fire,
-        definition_hash: Some("def-1".into()),
-        program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
-        subgraph: None,
-        seed: None,
-        instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: now,
-        run_class: weft_core::run_class::RunClass::Short,
-    };
-    let kick = weft_journal::ExecEvent::NodeKicked {
-        execution_id,
-        node_id: "entry".into(),
-        frames: Vec::new(),
-        firing: true,
-        payload: None,
-        port_snapshot: None,
-        at_unix: now,
-    };
-    let task = weft_task_store::tasks::NewTask {
-        kind: weft_task_store::TaskKind::Execute.into(),
-        target: weft_task_store::TaskTarget::Worker,
-        project_id: Some(missing_project),
-        dedup_key: Some(format!("{execution_id}:execute")),
-        execution_id: Some(execution_id.to_string()),
-        tenant_id: TENANT.into(),
-        target_replica: None,
-        binary_hash: None,
-        payload: json!({}),
-    };
-    let err = journal
-        .start_execution(&start, std::slice::from_ref(&kick), task.clone(), false)
+/// How many rows of `table` belong to run `execution_id`.
+async fn rows_of(pool: &PgPool, table: &str, execution_id: weft_core::ExecutionId) -> i64 {
+    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE execution_id = $1"))
+        .bind(execution_id)
+        .fetch_one(pool)
         .await
-        .expect_err("missing project must fail the birth");
+        .unwrap()
+}
+
+/// Queueing a run is ONE transaction: its row and its record's first row
+/// commit together or not at all. A run of a project with no row is
+/// refused with nothing written, and a run queued again by its id (a
+/// retried start) writes nothing twice.
+#[sqlx::test]
+async fn queueing_a_run_is_atomic_and_happens_once(pool: PgPool) {
+    let (journal, projects) = setup(&pool).await;
+    let missing = Uuid::new_v4();
+    let lost = weft_core::new_execution_id();
+    let err = queue(&journal, &[birth(lost, missing, weft_core::context::Phase::Fire, "bin-A")], false).await.unwrap_err();
     assert!(format!("{err:#}").contains("has no row"), "{err:?}");
-    // NOTHING survives: the whole birth rolled back.
-    let (events,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*)::bigint FROM exec_event WHERE execution_id = $1")
-            .bind(execution_id.to_string())
-            .fetch_one(&pool)
-            .await
-            .expect("count events");
-    let (execution_ids,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*)::bigint FROM execution WHERE execution_id = $1")
-            .bind(execution_id.to_string())
-            .fetch_one(&pool)
-            .await
-            .expect("count executions");
-    let (tasks,): (i64,) = sqlx::query_as("SELECT COUNT(*)::bigint FROM task WHERE execution_id = $1")
-        .bind(execution_id.to_string())
-        .fetch_one(&pool)
-        .await
-        .expect("count tasks");
-    assert_eq!((events, execution_ids, tasks), (0, 0, 0), "a failed birth must leave nothing");
+    assert_eq!((rows_of(&pool, "run", lost).await, rows_of(&pool, "run_log", lost).await), (0, 0), "a refused start leaves nothing");
 
-    // And the positive path: with the project registered, the SAME birth
-    // commits everything together.
-    let registered = Uuid::new_v4();
-    seed_project(&projects, registered, "bin-A").await;
-    let execution_id2 = weft_core::ExecutionId::new_v4();
-    let start2 = weft_journal::ExecEvent::ExecutionStarted {
-        execution_id: execution_id2,
-        project_id: registered,
-        entry_node: "entry".into(),
-        phase: weft_core::context::Phase::Fire,
-        definition_hash: Some("def-1".into()),
-        program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
-        subgraph: None,
-        seed: None,
-        instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: now,
-        run_class: weft_core::run_class::RunClass::Short,
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    let execution_id = weft_core::new_execution_id();
+    let start = birth(execution_id, id, weft_core::context::Phase::Fire, "bin-A");
+    let kick = ExecEvent::NodeKicked {
+        execution_id, node_id: "entry".into(), frames: vec![], firing: false, payload: None, port_snapshot: None, at_unix: 1,
     };
-    let task2 = weft_task_store::tasks::NewTask {
-        execution_id: Some(execution_id2.to_string()),
-        dedup_key: Some(format!("{execution_id2}:execute")),
-        project_id: Some(registered),
-        ..task
-    };
-    journal
-        .start_execution(&start2, &[], task2.clone(), false)
-        .await
-        .expect("birth for a registered project");
-    let (events2,): (i64,) =
-        sqlx::query_as("SELECT COUNT(*)::bigint FROM exec_event WHERE execution_id = $1")
-            .bind(execution_id2.to_string())
-            .fetch_one(&pool)
-            .await
-            .expect("count events");
-    let (tasks2,): (i64,) = sqlx::query_as("SELECT COUNT(*)::bigint FROM task WHERE execution_id = $1")
-        .bind(execution_id2.to_string())
-        .fetch_one(&pool)
-        .await
-        .expect("count tasks");
-    assert_eq!((events2, tasks2), (1, 1), "a successful birth commits the event AND the task");
-
-    sqlx::query("DELETE FROM task WHERE execution_id = $1").bind(execution_id2.to_string()).execute(&pool).await.unwrap();
-    journal.start_execution(&start2, &[], task2.clone(), false).await.unwrap();
-    let births: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM exec_event WHERE execution_id = $1 AND kind = 'execution_started'")
-        .bind(execution_id2.to_string()).fetch_one(&pool).await.unwrap();
-    let tasks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task WHERE execution_id = $1")
-        .bind(execution_id2.to_string()).fetch_one(&pool).await.unwrap();
-    assert_eq!((births, tasks), (1, 0), "finished admission cannot create a second execution");
+    assert!(queue(&journal, &[start.clone(), kick.clone()], false).await.unwrap());
+    assert_eq!((rows_of(&pool, "run", execution_id).await, rows_of(&pool, "run_log", execution_id).await), (1, 1),
+        "the birth and its kicks are the record's first row");
+    assert_eq!(journal.events_log(execution_id).await.unwrap().len(), 2);
+    assert!(!queue(&journal, &[start, kick], false).await.unwrap(), "a retried start finds its run");
+    assert_eq!(rows_of(&pool, "run_log", execution_id).await, 1, "and writes nothing twice");
 }
 
-/// An unrecorded run is born with its execution row and task alone (no
-/// journal row), is never listed, and is forgotten by a cancel that
-/// finds no process driving it. A failed one written afterwards becomes an
-/// ordinary run, listed with its rows; a second write is refused.
+/// Seed a live worker of `project_id` on image `binary_hash`, driving
+/// `in_flight` runs per trigger token.
+async fn seed_worker(pool: &PgPool, replica: &str, project_id: Uuid, binary_hash: &str, in_flight: serde_json::Value, alive: bool) {
+    let until = weft_dispatcher::lease::now_unix() + if alive { 60 } else { -60 };
+    sqlx::query(
+        "INSERT INTO worker_lease (replica, project_id, tenant_id, leased_until_unix, binary_hash, in_flight) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         ON CONFLICT (replica) DO UPDATE SET leased_until_unix = EXCLUDED.leased_until_unix, in_flight = EXCLUDED.in_flight",
+    )
+    .bind(replica)
+    .bind(project_id)
+    .bind(TENANT)
+    .bind(until)
+    .bind(binary_hash)
+    .bind(in_flight)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Claim queued run `execution_id` of `project_id` for `owner`, the way
+/// a worker takes it.
+async fn claim(pool: &PgPool, execution_id: weft_core::ExecutionId, project_id: Uuid, owner: &str) {
+    let mut conn = pool.acquire().await.unwrap();
+    weft_journal::record::claim(&mut conn, execution_id, project_id, owner).await.unwrap().expect("claimed");
+}
+
+/// A drain counts what the project's live workers say they drive, plus
+/// the runs on record that are queued or driven by a live worker. A run
+/// parked on a wait is not going, and neither is a run whose worker's
+/// lease lapsed (the lost-run sweep owns it).
 #[sqlx::test]
-async fn an_unrecorded_run_is_born_unjournaled_and_forgotten_or_recorded(pool: PgPool) {
+async fn the_drain_counts_what_workers_drive_and_the_runs_queued_or_driven(pool: PgPool) {
+    use weft_dispatcher::drain::{going, DrainScope, Reaching};
     let (journal, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
-    let birth = |execution_id: weft_core::ExecutionId| {
-        let start = weft_journal::ExecEvent::ExecutionStarted {
-            execution_id, project_id: id, entry_node: "route".into(),
-            phase: weft_core::context::Phase::Fire, definition_hash: Some("def-1".into()),
-            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Unrecorded,
-            subgraph: None, seed: None, instance: None, fired_trigger: Some("route".into()),
-            instance_values: Default::default(), picks: Default::default(), at_unix: 1,
-            run_class: weft_core::run_class::RunClass::Short,
-        };
-        let kick = weft_journal::ExecEvent::NodeKicked {
-            execution_id, node_id: "route".into(), frames: vec![], firing: true, payload: None, port_snapshot: None, at_unix: 1,
-        };
-        let task = execute_task(id, execution_id, "bin-A", Some(&[start.clone(), kick.clone()]));
-        (start, kick, task)
-    };
-    let rows = |execution_id: weft_core::ExecutionId| {
-        let pool = pool.clone();
-        async move {
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM exec_event WHERE execution_id = $1")
-                .bind(execution_id.to_string()).fetch_one(&pool).await.unwrap()
-        }
-    };
-    let kind = |execution_id: weft_core::ExecutionId| {
-        let pool = pool.clone();
-        async move {
-            sqlx::query_scalar::<_, String>("SELECT kind FROM execution WHERE execution_id = $1")
-                .bind(execution_id.to_string()).fetch_optional(&pool).await.unwrap()
-        }
-    };
-    let listed = || async {
-        journal.list_executions(TENANT, &weft_dispatcher::journal::ExecutionQuery {
-            limit: 50, ..Default::default()
-        }).await.unwrap().executions.into_iter().map(|e| e.execution_id).collect::<Vec<_>>()
-    };
+    let every = weft_core::instance::Copies::Shared;
+    let scope = DrainScope { project_id: id, reaching: Reaching::Copies(&every), except: None };
+    let older = DrainScope { project_id: id, reaching: Reaching::OtherImages("bin-B"), except: None };
+    assert_eq!(going(&pool, &scope).await.unwrap(), 0);
 
-    // Born: the execution row and the task, no journal row.
-    let gone = weft_core::ExecutionId::new_v4();
-    let (start, kick, task) = birth(gone);
-    journal.start_execution(&start, std::slice::from_ref(&kick), task, false).await.unwrap();
-    assert_eq!(rows(gone).await, 0, "an unrecorded birth writes no journal row");
-    assert_eq!(kind(gone).await.as_deref(), Some("unrecorded"));
-    let payload: serde_json::Value = sqlx::query_scalar("SELECT payload FROM task WHERE execution_id = $1")
-        .bind(gone.to_string()).fetch_one(&pool).await.unwrap();
-    assert_eq!(payload["unrecorded_birth"].as_array().map(Vec::len), Some(2), "the birth rides the task");
-    assert!(!listed().await.contains(&gone), "an unrecorded run is not listed");
+    let run = queued_run(&journal, id).await;
+    assert_eq!(going(&pool, &scope).await.unwrap(), 1, "queued for a worker");
+    claim(&pool, run, id, "worker-a").await;
+    assert_eq!(going(&pool, &scope).await.unwrap(), 0, "its owner has no live lease: lost, not going");
+    seed_worker(&pool, "worker-a", id, "bin-A", json!({ "tok": 2 }), true).await;
+    assert_eq!(going(&pool, &scope).await.unwrap(), 3, "two its worker states, plus the run on record");
+    assert_eq!(going(&pool, &older).await.unwrap(), 3, "all of it runs on an image other than bin-B");
+    seed_worker(&pool, "worker-b", id, "bin-B", json!({ "tok": 4 }), true).await;
+    assert_eq!(going(&pool, &older).await.unwrap(), 3, "the worker on bin-B is not older than bin-B");
+    seed_worker(&pool, "worker-a", id, "bin-A", json!({ "tok": 2 }), false).await;
+    assert_eq!(going(&pool, &scope).await.unwrap(), 4, "a worker whose lease lapsed says nothing, and its run is lost");
 
-    // A cancel with no process driving it: nothing journaled, the run forgotten
-    // and its files queued for the sweep.
-    journal.cancel_execution(gone, None, &weft_core::exec::CancelCause::User).await.unwrap();
-    assert_eq!(rows(gone).await, 0, "no cancel terminal for an unrecorded run");
-    assert_eq!(kind(gone).await, None, "forgotten");
-    let swept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM storage_sweep WHERE execution_id = $1")
-        .bind(gone.to_string()).fetch_one(&pool).await.unwrap();
-    assert_eq!(swept, 1);
-
-    // A failed one, written afterwards, is an ordinary listed run.
-    let failed = weft_core::ExecutionId::new_v4();
-    let (start, kick, task) = birth(failed);
-    journal.start_execution(&start, std::slice::from_ref(&kick), task, false).await.unwrap();
-    let mut record = vec![start, kick, weft_journal::ExecEvent::ExecutionFailed { execution_id: failed, error: "boom".into(), at_unix: 2 }];
-    if let weft_journal::ExecEvent::ExecutionStarted { run_kind, .. } = &mut record[0] {
-        *run_kind = weft_core::exec::RunKind::Execution;
-    }
-    weft_journal::unrecorded::record_retroactively(&pool, &record, None).await.unwrap();
-    assert_eq!(rows(failed).await, 3);
-    assert_eq!(kind(failed).await.as_deref(), Some("execution"));
-    assert!(listed().await.contains(&failed), "a failed unrecorded run lists like any other");
-    let again = weft_journal::unrecorded::record_retroactively(&pool, &record, None).await.unwrap_err();
-    assert!(again.to_string().contains("not an unrecorded run"), "{again:#}");
-
-    // A run whose costs reached the journal keeps its row: they are
-    // addressed by it.
-    let paid = weft_core::ExecutionId::new_v4();
-    let (start, kick, task) = birth(paid);
-    journal.start_execution(&start, std::slice::from_ref(&kick), task, false).await.unwrap();
-    weft_journal::record_events(&pool, &[weft_journal::ExecEvent::CostReported {
-        execution_id: paid, node_id: "llm".into(), frames: vec![], cost_id: "c".into(), service: "llm".into(),
-        model: None, amount_usd: Some(0.1), billed: true, origin: weft_core::CredentialOwner::Author,
-        metadata: serde_json::json!({}), at_unix: 2,
-    }], None, None).await.unwrap();
-    let mut tx = pool.begin().await.unwrap();
-    assert!(!weft_journal::unrecorded::forget_in(&mut tx, paid).await.unwrap());
-    tx.commit().await.unwrap();
-    assert_eq!(kind(paid).await.as_deref(), Some("unrecorded"));
-    assert!(!listed().await.contains(&paid));
+    sqlx::query("UPDATE run SET state = 'parked', owner = NULL WHERE execution_id = $1").bind(run).execute(&pool).await.unwrap();
+    seed_worker(&pool, "worker-b", id, "bin-B", json!({}), true).await;
+    assert_eq!(going(&pool, &scope).await.unwrap(), 0, "a parked run is not going");
 }
 
-/// An in-flight unrecorded run is live to every project sweep exactly
-/// while a worker can still drive it: its execute task waiting, or held
-/// by a claim that is being renewed. The same run whose claim lapsed is
-/// not live, and neither is one whose task finished. The stop-by-tag
-/// read goes through the same rule.
+/// A run whose owner's lease ran out is let go of: a durable one is
+/// queued again for the next worker, its epoch raised so a late batch of
+/// the old owner is refused; a fast one lived in its worker's memory and
+/// ends, cancelled. A run whose owner is alive is left alone.
 #[sqlx::test]
-async fn an_unrecorded_run_is_live_while_a_worker_holds_its_task(pool: PgPool) {
+async fn a_lost_run_is_queued_again_when_durable_and_ended_when_fast(pool: PgPool) {
+    use weft_dispatcher::journal::Lost;
+    use weft_core::run_settings::{Keeping, RunSettings};
     let (journal, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
-    let execution_id = weft_core::ExecutionId::new_v4();
-    let start = weft_journal::ExecEvent::ExecutionStarted {
-        execution_id, project_id: id, entry_node: "route".into(),
-        phase: weft_core::context::Phase::Fire, definition_hash: Some("def-1".into()),
-        program: None, source_version: None, run_kind: weft_core::exec::RunKind::Unrecorded,
-        subgraph: None, seed: None, instance: None, fired_trigger: Some("route".into()),
-        instance_values: Default::default(), picks: Default::default(), at_unix: 1,
-        run_class: weft_core::run_class::RunClass::Short,
-    };
-    let task = execute_task(id, execution_id, "bin-A", Some(std::slice::from_ref(&start)));
-    journal.start_execution(&start, &[], task, false).await.unwrap();
-    sqlx::query("INSERT INTO execution_tag (execution_id, tag, tagged_at_unix) VALUES ($1, 'poll', 1)")
-        .bind(execution_id.to_string()).execute(&pool).await.unwrap();
-
-    let live = || async {
-        journal.list_non_terminal_execution_ids_for_project(id).await.unwrap().into_iter().map(|(c, _)| c).collect::<Vec<_>>()
-    };
-    let tagged = || async {
-        weft_journal::tags::live_tagged_executions(&pool, id, "poll").await.unwrap().len()
-    };
-    assert_eq!(live().await, vec![execution_id], "waiting for a worker: live");
-    assert_eq!(tagged().await, 1, "and reachable by tag");
-
-    let claim = |until: i64| {
-        let pool = pool.clone();
-        async move {
-            sqlx::query("UPDATE task SET status = 'claimed', claimed_by = 'worker-a', claimed_until_unix = $2 WHERE execution_id = $1")
-                .bind(execution_id.to_string()).bind(until).execute(&pool).await.unwrap();
+    let start = |keeping: Keeping| {
+        let execution_id = weft_core::new_execution_id();
+        let mut started = birth(execution_id, id, weft_core::context::Phase::Fire, "bin-A");
+        if let ExecEvent::ExecutionStarted { settings, .. } = &mut started {
+            *settings = RunSettings::new(keeping, true).unwrap();
         }
+        (execution_id, started)
     };
     let now = weft_dispatcher::lease::now_unix();
-    claim(now + 60).await;
-    assert_eq!(live().await, vec![execution_id], "held by a renewed claim: live");
+    let (durable, started) = start(Keeping::Durable);
+    queue(&journal, &[started], false).await.unwrap();
+    claim(&pool, durable, id, "worker-a").await;
+    let epoch: i32 = run_column(&pool, "epoch", durable).await.unwrap();
 
-    claim(now - 60).await;
-    assert!(live().await.is_empty(), "its claim lapsed, so its worker is gone and so is the run");
-    assert_eq!(tagged().await, 0);
+    seed_worker(&pool, "worker-a", id, "bin-A", json!({}), true).await;
+    assert_eq!(journal.let_go_of_lost(durable, now, None).await.unwrap(), Lost::NotLost, "its owner is alive");
+    seed_worker(&pool, "worker-a", id, "bin-A", json!({}), false).await;
+    assert_eq!(journal.let_go_of_lost(durable, now, None).await.unwrap(), Lost::Requeued);
+    assert_eq!(run_column::<String>(&pool, "state", durable).await.as_deref(), Some("queued"));
+    assert_eq!(run_column::<Option<String>>(&pool, "owner", durable).await, Some(None));
+    assert!(run_column::<i32>(&pool, "epoch", durable).await.unwrap() > epoch, "a late batch of the old owner is refused");
 
-    claim(now + 60).await;
-    sqlx::query("UPDATE task SET status = 'complete' WHERE execution_id = $1").bind(execution_id.to_string()).execute(&pool).await.unwrap();
-    assert!(live().await.is_empty(), "its task finished, so did the run");
+    let (fast, started) = start(Keeping::Fast);
+    queue(&journal, &[started], false).await.unwrap();
+    claim(&pool, fast, id, "worker-a").await;
+    assert_eq!(journal.let_go_of_lost(fast, now, None).await.unwrap(), Lost::Ended);
+    assert_eq!(run_column::<String>(&pool, "state", fast).await.as_deref(), Some("ended"));
+    assert!(matches!(journal.events_log(fast).await.unwrap().last(), Some(ExecEvent::ExecutionCancelled { .. })));
+    assert_eq!(journal.let_go_of_lost(fast, now, None).await.unwrap(), Lost::NotLost, "an ended run is not lost");
 }
 
-/// `weft rm --journal`'s quiesce waits for every live run of the
-/// project, an unrecorded one started by hand included, and returns at
-/// the ending's announcement rather than on a safety tick.
+/// A cancel ends a run nobody drives on the spot, after its last row; a
+/// run a worker drives is asked to stop, and its worker writes the ending.
 #[sqlx::test]
-async fn quiesce_waits_until_no_run_of_the_project_is_live(pool: PgPool) {
+async fn a_cancel_ends_a_waiting_run_and_asks_a_driven_one_to_stop(pool: PgPool) {
     let (journal, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
-    let execution_id = weft_core::ExecutionId::new_v4();
-    let start = weft_journal::ExecEvent::ExecutionStarted {
-        execution_id, project_id: id, entry_node: "a".into(),
-        phase: weft_core::context::Phase::Fire, definition_hash: Some("def-1".into()),
-        program: None, source_version: None, run_kind: weft_core::exec::RunKind::Unrecorded,
-        subgraph: None, seed: None, instance: None, fired_trigger: None,
-        instance_values: Default::default(), picks: Default::default(), at_unix: 1,
-        run_class: weft_core::run_class::RunClass::Short,
-    };
-    let task = execute_task(id, execution_id, "bin-A", Some(std::slice::from_ref(&start)));
-    journal.start_execution(&start, &[], task, false).await.unwrap();
+    let cause = weft_core::exec::CancelCause::User;
 
-    let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool.connect_options(), weft_dispatcher::take_down::RUN_ENDING_CHANNELS)
-        .await
-        .unwrap();
-    let journal = std::sync::Arc::new(journal);
-    let waiter = {
-        let journal = journal.clone();
-        let signals = watch.subscribe();
-        tokio::spawn(async move { weft_dispatcher::take_down::wait_until_no_live_runs(journal.as_ref(), signals, id).await })
-    };
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert!(!waiter.is_finished(), "a hand-started run is still live, so the quiesce waits");
+    let waiting = queued_run(&journal, id).await;
+    sqlx::query("UPDATE run SET state = 'parked' WHERE execution_id = $1").bind(waiting).execute(&pool).await.unwrap();
+    let written = journal.cancel_execution(waiting, None, &cause).await.unwrap();
+    assert!(!written.requested);
+    assert_eq!(written.node_cancellations, Some(0));
+    assert_eq!(run_column::<String>(&pool, "state", waiting).await.as_deref(), Some("ended"));
+    assert!(matches!(journal.events_log(waiting).await.unwrap().last(), Some(ExecEvent::ExecutionCancelled { .. })));
 
-    let mut tx = pool.begin().await.unwrap();
-    weft_journal::unrecorded::forget_in(&mut tx, execution_id).await.unwrap();
-    tx.commit().await.unwrap();
-    // What every caller of `forget_in` does once its transaction commits.
-    weft_task_store::announce::committed(&pool);
-    tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
-        .await
-        .expect("the ending wakes the quiesce at once")
-        .unwrap()
-        .unwrap();
+    let driven = queued_run(&journal, id).await;
+    claim(&pool, driven, id, "worker-a").await;
+    let written = journal.cancel_execution(driven, None, &cause).await.unwrap();
+    assert!(written.requested, "its worker is asked");
+    assert_eq!(written.node_cancellations, None);
+    assert_eq!(run_column::<String>(&pool, "state", driven).await.as_deref(), Some("running"), "its worker ends it");
+    let asked: Option<serde_json::Value> = run_column(&pool, "cancel_requested", driven).await;
+    assert!(asked.is_some());
+    assert_eq!(journal.events_log(driven).await.unwrap().len(), 1, "nothing written into a record its worker writes");
 }
 
-/// Forgetting an unrecorded run announces its ending on the channel the
-/// dispatcher re-checks drains from, at the commit and not before, and
-/// the run stops counting as live at once, while its execute task is
-/// still claimed (the worker closes it only after the settle). A run
-/// whose costs keep its row is stamped ended instead of dropped.
+/// An ending somebody waits on is found off the run's row, whether or not
+/// its announcement was heard: the look after a lost notification finds
+/// it, two dispatchers never take it at once, and once handled it is not
+/// found again.
 #[sqlx::test]
-async fn forgetting_an_unrecorded_run_announces_its_ending_at_the_commit(pool: PgPool) {
-    use weft_journal::unrecorded::{UnrecordedEnded, UNRECORDED_ENDED_CHANNEL};
+async fn an_ending_with_work_left_is_found_without_its_announcement(pool: PgPool) {
+    use weft_dispatcher::run_ends::{clear_flags, take_flagged};
     let (journal, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
-    let execution_id = weft_core::ExecutionId::new_v4();
-    let start = weft_journal::ExecEvent::ExecutionStarted {
-        execution_id, project_id: id, entry_node: "route".into(),
-        phase: weft_core::context::Phase::Fire, definition_hash: Some("def-1".into()),
-        program: None, source_version: None, run_kind: weft_core::exec::RunKind::Unrecorded,
-        subgraph: None, seed: None, instance: None, fired_trigger: Some("route".into()),
-        instance_values: Default::default(), picks: Default::default(), at_unix: 1,
-        run_class: weft_core::run_class::RunClass::Short,
-    };
-    let task = execute_task(id, execution_id, "bin-A", Some(std::slice::from_ref(&start)));
-    journal.start_execution(&start, &[], task, false).await.unwrap();
-    sqlx::query("UPDATE task SET status = 'claimed', claimed_by = 'worker-a', claimed_until_unix = $2 WHERE execution_id = $1")
-        .bind(execution_id.to_string()).bind(weft_dispatcher::lease::now_unix() + 60).execute(&pool).await.unwrap();
-    weft_journal::record_events(&pool, &[weft_journal::ExecEvent::CostReported {
-        execution_id, node_id: "llm".into(), frames: vec![], cost_id: "c".into(), service: "llm".into(),
-        model: None, amount_usd: Some(0.1), billed: true, origin: weft_core::CredentialOwner::Author,
-        metadata: serde_json::json!({}), at_unix: 2,
-    }], None, None).await.unwrap();
-    let live = || async {
-        journal.list_non_terminal_execution_ids_for_project(id).await.unwrap().into_iter().map(|(c, _)| c).collect::<Vec<_>>()
-    };
-    assert_eq!(live().await, vec![execution_id]);
+    let execution_id = weft_core::new_execution_id();
+    let started = birth(execution_id, id, weft_core::context::Phase::Fire, "bin-A");
+    assert!(journal.queue_run(Queued {
+        events: std::slice::from_ref(&started), tenant: TENANT, keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT,
+        watch_end: true, stale: &[], spec: None, example: None,
+    }, false).await.unwrap());
+    let quiet = queued_run(&journal, id).await;
+    complete(&journal, execution_id).await;
+    complete(&journal, quiet).await;
 
-    static CHANNELS: &[&str] = &[UNRECORDED_ENDED_CHANNEL];
-    let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool.connect_options(), CHANNELS).await.unwrap();
-    let mut heard = watch.subscribe();
-    async fn heard_next(heard: &mut weft_task_store::pg_signal::Subscription) -> Option<String> {
-        match heard.next().await.unwrap() {
-            weft_task_store::pg_signal::Heard::Signal { channel, payload } if channel == UNRECORDED_ENDED_CHANNEL => {
-                Some(payload.to_string())
-            }
-            _ => None,
-        }
-    }
+    let mut one = pool.begin().await.unwrap();
+    let found = take_flagged(&mut one, execution_id).await.unwrap().expect("the watched ending is flagged");
+    assert!(found.watch_end);
+    let mut other = pool.begin().await.unwrap();
+    assert!(take_flagged(&mut other, quiet).await.unwrap().is_none(), "nobody waits on the other ending");
+    assert!(take_flagged(&mut other, execution_id).await.unwrap().is_none(), "held by the first look");
+    other.rollback().await.unwrap();
+    clear_flags(&mut one, &found).await.unwrap();
+    one.commit().await.unwrap();
+    let mut again = pool.begin().await.unwrap();
+    assert!(take_flagged(&mut again, execution_id).await.unwrap().is_none(), "handled once");
+}
 
-    let mut tx = pool.begin().await.unwrap();
-    assert!(!weft_journal::unrecorded::forget_in(&mut tx, execution_id).await.unwrap(), "its cost keeps the row");
-    let before = tokio::time::timeout(std::time::Duration::from_millis(300), heard_next(&mut heard)).await;
-    assert!(before.is_err(), "nothing is announced before the commit");
-    tx.commit().await.unwrap();
-    // What every caller of `forget_in` does once its transaction commits.
-    weft_task_store::announce::committed(&pool);
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    let announced = loop {
-        let got = tokio::time::timeout_at(deadline, heard_next(&mut heard)).await.expect("the ending is announced");
-        if let Some(payload) = got {
-            break serde_json::from_str::<UnrecordedEnded>(&payload).unwrap();
-        }
-    };
-    assert_eq!(announced, UnrecordedEnded { execution_id, project_id: id, fired_by: Some("route".into()), instance: None });
-    assert!(live().await.is_empty(), "ended at once, although its task is still claimed");
-    let ended: Option<i64> = sqlx::query_scalar("SELECT ended_at_unix FROM execution WHERE execution_id = $1")
-        .bind(execution_id.to_string()).fetch_one(&pool).await.unwrap();
-    assert!(ended.is_some(), "a row its costs keep is stamped ended");
+/// The retention loop erases a run once it ended longer ago than it is
+/// kept for, with its record, and never a run that has not ended, however
+/// old.
+#[sqlx::test]
+async fn retention_erases_ended_runs_past_their_keep_and_never_a_waiting_one(pool: PgPool) {
+    let (journal, projects) = setup(&pool).await;
+    let id = Uuid::new_v4();
+    seed_project(&projects, id, "bin-A").await;
+    let ended = queued_run(&journal, id).await;
+    complete(&journal, ended).await;
+    let parked = queued_run(&journal, id).await;
+    sqlx::query("UPDATE run SET state = 'parked', started_at = 0 WHERE execution_id = $1").bind(parked).execute(&pool).await.unwrap();
+    let keep_until: i64 = run_column(&pool, "keep_until", ended).await.expect("an ended run has its keep");
+
+    assert_eq!(journal.erase_expired(keep_until, 100).await.unwrap().0, 0, "kept until its keep runs out");
+    assert_eq!(journal.erase_expired(i64::MAX, 100).await.unwrap().0, 1);
+    assert_eq!((rows_of(&pool, "run", ended).await, rows_of(&pool, "run_log", ended).await), (0, 0));
+    assert_eq!(rows_of(&pool, "run", parked).await, 1, "a parked run is never erased");
 }
 
 // ----- supervisor lease hygiene -----------------------------------------
@@ -1056,22 +895,23 @@ async fn removed_projects_do_not_keep_supervisor_leases(pool: PgPool) {
     assert_eq!(released, 1, "project removal releases its lease");
 }
 
-/// The referenced-image set (the keep-set image pruning deletes against) must cover a
-/// project's current hash, the hash stamped on a pending/claimed task (a
-/// run settling on an older image keeps that image until it ends), every infra image ref in any project's tag map,
-/// AND the refs recorded on live infra units (a unit left UP across a
-/// sync stays frozen at its recorded image, which can be older than the
-/// project's current map): `weft clean --images` deletes everything
-/// outside this set, so any of them escaping it would be deleted out
-/// from under a running workload. Completed tasks' hashes drop out; a project with no infra tags contributes none; a
-/// blank ref is skipped (matches no image); a unit stamped before refs
-/// were recorded contributes nothing.
+/// The referenced-image set (the keep-set image pruning deletes against)
+/// must cover a project's current hash, the image of every run that has
+/// not ended (a run waiting on a form resumes on the image it started
+/// on), every live worker's image (it may drive a run its door just bore),
+/// every infra image ref in any project's tag map, AND the refs recorded
+/// on live infra units (a unit left UP across a sync stays frozen at its
+/// recorded image, which can be older than the project's current map):
+/// `weft clean --images` deletes everything outside this set, so any of
+/// them escaping it would be deleted out from under a running workload.
+/// A finished run's image and a lapsed worker's drop out; a project with
+/// no infra tags contributes none; a blank ref is skipped (matches no
+/// image); a unit stamped before refs were recorded contributes nothing.
 #[sqlx::test]
-async fn referenced_images_cover_projects_tasks_maps_and_unit_refs(
+async fn referenced_images_cover_projects_runs_workers_maps_and_unit_refs(
     pool: PgPool,
 ) {
-    let (_journal, projects) = setup(&pool).await;
-    let now = weft_dispatcher::lease::now_unix();
+    let (journal, projects) = setup(&pool).await;
     let plain = Uuid::new_v4();
     seed_project(&projects, plain, "hash-current").await;
     // A second project whose committed infra sync recorded two nodes'
@@ -1125,50 +965,19 @@ async fn referenced_images_cover_projects_tasks_maps_and_unit_refs(
     .execute(&pool)
     .await
     .expect("seed infra_node units");
-    for (status, hash) in [
-        ("pending", "hash-pending-task"),
-        ("claimed", "hash-claimed-task"),
-        ("complete", "hash-done-task"),
-    ] {
-        sqlx::query(
-            "INSERT INTO task \
-             (id, kind, target, project_id, tenant_id, status, binary_hash, payload, attempts, created_at_unix) \
-             VALUES ($4, 'execute', 'worker', gen_random_uuid(), 'tenant', $1, $2, '{}'::jsonb, 0, $3)",
-        )
-        .bind(status)
-        .bind(hash)
-        .bind(now)
-        .bind(Uuid::new_v4())
-        .execute(&pool)
-        .await
-        .expect("seed task");
-    }
+    // A live worker's image stays (it may drive a run its door just bore,
+    // before anything of it is on record); a worker whose lease lapsed is
+    // gone.
+    seed_worker(&pool, "worker-live", plain, "hash-live-worker", json!({}), true).await;
+    seed_worker(&pool, "worker-gone", plain, "hash-gone-worker", json!({}), false).await;
 
     // A run still waiting (a form, a timer) resumes on the image it
     // started on, so its image stays; a finished run's does not.
-    for (execution_id, hash, finished) in [("run-waiting", "hash-waiting-run", false), ("run-finished", "hash-finished-run", true)] {
-        sqlx::query(
-            "INSERT INTO execution (execution_id, project_id, tenant_id, started_at_unix, phase) \
-             VALUES ($1, gen_random_uuid(), 'tenant', $2, 'fire')",
-        )
-        .bind(execution_id)
-        .bind(now)
-        .execute(&pool)
-        .await
-        .expect("seed an execution");
-        let started = serde_json::json!({ "program": { "binary_hash": hash, "definition_hash": "d", "implementations": {} } });
-        sqlx::query("INSERT INTO exec_event (execution_id, kind, payload_json, created_at) VALUES ($1, 'execution_started', $2, 0)")
-            .bind(execution_id)
-            .bind(started.to_string())
-            .execute(&pool)
-            .await
-            .expect("seed its start");
+    for (hash, finished) in [("hash-waiting-run", false), ("hash-finished-run", true)] {
+        let execution_id = weft_core::new_execution_id();
+        queue(&journal, &[birth(execution_id, plain, weft_core::context::Phase::Fire, hash)], false).await.unwrap();
         if finished {
-            sqlx::query("INSERT INTO exec_event (execution_id, kind, payload_json, created_at) VALUES ($1, 'execution_completed', '{}', 0)")
-                .bind(execution_id)
-                .execute(&pool)
-                .await
-                .expect("seed its end");
+            complete(&journal, execution_id).await;
         }
     }
 
@@ -1180,14 +989,13 @@ async fn referenced_images_cover_projects_tasks_maps_and_unit_refs(
     assert_eq!(
         hashes,
         vec![
-            "hash-claimed-task".to_string(),
             "hash-current".to_string(),
             "hash-infra-project".to_string(),
-            "hash-pending-task".to_string(),
+            "hash-live-worker".to_string(),
             "hash-waiting-run".to_string(),
         ],
-        "project + live task hashes in (pending AND claimed) + live runs' images; \
-         completed task hashes and finished runs' images out"
+        "project hashes + live workers' images + the images of runs that have not ended; \
+         a lapsed worker's image and finished runs' images out"
     );
     assert_eq!(
         referenced.infra_refs,
@@ -1204,19 +1012,12 @@ async fn referenced_images_cover_projects_tasks_maps_and_unit_refs(
     );
 }
 
-// ----- parked-fire queue: append classification, retry backoff ---------
+// ----- parked fires: one row per event, FIFO per trigger ------------------
 
-/// One parked element with an explicit retry state (the values every
-/// backoff decision reads).
-fn parked(id: &str, attempts: u32, not_before_unix: i64) -> ParkedFire {
-    ParkedFire {
-        id: id.to_string(),
-        payload: json!({ "v": 1 }),
-        received_at_unix: 1_700_000_000,
-        attempts,
-        not_before_unix,
-        instance_gap: None,
-    }
+/// An event waiting for its trigger, its `attempts`-th failure behind it,
+/// due at `not_before`.
+fn parked(attempts: u32, not_before: i64) -> Waiting {
+    Waiting { fire_id: Uuid::new_v4(), payload: json!({ "v": 1 }), caller: None, attempts, not_before, instance_gap: None }
 }
 
 /// Seed one signal row for `token`. Entry rows are keyed by
@@ -1232,30 +1033,62 @@ async fn seed_parked_signal(journal: &PostgresJournal, token: &str, project: Uui
         .expect("seed signal row");
 }
 
-/// Consuming a resume token deletes its row and hands the row back, so
-/// what follows the DELETE (unregistering its kind) reads the spec it
-/// had. An entry row is not consumed.
+/// A wait `token` of run `execution_id`.
+async fn seed_wait(journal: &PostgresJournal, token: &str, project: Uuid, execution_id: weft_core::ExecutionId) {
+    let mut wait = entry_signal(token, project);
+    wait.node_id = format!("wait-{token}");
+    wait.is_resume = true;
+    wait.execution_id = Some(execution_id);
+    journal.signal_insert(&wait).await.expect("seed the wait");
+}
+
+/// An answer reaches its run once: a run nobody drives gets it in its
+/// record and is queued to carry on; a run a worker drives has it handed
+/// to that worker (nobody else writes its record); a run that ended takes
+/// nothing. The wait's signal goes in every case, so a second answer finds
+/// nothing, and an entry's token is never a wait.
 #[sqlx::test]
-async fn consume_suspension_returns_the_deleted_row(pool: PgPool) {
+async fn an_answer_reaches_its_run_once(pool: PgPool) {
+    use weft_dispatcher::journal::Answered;
     let (journal, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project, "bin-A").await;
     seed_parked_signal(&journal, "tok-entry", project).await;
-    let mut resume = entry_signal("tok-resume", project);
-    resume.is_resume = true;
-    journal
-        .signal_insert(&resume)
-        .await
-        .expect("seed resume signal");
+    assert!(matches!(journal.answer("tok-entry", &json!(1)).await.unwrap(), Answered::Gone), "an entry is not a wait");
 
-    let consumed = journal.consume_suspension("tok-resume").await.unwrap().expect("the resume row");
-    assert_eq!(consumed.token, "tok-resume");
-    assert!(consumed.is_resume);
-    assert!(journal.signal_get("tok-resume").await.unwrap().is_none(), "single use");
-    assert!(journal.consume_suspension("tok-resume").await.unwrap().is_none());
+    let parked_run = queued_run(&journal, project).await;
+    sqlx::query("UPDATE run SET state = 'parked' WHERE execution_id = $1").bind(parked_run).execute(&pool).await.unwrap();
+    seed_wait(&journal, "tok-parked", project, parked_run).await;
+    let Answered::Reached { consumed } = journal.answer("tok-parked", &json!("yes")).await.unwrap() else { panic!("reached") };
+    assert_eq!(consumed.token, "tok-parked");
+    assert!(journal.signal_get("tok-parked").await.unwrap().is_none(), "answered once");
+    assert_eq!(run_column::<String>(&pool, "state", parked_run).await.as_deref(), Some("queued"), "queued to carry on");
+    assert!(matches!(journal.events_log(parked_run).await.unwrap().last(),
+        Some(ExecEvent::SuspensionResolved { token, value, .. }) if token == "tok-parked" && value == &json!("yes")));
+    assert!(matches!(journal.answer("tok-parked", &json!("again")).await.unwrap(), Answered::Gone));
 
-    assert!(journal.consume_suspension("tok-entry").await.unwrap().is_none(), "entry rows stay");
-    assert!(journal.signal_get("tok-entry").await.unwrap().is_some(), "entry row kept");
+    let driven = queued_run(&journal, project).await;
+    claim(&pool, driven, project, "worker-a").await;
+    seed_wait(&journal, "tok-driven", project, driven).await;
+    assert!(matches!(journal.answer("tok-driven", &json!(2)).await.unwrap(), Answered::Reached { .. }));
+    assert_eq!(journal.events_log(driven).await.unwrap().len(), 1, "nothing written into a record its worker writes");
+    assert_eq!(weft_task_store::parked_fires::answers_for(&pool, driven).await.unwrap(), vec![("tok-driven".to_string(), json!(2))]);
+
+    let ended = queued_run(&journal, project).await;
+    seed_wait(&journal, "tok-ended", project, ended).await;
+    complete(&journal, ended).await;
+    assert!(matches!(journal.answer("tok-ended", &json!(3)).await.unwrap(), Answered::RunEnded { .. }));
+    assert!(journal.signal_get("tok-ended").await.unwrap().is_none());
+
+    // An answer queued while the run's trigger was not live is the wait's
+    // one answer: a later one finds the wait answered, and the queued one
+    // stays for the drain to hand over.
+    let queued_for = queued_run(&journal, project).await;
+    sqlx::query("UPDATE run SET state = 'parked' WHERE execution_id = $1").bind(queued_for).execute(&pool).await.unwrap();
+    seed_wait(&journal, "tok-queued", project, queued_for).await;
+    assert_eq!(park(&pool, "tok-queued", &parked(0, 0), None).await.unwrap(), ParkAppend::Parked);
+    assert!(matches!(journal.answer("tok-queued", &json!("second")).await.unwrap(), Answered::Gone));
+    assert!(journal.signal_get("tok-queued").await.unwrap().is_some(), "the queued answer still has its wait");
 }
 
 /// The consumer listing decodes the same row shape as every journal
@@ -1276,86 +1109,61 @@ async fn the_consumer_listing_reads_the_whole_signal_row(pool: PgPool) {
     assert!(signals_visible_to(&pool, "someone-else", &[], &[], None).await.unwrap().is_empty());
 }
 
-/// Read one token's queue back as parsed JSON.
-async fn parked_queue(pool: &PgPool, token: &str) -> serde_json::Value {
-    sqlx::query_as::<_, (serde_json::Value,)>("SELECT parked_fires FROM signal WHERE token = $1")
-        .bind(token)
-        .fetch_one(pool)
-        .await
-        .expect("read parked_fires")
-        .0
-}
-
-/// The append names its refusal instead of returning "0 rows": a re-run
-/// that finds its own element queued (nothing lost), a resume signal
-/// already answered, an entry queue at its cap (a refused NEW fire, a
-/// loss the caller must say out loud), and a vanished row (the project
-/// was wiped under the fire) are four different facts.
+/// The park names its refusal instead of returning "0 rows": a re-run
+/// that finds its own event queued (nothing lost), a wait already
+/// answered, an entry queue at its cap (a refused NEW event, a loss the
+/// caller must say out loud), and a vanished signal (the project was wiped
+/// under the fire) are four different facts. A signal going takes its
+/// queue along.
 #[sqlx::test]
-async fn parked_fire_append_names_its_refusal(pool: PgPool) {
+async fn a_park_names_its_refusal(pool: PgPool) {
     let (journal, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project, "bin-A").await;
     seed_parked_signal(&journal, "tok-entry", project).await;
-    let mut resume = entry_signal("tok-resume", project);
-    resume.is_resume = true;
-    journal
-        .signal_insert(&resume)
-        .await
-        .expect("seed resume signal");
+    let waiting_run = queued_run(&journal, project).await;
+    seed_wait(&journal, "tok-resume", project, waiting_run).await;
 
+    let first = parked(0, 0);
+    assert_eq!(park(&pool, "tok-entry", &first, None).await.unwrap(), ParkAppend::Parked);
     assert_eq!(
-        append_parked_fire(&pool, "tok-entry", &parked("f1", 0, 0)).await.unwrap(),
-        ParkAppend::Parked
-    );
-    assert_eq!(
-        append_parked_fire(&pool, "tok-entry", &parked("f1", 9, 99)).await.unwrap(),
+        park(&pool, "tok-entry", &Waiting { attempts: 9, not_before: 99, ..first.clone() }, None).await.unwrap(),
         ParkAppend::Refused(ParkRefusal::AlreadyQueued),
-        "a re-run of a task that already parked this fire finds its element"
+        "a re-run of a task that already parked this event finds it"
     );
 
-    append_parked_fire(&pool, "tok-resume", &parked("r1", 0, 0))
-        .await
-        .unwrap();
+    park(&pool, "tok-resume", &parked(0, 0), None).await.unwrap();
     assert_eq!(
-        append_parked_fire(&pool, "tok-resume", &parked("r2", 0, 0)).await.unwrap(),
+        park(&pool, "tok-resume", &parked(0, 0), None).await.unwrap(),
         ParkAppend::Refused(ParkRefusal::ResumeAlreadyAnswered),
-        "one submission answers one suspension; a second is a duplicate"
+        "one answer resolves one wait; a second is a duplicate"
     );
 
-    // Fill the entry queue to its cap in one write, then a NEW fire is
+    // Fill the entry queue to its cap in one write, then a NEW event is
     // refused (a loss, named as such).
     sqlx::query(
-        "UPDATE signal SET parked_fires = ( \
-             SELECT jsonb_agg(jsonb_build_object('id', 'filler-' || g, 'payload', '{}', \
-                                        'received_at_unix', 0) ORDER BY g) \
-             FROM generate_series(1, 1000) g) \
-         WHERE token = 'tok-entry'",
+        "INSERT INTO parked_fire (token, fire_id, payload, attempts, not_before, is_resume) \
+         SELECT 'tok-entry', gen_random_uuid(), '{}', 0, 0, FALSE FROM generate_series(2, $1)",
     )
+    .bind(weft_task_store::parked_fires::MAX_PARKED_ENTRY_FIRES)
     .execute(&pool)
     .await
     .expect("fill the queue to the cap");
-    assert_eq!(
-        append_parked_fire(&pool, "tok-entry", &parked("f2", 0, 0)).await.unwrap(),
-        ParkAppend::Refused(ParkRefusal::QueueFull)
-    );
+    assert_eq!(park(&pool, "tok-entry", &parked(0, 0), None).await.unwrap(), ParkAppend::Refused(ParkRefusal::QueueFull));
 
-    sqlx::query("DELETE FROM signal WHERE token = 'tok-resume'")
-        .execute(&pool)
-        .await
-        .expect("wipe the resume row");
+    journal.signal_remove_many(&["tok-entry".to_string()]).await.unwrap();
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM parked_fire WHERE token = 'tok-entry'").fetch_one(&pool).await.unwrap();
+    assert_eq!(left, 0, "a signal going takes its queue along");
     assert_eq!(
-        append_parked_fire(&pool, "tok-resume", &parked("r3", 0, 0)).await.unwrap(),
+        park(&pool, "tok-entry", &parked(0, 0), None).await.unwrap(),
         ParkAppend::Refused(ParkRefusal::RowGone),
-        "a vanished row means the project was wiped under the fire"
+        "a vanished signal means the trigger was wiped under the fire"
     );
 }
 
-/// The sweep's selection, against the real statement: only ACTIVE
-/// projects, only unclaimed rows, only tokens whose HEAD is due. A
-/// backing-off head blocks its whole token (FIFO: a later fire may not
-/// overtake it), and an element from before the backoff fields existed
-/// reads as due now.
+/// The sweep's selection, against the real statement: only triggers that
+/// are live, only tokens whose HEAD is due. A backing-off head blocks its
+/// whole token (FIFO: a later event may not overtake it).
 #[sqlx::test]
 async fn the_sweep_selects_only_due_heads_on_active_triggers(pool: PgPool) {
     let (journal, projects) = setup(&pool).await;
@@ -1378,57 +1186,55 @@ async fn the_sweep_selects_only_due_heads_on_active_triggers(pool: PgPool) {
 
     let now = weft_dispatcher::lease::now_unix();
     seed_parked_signal(&journal, "tok-due", active).await;
-    append_parked_fire(&pool, "tok-due", &parked("f-due", 0, now - 10))
-        .await
-        .unwrap();
+    park(&pool, "tok-due", &parked(0, now - 10), None).await.unwrap();
     seed_parked_signal(&journal, "tok-later", active).await;
-    append_parked_fire(&pool, "tok-later", &parked("f-later", 3, now + 300))
-        .await
-        .unwrap();
-    seed_parked_signal(&journal, "tok-legacy", active).await;
-    append_parked_fire(&pool, "tok-legacy", &parked("f-legacy", 0, 0))
-        .await
-        .unwrap();
-    // Strip the backoff fields: the element shape an older dispatcher
-    // wrote, which must read as due now.
-    sqlx::query(
-        "UPDATE signal SET parked_fires = \
-         '[{\"id\": \"f-legacy\", \"payload\": {}, \"received_at_unix\": 1}]'::jsonb \
-         WHERE token = 'tok-legacy'",
-    )
-    .execute(&pool)
-    .await
-    .expect("write a legacy element");
-    seed_parked_signal(&journal, "tok-claimed", active).await;
-    append_parked_fire(&pool, "tok-claimed", &parked("f-claimed", 0, now - 10))
-        .await
-        .unwrap();
-    sqlx::query(
-        "UPDATE signal SET drain_claimed_at_unix = $1, drain_claimed_by = 'replica-x' \
-         WHERE token = 'tok-claimed'",
-    )
-    .bind(now)
-    .execute(&pool)
-    .await
-    .expect("claim the token");
+    park(&pool, "tok-later", &parked(3, now + 300), None).await.unwrap();
+    park(&pool, "tok-later", &parked(0, now - 10), None).await.unwrap();
     seed_parked_signal(&journal, "tok-inactive", inactive).await;
-    append_parked_fire(&pool, "tok-inactive", &parked("f-inactive", 0, now - 10))
-        .await
-        .unwrap();
+    park(&pool, "tok-inactive", &parked(0, now - 10), None).await.unwrap();
 
-    let selected: std::collections::HashSet<String> =
-        due_parked_tokens(&pool, now).await.unwrap().into_iter().map(|(t, _)| t).collect();
-    let expected: std::collections::HashSet<String> =
-        ["tok-due", "tok-legacy"].into_iter().map(String::from).collect();
-    assert_eq!(
-        selected,
-        expected,
-        "due heads on live triggers only; a backing-off head, a claimed row, \
-         and a parked trigger's queue are all left alone"
-    );
+    assert_eq!(due_tokens(&pool, now).await.unwrap(), ["tok-due"],
+        "due heads on live triggers only; a backing-off head holds its queue, and a parked trigger's queue is left alone");
+    assert_eq!(next_due(&pool).await.unwrap(), Some(now - 10));
 }
 
-/// A fire parked because its instance has not filled a value never comes
+/// One trigger's events are handed over in the order they came, and two
+/// drains never take one head: the second finds the head locked and takes
+/// nothing (not the event behind it, which would overtake it).
+#[sqlx::test]
+async fn two_drains_never_take_one_head_and_events_leave_in_order(pool: PgPool) {
+    use weft_task_store::parked_fires::{remove_in, restamp_in, take_head};
+    let (journal, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project, "bin-A").await;
+    seed_parked_signal(&journal, "tok", project).await;
+    let (first, second) = (parked(0, 0), parked(0, 0));
+    park(&pool, "tok", &first, None).await.unwrap();
+    park(&pool, "tok", &second, None).await.unwrap();
+    let now = weft_dispatcher::lease::now_unix();
+
+    let mut one = pool.begin().await.unwrap();
+    let head = take_head(&mut one, "tok", now).await.unwrap().expect("the head");
+    assert_eq!(head.waiting.fire_id, first.fire_id, "first in, first out");
+    let mut other = pool.begin().await.unwrap();
+    assert!(take_head(&mut other, "tok", now).await.unwrap().is_none(), "a held head is skipped, and nothing overtakes it");
+    other.rollback().await.unwrap();
+
+    // A head that could not be handed over stays the head, backing off.
+    restamp_in(&mut one, &head, 1, now + 60, None).await.unwrap();
+    one.commit().await.unwrap();
+    let mut again = pool.begin().await.unwrap();
+    assert!(take_head(&mut again, "tok", now).await.unwrap().is_none(), "backing off, it holds its queue");
+    let head = take_head(&mut again, "tok", now + 60).await.unwrap().expect("due again");
+    assert_eq!((head.waiting.fire_id, head.waiting.attempts), (first.fire_id, 1));
+    remove_in(&mut again, &head).await.unwrap();
+    again.commit().await.unwrap();
+
+    let mut last = pool.begin().await.unwrap();
+    assert_eq!(take_head(&mut last, "tok", now).await.unwrap().expect("the next").waiting.fire_id, second.fire_id);
+}
+
+/// An event parked because its instance has not filled a value never comes
 /// due on a timer: the sweep and its next-due read pass its head by,
 /// whatever its stamp says. The instance's rows are what a change of their
 /// values routes again, and `weft status` counts them per trigger with
@@ -1444,16 +1250,14 @@ async fn fires_waiting_on_an_instance_value_wait_for_the_instance(pool: PgPool) 
         .execute(&pool)
         .await
         .expect("make tok-ada ada's");
-    let gap = |id: &str, reason: &str| ParkedFire { instance_gap: Some(reason.to_string()), ..parked(id, 1, 0) };
-    append_parked_fire(&pool, "tok-ada", &gap("f1", "instance 'ada' at 'answer': 'key' is not filled")).await.unwrap();
-    append_parked_fire(&pool, "tok-ada", &gap("f2", "instance 'ada' at 'answer': 'model' is not filled")).await.unwrap();
-    append_parked_fire(&pool, "tok-timer", &parked("f3", 1, 0)).await.unwrap();
+    let gap = |reason: &str| Waiting { instance_gap: Some(reason.to_string()), ..parked(1, 0) };
+    park(&pool, "tok-ada", &gap("instance 'ada' at 'answer': 'key' is not filled"), None).await.unwrap();
+    park(&pool, "tok-ada", &gap("instance 'ada' at 'answer': 'model' is not filled"), None).await.unwrap();
+    park(&pool, "tok-timer", &parked(1, 0), None).await.unwrap();
 
     let now = weft_dispatcher::lease::now_unix();
-    let due: Vec<String> = due_parked_tokens(&pool, now).await.unwrap().into_iter().map(|(t, _)| t).collect();
-    assert_eq!(due, ["tok-timer"], "only the timer-retried head is due");
-    let next = weft_dispatcher::api::project::next_parked_fire_due(&pool).await.unwrap();
-    assert_eq!(next, Some(0), "the next-due read sees the timer head alone");
+    assert_eq!(due_tokens(&pool, now).await.unwrap(), ["tok-timer"], "only the timer-retried head is due");
+    assert_eq!(next_due(&pool).await.unwrap(), Some(0), "the next-due read sees the timer head alone");
 
     let ada = InstanceId::new("ada").unwrap();
     assert_eq!(instance_gap_tokens(&pool, project, &ada).await.unwrap(), ["tok-ada"]);
@@ -1463,8 +1267,8 @@ async fn fires_waiting_on_an_instance_value_wait_for_the_instance(pool: PgPool) 
     let key = ActivationKey::new("trigger-tok-ada", Owner::from_instance(Some(ada)));
     let waiting = waits.get(&key).expect("ada's trigger waits");
     assert_eq!(waiting.fires, 2);
-    assert_eq!(waiting.reason, "instance 'ada' at 'answer': 'model' is not filled", "the fire parked last");
-    assert_eq!(waits.len(), 1, "a fire retried on its timer is not waiting on an instance");
+    assert_eq!(waiting.reason, "instance 'ada' at 'answer': 'model' is not filled", "the event parked last");
+    assert_eq!(waits.len(), 1, "an event retried on its timer is not waiting on an instance");
 }
 
 /// Every status reader goes through `infra_node::observe`, which reads
@@ -1475,7 +1279,7 @@ async fn fires_waiting_on_an_instance_value_wait_for_the_instance(pool: PgPool) 
 #[sqlx::test]
 async fn copies_read_with_the_commands_under_way(pool: PgPool) {
     use weft_broker::lifecycle_writes::{issue_command, IssuedCommand};
-    use weft_dispatcher::infra_lifecycle_command::{issue_lifecycle, InfraLifecycleVerb, RunningPolicy, TakeDown};
+    use weft_dispatcher::infra_lifecycle_command::{issue_lifecycle, InfraLifecycleVerb, TakeDown};
     use weft_dispatcher::infra_node::{observe, InfraNodeStatus};
     let (_journal, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
@@ -1495,7 +1299,7 @@ async fn copies_read_with_the_commands_under_way(pool: PgPool) {
     }
     let ada = InstanceId::new("ada").unwrap();
     let bob = InstanceId::new("bob").unwrap();
-    issue_lifecycle(&pool, TENANT, project, Some("db"), &weft_core::instance::Copies::Shared, TakeDown::Stop { force: false }, RunningPolicy::Cancel, 60, "disp-1")
+    issue_lifecycle(&pool, TENANT, project, Some("db"), &weft_core::instance::Copies::Shared, TakeDown::Stop { force: false }, None, "disp-1")
         .await
         .unwrap();
     for instance in [&ada, &bob] {
@@ -1506,7 +1310,6 @@ async fn copies_read_with_the_commands_under_way(pool: PgPool) {
             node_id: Some("bridge"),
             copies: &weft_core::instance::Copies::Instance(instance.clone()),
             verb: InfraLifecycleVerb::Apply,
-            running_policy: None,
             spec_json: Some(&spec),
             issued_by_replica: "worker-1",
         };
@@ -1527,7 +1330,7 @@ async fn copies_read_with_the_commands_under_way(pool: PgPool) {
 /// back, the shared copies' work does, and so does the project going.
 #[sqlx::test]
 async fn only_work_on_the_shared_copies_holds_the_program_back(pool: PgPool) {
-    use weft_dispatcher::infra_lifecycle_command::{any_in_flight, issue_lifecycle, RunningPolicy, TakeDown};
+    use weft_dispatcher::infra_lifecycle_command::{any_in_flight, issue_lifecycle, TakeDown};
     use weft_core::instance::Copies;
     let (_journal, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
@@ -1535,7 +1338,7 @@ async fn only_work_on_the_shared_copies_holds_the_program_back(pool: PgPool) {
     let stop = |copies: Copies| {
         let pool = pool.clone();
         async move {
-            issue_lifecycle(&pool, TENANT, project, Some("db"), &copies, TakeDown::Stop { force: false }, RunningPolicy::Cancel, 60, "disp-1")
+            issue_lifecycle(&pool, TENANT, project, Some("db"), &copies, TakeDown::Stop { force: false }, None, "disp-1")
                 .await
                 .unwrap()
         }
@@ -1593,160 +1396,21 @@ async fn a_failed_activation_puts_the_triggers_back_as_the_claim_found_them(pool
     assert!(!activations.restore(id, second, &previous).await.unwrap(), "a second restore finds no claim");
 }
 
-/// Claims older than the threshold release (both columns); a fresh
-/// claim survives. The sweep depends on this: it is the only thing that
-/// re-drives an Active project's queue, so a crashed process's stale claim
-/// must not starve the token's retries until the next activate.
-#[sqlx::test]
-async fn stale_drain_claims_release_and_fresh_ones_survive(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
-    let project = Uuid::new_v4();
-    seed_project(&projects, project, "bin-A").await;
-    seed_parked_signal(&journal, "tok-stale", project).await;
-    seed_parked_signal(&journal, "tok-fresh", project).await;
-    let now = weft_dispatcher::lease::now_unix();
-    sqlx::query(
-        "UPDATE signal SET drain_claimed_at_unix = $1, drain_claimed_by = 'replica-x' \
-         WHERE token = 'tok-stale'",
-    )
-    .bind(now - 301)
-    .execute(&pool)
-    .await
-    .expect("seed a stale claim");
-    sqlx::query(
-        "UPDATE signal SET drain_claimed_at_unix = $1, drain_claimed_by = 'replica-y' \
-         WHERE token = 'tok-fresh'",
-    )
-    .bind(now)
-    .execute(&pool)
-    .await
-    .expect("seed a fresh claim");
-
-    release_stale_drain_claims(&pool).await.expect("release pass");
-
-    let stale: (Option<i64>, Option<String>) = sqlx::query_as(
-        "SELECT drain_claimed_at_unix, drain_claimed_by FROM signal WHERE token = 'tok-stale'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("stale row");
-    assert_eq!(stale, (None, None), "the stale claim must be gone, both columns");
-    let fresh: (Option<i64>, Option<String>) = sqlx::query_as(
-        "SELECT drain_claimed_at_unix, drain_claimed_by FROM signal WHERE token = 'tok-fresh'",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("fresh row");
-    assert_eq!(
-        fresh,
-        (Some(now), Some("replica-y".to_string())),
-        "a live claim must survive the release"
-    );
-}
-
-/// A dispatch failure re-stamps its head IN PLACE: attempt count up, due
-/// time out, position kept (a pop-and-re-append would reorder one
-/// trigger's events), the rest of the queue untouched, and the write
-/// fenced on the drain's claim nonce.
-#[sqlx::test]
-async fn a_failed_dispatch_restamps_its_head_in_place(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
-    let project = Uuid::new_v4();
-    seed_project(&projects, project, "bin-A").await;
-    seed_parked_signal(&journal, "tok", project).await;
-    append_parked_fire(&pool, "tok", &parked("f1", 2, 1)).await.unwrap();
-    append_parked_fire(&pool, "tok", &parked("f2", 0, 0)).await.unwrap();
-    sqlx::query("UPDATE signal SET drain_claimed_by = 'drain-owner' WHERE token = 'tok'")
-        .execute(&pool)
-        .await
-        .expect("hold the drain claim");
-
-    let now = weft_dispatcher::lease::now_unix();
-    let rows = restamp_parked_fire(&pool, "tok", "f1", 3, now + 4, Some("drain-owner"))
-        .await
-        .unwrap();
-    assert_eq!(rows, 1, "our own claim restamps the element");
-
-    let queue = parked_queue(&pool, "tok").await;
-    let elements = queue.as_array().expect("queue is an array");
-    assert_eq!(elements.len(), 2, "no element may be added or lost");
-    assert_eq!(elements[0]["id"], json!("f1"), "the failed fire stays the head");
-    assert_eq!(elements[0]["attempts"], json!(3), "the attempt count moves up");
-    assert_eq!(elements[0]["not_before_unix"], json!(now + 4), "the due time moves out");
-    assert_eq!(
-        (
-            elements[1]["id"].clone(),
-            elements[1]["attempts"].clone(),
-            elements[1]["not_before_unix"].clone()
-        ),
-        (json!("f2"), json!(0), json!(0)),
-        "the element behind the head is untouched"
-    );
-
-    // Someone else's claim, and an element that is not queued: both are
-    // no-ops, and neither may disturb the array.
-    assert_eq!(
-        restamp_parked_fire(&pool, "tok", "f1", 4, now + 8, Some("someone-else"))
-            .await
-            .unwrap(),
-        0,
-        "a fenced restamp on another owner's claim writes nothing"
-    );
-    assert_eq!(
-        restamp_parked_fire(&pool, "tok", "nope", 1, now + 1, Some("drain-owner"))
-            .await
-            .unwrap(),
-        0,
-        "restamping an element that is not queued writes nothing"
-    );
-    assert_eq!(
-        parked_queue(&pool, "tok").await,
-        queue,
-        "both refused restamps left the queue exactly as it was"
-    );
-}
-
-/// Journal a fresh execution for `project`, the way production does
-/// (the `execution` index row rides the same transaction).
-async fn start_execution(journal: &PostgresJournal, project: Uuid) -> weft_core::ExecutionId {
-    let execution_id = weft_core::ExecutionId::new_v4();
-    journal
-        .record_event(&weft_journal::ExecEvent::ExecutionStarted {
-            execution_id,
-            project_id: project,
-            entry_node: "start".into(),
-            phase: weft_core::context::Phase::Fire,
-            definition_hash: Some("def-1".into()),
-            program: None,
-            run_kind: weft_core::exec::RunKind::Execution,
-            source_version: None,
-            subgraph: None,
-            seed: None,
-            instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 1,
-            run_class: weft_core::run_class::RunClass::Short,
-        })
-        .await
-        .expect("ExecutionStarted");
-    execution_id
-}
-
-async fn count(pool: &PgPool, sql: &str, execution_id: weft_core::ExecutionId) -> i64 {
-    sqlx::query_scalar::<_, i64>(sql)
-        .bind(execution_id.to_string())
-        .fetch_one(pool)
-        .await
-        .expect("count")
-}
-
-/// Everywhere one execution lives, so a table dropped from the erase
-/// list cannot ship quietly.
+/// Everywhere one run lives, so a table dropped from the erase list
+/// cannot ship quietly.
 async fn footprint(pool: &PgPool, execution_id: weft_core::ExecutionId) -> i64 {
-    count(pool, "SELECT COUNT(*) FROM exec_event WHERE execution_id = $1", execution_id).await
-        + count(pool, "SELECT COUNT(*) FROM execution WHERE execution_id = $1", execution_id).await
-        + count(pool, "SELECT COUNT(*) FROM execution_tag WHERE execution_id = $1", execution_id).await
-        + count(pool, "SELECT COUNT(*) FROM trigger_setup WHERE execution_id = $1", execution_id).await
-        + count(pool, "SELECT COUNT(*) FROM signal WHERE execution_id = $1 AND is_resume = TRUE", execution_id)
-            .await
+    let mut rows = 0;
+    for table in ["run", "run_log", "execution_tag", "trigger_setup", "run_search_queue", "run_search"] {
+        rows += rows_of(pool, table, execution_id).await;
+    }
+    rows + sqlx::query_scalar::<_, i64>(
+        "SELECT (SELECT COUNT(*) FROM signal WHERE execution_id = $1 AND is_resume) \
+              + (SELECT COUNT(*) FROM parked_fire WHERE execution_id = $1)",
+    )
+    .bind(execution_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 /// Removing a project frees the space its history took: every table an
@@ -1769,19 +1433,19 @@ async fn removing_a_projects_executions_frees_every_table_they_touched(pool: PgP
     seed_project(&projects, doomed, "bin-A").await;
     seed_project(&projects, neighbour, "bin-A").await;
 
-    let first = start_execution(&journal, doomed).await;
-    let second = start_execution(&journal, doomed).await;
-    let survivor = start_execution(&journal, neighbour).await;
+    let first = queued_run(&journal, doomed).await;
+    let second = queued_run(&journal, doomed).await;
+    let survivor = queued_run(&journal, neighbour).await;
 
     // Everything else a run leaves behind, on the first execution.
     let mut tx = pool.begin().await.unwrap();
-    weft_journal::tags::tag_execution_in(&mut tx, first, &["user_7".to_string()], 10, None)
+    weft_journal::tags::tag_execution_in(&mut tx, first, &["user_7".to_string()], 10)
         .await
         .expect("tag");
     tx.commit().await.unwrap();
     sqlx::query("INSERT INTO trigger_setup (project_id, execution_id) VALUES ($1, $2)")
         .bind(doomed)
-        .bind(first.to_string())
+        .bind(first)
         .execute(&pool)
         .await
         .expect("trigger_setup");
@@ -1797,12 +1461,20 @@ async fn removing_a_projects_executions_frees_every_table_they_touched(pool: PgP
         .bind(token)
         .bind(TENANT)
         .bind(doomed)
-        .bind(execution_id.map(|c| c.to_string()))
+        .bind(execution_id)
         .bind(is_resume)
         .execute(&pool)
         .await
         .expect("signal");
     }
+    let mut tx = pool.begin().await.unwrap();
+    weft_task_store::parked_fires::hand_answer_in(&mut tx, "answered-tok", first, &json!(1)).await.expect("a handed answer");
+    sqlx::query("INSERT INTO run_search_queue (execution_id) VALUES ($1) ON CONFLICT DO NOTHING")
+        .bind(first)
+        .execute(&mut *tx)
+        .await
+        .expect("waiting for the index");
+    tx.commit().await.unwrap();
     assert!(footprint(&pool, first).await > 0, "the run left something behind to erase");
 
     let erased = journal
@@ -1834,8 +1506,8 @@ async fn executions_of_a_gone_project_can_be_found_again(pool: PgPool) {
     let living = Uuid::new_v4();
     seed_project(&projects, gone, "bin-A").await;
     seed_project(&projects, living, "bin-A").await;
-    let orphan = start_execution(&journal, gone).await;
-    start_execution(&journal, living).await;
+    let orphan = queued_run(&journal, gone).await;
+    queued_run(&journal, living).await;
 
     // While both projects exist there is nothing to sweep.
     assert!(
@@ -1855,7 +1527,8 @@ async fn executions_of_a_gone_project_can_be_found_again(pool: PgPool) {
     );
 }
 
-/// A removed project's queued work is cleared; a live project's never is.
+/// A removed project's waiting work is cleared; work already taken is
+/// left to finish, and a live project's is never touched.
 #[sqlx::test]
 async fn a_removed_projects_work_is_cleared_and_nothing_else(pool: PgPool) {
     let (_journal, projects) = setup(&pool).await;
@@ -1868,14 +1541,11 @@ async fn a_removed_projects_work_is_cleared_and_nothing_else(pool: PgPool) {
             weft_task_store::tasks::enqueue_dedup(
                 &pool,
                 weft_task_store::tasks::NewTask {
-                    kind: "execute".into(),
-                    target: weft_task_store::TaskTarget::Worker,
+                    kind: weft_task_store::TaskKind::RegisterSignal.into(),
                     project_id: Some(project),
                     dedup_key: Some(key.into()),
                     execution_id: None,
                     tenant_id: TENANT.into(),
-                    target_replica: None,
-                    binary_hash: Some("bin".into()),
                     payload: json!({}),
                 },
             )
@@ -1885,37 +1555,15 @@ async fn a_removed_projects_work_is_cleared_and_nothing_else(pool: PgPool) {
     };
     queue(live, "a").await;
     queue(removed, "b").await;
-    // Work of the removed project the sweep must leave alone: a worker
-    // task already claimed (its worker finishes or the orphan sweep
-    // recovers it), and a pending task for the dispatcher.
     queue(removed, "claimed").await;
     sqlx::query("UPDATE task SET status = 'claimed' WHERE dedup_key = 'claimed'")
         .execute(&pool)
         .await
         .unwrap();
-    weft_task_store::tasks::enqueue_dedup(
-        &pool,
-        weft_task_store::tasks::NewTask {
-            kind: "execute".into(),
-            target: weft_task_store::TaskTarget::Dispatcher,
-            project_id: Some(removed),
-            dedup_key: Some("dispatcher".into()),
-            execution_id: None,
-            tenant_id: TENANT.into(),
-            target_replica: None,
-            binary_hash: None,
-            payload: json!({}),
-        },
-    )
-    .await
-    .unwrap();
     assert_eq!(weft_dispatcher::reaper::drop_work_of_removed_projects(&pool).await.unwrap(), 1);
     let left: Vec<(Uuid, String)> =
         sqlx::query_as("SELECT project_id, dedup_key FROM task ORDER BY dedup_key").fetch_all(&pool).await.unwrap();
-    assert_eq!(
-        left,
-        vec![(live, "a".to_string()), (removed, "claimed".to_string()), (removed, "dispatcher".to_string())]
-    );
+    assert_eq!(left, vec![(live, "a".to_string()), (removed, "claimed".to_string())]);
 }
 
 /// Removing a project takes its instances' connections, values and tokens:
@@ -1982,7 +1630,7 @@ async fn a_whole_project_take_down_removes_its_entry_signals(pool: PgPool) {
     let (journal, projects) = setup(&pool).await;
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
-    let spared = weft_core::ExecutionId::new_v4();
+    let spared = queued_run(&journal, id).await;
     let mut wait = entry_signal("spared-wait", id);
     wait.is_resume = true;
     wait.execution_id = Some(spared);
@@ -2304,157 +1952,82 @@ async fn the_held_rows_announce_their_changes(pool: PgPool) {
     assert!(heard_on(&mut heard, INFRA_STATUS_CHANNEL, &project).await, "and the infra it declares changing");
 }
 
-/// A live run's birth, as a caller's handshake makes it: its
-/// `ExecutionStarted` and its execute task, waiting for the caller until
-/// 1 000.
-fn live_birth(project: Uuid, execution_id: weft_core::ExecutionId) -> (weft_journal::ExecEvent, weft_task_store::tasks::NewTask) {
-    let start = weft_journal::ExecEvent::ExecutionStarted {
-        execution_id,
-        project_id: project,
-        entry_node: "entry".into(),
-        phase: weft_core::context::Phase::Fire,
-        definition_hash: Some("def-1".into()),
-        program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
-        subgraph: None,
-        seed: None,
-        instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-        run_class: weft_core::run_class::RunClass::Short,
-    };
-    let task = weft_dispatcher::task_kinds::execute::execution_task_spec(weft_dispatcher::task_kinds::execute::ExecutionTask {
-        kind: weft_task_store::TaskKind::Execute,
-        project_id: project,
-        execution_id,
-        definition_hash: "def-1",
-        binary_hash: "bin-A",
-        tenant_id: TENANT,
-        run_class: weft_core::run_class::RunClass::Short,
-        live_connection: Some(weft_task_store::kinds::LiveConnectionStart {
-            spec: weft_core::primitive::SignalSpec::of_kind("route", json!({})),
-            request: Default::default(),
-            arrive_by: Some(1_000),
-            fired: None,
-        }),
-        unrecorded_birth: None,
-    })
-    .unwrap();
-    (start, task)
-}
-
-/// A live call's admission at the entry `tok`, which takes `at_once` runs
-/// at once, taking a slot for `execution_id` that holds until 1 000.
-fn live_admission(at_once: u32, execution_id: weft_core::ExecutionId) -> weft_dispatcher::entry_limits::Admission {
-    let limits = weft_core::signal::EntryLimits { per_caller_per_minute: Some(0), per_minute: Some(0), at_once: Some(at_once) }.resolve();
-    let edge = weft_dispatcher::entry_limits::EdgeConfig {
-        trusted_proxy_hops: weft_platform_traits::config::ProxyHops { public: 1, outside: 1, domains: 2 },
-        invalid_tokens_per_minute: None,
-    };
-    weft_dispatcher::entry_limits::Admission::call(&edge, None, "tok", "ip:a", &limits, Some((&execution_id.to_string(), 1_000)), 0)
-}
-
-/// A live call its entry's limits refuse is never born: the refusal and
-/// the birth are one call to the database, so nothing of the run (journal,
-/// execution, task, slot) is written, and the refusal is counted. A run
-/// already born is left as it is when its birth is asked for again.
+/// What an infra says changed is written where its node put it, with no
+/// node running: a password into the connection the node published, a
+/// baked output over the saved one. A push naming anything the node did
+/// not hand weft, or a copy that is gone, is refused and writes nothing.
 #[sqlx::test]
-async fn a_live_call_refused_at_its_limit_is_never_born(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
+async fn what_an_infra_says_changed_is_written_where_its_node_put_it(pool: PgPool) {
+    let (_journal, projects) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project, "bin-A").await;
-    let first = weft_core::ExecutionId::new_v4();
-    let (start, task) = live_birth(project, first);
-    journal.admit_and_start_execution(&live_admission(1, first), &start, &[], task.clone()).await.unwrap().expect("room for one");
-    journal
-        .admit_and_start_execution(&live_admission(1, first), &start, &[], task)
-        .await
-        .unwrap()
-        .expect("a retry of a run already born collapses onto it, slot and all");
-
-    let second = weft_core::ExecutionId::new_v4();
-    let (start, task) = live_birth(project, second);
-    let refused = journal.admit_and_start_execution(&live_admission(1, second), &start, &[], task).await.unwrap().unwrap_err();
-    assert_eq!(refused.reason, weft_dispatcher::entry_limits::Limited::AtOnce);
-    for table in ["exec_event", "execution", "task", "entry_slot"] {
-        let (n,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*)::bigint FROM {table} WHERE execution_id = $1"))
-            .bind(second.to_string())
+    sqlx::query(
+        "INSERT INTO infra_node (project_id, node_id, copy_id, status, baked_json) VALUES ($1, 'db', 'c1', 'running', $2)",
+    )
+    .bind(project)
+    .bind(json!({ "address": "db:5432" }))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let spec: weft_core::AccessSpec = serde_json::from_value(json!({
+        "service": "selfrun",
+        "acquisition": { "kind": "static", "fields": [{ "name": "host", "secret": false }, { "name": "password" }] },
+    }))
+    .unwrap();
+    weft_access_store::publish_grant(
+        &pool,
+        TENANT,
+        weft_access_store::PublishAccess {
+            spec,
+            project_id: project,
+            instance: None,
+            node_id: "db".into(),
+            values: [("host".to_string(), "db".to_string()), ("password".to_string(), "p1".to_string())].into(),
+            label: None,
+        },
+    )
+    .await
+    .unwrap();
+    let password = || async {
+        let sealed: String = sqlx::query_scalar("SELECT values_sealed FROM access_grant WHERE project_id = $1 AND published_by_node = 'db'")
+            .bind(project)
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(n, 0, "{table} holds a run its entry refused");
-    }
-    assert_eq!(
-        weft_dispatcher::entry_limits::recent_refusals(&pool, "tok", 0).await.unwrap(),
-        vec![(weft_dispatcher::entry_limits::Limited::AtOnce, 1)]
-    );
-}
-
-/// A live run born at its caller's handshake whose caller never came is
-/// erased whole once their ticket expires: its journal, its execution, its
-/// task and its entry slot, so nothing of it is left. One the caller did
-/// reach is never touched.
-#[sqlx::test]
-async fn a_live_run_whose_caller_never_came_leaves_nothing(pool: PgPool) {
-    let (journal, projects) = setup(&pool).await;
-    let project = Uuid::new_v4();
-    seed_project(&projects, project, "bin-A").await;
-    let born = |execution_id: weft_core::ExecutionId| live_birth(project, execution_id);
-    let count = |table: &'static str, execution_id: weft_core::ExecutionId| {
-        let pool = pool.clone();
-        async move {
-            let (n,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*)::bigint FROM {table} WHERE execution_id = $1"))
-                .bind(execution_id.to_string())
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-            n
-        }
+        weft_access_store::open_json(&sealed).unwrap()["password"].as_str().unwrap().to_string()
+    };
+    let baked = || async {
+        sqlx::query_scalar::<_, serde_json::Value>("SELECT baked_json FROM infra_node WHERE project_id = $1 AND node_id = 'db'")
+            .bind(project)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
     };
 
-    // Born as a live call is: admitted at its entry (a slot taken for it)
-    // in the same commit as its birth.
-    let admitted = |execution_id: weft_core::ExecutionId| live_admission(5, execution_id);
+    let reset = weft_core::infra::bake::PushedValues {
+        connection: [("password".to_string(), "p2".to_string())].into(),
+        outputs: [("address".to_string(), json!("db:6543"))].into(),
+    };
+    weft_access_store::write_pushed_values(&pool, project, "c1", &reset).await.unwrap();
+    assert_eq!(password().await, "p2", "the connection holds the new password");
+    assert_eq!(baked().await, json!({ "address": "db:6543" }));
 
-    let absent = weft_core::ExecutionId::new_v4();
-    let (start, task) = born(absent);
-    journal.admit_and_start_execution(&admitted(absent), &start, &[], task).await.unwrap().expect("admitted");
-    assert_eq!(count("entry_slot", absent).await, 1, "the slot is taken with the birth");
-
-    let present = weft_core::ExecutionId::new_v4();
-    let (start, task) = born(present);
-    journal.start_execution(&start, &[], task, false).await.unwrap();
-    let claimed = weft_task_store::tasks::claim_execution(&pool, "worker-a", project, &present.to_string())
-        .await
-        .unwrap()
-        .expect("the caller arrived")
-        .task;
-
-    const PAST: weft_task_store::tasks::UnclaimedLiveRun = weft_task_store::tasks::UnclaimedLiveRun::PastDeadline { now: 1_001 };
-    let gone = weft_task_store::tasks::callers_never_arrived(&pool, 1_001).await.unwrap();
-    assert_eq!(gone.len(), 1, "only the run nobody claimed");
-    assert_eq!(gone[0].execution_id, absent.to_string());
-    assert!(journal.erase_unclaimed_live_run(absent, PAST).await.unwrap());
-    for table in ["exec_event", "execution", "task", "entry_slot"] {
-        assert_eq!(count(table, absent).await, 0, "{table} still holds the run nobody came for");
-    }
-    assert!(!journal.erase_unclaimed_live_run(present, PAST).await.unwrap(), "a claimed run is the caller's");
-    assert!(weft_task_store::tasks::requeue(&pool, claimed.id, "worker-a").await.unwrap());
-    assert!(
-        !journal.erase_unclaimed_live_run(present, PAST).await.unwrap(),
-        "nor one put back pending: it is pinned to the worker its caller reached"
-    );
-    assert_eq!(count("execution", present).await, 1);
-    assert!(weft_task_store::tasks::callers_never_arrived(&pool, 1_001).await.unwrap().is_empty());
-
-    // A run its handshake could not pass to any worker goes at once,
-    // long before its deadline, slot and all, so the caller's retry finds
-    // the route's slot free; the run a caller did reach is never taken.
-    let unreached = weft_core::ExecutionId::new_v4();
-    let (start, task) = born(unreached);
-    journal.admit_and_start_execution(&admitted(unreached), &start, &[], task).await.unwrap().expect("admitted");
-    const UNREACHED: weft_task_store::tasks::UnclaimedLiveRun = weft_task_store::tasks::UnclaimedLiveRun::NeverPassedOn;
-    assert!(!journal.erase_unclaimed_live_run(unreached, weft_task_store::tasks::UnclaimedLiveRun::PastDeadline { now: 999 }).await.unwrap(), "its deadline has not passed");
-    assert!(journal.erase_unclaimed_live_run(unreached, UNREACHED).await.unwrap());
-    for table in ["exec_event", "execution", "task", "entry_slot"] {
-        assert_eq!(count(table, unreached).await, 0, "{table} still holds the run no worker got");
-    }
-    assert!(!journal.erase_unclaimed_live_run(present, UNREACHED).await.unwrap(), "a claimed run is the caller's");
+    // Only what the node handed weft can change, and nothing is written
+    // when any of it is refused.
+    let refused = |e: anyhow::Error| match e.downcast::<weft_access_store::AccessError>() {
+        Ok(weft_access_store::AccessError::Invalid(why)) => why,
+        other => panic!("not a refusal: {other:?}"),
+    };
+    let stray = weft_core::infra::bake::PushedValues {
+        connection: [("password".to_string(), "p3".to_string())].into(),
+        outputs: [("status".to_string(), json!("up"))].into(),
+    };
+    let why = refused(weft_access_store::write_pushed_values(&pool, project, "c1", &stray).await.unwrap_err());
+    assert!(why.contains("no baked output 'status'"), "{why}");
+    assert_eq!(password().await, "p2", "a refused push changes nothing");
+    let unknown = weft_core::infra::bake::PushedValues { connection: [("user".to_string(), "root".to_string())].into(), ..Default::default() };
+    let why = refused(weft_access_store::write_pushed_values(&pool, project, "c1", &unknown).await.unwrap_err());
+    assert!(why.contains("stores no 'user'"), "{why}");
+    let why = refused(weft_access_store::write_pushed_values(&pool, project, "gone", &reset).await.unwrap_err());
+    assert!(why.contains("no longer running"), "{why}");
 }

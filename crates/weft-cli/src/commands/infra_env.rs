@@ -251,7 +251,7 @@ pub async fn run(ctx: Ctx, args: EnvArgs) -> Result<()> {
     for (name, want) in &wanted {
         let item = match pick(&feed, want)? {
             Pick::Value(item) => item,
-            Pick::HandedOver(item, action) => bail!("{}", handed_over(&card.place, item, action)),
+            Pick::HandedOver(item, action) => bail!("{}", handed_over(&card.place, item, action, ctx.on())),
         };
         let value = item_text(item);
         written.push(match item.kind {
@@ -289,13 +289,14 @@ pub async fn run(ctx: Ctx, args: EnvArgs) -> Result<()> {
 
 /// The refusal for a secret the node handed over already: what its card
 /// says there, and the button that gets a new one.
-fn handed_over(place: &str, item: &LiveItem, action: &LiveAction) -> String {
+fn handed_over(place: &str, item: &LiveItem, action: &LiveAction, on: Option<&str>) -> String {
     format!(
         "{place}'s card shows no secret under '{}' right now; it says \"{}\". To get a new one, press the card's \
-         button (`weft infra show {place}` lists them, `weft infra press {place} {}` presses '{}'), then run this again",
+         button (`{}` lists them, `{}` presses '{}'), then run this again",
         item.label,
         item_text(item),
-        action.action_kind,
+        super::weft_on(on, &format!("infra show {place}")),
+        super::weft_on(on, &format!("infra press {place} {}", action.action_kind)),
         action.label,
     )
 }
@@ -375,7 +376,7 @@ mod tests {
 
     fn handed_over_text(feed: &LiveFeed) -> String {
         match pick(feed, &Want::OnlySecret).unwrap() {
-            Pick::HandedOver(item, action) => super::handed_over("db", item, action),
+            Pick::HandedOver(item, action) => super::handed_over("db", item, action, None),
             other => panic!("expected handed over, got {other:?}"),
         }
     }

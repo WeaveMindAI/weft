@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use sqlx::Connection;
 
 /// How long a connection may have sat idle before it is pinged on its way
@@ -24,13 +24,35 @@ pub const PING_AFTER_IDLE: Duration = Duration::from_secs(5);
 /// answering yet (a local one still starting, a serverless one waking).
 const REACH_FOR: Duration = Duration::from_secs(60);
 
+/// How many connections the broker writes workers' batches of records on
+/// (its record pool): as many batches go at once per broker, and the
+/// search index waits while one broker has that many going, which is its
+/// pool full.
+pub const RECORD_POOL_CONNECTIONS: u32 = 8;
+
+/// The name a broker's record pool connections carry
+/// (`application_name`), ahead of the broker's replica: one name per
+/// broker, so its batches are counted apart from other brokers'.
+pub const RECORD_POOL_APPLICATION: &str = "weft-records";
+
 /// A pool on `url` of at most `max_connections`, each request for a
 /// connection waiting at most `acquire_timeout`. The database may still be
 /// starting: it is tried again for a minute before the error is answered.
 pub async fn connect(url: &str, max_connections: u32, acquire_timeout: Duration) -> anyhow::Result<PgPool> {
+    reach(url.parse()?, max_connections, acquire_timeout).await
+}
+
+/// The record pool of the broker `replica` (`RECORD_POOL_CONNECTIONS`,
+/// named `RECORD_POOL_APPLICATION/<replica>`), on `url`, as [`connect`].
+pub async fn connect_record_pool(url: &str, replica: &str, acquire_timeout: Duration) -> anyhow::Result<PgPool> {
+    let named: PgConnectOptions = url.parse()?;
+    reach(named.application_name(&format!("{RECORD_POOL_APPLICATION}/{replica}")), RECORD_POOL_CONNECTIONS, acquire_timeout).await
+}
+
+async fn reach(connect: PgConnectOptions, max_connections: u32, acquire_timeout: Duration) -> anyhow::Result<PgPool> {
     let deadline = std::time::Instant::now() + REACH_FOR;
     loop {
-        match options(max_connections, acquire_timeout).connect(url).await {
+        match options(max_connections, acquire_timeout).connect_with(connect.clone()).await {
             Ok(pool) => return Ok(pool),
             Err(e) if std::time::Instant::now() < deadline => {
                 tracing::warn!(target: "weft_task_store::db", error = %e, "the database is not answering yet; trying again");

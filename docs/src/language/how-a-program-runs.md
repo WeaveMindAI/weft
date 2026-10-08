@@ -273,13 +273,12 @@ waiting, not stuck.
 ## What survives a restart
 
 As a run goes, the worker writes down each thing that happened, in a log called
-the journal. Those records are what the graph shows you, and they are what a
-replacement worker reads to rebuild a run that was interrupted. A step whose
-completion was safely written down does not run again.
+the journal. Those records are what the graph shows you.
 
-If the worker goes away in the middle of a step, that step is failed, because
-it may have partly happened. Only a step waiting on an answer is replayed. Before you put side effects around a wait, go and read
-[surviving a restart](../nodes/durable-execution.md).
+If its worker dies, what happens to a run depends on its trigger's `durable`
+setting: for that, go and read [how a run is
+kept](triggers-and-routes.md#how-a-run-is-kept). Before you put side effects
+around a wait, go and read [surviving a restart](../nodes/durable-execution.md).
 
 ## What the build catches
 

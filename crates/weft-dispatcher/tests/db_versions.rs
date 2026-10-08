@@ -1,6 +1,6 @@
 //! The version tree's Postgres store against a real database: the rows
-//! the tree verbs read and write, and the one cross-store rule (a run's
-//! row dies with its journal).
+//! the tree verbs read and write, and the runs it shows, read off the
+//! runs' own rows.
 //!
 //! Same rig as `db_lifecycle.rs`: `#[sqlx::test]` hands each test a fresh
 //! database; `setup` applies the dispatcher's whole schema (every group,
@@ -21,7 +21,8 @@ use weft_dispatcher::activation_store::{ActivationLifecycle, ActivationStoreOps,
 use weft_dispatcher::journal::postgres::PostgresJournal;
 use weft_dispatcher::journal::Journal;
 use weft_core::versions::Head;
-use weft_dispatcher::versions::{version_id, PostgresVersionStore, RunRow, VersionRow, VersionStoreOps};
+use weft_dispatcher::versions::{version_id, PostgresVersionStore, VersionRow, VersionStoreOps};
+use weft_journal::record::{Queued, Then};
 use weft_journal::ExecEvent;
 
 const TENANT: &str = "tenant-1";
@@ -61,18 +62,33 @@ fn version(project: Uuid, m: &BTreeMap<String, String>, parent: Option<&str>, la
     }
 }
 
-fn run(project: Uuid, execution_id: Uuid, version: &str, seed: Option<Uuid>, spec: Option<RunSpec>, at: u64) -> RunRow {
-    RunRow {
-        execution_id,
-        project_id: project,
-        version_id: version.to_string(),
-        seed_execution_id: seed,
-        stale: vec!["b".into(), "c".into()],
-        spec,
-        definition_hash: "def-1".into(),
-        example: None,
-        created_at: at,
-    }
+/// Start a run of `project` by hand, from `version`, the way `weft run`
+/// queues one: what the tree shows of it rides its row.
+async fn start_run(
+    journal: &PostgresJournal,
+    project: Uuid,
+    version: &str,
+    seed: Option<Uuid>,
+    spec: Option<&RunSpec>,
+    at: u64,
+) -> Uuid {
+    let execution_id = weft_core::new_execution_id();
+    let birth = ExecEvent::ExecutionStarted {
+        execution_id, project_id: project, entry_node: "a".into(),
+        phase: weft_core::context::Phase::Fire, definition_hash: Some("def-1".into()), binary_hash: Some("bin-A".into()),
+        source_version: Some(version.into()), run_kind: weft_core::exec::RunKind::Execution, selection: None,
+        seed: seed.map(|parent| weft_core::run_spec::Seed { parent, origins: Default::default() }),
+        instance: None, stand_in: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: at,
+        settings: Default::default(),
+    };
+    let spec = spec.map(|spec| serde_json::to_value(spec).unwrap());
+    let stale = ["b".to_string(), "c".to_string()];
+    let queued = Queued {
+        events: std::slice::from_ref(&birth), tenant: TENANT, keep_for: weft_core::run_settings::KeepFor::WEFT_DEFAULT,
+        watch_end: false, stale: &stale, spec: spec.as_ref(), example: None,
+    };
+    assert!(journal.queue_run(queued, false).await.unwrap());
+    execution_id
 }
 
 /// The same manifest is one row however often it is recorded, and a
@@ -96,48 +112,39 @@ async fn identical_code_is_one_version(pool: PgPool) {
     assert_eq!(versions.version(project, &rows[0].id).await.unwrap().unwrap().label.as_deref(), Some("renamed"));
 }
 
+/// The program definitions a project's runs need are read off their rows,
+/// whatever their record holds.
 #[sqlx::test]
-async fn retention_keeps_program_references_when_execution_selection_has_changed_format(pool: PgPool) {
-    let (journal, projects, _) = setup(&pool).await;
+async fn the_definitions_in_use_are_read_off_the_runs(pool: PgPool) {
+    let (journal, projects, versions) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
-    let execution_id = Uuid::new_v4();
-    let birth = ExecEvent::ExecutionStarted {
-        execution_id, project_id: project, entry_node: "mid".into(),
-        phase: weft_core::context::Phase::Fire, definition_hash: Some("def-1".into()),
-        program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution, subgraph: None, seed: None, instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-        run_class: weft_core::run_class::RunClass::Short,
-    };
-    journal.record_event(&birth).await.unwrap();
-    let mut row = serde_json::to_value(&birth).unwrap();
-    row["subgraph"] = json!(["mid"]);
-    sqlx::query("UPDATE exec_event SET payload_json = $2 WHERE execution_id = $1 AND kind = 'execution_started'")
-        .bind(execution_id.to_string()).bind(row.to_string()).execute(&pool).await.unwrap();
+    assert!(journal.definition_hashes_in_use(project).await.unwrap().is_empty());
+    let v = version(project, &manifest(&[("main.weft", "aaa")]), None, None, 1);
+    versions.upsert_version(&v).await.unwrap();
+    start_run(&journal, project, &v.id, None, None, 1).await;
     assert_eq!(journal.definition_hashes_in_use(project).await.unwrap(), vec!["def-1"]);
-    row["definition_hash"] = json!(42);
-    sqlx::query("UPDATE exec_event SET payload_json = $2 WHERE execution_id = $1 AND kind = 'execution_started'")
-        .bind(execution_id.to_string()).bind(row.to_string()).execute(&pool).await.unwrap();
-    assert!(journal.definition_hashes_in_use(project).await.is_err(), "an unreadable reference must block deletion");
 }
 
-/// A run's row round-trips whole (spec included) and lists under its
-/// project in the order it was recorded, whatever its clock says
-/// (`created_at` is whole seconds; two runs in one second must not
-/// swap).
+/// A run started by hand lists under its version with what it was asked
+/// (its spec, its seed, the places it ran again), in the order it was
+/// started, and carries the saved example it is set to. A run nobody
+/// started by hand (a trigger's) is counted on its version, never listed.
 #[sqlx::test]
 async fn runs_round_trip_and_list_in_recording_order(pool: PgPool) {
-    let (_, projects, versions) = setup(&pool).await;
+    let (journal, projects, versions) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
     let m = manifest(&[("main.weft", "aaa")]);
     let v = version(project, &m, None, None, 1);
     versions.upsert_version(&v).await.unwrap();
-    let (seed, child) = (Uuid::new_v4(), Uuid::new_v4());
     let spec = RunSpec { name: "angry".into(), from: [("classify".into(), Default::default())].into(), ..Default::default() };
-    versions.insert_run(&run(project, seed, &v.id, None, None, 10)).await.unwrap();
-    versions.insert_run(&run(project, child, &v.id, Some(seed), Some(spec.clone()), 5)).await.unwrap();
+    let seed = start_run(&journal, project, &v.id, None, Some(&RunSpec::default()), 5).await;
+    let child = start_run(&journal, project, &v.id, Some(seed), Some(&spec), 5).await;
+    start_run(&journal, project, &v.id, None, None, 6).await;
     let rows = versions.runs(project).await.unwrap();
-    assert_eq!(rows.iter().map(|r| r.execution_id).collect::<Vec<_>>(), vec![seed, child]);
+    assert_eq!(rows.iter().map(|r| r.execution_id).collect::<Vec<_>>(), vec![seed, child], "in the order they were started");
+    assert_eq!(rows[1].version_id, v.id);
     assert_eq!(rows[1].seed_execution_id, Some(seed));
     assert_eq!(rows[1].stale, vec!["b", "c"]);
     assert_eq!(rows[1].spec, Some(spec));
@@ -148,7 +155,7 @@ async fn runs_round_trip_and_list_in_recording_order(pool: PgPool) {
     assert_eq!(versions.run(child).await.unwrap().expect("found").example, None);
     assert!(
         versions.set_run_example(Uuid::new_v4(), Some("x")).await.is_err(),
-        "an unrecorded run is refused"
+        "a run that is not on record is refused"
     );
 }
 
@@ -200,67 +207,51 @@ async fn head_lives_on_the_project_row_and_activations_name_their_versions(pool:
     );
 }
 
-/// `weft clean <execution_id>` drops the run's row through the version store
-/// (the table is the version store's; the journal owns the journal),
-/// and a head that pointed at the run keeps its version and loses the
-/// run pointer.
+/// `weft clean <execution_id>` erases the run, and a head that pointed at
+/// it keeps its version and loses the run pointer.
 #[sqlx::test]
-async fn deleting_a_run_clears_its_row_and_head_run(pool: PgPool) {
+async fn cleaning_a_run_erases_it_and_clears_head_run(pool: PgPool) {
     let (journal, projects, versions) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
     let m = manifest(&[("main.weft", "aaa")]);
     let v = version(project, &m, None, None, 1);
     versions.upsert_version(&v).await.unwrap();
-    let execution_id = Uuid::new_v4();
-    journal
-        .record_event(&ExecEvent::ExecutionStarted {
-            execution_id,
-            project_id: project,
-            entry_node: "a".into(),
-            phase: weft_core::context::Phase::Fire,
-            definition_hash: Some("def-1".into()),
-            program: None, source_version: None, run_kind: weft_core::exec::RunKind::Execution,
-            subgraph: None,
-            seed: None,
-            instance: None, fired_trigger: None, instance_values: Default::default(), picks: Default::default(), at_unix: 0,
-            run_class: weft_core::run_class::RunClass::Short,
-        })
-        .await
-        .unwrap();
-    versions.insert_run(&run(project, execution_id, &v.id, None, None, 5)).await.unwrap();
+    let execution_id = start_run(&journal, project, &v.id, None, Some(&RunSpec::default()), 5).await;
     versions.move_head(project, &Head::default(), Some(&v.id), Some(execution_id)).await.unwrap();
-    // The order `clean_execution` uses: the tree row first (so a
-    // failure leaves the journal reachable and the command retryable),
-    // then the journal.
-    versions.delete_run(execution_id).await.unwrap();
+    // The order `clean_execution` uses.
+    versions.forget_head_run(execution_id).await.unwrap();
     journal.delete_execution(execution_id).await.unwrap();
-    assert!(versions.run(execution_id).await.unwrap().is_none(), "the run row is gone");
+    assert!(versions.run(execution_id).await.unwrap().is_none(), "the run is gone");
     // Idempotent, which is what makes the retry safe.
-    versions.delete_run(execution_id).await.unwrap();
+    versions.forget_head_run(execution_id).await.unwrap();
+    journal.delete_execution(execution_id).await.unwrap();
     let head = versions.head(project).await.unwrap();
     assert_eq!(head.head_version.as_deref(), Some(v.id.as_str()));
     assert_eq!(head.head_run, None);
     assert_eq!(versions.versions(project).await.unwrap().len(), 1, "the version stays");
 }
 
-/// Deleting versions cascades to their runs; a project's removal
-/// drops its whole tree (the store deletes it explicitly: a version
-/// left behind kept naming stored files of a project that no longer
-/// existed, and the same id registered again inherited a tree it
-/// never made).
+/// A pruned version takes its runs out of the tree (they stay on record
+/// until retention erases them); a project's removal drops its whole tree
+/// (the store deletes it explicitly: a version left behind kept naming
+/// stored files of a project that no longer existed, and the same id
+/// registered again inherited a tree it never made).
 #[sqlx::test]
-async fn deleting_versions_cascades_to_their_runs(pool: PgPool) {
-    let (_, projects, versions) = setup(&pool).await;
+async fn deleting_versions_takes_their_runs_out_of_the_tree(pool: PgPool) {
+    let (journal, projects, versions) = setup(&pool).await;
     let project = Uuid::new_v4();
     seed_project(&projects, project).await;
     let root = version(project, &manifest(&[("main.weft", "1")]), None, None, 1);
     let child = version(project, &manifest(&[("main.weft", "2")]), Some(&root.id), None, 2);
     versions.upsert_version(&root).await.unwrap();
     versions.upsert_version(&child).await.unwrap();
-    let (r1, r2) = (Uuid::new_v4(), Uuid::new_v4());
-    versions.insert_run(&run(project, r1, &root.id, None, None, 3)).await.unwrap();
-    versions.insert_run(&run(project, r2, &child.id, None, None, 4)).await.unwrap();
+    let r1 = start_run(&journal, project, &root.id, None, Some(&RunSpec::default()), 3).await;
+    let r2 = start_run(&journal, project, &child.id, None, Some(&RunSpec::default()), 4).await;
+    for run in [r1, r2] {
+        let written = journal.append(run, &[ExecEvent::ExecutionCompleted { execution_id: run, at_unix: 5 }], Then::Stays).await.unwrap();
+        assert!(matches!(written, weft_journal::record::Appended::At(_)));
+    }
     versions.delete_versions(project, std::slice::from_ref(&child.id)).await.unwrap();
     assert!(versions.run(r2).await.unwrap().is_none());
     assert!(versions.run(r1).await.unwrap().is_some());
@@ -268,4 +259,28 @@ async fn deleting_versions_cascades_to_their_runs(pool: PgPool) {
     assert!(projects.remove(project).await.unwrap());
     assert!(versions.versions(project).await.unwrap().is_empty(), "removing the project drops its tree");
     assert!(versions.run(r1).await.unwrap().is_none(), "and the tree's runs with it");
+}
+
+/// A version's trigger count sums every writer's lane and names the
+/// newest run across them.
+#[sqlx::test]
+async fn trigger_runs_sum_the_lanes_and_name_the_newest_run(pool: PgPool) {
+    let (_journal, _projects, versions) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    let older = Uuid::now_v7();
+    let newer = Uuid::now_v7();
+    for (lane, runs, last) in [("a", 2_i64, newer), ("b", 3, older)] {
+        sqlx::query("INSERT INTO version_runs (project_id, source_version, lane, runs, last_run) VALUES ($1, 'v1', $2, $3, $4)")
+            .bind(project)
+            .bind(lane)
+            .bind(runs)
+            .bind(last)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let counted = versions.trigger_runs(project).await.unwrap();
+    assert_eq!(counted.len(), 1);
+    assert_eq!(counted["v1"].runs, 5);
+    assert_eq!(counted["v1"].last, newer);
 }

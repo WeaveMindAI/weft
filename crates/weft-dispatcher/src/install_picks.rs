@@ -10,7 +10,7 @@
 //! install's picks), is then set up again on what is stored, each owner
 //! once. A pick is the install's, not a trigger's, so it stays stored
 //! when a setup fails: the answer then says so and names the triggers
-//! still armed on the old connection, which `weft activate` sets up again.
+//! still armed on the old connection, which `weft resync` sets up again.
 
 use axum::http::StatusCode;
 
@@ -308,7 +308,7 @@ async fn rearm(state: &DispatcherState, project_id: uuid::Uuid, live: &[Activati
         StatusCode::CONFLICT,
         format!(
             "the pick is stored, but these triggers are still set up with the connection they had, \
-             and `weft activate` sets them up again:\n  {}",
+             and `weft resync --mode park` sets them up again (the work waiting on them stays):\n  {}",
             failed.join("\n  ")
         ),
     ))

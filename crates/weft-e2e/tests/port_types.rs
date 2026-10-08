@@ -2,7 +2,7 @@
 //! `port_types` fixture runs two Python snippets: one hands a dict that
 //! happens to carry a stored-file marker to a `JsonDict` port (it flows
 //! whole, a dict is a dict), the other hands a string to a `Number` port
-//! (the send fails, the node fails naming the port, the run ends failed
+//! (the node refuses its own answer naming the port, the run ends failed
 //! and nothing behind it runs).
 #![cfg(feature = "e2e")]
 
@@ -31,14 +31,13 @@ async fn the_declared_type_judges_a_value_and_a_refusal_fails_the_node() -> anyh
     );
 
     // The mistyped output failed its own node, by name, and the run with it.
-    settled.failed_with("port 'n'")?;
-    settled.failed_with("does not accept")?;
+    settled.failed_with("on 'n', which takes Number")?;
     let error = settled
         .events_of("wrong")
         .find(|e| e.kind() == "node_failed")
         .and_then(|e| e.str_field("error").map(str::to_string));
     let Some(error) = error else { anyhow::bail!("'wrong' did not fail") };
-    anyhow::ensure!(error.contains("port 'n'") && error.contains("got String"), "{error}");
+    anyhow::ensure!(error.contains("on 'n'") && error.contains("got String"), "{error}");
     settled.assert_skipped("after")?;
 
     project.finish().await

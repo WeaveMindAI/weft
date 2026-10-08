@@ -1,13 +1,13 @@
 name: Provider request
-description: Ask for a paid provider to be usable on the shared keys in app.weavemind.ai.
+description: Ask for a paid provider's meter to ship with weft, so its calls are measured.
 labels: ["provider-request", "triage"]
 body:
   - type: markdown
     attributes:
       value: |
-        Ask here for a provider whose calls people can make without bringing their own key, billed to app.weavemind.ai instead.
+        Ask here for a provider whose meter should ship with weft: the code that records what each of its calls cost. Without one, its calls go through unmeasured, and an install cannot offer its own key for it, because that key only travels on routes a meter knows.
 
-        You are not blocked waiting on us. A provider defined inside your own project works today with your own key: write its meter as a shared `.rs` file in your package ([how meters work](https://weavemindai.github.io/weft/connections/meters.html)) and set the key on the node. This request is only about the shared keys, which need a reviewed meter shipped in weft itself.
+        You are not blocked waiting on us. A provider defined inside your own project works today with your own key: write its meter as a shared `.rs` file in your package ([how meters work](https://weavemindai.github.io/weft/connections/meters.html)) and set the key on the node. This request is about a meter shipped in weft itself, which every install gets.
 
   - type: input
     id: name

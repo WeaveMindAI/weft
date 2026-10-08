@@ -52,8 +52,6 @@ export function statusThemeIcon(status: string, cancelCause?: CancelCause | null
       return cancelCause?.kind === 'user'
         ? new vscode.ThemeIcon('stop-circle')
         : new vscode.ThemeIcon('circle-slash', new vscode.ThemeColor('charts.orange'));
-    case 'corrupt':
-      return new vscode.ThemeIcon('warning', new vscode.ThemeColor('charts.orange'));
     default:
       return new vscode.ThemeIcon('circle-outline');
   }

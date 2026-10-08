@@ -254,17 +254,15 @@ async fn an_unleased_projects_copy_is_claimed_then_swept() {
     );
 }
 
-/// A stop of every copy of `project`, cancelling whatever runs.
+/// A stop of the shared copies of `project`.
 fn stop_of(id: i64, project: uuid::Uuid) -> weft_broker_client::protocol::SupervisorCommandRow {
     weft_broker_client::protocol::SupervisorCommandRow {
         id,
         project_id: project,
         node_id: None,
         verb: weft_broker_client::protocol::InfraLifecycleVerb::Stop,
-        running_policy: Some(weft_broker_client::protocol::RunningPolicy::Cancel),
         spec_json: None,
         force: false,
-        drain_timeout_secs: weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS,
         copies: weft_core::instance::Copies::Shared,
     }
 }

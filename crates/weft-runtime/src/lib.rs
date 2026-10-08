@@ -52,9 +52,24 @@ const WORK_POOL: (u32, Duration) = (16, Duration::from_secs(5));
 /// itself then has to wait for (see `weft_dispatcher::lease`).
 const LOCK_POOL: (u32, Duration) = (16, Duration::from_secs(120));
 
+/// The pool the broker writes workers' batches of records on
+/// (`weft_broker::records`): a burst of records never starves the
+/// broker's other work of connections, and a batch waits for one rather
+/// than fails (a worker's lane has one batch in flight, so the wait is
+/// how the database slows the workers down).
+const RECORD_POOL_WAIT: Duration = Duration::from_secs(60);
+
 /// A required secret from the environment (`SECRET_ENV`).
 fn secret(name: &str) -> anyhow::Result<String> {
     optional_secret(name).ok_or_else(|| anyhow::anyhow!("{name} is required; the install puts it in this process's environment"))
+}
+
+/// The install's caller-ticket secret (`WEFT_CALLER_TOKEN_SECRET`), the root
+/// every project's own secret is derived from
+/// (`weft_core::caller_token::ProjectSecret`). It stays in weft's own
+/// processes; a project's workers are given only their project's.
+fn install_secret() -> anyhow::Result<Vec<u8>> {
+    hex::decode(secret("WEFT_CALLER_TOKEN_SECRET")?.trim()).context("WEFT_CALLER_TOKEN_SECRET is not hex")
 }
 
 /// A secret the environment may leave out.
@@ -168,9 +183,11 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
     if runs(CoreRole::Broker) {
         let (url, pool) = pool.as_ref().expect("the broker's process holds the database");
         let lock_pool = weft_task_store::db::connect(url, LOCK_POOL.0, LOCK_POOL.1).await.context("connect the broker's lock pool")?;
+        let record_pool = weft_task_store::db::connect_record_pool(url, &replica, RECORD_POOL_WAIT).await.context("connect the broker's record pool")?;
         let state = weft_broker::BrokerState::new(
             pool.clone(),
             lock_pool,
+            record_pool,
             signals.clone().expect("the broker's process listens"),
             weft_broker::state::BrokerSettings {
                 auth: weft_broker::AuthConfig {
@@ -208,10 +225,6 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                 domains: parts.domains.clone(),
                 holder_pool: parts.holder_pool.clone(),
                 tokens: parts.tokens.clone(),
-                // Only the dispatcher signs live callers' tickets, so only
-                // its process reads the secret.
-                caller_token_secret: hex::decode(secret("WEFT_CALLER_TOKEN_SECRET")?.trim())
-                    .context("WEFT_CALLER_TOKEN_SECRET is not hex")?,
             },
             weft_dispatcher::app::Defaults::for_auth(config.auth),
         )
@@ -228,7 +241,22 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
             }
         }
         let api = weft_dispatcher::api::router(state.clone(), weft_dispatcher::app::cors_for(config.auth));
-        public = public.merge(weft_dispatcher::door::router(state, api));
+        let door = weft_dispatcher::door::router(state.clone(), api);
+        // The projects that take work answer at their own address again:
+        // a machine's fronts went with the install's last process. A
+        // cloud's front is the platform's to keep, and outlives every boot
+        // of the install. On a task of its own, so a front slow to start
+        // holds up no other part of the boot; each project says on its row
+        // and in the log what it came to.
+        if matches!(config.platform, PlatformConfig::Local(_)) {
+            let fronts = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = weft_dispatcher::front::serve_all(&fronts, weft_dispatcher::front::Say::Every).await {
+                    tracing::error!(target: "weft_runtime", error = %format!("{e:#}"), "could not put the projects' fronts back; the reaper looks again shortly");
+                }
+            });
+        }
+        public = public.merge(door);
     }
 
     // The listener and the holder are one code; in a local install's one
@@ -255,6 +283,9 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
             tasks,
             link,
             parts.alarm.clone(),
+            // An entry's event goes straight to its project's worker, with
+            // the project's worker key.
+            weft_listener::fire_sink::HttpWorkerDoors::new(install_secret()?),
         );
         if runs(CoreRole::Listener) {
             if only.is_none() {

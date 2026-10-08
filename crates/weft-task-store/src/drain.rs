@@ -39,7 +39,8 @@ use tokio::time::Instant;
 
 use crate::pg_signal::Subscription;
 
-/// The usual safety net for missed notifications on a local install, and
+/// The usual safety net for missed notifications while a process that
+/// listens is up (on a local install, and a cloud role that writes), and
 /// how soon a failed drain is tried again anywhere. Notifications are
 /// best-effort by Postgres design (a reconnecting listener can lose
 /// some, though it says so with a recheck), so this only catches what
@@ -362,7 +363,13 @@ pub async fn run<F, Fut>(
 {
     let mut next_look = Instant::now();
     loop {
-        if Instant::now() < next_look {
+        // A loop that listens to no channel runs on its interval alone: a
+        // recheck (the watch fell behind, or reconnected) concerns only the
+        // loops that wait on a channel, and waking a timed sweep on one
+        // would run it back to back while notifications pour in.
+        if wake_on.is_empty() {
+            tokio::time::sleep_until(next_look).await;
+        } else if Instant::now() < next_look {
             let woken = signals
                 .woken_before(next_look, |channel, payload| wake_on.iter().any(|w| w.hears(channel, payload)))
                 .await;
@@ -465,6 +472,23 @@ mod tests {
         tx.send(Heard::Recheck).unwrap();
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(runs.lock().unwrap().len(), 2);
+    }
+
+    /// A loop that listens to no channel is never woken early, not even
+    /// by a recheck: it runs on its interval alone.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_loop_ignores_rechecks() {
+        let (tx, rx) = broadcast::channel(16);
+        let runs = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn(run(rx.into(), &[], Duration::from_secs(30), "test", scripted(runs.clone(), vec![])));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        for _ in 0..3 {
+            tx.send(Heard::Recheck).unwrap();
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(runs.lock().unwrap().len(), 1, "only the start drain");
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(runs.lock().unwrap().len(), 2, "then its interval");
     }
 
     #[tokio::test(start_paused = true)]

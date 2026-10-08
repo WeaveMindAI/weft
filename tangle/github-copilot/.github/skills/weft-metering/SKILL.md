@@ -321,7 +321,7 @@ async fn priceable(&self, path: &str, follow_up: FollowUp<'_>) -> anyhow::Result
 }
 ```
 
-`priceable` runs before a billable call goes out, so an `Err` here is the last point at which the money stays unspent. Unlike the methods below, it admits by default: a [meter] that says nothing here lets everything through.
+`priceable` runs before a billable call goes out, so an `Err` here is the last point at which the money stays unspent. Unlike `observe_session` below, it admits by default: a [meter] that says nothing here lets everything through.
 
 ## Checking it worked
 
@@ -335,6 +335,6 @@ Each measured call prints a `cost_reported` line carrying `service=` and `amount
 
 ## The rest of the trait
 
-`ceiling_usd` bounds the worst case before a call runs, and the session methods (`observe_session`, `session_slice_usd`, `session_max_frame_bytes`) price a long-lived socket that accrues as it goes. All refuse loudly by default, which is correct on the user's own key: you leave them alone unless the user asks for a spend cap or wires up a realtime socket. For those, the full trait, and what a [meter] must do before weft ships it, go and read [Measuring what a call costs](https://weavemindai.github.io/weft/connections/meters.html).
+`observe_session` prices a long-lived socket that accrues as it goes. If your meter classifies any route `BillableSession`, implement it; the default refuses every session on that route. For it, the full trait, and what a [meter] must do before weft ships it, go and read [Measuring what a call costs](https://weavemindai.github.io/weft/connections/meters.html).
 
 Every snippet on this page is compiled in weft's own `crates/weft-providers/tests/skill_example_meter.rs`, and all but `priceable` are exercised there too. If you change one here, you change it there.

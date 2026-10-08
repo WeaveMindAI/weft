@@ -22,7 +22,7 @@ Nothing starts it for you. Not `weft run`, not `weft build`, not activation.
 | `weft infra terminate` | Deletes it, **disk included**, unless the step asked for the disk to be kept |
 | `weft infra upgrade` | Rebuilds against your current source. The triggers it took down come back once the new infrastructure is up |
 | `weft infra status` | Where each piece stands, with its address |
-| `weft infra doors` | The addresses this project's infra answers on |
+| `weft infra list-doors` | The addresses this project's infra answers on |
 | `weft infra logs <node>` | What the containers actually printed |
 | `weft infra cancel` | Stops waiting on work in flight |
 | `weft infra node-stop <node>` / `node-terminate <node>` | The same, for one piece |
@@ -95,8 +95,10 @@ down with it and the rest stayed on. When `weft infra start` (or the
 program's own `ctx.infra(..).start()`) has the infrastructure up again, the
 triggers that came down with it come back on by themselves; one you switched
 off yourself since stays off. A plain `weft activate` turns back on whatever
-is still off. While a route's trigger is parked, its callers are kept on the
-line and served once it is back.
+is still off. While a route's trigger is parked, its callers are answered
+`503` with a `Retry-After` at once, so a client that retries gets through once
+it is back; the events a trigger picks up itself wait and run once it is
+back.
 
 A trigger that reads an instance's copy or an instance's value
 (`@per_instance`, `@instance_filled`) exists once per instance, and its copies
@@ -121,7 +123,7 @@ the triggers are down, park them:
 
 | Mode | Work that arrives meanwhile | What a person sees |
 |---|---|---|
-| `park` | Nothing is dropped. A call from outside, an answer to a waiting run, and every fire a trigger makes by itself (a schedule's tick, a message on a connection it holds) wait, and run once the triggers are back, on the version they come back with. Someone calling a route is kept on the line until then | Questions stay listed for the people who answer them, and an answer sent now waits too |
+| `park` | Nothing is lost. A provider's push (a Slack message, a new email) or a submitted form, an answer to a waiting run, and every fire a trigger makes by itself (a schedule's tick, a message on a connection it holds) wait, and run once the triggers are back, on the version they come back with. A call to a route is not held, even a webhook sent to one: it gets a `503` with a `Retry-After`, so a client that retries gets through once the triggers are back | Questions stay listed for the people who answer them, and an answer sent now waits too |
 | `hibernate` | The same as `park` for the grace window (`--grace`, in minutes). After it, nothing new is taken and the triggers stop listening | Questions are hidden for the whole time; someone who already has one open can still send their answer within the window |
 | `wipe` | Refused. Everything waiting is dropped and the runs waiting on the triggers are cancelled: a clean slate, and what you want while building | Questions are deleted |
 
@@ -129,9 +131,15 @@ A schedule parked for two hours has two hours of ticks waiting when it comes
 back; the reactivate choice below decides whether they run.
 
 With no terminal attached, or with `--json`, the default is `wipe`. Running
-executions are cancelled unless you pass `--running-policy wait`, which lets
-them land first, capped at a minute (`--drain-timeout`), and `weft
-cancel-running` ends that wait early.
+executions are cancelled unless you pass `--running-policy wait` with `--mode
+park` or `--mode hibernate` (a `wipe` cancels everything, so it refuses
+`wait`). That lets them land first, capped at a minute (`--drain-timeout`), and `weft
+cancel-running` ends that wait early. The wait covers every run the triggers
+started that is still going, fast ones included, even one that has not written
+anything yet. A run parked on a timer or a form is not waited for: the mode
+you picked decides what happens to it. Whatever is still going at the cap is
+cancelled, except a `recorded: false` run that has written nothing: the cancel
+cannot reach it, so it finishes on its own.
 
 The infra verbs that take triggers down (`weft infra stop`, `terminate`,
 `upgrade`) ask you the same thing, and their answer means the same. They ask
@@ -177,8 +185,8 @@ Infrastructure that only a run touches does not hold activation back.
 | `running` | Work is happening now |
 | `waiting_for_input` | Parked on a person or a service. No worker is up and nothing is being spent |
 | `completed` | Finished |
-| `failed` | A step failed, or the run could get no further |
-| `cancelled` | You or another run stopped it |
+| `failed` | A step failed (a wait the run held past its `holdSecs` and its node did not handle counts as one), or the run could get no further |
+| `cancelled` | You or another run stopped it; its live caller hung up; it was a fast run and its worker went away; its worker was stopped while it could not pause (`recorded: false`, a caller still on the line with `outlivesCaller` off, or a bus between its nodes open); it reached the hour a cloud install allows one stretch of a run; or the runtime stopped it (a newer build replaced its image) |
 
 `weft executions --status running` lists both the ones working and the ones
 waiting, and the status column tells them apart.

@@ -217,13 +217,40 @@ async fn firing_a_get_route_needs_no_body() -> anyhow::Result<()> {
     project.finish().await
 }
 
-/// A parked route keeps its callers: a call that arrives while the
-/// project is parked waits, and is answered by the program once it is
-/// back, the same way a parked trigger keeps its fires. A wipe is the
-/// other answer: the route is gone with its trigger's signals, and a
-/// caller is refused at once.
+/// A caller reaches the project's own address straight, with nothing of
+/// weft's in between: its routes answer there at the root, and while the
+/// trigger is parked the worker itself refuses with a `503`.
 #[tokio::test]
-async fn a_parked_route_holds_its_caller_until_it_is_back() -> anyhow::Result<()> {
+async fn the_project_answers_at_its_own_address() -> anyhow::Result<()> {
+    let disp = ensure::up().await?;
+    let mut project = Project::prepare("api_reply", disp.clone()).await?;
+    let base = project.unique_live_path()?;
+    project.activate().await?;
+
+    let status: Value = disp.get_json(&format!("/projects/{}/status", project.id())).await?;
+    anyhow::ensure!(status["address"]["state"] == "serving", "the project's address: {}", status["address"]);
+    let url = status["address"]["url"].as_str().expect("a serving address has a url").to_string();
+    let path = base.trim_start_matches("local/");
+    let answered = reqwest::get(format!("{url}/{path}/users/42")).await?;
+    assert_eq!(answered.status(), 200);
+    let body: Value = answered.json().await?;
+    assert_eq!(body["name"], "Ada", "{body}");
+
+    project.weft(&["deactivate", "--mode", "park", "--running-policy", "cancel"]).await?;
+    status::wait_until_status(&disp, &project.id(), "inactive", status::STATUS_DEADLINE).await?;
+    let refused = reqwest::get(format!("{url}/{path}/users/42")).await?;
+    assert_eq!(refused.status(), 503);
+    assert!(refused.headers().get("retry-after").is_some(), "the caller is told when to try again");
+
+    project.finish().await
+}
+
+/// A caller is never held: while a route's trigger is parked, a call is
+/// refused at once with a `503` and a `Retry-After`, the way any server that
+/// is down answers, and the call made once it is back is answered. A wipe
+/// takes the route away with its trigger's signals.
+#[tokio::test]
+async fn a_parked_route_refuses_its_caller_until_it_is_back() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let mut project = Project::prepare("api_reply", disp.clone()).await?;
     let base = project.unique_live_path()?;
@@ -231,17 +258,14 @@ async fn a_parked_route_holds_its_caller_until_it_is_back() -> anyhow::Result<()
 
     project.weft(&["deactivate", "--mode", "park", "--running-policy", "cancel"]).await?;
     status::wait_until_status(&disp, &project.id(), "inactive", status::STATUS_DEADLINE).await?;
-
-    let call = {
-        let disp = disp.clone();
-        let path = format!("{base}/users/42");
-        tokio::spawn(async move { live::http_request(&disp, Method::GET, &path, &[], None).await })
-    };
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    anyhow::ensure!(!call.is_finished(), "a parked route answered at once: {:?}", call.await);
+    let (status, headers, body) =
+        live::http_request(&disp, Method::GET, &format!("{base}/users/42"), &[], None).await?;
+    assert_eq!(status, 503, "{}", String::from_utf8_lossy(&body));
+    assert!(header(&headers, "retry-after").is_some(), "the caller is told when to try again");
 
     project.activate().await?;
-    let (status, _, body) = call.await??;
+    let (status, _, body) =
+        live::http_request(&disp, Method::GET, &format!("{base}/users/42"), &[], None).await?;
     assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
     let body: Value = serde_json::from_slice(&body)?;
     assert_eq!(body["name"], "Ada", "{body}");
@@ -251,6 +275,45 @@ async fn a_parked_route_holds_its_caller_until_it_is_back() -> anyhow::Result<()
     let (status, _, body) =
         live::http_request(&disp, Method::GET, &format!("{base}/users/42"), &[], None).await?;
     assert_eq!(status, 404, "{}", String::from_utf8_lossy(&body));
+
+    project.finish().await
+}
+
+/// Taking the triggers down with `--running-policy wait` lets a call that
+/// is running finish and answers it, while a call arriving meanwhile is
+/// refused like any other while the trigger is not on.
+#[tokio::test]
+async fn a_drain_lets_a_running_call_finish_and_refuses_new_ones() -> anyhow::Result<()> {
+    let disp = ensure::up().await?;
+    let mut project = Project::prepare("api_reply", disp.clone()).await?;
+    let base = project.unique_live_path()?;
+    project.activate().await?;
+
+    let running = {
+        let disp = disp.clone();
+        let path = format!("{base}/slow");
+        tokio::spawn(async move { live::http_request(&disp, Method::GET, &path, &[], None).await })
+    };
+    // The slow call is under way (it sleeps four seconds).
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    let deactivate = project.weft(&["deactivate", "--mode", "park", "--running-policy", "wait", "--drain-timeout", "60"]);
+    let meanwhile = async {
+        status::wait_until_status(&disp, &project.id(), "deactivating", status::STATUS_DEADLINE).await?;
+        let (status, headers, body) =
+            live::http_request(&disp, Method::GET, &format!("{base}/users/42"), &[], None).await?;
+        anyhow::ensure!(status == 503, "a call while the triggers go down: {status} {}", String::from_utf8_lossy(&body));
+        anyhow::ensure!(header(&headers, "retry-after").is_some(), "no Retry-After on the refusal");
+        anyhow::Ok(())
+    };
+    let (deactivated, meanwhile) = tokio::join!(deactivate, meanwhile);
+    deactivated?;
+    meanwhile?;
+
+    let (status, _, body) = running.await??;
+    assert_eq!(status, 200, "the running call is answered: {}", String::from_utf8_lossy(&body));
+    let body: Value = serde_json::from_slice(&body)?;
+    assert_eq!(body["slept"], true, "{body}");
+    status::wait_until_status(&disp, &project.id(), "inactive", status::STATUS_DEADLINE).await?;
 
     project.finish().await
 }

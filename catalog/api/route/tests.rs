@@ -224,7 +224,7 @@ async fn setup_registers(rig: FakeRig) -> WeftResult<()> {
     assert_eq!(spec["config"]["path"], "chat/{room}");
     assert_eq!(spec["config"]["methods"], json!(["POST"]));
     assert_eq!(spec["config"]["data_type"], "text");
-    assert_eq!(spec["config"]["can_suspend"], true);
+    assert_eq!(spec["config"]["outlives_caller"], true);
     assert_eq!(spec["config"]["auth"]["kind"], "none");
     Ok(())
 }

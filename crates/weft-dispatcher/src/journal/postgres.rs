@@ -1,7 +1,7 @@
 //! Postgres-backed journal. Multiple dispatchers share one
-//! Postgres database; the event log + token lookup tables are the
-//! durable state. Postgres is the source of truth, every dispatcher
-//! process is a stateless reader/writer.
+//! Postgres database; the run rows, their records and the signal tables
+//! are the durable state. Postgres is the source of truth, every
+//! dispatcher process is a stateless reader/writer.
 //!
 //! Applies no schema of its own: the boot's `app::apply_core_schema`
 //! runs every group (this crate's [`GROUP`] included) in one pass.
@@ -12,240 +12,100 @@ use sqlx::postgres::PgPool;
 
 use weft_core::ExecutionId;
 
-use weft_journal::{decode_event, ExecEvent};
-// The tag column every summary read selects, in claim order. The SQL
-// itself lives with the table's every other read and write, in
-// `weft_journal::tags`; it is spliced into the two summary queries,
-// which both have the execution in scope as `execution ec`.
-use weft_journal::tags::TAGS_LATERAL;
-use weft_journal::EXECUTION_TERMINAL_KINDS_SQL as TERMINAL;
-use weft_journal::RUN_PARKED_SQL as PARKED;
-use crate::journal::{
-    CancelWrite, SignalToken, ExecutionIdLookup, ExecutionOwner, ExecutionQuery, Journal, LogEntry, SignalRegistration,
-};
-use weft_core::program::{ExecutionPage, ExecutionSummary, RunStatus, SummaryStatus};
+use weft_journal::record::{Appended, Queued, Then};
+use weft_journal::ExecEvent;
+use crate::journal::{CancelWrite, ExecutionOwner, ExecutionQuery, Journal, LogEntry, SignalRegistration, SignalToken};
+use weft_core::program::{ExecutionPage, ExecutionSummary, RunStatus};
 
 pub struct PostgresJournal {
     pool: PgPool,
 }
 
-/// Retention reads the durable reference without interpreting execution
-/// state (an older row's selection format must neither keep nor free
-/// its code). A malformed reference refuses cleanup, since deletion must
-/// be safe: only an explicit `null` (a run with no program, such as a
-/// node self-test) means "nothing to keep"; a missing key is a row this
-/// reader does not understand.
-fn retained_definition(payload: &str) -> anyhow::Result<Option<String>> {
-    let row: serde_json::Value = serde_json::from_str(payload)?;
-    let fields = row.as_object().context("birth row is not an object")?;
-    // The SQL already selects birth rows by the `kind` column; the payload
-    // saying the same is the check that column and payload agree.
-    anyhow::ensure!(fields.get("kind").and_then(serde_json::Value::as_str) == Some("execution_started"), "row is not an execution birth");
-    match fields.get("definition_hash") {
-        Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::String(hash)) => Ok(Some(hash.clone())),
-        Some(_) => anyhow::bail!("birth row's definition_hash is not a string"),
-        None => anyhow::bail!("birth row carries no definition_hash field"),
-    }
-}
-
-#[cfg(test)]
-mod retention_tests {
-    use super::retained_definition;
-
-    #[test]
-    fn retention_reads_only_the_program_reference_and_refuses_a_broken_one() {
-        for selection in [r#"["mid"]"#, r#"{"nodes":["mid"]}"#] {
-            let row = format!(r#"{{"kind":"execution_started","entry_node":"mid","subgraph":{selection},"definition_hash":"kept"}}"#);
-            assert_eq!(retained_definition(&row).unwrap().as_deref(), Some("kept"));
-        }
-        assert_eq!(retained_definition(r#"{"kind":"execution_started","definition_hash":null}"#).unwrap(), None);
-        for row in ["broken", "[]", r#"{"kind":"execution_started","definition_hash":42}"#, r#"{"kind":"node_started"}"#,
-            r#"{"kind":"execution_started","entry_node":"mid"}"#] {
-            assert!(retained_definition(row).is_err(), "{row}");
-        }
-    }
-}
-
-/// The `execution.phase` column as a phase. The column is NOT
-/// NULL and only ever written from `Phase::as_str`, so an unreadable
-/// value is corruption of the same row whose payload already failed to
-/// decode; it is logged and answered as a fire so the row still
-/// appears (in the listing, on the point-get, and to the running set
-/// the cancel and wipe sweeps read, which must never be the thing a
-/// bad row breaks).
+/// The `run.phase` column as a phase. The column is NOT NULL and only
+/// ever written from `Phase::as_str`, so an unreadable value is a broken
+/// row; it is logged and answered as a fire so the row still appears (in
+/// the listing, on the point-get, and to the running set the cancel and
+/// wipe sweeps read, which must never be the thing a bad row breaks).
 pub(crate) fn phase_from_column(text: &str) -> weft_core::context::Phase {
     weft_core::context::Phase::from_tag(text).unwrap_or_else(|| {
         tracing::warn!(
             target: "weft_dispatcher::journal",
             phase = %text,
-            "execution row holds an unknown phase; answered as a fire"
+            "run row holds an unknown phase; answered as a fire"
         );
         weft_core::context::Phase::Fire
     })
 }
 
-/// The row a run whose journal no longer decodes is listed as: the
-/// same corrupt row from the listing and from the point-get, so the
-/// run that `weft executions` shows as corrupt can still be opened,
-/// inspected through its replay, and deleted. Everything on it comes
-/// from the `execution` columns the query matched on, never
-/// from a guess: a corrupt row that said `fire` while `--phase
-/// trigger_setup` selected it would contradict the filter that found
-/// it.
-fn corrupt_summary(
+/// The columns a summary is read from, over `run r`, in [`SummaryRow`]
+/// order: the run's own columns, its tags, and whether it is parked on a
+/// wait.
+// SYNC: SUMMARY_COLUMNS <-> SummaryRow
+const SUMMARY_COLUMNS: &str = concat!(
+    "r.execution_id, r.project_id, r.entry_node, r.phase, r.state, r.started_at, r.ended_at, r.outcome, \
+     r.error, r.cancel_cause, r.skipped, r.instance_id, ",
+    "(SELECT COALESCE(array_agg(tag ORDER BY seq), '{}') FROM execution_tag WHERE execution_id = r.execution_id)"
+);
+
+/// One run's summary columns ([`SUMMARY_COLUMNS`]).
+#[derive(sqlx::FromRow)]
+struct SummaryRow {
     execution_id: ExecutionId,
     project_id: uuid::Uuid,
-    phase_text: &str,
+    entry_node: Option<String>,
+    phase: String,
+    state: String,
     started_at: i64,
-    error: &anyhow::Error,
-) -> ExecutionSummary {
-    // `warn`, not `error`: the point-get is polled by the editor for
-    // an open run, so a corrupt one would otherwise fill the log with
-    // the same line; the row's `corrupt` status is what the reader
-    // acts on, and the replay carries the error itself.
-    tracing::warn!(
-        target: "weft_dispatcher::journal",
-        %execution_id, error = %error,
-        "execution row does not decode; answered as corrupt"
-    );
-    ExecutionSummary {
-        execution_id,
-        project_id,
-        entry_node: String::new(),
-        status: SummaryStatus::Corrupt,
-        phase: phase_from_column(phase_text),
-        started_at: started_at as u64,
-        completed_at: None,
-        tags: Vec::new(),
-        cancel_cause: None,
-        error: None,
-        skipped_nodes: 0,
-        instance: None,
-    }
-}
-
-/// Turn a `(started_payload, terminal_payload)` pair (an `execution_started`
-/// event JSON + its latest terminal event JSON, if any) into an
-/// `ExecutionSummary`. Shared by `list_executions` and `execution_summary` so
-/// the started-decode + terminal-status mapping lives in exactly one place.
-/// `Err` (naming the execution and `weft clean`) for any unusable row: one
-/// that does not decode, or one whose kind column and payload disagree;
-/// both callers answer that with `corrupt_summary`.
-fn summary_from_payloads(
-    execution_id: ExecutionId,
-    started_payload: &str,
-    terminal_payload: Option<String>,
+    ended_at: Option<i64>,
+    outcome: Option<String>,
+    error: Option<String>,
+    cancel_cause: Option<sqlx::types::Json<weft_core::exec::CancelCause>>,
+    skipped: i32,
+    instance_id: Option<String>,
+    #[sqlx(rename = "coalesce")]
     tags: Vec<String>,
-    skipped_nodes: i64,
-) -> anyhow::Result<ExecutionSummary> {
-    let started = decode_event(execution_id, started_payload).map_err(anyhow::Error::msg)?;
-    let ExecEvent::ExecutionStarted {
-        execution_id, project_id, entry_node, phase, at_unix, instance, ..
-    } = started
-    else {
-        // The row was selected by kind = 'execution_started', so a
-        // decodable non-started payload means the kind column and the
-        // payload disagree: corrupted post-write, same as undecodable.
-        anyhow::bail!(
-            "exec_event row for execution {execution_id} is kind execution_started but decodes \
-             to a different event; `weft clean {execution_id}` removes this execution's rows"
-        );
-    };
-    // The terminal lookup only selects execution_{completed,failed,cancelled}
-    // rows, so any other variant here means the journal row was corrupted
-    // post-write. Surface that loudly: a "running" placeholder would show a
-    // terminal execution as live.
-    let (status, completed_at, cancel_cause, error) = match terminal_payload {
-        None => (RunStatus::Running, None, None, None),
-        Some(p) => match decode_event(execution_id, &p).map_err(anyhow::Error::msg)? {
-            ExecEvent::ExecutionCompleted { at_unix, .. } => (RunStatus::Completed, Some(at_unix), None, None),
-            ExecEvent::ExecutionFailed { at_unix, error, .. } => (RunStatus::Failed, Some(at_unix), None, Some(error)),
-            ExecEvent::ExecutionCancelled { at_unix, cause, .. } => (RunStatus::Cancelled, Some(at_unix), cause, None),
-            other => anyhow::bail!(
-                "execution summary: terminal lookup returned non-terminal event \
-                 for execution {execution_id}: {other:?}"
-            ),
-        },
-    };
-    Ok(ExecutionSummary {
-        execution_id,
-        project_id,
-        entry_node,
-        status: status.into(),
-        phase,
-        started_at: at_unix,
-        completed_at,
-        tags,
-        cancel_cause,
-        error,
-        skipped_nodes: skipped_nodes.max(0) as u64,
-        instance,
-    })
 }
 
-/// The lateral that counts an execution's skipped node firings, for the
-/// panel's "completed, 3 skipped" words. Same shape as `TAGS_LATERAL`.
-const SKIPPED_LATERAL: &str = "(SELECT COUNT(*) FROM exec_event WHERE execution_id = ec.execution_id AND kind = 'node_skipped')";
-
-/// Write the dispatcher-side cancel terminals for `execution_id` on the
-/// caller's transaction: `NodeCancelled` per non-terminal node, then
-/// `ExecutionCancelled`, from the ONE shared definition of that list
-/// (`cancel_terminal_events`), so every transactional cancel writer
-/// emits identical rows. Skips entirely (`None`) when the journal
-/// already holds a terminal, so a worker's own terminal is never
-/// contradicted. Per-node cancels land BEFORE the terminal: a
-/// terminal-first partial write would make a retry skip the per-node
-/// rows forever. A payload that fails to decode fails the whole read,
-/// matching `events_log`. Returns the per-node count written.
-async fn cancel_terminals_in(
-    tx: &mut sqlx::PgConnection,
-    execution_id: ExecutionId,
-    program: Option<&weft_core::ProjectDefinition>,
-    cause: &weft_core::exec::CancelCause,
-) -> anyhow::Result<Option<usize>> {
-    let events = decode_all(execution_id, payload_rows(&mut *tx, execution_id).await?)?;
-    if events.iter().any(ExecEvent::is_execution_terminal) {
-        return Ok(None);
+impl SummaryRow {
+    /// The summary the row says: where the run stands is its state (a
+    /// parked run waits for input), and how it ended its outcome.
+    fn summary(self) -> anyhow::Result<ExecutionSummary> {
+        let status = match (self.state.as_str(), self.outcome.as_deref()) {
+            ("ended", Some(outcome)) => match weft_journal::record::Outcome::parse(outcome) {
+                Some(weft_journal::record::Outcome::Completed) => RunStatus::Completed,
+                Some(weft_journal::record::Outcome::Failed) => RunStatus::Failed,
+                Some(weft_journal::record::Outcome::Cancelled) => RunStatus::Cancelled,
+                None => anyhow::bail!("run {} holds an unknown outcome '{outcome}'", self.execution_id),
+            },
+            ("parked", _) => RunStatus::WaitingForInput,
+            ("running" | "queued", _) => RunStatus::Running,
+            (state, outcome) => anyhow::bail!("run {} holds state '{state}' with outcome {outcome:?}", self.execution_id),
+        };
+        Ok(ExecutionSummary {
+            execution_id: self.execution_id,
+            project_id: self.project_id,
+            entry_node: self.entry_node.unwrap_or_default(),
+            status,
+            phase: phase_from_column(&self.phase),
+            started_at: self.started_at as u64,
+            completed_at: self.ended_at.map(|at| at as u64),
+            tags: self.tags,
+            cancel_cause: self.cancel_cause.map(|cause| cause.0),
+            error: self.error,
+            skipped_nodes: self.skipped.max(0) as u64,
+            instance: self
+                .instance_id
+                .map(weft_core::instance::InstanceId::new)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("run {} holds a broken instance: {e}", self.execution_id))?,
+        })
     }
-    let now = crate::lease::now_unix() as u64;
-    let writes = crate::api::execution::cancel_terminal_events(execution_id, &events, program, cause, now)?;
-    let node_cancellations = writes.len() - 1;
-    for (event, dedup) in writes {
-        weft_journal::record_event_in(&mut *tx, &event, None, Some(&dedup))
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-    }
-    Ok(Some(node_cancellations))
-}
-
-/// Every payload for `execution_id`, in write order, undecoded. Takes the
-/// executor so both the pool reads and the in-transaction cancel read
-/// share one query.
-async fn payload_rows<'e, E: sqlx::PgExecutor<'e>>(
-    executor: E,
-    execution_id: ExecutionId,
-) -> anyhow::Result<Vec<weft_journal::RawJournalRow>> {
-    let rows: Vec<(i64, String)> = sqlx::query_as(&weft_task_store::journal_rows::rows_after_sql("$1", "0"))
-        .bind(execution_id.to_string())
-        .fetch_all(executor)
-        .await?;
-    Ok(rows.into_iter().map(|(id, payload)| weft_journal::RawJournalRow { id, payload }).collect())
-}
-
-/// Strictly decode every row: one undecodable row fails the whole read
-/// (a fold over a partial event list rebuilds a state that never
-/// existed).
-fn decode_all(execution_id: ExecutionId, rows: Vec<weft_journal::RawJournalRow>) -> anyhow::Result<Vec<ExecEvent>> {
-    Ok(weft_journal::decode_rows(execution_id, rows)?.into_iter().map(|row| row.event).collect())
 }
 
 impl PostgresJournal {
     /// Wrap an EXISTING pool. Pure: the schema (this crate's [`GROUP`]
     /// included) is applied once, before construction, by
-    /// [`crate::app::apply_core_schema`]; a second application here
-    /// would run this group's pending migrations ahead of every other
-    /// group's, breaking the one-global-id-order guarantee.
+    /// [`crate::app::apply_core_schema`].
     pub fn from_pool(pool: PgPool) -> Self {
         Self { pool }
     }
@@ -255,221 +115,122 @@ impl PostgresJournal {
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
+}
 
-    /// The execution's first `ExecutionStarted` event, decoded. The ONE
-    /// fetch behind `execution_definition_hash` (`execution_project`
-    /// and `execution_tenant` read the `execution` mirror
-    /// instead, so they survive a corrupt payload). A row whose JSON no longer
-    /// decodes is a PERMANENT poison: returning `Err` would make
-    /// pollers (the journal bridge's per-row processing) retry the
-    /// same row forever, stalling the cursor fleet-wide. Log loud
-    /// and report `Corrupt` (non-retryable, distinct from
-    /// `NotFound`) so callers can word the failure honestly.
-    async fn execution_started(&self, execution_id: ExecutionId) -> anyhow::Result<ExecutionIdLookup<ExecEvent>> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT payload_json FROM exec_event \
-             WHERE execution_id = $1 AND kind = 'execution_started' \
-             ORDER BY id ASC LIMIT 1",
-        )
-        .bind(execution_id.to_string())
-        .fetch_optional(&self.pool)
+/// Answer the wait `token` with `value`, on the caller's transaction:
+/// the wait's signal goes (a wait is answered once), and the answer
+/// reaches its run. A run nobody drives (parked, queued) gets it in its
+/// record, `SuspensionResolved` at `last_seq + 1`, and is queued for a
+/// worker to carry on; a run a worker drives is written by that worker
+/// alone, so the answer is handed to it
+/// (`weft_task_store::parked_fires::hand_answer_in`). The run's row is
+/// locked before the signal is touched, the order every writer of a run
+/// takes them in. The caller pokes the outbox once it commits.
+pub(crate) async fn answer_in(
+    tx: &mut sqlx::PgConnection,
+    token: &str,
+    value: &serde_json::Value,
+    from: AnswerFrom,
+) -> anyhow::Result<crate::journal::Answered> {
+    use crate::journal::Answered;
+    let run: Option<Option<ExecutionId>> = sqlx::query_scalar("SELECT execution_id FROM signal WHERE token = $1 AND is_resume")
+        .bind(token)
+        .fetch_optional(&mut *tx)
         .await?;
-        let Some((payload,)) = row else { return Ok(ExecutionIdLookup::NotFound) };
-        match serde_json::from_str::<ExecEvent>(&payload) {
-            Ok(ev) => Ok(ExecutionIdLookup::Found(ev)),
-            Err(e) => {
-                tracing::error!(
-                    target: "weft_dispatcher::journal",
-                    %execution_id,
-                    error = %e,
-                    "ExecutionStarted row failed to decode \
-                     (permanent corruption, retrying cannot fix it)"
-                );
-                Ok(ExecutionIdLookup::Corrupt)
-            }
+    let Some(run) = run else { return Ok(Answered::Gone) };
+    let execution_id = run.with_context(|| format!("the wait {token} names no run"))?;
+    let locked = weft_journal::record::lock_in(&mut *tx, execution_id).await?;
+    if from == AnswerFrom::Sender {
+        // An answer queued while the run's trigger was not live is the
+        // wait's one answer (its sender was told so): the queue's drain
+        // hands it over, and this one finds the wait answered. The signal's
+        // row is locked first, and `park` holds that lock while it queues
+        // one, so one queued meanwhile is seen here.
+        let signal: Option<i32> = sqlx::query_scalar("SELECT 1 FROM signal WHERE token = $1 AND is_resume FOR UPDATE")
+            .bind(token)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let queued: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM parked_fire WHERE token = $1 AND is_resume AND execution_id IS NULL)",
+        )
+        .bind(token)
+        .fetch_one(&mut *tx)
+        .await?;
+        if signal.is_none() || queued {
+            return Ok(Answered::Gone);
         }
     }
-
-    /// Write one event, pairing an `ExecutionStarted` with its
-    /// `execution` seed in ONE transaction. The seed
-    /// denormalizes (execution, project_id, tenant_id) so the broker's
-    /// scope check and the terminal sweeps
-    /// (`list_non_terminal_execution_ids_for_project`) can see the execution
-    /// without folding the journal; a crash between the event insert
-    /// and a separate seed would create an execution those sweeps can
-    /// NEVER see (untouchable junk), so the two commit together. A
-    /// missing project row fails the whole write loudly instead of
-    /// silently journaling an unsweepable execution.
-    async fn record_with_seed(
-        &self,
-        event: &ExecEvent,
-        dedup_key: Option<&str>,
-    ) -> anyhow::Result<()> {
-        if !matches!(event, ExecEvent::ExecutionStarted { .. }) {
-            weft_journal::record_event_in(&self.pool, event, None, dedup_key)
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            weft_task_store::announce::committed(&self.pool);
-            return Ok(());
-        }
-        let started = StartedRow::of(event, dedup_key, crate::lease::now_unix())?;
-        sqlx::query("SELECT weft_execution_started($1)")
-            .bind(serde_json::to_value(&started)?)
-            .execute(&self.pool)
-            .await
-            .map_err(birth_refusal)?;
-        weft_task_store::announce::committed(&self.pool);
-        Ok(())
+    let Some(row) = sqlx::query_as::<_, SignalRow>(SIGNAL_DELETE_RESUME_BY_TOKEN_RETURNING)
+        .bind(token)
+        .fetch_optional(&mut *tx)
+        .await
+        .context("answer a wait: read its signal row")?
+    else {
+        return Ok(Answered::Gone);
+    };
+    let consumed = row_to_signal(row)?;
+    let Some(locked) = locked.filter(|locked| locked.state != "ended") else { return Ok(Answered::RunEnded { consumed }) };
+    if locked.owner.is_some() {
+        weft_task_store::parked_fires::hand_answer_in(&mut *tx, token, execution_id, value).await?;
+        return Ok(Answered::Reached { consumed });
     }
-
-    /// A run's birth (`weft_start_execution`), behind `admission` when it
-    /// has one: one round trip whatever the birth writes.
-    async fn birth(
-        &self,
-        start: &ExecEvent,
-        kicks: &[ExecEvent],
-        task: weft_task_store::tasks::NewTask,
-        trigger_setup: Option<TriggerSetupRow>,
-        admission: Option<&crate::entry_limits::Admission>,
-    ) -> anyhow::Result<Result<(), crate::entry_limits::Refused>> {
-        let now = crate::lease::now_unix();
-        let started = StartedRow::of(start, None, now)?;
-        if let Some(stray) = kicks.iter().find(|kick| kick.execution_id() != start.execution_id()) {
-            anyhow::bail!("a birth of execution {} kicks a node of execution {}", start.execution_id(), stray.execution_id());
-        }
-        let kicks = kicks
-            .iter()
-            .map(|kick| Ok(EventRow { kind: kick.kind_str(), payload: serde_json::to_string(kick)? }))
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let call = BirthCall {
-            started,
-            kicks,
-            task: weft_task_store::tasks::DedupRow::of(&task, uuid::Uuid::new_v4(), now)?,
-            trigger_setup,
-            admission,
-        };
-        let answer: serde_json::Value = sqlx::query_scalar("SELECT weft_start_execution($1)")
-            .bind(serde_json::to_value(&call)?)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(birth_refusal)?;
-        weft_task_store::announce::committed(&self.pool);
-        match answer.get("outcome").and_then(serde_json::Value::as_str) {
-            Some("started" | "already_started") => Ok(Ok(())),
-            Some("refused") => {
-                let refused: crate::entry_limits::Answer =
-                    serde_json::from_value(answer["refused"].clone()).context("read the birth's refusal")?;
-                Ok(Err(refused.refused()?))
-            }
-            _ => anyhow::bail!("the database answered a birth with '{answer}', which weft does not read"),
-        }
+    let resolved = ExecEvent::SuspensionResolved {
+        execution_id,
+        token: token.to_string(),
+        value: value.clone(),
+        at_unix: crate::lease::now_unix() as u64,
+    };
+    match weft_journal::record::append_locked_in(&mut *tx, execution_id, &locked, std::slice::from_ref(&resolved), weft_journal::record::DISPATCHER, Then::Queued).await? {
+        Appended::At(_) => Ok(Answered::Reached { consumed }),
+        other => anyhow::bail!("run {execution_id} was locked with no owner, yet its answer was not written: {other:?}"),
     }
 }
 
-/// A failure of the birth functions. One they raise themselves (`RAISE
-/// EXCEPTION`, SQLSTATE P0001) is passed on in its own words, which name
-/// what is missing and what to do; any other keeps the database's whole
-/// error and where in the functions it happened, since one call now does
-/// what several statements did.
-fn birth_refusal(e: sqlx::Error) -> anyhow::Error {
-    let Some(db) = e.as_database_error() else { return anyhow::Error::from(e) };
-    if db.code().as_deref() == Some("P0001") {
-        return anyhow::anyhow!("{}", db.message());
+/// Who answers a wait, for [`answer_in`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnswerFrom {
+    /// Its sender, now: refused once an answer is queued for the wait.
+    Sender,
+    /// The queue's drain, handing over the answer queued for it.
+    Queue,
+}
+
+/// End `execution_id`, a run nobody drives, cancelled for `cause`, on the
+/// caller's transaction with its row locked as `locked`: `NodeCancelled`
+/// per open node, then `ExecutionCancelled`, from the ONE shared
+/// definition of that list (`cancel_terminal_events`). Answers the
+/// per-node count written.
+async fn cancel_unowned_in(
+    tx: &mut sqlx::PgConnection,
+    execution_id: ExecutionId,
+    locked: &weft_journal::record::Locked,
+    program: Option<&weft_core::ProjectDefinition>,
+    cause: &weft_core::exec::CancelCause,
+) -> anyhow::Result<usize> {
+    let events = weft_journal::record::read_record(&mut *tx, execution_id, None).await?.events(execution_id).map_err(anyhow::Error::msg)?;
+    let now = crate::lease::now_unix() as u64;
+    let writes = crate::api::execution::cancel_terminal_events(execution_id, &events, program, cause, now)?;
+    let node_cancellations = writes.len() - 1;
+    match weft_journal::record::append_locked_in(&mut *tx, execution_id, locked, &writes, weft_journal::record::DISPATCHER, Then::Stays).await? {
+        Appended::At(_) => Ok(node_cancellations),
+        other => anyhow::bail!("run {execution_id} was locked with no owner, yet its cancel was not written: {other:?}"),
     }
-    let at = db.try_downcast_ref::<sqlx::postgres::PgDatabaseError>().and_then(|pg| pg.r#where()).map(str::to_string);
-    let e = anyhow::Error::from(e);
-    match at {
-        Some(at) => e.context(format!("a run's birth failed in the database, at: {at}")),
-        None => e.context("a run's birth failed in the database"),
-    }
-}
-
-/// One journal row as the birth functions take it.
-#[derive(serde::Serialize)]
-struct EventRow {
-    kind: &'static str,
-    payload: String,
-}
-
-/// An `ExecutionStarted` and its seed, as `weft_execution_started` takes
-/// them.
-// SYNC: StartedRow's fields <-> weft_execution_started, weft_start_execution (GROUP below)
-#[derive(serde::Serialize)]
-struct StartedRow {
-    execution_id: String,
-    project_id: uuid::Uuid,
-    /// Whether the run keeps a journal; an unrecorded run is born with its
-    /// seed alone, its birth riding the execute task.
-    journaled: bool,
-    kind: &'static str,
-    payload: String,
-    at_unix: i64,
-    phase: &'static str,
-    run_kind: &'static str,
-    instance_id: Option<String>,
-    fired_by: Option<String>,
-    source_version: Option<String>,
-    dedup_key: Option<String>,
-    created_at: i64,
-}
-
-impl StartedRow {
-    fn of(event: &ExecEvent, dedup_key: Option<&str>, created_at: i64) -> anyhow::Result<Self> {
-        let ExecEvent::ExecutionStarted { execution_id, project_id, at_unix, phase, run_kind, source_version, instance, fired_trigger, .. } =
-            event
-        else {
-            anyhow::bail!("an execution's birth row must be its ExecutionStarted");
-        };
-        Ok(Self {
-            execution_id: execution_id.to_string(),
-            project_id: *project_id,
-            journaled: run_kind.journaled(),
-            kind: event.kind_str(),
-            payload: serde_json::to_string(event)?,
-            at_unix: *at_unix as i64,
-            phase: phase.as_str(),
-            run_kind: run_kind.as_str(),
-            instance_id: instance.as_ref().map(|m| m.as_str().to_string()),
-            fired_by: fired_trigger.clone(),
-            source_version: source_version.clone(),
-            dedup_key: dedup_key.map(str::to_string),
-            created_at,
-        })
-    }
-}
-
-/// A trigger setup's birth: recorded in flight, and, when an activation
-/// asked for it (the activation is the setup's own execution), born only
-/// while that activation still owns its rows.
-#[derive(serde::Serialize)]
-struct TriggerSetupRow {
-    for_activation: bool,
-}
-
-/// Everything `weft_start_execution` takes.
-// SYNC: BirthCall's fields <-> weft_start_execution (GROUP below)
-#[derive(serde::Serialize)]
-struct BirthCall<'a> {
-    started: StartedRow,
-    kicks: Vec<EventRow>,
-    task: weft_task_store::tasks::DedupRow,
-    trigger_setup: Option<TriggerSetupRow>,
-    admission: Option<&'a crate::entry_limits::Admission>,
 }
 
 /// The journal's schema. First in `app::ALL_GROUPS` (other groups'
 /// triggers attach to its tables); applied by the
 /// boot's one `apply_core_schema` pass, never here.
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
+    // Named for the table it first held; it is the run record's group.
     name: "exec_event",
-    tables: &["exec_event", "signal_token", "signal", "execution", "execution_tag", "trigger_setup", "trigger_bake"],
+    tables: &["run", "run_log", "run_selection", "signal_token", "signal", "execution_tag", "trigger_setup", "trigger_bake"],
     ddl: &[
         // One row per trigger setup in flight. Several may run at once for
         // one project (each activation claims its own triggers, one instance's
         // at a time), so the setup's own execution is the key.
         r#"CREATE TABLE IF NOT EXISTS trigger_setup (
             project_id UUID NOT NULL,
-            execution_id TEXT PRIMARY KEY
+            execution_id UUID PRIMARY KEY
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_trigger_setup_project ON trigger_setup(project_id)"#,
         // One bake per (project, owner, program identity): an instance's
@@ -488,51 +249,124 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         )"#,
         r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_trigger_bake_key
              ON trigger_bake(project_id, instance_id, program_hash) NULLS NOT DISTINCT"#,
-        // exec_event: append-only journal. `dedup_key` is the
-        // idempotency knob writers that may retry (dispatcher tasks
-        // that crash mid-execution) populate; the partial UNIQUE
-        // means unkeyed events (most worker-side events) are
-        // unrestricted, keyed events collapse on conflict.
-        // SYNC: exec_event's (execution_id, id, payload_json) <-> crates/weft-task-store/src/journal_rows.rs (rows_after_sql), crates/weft-task-store/tests/support/mod.rs (its stand-in)
-        r#"CREATE TABLE IF NOT EXISTS exec_event (
-            id BIGSERIAL PRIMARY KEY,
-            execution_id TEXT NOT NULL,
+        // run: a run's whole life on one row. Born by the worker that bears
+        // it (its first batch, `weft_record_batch`) or queued by the
+        // dispatcher (`weft run`, setup runs), claimed by a worker
+        // (`state = 'running'`, `owner`, `epoch` raised), let go of
+        // (`parked` on a wait, `queued` for a hand-back), and ended. Only
+        // the owner writes a running run's record, in its order; anybody
+        // else writes a run with no owner, under its row lock, at
+        // `last_seq + 1`. Everything the listing, `weft status` and
+        // `ctx.runs()` say about a run is a column here.
+        // SYNC: run's columns <-> weft_journal::record (the batch and the queued birth), weft_journal::read::RunRow
+        r#"CREATE TABLE IF NOT EXISTS run (
+            execution_id UUID PRIMARY KEY,
+            project_id UUID NOT NULL,
+            tenant_id TEXT NOT NULL,
+            -- fire | trigger_setup | infra_setup | ... (`Phase::as_str`)
+            phase TEXT NOT NULL,
+            -- execution | node_test (`RunKind`)
             kind TEXT NOT NULL,
-            payload_json TEXT NOT NULL,
-            created_at BIGINT NOT NULL,
-            -- The worker replica that wrote the row; NULL for the
-            -- dispatcher's and listener's own writes.
-            replica TEXT,
-            dedup_key TEXT,
-            -- The transaction that wrote the row, the order the
-            -- dispatcher's cursor reads in (`crate::settled`).
-            writer_xid XID8 NOT NULL DEFAULT pg_current_xact_id()
+            -- fast | durable (`Keeping`)
+            keeping TEXT NOT NULL,
+            -- false: a run that keeps no record, written down only because
+            -- it failed, reported a cost or stored a file.
+            recorded BOOLEAN NOT NULL,
+            entry_node TEXT,
+            instance_id TEXT,
+            fired_by TEXT,
+            source_version TEXT,
+            -- NULL for a run of no program (a node test).
+            definition_hash TEXT,
+            binary_hash TEXT,
+            -- The digest of its selection (`run_selection`), NULL for a run
+            -- of the whole program.
+            selection TEXT,
+            -- The run it was seeded from (`weft run --seed`), the places
+            -- it ran again rather than inherit, what it was asked to run
+            -- (`weft_core::run_spec::RunSpec`, as resolved) and the saved
+            -- example it came from: what the version tree shows of a run
+            -- started by hand. NULL and empty for every other run.
+            seed_of UUID,
+            stale TEXT[] NOT NULL DEFAULT '{}',
+            spec JSONB,
+            example TEXT,
+            -- running | parked | queued | ended
+            state TEXT NOT NULL,
+            -- The worker replica driving it, while it runs.
+            owner TEXT,
+            -- The owner's fencing token: raised by every claim and by the
+            -- lost-run sweep, so a batch from an owner that lost the run is
+            -- refused.
+            epoch INTEGER NOT NULL DEFAULT 1,
+            -- The `seq` of its last record row.
+            last_seq INTEGER NOT NULL,
+            -- How many times it was handed to a worker, this time included.
+            attempts INTEGER NOT NULL DEFAULT 1,
+            -- Until when (unix seconds) a queued run counts as handed to a
+            -- worker that has not claimed it yet.
+            delivered_until BIGINT,
+            -- A cancel waiting for its owner to write the run's ending.
+            cancel_requested JSONB,
+            -- It holds resume signals the dispatcher has to take down now
+            -- that it ended (set by its ending, cleared once handled).
+            holds_signals BOOLEAN NOT NULL DEFAULT FALSE,
+            -- Somebody waits on its ending (a trigger setup, baked from
+            -- it); cleared once the dispatcher handled it.
+            watch_end BOOLEAN NOT NULL DEFAULT FALSE,
+            started_at BIGINT NOT NULL,
+            ended_at BIGINT,
+            -- completed | failed | cancelled
+            outcome TEXT,
+            error TEXT,
+            cancel_cause JSONB,
+            -- Node firings it skipped.
+            skipped INTEGER NOT NULL DEFAULT 0,
+            -- It stored files of its own, which its ending's sweep reclaims.
+            wrote_files BOOLEAN NOT NULL DEFAULT FALSE,
+            -- What its metered calls cost, in micro-dollars.
+            cost_micro_usd BIGINT NOT NULL DEFAULT 0,
+            -- How long it is kept once it ended, in seconds (NULL: for
+            -- ever), and the moment that runs out, set when it ends.
+            keep_for BIGINT,
+            keep_until BIGINT
+        ) WITH (fillfactor = 85)"#,
+        // The listing: a project's runs, newest first.
+        r#"CREATE INDEX IF NOT EXISTS run_listing ON run (project_id, started_at DESC)"#,
+        // A project's runs that have not ended (queued, running, parked):
+        // what a take-down reaches, what a drain counts, what `weft status`
+        // shows going. Never holds a run born and ended in one batch.
+        r#"CREATE INDEX IF NOT EXISTS run_live ON run (project_id) WHERE state <> 'ended'"#,
+        // What is being worked on, by whom (the one in-flight predicate,
+        // `weft_task_store::in_flight`).
+        r#"CREATE INDEX IF NOT EXISTS run_in_flight ON run (owner) WHERE state = 'running'"#,
+        // What delivery hands to workers.
+        r#"CREATE INDEX IF NOT EXISTS run_queued ON run (started_at) WHERE state = 'queued'"#,
+        // What retention deletes. Keyed on a column delivery never
+        // changes, so a delivery lease update stays in place.
+        r#"CREATE INDEX IF NOT EXISTS run_expiry ON run (keep_until) WHERE state = 'ended'"#,
+        // Ended runs whose ending the dispatcher has yet to handle.
+        r#"CREATE INDEX IF NOT EXISTS run_end_unhandled ON run (project_id)
+             WHERE state = 'ended' AND (watch_end OR holds_signals)"#,
+        // run_log: a run's record, one row per run per write, in the run's
+        // order: the write's events, compressed (`weft_journal::stored`).
+        r#"CREATE TABLE IF NOT EXISTS run_log (
+            execution_id UUID NOT NULL,
+            seq INTEGER NOT NULL,
+            events BYTEA NOT NULL,
+            -- The replica that wrote it.
+            writer TEXT NOT NULL,
+            written_at BIGINT NOT NULL,
+            PRIMARY KEY (execution_id, seq)
         )"#,
-        r#"CREATE INDEX IF NOT EXISTS idx_exec_event_execution_id ON exec_event(execution_id, id)"#,
-        r#"CREATE INDEX IF NOT EXISTS idx_exec_event_settled ON exec_event(writer_xid, id)"#,
-        r#"CREATE INDEX IF NOT EXISTS idx_exec_event_kind ON exec_event(kind, id DESC)"#,
-        r#"CREATE UNIQUE INDEX IF NOT EXISTS idx_exec_event_dedup
-           ON exec_event(dedup_key) WHERE dedup_key IS NOT NULL"#,
-        // Announce the executions a write added rows to, once each, when
-        // it commits: the dispatcher's event bridge wakes on any, and a
-        // worker waiting on its run's journal (through the broker) on its
-        // own execution's. Once per statement, over the rows it added,
-        // and through the announcement outbox (`weft_task_store::announce`),
-        // since every run writes here.
-        // SYNC: 'weft_exec_event' <-> weft_journal::EXEC_EVENT_CHANNEL
-        r#"CREATE OR REPLACE FUNCTION exec_event_notify() RETURNS trigger AS $$
-            BEGIN
-                PERFORM weft_announce('weft_exec_event', a.execution_id)
-                    FROM (SELECT DISTINCT execution_id FROM added) a;
-                RETURN NULL;
-            END;
-            $$ LANGUAGE plpgsql"#,
-        r#"DROP TRIGGER IF EXISTS exec_event_notify_on_insert ON exec_event"#,
-        r#"CREATE TRIGGER exec_event_notify_on_insert
-            AFTER INSERT ON exec_event
-            REFERENCING NEW TABLE AS added
-            FOR EACH STATEMENT
-            EXECUTE FUNCTION exec_event_notify()"#,
+        // Already compressed: Postgres compressing it again gains nothing.
+        r#"ALTER TABLE run_log ALTER COLUMN events SET STORAGE EXTERNAL"#,
+        // Each run selection once, by digest
+        // (`weft_core::project::selection::RecordedSelection`).
+        r#"CREATE TABLE IF NOT EXISTS run_selection (
+            digest TEXT PRIMARY KEY,
+            selection JSONB NOT NULL
+        )"#,
         // signal_token: token-scoped enumeration credential. Allow
         // sets are TEXT[] arrays so parameterized binding gives no
         // SQL-injection surface and the filter SQL is a single `&&`
@@ -589,9 +423,11 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             source_version TEXT,
             tenant_id TEXT NOT NULL,
             project_id UUID NOT NULL,
-            execution_id TEXT,
+            execution_id UUID,
             node_id TEXT NOT NULL,
-            is_resume BOOLEAN NOT NULL,
+            -- A run's wait (it names its run) or an entry (it names none):
+            -- never one without the other.
+            is_resume BOOLEAN NOT NULL CHECK (is_resume = (execution_id IS NOT NULL)),
             spec_json TEXT NOT NULL,
             -- The connection this signal acts as (`spec.access.id`),
             -- denormalized at register time. NULL for kinds without
@@ -617,30 +453,6 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- the version can never be lost by handling the state
             -- blob (the blob stays purely the kind's own state).
             kind_state_seq BIGINT NOT NULL DEFAULT 0,
-            -- FIFO queue of fires that landed while the project was
-            -- not Active (Activating / park / hibernate-in-grace /
-            -- Deactivating). Each element is { "payload": <json>,
-            -- "received_at_unix": <int> }. Entry signals append on
-            -- every fire; resume signals append iff the queue is
-            -- empty (first submission wins; subsequent ones for the
-            -- same suspension are dropped). Drained on reactivate by
-            -- replaying every element through dispatch_listener_outcome,
-            -- then clearing the array.
-            parked_fires JSONB NOT NULL DEFAULT '[]'::jsonb,
-            -- Claim guard for the drain loop: set when a dispatcher
-            -- replica claims this row's queue for replay, cleared on
-            -- either success (alongside parked_fires=[]) or failure
-            -- (release). A sweeper releases stale claims older than
-            -- the claim-stale threshold so a dispatcher crash
-            -- mid-step doesn't leave the row uncloseable.
-            drain_claimed_at_unix BIGINT,
-            -- Per-claim owner nonce. Set when a drain claims the row;
-            -- every pop + the release is fenced on it. If a stale-claim
-            -- sweep hands the row to a sibling replica mid-drain, the
-            -- original drainer's fenced pop matches 0 rows and it aborts
-            -- instead of popping an element the new owner already
-            -- dispatched (which would silently drop an undispatched fire).
-            drain_claimed_by TEXT,
             consumer_kind TEXT,
             tags TEXT[] NOT NULL DEFAULT '{}',
             -- The trigger's delivered port values at registration time
@@ -764,6 +576,40 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             FOR EACH ROW
             WHEN (NEW.surface_kind = 'public_entry' OR OLD.surface_kind = 'public_entry')
             EXECUTE FUNCTION routes_notify_tenant()"#,
+        // Tell a project's workers one of its triggers changed, so their
+        // copy of them (`weft_engine::door`) is read again: an entry coming,
+        // going, changing anything a door admits by, or its holder changing.
+        // SYNC: 'weft_triggers' <-> weft_broker_client::line::TRIGGERS_CHANNEL
+        r#"CREATE OR REPLACE FUNCTION triggers_notify_project() RETURNS trigger AS $$
+            BEGIN
+                IF TG_OP = 'DELETE' THEN
+                    PERFORM pg_notify('weft_triggers', OLD.project_id::text);
+                ELSE
+                    PERFORM pg_notify('weft_triggers', NEW.project_id::text);
+                END IF;
+                RETURN NULL;
+            END;
+            $$ LANGUAGE plpgsql"#,
+        r#"DROP TRIGGER IF EXISTS signal_triggers_on_insert ON signal"#,
+        r#"CREATE TRIGGER signal_triggers_on_insert
+            AFTER INSERT ON signal
+            FOR EACH ROW
+            WHEN (NOT NEW.is_resume)
+            EXECUTE FUNCTION triggers_notify_project()"#,
+        r#"DROP TRIGGER IF EXISTS signal_triggers_on_delete ON signal"#,
+        r#"CREATE TRIGGER signal_triggers_on_delete
+            AFTER DELETE ON signal
+            FOR EACH ROW
+            WHEN (NOT OLD.is_resume)
+            EXECUTE FUNCTION triggers_notify_project()"#,
+        r#"DROP TRIGGER IF EXISTS signal_triggers_on_change ON signal"#,
+        r#"CREATE TRIGGER signal_triggers_on_change
+            AFTER UPDATE OF surface_kind, mount_path, mount_methods, project_id, node_id, spec_json,
+                auth_kind, auth_config, port_snapshot, program_json, source_version, instance_id,
+                activation_trigger, held_by ON signal
+            FOR EACH ROW
+            WHEN (NOT NEW.is_resume)
+            EXECUTE FUNCTION triggers_notify_project()"#,
         // Entry rows are keyed by (project_id, node_id), `node_id`
         // being the trigger's place spelled the way a person writes
         // it (`one.door`), so a file called from two places holds two
@@ -777,260 +623,177 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // The fire gate's join, and what taking an activation down selects.
         r#"CREATE INDEX IF NOT EXISTS idx_signal_activation
              ON signal(project_id, activation_trigger, instance_id) WHERE activation_trigger IS NOT NULL"#,
-        // Wake the parked-fires sweep when a fire is parked, so a
-        // project that is already Active again replays it at once
-        // instead of on the sweep's next look. Only a growing queue
-        // speaks: the drain's own pops shrink it.
-        // SYNC: 'weft_parked_fire' <-> crate::reaper::PARKED_FIRE_CHANNEL
-        r#"CREATE OR REPLACE FUNCTION signal_parked_fire_notify() RETURNS trigger AS $$
-            BEGIN
-                PERFORM pg_notify('weft_parked_fire', NEW.project_id::text);
-                RETURN NULL;
-            END;
-            $$ LANGUAGE plpgsql"#,
-        r#"DROP TRIGGER IF EXISTS signal_parked_fire_notify_on_grow ON signal"#,
-        r#"CREATE TRIGGER signal_parked_fire_notify_on_grow
-            AFTER UPDATE OF parked_fires ON signal
-            FOR EACH ROW
-            WHEN (jsonb_array_length(NEW.parked_fires) > jsonb_array_length(OLD.parked_fires))
-            EXECUTE FUNCTION signal_parked_fire_notify()"#,
-        // execution binds an execution to its project +
-        // tenant, denormalized for the broker's scope-check fast path.
-        // The dispatcher INSERTs this row alongside ExecutionStarted
-        // (which is the only event that introduces a fresh execution).
-        // Workers / listeners never write here; they only need it to
-        // exist so the broker can answer "does execution C belong to
-        // tenant T" without re-folding the journal.
-        r#"CREATE TABLE IF NOT EXISTS execution (
-            execution_id TEXT PRIMARY KEY,
-            project_id UUID NOT NULL,
-            tenant_id TEXT NOT NULL,
-            started_at_unix BIGINT NOT NULL,
-            phase TEXT NOT NULL,
-            -- Worker replica that owns this execution's writes. NULL until the
-            -- first worker claims an execution-bearing task (the broker
-            -- stamps it in task_claim_execution); thereafter it is the replica of
-            -- the LATEST claimer. The broker rejects any journal_record
-            -- whose caller.replica doesn't match, so a compromised
-            -- worker can only journal under its own bound replica, not
-            -- cross-write sibling executions in the same tenant.
-            --
-            -- "Latest claimer wins" is how a resume hands ownership to a
-            -- new replica when the original is gone: the resume task is
-            -- pinned to the original owner if it is still alive (so only
-            -- it reclaims and ownership stays stable), and spawns + pins
-            -- to a fresh replica only when the owner is dead (so the handoff
-            -- is the ONLY time ownership moves). Without that pinning a
-            -- fresh worker could steal a live owner's execution mid-flight
-            -- now that a project can run more than one worker; see
-            -- `task_kinds::execute::enqueue_resume`.
-            -- NULL also covers dispatcher-orchestrated writes (no replica).
-            owner_replica TEXT,
-            -- What this execution IS (`weft_core::exec::RunKind`):
-            -- 'execution' (a project run; the project-lifecycle sweeps,
-            -- cancel, wipe, drain counting and the listings operate on
-            -- these), 'node_test' (a node self-test's identity: real
-            -- cost attribution and broker scoping, but its lifecycle is
-            -- owned by its task, so the project sweeps must never cancel
-            -- it or wait on it), or 'unrecorded' (a run whose journal
-            -- lives in its worker's memory: never listed, dropped when
-            -- it ends unless its costs keep it, and turned into an
-            -- 'execution' with its whole record written if it fails).
-            kind TEXT NOT NULL DEFAULT 'execution',
-            -- Which instance the run is for: the one its `ExecutionStarted`
-            -- names, copied here in the same transaction so every
-            -- instance filter (clean, costs, an instance token's reads) is
-            -- a column read. NULL for a run of the shared program.
-            instance_id TEXT,
-            -- The trigger whose firing started the run (its
-            -- `ExecutionStarted.fired_trigger`), NULL for a run started
-            -- by hand and every setup run. With `instance_id` it names the
-            -- activation the run belongs to: a wait the run registers is
-            -- gated by that activation, and taking it down reaches it.
-            fired_by TEXT,
-            -- When an unrecorded run ended, for the one whose row its
-            -- costs keep after it is over (`weft_journal::unrecorded`):
-            -- NULL while it runs, so the live rule stops counting it the
-            -- moment it ends, before its execute task is closed. NULL
-            -- for every other kind, whose ending is its journal row.
-            ended_at_unix BIGINT
-        )"#,
-        r#"CREATE INDEX IF NOT EXISTS idx_execution_tenant ON execution(tenant_id)"#,
-        r#"CREATE INDEX IF NOT EXISTS idx_execution_project ON execution(project_id)"#,
-        // An instance's runs of one project: what `ctx.runs().instance(id)`,
-        // `weft clean --instance` and an instance token's reads select.
-        r#"CREATE INDEX IF NOT EXISTS idx_execution_instance
-             ON execution(project_id, instance_id) WHERE instance_id IS NOT NULL"#,
-        // The execution LISTING reads exactly this shape: one tenant's
-        // project runs, newest first, a page at a time, with the
-        // optional project / time / phase filters applied on top. The
-        // index carries the wall, the sort and the tie-break, so a page
-        // is a walk of `limit` rows instead of a sort of the tenant's
-        // whole history; `kind` is in the predicate rather than the key
-        // because every listing query is about project runs (a node
-        // test's execution is never listed).
-        r#"CREATE INDEX IF NOT EXISTS idx_execution_listing
-             ON execution(tenant_id, started_at_unix DESC, execution_id DESC)
-             WHERE kind = 'execution'"#,
         // execution_tag: the selectable copy of `ctx.tag_execution`, one
         // row per (execution, tag), written by the broker on the worker's
-        // behalf in the same transaction as the `ExecutionTagged`
-        // event. `ctx.stop_tagged` selects on it: "every live execution
-        // of this project carrying tag T" is one indexed read joined to
-        // `execution` instead of a fold over every open journal.
+        // behalf once the run's own `ExecutionTagged` is on record.
+        // `ctx.stop_tagged` selects on it: "every live execution of this
+        // project carrying tag T" is one indexed read joined to `run`
+        // instead of a fold over every open record.
         // `seq` is the order tags were written, gap-tolerant and never
         // tied, which is what the last-one-wins rule compares (unix
         // seconds would tie two runs of the same user inside one
         // second). The (execution, tag) uniqueness is what makes a body
         // replayed after a durable wait land on the same row instead of moving
-        // the run's place in the order. Rows go with the execution's
-        // journal on `weft clean`.
+        // the run's place in the order. Rows go with the run.
         r#"CREATE TABLE IF NOT EXISTS execution_tag (
             seq BIGSERIAL PRIMARY KEY,
-            execution_id TEXT NOT NULL,
+            execution_id UUID NOT NULL,
             tag TEXT NOT NULL,
             tagged_at_unix BIGINT NOT NULL,
             UNIQUE (execution_id, tag)
         )"#,
         r#"CREATE INDEX IF NOT EXISTS idx_execution_tag_tag ON execution_tag(tag)"#,
-        // An execution's journal lock, held until the transaction ends: the
-        // ONE spelling of its key, taken by every journal write here and by
-        // `weft_journal::lock_execution_ids`.
-        r#"CREATE OR REPLACE FUNCTION weft_lock_execution(p_execution_id TEXT) RETURNS VOID AS $$
-            BEGIN
-                PERFORM pg_advisory_xact_lock(hashtextextended('exec_event:' || p_execution_id, 0));
-            END;
-            $$ LANGUAGE plpgsql"#,
-        // THE journal insert (`weft_journal::write`): the execution's lock,
-        // then the rows in the order given, fenced on `p_owner` when one is
-        // named. Returns how many rows went in. The lock comes first so
-        // rows of one execution are numbered and committed in the same
-        // order; taking it again in a transaction that already holds it is
-        // free.
-        // SYNC: execution.owner_replica <-> weft_bind_execution_id_owner, bind_execution_id_owner (crates/weft-task-store/src/tasks.rs)
-        r#"CREATE OR REPLACE FUNCTION weft_journal_append(
-                p_execution_id TEXT, p_kinds TEXT[], p_payloads TEXT[], p_created_at BIGINT,
-                p_replica TEXT, p_owner TEXT, p_dedup_key TEXT
-            ) RETURNS BIGINT AS $$
+        // THE write of a worker's records (`weft_journal::record::record_batch`):
+        // one call, one transaction, for every run of one batch of one of
+        // the worker's writer lanes. Synced to disk only when somebody
+        // waits on it (`p_durable`, a durable run at a commit point); a
+        // batch of fast runs commits without waiting for the disk.
+        //
+        // Per run (the `p_ids` arrays, aligned; `p_born` and `p_ended` are
+        // JSON arrays aligned the same way, `null` where it does not apply):
+        //   - a run that starts here (`first_seq = 0`) is inserted, already
+        //     ended when it ends in the same batch;
+        //   - a run that goes on is applied only when it follows on from its
+        //     record exactly, under this owner and epoch, while running;
+        //   - a batch sent again (its answer was lost) finds its own last row
+        //     there and is "already_applied", changing nothing;
+        //   - a run another worker bore (a retried fire) is
+        //     "born_elsewhere", and anything else is "refused".
+        // Rows are locked in id order, the order every writer of run rows
+        // takes them in. Only the runs applied now bring their rows, their
+        // answers taken (`p_resolved_*`, by run ordinal), their version
+        // counts (on this lane's own row), their search queue entry and
+        // their storage sweep. Answers each run's fate, its project, and
+        // whether it ended now with somebody to tell (`watch_end`,
+        // `holds_signals`), in the order given.
+        // SYNC: weft_record_batch's parameters and answer <-> weft_journal::record::record_batch
+        r#"CREATE OR REPLACE FUNCTION weft_record_batch(
+                p_writer TEXT, p_tenant TEXT, p_lane TEXT, p_now BIGINT, p_durable BOOLEAN,
+                p_ids UUID[], p_epochs INTEGER[], p_first INTEGER[], p_last INTEGER[],
+                p_costs BIGINT[], p_skipped INTEGER[], p_wrote BOOLEAN[], p_born JSONB, p_ended JSONB,
+                p_row_run INTEGER[], p_row_seq INTEGER[], p_row_events BYTEA[],
+                p_resolved_run INTEGER[], p_resolved_token TEXT[],
+                p_selections JSONB
+            ) RETURNS TABLE (o_execution_id UUID, o_fate TEXT, o_project_id UUID, o_tell_end BOOLEAN) AS $$
             DECLARE
-                written BIGINT;
+                v_fates TEXT[];
+                v_inserted BIGINT;
             BEGIN
-                PERFORM weft_lock_execution(p_execution_id);
-                INSERT INTO exec_event (execution_id, kind, payload_json, created_at, replica, dedup_key)
-                    SELECT p_execution_id, e.kind, e.payload, p_created_at, p_replica, p_dedup_key
-                    FROM unnest(p_kinds, p_payloads) WITH ORDINALITY AS e(kind, payload, n)
-                    WHERE p_owner IS NULL
-                       OR EXISTS (SELECT 1 FROM execution x
-                                  WHERE x.execution_id = p_execution_id AND x.owner_replica = p_owner)
-                    ORDER BY e.n
-                    ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING;
-                GET DIAGNOSTICS written = ROW_COUNT;
-                RETURN written;
-            END;
-            $$ LANGUAGE plpgsql"#,
-        // An execution's `ExecutionStarted` and its `execution` seed,
-        // which commit together: the seed is what the broker's scope check
-        // and the terminal sweeps see an execution by, so one without the
-        // other would be an execution nothing can ever sweep. A missing
-        // project row refuses the whole write. The source version the run
-        // was prepared from is held (FOR KEY SHARE) so it cannot be removed
-        // under the run. An unrecorded run is born with its seed alone.
-        // SYNC: p's fields <-> crate::journal::postgres::StartedRow
-        r#"CREATE OR REPLACE FUNCTION weft_execution_started(p JSONB) RETURNS VOID AS $$
-            DECLARE
-                v_execution_id TEXT := p->>'execution_id';
-                v_project UUID := (p->>'project_id')::uuid;
-                seeded BIGINT;
-            BEGIN
-                PERFORM weft_lock_execution(v_execution_id);
-                IF p->>'source_version' IS NOT NULL THEN
-                    PERFORM 1 FROM project_version
-                        WHERE project_id = v_project AND id = p->>'source_version' FOR KEY SHARE;
-                    IF NOT FOUND THEN
-                        RAISE EXCEPTION 'source version % was removed during preparation; run the command again',
-                            p->>'source_version';
-                    END IF;
+                PERFORM set_config('synchronous_commit', CASE WHEN p_durable THEN 'on' ELSE 'off' END, true);
+                INSERT INTO run_selection (digest, selection)
+                    SELECT s->>'digest', s->'selection' FROM jsonb_array_elements(p_selections) AS s
+                    ON CONFLICT (digest) DO NOTHING;
+                PERFORM 1 FROM run r WHERE r.execution_id = ANY(p_ids) ORDER BY r.execution_id FOR UPDATE;
+                SELECT array_agg(CASE
+                        WHEN v.first_seq = 0 AND r.execution_id IS NULL THEN 'insert'
+                        WHEN v.first_seq > 0 AND r.last_seq = v.first_seq - 1 AND r.owner = p_writer
+                             AND r.epoch = v.epoch AND r.state = 'running' THEN 'continue'
+                        WHEN EXISTS (SELECT 1 FROM run_log l
+                                     WHERE l.execution_id = v.id AND l.seq = v.last_seq AND l.writer = p_writer) THEN 'already_applied'
+                        WHEN v.first_seq = 0 THEN 'born_elsewhere'
+                        ELSE 'refused' END ORDER BY v.n)
+                    INTO v_fates
+                    FROM unnest(p_ids, p_epochs, p_first, p_last) WITH ORDINALITY AS v(id, epoch, first_seq, last_seq, n)
+                    LEFT JOIN run r ON r.execution_id = v.id;
+                WITH born AS (
+                    INSERT INTO run (execution_id, project_id, tenant_id, phase, kind, keeping, recorded, entry_node,
+                                     instance_id, fired_by, source_version, definition_hash, binary_hash, selection,
+                                     seed_of, state, owner, epoch, last_seq, started_at, ended_at, outcome, error,
+                                     cancel_cause, skipped, wrote_files, cost_micro_usd, keep_for, keep_until)
+                    SELECT v.id, (x.b->>'project_id')::uuid, p_tenant, x.b->>'phase', x.b->>'kind', x.b->>'keeping',
+                           (x.b->>'recorded')::boolean, x.b->>'entry_node', x.b->>'instance_id', x.b->>'fired_by',
+                           x.b->>'source_version', x.b->>'definition_hash', x.b->>'binary_hash', x.b->>'selection',
+                           (x.b->>'seed_of')::uuid,
+                           CASE WHEN x.e IS NULL THEN 'running' ELSE 'ended' END,
+                           CASE WHEN x.e IS NULL THEN p_writer END,
+                           v.epoch, v.last_seq, (x.b->>'started_at')::bigint, (x.e->>'at')::bigint, x.e->>'outcome',
+                           x.e->>'error', x.e->'cancel_cause', v.skipped, v.wrote, v.costs, (x.b->>'keep_for')::bigint,
+                           (x.e->>'at')::bigint + (x.b->>'keep_for')::bigint
+                    FROM unnest(p_ids, p_epochs, p_last, p_costs, p_skipped, p_wrote, v_fates)
+                            WITH ORDINALITY AS v(id, epoch, last_seq, costs, skipped, wrote, fate, n)
+                        CROSS JOIN LATERAL (SELECT p_born->(v.n::integer - 1) AS b,
+                                                   NULLIF(p_ended->(v.n::integer - 1), 'null'::jsonb) AS e) x
+                    WHERE v.fate = 'insert'
+                    ORDER BY v.id
+                    ON CONFLICT (execution_id) DO NOTHING
+                    RETURNING 1
+                ) SELECT count(*) INTO v_inserted FROM born;
+                -- A run another worker inserted between the read above and
+                -- this insert (both bore one fire's run) is theirs.
+                IF v_inserted < (SELECT count(*) FROM unnest(v_fates) AS f(fate) WHERE f.fate = 'insert') THEN
+                    SELECT array_agg(CASE WHEN v.fate = 'insert' AND r.xmin <> xid(pg_current_xact_id())
+                                          THEN 'born_elsewhere' ELSE v.fate END ORDER BY v.n)
+                        INTO v_fates
+                        FROM unnest(p_ids, v_fates) WITH ORDINALITY AS v(id, fate, n)
+                        LEFT JOIN run r ON r.execution_id = v.id;
                 END IF;
-                IF (p->>'journaled')::boolean THEN
-                    PERFORM weft_journal_append(v_execution_id, ARRAY[p->>'kind'], ARRAY[p->>'payload'],
-                        (p->>'created_at')::bigint, NULL, NULL, p->>'dedup_key');
-                END IF;
-                INSERT INTO execution (execution_id, project_id, tenant_id, started_at_unix, phase, kind, instance_id, fired_by)
-                    SELECT v_execution_id, v_project, pr.tenant_id, (p->>'at_unix')::bigint, p->>'phase',
-                           p->>'run_kind', p->>'instance_id', p->>'fired_by'
-                    FROM project pr WHERE pr.id = v_project
+                UPDATE run r SET
+                        last_seq = v.last_seq,
+                        cost_micro_usd = r.cost_micro_usd + v.costs,
+                        skipped = r.skipped + v.skipped,
+                        wrote_files = r.wrote_files OR v.wrote,
+                        state = CASE WHEN x.e IS NULL THEN r.state ELSE 'ended' END,
+                        owner = CASE WHEN x.e IS NULL THEN r.owner END,
+                        ended_at = (x.e->>'at')::bigint,
+                        outcome = x.e->>'outcome',
+                        error = x.e->>'error',
+                        cancel_cause = x.e->'cancel_cause',
+                        keep_until = (x.e->>'at')::bigint + r.keep_for,
+                        holds_signals = x.e IS NOT NULL AND EXISTS (SELECT 1 FROM signal s WHERE s.execution_id = r.execution_id)
+                    FROM unnest(p_ids, p_last, p_costs, p_skipped, p_wrote, v_fates)
+                            WITH ORDINALITY AS v(id, last_seq, costs, skipped, wrote, fate, n)
+                        CROSS JOIN LATERAL (SELECT NULLIF(p_ended->(v.n::integer - 1), 'null'::jsonb) AS e) x
+                    WHERE v.fate = 'continue' AND r.execution_id = v.id;
+                INSERT INTO run_log (execution_id, seq, events, writer, written_at)
+                    SELECT p_ids[w.run], w.seq, w.events, p_writer, p_now
+                    FROM unnest(p_row_run, p_row_seq, p_row_events) AS w(run, seq, events)
+                    WHERE v_fates[w.run] IN ('insert', 'continue')
+                    ORDER BY 1, 2
+                    ON CONFLICT (execution_id, seq) DO NOTHING;
+                DELETE FROM parked_fire pf
+                    USING unnest(p_resolved_run, p_resolved_token) AS t(run, token)
+                    WHERE v_fates[t.run] IN ('insert', 'continue') AND pf.token = t.token AND pf.is_resume;
+                -- An answer handed to a run that ended without taking it
+                -- has nobody left to take it.
+                DELETE FROM parked_fire pf
+                    USING unnest(p_ids, v_fates) WITH ORDINALITY AS v(id, fate, n)
+                    WHERE v.fate IN ('insert', 'continue') AND p_ended->(v.n::integer - 1) <> 'null'::jsonb
+                      AND pf.execution_id = v.id;
+                INSERT INTO version_runs (project_id, source_version, lane, runs, last_run)
+                    SELECT (x.b->>'project_id')::uuid, x.b->>'source_version', p_lane, count(*),
+                           (array_agg(v.id ORDER BY v.id DESC))[1]
+                    FROM unnest(p_ids, v_fates) WITH ORDINALITY AS v(id, fate, n)
+                        CROSS JOIN LATERAL (SELECT p_born->(v.n::integer - 1) AS b) x
+                    WHERE v.fate = 'insert' AND x.b->>'source_version' IS NOT NULL
+                      AND x.b->>'kind' = 'execution' AND (x.b->>'recorded')::boolean
+                    GROUP BY 1, 2
+                    ORDER BY 1, 2
+                    ON CONFLICT (project_id, source_version, lane) DO UPDATE
+                        SET runs = version_runs.runs + EXCLUDED.runs,
+                            last_run = GREATEST(version_runs.last_run, EXCLUDED.last_run);
+                INSERT INTO run_search_queue (execution_id)
+                    SELECT r.execution_id
+                    FROM unnest(p_ids, v_fates) WITH ORDINALITY AS v(id, fate, n)
+                        JOIN run r ON r.execution_id = v.id
+                    WHERE v.fate IN ('insert', 'continue') AND p_ended->(v.n::integer - 1) <> 'null'::jsonb
+                      AND r.recorded
                     ON CONFLICT (execution_id) DO NOTHING;
-                GET DIAGNOSTICS seeded = ROW_COUNT;
-                IF seeded = 0 AND NOT EXISTS (SELECT 1 FROM execution WHERE execution_id = v_execution_id) THEN
-                    RAISE EXCEPTION 'refuse to journal ExecutionStarted for execution %: project % has no row, so the execution seed (which the broker scope check and the terminal sweeps depend on) cannot be written; register the project first',
-                        v_execution_id, v_project;
-                END IF;
-            END;
-            $$ LANGUAGE plpgsql"#,
-        // A run's whole birth, in one call: one execution's admission (its
-        // entry's limits, when it has any), its first task, its
-        // `ExecutionStarted` and seed, and the kicks that start it.
-        // Answers `{"outcome": "started" | "already_started" | "refused"}`,
-        // a refusal carrying which limit (`weft_admit`'s answer). Nothing
-        // is written for a run already born (its birth row, or its seed for
-        // an unrecorded run) or whose task is already live: a retried birth
-        // collapses onto the first, which keeps the slot it took. A refused
-        // run writes only its counts. The execution's lock is taken before
-        // any write, which is the journal's ordering rule.
-        // SYNC: p's fields <-> crate::journal::postgres::BirthCall
-        r#"CREATE OR REPLACE FUNCTION weft_start_execution(p JSONB) RETURNS JSONB AS $$
-            DECLARE
-                v_started JSONB := p->'started';
-                v_task JSONB := p->'task';
-                v_execution_id TEXT := v_started->>'execution_id';
-                v_project UUID := (v_started->>'project_id')::uuid;
-                v_journaled BOOLEAN := (v_started->>'journaled')::boolean;
-                v_refused JSONB;
-                v_inserted BOOLEAN;
-            BEGIN
-                PERFORM weft_lock_execution(v_execution_id);
-                IF (v_journaled AND EXISTS (SELECT 1 FROM exec_event
-                        WHERE execution_id = v_execution_id AND kind = 'execution_started'))
-                   OR (NOT v_journaled AND EXISTS (SELECT 1 FROM execution WHERE execution_id = v_execution_id)) THEN
-                    RETURN jsonb_build_object('outcome', 'already_started');
-                END IF;
-                IF jsonb_typeof(p->'admission') = 'object' THEN
-                    v_refused := weft_admit(p->'admission');
-                    IF v_refused IS NOT NULL THEN
-                        RETURN jsonb_build_object('outcome', 'refused', 'refused', v_refused);
-                    END IF;
-                END IF;
-                SELECT d.inserted INTO v_inserted FROM weft_enqueue_dedup(
-                    (v_task->>'id')::uuid, v_task->>'kind', v_task->>'target', (v_task->>'project_id')::uuid,
-                    v_task->>'dedup_key', v_task->>'execution_id', v_task->>'tenant_id', v_task->>'target_replica',
-                    v_task->>'binary_hash', v_task->'payload', (v_task->>'created_at')::bigint) d;
-                IF NOT v_inserted THEN
-                    RETURN jsonb_build_object('outcome', 'already_started');
-                END IF;
-                PERFORM weft_execution_started(v_started);
-                -- A trigger setup is born only while the activation that asked
-                -- for it still owns its rows (a cancel between the claim and
-                -- here wins), and is recorded as in flight.
-                IF jsonb_typeof(p->'trigger_setup') = 'object' THEN
-                    IF (p->'trigger_setup'->>'for_activation')::boolean THEN
-                        PERFORM 1 FROM trigger_activation
-                            WHERE project_id = v_project
-                              AND activating_execution_id = v_execution_id::uuid
-                              AND status = 'activating'
-                            FOR UPDATE;
-                        IF NOT FOUND THEN
-                            RAISE EXCEPTION 'activation % ended before trigger setup could start', v_execution_id;
-                        END IF;
-                    END IF;
-                    INSERT INTO trigger_setup (project_id, execution_id) VALUES (v_project, v_execution_id);
-                END IF;
-                IF v_journaled AND jsonb_array_length(p->'kicks') > 0 THEN
-                    PERFORM weft_journal_append(v_execution_id,
-                        ARRAY(SELECT k->>'kind' FROM jsonb_array_elements(p->'kicks') WITH ORDINALITY AS e(k, n) ORDER BY n),
-                        ARRAY(SELECT k->>'payload' FROM jsonb_array_elements(p->'kicks') WITH ORDINALITY AS e(k, n) ORDER BY n),
-                        (v_started->>'created_at')::bigint, NULL, NULL, NULL);
-                END IF;
-                RETURN jsonb_build_object('outcome', 'started');
+                INSERT INTO storage_sweep (execution_id, tenant_id, enqueued_at_unix)
+                    SELECT r.execution_id, r.tenant_id, p_now
+                    FROM unnest(p_ids, v_fates) WITH ORDINALITY AS v(id, fate, n)
+                        JOIN run r ON r.execution_id = v.id
+                    WHERE v.fate IN ('insert', 'continue') AND p_ended->(v.n::integer - 1) <> 'null'::jsonb
+                      AND r.wrote_files
+                    ON CONFLICT (execution_id) DO NOTHING;
+                RETURN QUERY
+                    SELECT v.id,
+                           CASE WHEN v.fate IN ('insert', 'continue') THEN 'accepted' ELSE v.fate END,
+                           r.project_id,
+                           COALESCE(v.fate IN ('insert', 'continue') AND r.state = 'ended'
+                                    AND (r.watch_end OR r.holds_signals), FALSE)
+                    FROM unnest(p_ids, v_fates) WITH ORDINALITY AS v(id, fate, n)
+                        LEFT JOIN run r ON r.execution_id = v.id
+                    ORDER BY v.n;
             END;
             $$ LANGUAGE plpgsql"#,
     ],
@@ -1041,14 +804,14 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
 impl Journal for PostgresJournal {
     async fn is_trigger_setup_pending(&self, execution_id: ExecutionId) -> anyhow::Result<bool> {
         Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM trigger_setup WHERE execution_id = $1)")
-            .bind(execution_id.to_string()).fetch_one(&self.pool).await?)
+            .bind(execution_id).fetch_one(&self.pool).await?)
     }
 
     async fn finish_trigger_setup(&self, execution_id: ExecutionId, bake: Option<&super::TriggerBake>) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
         let owner: Option<(uuid::Uuid,)> = sqlx::query_as(
             "DELETE FROM trigger_setup WHERE execution_id = $1 RETURNING project_id",
-        ).bind(execution_id.to_string()).fetch_optional(&mut *tx).await?;
+        ).bind(execution_id).fetch_optional(&mut *tx).await?;
         if let (Some((project_id,)), Some(bake)) = (owner, bake) {
             anyhow::ensure!(bake.project_id == project_id && bake.execution_id == execution_id, "bake does not belong to its setup");
             let instance = bake.instance.as_ref().map(|m| m.as_str());
@@ -1080,65 +843,66 @@ impl Journal for PostgresJournal {
         rows.into_iter().map(|(value,)| serde_json::from_str(&value).map_err(Into::into)).collect()
     }
 
-    async fn record_event(&self, event: &ExecEvent) -> anyhow::Result<()> {
-        // Single canonical row shape lives in weft-journal so the
-        // dispatcher, engine, and listener all INSERT identical rows;
-        // `record_with_seed` adds the execution seed in the
-        // same transaction for ExecutionStarted.
-        self.record_with_seed(event, None).await
-    }
-
-    async fn record_event_dedup(
-        &self,
-        event: &ExecEvent,
-        dedup_key: &str,
-    ) -> anyhow::Result<()> {
-        self.record_with_seed(event, Some(dedup_key)).await
+    async fn append(&self, execution_id: ExecutionId, events: &[ExecEvent], then: Then) -> anyhow::Result<Appended> {
+        let mut tx = self.pool.begin().await?;
+        let appended = weft_journal::record::append_unowned_in(&mut tx, execution_id, events, weft_journal::record::DISPATCHER, then).await?;
+        tx.commit().await?;
+        if matches!(appended, Appended::At(_)) {
+            // The write announced its row (and its ending, its storage
+            // sweep) through the outbox.
+            weft_task_store::announce::committed(&self.pool);
+        }
+        Ok(appended)
     }
 
     async fn events_log_lossy(
         &self,
         execution_id: ExecutionId,
     ) -> anyhow::Result<(Vec<crate::events::IdentifiedEvent<ExecEvent>>, Vec<String>)> {
-        let rows = payload_rows(&self.pool, execution_id).await?;
-        let mut out = Vec::with_capacity(rows.len());
-        let mut bad = Vec::new();
-        for row in rows {
-            match decode_event(execution_id, &row.payload) {
-                Ok(ev) => out.push(crate::events::IdentifiedEvent::recorded(row.id, ev)),
-                Err(reason) => bad.push(reason),
-            }
-        }
-        Ok((out, bad))
+        let mut conn = self.pool.acquire().await?;
+        let record = weft_journal::record::read_record(&mut conn, execution_id, None).await?;
+        let (rows, bad) = record.decode_lossy(execution_id);
+        Ok((rows.into_iter().map(|row| crate::events::IdentifiedEvent::recorded(row.seq, row.index, row.event)).collect(), bad))
     }
 
-    async fn start_execution(
-        &self,
-        start: &ExecEvent,
-        kicks: &[ExecEvent],
-        task: weft_task_store::tasks::NewTask,
-        for_activation: bool,
-    ) -> anyhow::Result<()> {
-        let trigger_setup = match start {
-            ExecEvent::ExecutionStarted { phase: weft_core::context::Phase::TriggerSetup, .. } => Some(TriggerSetupRow { for_activation }),
-            _ => None,
+    async fn queue_run(&self, queued: Queued<'_>, for_activation: bool) -> anyhow::Result<bool> {
+        let birth = queued.events.first().context("a run is queued with its birth")?;
+        let execution_id = birth.execution_id();
+        let ExecEvent::ExecutionStarted { project_id, phase, .. } = birth else {
+            anyhow::bail!("run {execution_id} is queued with a row that is not its birth");
         };
-        let born = self.birth(start, kicks, task, trigger_setup, None).await?;
-        born.map_err(|refused| anyhow::anyhow!("a birth with no limits to check was refused: {refused:?}"))
-    }
-
-    async fn admit_and_start_execution(
-        &self,
-        admission: &crate::entry_limits::Admission,
-        start: &ExecEvent,
-        kicks: &[ExecEvent],
-        task: weft_task_store::tasks::NewTask,
-    ) -> anyhow::Result<Result<(), crate::entry_limits::Refused>> {
-        anyhow::ensure!(
-            !matches!(start, ExecEvent::ExecutionStarted { phase: weft_core::context::Phase::TriggerSetup, .. }),
-            "a trigger setup is not admitted at an entry's limits"
-        );
-        self.birth(start, kicks, task, None, Some(admission)).await
+        let mut tx = self.pool.begin().await?;
+        let project_known: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM project WHERE id = $1)")
+            .bind(project_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        anyhow::ensure!(project_known, "run {execution_id} cannot be queued: project {project_id} has no row; register the project first");
+        if !weft_journal::record::insert_queued_in(&mut tx, &queued).await? {
+            return Ok(false);
+        }
+        // A trigger setup is queued only while the activation that asked
+        // for it still owns its rows (a cancel between the claim and here
+        // wins), and is recorded as in flight.
+        if *phase == weft_core::context::Phase::TriggerSetup {
+            if for_activation {
+                let owned: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM trigger_activation \
+                     WHERE project_id = $1 AND activating_execution_id = $2 AND status = 'activating' FOR UPDATE)",
+                )
+                .bind(project_id)
+                .bind(execution_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                anyhow::ensure!(owned, "activation {execution_id} ended before its trigger setup could start");
+            }
+            sqlx::query("INSERT INTO trigger_setup (project_id, execution_id) VALUES ($1, $2)")
+                .bind(project_id)
+                .bind(execution_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 
     async fn cancel_execution(
@@ -1148,67 +912,90 @@ impl Journal for PostgresJournal {
         cause: &weft_core::exec::CancelCause,
     ) -> anyhow::Result<CancelWrite> {
         let mut tx = self.pool.begin().await?;
-        // 0. Execution lock before the first write (the signal delete): the
-        //    ordering invariant on `weft_journal::write`.
-        weft_journal::lock_execution_ids(&mut tx, &[execution_id]).await?;
-        // 1. The wake signals go first in the write order for the same
-        //    reason they went first when these were separate statements:
-        //    a fire that resolves its signal row after this commits finds
-        //    nothing, and one that resolved it before enqueues a resume
-        //    the worker refuses on the terminal below.
+        // The run's row first: the one lock every writer of a run takes,
+        // in the same order.
+        let locked = weft_journal::record::lock_in(&mut tx, execution_id).await?;
+        // The wake signals go: a fire that resolves its signal row after
+        // this commits finds nothing to wake.
         let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_EXECUTION_ID_RETURNING)
-            .bind(execution_id.to_string())
+            .bind(execution_id)
             .fetch_all(&mut *tx)
             .await
-            .context("cancel_execution: strip the execution's signals: read a signal row")?;
-        let removed: Vec<SignalRegistration> =
-            rows.into_iter().map(row_to_signal).collect::<anyhow::Result<_>>()?;
-        // 2 + 3. Only a started execution has a journal to close and a process to
-        //    flag; its project and tenant were stamped on this row in the
-        //    birth transaction, so no other lookup is needed.
-        let owner: Option<(uuid::Uuid, String, String)> =
-            sqlx::query_as("SELECT project_id, tenant_id, kind FROM execution WHERE execution_id = $1")
-                .bind(execution_id.to_string())
-                .fetch_optional(&mut *tx)
-                .await?;
+            .context("cancel_execution: strip the run's signals: read a signal row")?;
+        let removed: Vec<SignalRegistration> = rows.into_iter().map(row_to_signal).collect::<anyhow::Result<_>>()?;
         let mut write = CancelWrite { removed, ..CancelWrite::default() };
-        if let Some((project_id, tenant_id, kind)) = owner {
-            let kind = weft_core::exec::RunKind::parse(&kind)
-                .map_err(|e| anyhow::anyhow!("execution.kind of {execution_id}: {e}"))?;
-            // An unrecorded run has no journal to close: the process driving it
-            // cancels it in memory and forgets it. With no process left to do
-            // that, the run died with its process, so it is forgotten here.
-            if kind.journaled() {
-                write.node_cancellations = cancel_terminals_in(&mut tx, execution_id, program, cause).await?;
+        match locked {
+            Some(locked) if locked.state == "ended" => {}
+            Some(locked) if locked.owner.is_some() => {
+                sqlx::query("UPDATE run SET cancel_requested = $2 WHERE execution_id = $1")
+                    .bind(execution_id)
+                    .bind(sqlx::types::Json(cause))
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("SELECT pg_notify($1, $2)")
+                    .bind(weft_task_store::runs::CANCEL_CHANNEL)
+                    .bind(weft_task_store::runs::cancel_payload(locked.project_id, execution_id))
+                    .execute(&mut *tx)
+                    .await?;
+                write.requested = true;
             }
-            write.task_enqueued = crate::task_kinds::execute::enqueue_cancel_in(
-                &mut tx,
-                project_id,
-                execution_id,
-                tenant_id.as_str(),
-                cause,
-            )
-            .await?;
-            if !kind.journaled() && !write.task_enqueued {
-                weft_journal::unrecorded::forget_in(&mut tx, execution_id).await?;
-                crate::storage::enqueue_sweep_in(&mut tx, tenant_id.as_str(), &execution_id.to_string()).await?;
+            Some(locked) => {
+                write.node_cancellations = Some(cancel_unowned_in(&mut tx, execution_id, &locked, program, cause).await?);
             }
+            None => {}
         }
         tx.commit().await?;
         weft_task_store::announce::committed(&self.pool);
         Ok(write)
     }
 
-    async fn consume_suspension(&self, token: &str) -> anyhow::Result<Option<SignalRegistration>> {
-        // Drop the signal row entirely; resume tokens are
-        // single-use. Entry triggers (is_resume=false) are NOT
-        // touched here; deactivate handles those.
-        let row: Option<SignalRow> = sqlx::query_as(SIGNAL_DELETE_RESUME_BY_TOKEN_RETURNING)
-            .bind(token)
-            .fetch_optional(&self.pool)
-            .await
-            .context("consume_suspension: read a signal row")?;
-        row.map(row_to_signal).transpose()
+    async fn let_go_of_lost(
+        &self,
+        execution_id: ExecutionId,
+        lapsed_before: i64,
+        program: Option<&weft_core::ProjectDefinition>,
+    ) -> anyhow::Result<crate::journal::Lost> {
+        use crate::journal::Lost;
+        let mut tx = self.pool.begin().await?;
+        let Some(mut locked) = weft_journal::record::lock_in(&mut tx, execution_id).await? else { return Ok(Lost::NotLost) };
+        let Some(owner) = locked.owner.clone().filter(|_| locked.state == "running") else { return Ok(Lost::NotLost) };
+        let alive: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM worker_lease WHERE replica = $1 AND leased_until_unix >= $2)")
+            .bind(&owner)
+            .bind(lapsed_before)
+            .fetch_one(&mut *tx)
+            .await?;
+        if alive {
+            return Ok(Lost::NotLost);
+        }
+        let durable = locked.keeping == weft_core::run_settings::Keeping::Durable.as_str();
+        sqlx::query("UPDATE run SET owner = NULL, epoch = epoch + 1, state = CASE WHEN $2 THEN 'queued' ELSE state END WHERE execution_id = $1")
+            .bind(execution_id)
+            .bind(durable)
+            .execute(&mut *tx)
+            .await?;
+        locked.owner = None;
+        let lost = if durable {
+            locked.state = "queued".into();
+            // The answers handed to it while it ran go on its record now.
+            if !weft_journal::record::resolve_handed_in(&mut tx, execution_id, &locked, weft_journal::record::DISPATCHER).await? {
+                weft_journal::record::notify_queued_in(&mut tx, locked.project_id).await?;
+            }
+            Lost::Requeued
+        } else {
+            cancel_unowned_in(&mut tx, execution_id, &locked, program, &weft_core::exec::CancelCause::fast_run_lost()).await?;
+            Lost::Ended
+        };
+        tx.commit().await?;
+        weft_task_store::announce::committed(&self.pool);
+        Ok(lost)
+    }
+
+    async fn answer(&self, token: &str, value: &serde_json::Value) -> anyhow::Result<crate::journal::Answered> {
+        let mut tx = self.pool.begin().await?;
+        let answered = answer_in(&mut tx, token, value, AnswerFrom::Sender).await?;
+        tx.commit().await?;
+        weft_task_store::announce::committed(&self.pool);
+        Ok(answered)
     }
 
     async fn mint_signal_token(&self, tok: &SignalToken) -> anyhow::Result<()> {
@@ -1296,238 +1083,126 @@ impl Journal for PostgresJournal {
     }
 
     async fn execution_owner(&self, execution_id: ExecutionId) -> anyhow::Result<Option<ExecutionOwner>> {
-        // One read of the `execution` row, whose project and
-        // tenant were stamped together in the SAME transaction as
-        // `ExecutionStarted` (see `write_birth_in`). Never re-derived:
-        // not from the started payload (undecodable exactly when
-        // `weft clean` is the way out), and not from the project store
-        // (deletable, and an execution deliberately outlives its
-        // project).
-        let row: Option<(uuid::Uuid, String, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT project_id, tenant_id, instance_id, fired_by FROM execution WHERE execution_id = $1",
+        type OwnerRow = (uuid::Uuid, String, Option<String>, Option<String>, String, Option<String>, Option<String>, Option<String>);
+        let row: Option<OwnerRow> = sqlx::query_as(
+            "SELECT project_id, tenant_id, instance_id, fired_by, phase, definition_hash, binary_hash, source_version \
+             FROM run WHERE execution_id = $1",
         )
-        .bind(execution_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(|(project_id, tenant, instance, fired_by)| {
+                .bind(execution_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        row.map(|(project_id, tenant, instance, fired_by, phase, definition_hash, binary_hash, source_version)| {
             Ok(ExecutionOwner {
                 project_id,
                 tenant,
-                instance: instance.map(weft_core::instance::InstanceId::new).transpose().map_err(|e| {
-                    anyhow::anyhow!("corrupt execution.instance_id for {execution_id}: {e}")
-                })?,
+                instance: instance
+                    .map(weft_core::instance::InstanceId::new)
+                    .transpose()
+                    .map_err(|e| anyhow::anyhow!("run {execution_id} holds a broken instance: {e}"))?,
                 fired_by,
+                phase: weft_core::context::Phase::from_tag(&phase)
+                    .ok_or_else(|| anyhow::anyhow!("run {execution_id} holds an unknown phase '{phase}'"))?,
+                definition_hash,
+                binary_hash,
+                source_version,
             })
         })
         .transpose()
     }
 
-    async fn execution_definition_hash(
-        &self,
-        execution_id: ExecutionId,
-    ) -> anyhow::Result<ExecutionIdLookup<String>> {
-        Ok(match self.execution_started(execution_id).await? {
-            // A definition-less start (a node self-test) answers
-            // NotFound: nothing may resume against it, and the
-            // caller's existing unknown-execution bail is the loud path.
-            ExecutionIdLookup::Found(ExecEvent::ExecutionStarted {
-                definition_hash: Some(hash),
-                ..
-            }) => ExecutionIdLookup::Found(hash),
-            ExecutionIdLookup::Found(_) => ExecutionIdLookup::NotFound,
-            ExecutionIdLookup::NotFound => ExecutionIdLookup::NotFound,
-            ExecutionIdLookup::Corrupt => ExecutionIdLookup::Corrupt,
-        })
-    }
-
     async fn definition_hashes_in_use(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<String>> {
-        // Read off the birth rows themselves rather than any copy of
-        // them: this answer decides what gets DELETED. Only the program
-        // reference matters here; an older execution's selection format
-        // must not prevent retention of its code or cleanup of unused code.
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT ec.execution_id, ev.payload_json FROM execution ec \
-             JOIN exec_event ev ON ev.execution_id = ec.execution_id \
-             WHERE ec.project_id = $1 AND ev.kind = 'execution_started'",
+        Ok(sqlx::query_scalar(
+            "SELECT DISTINCT definition_hash FROM run WHERE project_id = $1 AND definition_hash IS NOT NULL ORDER BY 1",
         )
         .bind(project_id)
         .fetch_all(&self.pool)
-        .await?;
-        let mut out: Vec<String> = Vec::new();
-        for (execution_id, payload) in rows {
-            if let Some(hash) = retained_definition(&payload)
-                .with_context(|| format!("cannot read the program reference on the birth row of execution {execution_id}; retaining its code"))?
-            { out.push(hash); }
-        }
-        out.sort();
-        out.dedup();
-        Ok(out)
+        .await?)
     }
 
     async fn logs_for(&self, execution_id: ExecutionId, limit: u32) -> anyhow::Result<Vec<LogEntry>> {
-        // Only the log-worthy kinds leave the database (`LogEntry::KINDS`
-        // is the projection's own list): every one of the execution's, in
-        // journal order, and the tail is cut by `LogEntry::tail` in
-        // WRITTEN order, the same code the fake runs. The cut cannot be
-        // the SQL's: a node's line lands in the journal whenever a process
-        // drains its task, so the row order is not the run's, and the
-        // written time lives inside the payload, which only a decode
-        // can read honestly. A display read, like `events_log_lossy`:
-        // a payload that fails to decode becomes an error line naming
-        // the row and `weft clean`, never a line quietly missing (read
-        // as "the node never said that") and never a read that hides
-        // every surviving line behind a 500.
-        let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT payload_json, created_at FROM exec_event \
-             WHERE execution_id = $1 AND kind = ANY($2) \
-             ORDER BY id ASC",
-        )
-        .bind(execution_id.to_string())
-        .bind(LogEntry::KINDS)
-        .fetch_all(&self.pool)
-        .await?;
-        let mut entries: Vec<LogEntry> = Vec::with_capacity(rows.len());
-        for (payload, created_at) in &rows {
-            match decode_event(execution_id, payload) {
-                Ok(event) => entries.extend(LogEntry::from_event(&event)),
-                Err(e) => entries.push(LogEntry::corrupt_row(*created_at as u64, e)),
+        // The cut is made in WRITTEN order by `LogEntry::tail`, the same
+        // code the fake runs: lines of parallel firings reach the record
+        // in whatever order they ran, so the record's order is not the
+        // order they were written in.
+        let mut conn = self.pool.acquire().await?;
+        let record = weft_journal::record::read_record(&mut conn, execution_id, None).await?;
+        let selection = record.selection.as_ref().map(|stored| {
+            weft_core::project::selection::RecordedSelection::read(stored.digest.clone(), stored.selection.clone())
+        });
+        let written_at: Vec<(i32, i64)> = sqlx::query_as("SELECT seq, written_at FROM run_log WHERE execution_id = $1")
+            .bind(execution_id)
+            .fetch_all(&mut *conn)
+            .await?;
+        let mut entries: Vec<LogEntry> = Vec::new();
+        for row in &record.rows {
+            match weft_journal::stored::decode(execution_id, selection.as_ref(), &row.events) {
+                Ok(events) => entries.extend(events.iter().flat_map(LogEntry::from_event)),
+                Err(e) => {
+                    let at = written_at.iter().find(|(seq, _)| *seq == row.seq).map_or(0, |(_, at)| *at);
+                    entries.push(LogEntry::corrupt_row(at as u64, e));
+                }
             }
         }
         Ok(LogEntry::tail(entries, limit))
     }
 
-    async fn list_executions(
-        &self,
-        tenant: &str,
-        query: &ExecutionQuery,
-    ) -> anyhow::Result<ExecutionPage> {
-        // One SQL statement: every `execution_started` row for this tenant (the
-        // EXISTS-style JOIN against `execution` keeps the tenant wall in
-        // SQL), narrowed by the optional project + start-time filters, joined
-        // laterally against its latest terminal event, newest first, with
-        // limit/offset paging. A parallel COUNT over the same filters gives the
-        // total so a consumer can render page controls. Filters + paging live in
-        // SQL so a tenant with a huge history never truncates blindly.
-        //
-        // Bind order is fixed ($1 tenant, $2 project filter, $3 after, $4 before,
-        // $5 phase, $6 entry node, $7 status, $8 instance, $9 tag, $10 node,
-        // $11 search) and every optional filter is a `($n IS NULL OR ...)`
-        // clause so one prepared statement serves every filter combination.
-        // The `execution` row (seeded at start) carries the real, indexed
-        // columns the filters key on: `tenant_id` (the wall), `project_id`, and
-        // `started_at_unix`. `exec_event` only has `execution_id`/`kind`/`payload_json`,
-        // so we filter on `ec` and fetch the started `payload_json` from the
-        // matching `execution_started` event.
-        let project = query.project_id;
-        let after = query.started_after.map(|v| v as i64);
-        let before = query.started_before.map(|v| v as i64);
-        let phase = query.phase.map(|p| p.as_str());
-        // The entry node is not a column: it lives in the
-        // `execution_started` payload, so it is matched inside the same
-        // lookup of that event both queries already do rather than in a
-        // second pass. The tenant, project and time predicates narrow
-        // the scan first, so this reads a payload only for rows that
-        // already matched everything else.
-        let entry_node = query.entry_node.as_deref();
-        // Status is not a column either: it IS which terminal event the
-        // run ended on, "running" is the absence of one, and
-        // "waiting_for_input" is that absence with a resume signal
-        // registered for the run (what the listing's overlay reads).
-        // Written as one clause over `ec` alone so the count and the page
-        // agree without the page's terminal join. A row the clause matches
-        // whose birth no longer decodes still lists, as `corrupt` (SQL
-        // cannot see the decode); `weft clean` deletes a listed run only
-        // when `RunStatus::reaches` its decoded status, so a filtered
-        // clean never deletes it.
+    async fn list_executions(&self, tenant: &str, query: &ExecutionQuery) -> anyhow::Result<ExecutionPage> {
+        // Bind order is fixed ($1 tenant, $2 project, $3 after, $4 before,
+        // $5 phase, $6 entry node, $7 status, $8 instance, $9 tag, $10
+        // node, $11 search) and every optional filter is a `($n IS NULL OR
+        // ...)` clause, so one prepared statement serves every filter
+        // combination. PROJECT RUNS only (`kind = 'execution'`): a node
+        // test's run has no definition, no graph, and no resume, so it
+        // never belongs in this listing. What a run's record holds (the
+        // nodes it started, its words) is read from its search entry,
+        // built behind the writes once it ended (`crate::search_index`).
         // SYNC: list_executions (status clause) <-> crates/weft-core/src/program.rs RunStatus
-        let status = query.status.map(|s| s.as_str());
-        // PROJECT EXECUTIONS only: this list is the user's record of
-        // their project running. A node-test execution is a real identity
-        // (its cost trail is addressed by execution from the test report),
-        // but it has no definition, no graph, and no resume, so it
-        // never belongs in this listing.
-        // The `waiting_for_input` arm is a run with no ending that is
-        // parked (`RUN_PARKED_SQL`, the shared parked rule).
-        let where_clause = format!("ec.tenant_id = $1 \
-             AND ec.kind = 'execution' \
-             AND ($2::uuid IS NULL OR ec.project_id = $2) \
-             AND ($3::bigint IS NULL OR ec.started_at_unix >= $3) \
-             AND ($4::bigint IS NULL OR ec.started_at_unix < $4) \
-             AND ($5::text IS NULL OR ec.phase = $5) \
-             AND ($7::text IS NULL OR CASE WHEN $7 IN ('running', 'waiting_for_input') THEN NOT EXISTS ( \
-                     SELECT 1 FROM exec_event WHERE execution_id = ec.execution_id \
-                       AND kind IN {TERMINAL} \
-                 ) AND ($7 = 'running' OR {PARKED}) ELSE EXISTS ( \
-                     SELECT 1 FROM exec_event WHERE execution_id = ec.execution_id \
-                       AND kind = 'execution_' || $7 \
-                 ) END) \
-             AND ($8::text IS NULL OR ec.instance_id = $8) \
+        let where_clause = "r.tenant_id = $1 \
+             AND r.kind = 'execution' \
+             AND ($2::uuid IS NULL OR r.project_id = $2) \
+             AND ($3::bigint IS NULL OR r.started_at >= $3) \
+             AND ($4::bigint IS NULL OR r.started_at < $4) \
+             AND ($5::text IS NULL OR r.phase = $5) \
+             AND ($6::text IS NULL OR r.entry_node = $6) \
+             AND ($7::text IS NULL OR CASE $7 \
+                     WHEN 'running' THEN r.state <> 'ended' \
+                     WHEN 'waiting_for_input' THEN r.state = 'parked' \
+                     ELSE r.state = 'ended' AND r.outcome = $7 END) \
+             AND ($8::text IS NULL OR r.instance_id = $8) \
              AND ($9::text IS NULL OR EXISTS ( \
-                     SELECT 1 FROM execution_tag et WHERE et.execution_id = ec.execution_id AND et.tag = $9 \
-                 )) \
+                     SELECT 1 FROM execution_tag et WHERE et.execution_id = r.execution_id AND et.tag = $9)) \
              AND ($10::text IS NULL OR EXISTS ( \
-                     SELECT 1 FROM exec_event WHERE execution_id = ec.execution_id \
-                       AND kind = 'node_started' AND payload_json::jsonb->>'node_id' = $10 \
-                 )) \
+                     SELECT 1 FROM run_search rs WHERE rs.execution_id = r.execution_id AND $10 = ANY(rs.nodes))) \
              AND ($11::text IS NULL OR EXISTS ( \
-                     SELECT 1 FROM execution_search es WHERE es.execution_id = ec.execution_id \
-                       AND es.words @@ websearch_to_tsquery('simple', $11) \
-                 ))");
-
-        // The count carries the SAME started-event predicate as the row
-        // query's inner lateral join: a seeded `execution` row
-        // with no `execution_started` event can never be listed, so it
-        // must not be counted either, else `total` promises rows the
-        // pages cannot produce.
-        let total: (i64,) = sqlx::query_as(&format!(
-            "SELECT COUNT(*) FROM execution ec WHERE {where_clause} \
-             AND EXISTS ( \
-                 SELECT 1 FROM exec_event \
-                 WHERE execution_id = ec.execution_id AND kind = 'execution_started' \
-                   AND ($6::text IS NULL OR payload_json::jsonb->>'entry_node' = $6) \
-             )"
-        ))
-        .bind(tenant)
-        .bind(project)
-        .bind(after)
-        .bind(before)
-        .bind(phase)
-        .bind(entry_node)
-        .bind(status)
-        .bind(query.instance.as_ref().map(|m| m.as_str()))
-        .bind(query.tag.as_deref())
-        .bind(query.node.as_deref())
-        .bind(query.search.as_deref())
-        .fetch_one(&self.pool)
-        .await?;
-
-        let rows: Vec<(String, uuid::Uuid, String, i64, String, Option<String>, Vec<String>, i64)> = sqlx::query_as(&format!(
-            "SELECT ec.execution_id, ec.project_id, ec.phase, ec.started_at_unix, \
-                    s.payload_json, t.payload_json, {TAGS_LATERAL}, {SKIPPED_LATERAL} \
-             FROM execution ec \
-             JOIN LATERAL ( \
-                 SELECT payload_json FROM exec_event \
-                 WHERE execution_id = ec.execution_id AND kind = 'execution_started' \
-                   AND ($6::text IS NULL OR payload_json::jsonb->>'entry_node' = $6) \
-                 ORDER BY id ASC LIMIT 1 \
-             ) s ON TRUE \
-             LEFT JOIN LATERAL ( \
-                 SELECT payload_json FROM exec_event \
-                 WHERE execution_id = ec.execution_id \
-                   AND kind IN {TERMINAL} \
-                 ORDER BY id DESC LIMIT 1 \
-             ) t ON TRUE \
+                     SELECT 1 FROM run_search rs WHERE rs.execution_id = r.execution_id \
+                       AND rs.words @@ websearch_to_tsquery('simple', $11)))";
+        let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM run r WHERE {where_clause}"))
+            .bind(tenant)
+            .bind(query.project_id)
+            .bind(query.started_after.map(|v| v as i64))
+            .bind(query.started_before.map(|v| v as i64))
+            .bind(query.phase.map(|p| p.as_str()))
+            .bind(query.entry_node.as_deref())
+            .bind(query.status.map(|s| s.as_str()))
+            .bind(query.instance.as_ref().map(|m| m.as_str()))
+            .bind(query.tag.as_deref())
+            .bind(query.node.as_deref())
+            .bind(query.search.as_deref())
+            .fetch_one(&self.pool)
+            .await?;
+        let rows: Vec<SummaryRow> = sqlx::query_as(&format!(
+            "SELECT {SUMMARY_COLUMNS} FROM run r \
              WHERE {where_clause} \
-               AND ($14::bigint IS NULL OR (ec.started_at_unix, ec.execution_id) < ($14, $15::text)) \
-             ORDER BY ec.started_at_unix DESC, ec.execution_id DESC LIMIT $12 OFFSET $13"
+               AND ($14::bigint IS NULL OR (r.started_at, r.execution_id) < ($14, $15::uuid)) \
+             ORDER BY r.started_at DESC, r.execution_id DESC LIMIT $12 OFFSET $13"
         ))
         .bind(tenant)
-        .bind(project)
-        .bind(after)
-        .bind(before)
-        .bind(phase)
-        .bind(entry_node)
-        .bind(status)
+        .bind(query.project_id)
+        .bind(query.started_after.map(|v| v as i64))
+        .bind(query.started_before.map(|v| v as i64))
+        .bind(query.phase.map(|p| p.as_str()))
+        .bind(query.entry_node.as_deref())
+        .bind(query.status.map(|s| s.as_str()))
         .bind(query.instance.as_ref().map(|m| m.as_str()))
         .bind(query.tag.as_deref())
         .bind(query.node.as_deref())
@@ -1535,197 +1210,65 @@ impl Journal for PostgresJournal {
         .bind(query.limit as i64)
         .bind(query.offset as i64)
         .bind(query.below.map(|(started, _)| started as i64))
-        .bind(query.below.map(|(_, execution_id)| execution_id.to_string()))
+        .bind(query.below.map(|(_, execution_id)| execution_id))
         .fetch_all(&self.pool)
         .await?;
-
-        let mut executions = Vec::with_capacity(rows.len());
-        for (execution_id_text, project_id, phase_text, started_at, started_payload, terminal_payload, tags, skipped) in rows {
-            let execution_id: ExecutionId = execution_id_text.parse().map_err(|e| {
-                anyhow::anyhow!("execution row holds a non-uuid execution '{execution_id_text}': {e}")
-            })?;
-            // One corrupt row must not take the whole list down (the
-            // list is also the door to `weft clean`, the recovery for
-            // exactly this state), and it must not vanish either: the
-            // count includes it, so the page renders it as a broken
-            // row (inspectable via replay, deletable).
-            executions.push(
-                summary_from_payloads(execution_id, &started_payload, terminal_payload, tags, skipped)
-                    .unwrap_or_else(|e| corrupt_summary(execution_id, project_id, &phase_text, started_at, &e)),
-            );
-        }
-        Ok(ExecutionPage { executions, total: total.0.max(0) as u64 })
+        let executions = rows.into_iter().map(SummaryRow::summary).collect::<anyhow::Result<_>>()?;
+        Ok(ExecutionPage { executions, total: total.max(0) as u64 })
     }
 
     async fn execution_ids_with_prefix(&self, tenant: &str, prefix: &str) -> anyhow::Result<Vec<ExecutionId>> {
-        // `LIKE` on the text form with the prefix escaped: a prefix is
-        // hex and dashes, but the escape keeps a stray `%` or `_` from
-        // widening the match.
-        let pattern = format!(
-            "{}%",
-            prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
-        );
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT execution_id FROM execution \
-             WHERE tenant_id = $1 AND kind = 'execution' AND execution_id LIKE $2 \
-             ORDER BY started_at_unix DESC LIMIT 2",
+        // `LIKE` on the text form with the prefix escaped: a prefix is hex
+        // and dashes, but the escape keeps a stray `%` or `_` from widening
+        // the match.
+        let pattern = format!("{}%", prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+        Ok(sqlx::query_scalar(
+            "SELECT execution_id FROM run WHERE tenant_id = $1 AND kind = 'execution' AND execution_id::text LIKE $2 \
+             ORDER BY started_at DESC LIMIT 2",
         )
         .bind(tenant)
         .bind(pattern)
         .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter().map(|(c,)| c.parse::<ExecutionId>().map_err(Into::into)).collect()
+        .await?)
     }
 
-    async fn execution_summary(
-        &self,
-        execution_id: ExecutionId,
-    ) -> anyhow::Result<Option<ExecutionSummary>> {
-        // Direct point-lookup by execution: the started row plus its latest terminal
-        // event, no windowed list scan. Returns None when the execution has no
-        // `execution_started` row.
-        let row: Option<(uuid::Uuid, String, i64, String, Option<String>, Vec<String>, i64)> = sqlx::query_as(&format!(
-            "SELECT ec.project_id, ec.phase, ec.started_at_unix, s.payload_json, t.payload_json, {TAGS_LATERAL}, {SKIPPED_LATERAL} \
-             FROM exec_event s \
-             JOIN execution ec ON ec.execution_id = s.execution_id \
-             LEFT JOIN LATERAL ( \
-                 SELECT payload_json FROM exec_event \
-                 WHERE execution_id = s.execution_id \
-                   AND kind IN {TERMINAL} \
-                 ORDER BY id DESC LIMIT 1 \
-             ) t ON TRUE \
-             WHERE s.kind = 'execution_started' AND s.execution_id = $1 \
-             ORDER BY s.id ASC LIMIT 1"
-        ))
-        .bind(execution_id.to_string())
-        .fetch_optional(&self.pool)
-        .await?;
-
-        match row {
-            None => Ok(None),
-            Some((project_id, phase_text, started_at, started_payload, terminal_payload, tags, skipped)) => {
-                Ok(Some(
-                    summary_from_payloads(execution_id, &started_payload, terminal_payload, tags, skipped)
-                        .unwrap_or_else(|e| corrupt_summary(execution_id, project_id, &phase_text, started_at, &e)),
-                ))
-            }
-        }
+    async fn execution_summary(&self, execution_id: ExecutionId) -> anyhow::Result<Option<ExecutionSummary>> {
+        let row: Option<SummaryRow> = sqlx::query_as(&format!("SELECT {SUMMARY_COLUMNS} FROM run r WHERE r.execution_id = $1"))
+            .bind(execution_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(SummaryRow::summary).transpose()
     }
 
     async fn execution_ids_for_project(&self, project_id: uuid::Uuid) -> anyhow::Result<Vec<ExecutionId>> {
-        // `execution` is the mirror every execution gets when it is
-        // born, written in the same transaction as the birth row, so it
-        // answers "did this project ever start this execution" without
-        // touching a payload.
-        let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT execution_id FROM execution WHERE project_id = $1")
-                .bind(project_id)
-                .fetch_all(&self.pool)
-                .await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (text,) in rows {
-            match text.parse::<ExecutionId>() {
-                Ok(execution_id) => out.push(execution_id),
-                // Said out loud rather than skipped in silence: the
-                // caller asked by project, so it has no execution to ask
-                // with instead, and a row nothing can name is what makes
-                // a version-tree row undeletable.
-                Err(e) => tracing::error!(
-                    target: "weft_dispatcher::journal",
-                    %project_id, execution_id = %text, error = %e,
-                    "an execution row's execution is not a uuid; it is left out of every \
-                     answer that asks which executions this project has"
-                ),
-            }
-        }
-        Ok(out)
+        Ok(sqlx::query_scalar("SELECT execution_id FROM run WHERE project_id = $1").bind(project_id).fetch_all(&self.pool).await?)
     }
 
-    async fn execution_summaries_for_project(
+    async fn execution_summaries(
         &self,
-        project_id: uuid::Uuid,
+        execution_ids: &[ExecutionId],
     ) -> anyhow::Result<std::collections::HashMap<ExecutionId, ExecutionSummary>> {
-        // The same shape as `execution_summary`, once for the project
-        // instead of once per execution.
-        // `DISTINCT ON (s.execution_id) ... ORDER BY s.execution_id, s.id ASC` pins the
-        // FIRST `execution_started` row of each execution, which is what the
-        // per-execution read and the paged listing both pin with their own
-        // `ORDER BY id ASC LIMIT 1`. Without it an execution with two birth rows
-        // answered twice and whichever came back last won, so this read and
-        // `execution_summary` could describe the same run differently.
-        let rows: Vec<(String, uuid::Uuid, String, i64, String, Option<String>, Vec<String>, i64)> =
-            sqlx::query_as(&format!(
-                "SELECT DISTINCT ON (s.execution_id) \
-                        s.execution_id, ec.project_id, ec.phase, ec.started_at_unix, s.payload_json, t.payload_json, {TAGS_LATERAL}, {SKIPPED_LATERAL} \
-                 FROM exec_event s \
-                 JOIN execution ec ON ec.execution_id = s.execution_id \
-                 LEFT JOIN LATERAL ( \
-                     SELECT payload_json FROM exec_event \
-                     WHERE execution_id = s.execution_id \
-                       AND kind IN {TERMINAL} \
-                     ORDER BY id DESC LIMIT 1 \
-                 ) t ON TRUE \
-                 WHERE s.kind = 'execution_started' AND ec.project_id = $1 \
-                 ORDER BY s.execution_id, s.id ASC"
-            ))
-            .bind(project_id)
+        let rows: Vec<SummaryRow> = sqlx::query_as(&format!("SELECT {SUMMARY_COLUMNS} FROM run r WHERE r.execution_id = ANY($1)"))
+            .bind(execution_ids)
             .fetch_all(&self.pool)
             .await?;
-        let mut out = std::collections::HashMap::with_capacity(rows.len());
-        for (execution_id_text, project, phase_text, started_at, started_payload, terminal_payload, tags, skipped) in rows {
-            let Ok(execution_id) = execution_id_text.parse::<ExecutionId>() else {
-                // An execution column that is not a uuid is a corrupt row, and
-                // the caller asked by project so it has no execution to look up
-                // instead. Said out loud: the run reads as `unknown` in the
-                // tree either way, and silence would leave nobody a way to
-                // find out why.
-                tracing::error!(
-                    target: "weft_dispatcher::journal",
-                    %project_id, execution_id = %execution_id_text,
-                    "an execution_started row carries an execution that is not a uuid; that run cannot \
-                     be summarised"
-                );
-                continue;
-            };
-            let summary = summary_from_payloads(execution_id, &started_payload, terminal_payload, tags, skipped)
-                .unwrap_or_else(|e| corrupt_summary(execution_id, project, &phase_text, started_at, &e));
-            out.insert(execution_id, summary);
-        }
-        Ok(out)
+        rows.into_iter().map(|row| row.summary().map(|summary| (summary.execution_id, summary))).collect()
     }
 
-    async fn list_non_terminal_execution_ids_for_project(
+    async fn going_execution_ids_for_project(
         &self,
         project_id: uuid::Uuid,
     ) -> anyhow::Result<Vec<(ExecutionId, weft_core::context::Phase)>> {
-        // An execution is "non-terminal" iff it belongs to this project
-        // AND is a live project run. `execution` is the
-        // denormalized (execution, project_id) index seeded at birth, so
-        // the project filter is an indexed equality lookup. This is the
-        // one read behind the cancel/wipe sweeps and the drain count; a
-        // node-test execution's lifecycle is owned by its task, never by
-        // the project's, so the rule never matches one.
-        // Liveness is the one rule every sweep shares
-        // (`weft_journal::unrecorded::LIVE_RUN_SQL`): an unrecorded run
-        // counts while a live process can still be driving it.
-        let query = format!(
-            "SELECT ec.execution_id, ec.phase FROM execution ec \
-             WHERE ec.project_id = $1 AND {} \
-             ORDER BY ec.started_at_unix ASC, ec.execution_id ASC",
-            weft_journal::unrecorded::LIVE_RUN_SQL
-        );
-        let rows: Vec<(String, String)> = sqlx::query_as(&query)
+        // Oldest first, ties broken on the id: the editor follows the last
+        // one as the latest run.
+        let rows: Vec<(ExecutionId, String)> = sqlx::query_as(
+            "SELECT execution_id, phase FROM run WHERE project_id = $1 AND kind = 'execution' AND state IN ('queued', 'running') \
+             ORDER BY started_at ASC, execution_id ASC",
+        )
         .bind(project_id)
         .fetch_all(&self.pool)
         .await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (c, phase) in rows {
-            let execution_id: ExecutionId = c
-                .parse()
-                .map_err(|e| anyhow::anyhow!("bad execution in execution: {e}"))?;
-            out.push((execution_id, phase_from_column(&phase)));
-        }
-        Ok(out)
+        Ok(rows.into_iter().map(|(execution_id, phase)| (execution_id, phase_from_column(&phase))).collect())
     }
 
     async fn live_tagged_executions(
@@ -1736,34 +1279,15 @@ impl Journal for PostgresJournal {
         Ok(weft_journal::tags::live_tagged_executions(&self.pool, project_id, tag).await?)
     }
 
-    async fn list_terminal_execution_ids_for_project(
+    async fn settled_execution_ids_for_project(
         &self,
         project_id: uuid::Uuid,
     ) -> anyhow::Result<std::collections::HashSet<ExecutionId>> {
-        // The complement of the non-terminal query: executions with a
-        // terminal event. Distinct because an execution has one terminal
-        // event but the join could otherwise repeat it.
-        let rows: Vec<(String,)> = sqlx::query_as(concat!(
-            "SELECT DISTINCT ec.execution_id FROM execution ec \
-             WHERE ec.project_id = $1 \
-               AND EXISTS ( \
-                   SELECT 1 FROM exec_event t \
-                   WHERE t.execution_id = ec.execution_id \
-                     AND t.kind IN ",
-            weft_journal::execution_terminal_kinds_sql!(),
-            ")",
-        ))
-        .bind(project_id)
-        .fetch_all(&self.pool)
-        .await?;
-        let mut out = std::collections::HashSet::with_capacity(rows.len());
-        for (c,) in rows {
-            let execution_id: ExecutionId = c
-                .parse()
-                .map_err(|e| anyhow::anyhow!("bad execution in execution: {e}"))?;
-            out.insert(execution_id);
-        }
-        Ok(out)
+        let rows: Vec<ExecutionId> = sqlx::query_scalar("SELECT execution_id FROM run WHERE project_id = $1 AND state IN ('ended', 'parked')")
+            .bind(project_id)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().collect())
     }
 
     async fn delete_execution(&self, execution_id: ExecutionId) -> anyhow::Result<Vec<SignalRegistration>> {
@@ -1773,58 +1297,12 @@ impl Journal for PostgresJournal {
         Ok(removed)
     }
 
-    async fn erase_unclaimed_live_run(
-        &self,
-        execution_id: ExecutionId,
-        which: weft_task_store::tasks::UnclaimedLiveRun,
-    ) -> anyhow::Result<bool> {
-        use weft_task_store::tasks::UnclaimedLiveRun;
-        let mut tx = self.pool.begin().await?;
-        weft_journal::lock_execution_ids(&mut tx, &[execution_id]).await?;
-        let condition = match which {
-            UnclaimedLiveRun::PastDeadline { .. } => weft_task_store::tasks::never_arrived_sql("$2"),
-            UnclaimedLiveRun::NeverPassedOn => weft_task_store::tasks::unclaimed_live_sql(),
-        };
-        let erase = format!("DELETE FROM task WHERE execution_id = $1 AND {condition}");
-        let mut erase = sqlx::query(&erase).bind(execution_id.to_string());
-        if let UnclaimedLiveRun::PastDeadline { now } = which {
-            erase = erase.bind(now);
-        }
-        let unclaimed = erase.execute(&mut *tx).await?.rows_affected();
-        if unclaimed == 0 {
-            return Ok(false);
-        }
-        // A run nothing ever drove parked on nothing, so no listener holds
-        // a signal of it.
-        let removed = erase_execution_ids(&mut tx, &[execution_id]).await?;
-        anyhow::ensure!(
-            removed.is_empty(),
-            "live run {execution_id} was never claimed yet held {} resume signal(s); left in place",
-            removed.len()
-        );
-        sqlx::query("DELETE FROM entry_slot WHERE execution_id = $1")
-            .bind(execution_id.to_string())
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(true)
-    }
-
     async fn delete_project_executions(&self, project_id: uuid::Uuid) -> anyhow::Result<u64> {
         let mut tx = self.pool.begin().await?;
-        // The project's executions come from the index rather than from the
-        // journal: it is the one table that knows which project an execution
-        // belongs to without parsing an event body, and it is the table
-        // the erase is about to empty for them.
-        let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT execution_id FROM execution WHERE project_id = $1")
-                .bind(project_id)
-                .fetch_all(&mut *tx)
-                .await?;
-        let execution_ids: Vec<ExecutionId> = rows
-            .into_iter()
-            .map(|(c,)| c.parse().map_err(|e| anyhow::anyhow!("bad execution in execution: {e}")))
-            .collect::<anyhow::Result<_>>()?;
+        let execution_ids: Vec<ExecutionId> = sqlx::query_scalar("SELECT execution_id FROM run WHERE project_id = $1")
+            .bind(project_id)
+            .fetch_all(&mut *tx)
+            .await?;
         // The signals these runs were parked on come back too, but
         // there is nothing to tell a process: `weft rm` deactivates before
         // it erases, and that already stripped and unregistered every
@@ -1834,10 +1312,25 @@ impl Journal for PostgresJournal {
         Ok(execution_ids.len() as u64)
     }
 
+    async fn erase_expired(&self, now: i64, limit: i64) -> anyhow::Result<(usize, Vec<SignalRegistration>)> {
+        let mut tx = self.pool.begin().await?;
+        let execution_ids: Vec<ExecutionId> = sqlx::query_scalar(
+            "SELECT execution_id FROM run WHERE state = 'ended' AND keep_until < $1 \
+                 AND NOT (watch_end OR holds_signals) \
+             ORDER BY keep_until LIMIT $2 FOR UPDATE SKIP LOCKED",
+        )
+        .bind(now)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        let removed = erase_execution_ids(&mut tx, &execution_ids).await?;
+        tx.commit().await?;
+        Ok((execution_ids.len(), removed))
+    }
+
     async fn projects_with_orphan_executions(&self) -> anyhow::Result<Vec<uuid::Uuid>> {
         Ok(sqlx::query_scalar(
-            "SELECT DISTINCT ec.project_id FROM execution ec \
-             WHERE NOT EXISTS (SELECT 1 FROM project p WHERE p.id = ec.project_id)",
+            "SELECT DISTINCT r.project_id FROM run r WHERE NOT EXISTS (SELECT 1 FROM project p WHERE p.id = r.project_id)",
         )
         .fetch_all(&self.pool)
         .await?)
@@ -1860,6 +1353,19 @@ impl Journal for PostgresJournal {
         // A claim that landed first moved the row: nothing is written and
         // the caller recomputes from the new state (`StateMoved`).
         let mut tx = self.pool.begin().await?;
+        // A wait is its run's: the run's row first (the lock every writer
+        // of a run takes first, and written before the run registers
+        // anything), and none for a run already ended, whose ending found
+        // no signal to take down.
+        if let Some(run) = sig.execution_id.filter(|_| sig.is_resume) {
+            match weft_journal::record::lock_in(&mut tx, run).await? {
+                None => anyhow::bail!("run {run} has no record, so its wait '{}' cannot be registered", sig.node_id),
+                Some(locked) if locked.state == "ended" => {
+                    anyhow::bail!("run {run} ended before its wait '{}' could be registered", sig.node_id)
+                }
+                Some(_) => {}
+            }
+        }
         if let Some(setup) = sig.setup_execution_id {
             // Arm only while THIS activation still owns the trigger's row:
             // a cancelled or superseded activation must not arm over the
@@ -1885,7 +1391,7 @@ impl Journal for PostgresJournal {
             .bind(&sig.token)
             .bind(&sig.tenant_id)
             .bind(sig.project_id)
-            .bind(sig.execution_id.map(|c| c.to_string()))
+            .bind(sig.execution_id)
             .bind(&sig.node_id)
             .bind(sig.is_resume)
             .bind(crate::lease::now_unix())
@@ -1968,9 +1474,19 @@ impl Journal for PostgresJournal {
         remove_signals(&self.pool, tokens).await
     }
 
+    async fn signal_withdraw(&self, execution_id: ExecutionId, token: &str) -> anyhow::Result<Option<SignalRegistration>> {
+        let row: Option<SignalRow> = sqlx::query_as(SIGNAL_DELETE_WAIT_OF_RUN_RETURNING)
+            .bind(token)
+            .bind(execution_id)
+            .fetch_optional(&self.pool)
+            .await
+            .context("signal_withdraw: read the signal row")?;
+        row.map(row_to_signal).transpose()
+    }
+
     async fn signal_list_for_execution_id(&self, execution_id: ExecutionId) -> anyhow::Result<Vec<SignalRegistration>> {
         let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_SELECT_WHERE_EXECUTION_ID_RESUME)
-            .bind(execution_id.to_string())
+            .bind(execution_id)
             .fetch_all(&self.pool)
             .await
             .context("signal_list_for_execution_id: read a signal row")?;
@@ -1994,7 +1510,7 @@ impl Journal for PostgresJournal {
         execution_id: ExecutionId,
     ) -> anyhow::Result<Vec<SignalRegistration>> {
         let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_EXECUTION_ID_RETURNING)
-            .bind(execution_id.to_string())
+            .bind(execution_id)
             .fetch_all(&self.pool)
             .await
             .context("signal_remove_for_execution_id: read a signal row")?;
@@ -2009,22 +1525,15 @@ impl Journal for PostgresJournal {
     }
 }
 
-/// Erase every trace of these executions, inside the caller's
-/// transaction.
+/// Erase every trace of these runs, inside the caller's transaction.
 ///
-/// ONE list of where an execution lives, used by the per-execution erase
-/// (`weft clean`) and the per-project one (`weft rm`), because two
-/// lists would drift and the drift would be invisible: a table the
-/// project erase forgot leaves rows nothing can ever reach again, on a
-/// path nobody runs twice.
-///
-/// It has to be one transaction. Half-applied, a crash in the window
-/// leaves tag and index rows whose journal is empty, which is exactly
-/// the row set the live tag read selects for, and a later stop writes
-/// fresh cancel rows into a deleted journal, resurrecting a ghost run.
-/// Every row of these executions, in one transaction. Answers the resume
-/// signals it removed, because a listener process holds each of those in
-/// RAM and only the caller can tell it to let go.
+/// ONE list of where a run lives, used by the per-run erase (`weft clean`)
+/// and the per-project one (`weft rm`), because two lists would drift and
+/// the drift would be invisible: a table the project erase forgot leaves
+/// rows nothing can ever reach again. One transaction, so a crash leaves
+/// either the whole run or none of it. Answers the resume signals it
+/// removed, because a listener process holds each of those in RAM and only
+/// the caller can tell it to let go.
 async fn erase_execution_ids(
     tx: &mut sqlx::PgConnection,
     execution_ids: &[ExecutionId],
@@ -2032,38 +1541,25 @@ async fn erase_execution_ids(
     if execution_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let ids: Vec<String> = execution_ids.iter().map(|c| c.to_string()).collect();
-    sqlx::query("DELETE FROM trigger_setup WHERE execution_id = ANY($1)")
-        .bind(&ids).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM exec_event WHERE execution_id = ANY($1)")
-        .bind(&ids).execute(&mut *tx).await?;
-    for execution_id in execution_ids {
-        weft_journal::tags::delete_for_execution_id(&mut *tx, *execution_id).await?;
-    }
-    // Resume tokens for these executions: signal rows with is_resume=true.
-    // Returned, not just dropped: the listener still serves each one,
-    // and a plain DELETE here is exactly what left a deleted run's
-    // question answerable there.
+    // The runs' rows first, in id order: the lock every writer of a run
+    // takes before anything else of it (an answer reaching one of its
+    // waits holds the row, then its signal).
+    sqlx::query("SELECT 1 FROM run WHERE execution_id = ANY($1) ORDER BY execution_id FOR UPDATE")
+        .bind(execution_ids)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM trigger_setup WHERE execution_id = ANY($1)").bind(execution_ids).execute(&mut *tx).await?;
+    weft_journal::tags::delete_for_execution_ids(&mut *tx, execution_ids).await?;
     let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_RESUME_BY_EXECUTION_IDS_RETURNING)
-        .bind(&ids)
+        .bind(execution_ids)
         .fetch_all(&mut *tx)
         .await
-        .context("erase executions: read a resume signal row")?;
+        .context("erase runs: read a resume signal row")?;
     let removed = rows.into_iter().map(row_to_signal).collect::<anyhow::Result<Vec<_>>>()?;
-    // execution is the denormalized (execution, project_id,
-    // tenant_id) index seeded at ExecutionStarted time. Without this
-    // delete the row outlives the journal it indexes, and
-    // `list_non_terminal_execution_ids_for_project` keeps returning the erased
-    // execution forever as non-terminal (its NOT EXISTS terminal check
-    // passes vacuously once every event is gone), so wipe and
-    // cancel_running re-sweep a ghost.
-    sqlx::query("DELETE FROM execution_search WHERE execution_id = ANY($1)")
-        .bind(&ids).execute(&mut *tx).await?;
-    sqlx::query("DELETE FROM execution WHERE execution_id = ANY($1)")
-        .bind(&ids).execute(&mut *tx).await?;
-    // The run's row in the version tree belongs to the version store,
-    // not here. For one execution `clean_execution` drops it alongside this;
-    // for a whole project the project's removal already took the tree.
+    sqlx::query("DELETE FROM parked_fire WHERE execution_id = ANY($1)").bind(execution_ids).execute(&mut *tx).await?;
+    for table in ["run_search", "run_search_queue", "run_log", "run"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE execution_id = ANY($1)")).bind(execution_ids).execute(&mut *tx).await?;
+    }
     Ok(removed)
 }
 
@@ -2087,7 +1583,7 @@ pub async fn remove_project_signals_except<'e>(
 ) -> anyhow::Result<Vec<SignalRegistration>> {
     let rows: Vec<SignalRow> = sqlx::query_as(SIGNAL_DELETE_BY_PROJECT_EXCEPT_RETURNING)
         .bind(project_id)
-        .bind(except.map(|c| c.to_string()))
+        .bind(except)
         .fetch_all(executor)
         .await
         .context("remove project signals: read a signal row")?;
@@ -2315,7 +1811,7 @@ const SIGNAL_DELETE_BY_PROJECT_RETURNING: &str =
 const SIGNAL_DELETE_BY_PROJECT_EXCEPT_RETURNING: &str = concat!(
     // `$2` NULL keeps nothing back: `execution_id IS DISTINCT FROM NULL` would
     // spare every entry signal (their execution is NULL too).
-    "DELETE FROM signal WHERE project_id = $1 AND ($2::text IS NULL OR execution_id IS DISTINCT FROM $2) RETURNING ",
+    "DELETE FROM signal WHERE project_id = $1 AND ($2::uuid IS NULL OR execution_id IS DISTINCT FROM $2) RETURNING ",
     signal_columns!("")
 );
 
@@ -2342,11 +1838,14 @@ const SIGNAL_DELETE_BY_ACTIVATIONS_RETURNING: &str =
     concat!("DELETE FROM signal WHERE ", governed_by_activations!(), " RETURNING ", signal_columns!(""));
 
 const PRESERVED_BY_ACTIVATIONS: &str = concat!(
-    "SELECT COALESCE(SUM(jsonb_array_length(parked_fires)), 0)::bigint, \
-            COUNT(*) FILTER (WHERE is_resume = TRUE AND jsonb_array_length(parked_fires) = 0) \
-     FROM signal WHERE ",
+    "SELECT COALESCE(SUM(waiting.n), 0)::bigint, COUNT(*) FILTER (WHERE is_resume AND waiting.n = 0) \
+     FROM signal s CROSS JOIN LATERAL (SELECT COUNT(*) AS n FROM parked_fire pf WHERE pf.token = s.token) waiting \
+     WHERE ",
     governed_by_activations!()
 );
+
+const SIGNAL_DELETE_WAIT_OF_RUN_RETURNING: &str =
+    concat!("DELETE FROM signal WHERE token = $1 AND is_resume AND execution_id = $2 RETURNING ", signal_columns!(""));
 
 const SIGNAL_DELETE_BY_TOKENS_RETURNING: &str =
     concat!("DELETE FROM signal WHERE token = ANY($1) RETURNING ", signal_columns!(""));
@@ -2371,7 +1870,7 @@ pub(crate) struct SignalRow {
     pub(crate) token: String,
     pub(crate) tenant_id: String,
     pub(crate) project_id: uuid::Uuid,
-    pub(crate) execution_id: Option<String>,
+    pub(crate) execution_id: Option<ExecutionId>,
     pub(crate) node_id: String,
     pub(crate) is_resume: bool,
     pub(crate) spec_json: String,
@@ -2393,18 +1892,7 @@ pub(crate) struct SignalRow {
 }
 
 pub(crate) fn row_to_signal(row: SignalRow) -> anyhow::Result<SignalRegistration> {
-    // Distinguish a NULL column (a legitimately absent value) from a NON-NULL value
-    // that fails to decode (corrupt state). A resume signal's `execution_id` is matched by
-    // the fire/resume path to route the signal to its suspended execution: silently
-    // collapsing a corrupt execution to `None` would make that execution unresumable
-    // with no error, so a present-but-unparseable execution fails LOUD here.
-    let execution_id = match row.execution_id {
-        None => None,
-        Some(s) => Some(
-            s.parse::<ExecutionId>()
-                .map_err(|e| anyhow::anyhow!("corrupt signal.execution '{s}' for token {}: {e}", row.token))?,
-        ),
-    };
+    let execution_id = row.execution_id;
     // The payload is the CACHE of what a consumer surface renders,
     // rebuilt from the spec on every re-register and read by nothing
     // else. One unreadable cache must not make the row unreadable: this

@@ -421,6 +421,7 @@ async fn unpicked_connections(client: &crate::client::DispatcherClient, project:
 
 fn print_unpicked(unpicked: &[String], target: &str) {
     if unpicked.is_empty() {
+        println!("connections: every connection the program reads is picked on {target}");
         return;
     }
     println!("the deploy workflow cannot turn the program on until these are fixed on {target} (add `--on {target}`):");

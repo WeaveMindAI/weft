@@ -1,8 +1,11 @@
 # The journal
 
-Every run writes down what it did, event by event, as it happens. That record
-is what the graph shows you, what `weft events` prints, and what a replacement
-worker reads to rebuild a run that was interrupted.
+Every recorded run writes down what it did, event by event. For when each
+write happens, go and read [when a run waits for its
+writes](#when-a-run-waits-for-its-writes).
+That record is what the graph shows you, what `weft events` prints, and what a
+worker reads to pick up a durable run that was interrupted, or a run that was
+waiting.
 
 ```bash
 weft events 9b81d0a2
@@ -10,12 +13,16 @@ weft events 9b81d0a2 --node classify --full
 weft logs 9b81d0a2
 ```
 
-It is append-only. Nothing edits or deletes an event once written, and
-`weft clean` is the only thing that removes any.
+Nothing edits an event once it is written. A run is deleted with its record
+once it has been kept long enough (go and read [how long a run is
+kept](#how-long-a-run-is-kept)), or sooner by `weft clean`, `weft prune` or
+`weft rm`.
 
 ## What is in it
 
-One row per event: which run, what kind, when, and the event itself.
+Each row holds one run's events from one write, in the order they happened:
+which run, what kinds, when, and the events themselves. A worker sends the rows
+of several runs in one write. A run's history is its rows, read in order.
 
 **The run's life.** It started, with the project, the entry node and a
 fingerprint of the exact program shape, so a resume runs against what it
@@ -23,18 +30,19 @@ suspended on rather than whatever you have edited since. Then it completed,
 failed, or was cancelled, with the reason in words and in a form the inspector
 can read.
 
-**Each node's life.** Kicked, started, and then completed, failed, skipped,
-suspended, resumed or cancelled. A skip carries why in plain words, for you to
-read, and a resume never reads it back.
+**Each node's life.** Given its inputs (kicked), started, and then completed,
+failed, skipped, suspended, resumed or cancelled. A skip carries its reason in
+plain words.
 
-**Values on wires.** `PortEmitted` is the only row that carries a value, and it
-carries it once. The fold puts the pulses on every outgoing wire itself, which
-is why replay lands on exactly the same picture as the live run did.
+**Values on wires.** `PortEmitted` is the only event that carries a value, and
+it carries it once. When a run is rebuilt, weft puts the value on every
+outgoing wire itself, which is why a replay lands on exactly the same picture
+as the live run did.
 
-`PortClosed` is separate, because a node deciding to close a port is a fact it
-chose, while the closures swept up when a body returns are not.
+`PortClosed` is written only when a node closes a port on purpose. The ports
+that close because a body returned are worked out again on replay.
 
-**Loops, streams and buses** get their own rows: an iteration launching, a
+**Loops, streams and buses** get their own events: an iteration launching, a
 gather assembling, a bus participant joining, a window of messages.
 
 **What a call cost**, from the meter, as it happens. A node can never write one
@@ -42,73 +50,106 @@ of those.
 
 ## Reading it back
 
-The fold takes the rows and the program and rebuilds where the run had got to.
+When weft reads a run back (the fold), it takes the rows and the program and
+works out where the run had got to.
 
-The important part: it records only the facts learned from **outside**, and
-recomputes everything else with the same functions the live engine ran. So the
-picture a replay rebuilds is identical to the one the live run held, rather
-than a second implementation that might disagree.
-
-That is also why a replayed run looks exactly like a live one in the editor.
-Same badges, same inspector, same timestamps, which are the journal's own, so a
-replay reads as when it happened.
+The journal holds only the facts learned from **outside**, and the fold
+recomputes everything else with the same functions the live engine ran, so a
+replay rebuilds exactly the picture the live run held. A replay shows the
+times the journal wrote down, so you see when each thing really happened.
 
 ## When a row cannot be read
 
 A row the fold cannot apply is a hole. It is logged, listed on the run, and the
-inspector shows the count rather than pretending the run is whole.
+inspector shows how many there are.
 
-A hole in dead history is cosmetic: the replay view degrades and the run
-carries on. A hole where a resume has to pick up is fatal and says so, because
-rebuilding half a world and carrying on would be worse than stopping.
+In a run that has ended, a hole only spoils the replay view. In a run that has
+to resume, a hole stops the resume with an error, because a run rebuilt from
+part of its record could run steps that already ran.
 
 ## The execution guarantee
 
-A node's completion is written after the node finishes. If the worker dies
-before that, the next worker finds no completion for the step and fails it,
-saying the worker went away and the step was not run again.
+A node's completion is written after the node finishes, so a step whose worker
+died before that has no completion on record. For what weft does with such a
+step, in a fast run and in a durable one, go and read [surviving a
+restart](../nodes/durable-execution.md#when-the-worker-dies-mid-step).
 
-A step that was waiting on an answer replays instead. For how that replay
-works, what `catchErrors` does with this failure, and what happens when
-`ctx.run` cannot save a result, go and read
-[surviving a restart](../nodes/durable-execution.md).
+## When a run waits for its writes
 
-## A run does not wait for its writes
+A worker gathers what its runs did and writes it a couple of milliseconds
+later, or at once when a run is waiting on it. Each run's records always
+arrive in order.
 
-A worker hands each event to a sender of its own and carries on: the rows
-reach the database in the background, in the order they happened. The run
-waits for them only where something else is about to read or act on its
-record: before it reads its own journal, before it hands anything to the
-dispatcher (a task, a tag, a stop), and when it ends or pauses, so a run is
-never reported finished before its record is whole. A write that fails stops
-the run at once, for the reason below.
+A fast run (the default) waits for its writes only where something else is
+about to act on its record: when it pauses, when an answer it was waiting for
+arrives, when its worker is stopping and hands it to another one, and before it
+asks weft for something on its behalf (a connection or an endpoint it does not
+already hold, anything on its stored files, a tag through `ctx.tag_execution`,
+a stop through `ctx.stop_tagged`, a call on its own program such as starting
+its infra). If a step calls a paid service and that call reports a cost, the cost is
+written in the background, and the run hands over its ending only once that
+cost is written. Once it has handed its ending over, the run is gone from the worker's memory straight away. The ending
+is written after every event the run handed over before it, so a run is never
+reported finished before the rest of its record.
+
+A durable run also waits before each step of a node that is not
+[pure](../nodes/metadata.md#features), before an answer leaves for its caller,
+and for its ending. One fired by an event also waits for its start to be
+written before the event counts as delivered. When the answer is the last thing the run does, its ending
+goes in the same write, so the answer costs no extra wait. A durable route that
+reshapes its input with pure nodes and answers with `Reply` (pure too) waits
+once, for the answer and the ending together. For choosing between the two, go and read [how a run is
+kept](../language/triggers-and-routes.md#how-a-run-is-kept).
+
+If the database falls behind and 64 MiB of events are already waiting on a
+worker, the next run with more to hand over waits until there is space, so
+nothing is dropped. For what that
+does to new calls, go and read [when a worker is
+full](architecture.md#when-a-worker-is-full).
 
 ## Why a failed write stops the run
 
-If the journal is missing rows the live worker believes it wrote, every later
-rebuild would reconstruct a different world: a node whose start was lost but
-whose emissions landed would run again and spend twice.
+If a write fails (the broker refuses it, or a minute of sending it again gets
+no answer), the runs whose rows were in it end as failed. A write that got no
+answer is safe to send again, because the record takes a batch sent twice only
+once. A journal missing rows the worker thinks it wrote would rebuild a different run:
+a node whose start was lost but whose values landed would run again and spend
+twice.
 
-So a failed write ends that run, as failed, rather than carrying on with a
-record nobody can trust.
+## How long a run is kept
 
-## Who may write
+An ended run is kept for a week, and then deleted with its record, its logs,
+its search entry and its tags. A run that has not ended (running, parked,
+waiting for a worker) is never deleted, however old. If you want another
+length:
 
-Every row from a worker carries which worker wrote it, and the database rejects
-a write from one whose registration has been removed. That is what stops an
-evicted worker still writing history for a run somebody else has taken over.
+- for every run of a project, set it in `weft.toml`:
+
+  ```toml
+  [runs]
+  keep_for = "30d"
+  ```
+
+- for the runs of one trigger, set its `keepRunsFor` input (`12h`, `30d`,
+  `forever`);
+- for one run you start by hand, `weft run --keep-for 2h`.
+
+A trigger's setting beats the project's, and `--keep-for` beats both. A run's keep
+time is fixed when it starts, so a change only reaches runs that start
+afterwards. If you change a trigger's `keepRunsFor` or the project's
+`keep_for`, the trigger's own runs pick up the change once you run `weft
+resync`, and a run you fire with `weft run --fire` once you run `weft bake`.
 
 ## Clearing it
 
 ```bash
-weft clean                    # runs older than 30 days
+weft clean                    # ended runs that started more than 30 days ago
 weft clean 9b81d0a2           # one run
 weft clean --project <id>     # that project's whole history
 weft clean --all              # everything
 ```
 
-A project's runs outlive the project, so `--project` is how you erase the
-history of something you already removed.
+Removing a project with `weft rm` erases its runs with it.
 
 ## A past run that shows nothing
 
@@ -116,6 +157,6 @@ The journal names the program each run used, by hash. If the dispatcher no
 longer holds that program, the run's rows are still there but nothing can be
 drawn against them.
 
-`weft build` puts it back: registering records the compiled program under its
-own hash, which is the hash the run names, so unchanged files make the run
-readable again.
+If your files are the same as when the run ran, `weft build` makes it readable
+again: it registers the program under its hash, and that is the hash the run
+names.

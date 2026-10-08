@@ -79,7 +79,9 @@ where
         expires_in_secs: Some(INSTANCE_TOKEN_SECS),
         ..MintTokenRequest::caller(format!("weft CLI acting in instance {instance}"))
     };
-    let first = mint(client, &request).await?;
+    let first = mint(client, &request).await.with_context(|| {
+        format!("mint an instance token for this command (is the project registered? `{}` does it)", ctx.weft("build"))
+    })?;
     let door = client.with_bearer(&first.token);
     let live: LiveTokens = std::sync::Arc::new(std::sync::Mutex::new(vec![first.id]));
     let (stop, stopped) = tokio::sync::watch::channel(());
@@ -107,17 +109,18 @@ where
             renewer.abort();
             let left = live_ids(&live)?.clone();
             for id in &left {
-                eprintln!("left live: instance token {id}; revoke it with `weft token revoke {id}`");
+                eprintln!("left live: instance token {id}; revoke it with `{}`", ctx.weft(&format!("token revoke {id}")));
             }
             bail!(
                 "interrupted (Ctrl+C) while revoking; {} instance token(s) left live (named above), and one being \
-                 minted at that moment may have survived too: `weft token list` shows it",
-                left.len()
+                 minted at that moment may have survived too: `{}` shows it",
+                left.len(),
+                ctx.weft("token list")
             );
         }
     };
     for (id, e) in &failed {
-        eprintln!("warning: could not revoke instance token {id} ({e:#}); revoke it with `weft token revoke {id}`");
+        eprintln!("warning: could not revoke instance token {id} ({e:#}); revoke it with `{}`", ctx.weft(&format!("token revoke {id}")));
     }
     let value = outcome?;
     renewer_ended?;
@@ -150,7 +153,7 @@ async fn mint(client: &DispatcherClient, request: &MintTokenRequest) -> Result<M
     let minted = client
         .post_json("/signal-tokens", &serde_json::to_value(request)?)
         .await
-        .context("mint an instance token for this command (is the project registered? `weft build` does it)")?;
+        .context("mint an instance token")?;
     serde_json::from_value(minted).context("read the instance token the install minted")
 }
 

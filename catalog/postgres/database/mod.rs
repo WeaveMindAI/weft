@@ -15,6 +15,16 @@
 //! than only the one that read it, so no failure in between can leave
 //! a database nothing can sign in to.
 //!
+//! Its one output is baked (`weft_core::infra::bake`): the run that
+//! applies its infra runs this body and saves the connection it emits,
+//! and any later run that reads only that output uses the saved value
+//! without running this node, so it asks the database nothing.
+//!
+//! The graph's `Reset password` button resets it in the database, and
+//! the credential container then pushes the new password to weft
+//! (`weft_core::infra::VALUES_URL_ENV`), which writes it into the
+//! connection this node published: no run of this node is involved.
+//!
 //! Nothing here is memoized with `ctx.run`, and it does not need to
 //! be: the body never waits, so it is never replayed, and every call
 //! it makes is safe to repeat when somebody runs the step again. Reading the password is a
@@ -288,6 +298,7 @@ impl Node for PostgresDatabaseNode {
         values.insert("port".to_string(), port.to_string());
         values.insert("database".to_string(), database);
         values.insert("user".to_string(), ADMIN_USER.to_string());
+        // SYNC: the published `password` <-> images/credential/bootstrap.py (push_values)
         values.insert("password".to_string(), password.clone());
         // Inside the project's own network; the database serves no TLS.
         values.insert("sslmode".to_string(), "disable".to_string());

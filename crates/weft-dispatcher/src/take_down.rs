@@ -46,7 +46,7 @@ pub struct RunFacts {
     pub instance: Option<InstanceId>,
     /// The trigger that fired it (`None` for a run started by hand).
     pub fired_by: Option<String>,
-    /// Parked on a wait (a resume signal), rather than working now.
+    /// Parked on a wait (`state = 'parked'`), rather than working now.
     pub suspended: bool,
 }
 
@@ -104,33 +104,22 @@ pub fn landing_lifecycle(spec: &DeactivateSpec, now_unix: i64, went_down: Option
     }
 }
 
-/// Every live run of the project, with what a take-down needs to know.
+/// Every run of the project that has not ended, with what a take-down
+/// needs to know.
 pub(crate) async fn live_runs(state: &DispatcherState, project_id: uuid::Uuid) -> anyhow::Result<Vec<RunFacts>> {
-    let live: std::collections::HashSet<ExecutionId> = state
-        .journal
-        .list_non_terminal_execution_ids_for_project(project_id)
-        .await?
-        .into_iter()
-        .map(|(execution_id, _)| execution_id)
-        .collect();
-    let suspended = crate::api::project::suspended_execution_id_set(state, project_id).await?;
-    let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT execution_id, instance_id, fired_by FROM execution \
-         WHERE project_id = $1 AND kind IN ('execution', 'unrecorded')",
+    let rows: Vec<(ExecutionId, Option<String>, Option<String>, bool)> = sqlx::query_as(
+        "SELECT execution_id, instance_id, fired_by, state = 'parked' FROM run \
+         WHERE project_id = $1 AND state <> 'ended' ORDER BY started_at, execution_id",
     )
     .bind(project_id)
     .fetch_all(&state.pg_pool)
     .await?;
-    let mut out = Vec::new();
-    for (execution_id, instance, fired_by) in rows {
-        let execution_id: ExecutionId = execution_id.parse().map_err(|e| anyhow::anyhow!("corrupt execution.execution '{execution_id}': {e}"))?;
-        if !live.contains(&execution_id) {
-            continue;
-        }
-        let instance = instance.map(InstanceId::new).transpose().map_err(|e| anyhow::anyhow!("corrupt execution.instance_id: {e}"))?;
-        out.push(RunFacts { execution_id, instance, fired_by, suspended: suspended.contains(&execution_id) });
-    }
-    Ok(out)
+    rows.into_iter()
+        .map(|(execution_id, instance, fired_by, suspended)| {
+            let instance = instance.map(InstanceId::new).transpose().map_err(|e| anyhow::anyhow!("run {execution_id} holds a broken instance: {e}"))?;
+            Ok(RunFacts { execution_id, instance, fired_by, suspended })
+        })
+        .collect()
 }
 
 /// Take `target` down under `spec`. Returns false when the project does
@@ -141,10 +130,10 @@ pub(crate) async fn live_runs(state: &DispatcherState, project_id: uuid::Uuid) -
 /// first) or a project mid-build; then wipe drops what the target's
 /// activations had registered and cancels every run it reaches, while
 /// hibernate and park keep the rows and the listeners keep holding them
-/// (what they hear waits for the trigger: `crate::arrival`); `cancel` stops what is
+/// (what they hear waits for the trigger: `weft_core::arrival`); `cancel` stops what is
 /// running now (a parked run survives hibernate and park), `wait` leaves
-/// it to finish and lands the activations once it has (the reaper cancels
-/// what is left at the cap). The lifecycle write comes before any of
+/// it to finish and lands the activations once it has (the drains loop
+/// cancels what is left at the cap, `crate::drain`). The lifecycle write comes before any of
 /// that, guarded, so a refused write leaves nothing done.
 pub async fn take_down(
     state: &DispatcherState,
@@ -184,7 +173,7 @@ pub async fn take_down(
     // failure after it leaves nothing registered for a row that is gone,
     // and the cancels below are safe to repeat. A park or a hibernate
     // keeps the rows, and the listeners keep holding them: what they hear
-    // waits for the trigger to be back on (`crate::arrival`).
+    // waits for the trigger to be back on (`weft_core::arrival`).
     // When it went down is the database's moment, the clock an infra
     // copy's apply is stamped with, which is what it is compared with
     // (`crate::api::infra::bring_back_triggers_whose_infra_returned`).
@@ -237,70 +226,21 @@ pub async fn take_down(
         crate::api::execution::cancel_execution_ids(state, &targets).await.map_err(|e| internal("cancel", e))?;
     }
 
+    // Nothing of the project takes work any more: its front goes.
+    crate::front::let_go_if_idle(state, project_id).await.map_err(|e| internal("let the front go", e))?;
+
     state.events.publish(DispatcherEvent::ProjectDeactivated { project_id }).await;
     if landing.status == ProjectStatus::Deactivating {
         // Nothing to wait for lands at once, so nobody sees a
-        // Deactivating that is already over.
+        // Deactivating that is already over; the rest land from the
+        // drains loop (`crate::drain`).
         for key in &keys {
-            crate::journal_bridge::try_finish_drain(state, project_id, key, None)
+            crate::drain::land_if_drained(state, project_id, key)
                 .await
                 .map_err(|e| internal("finish drain", e))?;
         }
     }
     Ok(true)
-}
-
-/// What wakes [`wait_until_no_live_runs`]: every write that can end a
-/// live run. A recorded run ends on a terminal journal row, an unrecorded
-/// one when it is forgotten or when its execute task closes. A claim that
-/// lapses (its worker went away) announces nothing; the wait's own safety
-/// look catches it.
-pub const RUN_ENDING_CHANNELS: &[&str] = &[
-    weft_journal::EXEC_EVENT_CHANNEL,
-    weft_journal::unrecorded::UNRECORDED_ENDED_CHANNEL,
-    weft_task_store::terminal::TERMINAL_CHANNEL,
-];
-
-/// Return once project `project_id` has no live run (the shared rule,
-/// `weft_journal::unrecorded::LIVE_RUN_SQL`), for a caller that just
-/// cancelled them all and must not touch their rows while a process can
-/// still be writing them. A recorded run is terminal at the cancel's
-/// commit; an unrecorded one ends when the process driving it lets go.
-///
-/// No deadline: how long a process takes to let go is not the caller's to
-/// cut short. Every minute still waiting is logged with the runs it is
-/// waiting on. `signals` must be subscribed before the cancels, so an
-/// ending between them and the first look is heard.
-pub async fn wait_until_no_live_runs(
-    journal: &dyn crate::journal::Journal,
-    mut signals: weft_task_store::pg_signal::Subscription,
-    project_id: uuid::Uuid,
-) -> anyhow::Result<()> {
-    use tokio::time::{Duration, Instant};
-    let started = Instant::now();
-    let mut next_breadcrumb = started + Duration::from_secs(60);
-    loop {
-        signals.clear()?;
-        let live = journal.list_non_terminal_execution_ids_for_project(project_id).await?;
-        if live.is_empty() {
-            return Ok(());
-        }
-        if Instant::now() >= next_breadcrumb {
-            let execution_ids: Vec<String> = live.iter().map(|(c, _)| c.to_string()).collect();
-            tracing::warn!(
-                target: "weft_dispatcher::take_down",
-                %project_id,
-                waited_secs = started.elapsed().as_secs(),
-                runs = %execution_ids.join(", "),
-                "still waiting for cancelled runs to end"
-            );
-            next_breadcrumb = Instant::now() + Duration::from_secs(60);
-        }
-        let deadline = next_breadcrumb.min(Instant::now() + weft_task_store::drain::SAFETY_POLL_INTERVAL);
-        signals
-            .woken_before(deadline, |channel, _| RUN_ENDING_CHANNELS.contains(&channel))
-            .await?;
-    }
 }
 
 #[cfg(test)]

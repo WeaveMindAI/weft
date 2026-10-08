@@ -321,11 +321,7 @@ not: those are the program's own shape, never an outcome to route around.
 What counts as a failure for a given node (an answer with an error status,
 say) is in that node's description.
 
-A step never runs twice by itself. If the worker running it goes away
-mid-step, the step may have partly happened, so it is failed rather than run
-again, and with `error` wired that failure goes there like any other. The
-run's log then says `the worker running '<node>' went away while it was
-running`.
+A step that could act outside the run is never started again after a crash. If its worker goes away mid-run, a fast run ends cancelled and a durable one fails the step that was running (How a run is kept, below, has both); only a step of a `pure` node that had sent nothing on and read no stream runs again. With `error` wired, that failure goes there like any other, and the log says `the worker running '<node>' went away while it was running` (or `while it was reading a stream`). A run waiting on a timer or a form, with nothing else of it running, survives its worker dying either way, unless its caller is still on the line with `outlivesCaller` off or a bus between its nodes is open: then its wait holds the worker (up to the trigger's `holdSecs`), and it ends with it.
 
 ````weft
 ask = LlmInference { provider: prov.provider, prompt: job.text }
@@ -725,9 +721,33 @@ trigger programs sharing dependencies without executing unrelated branches.
 
 Ends: completed (no pulse in flight), suspended (every live firing parked on
 an external wait: a person, a timer; costs nothing), stuck (provably
-deadlocked, fails loudly), or cancelled (a person pressed Stop, or a sibling
-run stopped it). Everything is journaled; a run is readable node by node with
-the values on the wires.
+deadlocked, fails loudly), or cancelled (a person pressed Stop, another run stopped it by tag, the live caller hung up, the worker of a fast run went away, it reached the hour a cloud install allows one stretch of a run, or the runtime itself ended it, such as a newer build replacing its image). Every recorded run is readable node by node with
+the values on the wires; one whose trigger has `recorded: false` keeps no
+history: if it fails, its failure is kept, and if it reported a cost or asked
+weft for something on its behalf, its costs and how it ended are kept.
+
+## How a run is kept
+
+Every trigger has inputs, written in its braces like any other, that say how the runs it starts are kept: `durable`, `recorded` and `keepRunsFor`:
+
+| Input | Default | Change it when |
+|---|---|---|
+| `durable` | off | the run has to carry on from the steps already finished if its worker dies, with a record of exactly which ones ran |
+| `recorded` | on | a route is polled every few seconds and each call would leave a run behind (turn it off) |
+| `keepRunsFor` | the project's `[runs] keep_for` in `weft.toml`, else a week | its runs should be kept longer or shorter once they end (`12h`, `30d`, `forever`), then they are deleted |
+
+```weft
+pay = Route -> (body: JsonDict) {
+  path: "pay"
+  method: "POST"
+  durable: true
+}
+```
+
+With `durable` off you get a fast run: it waits for its record only where weft has to act on it (a pause, a call to weft that names the run), and if its worker dies the run ends cancelled and is not run again. With it on, everything a run did is on record before a step that could act outside it starts (a pure node's step does not wait), and an answer to a caller is on record before it leaves. If the worker dies, another worker picks the run up and keeps every finished step; a step that was running is failed rather than run twice, unless it belongs to a `pure` node, read no stream and had sent nothing on: that one simply runs again. If a caller started the run, that caller's connection died with the old worker, so a step that answers it then fails, saying no live caller is attached. A
+run with `recorded: false` cannot be tagged, and `durable` or `outlivesCaller` (on any trigger that answers a live caller) with `recorded: false` is the `run-settings` error.
+A run that cannot pause (`recorded: false`, a caller on the line with `outlivesCaller` off, a bus between its nodes open) holds a wait (a timer, a form) in its worker instead of pausing, and the answer carries it on there. Every trigger has `holdSecs` (default 60, `0` to never wait, at most 30 days): when nothing has moved in the run for that long, the waiting node fails saying it gave up, which it may handle itself or send to `error`. If the run can pause again (its last bus closed), the wait pauses after all.
+A run you start by hand is always recorded. If it fires a trigger (`weft run --fire`), it is kept the way that trigger's `durable` and `keepRunsFor` say, and any other hand-started run is fast. `--durable`, `--fast`, `--keep-for` and `--hold-secs` override that for the one run. For polling routes and answering early, go and read the `weft-api` skill.
 
 ## Stopping other runs
 

@@ -14,11 +14,10 @@ node and the wrong value.
 
 - **If you want to know what ran, or whether your trigger fired since the
   change**: `weft executions --limit 10 --phase fire`. One line per run:
-  execution id, status (`running`, `completed`, `failed`, `cancelled`), phase, the
-  local start time, the entry node (the trigger that fired), the tags. An
+  execution id, status (`running`, `waiting_for_input`, `completed`, `failed`, `cancelled`), phase, the
+  start time in UTC, the project id, the entry node (the trigger that fired), the tags. An
   activate, a resync or an infra start creates setup runs, phases
-  `trigger_setup` and `infra_setup`; `--phase fire` hides them. `--project
-  <id>` narrows to one project.
+  `trigger_setup` and `infra_setup`; `--phase fire` hides them. `--project <id>` narrows to one project. A run whose trigger has `recorded: false` is listed only if it failed (with the step that failed and why, nothing before it) or reported a cost or asked weft for something on its behalf, so a route that answered and left nothing here may simply be unrecorded: `weft status` shows how many runs each trigger started in the last minute or two and how many failed, which is how you confirm its runs happen.
 - **If a run failed and you want the reason**: `weft logs <execution-id>`. It
   prints what the run's nodes wrote and every failure the journal recorded,
   as `error` and `warn` lines. A line about one node names it (and the loop
@@ -88,12 +87,8 @@ node and the wrong value.
    connection picked is [the runtime tier] firing at execution,
    not a source bug: you pick a stored connection yourself (`weft connect
    --node <id> --grant <grant>`) or send the user to the node's Connect
-   button / `weft connect` in their terminal, then run again. A failure saying
-   `the worker running '<node>' went away while it was running` means the
-   worker died mid-step: weft does not run a step again once its start is on
-   record, because the step may have partly happened. Check what it did outside (the email, the
-   row, the post), then `weft run --seed`, which reuses what completed and
-   runs that step again.
+   button / `weft connect` in their terminal, then run again. A failure saying `the worker running '<node>' went away while it was running` means the worker of a durable run died mid-step: weft does not run a step again once its start is on
+   record, because the step may have partly happened. Check what it did outside (the email, the row, the post), then, if it has to happen again, start a run at that step by hand: `weft run --from <node>=<inputs>`, with the inputs from `weft events <execution-id> --node <node> --full`. If the message says `went away while it was reading a stream` instead, the items it read are gone from the stream, so `--from` cannot hand them back: check what it did, then run the whole execution again.
 3. **A value is wrong, not failed.** Work upstream from the output: open the
    run, look at the top-level groups, find the first whose output is already
    wrong, descend, repeat. When you hold the concrete failing case, iterate
@@ -112,9 +107,7 @@ node and the wrong value.
    carrying that tag: look at **that** run, and if no sibling was supposed
    to stop this one, the bug is in whichever node tagged and stopped it
    (`weft executions` shows each run's tags, so you
-   see which runs shared it). `Caller disconnected` means the live caller
-   this run was answering dropped its connection. Anything else is the
-   runtime's own reason, printed as words (a worker shutting down).
+   see which runs shared it). `Caller disconnected` means the live caller this run was answering dropped its connection. `the worker running this run went away; a fast run lives in its worker's memory, so it is not run again` means a fast run lost its worker (a crash, a machine gone): check what it did outside, then start it again (let the trigger fire again, or fire it by hand: `weft bake`, then `weft run --fire <trigger>=<payload>`, with the `payload` on the trigger's `node_kicked` line in `weft events <execution-id>`), and if the trigger's runs have to carry on after a worker dies, set `durable: true` on it. A durable run whose worker stops or dies is never cancelled: another worker picks it up from its record, and only the step that was running fails (item 2). `the run had to leave the copy of the program running it (...), and it cannot be suspended: <why>` means its worker was stopping and this run could not move to another one; the `<why>` names the reason: its trigger has `recorded: false`, its route does not have `outlivesCaller`, or a bus between its nodes was open. Check what it did outside, then start it again the same way as a fast run that lost its worker. Anything else is the runtime's own reason, printed as words.
 6. **Stuck.** The engine proved nothing can proceed; that is a graph-shape
    bug (a wire the compiler could not catch). The `execution_failed` line
    names every firing left holding a pulse and the wired ports it never

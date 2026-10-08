@@ -35,7 +35,7 @@ use crate::context::{ContextHandle, EndpointMethod, ExecutionContext, LogLevel, 
 use crate::error::{WeftError, WeftResult};
 use crate::frames::LoopFrames;
 use crate::node::{InputSpec, Node, NodeMetadata, NodeOutput};
-use crate::primitive::{replay_await, replay_run, AwaitedEntry, AwaitedEntryKind, ReplayedAwait, SignalSpec};
+use crate::primitive::{replay_await, replay_run, AwaitEnd, AwaitedEntry, AwaitedEntryKind, ReplayedAwait, SignalSpec};
 use crate::weft_type::WeftType;
 
 // ----- The test declaration ------------------------------------------
@@ -761,8 +761,9 @@ struct FakeState {
     routes: Mutex<HashMap<RouteKey, CannedRoute>>,
     /// Every request sent through the rig's HTTP surface, in order.
     requests: Mutex<Vec<SentRequest>>,
-    /// Canned `await_signal` payloads, popped in order.
-    signals: Mutex<VecDeque<Value>>,
+    /// Canned `await_signal` endings (an answer, or a wait given up),
+    /// popped in order.
+    signals: Mutex<VecDeque<AwaitEnd>>,
     /// The wake payload for the NEXT `run` (a firing trigger's
     /// `ctx.wake`). Taken (consumed) when a run starts.
     wake: Mutex<Option<Value>>,
@@ -798,6 +799,9 @@ struct FakeState {
     /// Output ports the case wires downstream (`FakeRig::wire_output`),
     /// what the compiled graph supplies in production.
     wired_outputs: Mutex<HashSet<String>>,
+    /// What the rig's runs share (`ctx.shared`), the way a worker's runs
+    /// do: one rig is one worker, and nothing goes idle while it lives.
+    shared: Arc<crate::shared::Shared>,
     /// Declared custom input ports, what the compiler merges onto a
     /// node with `canAddInputPorts` from the source's inline list.
     /// Custom input ports in the order the case declared them, which
@@ -942,6 +946,7 @@ impl FakeState {
             connection_permissions: Mutex::new(BTreeMap::new()),
             output_types: Mutex::new(HashMap::new()),
             wired_outputs: Mutex::new(HashSet::new()),
+            shared: crate::shared::Shared::new(std::time::Duration::MAX),
             input_types: Mutex::new(Vec::new()),
             buses: Mutex::new(HashMap::new()),
             storage: Mutex::new(HashMap::new()),
@@ -1135,7 +1140,16 @@ impl FakeRig {
     /// Multiple calls queue in order; an `await_signal` on an empty
     /// queue fails loud ("the test declared no signal").
     pub fn signal(&self, payload: Value) {
-        self.state.signals.lock().unwrap().push_back(payload);
+        self.state.signals.lock().unwrap().push_back(AwaitEnd::Answered { value: payload });
+    }
+
+    /// Make the node's next `ctx.await_signal` fail the way a wait the
+    /// run could not pause on fails once its hold runs out
+    /// (`WeftError::WaitGaveUp`), queued in order with [`Self::signal`]:
+    /// how a test checks what the node does with a wait given up.
+    pub fn signal_given_up(&self) {
+        let error = "the wait was given up (`rig.signal_given_up()`)".to_string();
+        self.state.signals.lock().unwrap().push_back(AwaitEnd::GaveUp { error });
     }
 
     /// Make every run on this rig a run for this instance, what
@@ -1912,6 +1926,7 @@ fn test_context(
         inputs,
         handle,
     )
+    .marked_pure(manifest.features.pure)
 }
 
 /// The per-run output capture both rigs share: declared ports, the
@@ -2237,7 +2252,7 @@ impl ContextHandle for TestHandle {
         // that found no queued payload (otherwise "parked on nothing"
         // and "never awaited" would look the same).
         self.state.awaited_signals.lock().unwrap().push(spec.clone());
-        let payload = self.state.signals.lock().unwrap().pop_front().ok_or_else(|| {
+        let ended = self.state.signals.lock().unwrap().pop_front().ok_or_else(|| {
             WeftError::Config(format!(
                 "the node awaited a '{}' signal but the test declared no payload for it; \
                  queue one with rig.signal(json!(..)) before rig.run(..)",
@@ -2246,12 +2261,12 @@ impl ContextHandle for TestHandle {
         })?;
         self.record(AwaitedEntry {
             call_index,
-            kind: AwaitedEntryKind::Await {
-                token: format!("rig-{}-{call_index}", spec.kind),
-                resolved: Some(payload.clone()),
-            },
+            kind: AwaitedEntryKind::Await { token: format!("rig-{}-{call_index}", spec.kind), ended: Some(ended.clone()) },
         });
-        Ok(payload)
+        match ended {
+            AwaitEnd::Answered { value } => Ok(value),
+            AwaitEnd::GaveUp { error } => Err(WeftError::WaitGaveUp(error)),
+        }
     }
 
     async fn register_signal(&self, spec: SignalSpec, port_snapshot: Value) -> WeftResult<()> {
@@ -2270,6 +2285,10 @@ impl ContextHandle for TestHandle {
     ) -> WeftResult<crate::infra::InfraHandle> {
         // The node under test has one shared copy of its infra here.
         Ok(crate::infra::InfraHandle::new(NODE_UNDER_TEST_ID, name, None))
+    }
+
+    fn shared(&self) -> Arc<crate::shared::Shared> {
+        self.state.shared.clone()
     }
 
     async fn endpoint_address(
@@ -3221,6 +3240,10 @@ impl ContextHandle for CapturingHandle {
         self.inner.own_infra(name, instance)
     }
 
+    fn shared(&self) -> Arc<crate::shared::Shared> {
+        self.inner.shared()
+    }
+
     async fn endpoint_address(
         &self,
         infra: &crate::infra::InfraHandle,
@@ -3683,11 +3706,10 @@ mod tests {
             data_type: crate::signal::DataType::Json,
             backpressure: crate::signal::Backpressure::Block,
             error_mode: crate::signal::ErrorMode::Surface,
-            connect_timeout_secs: 5,
             max_inbound_bytes: 1024,
             caller_silence_secs: crate::signal::DEFAULT_CALLER_SILENCE_SECS,
             max_session_secs: 0,
-            suspend: crate::wait::SuspendPolicy::default(),
+            outlives_caller: false,
             inbound_window: crate::caller::DEFAULT_INBOUND_WINDOW,
             journal: crate::stream_journal::JournalPolicy::default(),
         });
@@ -3942,7 +3964,7 @@ mod tests {
         let steps = rig.recorded_steps(&AskThenPublishNode { ask: true });
         assert_eq!(steps.len(), 2, "one entry per call, replays add none: {steps:?}");
         assert!(
-            matches!(&steps[0].kind, AwaitedEntryKind::Await { resolved: Some(payload), .. } if payload == &json!({"ok": true}))
+            matches!(&steps[0].kind, AwaitedEntryKind::Await { ended: Some(AwaitEnd::Answered { value }), .. } if value == &json!({"ok": true}))
                 && steps[0].call_index == 0,
             "the await is index 0, as production numbers it: {steps:?}"
         );

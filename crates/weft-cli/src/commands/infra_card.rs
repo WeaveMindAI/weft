@@ -45,6 +45,17 @@ impl Card {
     }
 }
 
+/// `weft infra rebake <node>`: make the node's baked outputs again, and
+/// answer once its infra setup ended.
+pub async fn run_rebake(ctx: Ctx, node: &str, instance: Option<&weft_core::instance::InstanceId>) -> Result<()> {
+    let card = Card::open(&ctx, node, instance).await?;
+    card.client.post_json(&format!("{}/rebake{}", card.base, card.query), &serde_json::json!({})).await?;
+    if !ctx.json_out(&serde_json::json!({ "node": card.place, "rebaked": true }))? {
+        println!("baked {} again: every fire reads its new values from now on", card.place);
+    }
+    Ok(())
+}
+
 /// An item's own text, as a reader of the display would see it.
 pub(crate) fn item_text(item: &LiveItem) -> String {
     match item.data.as_str() {

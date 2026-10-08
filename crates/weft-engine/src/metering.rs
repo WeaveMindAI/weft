@@ -17,7 +17,7 @@
 //!      stream (the caller sees every chunk in real time; nothing is
 //!      buffered or delayed), and
 //!   3. when the response ends (cleanly or cut), resolves the meter's
-//!      figure and records it durably on the execution's cost trail.
+//!      figure and writes it on the run's record (`CostReported`).
 //!
 //! The auth middleware runs INSIDE the metering one, so the meter
 //! classifies the URL the node wrote while the credential lands on the
@@ -28,12 +28,12 @@
 //! A relayed call is not measured here: the relay is where the runtime's
 //! own measuring happens, and this side's only job is to route the call
 //! there. A worker-side figure is a MEASUREMENT, never a charge: the record
-//! it enqueues is pinned `billed: false` and the broker refuses anything
-//! else from a worker.
+//! it writes is pinned `billed: false`.
 //!
 //! The resolve + record run detached from the node's future (the call may
-//! be cut by a cancel), tracked by [`PendingCostRecords`] so the process never
-//! exits while money is still being written down.
+//! be cut by a cancel), tracked per run by [`PendingCostRecords`]: a run
+//! waits for its spend to be written down before its ending is, so the
+//! figure is on its record, before its ending.
 
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
@@ -53,10 +53,10 @@ use weft_providers::{
 
 // ---------- Pending-record tracking ----------
 
-/// Counts cost resolutions still in flight process-wide, so the process's exit
-/// paths can refuse to die while a call's money is still being written
-/// down. Incremented when a metered response ends (the resolve task is
-/// spawned), decremented when its record has landed (or loudly failed).
+/// Counts one run's cost resolutions still in flight, so the run's ending
+/// waits while a call's money is still being written down. Incremented
+/// when a metered response ends (the resolve task is spawned), decremented
+/// when its figure is on the run's record (or loudly failed).
 pub struct PendingCostRecords {
     inner: Arc<weft_core::in_flight::InFlight>,
 }
@@ -66,6 +66,7 @@ impl PendingCostRecords {
         Arc::new(Self { inner: weft_core::in_flight::InFlight::new("cost record") })
     }
 
+    #[cfg(test)]
     pub fn count(&self) -> usize {
         self.inner.count()
     }
@@ -82,11 +83,11 @@ impl PendingCostRecords {
     ///
     /// Every resolve is internally bounded (the follow-up client has a
     /// request timeout, the ledger poll a fixed budget). An OPEN charge
-    /// holds a token until the execution that opened it ends
-    /// (`OpenCharges::flush_execution_id`); a report being read holds one of its
-    /// own until the read returns (bounded the same way); and each record
-    /// being written holds one until it is enqueued. So this returns as
-    /// long as the executions being waited on have ended.
+    /// holds a token until its run closes it
+    /// (`OpenCharges::flush_execution_id`, which a run ending calls before
+    /// it waits here); a report being read holds one of its own until the
+    /// read returns (bounded the same way); and each figure being written
+    /// holds one until it is on record.
     pub async fn wait_zero(&self) {
         self.inner.wait_zero().await;
     }
@@ -160,7 +161,7 @@ struct ChargeReport {
     meter: &'static dyn ProviderMeter,
     path: String,
     observed: ObservedCall,
-    follow_up: reqwest_middleware::ClientWithMiddleware,
+    follow_up: FollowUpLane,
     done: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -201,7 +202,7 @@ impl OpenCharges {
         reported: &str,
         path: &str,
         observed: ObservedCall,
-        follow_up: &reqwest_middleware::ClientWithMiddleware,
+        follow_up: &FollowUpLane,
     ) -> impl std::future::Future<Output = ()> + use<> {
         let id = ChargeKey { service: meter.service(), id: reported.to_string() };
         let (done, received) = tokio::sync::oneshot::channel();
@@ -285,7 +286,7 @@ impl OpenCharges {
             sink.pending.begin();
             let result = std::panic::AssertUnwindSafe(report.meter.fold_report(
                 &report.path, report.observed, &mut scratch,
-                FollowUp { http: &report.follow_up, base_url: report.meter.base_url() },
+                report.follow_up.follow_up(report.meter.base_url()),
             )).catch_unwind().await;
             let completed = {
                 let mut charges = self.by_id();
@@ -411,24 +412,28 @@ fn book_open_charge(charge: OpenCharge, why: &str) {
     let model = metadata["model"].as_str().map(str::to_string);
     let sink = charge.sink.clone();
     // Book first, release the charge's token after: the count must not
-    // pass through zero while a record is still to be enqueued.
+    // pass through zero while a figure is still to be written down.
     sink.clone().book_resolved(MeasuredCost { amount_usd: None, model, metadata });
     sink.pending.end();
 }
 
 // ---------- The cost sink (where a measured figure lands) ----------
 
-/// Everything needed to book one call's measured cost to the execution's
-/// durable cost trail: the task client to enqueue through, the firing the
-/// spend belongs to, and the pending-records tracker.
+/// Everything needed to book one call's measured cost on the run's record:
+/// the run's handle, the firing the spend belongs to, and what is still
+/// being worked out (which the run waits for before it ends).
 pub struct CostSink {
-    pub tasks: Arc<dyn weft_task_store::TaskStoreClient>,
+    /// The run's record (`crate::context::RunRecord::journal`).
+    pub journal: Arc<dyn weft_journal::JournalClient>,
+    /// The process's writer, which writes the figure down at once.
+    pub writer: Arc<crate::journal_writer::WorkerJournal>,
+    /// This worker's replica, which writes the run's record.
+    pub replica: String,
+    /// The run's spend still being worked out.
     pub pending: Arc<PendingCostRecords>,
     /// Charges opened by a call whose amount a later response states.
     /// process-wide, because a charge outlives the call that opened it.
     pub open_charges: Arc<OpenCharges>,
-    pub project_id: uuid::Uuid,
-    pub tenant_id: String,
     pub execution_id: ExecutionId,
     pub node_id: String,
     pub frames: LoopFrames,
@@ -451,12 +456,11 @@ impl CostSink {
         cost: impl std::future::Future<Output = MeasuredCost> + Send + 'static,
     ) {
         self.pending.begin();
-        let dedup_key = format!("metered_cost:{}", uuid::Uuid::new_v4());
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
                     let cost = cost.await;
-                    self.record(dedup_key, cost).await;
+                    self.record(cost).await;
                     self.pending.end();
                 });
             }
@@ -482,64 +486,37 @@ impl CostSink {
         self.book(async move { cost });
     }
 
-    /// Enqueue the durable `RecordCost` task. One record per physical call
-    /// (a replayed body that calls again spends again, and gets its own
-    /// record), so the dedup key is minted per call and only guards
-    /// enqueue retries. A record that cannot be enqueued after bounded
-    /// retries is logged LOUDLY: the money trail is incomplete and says so.
-    async fn record(&self, dedup_key: String, cost: MeasuredCost) {
-        let payload = weft_task_store::RecordCostPayload {
-            execution_id: self.execution_id.to_string(),
+    /// Write the figure down: a `CostReported` on the run's record, one per
+    /// physical call (a replayed body that calls again spends again), and
+    /// on record at once whatever the run is kept as, since it is money:
+    /// an unrecorded run leaves a note of itself for it
+    /// (`weft_journal::unrecorded`). A figure that cannot be written is
+    /// said LOUDLY: the money trail is incomplete and says so.
+    async fn record(&self, cost: MeasuredCost) {
+        let event = weft_journal::ExecEvent::CostReported {
+            execution_id: self.execution_id,
             node_id: self.node_id.clone(),
             frames: self.frames.clone(),
+            cost_id: uuid::Uuid::now_v7().to_string(),
             service: self.service.clone(),
             model: cost.model,
             amount_usd: cost.amount_usd,
             billed: false,
             origin: self.origin.clone(),
             metadata: cost.metadata,
+            at_unix: crate::now_unix(),
         };
-        let payload_json = match serde_json::to_value(&payload) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!(
-                    target: "weft_engine::metering",
-                    "COST RECORD LOST for node {} ({}): payload serialize failed: {e}",
-                    self.node_id, self.service,
-                );
-                return;
-            }
+        let written = match self.journal.record_event(&event, Some(&self.replica)).await {
+            Ok(()) => self.writer.record_first(self.execution_id).await,
+            Err(e) => Err(e),
         };
-        const ENQUEUE_ATTEMPTS: u32 = 3;
-        for attempt in 1..=ENQUEUE_ATTEMPTS {
-            let task = weft_task_store::NewTask {
-                kind: weft_task_store::TaskKind::RecordCost.into(),
-                target: weft_task_store::TaskTarget::Dispatcher,
-                project_id: Some(self.project_id),
-                dedup_key: Some(dedup_key.clone()),
-                execution_id: Some(self.execution_id.to_string()),
-                tenant_id: self.tenant_id.clone(),
-                target_replica: None,
-                binary_hash: None,
-                payload: payload_json.clone(),
-            };
-            match self.tasks.enqueue_dedup(task).await {
-                Ok(_) => return,
-                Err(e) if attempt < ENQUEUE_ATTEMPTS => {
-                    tracing::warn!(
-                        target: "weft_engine::metering",
-                        "cost record enqueue failed (attempt {attempt}): {e:#}; retrying",
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
-                Err(e) => {
-                    tracing::error!(
-                        target: "weft_engine::metering",
-                        "COST RECORD LOST for node {} ({}): enqueue failed after retries: {e:#}",
-                        self.node_id, self.service,
-                    );
-                }
-            }
+        if let Err(e) = written {
+            tracing::error!(
+                target: "weft_engine::metering",
+                execution_id = %self.execution_id,
+                "COST RECORD LOST for node {} ({}): {e:#}",
+                self.node_id, self.service,
+            );
         }
     }
 }
@@ -554,12 +531,25 @@ pub struct MeteringMiddleware {
     meter: Option<&'static dyn ProviderMeter>,
     /// The runtime's relay for calls on this connection; `None` = direct.
     relay_url: Option<String>,
-    /// A signed-in client for the meter's own follow-up query on the
-    /// direct lane (the same auth the original call rode, on the
-    /// bounded follow-up pool). The meter itself never sees a
-    /// credential.
-    follow_up: reqwest_middleware::ClientWithMiddleware,
+    /// What the meter's own follow-up queries ride (see [`FollowUpLane`]).
+    follow_up: FollowUpLane,
     sink: Arc<CostSink>,
+}
+
+/// What a meter's own queries ride: a signed-in client on the direct lane
+/// (the same auth the original call rode, on the bounded follow-up pool;
+/// the meter itself never sees a credential), and what the worker holds
+/// for its runs to share, where a meter keeps what it looked up.
+#[derive(Clone)]
+struct FollowUpLane {
+    http: reqwest_middleware::ClientWithMiddleware,
+    shared: Arc<weft_core::shared::Shared>,
+}
+
+impl FollowUpLane {
+    fn follow_up<'a>(&'a self, base_url: &'a str) -> FollowUp<'a> {
+        FollowUp { http: &self.http, base_url, shared: &self.shared }
+    }
 }
 
 /// Build the signed-in (and, when a meter is registered, measured)
@@ -574,6 +564,7 @@ pub fn connection_client(
     steps: Vec<weft_core::access::client::AppliedStep>,
     relay_url: Option<&str>,
     sink: Arc<CostSink>,
+    shared: Arc<weft_core::shared::Shared>,
 ) -> WeftResult<reqwest_middleware::ClientWithMiddleware> {
     let meter = weft_providers::meter_for(service);
     if relay_url.is_some() && meter.is_none() {
@@ -595,9 +586,12 @@ pub fn connection_client(
              for the service"
         )));
     }
-    let follow_up = reqwest_middleware::ClientBuilder::new(follow_up_client().clone())
-        .with(weft_core::access::client::AuthMiddleware::new(steps.clone()))
-        .build();
+    let follow_up = FollowUpLane {
+        http: reqwest_middleware::ClientBuilder::new(follow_up_client().clone())
+            .with(weft_core::access::client::AuthMiddleware::new(steps.clone()))
+            .build(),
+        shared,
+    };
     let middleware = MeteringMiddleware {
         meter,
         relay_url: relay_url.map(str::to_string),
@@ -738,8 +732,7 @@ impl reqwest_middleware::Middleware for MeteringMiddleware {
         // ends, and the only moment that costs nothing to prevent is
         // this one.
         if matches!(class, RouteClass::Billable(_)) {
-            let follow_up = FollowUp { http: &self.follow_up, base_url: meter.base_url() };
-            if let Err(e) = meter.priceable(route, follow_up).await {
+            if let Err(e) = meter.priceable(route, self.follow_up.follow_up(meter.base_url())).await {
                 return Err(middleware_err(format!(
                     "refusing a billable call on '{}': {e:#}",
                     self.sink.service,
@@ -842,9 +835,8 @@ struct Finalizer {
     /// The charges this process is holding open, for a provider that states a
     /// call's amount on a later response.
     open_charges: Arc<OpenCharges>,
-    /// The signed-in follow-up client (bounded pool + the connection's
-    /// auth); the meter never sees a credential.
-    follow_up: reqwest_middleware::ClientWithMiddleware,
+    /// What the meter's own follow-up queries ride.
+    follow_up: FollowUpLane,
     sink: Arc<CostSink>,
 }
 
@@ -860,7 +852,7 @@ impl Finalizer {
         let observed = self.observer.end(interrupted);
         let meter = self.meter;
         let route = self.route;
-        let follow_up_http = self.follow_up;
+        let follow_up = self.follow_up;
         let open_charges = self.open_charges;
         let sink = self.sink;
 
@@ -868,7 +860,7 @@ impl Finalizer {
         // own: it closes the charge that spend opened.
         if matches!(self.class, RouteClass::Reports) {
             let Some(id) = meter.charge_reported_on(&route, &observed) else { return };
-            drop(open_charges.report(meter, &id, &route, observed, &follow_up_http));
+            drop(open_charges.report(meter, &id, &route, observed, &follow_up));
             return;
         }
 
@@ -894,11 +886,7 @@ impl Finalizer {
         }
 
         sink.book(async move {
-            let follow_up = FollowUp {
-                http: &follow_up_http,
-                base_url: meter.base_url(),
-            };
-            meter.resolve(&route, observed, follow_up).await
+            meter.resolve(&route, observed, follow_up.follow_up(meter.base_url())).await
         });
     }
 }
@@ -948,74 +936,50 @@ impl Drop for TapStream {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::Mutex;
     use weft_providers::{ObservedCall, RouteClass};
 
     // ---- Rig: a recording task store, a test meter, a gated SSE server ----
 
-    /// Records every enqueued task; everything else is unreachable in these
-    /// tests.
+    /// Keeps every event a run's record is handed.
     #[derive(Default)]
-    pub(super) struct RecordingTaskStore {
-        pub enqueued: Mutex<Vec<weft_task_store::NewTask>>,
+    pub(crate) struct RecordedCosts {
+        pub events: Mutex<Vec<weft_journal::ExecEvent>>,
     }
 
     #[async_trait::async_trait]
-    impl weft_task_store::TaskStoreClient for RecordingTaskStore {
-        async fn cancels_asked(
-            &self,
-            _project_id: uuid::Uuid,
-            _execution_ids: Vec<String>,
-        ) -> anyhow::Result<Vec<weft_task_store::tasks::CancelAsked>> {
-            Ok(Vec::new())
+    impl weft_journal::JournalClient for RecordedCosts {
+        async fn record_event(&self, event: &weft_journal::ExecEvent, _replica: Option<&str>) -> anyhow::Result<()> {
+            self.events.lock().unwrap().push(event.clone());
+            Ok(())
         }
+        async fn events_for_execution_id(&self, _execution_id: ExecutionId) -> anyhow::Result<Vec<weft_journal::ExecEvent>> {
+            unreachable!("metering tests only write")
+        }
+    }
 
-        async fn enqueue_dedup(
-            &self,
-            spec: weft_task_store::tasks::NewTask,
-        ) -> anyhow::Result<weft_task_store::tasks::DedupOutcome> {
-            self.enqueued.lock().unwrap().push(spec);
-            Ok(weft_task_store::tasks::DedupOutcome::Inserted(uuid::Uuid::new_v4()))
-        }
-        async fn wait_for_terminal(
-            &self,
-            _task_id: uuid::Uuid,
-            _timeout: std::time::Duration,
-        ) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
-            unreachable!("metering tests only enqueue")
-        }
-        async fn claim_execution(
-            &self,
-            _replica: &str,
-            _project_id: uuid::Uuid,
-            _execution_id: &str,
-        ) -> anyhow::Result<Option<weft_task_store::tasks::ClaimedExecution>> {
-            Ok(None)
-        }
-        async fn requeue(&self, _task_id: uuid::Uuid, _replica: &str) -> anyhow::Result<bool> {
-            Ok(true)
-        }
-        async fn heartbeat(&self, _task_id: uuid::Uuid, _replica: &str) -> anyhow::Result<bool> {
-            Ok(true)
-        }
-        async fn complete(
-            &self,
-            _task_id: uuid::Uuid,
-            _replica: &str,
-            _result: serde_json::Value,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn fail(
-            &self,
-            _task_id: uuid::Uuid,
-            _replica: &str,
-            _error: String,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
+    /// A writer over a record nothing reads: the sinks write through
+    /// [`RecordedCosts`], and ask the writer to write their run first,
+    /// which it does not write.
+    pub(crate) fn test_writer() -> Arc<crate::journal_writer::WorkerJournal> {
+        crate::journal_writer::WorkerJournal::start(
+            Arc::new(crate::test_record::FakeRecord::default()),
+            Default::default(),
+            &tokio::runtime::Handle::current(),
+        )
+    }
+
+    /// A figure as the run's record holds it.
+    pub(crate) struct Booked {
+        pub node_id: String,
+        pub service: String,
+        pub model: Option<String>,
+        pub amount_usd: Option<f64>,
+        pub billed: bool,
+        pub origin: weft_core::CredentialOwner,
+        pub metadata: serde_json::Value,
     }
 
     /// A meter for a provider living at the test server: chat/completions
@@ -1081,14 +1045,6 @@ mod tests {
             let mut parsed: serde_json::Value = serde_json::from_slice(body)?;
             parsed["usage"] = serde_json::json!({ "include": true });
             Ok(Some(serde_json::to_vec(&parsed)?))
-        }
-        async fn ceiling_usd(
-            &self,
-            _path: &str,
-            _body: &[u8],
-            _follow_up: FollowUp<'_>,
-        ) -> anyhow::Result<f64> {
-            Ok(1.0)
         }
         fn observe(&self, _path: &str, _query: &str, _request_body: &[u8]) -> Box<dyn CallObservation> {
             Box::new(TestObservation {
@@ -1171,7 +1127,7 @@ mod tests {
     fn rig(
         base: &'static str,
         relay_url: Option<String>,
-    ) -> (reqwest_middleware::ClientWithMiddleware, Arc<RecordingTaskStore>, Arc<PendingCostRecords>)
+    ) -> (reqwest_middleware::ClientWithMiddleware, Arc<RecordedCosts>, Arc<PendingCostRecords>)
     {
         rig_owned(base, relay_url, weft_core::CredentialOwner::Author, None)
     }
@@ -1181,16 +1137,16 @@ mod tests {
         relay_url: Option<String>,
         origin: weft_core::CredentialOwner,
         fixed_usd: Option<f64>,
-    ) -> (reqwest_middleware::ClientWithMiddleware, Arc<RecordingTaskStore>, Arc<PendingCostRecords>)
+    ) -> (reqwest_middleware::ClientWithMiddleware, Arc<RecordedCosts>, Arc<PendingCostRecords>)
     {
-        let tasks = Arc::new(RecordingTaskStore::default());
+        let tasks = Arc::new(RecordedCosts::default());
         let pending = PendingCostRecords::new();
         let sink = CostSink {
-            tasks: tasks.clone(),
+            journal: tasks.clone(),
+            writer: test_writer(),
+            replica: "w".into(),
             pending: pending.clone(),
             open_charges: OpenCharges::new(),
-            project_id: uuid::Uuid::from_u128(1),
-            tenant_id: "t1".into(),
             execution_id: uuid::Uuid::nil(),
             node_id: "node-x".into(),
             frames: LoopFrames::default(),
@@ -1200,7 +1156,10 @@ mod tests {
         // The follow-up client of the rig: same signed-in shape the
         // production composition builds (auth-free here; the test meter
         // makes no follow-up call).
-        let follow_up = reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build();
+        let follow_up = FollowUpLane {
+            http: reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build(),
+            shared: weft_core::shared::Shared::new(std::time::Duration::MAX),
+        };
         let middleware = MeteringMiddleware {
             meter: Some(Box::leak(Box::new(TestMeter { base, fixed_usd }))),
             relay_url,
@@ -1213,20 +1172,31 @@ mod tests {
         (client, tasks, pending)
     }
 
-    pub(super) fn recorded_payloads(tasks: &RecordingTaskStore) -> Vec<weft_task_store::RecordCostPayload> {
+    pub(crate) fn recorded_payloads(tasks: &RecordedCosts) -> Vec<Booked> {
         tasks
-            .enqueued
+            .events
             .lock()
             .unwrap()
             .iter()
-            .map(|t| serde_json::from_value(t.payload.clone()).expect("record_cost payload"))
+            .map(|event| match event {
+                weft_journal::ExecEvent::CostReported { node_id, service, model, amount_usd, billed, origin, metadata, .. } => Booked {
+                    node_id: node_id.clone(),
+                    service: service.clone(),
+                    model: model.clone(),
+                    amount_usd: *amount_usd,
+                    billed: *billed,
+                    origin: origin.clone(),
+                    metadata: metadata.clone(),
+                },
+                other => panic!("a sink writes costs only: {other:?}"),
+            })
             .collect()
     }
 
-    async fn wait_recorded(tasks: &RecordingTaskStore, pending: &PendingCostRecords) {
+    async fn wait_recorded(tasks: &RecordedCosts, pending: &PendingCostRecords) {
         pending.wait_zero().await;
         for _ in 0..100 {
-            if !tasks.enqueued.lock().unwrap().is_empty() {
+            if !tasks.events.lock().unwrap().is_empty() {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1288,7 +1258,7 @@ mod tests {
         impl Registered {
             fn client(
                 meter: &'static TestMeter,
-                tasks: Arc<RecordingTaskStore>,
+                tasks: Arc<RecordedCosts>,
                 pending: Arc<PendingCostRecords>,
             ) -> reqwest_middleware::ClientWithMiddleware {
                 let steps = weft_core::access::client::resolve_steps(
@@ -1302,11 +1272,11 @@ mod tests {
                 )
                 .unwrap();
                 let sink = CostSink {
-                    tasks,
+                    journal: tasks,
+                    writer: test_writer(),
+                    replica: "w".into(),
                     pending,
                     open_charges: OpenCharges::new(),
-                    project_id: uuid::Uuid::from_u128(1),
-                    tenant_id: "t1".into(),
                     execution_id: uuid::Uuid::nil(),
                     node_id: "node-x".into(),
                     frames: LoopFrames::default(),
@@ -1316,9 +1286,12 @@ mod tests {
                 // The exact production stack (metering outer, auth inner),
                 // with the meter injected directly since the global
                 // registry is keyed by the shipped services.
-                let follow_up = reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
-                    .with(weft_core::access::client::AuthMiddleware::new(steps.clone()))
-                    .build();
+                let follow_up = FollowUpLane {
+                    http: reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
+                        .with(weft_core::access::client::AuthMiddleware::new(steps.clone()))
+                        .build(),
+                    shared: weft_core::shared::Shared::new(std::time::Duration::MAX),
+                };
                 reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
                     .with(MeteringMiddleware {
                         meter: Some(meter),
@@ -1330,7 +1303,7 @@ mod tests {
                     .build()
             }
         }
-        let tasks = Arc::new(RecordingTaskStore::default());
+        let tasks = Arc::new(RecordedCosts::default());
         let pending = PendingCostRecords::new();
         let client = Registered::client(meter, tasks.clone(), pending.clone());
 
@@ -1398,14 +1371,14 @@ mod tests {
             &[("token".to_string(), "tok-1".to_string())].into_iter().collect(),
         )
         .unwrap();
-        let tasks = Arc::new(RecordingTaskStore::default());
+        let tasks = Arc::new(RecordedCosts::default());
         let pending = PendingCostRecords::new();
         let sink = CostSink {
-            tasks: tasks.clone(),
+            journal: tasks.clone(),
+            writer: test_writer(),
+            replica: "w".into(),
             pending: pending.clone(),
             open_charges: OpenCharges::new(),
-            project_id: uuid::Uuid::from_u128(1),
-            tenant_id: "t1".into(),
             execution_id: uuid::Uuid::nil(),
             node_id: "node-x".into(),
             frames: LoopFrames::default(),
@@ -1413,7 +1386,7 @@ mod tests {
             origin: weft_core::CredentialOwner::Author,
         };
         let client =
-            connection_client("no_such_meterless_service", steps, None, Arc::new(sink))
+            connection_client("no_such_meterless_service", steps, None, Arc::new(sink), weft_core::shared::Shared::new(std::time::Duration::MAX))
                 .expect("builds");
 
         chunk_tx.send(Bytes::from("data: [DONE]\n\n")).unwrap();
@@ -1426,18 +1399,18 @@ mod tests {
             .expect("send");
         response.bytes().await.expect("body");
         pending.wait_zero().await;
-        assert!(tasks.enqueued.lock().unwrap().is_empty(), "no meter = no record");
+        assert!(tasks.events.lock().unwrap().is_empty(), "no meter = no record");
         // The auth step still applied.
         assert!(received.lock().unwrap()[0].get("usage").is_none(), "no meter = no prepare");
 
         // And a RELAYED connection without a meter is refused at build.
         let steps2 = Vec::new();
         let sink2 = CostSink {
-            tasks: tasks.clone(),
+            journal: tasks.clone(),
+            writer: test_writer(),
+            replica: "w".into(),
             pending: pending.clone(),
             open_charges: OpenCharges::new(),
-            project_id: uuid::Uuid::from_u128(1),
-            tenant_id: "t1".into(),
             execution_id: uuid::Uuid::nil(),
             node_id: "node-x".into(),
             frames: LoopFrames::default(),
@@ -1449,6 +1422,7 @@ mod tests {
             steps2,
             Some("http://relay"),
             Arc::new(sink2),
+            weft_core::shared::Shared::new(std::time::Duration::MAX),
         )
         .unwrap_err();
         assert!(err.to_string().contains("no meter is registered"), "{err}");
@@ -1487,7 +1461,7 @@ mod tests {
             .expect("stream open")
             .expect("chunk ok");
         assert!(std::str::from_utf8(&first).unwrap().contains("hi"));
-        assert!(tasks.enqueued.lock().unwrap().is_empty(), "nothing recorded mid-stream");
+        assert!(tasks.events.lock().unwrap().is_empty(), "nothing recorded mid-stream");
 
         // Now the trailing usage chunk + end of stream.
         chunk_tx.send(Bytes::from("data: {\"usage\":{\"cost\":0.000031}}\n\ndata: [DONE]\n\n")).unwrap();
@@ -1564,7 +1538,7 @@ mod tests {
             .expect_err("an off-API URL must refuse on a runtime credential");
         assert!(err.to_string().contains("only travels"), "{err}");
         assert!(received.lock().unwrap().is_empty(), "nothing reached the server");
-        assert!(tasks.enqueued.lock().unwrap().is_empty());
+        assert!(tasks.events.lock().unwrap().is_empty());
 
         // An explicitly FREE route passes: the middleware lets it out
         // (a refusal would surface as the send() erroring, exactly as
@@ -1609,7 +1583,7 @@ mod tests {
         assert!(received.lock().unwrap()[0].get("usage").is_none());
         response.bytes().await.expect("body");
         pending.wait_zero().await;
-        assert!(tasks.enqueued.lock().unwrap().is_empty(), "no record on the relayed lane");
+        assert!(tasks.events.lock().unwrap().is_empty(), "no record on the relayed lane");
 
         // Outside the provider's API: refused loud, nothing sent.
         let err = client
@@ -1747,7 +1721,7 @@ mod tests {
 /// language feature, not fal.
 #[cfg(test)]
 mod open_charge_tests {
-    use super::tests::{recorded_payloads, RecordingTaskStore};
+    use super::tests::{recorded_payloads, test_writer, RecordedCosts};
     use super::*;
     use weft_providers::{ObservedCall, Pricing};
 
@@ -1811,13 +1785,13 @@ mod open_charge_tests {
 
     static QUEUED: QueuedMeter = QueuedMeter;
 
-    fn sink(tasks: Arc<RecordingTaskStore>, pending: Arc<PendingCostRecords>) -> Arc<CostSink> {
+    fn sink(tasks: Arc<RecordedCosts>, pending: Arc<PendingCostRecords>) -> Arc<CostSink> {
         Arc::new(CostSink {
-            tasks,
+            journal: tasks,
+            writer: test_writer(),
+            replica: "w".into(),
             pending,
             open_charges: OpenCharges::new(),
-            project_id: uuid::Uuid::from_u128(1),
-            tenant_id: "t1".into(),
             execution_id: uuid::Uuid::nil(),
             node_id: "node-x".into(),
             frames: LoopFrames::default(),
@@ -1828,17 +1802,17 @@ mod open_charge_tests {
 
     /// A sink for one execution, sharing the process's charge map.
     fn sink_on(
-        tasks: Arc<RecordingTaskStore>,
+        tasks: Arc<RecordedCosts>,
         pending: Arc<PendingCostRecords>,
         open_charges: Arc<OpenCharges>,
         execution_id: weft_core::ExecutionId,
     ) -> Arc<CostSink> {
         Arc::new(CostSink {
-            tasks,
+            journal: tasks,
+            writer: test_writer(),
+            replica: "w".into(),
             pending,
             open_charges,
-            project_id: uuid::Uuid::from_u128(1),
-            tenant_id: "t1".into(),
             execution_id,
             node_id: "node-x".into(),
             frames: LoopFrames::default(),
@@ -1859,12 +1833,16 @@ mod open_charge_tests {
         reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build()
     }
 
+    fn lane() -> FollowUpLane {
+        FollowUpLane { http: http(), shared: weft_core::shared::Shared::new(std::time::Duration::MAX) }
+    }
+
     /// The whole point: the submit books nothing (its amount does not
     /// exist yet), and the later read is what puts the figure on the
     /// trail, against the node that submitted.
     #[tokio::test]
     async fn the_read_that_reports_is_what_books_the_submit() {
-        let tasks = Arc::new(RecordingTaskStore::default());
+        let tasks = Arc::new(RecordedCosts::default());
         let pending = PendingCostRecords::new();
         let sink = sink(tasks.clone(), pending.clone());
         let charges = sink.open_charges.clone();
@@ -1878,7 +1856,7 @@ mod open_charge_tests {
             status: 200,
             data: serde_json::json!({ "units": 3.0 }),
         };
-        charges.report(&QUEUED, "req-1", "requests/req-1", report, &http()).await;
+        charges.report(&QUEUED, "req-1", "requests/req-1", report, &lane()).await;
         pending.wait_zero().await;
 
         assert_eq!(charges.count(), 0);
@@ -1894,7 +1872,7 @@ mod open_charge_tests {
     /// the first one.
     #[tokio::test]
     async fn an_inconclusive_report_leaves_the_charge_open() {
-        let tasks = Arc::new(RecordingTaskStore::default());
+        let tasks = Arc::new(RecordedCosts::default());
         let pending = PendingCostRecords::new();
         let sink = sink(tasks.clone(), pending.clone());
         let charges = sink.open_charges.clone();
@@ -1906,7 +1884,7 @@ mod open_charge_tests {
             status: 200,
             data: serde_json::json!({ "status": "IN_PROGRESS" }),
         };
-        charges.report(&QUEUED, "req-1", "requests/req-1", pending_report, &http()).await;
+        charges.report(&QUEUED, "req-1", "requests/req-1", pending_report, &lane()).await;
 
         assert_eq!(charges.count(), 1, "still waiting for the figure");
         assert!(recorded_payloads(&tasks).is_empty());
@@ -1920,7 +1898,7 @@ mod open_charge_tests {
       runs: 20,
       worker_threads: 4,
       async fn body() {
-        let tasks = Arc::new(RecordingTaskStore::default());
+        let tasks = Arc::new(RecordedCosts::default());
         let charges = OpenCharges::new();
         let pending = PendingCostRecords::new();
         let execution_id = uuid::Uuid::new_v4();
@@ -1929,10 +1907,10 @@ mod open_charge_tests {
 
         drop(charges.report(&QUEUED, "req-1", "requests/req-1", ObservedCall {
             interrupted: false, status: 200, data: serde_json::json!({"status": "IN_PROGRESS"}),
-        }, &http()));
+        }, &lane()));
         drop(charges.report(&QUEUED, "req-1", "requests/req-1", ObservedCall {
             interrupted: false, status: 200, data: serde_json::json!({"units": 3.0}),
-        }, &http()));
+        }, &lane()));
         charges.flush_execution_id(execution_id, "the execution ended before the job was read back");
         pending.wait_zero().await;
 
@@ -1953,7 +1931,7 @@ mod open_charge_tests {
     // open win the race to the map first, which is the (logged) other case.
     #[tokio::test]
     async fn a_charge_displaced_mid_read_keeps_its_figure_on_the_trail() {
-        let tasks = Arc::new(RecordingTaskStore::default());
+        let tasks = Arc::new(RecordedCosts::default());
         let charges = OpenCharges::new();
         let pending = PendingCostRecords::new();
         let execution_id = weft_core::ExecutionId::new_v4();
@@ -1963,7 +1941,7 @@ mod open_charge_tests {
         // open lands in that window.
         let read = charges.report(&QUEUED, "req-1", "requests/req-1", ObservedCall {
             interrupted: false, status: 200, data: serde_json::json!({"units": 3.0}),
-        }, &http());
+        }, &lane());
         // Let the spawned read reach the meter's own await before displacing.
         tokio::task::yield_now().await;
         charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, sink });
@@ -1982,7 +1960,7 @@ mod open_charge_tests {
     /// once, and the late report neither books again nor panics.
     #[tokio::test]
     async fn a_report_after_the_execution_closed_leaves_one_unknown_record() {
-        let tasks = Arc::new(RecordingTaskStore::default());
+        let tasks = Arc::new(RecordedCosts::default());
         let charges = OpenCharges::new();
         let pending = PendingCostRecords::new();
         let execution_id = weft_core::ExecutionId::new_v4();
@@ -1991,7 +1969,7 @@ mod open_charge_tests {
         charges.flush_execution_id(execution_id, "the execution ended before the job was read back");
         charges.report(&QUEUED, "req-1", "requests/req-1", ObservedCall {
             interrupted: false, status: 200, data: serde_json::json!({"units": 3.0}),
-        }, &http()).await;
+        }, &lane()).await;
         pending.wait_zero().await;
         assert_eq!(charges.count(), 0);
         let booked = recorded_payloads(&tasks);
@@ -2001,7 +1979,7 @@ mod open_charge_tests {
 
     #[tokio::test]
     async fn an_executions_charges_close_with_the_execution() {
-        let tasks = Arc::new(RecordingTaskStore::default());
+        let tasks = Arc::new(RecordedCosts::default());
         let charges = OpenCharges::new();
 
         let mine_pending = PendingCostRecords::new();
@@ -2033,7 +2011,7 @@ mod open_charge_tests {
     /// sink, putting a real figure on another execution's trail.
     #[tokio::test]
     async fn one_job_id_under_two_services_is_two_charges() {
-        let tasks = Arc::new(RecordingTaskStore::default());
+        let tasks = Arc::new(RecordedCosts::default());
         let charges = OpenCharges::new();
         let pending = PendingCostRecords::new();
         let execution_id = uuid::Uuid::new_v4();
@@ -2055,7 +2033,7 @@ mod open_charge_tests {
     /// is what stops that becoming a spend with no row at all.
     #[tokio::test]
     async fn a_charge_nobody_ever_reported_on_is_booked_as_unknown() {
-        let tasks = Arc::new(RecordingTaskStore::default());
+        let tasks = Arc::new(RecordedCosts::default());
         let pending = PendingCostRecords::new();
         let sink = sink(tasks.clone(), pending.clone());
         let charges = sink.open_charges.clone();
@@ -2111,14 +2089,14 @@ mod open_charge_tests {
         }
         static UNPRICEABLE: Unpriceable = Unpriceable;
 
-        let tasks = Arc::new(RecordingTaskStore::default());
+        let tasks = Arc::new(RecordedCosts::default());
         let pending = PendingCostRecords::new();
         let sink = sink(tasks.clone(), pending.clone());
         let client = reqwest_middleware::ClientBuilder::new(reqwest::Client::new())
             .with(MeteringMiddleware {
                 meter: Some(&UNPRICEABLE),
                 relay_url: None,
-                follow_up: http(),
+                follow_up: lane(),
                 sink,
             })
             .build();
@@ -2138,7 +2116,7 @@ mod open_charge_tests {
     /// finished job as often as it likes without spending twice.
     #[tokio::test]
     async fn re_reading_a_finished_job_books_nothing_further() {
-        let tasks = Arc::new(RecordingTaskStore::default());
+        let tasks = Arc::new(RecordedCosts::default());
         let pending = PendingCostRecords::new();
         let sink = sink(tasks.clone(), pending.clone());
         let charges = sink.open_charges.clone();
@@ -2148,7 +2126,7 @@ mod open_charge_tests {
             status: 200,
             data: serde_json::json!({ "units": 3.0 }),
         };
-        charges.report(&QUEUED, "req-unknown", "requests/req-unknown", report, &http()).await;
+        charges.report(&QUEUED, "req-unknown", "requests/req-unknown", report, &lane()).await;
         pending.wait_zero().await;
 
         assert!(recorded_payloads(&tasks).is_empty());

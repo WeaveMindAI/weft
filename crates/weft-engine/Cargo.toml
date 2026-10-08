@@ -16,6 +16,7 @@ weft-platform-traits = { workspace = true }
 # only that module, none of the platform's control side.
 weft-platform-gcp = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { version = "0.7" }
 async-trait = { workspace = true }
 # The node-test runner (`test_runner`, behind the `node-tests`
 # feature): argument surface of the per-package test binary and its
@@ -43,6 +44,7 @@ futures = { workspace = true }
 # handshake, routes the session, and taps frames for the session meter.
 tokio-tungstenite = { workspace = true }
 url = { workspace = true }
+percent-encoding = "2"
 base64 = { workspace = true }
 # The worker's inbound live-caller connection server (HTTP + WS upgrade).
 # Plain HTTP/WS inside the cluster: TLS terminates at the gateway and the
@@ -57,6 +59,11 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 # regular deps, not dev-only.
 bytes = { workspace = true }
 parking_lot = { workspace = true }
+# The allocator the generated worker binary declares (`Jemalloc`, re-exported
+# so a project's own manifest names nothing new). Never declared here: it
+# would change every binary that links the engine, tests included.
+tikv-jemallocator = { workspace = true }
+pprof = { workspace = true }
 
 [features]
 test-helpers = []
@@ -66,6 +73,7 @@ test-helpers = []
 node-tests = ["dep:clap", "dep:tracing-subscriber"]
 
 [dev-dependencies]
+tempfile = { workspace = true }
 weft-core = { workspace = true, features = ["test-helpers"] }
 weft-platform-traits = { workspace = true, features = ["test-helpers"] }
 # `oneshot` on the connection router: the arrival tests drive the real

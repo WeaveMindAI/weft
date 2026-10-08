@@ -19,28 +19,18 @@ use weft_listener::ListenerConfig;
 
 // ---------- Fakes ----------
 
-/// Records every fire the listener enqueued; no business logic.
-struct FakeTasks {
-    enqueued: Mutex<Vec<weft_task_store::tasks::NewTask>>,
-}
+/// The task store: an entry's event never becomes a task, so nothing
+/// here is asked to enqueue one.
+struct FakeTasks;
 
 #[async_trait::async_trait]
 impl weft_task_store::TaskStoreClient for FakeTasks {
-    async fn cancels_asked(
-        &self,
-        _project_id: uuid::Uuid,
-        _execution_ids: Vec<String>,
-    ) -> anyhow::Result<Vec<weft_task_store::tasks::CancelAsked>> {
-        Ok(Vec::new())
-    }
 
     async fn enqueue_dedup(
         &self,
-        spec: weft_task_store::tasks::NewTask,
+        _: weft_task_store::tasks::NewTask,
     ) -> anyhow::Result<weft_task_store::tasks::DedupOutcome> {
-        let id = uuid::Uuid::new_v4();
-        self.enqueued.lock().unwrap().push(spec);
-        Ok(weft_task_store::tasks::DedupOutcome::Inserted(id))
+        unreachable!("an entry's event never becomes a task")
     }
     async fn wait_for_terminal(
         &self,
@@ -48,26 +38,6 @@ impl weft_task_store::TaskStoreClient for FakeTasks {
         _: std::time::Duration,
     ) -> anyhow::Result<weft_task_store::tasks::TaskOutcome> {
         unreachable!("not used by the serving side")
-    }
-    async fn claim_execution(
-        &self,
-        _: &str,
-        _: uuid::Uuid,
-        _: &str,
-    ) -> anyhow::Result<Option<weft_task_store::tasks::ClaimedExecution>> {
-        unreachable!()
-    }
-    async fn heartbeat(&self, _: uuid::Uuid, _: &str) -> anyhow::Result<bool> {
-        unreachable!()
-    }
-    async fn requeue(&self, _: uuid::Uuid, _: &str) -> anyhow::Result<bool> {
-        unreachable!()
-    }
-    async fn complete(&self, _: uuid::Uuid, _: &str, _: Value) -> anyhow::Result<()> {
-        unreachable!()
-    }
-    async fn fail(&self, _: uuid::Uuid, _: &str, _: String) -> anyhow::Result<()> {
-        unreachable!()
     }
 }
 
@@ -160,6 +130,12 @@ async fn spawn_broker(gateway_url: String, multi_account: bool, mint_open: bool)
     let base = format!("http://{addr}");
     let mint_url = format!("{base}/mint");
     let app = axum::Router::new()
+        // An entry's event goes straight to its project's worker
+        // (`FakeDoors`).
+        .route(
+            "/v1/signal/fire_target",
+            post(|| async { axum::Json(json!({ "project_id": uuid::Uuid::nil(), "is_resume": false, "address": "http://worker.test" })) }),
+        )
         .route(
             "/v1/access/listener-resolve",
             post(move |State(_s): State<S>, axum::Json(req): axum::Json<Value>| async move {
@@ -246,12 +222,12 @@ weft_core::stress_test!(
 /// One scenario's shared listener-side rig: the fake task store and the
 /// listener every registration in the scenario goes through.
 struct Rig {
-    tasks: Arc<FakeTasks>,
+    doors: Arc<FakeDoors>,
     state: ListenerState,
 }
 
 fn rig(run_id: &str, broker_base: String) -> Rig {
-    let tasks = Arc::new(FakeTasks { enqueued: Mutex::new(Vec::new()) });
+    let doors = Arc::new(FakeDoors::default());
     let state = ListenerState::new(
         ListenerConfig {
             // Per-run instance: the shared-socket registry keys on it,
@@ -260,7 +236,7 @@ fn rig(run_id: &str, broker_base: String) -> Rig {
             holds_here: true,
             prefer_push: false,
         },
-        tasks.clone(),
+        Arc::new(FakeTasks),
         // The fake broker ignores the bearer.
         weft_broker_client::BrokerLink::new(
             broker_base,
@@ -271,8 +247,9 @@ fn rig(run_id: &str, broker_base: String) -> Rig {
             ),
         ),
         Arc::new(weft_platform_traits::FakeAlarm::new()),
+        doors.clone(),
     );
-    Rig { tasks, state }
+    Rig { doors, state }
 }
 
 /// Register one subscription through the real registration path.
@@ -299,7 +276,7 @@ async fn run_scenario() {
     let gateway = spawn_gateway().await;
     let (broker_base, broker) = spawn_broker(gateway.url.clone(), false, true).await;
     let rig = rig(&run_id, broker_base);
-    let tasks = rig.tasks.clone();
+    let doors = rig.doors.clone();
     let registry = rig.state.registry.clone();
 
     let access = Access::new(uuid::Uuid::new_v4().to_string(), "fakechat", None);
@@ -340,18 +317,17 @@ async fn run_scenario() {
         .await
         .unwrap();
 
-    wait_until(|| !tasks.enqueued.lock().unwrap().is_empty(), "the matching fire").await;
+    wait_until(|| !doors.fired.lock().unwrap().is_empty(), "the matching fire").await;
     {
-        let fires = tasks.enqueued.lock().unwrap();
+        let fires = doors.fired.lock().unwrap();
         assert_eq!(fires.len(), 1);
-        let payload = &fires[0].payload["payload"];
+        let payload = &fires[0].payload;
         assert_eq!(
             *payload,
             json!({ "type": "message", "channel": "C42", "text": "hello weft" }),
             "the fire carries the topic's NAMED fields, nothing raw"
         );
-        assert_eq!(fires[0].tenant_id, "tenant-a");
-        assert_eq!(fires[0].payload["token"], Value::String(sig_token.clone()));
+        assert_eq!(fires[0].token, Value::String(sig_token.clone()));
     }
 
     // The envelope was acked on the socket, per the recipe's reply
@@ -393,11 +369,11 @@ async fn run_scenario() {
         )
         .await
         .unwrap();
-    wait_until(|| tasks.enqueued.lock().unwrap().len() >= 2, "the second matching fire").await;
+    wait_until(|| doors.fired.lock().unwrap().len() >= 2, "the second matching fire").await;
     {
-        let fires = tasks.enqueued.lock().unwrap();
+        let fires = doors.fired.lock().unwrap();
         assert_eq!(fires.len(), 2, "the non-matching frame fired nothing");
-        assert_eq!(fires[1].payload["payload"]["text"], "weft again");
+        assert_eq!(fires[1].payload["text"], "weft again");
     }
 
     // Unregistering (registry removal) aborts the per-signal task;
@@ -473,16 +449,16 @@ async fn run_multi_account_scenario() {
     gateway.downlink.send(frame(Some("T1"), "own install")).await.unwrap();
 
     wait_until(
-        || rig.tasks.enqueued.lock().unwrap().len() >= 4,
+        || rig.doors.fired.lock().unwrap().len() >= 4,
         "the four expected fires",
     )
     .await;
-    let fires = rig.tasks.enqueued.lock().unwrap();
+    let fires = rig.doors.fired.lock().unwrap();
     let of = |token: &str| -> Vec<String> {
         fires
             .iter()
-            .filter(|f| f.payload["token"] == Value::String(token.to_string()))
-            .map(|f| f.payload["payload"]["text"].as_str().unwrap().to_string())
+            .filter(|f| f.token == Value::String(token.to_string()))
+            .map(|f| f.payload["text"].as_str().unwrap().to_string())
             .collect()
     };
     assert_eq!(
@@ -496,4 +472,23 @@ async fn run_multi_account_scenario() {
         "the account-scoped subscriber hears only frames proven to be its own account's"
     );
     assert_eq!(fires.len(), 4, "nothing else fired");
+}
+
+/// The project's worker, as the listener hands it events: records each
+/// one, and, while `failing`, cannot be reached.
+#[derive(Default)]
+struct FakeDoors {
+    fired: Mutex<Vec<weft_core::door_fire::DoorFire>>,
+    failing: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl weft_listener::fire_sink::WorkerDoors for FakeDoors {
+    async fn fire(&self, _: uuid::Uuid, address: &str, fire: &weft_core::door_fire::DoorFire) -> anyhow::Result<weft_core::door_fire::Fired> {
+        if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("no worker answers at {address}");
+        }
+        self.fired.lock().unwrap().push(fire.clone());
+        Ok(weft_core::door_fire::Fired::Started { execution_id: weft_core::door_fire::run_of_fire(fire.fire_id) })
+    }
 }

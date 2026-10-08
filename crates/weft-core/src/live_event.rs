@@ -10,9 +10,10 @@ use serde::{Deserialize, Serialize};
 use crate::frames::LoopFrames;
 use crate::ExecutionId;
 
-/// An event and its delivery identity. Journal projections derive identities
-/// from the stored row plus projection index, so replay and live delivery
-/// identify the same event without comparing timestamps or payload contents.
+/// An event and its delivery identity. A run's recorded events take theirs
+/// from their place in its record (the row's `seq`, the event's index in
+/// it), so replay and live delivery identify the same event without
+/// comparing timestamps or payload contents.
 // SYNC: IdentifiedEvent.event_id <-> extension-vscode/src/execFollower.ts DispatcherEvent
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdentifiedEvent<T> {
@@ -22,8 +23,9 @@ pub struct IdentifiedEvent<T> {
 }
 
 impl<T> IdentifiedEvent<T> {
-    pub fn recorded(id: i64, event: T) -> Self {
-        Self { event_id: format!("journal:{id}"), event }
+    /// The event at `index` of its run's record row `seq`.
+    pub fn recorded(seq: i32, index: u32, event: T) -> Self {
+        Self { event_id: format!("journal:{seq}:{index}"), event }
     }
 
     pub fn transient(event: T) -> Self {
@@ -519,17 +521,17 @@ mod identity_tests {
             execution_id: uuid::Uuid::nil(), project_id: uuid::Uuid::from_u128(0x100),
             outputs: serde_json::json!({}), at_unix: 1,
         };
-        let record = IdentifiedEvent::recorded(42, event);
+        let record = IdentifiedEvent::recorded(42, 3, event);
         let projected = record.clone().project(|event| vec![event.clone(), event]);
         assert_ne!(projected[0].event_id, projected[1].event_id);
         let replay = record.project(|event| vec![event.clone(), event]);
         assert_eq!(serde_json::to_value(&projected).unwrap(), serde_json::to_value(replay).unwrap());
         let json = serde_json::to_value(&projected[0]).unwrap();
-        assert_eq!(json["event_id"], "journal:42:0");
+        assert_eq!(json["event_id"], "journal:42:3:0");
         assert_eq!(json["kind"], "execution_completed");
         let decoded: LiveEvent = serde_json::from_value(json).unwrap();
         assert_eq!(decoded.event_id, projected[0].event_id);
-        let distinct = IdentifiedEvent::recorded(43, decoded.event).project(|event| vec![event]);
+        let distinct = IdentifiedEvent::recorded(42, 4, decoded.event).project(|event| vec![event]);
         assert_ne!(distinct[0].event_id, projected[0].event_id);
     }
 }

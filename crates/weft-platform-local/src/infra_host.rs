@@ -58,6 +58,49 @@ pub struct LocalInfraHostConfig {
     pub publish: Publish,
     /// The install these units belong to.
     pub install: weft_core::infra::Install,
+    /// How each unit's agent reaches the broker, to pass on what the
+    /// unit's containers push (`weft_platform_traits::unit_agent::VALUES_PATH`).
+    pub agent_broker: AgentBroker,
+}
+
+/// Where a unit's agent reaches the broker, and as whom.
+#[derive(Clone)]
+pub struct AgentBroker {
+    /// The broker's address as a container sees it.
+    pub url: String,
+    pub identity: AgentIdentity,
+}
+
+/// Who a unit's agent is to the broker: always its own copy
+/// (`Principal::InfraCopy`), proven one of two ways.
+#[derive(Clone)]
+pub enum AgentIdentity {
+    /// The install's key signs each agent a token naming its copy (a
+    /// laptop).
+    Minted(std::sync::Arc<crate::LocalIdentity>),
+    /// The agent asks the machine it runs on, whose token names the
+    /// machine and so the copy it runs (a cloud machine).
+    Machine,
+}
+
+/// A unit agent's broker token never expires on its own: the agent's
+/// container is the credential's life, like a local worker's.
+const AGENT_TOKEN_LIFE_SECS: i64 = 100 * 365 * 24 * 3600;
+
+impl AgentBroker {
+    /// What the agent of a unit of `node` is started with.
+    fn env(&self, node: &NodeRef) -> Vec<(&'static str, String)> {
+        use weft_platform_traits::unit_agent::{AGENT_BROKER_URL_ENV, AGENT_IDENTITY_ENV};
+        let identity = match &self.identity {
+            AgentIdentity::Minted(key) => {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("system clock past UNIX_EPOCH").as_secs() as i64;
+                let principal = weft_platform_traits::Principal::InfraCopy { tenant: node.tenant.clone(), project: node.project, copy_id: node.copy_id.clone() };
+                format!("token:{}", key.mint(principal, now + AGENT_TOKEN_LIFE_SECS))
+            }
+            AgentIdentity::Machine => "gcp-metadata".to_string(),
+        };
+        vec![(AGENT_BROKER_URL_ENV, self.url.clone()), (AGENT_IDENTITY_ENV, identity)]
+    }
 }
 
 /// How a container reaches the machine's GPUs.
@@ -221,7 +264,10 @@ impl LocalInfraHost {
             docker::run(self.docker.as_ref(), own_args(&self.cfg, r, name, gid, &owned)).await?;
         }
 
-        docker::run(self.docker.as_ref(), agent_args(node, unit, &self.cfg)).await?;
+        let env_file = self.write_env_file(&format!("{}-agent", agent_name(r, name)), &self.cfg.agent_broker.env(r))?;
+        let started = docker::run(self.docker.as_ref(), agent_args(node, unit, &env_file, &self.cfg)).await;
+        let _ = std::fs::remove_file(&env_file);
+        started.map_err(|e| e.context(format!("start the agent of unit '{name}' of '{}'", r.node)))?;
         for c in &unit.unit.init_containers {
             let env_file = self.env_file(r, name, c)?;
             let args = container_args(node, unit, c, &env_file, ContainerRun::Init, &self.cfg);
@@ -248,23 +294,35 @@ impl LocalInfraHost {
         Ok(())
     }
 
+    /// A container's environment: what its spec sets, and where it pushes
+    /// the values that changed (`weft_core::infra::VALUES_URL_ENV`, the
+    /// agent it shares a network with).
     fn env_file(&self, node: &NodeRef, unit: &str, c: &Container) -> anyhow::Result<PathBuf> {
+        let mut vars: Vec<(&str, String)> = c.env.iter().map(|e| (e.name.as_str(), e.value.clone())).collect();
+        vars.push((
+            weft_core::infra::VALUES_URL_ENV,
+            format!("http://127.0.0.1:{UNIT_AGENT}{}", weft_platform_traits::unit_agent::VALUES_PATH),
+        ));
+        self.write_env_file(&container_name(node, unit, &c.name), &vars)
+    }
+
+    /// An environment file for the container `name`, readable by this
+    /// process only.
+    fn write_env_file(&self, name: &str, vars: &[(&str, String)]) -> anyhow::Result<PathBuf> {
         use std::io::Write as _;
         std::fs::create_dir_all(&self.cfg.scratch_dir)?;
-        let path = self.cfg.scratch_dir.join(format!("{}.env", container_name(node, unit, &c.name)));
+        let path = self.cfg.scratch_dir.join(format!("{name}.env"));
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
         let mut file = opts.open(&path).map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
-        for e in &c.env {
+        for (var, value) in vars {
             anyhow::ensure!(
-                !e.value.contains('\n'),
-                "the environment variable {} of container '{}' holds a line break, which Docker cannot pass",
-                e.name,
-                c.name
+                !value.contains('\n'),
+                "the environment variable {var} of container '{name}' holds a line break, which Docker cannot pass"
             );
-            writeln!(file, "{}={}", e.name, e.value)?;
+            writeln!(file, "{var}={value}")?;
         }
         Ok(path)
     }
@@ -752,7 +810,7 @@ fn all_ports(unit: &ResolvedUnit) -> Vec<u16> {
 /// `docker run` for the unit's agent: it owns the unit's network, joins
 /// the install's under the unit's name, and publishes its own port on
 /// loopback and the unit's ports as the machine publishes them.
-fn agent_args(node: &ResolvedNode, unit: &ResolvedUnit, cfg: &LocalInfraHostConfig) -> Vec<String> {
+fn agent_args(node: &ResolvedNode, unit: &ResolvedUnit, env_file: &std::path::Path, cfg: &LocalInfraHostConfig) -> Vec<String> {
     let name = agent_name(&node.node, &unit.unit.name);
     let mut l = base_labels(&cfg.install, &node.node, &unit.unit.name);
     l.insert(labels::UNIT_HASH, unit.hash.clone());
@@ -766,11 +824,16 @@ fn agent_args(node: &ResolvedNode, unit: &ResolvedUnit, cfg: &LocalInfraHostConf
         docker::NETWORK.into(),
         "--network-alias".into(),
         name,
+    ];
+    // The agent forwards what the unit pushes to the broker, on the
+    // machine's internal port.
+    args.extend(docker::host_gateway_args());
+    args.extend([
         "--restart".into(),
         "unless-stopped".into(),
         "--publish".into(),
         format!("127.0.0.1::{UNIT_AGENT}"),
-    ];
+    ]);
     match cfg.publish {
         Publish::Loopback => {
             for port in all_ports(unit) {
@@ -784,6 +847,7 @@ fn agent_args(node: &ResolvedNode, unit: &ResolvedUnit, cfg: &LocalInfraHostConf
         }
     }
     args.extend(docker::label_args(&l));
+    args.extend(["--env-file".into(), env_file.display().to_string()]);
     args.extend([cfg.agent_image.clone(), "unit-agent".into(), "serve".into()]);
     args
 }
@@ -825,12 +889,9 @@ fn container_args(
         "--env-file".into(),
         env_file.display().to_string(),
     ]);
-    if let Some(cpu) = c.limits.cpu.as_ref().or(unit.unit.machine.cpu.as_ref()) {
-        args.extend(["--cpus".into(), crate::runner::docker_cpus(cpu)]);
-    }
-    if let Some(memory) = c.limits.memory.as_ref().or(unit.unit.machine.memory.as_ref()) {
-        args.extend(["--memory".into(), crate::runner::docker_memory(memory)]);
-    }
+    // No CPU or memory cap: a container's limits and its machine's size
+    // are what a cloud runs it on, and on this machine it takes what it
+    // asks for, like anything else run here.
     if let Some(user) = &c.run_as {
         args.extend(["--user".into(), user.clone()]);
     }
@@ -975,15 +1036,33 @@ mod tests {
 
     fn cfg(gpu: GpuAccess) -> LocalInfraHostConfig {
         let dir = std::env::temp_dir().join(format!("weft-infra-test-{}", uuid::Uuid::new_v4().simple()));
-        LocalInfraHostConfig { agent_image: "weft-runtime:t".into(), scratch_dir: dir, gpu, disks: DiskBacking::Volumes, publish: Publish::Loopback, install: weft_core::infra::Install::default_install() }
+        LocalInfraHostConfig {
+            agent_image: "weft-runtime:t".into(),
+            scratch_dir: dir,
+            gpu,
+            disks: DiskBacking::Volumes,
+            publish: Publish::Loopback,
+            install: weft_core::infra::Install::default_install(),
+            agent_broker: AgentBroker { url: "http://broker".into(), identity: AgentIdentity::Machine },
+        }
     }
 
     fn host(docker: Arc<FakeDocker>, gpu: bool) -> LocalInfraHost {
         LocalInfraHost::new(docker, cfg(if gpu { GpuAccess::DockerGpus } else { GpuAccess::None }))
     }
 
+    /// The agent forwards a unit's pushes to the broker on the machine's
+    /// internal port, which a Linux engine only names through the host
+    /// gateway.
     #[test]
-    fn a_container_runs_on_its_agents_network_with_its_command_disks_and_limits() {
+    fn the_agent_reaches_the_machine_by_name() {
+        let node = resolved();
+        let args = agent_args(&node, node.unit("main").unwrap(), std::path::Path::new("/tmp/e.env"), &cfg(GpuAccess::None));
+        assert!(args.windows(2).any(|w| w == crate::docker::host_gateway_args()), "{args:?}");
+    }
+
+    #[test]
+    fn a_container_runs_on_its_agents_network_with_its_command_and_disks_and_no_cap() {
         let node = resolved();
         let unit = node.unit("main").unwrap();
         let c = &unit.unit.containers[0];
@@ -991,7 +1070,7 @@ mod tests {
         let agent = agent_name(&node.node, "main");
         assert!(args.windows(2).any(|w| w == ["--network".to_string(), format!("container:{agent}")]));
         assert!(args.windows(2).any(|w| w == ["--entrypoint", "docker-entrypoint.sh"]));
-        assert!(args.windows(2).any(|w| w == ["--memory", "1g"]));
+        assert!(!args.iter().any(|a| a == "--memory" || a == "--cpus"), "a local container is not capped: {args:?}");
         assert!(args.windows(2).any(|w| w == ["--mount".to_string(), format!("type=volume,source={},target=/var/lib/postgresql", disk_volume(&node.node, "data"))]));
         let at = args.iter().position(|a| a == "postgres:18").unwrap();
         assert_eq!(args[at + 1..], ["postgres", "-c", "fsync=off"], "the command's rest, then the args");
@@ -1015,15 +1094,32 @@ mod tests {
     #[test]
     fn the_agent_publishes_its_port_and_the_units_on_loopback_or_as_is_on_a_cloud_machine() {
         let node = resolved();
-        let args = agent_args(&node, node.unit("main").unwrap(), &cfg(GpuAccess::None));
+        let args = agent_args(&node, node.unit("main").unwrap(), std::path::Path::new("/e"), &cfg(GpuAccess::None));
         let published: Vec<&String> = args.windows(2).filter(|w| w[0] == "--publish").map(|w| &w[1]).collect();
         assert_eq!(published, [&format!("127.0.0.1::{UNIT_AGENT}"), &"127.0.0.1::5432".to_string()]);
         assert_eq!(args[args.len() - 3..], ["weft-runtime:t", "unit-agent", "serve"]);
 
         let machine = LocalInfraHostConfig { publish: Publish::AllPorts, ..cfg(GpuAccess::None) };
-        let args = agent_args(&node, node.unit("main").unwrap(), &machine);
+        let args = agent_args(&node, node.unit("main").unwrap(), std::path::Path::new("/e"), &machine);
         let published: Vec<&String> = args.windows(2).filter(|w| w[0] == "--publish").map(|w| &w[1]).collect();
         assert_eq!(published, [&format!("127.0.0.1::{UNIT_AGENT}"), &"5432:5432".to_string()], "a cloud machine publishes every port as is");
+    }
+
+    #[tokio::test]
+    async fn an_agent_is_its_own_copy_to_the_broker() {
+        use weft_platform_traits::unit_agent::{AGENT_BROKER_URL_ENV, AGENT_IDENTITY_ENV};
+        let key = std::sync::Arc::new(crate::LocalIdentity::from_hex(&"ab".repeat(32)).unwrap());
+        let broker = AgentBroker { url: "http://broker".into(), identity: AgentIdentity::Minted(key.clone()) };
+        let env: BTreeMap<_, _> = broker.env(&node_ref()).into_iter().collect();
+        assert_eq!(env[AGENT_BROKER_URL_ENV], "http://broker");
+        let token = env[AGENT_IDENTITY_ENV].strip_prefix("token:").unwrap();
+        let node = node_ref();
+        assert_eq!(
+            weft_platform_traits::CallerIdentity::verify(key.as_ref(), token, &[]).await.unwrap(),
+            weft_platform_traits::Principal::InfraCopy { tenant: node.tenant, project: node.project, copy_id: node.copy_id }
+        );
+        let machine = AgentBroker { url: "http://broker".into(), identity: AgentIdentity::Machine };
+        assert_eq!(machine.env(&node_ref())[1].1, "gcp-metadata");
     }
 
     #[test]

@@ -147,8 +147,9 @@ values upstream of it, so each run exercises the container and nothing else.
 A fire names exactly one trigger; its payload wakes that trigger, which
 runs and decides what to emit. An emit supplies the trigger's declared
 outputs directly. You choose one per trigger. Trigger ports receive their
-prepared settings through `weft bake`; a trigger cannot be a `--from`
-[start].
+prepared settings through `weft bake`; a trigger cannot be a `--from` [start].
+
+A run that reads nothing from a running [infra node] but its baked outputs uses the values the node saved instead of running it (baked outputs have nothing to do with `weft bake`). After you change what the node emits on one, name the node in the run (`--target <node>` or `--from <node>` always runs it) to test the new code. To update the value every other run gets, run `weft build` and then `weft infra rebake <node>`, which restarts nothing. A fire is durable or fast, and kept as long, as the trigger's `durable` and `keepRunsFor` say, and `--durable`, `--fast` and `--keep-for` override them for that run. A fire you start by hand is always recorded, even when the trigger has `recorded: false`.
 
 `bake` runs preparation and saves the trigger settings without listening.
 Changed code or configuration needs a matching new bake. Closed group
@@ -156,9 +157,9 @@ gates can leave a trigger unprepared; you inspect the bake instead of
 forcing it. `weft activate` prepares and arms real listeners.
 `weft bake <project-id>` uses that project's registered build. If you
 deliberately use `--referenced`, you pass it to both bake and run. Off a
-terminal every verb that takes a [mode] (`deactivate`, `resync`, `infra
-stop`, `infra terminate`, `infra upgrade`) uses `wipe` unless you say
-otherwise, so a change to the program never leaves a run waiting on
+terminal `deactivate` and `resync` use `wipe` unless you say otherwise
+(`infra stop`, `infra terminate` and `infra upgrade` stop and name `--mode`
+when a trigger reads the infra), so a change to the program never leaves a run waiting on
 something nobody will answer. Say `--mode park` or `--mode hibernate`
 when the work in flight has to survive, and say it deliberately.
 
@@ -249,8 +250,10 @@ weft run invoice --clear group --from triage='{"text":"the invoice is wrong"}' -
 Explicit `--from`, `--target`, `--before`, `--group`, and `--fire` replace
 the corresponding saved settings. Repeated new from flags build the
 replacement starting map. Emit flags replace the named supplied ports and
-keep the other saved emit entries. `--clear from|target|before|group|emit|fire`
-clears a field before those edits; repeat the flag for several fields.
+keep the other saved emit entries. `--clear <field>` clears a saved field
+before those edits: `from`, `emit`, `target`, `before`, `group`, `feed`,
+`fire`, `instance`, `keeping` (what `--durable` or `--fast` saved) or
+`keep_for`; repeat the flag for several fields.
 Duplicate newly supplied ports are errors. Values are never guessed for
 renamed nodes.
 

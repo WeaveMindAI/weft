@@ -360,6 +360,8 @@ pub async fn run(ctx: Ctx, opts: ConnectOpts) -> Result<()> {
         interactive,
         json,
         doorway: Doorway::Owner,
+        install: install_named(&ctx, &client),
+        on: ctx.on().map(str::to_string),
     };
 
     if opts.disconnect {
@@ -541,12 +543,15 @@ async fn as_instance(
 ) -> Result<()> {
     let json = ctx.json();
     let project_id = ctx.project()?.id();
+    let install = install_named(ctx, client);
+    let on = ctx.on().map(str::to_string);
     super::instance_values::as_instance(ctx, client, instance, |door| async move {
-        instance_connect(&door, project_id, instance, opts, target, label, json).await
+        instance_connect(&door, project_id, instance, opts, target, label, json, install, on).await
     })
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn instance_connect(
     door: &DispatcherClient,
     project_id: Uuid,
@@ -555,6 +560,8 @@ async fn instance_connect(
     target: &AccessTarget,
     label: &str,
     json: bool,
+    install: String,
+    on: Option<String>,
 ) -> Result<()> {
     let step = target.spelling();
     let cx = Connecting {
@@ -565,6 +572,8 @@ async fn instance_connect(
         interactive: is_interactive(),
         json,
         doorway: Doorway::Instance,
+        install,
+        on,
     };
     if !matches!(target.picked, Pick::InstanceFilled) {
         bail!(
@@ -619,8 +628,9 @@ async fn instance_connect(
         .await
         .with_context(|| {
             format!(
-                "the connection is stored as {}; pick it with `weft connect --instance {instance} --node {step} --grant {}`",
-                grant.id, grant.id
+                "the connection is stored as {}; pick it with `{}`",
+                grant.id,
+                cx.weft(&format!("connect --instance {instance} --node {step} --grant {}", grant.id))
             )
         })?;
     let rearmed = serde_json::from_value::<weft_core::instance_door::ValuesChanged>(changed)
@@ -655,6 +665,20 @@ struct Connecting<'a> {
     /// Whose connection this is: the author's (picked on the install)
     /// or one instance's (`--instance`, picked at the instance door).
     doorway: Doorway,
+    /// The install the pick is kept on, as a person reads it: its target
+    /// and its address.
+    install: String,
+    /// The target the command was run `--on`, which every hint carries.
+    on: Option<String>,
+}
+
+/// The install `client` speaks to, as a message names it: the target the
+/// command was run `--on`, and the address.
+fn install_named(ctx: &Ctx, client: &DispatcherClient) -> String {
+    match ctx.on() {
+        Some(on) => format!("the '{on}' install ({})", client.base()),
+        None => format!("the install at {}", client.base()),
+    }
 }
 
 /// Whose connections `weft connect` manages. The author's go through
@@ -1254,6 +1278,13 @@ fn print_grants(target: &AccessTarget, label: &str, grants: &[GrantSummary]) {
 }
 
 impl Connecting<'_> {
+    /// A `weft` command for a hint, on the install this one runs on.
+    fn weft(&self, verb: &str) -> String {
+        super::weft_on(self.on.as_deref(), verb)
+    }
+}
+
+impl Connecting<'_> {
     /// Point the node, at the place it is named by, at this stored
     /// connection on this install, and say so. Answers the triggers the
     /// change set up again. When the write fails the connection still
@@ -1271,16 +1302,17 @@ impl Connecting<'_> {
         };
         let rearmed = self.write_picks(&body).await.with_context(|| {
             format!(
-                "the connection is stored as {}; attach it with `weft connect --node {} \
-                 --grant {}`",
-                g.id, self.target.spelling(), g.id
+                "the connection is stored as {}; attach it with `{}`",
+                g.id,
+                self.weft(&format!("connect --node {} --grant {}", self.target.spelling(), g.id))
             )
         })?;
         if !self.json {
             println!(
-                "'{}' now uses {} on this install.",
+                "'{}' now uses {} on {}.",
                 self.target.spelling(),
-                g.identity.clone().unwrap_or_else(|| g.id.to_string())
+                g.identity.clone().unwrap_or_else(|| g.id.to_string()),
+                self.install
             );
             if !rearmed.is_empty() {
                 println!("The trigger(s) reading it were set up again: {}.", rearmed.join(", "));
@@ -1881,7 +1913,8 @@ impl Connecting<'_> {
         if !self.interactive {
             bail!(
                 "{label} needs a browser sign-in, which cannot finish without a terminal. \
-             Run `weft connect` yourself{}",
+             Run `{}` yourself{}",
+                self.weft("connect"),
                 if target
                     .spec
                     .own_page
@@ -1926,7 +1959,8 @@ impl Connecting<'_> {
         // here does NOT undo a sign-in that already landed.
         println!(
             "Waiting for the sign-in to land (Ctrl+C to stop waiting; if the sign-in \
-         completed anyway, `weft connect` will list the connection)..."
+         completed anyway, `{}` will list the connection)...",
+            self.weft("connect")
         );
         // No deadline: the person may take as long as they like in the
         // browser. The install drops a sign-in nobody finished, and the
@@ -1952,10 +1986,13 @@ impl Connecting<'_> {
                 .await
                 // A dropped poll does not undo a sign-in that already
                 // landed; the caller needs to know where to look.
-                .context(
-                    "polling the sign-in outcome failed; if the sign-in completed anyway, \
-                 the connection shows in `weft connect --list`",
-                )?;
+                .with_context(|| {
+                    format!(
+                        "polling the sign-in outcome failed; if the sign-in completed anyway, \
+                         the connection shows in `{}`",
+                        self.weft("connect --list")
+                    )
+                })?;
             let outcome: Option<ConnectOutcome> =
                 serde_json::from_value(outcome).context("read the sign-in outcome")?;
             match outcome {

@@ -240,5 +240,8 @@
         "field": "cases"
       }
     }
-  ]
+  ],
+  "features": {
+    "pure": true
+  }
 }

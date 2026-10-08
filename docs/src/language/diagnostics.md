@@ -122,6 +122,7 @@ or a switch's cases.
 
 | Slug | What it found | What to do |
 |---|---|---|
+| `run-settings` | A trigger's `durable`, `recorded` or `outlivesCaller` is not `true` or `false`, or it is durable or outlives its caller and is not recorded | Write `true` or `false`; turn `recorded` back on, or the other one off |
 | `trigger-into-trigger` | A trigger is wired into another trigger | Remove the wire. A trigger's inputs are frozen at setup, so another trigger's output could never reach it |
 | `trigger-into-infra` | An infra node sits downstream of a trigger | Remove the wire. Provisioning happens before any event exists |
 | `trigger-in-loop` | A trigger inside a loop body | Move it out. A trigger registers once and fires outside any iteration |

@@ -34,8 +34,8 @@
 use anyhow::Result;
 use sqlx::postgres::PgPool;
 
-// `InfraLifecycleVerb` and `RunningPolicy` are the wire contract for
-// the `verb` and `running_policy` columns. They live in
+// `InfraLifecycleVerb` is the wire contract for the `verb` column, and
+// `RunningPolicy` the answer a take-down carries. They live in
 // `weft-broker-client::protocol` so the supervisor + dispatcher +
 // broker share one source of truth. Re-export here so the rest of
 // the dispatcher keeps the short module-relative path.
@@ -51,12 +51,6 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             project_id        UUID NOT NULL,
             node_id           TEXT,
             verb              TEXT NOT NULL,
-            -- Nullable because dispatcher-owned verbs
-            -- (deactivate / reactivate) carry their running_policy
-            -- inside spec_json (Deactivate) or have none at all
-            -- (Reactivate). Stop / Terminate populate this; Apply
-            -- ignores it. One source of truth per verb.
-            running_policy    TEXT,
             spec_json         JSONB,
             issued_by_replica     TEXT NOT NULL,
             issued_at_unix    BIGINT NOT NULL,
@@ -89,12 +83,17 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- Pending unclaimed rows are cancelled outright (outcome =
             -- 'cancelled') instead of flagged.
             cancel_requested  BOOLEAN NOT NULL DEFAULT FALSE,
-            -- Cap on the running_policy=wait drain before the op
-            -- proceeds anyway (loud warning). Per-command: the user
-            -- picks it with the wait choice; the default mirrors
-            -- weft_broker_client::protocol::DEFAULT_DRAIN_TIMEOUT_SECS
-            -- (SYNC: the two numbers move together, by migration here).
-            drain_timeout_secs BIGINT NOT NULL DEFAULT 60,
+            -- A stop or terminate that first waits for the running work
+            -- its copies reach (`--running-policy wait`): until when
+            -- (unix seconds), past which what is left is cancelled. The
+            -- dispatcher's claimer waits it out (`crate::drain`), clears
+            -- it, and only then does a supervisor take the command. NULL
+            -- for every other command.
+            drain_by_unix     BIGINT,
+            -- The run that asked for the take-down (a program's own
+            -- `ctx.infra(..).stop(..)`): waited for like any other, never
+            -- cancelled by its drain; its own `StopSelf` decides.
+            asked_by          UUID,
             -- Which copies of the infra the command acts on
             -- (`weft_core::instance::Copies`): the shared ones (instance_id
             -- NULL, every_copy FALSE), one instance's (instance_id set), or
@@ -122,16 +121,16 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             ")",
         ),
         // Mirror for the dispatcher claim loop (deactivate /
-        // reactivate / upgrade). No tenant filter: the dispatcher pool claims
-        // across all tenants.
+        // reactivate / upgrade, and a take-down's drain). No tenant filter:
+        // the dispatcher pool claims across all tenants.
         concat!(
             r#"CREATE INDEX IF NOT EXISTS idx_lifecycle_cmd_dispatcher_claim
               ON infra_lifecycle_command(id)
               WHERE completed_at_unix IS NULL
                 AND claimed_by_replica IS NULL
-                AND verb IN ("#,
+                AND (drain_by_unix IS NOT NULL OR verb IN ("#,
             weft_broker_client::dispatcher_verbs_sql!(),
-            ")",
+            "))",
         ),
         // Partial unique index: at most one pending apply for a
         // given (project_id, node_id). Stops a worker restart from
@@ -140,14 +139,14 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         r#"CREATE UNIQUE INDEX IF NOT EXISTS uq_lifecycle_cmd_pending_apply
               ON infra_lifecycle_command(project_id, node_id, instance_id) NULLS NOT DISTINCT
               WHERE completed_at_unix IS NULL AND verb = 'apply'"#,
-        // Announce a command when it is issued (its claimers wake) and
-        // when it completes (whoever waits on its outcome wakes), from
-        // a trigger so no writer (the dispatcher's own verbs, the
-        // broker's supervisor and worker paths) can forget.
+        // Announce a command when it is issued or its drain is over (its
+        // claimers wake) and when it completes (whoever waits on its
+        // outcome wakes), from a trigger so no writer (the dispatcher's
+        // own verbs, the broker's supervisor and worker paths) can forget.
         // SYNC: the payloads <-> weft_broker_client::lifecycle_command::InfraCommandSignal
         r#"CREATE OR REPLACE FUNCTION infra_command_notify() RETURNS trigger AS $$
             BEGIN
-                IF TG_OP = 'INSERT' THEN
+                IF TG_OP = 'INSERT' OR (NEW.completed_at_unix IS NULL AND NEW.drain_by_unix IS NULL) THEN
                     PERFORM pg_notify('weft_infra_command', 'issued:' || NEW.project_id::text);
                 ELSE
                     PERFORM pg_notify('weft_infra_command', 'done:' || NEW.id::text);
@@ -159,6 +158,12 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         r#"CREATE TRIGGER infra_command_notify_on_issue
             AFTER INSERT ON infra_lifecycle_command
             FOR EACH ROW
+            EXECUTE FUNCTION infra_command_notify()"#,
+        r#"DROP TRIGGER IF EXISTS infra_command_notify_on_drained ON infra_lifecycle_command"#,
+        r#"CREATE TRIGGER infra_command_notify_on_drained
+            AFTER UPDATE OF drain_by_unix ON infra_lifecycle_command
+            FOR EACH ROW
+            WHEN (NEW.drain_by_unix IS NULL AND OLD.drain_by_unix IS NOT NULL)
             EXECUTE FUNCTION infra_command_notify()"#,
         r#"DROP TRIGGER IF EXISTS infra_command_notify_on_done ON infra_lifecycle_command"#,
         r#"CREATE TRIGGER infra_command_notify_on_done
@@ -205,8 +210,20 @@ impl TakeDown {
     }
 }
 
-/// Enqueue a Stop or Terminate command. Returns its id; the
-/// supervisor polling for the tenant claims it on its next tick.
+/// A take-down that first waits for the running work its copies reach
+/// (`--running-policy wait`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrainFirst {
+    /// Until when (unix seconds); what is left then is cancelled.
+    pub by_unix: i64,
+    /// The run that asked, never cancelled by the wait.
+    pub asked_by: Option<weft_core::ExecutionId>,
+}
+
+/// Enqueue a Stop or Terminate command. Returns its id. With `drain`, the
+/// dispatcher's claimer first waits for the running work its copies reach
+/// (`crate::lifecycle_claimer`); the owning supervisor claims it once that
+/// wait is over, or at once without.
 pub async fn issue_lifecycle(
     pool: &PgPool,
     tenant_id: &str,
@@ -214,15 +231,14 @@ pub async fn issue_lifecycle(
     node_id: Option<&str>,
     copies: &weft_core::instance::Copies,
     take_down: TakeDown,
-    running_policy: RunningPolicy,
-    drain_timeout_secs: u64,
+    drain: Option<DrainFirst>,
     issued_by_replica: &str,
 ) -> Result<i64> {
     let (instance_id, every_copy) = copies.columns();
     let (force, spec_json) = take_down.columns();
     let row: (i64,) = sqlx::query_as(
         "INSERT INTO infra_lifecycle_command \
-         (tenant_id, project_id, node_id, verb, running_policy, force, spec_json, drain_timeout_secs, \
+         (tenant_id, project_id, node_id, verb, force, spec_json, drain_by_unix, asked_by, \
           issued_by_replica, issued_at_unix, instance_id, every_copy) \
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, EXTRACT(EPOCH FROM NOW())::BIGINT, $10, $11) \
          RETURNING id",
@@ -231,10 +247,10 @@ pub async fn issue_lifecycle(
     .bind(project_id)
     .bind(node_id)
     .bind(take_down.verb().as_str())
-    .bind(running_policy.as_str())
     .bind(force)
     .bind(spec_json)
-    .bind(drain_timeout_secs as i64)
+    .bind(drain.map(|drain| drain.by_unix))
+    .bind(drain.and_then(|drain| drain.asked_by))
     .bind(issued_by_replica)
     .bind(instance_id)
     .bind(every_copy)
@@ -694,10 +710,8 @@ mod tests {
                 node_id: None,
                 copies: weft_core::instance::Copies::Shared,
                 verb: take_down.verb(),
-                running_policy: Some(RunningPolicy::Cancel),
                 spec_json,
                 force,
-                drain_timeout_secs: 60,
             };
             (row.force, row.terminate_work())
         };

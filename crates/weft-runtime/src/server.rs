@@ -86,7 +86,19 @@ fn now_ms() -> i64 {
 
 /// Serve `app` on `listener` until the process ends, with the peer's
 /// address on every request (the public door counts callers by it).
+///
+/// Every accepted connection sends at once (`TCP_NODELAY`). An answer
+/// whose headers and body leave in two writes otherwise holds the body
+/// until the caller acknowledges the headers, and a caller on a kept-alive
+/// connection delays that acknowledgement by up to 40 ms: every call after
+/// the first on a connection paid it.
 pub async fn serve(listener: tokio::net::TcpListener, app: Router) -> anyhow::Result<()> {
+    use axum::serve::ListenerExt as _;
+    let listener = listener.tap_io(|connection| {
+        if let Err(e) = connection.set_nodelay(true) {
+            tracing::warn!(target: "weft_runtime", error = %e, "could not make a connection send at once; its answers may wait on the caller's acknowledgements");
+        }
+    });
     axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(shutdown())
         .await?;

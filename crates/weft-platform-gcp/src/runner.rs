@@ -1,17 +1,22 @@
 //! Workers on Cloud Run.
 //!
-//! Each project image runs as a Cloud Run service of its own
-//! (`names::worker_service`), scaling to zero unless the project keeps
-//! copies warm, as the project's own service account: one account per
-//! project, so a project's workers can prove which project they are and
-//! nothing else. Only weft's own service account may invoke the service,
-//! so the worker trusts any call that reaches it (`WEFT_WORKER_DOOR=
-//! platform`). A long run is an execution of a Cloud Run job on the same
-//! image, running `--run <execution_id>`.
+//! Each project runs as one Cloud Run service (`names::worker_service`),
+//! as the project's own service account: one account per project, so a
+//! project's workers can prove which project they are and nothing else.
+//! Each program and worker settings the project runs is a revision of that
+//! service, under a tag of its own (`names::worker_tag`) whose address
+//! weft's own calls use; the project's callers reach the service's own
+//! address, whose traffic goes to the project's front
+//! (`Runner::front`). Instances kept warm (`min_instances`) are the
+//! front's alone: the service holds them (Cloud Run splits a service's
+//! minimum by traffic, so a revision taking none keeps none), and a
+//! project that takes no calls keeps none. Anybody may call the service (its invoker check is
+//! off): the worker checks its callers itself, and weft's own calls carry
+//! the project's key, which the worker derives from its project secret.
 //!
-//! Cloud Run cuts one request at 60 minutes, so a short run lives inside
-//! that; the worker stops itself shortly before it and says which setting
-//! lifts it.
+//! Cloud Run cuts one request at 60 minutes, so a run lives inside that;
+//! the worker stops it shortly before and says how a pause gives it a
+//! fresh hour.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,15 +27,11 @@ use serde_json::{json, Value};
 use weft_platform_traits::config::GcpPlatform;
 use weft_platform_traits::{Patience, Runner, WorkerEndpoint, WorkerSettings, WorkerStarting, WorkerTarget};
 
-use crate::accounts::{add_binding, Access};
 use crate::api::{is_status, Google};
 use crate::names;
 
 /// The longest one request may run on Cloud Run.
 const REQUEST_CAP: Duration = Duration::from_secs(3600);
-
-/// The longest a Cloud Run job's task may run.
-const JOB_CAP_SECS: u64 = 7 * 24 * 3600;
 
 /// How long a bring-up waits for a deploy in flight to settle, and how
 /// often it looks. Cloud Run settles a revision in minutes; past this the
@@ -48,7 +49,7 @@ const CALLER_HOLD: Duration = Duration::from_secs(20);
 /// or the failure in words (an `anyhow::Error` cannot be shared).
 type Landed = Option<Result<String, String>>;
 
-/// The bring-ups in flight in this process, one per service or job name
+/// The bring-ups in flight in this process, one per service name
 /// and spec: however many deliveries and live callers want the same one,
 /// one task deploys it and polls Cloud Run while it settles, and each
 /// caller waits on that task's outcome for as long as it may. The task
@@ -131,115 +132,40 @@ impl Drop for Landing {
     }
 }
 
-/// The label naming the spec a service or job stands deployed at.
-const SPEC_LABEL: &str = "weft-spec";
-
-/// A short fingerprint of a service or job body, as a label value.
-fn spec_of(body: &Value) -> String {
-    use sha2::{Digest, Sha256};
-    Sha256::digest(body.to_string().as_bytes()).iter().take(16).map(|b| format!("{b:02x}")).collect()
-}
-
-/// `body` carrying its own spec label. The label rides the same write as
-/// the body it names, so whatever Cloud Run holds is labelled with the
-/// spec it runs, whichever of two racing copies wrote last: a label
-/// written apart from its body could name the other copy's.
-fn labelled(body: &Value, spec: &str) -> Value {
-    let mut out = body.clone();
-    out["labels"][SPEC_LABEL] = json!(spec);
-    out
-}
-
-/// The annotation on a service's revision template that makes each deploy
-/// attempt a template of its own.
-const ATTEMPT_ANNOTATION: &str = "weft-attempt";
-
-/// `body` as one deploy attempt writes it. Cloud Run makes a new revision
-/// only when the template changes, so a retry of a byte-identical body
-/// after a revision failed for a reason that settles on its own (a new
-/// account's access to the secret not spread yet) would leave the service
-/// on the failed revision for good. A fresh value in the template makes
-/// every attempt a new revision. It is added after [`spec_of`] read the
-/// body, so the spec names what is deployed and never the attempt. A job
-/// has no revisions (each execution reads its current template), so it is
-/// written as is.
-fn attempt(body: &Value, kind: Kind) -> Value {
-    let mut out = body.clone();
-    if kind == Kind::Service {
-        out["template"]["annotations"][ATTEMPT_ANNOTATION] = json!(uuid::Uuid::new_v4().simple().to_string());
-    }
-    out
-}
-
-/// What a deployed Cloud Run resource is to weft.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    /// Called over HTTP at its own address; only weft may invoke it.
-    Service,
-    /// Started by resource URL (`:run`), never called.
-    Job,
-}
-
-impl Kind {
-    /// Where weft reaches the resource at `url`, read off what Cloud Run
-    /// holds for it.
-    fn address(self, url: &str, found: &Value) -> Option<String> {
-        match self {
-            Kind::Service => found.get("uri").and_then(Value::as_str).map(str::to_string),
-            Kind::Job => Some(url.to_string()),
-        }
-    }
-}
-
-/// Where a service or job Cloud Run holds stands against the spec weft
-/// wants it at.
+/// How a revision of a project's service stands.
 #[derive(Debug, PartialEq, Eq)]
-enum Standing {
-    /// At the spec, ready, and (a service) serving its latest revision.
+enum RevisionStanding {
+    /// Ready to take calls.
     Ready,
-    /// A deploy (another dispatcher copy's, or an earlier one) is still
-    /// settling. Redeploying now would replace that copy's revision with
-    /// ours mid-flight, so the caller waits and reads again.
+    /// Still coming up.
     Settling,
-    /// A deploy is due: another spec, or a latest
-    /// revision that failed only because the project's new account had
-    /// not spread yet (which a fresh attempt gets past).
+    /// It failed only because the project's new account had not spread
+    /// yet: a fresh attempt gets past it.
     Due,
-    /// At the spec, and its latest attempt failed for a reason a redeploy
-    /// of the same spec would hit again (the image crashes at start, a
-    /// bad setting). Carries Cloud Run's own words.
+    /// It failed for a reason a fresh attempt would hit again (the image
+    /// crashes at start, a bad setting). Carries Cloud Run's own words.
     Failed(String),
 }
 
-/// How `found` (a Cloud Run v2 service or job) stands against `spec`.
-/// Cloud Run puts a resource's readiness and, when it did not reach a
-/// serving state, the failure in `terminalCondition` (`state`, `reason`,
-/// `message`); `conditions` holds its sub-resources' (the revision's).
-fn standing(found: &Value, spec: &str, kind: Kind) -> Standing {
-    if found.pointer(&format!("/labels/{SPEC_LABEL}")).and_then(Value::as_str) != Some(spec) {
-        return Standing::Due;
-    }
-    let terminal = found.get("terminalCondition");
-    let state = terminal.and_then(|c| c.get("state")).and_then(Value::as_str);
+/// How `found` (a Cloud Run v2 revision) stands. Cloud Run puts its
+/// readiness and, when it did not come up, the failure in `conditions`
+/// (`type`, `state`, `reason`, `message`).
+fn revision_standing(found: &Value) -> RevisionStanding {
+    let conditions: Vec<&Value> = found.get("conditions").and_then(Value::as_array).into_iter().flatten().collect();
+    let ready = conditions.iter().find(|c| c.get("type").and_then(Value::as_str) == Some("Ready"));
+    let state = ready.and_then(|c| c.get("state")).and_then(Value::as_str);
     if found.get("reconciling").and_then(Value::as_bool) == Some(true)
         || matches!(state, None | Some("CONDITION_PENDING" | "CONDITION_RECONCILING" | "STATE_UNSPECIFIED"))
     {
-        return Standing::Settling;
+        return RevisionStanding::Settling;
     }
-    // An older revision still serving while the latest failed runs other
-    // settings than this spec's, so it is no more usable than none.
-    let serves_latest = kind == Kind::Job || found.get("latestReadyRevision") == found.get("latestCreatedRevision");
-    if state == Some("CONDITION_SUCCEEDED") && serves_latest {
-        return Standing::Ready;
+    if state == Some("CONDITION_SUCCEEDED") {
+        return RevisionStanding::Ready;
     }
-    let failed = terminal
-        .into_iter()
-        .chain(found.get("conditions").and_then(Value::as_array).into_iter().flatten())
-        .filter(|c| c.get("state").and_then(Value::as_str) == Some("CONDITION_FAILED"));
     let mut reasons = Vec::new();
     let mut messages = Vec::new();
-    for c in failed {
-        for field in ["reason", "revisionReason", "executionReason"] {
+    for c in conditions.iter().filter(|c| c.get("state").and_then(Value::as_str) == Some("CONDITION_FAILED")) {
+        for field in ["reason", "revisionReason"] {
             if let Some(r) = c.get(field).and_then(Value::as_str) {
                 reasons.push(r.to_string());
             }
@@ -252,25 +178,102 @@ fn standing(found: &Value, spec: &str, kind: Kind) -> Standing {
     }
     let message = messages.join("; ");
     if reasons.iter().any(|r| r == "SECRETS_ACCESS_CHECK_FAILED") || crate::accounts::says_account_not_spread(&message) {
-        return Standing::Due;
+        return RevisionStanding::Due;
     }
-    Standing::Failed(match (message.is_empty(), reasons.is_empty()) {
+    RevisionStanding::Failed(match (message.is_empty(), reasons.is_empty()) {
         (false, _) => message,
         (true, false) => format!("Cloud Run reports it failed ({})", reasons.join(", ")),
-        (true, true) => "its latest revision is not the one serving, and Cloud Run gives no reason".to_string(),
+        (true, true) => "Cloud Run reports it failed and gives no reason".to_string(),
     })
 }
 
-/// What this process last saw deployed and usable under one name. Only
-/// an optimization: Cloud Run stays the one record, so an entry is
-/// dropped whenever a call shows its address is gone
+/// The revision the tag `tag` names on the service `found`, as its
+/// traffic says.
+fn tagged_revision(found: &Value, tag: &str) -> Option<String> {
+    found
+        .get("traffic")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|t| t.get("tag").and_then(Value::as_str) == Some(tag))
+        .and_then(|t| t.get("revision"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// The address of the tag `tag` on the service `found`, once Cloud Run
+/// serves it.
+fn tag_address(found: &Value, tag: &str) -> Option<String> {
+    found
+        .get("trafficStatuses")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|t| t.get("tag").and_then(Value::as_str) == Some(tag))
+        .and_then(|t| t.get("uri"))
+        .and_then(Value::as_str)
+        .filter(|uri| !uri.is_empty())
+        .map(str::to_string)
+}
+
+/// The service's traffic with `revision` under `tag` (replacing whatever
+/// the tag named before), every other tag kept. `front` sends every call
+/// to that revision; otherwise the calls keep going where they went, and
+/// the first revision of a new service takes them all.
+fn traffic_with(found: Option<&Value>, tag: &str, revision: &str, front: bool) -> Value {
+    let mut traffic: Vec<Value> = found
+        .and_then(|f| f.get("traffic"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|t| t.get("tag").and_then(Value::as_str) != Some(tag))
+        .collect();
+    let takes_all = front || traffic.iter().all(|t| t.get("percent").and_then(Value::as_u64).unwrap_or(0) == 0);
+    if takes_all {
+        for t in traffic.iter_mut() {
+            t["percent"] = json!(0);
+        }
+    }
+    traffic.push(json!({
+        "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION",
+        "revision": revision,
+        "tag": tag,
+        "percent": if takes_all { 100 } else { 0 },
+    }));
+    Value::Array(traffic.into_iter().filter(written_back).collect())
+}
+
+/// Whether every call to the service `found` goes to `revision`, as its
+/// traffic says (Cloud Run leaves a zero out of what it answers).
+fn takes_every_call(found: &Value, revision: &str) -> bool {
+    let percent = |t: &Value| t.get("percent").and_then(Value::as_u64).unwrap_or(0);
+    let traffic = found.get("traffic").and_then(Value::as_array).into_iter().flatten();
+    let mut all = 0;
+    for t in traffic {
+        if t.get("revision").and_then(Value::as_str) == Some(revision) {
+            all += percent(t);
+        } else if percent(t) > 0 {
+            return false;
+        }
+    }
+    all == 100
+}
+
+/// Whether Cloud Run takes a traffic entry back as written: one that
+/// names its revision, or the "latest" one. An entry whose revision was
+/// deleted by hand names none.
+fn written_back(entry: &Value) -> bool {
+    entry.get("revision").and_then(Value::as_str).is_some()
+        || entry.get("type").and_then(Value::as_str) == Some("TRAFFIC_TARGET_ALLOCATION_TYPE_LATEST")
+}
+
+/// What this process last saw deployed and usable for one tag of one
+/// service. Only an optimization: Cloud Run stays the one record, so an
+/// entry is dropped whenever a call shows its address is gone
 /// ([`weft_platform_traits::WorkerCall::address_is_gone`]), its project
-/// retires or its image goes, and a changed spec never matches it. A
-/// sibling dispatcher copy holding a stale entry costs one failed call,
-/// after which it asks Cloud Run again. A failed deploy is never
-/// remembered: every copy reads it from Cloud Run.
+/// retires or its image goes. A sibling dispatcher copy holding a stale
+/// entry costs one failed call, after which it asks Cloud Run again. A
+/// failed deploy is never remembered: every copy reads it from Cloud Run.
 struct Known {
-    spec: String,
     address: String,
     project: uuid::Uuid,
     image_hash: String,
@@ -288,26 +291,41 @@ pub struct CloudRunRunner {
     /// The broker's address as a worker reaches it.
     broker_url: String,
     install: weft_core::infra::Install,
-    /// One deploy at a time per service or job in this process (two specs
-    /// of one name included), while deploys are in flight. Only spares
-    /// duplicate work: whether one is deployed is read from Cloud Run
-    /// under the gate, since another dispatcher copy may have changed or
-    /// deleted it.
-    deploying: Arc<parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
-    /// Keyed by service or job name. Spares a Cloud Run read on every
-    /// call to a project's workers.
-    known: Arc<parking_lot::Mutex<HashMap<String, Known>>>,
+    /// What the install allows at its public edge, which a worker's door
+    /// holds its callers to.
+    edge: weft_platform_traits::config::EdgeConfig,
+    /// The install's caller-ticket secret, decoded: what each project's own
+    /// secret is derived from (`weft_core::caller_token::ProjectSecret`). A
+    /// worker is given only its project's.
+    install_secret: Arc<Vec<u8>>,
+    /// One change at a time per service in this process. Only spares
+    /// duplicate work and needless conflicts: every change is made against
+    /// the service as Cloud Run holds it (its `etag`), since another
+    /// dispatcher copy may change it too.
+    changing: Arc<parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Keyed by service and tag. Spares a Cloud Run read on every call to
+    /// a project's workers.
+    known: Arc<parking_lot::Mutex<HashMap<(String, String), Known>>>,
     flights: Arc<Flights>,
 }
 
 impl CloudRunRunner {
-    pub fn new(google: Google, gcp: GcpPlatform, broker_url: String, install: weft_core::infra::Install) -> Self {
+    pub fn new(
+        google: Google,
+        gcp: GcpPlatform,
+        broker_url: String,
+        install: weft_core::infra::Install,
+        edge: weft_platform_traits::config::EdgeConfig,
+        install_secret: Vec<u8>,
+    ) -> Self {
         Self {
             google,
             gcp,
             broker_url,
             install,
-            deploying: Arc::default(),
+            edge,
+            install_secret: Arc::new(install_secret),
+            changing: Arc::default(),
             known: Arc::default(),
             flights: Arc::new(Flights::new(CALLER_HOLD)),
         }
@@ -317,54 +335,67 @@ impl CloudRunRunner {
         format!("https://run.googleapis.com/v2/projects/{}/locations/{}", self.gcp.project, self.gcp.region)
     }
 
+    fn service_url(&self, project: uuid::Uuid) -> String {
+        format!("{}/services/{}", self.run_base(), names::worker_service(project))
+    }
+
+    /// The tag of `target`'s revisions.
+    fn tag_of(target: &WorkerTarget) -> String {
+        use sha2::{Digest, Sha256};
+        let settings = serde_json::to_vec(&target.settings).expect("worker settings serialize");
+        let digest: String = Sha256::digest(&settings).iter().take(2).map(|b| format!("{b:02x}")).collect();
+        names::worker_tag(&target.image, &digest)
+    }
+
+    /// `project`'s own secret, which its workers hold.
+    fn secret_of(&self, project: uuid::Uuid) -> weft_core::caller_token::ProjectSecret {
+        weft_core::caller_token::ProjectSecret::of(&self.install_secret, project)
+    }
+
+    /// The account `project`'s workers run as. It needs no grant: what a
+    /// worker holds of weft's comes in its environment.
     async fn ensure_account(&self, project: uuid::Uuid) -> anyhow::Result<String> {
-        crate::accounts::ensure_project_account(&self.google, &self.gcp, project, &[Access::CallerTokenSecret]).await
+        crate::accounts::ensure_project_account(&self.google, &self.gcp, project, &[]).await
     }
 
-    /// Create or update the service or job at `url` to `body`, whole
-    /// (Cloud Run's `allowMissing` makes one call do both, so dispatcher
-    /// copies deploying the same one at once never collide on "already
-    /// exists"), and wait for it. Each try is its own [`attempt`].
-    async fn upsert(&self, url: &str, body: &Value, kind: Kind) -> anyhow::Result<()> {
-        let call = format!("{url}?allowMissing=true");
-        // One bounded wait covers both things that settle on their own: a
-        // new project account (and its grants) reaching Cloud Run, and
-        // another copy's change to the same one still going (409).
-        crate::accounts::until_settled(
-            |e| is_status(e, 409),
-            || async {
-                let op = self.google.patch(&call, &attempt(body, kind)).await?;
-                self.google.wait("https://run.googleapis.com/v2", op).await
-            },
-        )
-        .await
-        .map(|_| ())
-    }
-
-    fn container(&self, target: &WorkerTarget, long: bool) -> Value {
+    // SYNC: the worker's environment <-> crates/weft-compiler/src/codegen.rs (write_main_rs Args),
+    //       crates/weft-platform-local/src/runner.rs (worker_env),
+    //       crates/weft-core/src/caller_token.rs (ProjectSecret::from_env),
+    //       crates/weft-engine/src/worker.rs (identity_from_env)
+    fn container(&self, target: &WorkerTarget) -> Value {
+        let secret = self.secret_of(target.project);
         let mut env = vec![
             json!({ "name": "WEFT_PROJECT_ID", "value": target.project.to_string() }),
             json!({ "name": "WEFT_TENANT_ID", "value": target.tenant }),
             json!({ "name": "WEFT_BROKER_URL", "value": self.broker_url }),
-            json!({ "name": "WEFT_WORKER_DOOR", "value": "platform" }),
             json!({ "name": "WEFT_WORKER_IDENTITY", "value": "gcp-metadata" }),
-            json!({ "name": "WEFT_CALLER_TOKEN_SECRET", "valueSource": { "secretKeyRef": { "secret": self.gcp.caller_token_secret, "version": "latest" } } }),
+            json!({ "name": "WEFT_PROJECT_SECRET", "value": secret.to_hex() }),
+            // Google's front end appends the caller's address, the way it
+            // does for the install's own public door.
+            json!({ "name": "WEFT_TRUSTED_HOPS", "value": self.edge.trusted_proxy_hops.public.to_string() }),
+            json!({ "name": "WEFT_INVALID_TOKENS_PER_MINUTE", "value": weft_platform_traits::config::invalid_tokens_env(self.edge.invalid_tokens_per_minute) }),
         ];
-        if !long {
-            env.push(json!({ "name": "WEFT_SHORT_RUN_CAP_SECS", "value": REQUEST_CAP.as_secs().to_string() }));
+        env.extend(target.settings.worker_env().into_iter().map(|(name, value)| json!({ "name": name, "value": value })));
+        if let Some(binary_hash) = &target.binary_hash {
+            env.push(json!({ "name": "WEFT_BINARY_HASH", "value": binary_hash }));
         }
+        env.push(json!({ "name": "WEFT_RUN_CAP_SECS", "value": REQUEST_CAP.as_secs().to_string() }));
+        // Cloud Run may stop an instance no request holds open, so a run
+        // left with no caller moves under weft's own held call.
+        env.push(json!({ "name": "WEFT_RESUME_WHEN_CALLER_LEAVES", "value": "true" }));
         let mut c = json!({
             "image": target.image,
             "env": env,
             "resources": {
-                "limits": { "cpu": target.settings.cpu, "memory": target.settings.memory },
+                "limits": {
+                    "cpu": target.settings.cpu.as_deref().unwrap_or(WorkerSettings::CLOUD_DEFAULT_CPU),
+                    "memory": target.settings.memory,
+                },
             },
         });
-        if !long {
-            c["ports"] = json!([{ "containerPort": WORKER_PORT }]);
-            c["resources"]["cpuIdle"] = json!(!target.settings.cpu_always_allocated);
-            c["resources"]["startupCpuBoost"] = json!(target.settings.startup_boost);
-        }
+        c["ports"] = json!([{ "containerPort": WORKER_PORT }]);
+        c["resources"]["cpuIdle"] = json!(!target.settings.cpu_always_allocated);
+        c["resources"]["startupCpuBoost"] = json!(target.settings.startup_boost);
         c
     }
 
@@ -380,211 +411,186 @@ impl CloudRunRunner {
         })
     }
 
-    fn labels(&self, target: &WorkerTarget) -> Value {
+    fn labels(&self, project: uuid::Uuid) -> Value {
         json!({
             weft_core::infra::INSTALL_LABEL: self.install.label_value(),
-            "weft-project": target.project.simple().to_string(),
-            "weft-image": names::image_hash(&target.image),
+            "weft-project": project.simple().to_string(),
         })
     }
 
-    fn service_body(&self, target: &WorkerTarget, account: &str) -> Value {
+    /// The revision `revision` running `target`, as the service's template.
+    fn revision_template(&self, target: &WorkerTarget, account: &str, revision: &str) -> Value {
         let s: &WorkerSettings = &target.settings;
         json!({
-            "labels": self.labels(target),
-            "ingress": "INGRESS_TRAFFIC_ALL",
-            "invokerIamDisabled": false,
-            "template": {
-                "serviceAccount": account,
-                "scaling": { "minInstanceCount": s.min_instances, "maxInstanceCount": s.max_instances },
-                "maxInstanceRequestConcurrency": s.concurrency,
-                "timeout": format!("{}s", REQUEST_CAP.as_secs()),
-                "vpcAccess": self.vpc(),
-                "containers": [self.container(target, false)],
-            },
+            "revision": revision,
+            "labels": { "weft-image": names::image_hash(&target.image), "weft-tag": Self::tag_of(target) },
+            "serviceAccount": account,
+            // Warm instances are the service's, for its front (`front`).
+            "scaling": { "minInstanceCount": 0, "maxInstanceCount": s.max_instances },
+            "maxInstanceRequestConcurrency": s.concurrency,
+            "timeout": format!("{}s", REQUEST_CAP.as_secs()),
+            "vpcAccess": self.vpc(),
+            "containers": [self.container(target)],
         })
     }
 
-
-    /// Let weft's own account call the service at `url`. A grant cannot
-    /// precede the service it is on, so it follows the deploy; and a copy
-    /// stopped between the two leaves a service at its spec that weft may
-    /// not call, which is why every read that finds one at its spec runs
-    /// this too (a policy read when the grant is there already).
-    async fn let_weft_call(&self, url: &str, kind: Kind) -> anyhow::Result<()> {
-        if kind == Kind::Service {
-            add_binding(&self.google, url, "roles/run.invoker", &format!("serviceAccount:{}", self.gcp.core_service_account)).await?;
+    /// The project's service as weft writes it: open to every caller (the
+    /// worker checks them), with `template` and `traffic`, `warm` instances
+    /// kept for whatever takes its calls, against the version `etag` names
+    /// when it changes one Cloud Run holds.
+    fn service_body(&self, project: uuid::Uuid, template: Value, traffic: Value, warm: u64, etag: Option<&str>) -> Value {
+        let mut body = json!({
+            "labels": self.labels(project),
+            "ingress": "INGRESS_TRAFFIC_ALL",
+            "invokerIamDisabled": true,
+            "scaling": { "minInstanceCount": warm },
+            "template": template,
+            "traffic": traffic,
+        });
+        if let Some(etag) = etag {
+            body["etag"] = json!(etag);
         }
-        Ok(())
+        body
     }
 
-    /// Where the service or job `name` at `url` is reached, when it
-    /// stands deployed at `spec` and weft may call it; `None` when a
-    /// deploy is due. A spec whose latest revision failed for a lasting
-    /// reason is an error, read from Cloud Run on every call (so every
-    /// dispatcher copy sees it) until a new build changes the spec:
-    /// deploying the same spec again would only fail again.
-    ///
-    /// A resource still settling at the spec is waited on (bounded: an
-    /// internal wait on Cloud Run, never on the user) and read again. Only
-    /// a bring-up task runs this ([`Flights`]), so one poller per name
-    /// reads Cloud Run however many callers wait.
-    async fn usable_at(&self, name: &str, url: &str, spec: &str, kind: Kind) -> anyhow::Result<Option<String>> {
+    /// Write `body` to the service at `url` (Cloud Run's `allowMissing`
+    /// makes one call create or update it) and wait for it. A conflict
+    /// (another copy changed it since it was read) is the caller's to read
+    /// again and retry.
+    async fn write_service(&self, url: &str, body: &Value) -> anyhow::Result<()> {
+        let op = self.google.patch(&format!("{url}?allowMissing=true"), body).await?;
+        self.google.wait("https://run.googleapis.com/v2", op).await.map(|_| ())
+    }
+
+    /// The gate one service's changes take in this process.
+    fn gate(&self, service: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.changing.lock().entry(service.to_string()).or_default().clone()
+    }
+
+    /// Let go of a service's gate once no change waits on it.
+    fn ungate(&self, service: &str, gate: &Arc<tokio::sync::Mutex<()>>) {
+        let mut changing = self.changing.lock();
+        if changing.get(service).is_some_and(|g| Arc::ptr_eq(g, gate) && Arc::strong_count(g) == 2) {
+            changing.remove(service);
+        }
+    }
+
+    /// The address of `target`'s revision on its project's service,
+    /// deploying it when there is none; waited on as `patience` says.
+    /// Past the memo, the work is one shared bring-up per service and tag
+    /// ([`Flights`]).
+    async fn ensure(&self, target: &WorkerTarget, patience: Patience) -> anyhow::Result<String> {
+        target.settings.validate().map_err(|e| anyhow::anyhow!("project {}: {e}", target.project))?;
+        let key = (names::worker_service(target.project), Self::tag_of(target));
+        if let Some(known) = self.known.lock().get(&key) {
+            return Ok(known.address.clone());
+        }
+        let this = self.clone();
+        let owned = target.clone();
+        let what = format!("{}'s revision {}", key.0, key.1);
+        let rx = self.flights.join(key.clone(), move || async move { this.bring_up(&owned).await });
+        self.flights.wait(rx, patience, &what).await
+    }
+
+    /// The one bring-up of `target`'s revision: deploy it when due, wait
+    /// for it to come up, and remember its address.
+    async fn bring_up(&self, target: &WorkerTarget) -> anyhow::Result<String> {
+        let service = names::worker_service(target.project);
+        let tag = Self::tag_of(target);
+        let url = self.service_url(target.project);
+        let account = self.ensure_account(target.project).await?;
         let started = tokio::time::Instant::now();
         loop {
-            let Some(found) = self.google.get_opt(url).await? else { return Ok(None) };
-            match standing(&found, spec, kind) {
-                Standing::Settling if started.elapsed() < SETTLE_WAIT => tokio::time::sleep(SETTLE_POLL).await,
-                Standing::Settling => {
-                    anyhow::bail!("{name} is still settling after {}s at Cloud Run; look at its latest revision in the console", SETTLE_WAIT.as_secs())
+            anyhow::ensure!(
+                started.elapsed() < SETTLE_WAIT,
+                "{service}'s revision {tag} did not come up within {}s at Cloud Run; look at it in the console",
+                SETTLE_WAIT.as_secs()
+            );
+            let found = self.google.get_opt(&url).await?;
+            let revision = found.as_ref().and_then(|f| tagged_revision(f, &tag));
+            let standing = match &revision {
+                Some(revision) => match self.google.get_opt(&format!("{url}/revisions/{revision}")).await? {
+                    Some(found) => revision_standing(&found),
+                    None => RevisionStanding::Due,
+                },
+                None => RevisionStanding::Due,
+            };
+            match standing {
+                RevisionStanding::Ready => match found.as_ref().and_then(|f| tag_address(f, &tag)) {
+                    Some(address) => {
+                        self.known.lock().insert(
+                            (service, tag),
+                            Known { address: address.clone(), project: target.project, image_hash: names::image_hash(&target.image) },
+                        );
+                        return Ok(address);
+                    }
+                    // Cloud Run gives a tag its address a moment after
+                    // the revision is up.
+                    None => tokio::time::sleep(SETTLE_POLL).await,
+                },
+                RevisionStanding::Settling => tokio::time::sleep(SETTLE_POLL).await,
+                RevisionStanding::Failed(why) => {
+                    anyhow::bail!("the program's worker ({service}, revision {tag}) failed to start: {why}; fix the program and build again")
                 }
-                Standing::Due => return Ok(None),
-                Standing::Failed(why) => {
-                    anyhow::bail!("the program's worker ({name}) failed to start: {why}; fix the program and build again")
-                }
-                Standing::Ready => {
-                    self.let_weft_call(url, kind).await?;
-                    return kind
-                        .address(url, &found)
-                        .map(Some)
-                        .ok_or_else(|| anyhow::anyhow!("{name} is ready but Cloud Run gives it no address"));
+                RevisionStanding::Due => {
+                    let gate = self.gate(&service);
+                    let written = {
+                        let _one = gate.lock().await;
+                        // Read again under the gate: another bring-up of
+                        // this process may have just written the service.
+                        let found = self.google.get_opt(&url).await?;
+                        let revision = format!("{service}-{tag}-{}", random_suffix());
+                        let template = self.revision_template(target, &account, &revision);
+                        let traffic = traffic_with(found.as_ref(), &tag, &revision, false);
+                        let etag = found.as_ref().and_then(|f| f.get("etag")).and_then(Value::as_str);
+                        let body = self.service_body(target.project, template, traffic, found.as_ref().map_or(0, warm_of), etag);
+                        crate::accounts::until_account_is_known(|| self.write_service(&url, &body)).await
+                    };
+                    self.ungate(&service, &gate);
+                    // Another copy changed the service since it was read,
+                    // or is changing it now: read it again in a moment.
+                    match written {
+                        Err(e) if is_status(&e, 409) || is_status(&e, 412) => tokio::time::sleep(SETTLE_POLL).await,
+                        other => other.map_err(|e| e.context(format!("deploy {service}'s revision {tag} for project {}", target.project)))?,
+                    }
                 }
             }
         }
     }
 
-    /// What this process last saw deployed as `name` at `spec`.
-    fn remembered(&self, name: &str, spec: &str) -> Option<String> {
-        self.known.lock().get(name).filter(|k| k.spec == spec).map(|k| k.address.clone())
-    }
-
-    fn remember(&self, name: &str, target: &WorkerTarget, spec: &str, address: &str) {
-        self.known.lock().insert(
-            name.to_string(),
-            Known { spec: spec.to_string(), address: address.to_string(), project: target.project, image_hash: names::image_hash(&target.image) },
-        );
-    }
-
-    /// Deploy (or update) the service or job `name` at `url` to `body`,
-    /// answering its address.
-    ///
-    /// The resource carries a label naming the spec it was deployed at,
-    /// written in the same call as the body it names (see [`labelled`]).
-    ///
-    /// Past the memo, the work is one shared bring-up per name and spec
-    /// ([`Flights`]); `patience` is how long this caller waits on it.
-    async fn ensure(
-        &self,
-        target: &WorkerTarget,
-        name: &str,
-        url: &str,
-        body: &Value,
-        kind: Kind,
-        patience: Patience,
-    ) -> anyhow::Result<String> {
-        let spec = spec_of(body);
-        if let Some(known) = self.remembered(name, &spec) {
-            return Ok(known);
+    /// Every call to the project's service goes to `target`'s revision.
+    async fn send_traffic_to(&self, target: &WorkerTarget) -> anyhow::Result<String> {
+        let service = names::worker_service(target.project);
+        let tag = Self::tag_of(target);
+        let url = self.service_url(target.project);
+        let gate = self.gate(&service);
+        let sent = async {
+            let _one = gate.lock().await;
+            loop {
+                let found = self.google.get_opt(&url).await?.ok_or_else(|| anyhow::anyhow!("{service} is gone"))?;
+                let revision = tagged_revision(&found, &tag).ok_or_else(|| anyhow::anyhow!("{service} has no revision tagged {tag}"))?;
+                let warm = u64::from(target.settings.min_instances);
+                if takes_every_call(&found, &revision) && warm_of(&found) == warm {
+                    return found.get("uri").and_then(Value::as_str).map(str::to_string).ok_or_else(|| anyhow::anyhow!("{service} has no address"));
+                }
+                let traffic = traffic_with(Some(&found), &tag, &revision, true);
+                let template = found.get("template").cloned().ok_or_else(|| anyhow::anyhow!("{service} has no template"))?;
+                let body = self.service_body(target.project, template, traffic, warm, found.get("etag").and_then(Value::as_str));
+                match self.write_service(&url, &body).await {
+                    // Another copy is changing the service: read it again
+                    // in a moment.
+                    Err(e) if is_status(&e, 409) || is_status(&e, 412) => tokio::time::sleep(SETTLE_POLL).await,
+                    written => written?,
+                }
+            }
         }
-        let this = self.clone();
-        let (target, owned_name, url, body, owned_spec) = (target.clone(), name.to_string(), url.to_string(), body.clone(), spec.clone());
-        let rx = self.flights.join((name.to_string(), spec), move || async move {
-            this.bring_up(&target, &owned_name, &url, &body, &owned_spec, kind).await
-        });
-        self.flights.wait(rx, patience, name).await
+        .await;
+        self.ungate(&service, &gate);
+        sent
     }
 
-    /// The one bring-up of `name` at `spec`: deploy it when due, wait for
-    /// it to settle, and remember its address.
-    async fn bring_up(&self, target: &WorkerTarget, name: &str, url: &str, body: &Value, spec: &str, kind: Kind) -> anyhow::Result<String> {
-        let gate = self.deploying.lock().entry(name.to_string()).or_default().clone();
-        let deployed = self.deploy_once(target, name, url, body, spec, kind, &gate).await;
-        // The gate is only for deploys in flight; the map keeps nothing
-        // once the last of them is done.
-        let mut deploying = self.deploying.lock();
-        if deploying.get(name).is_some_and(|g| Arc::ptr_eq(g, &gate) && Arc::strong_count(g) == 2) {
-            deploying.remove(name);
-        }
-        drop(deploying);
-        let at = deployed?;
-        self.remember(name, target, spec, &at);
-        Ok(at)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn deploy_once(
-        &self,
-        target: &WorkerTarget,
-        name: &str,
-        url: &str,
-        body: &Value,
-        spec: &str,
-        kind: Kind,
-        gate: &tokio::sync::Mutex<()>,
-    ) -> anyhow::Result<String> {
-        let _one = gate.lock().await;
-        if let Some(at) = self.usable_at(name, url, spec, kind).await? {
-            return Ok(at);
-        }
-        self.ensure_account(target.project).await?;
-        // A service at its spec whose latest revision failed while the
-        // project's account was still spreading lands here too, and the
-        // fresh attempt redeploys it (see [`standing`]).
-        self.upsert(url, &labelled(body, spec), kind)
-            .await
-            .map_err(|e| e.context(format!("deploy {name} for the workers of project {}", target.project)))?;
-        self.usable_at(name, url, spec, kind)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("{name} is deployed but has no address or is not ready"))
-    }
-
-    /// Deploy (or update) the service for `target`, answering its URL,
-    /// waiting on the bring-up as `patience` says.
-    async fn ensure_service(&self, target: &WorkerTarget, patience: Patience) -> anyhow::Result<String> {
-        target.settings.validate().map_err(|e| anyhow::anyhow!("project {}: {e}", target.project))?;
-        let name = names::worker_service(target.project, &target.image);
-        let url = format!("{}/services/{name}", self.run_base());
-        let account = names::project_account_email(target.project, &self.gcp.project);
-        let body = self.service_body(target, &account);
-        self.ensure(target, &name, &url, &body, Kind::Service, patience).await
-    }
-
-    /// Deploy (or update) the long-run job for `target`, answering its
-    /// resource URL.
-    async fn ensure_job(&self, target: &WorkerTarget, patience: Patience) -> anyhow::Result<String> {
-        let name = names::worker_job(target.project, &target.image);
-        let url = format!("{}/jobs/{name}", self.run_base());
-        let account = names::project_account_email(target.project, &self.gcp.project);
-        let body = self.job_body(target, &account);
-        self.ensure(target, &name, &url, &body, Kind::Job, patience).await
-    }
-
-    fn job_body(&self, target: &WorkerTarget, account: &str) -> Value {
-        json!({
-            "labels": self.labels(target),
-            "template": {
-                "taskCount": 1,
-                "template": {
-                    "serviceAccount": account,
-                    "timeout": format!("{JOB_CAP_SECS}s"),
-                    // A long run that fails is the run's own ending; a
-                    // retry would start it again from nothing.
-                    "maxRetries": 0,
-                    "vpcAccess": self.vpc(),
-                    "containers": [self.container(target, true)],
-                },
-            },
-        })
-    }
-
-    /// Forget what this process remembered about deployments matching
-    /// `drop`, so the memo never outlives what it describes.
-    fn forget_where(&self, drop: impl Fn(&Known) -> bool) {
-        self.known.lock().retain(|_, k| !drop(k));
-    }
-
-    /// The names of the services and jobs labeled `label=value`.
-    async fn labeled(&self, kind: &str, label: &str, value: &str) -> anyhow::Result<Vec<String>> {
+    /// The names of the services labeled `label=value`.
+    async fn labeled(&self, label: &str, value: &str) -> anyhow::Result<Vec<String>> {
         let mut out = Vec::new();
         let mut page: Option<String> = None;
         loop {
@@ -592,8 +598,8 @@ impl CloudRunRunner {
             if let Some(token) = page.take() {
                 query.push(("pageToken", token));
             }
-            let listed = self.google.get_query(&format!("{}/{kind}", self.run_base()), &query).await?;
-            for item in listed.get(kind).and_then(Value::as_array).into_iter().flatten() {
+            let listed = self.google.get_query(&format!("{}/services", self.run_base()), &query).await?;
+            for item in listed.get("services").and_then(Value::as_array).into_iter().flatten() {
                 let labels = item.get("labels");
                 let ours = labels.and_then(|l| l.get(weft_core::infra::INSTALL_LABEL)).and_then(Value::as_str) == Some(self.install.label_value());
                 if ours && labels.and_then(|l| l.get(label)).and_then(Value::as_str) == Some(value) {
@@ -617,60 +623,150 @@ impl CloudRunRunner {
         }
         Ok(())
     }
+
+    /// Take every revision of the service `name` (full resource name)
+    /// running an image of digest `image_hash` out of its traffic, and
+    /// delete them. One that takes calls is the project's front, which
+    /// never runs an image nothing references: it is left alone.
+    async fn forget_revisions(&self, name: &str, image_hash: &str) -> anyhow::Result<()> {
+        let url = format!("https://run.googleapis.com/v2/{name}");
+        let listed = self.google.get(&format!("{url}/revisions")).await?;
+        let going: Vec<String> = listed
+            .get("revisions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|r| r.pointer("/labels/weft-image").and_then(Value::as_str) == Some(image_hash))
+            .filter_map(|r| r.get("name").and_then(Value::as_str).and_then(|n| n.rsplit('/').next()).map(str::to_string))
+            .collect();
+        if going.is_empty() {
+            return Ok(());
+        }
+        loop {
+            let Some(found) = self.google.get_opt(&url).await? else { return Ok(()) };
+            let traffic: Vec<Value> = found.get("traffic").and_then(Value::as_array).cloned().unwrap_or_default();
+            if traffic.iter().any(|t| {
+                t.get("percent").and_then(Value::as_u64).unwrap_or(0) > 0
+                    && t.get("revision").and_then(Value::as_str).is_some_and(|r| going.iter().any(|g| g == r))
+            }) {
+                tracing::warn!(target: "weft_platform_gcp::runner", service = %name, "an image being forgotten still takes the project's calls; its revisions stay");
+                return Ok(());
+            }
+            let kept: Vec<Value> =
+                traffic.iter().filter(|t| !t.get("revision").and_then(Value::as_str).is_some_and(|r| going.iter().any(|g| g == r))).cloned().collect();
+            if kept.len() == traffic.len() {
+                break;
+            }
+            let template = found.get("template").cloned().ok_or_else(|| anyhow::anyhow!("{name} has no template"))?;
+            let project = found
+                .pointer("/labels/weft-project")
+                .and_then(Value::as_str)
+                .and_then(|p| uuid::Uuid::parse_str(p).ok())
+                .ok_or_else(|| anyhow::anyhow!("{name} carries no readable weft-project label"))?;
+            let body = self.service_body(project, template, Value::Array(kept), warm_of(&found), found.get("etag").and_then(Value::as_str));
+            match self.write_service(&url, &body).await {
+                Err(e) if is_status(&e, 409) || is_status(&e, 412) => tokio::time::sleep(SETTLE_POLL).await,
+                written => {
+                    written?;
+                    break;
+                }
+            }
+        }
+        for revision in going {
+            match self.google.delete(&format!("{url}/revisions/{revision}")).await {
+                Ok(Some(op)) => {
+                    self.google.wait("https://run.googleapis.com/v2", op).await?;
+                }
+                Ok(None) => {}
+                // The service's own template still names it (its latest
+                // revision): it goes with the next one.
+                Err(e) if is_status(&e, 400) || is_status(&e, 409) || is_status(&e, 412) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// How many instances the service `found` keeps warm.
+fn warm_of(found: &Value) -> u64 {
+    found.pointer("/scaling/minInstanceCount").and_then(Value::as_u64).unwrap_or(0)
+}
+
+/// A few random characters that make each deploy attempt a revision of its
+/// own: a revision's name is final, so a retry after a failure that
+/// settles on its own (a new account's access to the secret spreading)
+/// needs a new one.
+fn random_suffix() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..4].to_string()
 }
 
 #[async_trait]
 impl Runner for CloudRunRunner {
     async fn prepare(&self, target: &WorkerTarget) -> anyhow::Result<()> {
-        self.ensure_service(target, Patience::ToTheEnd).await.map(|_| ())
+        self.ensure(target, Patience::ToTheEnd).await.map(|_| ())
     }
 
     async fn endpoint(&self, target: &WorkerTarget, patience: Patience) -> anyhow::Result<WorkerEndpoint> {
-        let base_url = self.ensure_service(target, patience).await?;
-        let bearer = self.google.tokens().id_token(&base_url).await?;
-        Ok(WorkerEndpoint { base_url, bearer, hold: None })
+        let base_url = self.ensure(target, patience).await?;
+        Ok(WorkerEndpoint { base_url, bearer: self.secret_of(target.project).worker_door_key(), hold: None })
+    }
+
+    async fn front(&self, target: &WorkerTarget, _port: Option<u16>) -> anyhow::Result<weft_core::projects::ProjectAddress> {
+        self.ensure(target, Patience::ToTheEnd).await?;
+        let url = self.send_traffic_to(target).await?;
+        Ok(weft_core::projects::ProjectAddress::Serving { url })
+    }
+
+    // The service keeps no warm instance any more and scales to zero on
+    // its own; its traffic stays where it was, and its routes answer that
+    // they take no calls.
+    async fn let_front_go(&self, project: uuid::Uuid) -> anyhow::Result<()> {
+        let service = names::worker_service(project);
+        let url = self.service_url(project);
+        let gate = self.gate(&service);
+        let cooled = async {
+            let _one = gate.lock().await;
+            loop {
+                let Some(found) = self.google.get_opt(&url).await? else { return Ok(()) };
+                if warm_of(&found) == 0 {
+                    return Ok(());
+                }
+                let template = found.get("template").cloned().ok_or_else(|| anyhow::anyhow!("{service} has no template"))?;
+                let traffic = found.get("traffic").cloned().unwrap_or_else(|| json!([]));
+                let body = self.service_body(project, template, traffic, 0, found.get("etag").and_then(Value::as_str));
+                match self.write_service(&url, &body).await {
+                    Err(e) if is_status(&e, 409) || is_status(&e, 412) => tokio::time::sleep(SETTLE_POLL).await,
+                    written => return written,
+                }
+            }
+        }
+        .await;
+        self.ungate(&service, &gate);
+        cooled
     }
 
     fn forget_address(&self, target: &WorkerTarget) {
-        self.known.lock().remove(&names::worker_service(target.project, &target.image));
-    }
-
-    async fn start_long(&self, target: &WorkerTarget, execution_id: uuid::Uuid, patience: Patience) -> anyhow::Result<()> {
-        let job = self.ensure_job(target, patience).await?;
-        let started = self
-            .google
-            .post(
-                &format!("{job}:run"),
-                &json!({ "overrides": { "containerOverrides": [{ "args": ["--run", execution_id.to_string()] }] } }),
-            )
-            .await;
-        if started.as_ref().is_err_and(|e| is_status(e, 404)) {
-            // Deleted behind this process's back: the next start deploys it.
-            self.known.lock().remove(&names::worker_job(target.project, &target.image));
-        }
-        started.map_err(|e| e.context(format!("start the long run {execution_id}")))?;
-        Ok(())
+        self.known.lock().remove(&(names::worker_service(target.project), Self::tag_of(target)));
     }
 
     async fn retire(&self, _tenant: &str, project: uuid::Uuid) -> anyhow::Result<()> {
         let value = project.simple().to_string();
-        let mut all = self.labeled("services", "weft-project", &value).await?;
-        all.extend(self.labeled("jobs", "weft-project", &value).await?);
-        self.forget_where(|k| k.project == project);
+        let all = self.labeled("weft-project", &value).await?;
+        self.known.lock().retain(|_, k| k.project != project);
         self.delete_all(all).await?;
         crate::accounts::revoke_project_account(&self.google, &self.gcp, project).await
     }
 
     async fn forget_image(&self, image: &str) -> anyhow::Result<()> {
         let hash = names::image_hash(image);
-        let mut all = self.labeled("services", "weft-image", &hash).await?;
-        all.extend(self.labeled("jobs", "weft-image", &hash).await?);
-        self.forget_where(|k| k.image_hash == hash);
-        self.delete_all(all).await
-    }
-
-    fn short_run_cap(&self) -> Option<Duration> {
-        Some(REQUEST_CAP)
+        self.known.lock().retain(|_, k| k.image_hash != hash);
+        for service in self.labeled(weft_core::infra::INSTALL_LABEL, self.install.label_value()).await? {
+            if service.rsplit('/').next().is_some_and(|name| name.starts_with("wk-")) {
+                self.forget_revisions(&service, &hash).await?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -697,21 +793,48 @@ mod tests {
             deployer_service_account: "d".into(),
             frontend_service_account: "f".into(),
             workload_identity_provider: "w".into(),
-            caller_token_secret: "weft-caller-token-secret".into(),
             infra_network_tag: "weft-infra".into(),
             build_machine: None,
         }
     }
 
+    fn edge() -> weft_platform_traits::config::EdgeConfig {
+        weft_platform_traits::config::EdgeConfig {
+            trusted_proxy_hops: weft_platform_traits::config::ProxyHops { public: 1, outside: 1, domains: 2 },
+            invalid_tokens_per_minute: Some(30),
+        }
+    }
+
     fn target(settings: WorkerSettings) -> WorkerTarget {
-        WorkerTarget { tenant: "local".into(), project: uuid::Uuid::from_u128(3), image: "us-central1-docker.pkg.dev/acme/weft/weft-worker:ab".into(), settings }
+        WorkerTarget { tenant: "local".into(), project: uuid::Uuid::from_u128(3), image: "us-central1-docker.pkg.dev/acme/weft/weft-worker:ab".into(), binary_hash: Some("ab".into()), settings }
+    }
+
+    fn runner(broker: &str) -> CloudRunRunner {
+        CloudRunRunner::new(
+            Google::new(Arc::new(crate::metadata::MetadataTokens::new())),
+            gcp(),
+            broker.into(),
+            weft_core::infra::Install::default_install(),
+            edge(),
+            b"test-secret-32-bytes-aaaaaaaaaaa".to_vec(),
+        )
+    }
+
+    /// A revision keeps no warm instance of its own, whatever the settings:
+    /// those are the front's (`service_body`), so a revision that stops
+    /// taking calls stops costing anything.
+    #[test]
+    fn a_revision_keeps_no_warm_instance_of_its_own() {
+        let r = runner("b");
+        let t = r.revision_template(&target(WorkerSettings { min_instances: 2, ..WorkerSettings::default() }), "a", "rev-1");
+        assert_eq!(t["scaling"]["minInstanceCount"], 0);
     }
 
     #[test]
-    fn a_service_carries_every_worker_lever_and_scales_to_zero_by_default() {
-        let r = CloudRunRunner::new(Google::new(Arc::new(crate::metadata::MetadataTokens::new())), gcp(), "http://10.10.0.2:14113/broker".into(), weft_core::infra::Install::default_install());
-        let body = r.service_body(&target(WorkerSettings::default()), "wp-x@acme.iam.gserviceaccount.com");
-        let t = &body["template"];
+    fn a_revision_carries_every_worker_lever_and_scales_to_zero_by_default() {
+        let r = runner("http://10.10.0.2:14113/broker");
+        let t = r.revision_template(&target(WorkerSettings::default()), "wp-x@acme.iam.gserviceaccount.com", "rev-1");
+        assert_eq!(t["revision"], "rev-1");
         assert_eq!(t["scaling"]["minInstanceCount"], 0);
         assert_eq!(t["scaling"]["maxInstanceCount"], 10);
         assert_eq!(t["maxInstanceRequestConcurrency"], 80);
@@ -722,80 +845,95 @@ mod tests {
         assert_eq!(c["resources"]["cpuIdle"], true);
         let env = c["env"].as_array().unwrap();
         let var = |n: &str| env.iter().find(|e| e["name"] == n).cloned().unwrap();
-        assert_eq!(var("WEFT_WORKER_DOOR")["value"], "platform");
         assert_eq!(var("WEFT_BROKER_URL")["value"], "http://10.10.0.2:14113/broker");
-        assert_eq!(var("WEFT_CALLER_TOKEN_SECRET")["valueSource"]["secretKeyRef"]["secret"], "weft-caller-token-secret");
-        assert_eq!(var("WEFT_SHORT_RUN_CAP_SECS")["value"], "3600");
+        assert!(env.iter().all(|e| e["name"] != "WEFT_INSTALL_URL"));
+        let secret = weft_core::caller_token::ProjectSecret::of(b"test-secret-32-bytes-aaaaaaaaaaa", uuid::Uuid::from_u128(3));
+        assert_eq!(var("WEFT_PROJECT_SECRET")["value"], secret.to_hex(), "a worker holds its project's secret");
+        assert!(env.iter().all(|e| e["name"] != "WEFT_CALLER_TOKEN_SECRET"), "and never the install's");
+        assert_eq!(var("WEFT_RUN_CAP_SECS")["value"], "3600");
+        assert_eq!(var("WEFT_RESUME_WHEN_CALLER_LEAVES")["value"], "true");
     }
 
-    /// The label is part of the body written, and the spec it names is
-    /// the body without it, so a read compares like with like.
+    /// Anybody may call a project's service: its workers check their
+    /// callers themselves.
     #[test]
-    fn the_spec_label_rides_the_body_it_names() {
-        let r = CloudRunRunner::new(Google::new(Arc::new(crate::metadata::MetadataTokens::new())), gcp(), "b".into(), weft_core::infra::Install::default_install());
-        for body in [r.service_body(&target(WorkerSettings::default()), "a"), r.job_body(&target(WorkerSettings::default()), "a")] {
-            let spec = spec_of(&body);
-            let written = labelled(&body, &spec);
-            assert_eq!(written["labels"][SPEC_LABEL], spec.as_str());
-            assert_eq!(written["labels"]["weft-project"], body["labels"]["weft-project"]);
-            assert_eq!(written["template"], body["template"]);
-        }
+    fn a_projects_service_is_open_to_every_caller() {
+        let r = runner("b");
+        let body = r.service_body(uuid::Uuid::from_u128(3), json!({}), json!([]), 2, Some("e1"));
+        assert_eq!(body["invokerIamDisabled"], true);
+        assert_eq!(body["scaling"]["minInstanceCount"], 2, "warm instances are the service's, for its front");
+        assert_eq!(body["ingress"], "INGRESS_TRAFFIC_ALL");
+        assert_eq!(body["etag"], "e1", "a change is made against the version it read");
+        assert_eq!(body["labels"]["weft-project"], uuid::Uuid::from_u128(3).simple().to_string());
     }
 
-    /// Two attempts at one body differ in the service's template (so each
-    /// is a new revision) and agree on everything else, the spec label
-    /// included. A job is written as is.
+    /// Another program and other settings are another tag; the same are
+    /// the same.
     #[test]
-    fn every_attempt_is_a_new_revision_of_the_same_spec() {
-        let r = CloudRunRunner::new(Google::new(Arc::new(crate::metadata::MetadataTokens::new())), gcp(), "b".into(), weft_core::infra::Install::default_install());
-        let body = labelled(&r.service_body(&target(WorkerSettings::default()), "a"), "s");
-        let (one, two) = (attempt(&body, Kind::Service), attempt(&body, Kind::Service));
-        assert_ne!(one["template"], two["template"]);
-        assert_eq!(one["labels"], body["labels"]);
-        let strip = |mut v: Value| {
-            v["template"].as_object_mut().unwrap().remove("annotations");
-            v
-        };
-        assert_eq!(strip(one), body);
-        let job = r.job_body(&target(WorkerSettings::default()), "a");
-        assert_eq!(attempt(&job, Kind::Job), job);
+    fn a_tag_names_the_program_and_its_settings() {
+        let one = target(WorkerSettings::default());
+        assert_eq!(CloudRunRunner::tag_of(&one), CloudRunRunner::tag_of(&one.clone()));
+        let mut other_image = one.clone();
+        other_image.image.push('c');
+        assert_ne!(CloudRunRunner::tag_of(&one), CloudRunRunner::tag_of(&other_image));
+        let mut other_settings = one.clone();
+        other_settings.settings.min_instances = 1;
+        assert_ne!(CloudRunRunner::tag_of(&one), CloudRunRunner::tag_of(&other_settings));
     }
 
-    fn service(state: &str, ready: &str, created: &str, conditions: Value) -> Value {
-        json!({
-            "labels": { SPEC_LABEL: "s" },
-            "terminalCondition": { "type": "Ready", "state": state },
-            "latestReadyRevision": ready,
-            "latestCreatedRevision": created,
-            "conditions": conditions,
-        })
+    /// A new revision takes no calls from the front unless it is the
+    /// first, or made the front; every other tag stays reachable.
+    #[test]
+    fn traffic_keeps_every_tag_and_moves_only_for_a_front() {
+        let first = traffic_with(None, "v1", "svc-v1-aaaa", false);
+        assert_eq!(first, json!([{ "type": "TRAFFIC_TARGET_ALLOCATION_TYPE_REVISION", "revision": "svc-v1-aaaa", "tag": "v1", "percent": 100 }]));
+        let found = json!({ "traffic": first });
+        let second = traffic_with(Some(&found), "v2", "svc-v2-bbbb", false);
+        assert_eq!(second[0]["percent"], 100, "the front keeps its calls");
+        assert_eq!(second[1]["percent"], 0);
+        assert!(!takes_every_call(&json!({ "traffic": second.clone() }), "svc-v2-bbbb"));
+        let moved = traffic_with(Some(&json!({ "traffic": second })), "v2", "svc-v2-bbbb", true);
+        assert!(takes_every_call(&json!({ "traffic": moved.clone() }), "svc-v2-bbbb"));
+        assert_eq!(moved.as_array().unwrap().len(), 2, "the old tag stays reachable");
+        // Cloud Run leaves a zero out of what it answers.
+        assert!(takes_every_call(&json!({ "traffic": [{ "revision": "r2", "percent": 100 }, { "revision": "r1", "tag": "v1" }] }), "r2"));
+        // A retried deploy of one tag replaces what the tag named.
+        let retried = traffic_with(Some(&json!({ "traffic": moved })), "v2", "svc-v2-cccc", false);
+        assert_eq!(retried.as_array().unwrap().iter().filter(|t| t["tag"] == "v2").count(), 1);
     }
 
     #[test]
     fn a_failed_revision_redeploys_only_while_the_account_spreads() {
-        let failed_rev = |reason: &str, message: &str| {
-            json!([{ "type": "RoutesReady", "state": "CONDITION_FAILED", "reason": reason, "message": message }])
+        let revision = |state: &str, reason: &str, message: &str| {
+            json!({ "conditions": [{ "type": "Ready", "state": state, "reason": reason, "message": message }] })
         };
-        assert_eq!(standing(&service("CONDITION_SUCCEEDED", "r1", "r1", json!([])), "s", Kind::Service), Standing::Ready);
-        assert_eq!(standing(&service("CONDITION_SUCCEEDED", "r1", "r1", json!([])), "other", Kind::Service), Standing::Due, "another spec");
-        let mut settling = service("CONDITION_RECONCILING", "r1", "r2", json!([]));
-        assert_eq!(standing(&settling, "s", Kind::Service), Standing::Settling, "another copy's deploy in flight");
-        let mut reconciling = service("CONDITION_SUCCEEDED", "r1", "r1", json!([]));
-        reconciling["reconciling"] = json!(true);
-        assert_eq!(standing(&reconciling, "s", Kind::Service), Standing::Settling);
-        settling["terminalCondition"]["state"] = json!("CONDITION_PENDING");
-        assert_eq!(standing(&settling, "s", Kind::Service), Standing::Settling);
-        assert_eq!(standing(&settling, "other", Kind::Service), Standing::Due, "a settling deploy of another spec is replaced");
-        let spreading = service("CONDITION_FAILED", "", "r1", failed_rev("SECRETS_ACCESS_CHECK_FAILED", ""));
-        assert_eq!(standing(&spreading, "s", Kind::Service), Standing::Due);
-        let spreading = service("CONDITION_FAILED", "", "r1", failed_rev("UNKNOWN", "Permission denied on secret: projects/acme/secrets/s/versions/latest"));
-        assert_eq!(standing(&spreading, "s", Kind::Service), Standing::Due);
-        let crash = service("CONDITION_FAILED", "", "r1", failed_rev("UNKNOWN", "The user-provided container failed to start and listen on the port"));
-        assert_eq!(standing(&crash, "s", Kind::Service), Standing::Failed("The user-provided container failed to start and listen on the port".into()));
-        let older_serves = service("CONDITION_FAILED", "r1", "r2", failed_rev("CONTAINER_MISSING", ""));
-        assert_eq!(standing(&older_serves, "s", Kind::Service), Standing::Failed("Cloud Run reports it failed (CONTAINER_MISSING)".into()));
-        let older_serves_quietly = service("CONDITION_SUCCEEDED", "r1", "r2", json!([]));
-        assert!(matches!(standing(&older_serves_quietly, "s", Kind::Service), Standing::Failed(_)), "an older revision runs other settings");
+        assert_eq!(revision_standing(&revision("CONDITION_SUCCEEDED", "", "")), RevisionStanding::Ready);
+        assert_eq!(revision_standing(&revision("CONDITION_RECONCILING", "", "")), RevisionStanding::Settling);
+        assert_eq!(revision_standing(&json!({})), RevisionStanding::Settling, "no condition yet");
+        assert_eq!(revision_standing(&revision("CONDITION_FAILED", "SECRETS_ACCESS_CHECK_FAILED", "")), RevisionStanding::Due);
+        assert_eq!(
+            revision_standing(&revision("CONDITION_FAILED", "UNKNOWN", "Permission denied on secret: projects/acme/secrets/s/versions/latest")),
+            RevisionStanding::Due
+        );
+        assert_eq!(
+            revision_standing(&revision("CONDITION_FAILED", "UNKNOWN", "The user-provided container failed to start and listen on the port")),
+            RevisionStanding::Failed("The user-provided container failed to start and listen on the port".into())
+        );
+        assert_eq!(
+            revision_standing(&revision("CONDITION_FAILED", "CONTAINER_MISSING", "")),
+            RevisionStanding::Failed("Cloud Run reports it failed (CONTAINER_MISSING)".into())
+        );
+    }
+
+    #[test]
+    fn a_tags_revision_and_address_are_read_off_the_service() {
+        let found = json!({
+            "traffic": [{ "revision": "r1", "tag": "v1", "percent": 100 }],
+            "trafficStatuses": [{ "revision": "r1", "tag": "v1", "uri": "https://v1---wk-x-1.a.run.app" }],
+        });
+        assert_eq!(tagged_revision(&found, "v1").as_deref(), Some("r1"));
+        assert_eq!(tag_address(&found, "v1").as_deref(), Some("https://v1---wk-x-1.a.run.app"));
+        assert_eq!(tagged_revision(&found, "v2"), None);
     }
 
     /// However many callers want one bring-up, it runs once and every one
@@ -835,13 +973,5 @@ mod tests {
         assert!(flights.inflight.lock().is_empty(), "a landed bring-up leaves the map");
         let failed = flights.join(key(), || async { anyhow::bail!("the revision crashed") });
         assert_eq!(format!("{:#}", flights.wait(failed, Patience::ToTheEnd, "svc").await.unwrap_err()), "the revision crashed");
-    }
-
-    #[test]
-    fn a_long_run_has_no_port_and_no_short_cap() {
-        let r = CloudRunRunner::new(Google::new(Arc::new(crate::metadata::MetadataTokens::new())), gcp(), "b".into(), weft_core::infra::Install::default_install());
-        let c = r.container(&target(WorkerSettings::default()), true);
-        assert!(c.get("ports").is_none());
-        assert!(!c["env"].as_array().unwrap().iter().any(|e| e["name"] == "WEFT_SHORT_RUN_CAP_SECS"));
     }
 }

@@ -50,6 +50,10 @@ pub struct ResolvedAccess {
     /// are. What lets a worker keep them (the broker's
     /// `ResolveConnectionResponse::keep_until_unix`).
     pub fresh_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// The infra node (spelled) that published the connection, when one
+    /// did: its values were made by that node's infra setup, and a failure
+    /// using them may mean they changed where weft could not see.
+    pub published_by: Option<String>,
 }
 
 /// The permission drift backstop, pure: a VERIFIED connection short of
@@ -126,6 +130,8 @@ struct WalledGrant {
     provider_account: Option<String>,
     /// See [`ResolvedAccess::fresh_until`].
     fresh_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// See [`ResolvedAccess::published_by`].
+    published_by: Option<String>,
 }
 
 /// Who is about to use a connection. An instance's connection is its own,
@@ -196,7 +202,7 @@ async fn read_walled_grant(
     // queueing). A Stored read takes no lock: it writes nothing.
     const COLUMNS: &str = "SELECT tenant_id, service, registration_sealed, spec_json, \
                            values_sealed, granted_scopes, permissions_verified, owner, door, \
-                           identity, provider_account, expires_at, instance_id, project_id \
+                           identity, provider_account, expires_at, instance_id, project_id, published_by_node \
                            FROM access_grant WHERE id = $1";
     #[allow(clippy::type_complexity)]
     type Row = (
@@ -214,6 +220,7 @@ async fn read_walled_grant(
         Option<chrono::DateTime<chrono::Utc>>,
         Option<String>,
         Option<uuid::Uuid>,
+        Option<String>,
     );
     let mut tx = None;
     let row: Option<Row> = match freshness {
@@ -245,6 +252,7 @@ async fn read_walled_grant(
         expires_at,
         instance,
         row_project,
+        published_by,
     )) = row
     else {
         return Err(AccessError::NotFound.into());
@@ -301,6 +309,7 @@ async fn read_walled_grant(
             door,
             provider_account,
             fresh_until: None,
+            published_by,
         });
     }
     let mut values = values_of(&crate::open_json(&values_sealed)?);
@@ -337,6 +346,7 @@ async fn read_walled_grant(
         door,
         provider_account,
         fresh_until: expires_at.map(|at| at - REFRESH_MARGIN),
+        published_by,
     })
 }
 
@@ -367,7 +377,7 @@ fn worker_handoff(
     service: &str,
     required_values: &[String],
 ) -> anyhow::Result<ResolvedAccess> {
-    let WalledGrant { service: row_service, spec, registration, values, identity, owner, fresh_until, .. } =
+    let WalledGrant { service: row_service, spec, registration, values, identity, owner, fresh_until, published_by, .. } =
         grant;
     let app_client_id = registration.as_ref().map(|r| r.client_id.clone());
     if matches!(spec.acquisition, Acquisition::Runtime {}) {
@@ -379,6 +389,7 @@ fn worker_handoff(
             owner,
             app_client_id,
             fresh_until,
+            published_by,
         });
     }
 
@@ -426,6 +437,7 @@ fn worker_handoff(
         owner,
         app_client_id,
         fresh_until,
+        published_by,
     })
 }
 

@@ -33,10 +33,8 @@ use crate::DispatcherState;
 /// lock. Runs BEFORE the journal or any store is constructed; none of them
 /// applies schema on its own.
 pub async fn apply_core_schema(pool: &sqlx::PgPool) -> anyhow::Result<()> {
-    // Dependency order: the `dispatcher_cursor` table group precedes the
-    // `infra_event_bridge_cursor` seed that writes into it. The guard
-    // refuses to run any group whose stamped fingerprint no longer matches
-    // its DDL, naming the tables to drop.
+    // The guard refuses to run any group whose stamped fingerprint no
+    // longer matches its DDL, naming the tables to drop.
     weft_task_store::apply_groups(pool, ALL_GROUPS)
         .await
         .context("apply core schema groups")
@@ -51,6 +49,8 @@ pub static ALL_GROUPS: &[&weft_task_store::SchemaGroup] = &[
     // trigger on a run's path writes to it.
     &weft_task_store::announce::GROUP,
     &crate::journal::postgres::GROUP,
+    // Which worker processes are alive, and what their doors counted.
+    &weft_task_store::worker_door::GROUP,
     // The exclusive infra ownership leases.
     &crate::infra_owner::GROUP,
     &weft_task_store::tasks::GROUP,
@@ -58,8 +58,9 @@ pub static ALL_GROUPS: &[&weft_task_store::SchemaGroup] = &[
     &crate::infra_node::GROUP,
     &crate::infra_event::GROUP,
     &crate::infra_lifecycle_command::GROUP,
-    &crate::journal_bridge::GROUP,
-    &crate::infra_event_bridge::GROUP,
+    // The events waiting for a parked trigger, one row each (their notify
+    // trigger reads `signal`, so after the journal's group).
+    &weft_task_store::parked_fires::GROUP,
     // The durable terminate-sweep queue (no FK; the dispatcher owns it and
     // the reaper drains it by asking the broker to sweep a terminated
     // execution's files).
@@ -80,8 +81,8 @@ pub static ALL_GROUPS: &[&weft_task_store::SchemaGroup] = &[
     // entry has going (no FK: a slot outlives nothing it names).
     &crate::entry_limits::GROUP,
     // Every finished run's words, for finding a run by what went through
-    // it (`run_search`).
-    &crate::run_search::GROUP,
+    // it (`search_index`).
+    &crate::search_index::GROUP,
     // The image builds running and done, by image ref (`build::ledger`).
     &crate::build::ledger::GROUP,
     // The wakes a local install has set and not yet delivered (a cloud
@@ -90,7 +91,19 @@ pub static ALL_GROUPS: &[&weft_task_store::SchemaGroup] = &[
     // When each loop of a role that scales to zero next wants a look
     // (`weft_task_store::drain`); empty on a local install.
     &weft_task_store::drain::GROUP,
+    &RETIRED_DISPATCHER_CURSOR,
+    &RETIRED_INFRA_EVENT_BRIDGE_CURSOR,
 ];
+
+/// The cursors the dispatcher once read the journal and the infra events
+/// with, before a run's own row and an event's notification carried what
+/// they tracked. Their tables are gone; each group stays listed, with
+/// none, so a database that still holds one is carried to its drop by the
+/// group's history (`migrations/<group>/`).
+static RETIRED_DISPATCHER_CURSOR: weft_task_store::SchemaGroup =
+    weft_task_store::SchemaGroup { name: "dispatcher_cursor", tables: &[], ddl: &[], seed: &[] };
+static RETIRED_INFRA_EVENT_BRIDGE_CURSOR: weft_task_store::SchemaGroup =
+    weft_task_store::SchemaGroup { name: "infra_event_bridge_cursor", tables: &[], ddl: &[], seed: &[] };
 
 /// The construction-time policies threaded into `build_state`: who a
 /// request authenticates as, which tenant owns a project, and how a
@@ -124,12 +137,13 @@ impl Defaults {
 pub const DISPATCHER_CHANNELS: &[&str] = &[
     weft_task_store::tasks::TASK_READY_CHANNEL,
     weft_task_store::terminal::TERMINAL_CHANNEL,
-    weft_journal::EXEC_EVENT_CHANNEL,
-    weft_journal::unrecorded::UNRECORDED_ENDED_CHANNEL,
+    weft_task_store::runs::RUN_QUEUED_CHANNEL,
+    weft_journal::RUN_LOG_CHANNEL,
+    weft_journal::RUN_ENDED_CHANNEL,
     weft_broker_client::lifecycle_command::INFRA_COMMAND_CHANNEL,
     crate::infra_event_bridge::INFRA_EVENT_CHANNEL,
     crate::events::NOTIFY_CHANNEL,
-    crate::reaper::PARKED_FIRE_CHANNEL,
+    weft_task_store::parked_fires::PARKED_FIRE_CHANNEL,
     crate::reaper::STORAGE_SWEEP_CHANNEL,
     crate::display_feeds::LOOK_NOW_CHANNEL,
     crate::holders::HELD_SIGNALS_CHANNEL,
@@ -161,8 +175,6 @@ pub struct DispatcherSettings<'a> {
     pub holder_pool: Arc<dyn weft_platform_traits::HolderPool>,
     /// The dispatcher's identity for its calls to the other roles.
     pub tokens: Arc<dyn weft_platform_traits::IdentityTokens>,
-    /// Signs live-caller routing tickets (`WEFT_CALLER_TOKEN_SECRET`).
-    pub caller_token_secret: Vec<u8>,
 }
 
 /// Build the dispatcher state.
@@ -181,15 +193,10 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         domains,
         holder_pool,
         tokens,
-        caller_token_secret,
     } = settings;
     for channel in DISPATCHER_CHANNELS {
         signals.require(channel)?;
     }
-    anyhow::ensure!(
-        !caller_token_secret.is_empty(),
-        "WEFT_CALLER_TOKEN_SECRET is empty: live-caller tickets would verify under an empty key"
-    );
     info!("dispatcher replica: {replica}");
     let journal = PostgresJournal::from_pool(pool.clone());
     let projects: crate::ProjectStore = Arc::new(crate::PostgresProjectStore::new(pool.clone()));
@@ -256,9 +263,14 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
             weft_broker_client::TokenSource::role(tokens, replica.clone(), CoreRole::Dispatcher),
         ),
         http,
-        caller_token_secret: Arc::new(caller_token_secret),
         programs: Arc::new(weft_core::content_cache::ContentCache::new(64)),
         held,
+        project_ports: match &config.platform {
+            weft_platform_traits::config::PlatformConfig::Local(local) => {
+                Some(crate::project_ports::ProjectPorts::new(local.listen.public, local.project_ports))
+            }
+            weft_platform_traits::config::PlatformConfig::Gcp(_) => None,
+        },
     })
 }
 
@@ -291,10 +303,8 @@ pub fn core_task_registry_builder() -> crate::task_executor::TaskRegistryBuilder
     use weft_task_store::TaskKind;
     crate::task_executor::TaskRegistry::builder()
         .register(TaskKind::RegisterSignal, Arc::new(crate::task_kinds::RegisterSignalExecutor))
-        .register(TaskKind::RouteEntry, Arc::new(crate::task_kinds::RouteEntryExecutor))
+        .register(TaskKind::WithdrawSignal, Arc::new(crate::task_kinds::WithdrawSignalExecutor))
         .register(TaskKind::FireSignal, Arc::new(crate::task_kinds::FireSignalExecutor))
-        .register(TaskKind::RecordCost, Arc::new(crate::task_kinds::RecordCostExecutor))
-        .register(TaskKind::RecordLog, Arc::new(crate::task_kinds::RecordLogExecutor))
         .register(TaskKind::StopTagged, Arc::new(crate::task_kinds::StopTaggedExecutor))
         .register(TaskKind::ProgramCall, Arc::new(crate::task_kinds::ProgramCallExecutor))
         .register_str(
@@ -304,8 +314,8 @@ pub fn core_task_registry_builder() -> crate::task_executor::TaskRegistryBuilder
 }
 
 /// The dispatcher's background loops: its task picker, the delivery of
-/// executions to workers, the lifecycle claimer, the two bridges and the
-/// reapers. The runtime runs them where the dispatcher is placed (see
+/// queued runs to workers, the lifecycle claimer, what runs' endings leave
+/// to do, the drains, the search index, retention and the reapers. The runtime runs them where the dispatcher is placed (see
 /// `weft_task_store::drain`).
 pub fn drain_loops(state: &DispatcherState, registry: crate::task_executor::TaskRegistry) -> anyhow::Result<Vec<DrainLoop>> {
     let picker_store = Arc::new(
@@ -320,8 +330,10 @@ pub fn drain_loops(state: &DispatcherState, registry: crate::task_executor::Task
         in_motion(weft_task_store::dispatcher_picker_loop(picker_store, state.clone(), registry, state.replica.clone())),
         in_motion(crate::delivery::drain_loop(state.clone())),
         in_motion(crate::lifecycle_claimer::drain_loop(state.clone())),
-        crate::journal_bridge::drain_loop(state.clone()),
-        crate::infra_event_bridge::drain_loop(state.clone()),
+        crate::run_ends::drain_loop(state.clone()),
+        crate::drain::drain_loop(state.clone()),
+        crate::search_index::drain_loop(state.clone(), crate::search_index::rate_from_env()?),
+        crate::retention::drain_loop(state.clone()),
         crate::build::follow::drain_loop(state),
         crate::holders::drain_loop(state),
         crate::domains::drain_loop(state),
@@ -355,8 +367,8 @@ pub fn loop_wakes() -> Vec<(&'static str, &'static [WakeOn])> {
         ("dispatcher_picker", weft_task_store::executor::DISPATCHER_READY),
         ("delivery", crate::delivery::WAKE_ON),
         ("lifecycle_claimer", crate::lifecycle_claimer::WAKE_ON),
-        ("journal_bridge", crate::journal_bridge::ON_EXEC_EVENT),
-        ("infra_event_bridge", crate::infra_event_bridge::ON_INFRA_EVENT),
+        ("run_ends", crate::run_ends::WAKE_ON),
+        ("drains", crate::drain::WAKE_ON),
         ("parked_fires", crate::reaper::ON_PARKED_FIRE),
         ("storage_sweep", crate::reaper::ON_STORAGE_SWEEP),
         ("hibernations", crate::reaper::ON_HIBERNATION),
@@ -371,10 +383,8 @@ pub fn loop_wakes() -> Vec<(&'static str, &'static [WakeOn])> {
 /// does, whatever its placement: they only serve requests this process is
 /// answering.
 pub fn spawn_relays(state: &DispatcherState) {
-    let endings = state.clone();
-    spawn_supervised("unrecorded_endings", async move {
-        crate::journal_bridge::run_unrecorded_endings(endings).await;
-    });
+    spawn_supervised("live_view", crate::live_view::run(state.clone()));
+    spawn_supervised("infra_event_bridge", crate::infra_event_bridge::run(state.clone()));
     // Builds and removals ask for a reclaim of the images nothing uses,
     // but one a container still ran from, or one a process died before
     // reclaiming, would wait for the next build. So the reclaim also runs

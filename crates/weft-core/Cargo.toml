@@ -39,10 +39,10 @@ bytes = { workspace = true, optional = true }
 cron = { version = "0.12", optional = true }
 # The zone a cron timer counts in, validated where the signal is written.
 chrono-tz = { workspace = true, optional = true }
-# Signed routing-token mint/verify (`caller_token`): the dispatcher signs
-# an (execution id, project, binary) token at the control handshake; the worker
-# verifies it before accepting a live connection. HMAC-SHA256 over a
-# base64url payload.
+# Signed socket tickets (`caller_token`): a worker's door signs one for a
+# browser that asks a socket route with a plain request, and whichever
+# worker copy the socket reaches checks it. HMAC-SHA256 over a base64url
+# payload.
 hmac = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 # OAuth 1.0a request signing (`access::client`): HMAC-SHA1 by spec.

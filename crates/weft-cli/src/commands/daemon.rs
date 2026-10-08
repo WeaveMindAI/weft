@@ -141,6 +141,14 @@ impl Install {
         }
     }
 
+    /// Where the install's Postgres puts its socket, shared with the host
+    /// (`ensure_postgres`). Inside the database's own directory: Postgres
+    /// owns it as its own user, and it goes wherever the database's files
+    /// go (`remove_install`, `./setup.sh --purge`).
+    fn postgres_socket_dir(&self) -> PathBuf {
+        self.postgres_dir().join("socket")
+    }
+
     fn prefix(&self) -> String {
         self.id.resource_prefix()
     }
@@ -540,13 +548,21 @@ async fn guard_postgres_major(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What the install's Postgres is started with, sized for the record's
+/// batches: room for the write-ahead log between checkpoints (the defaults
+/// asked for a checkpoint every couple of seconds under load), the log
+/// compressed, and a buffer cache that holds the hot runs.
+const POSTGRES_SETTINGS: [&str; 4] = ["max_wal_size=8GB", "wal_compression=lz4", "checkpoint_timeout=15min", "shared_buffers=1GB"];
+
 async fn ensure_postgres(install: &Install, port: u16) -> Result<()> {
     let dir = install.postgres_dir();
     std::fs::create_dir_all(&dir)?;
     guard_postgres_major(&dir).await?;
     let name = install.postgres_container();
-    let args: Vec<String> = [
+    let mut args: Vec<String> = [
         "run", "-d", "--name", &name, "--restart", "unless-stopped",
+        // For a person's own tools (`psql`, a database client); the
+        // runtime goes through the socket where it can.
         "-p", &format!("127.0.0.1:{port}:5432"),
         "-v", &format!("{}:/var/lib/postgresql/data", dir.display()),
         "-e", &format!("POSTGRES_USER={PG_USER}"),
@@ -554,11 +570,25 @@ async fn ensure_postgres(install: &Install, port: u16) -> Result<()> {
         "-e", &format!("POSTGRES_DB={PG_DB}"),
         "-e", "PGDATA=/var/lib/postgresql/data/pgdata",
         "--label", &format!("{}={}", weft_core::infra::INSTALL_LABEL, install.id.label_value()),
-        POSTGRES_IMAGE,
     ]
     .iter()
     .map(|s| s.to_string())
     .collect();
+    if SOCKET_REACHES_POSTGRES {
+        // The container's socket directory, seen from the host. The runtime connects there, past Docker's
+        // port relay (a round trip through it costs about four times one
+        // straight to Postgres). The image's entrypoint makes the directory
+        // Postgres's own as it starts, and the socket in it is open to
+        // every user.
+        let socket = install.postgres_socket_dir();
+        std::fs::create_dir_all(&socket)?;
+        args.extend(["-v".to_string(), format!("{}:/var/run/postgresql", socket.display())]);
+    }
+    args.push(POSTGRES_IMAGE.to_string());
+    args.push("postgres".to_string());
+    for setting in POSTGRES_SETTINGS {
+        args.extend(["-c".to_string(), setting.to_string()]);
+    }
     let published = PortUse::of(install, ([127, 0, 0, 1], port).into(), "its database", "WEFT_POSTGRES_PORT");
     ensure_container(&name, &args, &install.dir, Some(published)).await?;
     // Ready before the runtime connects: it applies the schema at boot.
@@ -576,8 +606,23 @@ async fn ensure_postgres(install: &Install, port: u16) -> Result<()> {
     }
 }
 
-fn database_url(port: u16) -> String {
-    format!("postgres://{PG_USER}:{PG_PASSWORD}@127.0.0.1:{port}/{PG_DB}")
+/// Whether the host can reach the Postgres container through a socket in
+/// a shared directory (`ensure_postgres` shares it): on Linux, where the
+/// containers run on the host's own kernel. Docker Desktop runs them in a machine of its own, and a socket
+/// does not cross into it, so there the published port is the way in.
+const SOCKET_REACHES_POSTGRES: bool = cfg!(target_os = "linux");
+
+/// The runtime's address for its database: the shared socket where it
+/// reaches Postgres ([`SOCKET_REACHES_POSTGRES`]), else the published
+/// loopback `port`.
+fn database_url(install: &Install, port: u16) -> String {
+    if SOCKET_REACHES_POSTGRES {
+        let socket: String = url::form_urlencoded::byte_serialize(install.postgres_socket_dir().display().to_string().as_bytes()).collect();
+        // The socket is named by Postgres's own port inside the container.
+        format!("postgres://{PG_USER}:{PG_PASSWORD}@localhost:5432/{PG_DB}?host={socket}")
+    } else {
+        format!("postgres://{PG_USER}:{PG_PASSWORD}@127.0.0.1:{port}/{PG_DB}")
+    }
 }
 
 // ----- object store ------------------------------------------------------
@@ -709,7 +754,7 @@ fn secrets(
     let keep_or = |name: &str, make: &mut dyn FnMut() -> String| old.get(name).filter(|v| !v.is_empty()).cloned().unwrap_or_else(make);
     let mut env = std::collections::BTreeMap::new();
     // SYNC: secrets.env <-> setup.sh (the --migration --release block reads WEFT_DATABASE_URL from it)
-    env.insert("WEFT_DATABASE_URL".to_string(), database_url(ports.postgres));
+    env.insert("WEFT_DATABASE_URL".to_string(), database_url(install, ports.postgres));
     env.insert("WEFT_IDENTITY_KEY".to_string(), keep_or("WEFT_IDENTITY_KEY", &mut random_hex_32));
     env.insert("WEFT_CALLER_TOKEN_SECRET".to_string(), keep_or("WEFT_CALLER_TOKEN_SECRET", &mut random_hex_32));
     // The sealing key is the operator's (the shell or the `.env`); once
@@ -846,7 +891,7 @@ fn install_config(
     let edge = edge_config(previous.edge)?;
     let config = InstallConfig {
         install: install.id.clone(),
-        platform: PlatformConfig::Local(LocalPlatform {
+        platform: PlatformConfig::Local(Box::new(LocalPlatform {
             data_dir: install.dir.clone(),
             container_internal_url: container_internal_url(ports),
             runtime_image,
@@ -859,8 +904,12 @@ fn install_config(
                 // tunnel opened later finds it already there.
                 outside: Some(([127, 0, 0, 1], ports.outside).into()),
             },
+            project_ports: install.id.name().is_none().then_some(weft_platform_traits::config::PortRange {
+                first: weft_core::ports::PROJECTS.0,
+                last: weft_core::ports::PROJECTS.1,
+            }),
             internal_url: format!("http://127.0.0.1:{}", ports.internal),
-        }),
+        })),
         auth: AuthMode::Local,
         public_url: format!("http://127.0.0.1:{}", ports.public),
         internet_url,
@@ -991,7 +1040,7 @@ async fn announce_tunnel(url: &str, named: bool, container: &str, ports: Ports) 
     std::fs::create_dir_all(data_dir())?;
     std::fs::write(public_url_file(), url)?;
     println!("public address: {url}");
-    println!("  it carries only the doors outside callers use: /events/... (provider event pushes), /signal/... (fire links), /signal-token/..., /public/files/... (shared file links), /connect/... and /live/... (live routes), /infra/... (public infra endpoints) and the OAuth callback. Rerun with --no-public-url to close it.");
+    println!("  it carries only the doors outside callers use: /events/... (provider event pushes), /signal/... (fire links), /signal-token/..., /public/files/... (shared file links), /connect/... (live routes), /infra/... (public infra endpoints) and the OAuth callback. Rerun with --no-public-url to close it.");
     if !named {
         println!(
             "  NOTE: this free-tunnel address changes whenever the tunnel reconnects, and everything registered against it \
@@ -1485,11 +1534,26 @@ mod tests {
         let written = serde_json::to_value(&closed).unwrap();
         assert!(written.get("workers").is_none() && written["platform"].get("workerIdleStopSeconds").is_none(), "a lever nobody set is not written");
         assert_eq!(again.edge.trusted_proxy_hops, ProxyHops { public: 2, outside: 1, domains: 0 });
-        assert_eq!(again.platform, PlatformConfig::Local(LocalPlatform { runtime_image: "weft-runtime:y".into(), ..match closed.platform { PlatformConfig::Local(l) => l, _ => unreachable!() } }));
+        assert_eq!(again.platform, PlatformConfig::Local(Box::new(LocalPlatform { runtime_image: "weft-runtime:y".into(), ..match closed.platform { PlatformConfig::Local(l) => *l, _ => unreachable!() } })));
     }
 
-    /// A pid is this install's runtime only when its command line is the
-    /// one the start execs on this install's config.
+    /// On Linux the runtime reaches its database through the socket the
+    /// container shares (its path carried whole, spaces and all), named by
+    /// Postgres's own port; elsewhere through the published one.
+    #[test]
+    fn the_runtime_reaches_its_database_past_the_port_relay() {
+        let spaced = Install { id: install(Some("cell3")).id, dir: "/home/u/my data/weft".into() };
+        let url = database_url(&spaced, 15432);
+        if SOCKET_REACHES_POSTGRES {
+            assert_eq!(url, format!("postgres://{PG_USER}:{PG_PASSWORD}@localhost:5432/{PG_DB}?host=%2Fhome%2Fu%2Fmy+data%2Fweft%2Fpostgres-data%2Fsocket"));
+            let parsed = url::Url::parse(&url).unwrap();
+            let host = parsed.query_pairs().find(|(k, _)| k == "host").map(|(_, v)| v.into_owned());
+            assert_eq!(host.as_deref(), Some("/home/u/my data/weft/postgres-data/socket"));
+        } else {
+            assert_eq!(url, format!("postgres://{PG_USER}:{PG_PASSWORD}@127.0.0.1:15432/{PG_DB}"));
+        }
+    }
+
     #[test]
     fn a_port_variable_moves_only_its_own_port() {
         let kept = moved_by_env(Ports::DEFAULT, |_| None).unwrap();
@@ -1499,6 +1563,8 @@ mod tests {
         assert!(moved_by_env(Ports::DEFAULT, |n| (n == "WEFT_POSTGRES_PORT").then(|| "x".to_string())).is_err());
     }
 
+    /// A pid is this install's runtime only when its command line is the
+    /// one the start execs on this install's config.
     #[test]
     fn a_pid_is_the_runtime_only_on_its_own_command_line() {
         let d = install(None);

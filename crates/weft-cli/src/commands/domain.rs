@@ -49,7 +49,7 @@ pub async fn run(ctx: Ctx, action: DomainAction) -> anyhow::Result<()> {
                 eprintln!("the door in front of the install's domains refuses to follow them, and the install keeps trying: {why}");
             }
             if domains.is_empty() {
-                println!("no domains; the install answers at its own address only (add one with `weft domain add <name>`)");
+                println!("no domains; the install answers at its own address only (add one with `{}`)", ctx.weft("domain add <name>"));
                 return Ok(());
             }
             for e in domains {
@@ -92,7 +92,7 @@ pub async fn run(ctx: Ctx, action: DomainAction) -> anyhow::Result<()> {
                 println!("the door in front of the install's domains is {cost}; removing the last domain takes it down");
             }
             if no_wait {
-                println!("the door gets the domain's certificate once the record is in place (`weft domain list` shows it again)");
+                println!("the door gets the domain's certificate once the record is in place (`{}` shows it again)", ctx.weft("domain list"));
                 return Ok(());
             }
             let address: IpAddr = entry
@@ -101,7 +101,11 @@ pub async fn run(ctx: Ctx, action: DomainAction) -> anyhow::Result<()> {
                 .parse()
                 .map_err(|_| anyhow::anyhow!("the install answered '{}' as the record's address", entry.record.value))?;
             wait_for_dns(&name, address).await;
-            println!("{name} points at the install; https://{name} works once the door has its certificate, which is issued on its own once the record is seen, and can take a while (`weft domain list` shows the record again)");
+            println!(
+                "{name} points at the install; https://{name} works once the door has its certificate, which is issued on its own once \
+                 the record is seen, and can take a while (`{}` shows the record again)",
+                ctx.weft("domain list")
+            );
             Ok(())
         }
     }

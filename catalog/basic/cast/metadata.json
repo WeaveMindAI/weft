@@ -27,6 +27,7 @@
     }
   ],
   "features": {
+    "pure": true,
     "castPorts": {
       "input": "value",
       "output": "value"

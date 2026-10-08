@@ -701,8 +701,11 @@ mod fs_hashes {
             .map_err(|e| CompileLoadError::Read(format!("catalog: {e}")))?;
         let src_dir = project.src_dir();
         let fs = crate::CompileFs::disk(&project.root).anchored_at(Some(&src_dir));
-        let definition = compile_enriched_with_diagnostics(&source, project.id(), fs, &catalog)
+        let mut definition = compile_enriched_with_diagnostics(&source, project.id(), fs, &catalog)
             .map_err(CompileLoadError::Diagnostics)?;
+        // What weft.toml says for every run and trigger rides in the
+        // program, so a version reads the defaults it was built with.
+        definition.defaults = project.manifest.defaults();
         Ok((definition, catalog))
     }
 

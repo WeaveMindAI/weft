@@ -188,6 +188,11 @@ pub struct ProjectStatusResponse {
     /// The image builds running for the project right now.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub builds: Vec<BuildInFlight>,
+    /// The project's own address, serving its routes at its root, once
+    /// it has one (a local install gives each project a port at its first
+    /// activation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<ProjectAddress>,
     /// True when live `infra_node` rows exist whose node is NOT in the
     /// current source (the node was deleted while deployed). Never gates
     /// run/activate; clients OR it into their infra-controls check so the
@@ -218,10 +223,15 @@ pub struct ProjectStatusResponse {
     pub activations: Vec<ActivationEntry>,
     /// Counts of preserved state, for the reactivate-time prompt.
     pub preservation: PreservationCounts,
-    /// The public entries whose limits refused calls in the last two
-    /// minutes, so an author sees a limit acting. Empty when none did.
+    /// The public entries whose limits refused calls in the last minute
+    /// or two, so an author sees a limit acting. Empty when none did.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub limited: Vec<LimitedEntry>,
+    /// How many runs each trigger started in the last minute or two, and
+    /// how many of those failed: the one trace a run kept unrecorded
+    /// leaves when it goes well. Empty when no trigger started one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<TriggerRuns>,
 }
 
 /// What `DELETE /projects/{id}` answers: what a forced removal could not
@@ -266,6 +276,15 @@ pub enum BuildState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildStateResponse {
     pub state: Option<BuildState>,
+}
+
+/// One trigger's runs in the last minute or two (`ProjectStatusResponse::runs`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggerRuns {
+    /// The trigger's node, as the program spells it.
+    pub node: String,
+    pub started: u64,
+    pub failed: u64,
 }
 
 /// One public entry that refused calls recently, and by which limit.
@@ -390,7 +409,7 @@ pub struct ProjectExecutionsSummary {
     pub setup: usize,
     pub last_completed_at: Option<u64>,
     pub last_execution_id: Option<String>,
-    pub last_status: Option<crate::program::SummaryStatus>,
+    pub last_status: Option<crate::program::RunStatus>,
     /// Every execution running right now (suspended ones excluded), the
     /// same set `running_count` counts. The editor REPLACES its own
     /// running set with this on every status refresh, so a terminal event
@@ -431,4 +450,15 @@ mod tests {
         };
         assert_eq!(q.to_query_string(), "?desiredBinaryHash=b&desiredInfraHash=i");
     }
+}
+
+/// A project's own address: where its callers reach its routes, at the
+/// root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ProjectAddress {
+    Serving { url: String },
+    /// It has one and it cannot be served right now, and why (another
+    /// program holds its port).
+    Unavailable { why: String },
 }

@@ -43,6 +43,15 @@ pub struct ActivationLifecycle {
 }
 
 impl ActivationLifecycle {
+    /// How it stands for arriving work (`weft_core::arrival`).
+    pub fn standing(&self) -> weft_core::arrival::Standing {
+        weft_core::arrival::Standing {
+            status: self.status,
+            accepting_fires: self.accepting_fires,
+            fires_deadline_unix: self.fires_deadline_unix,
+        }
+    }
+
     /// Never activated: what an absent row means.
     pub fn registered() -> Self {
         Self { status: ProjectStatus::Registered, ..Self::active() }

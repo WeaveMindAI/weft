@@ -1,7 +1,10 @@
 //! The door in front of the install's domains: a global external HTTPS
-//! load balancer sending every request to the dispatcher's Cloud Run
-//! service, with a Google-managed certificate per domain (Certificate
-//! Manager, one map entry per name).
+//! load balancer with a Google-managed certificate per domain (Certificate
+//! Manager, one map entry per name). A project's API domain is sent
+//! straight to the project's own Cloud Run service (a serverless endpoint
+//! group and backend of its own, picked by host in the URL map), so its
+//! callers reach its workers with nothing of weft's in between; every
+//! other request goes to the dispatcher's service.
 //!
 //! The install answers at its service's own `run.app` address without
 //! any of this. A domain needs a load balancer, which Google bills by the
@@ -186,6 +189,78 @@ impl LoadBalancerDomains {
         Ok(())
     }
 
+    /// The backend (and its endpoint group) that sends a project's API
+    /// domains to the project's own service.
+    fn project_backend(&self, project: uuid::Uuid) -> String {
+        format!("{}-p-{}", self.door(), &project.simple().to_string()[..12])
+    }
+
+    /// The project backends the door holds now, by name.
+    async fn project_backends(&self) -> anyhow::Result<Vec<String>> {
+        let prefix = format!("{}-p-", self.door());
+        let listed = self.google.get(&self.global("backendServices")).await?;
+        Ok(listed
+            .get("items")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|b| b.get("name").and_then(Value::as_str))
+            .filter(|name| name.starts_with(&prefix))
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Send each project's API domains (`api`, project to names) to the
+    /// project's own service, and everything else to the dispatcher: one
+    /// backend per project, picked by host in the URL map, and the
+    /// backends of projects with no API domain left taken away.
+    async fn route_apis(&self, api: &std::collections::BTreeMap<uuid::Uuid, Vec<String>>) -> anyhow::Result<()> {
+        let door = self.door();
+        for project in api.keys() {
+            let name = self.project_backend(*project);
+            let service = crate::names::worker_service(*project);
+            self.ensure_matching(
+                &self.regional("networkEndpointGroups"),
+                &format!("{}/{name}", self.regional("networkEndpointGroups")),
+                json!({ "name": name, "networkEndpointType": "SERVERLESS", "cloudRun": { "service": service } }),
+                COMPUTE,
+                |existing| sends_to(existing, &name, &self.gcp.region, &service),
+            )
+            .await?;
+            self.ensure(
+                &self.global("backendServices"),
+                json!({
+                    "name": name,
+                    "loadBalancingScheme": "EXTERNAL_MANAGED",
+                    "protocol": "HTTPS",
+                    "backends": [{ "group": self.link(&format!("{}/{name}", self.regional("networkEndpointGroups"))) }],
+                }),
+                COMPUTE,
+            )
+            .await?;
+        }
+        let url_map = format!("{}/{door}", self.global("urlMaps"));
+        let found = self.google.get(&url_map).await?;
+        let (host_rules, path_matchers) = url_map_rules(api, |project| self.link(&format!("{}/{}", self.global("backendServices"), self.project_backend(project))));
+        let unchanged = found.get("hostRules").cloned().unwrap_or(json!([])) == host_rules
+            && found.get("pathMatchers").cloned().unwrap_or(json!([])) == path_matchers;
+        if !unchanged {
+            let fingerprint = found.get("fingerprint").cloned().unwrap_or(Value::Null);
+            let op = self
+                .google
+                .patch(&url_map, &json!({ "hostRules": host_rules, "pathMatchers": path_matchers, "fingerprint": fingerprint }))
+                .await?;
+            self.google.wait(COMPUTE, op).await?;
+        }
+        for name in self.project_backends().await? {
+            if !api.keys().any(|project| self.project_backend(*project) == name) {
+                self.remove(&format!("{}/{name}", self.global("backendServices")), COMPUTE).await?;
+                self.remove(&format!("{}/{name}", self.regional("networkEndpointGroups")), COMPUTE).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Every part of the door, gone, in the order nothing still uses
     /// what is removed.
     async fn take_down(&self) -> anyhow::Result<()> {
@@ -199,6 +274,10 @@ impl LoadBalancerDomains {
         self.remove(&format!("{}/{redirect}", self.global("urlMaps")), COMPUTE).await?;
         self.remove(&format!("{}/{door}", self.global("backendServices")), COMPUTE).await?;
         self.remove(&format!("{}/{door}", self.regional("networkEndpointGroups")), COMPUTE).await?;
+        for name in self.project_backends().await? {
+            self.remove(&format!("{}/{name}", self.global("backendServices")), COMPUTE).await?;
+            self.remove(&format!("{}/{name}", self.regional("networkEndpointGroups")), COMPUTE).await?;
+        }
         for (entry, _) in self.entries().await? {
             self.unserve(&entry).await?;
         }
@@ -273,6 +352,16 @@ fn certificate_id(door: &str, name: &str) -> String {
     format!("{door}-{}", &digest[..16])
 }
 
+/// The URL map's host rules and path matchers that send each project's
+/// API domains (`api`) to its backend (`backend` names it): one matcher per
+/// project, everything else left to the map's default (the dispatcher).
+fn url_map_rules(api: &std::collections::BTreeMap<uuid::Uuid, Vec<String>>, backend: impl Fn(uuid::Uuid) -> String) -> (Value, Value) {
+    let matcher = |project: &uuid::Uuid| format!("p-{}", &project.simple().to_string()[..12]);
+    let host_rules = api.iter().map(|(project, names)| json!({ "hosts": names, "pathMatcher": matcher(project) })).collect::<Vec<_>>();
+    let path_matchers = api.keys().map(|project| json!({ "name": matcher(project), "defaultService": backend(*project) })).collect::<Vec<_>>();
+    (Value::Array(host_rules), Value::Array(path_matchers))
+}
+
 /// Whether the endpoint group `name`, as Google answers it, sends the
 /// door's requests to the Cloud Run service `service`. One that sends
 /// them anywhere else is refused, naming both: taking it would put the
@@ -281,8 +370,8 @@ fn sends_to(group: &Value, name: &str, region: &str, service: &str) -> anyhow::R
     let found = group.get("cloudRun").and_then(|c| c.get("service")).and_then(Value::as_str);
     anyhow::ensure!(
         found == Some(service),
-        "the network endpoint group '{name}' is already there but sends its requests to {}, not to the install's \
-         dispatcher service '{service}'; delete it (`gcloud compute network-endpoint-groups delete {name} --region {region}`) and add \
+        "the network endpoint group '{name}' is already there but sends its requests to {}, not to the Cloud Run \
+         service '{service}'; delete it (`gcloud compute network-endpoint-groups delete {name} --region {region}`) and add \
          the domain again",
         found.map_or_else(|| "no Cloud Run service".to_string(), |s| format!("the Cloud Run service '{s}'")),
     );
@@ -291,19 +380,27 @@ fn sends_to(group: &Value, name: &str, region: &str, service: &str) -> anyhow::R
 
 #[async_trait]
 impl DomainHosting for LoadBalancerDomains {
-    async fn serve(&self, names: &[String]) -> anyhow::Result<Option<std::net::IpAddr>> {
-        if names.is_empty() {
+    async fn serve(&self, domains: &[weft_core::install::Domain]) -> anyhow::Result<Option<std::net::IpAddr>> {
+        if domains.is_empty() {
             self.take_down().await.map_err(|e| e.context("take down the door in front of the install's domains"))?;
             return Ok(None);
         }
         self.build().await.map_err(|e| e.context("make the door in front of the install's domains"))?;
+        let mut api: std::collections::BTreeMap<uuid::Uuid, Vec<String>> = Default::default();
+        for domain in domains {
+            if let weft_core::install::DomainServes::Api { project } = &domain.serves {
+                api.entry(*project).or_default().push(domain.name.clone());
+            }
+        }
+        self.route_apis(&api).await.map_err(|e| e.context("send the projects' API domains to their services"))?;
+        let names: Vec<String> = domains.iter().map(|d| d.name.clone()).collect();
         let wanted: Vec<String> = names.iter().map(|n| certificate_id(&self.door(), n)).collect();
         for (id, _) in self.entries().await? {
             if !wanted.contains(&id) {
                 self.unserve(&id).await?;
             }
         }
-        for name in names {
+        for name in &names {
             self.serve_name(name).await?;
         }
         self.address().await?.ok_or_else(|| anyhow::anyhow!("the door was made but its address is not there"))
@@ -337,6 +434,21 @@ mod tests {
         assert!(id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'));
         assert_eq!(id, certificate_id("weft-door", "api.shop.example.com"));
         assert_ne!(id, certificate_id("weft-door", "app.shop.example.com"));
+    }
+
+    #[test]
+    fn a_projects_api_domains_go_to_its_own_backend() {
+        let (one, two) = (uuid::Uuid::from_u128(1), uuid::Uuid::from_u128(2));
+        let mut api = std::collections::BTreeMap::new();
+        api.insert(one, vec!["api.a.example".to_string(), "api2.a.example".to_string()]);
+        api.insert(two, vec!["api.b.example".to_string()]);
+        let (hosts, matchers) = url_map_rules(&api, |p| format!("backend-{}", p.as_u128()));
+        assert_eq!(hosts[0]["hosts"], json!(["api.a.example", "api2.a.example"]));
+        assert_eq!(hosts[0]["pathMatcher"], matchers[0]["name"]);
+        assert_eq!(matchers[0]["defaultService"], "backend-1");
+        assert_eq!(matchers[1]["defaultService"], "backend-2");
+        let (none_hosts, none_matchers) = url_map_rules(&Default::default(), |_| String::new());
+        assert_eq!((none_hosts, none_matchers), (json!([]), json!([])), "with no API domain, everything goes to the dispatcher");
     }
 
     #[test]
