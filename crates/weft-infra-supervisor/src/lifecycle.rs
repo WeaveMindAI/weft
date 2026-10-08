@@ -514,18 +514,10 @@ async fn wait_for_readiness(
             return Ok(());
         }
         let now_waiting = waiting.join("; ");
-        if now_waiting != recorded {
-            // For `weft status`. A copy the command no longer reaches, or
-            // a project another supervisor took, is the next check's to
-            // end; the record is only what a person reads.
-            match state.broker.set_waiting(&state.replica, command_id, project_id, node_id, instance, &now_waiting).await {
-                Ok(_) => recorded = now_waiting,
-                Err(e) => tracing::warn!(
-                    target: "weft_infra_supervisor::lifecycle",
-                    copy_id = %node.copy_id, error = %format!("{e:#}"),
-                    "could not record what the apply waits on"
-                ),
-            }
+        if now_waiting != recorded
+            && record_waiting(state, command_id, project_id, node_id, instance, &node.copy_id, &now_waiting).await
+        {
+            recorded = now_waiting;
         }
         if state.clock.now() >= next_breadcrumb {
             tracing::info!(
@@ -537,6 +529,33 @@ async fn wait_for_readiness(
             next_breadcrumb = state.clock.now() + READINESS_BREADCRUMB_INTERVAL;
         }
         state.clock.sleep(READINESS_POLL_INTERVAL).await;
+    }
+}
+
+/// Record on the copy's row what the command `command_id` waits on, for
+/// `weft status`; true once the broker answered. A copy the command no
+/// longer reaches, or a project another supervisor took, is the command's
+/// next fenced write to end: the record is only what a person reads, so
+/// a failure is logged and the work goes on.
+async fn record_waiting(
+    state: &SupervisorState,
+    command_id: i64,
+    project_id: Uuid,
+    node_id: &str,
+    instance: Option<&weft_core::instance::InstanceId>,
+    copy_id: &str,
+    waiting: &str,
+) -> bool {
+    match state.broker.set_waiting(&state.replica, command_id, project_id, node_id, instance, waiting).await {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(
+                target: "weft_infra_supervisor::lifecycle",
+                %copy_id, error = %format!("{e:#}"),
+                "could not record what the command waits on"
+            );
+            false
+        }
     }
 }
 
@@ -655,6 +674,11 @@ async fn execute(
                             "set_status(stopping) failed; continuing with the stop"
                         );
                     }
+                    // The host's stop can take minutes (a machine
+                    // powering off): say what the stop is on.
+                    let waiting = format!("{unit}: its host is taking it down");
+                    record_waiting(state, cmd.id, cmd.project_id, &n.node_id, n.instance.as_ref(), &n.copy_id, &waiting)
+                        .await;
                     state.host.stop_unit(&copy, unit).await?;
                     let outcome = state
                         .broker
@@ -775,6 +799,8 @@ async fn execute(
                 // supervisor has no spec at terminate time, but it has the
                 // row. Whether they stay is the command's answer.
                 let keep = disks.expect("a terminate read its disks above").kept(&n.keep_disks);
+                let removing = "its host is removing it";
+                record_waiting(state, cmd.id, cmd.project_id, &n.node_id, n.instance.as_ref(), &n.copy_id, removing).await;
                 state.host.terminate(&node_ref(&project, &n.node_id, &n.copy_id), keep).await?;
                 if !state
                     .broker

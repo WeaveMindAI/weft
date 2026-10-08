@@ -43,6 +43,13 @@ pub const MD_GCP_PROJECT: &str = "weft-gcp-project";
 /// its project's health when how its unit stands changes.
 pub const MD_BROKER_URL: &str = "weft-broker-url";
 
+/// The image the host agent's container was made from, handed to it by
+/// the startup script that made it: fixed for the container's life, so
+/// a container Docker brings back after the machine's metadata changed
+/// still names the image it runs.
+// SYNC: AGENT_IMAGE_ENV <-> STARTUP_SCRIPT's `docker run -e`
+pub const AGENT_IMAGE_ENV: &str = "WEFT_AGENT_IMAGE";
+
 /// The boot image of every infra machine.
 const BOOT_IMAGE: &str = "projects/cos-cloud/global/images/family/cos-stable";
 
@@ -81,6 +88,7 @@ mkdir -p "$HOME"
 docker-credential-gcr configure-docker --registries="${image%%/*}"
 docker rm -f weft-host-agent >/dev/null 2>&1 || true
 docker run -d --name weft-host-agent --restart always --network host \
+  -e WEFT_AGENT_IMAGE="$image" \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /mnt/disks:/mnt/disks -v /var/lib/weft:/var/lib/weft \
   "$image" unit-agent host
@@ -185,10 +193,31 @@ impl ComputeInfraHost {
         Ok(attached)
     }
 
+    /// Every metadata item weft writes on a unit's machine: what the
+    /// startup script and the host agent read. Written whole when the
+    /// machine is made, and written again over a machine that exists each
+    /// time weft applies its unit ([`Self::refresh_machine`]), so a
+    /// machine an older weft made boots this install's agent from its
+    /// next start on.
+    fn machine_metadata(&self, node: &ResolvedNode, unit: &ResolvedUnit, disks: &[String], gpus: u32) -> anyhow::Result<Vec<(&'static str, String)>> {
+        let assignment = serde_json::to_string(&UnitAssignment { node: node.clone(), unit: unit.unit.name.clone() })?;
+        Ok(vec![
+            ("startup-script", STARTUP_SCRIPT.to_string()),
+            (MD_UNIT, assignment),
+            (MD_DISKS, disks.join(" ")),
+            (MD_GPU, String::from(if gpus > 0 { "yes" } else { "no" })),
+            (MD_RUNTIME_IMAGE, self.gcp.runtime_image.clone()),
+            (MD_CORE_ACCOUNT, self.gcp.core_service_account.clone()),
+            (MD_GCP_PROJECT, self.gcp.project.clone()),
+            (MD_BROKER_URL, self.broker_url.clone()),
+        ])
+    }
+
     fn instance_body(&self, node: &ResolvedNode, unit: &ResolvedUnit, disks: &[String], account: &str) -> anyhow::Result<Value> {
         let shape = machine_shape(&self.gcp.zone, unit)?;
         let base = node.node.resource_base();
-        let assignment = serde_json::to_string(&UnitAssignment { node: node.clone(), unit: unit.unit.name.clone() })?;
+        let metadata: Vec<Value> =
+            self.machine_metadata(node, unit, disks, shape.gpus)?.into_iter().map(|(key, value)| json!({ "key": key, "value": value })).collect();
         let mut attached = vec![json!({
             "boot": true,
             "autoDelete": true,
@@ -210,16 +239,7 @@ impl ComputeInfraHost {
             "networkInterfaces": [{ "network": self.gcp.network, "subnetwork": self.gcp.subnet }],
             "tags": { "items": [self.gcp.infra_network_tag] },
             "serviceAccounts": [{ "email": account, "scopes": ["https://www.googleapis.com/auth/cloud-platform"] }],
-            "metadata": { "items": [
-                { "key": "startup-script", "value": STARTUP_SCRIPT },
-                { "key": MD_UNIT, "value": assignment },
-                { "key": MD_DISKS, "value": disks.join(" ") },
-                { "key": MD_GPU, "value": if shape.gpus > 0 { "yes" } else { "no" } },
-                { "key": MD_RUNTIME_IMAGE, "value": self.gcp.runtime_image },
-                { "key": MD_CORE_ACCOUNT, "value": self.gcp.core_service_account },
-                { "key": MD_GCP_PROJECT, "value": self.gcp.project },
-                { "key": MD_BROKER_URL, "value": self.broker_url },
-            ]},
+            "metadata": { "items": metadata },
         });
         if let Some(kind) = &shape.accelerator {
             body["guestAccelerators"] = json!([{ "acceleratorType": format!("zones/{}/acceleratorTypes/{kind}", self.gcp.zone), "acceleratorCount": shape.gpus }]);
@@ -302,28 +322,40 @@ impl ComputeInfraHost {
         }
     }
 
-    async fn set_assignment(&self, machine: &Value, node: &ResolvedNode, unit: &ResolvedUnit) -> anyhow::Result<()> {
-        let fingerprint = machine.pointer("/metadata/fingerprint").and_then(Value::as_str).unwrap_or_default();
-        let mut items: Vec<Value> = machine.pointer("/metadata/items").and_then(Value::as_array).cloned().unwrap_or_default();
-        let assignment = serde_json::to_string(&UnitAssignment { node: node.clone(), unit: unit.unit.name.clone() })?;
-        items.retain(|i| i.get("key").and_then(Value::as_str) != Some(MD_UNIT));
-        items.push(json!({ "key": MD_UNIT, "value": assignment }));
-        let op = self
-            .google
-            .post(&format!("{}/setMetadata", self.instance_url(name_of(machine))), &json!({ "fingerprint": fingerprint, "items": items }))
-            .await?;
-        self.wait(op).await?;
-        let op = self
-            .google
-            .post(
-                &format!("{}/setLabels", self.instance_url(name_of(machine))),
-                &json!({
-                    "labelFingerprint": machine.get("labelFingerprint").and_then(Value::as_str).unwrap_or_default(),
-                    "labels": labels(&self.install, &node.node, &unit.unit.name, Some(&unit.hash)),
-                }),
-            )
-            .await?;
-        self.wait(op).await?;
+    /// Bring a machine that is kept for `unit` up to date: its metadata
+    /// to [`Self::machine_metadata`] in one write (the unit it runs, and
+    /// this install's agent image and startup script, which a machine an
+    /// older weft made still names), and its hash label to the unit's.
+    /// Each is written only when something in it differs, each once
+    /// against the fingerprint `machine` was read with.
+    async fn refresh_machine(&self, machine: &Value, node: &ResolvedNode, unit: &ResolvedUnit, disks: &[String], gpus: u32) -> anyhow::Result<()> {
+        let name = name_of(machine);
+        let items: &[Value] = machine.pointer("/metadata/items").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+        if let Some(items) = metadata_update(items, &self.machine_metadata(node, unit, disks, gpus)?) {
+            let fingerprint = machine
+                .pointer("/metadata/fingerprint")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("machine '{name}' was read without its metadata fingerprint"))?;
+            let op = self
+                .google
+                .post(&format!("{}/setMetadata", self.instance_url(name)), &json!({ "fingerprint": fingerprint, "items": items }))
+                .await?;
+            self.wait(op).await?;
+        }
+        if label(machine, "weft-unit-hash") != Some(&unit.hash[..unit.hash.len().min(63)]) {
+            let fingerprint = machine
+                .get("labelFingerprint")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("machine '{name}' was read without its label fingerprint"))?;
+            let op = self
+                .google
+                .post(
+                    &format!("{}/setLabels", self.instance_url(name)),
+                    &json!({ "labelFingerprint": fingerprint, "labels": labels(&self.install, &node.node, &unit.unit.name, Some(&unit.hash)) }),
+                )
+                .await?;
+            self.wait(op).await?;
+        }
         Ok(())
     }
 }
@@ -558,6 +590,29 @@ fn label<'a>(machine: &'a Value, key: &str) -> Option<&'a str> {
     machine.get("labels").and_then(|l| l.get(key)).and_then(Value::as_str)
 }
 
+/// A machine's metadata `items` with each of `wanted` set to its value,
+/// every other item kept as it is, or `None` when every one already
+/// holds it (nothing to write).
+fn metadata_update(items: &[Value], wanted: &[(&str, String)]) -> Option<Vec<Value>> {
+    let mut out = items.to_vec();
+    let mut changed = false;
+    for (key, value) in wanted {
+        let item = json!({ "key": key, "value": value });
+        match out.iter_mut().find(|i| i.get("key").and_then(Value::as_str) == Some(*key)) {
+            Some(had) if had.get("value").and_then(Value::as_str) == Some(value.as_str()) => {}
+            Some(had) => {
+                *had = item;
+                changed = true;
+            }
+            None => {
+                out.push(item);
+                changed = true;
+            }
+        }
+    }
+    changed.then_some(out)
+}
+
 /// The unit a machine was given, from its metadata. None for a machine
 /// that carries no assignment (one of the install's own); an assignment
 /// that does not read is an error naming the machine, never a silent
@@ -625,10 +680,10 @@ impl InfraHost for ComputeInfraHost {
             }
             return self.create_machine(node, resolved, &disks, &account).await;
         }
-        if label(&machine, "weft-unit-hash") != Some(&resolved.hash[..resolved.hash.len().min(63)]) {
-            self.set_assignment(&machine, node, resolved).await?;
-        }
+        self.refresh_machine(&machine, node, resolved, &disks, want.gpus).await?;
         match machine.get("status").and_then(Value::as_str) {
+            // Its agent applies the unit again; the agent itself stays the
+            // one its machine booted, until the machine restarts.
             Some("RUNNING") => {
                 self.agent(&machine, reqwest::Method::POST, HOST_APPLY).await?;
             }
@@ -896,6 +951,39 @@ mod tests {
         let g2 = named("g2-standard-8", Some(Gpu { kind: "nvidia-l4".into(), count: 1 })).unwrap();
         assert_eq!((g2.accelerator, g2.gpus), (None, 1));
         assert!(named("N2 Standard", None).is_err());
+    }
+
+    /// A machine kept for its unit gets this install's agent image and
+    /// its unit in one write, keeps what weft did not write (a key Compute
+    /// Engine added), and is not written at all when nothing differs.
+    #[test]
+    fn a_kept_machine_takes_the_current_agent_image_and_unit_in_one_write() {
+        let had = vec![
+            json!({ "key": "ssh-keys", "value": "k" }),
+            json!({ "key": MD_UNIT, "value": "old unit" }),
+            json!({ "key": MD_RUNTIME_IMAGE, "value": "r/weft-runtime:old" }),
+        ];
+        let wanted = |unit: &str, image: &str| vec![(MD_UNIT, unit.to_string()), (MD_RUNTIME_IMAGE, image.to_string())];
+        assert_eq!(metadata_update(&had, &wanted("old unit", "r/weft-runtime:old")), None, "nothing differs, nothing is written");
+        let items = metadata_update(&had, &wanted("old unit", "r/weft-runtime:new")).expect("an older agent image is rewritten");
+        assert_eq!(
+            items,
+            vec![
+                json!({ "key": "ssh-keys", "value": "k" }),
+                json!({ "key": MD_UNIT, "value": "old unit" }),
+                json!({ "key": MD_RUNTIME_IMAGE, "value": "r/weft-runtime:new" }),
+            ]
+        );
+        let items = metadata_update(&had[..1], &wanted("new unit", "r/weft-runtime:new")).expect("missing items are added");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[1], json!({ "key": MD_UNIT, "value": "new unit" }));
+    }
+
+    /// The agent learns its image from the startup script that made its
+    /// container, under the name it reads.
+    #[test]
+    fn the_startup_script_hands_the_agent_its_image() {
+        assert!(STARTUP_SCRIPT.contains(&format!("-e {AGENT_IMAGE_ENV}=\"$image\"")), "{STARTUP_SCRIPT}");
     }
 
     #[test]

@@ -12,7 +12,7 @@
 	import { buildSpecMap, deriveInputsFromEntries, deriveOutputsFromEntries, entryForSource, entryPortCollisions, entryPortName, hasValue, isEmptyChoiceSet, isFilledIn, isValidFieldKey, type PortEntryDef, type PortSpec } from '../../utils/port-specs';
 	import { getStatusBadgeColor, getStatusIcon } from "../../utils/status";
 	import { describeProgress } from "../../../../status";
-	import type { ApplyProgress, ConfigFieldSpan, FileContent, BusInspectorEvent, BusMeta, CorruptionSite, NodeFeedState } from "../../../../protocol";
+	import type { ChangeProgress, ConfigFieldSpan, FileContent, BusInspectorEvent, BusMeta, CorruptionSite, NodeFeedState } from "../../../../protocol";
 	import { BadgeQuestionMark, Eye, EyeOff, Maximize2, Minimize2, FileSymlink, Pencil } from '@lucide/svelte';
 	import { createFieldEditor } from '../../utils/field-editor.svelte';
 	import { useFieldEditorRegistry } from './field-editor-registry';
@@ -92,7 +92,7 @@
 			infraFailureStage?: string;
 			infraFailureMessage?: string;
 			/// While a start is under way: since when, and what it waits on.
-			infraProgress?: ApplyProgress;
+			infraProgress?: ChangeProgress;
 			debugData?: unknown;
 			executions?: NodeExecution[];
 			/// One IRC-style scrollable log per bus this node took part
@@ -1818,7 +1818,7 @@
 					title={data.infraFailureMessage
 						? `${data.infraFailureStage ? data.infraFailureStage + ': ' : ''}${data.infraFailureMessage}`
 						: data.infraProgress
-							? `starting ${describeProgress(data.infraProgress, Date.now() / 1000)}`
+							? `${data.infraNodeStatus} ${describeProgress(data.infraProgress, Date.now() / 1000)}`
 							: undefined}
 				>
 					<span class="w-1.5 h-1.5 rounded-full

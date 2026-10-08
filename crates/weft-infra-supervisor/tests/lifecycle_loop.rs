@@ -259,6 +259,40 @@ async fn terminate_flips_status_removes_the_copy_then_the_row() {
     assert!(events.iter().any(|(_, _, _, k, _)| k == "terminated"));
 }
 
+/// A stop and a terminate say what they wait on once the row reads
+/// stopping or terminating and before the host is handed the copy (a
+/// machine powering off takes minutes), so `weft status` names it.
+#[tokio::test]
+async fn stop_and_terminate_record_what_they_wait_on_before_the_host_works() {
+    use weft_infra_supervisor::broker_ops::BrokerCall;
+    let trail = |rig: &SupervisorTestRig| -> Vec<String> {
+        rig.broker
+            .calls()
+            .iter()
+            .filter_map(|c| match c {
+                BrokerCall::SetStatus { status, .. } => Some(format!("status {}", status.as_str())),
+                BrokerCall::SetWaiting { command_id, waiting, .. } => Some(format!("waiting {command_id}: {waiting}")),
+                BrokerCall::RemoveNode { .. } => Some("remove".to_string()),
+                _ => None,
+            })
+            .collect()
+    };
+    let stopped = rig();
+    stopped.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
+    stopped.broker.enqueue_command(cmd(1, Verb::Stop, Some(NODE)));
+    stopped.tick_lifecycle().await.unwrap();
+    assert_eq!(
+        trail(&stopped),
+        ["status stopping", "waiting 1: bridge: its host is taking it down", "status stopped"]
+    );
+
+    let terminated = rig();
+    terminated.broker.add_infra_node(PROJECT, NODE, "inst1", Status::Running);
+    terminated.broker.enqueue_command(cmd(2, Verb::Terminate, Some(NODE)));
+    terminated.tick_lifecycle().await.unwrap();
+    assert_eq!(trail(&terminated), ["status terminating", "waiting 2: its host is removing it", "remove"]);
+}
+
 // ---------- no matching rows (soft no-op) ----------
 
 #[tokio::test]

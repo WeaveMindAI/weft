@@ -9,7 +9,7 @@ import type {
   ActionAvailability,
   ActionBarState,
   ActionVerb,
-  ApplyProgress,
+  ChangeProgress,
   BackendSnapshot,
   ExecutionPhase,
   ProjectTransition,
@@ -36,7 +36,7 @@ export interface RawStatusPayload {
     failureStage?: string;
     failureMessage?: string;
     instance_copy_count?: number;
-    progress?: ApplyProgress;
+    progress?: ChangeProgress;
   }>;
   drift?: {
     binary_drift?: boolean;
@@ -214,16 +214,16 @@ export function backendFromSnapshot(snapshot: ActionAvailability): BackendSnapsh
  *  duration is the server's at the answer plus the time elapsed here
  *  since, so it keeps ticking between answers whatever the two clocks
  *  say. */
-export function progressOnLocalClock(progress: ApplyProgress, localNowUnix: number): ApplyProgress {
+export function progressOnLocalClock(progress: ChangeProgress, localNowUnix: number): ChangeProgress {
   const shift = localNowUnix - progress.asOfUnix;
   return { ...progress, sinceUnix: progress.sinceUnix + shift, asOfUnix: localNowUnix };
 }
 
-/** How far a start of an infra copy got, as a person reads it: "for
+/** How far a change of an infra copy got, as a person reads it: "for
  *  3m12s, waiting on: ...". `nowUnix` is on the clock the progress's
  *  stamps are on (this machine's, once `parseStatusPayload` moved it). */
-// SYNC: describeProgress <-> crates/weft-core/src/infra/wire.rs ApplyProgress::describe
-export function describeProgress(progress: ApplyProgress, nowUnix: number): string {
+// SYNC: describeProgress <-> crates/weft-core/src/infra/wire.rs ChangeProgress::describe
+export function describeProgress(progress: ChangeProgress, nowUnix: number): string {
   const secs = Math.max(0, Math.floor(nowUnix - progress.sinceUnix));
   const elapsed = secs >= 60 ? `${Math.floor(secs / 60)}m${String(secs % 60).padStart(2, '0')}s` : `${secs}s`;
   return progress.waiting ? `for ${elapsed}, waiting on: ${progress.waiting}` : `for ${elapsed}`;

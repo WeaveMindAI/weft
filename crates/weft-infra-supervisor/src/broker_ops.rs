@@ -90,8 +90,8 @@ pub trait BrokerSupervisorOps: Send + Sync {
         failure_stage: Option<weft_broker_client::protocol::FailureStage>,
         failure_message: Option<&str>,
     ) -> Result<weft_broker_client::WriteOutcome<weft_broker_client::protocol::SupervisorSetStatusResponse>>;
-    /// Record what the apply `command_id` waits on for this copy, for
-    /// `weft status`.
+    /// Record what the command `command_id` (an apply, a stop, a
+    /// terminate) waits on for this copy, for `weft status`.
     async fn set_waiting(
         &self,
         replica: &str,

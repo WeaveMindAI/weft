@@ -275,13 +275,18 @@ const WATCH_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Run the machine's unit and answer weft about it.
 pub async fn host() -> anyhow::Result<()> {
-    use weft_platform_gcp::infra_host::{MD_CORE_ACCOUNT, MD_GCP_PROJECT, MD_GPU, MD_RUNTIME_IMAGE};
+    use weft_platform_gcp::infra_host::{AGENT_IMAGE_ENV, MD_CORE_ACCOUNT, MD_GCP_PROJECT, MD_GPU};
     use weft_platform_local::{DiskBacking, GpuAccess, LocalInfraHostConfig, Publish};
     use weft_platform_traits::unit_agent::{HOST_APPLY, HOST_LOGS, HOST_OBSERVE, HOST_RESTART};
 
     // The Docker CLI this process runs reads its login from here.
     std::env::set_var("DOCKER_CONFIG", Path::new(HOST_STATE).join("docker"));
-    let image = attribute(MD_RUNTIME_IMAGE).await?;
+    // The image this container was made from, as the startup script that
+    // made it says; never the machine's metadata, which an apply rewrites
+    // while this container keeps running (and Docker brings it back as it
+    // was). The unit's own agent runs the same image.
+    let image = std::env::var(AGENT_IMAGE_ENV)
+        .with_context(|| format!("{AGENT_IMAGE_ENV} is required: the image this agent runs, which the machine's startup script sets"))?;
     let registry = image.split('/').next().unwrap_or_default().to_string();
     let gpu = if attribute(MD_GPU).await? == "yes" { GpuAccess::CosDriver } else { GpuAccess::None };
     // Where the unit's agent pushes its values and this machine asks for
