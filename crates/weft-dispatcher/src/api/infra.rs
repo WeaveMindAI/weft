@@ -1531,7 +1531,7 @@ async fn read_infra_entries(
 /// gives its copy.
 fn row_to_entry(
     row: InfraNodeRow,
-    progress: Option<weft_core::infra::wire::ApplyProgress>,
+    progress: Option<weft_core::infra::wire::ChangeProgress>,
     front_door: &str,
 ) -> InfraStatusEntry {
     InfraStatusEntry {

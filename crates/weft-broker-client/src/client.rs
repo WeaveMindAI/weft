@@ -935,7 +935,8 @@ impl BrokerSupervisorClient {
             .await
     }
 
-    /// Record what the apply `command_id` waits on for this copy.
+    /// Record what the command `command_id` (an apply, a stop, a
+    /// terminate) waits on for this copy.
     pub async fn set_waiting(
         &self,
         replica: &str,

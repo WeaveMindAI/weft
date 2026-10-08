@@ -1062,9 +1062,9 @@ export interface InstanceInfraEntry {
   node: string;
   instance: string;
   status: string;
-  /// While a start of the copy is under way: since when, and what it
-  /// waits on.
-  progress?: ApplyProgress;
+  /// While a start, stop or terminate of the copy is under way: since
+  /// when, and what it waits on.
+  progress?: ChangeProgress;
 }
 
 /// The parent run and the original run supplying each reused result,
@@ -1730,16 +1730,17 @@ export interface InfraPlacementStatus {
   /// failed (`provision` | `apply` | `execute` | `apply_lifecycle`).
   failureStage?: string;
   failureMessage?: string;
-  /// While a start of the copy is under way: since when, and what it
-  /// waits on.
-  progress?: ApplyProgress;
+  /// While a start, stop or terminate of the copy is under way: since
+  /// when, and what it waits on.
+  progress?: ChangeProgress;
 }
 
-/// How far a start of an infra copy got: since when it was asked for,
-/// as of the clock `asOfUnix` names. The server's answer carries its own
-/// clock; `parseStatusPayload` moves both stamps onto this machine's.
-// SYNC: ApplyProgress <-> crates/weft-core/src/infra/wire.rs ApplyProgress
-export interface ApplyProgress {
+/// How far a start, stop or terminate of an infra copy got: since when
+/// it was asked for, as of the clock `asOfUnix` names. The server's
+/// answer carries its own clock; `parseStatusPayload` moves both stamps
+/// onto this machine's.
+// SYNC: ChangeProgress <-> crates/weft-core/src/infra/wire.rs ChangeProgress
+export interface ChangeProgress {
   sinceUnix: number;
   asOfUnix: number;
   /// What it waits on right now, in the host's words; absent before the

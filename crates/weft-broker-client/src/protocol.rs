@@ -1069,8 +1069,8 @@ pub struct SupervisorSetStatusRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorSetStatusResponse {}
 
-/// What an apply waits on for one copy, in the host's words, so `weft
-/// status` can say it. Written under the apply's command.
+/// What a change of one copy (an apply, a stop, a terminate) waits on,
+/// so `weft status` can say it. Written under that change's command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorSetWaitingRequest {
     pub replica: String,

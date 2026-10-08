@@ -504,12 +504,16 @@ fn rollup_sql(units_expr: &str) -> String {
 /// EXISTS is evaluated atomically with the write so a command that
 /// appeared after the supervisor's tick-level gate still blocks here.
 pub async fn set_status(pool: &PgPool, req: &SupervisorSetStatusRequest) -> anyhow::Result<FencedWrite> {
-    // An apply's progress (what it waits on, since when) belongs to the
-    // copy while it provisions: a status that leaves provisioning clears
-    // it, so a later start never shows an earlier one's.
+    // What a change waits on belongs to the change the row's status is
+    // in (an apply while it provisions, a stop while it stops, a
+    // terminate while it terminates): a stamp that changes the status
+    // clears it, so neither the next change nor the resting copy shows
+    // an earlier one's. An apply's start time goes once the copy leaves
+    // provisioning. `status` on the right of a SET is the row's status
+    // before this write.
     let progress = |new_status: &str| {
         format!(
-            ", waiting_on = CASE WHEN {new_status} = 'provisioning' THEN waiting_on END, \
+            ", waiting_on = CASE WHEN {new_status} = status THEN waiting_on END, \
              provisioning_since_unix = CASE WHEN {new_status} = 'provisioning' THEN provisioning_since_unix END"
         )
     };
@@ -599,9 +603,11 @@ pub async fn set_status(pool: &PgPool, req: &SupervisorSetStatusRequest) -> anyh
     stale_answer(pool, &req.replica, req.project_id).await
 }
 
-/// Record what the apply `req.command_id` waits on for its copy. The
-/// command must still be an uncompleted apply that reaches the copy, and `replica`
-/// must still own the project, all in the UPDATE's own WHERE.
+/// Record what the supervisor's command `req.command_id` (an apply, a
+/// stop or a terminate) waits on for its copy. The command must still be
+/// an uncompleted supervisor command that reaches the copy, and `replica`
+/// must still own the project, all in the UPDATE's own WHERE. The next
+/// stamp that changes the row's status clears it ([`set_status`]).
 pub async fn set_waiting(pool: &PgPool, req: &SupervisorSetWaitingRequest) -> anyhow::Result<FencedWrite> {
     let res = sqlx::query(&format!(
         "UPDATE infra_node SET waiting_on = $1 \
@@ -610,10 +616,10 @@ pub async fn set_waiting(pool: &PgPool, req: &SupervisorSetWaitingRequest) -> an
            SELECT 1 FROM infra_lifecycle_command c \
            WHERE c.id = $5 \
              AND c.project_id = $2 \
-             AND c.verb = 'apply' \
+             AND {pending} \
              AND {reaches} \
-             AND c.completed_at_unix IS NULL \
          ) AND {owns}",
+        pending = pending_supervisor_command("c"),
         reaches = command_reaches_copy("c", "$3", "$4"),
         owns = owns_project_predicate("$6", "$2"),
     ))

@@ -1262,9 +1262,10 @@ pub async fn supervisor_set_status(
     Ok(Json(SupervisorSetStatusResponse {}))
 }
 
-/// Record what an apply waits on, for `weft status`: the supervisor
-/// writes it as its units come up. Fenced like `set_status` under a
-/// command.
+/// Record what a change of a copy waits on, for `weft status`: the
+/// supervisor writes it as an apply's units come up, and as a stop or a
+/// terminate hands the copy to its host. Fenced like `set_status` under
+/// a command.
 pub async fn supervisor_set_waiting(
     State(state): State<Arc<BrokerState>>,
     AuthedCaller(caller): AuthedCaller,

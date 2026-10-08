@@ -5300,7 +5300,7 @@ mod infra_entries_tests {
         let copies = ObservedCopies {
             rows: vec![row("db", None, InfraNodeStatus::Running), row("bridge", Some("ada"), InfraNodeStatus::Stopped)],
             starting: vec![("queue".into(), None), ("bridge".into(), Some(InstanceId::new("bob").unwrap()))],
-            start_asked_unix: [(("queue".to_string(), None), 100), (("bridge".to_string(), Some(InstanceId::new("bob").unwrap())), 110)]
+            change_asked_unix: [(("queue".to_string(), None), 100), (("bridge".to_string(), Some(InstanceId::new("bob").unwrap())), 110)]
                 .into(),
             as_of_unix: 130,
         };
@@ -5321,7 +5321,7 @@ mod infra_entries_tests {
         assert_eq!(instances, [("bridge", "ada", "stopped"), ("bridge", "bob", "provisioning")]);
         // A copy being started counts from its request, row or no row, as
         // of the clock the copies were read on.
-        let since = |progress: Option<&weft_core::infra::wire::ApplyProgress>| progress.map(|p| (p.since_unix, p.as_of_unix));
+        let since = |progress: Option<&weft_core::infra::wire::ChangeProgress>| progress.map(|p| (p.since_unix, p.as_of_unix));
         let shared = |node: &str| infra.iter().find(|e| e.node == node).unwrap().progress.as_ref();
         assert_eq!(since(shared("queue")), Some((100, 130)), "a shared copy with no row");
         assert_eq!(since(shared("db")), None, "a running copy shows none");

@@ -199,9 +199,10 @@ async fn stamp_by_a_displaced_replica_is_displaced(pool: PgPool) {
     assert_eq!(row(&pool).await.0, "running");
 }
 
-/// What an apply waits on is recorded by the owner under its apply only,
-/// refused (the row untouched) for a process that lost the project, and
-/// cleared, with when it began, once the copy leaves provisioning.
+/// What an apply waits on is recorded by the owner under a command still
+/// under way, refused (the row untouched) for a process that lost the
+/// project, and cleared, with when it began, once the copy leaves
+/// provisioning.
 #[sqlx::test]
 async fn what_an_apply_waits_on_is_its_own_and_ends_with_it(pool: PgPool) {
     schema(&pool).await;
@@ -237,11 +238,17 @@ async fn what_an_apply_waits_on_is_its_own_and_ends_with_it(pool: PgPool) {
     };
     assert_eq!(set_waiting(&pool, &waiting(OTHER, "theirs")).await.unwrap(), FencedWrite::Displaced);
     assert_eq!(read().await, None);
+    sqlx::query("UPDATE infra_lifecycle_command SET completed_at_unix = 1 WHERE id = $1")
+        .bind(stop)
+        .execute(&pool)
+        .await
+        .unwrap();
     assert_eq!(
-        set_waiting(&pool, &SupervisorSetWaitingRequest { command_id: stop, ..waiting(OWNER, "under a stop") }).await.unwrap(),
+        set_waiting(&pool, &SupervisorSetWaitingRequest { command_id: stop, ..waiting(OWNER, "under a done stop") }).await.unwrap(),
         FencedWrite::Gone,
-        "only an apply records what it waits on"
+        "a finished command records nothing"
     );
+    assert_eq!(read().await, None);
     assert_eq!(set_waiting(&pool, &waiting(OWNER, "a: its machine's agent does not answer yet")).await.unwrap(), FencedWrite::Applied);
     assert_eq!(read().await.as_deref(), Some("a: its machine's agent does not answer yet"));
     // The start fails: its progress goes with it, so a later start never
@@ -255,6 +262,43 @@ async fn what_an_apply_waits_on_is_its_own_and_ends_with_it(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(since, None);
+}
+
+/// What a stop waits on is recorded under the stop, kept while the copy
+/// stays stopping, and cleared once a unit's stop lands and the copy
+/// leaves stopping.
+#[sqlx::test]
+async fn what_a_stop_waits_on_ends_when_the_copy_leaves_stopping(pool: PgPool) {
+    schema(&pool).await;
+    lease(&pool, OWNER).await;
+    let stop = command(&pool).await;
+    node_row(&pool, "running", serde_json::json!({ "a": unit("running"), "b": unit("running") })).await;
+    let read = || async {
+        let (w,): (Option<String>,) = sqlx::query_as("SELECT waiting_on FROM infra_node WHERE project_id = $1")
+            .bind(PROJECT)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        w
+    };
+    let waiting = |text: &str| SupervisorSetWaitingRequest {
+        replica: OWNER.into(),
+        command_id: stop,
+        project_id: PROJECT,
+        node_id: NODE.into(),
+        instance: None,
+        waiting: text.into(),
+    };
+    assert_eq!(set_status(&pool, &stamp(OWNER, Some(stop), Some("a"), Status::Stopping)).await.unwrap(), FencedWrite::Applied);
+    assert_eq!(set_waiting(&pool, &waiting("a: its host is taking it down")).await.unwrap(), FencedWrite::Applied);
+    // A stamp that leaves the copy stopping keeps it.
+    assert_eq!(set_status(&pool, &stamp(OWNER, Some(stop), Some("b"), Status::Stopping)).await.unwrap(), FencedWrite::Applied);
+    assert_eq!(read().await.as_deref(), Some("a: its host is taking it down"));
+    assert_eq!(set_status(&pool, &stamp(OWNER, Some(stop), Some("a"), Status::Stopped)).await.unwrap(), FencedWrite::Applied);
+    assert_eq!(read().await.as_deref(), Some("a: its host is taking it down"), "b still stops, so the copy reads stopping");
+    assert_eq!(set_status(&pool, &stamp(OWNER, Some(stop), Some("b"), Status::Stopped)).await.unwrap(), FencedWrite::Applied);
+    assert_eq!(row(&pool).await.0, "stopped");
+    assert_eq!(read().await, None);
 }
 
 /// The autonomous (health) stamp is fenced by ownership too: a process that

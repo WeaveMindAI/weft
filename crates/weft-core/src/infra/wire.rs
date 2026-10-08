@@ -329,21 +329,22 @@ pub struct InfraStatusEntry {
     /// warnings. Empty when the copy runs as asked.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
-    /// How far a start of this copy got, while one is under way.
+    /// How far a start, stop or terminate of this copy got, while one is
+    /// under way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub progress: Option<ApplyProgress>,
+    pub progress: Option<ChangeProgress>,
 }
 
-/// How far a start of an infra copy got: since when it runs, and what it
-/// waits on right now, in the host's words ("its machine's agent does not
-/// answer yet: ..."). `waiting` is absent before the host reports
-/// anything (the machine is still being made). `since_unix` is when the
-/// start was asked, and `as_of_unix` the server's clock when it answered:
-/// both on one clock, so how long it has run never depends on the
-/// reader's own.
-// SYNC: ApplyProgress <-> packages/weft-graph/src/protocol.ts ApplyProgress
+/// How far a change of an infra copy got (a start, a stop or a
+/// terminate): since when it runs, and what it waits on right now ("its
+/// machine's agent does not answer yet: ...", "its host is taking it
+/// down"). `waiting` is absent before anything reports (the machine is
+/// still being made). `since_unix` is when the change was asked, and
+/// `as_of_unix` the server's clock when it answered: both on one clock,
+/// so how long it has run never depends on the reader's own.
+// SYNC: ChangeProgress <-> packages/weft-graph/src/protocol.ts ChangeProgress
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApplyProgress {
+pub struct ChangeProgress {
     #[serde(rename = "sinceUnix")]
     pub since_unix: i64,
     #[serde(rename = "asOfUnix")]
@@ -352,7 +353,7 @@ pub struct ApplyProgress {
     pub waiting: Option<String>,
 }
 
-impl ApplyProgress {
+impl ChangeProgress {
     /// As a person reads it, `now_unix` being the time it is read, on the
     /// clock `since_unix` is on (`as_of_unix` reads it as of the answer):
     /// "for 3m12s, waiting on: ...".
@@ -368,14 +369,14 @@ impl ApplyProgress {
 }
 
 #[cfg(test)]
-mod apply_progress_tests {
-    use super::ApplyProgress;
+mod change_progress_tests {
+    use super::ChangeProgress;
 
     #[test]
     fn progress_reads_as_how_long_and_on_what() {
-        let p = ApplyProgress { since_unix: 100, as_of_unix: 292, waiting: Some("db: its machine's agent does not answer yet".into()) };
+        let p = ChangeProgress { since_unix: 100, as_of_unix: 292, waiting: Some("db: its machine's agent does not answer yet".into()) };
         assert_eq!(p.describe(p.as_of_unix), "for 3m12s, waiting on: db: its machine's agent does not answer yet");
-        let bare = ApplyProgress { since_unix: 100, as_of_unix: 130, waiting: None };
+        let bare = ChangeProgress { since_unix: 100, as_of_unix: 130, waiting: None };
         assert_eq!(bare.describe(bare.as_of_unix), "for 30s");
     }
 
@@ -383,17 +384,17 @@ mod apply_progress_tests {
     /// reader whose clock runs 20s behind the server's still reads 20s.
     #[test]
     fn progress_as_of_the_answer_ignores_the_readers_clock() {
-        let p = ApplyProgress { since_unix: 1_000, as_of_unix: 1_020, waiting: None };
+        let p = ChangeProgress { since_unix: 1_000, as_of_unix: 1_020, waiting: None };
         assert_eq!(p.describe(p.as_of_unix), "for 20s");
         assert_eq!(p.describe(990), "for 0s", "a time before the start reads as no time at all");
     }
 
     #[test]
     fn progress_travels_as_camel_case() {
-        let p = ApplyProgress { since_unix: 1, as_of_unix: 2, waiting: None };
+        let p = ChangeProgress { since_unix: 1, as_of_unix: 2, waiting: None };
         assert_eq!(serde_json::to_value(&p).unwrap(), serde_json::json!({ "sinceUnix": 1, "asOfUnix": 2 }));
         assert!(
-            serde_json::from_value::<ApplyProgress>(serde_json::json!({ "sinceUnix": 1 })).is_err(),
+            serde_json::from_value::<ChangeProgress>(serde_json::json!({ "sinceUnix": 1 })).is_err(),
             "an answer without its clock is refused"
         );
     }

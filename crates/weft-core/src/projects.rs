@@ -348,9 +348,10 @@ pub struct InstanceInfraEntry {
     pub node: String,
     pub instance: crate::instance::InstanceId,
     pub status: String,
-    /// How far a start of the copy got, while one is under way.
+    /// How far a start, stop or terminate of the copy got, while one is
+    /// under way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub progress: Option<crate::infra::wire::ApplyProgress>,
+    pub progress: Option<crate::infra::wire::ChangeProgress>,
 }
 
 /// One trigger activation in the status answer.
@@ -435,9 +436,10 @@ pub struct ProjectInfraEntry {
     /// is listed in `instance_infra`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instance_copy_count: Option<usize>,
-    /// How far a start of the copy got, while one is under way.
+    /// How far a start, stop or terminate of the copy got, while one is
+    /// under way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub progress: Option<crate::infra::wire::ApplyProgress>,
+    pub progress: Option<crate::infra::wire::ChangeProgress>,
 }
 
 // SYNC: ProjectExecutionsSummary <-> packages/weft-graph/src/status.ts RawStatusPayload.executions
