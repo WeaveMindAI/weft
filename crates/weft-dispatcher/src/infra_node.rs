@@ -277,6 +277,10 @@ pub struct PendingOp {
     /// stop of the copy cancels it, so its applies never land after the
     /// stop).
     pub setup: Option<weft_core::ExecutionId>,
+    /// When it was asked for (unix seconds): a command's
+    /// `issued_at_unix`, a setup run's `started_at`. A start counts its
+    /// progress from it.
+    pub asked_unix: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -317,6 +321,24 @@ impl PendingOps {
             (Some(PendingKind::Terminate), Some(_)) => Some(InfraNodeStatus::Terminating),
             (Some(PendingKind::Stop | PendingKind::Terminate), None) => None,
         }
+    }
+
+    /// When the start under way for this copy was asked for, `None` when
+    /// no start is what is under way. Of the starts carried out after the
+    /// copy's last stop or terminate, the earliest: a setup run issues
+    /// its applies once it runs, so the run asked first.
+    pub fn start_asked_unix(&self, node: &str, instance: Option<&weft_core::instance::InstanceId>) -> Option<i64> {
+        if !self.starting(node, instance) {
+            return None;
+        }
+        let covering = || {
+            self.ops.iter().filter(|op| op.node.as_deref().is_none_or(|n| n == node) && op.copies.admits(instance))
+        };
+        let last_taken_down = covering().filter(|op| op.kind != PendingKind::Start).map(|op| op.order).max();
+        covering()
+            .filter(|op| op.kind == PendingKind::Start && last_taken_down.is_none_or(|order| op.order > order))
+            .map(|op| op.asked_unix)
+            .min()
     }
 
     /// Whether a start of this copy is under way.
@@ -371,6 +393,13 @@ pub struct ObservedCopies {
     /// Copies with no row yet that a start is bringing up, as `(place,
     /// instance)`: they read `provisioning`.
     pub starting: Vec<(String, Option<weft_core::instance::InstanceId>)>,
+    /// For each copy a start is bringing up (`(place, instance)`), when
+    /// that start was asked for ([`PendingOps::start_asked_unix`]).
+    pub start_asked_unix: BTreeMap<(String, Option<weft_core::instance::InstanceId>), i64>,
+    /// The database's clock when this was read (unix seconds): the clock
+    /// a row's and a command's stamps are on (a setup run's `started_at`
+    /// is on the clock of whoever began it).
+    pub as_of_unix: i64,
 }
 
 impl ObservedCopies {
@@ -384,6 +413,31 @@ impl ObservedCopies {
             .iter()
             .any(|(n, m)| n == node && m.as_ref() == instance)
             .then_some(InfraNodeStatus::Provisioning)
+    }
+
+    /// How far the start of one copy got, while it reads `provisioning`:
+    /// counted from when the start was asked for, or from when the
+    /// supervisor began the apply under way (`provisioning_since_unix`)
+    /// when that came first (a start asked again while an earlier apply
+    /// still runs), read as of [`Self::as_of_unix`]. `None` for a copy
+    /// that is not starting, and for a provisioning row stamped by
+    /// nothing (one written before the column existed).
+    pub fn progress_of(
+        &self,
+        node: &str,
+        instance: Option<&weft_core::instance::InstanceId>,
+    ) -> Option<weft_core::infra::wire::ApplyProgress> {
+        if self.status_of(node, instance) != Some(InfraNodeStatus::Provisioning) {
+            return None;
+        }
+        let row = self.rows.iter().find(|r| r.node_id == node && r.instance.as_ref() == instance);
+        let asked = self.start_asked_unix.get(&(node.to_string(), instance.cloned())).copied();
+        let since_unix = [row.and_then(|r| r.provisioning_since_unix), asked].into_iter().flatten().min()?;
+        Some(weft_core::infra::wire::ApplyProgress {
+            since_unix,
+            as_of_unix: self.as_of_unix,
+            waiting: row.and_then(|r| r.waiting.clone()),
+        })
     }
 }
 
@@ -403,6 +457,7 @@ pub async fn observe_with(
     project_id: uuid::Uuid,
     project: &weft_core::ProjectDefinition,
 ) -> Result<(ObservedCopies, PendingOps)> {
+    let (as_of_unix,): (i64,) = sqlx::query_as("SELECT EXTRACT(EPOCH FROM NOW())::BIGINT").fetch_one(pool).await?;
     let mut rows = list_for_project(pool, project_id).await?;
     let pending = pending_ops(pool, project_id, project).await?;
     for row in &mut rows {
@@ -411,7 +466,13 @@ pub async fn observe_with(
         }
     }
     let starting = pending.starting_without_row(&rows);
-    Ok((ObservedCopies { rows, starting }, pending))
+    let start_asked_unix = rows
+        .iter()
+        .map(|r| (r.node_id.clone(), r.instance.clone()))
+        .chain(starting.iter().cloned())
+        .filter_map(|copy| pending.start_asked_unix(&copy.0, copy.1.as_ref()).map(|asked| (copy, asked)))
+        .collect();
+    Ok((ObservedCopies { rows, starting, start_asked_unix, as_of_unix }, pending))
 }
 
 /// Read what is under way for `project_id`'s copies (see [`PendingOps`]).
@@ -422,17 +483,17 @@ pub async fn pending_ops(
     project: &weft_core::ProjectDefinition,
 ) -> Result<PendingOps> {
     let mut ops = Vec::new();
-    /// id, node_id, verb, instance_id, every_copy.
-    type CommandRow = (i64, Option<String>, String, Option<String>, bool);
+    /// id, node_id, verb, instance_id, every_copy, issued_at_unix.
+    type CommandRow = (i64, Option<String>, String, Option<String>, bool, i64);
     let commands: Vec<CommandRow> = sqlx::query_as(&format!(
-        "SELECT id, node_id, verb, instance_id, every_copy FROM infra_lifecycle_command \
+        "SELECT id, node_id, verb, instance_id, every_copy, issued_at_unix FROM infra_lifecycle_command \
          WHERE project_id = $1 AND completed_at_unix IS NULL AND verb IN ({verbs})",
         verbs = weft_broker_client::lifecycle_command::SUPERVISOR_VERBS_SQL,
     ))
     .bind(project_id)
     .fetch_all(pool)
     .await?;
-    for (id, node, verb, instance, every) in commands {
+    for (id, node, verb, instance, every, issued_at_unix) in commands {
         let kind = match crate::infra_lifecycle_command::InfraLifecycleVerb::parse(&verb) {
             Some(crate::infra_lifecycle_command::InfraLifecycleVerb::Apply) => PendingKind::Start,
             Some(crate::infra_lifecycle_command::InfraLifecycleVerb::Stop) => PendingKind::Stop,
@@ -441,21 +502,23 @@ pub async fn pending_ops(
         };
         let copies = weft_core::instance::Copies::from_columns(instance, every)
             .map_err(|e| anyhow::anyhow!("infra_lifecycle_command {id}: {e}"))?;
-        ops.push(PendingOp { kind, node, copies, order: id, setup: None });
+        ops.push(PendingOp { kind, node, copies, order: id, setup: None, asked_unix: issued_at_unix });
     }
     // A setup run that has not ended brings up the infra places its
     // selection holds, for its instance.
     let infra: std::collections::BTreeSet<String> = weft_core::project::infra_place_spellings(project);
-    let setups: Vec<(weft_core::ExecutionId, Option<String>, Option<sqlx::types::Json<weft_core::project::selection::RunSelection>>)> =
-        sqlx::query_as(
-            "SELECT r.execution_id, r.instance_id, s.selection FROM run r \
-             LEFT JOIN run_selection s ON s.digest = r.selection \
-             WHERE r.project_id = $1 AND r.phase = 'infra_setup' AND r.state <> 'ended'",
-        )
-        .bind(project_id)
-        .fetch_all(pool)
-        .await?;
-    for (execution_id, instance, subgraph) in setups {
+    /// execution_id, instance_id, started_at, selection.
+    type SetupRow =
+        (weft_core::ExecutionId, Option<String>, i64, Option<sqlx::types::Json<weft_core::project::selection::RunSelection>>);
+    let setups: Vec<SetupRow> = sqlx::query_as(
+        "SELECT r.execution_id, r.instance_id, r.started_at, s.selection FROM run r \
+         LEFT JOIN run_selection s ON s.digest = r.selection \
+         WHERE r.project_id = $1 AND r.phase = 'infra_setup' AND r.state <> 'ended'",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+    for (execution_id, instance, started_at, subgraph) in setups {
         let instance = instance
             .map(weft_core::instance::InstanceId::new)
             .transpose()
@@ -472,6 +535,7 @@ pub async fn pending_ops(
                     copies: weft_core::instance::Copies::of(instance.clone()),
                     order: i64::MAX,
                     setup: Some(execution_id),
+                    asked_unix: started_at,
                 });
             }
         }
@@ -623,7 +687,11 @@ mod tests {
     }
 
     fn op(kind: PendingKind, node: Option<&str>, copies: weft_core::instance::Copies, order: i64) -> PendingOp {
-        PendingOp { kind, node: node.map(str::to_string), copies, order, setup: None }
+        asked(kind, node, copies, order, 0)
+    }
+
+    fn asked(kind: PendingKind, node: Option<&str>, copies: weft_core::instance::Copies, order: i64, asked_unix: i64) -> PendingOp {
+        PendingOp { kind, node: node.map(str::to_string), copies, order, setup: None, asked_unix }
     }
 
     fn ada() -> weft_core::instance::InstanceId {
@@ -696,6 +764,88 @@ mod tests {
         use weft_core::instance::Copies;
         let ops = PendingOps::new(vec![op(PendingKind::Start, Some("bridge"), Copies::Instance(ada()), i64::MAX)]);
         assert_eq!(ops.starting_without_row(&[]), vec![("bridge".to_string(), Some(ada()))]);
+    }
+
+    /// A start counts from when it was asked: the earliest start carried
+    /// out after the copy's last stop (a setup run asked before the apply
+    /// it issued), never one a later stop overrode, and nothing at all
+    /// while a stop is what is under way.
+    #[test]
+    fn a_start_is_asked_when_its_earliest_live_request_was() {
+        use weft_core::instance::Copies;
+        let instance = Copies::Instance(ada());
+        let resumed = PendingOps::new(vec![
+            asked(PendingKind::Start, Some("bridge"), instance.clone(), 3, 50),
+            asked(PendingKind::Stop, Some("bridge"), instance.clone(), 7, 60),
+            asked(PendingKind::Start, Some("bridge"), instance.clone(), 9, 80),
+            asked(PendingKind::Start, Some("bridge"), instance.clone(), i64::MAX, 70),
+        ]);
+        assert_eq!(resumed.start_asked_unix("bridge", Some(&ada())), Some(70), "the setup run, asked before its apply");
+        assert_eq!(resumed.start_asked_unix("other", Some(&ada())), None, "nothing starts another place");
+        let paused = PendingOps::new(vec![
+            asked(PendingKind::Start, Some("bridge"), instance.clone(), 8, 50),
+            asked(PendingKind::Stop, Some("bridge"), instance, 9, 60),
+        ]);
+        assert_eq!(paused.start_asked_unix("bridge", Some(&ada())), None, "a stop is what is under way");
+    }
+
+    fn provisioning_row(since: Option<i64>, waiting: Option<&str>) -> InfraNodeRow {
+        InfraNodeRow {
+            project_id: uuid::Uuid::nil(),
+            node_id: "db".into(),
+            instance: None,
+            copy_id: String::new(),
+            status: InfraNodeStatus::Provisioning,
+            failure_stage: None,
+            failure_message: None,
+            applied_spec_hash: None,
+            applied_at_unix: None,
+            endpoints: Default::default(),
+            public_paths: Default::default(),
+            doors: Default::default(),
+            install_endpoints: Default::default(),
+            keep_disks: Vec::new(),
+            units: Default::default(),
+            notes: Vec::new(),
+            waiting: waiting.map(str::to_string),
+            provisioning_since_unix: since,
+        }
+    }
+
+    /// A copy being started counts from the request, row or no row: with
+    /// no row yet it counts from the request alone, and over a row the
+    /// supervisor stamped later it still counts from the request (which
+    /// came first), keeping what the row says it waits on. Every answer
+    /// carries the clock it was read on.
+    #[test]
+    fn a_starting_copy_counts_from_the_request() {
+        let bob = weft_core::instance::InstanceId::new("bob").unwrap();
+        let copies = ObservedCopies {
+            rows: vec![provisioning_row(Some(120), Some("its machine's agent does not answer yet"))],
+            starting: vec![("bridge".into(), Some(bob.clone()))],
+            start_asked_unix: [(("db".to_string(), None), 100), (("bridge".to_string(), Some(bob.clone())), 90)].into(),
+            as_of_unix: 130,
+        };
+        let db = copies.progress_of("db", None).expect("the row provisions");
+        assert_eq!((db.since_unix, db.as_of_unix), (100, 130));
+        assert_eq!(db.waiting.as_deref(), Some("its machine's agent does not answer yet"));
+        let bridge = copies.progress_of("bridge", Some(&bob)).expect("a start with no row yet");
+        assert_eq!((bridge.since_unix, bridge.as_of_unix, bridge.waiting), (90, 130, None));
+        assert_eq!(copies.progress_of("cache", None), None, "nothing starts it");
+    }
+
+    /// A row the supervisor already stamped, with no request under way
+    /// any more, counts from its own stamp; a copy that is up shows none.
+    #[test]
+    fn a_provisioning_row_alone_counts_from_its_stamp() {
+        let copies = ObservedCopies { rows: vec![provisioning_row(Some(120), None)], as_of_unix: 130, ..Default::default() };
+        assert_eq!(copies.progress_of("db", None).map(|p| p.since_unix), Some(120));
+        let running = ObservedCopies {
+            rows: vec![InfraNodeRow { status: InfraNodeStatus::Running, ..provisioning_row(Some(120), None) }],
+            as_of_unix: 130,
+            ..Default::default()
+        };
+        assert_eq!(running.progress_of("db", None), None);
     }
 
     #[test]

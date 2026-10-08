@@ -1,5 +1,11 @@
-import { describe, it, expect } from 'vitest';
-import { parseRunning, parseStatusPayload, emptyActionAvailability } from './status';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import {
+  describeProgress,
+  emptyActionAvailability,
+  parseRunning,
+  parseStatusPayload,
+  progressOnLocalClock,
+} from './status';
 
 describe('parseStatusPayload', () => {
   it('remaps snake_case wire fields to the camelCase snapshot', () => {
@@ -65,5 +71,30 @@ describe('parseRunning', () => {
     expect(() => parseRunning({
       executions: { running: [{ execution_id: 'a', phase: 'mystery' as never }] },
     })).toThrow(/cannot read/);
+  });
+});
+
+describe('infra progress', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('counts the server\'s duration, then ticks on this machine\'s clock', () => {
+    // The server says 20s had passed; this machine's clock runs 500s ahead.
+    const local = progressOnLocalClock({ sinceUnix: 1_000, asOfUnix: 1_020, waiting: 'db' }, 1_520);
+    expect(local).toEqual({ sinceUnix: 1_500, asOfUnix: 1_520, waiting: 'db' });
+    expect(describeProgress(local, 1_520)).toBe('for 20s, waiting on: db');
+    expect(describeProgress(local, 1_565)).toBe('for 1m05s, waiting on: db');
+  });
+
+  it('moves a status answer\'s progress onto this machine\'s clock as it arrives', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(9_000_000);
+    const snap = parseStatusPayload({
+      infra: [{ node: 'db', node_type: 'pg', status: 'provisioning', progress: { sinceUnix: 100, asOfUnix: 130 } }],
+    });
+    const progress = snap.infraNodes[0].progress!;
+    expect(progress).toEqual({ sinceUnix: 8_970, asOfUnix: 9_000 });
+    expect(describeProgress(progress, Date.now() / 1000)).toBe('for 30s');
   });
 });

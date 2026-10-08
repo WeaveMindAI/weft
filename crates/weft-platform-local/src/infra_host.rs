@@ -408,9 +408,10 @@ impl LocalInfraHost {
             if let Some(ready) = readiness {
                 let answer = self.probe(&agent_url, &c.name, ready).await?;
                 if !answer.ok {
-                    return Ok(UnitRunState::NotReady {
-                        why: format!("container {short}: {}", answer.why.unwrap_or_else(|| "not ready".into())),
-                    });
+                    let started = docker::started_at(self.docker.as_ref(), &c.name).await?;
+                    let now = daemon_now(self.docker.as_ref()).await?;
+                    let why = answer.why.unwrap_or_else(|| "not ready".into());
+                    return Ok(readiness_failed(short, &why, now.signed_duration_since(started), ready));
                 }
             }
         }
@@ -421,6 +422,28 @@ impl LocalInfraHost {
 /// On an app container: its checks (`encode_probes`), so an observation
 /// after a restart of this process still knows them.
 const PROBES: &str = "weft.probes";
+
+/// How long after it starts a container may fail its readiness check
+/// and still count as starting: the wait its probe asks before the first
+/// check, then one period per failure it tolerates.
+fn startup_window(probe: &weft_core::infra::Probe) -> chrono::TimeDelta {
+    let seconds = u64::from(probe.initial_delay_seconds) + u64::from(probe.period_seconds) * u64::from(probe.failure_threshold.max(1));
+    // Two u32 settings multiplied can pass what a duration holds; a
+    // window that long is a container never declared stuck, so it is
+    // the longest duration rather than a panic.
+    i64::try_from(seconds).ok().and_then(chrono::TimeDelta::try_seconds).unwrap_or(chrono::TimeDelta::MAX)
+}
+
+/// What a running container whose readiness check failed with `why` is
+/// doing, `up` after it started: still starting inside its
+/// [`startup_window`], otherwise not ready, with why.
+fn readiness_failed(short: &str, why: &str, up: chrono::TimeDelta, probe: &weft_core::infra::Probe) -> UnitRunState {
+    if up < startup_window(probe) {
+        UnitRunState::Starting { step: format!("container {short} has not answered its health check yet") }
+    } else {
+        UnitRunState::NotReady { why: format!("container {short}: {why}") }
+    }
+}
 
 fn container_short(c: &ContainerRow) -> &str {
     c.label("weft.container").unwrap_or(&c.name)
@@ -1277,5 +1300,33 @@ mod tests {
         let raw = encode_probes(Some(&p), None);
         assert!(!raw.contains(','));
         assert_eq!(decode_probes(&raw).unwrap(), (Some(p), None));
+    }
+
+    #[test]
+    fn the_startup_window_is_the_probes_delay_then_a_period_per_tolerated_failure() {
+        let mut p = Probe::http("/health", 8099);
+        p.initial_delay_seconds = 5;
+        p.period_seconds = 10;
+        p.failure_threshold = 3;
+        assert_eq!(startup_window(&p), chrono::TimeDelta::seconds(35));
+        p.failure_threshold = 0;
+        assert_eq!(startup_window(&p), chrono::TimeDelta::seconds(15), "a threshold of 0 still allows one failure, as liveness reads it");
+    }
+
+    #[test]
+    fn a_failing_readiness_check_is_starting_inside_the_window_and_not_ready_after() {
+        let mut p = Probe::http("/health", 8099);
+        p.initial_delay_seconds = 0;
+        p.period_seconds = 10;
+        p.failure_threshold = 3;
+        let why = "GET /health on 8099: error sending request";
+        assert_eq!(
+            readiness_failed("credential", why, chrono::TimeDelta::seconds(2), &p),
+            UnitRunState::Starting { step: "container credential has not answered its health check yet".into() }
+        );
+        assert_eq!(
+            readiness_failed("credential", why, chrono::TimeDelta::seconds(30), &p),
+            UnitRunState::NotReady { why: format!("container credential: {why}") }
+        );
     }
 }

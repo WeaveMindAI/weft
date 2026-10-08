@@ -337,23 +337,24 @@ pub struct InfraStatusEntry {
 /// How far a start of an infra copy got: since when it runs, and what it
 /// waits on right now, in the host's words ("its machine's agent does not
 /// answer yet: ..."). `waiting` is absent before the host reports
-/// anything (the machine is still being made).
+/// anything (the machine is still being made). `since_unix` is when the
+/// start was asked, and `as_of_unix` the server's clock when it answered:
+/// both on one clock, so how long it has run never depends on the
+/// reader's own.
 // SYNC: ApplyProgress <-> packages/weft-graph/src/protocol.ts ApplyProgress
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplyProgress {
     #[serde(rename = "sinceUnix")]
     pub since_unix: i64,
+    #[serde(rename = "asOfUnix")]
+    pub as_of_unix: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting: Option<String>,
 }
 
 impl ApplyProgress {
-    /// The progress a row records, when it records one.
-    pub fn of(since_unix: Option<i64>, waiting: Option<String>) -> Option<Self> {
-        since_unix.map(|since_unix| Self { since_unix, waiting })
-    }
-
-    /// As a person reads it, `now_unix` being the time it is read:
+    /// As a person reads it, `now_unix` being the time it is read, on the
+    /// clock `since_unix` is on (`as_of_unix` reads it as of the answer):
     /// "for 3m12s, waiting on: ...".
     // SYNC: describe <-> packages/weft-graph/src/status.ts describeProgress
     pub fn describe(&self, now_unix: i64) -> String {
@@ -364,15 +365,6 @@ impl ApplyProgress {
             None => format!("for {elapsed}"),
         }
     }
-
-    /// [`Self::describe`], read now.
-    pub fn describe_now(&self) -> String {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(self.since_unix);
-        self.describe(now)
-    }
 }
 
 #[cfg(test)]
@@ -381,10 +373,29 @@ mod apply_progress_tests {
 
     #[test]
     fn progress_reads_as_how_long_and_on_what() {
-        let p = ApplyProgress { since_unix: 100, waiting: Some("db: its machine's agent does not answer yet".into()) };
-        assert_eq!(p.describe(292), "for 3m12s, waiting on: db: its machine's agent does not answer yet");
-        assert_eq!(ApplyProgress { since_unix: 100, waiting: None }.describe(130), "for 30s");
-        assert_eq!(ApplyProgress::of(None, Some("x".into())), None, "no start, no progress");
+        let p = ApplyProgress { since_unix: 100, as_of_unix: 292, waiting: Some("db: its machine's agent does not answer yet".into()) };
+        assert_eq!(p.describe(p.as_of_unix), "for 3m12s, waiting on: db: its machine's agent does not answer yet");
+        let bare = ApplyProgress { since_unix: 100, as_of_unix: 130, waiting: None };
+        assert_eq!(bare.describe(bare.as_of_unix), "for 30s");
+    }
+
+    /// Read as of the answer, the duration is the server's alone: a
+    /// reader whose clock runs 20s behind the server's still reads 20s.
+    #[test]
+    fn progress_as_of_the_answer_ignores_the_readers_clock() {
+        let p = ApplyProgress { since_unix: 1_000, as_of_unix: 1_020, waiting: None };
+        assert_eq!(p.describe(p.as_of_unix), "for 20s");
+        assert_eq!(p.describe(990), "for 0s", "a time before the start reads as no time at all");
+    }
+
+    #[test]
+    fn progress_travels_as_camel_case() {
+        let p = ApplyProgress { since_unix: 1, as_of_unix: 2, waiting: None };
+        assert_eq!(serde_json::to_value(&p).unwrap(), serde_json::json!({ "sinceUnix": 1, "asOfUnix": 2 }));
+        assert!(
+            serde_json::from_value::<ApplyProgress>(serde_json::json!({ "sinceUnix": 1 })).is_err(),
+            "an answer without its clock is refused"
+        );
     }
 }
 

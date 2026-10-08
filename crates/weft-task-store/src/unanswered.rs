@@ -67,6 +67,9 @@ pub struct Failing {
     pub error: String,
     pub since_ms: i64,
     pub last_ms: i64,
+    /// The database's clock when this was read, which the times above are
+    /// on: how long ago reads right whatever clock the reader has.
+    pub as_of_ms: i64,
 }
 
 /// A try at `callee` failed with `error`.
@@ -93,8 +96,8 @@ pub async fn answered(pool: &PgPool, callee: Callee<'_>) -> Result<()> {
 /// Every role still failing, and `project`'s workers if they are: what
 /// the project's work waits on.
 pub async fn failing_for(pool: &PgPool, project: uuid::Uuid) -> Result<Vec<Failing>> {
-    let rows: Vec<(String, String, i64, i64)> = sqlx::query_as(&format!(
-        "SELECT callee, error, since_ms, last_ms FROM unanswered_call \
+    let rows: Vec<(String, String, i64, i64, i64)> = sqlx::query_as(&format!(
+        "SELECT callee, error, since_ms, last_ms, {DB_NOW_MS} FROM unanswered_call \
          WHERE (callee LIKE 'role:%' OR callee = $1) AND last_ms >= {DB_NOW_MS} - {RECENT_MS} \
          ORDER BY callee"
     ))
@@ -103,11 +106,12 @@ pub async fn failing_for(pool: &PgPool, project: uuid::Uuid) -> Result<Vec<Faili
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(callee, error, since_ms, last_ms)| Failing {
+        .map(|(callee, error, since_ms, last_ms, as_of_ms)| Failing {
             role: callee.strip_prefix("role:").map(str::to_string),
             error,
             since_ms,
             last_ms,
+            as_of_ms,
         })
         .collect())
 }

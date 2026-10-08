@@ -1735,10 +1735,13 @@ export interface InfraPlacementStatus {
   progress?: ApplyProgress;
 }
 
-/// How far a start of an infra copy got.
+/// How far a start of an infra copy got: since when it was asked for,
+/// as of the clock `asOfUnix` names. The server's answer carries its own
+/// clock; `parseStatusPayload` moves both stamps onto this machine's.
 // SYNC: ApplyProgress <-> crates/weft-core/src/infra/wire.rs ApplyProgress
 export interface ApplyProgress {
   sinceUnix: number;
+  asOfUnix: number;
   /// What it waits on right now, in the host's words; absent before the
   /// host reports anything.
   waiting?: string;

@@ -376,9 +376,11 @@ async fn export(
     for (k, v) in &settings.variables {
         println!("  variable {k}={v}");
     }
-    // Only how many: nothing that comes out of a secret reaches the
-    // terminal, its name included.
-    println!("  secrets  {} set", settings.secrets.len());
+    // The names only: they are weft's own fixed words, so a person can check
+    // what the workflow received; a value never reaches the terminal.
+    for (k, _) in &settings.secrets {
+        println!("  secret   {k}");
+    }
     println!("run its deploy workflow from the Actions tab");
     if let Some(frontend) = deployed_before(&minted, frontend) {
         println!("frontend '{frontend}' keeps its old token working until that run deploys the new one and retires it");
@@ -702,9 +704,15 @@ fn committed_target_matches(committed: &str, name: &str, url: &str) -> Result<()
     }
 }
 
+/// Where a project keeps its frontend server's own settings for a cloud
+/// target, the file the next export's `--front-env` hands the deploy
+/// workflow: in `front/`, which the workflow builds.
+pub const FRONT_ENV_FILE: &str = "front/.env.prod";
+
 /// The `weft target export ... --github` a person runs next, spelled with
 /// a target they really have: the one this command was given, else the
-/// project's only cloud target, else the choice between them.
+/// project's only cloud target, else the choice between them. With
+/// [`FRONT_ENV_FILE`] in the project, it hands that file over too.
 pub fn export_command(project: &weft_compiler::project::Project, on: Option<&str>) -> String {
     let name = match on {
         Some(on) => on.to_string(),
@@ -723,7 +731,10 @@ pub fn export_command(project: &weft_compiler::project::Project, on: Option<&str
             }
         }
     };
-    format!("`weft target export {name} --github`")
+    match project.root.join(FRONT_ENV_FILE).is_file() {
+        true => format!("`weft target export {name} --github --front-env {FRONT_ENV_FILE}`"),
+        false => format!("`weft target export {name} --github`"),
+    }
 }
 
 /// A target name is what people type after `--on`, and a TOML key.

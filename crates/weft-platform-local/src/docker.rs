@@ -128,6 +128,22 @@ pub async fn containers_using(docker: &dyn Docker, volume: &str) -> anyhow::Resu
     Ok(out.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
 }
 
+/// When the container `name` last started (`State.StartedAt`, on the
+/// daemon's clock): a restart moves it. `docker ps` prints only a
+/// rounded "Up 2 minutes", so this asks `docker inspect`.
+pub async fn started_at(docker: &dyn Docker, name: &str) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+    let out = run(docker, vec!["inspect".into(), "--format".into(), "{{json .State.StartedAt}}".into(), name.into()]).await?;
+    parse_started_at(name, &out)
+}
+
+fn parse_started_at(name: &str, printed: &str) -> anyhow::Result<chrono::DateTime<chrono::Utc>> {
+    let at: String = serde_json::from_str(printed.trim())
+        .map_err(|e| anyhow::anyhow!("`docker inspect` printed no start time for {name} ({e}): {}", printed.trim()))?;
+    Ok(chrono::DateTime::parse_from_rfc3339(&at)
+        .map_err(|e| anyhow::anyhow!("`docker inspect` printed a start time for {name} that is not RFC 3339 ({e}): {at}"))?
+        .to_utc())
+}
+
 /// One line of `docker ps --format '{{json .}}'`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerRow {
@@ -308,6 +324,14 @@ mod tests {
         assert_eq!(row.state, "running");
         assert_eq!(row.label(labels::ROLE), Some("worker"));
         assert!(ContainerRow::parse("not json").is_err());
+    }
+
+    #[test]
+    fn a_start_time_is_read_from_inspect_or_refused() {
+        let at = parse_started_at("c-pg", "\"2024-01-01T00:00:05.123456789Z\"\n").unwrap();
+        assert_eq!(at, chrono::DateTime::parse_from_rfc3339("2024-01-01T00:00:05.123456789Z").unwrap().to_utc());
+        assert!(parse_started_at("c-pg", "\"yesterday\"").is_err());
+        assert!(parse_started_at("c-pg", "").is_err());
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! StartInstanceInfra: bring up one instance's copy of a `@per_instance`
-//! infra node, and fire `done` once the copy answers.
+//! infra node, and fire `done` once the copy answers, or, with
+//! `waitUntilRunning` off, once weft accepted the start.
 
 use async_trait::async_trait;
 
@@ -23,7 +24,13 @@ impl Node for StartInstanceInfraNode {
 
     async fn run(&self, ctx: ExecutionContext) -> WeftResult<()> {
         let node: String = ctx.inputs.get("node")?;
-        ctx.infra(node).instance(instance(&ctx)?).start().await?;
+        let wait_until_running: bool = ctx.inputs.get("waitUntilRunning")?;
+        let copy = ctx.infra(node).instance(instance(&ctx)?);
+        if wait_until_running {
+            copy.start().await?;
+        } else {
+            copy.request_start().await?;
+        }
         ctx.pulse_downstream(NodeOutput::new().set("done", true)).await
     }
 }

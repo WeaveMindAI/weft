@@ -231,10 +231,14 @@ infra node, or not per instance, is refused then); a name arriving on a wire
 is checked only when the run reaches it.
 
 Creating an instance, from a gated route the backend calls:
-`MintInstanceToken` (if a browser will act inside it), then `Reply` with the
-token so the request ends at once, then `StartInstanceInfra` if the program
-has a per-instance infra node (it fires `done` once the container runs), then
-`ActivateInstanceTriggers`. A container can take minutes to come up, so the
+`MintInstanceToken` (if a browser will act inside it), then, if the program
+has a per-instance infra node, `StartInstanceInfra` with `waitUntilRunning`
+off (it fires `done` as soon as weft accepts the start), then `Reply` with the
+token so the request ends at once, then a second `StartInstanceInfra` left on
+(it fires `done` once the container runs), then `ActivateInstanceTriggers`.
+Never put the `Reply` before the first start: a caller that lists the
+instance's containers right after the answer would find nothing yet, while a
+start weft accepted already reads `provisioning`. A container can take minutes to come up, so the
 request never waits for it: whoever shows it reads the `status` of that
 instance's displays (the `weft-consumers` skill has the listing) or polls a
 status route. If a trigger needs a value with no fallback, turning it on is
@@ -288,7 +292,7 @@ something they do not cover calls the ctx directly in a node of its own:
 | Call | What it does |
 |---|---|
 | `ctx.instance()` | Which instance this run is for (the `CurrentInstance` node fires `instance` or `nobody`) |
-| `ctx.infra("bridge").instance(id).start()` / `.stop(spec, stop_self)` / `.terminate(spec, stop_self)` / `.wipe(spec, stop_self)` / `.status()` | One instance's container; `terminate` keeps the disks listed in `keepOnTerminate`, `wipe` deletes them too |
+| `ctx.infra("bridge").instance(id).start()` / `.request_start()` / `.stop(spec, stop_self)` / `.terminate(spec, stop_self)` / `.wipe(spec, stop_self)` / `.status()` | One instance's container; `terminate` keeps the disks listed in `keepOnTerminate`, `wipe` deletes them too |
 | `ctx.infra("bridge").copies()` | Every copy of the node: the shared one and each instance's (the `ListInstanceInfra` node) |
 | `ctx.triggers().instance(id).activate()` / `.deactivate(spec, stop_self)` | An instance's triggers (`.only([..])` narrows) |
 | `ctx.values().instance(id).get()` / `.set(step, field, value)` / `.clear(step, field)` / `.apply()` / `.forget()` | What was given for an instance's `@instance_filled` fields: read (the `GetInstanceValues` node), change in one go (the `SetInstanceValues` node; `apply()` returns the triggers it set up again), or forget all |
@@ -303,7 +307,11 @@ something they do not cover calls the ctx directly in a node of its own:
 (the run parks between looks and holds no worker), so you can activate the
 instance's triggers right after it. If the container never comes up,
 `start()` fails with the reason, and so it does if somebody stops the
-container while it waits (it never starts it again behind a pause). Every
+container while it waits (it never starts it again behind a pause).
+`request_start()` returns as soon as weft accepts the start, without waiting
+for the container (`StartInstanceInfra` with `waitUntilRunning` off); a start
+refused for a passing reason, such as a build in progress, is asked again
+until it is accepted. Every
 reader of a container's state (`weft status`, `weft infra status`,
 `.status()`, `InstanceInfraStatus`) gives one answer: `none` for a copy never
 started (or terminated), and a start or stop on its way reads `provisioning`

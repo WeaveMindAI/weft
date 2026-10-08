@@ -253,11 +253,16 @@ pub struct Unanswered {
     pub since_unix: i64,
     #[serde(rename = "lastUnix")]
     pub last_unix: i64,
+    /// The install's clock when this was read, which the times above are
+    /// on, so how long ago reads right whatever clock the reader has.
+    #[serde(rename = "asOfUnix")]
+    pub as_of_unix: i64,
 }
 
 impl Unanswered {
     /// One line for a person: what is not answering, since when, and why.
-    pub fn describe(&self, now_unix: i64) -> String {
+    pub fn describe(&self) -> String {
+        let now_unix = self.as_of_unix;
         let span = |secs: i64| match secs.max(0) {
             secs @ 0..120 => format!("{secs}s"),
             secs => format!("{} min", secs / 60),

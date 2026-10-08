@@ -135,7 +135,7 @@ export function parseStatusPayload(raw: RawStatusPayload): ActionAvailability {
     ...(n.failureStage !== undefined ? { failureStage: n.failureStage } : {}),
     ...(n.failureMessage !== undefined ? { failureMessage: n.failureMessage } : {}),
     ...(n.instance_copy_count !== undefined ? { instanceCopyCount: n.instance_copy_count } : {}),
-    ...(n.progress !== undefined ? { progress: n.progress } : {}),
+    ...(n.progress !== undefined ? { progress: progressOnLocalClock(n.progress, Date.now() / 1000) } : {}),
   }));
   return {
     availableActions: (Array.isArray(raw.available_actions)
@@ -208,8 +208,20 @@ export function backendFromSnapshot(snapshot: ActionAvailability): BackendSnapsh
   };
 }
 
+/** The server's progress, moved onto this machine's clock: both stamps
+ *  shift by how far this clock reads from the server's when the answer
+ *  arrived (`localNowUnix`). Read against `Date.now()` afterwards, the
+ *  duration is the server's at the answer plus the time elapsed here
+ *  since, so it keeps ticking between answers whatever the two clocks
+ *  say. */
+export function progressOnLocalClock(progress: ApplyProgress, localNowUnix: number): ApplyProgress {
+  const shift = localNowUnix - progress.asOfUnix;
+  return { ...progress, sinceUnix: progress.sinceUnix + shift, asOfUnix: localNowUnix };
+}
+
 /** How far a start of an infra copy got, as a person reads it: "for
- *  3m12s, waiting on: ...". */
+ *  3m12s, waiting on: ...". `nowUnix` is on the clock the progress's
+ *  stamps are on (this machine's, once `parseStatusPayload` moved it). */
 // SYNC: describeProgress <-> crates/weft-core/src/infra/wire.rs ApplyProgress::describe
 export function describeProgress(progress: ApplyProgress, nowUnix: number): string {
   const secs = Math.max(0, Math.floor(nowUnix - progress.sinceUnix));

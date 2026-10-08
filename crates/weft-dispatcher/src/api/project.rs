@@ -1268,6 +1268,7 @@ pub(crate) async fn unanswered_for(state: &DispatcherState, project_id: uuid::Uu
             error: f.error,
             since_unix: f.since_ms / 1000,
             last_unix: f.last_ms / 1000,
+            as_of_unix: f.as_of_ms / 1000,
         })
         .collect())
 }
@@ -1598,7 +1599,7 @@ fn infra_entries(
                 node: row.node_id.clone(),
                 instance: row.instance.clone()?,
                 status: row.status.as_str().to_string(),
-                progress: crate::api::infra::provisioning_progress(row.status, row.provisioning_since_unix, row.waiting.clone()),
+                progress: copies.progress_of(&row.node_id, row.instance.as_ref()),
             })
         })
         .chain(copies.starting.iter().filter_map(|(node, instance)| {
@@ -1606,7 +1607,7 @@ fn infra_entries(
                 node: node.clone(),
                 instance: instance.clone()?,
                 status: crate::infra_node::InfraNodeStatus::Provisioning.as_str().to_string(),
-                progress: None,
+                progress: copies.progress_of(node, instance.as_ref()),
             })
         }))
         .collect();
@@ -1640,17 +1641,16 @@ fn infra_entries(
                 endpoint_url: row.install_endpoints.values().next().cloned(),
                 failure_stage: row.failure_stage.map(|f| f.as_str().to_string()),
                 failure_message: row.failure_message.clone(),
-                progress: crate::api::infra::provisioning_progress(
-                    row.status,
-                    row.provisioning_since_unix,
-                    row.waiting.clone(),
-                ),
+                progress: copies.progress_of(&spelled, None),
                 ..entry(row.status.as_str().to_string())
             }),
-            None => infra.push(entry(match copies.status_of(&spelled, None) {
-                Some(status) => status.as_str().to_string(),
-                None => INFRA_NOT_STARTED.to_string(),
-            })),
+            None => infra.push(match copies.status_of(&spelled, None) {
+                Some(status) => ProjectInfraEntry {
+                    progress: copies.progress_of(&spelled, None),
+                    ..entry(status.as_str().to_string())
+                },
+                None => entry(INFRA_NOT_STARTED.to_string()),
+            }),
         }
     }
     (infra, instance_infra)
@@ -5300,8 +5300,11 @@ mod infra_entries_tests {
         let copies = ObservedCopies {
             rows: vec![row("db", None, InfraNodeStatus::Running), row("bridge", Some("ada"), InfraNodeStatus::Stopped)],
             starting: vec![("queue".into(), None), ("bridge".into(), Some(InstanceId::new("bob").unwrap()))],
+            start_asked_unix: [(("queue".to_string(), None), 100), (("bridge".to_string(), Some(InstanceId::new("bob").unwrap())), 110)]
+                .into(),
+            as_of_unix: 130,
         };
-        let (infra, instances) = infra_entries(&project, &copies);
+        let (infra, instance_entries) = infra_entries(&project, &copies);
         let listed: Vec<(&str, &str, Option<usize>)> =
             infra.iter().map(|e| (e.node.as_str(), e.status.as_str(), e.instance_copy_count)).collect();
         assert_eq!(
@@ -5314,8 +5317,16 @@ mod infra_entries_tests {
             ]
         );
         let instances: Vec<(&str, &str, &str)> =
-            instances.iter().map(|c| (c.node.as_str(), c.instance.as_str(), c.status.as_str())).collect();
+            instance_entries.iter().map(|c| (c.node.as_str(), c.instance.as_str(), c.status.as_str())).collect();
         assert_eq!(instances, [("bridge", "ada", "stopped"), ("bridge", "bob", "provisioning")]);
+        // A copy being started counts from its request, row or no row, as
+        // of the clock the copies were read on.
+        let since = |progress: Option<&weft_core::infra::wire::ApplyProgress>| progress.map(|p| (p.since_unix, p.as_of_unix));
+        let shared = |node: &str| infra.iter().find(|e| e.node == node).unwrap().progress.as_ref();
+        assert_eq!(since(shared("queue")), Some((100, 130)), "a shared copy with no row");
+        assert_eq!(since(shared("db")), None, "a running copy shows none");
+        let bob = instance_entries.iter().find(|e| e.instance.as_str() == "bob").unwrap();
+        assert_eq!(since(bob.progress.as_ref()), Some((110, 130)), "an instance's copy with no row");
     }
 
     /// A program with no infra node lists none, which is the one case the
