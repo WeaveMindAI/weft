@@ -1487,7 +1487,8 @@ pub(crate) async fn live_endpoint_url(
 
 /// Every copy as `weft status` and a program's `ctx.infra(..).status()`
 /// show it (`infra_node::observe`): a start or a stop under way reads as
-/// such before the supervisor reaches the copy.
+/// such before the supervisor reaches the copy, and a start counts its
+/// progress from when it was asked for.
 async fn read_infra_entries(
     state: &DispatcherState,
     project_id: uuid::Uuid,
@@ -1501,23 +1502,38 @@ async fn read_infra_entries(
     let copies = infra_node::observe(&state.pg_pool, project_id, &project)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("infra copies: {e:#}")))?;
-    let mut entries: Vec<InfraStatusEntry> =
-        copies.rows.into_iter().map(|row| row_to_entry(row, state.external_base_url())).collect();
-    entries.extend(copies.starting.into_iter().map(|(node, instance)| InfraStatusEntry {
-        node,
-        instance,
-        status: infra_node::InfraNodeStatus::Provisioning.as_str().to_string(),
-        endpoint_url: None,
-        public_urls: Default::default(),
-        failure_stage: None,
-        failure_message: None,
-        notes: Vec::new(),
-        progress: None,
-    }));
-    Ok(entries)
+    let starting: Vec<InfraStatusEntry> = copies
+        .starting
+        .iter()
+        .map(|(node, instance)| InfraStatusEntry {
+            node: node.clone(),
+            instance: instance.clone(),
+            status: infra_node::InfraNodeStatus::Provisioning.as_str().to_string(),
+            endpoint_url: None,
+            public_urls: Default::default(),
+            failure_stage: None,
+            failure_message: None,
+            notes: Vec::new(),
+            progress: copies.progress_of(node, instance.as_ref()),
+        })
+        .collect();
+    let progress: Vec<_> = copies.rows.iter().map(|row| copies.progress_of(&row.node_id, row.instance.as_ref())).collect();
+    Ok(copies
+        .rows
+        .into_iter()
+        .zip(progress)
+        .map(|(row, progress)| row_to_entry(row, progress, state.external_base_url()))
+        .chain(starting)
+        .collect())
 }
 
-fn row_to_entry(row: InfraNodeRow, front_door: &str) -> InfraStatusEntry {
+/// One row as an entry, with the progress [`infra_node::ObservedCopies::progress_of`]
+/// gives its copy.
+fn row_to_entry(
+    row: InfraNodeRow,
+    progress: Option<weft_core::infra::wire::ApplyProgress>,
+    front_door: &str,
+) -> InfraStatusEntry {
     InfraStatusEntry {
         public_urls: row
             .public_paths
@@ -1534,18 +1550,8 @@ fn row_to_entry(row: InfraNodeRow, front_door: &str) -> InfraStatusEntry {
         failure_stage: row.failure_stage.map(|f| f.as_str().to_string()),
         failure_message: row.failure_message,
         notes: row.notes,
-        progress: provisioning_progress(row.status, row.provisioning_since_unix, row.waiting),
+        progress,
     }
-}
-
-/// The progress a row records, shown only while it provisions: the
-/// columns hold the last apply's until the next one rewrites them.
-pub(crate) fn provisioning_progress(
-    status: InfraNodeStatus,
-    since_unix: Option<i64>,
-    waiting: Option<String>,
-) -> Option<weft_core::infra::wire::ApplyProgress> {
-    (status == InfraNodeStatus::Provisioning).then(|| weft_core::infra::wire::ApplyProgress::of(since_unix, waiting)).flatten()
 }
 
 /// Enqueue a lifecycle command for `project_id`, under its tenant. The

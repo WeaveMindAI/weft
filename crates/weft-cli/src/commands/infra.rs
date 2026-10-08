@@ -624,9 +624,8 @@ async fn infra_status(ctx: &Ctx) -> Result<()> {
         eprintln!("warning: {note}");
     }
     // Printed apart from the copies: a start stuck this way has none yet.
-    let now = crate::progress::now_unix() as i64;
     for entry in &status.unanswered {
-        eprintln!("warning: {}", entry.describe(now));
+        eprintln!("warning: {}", entry.describe());
     }
     Ok(())
 }
@@ -644,15 +643,14 @@ async fn changing_now(client: &crate::client::DispatcherClient, project_id: &str
     };
     // A call of weft's own that keeps failing comes first: it is why
     // nothing below moves.
-    let now = crate::progress::now_unix() as i64;
-    let unanswered = status.unanswered.iter().map(|u| u.describe(now));
+    let unanswered = status.unanswered.iter().map(|u| u.describe());
     let copies = status.nodes.iter().filter_map(|n| {
         let node = match &n.instance {
             Some(instance) => format!("{} (instance {instance})", n.node),
             None => n.node.clone(),
         };
         if let Some(progress) = &n.progress {
-            return Some(format!("{node}: {} {}", n.status, progress.describe_now()));
+            return Some(format!("{node}: {} {}", n.status, progress.describe(progress.as_of_unix)));
         }
         let changing = matches!(
             InfraNodeStatus::parse(&n.status),
@@ -695,7 +693,7 @@ fn print_status(name: &str, id: &str, status: &InfraStatus) {
         let url = n.endpoint_url.as_deref().unwrap_or("(no endpoint)");
         println!("  {node} [{}] -> {url}", n.status);
         if let Some(progress) = &n.progress {
-            println!("    {}", progress.describe_now());
+            println!("    {}", progress.describe(progress.as_of_unix));
         }
         // A public endpoint's outside address: what to hand to whoever
         // calls in (the node declared only its own path).

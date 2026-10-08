@@ -471,7 +471,7 @@ the `instances` package of the standard catalog has a node for each step:
 
 | Node | What it does |
 |---|---|
-| `StartInstanceInfra` | Starts an instance's copy of an infra node, and fires once it runs |
+| `StartInstanceInfra` | Starts an instance's copy of an infra node, and fires once it runs (or, with `waitUntilRunning` off, once weft accepted the start) |
 | `StopInstanceInfra` | Stops it, keeping its disk |
 | `TerminateInstanceInfra` | Deletes it and its disk |
 | `InstanceInfraStatus` | Reads the state of an instance's copy |
@@ -488,8 +488,11 @@ the `instances` package of the standard catalog has a node for each step:
 
 If your backend should create instances, put `MintInstanceToken`,
 `StartInstanceInfra` and `ActivateInstanceTriggers` behind a gated route, in
-that order, and reply with the token before the copy comes up so the request
-does not wait minutes. If one of the instance's triggers reads a value with no
+that order. If you want the request to answer at once rather than wait
+minutes for the copy, turn `waitUntilRunning` off on `StartInstanceInfra` and
+reply with the token after it: the start is accepted by then, so a list read
+right after shows the copy as `provisioning`. A reply placed before the start
+leaves nothing for that list to show yet. If one of the instance's triggers reads a value with no
 fallback, activating it at creation is refused, so leave
 `ActivateInstanceTriggers` for a second call your website makes once the
 settings are saved. The same route can remove an instance with `WipeInstance`:

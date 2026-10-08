@@ -66,9 +66,12 @@ into that group through the group's inputs.
    be turned on the moment the instance is created.
 2. **An admin route** the frontend's server calls, gated by `ApiKeyAuth` on
    the `Route`'s `auth`, its key only in that server's environment. It
-   onboards a person: writes the row, `MintInstanceToken`, `Reply` with the
-   token so the request ends at once, then `StartInstanceInfra` if there is a
-   per-instance infra node, then `ActivateInstanceTriggers`. The same route
+   onboards a person: writes the row, `MintInstanceToken`, then, if there is
+   a per-instance infra node, `StartInstanceInfra` with `waitUntilRunning` off,
+   then `Reply` with the token so the request ends at once, then a second
+   `StartInstanceInfra` left on and `ActivateInstanceTriggers`. A `Reply`
+   before the start would leave the person's container out of a list read
+   right after it. The same route
    (or siblings on the same gate) lists a person's instances, mints a token
    for the one they open, and removes one with `WipeInstance`.
 3. **A settings page** where each person fills in what the program asks of

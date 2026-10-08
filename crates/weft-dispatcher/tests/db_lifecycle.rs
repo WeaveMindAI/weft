@@ -1325,6 +1325,68 @@ async fn copies_read_with_the_commands_under_way(pool: PgPool) {
     assert_eq!(copies.status_of("bridge", None), None, "no shared copy, nothing starting one");
 }
 
+/// A copy being started counts from when the start was asked for, before
+/// the supervisor writes any row: an instance's copy with no row yet, and
+/// one restarted over its stopped row (which holds no stamp of its own),
+/// both read as provisioning since their apply command was issued, on the
+/// database's clock.
+#[sqlx::test]
+async fn a_starting_copy_counts_from_its_request(pool: PgPool) {
+    use weft_broker::lifecycle_writes::{issue_command, IssuedCommand};
+    use weft_dispatcher::infra_lifecycle_command::InfraLifecycleVerb;
+    use weft_dispatcher::infra_node::observe;
+    let (_journal, projects) = setup(&pool).await;
+    let project = Uuid::new_v4();
+    seed_project(&projects, project, "bin-A").await;
+    sqlx::query("INSERT INTO infra_node (project_id, node_id, instance_id, copy_id, status) VALUES ($1, 'bridge', 'ada', 'inst', 'stopped')")
+        .bind(project)
+        .execute(&pool)
+        .await
+        .expect("seed ada's stopped copy");
+    let ada = InstanceId::new("ada").unwrap();
+    let bob = InstanceId::new("bob").unwrap();
+    let mut issued = Vec::new();
+    for (instance, asked_unix) in [(&ada, 1_000_i64), (&bob, 2_000)] {
+        let spec = json!({});
+        let apply = IssuedCommand {
+            tenant_id: TENANT,
+            project_id: project,
+            node_id: Some("bridge"),
+            copies: &weft_core::instance::Copies::Instance(instance.clone()),
+            verb: InfraLifecycleVerb::Apply,
+            spec_json: Some(&spec),
+            issued_by_replica: "worker-1",
+        };
+        let id = issue_command(&pool, &apply).await.unwrap().expect("the project row is there");
+        // Asked well in the past, so the count cannot pass by luck.
+        sqlx::query("UPDATE infra_lifecycle_command SET issued_at_unix = $2 WHERE id = $1")
+            .bind(id)
+            .bind(asked_unix)
+            .execute(&pool)
+            .await
+            .unwrap();
+        issued.push(asked_unix);
+    }
+
+    let copies = observe(&pool, project, &empty_project(project)).await.unwrap();
+    let (db_now,): (i64,) = sqlx::query_as("SELECT EXTRACT(EPOCH FROM NOW())::BIGINT").fetch_one(&pool).await.unwrap();
+    let restarted = copies.progress_of("bridge", Some(&ada)).expect("a restart over a stopped row shows progress");
+    assert_eq!(restarted.since_unix, issued[0]);
+    let fresh = copies.progress_of("bridge", Some(&bob)).expect("a start with no row yet shows progress");
+    assert_eq!(fresh.since_unix, issued[1]);
+    assert_eq!(fresh.waiting, None, "nothing has reported what it waits on yet");
+    assert!(fresh.as_of_unix <= db_now && fresh.as_of_unix > issued[1], "read on the database's clock: {}", fresh.as_of_unix);
+
+    // Once the supervisor stamps the row later, the request still counts.
+    sqlx::query("UPDATE infra_node SET status = 'provisioning', provisioning_since_unix = 5000 WHERE project_id = $1")
+        .bind(project)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let copies = observe(&pool, project, &empty_project(project)).await.unwrap();
+    assert_eq!(copies.progress_of("bridge", Some(&ada)).map(|p| p.since_unix), Some(issued[0]), "the request came first");
+}
+
 /// What holds the program's own verbs back is infra work on the copies
 /// the bar starts and stops: an instance's copy coming up holds nothing
 /// back, the shared copies' work does, and so does the project going.

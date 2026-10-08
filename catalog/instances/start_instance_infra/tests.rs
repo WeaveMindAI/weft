@@ -2,8 +2,9 @@
 //! copy of that node and `done` waits for the copy to run, a copy that
 //! fails fails the node, a copy somebody stops (or that never came to be)
 //! while the node waits fails it instead of being started again, a start
-//! refused for a passing reason is asked again, and a blank instance is
-//! refused before anything is asked.
+//! refused for a passing reason is asked again, a node told not to wait
+//! finishes once the start is accepted without looking at the copy, and a
+//! blank instance is refused before anything is asked.
 
 use serde_json::json;
 
@@ -20,6 +21,8 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("a_copy_stopped_while_waiting_fails_the_node", stopped_while_waiting),
         NodeTest::fake("a_start_that_ends_without_a_copy_fails_the_node", no_copy),
         NodeTest::fake("a_start_refused_for_now_is_asked_again", refused_for_now),
+        NodeTest::fake("without_waiting_finishes_once_the_start_is_accepted", without_waiting),
+        NodeTest::fake("without_waiting_a_start_refused_for_now_is_asked_again", without_waiting_refused_for_now),
         NodeTest::fake("a_blank_instance_is_refused", blank_instance),
     ]
 }
@@ -97,6 +100,35 @@ async fn refused_for_now(rig: FakeRig) -> WeftResult<()> {
     let outcome = rig.run(&StartInstanceInfraNode, json!({ "node": "bridge", "instance": "user-42" })).await.ok()?;
     let starts = rig.program_calls().iter().filter(|(call, _)| matches!(call, ProgramCall::InfraStart { .. })).count();
     assert_eq!(starts, 2, "asked again after the wait");
+    assert_eq!(rig.awaited_signals().len(), 1);
+    assert_eq!(outcome.outputs["done"], json!(true));
+    Ok(())
+}
+
+async fn without_waiting(rig: FakeRig) -> WeftResult<()> {
+    let outcome = rig
+        .run(&StartInstanceInfraNode, json!({ "node": "bridge", "instance": "user-42", "waitUntilRunning": false }))
+        .await
+        .ok()?;
+    let calls = rig.program_calls();
+    assert_eq!(calls.len(), 1, "the start only, no look at the copy: {calls:?}");
+    assert!(matches!(&calls[0], (ProgramCall::InfraStart { .. }, StopSelf::Keep)), "{calls:?}");
+    assert!(rig.awaited_signals().is_empty());
+    assert_eq!(outcome.outputs["done"], json!(true));
+    Ok(())
+}
+
+async fn without_waiting_refused_for_now(rig: FakeRig) -> WeftResult<()> {
+    rig.answer_program_call("weft.infra.start", json!({ "answer": "waiting", "reason": "project is building" }));
+    rig.answer_program_call("weft.infra.start", json!({ "answer": "already_starting" }));
+    rig.signal(json!({}));
+    let outcome = rig
+        .run(&StartInstanceInfraNode, json!({ "node": "bridge", "instance": "user-42", "waitUntilRunning": false }))
+        .await
+        .ok()?;
+    let calls = rig.program_calls();
+    assert_eq!(calls.len(), 2, "asked again after the wait, then done without a look: {calls:?}");
+    assert!(calls.iter().all(|(call, _)| matches!(call, ProgramCall::InfraStart { .. })), "{calls:?}");
     assert_eq!(rig.awaited_signals().len(), 1);
     assert_eq!(outcome.outputs["done"], json!(true));
     Ok(())

@@ -154,11 +154,20 @@ fn hand_over(ctx: &Ctx, project: &str, install_url: &str, f: &Frontend, token: O
         if let Some(url) = &f.url {
             println!("visitors reach it at {url}");
         }
+        let project = ctx.project()?;
         println!(
             "next, in {}: {} hands its deploy workflow the service and a token",
             repo.name,
-            super::target::export_command(ctx.project()?, ctx.on())
+            super::target::export_command(project, ctx.on())
         );
+        if !project.root.join(super::target::FRONT_ENV_FILE).is_file() {
+            println!(
+                "if the frontend needs settings of its own (its database address, a sign-in secret), write them to \
+                 {} and add `--front-env {}`",
+                super::target::FRONT_ENV_FILE,
+                super::target::FRONT_ENV_FILE
+            );
+        }
         return Ok(());
     }
     // A frontend running elsewhere reaches the install at its public

@@ -189,7 +189,8 @@ pub struct WaitingFires {
 /// What `ProgramCall::InfraStart` answers: a start queued, one already
 /// under way or done, or none yet for a passing reason (a build in
 /// progress, a trigger of the copy mid-activation), which
-/// `ctx.infra(..).start()` asks again at its next look.
+/// `ctx.infra(..).start()` and `.request_start()` ask again at their next
+/// look.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "answer", rename_all = "snake_case")]
 pub enum InfraStartAnswer {
@@ -200,8 +201,9 @@ pub enum InfraStartAnswer {
 }
 
 impl InfraStartAnswer {
-    /// Whether a start is under way: every answer but `Waiting`.
-    pub fn queued(&self) -> bool {
+    /// Whether weft accepted the start (it is under way or done): every
+    /// answer but `Waiting`.
+    pub fn accepted(&self) -> bool {
         !matches!(self, InfraStartAnswer::Waiting { .. })
     }
 }

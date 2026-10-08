@@ -176,7 +176,7 @@ pub async fn run(ctx: Ctx) -> Result<()> {
                 st => {
                     println!("    {node}: {st} ({})", entry.endpoint_url.as_deref().unwrap_or("-"));
                     if let Some(progress) = &entry.progress {
-                        println!("      {}", progress.describe_now());
+                        println!("      {}", progress.describe(progress.as_of_unix));
                     }
                 }
             }
@@ -210,7 +210,7 @@ pub async fn run(ctx: Ctx) -> Result<()> {
         for entry in &data.instance_infra {
             println!("    {} (instance {}): {}", entry.node, entry.instance, entry.status);
             if let Some(progress) = &entry.progress {
-                println!("      {}", progress.describe_now());
+                println!("      {}", progress.describe(progress.as_of_unix));
             }
         }
     }
@@ -237,9 +237,8 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     // not move.
     if !data.unanswered.is_empty() {
         println!("  waiting on weft:");
-        let now = crate::progress::now_unix() as i64;
         for entry in &data.unanswered {
-            println!("    {}", entry.describe(now));
+            println!("    {}", entry.describe());
         }
     }
     // What each trigger started lately: the one trace a run kept

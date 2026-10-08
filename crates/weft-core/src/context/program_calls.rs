@@ -146,7 +146,8 @@ impl InfraCalls<'_> {
     }
 
     /// Bring the copy up, and return once it answers, so what comes
-    /// next (activating the triggers that read it, say) can use it.
+    /// next (activating the triggers that read it, say) can use it: a
+    /// [`Self::request_start`], then a wait for the copy to run.
     /// Starting a copy that runs, or is already starting, does not start
     /// it twice. A copy that fails to come up fails this call with the
     /// reason, and so does one somebody stops (or terminates) while this
@@ -158,25 +159,12 @@ impl InfraCalls<'_> {
     /// next to their infra never waits on the run that asked for it.
     pub async fn start(self) -> WeftResult<()> {
         let instance = instance_id(&self.instance)?;
+        self.ask_until_accepted(&instance).await?;
         let node = self.node;
-        let start = || ProgramCall::InfraStart { node: node.clone(), instance: instance.clone() };
-        // Until a start is queued (one refused for a passing reason, a
-        // build in progress or a trigger of the copy mid-activation, is
-        // asked again at each look), what the copy reads is no answer to
-        // this start.
-        let mut queued = false;
         loop {
-            if !queued {
-                let answer: InfraStartAnswer = self.ctx.program_call(start(), StopSelf::Keep).await?;
-                queued = answer.queued();
-                if !queued {
-                    self.ctx.await_signal(START_LOOK_AGAIN).await?;
-                    continue;
-                }
-            }
-            // A queued start reads `provisioning` from the moment the call
-            // above answered (the runtime counts the start under way, not
-            // only what the copy's row says), so every other answer is
+            // An accepted start reads `provisioning` from the moment the
+            // runtime accepted it (the runtime counts the start under way,
+            // not only what the copy's row says), so every other answer is
             // where the copy really stands.
             let status = ProgramCall::InfraStatus { node: node.clone(), instance: instance.clone() };
             let copy: Option<InfraCopy> = self.ctx.program_call(status, StopSelf::Keep).await?;
@@ -200,6 +188,34 @@ impl InfraCalls<'_> {
                     )));
                 }
                 Some(InfraNodeStatus::Provisioning | InfraNodeStatus::Flaky) => {}
+            }
+            self.ctx.await_signal(START_LOOK_AGAIN).await?;
+        }
+    }
+
+    /// Ask for the copy to come up, and return once weft accepted the
+    /// start, without waiting for the copy to run. From then on a status
+    /// read ([`Self::status`], [`Self::copies`]) shows the copy as
+    /// `provisioning`, so a program answering a caller fast (a route
+    /// replying 202) replies after this and the caller's next read finds
+    /// the copy. A start refused for a passing reason (a build in
+    /// progress, a trigger of the copy mid-activation) is asked again
+    /// every few seconds until it is accepted; a copy already running or
+    /// starting is not started twice. Whether the copy then comes up is
+    /// for a later `status` read to tell: nothing here waits for it.
+    pub async fn request_start(self) -> WeftResult<()> {
+        let instance = instance_id(&self.instance)?;
+        self.ask_until_accepted(&instance).await
+    }
+
+    /// Ask for the start until weft accepts it, parking on a timer
+    /// between refusals for a passing reason.
+    async fn ask_until_accepted(&self, instance: &Option<InstanceId>) -> WeftResult<()> {
+        loop {
+            let call = ProgramCall::InfraStart { node: self.node.clone(), instance: instance.clone() };
+            let answer: InfraStartAnswer = self.ctx.program_call(call, StopSelf::Keep).await?;
+            if answer.accepted() {
+                return Ok(());
             }
             self.ctx.await_signal(START_LOOK_AGAIN).await?;
         }
