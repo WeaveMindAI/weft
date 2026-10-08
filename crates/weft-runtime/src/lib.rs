@@ -137,7 +137,10 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
     let parts = platform::build(&config, pool.as_ref().map(|(_, p)| p)).await?;
     // A writer that is up wakes the roles at zero its writes concern.
     let waker = match writes {
-        true => role_waker::RoleWaker::new(&config, &addresses, parts.tokens.clone())?.map(Arc::new),
+        true => {
+            let (_, pool) = pool.as_ref().expect("a process that writes holds the database");
+            role_waker::RoleWaker::new(&config, &addresses, parts.tokens.clone(), pool.clone())?.map(Arc::new)
+        }
         false => None,
     };
 

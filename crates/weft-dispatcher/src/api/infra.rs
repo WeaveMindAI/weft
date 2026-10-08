@@ -197,6 +197,7 @@ pub(super) async fn sync_inner(
     finish_sync(&state, id, begun).await?;
     Ok(Json(InfraStatus {
         nodes: read_infra_entries(&state, id).await?,
+        unanswered: crate::api::project::unanswered_for(&state, id).await?,
     }))
 }
 
@@ -1092,6 +1093,7 @@ pub async fn status(
     authorize_project(&state, &caller.0, id).await?;
     Ok(Json(InfraStatus {
         nodes: read_infra_entries(&state, id).await?,
+        unanswered: crate::api::project::unanswered_for(&state, id).await?,
     }))
 }
 

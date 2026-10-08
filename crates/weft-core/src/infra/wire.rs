@@ -291,6 +291,11 @@ pub struct PerNodeRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InfraStatus {
     pub nodes: Vec<InfraStatusEntry>,
+    /// weft's own calls this infra's work waits on that keep failing (a
+    /// supervisor that cannot be woken never starts it). Empty when every
+    /// one goes through.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unanswered: Vec<crate::projects::Unanswered>,
 }
 
 impl InfraStatus {

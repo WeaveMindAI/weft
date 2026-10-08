@@ -54,7 +54,7 @@ export const fallback: RequestHandler = ({ request, params }) => pass(request, p
 It passes on the instance door (`/instance/...`), the signal doors
 (`/signal/...`), the token's listings, displays and files
 (`/signal-token/...`), the program's own routes
-(`/connect/<tenant>/<path>`), the picture links in their answers
+(`/connect/<tenant>/<project id>/<path>`), the picture links in their answers
 (`/public/files/<token>`) and a field's file chooser
 (`/access/picker/<state>` and the result it posts back), and answers 404 for
 anything else. It carries the caller's `Authorization`, `Weft-Instance-Token`,

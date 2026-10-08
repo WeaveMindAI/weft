@@ -4,8 +4,8 @@
 #
 #   scripts/load-route.sh <url> [calls] [at-once] [method] [body]
 #
-#   scripts/load-route.sh http://127.0.0.1:14111/connect/local/load/ping 1000 50
-#   scripts/load-route.sh http://127.0.0.1:14111/connect/local/load/burn 200 20 POST '{"rounds":200000}'
+#   scripts/load-route.sh http://127.0.0.1:14111/connect/local/<project id>/load/ping 1000 50
+#   scripts/load-route.sh http://127.0.0.1:14111/connect/local/<project id>/load/burn 200 20 POST '{"rounds":200000}'
 #
 # Every call has a 30 second cap, and the whole run is capped at ten
 # minutes. A call that hit its cap shows as status 000. The calls are made

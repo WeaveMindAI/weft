@@ -15,6 +15,7 @@ use weft_core::access::events::EventsSpec;
 use weft_core::access::spec::{
     lookup_path, percent_encode, AccessSpec, Acquisition, AppRegistration, Door, OAuthGrant,
 };
+use weft_core::net::EmptyBody;
 use weft_core::node::Lookup;
 
 use crate::flows::{apply_captures, expires_at_of, token_request};
@@ -869,6 +870,7 @@ pub(crate) async fn mint_and_exchange(
         .post(&url)
         .bearer_auth(&jwt)
         .header(reqwest::header::ACCEPT, "application/json")
+        .empty_body()
         .send()
         .await
         .map_err(|e| {

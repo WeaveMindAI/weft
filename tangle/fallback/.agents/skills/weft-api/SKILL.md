@@ -21,18 +21,18 @@ storage, the only way bytes travel a wire.
 
 ## The URL is known before anything runs
 
-A [route] answers at `<install>/connect/local/<path>`, and every part of that address is fixed by the install before the route is ever activated. On this machine the install
+A [route] answers at `<install>/connect/local/<project id>/<path>`, and every part of that address is fixed before the route is ever activated: the install, and the project id, which is the `id` under `[package]` in the project's `weft.toml` (the same on every install, so two projects can serve the same path). On this machine the install
 is `http://127.0.0.1:14111`, so `hello = Route { path: "hello" }` answers at
-`http://127.0.0.1:14111/connect/local/hello`, and a socket at the same
+`http://127.0.0.1:14111/connect/local/<project id>/hello`, and a socket at the same
 address with `ws://`. On a cloud install it is the target's `url` in
-`weft.toml` (`https://weft-role-dispatcher-123456789.us-central1.run.app/connect/local/hello`,
+`weft.toml` (`https://weft-role-dispatcher-123456789.us-central1.run.app/connect/local/<project id>/hello`,
 and `wss://`). You write those URLs into the frontend-builder's
 [the brief] the moment the routes are shaped, while the graph is still being
 built; `weft activate` only turns them on.
 
-Each project also has an address of its own where the program answers its routes at the root with nothing of weft's in between, which is the fastest way in: on this machine a free port it gets the first time it is activated (14200 or above) and keeps, moving to another free one if a program took it (`http://127.0.0.1:14200/hello`; `weft activate --port <n>` opens a chosen one and keeps it; if another program or project holds it, the command fails and nothing is activated), on a cloud install the project's own Cloud Run address. `weft activate` prints it and `weft status` shows it, or says why it is unavailable. While a route's trigger is parked or still coming on, a call is answered `503` with `Retry-After: 5`, so tell the frontend to retry on a 503; once the project is switched off (wiped), its own port is closed and `/connect/local/<path>` answers 404. When you brief a frontend, give it the `/connect/local/` address: it has the same shape on every install, so the frontend's code runs unchanged on a cloud.
+Each project also has an address of its own where the program answers its routes at the root with nothing of weft's in between, which is the fastest way in: on this machine a free port it gets the first time it is activated (14200 or above) and keeps, moving to another free one if a program took it (`http://127.0.0.1:14200/hello`; `weft activate --port <n>` opens a chosen one and keeps it; if another program or project holds it, the command fails and nothing is activated), on a cloud install the project's own Cloud Run address. `weft activate` prints it and `weft status` shows it, or says why it is unavailable. While a route's trigger is parked or still coming on, a call is answered `503` with `Retry-After: 5`, so tell the frontend to retry on a 503; once the project is switched off (wiped), its own port is closed and `/connect/local/<project id>/<path>` answers 404. When you brief a frontend, give it the `/connect/local/<project id>/` address: it has the same shape on every install, so the frontend's code runs unchanged on a cloud.
 
-Both local addresses, the project's own port and `127.0.0.1:14111`, answer only on this machine. When the install has a public address (a tunnel), `weft daemon status` prints it, and each route answers there at `<public address>/connect/local/<path>`, reaching the same program. A frontend that runs
+Both local addresses, the project's own port and `127.0.0.1:14111`, answer only on this machine. When the install has a public address (a tunnel), `weft daemon status` prints it, and each route answers there at `<public address>/connect/local/<project id>/<path>`, reaching the same program. A frontend that runs
 anywhere else (a hosted site, a phone, a browser on another machine) uses the
 public one; a server on this same machine may use either.
 
@@ -41,7 +41,7 @@ If the user wants one and has agreed to its price, the deployer runs `weft
 domain add api.shop.com --for api --on prod` (with `--accept-cost` for the
 install's first domain), which serves the project's routes at the root of that domain,
 so `hello` answers at `https://api.shop.com/hello` as well as at its
-`/connect/local/` address. A domain costs money, because it needs a load balancer, so
+`/connect/local/<project id>/` address. A domain costs money, because it needs a load balancer, so
 design for the free address and offer a domain only when the user wants a
 name people see; read weft-deploying before you offer one.
 

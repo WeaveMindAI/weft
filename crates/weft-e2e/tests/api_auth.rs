@@ -125,52 +125,35 @@ async fn api_keys_and_a_signing_secret_gate_their_routes() -> anyhow::Result<()>
     secret.finish().await
 }
 
-/// Two PROJECTS of one account claiming one address. Each file is fine
-/// on its own, so the compiler cannot see this pair; only the
-/// dispatcher, which holds every project's claims in one table, can.
-/// The second activation is refused naming the overlap, before any
-/// route of it is armed, and the first keeps serving.
+/// Two PROJECTS of one account serving the same path. Each project's
+/// routes sit under its own id on the install's shared address, so both
+/// activate and each call reaches the project its address names.
 ///
-/// The half inside ONE file is answered earlier, by the compiler
+/// Two routes of ONE file colliding is answered earlier, by the compiler
 /// (`route-overlap`), so a program that collides with itself never gets
 /// this far.
 #[tokio::test]
-async fn overlapping_routes_are_refused_at_activation() -> anyhow::Result<()> {
+async fn two_projects_serve_the_same_path_each_at_its_own_address() -> anyhow::Result<()> {
     let disp = ensure::up().await?;
     let mut first = Project::prepare("api_overlap", disp.clone()).await?;
     // The bare path is what goes in the file; the callable one carries
-    // the tenant the dispatcher serves it under, and is what a caller
-    // dials.
+    // the tenant and project the dispatcher serves it under, and is what
+    // a caller dials.
     let path = first.bare_live_path();
-    let base = first.mount_at(&path)?;
+    let first_base = first.mount_at(&path)?;
     first.activate().await?;
 
-    // The first project's route answers before the collision, so a
-    // failure after it cannot be blamed on the route never having
-    // worked.
-    let call = format!("{base}/chat/anything");
-    let (status, _, _) =
-        live::http_json(&disp, Method::POST, &call, &[], &serde_json::json!({})).await?;
-    anyhow::ensure!(status.is_success(), "the first project serves its route: {status}");
-
-    // The same address, from a second project of the same account.
+    // The same path, from a second project of the same account.
     let mut second = Project::prepare("api_overlap", disp.clone()).await?;
-    second.mount_at(&path)?;
-    let out = second.activate_refused().await?;
-    anyhow::ensure!(
-        out.contains("neither is the more specific"),
-        "the refusal says why the pair cannot stand: {out}"
-    );
+    let second_base = second.mount_at(&path)?;
+    second.activate().await?;
+    anyhow::ensure!(first_base != second_base, "each project is called at its own address");
 
-    // The half the comment used to promise and never checked: a refused
-    // activation must not have armed anything, so the project that was
-    // already there keeps answering exactly as before.
-    let (status, _, _) =
-        live::http_json(&disp, Method::POST, &call, &[], &serde_json::json!({})).await?;
-    anyhow::ensure!(
-        status.is_success(),
-        "the refused second activation left the first project serving: {status}"
-    );
+    for (base, project) in [(&first_base, &first), (&second_base, &second)] {
+        let call = format!("{base}/chat/anything");
+        let (status, _, _) = live::http_json(&disp, Method::POST, &call, &[], &serde_json::json!({})).await?;
+        anyhow::ensure!(status.is_success(), "{} serves its route at {call}: {status}", project.id());
+    }
 
     second.finish().await?;
     first.finish().await

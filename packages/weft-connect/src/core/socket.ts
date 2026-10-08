@@ -25,7 +25,7 @@ export const CONVERSATION_OVER = 4000;
 export const SETTLED_MS = 10_000;
 
 export interface LiveSocketOptions {
-	/** The route's address, `http(s)://.../connect/<tenant>/<path>`. */
+	/** The route's address, `http(s)://.../connect/<tenant>/<project id>/<path>`. */
 	url: string;
 	/** The conversation this is, kept across reconnects. A fresh one is
 	 *  made when absent; pass a stored one to resume a conversation after

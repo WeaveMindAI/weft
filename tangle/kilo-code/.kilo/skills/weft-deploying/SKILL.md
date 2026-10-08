@@ -49,7 +49,7 @@ shows every domain and its record.
 A domain can serve one project instead of the whole install: `--for api`
 serves that project's routes at the root of the domain
 (`https://api.shop.com/users/42`, on top of
-`<install address>/connect/local/users/42`), and `--for frontend --to <its
+`<install address>/connect/local/<project id>/users/42`), and `--for frontend --to <its
 https address>` passes the domain on to the project's frontend (`weft
 frontend ls --on prod` shows that address).
 
@@ -213,8 +213,9 @@ Activate never starts infrastructure. On a first deploy of a program with
 infra (a database, a bridge), run `weft infra start --on prod` first (step 6
 above, which builds the program too): if a trigger reads infra that is not
 running, activate refuses with "these triggers' infra is not running:
-<node>". On GCP each piece boots a machine, so it takes a few minutes;
-`weft status --on prod` shows each one's state.
+<node>", and while it is still starting, with "this program's infra is
+changing (infra provisioning)". On GCP each piece boots a machine, so it
+takes a few minutes; `weft status --on prod` shows each one's state.
 
 `weft activate` is for a program that is off. Once its triggers are on, it
 refuses, and a change goes live with `weft resync --on prod --mode <mode>`,

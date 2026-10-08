@@ -9,8 +9,9 @@ terraform {
   required_providers {
     google = {
       source = "hashicorp/google"
-      # Cloud Run worker pools (the holders) arrived in 7.
-      version = "~> 7.12"
+      # Cloud Run worker pools (the holders) arrived in 7, and
+      # `google_workload_identity_service_agent` (machines.tf) in 7.28.
+      version = "~> 7.28"
     }
     random = {
       source  = "hashicorp/random"
@@ -48,6 +49,8 @@ resource "google_project_service" "apis" {
     "run.googleapis.com",
     "secretmanager.googleapis.com",
     "storage.googleapis.com",
+    # making Cloud Logging's service agent up front (machines.tf)
+    "workloadidentity.googleapis.com",
   ])
   service            = each.value
   disable_on_destroy = false

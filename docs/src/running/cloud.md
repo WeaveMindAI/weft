@@ -262,7 +262,7 @@ every domain with its record.
 A domain can also serve one project instead of the whole install:
 `--for api` answers that project's routes at the root of the domain
 (`https://api.example.com/users/42`, as well as
-`https://<the install's address>/connect/local/users/42`), sending its calls
+`https://<the install's address>/connect/local/<project id>/users/42`), sending its calls
 straight to the project's own Cloud Run service, and
 `--for frontend --to <address>` passes visitors on to the project's
 frontend on Cloud Run, at the address `weft frontend ls --on prod` shows for
@@ -474,9 +474,11 @@ frontend builds differently, edit the workflow's "build the frontend" step.
 
 ## Routes on the internet
 
-A `Route` answers at `https://<the install's address>/connect/local/<path>`,
-where `<path>` is the route's `path`. The `local` in that path is the same on every install, prod included, so a
-route's address on prod differs from your machine's only in the host. The
+A `Route` answers at `https://<the install's address>/connect/local/<project id>/<path>`,
+where `<project id>` is the `id` under `[package]` in your `weft.toml` and
+`<path>` is the route's `path`. The `local` and the project id are the same on
+every install, prod included, so a route's address on prod differs from your
+machine's only in the host. The
 project also answers at its own Cloud Run address (`weft status --on prod`
 shows it), where the call reaches your program with nothing of weft's in
 between: give that one, or a `--for api` domain, to a client that cares how

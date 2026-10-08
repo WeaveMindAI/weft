@@ -1906,7 +1906,7 @@ async fn the_held_rows_announce_their_changes(pool: PgPool) {
     assert!(!heard_on(&mut heard, ROUTES_CHANNEL, TENANT).await, "a signal that is no public entry is silent");
     let route = SignalRegistration {
         surface_kind: "public_entry".into(),
-        mount_path: Some(format!("/{TENANT}/notes")),
+        mount_path: Some(format!("/{TENANT}/{id}/notes")),
         ..entry_at("route", id)
     };
     journal.signal_insert(&route).await.unwrap();

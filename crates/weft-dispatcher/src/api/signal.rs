@@ -1045,21 +1045,20 @@ async fn public_entry_target(
                 .to_string(),
         )
     };
-    // The stored address is `/<tenant>/<pattern>`, and a pattern is not
+    // The stored address is `/<tenant>/<project>/<pattern>`, and a pattern is not
     // a string to compare: `cards/{id}` has to be MATCHED against
     // `cards/7`. This used to be an equality lookup, so a registered
     // address holding a capture could never be reached through here at
     // all, whatever was called.
-    let (tenant, called) = split_tenant(&normalized).map_err(|_| refuse())?;
+    let (mount, called) = weft_core::route::SharedMount::split(&normalized).ok_or_else(refuse)?;
     // Matched against the held routes, and against the rows themselves
     // before refusing: a route activated a moment ago may not have been
     // heard yet.
-    let rows_of = |routes: &[HeldRoute]| -> Vec<RouteRow> { routes.iter().map(|route| route.row.clone()).collect() };
-    let rows = match state.held.routes.held(&tenant.to_string()).map(|held| rows_of(&held)) {
-        Some(held) if resolve_route(&held, tenant, "POST", called).is_ok() => held,
-        _ => rows_of(&fresh_tenant_routes(state, tenant).await?),
+    let rows = match state.held.routes.held(&mount.tenant.to_string()).map(|held| rows_of(&held, mount.project)) {
+        Some(held) if resolve_route(&held, mount, "POST", called).is_ok() => held,
+        _ => rows_of(&fresh_tenant_routes(state, mount.tenant).await?, mount.project),
     };
-    let (matched, params) = resolve_route(&rows, tenant, "POST", called).map_err(|_| refuse())?;
+    let (matched, params) = resolve_route(&rows, mount, "POST", called).map_err(|_| refuse())?;
     // An address with a capture in it is a live route's shape, and a
     // live route is served (and gated, and answered) at `/connect`.
     // Reached here it would fire the program with the capture thrown
@@ -1088,7 +1087,12 @@ async fn public_entry_target(
     Ok((token, routing, payload))
 }
 
-/// One public-entry row of the tenant, as the route matcher sees it.
+/// The rows of `project` among a tenant's held routes.
+fn rows_of(routes: &[HeldRoute], project: uuid::Uuid) -> Vec<RouteRow> {
+    routes.iter().filter(|route| route.project_id == project).map(|route| route.row.clone()).collect()
+}
+
+/// One public-entry row of a project, as the route matcher sees it.
 #[derive(Debug, Clone)]
 pub(crate) struct RouteRow {
     pub mount_path: String,
@@ -1099,20 +1103,20 @@ pub(crate) struct RouteRow {
 /// The route a call resolved to: its row and the path's captures.
 pub(crate) type ResolvedRoute<'r> = (&'r RouteRow, std::collections::BTreeMap<String, String>);
 
-/// Pick the row serving `method` on `path` among the tenant's public
-/// entries, or the HTTP answer when none does: `404` for an unknown
-/// path, `405` naming the allowed methods for a known path called with
-/// the wrong verb. Pure over the rows (the SQL only narrows to the
-/// tenant); a stored pattern that no longer parses is skipped, loud in
-/// the log (its own register validated it, so this is corruption).
+/// Pick the row serving `method` on `path` among one project's public
+/// entries (`rows`, all under `mount`), or the HTTP answer when none does:
+/// `404` for an unknown path, `405` naming the allowed methods for a known
+/// path called with the wrong verb. Pure over the rows; a stored pattern
+/// that no longer parses is skipped, loud in the log (its own register
+/// validated it, so this is corruption).
 pub(crate) fn resolve_route<'r>(
     rows: &'r [RouteRow],
-    tenant: &str,
+    mount: weft_core::route::SharedMount<'_>,
     method: &str,
     path: &str,
 ) -> Result<ResolvedRoute<'r>, (StatusCode, String)> {
     let candidates = rows.iter().filter_map(|row| {
-        let pattern = weft_core::route::pattern_of_mount_path(&row.mount_path, tenant);
+        let pattern = mount.pattern_of(&row.mount_path);
         match weft_core::route::RoutePattern::parse(&pattern) {
             Ok(pattern) => Some((
                 weft_core::route::RouteKey { pattern, methods: row.mount_methods.clone() },
@@ -1140,36 +1144,22 @@ pub(crate) fn resolve_route<'r>(
     }
 }
 
-/// Split the called `/connect/{*path}` into the tenant segment and the
-/// path under the project (no leading slash). The tenant is always the
-/// first segment; a call with none is not a route anyone registered.
-pub(crate) fn split_tenant(called: &str) -> Result<(&str, &str), (StatusCode, String)> {
-    let called = called.trim_start_matches('/');
-    let (tenant, rest) = match called.split_once('/') {
-        Some((t, r)) => (t, r),
-        None => (called, ""),
-    };
-    if tenant.is_empty() {
-        return Err((StatusCode::NOT_FOUND, "no live endpoint at this path".into()));
-    }
-    Ok((tenant, rest))
-}
-
 // ----- Live callers at a shared address -----------------------------
 
 /// Set by the install's door on a request that came for one project's API
-/// domain: the relay then matches only that project's routes. The door
-/// drops any copy a caller sent; one that reaches the relay some other way
-/// can only narrow what matches.
+/// domain, naming that project: the call sits at the domain's root, so the
+/// worker is told no prefix. The door drops any copy a caller sent; one
+/// that reaches the relay some other way must name the project the path
+/// names, or nothing matches.
 // SYNC: API_PROJECT_HEADER <-> crates/weft-dispatcher/src/door.rs (route)
 pub const API_PROJECT_HEADER: &str = "x-weft-api-project";
 
 /// `ANY /connect/{*path}`: a live call at an address the install shares
-/// between its projects. The tenant's routes (pattern + method) pick the
-/// project and the program serving the route, and the call is passed on to
-/// that project's workers as the caller sent it (`live_relay`), whose door
-/// runs every check. A path no route serves is answered here, so a stray
-/// call wakes no worker.
+/// between its projects, `/connect/<tenant>/<project id>/<path>`. The
+/// project's routes (pattern + method) pick the program serving the route,
+/// and the call is passed on to that project's workers as the caller sent
+/// it (`live_relay`), whose door runs every check. A path no route serves
+/// is answered here, so a stray call wakes no worker.
 pub async fn connect_live(
     State(state): State<DispatcherState>,
     address: crate::api::CallerAddress,
@@ -1177,31 +1167,36 @@ pub async fn connect_live(
     RawQuery(raw_query): RawQuery,
     request: axum::extract::Request,
 ) -> Result<Response, (StatusCode, String)> {
-    let (tenant_segment, path) = split_tenant(&called_path)?;
-    let (tenant_segment, path) = (tenant_segment.to_string(), path.to_string());
-    let only_project = match request.headers().get(API_PROJECT_HEADER) {
-        None => None,
-        Some(v) => Some(
-            v.to_str()
+    let no_endpoint = || (StatusCode::NOT_FOUND, "no live endpoint at this path".to_string());
+    let (mount, path) = weft_core::route::SharedMount::split(&called_path).ok_or_else(no_endpoint)?;
+    let by_domain = match request.headers().get(API_PROJECT_HEADER) {
+        None => false,
+        Some(v) => {
+            let named = v
+                .to_str()
                 .ok()
                 .and_then(|v| v.parse::<uuid::Uuid>().ok())
-                .ok_or((StatusCode::BAD_REQUEST, format!("{API_PROJECT_HEADER} is not a project id")))?,
-        ),
+                .ok_or((StatusCode::BAD_REQUEST, format!("{API_PROJECT_HEADER} is not a project id")))?;
+            if named != mount.project {
+                return Err(no_endpoint());
+            }
+            true
+        }
     };
-    let (project_id, binary_hash) = relayed_route(&state, &tenant_segment, only_project, request.method().as_str(), &path).await?;
+    let binary_hash = relayed_route(&state, mount, request.method().as_str(), path).await?;
     // The path as the caller sent it, still percent-encoded: the decoded
     // capture would turn an escaped `?`, `/` or `#` into a real one on the
     // way to the worker. A project's API domain serves its routes at its
-    // root; everything else sits under its tenant.
-    let mount = format!("/connect/{tenant_segment}");
+    // root; everything else sits under its tenant and project.
+    let shared = format!("/connect{}", mount.prefix());
     let raw_path = request
         .uri()
         .path()
-        .strip_prefix(&mount)
-        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, format!("a live call reached the relay at {}, outside {mount}", request.uri().path())))?;
+        .strip_prefix(&shared)
+        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, format!("a live call reached the relay at {}, outside {shared}", request.uri().path())))?;
     let raw_path = if raw_path.is_empty() { "/".to_string() } else { raw_path.to_string() };
-    let prefix = if only_project.is_some() { String::new() } else { mount };
-    Ok(crate::live_relay::to_project(&state, project_id, &binary_hash, address.0, &prefix, &raw_path, raw_query.as_deref().unwrap_or(""), request).await)
+    let prefix = if by_domain { String::new() } else { shared };
+    Ok(crate::live_relay::to_project(&state, mount.project, &binary_hash, address.0, &prefix, &raw_path, raw_query.as_deref().unwrap_or(""), request).await)
 }
 
 /// One public entry of a tenant as held in memory (`crate::held`): where
@@ -1212,42 +1207,38 @@ pub(crate) struct HeldRoute {
     binary_hash: String,
 }
 
-/// The project and the program serving `method` on `path` among
-/// `tenant`'s live routes (of `only_project`, when the call came by a
-/// project's API domain). Matched against the routes this dispatcher holds,
-/// and against the rows themselves before refusing: a route armed a moment
-/// ago may not have been heard yet.
+/// The program serving `method` on `path` among the live routes of the
+/// project `mount` names. Matched against the routes this dispatcher
+/// holds, and against the rows themselves before refusing: a route armed a
+/// moment ago may not have been heard yet.
 async fn relayed_route(
     state: &DispatcherState,
-    tenant: &str,
-    only_project: Option<uuid::Uuid>,
+    mount: weft_core::route::SharedMount<'_>,
     method: &str,
     path: &str,
-) -> Result<(uuid::Uuid, String), (StatusCode, String)> {
-    if let Some(held) = state.held.routes.held(&tenant.to_string()) {
-        if let Ok(found) = match_relayed(&held, tenant, only_project, method, path) {
+) -> Result<String, (StatusCode, String)> {
+    if let Some(held) = state.held.routes.held(&mount.tenant.to_string()) {
+        if let Ok(found) = match_relayed(&held, mount, method, path) {
             return Ok(found);
         }
     }
-    match_relayed(&fresh_tenant_routes(state, tenant).await?, tenant, only_project, method, path)
+    match_relayed(&fresh_tenant_routes(state, mount.tenant).await?, mount, method, path)
 }
 
 fn match_relayed(
     routes: &[HeldRoute],
-    tenant: &str,
-    only_project: Option<uuid::Uuid>,
+    mount: weft_core::route::SharedMount<'_>,
     method: &str,
     path: &str,
-) -> Result<(uuid::Uuid, String), (StatusCode, String)> {
-    let candidates: Vec<&HeldRoute> =
-        routes.iter().filter(|route| only_project.is_none_or(|only| route.project_id == only)).collect();
+) -> Result<String, (StatusCode, String)> {
+    let candidates: Vec<&HeldRoute> = routes.iter().filter(|route| route.project_id == mount.project).collect();
     let rows: Vec<RouteRow> = candidates.iter().map(|route| route.row.clone()).collect();
-    let (matched, _) = resolve_route(&rows, tenant, method, path)?;
+    let (matched, _) = resolve_route(&rows, mount, method, path)?;
     let route = candidates
         .iter()
         .find(|route| route.row.token == matched.token)
         .expect("the matched route is one of the rows it was matched among");
-    Ok((route.project_id, route.binary_hash.clone()))
+    Ok(route.binary_hash.clone())
 }
 
 /// Every public entry of `tenant` as the rows say now, kept for the next
@@ -1362,47 +1353,65 @@ mod route_lookup_tests {
         }
     }
 
-    #[test]
-    fn the_tenant_is_the_first_segment() {
-        assert_eq!(split_tenant("alice/chat/room7").unwrap(), ("alice", "chat/room7"));
-        assert_eq!(split_tenant("alice").unwrap(), ("alice", ""));
-        assert_eq!(split_tenant("/alice/").unwrap(), ("alice", ""));
-        assert_eq!(split_tenant("").unwrap_err().0, StatusCode::NOT_FOUND);
+    const P: uuid::Uuid = uuid::Uuid::from_u128(7);
+
+    fn mount() -> weft_core::route::SharedMount<'static> {
+        weft_core::route::SharedMount::new("alice", P)
+    }
+
+    /// A row of project `P` of tenant `alice`, at `rest` under it.
+    fn at(rest: &str, methods: &[&str], token: &str) -> RouteRow {
+        row(&mount().mount_path(rest), methods, token)
     }
 
     #[test]
     fn a_literal_route_beats_a_capture_and_params_come_back() {
-        let rows = vec![
-            row("/alice/users/{id}", &[], "by-id"),
-            row("/alice/users/me", &[], "me"),
-        ];
-        let (hit, params) = resolve_route(&rows, "alice", "GET", "users/me").unwrap();
+        let rows = vec![at("users/{id}", &[], "by-id"), at("users/me", &[], "me")];
+        let (hit, params) = resolve_route(&rows, mount(), "GET", "users/me").unwrap();
         assert_eq!(hit.token, "me");
         assert!(params.is_empty());
-        let (hit, params) = resolve_route(&rows, "alice", "GET", "users/42").unwrap();
+        let (hit, params) = resolve_route(&rows, mount(), "GET", "users/42").unwrap();
         assert_eq!(hit.token, "by-id");
         assert_eq!(params.get("id").map(String::as_str), Some("42"));
     }
 
     #[test]
     fn a_known_path_with_the_wrong_verb_is_405_naming_the_allowed_ones() {
-        let rows = vec![row("/alice/items", &["POST", "PUT"], "w"), row("/alice/items", &["DELETE"], "d")];
-        let err = resolve_route(&rows, "alice", "GET", "items").unwrap_err();
+        let rows = vec![at("items", &["POST", "PUT"], "w"), at("items", &["DELETE"], "d")];
+        let err = resolve_route(&rows, mount(), "GET", "items").unwrap_err();
         assert_eq!(err.0, StatusCode::METHOD_NOT_ALLOWED);
         assert!(err.1.contains("DELETE, POST, PUT"), "{}", err.1);
     }
 
     #[test]
     fn an_unknown_path_is_404_and_the_root_route_serves_the_empty_path() {
-        let rows = vec![row("/alice", &[], "root")];
-        assert_eq!(resolve_route(&rows, "alice", "GET", "nothing").unwrap_err().0, StatusCode::NOT_FOUND);
-        assert_eq!(resolve_route(&rows, "alice", "GET", "").unwrap().0.token, "root");
+        let rows = vec![at("", &[], "root")];
+        assert_eq!(resolve_route(&rows, mount(), "GET", "nothing").unwrap_err().0, StatusCode::NOT_FOUND);
+        assert_eq!(resolve_route(&rows, mount(), "GET", "").unwrap().0.token, "root");
     }
 
     #[test]
     fn a_corrupt_stored_pattern_is_skipped_not_fatal() {
-        let rows = vec![row("/alice/bad/{", &[], "bad"), row("/alice/good", &[], "good")];
-        assert_eq!(resolve_route(&rows, "alice", "GET", "good").unwrap().0.token, "good");
+        let rows = vec![at("bad/{", &[], "bad"), at("good", &[], "good")];
+        assert_eq!(resolve_route(&rows, mount(), "GET", "good").unwrap().0.token, "good");
+    }
+
+    /// Two projects serving the same path each answer at their own
+    /// address: the project the path names is the only one matched.
+    #[test]
+    fn a_call_reaches_only_the_project_its_address_names() {
+        let other = uuid::Uuid::from_u128(8);
+        let held = |project: uuid::Uuid, token: &str, binary: &str| HeldRoute {
+            project_id: project,
+            row: row(&weft_core::route::SharedMount::new("alice", project).mount_path("chat"), &[], token),
+            binary_hash: binary.into(),
+        };
+        let routes = vec![held(P, "mine", "bin-p"), held(other, "theirs", "bin-o")];
+        assert_eq!(match_relayed(&routes, mount(), "GET", "chat").unwrap(), "bin-p");
+        let theirs = weft_core::route::SharedMount::new("alice", other);
+        assert_eq!(match_relayed(&routes, theirs, "GET", "chat").unwrap(), "bin-o");
+        let nobody = weft_core::route::SharedMount::new("alice", uuid::Uuid::from_u128(9));
+        assert_eq!(match_relayed(&routes, nobody, "GET", "chat").unwrap_err().0, StatusCode::NOT_FOUND);
     }
 }
 

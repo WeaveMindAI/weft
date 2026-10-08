@@ -24,6 +24,20 @@ resource "google_logging_project_sink" "machine_events" {
     protoPayload.methodName=("compute.instances.preempted" OR "compute.instances.hostError" OR "compute.instances.guestTerminate" OR "compute.instances.automaticRestart" OR "v1.compute.instances.stop" OR "v1.compute.instances.suspend" OR "v1.compute.instances.delete" OR "v1.compute.instances.reset")
   EOT
   unique_writer_identity = true
+  depends_on             = [google_workload_identity_service_agent.logging]
+}
+
+# The sink writes as Cloud Logging's service agent, which Google makes on
+# its own only some time after the API is first used: on a new project the
+# grant to the sink's writer can name an account that does not exist yet.
+# So the agent is asked for before the sink, the way Google's docs say to
+# for infrastructure as code. All it needs here is to publish to the topic,
+# granted below. Another install in the same project shares the agent, so
+# a destroy leaves it.
+resource "google_workload_identity_service_agent" "logging" {
+  parent          = "projects/${data.google_project.this.number}/locations/global/serviceProducers/logging.googleapis.com"
+  deletion_policy = "ABANDON"
+  depends_on      = [google_project_service.apis]
 }
 
 resource "google_pubsub_topic_iam_member" "machine_events_published_by_the_sink" {

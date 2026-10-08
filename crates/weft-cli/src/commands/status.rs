@@ -225,13 +225,23 @@ pub async fn run(ctx: Ctx) -> Result<()> {
     if let (Some(execution_id), Some(status)) = (&execs.last_execution_id, &execs.last_status) {
         match execs.last_completed_at {
             Some(ts) => {
-                let age = unix_now().saturating_sub(ts);
+                let age = crate::progress::now_unix().saturating_sub(ts);
                 println!("    last: {execution_id} ({status}, completed {age}s ago)");
             }
             None => println!("    last: {execution_id} ({status}, in flight)"),
         }
     }
     print_drift(&ctx, &data.drift);
+    // One of weft's own calls for this project keeps failing (waking the
+    // supervisor, handing a run to the workers): why infra or runs do
+    // not move.
+    if !data.unanswered.is_empty() {
+        println!("  waiting on weft:");
+        let now = crate::progress::now_unix() as i64;
+        for entry in &data.unanswered {
+            println!("    {}", entry.describe(now));
+        }
+    }
     // What each trigger started lately: the one trace a run kept
     // unrecorded leaves when it goes well.
     if !data.runs.is_empty() {
@@ -291,9 +301,3 @@ fn print_drift(ctx: &Ctx, drift: &ProjectDrift) {
     }
 }
 
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock past UNIX_EPOCH")
-        .as_secs()
-}

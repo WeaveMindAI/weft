@@ -19,7 +19,9 @@
 //! wakes (writes made before it listened were heard by nobody), which
 //! starts each role's own chain of wakes (every tick books the next one),
 //! and again whenever notifications may have been lost. A ring that fails
-//! is rung again, with a growing pause, until the role answers. A process
+//! is rung again, with a growing pause, until the role answers; each
+//! failure is kept in the database (`weft_task_store::unanswered`), so
+//! `weft status` can say why the work waiting on that role does not move. A process
 //! that is stopping waits a few seconds for the rings still out, and logs
 //! the ones it gives up on.
 //!
@@ -34,11 +36,13 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use weft_broker_client::lifecycle_command::{ISSUED_WAKE, LOOK_WAKE};
+use weft_core::net::EmptyBody;
 use weft_platform_traits::config::InstallConfig;
 use weft_platform_traits::roles::TICK_PATH;
 use weft_platform_traits::{CoreRole, IdentityTokens, Placement, RoleAddresses};
 use weft_task_store::drain::WakeOn;
 use weft_task_store::pg_signal::{Heard, Subscription};
+use weft_task_store::unanswered::{self, Callee};
 
 use crate::server::TICK_LOOP_PARAM;
 
@@ -92,6 +96,8 @@ struct Bell {
 pub struct RoleWaker {
     bells: BTreeMap<CoreRole, Arc<Bell>>,
     tokens: Arc<dyn IdentityTokens>,
+    /// Where a ring that keeps failing is written down.
+    pool: sqlx::PgPool,
     http: reqwest::Client,
     /// Told whenever a ring is answered and none is left for its role, so
     /// a stopping process can wait for the rings still out ([`Self::settle`]).
@@ -101,7 +107,12 @@ pub struct RoleWaker {
 impl RoleWaker {
     /// A bell for every serverless role with loops to wake, at its
     /// address as this process reaches it. `None` when none sleeps.
-    pub fn new(config: &InstallConfig, addresses: &RoleAddresses, tokens: Arc<dyn IdentityTokens>) -> anyhow::Result<Option<Self>> {
+    pub fn new(
+        config: &InstallConfig,
+        addresses: &RoleAddresses,
+        tokens: Arc<dyn IdentityTokens>,
+        pool: sqlx::PgPool,
+    ) -> anyhow::Result<Option<Self>> {
         let mut bells = BTreeMap::new();
         // The listener has no loops to drain, so no tick to ring; the
         // holder is never serverless.
@@ -116,7 +127,7 @@ impl RoleWaker {
         if bells.is_empty() {
             return Ok(None);
         }
-        Ok(Some(Self { bells, tokens, http: reqwest::Client::new(), answered: Arc::default() }))
+        Ok(Some(Self { bells, tokens, pool, http: reqwest::Client::new(), answered: Arc::default() }))
     }
 
     /// Every channel a sleeping role's loops wait on: what this process's
@@ -191,22 +202,31 @@ impl RoleWaker {
             }
             ring.ringing = true;
         }
-        let (tokens, http, answered) = (self.tokens.clone(), self.http.clone(), self.answered.clone());
+        let (tokens, http, answered, pool) = (self.tokens.clone(), self.http.clone(), self.answered.clone(), self.pool.clone());
         tokio::spawn(async move {
             let mut woken = woken;
             let mut pause = Duration::from_secs(1);
+            let callee = Callee::Role(bell.role.as_str());
+            // Whether this ring's last try failed, so its first answer
+            // clears what it wrote down.
+            let mut failing = false;
             loop {
                 let sent = async {
                     let token = tokens.token_for(&bell.audience).await?;
                     let query: Vec<(&str, &str)> = woken.iter().map(|name| (TICK_LOOP_PARAM, name.as_str())).collect();
-                    http.post(&bell.url).query(&query).bearer_auth(token).send().await?.error_for_status()?;
+                    http.post(&bell.url).query(&query).bearer_auth(token).empty_body().send().await?.error_for_status()?;
                     anyhow::Ok(())
                 };
                 if let Err(e) = sent.await {
+                    let error = format!("{e:#}");
                     tracing::warn!(
-                        target: "weft_runtime::role_waker", role = %bell.role, error = %format!("{e:#}"),
+                        target: "weft_runtime::role_waker", role = %bell.role, %error,
                         retry_in_secs = pause.as_secs(), "could not wake a role; ringing again"
                     );
+                    failing = true;
+                    if let Err(e) = unanswered::failed(&pool, callee, &error).await {
+                        tracing::warn!(target: "weft_runtime::role_waker", role = %bell.role, error = %format!("{e:#}"), "could not write down a ring that failed");
+                    }
                     tokio::time::sleep(pause).await;
                     pause = (pause * 2).min(LONGEST_RETRY);
                     if let Some(more) = bell.ring.lock().pending.take() {
@@ -215,6 +235,11 @@ impl RoleWaker {
                     continue;
                 }
                 pause = Duration::from_secs(1);
+                if std::mem::take(&mut failing) {
+                    if let Err(e) = unanswered::answered(&pool, callee).await {
+                        tracing::warn!(target: "weft_runtime::role_waker", role = %bell.role, error = %format!("{e:#}"), "could not clear a ring that failed before");
+                    }
+                }
                 let mut ring = bell.ring.lock();
                 match ring.pending.take() {
                     Some(more) => woken = more,

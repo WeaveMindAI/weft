@@ -327,11 +327,12 @@ impl Project {
 
     /// Substitute the live-trigger mount-path placeholder `__E2E_PATH__` with a
     /// per-project-unique path, and return the CALLABLE path the test connects
-    /// to. Mount paths are namespaced per tenant on the dispatcher, so the
-    /// stored path (and the callable URL) is `/<tenant>/<path>`: the node config
-    /// gets the bare `<path>`, but a caller reaches it at `/connect/<tenant>/<path>`
-    /// (live) or `POST /<tenant>/<path>` (public fire). e2e runs as tenant
-    /// `local`, so the callable path is `local/<path>`. The unique suffix is
+    /// to. Mount paths sit under the tenant and the project on the install's
+    /// shared address, so the stored path (and the callable URL) is
+    /// `/<tenant>/<project>/<path>`: the node config gets the bare `<path>`,
+    /// but a caller reaches it at `/connect/<tenant>/<project>/<path>` (live)
+    /// or `POST /<tenant>/<project>/<path>` (public fire). e2e runs as tenant
+    /// `local`, so the callable path is `local/<project>/<path>`. The unique suffix is
     /// derived from the project's fresh id (stable within a run, distinct across
     /// runs). Call BEFORE activate.
     pub fn unique_live_path(&self) -> Result<String> {
@@ -358,10 +359,10 @@ impl Project {
     /// and answer the callable path.
     pub fn mount_at(&self, path: &str) -> Result<String> {
         // The node config carries the BARE path; the dispatcher prefixes the
-        // owning tenant when it stores + serves the mount path.
+        // owning tenant and project when it stores + serves the mount path.
         self.substitute_in_sources("__E2E_PATH__", path)?;
-        // The test connects at the tenant-namespaced path (e2e tenant = local).
-        Ok(format!("local/{path}"))
+        // The test connects under the tenant (e2e tenant = local) and project.
+        Ok(format!("local/{}/{path}", self.id))
     }
 
     /// Build the project's worker image and register it (the real

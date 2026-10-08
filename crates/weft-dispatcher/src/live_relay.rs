@@ -1,12 +1,12 @@
 //! Passing a live caller on to the project's workers, from an address the
 //! install shares between its projects: the loopback port, the tunnel's
-//! hostname, an install domain (`/connect/<tenant>/...`), or a project's
+//! hostname, an install domain (`/connect/<tenant>/<project>/...`), or a project's
 //! API domain served at its root.
 //!
 //! A caller who reaches the project's own address talks to its workers
 //! straight. One who reaches a shared address is passed on here, and this
-//! is a relay only: the tenant's routes (held in memory) pick the project
-//! and the program serving the route, and the request goes to that
+//! is a relay only: the address names the project, its routes (held in
+//! memory) pick the program serving the route, and the request goes to that
 //! project's workers as the caller sent it. Every check (whether the route
 //! takes calls, its gate, the instance, the limits) is the worker's door's
 //! (`weft_engine::door`); nothing of the call is read or written here.
@@ -25,7 +25,7 @@ use crate::state::DispatcherState;
 /// Pass `request` to a worker of `project` running `binary_hash`, at
 /// `path` (with its leading slash) and `query`, both still percent-encoded
 /// as the caller sent them. `prefix` is what the route sits under at the
-/// address the caller used (`/connect/<tenant>`, or empty at an API
+/// address the caller used (`/connect/<tenant>/<project>`, or empty at an API
 /// domain's root).
 pub(crate) async fn to_project(
     state: &DispatcherState,

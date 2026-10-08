@@ -16,7 +16,7 @@ import { trimTrailingSlashes } from '../core/url';
 /** The first path segment of each door a page may reach through here: the
  *  instance door, a signal's fire / skip / cancel door, the instance or
  *  api token's listings (signals, displays, files), the program's own live
- *  routes (`connect/<tenant>/<path>`), which a browser calls with its
+ *  routes (`connect/<tenant>/<project id>/<path>`), which a browser calls with its
  *  instance token, a field's provider chooser (`access/picker/<state>` and the
  *  `/result` it posts; nothing else under `access` passes), and a stored
  *  file's link (`public/files/<token>`: a route's answer names a picture by

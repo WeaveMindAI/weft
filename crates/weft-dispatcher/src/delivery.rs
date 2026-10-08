@@ -18,6 +18,7 @@
 
 use std::time::Duration;
 
+use weft_core::net::EmptyBody;
 use weft_core::ExecutionId;
 use weft_task_store::drain::{DrainLoop, DrainStep, WakeOn};
 
@@ -169,13 +170,20 @@ async fn deliver(state: &DispatcherState, delivery: Delivery) {
                     reason = %format!("{e:#}"),
                     "the run waits for its worker to start; it is handed out again on the next pass"
                 ),
-                GiveBack::CouldNotHand => tracing::warn!(
-                    target: "weft_dispatcher::delivery",
-                    %execution_id,
-                    project = %delivery.project_id,
-                    error = %format!("{e:#}"),
-                    "could not hand the run to a worker; it is handed out again on the next pass"
-                ),
+                GiveBack::CouldNotHand => {
+                    let error = format!("{e:#}");
+                    tracing::warn!(
+                        target: "weft_dispatcher::delivery",
+                        %execution_id,
+                        project = %delivery.project_id,
+                        %error,
+                        "could not hand the run to a worker; it is handed out again on the next pass"
+                    );
+                    let callee = weft_task_store::unanswered::Callee::Workers(delivery.project_id);
+                    if let Err(e) = weft_task_store::unanswered::failed(&state.pg_pool, callee, &error).await {
+                        tracing::warn!(target: "weft_dispatcher::delivery", %execution_id, error = %format!("{e:#}"), "could not write down a hand-off that failed");
+                    }
+                }
             }
             if let Err(e) = give_back(&state.pg_pool, execution_id).await {
                 tracing::warn!(target: "weft_dispatcher::delivery", %execution_id, error = %e, "could not give the delivery back; it is made again once its lease runs out");
@@ -215,6 +223,7 @@ async fn run_on_worker(
         .http
         .post(format!("{}/_weft/run/{execution_id}", endpoint.base_url.trim_end_matches('/')))
         .header(weft_platform_traits::WORKER_AUTH_HEADER, endpoint.auth_value())
+        .empty_body()
         .send()
         .await
         .map_err(|e| {

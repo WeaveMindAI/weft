@@ -69,9 +69,14 @@ specific. Two spellings that genuinely overlap are the `route-overlap` error,
 because a call arriving would have no defined answer.
 
 You know a route's address before you activate: on your machine it is
-`http://127.0.0.1:14111/connect/local/cards` (the install's address, then
-`/connect/local/`, then the path). On a cloud install it is the install's own
-address, then `/connect/local/`, then the path.
+`http://127.0.0.1:14111/connect/local/<project id>/cards` (the install's
+address, then `/connect/local/`, then your project's id, then the path). The
+project id is the `id` under `[package]` in your `weft.toml`, so it is the
+same on every install, and two projects can each serve a `cards` route without
+getting in each other's way. On a cloud install it is the install's own
+address, then `/connect/local/<project id>/`, then the path. `weft activate`
+prints the id (`activated cards (<project id>)`), and the route's trigger
+shows its full address in the editor.
 
 If you want the fastest way in, or a frontend wants your routes at the root of
 an address, call the project's own address, where your program answers with
@@ -84,13 +89,13 @@ activate --port 8080` opens that one, and the project keeps it for later
 activates. If another program or another of your projects holds that port,
 `weft activate` fails and nothing is activated.
 `weft activate` prints the address, and `weft status` shows it later or says
-why it is unavailable. Your routes keep answering under `/connect/local/` as well.
+why it is unavailable. Your routes keep answering under `/connect/local/<project id>/` as well.
 
 If a call arrives while the route's trigger is parked, hibernating within its
 grace window, or still being set up, it is answered `503` with a `Retry-After`
 at once, so a client that retries gets through once the trigger is on. Once
 the project is switched off (wiped), its own port is closed and
-`/connect/local/<path>` answers `404`.
+`/connect/local/<project id>/<path>` answers `404`.
 
 ## How a run is kept
 

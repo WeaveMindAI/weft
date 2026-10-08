@@ -232,6 +232,44 @@ pub struct ProjectStatusResponse {
     /// leaves when it goes well. Empty when no trigger started one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runs: Vec<TriggerRuns>,
+    /// weft's own calls the project's work waits on that keep failing.
+    /// Empty when every one goes through.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unanswered: Vec<Unanswered>,
+}
+
+/// One of weft's own calls that keeps failing, so the work behind it
+/// waits: a role woken to pick up work (the supervisor, which starts and
+/// stops infra), or the project's workers being handed a run. weft keeps
+/// trying on its own; this is what a person waiting is shown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Unanswered {
+    /// What does not answer, in a person's words, as the subject of a
+    /// sentence ("weft's supervisor, which starts and stops infra,").
+    pub callee: String,
+    /// The last try's error.
+    pub error: String,
+    #[serde(rename = "sinceUnix")]
+    pub since_unix: i64,
+    #[serde(rename = "lastUnix")]
+    pub last_unix: i64,
+}
+
+impl Unanswered {
+    /// One line for a person: what is not answering, since when, and why.
+    pub fn describe(&self, now_unix: i64) -> String {
+        let span = |secs: i64| match secs.max(0) {
+            secs @ 0..120 => format!("{secs}s"),
+            secs => format!("{} min", secs / 60),
+        };
+        format!(
+            "{} cannot be reached (failing for {}, last tried {} ago; weft keeps trying): {}",
+            self.callee,
+            span(now_unix - self.since_unix),
+            span(now_unix - self.last_unix),
+            self.error,
+        )
+    }
 }
 
 /// What `DELETE /projects/{id}` answers: what a forced removal could not

@@ -145,13 +145,15 @@ impl From<&crate::access::Access> for AccessRef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SignalSurface {
-    /// Author-controlled HTTP entrypoint. Mounted under the tenant at
-    /// the dispatcher root: external callers reach it at
-    /// `<dispatcher_base>/connect/<tenant>/<path>` (a live route) or
-    /// `POST <dispatcher_base>/<tenant>/<path>` (a plain public fire).
+    /// Author-controlled HTTP entrypoint. Mounted under the tenant and
+    /// the project at the dispatcher root
+    /// ([`crate::route::SharedMount`]): external callers reach it at
+    /// `<dispatcher_base>/connect/<tenant>/<project>/<path>` (a live route)
+    /// or `POST <dispatcher_base>/<tenant>/<project>/<path>` (a plain
+    /// public fire).
     /// `path` is a route pattern (`chat/{room}`); `""` means the root.
     /// `methods` lists the HTTP methods served, uppercase; empty = any.
-    /// Two routes of one tenant may not overlap (same shape, a shared
+    /// Two routes of one project may not overlap (same shape, a shared
     /// method), checked at register time. Used by the live-caller kinds
     /// (Route, Socket) and any future public-form-like kind.
     PublicEntry {

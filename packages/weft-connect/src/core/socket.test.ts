@@ -39,7 +39,7 @@ describe('openLiveSocket', () => {
 			FakeSocket.made = [];
 			const drops: number[] = [];
 			const live = openLiveSocket({
-				url: 'https://w.example/connect/local/chat',
+				url: 'https://w.example/connect/local/2c65676f-ac18-496c-8e61-2d4a170d2f00/chat',
 				onMessage: () => {},
 				onDrop: (d) => drops.push(d.retryInMs),
 				retry: { firstMs: 100, longestMs: 400 },
@@ -47,7 +47,7 @@ describe('openLiveSocket', () => {
 			});
 			await vi.waitFor(() => expect(FakeSocket.made.length).toBe(1));
 			const first = FakeSocket.made[0];
-			expect(first.url).toBe(`wss://w.example/connect/local/chat?session=${live.session}`);
+			expect(first.url).toBe(`wss://w.example/connect/local/2c65676f-ac18-496c-8e61-2d4a170d2f00/chat?session=${live.session}`);
 			first.open();
 			first.drop(1006);
 			live.send('while away');
@@ -67,14 +67,14 @@ describe('openLiveSocket', () => {
 		FakeSocket.made = [];
 		let ended = 0;
 		openLiveSocket({
-			url: 'http://127.0.0.1:14111/connect/local/chat',
+			url: 'http://127.0.0.1:14111/connect/local/2c65676f-ac18-496c-8e61-2d4a170d2f00/chat',
 			session: 's1',
 			onMessage: () => {},
 			onEnd: (e) => (ended = e.code),
 			WebSocketImpl: FakeSocket as unknown as typeof WebSocket,
 		});
 		await vi.waitFor(() => expect(FakeSocket.made.length).toBe(1));
-		expect(FakeSocket.made[0].url).toBe('ws://127.0.0.1:14111/connect/local/chat?session=s1');
+		expect(FakeSocket.made[0].url).toBe('ws://127.0.0.1:14111/connect/local/2c65676f-ac18-496c-8e61-2d4a170d2f00/chat?session=s1');
 		FakeSocket.made[0].open();
 		FakeSocket.made[0].drop(CONVERSATION_OVER);
 		await flush();
@@ -87,7 +87,7 @@ describe('openLiveSocket', () => {
 		let ended: { status?: number } | null = null;
 		const fetcher = (async () => new Response('refused', { status: 401 })) as unknown as typeof fetch;
 		const live = openLiveSocket({
-			url: 'https://w.example/connect/local/chat',
+			url: 'https://w.example/connect/local/2c65676f-ac18-496c-8e61-2d4a170d2f00/chat',
 			headers: { 'Weft-Instance-Token': 'revoked' },
 			onMessage: () => {},
 			onEnd: (e) => (ended = e),
@@ -106,7 +106,7 @@ describe('openLiveSocket', () => {
 			FakeSocket.made = [];
 			const drops: number[] = [];
 			openLiveSocket({
-				url: 'https://w.example/connect/local/chat',
+				url: 'https://w.example/connect/local/2c65676f-ac18-496c-8e61-2d4a170d2f00/chat',
 				onMessage: () => {},
 				onDrop: (d) => drops.push(d.retryInMs),
 				retry: { firstMs: 100, longestMs: 1_000 },
@@ -135,10 +135,10 @@ describe('openLiveSocket', () => {
 		const asked: { url: string; headers: HeadersInit | undefined }[] = [];
 		const fetcher = (async (url: string, init?: RequestInit) => {
 			asked.push({ url, headers: init?.headers });
-			return new Response(JSON.stringify({ url: 'https://w.example/connect/local/chat?session=s2&wct=t', protocol: 'websocket' }));
+			return new Response(JSON.stringify({ url: 'https://w.example/connect/local/2c65676f-ac18-496c-8e61-2d4a170d2f00/chat?session=s2&wct=t', protocol: 'websocket' }));
 		}) as unknown as typeof fetch;
 		openLiveSocket({
-			url: 'https://w.example/connect/local/chat',
+			url: 'https://w.example/connect/local/2c65676f-ac18-496c-8e61-2d4a170d2f00/chat',
 			session: 's2',
 			headers: { 'Weft-Instance-Token': 'wft-1' },
 			onMessage: () => {},
@@ -146,7 +146,7 @@ describe('openLiveSocket', () => {
 			WebSocketImpl: FakeSocket as unknown as typeof WebSocket,
 		});
 		await vi.waitFor(() => expect(FakeSocket.made.length).toBe(1));
-		expect(asked).toEqual([{ url: 'https://w.example/connect/local/chat?session=s2', headers: { 'Weft-Instance-Token': 'wft-1' } }]);
-		expect(FakeSocket.made[0].url).toBe('wss://w.example/connect/local/chat?session=s2&wct=t');
+		expect(asked).toEqual([{ url: 'https://w.example/connect/local/2c65676f-ac18-496c-8e61-2d4a170d2f00/chat?session=s2', headers: { 'Weft-Instance-Token': 'wft-1' } }]);
+		expect(FakeSocket.made[0].url).toBe('wss://w.example/connect/local/2c65676f-ac18-496c-8e61-2d4a170d2f00/chat?session=s2&wct=t');
 	});
 });
