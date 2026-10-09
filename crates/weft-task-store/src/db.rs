@@ -1,11 +1,10 @@
 //! Connecting to the install's database. Every pool weft opens comes from
-//! here, and keeps its connections for as long as the process runs: each
-//! process that reaches the database already holds one connection open
-//! for its whole life to hear the database's announcements
-//! (`crate::pg_signal`), so a database that sleeps once nobody is
-//! connected (a serverless Postgres) can only sleep once the process is
-//! gone, and closing the pool's idle connections earlier would only make
-//! the next call open new ones (an encrypted handshake and a sign-in).
+//! here, and keeps its connections for as long as the process runs. A
+//! database that sleeps (a serverless Postgres) sleeps once no query has
+//! run for a while, whatever connections stay open, and closes them as it
+//! goes; a pool finds that on its next call (see `PING_AFTER_IDLE`) and
+//! connects again. Closing idle connections earlier would only make the
+//! next call open new ones (an encrypted handshake and a sign-in).
 
 use std::time::Duration;
 

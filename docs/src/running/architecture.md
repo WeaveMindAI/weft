@@ -251,9 +251,10 @@ line up every write in the database behind the others.
 
 Some endings leave the dispatcher work (finishing a trigger's setup, clearing a
 run's pending waits). If it crashes or loses its Postgres connection it can
-miss such an ending, but it finds the work anyway: it looks when it starts, when the connection comes back, and every 30 seconds while it is up.
-On a cloud install where it sat at zero, it also looks within six hours at the
-latest.
+miss such an ending, but it finds the work anyway: it looks when it starts
+and when the connection comes back, and on your machine also every 30 seconds
+while it is up. A cloud install sets no timer for this, so a dispatcher at
+zero stays there; the next call that starts one also looks.
 
 ## The listener
 

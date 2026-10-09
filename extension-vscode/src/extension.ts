@@ -36,6 +36,7 @@ import { runWeftJson, WeftCliError } from './cli';
 import { ExecutionFollower } from './execFollower';
 import { AutoFollowController } from './autoFollow';
 import { ProjectEventStream } from './projectEvents';
+import { Presence } from './presence';
 import type { ActionVerb, ActionErrorDetails, CliEvent, SourceLocation, TriggerChoiceIntent } from '../../packages/weft-graph/src/protocol';
 import { LOCAL_INSTALL } from '../../packages/weft-graph/src/protocol';
 import { installDir, localAddress, RETIRED_DEFAULT_URL, unreachableHint } from './localInstall';
@@ -76,7 +77,20 @@ export function activate(context: vscode.ExtensionContext) {
   // so nothing shadows it here.
   let pinnedProject: WeftProject | undefined;
 
-  const graphView = new GraphViewController(context, dispatcher, parseServer);
+  // Whether the live streams to the install are held open: closed once
+  // the person has been away from a remote install for a while, so the
+  // cloud install can scale to zero, and reopened when they come back.
+  const presence = new Presence(
+    dispatcher,
+    {
+      current: () => vscode.window.state,
+      onDidChange: (listener) => vscode.window.onDidChangeWindowState(listener),
+    },
+    { set: (fn, ms) => setTimeout(fn, ms), clear: (handle) => clearTimeout(handle as NodeJS.Timeout) },
+  );
+  context.subscriptions.push(presence);
+
+  const graphView = new GraphViewController(context, dispatcher, parseServer, presence);
 
   // Action-bar state machine: combines `weft status --json`
   // snapshots (the backend's view) with CLI NDJSON events (the
@@ -116,6 +130,7 @@ export function activate(context: vscode.ExtensionContext) {
   const follower = new ExecutionFollower(
     dispatcher,
     (msg) => graphView.post(msg),
+    presence,
   );
 
   const autoFollow = new AutoFollowController(
@@ -165,7 +180,7 @@ export function activate(context: vscode.ExtensionContext) {
   // stream was down are unrecoverable, so every (re)connect resyncs
   // from authoritative state: refetch status, refetch the executions
   // list, and hand auto-follow the newest still-running execution.
-  const projectStream = new ProjectEventStream(dispatcher);
+  const projectStream = new ProjectEventStream(dispatcher, presence);
   projectStream.onEvent((ev) => {
     autoFollow.handleEvent(ev);
     executionsProvider.noteEvent();

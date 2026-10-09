@@ -13,7 +13,8 @@
 //! A role runs its loops one of two ways, by where it is placed:
 //!
 //! - in a local install's one process, [`run_forever`] per loop, sleeping
-//!   on the process's one `LISTEN` connection;
+//!   on the process's one `LISTEN` connection, and looking anyway at its
+//!   safety interval ([`Looks::AtSafety`]);
 //! - as a service that scales to zero, [`drain_due`] once per tick: the
 //!   role is called (by the process that wrote what a loop waits on,
 //!   naming the loops it concerns, or by its own next alarm), drains those
@@ -21,9 +22,18 @@
 //!   process at zero hears no notification, so this is the only way its
 //!   loops run there. A tick may land on any instance of the role, so
 //!   when each loop is due lives in the database (the `role_loop_due`
-//!   table, [`GROUP`]), shared by them all. A loop with nothing left to
-//!   watch is not looked at again for [`IDLE_LOOK`], so an install with
-//!   nothing going on wakes nothing, and its database can sleep.
+//!   table, [`GROUP`]), shared by them all. A process of the role that is
+//!   up and hears the database also runs its loops for as long as it
+//!   lives, looking on their safety interval only while it has work
+//!   ([`Looks::WhileWorking`]): its timed looks are the ticks'.
+//!
+//! Scaled to zero, nothing is looked at "just in case": a loop with
+//! nothing left sleeps until a write wakes it, and only a look a loop
+//! asked for ([`DrainStep::RetryIn`]) books a wake. A loop no write wakes
+//! (a sweep for what nobody announces) runs again once its safety
+//! interval has passed, on whichever pass the role makes next, and books
+//! no wake of its own. So an install with nothing going on wakes nothing,
+//! and its database sleeps.
 //!
 //! The subsystem provides its drain body, which channels wake it, and its
 //! safety interval; the coalescing and the timing live here.
@@ -37,24 +47,21 @@ use anyhow::{Context, Result};
 use sqlx::PgPool;
 use tokio::time::Instant;
 
-use crate::pg_signal::Subscription;
+use crate::pg_signal::{PgSignalWatch, Subscription};
 
-/// The usual safety net for missed notifications while a process that
-/// listens is up (on a local install, and a cloud role that writes), and
-/// how soon a failed drain is tried again anywhere. Notifications are
+/// The usual safety net for missed notifications while a local install's
+/// process is up, and how soon a failed drain is tried again anywhere. Notifications are
 /// best-effort by Postgres design (a reconnecting listener can lose
 /// some, though it says so with a recheck), so this only catches what
 /// slipped past; 30s of delay on a lost one is acceptable, and a tighter
 /// tick would hammer the DB for nothing.
 pub const SAFETY_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-/// How long a loop of a role that scales to zero sleeps once it has
-/// nothing left to watch ([`DrainStep::Done`]): until a write wakes it, or
-/// this long at the latest. Every look wakes the role and its database, so
-/// it is long; all it catches is a wake lost between a write and its ring
-/// (the writer's process died right after its commit), and the
-/// housekeeping that may run late (expiries, retention).
-pub const IDLE_LOOK: Duration = Duration::from_secs(6 * 3600);
+/// How long a loop's row in `role_loop_due` stays once no pass of this
+/// weft runs that loop: a loop renamed or dropped by a later weft leaves
+/// its row behind, and until this long has passed it may be a loop of
+/// another weft still taking ticks beside this one (a deploy rolling out).
+const FORGET_AFTER: Duration = Duration::from_secs(24 * 3600);
 
 /// How soon a loop looks again when a sibling holds its install-wide lock.
 /// The sibling is draining right now, but it may have read before the
@@ -71,7 +78,7 @@ pub enum DrainStep {
     More,
     /// Nothing is left that a look before the next write would find:
     /// the runner sleeps until a wake (on a local install, at most its
-    /// safety interval; scaled to zero, [`IDLE_LOOK`]).
+    /// safety interval; scaled to zero, until woken, see the module docs).
     Done,
     /// Something is left that will need a look without anything
     /// announcing it (a row whose writer has not committed, a delay that
@@ -123,10 +130,30 @@ impl DrainLoop {
     }
 
     /// Run this loop for the life of the process (see [`run`]).
-    pub async fn run_forever(&self, signals: Subscription) {
+    pub async fn run_forever(&self, signals: Subscription, looks: Looks) {
         let drain = self.drain.clone();
-        run(signals, self.wake_on, self.safety, self.name, move || drain()).await
+        run(signals, self.wake_on, self.safety, looks, self.name, move || drain()).await
     }
+
+    /// Whether a write wakes this loop, or only time does (a sweep for
+    /// what nobody announces).
+    pub fn woken_by_writes(&self) -> bool {
+        !self.wake_on.is_empty()
+    }
+}
+
+/// How a loop run for the life of its process ([`run`]) looks when
+/// nothing wakes it.
+#[derive(Clone)]
+pub enum Looks {
+    /// At its safety interval: a machine's process, up for good.
+    AtSafety,
+    /// At its safety interval only while the process has work
+    /// ([`PgSignalWatch::worked_since`]): a process of a role that scales
+    /// to zero, left idle, queries nothing, and its timed looks are the
+    /// role's ticks' ([`drain_due`]). Each drain holds the watch
+    /// ([`PgSignalWatch::looking`]), so it listens while the drain runs.
+    WhileWorking(std::sync::Arc<PgSignalWatch>),
 }
 
 /// The `role_loop_due` table: when each loop of a role that scales to zero
@@ -143,8 +170,11 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             loop_name TEXT NOT NULL,
             -- When the loop next wants a look, in unix milliseconds on the
             -- database's clock, so instances whose own clocks disagree
-            -- still agree on it.
-            due_ms BIGINT NOT NULL,
+            -- still agree on it. Empty while it has nothing to look at
+            -- until a write wakes it (or, for a loop no write wakes, until
+            -- its safety interval has passed since `written_ms`, on the
+            -- role's next pass).
+            due_ms BIGINT,
             -- When this row was last written, on the same clock: how a
             -- pass tells whether a sibling booked a look since it read.
             written_ms BIGINT NOT NULL,
@@ -164,23 +194,46 @@ enum Plan {
     Run,
     /// Leave it until this moment (unix ms, the database's clock).
     SleepUntil(i64),
+    /// Leave it until a write wakes it (or, for a loop no write wakes,
+    /// until a later pass finds its safety interval passed).
+    Asleep,
     /// The due times could not be read: leave it, and look again at its
     /// safety interval.
     Unknown,
 }
 
+/// A loop's row in `role_loop_due`, as a pass reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Booked {
+    due_ms: Option<i64>,
+    written_ms: i64,
+}
+
 /// What a pass that read the due times at `read_at` (`None` when the read
-/// failed) does with a loop booked for `due_ms` (`None` with no row). A
-/// woken loop always runs; one with no row is due now.
-fn plan(woken: bool, read_at: Option<i64>, due_ms: Option<i64>) -> Plan {
+/// failed) does with a loop booked as `booked` (`None` with no row). A
+/// woken loop always runs; one with no row is due now. `sweeps_every` is
+/// the safety interval of a loop no write wakes, which runs again once it
+/// has passed since the loop was last booked; `None` for a loop a write
+/// wakes, which sleeps until then.
+fn plan(woken: bool, read_at: Option<i64>, booked: Option<Booked>, sweeps_every: Option<Duration>) -> Plan {
     if woken {
         return Plan::Run;
     }
-    match (read_at, due_ms) {
-        (None, _) => Plan::Unknown,
-        (Some(now), Some(at)) if at > now => Plan::SleepUntil(at),
-        (Some(_), _) => Plan::Run,
+    let Some(now) = read_at else { return Plan::Unknown };
+    match booked {
+        None => Plan::Run,
+        Some(Booked { due_ms: Some(at), .. }) if at > now => Plan::SleepUntil(at),
+        Some(Booked { due_ms: Some(_), .. }) => Plan::Run,
+        Some(Booked { due_ms: None, written_ms }) => match sweeps_every {
+            Some(every) if written_ms.saturating_add(millis(every)) <= now => Plan::Run,
+            _ => Plan::Asleep,
+        },
     }
+}
+
+/// `d` in whole milliseconds, saturating.
+fn millis(d: Duration) -> i64 {
+    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
 }
 
 /// `at_ms` on the database's clock as an instant of this process, given
@@ -190,47 +243,49 @@ fn instant_of(clock: (i64, Instant), at_ms: i64) -> Instant {
     clock.1 + Duration::from_millis(at_ms.saturating_sub(clock.0).max(0).unsigned_abs())
 }
 
-/// The database's clock now, and when each of `role`'s loops that has a
-/// row is next due, in one query.
-/// What a pass reads of `role`'s due times: the database's clock, when
-/// each loop is due, and the loops nobody has booked for two idle looks.
+/// What a pass reads of `role`'s due times: the database's clock, each
+/// loop's row, and the loops nobody has booked for [`FORGET_AFTER`].
 struct ReadDue {
     now: i64,
-    due: HashMap<String, i64>,
+    booked: HashMap<String, Booked>,
     unbooked: Vec<String>,
 }
 
 /// One row of [`read_due`]'s query: the clock, then a loop's name, when
-/// it is due, and whether nobody has booked it for two idle looks (all
-/// three `None` when the role has no row).
-type DueRow = (i64, Option<String>, Option<i64>, Option<bool>);
+/// it is due, when it was written, and whether nobody has booked it for
+/// [`FORGET_AFTER`] (all four `None` when the role has no row).
+type DueRow = (i64, Option<String>, Option<i64>, Option<i64>, Option<bool>);
 
 async fn read_due(pool: &PgPool, role: &str) -> Result<ReadDue> {
     let rows: Vec<DueRow> = sqlx::query_as(&format!(
-        "SELECT c.now_ms, d.loop_name, d.due_ms, d.written_ms < c.now_ms - $2 \
+        "SELECT c.now_ms, d.loop_name, d.due_ms, d.written_ms, d.written_ms < c.now_ms - $2 \
          FROM (SELECT {DB_NOW_MS} AS now_ms) c \
          LEFT JOIN role_loop_due d ON d.role = $1"
     ))
     .bind(role)
-    .bind(i64::try_from(2 * IDLE_LOOK.as_millis()).unwrap_or(i64::MAX))
+    .bind(millis(FORGET_AFTER))
     .fetch_all(pool)
     .await?;
     let now = rows.first().map(|r| r.0).context("the clock query returned no row")?;
-    let unbooked = rows.iter().filter(|r| r.3 == Some(true)).filter_map(|r| r.1.clone()).collect();
-    let due = rows.into_iter().filter_map(|(_, name, at, _)| Some((name?, at?))).collect();
-    Ok(ReadDue { now, due, unbooked })
+    let unbooked = rows.iter().filter(|r| r.4 == Some(true)).filter_map(|r| r.1.clone()).collect();
+    let booked = rows
+        .into_iter()
+        .filter_map(|(_, name, due_ms, written_ms, _)| Some((name?, Booked { due_ms, written_ms: written_ms? })))
+        .collect();
+    Ok(ReadDue { now, booked, unbooked })
 }
 
 /// Book `role`'s loop `name` for a look `after` from now on the database's
-/// clock, and answer when it is now due and the clock at the write. When
-/// a sibling wrote the row since this pass read it at `read_at` (or the
-/// read failed), the sooner of the two looks stands, so a wake the sibling
-/// booked is never pushed back. A row written in the very millisecond of
-/// the read counts as a sibling's: keeping the sooner look costs one extra
+/// clock (`None`: asleep until woken), and answer when it is now due and
+/// the clock at the write. When a sibling wrote the row since this pass
+/// read it at `read_at` (or the read failed), the sooner of the two looks
+/// stands, so a wake the sibling booked is never pushed back (an empty
+/// due is the latest of all). A row written in the very millisecond of the
+/// read counts as a sibling's: keeping the sooner look costs one extra
 /// pass at most, overwriting it could cost a wake.
-async fn book(pool: &PgPool, role: &str, name: &str, after: Duration, read_at: Option<i64>) -> Result<(i64, i64)> {
-    let after_ms = i64::try_from(after.as_millis()).context("a look further out than the clock reaches")?;
-    let row: (i64, i64) = sqlx::query_as(&format!(
+async fn book(pool: &PgPool, role: &str, name: &str, after: Option<Duration>, read_at: Option<i64>) -> Result<(Option<i64>, i64)> {
+    let after_ms = after.map(|after| i64::try_from(after.as_millis()).context("a look further out than the clock reaches")).transpose()?;
+    let row: (Option<i64>, i64) = sqlx::query_as(&format!(
         "INSERT INTO role_loop_due AS d (role, loop_name, due_ms, written_ms) \
          SELECT $1, $2, c.now_ms + $3, c.now_ms FROM (SELECT {DB_NOW_MS} AS now_ms) c \
          ON CONFLICT (role, loop_name) DO UPDATE SET \
@@ -260,22 +315,24 @@ pub const TICK_SLICE: Duration = Duration::from_secs(60);
 /// `woken` (the writes they wait on happened) and the ones whose next
 /// look is due, each until it has nothing left (or asks to look again
 /// later, or spent its share of [`TICK_SLICE`]), book each one's next
-/// look in `role_loop_due`, and answer how
-/// soon any loop of `role` next wants a look. The others stay asleep, so
-/// a pass run because a journal event was written does not also run the
-/// hourly sweeps. A loop with nothing left sleeps [`IDLE_LOOK`]; one that
-/// asked to look again does so then; a drain that fails is logged and
-/// looked at again at its safety interval. When the due times cannot be
-/// read or written, that is logged too, and the loops it leaves unknown
-/// are looked at again at their safety interval.
-pub async fn drain_due(pool: &PgPool, role: &str, loops: &[DrainLoop], woken: &[String]) -> Duration {
+/// look in `role_loop_due`, and answer how soon any loop of `role` next
+/// wants a look, or `None` when none does. The others stay asleep, so a
+/// pass run because a journal event was written does not also run the
+/// hourly sweeps. A loop with nothing left sleeps until woken (see the
+/// module docs); one that asked to look again does so then; a drain that
+/// fails is logged and, when a write would wake it, looked at again at
+/// its safety interval (a sweep that fails runs again on a later pass
+/// like one that did not). When the due times cannot be read or written,
+/// that is logged too, and the loops it leaves unknown are looked at again
+/// at their safety interval.
+pub async fn drain_due(pool: &PgPool, role: &str, loops: &[DrainLoop], woken: &[String]) -> Option<Duration> {
     drain_pass(pool, role, loops, woken, TICK_SLICE).await
 }
 
 /// [`drain_due`] with the pass's draining time as `slice`.
-async fn drain_pass(pool: &PgPool, role: &str, loops: &[DrainLoop], woken: &[String], slice: Duration) -> Duration {
-    let (read_at, due, unbooked) = match read_due(pool, role).await {
-        Ok(read) => (Some(read.now), read.due, read.unbooked),
+async fn drain_pass(pool: &PgPool, role: &str, loops: &[DrainLoop], woken: &[String], slice: Duration) -> Option<Duration> {
+    let (read_at, booked, unbooked) = match read_due(pool, role).await {
+        Ok(read) => (Some(read.now), read.booked, read.unbooked),
         Err(e) => {
             tracing::warn!(
                 target: "weft_task_store::drain", role, error = %format!("{e:#}"),
@@ -285,10 +342,7 @@ async fn drain_pass(pool: &PgPool, role: &str, loops: &[DrainLoop], woken: &[Str
         }
     };
     // A loop renamed or dropped by a later weft leaves its row behind,
-    // forgotten once nobody has booked it for two idle looks: until then
-    // it may be a loop of another weft still taking ticks beside this one
-    // (a deploy rolling out), which books every loop it runs at least
-    // once per idle look.
+    // forgotten once nobody has booked it for `FORGET_AFTER`.
     let gone: Vec<&String> = unbooked.iter().filter(|name| !loops.iter().any(|l| l.name == name.as_str())).collect();
     if !gone.is_empty() {
         if let Err(e) = sqlx::query("DELETE FROM role_loop_due WHERE role = $1 AND loop_name = ANY($2)")
@@ -302,23 +356,30 @@ async fn drain_pass(pool: &PgPool, role: &str, loops: &[DrainLoop], woken: &[Str
     }
     let mut clock = read_at.map(|now| (now, Instant::now()));
     let mut next: Option<Instant> = None;
-    let plans: Vec<Plan> = loops.iter().map(|l| plan(woken.iter().any(|w| w == l.name), read_at, due.get(l.name).copied())).collect();
+    let plans: Vec<Plan> = loops
+        .iter()
+        .map(|l| {
+            let sweeps_every = (!l.woken_by_writes()).then_some(l.safety);
+            plan(woken.iter().any(|w| w == l.name), read_at, booked.get(l.name).copied(), sweeps_every)
+        })
+        .collect();
     let share = slice / u32::try_from(plans.iter().filter(|p| **p == Plan::Run).count().max(1)).unwrap_or(u32::MAX);
     for (l, plan) in loops.iter().zip(plans) {
         let look = match plan {
-            Plan::SleepUntil(at) => instant_of(clock.expect("a planned sleep comes from a read clock"), at),
-            Plan::Unknown => Instant::now() + l.safety,
+            Plan::SleepUntil(at) => Some(instant_of(clock.expect("a planned sleep comes from a read clock"), at)),
+            Plan::Asleep => None,
+            Plan::Unknown => Some(Instant::now() + l.safety),
             Plan::Run => {
                 let started = Instant::now();
                 let after = loop {
                     match (l.drain)().await {
-                        Ok(DrainStep::More) if started.elapsed() >= share => break Duration::ZERO,
+                        Ok(DrainStep::More) if started.elapsed() >= share => break Some(Duration::ZERO),
                         Ok(DrainStep::More) => continue,
-                        Ok(DrainStep::Done) => break IDLE_LOOK,
-                        Ok(DrainStep::RetryIn(after)) => break after,
+                        Ok(DrainStep::Done) => break None,
+                        Ok(DrainStep::RetryIn(after)) => break Some(after),
                         Err(e) => {
                             tracing::warn!(target: "weft_task_store::drain", subsystem = l.name, error = %e, "drain failed; will retry at its next look");
-                            break l.safety;
+                            break l.woken_by_writes().then_some(l.safety);
                         }
                     }
                 };
@@ -326,28 +387,31 @@ async fn drain_pass(pool: &PgPool, role: &str, loops: &[DrainLoop], woken: &[Str
                     Ok((due_ms, now)) => {
                         let at = (now, Instant::now());
                         clock = Some(at);
-                        instant_of(at, due_ms)
+                        due_ms.map(|due_ms| instant_of(at, due_ms))
                     }
                     Err(e) => {
                         tracing::warn!(
                             target: "weft_task_store::drain", role, subsystem = l.name, error = %format!("{e:#}"),
                             "could not book the loop's next look; looking again at its safety interval"
                         );
-                        Instant::now() + after.min(l.safety)
+                        Some(Instant::now() + after.map_or(l.safety, |after| after.min(l.safety)))
                     }
                 }
             }
         };
-        next = Some(next.map_or(look, |n| n.min(look)));
+        if let Some(look) = look {
+            next = Some(next.map_or(look, |n| n.min(look)));
+        }
     }
-    next.map(|n| n.saturating_duration_since(Instant::now())).unwrap_or(IDLE_LOOK)
+    next.map(|n| n.saturating_duration_since(Instant::now()))
 }
 
 /// Drive the drain loop forever: drain once at start (rows that landed
 /// before the loop subscribed), then after every wake, every `RetryIn`,
-/// and every `safety` interval. Returns only when the process's signal
-/// watch stops, since nothing could wake the loop again; the caller's
-/// supervisor crashes the process on that.
+/// and every `safety` interval (only when the process had work since the
+/// last look, for [`Looks::WhileWorking`]). Returns only when the
+/// process's signal watch stops, since nothing could wake the loop again;
+/// the caller's supervisor crashes the process on that.
 ///
 /// `signals` must be subscribed before the call, and `target` is the
 /// tracing target, so subsystems log under their own module name.
@@ -355,27 +419,47 @@ pub async fn run<F, Fut>(
     mut signals: Subscription,
     wake_on: &[WakeOn],
     safety: Duration,
+    looks: Looks,
     target: &'static str,
     mut drain: F,
 ) where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<DrainStep>>,
 {
-    let mut next_look = Instant::now();
+    // A look the drain asked for (the first one: at once), and the next
+    // look on the safety interval.
+    let mut asked = Some(Instant::now());
+    let mut sweep = Instant::now() + safety;
+    let mut last_look = Instant::now();
     loop {
+        let deadline = asked.map_or(sweep, |at| at.min(sweep));
         // A loop that listens to no channel runs on its interval alone: a
         // recheck (the watch fell behind, or reconnected) concerns only the
         // loops that wait on a channel, and waking a timed sweep on one
         // would run it back to back while notifications pour in.
-        if wake_on.is_empty() {
-            tokio::time::sleep_until(next_look).await;
-        } else if Instant::now() < next_look {
-            let woken = signals
-                .woken_before(next_look, |channel, payload| wake_on.iter().any(|w| w.hears(channel, payload)))
-                .await;
-            if let Err(e) = woken {
-                tracing::error!(target: "weft_task_store::drain", subsystem = target, error = %e, "cannot be woken any more");
-                return;
+        let woken = if Instant::now() >= deadline {
+            false
+        } else if wake_on.is_empty() {
+            tokio::time::sleep_until(deadline).await;
+            false
+        } else {
+            match signals.woken_before(deadline, |channel, payload| wake_on.iter().any(|w| w.hears(channel, payload))).await {
+                Ok(woken) => woken,
+                Err(e) => {
+                    tracing::error!(target: "weft_task_store::drain", subsystem = target, error = %e, "cannot be woken any more");
+                    return;
+                }
+            }
+        };
+        let now = Instant::now();
+        // The safety look alone, in a process that scales to zero: skipped
+        // while the process has had no work, so an idle one queries nothing.
+        if !woken && asked.is_none_or(|at| at > now) {
+            if let Looks::WhileWorking(watch) = &looks {
+                if !watch.worked_since(last_look) {
+                    sweep = now + safety;
+                    continue;
+                }
             }
         }
         // Everything heard up to here is covered by the drain that
@@ -385,7 +469,13 @@ pub async fn run<F, Fut>(
             tracing::error!(target: "weft_task_store::drain", subsystem = target, error = %e, "cannot be woken any more");
             return;
         }
-        next_look = Instant::now() + safety;
+        last_look = now;
+        sweep = now + safety;
+        asked = None;
+        let looking = match &looks {
+            Looks::AtSafety => None,
+            Looks::WhileWorking(watch) => Some(watch.looking().await),
+        };
         // Drain until the body reports it has nothing left. This is what
         // makes a burst of more rows than one batch finish in one wake.
         loop {
@@ -393,7 +483,7 @@ pub async fn run<F, Fut>(
                 Ok(DrainStep::More) => continue,
                 Ok(DrainStep::Done) => break,
                 Ok(DrainStep::RetryIn(after)) => {
-                    next_look = next_look.min(Instant::now() + after);
+                    asked = Some(Instant::now() + after);
                     break;
                 }
                 Err(e) => {
@@ -407,6 +497,7 @@ pub async fn run<F, Fut>(
                 }
             }
         }
+        drop(looking);
     }
 }
 
@@ -443,7 +534,7 @@ mod tests {
         let (_tx, rx) = broadcast::channel(16);
         let runs = Arc::new(Mutex::new(Vec::new()));
         let body = scripted(runs.clone(), vec![DrainStep::More, DrainStep::More]);
-        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), "test", body));
+        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), Looks::AtSafety, "test", body));
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(runs.lock().unwrap().len(), 3, "More, More, Done");
     }
@@ -452,7 +543,7 @@ mod tests {
     async fn a_wake_that_concerns_it_drains_and_one_that_does_not_is_ignored() {
         let (tx, rx) = broadcast::channel(16);
         let runs = Arc::new(Mutex::new(Vec::new()));
-        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), "test", scripted(runs.clone(), vec![])));
+        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), Looks::AtSafety, "test", scripted(runs.clone(), vec![])));
         tokio::time::sleep(Duration::from_secs(1)).await;
         tx.send(signal("theirs")).unwrap();
         tx.send(Heard::Signal { channel: "other", payload: "mine".into() }).unwrap();
@@ -467,7 +558,7 @@ mod tests {
     async fn a_recheck_drains() {
         let (tx, rx) = broadcast::channel(16);
         let runs = Arc::new(Mutex::new(Vec::new()));
-        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), "test", scripted(runs.clone(), vec![])));
+        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), Looks::AtSafety, "test", scripted(runs.clone(), vec![])));
         tokio::time::sleep(Duration::from_secs(1)).await;
         tx.send(Heard::Recheck).unwrap();
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -480,7 +571,7 @@ mod tests {
     async fn a_timed_loop_ignores_rechecks() {
         let (tx, rx) = broadcast::channel(16);
         let runs = Arc::new(Mutex::new(Vec::new()));
-        tokio::spawn(run(rx.into(), &[], Duration::from_secs(30), "test", scripted(runs.clone(), vec![])));
+        tokio::spawn(run(rx.into(), &[], Duration::from_secs(30), Looks::AtSafety, "test", scripted(runs.clone(), vec![])));
         tokio::time::sleep(Duration::from_secs(1)).await;
         for _ in 0..3 {
             tx.send(Heard::Recheck).unwrap();
@@ -495,7 +586,7 @@ mod tests {
     async fn a_burst_of_wakes_costs_one_drain() {
         let (tx, rx) = broadcast::channel(64);
         let runs = Arc::new(Mutex::new(Vec::new()));
-        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), "test", scripted(runs.clone(), vec![])));
+        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), Looks::AtSafety, "test", scripted(runs.clone(), vec![])));
         tokio::time::sleep(Duration::from_secs(1)).await;
         for _ in 0..20 {
             tx.send(signal("mine")).unwrap();
@@ -508,7 +599,7 @@ mod tests {
     async fn with_no_signal_the_safety_tick_drains() {
         let (_tx, rx) = broadcast::channel(16);
         let runs = Arc::new(Mutex::new(Vec::new()));
-        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), "test", scripted(runs.clone(), vec![])));
+        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), Looks::AtSafety, "test", scripted(runs.clone(), vec![])));
         tokio::time::sleep(Duration::from_secs(61)).await;
         let runs = runs.lock().unwrap().clone();
         assert_eq!(runs, vec![Duration::ZERO, Duration::from_secs(30), Duration::from_secs(60)]);
@@ -519,7 +610,7 @@ mod tests {
         let (_tx, rx) = broadcast::channel(16);
         let runs = Arc::new(Mutex::new(Vec::new()));
         let body = scripted(runs.clone(), vec![DrainStep::RetryIn(Duration::from_millis(100)), DrainStep::Done]);
-        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), "test", body));
+        tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), Looks::AtSafety, "test", body));
         tokio::time::sleep(Duration::from_secs(1)).await;
         let runs = runs.lock().unwrap().clone();
         assert_eq!(runs, vec![Duration::ZERO, Duration::from_millis(100)]);
@@ -529,7 +620,7 @@ mod tests {
     async fn a_stopped_watch_ends_the_loop() {
         let (tx, rx) = broadcast::channel::<Heard>(16);
         let runs = Arc::new(Mutex::new(Vec::new()));
-        let handle = tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), "test", scripted(runs.clone(), vec![])));
+        let handle = tokio::spawn(run(rx.into(), WAKE, Duration::from_secs(30), Looks::AtSafety, "test", scripted(runs.clone(), vec![])));
         tokio::time::sleep(Duration::from_secs(1)).await;
         drop(tx);
         handle.await.unwrap();
@@ -540,24 +631,46 @@ mod tests {
 mod plan_tests {
     use super::*;
 
+    fn due(at: i64) -> Option<Booked> {
+        Some(Booked { due_ms: Some(at), written_ms: 0 })
+    }
+
+    fn asleep(written_ms: i64) -> Option<Booked> {
+        Some(Booked { due_ms: None, written_ms })
+    }
+
+    const SWEEP: Option<Duration> = Some(Duration::from_millis(50));
+
     #[test]
     fn a_woken_loop_always_runs() {
-        assert_eq!(plan(true, Some(100), Some(1_000)), Plan::Run);
-        assert_eq!(plan(true, None, None), Plan::Run, "even when the due times could not be read");
+        assert_eq!(plan(true, Some(100), due(1_000), None), Plan::Run);
+        assert_eq!(plan(true, Some(100), asleep(100), None), Plan::Run);
+        assert_eq!(plan(true, None, None, None), Plan::Run, "even when the due times could not be read");
     }
 
     #[test]
     fn a_loop_with_no_row_or_a_row_due_runs_and_one_booked_later_sleeps() {
-        assert_eq!(plan(false, Some(100), None), Plan::Run, "no row: due now");
-        assert_eq!(plan(false, Some(100), Some(100)), Plan::Run);
-        assert_eq!(plan(false, Some(100), Some(50)), Plan::Run);
-        assert_eq!(plan(false, Some(100), Some(101)), Plan::SleepUntil(101));
+        assert_eq!(plan(false, Some(100), None, None), Plan::Run, "no row: due now");
+        assert_eq!(plan(false, Some(100), due(100), None), Plan::Run);
+        assert_eq!(plan(false, Some(100), due(50), None), Plan::Run);
+        assert_eq!(plan(false, Some(100), due(101), None), Plan::SleepUntil(101));
+    }
+
+    /// A loop with nothing left sleeps until a write wakes it, however
+    /// long ago it was booked; a sweep no write wakes runs again on the
+    /// first pass after its interval, and never sooner.
+    #[test]
+    fn an_asleep_loop_waits_for_a_write_and_a_sweep_for_its_interval() {
+        assert_eq!(plan(false, Some(1_000_000), asleep(0), None), Plan::Asleep);
+        assert_eq!(plan(false, Some(100), asleep(60), SWEEP), Plan::Asleep);
+        assert_eq!(plan(false, Some(110), asleep(60), SWEEP), Plan::Run);
+        assert_eq!(plan(false, Some(100), due(150), SWEEP), Plan::SleepUntil(150), "a look it asked for stands");
     }
 
     #[test]
     fn an_unread_due_time_is_unknown() {
-        assert_eq!(plan(false, None, Some(1)), Plan::Unknown);
-        assert_eq!(plan(false, None, None), Plan::Unknown);
+        assert_eq!(plan(false, None, due(1), None), Plan::Unknown);
+        assert_eq!(plan(false, None, None, SWEEP), Plan::Unknown);
     }
 
     #[test]
@@ -575,6 +688,7 @@ mod drain_due_tests {
     use std::sync::Arc;
 
     const NONE: &[WakeOn] = &[];
+    const WRITES: &[WakeOn] = &[WakeOn::any("chan")];
     const ROLE: &str = "dispatcher";
 
     async fn schema(pool: &PgPool) {
@@ -595,7 +709,7 @@ mod drain_due_tests {
         d <= Duration::from_secs(secs) && d + Duration::from_secs(2) > Duration::from_secs(secs)
     }
 
-    async fn due_ms(pool: &PgPool, name: &str) -> i64 {
+    async fn due_ms(pool: &PgPool, name: &str) -> Option<i64> {
         sqlx::query_scalar("SELECT due_ms FROM role_loop_due WHERE role = $1 AND loop_name = $2")
             .bind(ROLE)
             .bind(name)
@@ -617,7 +731,7 @@ mod drain_due_tests {
         let c = DrainLoop::new("c", NONE, Duration::from_secs(90), || async { anyhow::bail!("boom") });
         let next = drain_due(&pool, ROLE, &[a, b, c], &[]).await;
         assert_eq!(a_runs.load(Ordering::SeqCst), 3, "More, More, Done");
-        assert!(approx(next, 5), "the RetryIn is the soonest: {next:?}");
+        assert!(approx(next.expect("a look is due"), 5), "the RetryIn is the soonest: {next:?}");
     }
 
     /// Two loops that always have more both drain within one pass, each
@@ -642,27 +756,33 @@ mod drain_due_tests {
         let next = drain_pass(&pool, ROLE, &[first, second], &[], Duration::from_millis(200)).await;
         let left: i64 = sqlx::query_scalar("SELECT count(*) FROM role_loop_due WHERE loop_name = 'renamed'").fetch_one(&pool).await.unwrap();
         assert_eq!(left, 0, "a loop this role no longer has is forgotten");
-        book(&pool, ROLE, "another_wefts", Duration::from_secs(60), None).await.unwrap();
+        book(&pool, ROLE, "another_wefts", Some(Duration::from_secs(60)), None).await.unwrap();
         let (fresh, _) = busy("fresh");
         drain_pass(&pool, ROLE, &[fresh], &[], Duration::from_millis(50)).await;
         let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM role_loop_due WHERE loop_name = 'another_wefts'").fetch_one(&pool).await.unwrap();
         assert_eq!(kept, 1, "a loop another weft booked lately is left to it");
         assert!(first_runs.load(Ordering::SeqCst) > 1 && second_runs.load(Ordering::SeqCst) > 1, "both drained");
-        assert!(next < Duration::from_secs(1), "and both are due again at once: {next:?}");
+        assert!(next.expect("a look is due") < Duration::from_secs(1), "and both are due again at once: {next:?}");
         let now: i64 = sqlx::query_scalar(&format!("SELECT {DB_NOW_MS}")).fetch_one(&pool).await.unwrap();
-        assert!(due_ms(&pool, "first").await <= now && due_ms(&pool, "second").await <= now);
+        assert!(due_ms(&pool, "first").await.unwrap() <= now && due_ms(&pool, "second").await.unwrap() <= now);
     }
 
-    /// A loop with nothing left to watch is not looked at again until a
-    /// write wakes it or the idle look comes, so a quiet install wakes
-    /// nothing; one that failed is looked at again at its safety.
+    /// A quiet install books no wake at all: a loop with nothing left
+    /// sleeps until a write wakes it, and a sweep (which no write wakes)
+    /// waits for a pass that happens anyway. Only a loop a write wakes that
+    /// failed is looked at again, at its safety interval.
     #[sqlx::test]
-    async fn a_quiet_pass_sleeps_the_idle_look_and_a_failed_one_its_safety(pool: PgPool) {
+    async fn a_quiet_pass_books_no_wake_and_a_failed_one_its_safety(pool: PgPool) {
         schema(&pool).await;
-        let (quiet, _) = counting("quiet", 30);
-        assert!(approx(drain_due(&pool, ROLE, &[quiet], &[]).await, IDLE_LOOK.as_secs()));
-        let failing = DrainLoop::new("failing", NONE, Duration::from_secs(90), || async { anyhow::bail!("boom") });
-        assert!(approx(drain_due(&pool, ROLE, &[failing], &[]).await, 90));
+        let quiet = DrainLoop::new("quiet", WRITES, Duration::from_secs(30), || async { Ok(DrainStep::Done) });
+        let (sweep, _) = counting("sweep", 30);
+        assert_eq!(drain_due(&pool, ROLE, &[quiet.clone(), sweep.clone()], &[]).await, None);
+        assert_eq!(due_ms(&pool, "quiet").await, None, "asleep until woken");
+        assert_eq!(drain_due(&pool, ROLE, &[quiet, sweep], &[]).await, None, "and a pass right after runs nothing");
+        let failing_sweep = DrainLoop::new("failing_sweep", NONE, Duration::from_secs(90), || async { anyhow::bail!("boom") });
+        assert_eq!(drain_due(&pool, ROLE, &[failing_sweep], &[]).await, None, "a sweep that failed runs on a later pass");
+        let failing = DrainLoop::new("failing", WRITES, Duration::from_secs(90), || async { anyhow::bail!("boom") });
+        assert!(approx(drain_due(&pool, ROLE, &[failing], &[]).await.expect("a look is due"), 90));
     }
 
     /// The due times are the database's, not a process's: a pass started
@@ -682,14 +802,42 @@ mod drain_due_tests {
         let loops = [hourly, picker];
         drain_due(&pool, ROLE, &loops, &[]).await;
         let next = drain_due(&pool, ROLE, &loops, &["picker".to_string()]).await;
-        assert_eq!(hourly_runs.load(Ordering::SeqCst), 1, "not due again until the idle look");
+        assert_eq!(hourly_runs.load(Ordering::SeqCst), 1, "not due again until its interval");
         assert_eq!(picker_runs.load(Ordering::SeqCst), 2, "woken");
-        assert!(approx(next, 30), "{next:?}");
+        assert!(approx(next.expect("a look is due"), 30), "{next:?}");
         drain_due(&pool, ROLE, &loops, &[]).await;
         assert_eq!(picker_runs.load(Ordering::SeqCst), 2, "nothing woken, nothing due");
         let (other_role, other_runs) = counting("hourly", 3600);
         drain_due(&pool, "broker", &[other_role], &[]).await;
         assert_eq!(other_runs.load(Ordering::SeqCst), 1, "another role's loop of the same name has its own row");
+    }
+
+    /// In a process that scales to zero, a loop run for the life of the
+    /// process drains at start and when a write wakes it, and on its
+    /// safety interval only once the process had work since: a process
+    /// left idle queries nothing.
+    #[sqlx::test]
+    async fn a_loop_looks_on_its_interval_only_while_its_process_works(pool: PgPool) {
+        let watch = PgSignalWatch::start(&pool.connect_options(), &["chan"], crate::pg_signal::Listening::WhileBusy).await.unwrap();
+        let runs = Arc::new(AtomicU32::new(0));
+        let counter = runs.clone();
+        let l = DrainLoop::new("woken", WRITES, Duration::from_millis(200), move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async { Ok(DrainStep::Done) }
+        });
+        let subscription = watch.subscribe();
+        let looks = Looks::WhileWorking(watch.clone());
+        tokio::spawn(async move { l.run_forever(subscription, looks).await });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the start drain, and no safety look since");
+        sqlx::query("SELECT pg_notify('chan', '')").execute(&pool).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "a write wakes it");
+        drop(watch.busy().await);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 3, "work since: the safety look runs");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(runs.load(Ordering::SeqCst), 3, "and none after it while nothing works");
     }
 
     /// A pass that drained a loop replaces its booking when nobody wrote
@@ -702,18 +850,21 @@ mod drain_due_tests {
         let later = Duration::from_secs(3600);
 
         // Nobody wrote since the read: the new booking stands, even later.
-        book(&pool, ROLE, "x", soon, None).await.unwrap();
+        book(&pool, ROLE, "x", Some(soon), None).await.unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await;
         let read_at = read_due(&pool, ROLE).await.unwrap().now;
-        let (due, now) = book(&pool, ROLE, "x", later, Some(read_at)).await.unwrap();
-        assert_eq!(due, now + 3_600_000);
+        let (due, now) = book(&pool, ROLE, "x", Some(later), Some(read_at)).await.unwrap();
+        assert_eq!(due, Some(now + 3_600_000));
         assert_eq!(due_ms(&pool, "x").await, due);
 
-        // A sibling booked a sooner look after this pass read: it stands.
+        // A sibling booked a sooner look after this pass read: it stands,
+        // even over a pass that found nothing left.
         let read_at = read_due(&pool, ROLE).await.unwrap().now;
         tokio::time::sleep(Duration::from_millis(5)).await;
-        let (sibling_due, _) = book(&pool, ROLE, "x", soon, None).await.unwrap();
-        let (due, _) = book(&pool, ROLE, "x", later, Some(read_at)).await.unwrap();
+        let (sibling_due, _) = book(&pool, ROLE, "x", Some(soon), None).await.unwrap();
+        let (asleep, _) = book(&pool, ROLE, "x", None, Some(read_at)).await.unwrap();
+        assert_eq!(asleep, sibling_due, "the sibling's look outlasts an empty booking");
+        let (due, _) = book(&pool, ROLE, "x", Some(later), Some(read_at)).await.unwrap();
         assert_eq!(due, sibling_due, "the sibling's sooner look is kept");
     }
 }

@@ -24,29 +24,48 @@ use axum::routing::post;
 use axum::Router;
 use weft_platform_traits::roles::TICK_PATH;
 use weft_platform_traits::{Alarm, CoreRole, Wake};
+use weft_task_store::pg_signal::{Busy, PgSignalWatch};
 
 /// A role's own tick, for a role that scales to zero: drain its loops,
-/// then set its next wake. `run` takes the loops the caller says a write
-/// woke (`?loop=<name>`, repeated: a writer's waker names them, a
-/// builder's announcement names the build loop); the loops whose own next
-/// look is due run too.
+/// then set its next wake, if any loop wants one. `run` takes the loops
+/// the caller says a write woke (`?loop=<name>`, repeated: a writer's
+/// waker names them); the loops whose own next look is due run too. It
+/// answers how soon a loop next wants a look, or `None` when none does,
+/// and then no wake is set: the role sleeps until a write rings it.
 #[derive(Clone)]
 pub struct Tick {
     pub role: CoreRole,
-    pub run: Arc<dyn Fn(Vec<String>) -> futures::future::BoxFuture<'static, Duration> + Send + Sync>,
+    pub run: Arc<dyn Fn(Vec<String>) -> futures::future::BoxFuture<'static, Option<Duration>> + Send + Sync>,
     pub alarm: Arc<dyn Alarm>,
 }
 
+impl Tick {
+    /// One pass: run the woken loops and the due ones, then set the next
+    /// wake the pass asks for. The tick route calls it, and so does a
+    /// process of the role as it starts, for what came due while no
+    /// process of it was up.
+    pub async fn pass(&self, woken: Vec<String>) -> anyhow::Result<()> {
+        let Some(next) = (self.run)(woken).await else { return Ok(()) };
+        let wake = Wake {
+            key: format!("tick:{}", self.role),
+            at_unix_ms: wake_at(now_ms(), next),
+            role: self.role,
+            path: TICK_PATH.to_string(),
+            body: serde_json::json!({}),
+        };
+        self.alarm.set(wake).await
+    }
+}
+
 /// The name of the query parameter a tick reads its woken loops from.
-// SYNC: TICK_LOOP_PARAM <-> deploy/terraform/gcp/builds.tf (the push endpoint)
 pub const TICK_LOOP_PARAM: &str = "loop";
 
-/// The next wake for a tick that wants another look after `next`: the end
-/// of the `next`-long slot `now` falls in, so every tick inside one slot
-/// sets the same wake and the platform keeps one.
-pub fn next_slot(now_ms: i64, next: Duration) -> i64 {
-    let slot = (next.as_millis() as i64).max(1000);
-    (now_ms / slot + 1) * slot
+/// The moment of a wake wanted `next` from `now_ms`: rounded up to the
+/// whole second, so every pass that wants the same look sets the same
+/// wake and the platform keeps one; a second away at the soonest.
+pub fn wake_at(now_ms: i64, next: Duration) -> i64 {
+    let at = now_ms.saturating_add(i64::try_from(next.as_millis()).unwrap_or(i64::MAX).max(1000));
+    at.saturating_add(999) / 1000 * 1000
 }
 
 async fn tick(State(t): State<Tick>, axum::extract::RawQuery(query): axum::extract::RawQuery) -> Response {
@@ -54,21 +73,53 @@ async fn tick(State(t): State<Tick>, axum::extract::RawQuery(query): axum::extra
         .filter(|(k, _)| k == TICK_LOOP_PARAM)
         .map(|(_, v)| v.into_owned())
         .collect();
-    let next = (t.run)(woken).await;
-    let now = now_ms();
-    let wake = Wake {
-        key: format!("tick:{}", t.role),
-        at_unix_ms: next_slot(now, next),
-        role: t.role,
-        path: TICK_PATH.to_string(),
-        body: serde_json::json!({}),
-    };
-    match t.alarm.set(wake).await {
+    match t.pass(woken).await {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => {
             tracing::error!(target: "weft_runtime::server", role = %t.role, error = %format!("{e:#}"), "could not set the next tick");
             (StatusCode::INTERNAL_SERVER_ERROR, format!("the next tick could not be set: {e:#}")).into_response()
         }
+    }
+}
+
+/// Keep `watch` listening while a request is answered, to the end of its
+/// answer's body: a stream of events is listened for until it closes. A
+/// process that scales to zero lets its watch go quiet only between
+/// requests (`weft_task_store::pg_signal::Listening::WhileBusy`), and
+/// every request it answers may write, so a quiet watch listens again
+/// before the request goes on.
+pub async fn keep_listening(
+    State(watch): State<Arc<PgSignalWatch>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let busy = watch.busy().await;
+    next.run(request).await.map(|body| axum::body::Body::new(Held { body, _busy: busy }))
+}
+
+/// An answer's body, holding its process busy until it ends.
+struct Held {
+    body: axum::body::Body,
+    _busy: Busy,
+}
+
+impl http_body::Body for Held {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
     }
 }
 
@@ -137,12 +188,18 @@ pub fn shutdown() -> impl std::future::Future<Output = ()> {
 mod tests {
     use super::*;
 
+    /// A wake lands where it was asked for, on the next whole second, so
+    /// every pass that wants the same moment sets the same wake. A grid as
+    /// wide as the wait itself would put a 5-hour wait at a random point
+    /// inside it, almost always early, and wake a quiet install again and
+    /// again before its look was due.
     #[test]
-    fn every_tick_inside_one_slot_sets_the_same_wake() {
-        let slot = Duration::from_secs(30);
-        assert_eq!(next_slot(1_000, slot), 30_000);
-        assert_eq!(next_slot(29_999, slot), 30_000);
-        assert_eq!(next_slot(30_000, slot), 60_000);
-        assert_eq!(next_slot(5, Duration::ZERO), 1_000, "never a wake in the past or at once");
+    fn a_wake_lands_on_the_next_whole_second_after_the_wait() {
+        let hours = Duration::from_secs(5 * 3600 + 12 * 60 + 33);
+        assert_eq!(wake_at(1_000, hours), 1_000 + 18_753_000);
+        assert_eq!(wake_at(1_001, hours), 1_000 + 18_754_000, "rounded up, never early");
+        assert_eq!(wake_at(10_200, Duration::from_millis(1_500)), 12_000);
+        assert_eq!(wake_at(10_900, Duration::from_millis(1_500)), 13_000);
+        assert_eq!(wake_at(5, Duration::ZERO), 2_000, "never a wake at once");
     }
 }

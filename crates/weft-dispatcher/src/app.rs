@@ -155,6 +155,7 @@ pub const DISPATCHER_CHANNELS: &[&str] = &[
     crate::held::WORKER_SETTINGS_CHANNEL,
     crate::held::INFRA_STATUS_CHANNEL,
     crate::held::ACCESS_CHANNEL,
+    crate::build::follow::BUILD_STARTED_CHANNEL,
 ];
 
 /// What the dispatcher is built from: the install's config and what the
@@ -378,6 +379,7 @@ pub fn loop_wakes() -> Vec<(&'static str, &'static [WakeOn])> {
         ("infra_returns", crate::reaper::ON_INFRA_STATUS),
         ("holders", crate::holders::ON_HELD_SIGNALS),
         ("domains_door", crate::domains::ON_DOMAINS),
+        ("image_builds", crate::build::follow::WAKE_ON),
     ]
 }
 

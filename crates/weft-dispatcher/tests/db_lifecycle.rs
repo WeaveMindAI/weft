@@ -1917,7 +1917,7 @@ async fn a_held_row_coming_or_going_wakes_the_holder_sizing(pool: PgPool) {
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     static CHANNELS: &[&str] = &[HELD_SIGNALS_CHANNEL];
-    let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool.connect_options(), CHANNELS).await.unwrap();
+    let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool.connect_options(), CHANNELS, weft_task_store::pg_signal::Listening::Always).await.unwrap();
     let mut heard = watch.subscribe();
     async fn woken(heard: &mut weft_task_store::pg_signal::Subscription) -> bool {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -1956,7 +1956,7 @@ async fn the_held_rows_announce_their_changes(pool: PgPool) {
     let id = Uuid::new_v4();
     seed_project(&projects, id, "bin-A").await;
     static CHANNELS: &[&str] = &[ROUTES_CHANNEL, WORKER_SETTINGS_CHANNEL, INFRA_STATUS_CHANNEL];
-    let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool.connect_options(), CHANNELS).await.unwrap();
+    let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool.connect_options(), CHANNELS, weft_task_store::pg_signal::Listening::Always).await.unwrap();
     let mut heard = watch.subscribe();
     async fn heard_on(heard: &mut weft_task_store::pg_signal::Subscription, channel: &'static str, key: &str) -> bool {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);

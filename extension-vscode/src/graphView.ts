@@ -14,6 +14,7 @@ import * as vscode from 'vscode';
 import type { DispatcherClient } from './dispatcher';
 import { HttpError } from './dispatcher';
 import { ReconnectingStream } from './projectEvents';
+import type { LivePause } from './presence';
 import { runWeftJson, docDirOf } from './cli';
 import type { ParseServer } from './parseServer';
 import { afterTabModelSettles, isReviewDoc } from './tabs';
@@ -202,8 +203,9 @@ export class GraphViewController {
     private readonly context: vscode.ExtensionContext,
     private readonly client: DispatcherClient,
     private readonly parseServer: ParseServer,
+    livePause: LivePause,
   ) {
-    this.displayStream = new ReconnectingStream<DisplayFeedMessage>(client, 'displays');
+    this.displayStream = new ReconnectingStream<DisplayFeedMessage>(client, 'displays', livePause);
     this.displayStream.onMessage((msg) => this.showDisplay(msg));
   }
 

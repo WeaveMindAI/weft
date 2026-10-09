@@ -14,10 +14,15 @@
 // A single follower tracks a single execution at a time. Switching
 // follows (the user picks a different past execution in the
 // sidebar) disposes the current EventSource and spins a new one.
+//
+// While the person is away from a remote install (see `presence.ts`)
+// the stream is closed, and coming back opens the same execution
+// again the way a click does: history first, then live.
 
 import type * as vscode from 'vscode';
 
 import type { DispatcherClient } from './dispatcher';
+import type { LivePause } from './presence';
 import type {
   WirePayload,
   CancelCause,
@@ -158,11 +163,20 @@ export class ExecutionFollower implements vscode.Disposable {
   private generation = 0;
   private cancelStart: (() => void) | undefined;
   private historyAbort: AbortController | undefined;
+  /// The execution being followed, kept across a pause so coming back
+  /// reopens it; cleared when the follow stops or is lost.
+  private executionId: string | undefined;
 
   constructor(
     private readonly client: DispatcherClient,
     private readonly post: PostFn,
-  ) {}
+    private readonly pause: LivePause,
+  ) {
+    pause.onChange((paused) => {
+      if (paused) this.close();
+      else if (this.executionId) void this.start(this.executionId);
+    });
+  }
 
   /** Hydrate a past execution by replaying every journaled event up
    *  front, then keep following so a still-running execution stays
@@ -178,12 +192,15 @@ export class ExecutionFollower implements vscode.Disposable {
    *  forever. Stable event identities remove the overlap without
    *  comparing payloads or assuming that repeated updates are harmless. */
   private async start(executionId: string): Promise<void> {
-    this.stop();
+    this.close();
+    this.executionId = executionId;
+    this.post({ kind: 'execReset' });
+    // Coming back opens it.
+    if (this.pause.paused()) return;
     const generation = this.generation;
     const historyAbort = new AbortController();
     this.historyAbort = historyAbort;
     const isCurrent = () => this.generation === generation;
-    this.post({ kind: 'execReset' });
 
     let opened!: (ready: boolean) => void;
     const ready = new Promise<boolean>((resolve) => { opened = resolve; });
@@ -290,7 +307,15 @@ export class ExecutionFollower implements vscode.Disposable {
     }
   }
 
+  /** Stop following: nothing reopens it. */
   stop(): void {
+    this.executionId = undefined;
+    this.close();
+  }
+
+  /** Close the stream and abandon a replay in flight, keeping which
+   *  execution it was (a pause reopens it). */
+  private close(): void {
     this.generation++;
     this.cancelStart?.();
     this.cancelStart = undefined;

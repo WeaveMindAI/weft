@@ -119,9 +119,9 @@ Then, in your fork's settings on GitHub, add these repository variables:
 
 weft keeps everything in a Postgres database you bring, and only needs its
 address. Any Postgres the internet can reach works. If you want the install to cost next to nothing while
-nobody uses it, pick one that scales to zero: once weft's services
-have scaled to zero they hold no connection to it, so the database can sleep (for
-what keeps it awake, see [what you get](#what-you-get)). If you work with Tangle, it
+nobody uses it, pick one that scales to zero: once nobody uses the install, weft
+stops querying it, so the database can sleep (for what keeps it awake, see
+[what you get](#what-you-get)). If you work with Tangle, it
 can create one that scales to zero and set the secrets below for you.
 
 Put its address in a repository secret named `WEFT_DATABASE_URL`, as a
@@ -185,9 +185,11 @@ is: delete it from its own provider if you no longer want it.
 
 ### What you get
 
-While nobody is using the install, no trigger keeps a connection open, and
-no program's infrastructure is up, none of weft runs, apart from a check every
-few hours that wakes each part for a moment.
+While nobody is using the install and no trigger keeps a connection open,
+none of weft runs and your database sleeps. weft books a wake only for a
+moment something is due (a schedule, a retry, a hibernation ending), and a
+program's infrastructure that runs fine keeps nothing awake: each machine
+says so itself when its state changes.
 
 | Piece | What it is |
 |---|---|
@@ -195,7 +197,7 @@ few hours that wakes each part for a moment.
 | The holders | a Cloud Run worker pool for the triggers that keep a connection open between events (a stream, a socket, an event subscription that dials out). weft runs one holder per 200 such triggers and none when there are none |
 | Your database | everything weft keeps, at the address you gave it |
 | Cloud Build | builds your programs' images when you deploy |
-| Pub/Sub | the `cloud-builds` topic, on which Cloud Build announces each build's end, so the dispatcher hears it at once, and one carrying Compute Engine's record of an infrastructure machine stopping or failing to the supervisor |
+| Pub/Sub | a topic carrying Compute Engine's record of an infrastructure machine stopping or failing to the supervisor |
 | Cloud Tasks | every timer, schedule and poll your programs set, and the wakes weft schedules for itself to check on its own pending work |
 | Compute Engine | one machine per infrastructure unit your programs start (a database, a GPU model) |
 | A storage bucket | weft's files, reached as weft's own service account: no key is made for it, so an organization that forbids service-account keys runs weft as is |
@@ -210,13 +212,17 @@ connection, go and read
 [how a trigger picks its road](../connections/events.md#the-two-roads).
 You pay for a holder while it runs. A running holder also checks in with weft
 every 10 seconds, so weft's broker and your database never get to sleep
-while such a trigger is on. A program's infrastructure does the same while it
-is up: the supervisor checks its health every 30 seconds, through the broker,
-so the database stays awake until you stop it. If a
+while such a trigger is on. If a
 holder crashes, its triggers hear nothing for up to about 40 seconds: its
 claims run out 30 seconds after it last renewed them, and another holder, or
 its restarted copy, takes them at its next look. A
 holder that is stopped normally hands its triggers over at once.
+
+If you have VS Code pointed at the install, the editor keeps a live
+connection open to it, and the install and your database stay awake while
+it does. Once the window has been out of focus or untouched for 5 minutes,
+the editor closes that connection, and opens it again when you come back.
+Switching the editor back to your local install closes it at once.
 
 If you want to change one of the install's defaults (how many triggers a
 holder takes, a holder's CPU and memory, how many builds run at once, how

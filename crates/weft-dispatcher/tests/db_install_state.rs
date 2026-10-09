@@ -152,7 +152,7 @@ async fn a_refused_new_domain_is_forgotten_and_wakes_the_door(pool: PgPool) {
     use weft_dispatcher::domains::{add, list, serve_added, Added, ServeError, DOMAINS_CHANNEL};
     project(&pool).await;
     static CHANNELS: &[&str] = &[DOMAINS_CHANNEL];
-    let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool.connect_options(), CHANNELS).await.unwrap();
+    let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool.connect_options(), CHANNELS, weft_task_store::pg_signal::Listening::Always).await.unwrap();
     let mut heard = watch.subscribe();
     let domain = Domain { name: "a.example.com".into(), serves: DomainServes::Install };
     let new = add(&pool, &domain, 1).await.unwrap() == Added::New;

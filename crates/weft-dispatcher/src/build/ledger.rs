@@ -233,18 +233,22 @@ pub async fn claim(
 /// longer this running build's (it was cancelled, or given up on, while
 /// it was being made): nobody will ask about it, so the caller frees it.
 pub async fn started(pool: &PgPool, image_ref: &str, name: &str, handle: &weft_platform_traits::BuildHandle) -> Result<bool> {
-    let res = sqlx::query(
+    // Announced in the same statement, so the build loop watches it from
+    // the moment it is recorded.
+    let recorded = sqlx::query(
         "UPDATE image_build SET builder_id = $3, log_url = $4 \
-         WHERE image_ref = $1 AND build_name = $2 AND status = 'running' AND builder_id IS NULL",
+         WHERE image_ref = $1 AND build_name = $2 AND status = 'running' AND builder_id IS NULL \
+         RETURNING pg_notify($5, image_ref)",
     )
     .bind(image_ref)
     .bind(name)
     .bind(&handle.external_build_id)
     .bind(&handle.log_url)
-    .execute(pool)
+    .bind(super::follow::BUILD_STARTED_CHANNEL)
+    .fetch_optional(pool)
     .await
     .context("record the build's id on its builder")?;
-    Ok(res.rows_affected() == 1)
+    Ok(recorded.is_some())
 }
 
 /// The builder failed to answer about the build `name` at `now`: since

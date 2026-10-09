@@ -5410,6 +5410,7 @@ dependencies = [
  "clap",
  "futures",
  "hex",
+ "http-body 1.0.1",
  "parking_lot",
  "reqwest",
  "serde_json",

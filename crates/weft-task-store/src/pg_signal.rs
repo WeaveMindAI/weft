@@ -26,10 +26,22 @@
 //! it proves it hears back a notification of its own, so a session that
 //! cannot listen is refused at once, naming the fix, rather than leaving
 //! every waiter to sleep to its deadline.
+//!
+//! A process that scales to zero listens only while it has work
+//! ([`Listening::WhileBusy`]). A serverless database (Neon) goes to sleep
+//! once no query has run for a few minutes and closes every connection as
+//! it does, the listening one included; listening again at once would wake
+//! it straight back up, so a watch that loses its connection while nothing
+//! in its process is busy ([`PgSignalWatch::busy`]) stays down until
+//! something is. Nothing is missed meanwhile: every write is made by a
+//! process that is busy making it, so that process hears it.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use tokio::sync::Notify;
+use tokio::time::Instant;
 
 use anyhow::Result;
 use sqlx::postgres::{PgConnectOptions, PgListener, PgPool, PgPoolOptions};
@@ -47,6 +59,11 @@ pub const MAX_HOLD: Duration = Duration::from_secs(25);
 pub enum Heard {
     Signal { channel: &'static str, payload: Arc<str> },
     Recheck,
+    /// Listening again after a quiet spell ([`Listening::WhileBusy`]):
+    /// nothing a listening process missed, but whatever this process keeps
+    /// from before may be stale, so every waiter looks again as on a
+    /// [`Heard::Recheck`].
+    Resumed,
     /// The listening connection is gone: nothing is heard until a
     /// [`Heard::Recheck`] says it listens again. A waiter that reads its
     /// row anyway has nothing to do; a copy of rows kept in memory
@@ -62,6 +79,71 @@ const FANOUT_CAPACITY: usize = 1024;
 /// Wait between attempts to listen again after the connection failed in
 /// a way the listener does not recover from by itself.
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// How long after its last busy moment a process still counts as busy
+/// when its connection drops: a write that committed just before its
+/// request ended may not have been heard yet.
+const QUIET_AFTER: Duration = Duration::from_secs(5);
+
+/// How long [`PgSignalWatch::busy`] waits for a quiet watch to listen
+/// again before letting the work go ahead without it (the database is
+/// down, and that work will say so itself).
+const RESUME_WAIT: Duration = Duration::from_secs(10);
+
+/// When a watch listens: for the life of its process, or only while the
+/// process has work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Listening {
+    /// A lost connection is made again at once: a machine's process, up
+    /// for good.
+    Always,
+    /// A connection lost while nothing in the process is busy is left down
+    /// until something is: a process that scales to zero, beside a
+    /// database that sleeps (see the module docs).
+    WhileBusy,
+}
+
+/// What the process is doing, as the watch needs to know it.
+struct Demand {
+    listening: Listening,
+    /// Every [`Busy`] alive: work, and the looks of the process's own loops.
+    held: AtomicUsize,
+    /// The ones that are work ([`PgSignalWatch::busy`]).
+    working: AtomicUsize,
+    /// When the last work ended.
+    last_work: Mutex<Instant>,
+    /// Told when something needs the watch while it does not listen.
+    wanted: Notify,
+    /// Told every time the watch listens again.
+    listening_again: Notify,
+}
+
+impl Demand {
+    /// Whether a connection lost now is left down.
+    fn quiet_now(&self) -> bool {
+        self.listening == Listening::WhileBusy
+            && self.held.load(Ordering::Acquire) == 0
+            && self.last_work.lock().expect("demand clock").elapsed() >= QUIET_AFTER
+    }
+}
+
+/// Something in flight in a process whose watch listens only while it
+/// has some ([`PgSignalWatch::busy`], [`PgSignalWatch::looking`]); the
+/// watch may go quiet once every one is dropped.
+pub struct Busy {
+    demand: Arc<Demand>,
+    work: bool,
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        if self.work {
+            *self.demand.last_work.lock().expect("demand clock") = Instant::now();
+            self.demand.working.fetch_sub(1, Ordering::AcqRel);
+        }
+        self.demand.held.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// The channel a watch proves it can hear on, every time it listens.
 const PROBE_CHANNEL: &str = "weft_listen_probe";
@@ -86,6 +168,7 @@ pub struct PgSignalWatch {
     /// that follows a reconnect. A subscriber that fell behind and missed
     /// either reads the state here.
     listening: Arc<AtomicBool>,
+    demand: Arc<Demand>,
     /// The listening task. It lives exactly as long as the watch: when
     /// the process part that owns the watch goes, so does its connection
     /// (a test's database cannot be dropped while it is held).
@@ -102,8 +185,9 @@ impl PgSignalWatch {
     /// Start listening at `connect` (a session of its own, see the module
     /// docs), on every one of `channels`. Fails when the first connection
     /// cannot be made or cannot listen; after that, the listener
-    /// reconnects on its own and every waiter is told to recheck.
-    pub async fn start(connect: &PgConnectOptions, channels: &'static [&'static str]) -> Result<Arc<Self>> {
+    /// reconnects on its own (as `listening` says) and every waiter is
+    /// told to recheck.
+    pub async fn start(connect: &PgConnectOptions, channels: &'static [&'static str], listening: Listening) -> Result<Arc<Self>> {
         let own = PgPoolOptions::new()
             .max_connections(1)
             .max_lifetime(None)
@@ -112,9 +196,71 @@ impl PgSignalWatch {
             .await?;
         let listener = listen(&own, channels).await?;
         let (tx, template) = broadcast::channel(FANOUT_CAPACITY);
-        let listening = Arc::new(AtomicBool::new(true));
-        let pump = tokio::spawn(pump(listener, own, channels, tx, listening.clone()));
-        Ok(Arc::new(Self { channels, template: Mutex::new(template), listening, pump }))
+        let listening_now = Arc::new(AtomicBool::new(true));
+        let demand = Arc::new(Demand {
+            listening,
+            held: AtomicUsize::new(0),
+            working: AtomicUsize::new(0),
+            last_work: Mutex::new(Instant::now()),
+            wanted: Notify::new(),
+            listening_again: Notify::new(),
+        });
+        let pump = tokio::spawn(pump(listener, own, channels, tx, listening_now.clone(), demand.clone()));
+        Ok(Arc::new(Self { channels, template: Mutex::new(template), listening: listening_now, demand, pump }))
+    }
+
+    /// Hold this while doing work that writes, or that waits on what this
+    /// watch hears (a request, an open line, a command being carried out):
+    /// a watch that is down listens again first (waiting [`RESUME_WAIT`]
+    /// at most), and does not go quiet while it is held. A no-op for a
+    /// watch that listens [`Listening::Always`].
+    pub async fn busy(&self) -> Busy {
+        self.hold(true).await
+    }
+
+    /// Hold this while one of the process's own loops looks at its rows:
+    /// the watch listens meanwhile, but a look is not work, so a process
+    /// whose loops only look still goes quiet ([`Self::worked_since`]).
+    pub async fn looking(&self) -> Busy {
+        self.hold(false).await
+    }
+
+    /// Whether the process has had work ([`Self::busy`]) since `since`.
+    pub fn worked_since(&self, since: Instant) -> bool {
+        self.demand.working.load(Ordering::Acquire) > 0 || *self.demand.last_work.lock().expect("demand clock") > since
+    }
+
+    async fn hold(&self, work: bool) -> Busy {
+        let demand = self.demand.clone();
+        demand.held.fetch_add(1, Ordering::AcqRel);
+        if work {
+            demand.working.fetch_add(1, Ordering::AcqRel);
+        }
+        // The guard first, so a caller dropped while it waits gives it back.
+        let held = Busy { demand: demand.clone(), work };
+        if demand.listening == Listening::WhileBusy && !self.listening.load(Ordering::Acquire) {
+            demand.wanted.notify_one();
+            let resumed = tokio::time::timeout(RESUME_WAIT, async {
+                loop {
+                    let again = demand.listening_again.notified();
+                    tokio::pin!(again);
+                    again.as_mut().enable();
+                    if self.listening.load(Ordering::Acquire) {
+                        return;
+                    }
+                    again.await;
+                }
+            })
+            .await;
+            if resumed.is_err() {
+                tracing::warn!(
+                    target: "weft_task_store::pg_signal",
+                    "the signal listener is not listening again after {}s; going ahead without it",
+                    RESUME_WAIT.as_secs()
+                );
+            }
+        }
+        held
     }
 
     /// Subscribe BEFORE reading the row: a change that lands between the
@@ -197,6 +343,17 @@ impl Subscription {
         }
     }
 
+    /// Wait, however long it takes, for a reason to read the row again: a
+    /// signal that `concerns` (given its channel and payload) says is
+    /// ours, or a recheck.
+    pub async fn woken(&mut self, concerns: impl Fn(&str, &str) -> bool) -> Result<()> {
+        loop {
+            if wakes(&self.next().await?, &concerns) {
+                return Ok(());
+            }
+        }
+    }
+
     /// Wait for a reason to read the row again: a signal that `concerns`
     /// (given its channel and payload) says is ours, or a recheck.
     /// `false` when `deadline` passed first.
@@ -221,7 +378,7 @@ impl Subscription {
 /// Whether `heard` is a reason for a waiter to look again.
 fn wakes(heard: &Heard, concerns: &impl Fn(&str, &str) -> bool) -> bool {
     match heard {
-        Heard::Recheck => true,
+        Heard::Recheck | Heard::Resumed => true,
         // The recheck that follows a reconnect is what wakes the waiter.
         Heard::Lost => false,
         Heard::Signal { channel, payload } => concerns(channel, payload),
@@ -269,6 +426,7 @@ async fn pump(
     channels: &'static [&'static str],
     tx: broadcast::Sender<Heard>,
     listening: Arc<AtomicBool>,
+    demand: Arc<Demand>,
 ) {
     loop {
         let e = hear(&mut listener, channels, &tx).await;
@@ -279,19 +437,43 @@ async fn pump(
         // row, since nothing was heard meanwhile. The old listener goes
         // first: it holds the one connection its pool allows, and a new
         // one could never get it while it lives.
-        tracing::warn!(target: "weft_task_store::pg_signal", error = %e, "signal listener failed; listening again");
         drop(listener);
         listening.store(false, Ordering::Release);
         let _ = tx.send(Heard::Lost);
+        let quiet = demand.quiet_now();
+        if quiet {
+            // The database closing an idle process's connection as it goes
+            // to sleep: listen again once there is work, not before, or the
+            // listening would wake it straight back up.
+            tracing::info!(target: "weft_task_store::pg_signal", error = %e, "the signal listener's connection closed while nothing here is busy; listening again when work arrives");
+            loop {
+                let wanted = demand.wanted.notified();
+                tokio::pin!(wanted);
+                wanted.as_mut().enable();
+                if demand.held.load(Ordering::Acquire) > 0 {
+                    break;
+                }
+                wanted.await;
+            }
+        } else {
+            tracing::warn!(target: "weft_task_store::pg_signal", error = %e, "signal listener failed; listening again");
+        }
+        // Work waits on a watch coming back from quiet: no pause before
+        // its first try.
+        let mut pause = !quiet;
         listener = loop {
-            tokio::time::sleep(RETRY_DELAY).await;
+            if pause {
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            pause = true;
             match listen(&own, channels).await {
                 Ok(fresh) => break fresh,
                 Err(e) => tracing::warn!(target: "weft_task_store::pg_signal", error = %e, "signal listener cannot listen yet"),
             }
         };
         listening.store(true, Ordering::Release);
-        let _ = tx.send(Heard::Recheck);
+        demand.listening_again.notify_waiters();
+        let _ = tx.send(if quiet { Heard::Resumed } else { Heard::Recheck });
     }
 }
 
@@ -339,6 +521,7 @@ mod tests {
     #[test]
     fn a_recheck_wakes_every_waiter() {
         assert!(wakes(&Heard::Recheck, &|_: &str, _: &str| false));
+        assert!(wakes(&Heard::Resumed, &|_: &str, _: &str| false));
     }
 
     #[test]

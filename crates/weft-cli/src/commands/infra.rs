@@ -86,13 +86,11 @@ pub async fn run(ctx: Ctx, action: InfraAction, opts: InfraOpts) -> Result<()> {
     // Terminating deletes resources, stored data included unless a node
     // keeps it, so it never runs on a bare command: a terminal is asked,
     // and a script says `--yes`.
-    let copies_of = |what: &str| match &opts.instance {
-        Some(instance) => format!("instance '{instance}''s copies of {what}"),
-        None => what.to_string(),
-    };
-    let unconfirmed = match &action {
-        InfraAction::Terminate { yes: false } => Some(copies_of("the program's shared infra")),
-        InfraAction::NodeTerminate { node, yes: false } => Some(copies_of(&format!("infra node '{node}'"))),
+    let unconfirmed = match (&action, &opts.instance) {
+        (InfraAction::Terminate { yes: false }, None) => Some("the program's shared infra".to_string()),
+        (InfraAction::Terminate { yes: false }, Some(instance)) => Some(format!("the infra of instance '{instance}'")),
+        (InfraAction::NodeTerminate { node, yes: false }, None) => Some(format!("infra node '{node}'")),
+        (InfraAction::NodeTerminate { node, yes: false }, Some(instance)) => Some(format!("infra node '{node}' of instance '{instance}'")),
         _ => None,
     };
     if let Some(whose) = unconfirmed {

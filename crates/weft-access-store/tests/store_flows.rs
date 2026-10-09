@@ -1765,7 +1765,7 @@ async fn publishing_twice_updates_one_connection(pool: PgPool) {
 async fn only_a_publish_that_changes_the_connection_announces_it(pool: PgPool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
     static CHANNELS: &[&str] = &["weft_access"];
-    let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool.connect_options(), CHANNELS).await.unwrap();
+    let watch = weft_task_store::pg_signal::PgSignalWatch::start(&pool.connect_options(), CHANNELS, weft_task_store::pg_signal::Listening::Always).await.unwrap();
     let mut heard = watch.subscribe();
     async fn heard_it(heard: &mut weft_task_store::pg_signal::Subscription) -> bool {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);

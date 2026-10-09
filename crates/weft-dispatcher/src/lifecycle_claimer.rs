@@ -74,7 +74,13 @@ async fn claim_and_run_one(state: &DispatcherState) -> Result<bool> {
         return Ok(false);
     };
     let state = state.clone();
-    tokio::spawn(async move { run_and_complete(&state, row).await });
+    // Work of its own, outliving the drain that claimed it: the database
+    // is listened to until it ends, for what it writes.
+    let busy = state.signals.busy().await;
+    tokio::spawn(async move {
+        let _busy = busy;
+        run_and_complete(&state, row).await
+    });
     Ok(true)
 }
 

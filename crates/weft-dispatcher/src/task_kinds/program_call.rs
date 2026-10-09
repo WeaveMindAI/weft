@@ -221,7 +221,10 @@ async fn infra_start(
     };
     let state = state.clone();
     let node = node.to_string();
+    // The start lands after this answer: work until it does.
+    let busy = state.signals.busy().await;
     tokio::spawn(async move {
+        let _busy = busy;
         if let Err(not_landed) = crate::api::infra::finish_sync(&state, project_id, begun).await {
             let (status, message) = <(StatusCode, String)>::from(not_landed);
             tracing::error!(
