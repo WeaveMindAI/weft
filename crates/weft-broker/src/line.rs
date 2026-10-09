@@ -54,7 +54,15 @@ async fn open(state: Arc<BrokerState>, headers: HeaderMap, ws: WebSocketUpgrade,
         Err((status, message)) => return (status, message).into_response(),
     };
     let follower = follower(state.lines.clone(), principal);
-    server::upgrade(ws).on_upgrade(move |socket| server::serve(socket, api, Some(follower))).into_response()
+    // A line carries calls that write, and the notices its far end waits
+    // on (a run's cancel), so the database is listened to while it is open.
+    let busy = state.signals.busy().await;
+    server::upgrade(ws)
+        .on_upgrade(move |socket| async move {
+            let _busy = busy;
+            server::serve(socket, api, Some(follower)).await
+        })
+        .into_response()
 }
 
 /// How many notices a line may fall behind by before the fan-out lets go of
@@ -182,8 +190,8 @@ impl LineFanout {
                             fanout.hand(audience, Notice::Signal { channel: channel.to_string(), payload: payload.to_string() });
                         }
                     }
-                    Ok(Heard::Recheck) if heard.listening() => fanout.say_to_all(true),
-                    Ok(Heard::Recheck | Heard::Lost) => fanout.say_to_all(false),
+                    Ok(Heard::Recheck | Heard::Resumed) if heard.listening() => fanout.say_to_all(true),
+                    Ok(Heard::Recheck | Heard::Resumed | Heard::Lost) => fanout.say_to_all(false),
                     Err(e) => {
                         tracing::error!(target: "weft_broker::line", error = %format!("{e:#}"), "the broker's database listener stopped; every line says so");
                         fanout.say_to_all(false);

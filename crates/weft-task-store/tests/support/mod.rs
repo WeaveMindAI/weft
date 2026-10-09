@@ -15,7 +15,7 @@ pub const CHANNELS: &[&str] = &[tasks::TASK_READY_CHANNEL, weft_task_store::term
 /// A signal watch on the test database, listening on [`CHANNELS`].
 #[allow(dead_code)]
 pub async fn signals(pool: &PgPool) -> Arc<PgSignalWatch> {
-    PgSignalWatch::start(&pool.connect_options(), CHANNELS).await.expect("start the signal watch")
+    PgSignalWatch::start(&pool.connect_options(), CHANNELS, weft_task_store::pg_signal::Listening::Always).await.expect("start the signal watch")
 }
 
 /// Apply the task and worker-process schema to a fresh test database.

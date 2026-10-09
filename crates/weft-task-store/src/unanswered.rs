@@ -93,6 +93,17 @@ pub async fn answered(pool: &PgPool, callee: Callee<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Every role whose ring is written down as not answered, however long
+/// ago: a process that gave up ringing it (it was stopped) left the row,
+/// and the work the ring was for still waits, so a process that starts
+/// rings these again.
+pub async fn unanswered_roles(pool: &PgPool) -> Result<Vec<String>> {
+    let keys: Vec<String> = sqlx::query_scalar("SELECT callee FROM unanswered_call WHERE callee LIKE 'role:%' ORDER BY callee")
+        .fetch_all(pool)
+        .await?;
+    Ok(keys.into_iter().filter_map(|key| key.strip_prefix("role:").map(str::to_string)).collect())
+}
+
 /// Every role still failing, and `project`'s workers if they are: what
 /// the project's work waits on.
 pub async fn failing_for(pool: &PgPool, project: uuid::Uuid) -> Result<Vec<Failing>> {

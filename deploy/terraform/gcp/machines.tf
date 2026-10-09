@@ -45,8 +45,15 @@ resource "google_pubsub_topic_iam_member" "machine_events_published_by_the_sink"
   member = google_logging_project_sink.machine_events.writer_identity
 }
 
-# The push presents the core account's identity, as the build
-# notifications do (builds.tf grants Pub/Sub that).
+# Pub/Sub presents the core account's identity to the supervisor, as the
+# wakes queue does, which its own service agent may only do when allowed.
+resource "google_service_account_iam_member" "pubsub_signs_as_core" {
+  service_account_id = google_service_account.core.name
+  role               = "roles/iam.serviceAccountTokenCreator"
+  member             = "serviceAccount:service-${data.google_project.this.number}@gcp-sa-pubsub.iam.gserviceaccount.com"
+  depends_on         = [google_project_service.apis]
+}
+
 # SYNC: the tick path <-> crates/weft-platform-traits/src/roles.rs (TICK_PATH)
 resource "google_pubsub_subscription" "machine_events_wake_the_supervisor" {
   name  = "${var.name}-machine-events-wake-the-supervisor"

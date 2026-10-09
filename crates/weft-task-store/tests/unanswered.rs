@@ -39,3 +39,17 @@ async fn a_call_that_keeps_failing_is_shown_to_the_projects_it_holds_up(pool: Pg
     sqlx::query("UPDATE unanswered_call SET last_ms = last_ms - $1 - 1").bind(unanswered::RECENT_MS).execute(&pool).await.unwrap();
     assert!(unanswered::failing_for(&pool, mine).await.unwrap().is_empty(), "an old failure is not shown");
 }
+
+/// A ring given up on stays written down however old it is, so the next
+/// process that starts rings that role again; a project's workers are not
+/// a role and are never in that list.
+#[sqlx::test]
+async fn a_ring_given_up_on_is_found_again_at_the_next_start(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&unanswered::GROUP]).await.expect("schema");
+    unanswered::failed(&pool, Callee::Role("supervisor"), "503").await.unwrap();
+    unanswered::failed(&pool, Callee::Workers(Uuid::from_u128(1)), "connection refused").await.unwrap();
+    sqlx::query("UPDATE unanswered_call SET last_ms = last_ms - $1 - 1").bind(unanswered::RECENT_MS).execute(&pool).await.unwrap();
+    assert_eq!(unanswered::unanswered_roles(&pool).await.unwrap(), vec!["supervisor".to_string()]);
+    unanswered::answered(&pool, Callee::Role("supervisor")).await.unwrap();
+    assert!(unanswered::unanswered_roles(&pool).await.unwrap().is_empty());
+}

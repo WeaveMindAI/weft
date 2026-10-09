@@ -15,15 +15,19 @@
 //! no process stays up to listen when nothing is being written, so an
 //! idle install and its database sleep.
 //!
-//! It also rings every such role when it starts, naming every loop a write
-//! wakes (writes made before it listened were heard by nobody), which
-//! starts each role's own chain of wakes (every tick books the next one),
-//! and again whenever notifications may have been lost. A ring that fails
-//! is rung again, with a growing pause, until the role answers; each
+//! It rings every such role, naming every loop a write wakes, whenever
+//! notifications may have been lost (its listening connection dropped
+//! while it had work). When its watch only went quiet and listens again
+//! ([`Heard::Resumed`]), a process that writes listened while it wrote,
+//! so nothing was missed, and ringing every role then would wake the whole
+//! install each time the database woke up: it rings only its own roles,
+//! whose pass books the looks its loops ask for as they catch up. A ring that
+//! fails is rung again, with a growing pause, until the role answers; each
 //! failure is kept in the database (`weft_task_store::unanswered`), so
-//! `weft status` can say why the work waiting on that role does not move. A process
-//! that is stopping waits a few seconds for the rings still out, and logs
-//! the ones it gives up on.
+//! `weft status` can say why the work waiting on that role does not move.
+//! A process that is stopping waits a few seconds for the rings still out,
+//! and logs the ones it gives up on; the next process to start rings those
+//! roles again.
 //!
 //! A ring is coalesced per role: one tick runs at a time, and rings
 //! arriving during it are sent as one more once it answers, naming every
@@ -50,9 +54,9 @@ use crate::server::TICK_LOOP_PARAM;
 /// by a machine running a project's infra saying how it stands changed.
 const SUPERVISOR_WAKES: &[(&str, &[WakeOn])] = &[("supervisor", &[ISSUED_WAKE, LOOK_WAKE])];
 
-/// What wakes each of `role`'s loops, by loop name. The broker's loops run
-/// on their own timers, so only its first ring and its alarms wake it; the
-/// listener and the holder have no loops at all.
+/// What wakes each of `role`'s loops, by loop name. No write wakes the
+/// broker's loops (sweeps, run by its own process while it has work, and
+/// by its passes); the listener and the holder have no loops at all.
 fn loop_wakes(role: CoreRole) -> Vec<(&'static str, &'static [WakeOn])> {
     match role {
         CoreRole::Dispatcher => weft_dispatcher::app::loop_wakes(),
@@ -69,6 +73,11 @@ fn woken_by(wakes: &[(&'static str, &[WakeOn])], channel: &str, payload: &str) -
         .filter(|(_, wake_on)| wake_on.iter().any(|w| w.hears(channel, payload)))
         .map(|(name, _)| name.to_string())
         .collect()
+}
+
+/// Every loop of `role` a write wakes, by name.
+fn every_loop(role: CoreRole) -> BTreeSet<String> {
+    loop_wakes(role).iter().map(|(name, _)| name.to_string()).collect()
 }
 
 /// The longest pause between two tries of a ring that failed.
@@ -95,6 +104,8 @@ struct Bell {
 
 pub struct RoleWaker {
     bells: BTreeMap<CoreRole, Arc<Bell>>,
+    /// The roles this process runs itself.
+    own: Vec<CoreRole>,
     tokens: Arc<dyn IdentityTokens>,
     /// Where a ring that keeps failing is written down.
     pool: sqlx::PgPool,
@@ -109,6 +120,7 @@ impl RoleWaker {
     /// address as this process reaches it. `None` when none sleeps.
     pub fn new(
         config: &InstallConfig,
+        own: &[CoreRole],
         addresses: &RoleAddresses,
         tokens: Arc<dyn IdentityTokens>,
         pool: sqlx::PgPool,
@@ -127,7 +139,7 @@ impl RoleWaker {
         if bells.is_empty() {
             return Ok(None);
         }
-        Ok(Some(Self { bells, tokens, pool, http: reqwest::Client::new(), answered: Arc::default() }))
+        Ok(Some(Self { bells, own: own.to_vec(), tokens, pool, http: reqwest::Client::new(), answered: Arc::default() }))
     }
 
     /// Every channel a sleeping role's loops wait on: what this process's
@@ -138,8 +150,15 @@ impl RoleWaker {
 
     /// Ring on what the watch hears, for the process's whole life.
     pub async fn run(self: Arc<Self>, mut heard: Subscription) -> anyhow::Result<()> {
-        // Writes made before this process listened were heard by nobody.
-        self.ring_every_loop();
+        // A ring a stopped process gave up on is still owed.
+        match unanswered::unanswered_roles(&self.pool).await {
+            Ok(roles) => {
+                for role in roles.iter().filter_map(|r| self.bells.keys().find(|b| b.as_str() == r.as_str()).copied()) {
+                    self.ring(role, every_loop(role));
+                }
+            }
+            Err(e) => tracing::warn!(target: "weft_runtime::role_waker", error = %format!("{e:#}"), "could not read the rings left unanswered; their roles run at their own next wake"),
+        }
         loop {
             match heard.next().await? {
                 Heard::Signal { channel, payload } => {
@@ -152,6 +171,13 @@ impl RoleWaker {
                 }
                 // Notifications may have been lost.
                 Heard::Recheck => self.ring_every_loop(),
+                // Quiet, then listening again: nothing was missed, but its
+                // own loops catch up, and their next looks get booked.
+                Heard::Resumed => {
+                    for role in &self.own {
+                        self.ring(*role, every_loop(*role));
+                    }
+                }
                 // The recheck after the reconnect rings every loop.
                 Heard::Lost => {}
             }
@@ -159,11 +185,11 @@ impl RoleWaker {
     }
 
     /// Ring every sleeping role, naming each of its loops that a write
-    /// wakes, so each looks whether or not its next look is due: when this
-    /// process starts, and whenever notifications may have been lost.
+    /// wakes, so each looks whether or not its next look is due: whenever
+    /// notifications may have been lost.
     fn ring_every_loop(&self) {
         for role in self.bells.keys() {
-            self.ring(*role, loop_wakes(*role).iter().map(|(name, _)| name.to_string()).collect());
+            self.ring(*role, every_loop(*role));
         }
     }
 

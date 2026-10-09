@@ -170,6 +170,12 @@ export class DispatcherClient {
     return this.baseUrl;
   }
 
+  /// A remote install is one reached with an operator key (a cloud
+  /// install); the local one is reached without.
+  isRemote(): boolean {
+    return this.operatorKey !== undefined;
+  }
+
   async get<T>(path: string, signal?: AbortSignal): Promise<T> {
     const res = await this.send(path, { signal, headers: this.headers() });
     if (!res.ok) throw await httpError('GET', path, res);

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { DispatcherClient } from './dispatcher';
 import { ExecutionFollower, MAX_REPLAY_BUFFER_BYTES, type DispatcherEvent } from './execFollower';
 import type { HostMessage } from '../../packages/weft-graph/src/protocol';
+import type { LivePause } from './presence';
 
 type Handlers = NonNullable<Parameters<DispatcherClient['subscribe']>[2]>;
 
@@ -29,11 +30,24 @@ function completed(node: string): DispatcherEvent {
   return { event_id: `event:${node}`, kind: 'node_completed', execution_id: 'a', project_id: 'p', node, frames: [], output: {}, at_unix: 1 };
 }
 
+/** A pause the test flips by hand. */
+class ManualPause implements LivePause {
+  private value = false;
+  private readonly listeners: Array<(paused: boolean) => void> = [];
+  paused(): boolean { return this.value; }
+  onChange(listener: (paused: boolean) => void): void { this.listeners.push(listener); }
+  set(value: boolean): void {
+    this.value = value;
+    for (const listener of this.listeners) listener(value);
+  }
+}
+
 function rig() {
   const client = new FakeDispatcher();
   const posted: HostMessage[] = [];
-  const follower = new ExecutionFollower(client, (event) => posted.push(event));
-  return { client, follower, posted };
+  const pause = new ManualPause();
+  const follower = new ExecutionFollower(client, (event) => posted.push(event), pause);
+  return { client, follower, posted, pause };
 }
 
 describe('execution history and live follow', () => {
@@ -142,5 +156,57 @@ describe('execution history and live follow', () => {
     await following;
     expect(posted.some((e) => e.kind === 'execEvent')).toBe(false);
     expect(posted.at(-1)).toEqual({ kind: 'followLost', executionId: 'a', reason: 'closed' });
+  });
+});
+
+describe('pausing while the person is away', () => {
+  it('closes the stream on pause and reopens the same run, history first, on resume', async () => {
+    const { client, follower, posted, pause } = rig();
+    const following = follower.replay('a');
+    client.subscriptions[0].handlers.onOpen?.();
+    await Promise.resolve();
+    client.reads[0].resolve([completed('before')]);
+    await following;
+
+    pause.set(true);
+    expect(client.subscriptions[0].closed).toBe(true);
+    expect(posted.some((e) => e.kind === 'followLost')).toBe(false);
+
+    pause.set(false);
+    expect(client.subscriptions).toHaveLength(2);
+    client.subscriptions[1].handlers.onOpen?.();
+    await Promise.resolve();
+    expect(client.reads[1].path).toBe('/executions/a/replay');
+    client.reads[1].resolve([completed('before'), completed('meanwhile')]);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(posted.filter((e) => e.kind === 'execReset')).toHaveLength(2);
+    expect(posted.filter((e) => e.kind === 'execEvent').map((e) => e.event.nodeId))
+      .toEqual(['before', 'before', 'meanwhile']);
+    follower.stop();
+  });
+
+  it('opens nothing for a run picked while paused until the person is back', async () => {
+    const { client, follower, pause } = rig();
+    pause.set(true);
+    await follower.replay('a');
+    expect(client.subscriptions).toHaveLength(0);
+    pause.set(false);
+    expect(client.subscriptions).toHaveLength(1);
+    follower.stop();
+  });
+
+  it('does not revive a follow that was stopped or lost', async () => {
+    const { client, follower, pause } = rig();
+    const following = follower.replay('a');
+    client.subscriptions[0].handlers.onClosed?.();
+    await following;
+    pause.set(true);
+    pause.set(false);
+    expect(client.subscriptions).toHaveLength(1);
+    follower.stop();
+    pause.set(true);
+    pause.set(false);
+    expect(client.subscriptions).toHaveLength(1);
   });
 });

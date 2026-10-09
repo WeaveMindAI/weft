@@ -45,13 +45,19 @@ neon_json=$(mktemp)
 trap 'rm -f "$neon_json"' EXIT
 curl -sS https://console.neon.tech/api/v2/projects \
   -H "Authorization: Bearer $NEON_API_KEY" -H "Content-Type: application/json" \
-  -d '{"project": {"name": "weft", "region_id": "<a region id>"}}' > "$neon_json"
+  -d '{"project": {"name": "weft", "region_id": "<a region id>", "default_endpoint_settings": {"autoscaling_limit_min_cu": 0.25, "autoscaling_limit_max_cu": 1, "suspend_timeout_seconds": 300}}}' > "$neon_json"
 jq -e '.connection_uris[0]' "$neon_json" >/dev/null || { cat "$neon_json"; exit 1; }
 direct=$(jq -r '.connection_uris[0].connection_uri' "$neon_json")
 pooler_host=$(jq -r '.connection_uris[0].connection_parameters.pooler_host' "$neon_json")
 printf '%s' "$direct" | sed "s/@[^/:]*/@$pooler_host/" | gh secret set WEFT_DATABASE_URL --repo <fork> &&
   printf '%s' "$direct" | gh secret set WEFT_DATABASE_LISTEN_URL --repo <fork>
 ```
+
+The `default_endpoint_settings` start the database at the smallest size (0.25
+compute unit), let it grow to 1 under load, and put it to sleep after 300
+seconds with no queries. Without them Neon picks the size itself, on some
+accounts a fixed 1 compute unit, which bills about $77 a month if it never
+sleeps.
 
 If it printed Neon's answer and stopped, that is Neon refusing, and the answer
 says why (a wrong region id, a limit of the plan). `WEFT_DATABASE_URL` gets the
@@ -64,17 +70,29 @@ project. Check which are set with `gh secret list --repo <fork>`, have the user
 open the project's **Connect** dialog in the Neon console (the pooled address,
 or the direct one with pooling off), and set each missing one with
 `gh secret set <NAME> --repo <fork>`, piping in its address. If neither printed anything, both secrets are set: tell the user the
-database is ready and go back to weft-cloud-install.
+database is ready, and in one or two plain sentences what they got. It runs at
+the smallest size (0.25 compute unit), grows up to 1 under load, and sleeps
+after 5 minutes with no queries; Neon bills only the hours it is awake, about
+$0.11 per compute-unit-hour on the paid Launch plan, and the free plan gives
+100 compute-unit-hours a month. If they want it bigger or never asleep, those
+are settings of the compute in the Neon console (**Branches**, the compute,
+**Edit**), and either one costs more. Then go back to weft-cloud-install.
 
 ## What it costs
 
-Neon's free plan sleeps the database after five minutes with nothing
-connected, and gives a project 100 CU-hours a month (about 400 hours at the smallest size). An idle install
-lets it sleep, apart from a check every few hours: once weft's Cloud Run
-services have scaled to zero they hold no connection to it. Two things keep it
-awake around the clock: a trigger that keeps a connection open, because its
-holder checks in through weft every 10 seconds, and a program's
-infrastructure while it is up, because the supervisor checks its health every
-30. Either one uses up the free hours within the month. When they run out, the
-database stops until the next month or a paid plan, and the install stops
-with it.
+Neon's free plan gives a project 100 CU-hours a month, which at 0.25 CU is
+about 400 hours awake. The database sleeps 5 minutes after the last thing that
+used it, and an idle install wakes nothing: weft books a wake-up only for a
+moment something is actually due (a hibernation ending, a queued event's
+retry), and its services hold no busy connection to the database once quiet.
+Infrastructure that runs fine keeps nothing awake either, because a machine
+reports only when its state changes.
+
+Two things do keep it awake. A trigger that keeps a connection open keeps it
+awake around the clock, because its holder checks in through weft every 10
+seconds; on the free plan that uses up the month's hours, and when they run
+out the database stops until the next month or a paid plan, and the install
+stops with it. A VS Code editor pointed at the install keeps it awake while
+the person uses it; once the window has been out of focus or untouched for 5
+minutes, the editor stops its live connection so the install can sleep, and
+picks back up when they return.

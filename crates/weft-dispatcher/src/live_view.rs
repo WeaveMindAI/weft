@@ -72,7 +72,7 @@ pub async fn run(state: DispatcherState) {
             }
             // Announcements may have been lost: every run painted here is
             // read again past its last painted row.
-            Ok(Heard::Recheck) => views.recheck(&state).await,
+            Ok(Heard::Recheck | Heard::Resumed) => views.recheck(&state).await,
             Ok(_) => Ok(()),
             Err(e) => {
                 tracing::error!(target: "weft_dispatcher::live_view", error = %e, "the live view stopped hearing new record rows");

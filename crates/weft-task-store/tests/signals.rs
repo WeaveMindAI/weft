@@ -95,6 +95,57 @@ async fn a_lost_connection_tells_every_waiter_to_recheck(pool: PgPool) {
     assert!(heard.listening(), "listening again");
 }
 
+/// Cut every listening connection of the test database, as a database
+/// going to sleep does.
+async fn cut_the_listener(pool: &PgPool) {
+    let killed: Vec<(bool,)> = sqlx::query_as(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+         WHERE datname = current_database() AND application_name = $1",
+    )
+    .bind(weft_task_store::pg_signal::WATCH_APPLICATION_NAME)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(killed.len(), 1, "exactly one listening connection per watch");
+}
+
+/// A process that scales to zero listens only while it has work: a
+/// connection that drops while nothing is busy (the database going to
+/// sleep) stays down, so listening does not wake the database straight
+/// back up, until work arrives, which waits for it to listen again and is
+/// told it resumed; a drop while something is busy reconnects at once.
+#[sqlx::test]
+async fn a_quiet_watch_listens_again_only_when_work_arrives(pool: PgPool) {
+    setup(&pool).await;
+    let watch = weft_task_store::pg_signal::PgSignalWatch::start(
+        &pool.connect_options(),
+        support::CHANNELS,
+        weft_task_store::pg_signal::Listening::WhileBusy,
+    )
+    .await
+    .unwrap();
+    let mut heard = watch.subscribe();
+    // Past the moment just after work, when a drop still counts as busy.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    cut_the_listener(&pool).await;
+    let next = tokio::time::timeout(Duration::from_secs(20), heard.next()).await.expect("heard in time");
+    assert_eq!(next.unwrap(), Heard::Lost);
+    assert!(tokio::time::timeout(Duration::from_secs(3), heard.next()).await.is_err(), "nothing while quiet");
+    assert!(!heard.listening());
+
+    let busy = watch.busy().await;
+    assert!(heard.listening(), "work waits for the watch to listen");
+    let next = tokio::time::timeout(Duration::from_secs(20), heard.next()).await.expect("heard in time");
+    assert_eq!(next.unwrap(), Heard::Resumed);
+
+    cut_the_listener(&pool).await;
+    let next = tokio::time::timeout(Duration::from_secs(20), heard.next()).await.expect("heard in time");
+    assert_eq!(next.unwrap(), Heard::Lost);
+    let next = tokio::time::timeout(Duration::from_secs(20), heard.next()).await.expect("heard in time");
+    assert_eq!(next.unwrap(), Heard::Recheck, "busy: listening again at once");
+    drop(busy);
+}
+
 /// A task announces itself when it becomes claimable, and only then:
 /// claims, heartbeats and completions are the hot path and stay silent,
 /// while a requeue is loud.

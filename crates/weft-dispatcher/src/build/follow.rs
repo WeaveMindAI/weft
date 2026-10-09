@@ -3,11 +3,10 @@
 //!
 //! Anyone who looks moves a build forward ([`advance`]): the verb waiting
 //! on it, and otherwise the dispatcher's build loop ([`drain_loop`]),
-//! whichever dispatcher wakes. A dispatcher that scales to zero is woken
-//! for it by its own next look, or at once by the builder's own
-//! announcement that a build ended (Cloud Build's, pushed to the
-//! dispatcher's tick: deploy/terraform/gcp/builds.tf). No process holds a
-//! build, so none has to stay up for it to finish.
+//! whichever dispatcher wakes. A build starting wakes the loop
+//! ([`BUILD_STARTED_CHANNEL`]), which then looks every [`look_every`]
+//! until no build runs, and sleeps after. No process holds a build, so
+//! none has to stay up for it to finish.
 
 use anyhow::Result;
 use sqlx::PgPool;
@@ -20,10 +19,14 @@ use crate::state::DispatcherState;
 /// How often the loop looks at the running builds while there are some,
 /// in real time at this install's pace.
 fn look_every() -> std::time::Duration {
-    weft_core::time_scale::scaled(std::time::Duration::from_secs(15))
+    weft_core::time_scale::scaled(std::time::Duration::from_secs(5))
 }
 
-const NOTHING: &[WakeOn] = &[];
+/// The channel a build announces on once it runs on its builder
+/// ([`ledger::started`]); the payload is its image.
+pub const BUILD_STARTED_CHANNEL: &str = "weft_build_started";
+
+pub(crate) static WAKE_ON: &[WakeOn] = &[WakeOn::any(BUILD_STARTED_CHANNEL)];
 
 /// Ask the builder about the build running for `image_ref` and record its
 /// end when it ended. Errs only when the ledger cannot be read or
@@ -97,9 +100,8 @@ async fn advance_build(pool: &PgPool, images: &dyn ImageBuilder, build: &ledger:
 /// look again soon while any still runs. One dispatcher at a time
 /// (`crate::reaper`'s install-wide lock), so the builder is asked once per
 /// look, not once per replica.
-// SYNC: "image_builds" <-> deploy/terraform/gcp/builds.tf (the push endpoint's `loop`)
 pub fn drain_loop(state: &DispatcherState) -> DrainLoop {
-    crate::reaper::woken(state, NOTHING, "image_builds", |state| async move {
+    crate::reaper::woken(state, WAKE_ON, "image_builds", |state| async move {
         let builds = ledger::running(&state.pg_pool, None).await?;
         // One build's failure never skips the others; the failures are
         // answered together after.

@@ -952,7 +952,7 @@ fn spawn_cancel_watch(worker: Worker) {
                         fire_cancels(&worker).await;
                     }
                 }
-                Ok(weft_task_store::pg_signal::Heard::Recheck) if driving => fire_cancels(&worker).await,
+                Ok(weft_task_store::pg_signal::Heard::Recheck | weft_task_store::pg_signal::Heard::Resumed) if driving => fire_cancels(&worker).await,
                 Ok(_) => {}
                 Err(e) => {
                     tracing::error!(target: "weft_engine::worker", error = %format!("{e:#}"), "the cancel watch stopped hearing the line");

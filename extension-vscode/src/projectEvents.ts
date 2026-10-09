@@ -14,9 +14,14 @@
 //     the signal to resync from authoritative state (refetch status,
 //     refetch the executions list, catch up to a run that started
 //     meanwhile).
+//
+// While the person is away from a remote install (see `presence.ts`)
+// the stream is closed and does not retry; coming back connects it
+// again, and that connect resyncs like any other.
 
 import type { DispatcherClient, SseSubscription } from './dispatcher';
 import type { DispatcherEvent } from './execFollower';
+import type { LivePause } from './presence';
 
 const INITIAL_BACKOFF_MS = 500;
 const MAX_BACKOFF_MS = 5000;
@@ -38,9 +43,20 @@ export class ReconnectingStream<T> {
   constructor(
     private readonly client: DispatcherClient,
     private readonly name: string,
+    private readonly pause: LivePause,
   ) {
     // Another install answers now: the same path, asked there.
     client.onInstallChange(() => this.setPath(this.path));
+    pause.onChange((paused) => {
+      if (paused) {
+        // Bumped so a callback from the closed connection goes inert.
+        this.generation += 1;
+        this.stopCurrent();
+      } else if (!this.subscription && !this.retryTimer) {
+        // An install switch may already have reconnected it.
+        this.setPath(this.path);
+      }
+    });
   }
 
   onMessage(listener: (msg: T) => void): void {
@@ -78,6 +94,7 @@ export class ReconnectingStream<T> {
 
   private connect(generation: number): void {
     if (generation !== this.generation || !this.path) return;
+    if (this.pause.paused()) return;
     // Own exactly one live subscription: close whatever is there
     // before opening the next, so a reconnect can never stack a
     // still-running reader under the new one.
@@ -131,8 +148,8 @@ export class ReconnectingStream<T> {
 
 /** The ONE project-level stream every consumer listens on. */
 export class ProjectEventStream extends ReconnectingStream<DispatcherEvent> {
-  constructor(client: DispatcherClient) {
-    super(client, 'projectEvents');
+  constructor(client: DispatcherClient, pause: LivePause) {
+    super(client, 'projectEvents', pause);
   }
 
   /** Point the stream at a project (or nothing). */

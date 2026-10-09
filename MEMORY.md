@@ -44,3 +44,9 @@ Before building anything, answer all three, and say so. **Levers**: what a perso
 
 ## Every slow command runs in the background, with a realistic cap
 Anything that can take more than a few seconds runs with `run_in_background`: builds, tests, installs, and cloud work too (`gcloud ... create`, a Cloud SQL instance, `terraform apply`, project or machine creation). Never in the foreground, never "just this once"; an unknown duration counts as slow. Every wait on it is capped at how long that thing normally takes (a cargo check about a minute, an e2e test at most 5, a Cloud SQL create about 10), never a catch-all like 25 minutes: at the cap, look at what it is doing (its output, its operation's state) and tell the [user]. A foreground `gcloud sql instances create` once sat silent for many minutes until the [user] backgrounded it by hand.
+
+## Every change keeps the hot path as fast as it is
+The architecture was reworked to be lean and fast, and it stays that way. A bug is fixed by reshaping so the fast path stays fast and the bug is impossible, never by bolting a check, a retry, an extra query or an extra hop onto it. Before adding anything a common path pays for (a query per call, a lock, a round trip, a per-run write, a wider transaction), ask the [user] first, with what it costs and the alternative.
+
+## Every change keeps the install able to scale to zero
+weft is serverless: an install nobody uses runs nothing and its database sleeps. Every change is checked against that, including what calls in from outside (the editor, the CLI, a frontend, a holder): no timer, poll, held connection, self-wake or background loop may keep a part up, or the database awake, for good while nothing real is happening. Something reasonable that stays up while a person is actually using it is fine (an open editor, a running run), as long as it ends on its own once they stop. If a change could keep something up indefinitely, ask the [user] first.

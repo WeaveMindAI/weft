@@ -297,14 +297,18 @@ pub async fn unserve(pool: &PgPool, hosting: &dyn DomainHosting, stored: &[Domai
     Ok(())
 }
 
+/// The longest wait between two tries at a door the platform keeps
+/// refusing.
+const LONGEST_DOOR_RETRY: Duration = Duration::from_secs(6 * 3600);
+
 /// How soon the door is put on the stored domains again after the
-/// platform refused once; each refusal in a row doubles it, up to the
-/// idle look, so a refusal that needs a person does not keep the install
-/// awake.
+/// platform refused once; each refusal in a row doubles it, up to
+/// [`LONGEST_DOOR_RETRY`], so a refusal that needs a person does not keep
+/// the install awake.
 fn door_retry(refusals: i32) -> Duration {
     let first = weft_core::time_scale::scaled(Duration::from_secs(300));
     let doublings = u32::try_from(refusals.saturating_sub(1).clamp(0, 16)).unwrap_or(16);
-    first.saturating_mul(1 << doublings).min(weft_task_store::drain::IDLE_LOOK)
+    first.saturating_mul(1 << doublings).min(LONGEST_DOOR_RETRY)
 }
 
 /// Put the platform's door on what is stored, when the rows change and

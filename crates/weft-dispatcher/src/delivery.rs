@@ -63,7 +63,13 @@ pub fn drain_loop(state: DispatcherState) -> DrainLoop {
             let full = taken.len() as i64 == BATCH;
             for delivery in taken {
                 let state = state.clone();
-                tokio::spawn(async move { deliver(&state, delivery).await });
+                // A run being handed over is work until it lands: the
+                // database is listened to meanwhile, for what it writes.
+                let busy = state.signals.busy().await;
+                tokio::spawn(async move {
+                    let _busy = busy;
+                    deliver(&state, delivery).await
+                });
             }
             Ok(if full { DrainStep::More } else { DrainStep::Done })
         }

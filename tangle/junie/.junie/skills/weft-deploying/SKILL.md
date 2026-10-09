@@ -64,13 +64,18 @@ an event subscription that dials out) runs on a holder, which weft starts
 only while such a trigger is on and which is billed while it runs. Its node
 shows "waiting for a holder to take it" until one has. While a holder runs,
 it checks in through weft every 10 seconds, which also keeps weft's broker
-and the database up. Infrastructure that is up also keeps the broker and the
-database awake: the supervisor checks its health every 30 seconds, through the
-broker. Everything else (a route, a form, a timer, a poll, a
-provider that pushes its events) needs nothing running between events. If
-the install's database is on a plan that sleeps and has limited hours, tell
-the user before you deploy such a trigger, or infrastructure, that it keeps
-the database awake around the clock.
+and the database up. Infrastructure that runs fine keeps nothing awake: its
+machine reports only when its state changes. Everything else (a route, a
+form, a timer, a poll, a provider that pushes its events) needs nothing
+running between events. If the install's database is on a plan that sleeps
+and has limited hours, tell the user before you deploy such a trigger that it
+keeps the database awake around the clock.
+
+While the user's VS Code editor is pointed at the cloud install, it keeps a
+live connection to it, which keeps the install and its database awake. After
+5 minutes away from the window it pauses that connection and resumes when
+they come back; switching the editor back to the local install ends it at
+once.
 
 ## Setting a project up for its cloud
 

@@ -213,8 +213,8 @@ where
             // A recheck can also mean this copy fell behind and missed what
             // was said, a lost connection included: whether the watch
             // listens now is what decides.
-            Ok(Heard::Recheck) if subscription.listening() => copy.follow_again(),
-            Ok(Heard::Recheck | Heard::Lost) => copy.stop_following(),
+            Ok(Heard::Recheck | Heard::Resumed) if subscription.listening() => copy.follow_again(),
+            Ok(Heard::Recheck | Heard::Resumed | Heard::Lost) => copy.stop_following(),
             Err(e) => {
                 tracing::error!(
                     target: "weft_task_store::held_copy",

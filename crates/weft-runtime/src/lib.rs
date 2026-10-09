@@ -7,8 +7,10 @@
 //! own path prefix, each role's loops running for as long as the process
 //! does. On a cloud each role is a process of its own (`serve --role
 //! <role>`) serving that one role at its root: placed serverless it runs
-//! its loops once per tick and sets its next wake, and the holder, in a
-//! pool, holds its share of the held connections until it is stopped.
+//! its loops once per tick and sets its next wake only when one is due,
+//! listens to the database only while it has work, and so lets an idle
+//! install and its database sleep; the holder, in a pool, holds its share
+//! of the held connections until it is stopped.
 //!
 //! - `platform`: the trait objects every role takes, per platform.
 //! - `server`: the ports and what they carry.
@@ -139,13 +141,15 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
     let waker = match writes {
         true => {
             let (_, pool) = pool.as_ref().expect("a process that writes holds the database");
-            role_waker::RoleWaker::new(&config, &addresses, parts.tokens.clone(), pool.clone())?.map(Arc::new)
+            role_waker::RoleWaker::new(&config, &hosted, &addresses, parts.tokens.clone(), pool.clone())?.map(Arc::new)
         }
         false => None,
     };
 
     // The process's one LISTEN connection, on every channel its roles
-    // and its waker wait on, for as long as the process is up. A pooled
+    // and its waker wait on: for as long as the process is up on a
+    // machine, and while it has work when it scales to zero, so the
+    // database can sleep between (`pg_signal::Listening`). A pooled
     // database address cannot hold one, so it may have an address of its
     // own (`WEFT_DATABASE_LISTEN_URL`).
     let signals = match &pool {
@@ -167,7 +171,11 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
             let listen_url = optional_secret("WEFT_DATABASE_LISTEN_URL").unwrap_or_else(|| url.clone());
             let connect: sqlx::postgres::PgConnectOptions =
                 listen_url.parse().context("WEFT_DATABASE_LISTEN_URL (or WEFT_DATABASE_URL) is not a Postgres address")?;
-            Some(weft_task_store::pg_signal::PgSignalWatch::start(&connect, channels).await.context("listen for Postgres signals")?)
+            let listening = match serverless {
+                true => weft_task_store::pg_signal::Listening::WhileBusy,
+                false => weft_task_store::pg_signal::Listening::Always,
+            };
+            Some(weft_task_store::pg_signal::PgSignalWatch::start(&connect, channels, listening).await.context("listen for Postgres signals")?)
         }
         _ => None,
     };
@@ -330,9 +338,12 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
     }
 
     // Where the loops run: for the life of the process, or once per tick.
+    // A role that scales to zero also runs one pass as its process starts,
+    // for what came due while no process of it was up.
+    let mut first_passes: Vec<server::Tick> = Vec::new();
     for (role, l) in loops {
         if serverless {
-            let run: Arc<dyn Fn(Vec<String>) -> futures::future::BoxFuture<'static, Duration> + Send + Sync> = match l {
+            let run: Arc<dyn Fn(Vec<String>) -> futures::future::BoxFuture<'static, Option<Duration>> + Send + Sync> = match l {
                 // When each loop is due lives in the database, shared by
                 // every instance of the role, since a tick may land on any.
                 Loops::Drain(loops) => {
@@ -343,13 +354,16 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                     // process does: a task written for it is picked up the
                     // moment it is announced, never after a ring's trip
                     // through the platform, which waits behind the tick
-                    // already running. The tick still starts the role when it
-                    // is at zero, and runs what is due; both claim the same
-                    // rows, so whichever reaches a task first runs it.
+                    // already running. Their safety looks run only while the
+                    // process has work, so one left idle queries nothing. The
+                    // tick still starts the role when it is at zero, and runs
+                    // what is due; both claim the same rows, so whichever
+                    // reaches a task first runs it.
                     if let Some(signals) = &signals {
-                        for l in loops.clone() {
+                        for l in loops.iter().cloned() {
                             let subscription = signals.subscribe();
-                            weft_dispatcher::app::spawn_supervised(l.name, async move { l.run_forever(subscription).await });
+                            let looks = weft_task_store::drain::Looks::WhileWorking(signals.clone());
+                            weft_dispatcher::app::spawn_supervised(l.name, async move { l.run_forever(subscription, looks).await });
                         }
                     }
                     let loops = Arc::new(loops);
@@ -367,16 +381,19 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                     let state = state.clone();
                     Box::pin(async move {
                         match weft_infra_supervisor::tick(&state).await {
-                            Ok(next) => next.unwrap_or(weft_task_store::drain::IDLE_LOOK),
+                            Ok(next) => next,
                             Err(e) => {
                                 tracing::warn!(target: "weft_runtime", error = %format!("{e:#}"), "a supervisor tick failed; the next one retries");
-                                state.health_interval
+                                Some(state.health_interval)
                             }
                         }
                     })
                 }),
             };
             let t = server::Tick { role, run, alarm: parts.alarm.clone() };
+            if writes {
+                first_passes.push(t.clone());
+            }
             internal = mount(internal, role, guard_for(role).guard(server::tick_route(t)));
         } else {
             match l {
@@ -384,7 +401,9 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
                     let signals = signals.clone().expect("a process with drain loops listens");
                     for l in loops {
                         let subscription = signals.subscribe();
-                        weft_dispatcher::app::spawn_supervised(l.name, async move { l.run_forever(subscription).await });
+                        weft_dispatcher::app::spawn_supervised(l.name, async move {
+                            l.run_forever(subscription, weft_task_store::drain::Looks::AtSafety).await
+                        });
                     }
                 }
                 Loops::Supervisor(state) => {
@@ -435,7 +454,19 @@ pub async fn serve(config: InstallConfig, only: Option<CoreRole>) -> anyhow::Res
         _ if serverless => {
             let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8080);
             let addr: std::net::SocketAddr = ([0, 0, 0, 0], port).into();
-            let app = public.merge(internal);
+            let mut app = public.merge(internal);
+            if let Some(signals) = &signals {
+                app = app.layer(axum::middleware::from_fn_with_state(signals.clone(), server::keep_listening));
+                for t in first_passes {
+                    let signals = signals.clone();
+                    tokio::spawn(async move {
+                        let _looking = signals.looking().await;
+                        if let Err(e) = t.pass(Vec::new()).await {
+                            tracing::warn!(target: "weft_runtime", role = %t.role, error = %format!("{e:#}"), "the first pass could not set the next wake; the next pass sets it");
+                        }
+                    });
+                }
+            }
             let listener = tokio::net::TcpListener::bind(addr).await.with_context(|| format!("bind {addr}"))?;
             tracing::info!(target: "weft_runtime", role = ?only, %addr, "serving");
             tokio::spawn(server::serve(listener, app))
