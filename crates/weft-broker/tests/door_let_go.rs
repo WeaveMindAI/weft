@@ -139,7 +139,7 @@ async fn an_answer_handed_to_a_run_that_parks_reaches_its_record(pool: PgPool) {
     schema(&pool).await;
     let execution_id = driven_by(&pool, "w1").await;
     let mut tx = pool.begin().await.unwrap();
-    weft_task_store::parked_fires::hand_answer_in(&mut tx, "form", execution_id, &serde_json::json!("yes")).await.unwrap();
+    weft_task_store::parked_fires::hand_answer_in(&mut tx, "form", execution_id, &weft_core::primitive::WaitAnswer::Given { value: serde_json::json!("yes") }).await.unwrap();
     tx.commit().await.unwrap();
     assert!(let_go(&pool, worker("w1"), execution_id, LetGo::Parked).await.unwrap());
     assert_eq!(standing(&pool, execution_id).await, ("queued".into(), None));

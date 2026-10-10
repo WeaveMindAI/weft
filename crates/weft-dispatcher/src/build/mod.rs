@@ -6,11 +6,14 @@
 //! version's files are fetched back and checked against their hashes, the
 //! project is compiled with the catalog this install ships, every image it
 //! needs is planned with content-addressed refs in the platform's image
-//! store, the stale ones are built by the platform's builder
-//! (`weft_platform_traits::ImageBuilder`), and the caller registers the
-//! result. Nothing the client
-//! computed is believed: not a hash, not an image, not a stored file's
-//! metadata.
+//! store, and the stale ones are started on the platform's builder
+//! (`weft_platform_traits::ImageBuilder`). The request answers as soon as
+//! they run: a build takes minutes, and a request held open that long with
+//! nothing on the wire is one any network path between may drop. The
+//! version is written down as waiting on them (`waiting`), and the build
+//! loop (`follow`) sees each build through and registers the version once
+//! they all ended; the caller only follows it. Nothing the client computed
+//! is believed: not a hash, not an image, not a stored file's metadata.
 //!
 //! What the compile cannot do on its own is read an `@asset` that lives on
 //! the author's disk outside the project, or a URL the author fetched: the
@@ -24,13 +27,14 @@ pub mod follow;
 pub mod ledger;
 pub mod prune;
 pub mod source;
+pub mod waiting;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use weft_platform_traits::{BuildHandle, BuildRequest, ImageBuilder};
+use weft_platform_traits::{BuildHandle, BuildRequest, ImageBuilder, Staging};
 
 /// The control point the version builder (`crate::build`) calls around REAL build work, so the
 /// dispatcher's `building` transition only engages when something actually
@@ -38,22 +42,44 @@ use weft_platform_traits::{BuildHandle, BuildRequest, ImageBuilder};
 /// an up-to-date project never serialize against each other).
 ///
 /// The mechanism behind the gate is weft's (the project row's `transition`
-/// marker + heartbeat + the stuck-transition reaper); the KNOWLEDGE of "a real
+/// marker, held by the request while it starts the builds and by the builds
+/// themselves after, see `crate::transition`); the KNOWLEDGE of "a real
 /// build is starting" is the builder's. This trait is the seam between them.
 #[async_trait]
 pub trait BuildGate: Send + Sync {
     /// Called once, just before the first actual image build is submitted.
     /// Errs when the project cannot enter the `building` transition right now
     /// (another verb is already building, or the lifecycle is mid-flip); the
-    /// builder aborts with that error and the verb surfaces it.
+    /// builder aborts with that error and the verb surfaces it. From here
+    /// until [`Self::let_go`] the start is on record as alive.
     async fn begin(&self) -> anyhow::Result<()>;
 
-    /// Whether the user requested cancellation of this build. Polled while
-    /// the builds run; on `true` every build this project started is
-    /// stopped (`ImageBuilder::release`, after the ledger records the
-    /// cancel), a build another project started is left running, and the
-    /// verb errs with a cancellation message.
-    async fn cancel_requested(&self) -> anyhow::Result<bool>;
+    /// Called once the starts [`Self::begin`] opened are all answered and
+    /// the version waiting on them is written down, whether or not anybody
+    /// still waits on the request: the project rests from here on its
+    /// waiting version. A no-op when `begin` was never called, or refused.
+    async fn let_go(&self);
+}
+
+/// Why a build request failed when the person cancelled the project's
+/// build while it was starting its images: an image claimed after the
+/// cancel is refused (`ledger::claim`), and so is a version written down
+/// after it (`waiting::ask`).
+#[derive(Debug)]
+pub struct BuildCancelled;
+
+impl std::fmt::Display for BuildCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the build was cancelled")
+    }
+}
+
+impl std::error::Error for BuildCancelled {}
+
+/// Whether `e` is a cancel's refusal ([`BuildCancelled`]), wherever in its
+/// chain.
+pub fn cancelled(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<BuildCancelled>().is_some()
 }
 
 /// Content-addressed image refs, named in the platform's image store.
@@ -86,16 +112,38 @@ pub fn replaced_infra_images(
         .collect()
 }
 
-/// What a build produced: the answer the caller registers and hands the
-/// client (its `replaced_infra_images` filled at registration, from
-/// [`replaced_infra_images`]), and the images the version runs.
+/// What a build request comes to: the version ready to register, or the
+/// version build now waiting on its images.
+#[derive(Debug)]
+pub enum VersionBuild {
+    /// Every image the version needs is in the registry: register it
+    /// (`waiting::register`) under `hold`, which claims them all.
+    Ready { version: Box<Version>, hold: prune::ImageHold },
+    /// These builds run for the version (started by this request, or
+    /// already running for the same content), and the version waits on
+    /// them: the install registers it once they ended.
+    Waiting(weft_core::builds::BuildsUnderway),
+}
+
+/// A version as a build compiled it: what registration writes, and what a
+/// version waiting on its builds keeps until then.
 #[derive(Debug, Clone)]
-pub struct Build {
+pub struct Version {
+    /// The project's name, as the request named it.
+    pub name: String,
+    /// The version's files, registered as the program's source.
+    pub manifest: weft_core::project::hash::Manifest,
+    /// The answer registration completes (its `replaced_infra_images`,
+    /// from [`replaced_infra_images`]) and hands the client.
     pub program: weft_core::builds::BuiltProgram,
     /// Every image ref this version runs, built now or found already
     /// there. Registration records them as the project's running version
     /// (`ledger::note_running`); the client has no use for it.
     pub images: Vec<String>,
+    /// Its request's place in the project's order of asks
+    /// (`ProjectStoreOps::next_build_ask`): it registers only over an
+    /// older one (`waiting::settle`).
+    pub ask: i64,
 }
 
 /// The project's files and stored-file metadata, as the build reads them.
@@ -122,8 +170,6 @@ pub struct VersionBuilder {
     /// How many worker builds compile side by side, each in a compile
     /// cache of its own (`weft_compiler::worker_image::COMPILE_LANE_ARG`).
     pub compile_lanes: u32,
-    /// How often an in-flight build is looked at.
-    pub poll_every: std::time::Duration,
     /// The reclaims registered builds asked for (`prune::AfterBuildPrunes`).
     pub prunes: Arc<prune::AfterBuildPrunes>,
     /// The version files this replica fetched before (`blob_cache`).
@@ -132,24 +178,31 @@ pub struct VersionBuilder {
 
 impl VersionBuilder {
     /// Build `request` for `project_id`: fetch and check its files, compile,
-    /// plan, build every stale image. `gate` is entered before the first
-    /// real build and polled for cancellation while one runs; a version
-    /// whose images all exist never touches it. `hold` claims every
-    /// planned image against a prune until the caller registers them.
+    /// plan, and start a build of every stale image. `gate` is entered
+    /// before the first real build; a version whose images all exist never
+    /// touches it. `hold` claims every planned image against a prune until
+    /// the version registers. `ask` is the request's place in the
+    /// project's order of asks, taken as it arrived.
+    #[allow(clippy::too_many_arguments)]
     pub async fn build(
         &self,
         storage: &dyn ProjectStorage,
         project_id: uuid::Uuid,
         tenant: &str,
         request: &weft_core::builds::VersionBuildRequest,
-        gate: &dyn BuildGate,
-        hold: &prune::ImageHold,
-    ) -> Result<Build> {
+        ask: i64,
+        gate: Arc<dyn BuildGate>,
+        hold: prune::ImageHold,
+    ) -> Result<VersionBuild> {
         let workdir = tempfile::Builder::new()
             .prefix("weft-version-")
             .tempdir()
             .context("create the build's working directory")?;
         let root = workdir.path().to_path_buf();
+        // The image contexts are staged under it, and a build started from
+        // one may read it after this request answered: every start keeps a
+        // clone, and the directory goes with the last (`Staging`).
+        let staging = Staging::new(workdir);
         source::materialize(storage, &self.blobs, tenant, &request.manifest, &root).await?;
 
         let assets = request.assets.clone();
@@ -176,14 +229,13 @@ impl VersionBuilder {
         .await
         .context("the planning task panicked")??;
 
-        let built_images = self.ensure_images(&plan.images, project_id, tenant, gate, hold).await?;
         let images: Vec<String> =
             plan.images.iter().map(|image| image.image_ref.clone()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
         let infra_images = infra_places(&definition, &plan.images)?;
-        drop(workdir);
-        Ok(Build {
+        let version = Version {
+            name: request.name.clone(),
+            manifest: request.manifest.clone(),
             program: weft_core::builds::BuiltProgram {
-                built_images,
                 definition,
                 binary_hash: plan.binary_hash,
                 definition_hash: plan.definition_hash,
@@ -193,30 +245,40 @@ impl VersionBuilder {
                 replaced_infra_images: Vec::new(),
             },
             images,
-        })
+            ask,
+        };
+        self.start_images(version, &plan.images, &staging, project_id, tenant, gate, hold).await
     }
 
-    /// Make every planned image exist in the registry, building the ones
-    /// that do not side by side, and answer the refs it built. Every image
-    /// is claimed in `hold` before the registry is asked about any, so a
-    /// prune cannot take one this build found. The gate is entered once,
-    /// before the first build, whether this process starts it or joins one
-    /// already running.
+    /// Start a build of every planned image the registry lacks, side by
+    /// side, and write `version` down as waiting on the builds it needs:
+    /// each one this request started, or the one already running for the
+    /// same ref (another project with the same content). Ready when every
+    /// image is there, including one a build of another request finished
+    /// meanwhile. Every image is claimed in `hold` before the registry is
+    /// asked about any, so a prune cannot take one this build found. The
+    /// gate is entered once, before the first build. Each build started
+    /// keeps a clone of `staging`, what keeps the contexts on disk.
     ///
-    /// Each image is waited on by a task of its own. A build never depends
-    /// on this verb to be seen through: its row is moved forward by
-    /// whoever looks (`follow::advance`), this verb while it waits and the
-    /// build loop otherwise, so a sibling image failing, or the request
-    /// that asked being dropped, leaves nothing stuck. The verb waits for
-    /// every image and reports every failure, the first one first.
-    pub async fn ensure_images(
+    /// Nothing here waits for a build to end: the build loop sees each one
+    /// through and registers the version (`follow`, `waiting`). A start
+    /// that fails stops the builds this request may stop, so the project is
+    /// left with nothing half started, and the request fails. All of that,
+    /// from the gate entered to the gate let go, runs on a task the request
+    /// waits on without owning: a caller that goes away drops the request,
+    /// never the starts, the version waiting on them, or what they owe once
+    /// they end.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_images(
         &self,
+        version: Version,
         images: &[weft_compiler::build_plan::PlannedImage],
+        staging: &Staging,
         project_id: uuid::Uuid,
         tenant: &str,
-        gate: &dyn BuildGate,
-        hold: &prune::ImageHold,
-    ) -> Result<Vec<String>> {
+        gate: Arc<dyn BuildGate>,
+        hold: prune::ImageHold,
+    ) -> Result<VersionBuild> {
         let refs: Vec<String> = images.iter().map(|image| image.image_ref.clone()).collect();
         hold.claim(&refs).await?;
         let mut stale = Vec::new();
@@ -230,42 +292,99 @@ impl VersionBuilder {
             }
         }
         if stale.is_empty() {
-            return Ok(Vec::new());
+            return Ok(VersionBuild::Ready { version: Box::new(version), hold });
         }
+        let (this, staging, tenant) = (self.clone(), staging.clone(), tenant.to_string());
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let started = this.start_stale(stale, &staging, project_id, &tenant, gate.as_ref(), version, hold).await;
+            gate.let_go().await;
+            // Nobody waits any more (the caller went away): what went wrong
+            // is said here, or nowhere.
+            if let Err(Err(e)) = answer.send(started) {
+                tracing::error!(
+                    target: "weft_dispatcher::build",
+                    %project_id,
+                    error = %format!("{e:#}"),
+                    "starting the project's images failed after its request went away"
+                );
+            }
+        });
+        answered.await.map_err(|_| anyhow!("the start of the project's images ended without an answer"))?
+    }
+
+    /// [`Self::start_images`]' starts and the version written down as
+    /// waiting on them, on the task the request waits on.
+    #[allow(clippy::too_many_arguments)]
+    async fn start_stale(
+        &self,
+        stale: Vec<weft_compiler::build_plan::PlannedImage>,
+        staging: &Staging,
+        project_id: uuid::Uuid,
+        tenant: &str,
+        gate: &dyn BuildGate,
+        version: Version,
+        hold: prune::ImageHold,
+    ) -> Result<VersionBuild> {
         gate.begin().await?;
-        let (cancel, cancelled) = tokio::sync::watch::channel(false);
-        let waiters: Vec<(String, tokio::task::JoinHandle<Result<()>>)> = stale
+        // Each image starts on a task of its own, so one start's panic is
+        // that image's failure. Each carries the staging until its start is
+        // recorded.
+        let tasks: Vec<_> = stale
             .into_iter()
             .map(|image| {
-                let builder = self.clone();
-                let (tenant, cancelled) = (tenant.to_string(), cancelled.clone());
-                let image_ref = image.image_ref.clone();
-                (image_ref, tokio::spawn(async move { builder.build_one(&image, project_id, &tenant, cancelled).await }))
+                let (this, staging, tenant) = (self.clone(), staging.clone(), tenant.to_string());
+                tokio::spawn(async move { this.start_one(&image, &staging, project_id, &tenant).await })
             })
             .collect();
-        let (refs, handles): (Vec<String>, Vec<_>) = waiters.into_iter().unzip();
-        let mut all = std::pin::pin!(futures::future::join_all(handles));
-        let joined = loop {
-            tokio::select! {
-                joined = &mut all => break joined,
-                _ = tokio::time::sleep(self.poll_every) => {
-                    if !*cancel.borrow() && gate.cancel_requested().await? {
-                        cancel.send_replace(true);
-                    }
-                }
-            }
-        };
-        let built = refs.clone();
+        let starts = futures::future::join_all(tasks).await.into_iter().map(|joined| match joined {
+            Ok(started) => started,
+            Err(e) => Err(anyhow!("an image's start ended without an answer: {e}")),
+        });
+        let mut underway = Vec::new();
+        // The builds this project may stop: the ones it started, and one
+        // it joined that it had started before.
+        let mut stoppable = Vec::new();
         let mut failures = Vec::new();
-        for (image_ref, joined) in refs.into_iter().zip(joined) {
-            match joined {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => failures.push(e),
-                Err(e) => failures.push(anyhow!("the wait on the build of {image_ref} panicked: {e}")),
+        for start in starts {
+            match start {
+                Ok(Some((build, ours))) => {
+                    if ours {
+                        stoppable.push(build.clone());
+                    }
+                    underway.push(build);
+                }
+                Ok(None) => {}
+                Err(e) => failures.push(e),
             }
         }
+        if failures.is_empty() {
+            if underway.is_empty() {
+                return Ok(VersionBuild::Ready { version: Box::new(version), hold });
+            }
+            // A claim that lapsed may have let a prune take an image the
+            // version found, so it is never passed to a waiting version.
+            let written = match hold.confirm().await {
+                Ok(()) => waiting::ask(&self.pool, hold, project_id, tenant, &version, &underway, crate::lease::now_unix())
+                    .await
+                    .context("write the version down as waiting on its builds"),
+                Err(e) => Err(e),
+            };
+            match written {
+                Ok(build) => return Ok(VersionBuild::Waiting(weft_core::builds::BuildsUnderway { build, images: underway })),
+                Err(e) => failures.push(e),
+            }
+        }
+        // A failed stop never hides why a start failed: every error goes
+        // into the answer.
+        if let Err(e) = self.stop(&stoppable).await {
+            failures.push(e.context("stop the builds this request started"));
+        }
+        if failures.iter().any(cancelled) {
+            return Err(BuildCancelled.into());
+        }
         let mut failures = failures.into_iter();
-        let Some(first) = failures.next() else { return Ok(built) };
+        let first = failures.next().expect("only a start that failed gets here");
         let others: Vec<String> = failures.map(|e| format!("{e:#}")).collect();
         if others.is_empty() {
             return Err(first);
@@ -273,53 +392,57 @@ impl VersionBuilder {
         bail!("{first:#}\n\n{} other image(s) failed too:\n{}", others.len(), others.join("\n\n"))
     }
 
-    /// See one image to a pushed image: start its build, or join the one
-    /// already running for the same ref (another project with the same
-    /// content), then wait for its row to end, moving it forward while
-    /// waiting.
-    ///
-    /// A cancel of this project stops a build it may stop (`stoppable`):
-    /// the end is recorded, then the build is freed. A build it may not
-    /// stop goes on; the verb only stops waiting on it.
-    async fn build_one(
+    /// Start one image's build, or join the one already running for the
+    /// same ref; `None` when a build of it finished meanwhile. With the
+    /// build, whether a cancel of this project may stop it
+    /// (`ledger::Claim::stoppable`).
+    async fn start_one(
         &self,
         image: &weft_compiler::build_plan::PlannedImage,
+        staging: &Staging,
         project_id: uuid::Uuid,
         tenant: &str,
-        cancelled: tokio::sync::watch::Receiver<bool>,
-    ) -> Result<()> {
+    ) -> Result<Option<(weft_core::builds::ImageBuild, bool)>> {
         let now = crate::lease::now_unix();
         let lanes = (image.kind == weft_compiler::build_plan::ImageKind::Worker).then_some(self.compile_lanes);
         let claim = ledger::claim(&self.pool, self.images.as_ref(), &image.image_ref, project_id, tenant, lanes, now).await?;
         let stoppable = claim.stoppable();
-        // The build this verb waits on: a cancel stops that one, never a
-        // later build of the same ref the row may run by then.
         let name = match claim {
             ledger::Claim::Start { name, lane } => {
-                self.start(image, project_id, tenant, &name, lane).await?;
+                self.start(image, staging, project_id, tenant, &name, lane).await?;
                 name
             }
             ledger::Claim::Join { name, .. } => name,
-            ledger::Claim::Built => return Ok(()),
+            ledger::Claim::Built => return Ok(None),
         };
-        loop {
-            if *cancelled.borrow() {
-                if !stoppable {
-                    bail!("the build of {} was cancelled", image.image_ref);
-                }
-                // Recorded before anything is freed, like any end. A build
-                // not made on the builder yet is freed by its starter, which
-                // finds the row no longer its own.
-                if let Some(Some(builder_id)) = ledger::cancel(&self.pool, &image.image_ref, &name, crate::lease::now_unix()).await? {
-                    self.images.release(&BuildHandle::named(builder_id)).await;
-                }
+        Ok(Some((weft_core::builds::ImageBuild { image: image.image_ref.clone(), name }, stoppable)))
+    }
+
+    /// Stop `builds`: each one's end recorded as cancelled, then freed on
+    /// the builder. A build not made on the builder yet is freed by its
+    /// starter, which finds the row no longer its own (`ledger::started`);
+    /// one that ended already is left as it ended.
+    async fn stop(&self, builds: &[weft_core::builds::ImageBuild]) -> Result<()> {
+        for build in builds {
+            if let Some(Some(builder_id)) = ledger::cancel(&self.pool, &build.image, &build.name, crate::lease::now_unix()).await? {
+                self.images.release(&BuildHandle::named(builder_id)).await;
             }
-            follow::advance(&self.pool, self.images.as_ref(), &image.image_ref).await?;
-            if let ledger::Seen::Ended(outcome) = ledger::look(&self.pool, &image.image_ref).await? {
-                return ended(&image.image_ref, outcome);
-            }
-            tokio::time::sleep(self.poll_every).await;
         }
+        Ok(())
+    }
+
+    /// Cancel what `project` builds: every build it started is stopped
+    /// ([`Self::stop`]), the ones other projects started go on for them,
+    /// and its waiting version ends `cancelled` (`waiting::cancel`).
+    pub async fn cancel_project(&self, project: uuid::Uuid) -> Result<()> {
+        let own: Vec<weft_core::builds::ImageBuild> = ledger::running(&self.pool, Some(project))
+            .await?
+            .into_iter()
+            .filter(|build| build.project_id == project)
+            .map(|build| weft_core::builds::ImageBuild { image: build.image_ref, name: build.build_name })
+            .collect();
+        self.stop(&own).await?;
+        waiting::cancel(&self.pool, project).await
     }
 
     /// Start the build `name` of `image` (in `lane`, for a worker), whose
@@ -329,6 +452,7 @@ impl VersionBuilder {
     async fn start(
         &self,
         image: &weft_compiler::build_plan::PlannedImage,
+        staging: &Staging,
         project_id: uuid::Uuid,
         tenant: &str,
         name: &str,
@@ -343,6 +467,7 @@ impl VersionBuilder {
             project_id,
             tenant: tenant.to_string(),
             context_dir: image.context_dir.clone(),
+            staging: staging.clone(),
             image_ref: image.image_ref.clone(),
             build_args,
         };
@@ -394,15 +519,6 @@ fn with_secondary(primary: anyhow::Error, recorded: Result<()>) -> anyhow::Error
     match recorded {
         Ok(()) => primary,
         Err(finish) => anyhow!("{primary:#}\n(and recording that end failed too: {finish:#})"),
-    }
-}
-
-/// What the verb waiting on `image_ref` gets from how its build ended.
-fn ended(image_ref: &str, outcome: ledger::Outcome) -> Result<()> {
-    match outcome {
-        ledger::Outcome::Succeeded => Ok(()),
-        ledger::Outcome::Failed(reason) => bail!("the build of {image_ref} failed:\n{reason}"),
-        ledger::Outcome::Cancelled => bail!("the build of {image_ref} was cancelled"),
     }
 }
 

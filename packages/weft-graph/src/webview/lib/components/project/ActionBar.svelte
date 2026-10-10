@@ -186,6 +186,19 @@
 	const infraReady = $derived(sourceInfraReady(verbInputs));
 	const isVerbAvailable = (v: ActionVerb): boolean => isVerbOffered(v, verbInputs);
 
+	// The triggers that are off while the others run, as the second
+	// button names them: two by name, then a count.
+	function offNames(off: string[]): string {
+		if (off.length === 0) return 'the triggers that are off';
+		if (off.length <= 2) return off.join(', ');
+		return `${off.slice(0, 2).join(', ')} and ${off.length - 2} more`;
+	}
+
+	function offTitle(off: string[]): string {
+		const which = off.length > 0 ? `Off while the others run: ${off.join(', ')}.` : 'Some triggers are off while the others run.';
+		return `${which} An infra stop takes down the triggers reading it. Turn them back on.`;
+	}
+
 	// The build-transition axis. While not 'none', the whole bar is in
 	// the unified transitional pattern: the slot that owns the verb
 	// shows "Building... (cancel)" and every other verb is gated (the
@@ -229,6 +242,15 @@
 			case 'build_image':
 			case 'build_image_done':
 			case 'build_wait': return 'Building...';
+			case 'build_unreachable': {
+				// The install did not answer the last look at the build: the
+				// build may go on there, but nothing here can see it, so the
+				// bar stops saying "Building..." until it answers again.
+				// SYNC: the build_unreachable detail <-> crates/weft-cli/src/progress.rs (Progress::build_unreachable)
+				const elapsed =
+					typeof detail?.elapsedSeconds === 'number' ? ` (${detail.elapsedSeconds}s)` : '';
+				return `Install not answering, looking again${elapsed}...`;
+			}
 			case 'build_done': return 'Loading...';
 			case 'infra_provision_start':
 			case 'infra_provision_done': return 'Provisioning infra...';
@@ -936,10 +958,10 @@
 				<button
 					class="{btn} {btnDisabled} bg-zinc-900 border-zinc-900 text-white hover:bg-zinc-800"
 					onclick={slot.turnOn === 'reactivate' ? onReactivate : onActivate}
-					title="Some triggers are off while the others run (an infra stop took down the ones reading it). Turn them back on."
+					title={offTitle(backend.triggersOff)}
 				>
 					<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-					<span class={labelCss}>{slot.turnOn === 'reactivate' ? 'Reactivate the rest' : 'Activate the rest'}</span>
+					<span class={labelCss}>{slot.turnOn === 'reactivate' ? 'Reactivate' : 'Activate'} {offNames(backend.triggersOff)}</span>
 				</button>
 			{/if}
 		</div>

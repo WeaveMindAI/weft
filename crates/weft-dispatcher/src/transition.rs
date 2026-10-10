@@ -17,10 +17,25 @@
 //!   transition around a version's build. The gate engages ONLY when
 //!   an image actually has to be built (a build whose images all exist
 //!   never flips the marker, so concurrent builds of an unchanged
-//!   project never serialize), and relays the user's cancel request
-//!   (`transition = cancelling_build`) into the builder's await loop.
+//!   project never serialize).
+//! - [`settle`]: the one way the build transition lands back at rest.
+//!
+//! Who holds the build transition: the request that entered it, while its
+//! builds are being started (its heartbeat, which beats until the last
+//! start is recorded and the version waiting on them written down, even
+//! when the request itself went away), and then the project's waiting
+//! version (`crate::build::waiting`), until it registers or ends. The
+//! request answers as soon as its builds run, so it cannot hold the
+//! transition for their length; nor can a second marker or a task that
+//! outlives it, which a dispatcher that scales to zero would lose. The
+//! marker is cleared by whoever sees that nothing holds it any more
+//! (`crate::project_store::build_held`): the request letting go, a
+//! registration, the build loop, a cancel, and the stuck-transition
+//! reaper, all through [`settle`]. The marker stays the single value every
+//! guard reads (an activation's CAS, the status, the editor's cancel bar).
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use axum::http::StatusCode;
 
@@ -44,10 +59,10 @@ pub fn heartbeat_stale_secs() -> i64 {
     weft_core::time_scale::scaled_secs(60)
 }
 
-/// Drop-guarded heartbeat: bumps `transition_heartbeat_unix` every
-/// [`heartbeat_interval`] until dropped. Hold it for exactly the
-/// window the transition is driven in-process (the activate window,
-/// the build await); dropping it stops the bumps so an orphaned row
+/// Drop-guarded heartbeat of a project's build transition: bumps
+/// `transition_heartbeat_unix` every [`heartbeat_interval`] until dropped.
+/// Held for exactly the window a build request drives the transition
+/// ([`ProjectBuildGate`]); dropping it stops the bumps so an orphaned row
 /// goes stale and the reaper repairs it.
 pub struct TransitionHeartbeat {
     handle: tokio::task::JoinHandle<()>,
@@ -167,65 +182,44 @@ pub(crate) async fn publish_transition_changed(state: &DispatcherState, id: uuid
         .await;
 }
 
+/// Land at rest every project in a build transition that nothing holds
+/// any more (`ProjectStoreOps::settle_building`), `project` narrowing it
+/// to one, and announce each.
+pub(crate) async fn settle(state: &DispatcherState, project: Option<uuid::Uuid>) -> anyhow::Result<()> {
+    let stale_before = crate::lease::now_unix() - heartbeat_stale_secs();
+    for id in state.projects.settle_building(project, stale_before).await? {
+        publish_transition_changed(state, id).await;
+    }
+    Ok(())
+}
+
 /// The weft impl of the builder's `BuildGate`: ties the builder's
 /// "a real build is starting" knowledge to the project row's
-/// `building` transition + heartbeat + the user's cancel request.
+/// `building` transition and its heartbeat.
 pub struct ProjectBuildGate {
     state: DispatcherState,
     id: uuid::Uuid,
     engaged: AtomicBool,
-    saw_cancel: AtomicBool,
-    heartbeat: std::sync::Mutex<Option<TransitionHeartbeat>>,
+    /// Beats from `begin` until `let_go`.
+    heartbeat: Mutex<Option<TransitionHeartbeat>>,
 }
 
 impl ProjectBuildGate {
     fn new(state: DispatcherState, id: uuid::Uuid) -> Self {
-        Self {
-            state,
-            id,
-            engaged: AtomicBool::new(false),
-            saw_cancel: AtomicBool::new(false),
-            heartbeat: std::sync::Mutex::new(None),
-        }
+        Self { state, id, engaged: AtomicBool::new(false), heartbeat: Mutex::new(None) }
     }
 
     /// Whether `begin` engaged the `building` transition.
     fn engaged(&self) -> bool {
         self.engaged.load(Ordering::Acquire)
     }
-
-    /// Whether the builder observed a cancel request via this gate.
-    fn saw_cancel(&self) -> bool {
-        self.saw_cancel.load(Ordering::Acquire)
-    }
-
-    /// Land the transition back at rest (if engaged) and stop the
-    /// heartbeat. Idempotent; safe when the reaper already cleared.
-    async fn finish(&self) {
-        // Stop bumping first so a failed clear goes stale and the
-        // reaper repairs it, rather than us keeping a zombie fresh.
-        self.heartbeat.lock().expect("heartbeat mutex").take();
-        if !self.engaged() {
-            return;
-        }
-        if let Err(e) = self.state.projects.finish_building(self.id).await {
-            tracing::error!(
-                target: "weft_dispatcher::transition",
-                project_id = %self.id,
-                error = %e,
-                "finish_building failed; the stuck-transition reaper will clear the \
-                 marker once the heartbeat goes stale"
-            );
-            return;
-        }
-        publish_transition_changed(&self.state, self.id).await;
-    }
 }
 
 #[async_trait::async_trait]
 impl BuildGate for ProjectBuildGate {
     async fn begin(&self) -> anyhow::Result<()> {
-        let won = self.state.projects.try_begin_building(self.id).await?;
+        let stale_before = crate::lease::now_unix() - heartbeat_stale_secs();
+        let won = self.state.projects.try_begin_building(self.id, stale_before).await?;
         if !won {
             // Name the blocker so the verb's 409 is actionable.
             let transition = self
@@ -245,57 +239,77 @@ impl BuildGate for ProjectBuildGate {
             );
         }
         self.engaged.store(true, Ordering::Release);
-        *self.heartbeat.lock().expect("heartbeat mutex") = Some(TransitionHeartbeat::spawn(
-            self.state.projects.clone(),
-            self.id,
-        ));
+        // Bumped until `let_go`, which may come after this request is gone
+        // (`crate::build::VersionBuilder::start_images`): the build loop
+        // reads a stale heartbeat as a start nobody drives any more.
+        *self.heartbeat.lock().expect("the gate's heartbeat slot is never poisoned") =
+            Some(TransitionHeartbeat::spawn(self.state.projects.clone(), self.id));
         publish_transition_changed(&self.state, self.id).await;
         Ok(())
     }
 
-    async fn cancel_requested(&self) -> anyhow::Result<bool> {
-        let cancelling = self
-            .state
-            .projects
-            .transition(self.id)
-            .await?
-            .map(|t| t == ProjectTransition::CancellingBuild)
-            .unwrap_or(false);
-        if cancelling {
-            self.saw_cancel.store(true, Ordering::Release);
+    /// Stop the heartbeat and let go of the transition (if engaged): from
+    /// here it rests on the project's waiting version, and lands at rest
+    /// now when there is none (every image was there after all, the
+    /// request failed, or a cancel ended it). Idempotent; safe when the
+    /// reaper already cleared. A failed release goes stale, and the reaper
+    /// settles it.
+    async fn let_go(&self) {
+        if !self.engaged() {
+            return;
         }
-        Ok(cancelling)
+        drop(self.heartbeat.lock().expect("the gate's heartbeat slot is never poisoned").take());
+        let released = match self.state.projects.release_build_driver(self.id).await {
+            Ok(()) => settle(&self.state, Some(self.id)).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = released {
+            tracing::error!(
+                target: "weft_dispatcher::transition",
+                project_id = %self.id,
+                error = %format!("{e:#}"),
+                "letting go of the build transition failed; the stuck-transition reaper \
+                 settles it once the heartbeat goes stale"
+            );
+        }
     }
 }
 
 /// Build one version of a project through the `building` transition:
 /// the gate engages only when an image actually has to be built
-/// (single-flight per project, heartbeat, cancellable through
-/// `/cancel-build`). A build that loses the single-flight is a 409
-/// naming the in-flight state; a user cancel is a 409 "build cancelled"
-/// rather than a 500.
+/// (single-flight per project, cancellable through `/cancel-build`), and
+/// is let go once the version waiting on its builds is written down,
+/// leaving the transition to it. A build that loses the single-flight is a
+/// 409 naming the in-flight state, marked
+/// [`weft_core::builds::BUILD_BUSY_HEADER`] (a caller resending an ask
+/// whose answer it lost waits and sends it again); a user cancel is a 409
+/// "build cancelled" rather than a 500.
 pub(crate) async fn build_version_gated(
     state: &DispatcherState,
     id: uuid::Uuid,
     tenant: &crate::tenant::TenantId,
     request: &weft_core::builds::VersionBuildRequest,
-    hold: &crate::build::prune::ImageHold,
-) -> Result<crate::build::Build, (StatusCode, String)> {
-    let gate = ProjectBuildGate::new(state.clone(), id);
+    ask: i64,
+    hold: crate::build::prune::ImageHold,
+) -> Result<crate::build::VersionBuild, axum::response::Response> {
+    use axum::response::IntoResponse;
+    let gate = std::sync::Arc::new(ProjectBuildGate::new(state.clone(), id));
     let storage = crate::storage::BrokerStorage(state);
-    let result = state.builder.build(&storage, id, tenant.as_str(), request, &gate, hold).await;
-    gate.finish().await;
-    match result {
+    // The gate is let go where it was entered, with the starts
+    // (`crate::build::VersionBuilder::start_images`).
+    match state.builder.build(&storage, id, tenant.as_str(), request, ask, gate.clone(), hold).await {
         Ok(built) => Ok(built),
-        Err(e) if gate.saw_cancel() => Err((StatusCode::CONFLICT, format!("build cancelled by user: {e}"))),
+        Err(e) if crate::build::cancelled(&e) => {
+            Err((StatusCode::CONFLICT, format!("build cancelled by user: {e:#}")).into_response())
+        }
         // A lost single-flight (gate.begin refused) is a state
         // conflict, not a server fault.
         Err(e) if !gate.engaged() && format!("{e}").starts_with("cannot build now") => {
-            Err((StatusCode::CONFLICT, format!("{e}")))
+            Err((StatusCode::CONFLICT, [(weft_core::builds::BUILD_BUSY_HEADER, "1")], format!("{e}")).into_response())
         }
         // `{e:#}` (alternate) prints the FULL chain so the compile
         // diagnostics (`line:col message`) reach the client, not just
         // the outermost context.
-        Err(e) => Err((StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}"))),
+        Err(e) => Err((StatusCode::UNPROCESSABLE_ENTITY, format!("{e:#}")).into_response()),
     }
 }

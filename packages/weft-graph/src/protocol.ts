@@ -658,6 +658,9 @@ export interface InputSpec {
   name: string;
   type: string;
   required?: boolean;
+  /// Optional while unwired, required once wired; never with `required`.
+  // SYNC: InputSpec.requiredWhenWired <-> crates/weft-core/src/node.rs InputSpec.required_when_wired
+  requiredWhenWired?: boolean;
   // SYNC: InputSpec.accepts <-> crates/weft-core/src/node.rs InputSpec.accepts
   accepts?: Accepts;
   widget?: Widget;
@@ -845,7 +848,8 @@ export type SkipReason =
   | { kind: 'required_input_closed'; port: string; failure?: Failure }
   | { kind: 'every_input_closed'; failure?: Failure }
   | { kind: 'one_of_group_closed'; ports: string[]; failure?: Failure }
-  | { kind: 'scope_skipped'; scope: string };
+  | { kind: 'scope_skipped'; scope: string }
+  | { kind: 'wait_skipped' };
 
 /// A node that broke, as the closures it leaves carry it: the node spelled
 /// the way the program reads it, and its error. Passed on unchanged through
@@ -1445,6 +1449,10 @@ export interface ActionAvailability {
   /// Count of running, non-suspended executions. Drives the
   /// deactivating-state UI: shows "draining N executions...".
   runningCount: number;
+  /// The program's own triggers that are off while the project is
+  /// active (an infra stop took down the ones reading it): what the
+  /// bar's second button turns back on, by name.
+  triggersOff: string[];
   /// Infra rollup.
   infraRollup: InfraRollup;
   /// An infra operation is in flight that the rollup cannot see yet.
@@ -1510,6 +1518,10 @@ export type CliPhase =
   /// The build goes on; detail `elapsedSeconds`, `images`, the ones
   /// still building, and `built`, the ones done during this wait.
   | 'build_wait'
+  /// The install cannot be reached to see where the build is; the CLI
+  /// keeps looking. Detail `elapsedSeconds` and `message`, why the last
+  /// look failed. The next `build_wait` or `build_image` says it answers again.
+  | 'build_unreachable'
   | 'dispatcher_call_start'
   | 'dispatcher_call_done'
   | 'infra_provision_start'
@@ -1701,6 +1713,8 @@ export type BackendSnapshot = {
   infraBusy: boolean;
   /// Drain progress when status='deactivating'.
   runningCount: number;
+  /// See `ActionAvailability.triggersOff`.
+  triggersOff: string[];
   /// Hibernate-grace deadline, when present.
   firesDeadlineUnix?: number;
 };

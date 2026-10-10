@@ -36,6 +36,18 @@
     },
     "permissions": [
       {
+        "id": "openid",
+        "label": "Know who you are",
+        "description": "Confirm which Google account this is (asked on every connection, whatever else is picked).",
+        "always": true
+      },
+      {
+        "id": "https://www.googleapis.com/auth/userinfo.email",
+        "label": "See your email address",
+        "description": "Read the account's email address, which names the connection (asked on every connection, whatever else is picked).",
+        "always": true
+      },
+      {
         "id": "https://www.googleapis.com/auth/drive.file",
         "label": "Files you pick",
         "description": "Read and write only the files you pick or this project creates.",
@@ -59,17 +71,17 @@
       {
         "id": "https://www.googleapis.com/auth/gmail.metadata",
         "label": "Read mail headers",
-        "description": "Read subjects, senders and message ids, never message bodies (this is what threading a reply needs)."
+        "description": "Read subjects, senders and message ids, never message bodies (enough to thread a reply)."
       },
       {
         "id": "https://www.googleapis.com/auth/gmail.readonly",
         "label": "Read mail",
-        "description": "Read the account's email (needed by the new-email trigger and message reads)."
+        "description": "Read the account's email (needed by the new-email trigger and message reads; sending from another address needs this or Organize mail)."
       },
       {
         "id": "https://www.googleapis.com/auth/gmail.modify",
         "label": "Organize mail",
-        "description": "Add and remove labels on the account's email."
+        "description": "Read the account's email and add and remove its labels."
       },
       {
         "id": "https://www.googleapis.com/auth/calendar.events",
@@ -95,11 +107,11 @@
       }
     ],
     "test": {
-      "url": "https://www.googleapis.com/drive/v3/about?fields=user",
+      "url": "https://openidconnect.googleapis.com/v1/userinfo",
       "captures": [
         {
           "name": "user_email",
-          "path": "user.emailAddress"
+          "path": "email"
         }
       ]
     },

@@ -41,7 +41,7 @@ struct FakeState {
     next_tag_seq: i64,
     /// Answers handed to a run its worker drives, by run, for the worker
     /// to take (the Postgres `parked_fire` rows `hand_answer_in` writes).
-    handed: HashMap<ExecutionId, Vec<(String, serde_json::Value)>>,
+    handed: HashMap<ExecutionId, Vec<(String, weft_core::primitive::WaitAnswer)>>,
 }
 
 #[derive(Default)]
@@ -99,7 +99,7 @@ impl FakeJournal {
     }
 
     /// The answers handed to `execution_id`'s worker, in order.
-    pub fn handed(&self, execution_id: ExecutionId) -> Vec<(String, serde_json::Value)> {
+    pub fn handed(&self, execution_id: ExecutionId) -> Vec<(String, weft_core::primitive::WaitAnswer)> {
         self.inner.lock().unwrap().handed.get(&execution_id).cloned().unwrap_or_default()
     }
 
@@ -388,7 +388,7 @@ impl Journal for FakeJournal {
     /// An answer reaches its run as Postgres's does: written into the
     /// record of a run nobody drives (queued to carry on), handed to the
     /// worker of a run one drives ([`Self::handed`]).
-    async fn answer(&self, token: &str, value: &serde_json::Value) -> anyhow::Result<crate::journal::Answered> {
+    async fn answer(&self, token: &str, answer: &weft_core::primitive::WaitAnswer) -> anyhow::Result<crate::journal::Answered> {
         use crate::journal::Answered;
         let mut g = self.inner.lock().unwrap();
         let Some(consumed) = g.signals.get(token).filter(|s| s.is_resume).cloned() else { return Ok(Answered::Gone) };
@@ -396,11 +396,11 @@ impl Journal for FakeJournal {
         let Some(execution_id) = consumed.execution_id else { return Ok(Answered::Gone) };
         let Some(row) = g.runs.get_mut(&execution_id).filter(|row| row.state != "ended") else { return Ok(Answered::RunEnded { consumed }) };
         if row.owner.is_some() {
-            g.handed.entry(execution_id).or_default().push((token.to_string(), value.clone()));
+            g.handed.entry(execution_id).or_default().push((token.to_string(), answer.clone()));
             return Ok(Answered::Reached { consumed });
         }
         row.state = "queued";
-        g.events.push(ExecEvent::SuspensionResolved { execution_id, token: token.to_string(), value: value.clone(), at_unix: 0 });
+        g.events.push(ExecEvent::wait_answered(execution_id, token.to_string(), answer.clone(), 0));
         Ok(Answered::Reached { consumed })
     }
 
@@ -865,17 +865,17 @@ pub(crate) mod tests {
         resume.is_resume = true;
         resume.execution_id = Some(run);
         j.signal_insert(&resume).await.unwrap();
-        let crate::journal::Answered::Reached { consumed } = j.answer("tok-r", &serde_json::json!("yes")).await.unwrap() else {
+        let crate::journal::Answered::Reached { consumed } = j.answer("tok-r", &weft_core::primitive::WaitAnswer::Given { value: serde_json::json!("yes") }).await.unwrap() else {
             panic!("the wait is answered")
         };
         assert_eq!(consumed.token, "tok-r");
         assert!(j.signal_get("tok-r").await.unwrap().is_none(), "single use");
         assert_eq!(j.inner.lock().unwrap().runs[&run].state, "queued");
-        assert!(matches!(j.answer("tok-r", &serde_json::Value::Null).await.unwrap(), crate::journal::Answered::Gone));
+        assert!(matches!(j.answer("tok-r", &weft_core::primitive::WaitAnswer::Skipped).await.unwrap(), crate::journal::Answered::Gone));
 
         // An entry row is never answered this way.
         j.signal_insert(&registration("tok-e")).await.unwrap();
-        assert!(matches!(j.answer("tok-e", &serde_json::Value::Null).await.unwrap(), crate::journal::Answered::Gone));
+        assert!(matches!(j.answer("tok-e", &weft_core::primitive::WaitAnswer::Skipped).await.unwrap(), crate::journal::Answered::Gone));
         assert!(j.signal_get("tok-e").await.unwrap().is_some(), "entry rows stay");
     }
 

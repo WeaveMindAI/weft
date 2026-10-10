@@ -126,8 +126,19 @@ Unknown keys are a loud parse error. Top level:
 | `service` | access nodes only, the connection recipe |
 | `accessApps` | project-shipped OAuth apps |
 
-Input entry: `name`, `type`, `required`, `accepts`, `widget`, `default`,
-`label`, `placeholder`, `description`, `requiresScopes`, `requiresValues`.
+Input entry: `name`, `type`, `required`, `requiredWhenWired`, `accepts`,
+`widget`, `default`, `label`, `placeholder`, `description`, `requiresScopes`,
+`requiresValues`.
+
+If an unwired input means something of its own (no `instance`: the program's
+own copy), mark it `requiredWhenWired`, not `required`: unwired, the node runs;
+wired, a wire that delivers nothing skips the node instead of falling back to
+that meaning. If an optional input needs one more permission when it is used,
+leave it out of `requiresScopes`, which every program using the node is asked
+for. In `run`, when the input is used and before `ctx.client(&account)`, copy
+`account.required_permissions()` (it already holds the declared ones), push the
+extra one, and pass the list to `account.with_required_permissions`. Opening
+then refuses a connection that lacks it, naming the permission.
 
 A `select` or `multiselect` widget's `options` are a closed list: a program
 writing anything else fails with `literal-not-an-option`. Keep it closed when
@@ -170,7 +181,7 @@ nodes by a feature they declare, with `with: {feature: value}`.
 
 `{with}`, `{per_instance_reason}` and `{names}` in the message name what the
 check found (`{per_instance_reason}` says why, path included: "it reads
-'bridge'", "it sits inside group 'work', which receives 'bridge'"). Copy a real rule from `Route`, `Reply` or `StartInstanceInfra`
+'bridge'", "it sits inside group 'work', which receives 'bridge'"). Copy a real rule from `Route`, `Reply` or `StartInfra`
 before writing your own.
 
 `required` is written only as `"required": true`, on an input the node cannot
@@ -387,7 +398,7 @@ and end in one call:
 The types are in `weft::program` (`InfraCopy`, `CostRecord`, `PaidBy`,
 `MintedInstanceToken`). Every call is journaled, so none goes through
 `ctx.run`. The `instances` package already wraps most of them (`CurrentInstance`,
-`StartInstanceInfra`, `ListInstanceInfra`, `InstanceCosts`, `SetInstanceValues`, ...), so check it before
+`StartInfra`, `ListInstanceInfra`, `InstanceCosts`, `SetInstanceValues`, ...), so check it before
 writing one. In the `fake` tier, `rig.instance("user-42")` makes the run a run
 for that instance, `rig.answer_program_call("weft.infra.status", json!(..))`
 queues the answer to one call by its journal name (`weft.infra.copies`,
@@ -401,8 +412,12 @@ plus a `service` recipe in metadata (acquisition fields with `secret: true`,
 auth steps, a test URL, an identity template). The macro reads the `account`
 input and pulses it on `access`. It has no `tests.rs`: the macro is the whole
 body, so there is nothing of yours to test, and the review does not ask for
-one. Credentials live sealed in the runtime's access store, never in the
-project. The compiler synthesizes the runtime
+one. The test URL must pass whatever permissions the person ticked: when it
+needs a permission of its own to learn who the account is, declare that
+permission with `"always": true` and it is asked for on every connection
+(Google's `openid` and `userinfo.email`; the service docs' "Permissions"
+section has the rules). Credentials live sealed in the runtime's access store,
+never in the project. The compiler synthesizes the runtime
 "no connection picked" rule from the `service` block; a hand-written one is
 a finding. `"connection_optional": true` inside the service block is
 reserved for a node that genuinely runs unconnected. That node is the one

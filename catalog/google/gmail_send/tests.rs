@@ -20,10 +20,19 @@ pub fn tests() -> Vec<NodeTest> {
     vec![
         NodeTest::fake("sends_the_assembled_raw_message", sends),
         NodeTest::fake("attachments_and_reply_threading_ride_the_raw_message", attachments_and_reply),
+        NodeTest::fake("from_an_accepted_alias_names_it_as_the_sender", from_alias),
+        NodeTest::fake("from_an_address_off_the_send_as_list_fails_naming_the_allowed_ones", from_unknown),
         NodeTest::fake("no_recipient_refuses_before_any_call", no_recipient),
         NodeTest::fake("a_refused_send_fails_the_run_when_error_is_unwired", refused_unwired),
         NodeTest::fake("a_refused_send_comes_out_on_error_when_it_is_wired", refused_wired),
         NodeTest::fake("a_missing_recipient_is_never_caught_by_error", mistake_not_caught),
+        NodeTest::fake("a_plain_send_asks_only_for_send_mail", plain_send_permissions),
+        NodeTest::fake("a_reply_on_send_mail_alone_fails_naming_read_mail", reply_needs_read_mail),
+        NodeTest::fake(
+            "sending_from_another_address_on_send_mail_alone_fails_naming_read_mail",
+            alias_needs_read_mail,
+        ),
+        NodeTest::fake("a_reply_on_organize_mail_is_not_asked_for_read_mail", reply_on_organize_mail),
         NodeTest::live("one_real_send", "google", live_send).with_fixture(fixture_spec(
             "GMAIL_TO",
             "Recipient address",
@@ -116,6 +125,59 @@ async fn sends(rig: FakeRig) -> WeftResult<()> {
     assert!(mime.contains("To: ada@example.com"), "{mime}");
     assert!(mime.contains("Subject: hello"), "{mime}");
     assert!(mime.contains("body text"), "{mime}");
+    // No `from`: the connection's own address, and no Send mail as read.
+    assert!(mime.contains("From: me@example.com"), "{mime}");
+    assert_eq!(rig.requests().len(), 1, "only the send");
+    Ok(())
+}
+
+/// The account's Send mail as list as Gmail answers it: the primary
+/// (no verificationStatus), a verified alias, and one still pending.
+fn send_as_list(rig: &FakeRig) {
+    rig.respond(
+        "GET",
+        "/gmail/v1/users/me/settings/sendAs",
+        json!({ "sendAs": [
+            { "sendAsEmail": "me@example.com", "isPrimary": true },
+            { "sendAsEmail": "Team@Example.com", "verificationStatus": "accepted" },
+            { "sendAsEmail": "pending@example.com", "verificationStatus": "pending" },
+        ]}),
+    );
+}
+
+async fn from_alias(rig: FakeRig) -> WeftResult<()> {
+    send_as_list(&rig);
+    rig.respond(
+        "POST",
+        "/gmail/v1/users/me/messages/send",
+        json!({ "id": "m3", "threadId": "t3" }),
+    );
+    let mut mail = a_mail();
+    // Matched case-insensitively; the header keeps it as given.
+    mail["from"] = json!("team@example.com");
+    rig.run(&GmailSendNode, mail).await.ok()?;
+
+    let sent = rig.requests();
+    assert_eq!(sent.len(), 2, "read the Send mail as list, then send");
+    let body = sent[1].body.clone().expect("send body");
+    let mime = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(body["raw"].as_str().expect("raw message"))
+        .expect("raw is base64url");
+    let mime = String::from_utf8_lossy(&mime);
+    assert!(mime.contains("From: team@example.com"), "{mime}");
+    Ok(())
+}
+
+async fn from_unknown(rig: FakeRig) -> WeftResult<()> {
+    send_as_list(&rig);
+    let mut mail = a_mail();
+    // A pending alias would be rewritten to the primary, so it is
+    // refused like an address Gmail has never heard of.
+    mail["from"] = json!("pending@example.com");
+    let err = rig.run(&GmailSendNode, mail).await.failure()?;
+    assert!(err.contains("pending@example.com"), "{err}");
+    assert!(err.contains("Allowed: me@example.com, Team@Example.com."), "{err}");
+    assert_eq!(rig.requests().len(), 1, "nothing was sent");
     Ok(())
 }
 
@@ -142,7 +204,7 @@ fn refuse_the_send(rig: &FakeRig) {
     );
 }
 
-fn a_mail(rig: &FakeRig) -> serde_json::Value {
+fn a_mail() -> serde_json::Value {
     json!({
         "account": google_account(),
         "to": "ada@example.com",
@@ -153,7 +215,7 @@ fn a_mail(rig: &FakeRig) -> serde_json::Value {
 
 async fn refused_unwired(rig: FakeRig) -> WeftResult<()> {
     refuse_the_send(&rig);
-    let err = rig.run(&GmailSendNode, a_mail(&rig)).await.failure()?;
+    let err = rig.run(&GmailSendNode, a_mail()).await.failure()?;
     assert!(err.contains("Daily sending quota exceeded"), "{err}");
     Ok(())
 }
@@ -161,7 +223,7 @@ async fn refused_unwired(rig: FakeRig) -> WeftResult<()> {
 async fn refused_wired(rig: FakeRig) -> WeftResult<()> {
     refuse_the_send(&rig);
     rig.wire_output("error");
-    let outcome = rig.run(&GmailSendNode, a_mail(&rig)).await.ok()?;
+    let outcome = rig.run(&GmailSendNode, a_mail()).await.ok()?;
     let error = outcome.output("error")?.as_str().expect("error is a string").to_string();
     assert!(error.contains("Daily sending quota exceeded"), "{error}");
     for port in ["id", "threadId"] {
@@ -183,6 +245,103 @@ async fn mistake_not_caught(rig: FakeRig) -> WeftResult<()> {
     assert!(err.contains("no recipient"), "{err}");
     assert!(rig.requests().is_empty(), "nothing was sent");
     Ok(())
+}
+
+const SEND_MAIL: &str = "https://www.googleapis.com/auth/gmail.send";
+const ORGANIZE_MAIL: &str = "https://www.googleapis.com/auth/gmail.modify";
+
+async fn plain_send_permissions(rig: FakeRig) -> WeftResult<()> {
+    rig.connection_permissions("google", &[SEND_MAIL]);
+    rig.respond(
+        "POST",
+        "/gmail/v1/users/me/messages/send",
+        json!({ "id": "m4", "threadId": "t4" }),
+    );
+    let mut mail = a_mail();
+    // The account's own address, in another case, is no other address.
+    mail["from"] = json!("ME@example.com");
+    rig.run(&GmailSendNode, mail).await.ok()?;
+    assert_eq!(rig.requests().len(), 1, "only the send");
+    Ok(())
+}
+
+/// The replied-to message, as Gmail answers its metadata read.
+fn original_message(rig: &FakeRig) {
+    rig.respond(
+        "GET",
+        "/gmail/v1/users/me/messages/orig-1?format=metadata&metadataHeaders=Message-ID",
+        json!({
+            "threadId": "t-orig",
+            "payload": { "headers": [{ "name": "Message-ID", "value": "<abc@mail>" }] }
+        }),
+    );
+}
+
+/// Organize mail reads everything Read mail does, so a connection
+/// holding it and Send mail replies without Read mail being asked for.
+async fn reply_on_organize_mail(rig: FakeRig) -> WeftResult<()> {
+    rig.connection_permissions("google", &[SEND_MAIL, ORGANIZE_MAIL]);
+    original_message(&rig);
+    rig.respond(
+        "POST",
+        "/gmail/v1/users/me/messages/send",
+        json!({ "id": "m5", "threadId": "t-orig" }),
+    );
+    let mut mail = a_mail();
+    mail["replyTo"] = json!("orig-1");
+    rig.run(&GmailSendNode, mail).await.ok()?;
+    assert_eq!(rig.requests().len(), 2, "read the original, then send");
+    Ok(())
+}
+
+/// Gmail's answer to a read on a token holding Send mail alone.
+fn insufficient_scopes(rig: &FakeRig, path: &str) {
+    rig.respond_status(
+        "GET",
+        path,
+        403,
+        json!({ "error": {
+            "code": 403,
+            "message": "Request had insufficient authentication scopes.",
+            "status": "PERMISSION_DENIED",
+        }}),
+    );
+}
+
+/// A connection holding Send mail alone gets Gmail's refusal on the
+/// read, named with the permissions that would work, and nothing is
+/// sent.
+async fn refused_for_read_mail(
+    rig: &FakeRig,
+    mail: serde_json::Value,
+    read_path: &str,
+) -> WeftResult<()> {
+    rig.connection_permissions("google", &[SEND_MAIL]);
+    insufficient_scopes(rig, read_path);
+    let err = rig.run(&GmailSendNode, mail).await.failure()?;
+    assert!(err.contains("insufficient authentication scopes"), "{err}");
+    assert!(err.contains("'Read mail'") && err.contains("'Organize mail'"), "{err}");
+    let sent = rig.requests();
+    assert_eq!(sent.len(), 1, "only the refused read: {sent:?}");
+    assert_eq!(sent[0].method, "GET", "nothing was sent");
+    Ok(())
+}
+
+async fn reply_needs_read_mail(rig: FakeRig) -> WeftResult<()> {
+    let mut mail = a_mail();
+    mail["replyTo"] = json!("orig-1");
+    refused_for_read_mail(
+        &rig,
+        mail,
+        "/gmail/v1/users/me/messages/orig-1?format=metadata&metadataHeaders=Message-ID",
+    )
+    .await
+}
+
+async fn alias_needs_read_mail(rig: FakeRig) -> WeftResult<()> {
+    let mut mail = a_mail();
+    mail["from"] = json!("team@example.com");
+    refused_for_read_mail(&rig, mail, "/gmail/v1/users/me/settings/sendAs").await
 }
 
 async fn live_send(rig: LiveRig) -> WeftResult<()> {

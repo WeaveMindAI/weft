@@ -157,6 +157,8 @@ impl ImageBuilder for CloudBuildImages {
         format!("{}/{tag}", self.gcp.artifact_registry.trim_end_matches('/'))
     }
 
+    /// Uploads the whole context before it answers: Cloud Build reads the
+    /// bucket's copy, so `req.staging` goes when this returns.
     async fn start(&self, req: BuildRequest) -> anyhow::Result<BuildHandle> {
         let dir = req.context_dir.clone();
         let bytes = tokio::task::spawn_blocking(move || tar_context(&dir)).await??;
@@ -270,6 +272,7 @@ mod tests {
             project_id: uuid::Uuid::from_u128(1),
             tenant: "local".into(),
             context_dir: "/ctx".into(),
+            staging: weft_platform_traits::Staging::new(()),
             image_ref: "us-central1-docker.pkg.dev/acme/weft/weft-worker:abc".into(),
             build_args: vec![("WEFT_COMPILE_LANE".into(), "0".into())],
         };

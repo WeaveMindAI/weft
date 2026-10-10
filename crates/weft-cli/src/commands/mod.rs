@@ -278,7 +278,7 @@ impl Ctx {
     /// resolves it, so an install with no address yet errors here.
     pub fn client(&self) -> anyhow::Result<crate::client::DispatcherClient> {
         let install = self.install()?;
-        Ok(crate::client::DispatcherClient::new(install.url.clone(), install.operator_key.clone()))
+        Ok(crate::client::DispatcherClient::new(install.url.clone(), install.operator_key.clone()).for_target(self.on()))
     }
 
     /// A client resolved afresh on every call, never cached: a long-lived
@@ -291,7 +291,7 @@ impl Ctx {
     /// edit is seen.
     pub fn fresh_client(&self, project: Option<&Project>) -> anyhow::Result<crate::client::DispatcherClient> {
         let install = self.resolve_install(|| Ok(project.cloned()))?;
-        Ok(crate::client::DispatcherClient::new(install.url, install.operator_key))
+        Ok(crate::client::DispatcherClient::new(install.url, install.operator_key).for_target(self.on()))
     }
 
     /// The cwd-discovered project, lazy-loaded and cached, keeping

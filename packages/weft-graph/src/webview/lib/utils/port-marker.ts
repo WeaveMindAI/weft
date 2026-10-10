@@ -11,6 +11,13 @@ import type { PortDefinition } from '../types';
  */
 export type PortMarkerState = 'full' | 'empty' | 'half' | 'empty-dotted';
 
+/** Whether an input draws as required: a required input always, and one
+ *  required only once wired (`requiredWhenWired`) exactly while a wire
+ *  feeds it, so its look follows connect and disconnect. */
+export function portLooksRequired(port: PortDefinition, isWired: boolean): boolean {
+	return port.required || (isWired && !!port.requiredWhenWired);
+}
+
 /** Pick the marker state for an input port.
  *  A literal fill takes visual precedence over required/oneOfRequired:
  *  if the port has a non-null body-set literal and no edge, it renders
@@ -42,6 +49,7 @@ export function inputMarkerState(
  *  - color: the port's type color
  *  - side: 'input' (honors state) or 'output' (always full)
  *  - extraClass: optional extra Tailwind utilities
+ *  - isWired: whether a wire feeds this input (see `portLooksRequired`)
  */
 export function portMarkerStyle(
 	port: PortDefinition,
@@ -50,10 +58,11 @@ export function portMarkerStyle(
 	color: string,
 	side: 'input' | 'output',
 	extraClass: string = '',
+	isWired: boolean = false,
 ): { style: string; class: string } {
 	// Outputs are always `full`, regardless of the port's `required` flag.
 	const state: PortMarkerState = side === 'input'
-		? inputMarkerState(port.required, oneOfRequiredPorts.has(port.name), literalFilledPorts.has(port.name))
+		? inputMarkerState(portLooksRequired(port, isWired), oneOfRequiredPorts.has(port.name), literalFilledPorts.has(port.name))
 		: 'full';
 
 	if (state === 'full') return filledMarkerStyle(color, 'port', extraClass);

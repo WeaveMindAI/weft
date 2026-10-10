@@ -405,6 +405,7 @@ pub fn fixture_spec(name: &str, label: &str, description: &str) -> InputSpec {
         description: Some(description.to_string()),
         requires_scopes: None,
         requires_values: None,
+        required_when_wired: false,
     }
 }
 
@@ -1150,6 +1151,14 @@ impl FakeRig {
     pub fn signal_given_up(&self) {
         let error = "the wait was given up (`rig.signal_given_up()`)".to_string();
         self.state.signals.lock().unwrap().push_back(AwaitEnd::GaveUp { error });
+    }
+
+    /// Make the node's next `ctx.await_signal` end the way a person
+    /// skipping it does (the `/skip` door, `WeftError::WaitSkipped`),
+    /// queued in order with [`Self::signal`]: in production the step then
+    /// ends skipped with every output closed.
+    pub fn signal_skipped(&self) {
+        self.state.signals.lock().unwrap().push_back(AwaitEnd::Skipped);
     }
 
     /// Make every run on this rig a run for this instance, what
@@ -2266,6 +2275,7 @@ impl ContextHandle for TestHandle {
         match ended {
             AwaitEnd::Answered { value } => Ok(value),
             AwaitEnd::GaveUp { error } => Err(WeftError::WaitGaveUp(error)),
+            AwaitEnd::Skipped => Err(crate::primitive::wait_skipped()),
         }
     }
 

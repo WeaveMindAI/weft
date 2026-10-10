@@ -366,7 +366,9 @@ async fn run_command(
         .err()
         .map(|e| e.downcast_ref::<CancelledByUser>().is_some())
         .unwrap_or(false);
-    let error = result.as_ref().err().map(|e| e.to_string());
+    // The whole chain: the outermost context alone ("start the agent of
+    // unit ..") hides the reason the person needs.
+    let error = result.as_ref().err().map(|e| format!("{e:#}"));
     // `command_complete` is Gone if the row was already completed
     // (remove_node cascade cancelled it) and Displaced if this supervisor no
     // longer owns the project (drain / lease takeover moved it
@@ -393,13 +395,13 @@ async fn run_command(
         if cancelled {
             tracing::info!(
                 command_id = cmd.id,
-                halt = %e,
+                halt = format!("{e:#}"),
                 "lifecycle command halted by user cancel; marked cancelled"
             );
         } else {
             tracing::warn!(
                 command_id = cmd.id,
-                error = %e,
+                error = format!("{e:#}"),
                 "lifecycle command failed; marked complete with error"
             );
         }

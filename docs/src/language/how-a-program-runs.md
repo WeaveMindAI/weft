@@ -37,10 +37,12 @@ For an ordinary step:
 | What happened | What the step does |
 |---|---|
 | A required input closed | Skips |
+| A wired input its node marks required once wired (`requiredWhenWired`) closed | Skips, as for a required one. Left unwired, it is optional |
 | An optional input closed | Nothing. The other inputs decide |
 | Every input closed | Skips |
 | Every `@require_one_of` input closed | Skips |
 | `_should_flow` is `false`, or closed | Skips |
+| It was waiting on a person, who skipped the question | Skips |
 
 A skipped step closes its own outputs, which can skip the next step, and the
 next, until the closures reach something that can carry on with what it has.

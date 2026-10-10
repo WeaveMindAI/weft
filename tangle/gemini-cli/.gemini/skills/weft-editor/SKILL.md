@@ -109,7 +109,11 @@ line) and the verb is not sent, so a build that cannot run never starts.
   "Running...". While following a live run it is "Stop Execution".
 - **Trigger slot** (when the source declares triggers): "Activate" /
   "Deactivate" / "Resync" (amber "Out of sync" when the project changed
-  since activation). An eye toggle "Show trigger subgraph". Deactivating
+  since activation). An eye toggle "Show trigger subgraph". When some
+  triggers are off while the others run (an infra stop took down the ones
+  reading it), a second button beside "Deactivate" turns them back on and
+  names them: "Activate gmail.watch", or "Reactivate ..." when runs wait on
+  them, two by name and then "and N more". Deactivating
   opens the picker "Deactivate: how should triggers come down?": **Park**
   (nothing dropped: everything that arrives waits and runs once the
   triggers are back), **Hibernate** (the same for a grace window, questions

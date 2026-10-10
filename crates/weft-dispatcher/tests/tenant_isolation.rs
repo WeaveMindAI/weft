@@ -33,7 +33,7 @@ fn definition(id: Uuid) -> ProjectDefinition {
 
 async fn register(store: &FakeProjectStore, id: Uuid, name: &str, tenant: &str) {
     store
-        .register_with_hashes(definition(id), name, "", tenant, None, None, None, None, None, None)
+        .register_with_hashes(definition(id), name, "", tenant, None, None, None, None, None, None, None)
         .await
         .expect("register");
 }
@@ -82,7 +82,7 @@ async fn cross_tenant_project_id_takeover_is_refused() {
     register(&store, shared_id, "a-owned", TENANT_A).await;
 
     let takeover = store
-        .register_with_hashes(definition(shared_id), "b-grab", "", TENANT_B, None, None, None, None, None, None)
+        .register_with_hashes(definition(shared_id), "b-grab", "", TENANT_B, None, None, None, None, None, None, None)
         .await;
     assert!(takeover.is_err(), "cross-tenant re-register must be refused");
     assert_eq!(
@@ -93,7 +93,7 @@ async fn cross_tenant_project_id_takeover_is_refused() {
 
     // The owner CAN re-register its own project (idempotent update).
     store
-        .register_with_hashes(definition(shared_id), "a-owned-v2", "", TENANT_A, None, None, None, None, None, None)
+        .register_with_hashes(definition(shared_id), "a-owned-v2", "", TENANT_A, None, None, None, None, None, None, None)
         .await
         .expect("owner re-register allowed");
 }
@@ -248,11 +248,11 @@ async fn a_program_is_retired_only_when_no_run_still_names_it() {
 
     // Two recorded versions; only one of them ever ran.
     store
-        .register_with_hashes(definition(project), "doomed", "", TENANT_A, None, Some("ran"), None, None, None, None)
+        .register_with_hashes(definition(project), "doomed", "", TENANT_A, None, Some("ran"), None, None, None, None, None)
         .await
         .expect("record the version that ran");
     store
-        .register_with_hashes(definition(project), "doomed", "", TENANT_A, None, Some("never-ran"), None, None, None, None)
+        .register_with_hashes(definition(project), "doomed", "", TENANT_A, None, Some("never-ran"), None, None, None, None, None)
         .await
         .expect("record a version nothing ran");
     let execution_id = Uuid::new_v4();

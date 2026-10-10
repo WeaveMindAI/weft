@@ -49,7 +49,7 @@ impl TaskExecutor<DispatcherState> for FireSignalExecutor {
         let takes_no_work = routing.standing().arrival(crate::lease::now_unix()) == weft_core::arrival::Arrival::Refused;
         // A retry of this same task finds the wait answered already, and
         // drops it as a duplicate below.
-        let status = match crate::api::signal::answer_run(state, &payload.token, &routing, payload.value).await {
+        let status = match crate::api::signal::answer_run(state, &payload.token, &routing, weft_core::primitive::WaitAnswer::Given { value: payload.value }).await {
             Ok(status) if takes_no_work => {
                 let_go_of_it(state, &payload.token).await?;
                 status

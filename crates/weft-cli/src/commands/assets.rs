@@ -371,10 +371,7 @@ impl AssetStore for DispatcherStore<'_> {
     }
 
     fn interrupted(&self, error: &anyhow::Error) -> bool {
-        error
-            .chain()
-            .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
-            .any(|e| e.is_connect() || e.is_timeout() || e.is_request() || e.is_body())
+        crate::client::connection_failed(error)
     }
 }
 
@@ -634,7 +631,8 @@ impl DispatcherStore<'_> {
         // the same bounded backoff the engine gives a completion. Otherwise
         // look once, without retrying the upload or interpreting error text.
         let Some(key) = upload_key else { return Err(error) };
-        let completing = error.chain().any(|cause| cause.is::<crate::client::StoreCompleting>());
+        let completing =
+            crate::client::refusal(&error).is_some_and(|refused| refused.marked() == Some(crate::client::Marked::StoreCompleting));
         let mut attempt = 0;
         loop {
             let stored = self.client.get_json_if_found(&format!("/storage/files/meta/{key}")).await

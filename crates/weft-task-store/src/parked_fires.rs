@@ -50,6 +50,9 @@ pub static GROUP: crate::SchemaGroup = crate::SchemaGroup {
             instance_gap JSONB,
             -- An answer to a waiting run, rather than an event of an entry.
             is_resume BOOLEAN NOT NULL,
+            -- An answer that is a person skipping the wait (its `/skip`
+            -- door), not a value: `payload` is then null and unread.
+            skipped BOOLEAN NOT NULL DEFAULT FALSE,
             -- Set on an answer already taken off its wait (the wait's
             -- signal is gone) for a run a worker drives: the run it is
             -- for. Its worker takes it; if the worker lets go of the run
@@ -121,6 +124,33 @@ pub struct Waiting {
     /// change of values routes it again. Shown per trigger by `weft status`
     /// and `ctx.instances().list()`.
     pub instance_gap: Option<String>,
+    /// An answer (`is_resume`) that is a person skipping the wait, not a
+    /// value: `payload` is then null and unread. Always false for an
+    /// entry's event.
+    pub skipped: bool,
+}
+
+impl Waiting {
+    /// The answer this is, when it answers a waiting run.
+    pub fn answer(&self) -> weft_core::primitive::WaitAnswer {
+        stored_answer(self.payload.clone(), self.skipped)
+    }
+}
+
+/// An answer as a row holds it (`payload`, `skipped`) and back: the one
+/// spelling of a skip in this table.
+fn answer_row(answer: &weft_core::primitive::WaitAnswer) -> (Value, bool) {
+    match answer {
+        weft_core::primitive::WaitAnswer::Given { value } => (value.clone(), false),
+        weft_core::primitive::WaitAnswer::Skipped => (Value::Null, true),
+    }
+}
+
+fn stored_answer(payload: Value, skipped: bool) -> weft_core::primitive::WaitAnswer {
+    match skipped {
+        true => weft_core::primitive::WaitAnswer::Skipped,
+        false => weft_core::primitive::WaitAnswer::Given { value: payload },
+    }
 }
 
 /// Seconds an event waits before its `attempts`-th retry: 1, 2, 4, ...
@@ -145,7 +175,14 @@ pub const MAX_PARKED_ENTRY_FIRES: i64 = 1000;
 /// `attempts`-th failure, retried after its backoff.
 pub fn waiting(fire_id: uuid::Uuid, payload: Value, caller: Option<String>, attempts: u32, instance_gap: Option<String>) -> Waiting {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
-    Waiting { fire_id, payload, caller, attempts, not_before: now + park_backoff_secs(attempts), instance_gap }
+    Waiting { fire_id, payload, caller, attempts, not_before: now + park_backoff_secs(attempts), instance_gap, skipped: false }
+}
+
+/// An answer to a waiting run, as it waits until the run can take it:
+/// [`waiting`] for a value, or a person's skip.
+pub fn waiting_answer(fire_id: uuid::Uuid, answer: weft_core::primitive::WaitAnswer) -> Waiting {
+    let (payload, skipped) = answer_row(&answer);
+    Waiting { skipped, ..waiting(fire_id, payload, None, 0, None) }
 }
 
 /// THE one park. Every park site (an answer whose run cannot take it now, a
@@ -188,8 +225,8 @@ pub async fn park(pool: &sqlx::PgPool, token: &str, waiting: &Waiting, held_by: 
         return Ok(ParkAppend::Refused(ParkRefusal::QueueFull));
     }
     let inserted = sqlx::query(
-        "INSERT INTO parked_fire (token, fire_id, payload, caller, attempts, not_before, instance_gap, is_resume) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (fire_id) DO NOTHING",
+        "INSERT INTO parked_fire (token, fire_id, payload, caller, attempts, not_before, instance_gap, is_resume, skipped) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (fire_id) DO NOTHING",
     )
     .bind(token)
     .bind(waiting.fire_id)
@@ -199,6 +236,7 @@ pub async fn park(pool: &sqlx::PgPool, token: &str, waiting: &Waiting, held_by: 
     .bind(waiting.not_before)
     .bind(waiting.instance_gap.as_ref().map(sqlx::types::Json))
     .bind(is_resume)
+    .bind(waiting.skipped)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -252,7 +290,7 @@ pub struct Head {
 /// overtake each other.
 pub async fn take_head(tx: &mut sqlx::PgConnection, token: &str, now: i64) -> anyhow::Result<Option<Head>> {
     let row: Option<HeadRow> = sqlx::query_as(
-        "SELECT token, seq, fire_id, payload, caller, attempts, not_before, instance_gap, is_resume FROM parked_fire p \
+        "SELECT token, seq, fire_id, payload, caller, attempts, not_before, instance_gap, is_resume, skipped FROM parked_fire p \
          WHERE p.token = $1 AND p.seq = (SELECT min(q.seq) FROM parked_fire q WHERE q.token = $1) \
            AND p.not_before <= $2 AND p.instance_gap IS NULL \
          FOR UPDATE SKIP LOCKED",
@@ -268,7 +306,7 @@ pub async fn take_head(tx: &mut sqlx::PgConnection, token: &str, now: i64) -> an
 /// again, whatever their backoff: the same as [`take_head`] but due now.
 pub async fn take_head_now(tx: &mut sqlx::PgConnection, token: &str) -> anyhow::Result<Option<Head>> {
     let row: Option<HeadRow> = sqlx::query_as(
-        "SELECT token, seq, fire_id, payload, caller, attempts, not_before, instance_gap, is_resume FROM parked_fire p \
+        "SELECT token, seq, fire_id, payload, caller, attempts, not_before, instance_gap, is_resume, skipped FROM parked_fire p \
          WHERE p.token = $1 AND p.seq = (SELECT min(q.seq) FROM parked_fire q WHERE q.token = $1) \
          FOR UPDATE SKIP LOCKED",
     )
@@ -303,20 +341,22 @@ pub async fn restamp_in(tx: &mut sqlx::PgConnection, head: &Head, attempts: u32,
     Ok(())
 }
 
-/// Hand `value`, the answer to the wait `token` of run `execution_id`,
+/// Hand `answer`, the answer to the wait `token` of run `execution_id`,
 /// which a worker drives, to that worker, on the caller's transaction:
 /// nobody but a run's worker writes the record of a run it drives. The
 /// wait's signal is consumed by the caller in the same transaction, so it
 /// is answered once.
-pub async fn hand_answer_in(tx: &mut sqlx::PgConnection, token: &str, execution_id: weft_core::ExecutionId, value: &Value) -> anyhow::Result<()> {
+pub async fn hand_answer_in(tx: &mut sqlx::PgConnection, token: &str, execution_id: weft_core::ExecutionId, answer: &weft_core::primitive::WaitAnswer) -> anyhow::Result<()> {
+    let (value, skipped) = answer_row(answer);
     sqlx::query(
-        "INSERT INTO parked_fire (token, fire_id, payload, attempts, not_before, is_resume, execution_id) \
-         VALUES ($1, $2, $3, 0, 0, TRUE, $4)",
+        "INSERT INTO parked_fire (token, fire_id, payload, attempts, not_before, is_resume, execution_id, skipped) \
+         VALUES ($1, $2, $3, 0, 0, TRUE, $4, $5)",
     )
     .bind(token)
     .bind(uuid::Uuid::new_v4())
     .bind(value)
     .bind(execution_id)
+    .bind(skipped)
     .execute(&mut *tx)
     .await?;
     Ok(())
@@ -326,11 +366,12 @@ pub async fn hand_answer_in(tx: &mut sqlx::PgConnection, token: &str, execution_
 /// first: what the worker driving the run takes. They go once the run's
 /// record holds them (`weft_record_batch` deletes the answers a batch
 /// resolves).
-pub async fn answers_for<'e, E: sqlx::PgExecutor<'e>>(executor: E, execution_id: weft_core::ExecutionId) -> anyhow::Result<Vec<(String, Value)>> {
-    Ok(sqlx::query_as("SELECT token, payload FROM parked_fire WHERE execution_id = $1 ORDER BY seq")
+pub async fn answers_for<'e, E: sqlx::PgExecutor<'e>>(executor: E, execution_id: weft_core::ExecutionId) -> anyhow::Result<Vec<(String, weft_core::primitive::WaitAnswer)>> {
+    let rows: Vec<(String, Value, bool)> = sqlx::query_as("SELECT token, payload, skipped FROM parked_fire WHERE execution_id = $1 ORDER BY seq")
         .bind(execution_id)
         .fetch_all(executor)
-        .await?)
+        .await?;
+    Ok(rows.into_iter().map(|(token, payload, skipped)| (token, stored_answer(payload, skipped))).collect())
 }
 
 #[derive(sqlx::FromRow)]
@@ -344,6 +385,7 @@ struct HeadRow {
     not_before: i64,
     instance_gap: Option<sqlx::types::Json<String>>,
     is_resume: bool,
+    skipped: bool,
 }
 
 impl HeadRow {
@@ -358,6 +400,7 @@ impl HeadRow {
                 attempts: self.attempts.max(0) as u32,
                 not_before: self.not_before,
                 instance_gap: self.instance_gap.map(|gap| gap.0),
+                skipped: self.skipped,
             },
             is_resume: self.is_resume,
         }

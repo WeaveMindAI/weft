@@ -98,6 +98,23 @@ would depend on which input arrives, like a post that needs one scope for a
 person and another for a company page, that is two nodes, each declaring its
 own. One node with the rule written in prose protects nobody.
 
+If an optional input needs one more permission only when somebody uses it,
+leave that permission out of `requiresScopes`, which every program using the
+node is asked for, and add it in `run` before you open the connection:
+
+```rust
+if reply_to.is_some() {
+    let mut needed = account.required_permissions().to_vec();
+    needed.push("https://www.googleapis.com/auth/gmail.readonly".to_string());
+    account = account.with_required_permissions(needed);
+}
+let http = ctx.client(&account).await?;
+```
+
+Extend the list rather than replace it: it already holds what `requiresScopes`
+declared. Opening then refuses a connection that lacks the permission, naming
+it, the same way it refuses one missing a declared one.
+
 A missing stored value always refuses. A missing permission only refuses when
 weft actually knows it is missing: on a service that reports nothing, the call
 goes through and the provider decides.

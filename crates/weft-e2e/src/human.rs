@@ -8,7 +8,8 @@
 //!
 //! This module is a thin, intent-named layer over [`crate::signal`]: discover a
 //! form, answer it. The resume itself is asserted through the normal replay
-//! (a `node_resumed` carrying the answer, then the node completing).
+//! (a `wait_ended` carrying the answer, then the node resuming and
+//! completing).
 
 use std::time::Duration;
 
@@ -60,4 +61,12 @@ pub async fn answer_form(
         .token()
         .context("discovered form has no signal token to submit to")?;
     signal::fire_token(disp, token, answer).await
+}
+
+/// Skip a discovered form, as a person declining the question does.
+pub async fn skip_form(disp: &Dispatcher, form: &DiscoveredSignal) -> Result<()> {
+    let token = form
+        .token()
+        .context("discovered form has no signal token to skip")?;
+    signal::skip_token(disp, token).await
 }

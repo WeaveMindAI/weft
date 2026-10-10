@@ -64,7 +64,7 @@ option buttons, approve and reject pairs, images and files.
 |---|---|
 | **Submit** | Answers a question inside a run already going |
 | **Fire** | Starts a new run, on a trigger |
-| **Skip** | Answers with nothing and lets the run carry on. Not shown on a trigger, because skipping a trigger would fire it |
+| **Skip** | Declines the question: the step that asked ends skipped, and the steps reading its answer skip too. The rest of the run carries on. Not shown on a trigger, which has no question to skip (weft refuses it) |
 | **Cancel run** | Ends the whole execution. Also not shown on a trigger |
 
 Approve and reject are labelled by whoever wrote the step, so they can read

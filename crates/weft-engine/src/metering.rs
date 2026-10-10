@@ -33,12 +33,29 @@
 //! The resolve + record run detached from the node's future (the call may
 //! be cut by a cancel), tracked per run by [`PendingCostRecords`]: a run
 //! waits for its spend to be written down before its ending is, so the
-//! figure is on its record, before its ending.
+//! figure is on its record, before its ending. The token that keeps the
+//! ending waiting is taken when the call goes out, not when its response
+//! ends: a response body can outlive the node that asked for it (a client
+//! library reading the stream on a task of its own finishes the body after
+//! the node already returned), and a token taken only then would arrive
+//! after the run had ended.
+//!
+//! That same library task is why aborting the node does not end a call:
+//! the body lives on the library's task, not in the node's future. So the
+//! tap itself stops reading a call's answer when the provider sends
+//! nothing for [`ANSWER_SILENCE_LIMIT`] while it is waited on, or when the
+//! call's run is cancelled (the run's own cancel flag, on the
+//! [`CostSink`]). The reader then gets an error, which ends the library's
+//! task; the call is booked as cut, naming why; and its token goes, so the
+//! run's ending never waits on a provider that stays connected and silent.
+//! A call the run's cancel catches before its answer even started is let
+//! go the same way.
 
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::stream::BoxStream;
@@ -53,10 +70,12 @@ use weft_providers::{
 
 // ---------- Pending-record tracking ----------
 
-/// Counts one run's cost resolutions still in flight, so the run's ending
-/// waits while a call's money is still being written down. Incremented
-/// when a metered response ends (the resolve task is spawned), decremented
-/// when its figure is on the run's record (or loudly failed).
+/// Counts one run's spend not yet on its record, so the run's ending
+/// waits while a call's money is still being written down. A token is
+/// taken when a metered call goes out and travels with it: the response's
+/// tap carries it, then the open charge or the figure being written, and
+/// it is released once the figure is on the run's record (or loudly
+/// failed).
 pub struct PendingCostRecords {
     inner: Arc<weft_core::in_flight::InFlight>,
 }
@@ -71,12 +90,10 @@ impl PendingCostRecords {
         self.inner.count()
     }
 
-    fn begin(&self) {
-        self.inner.begin();
-    }
-
-    fn end(&self) {
-        self.inner.end();
+    /// Take a token for spend not on record yet; it is released when it
+    /// drops.
+    pub(crate) fn hold(&self) -> weft_core::in_flight::InFlightToken {
+        self.inner.token()
     }
 
     /// Resolve once no cost records are in flight.
@@ -84,8 +101,8 @@ impl PendingCostRecords {
     /// Every resolve is internally bounded (the follow-up client has a
     /// request timeout, the ledger poll a fixed budget). An OPEN charge
     /// holds a token until its run closes it
-    /// (`OpenCharges::flush_execution_id`, which a run ending calls before
-    /// it waits here); a report being read holds one of its own until the
+    /// (`OpenCharges::close_execution_id`, which a run ending calls, and
+    /// which waits here); a report being read holds one of its own until the
     /// read returns (bounded the same way); and each figure being written
     /// holds one until it is on record.
     pub async fn wait_zero(&self) {
@@ -141,13 +158,31 @@ struct OpenCharge {
     /// call that opened it, so the sink that books it is carried with it
     /// rather than looked up later.
     sink: Arc<CostSink>,
+    /// The billable call's own pending token, carried on until the charge
+    /// is booked, so its run's ending waits for it.
+    held: weft_core::in_flight::InFlightToken,
 }
 
 /// One owner per charge, with reports queued in arrival order. A closing
 /// execution drains received reports before declaring the amount unknown.
 pub struct OpenCharges {
     next_token: std::sync::atomic::AtomicU64,
-    by_id: std::sync::Mutex<std::collections::HashMap<ChargeKey, ChargeState>>,
+    book: std::sync::Mutex<Book>,
+}
+
+/// The charges held open, and the runs whose ending already closed theirs.
+/// One lock over both, so a charge cannot slip in between a run's close
+/// and the mark that refuses it.
+#[derive(Default)]
+struct Book {
+    by_id: std::collections::HashMap<ChargeKey, ChargeState>,
+    /// Runs being ended (`OpenCharges::close_execution_id`). A response
+    /// body can finish after its run's charges were closed (a client
+    /// library reading the stream on a task of its own), and a charge it
+    /// opened then would hold the run's token with nothing left to close
+    /// it, so the ending would wait forever. Such a charge is booked as
+    /// unknown at once instead.
+    ending: std::collections::HashSet<ExecutionId>,
 }
 
 struct ChargeState {
@@ -169,23 +204,32 @@ impl OpenCharges {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             next_token: std::sync::atomic::AtomicU64::new(0),
-            by_id: std::sync::Mutex::new(std::collections::HashMap::new()),
+            book: std::sync::Mutex::new(Book::default()),
         })
     }
 
-    fn by_id(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<ChargeKey, ChargeState>> {
-        self.by_id.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn book(&self) -> std::sync::MutexGuard<'_, Book> {
+        self.book.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    pub fn count(&self) -> usize { self.by_id().len() }
+    pub fn count(&self) -> usize { self.book().by_id.len() }
 
     fn open(&self, service: &'static str, id: String, mut charge: OpenCharge) {
         let id = ChargeKey { service, id };
         charge.token = self.next_token.fetch_add(1, Ordering::SeqCst);
-        charge.sink.pending.begin();
-        let replaced = self.by_id().insert(id.clone(), ChargeState {
-            charge, reports: Default::default(), processing: false, closing: None,
-        });
+        let replaced = {
+            let mut book = self.book();
+            if book.ending.contains(&charge.sink.execution_id) {
+                drop(book);
+                tracing::warn!(target: "weft_engine::metering", charge = %id,
+                    "a call opened a charge after its run began ending; booking it as unknown");
+                book_open_charge(charge, "the call's response finished after its run began ending");
+                return;
+            }
+            book.by_id.insert(id.clone(), ChargeState {
+                charge, reports: Default::default(), processing: false, closing: None,
+            })
+        };
         if let Some(replaced) = replaced {
             tracing::error!(target: "weft_engine::metering", charge = %id, unread = replaced.reports.len(),
                 "two billable calls claimed the same charge id; booking the displaced call as unknown \
@@ -207,8 +251,8 @@ impl OpenCharges {
         let id = ChargeKey { service: meter.service(), id: reported.to_string() };
         let (done, received) = tokio::sync::oneshot::channel();
         let (known, start) = {
-            let mut charges = self.by_id();
-            match charges.get_mut(&id) {
+            let mut book = self.book();
+            match book.by_id.get_mut(&id) {
                 None => (false, None),
                 Some(state) => {
                     state.reports.push_back(ChargeReport {
@@ -244,9 +288,9 @@ impl OpenCharges {
                 }
                 Err(_) => {
                     let held = {
-                        let mut charges = self.by_id();
-                        if charges.get(&id).is_some_and(|state| state.charge.token == token) {
-                            charges.remove(&id)
+                        let mut book = self.book();
+                        if book.by_id.get(&id).is_some_and(|state| state.charge.token == token) {
+                            book.by_id.remove(&id)
                         } else { None }
                     };
                     if let Some(held) = held {
@@ -261,7 +305,8 @@ impl OpenCharges {
     async fn drain_reports(&self, id: ChargeKey, token: u64) {
         loop {
             let next = {
-                let mut charges = self.by_id();
+                let mut book = self.book();
+                let charges = &mut book.by_id;
                 let Some(state) = charges.get_mut(&id).filter(|state| state.charge.token == token) else { return };
                 match state.reports.pop_front() {
                     Some(report) => Ok((report, state.charge.scratch.clone(), state.charge.sink.clone())),
@@ -283,13 +328,14 @@ impl OpenCharges {
             // released under it (a second call displacing the charge books it
             // as unknown), and a figure this read still produces must not
             // land after `wait_zero` let the process exit.
-            sink.pending.begin();
+            let reading = sink.pending.hold();
             let result = std::panic::AssertUnwindSafe(report.meter.fold_report(
                 &report.path, report.observed, &mut scratch,
                 report.follow_up.follow_up(report.meter.base_url()),
             )).catch_unwind().await;
             let completed = {
-                let mut charges = self.by_id();
+                let mut book = self.book();
+                let charges = &mut book.by_id;
                 match charges.get_mut(&id).filter(|state| state.charge.token == token) {
                     Some(state) => {
                         state.charge.scratch = scratch;
@@ -316,13 +362,12 @@ impl OpenCharges {
                                 tracing::warn!(target: "weft_engine::metering", charge = %id,
                                     "the amount for this charge arrived after a second call displaced it; it is \
                                      on the trail twice, once as unknown and once with the figure");
-                                sink.clone().book_resolved(cost);
+                                sink.clone().book_resolved(reading, cost);
                             }
                             Ok(None) => {}
                             Err(_) => tracing::error!(target: "weft_engine::metering", charge = %id,
                                 "the meter panicked while reading a cost report for a charge a second call had displaced"),
                         }
-                        sink.pending.end();
                         let _ = report.done.send(());
                         return;
                     }
@@ -330,11 +375,7 @@ impl OpenCharges {
             };
             if let Some((charge, result, unread)) = completed {
                 match result {
-                    Ok(Some(cost)) => {
-                        let sink = charge.sink;
-                        sink.clone().book_resolved(cost);
-                        sink.pending.end();
-                    }
+                    Ok(Some(cost)) => charge.sink.book_resolved(charge.held, cost),
                     Err(_) => {
                         tracing::error!(target: "weft_engine::metering", charge = %id,
                             "the meter panicked while reading a cost report");
@@ -355,19 +396,32 @@ impl OpenCharges {
                     tracing::warn!(target: "weft_engine::metering", charge = %id, unread,
                         "reports received after the one that priced this charge were not read");
                 }
-                sink.pending.end();
+                drop(reading);
                 let _ = report.done.send(());
                 return;
             }
-            sink.pending.end();
+            drop(reading);
             let _ = report.done.send(());
         }
     }
 
     pub fn flush(&self, why: &str) { self.close_where(|_| true, why); }
 
-    pub fn flush_execution_id(&self, execution_id: weft_core::ExecutionId, why: &str) {
+    /// End a run's spend: book every charge it still holds as unknown, then
+    /// wait until each of its figures is on record. Until that wait returns,
+    /// a charge the run opens late (a body that finished after this began)
+    /// is booked as unknown at once rather than held. Once it returns no
+    /// call of the run is left to open one, so the mark is dropped, and a
+    /// run that paused can open charges again when it resumes.
+    pub async fn close_execution_id(&self, execution_id: ExecutionId, pending: &PendingCostRecords, why: &str) {
+        struct Ending<'a>(&'a OpenCharges, ExecutionId);
+        impl Drop for Ending<'_> {
+            fn drop(&mut self) { self.0.book().ending.remove(&self.1); }
+        }
+        self.book().ending.insert(execution_id);
+        let _ending = Ending(self, execution_id);
         self.close_where(|charge| charge.sink.execution_id == execution_id, why);
+        pending.wait_zero().await;
     }
 
     /// Book every matching charge as unknown and drop it. A charge whose
@@ -378,7 +432,8 @@ impl OpenCharges {
     /// that read, which is bounded by the follow-up client's timeout.
     fn close_where(&self, matches: impl Fn(&OpenCharge) -> bool, why: &str) {
         let held = {
-            let mut charges = self.by_id();
+            let mut book = self.book();
+            let charges = &mut book.by_id;
             let ids: Vec<_> = charges.iter_mut().filter_map(|(id, state)| {
                 if !matches(&state.charge) { return None; }
                 if state.processing {
@@ -410,11 +465,9 @@ fn book_open_charge(charge: OpenCharge, why: &str) {
         "the call spent, and no response ever stated what it cost ({why})"
     ));
     let model = metadata["model"].as_str().map(str::to_string);
-    let sink = charge.sink.clone();
-    // Book first, release the charge's token after: the count must not
-    // pass through zero while a figure is still to be written down.
-    sink.clone().book_resolved(MeasuredCost { amount_usd: None, model, metadata });
-    sink.pending.end();
+    // The charge's token moves into the booking, so the count cannot pass
+    // through zero while the figure is still to be written down.
+    charge.sink.book_resolved(charge.held, MeasuredCost { amount_usd: None, model, metadata });
 }
 
 // ---------- The cost sink (where a measured figure lands) ----------
@@ -441,34 +494,38 @@ pub struct CostSink {
     /// Whose credential the connection rides; recorded on every figure
     /// so the cost trail says whose account spent.
     pub origin: weft_core::CredentialOwner,
+    /// The run's cancel flag: a call still going when it trips is let go
+    /// (see the module doc).
+    pub cancellation: Arc<weft_core::cancellation::CancellationFlag>,
 }
 
 impl CostSink {
     /// Book one finished observation's figure: resolve `cost` and write
     /// it down durably, detached from the caller's future (which may be
-    /// aborted at any point) and tracked by the pending counter so the
-    /// process cannot exit while money is still being written. The one
-    /// begin/spawn/record/end sequence behind every finalizer, HTTP and
-    /// session alike; a session hands a ready future, an HTTP call the
+    /// aborted at any point). `held` is the pending token the spend has
+    /// carried since its call went out; it is released once the figure is
+    /// on record, so the run cannot end while money is still being
+    /// written. The one spawn/record sequence behind every finalizer, HTTP
+    /// and session alike; a session hands a ready future, an HTTP call the
     /// meter's resolve.
     pub(crate) fn book(
         self: Arc<Self>,
+        held: weft_core::in_flight::InFlightToken,
         cost: impl std::future::Future<Output = MeasuredCost> + Send + 'static,
     ) {
-        self.pending.begin();
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
                     let cost = cost.await;
                     self.record(cost).await;
-                    self.pending.end();
+                    drop(held);
                 });
             }
             Err(_) => {
                 // No runtime to spawn on (the process is tearing down
                 // outside tokio): the record cannot be written. Say so
                 // loudly; never drop money silently.
-                self.pending.end();
+                drop(held);
                 tracing::error!(
                     target: "weft_engine::metering",
                     "COST RECORD LOST for node {} ({}): the async runtime was already torn \
@@ -482,8 +539,8 @@ impl CostSink {
     /// Book a figure that is already resolved. The twin of [`Self::book`]
     /// for a charge whose amount arrived on a later response, where there
     /// is nothing left to await by the time it is known.
-    pub(crate) fn book_resolved(self: Arc<Self>, cost: MeasuredCost) {
-        self.book(async move { cost });
+    pub(crate) fn book_resolved(self: Arc<Self>, held: weft_core::in_flight::InFlightToken, cost: MeasuredCost) {
+        self.book(held, std::future::ready(cost));
     }
 
     /// Write the figure down: a `CostReported` on the run's record, one per
@@ -781,7 +838,41 @@ impl reqwest_middleware::Middleware for MeteringMiddleware {
         let request_bytes: Vec<u8> =
             req.body().and_then(|b| b.as_bytes()).map(|b| b.to_vec()).unwrap_or_default();
 
-        let response = next.run(req, extensions).await?;
+        // Named in the warning if the tap has to cut the call.
+        let host = req.url().host_str().unwrap_or("").to_string();
+
+        // The run's ending waits from here: the token rides the response's
+        // tap into the figure's record, and a body still being read after
+        // the node returned keeps it held. Until the answer starts, a
+        // cancel of the run lets the call go (the send may be on a task
+        // the node's abort does not reach). A run already cancelled sends
+        // nothing: no call goes out, so nothing is booked.
+        if self.sink.cancellation.is_cancelled() {
+            return Err(middleware_err(format!(
+                "the run was cancelled: the call to '{}' was not sent",
+                self.sink.service
+            )));
+        }
+        let unanswered = Unanswered {
+            sink: self.sink.clone(),
+            host: host.clone(),
+            held: Some(self.sink.pending.hold()),
+            spends: matches!(class, RouteClass::Billable(_)),
+        };
+        let response = tokio::select! {
+            biased;
+            sent = next.run(req, extensions) => match sent {
+                Ok(response) => response,
+                Err(e) => {
+                    unanswered.failed(&e);
+                    return Err(e);
+                }
+            },
+            () = self.sink.cancellation.cancelled() => {
+                return Err(middleware_err(format!("{CANCELLED_BEFORE_ANSWER}: the call to '{}' was let go", self.sink.service)));
+            }
+        };
+        let held = unanswered.answered();
 
         // Tap the response: the caller sees every chunk in real time while
         // the observer reads what it needs in passing. When the stream
@@ -798,7 +889,9 @@ impl reqwest_middleware::Middleware for MeteringMiddleware {
         // provider's own figure never has to re-derive one.
         observer.on_headers(&headers);
         let tapped = TapStream {
-            inner: response.bytes_stream().boxed(),
+            inner: Some(response.bytes_stream().boxed()),
+            host,
+            watch: None,
             finalizer: Some(Finalizer {
                 observer,
                 meter,
@@ -807,6 +900,7 @@ impl reqwest_middleware::Middleware for MeteringMiddleware {
                 open_charges: self.sink.open_charges.clone(),
                 follow_up: self.follow_up.clone(),
                 sink: self.sink.clone(),
+                held,
             }),
         };
         // The rebuild carries the wire-visible surface only (status,
@@ -838,6 +932,8 @@ struct Finalizer {
     /// What the meter's own follow-up queries ride.
     follow_up: FollowUpLane,
     sink: Arc<CostSink>,
+    /// The call's pending token, taken when it went out.
+    held: weft_core::in_flight::InFlightToken,
 }
 
 impl Finalizer {
@@ -848,17 +944,18 @@ impl Finalizer {
     /// may answer 200 with a failure body it never bills, or bill a
     /// call it then refuses), so the declared price is the meter's
     /// input, never the middleware's verdict.
-    fn finish(self, interrupted: bool) {
-        let observed = self.observer.end(interrupted);
-        let meter = self.meter;
-        let route = self.route;
-        let follow_up = self.follow_up;
-        let open_charges = self.open_charges;
-        let sink = self.sink;
+    ///
+    /// `cut` is why the tap stopped reading the answer, when it did: it
+    /// lands on the figure (under `cut`), whatever the meter makes of the
+    /// part it saw.
+    fn finish(self, interrupted: bool, cut: Option<String>) {
+        let Finalizer { observer, meter, route, class, open_charges, follow_up, sink, held } = self;
+        let observed = observer.end(interrupted);
 
         // A response that reports on an earlier spend books nothing of its
-        // own: it closes the charge that spend opened.
-        if matches!(self.class, RouteClass::Reports) {
+        // own: it closes the charge that spend opened, which holds its own
+        // run's token, so this call's token is released here.
+        if matches!(class, RouteClass::Reports) {
             let Some(id) = meter.charge_reported_on(&route, &observed) else { return };
             drop(open_charges.report(meter, &id, &route, observed, &follow_up));
             return;
@@ -881,30 +978,224 @@ impl Finalizer {
                 other => serde_json::json!({ "meterState": other }),
             };
             scratch["route"] = serde_json::json!(route);
-            open_charges.open(meter.service(), id, OpenCharge { token: 0, scratch, sink });
+            if let Some(cut) = cut {
+                scratch["cut"] = serde_json::json!(cut);
+            }
+            open_charges.open(meter.service(), id, OpenCharge { token: 0, scratch, sink, held });
             return;
         }
 
-        sink.book(async move {
-            meter.resolve(&route, observed, follow_up.follow_up(meter.base_url())).await
+        sink.book(held, async move {
+            let mut cost = meter.resolve(&route, observed, follow_up.follow_up(meter.base_url())).await;
+            if let Some(cut) = cut {
+                // Shape-checked like `scratch` above, for the same reason.
+                if !cost.metadata.is_object() {
+                    cost.metadata = serde_json::json!({ "meterState": cost.metadata });
+                }
+                cost.metadata["cut"] = serde_json::json!(cut);
+            }
+            cost
         });
     }
 }
 
+/// How long a metered call's answer may send nothing while it is waited
+/// on before the tap stops reading it (see the module doc). Real time,
+/// never scaled: it waits on a provider, not on weft
+/// (`weft_core::time_scale`). A streamed answer sends every token. The
+/// wait for an answer's status and headers is before the tap exists, so
+/// a provider that takes minutes to answer at all is not affected; one
+/// that answers its headers and then sends nothing for this long is.
+pub(crate) const ANSWER_SILENCE_LIMIT: Duration = Duration::from_secs(60);
+
+/// Why a call cancelled before its answer started was let go.
+const CANCELLED_BEFORE_ANSWER: &str = "the run was cancelled before the provider answered";
+
+/// A metered call between going out and its answer starting: the call's
+/// pending token, and what a call let go here books. A call that spends
+/// and ends here without an answer (its run cancelled, its caller gone, its
+/// send failed after the connection was made) may have been charged, so it
+/// is booked as an unknown spend, never as nothing. Only a call that never
+/// reached the provider books nothing.
+struct Unanswered {
+    sink: Arc<CostSink>,
+    host: String,
+    held: Option<weft_core::in_flight::InFlightToken>,
+    /// A billable route; a reporting route spends nothing.
+    spends: bool,
+}
+
+impl Unanswered {
+    /// The answer started: its tap carries the token on.
+    fn answered(mut self) -> weft_core::in_flight::InFlightToken {
+        self.held.take().expect("the token is only taken here or by `failed`")
+    }
+
+    /// The send failed, and the error goes back to the caller. A failure to
+    /// connect means the provider never saw the call: nothing is booked.
+    /// Any other (a timeout, a reset once the request went out) may come
+    /// after the provider started work it bills, so it is booked as unknown.
+    fn failed(mut self, error: &reqwest_middleware::Error) {
+        if never_connected(error) {
+            self.held = None;
+            return;
+        }
+        self.book_unknown(&format!("the call failed before the provider answered: {error}"));
+    }
+
+    /// Book the call as an unknown spend, naming `why`, and release its
+    /// token once that is on record. A reporting route spends nothing.
+    fn book_unknown(&mut self, why: &str) {
+        let Some(held) = self.held.take() else { return };
+        if !self.spends {
+            return;
+        }
+        tracing::warn!(
+            target: "weft_engine::metering",
+            execution_id = %self.sink.execution_id,
+            node = %self.sink.node_id,
+            service = %self.sink.service,
+            host = %self.host,
+            "{why}; its cost is booked as unknown",
+        );
+        let cost = MeasuredCost {
+            amount_usd: None,
+            model: None,
+            metadata: serde_json::json!({ "resolution": format!("unknown: {why}") }),
+        };
+        self.sink.clone().book_resolved(held, cost);
+    }
+}
+
+impl Drop for Unanswered {
+    fn drop(&mut self) {
+        let why = if self.sink.cancellation.is_cancelled() {
+            CANCELLED_BEFORE_ANSWER
+        } else {
+            "the call was dropped before the provider answered"
+        };
+        self.book_unknown(why);
+    }
+}
+
+/// Whether a send failed before any connection to the provider was made:
+/// a connect error anywhere in its chain.
+fn never_connected(error: &reqwest_middleware::Error) -> bool {
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = match error {
+        reqwest_middleware::Error::Reqwest(e) => Some(e),
+        reqwest_middleware::Error::Middleware(e) => Some(e.as_ref()),
+    };
+    while let Some(e) = cause {
+        if e.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_connect) {
+            return true;
+        }
+        cause = e.source();
+    }
+    false
+}
+
+/// Why the tap stopped reading an answer.
+#[derive(Debug, Clone, Copy)]
+enum Cut {
+    Silent,
+    Cancelled,
+}
+
+impl std::fmt::Display for Cut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Cut::Silent => write!(f, "the provider sent nothing for {}s", ANSWER_SILENCE_LIMIT.as_secs()),
+            Cut::Cancelled => f.write_str("the run was cancelled before the call's answer finished"),
+        }
+    }
+}
+
+impl std::error::Error for Cut {}
+
+/// What the tap's reader is handed: the body's own error, or a [`Cut`].
+type TapError = Box<dyn std::error::Error + Send + Sync>;
+
 /// The response-body tap: forwards every chunk untouched and unbuffered,
 /// feeding the observer in passing. Finalizes exactly once: on clean end,
-/// on stream error, or on drop (the caller hung up mid-stream).
+/// on stream error, on a cut, or on drop (the caller hung up mid-stream).
 struct TapStream {
-    inner: BoxStream<'static, reqwest::Result<Bytes>>,
+    /// `None` once the tap cut the answer: the body is dropped, and its
+    /// connection with it.
+    inner: Option<BoxStream<'static, reqwest::Result<Bytes>>>,
     finalizer: Option<Finalizer>,
+    /// The host the call went to, named if the tap cuts it.
+    host: String,
+    /// What can cut the answer, made the first time the reader waits.
+    watch: Option<Watch>,
+}
+
+/// The two ways a waited-on answer is cut (see the module doc).
+struct Watch {
+    cancelled: Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    silence: Pin<Box<tokio::time::Sleep>>,
+    /// The reader is waiting, since the silence deadline was last set: a
+    /// chunk clears it, and the next wait sets the deadline again.
+    waiting: bool,
+}
+
+impl TapStream {
+    /// Nothing is ready for the reader: whether the answer is to be cut.
+    /// The silence counts from when the reader started waiting, so a
+    /// reader that was busy elsewhere never cuts an answer that waited
+    /// for it.
+    fn stalled(&mut self, cx: &mut Context<'_>) -> Option<Cut> {
+        let cancellation = &self.finalizer.as_ref()?.sink.cancellation;
+        let watch = self.watch.get_or_insert_with(|| {
+            let cancellation = cancellation.clone();
+            Watch {
+                cancelled: Box::pin(async move { cancellation.cancelled().await }),
+                silence: Box::pin(tokio::time::sleep(ANSWER_SILENCE_LIMIT)),
+                waiting: true,
+            }
+        });
+        if !watch.waiting {
+            watch.waiting = true;
+            watch.silence.as_mut().reset(tokio::time::Instant::now() + ANSWER_SILENCE_LIMIT);
+        }
+        if watch.cancelled.poll_unpin(cx).is_ready() {
+            return Some(Cut::Cancelled);
+        }
+        if watch.silence.poll_unpin(cx).is_ready() {
+            return Some(Cut::Silent);
+        }
+        None
+    }
+
+    /// Stop reading the answer: drop the body, book the call as cut, and
+    /// hand the reader the reason as the body's error.
+    fn cut(&mut self, cut: Cut) -> Poll<Option<Result<Bytes, TapError>>> {
+        self.inner = None;
+        self.watch = None;
+        if let Some(f) = self.finalizer.take() {
+            tracing::warn!(
+                target: "weft_engine::metering",
+                execution_id = %f.sink.execution_id,
+                node = %f.sink.node_id,
+                service = %f.sink.service,
+                host = %self.host,
+                "{cut}: weft stopped reading the call's answer, and its cost is booked from what arrived",
+            );
+            f.finish(true, Some(cut.to_string()));
+        }
+        Poll::Ready(Some(Err(Box::new(cut))))
+    }
 }
 
 impl Stream for TapStream {
-    type Item = reqwest::Result<Bytes>;
+    type Item = Result<Bytes, TapError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.inner.poll_next_unpin(cx) {
+        let Some(inner) = self.inner.as_mut() else { return Poll::Ready(None) };
+        match inner.poll_next_unpin(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
+                if let Some(watch) = self.watch.as_mut() {
+                    watch.waiting = false;
+                }
                 if let Some(f) = self.finalizer.as_mut() {
                     f.observer.on_chunk(&chunk);
                 }
@@ -912,17 +1203,20 @@ impl Stream for TapStream {
             }
             Poll::Ready(Some(Err(e))) => {
                 if let Some(f) = self.finalizer.take() {
-                    f.finish(true);
+                    f.finish(true, None);
                 }
-                Poll::Ready(Some(Err(e)))
+                Poll::Ready(Some(Err(Box::new(e))))
             }
             Poll::Ready(None) => {
                 if let Some(f) = self.finalizer.take() {
-                    f.finish(false);
+                    f.finish(false, None);
                 }
                 Poll::Ready(None)
             }
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => match self.stalled(cx) {
+                Some(cut) => self.cut(cut),
+                None => Poll::Pending,
+            },
         }
     }
 }
@@ -930,7 +1224,7 @@ impl Stream for TapStream {
 impl Drop for TapStream {
     fn drop(&mut self) {
         if let Some(f) = self.finalizer.take() {
-            f.finish(true);
+            f.finish(true, None);
         }
     }
 }
@@ -1129,7 +1423,7 @@ pub(crate) mod tests {
         relay_url: Option<String>,
     ) -> (reqwest_middleware::ClientWithMiddleware, Arc<RecordedCosts>, Arc<PendingCostRecords>)
     {
-        rig_owned(base, relay_url, weft_core::CredentialOwner::Author, None)
+        rig_owned(base, relay_url, weft_core::CredentialOwner::Author, None, weft_core::cancellation::CancellationFlag::new_arc())
     }
 
     fn rig_owned(
@@ -1137,6 +1431,7 @@ pub(crate) mod tests {
         relay_url: Option<String>,
         origin: weft_core::CredentialOwner,
         fixed_usd: Option<f64>,
+        cancellation: Arc<weft_core::cancellation::CancellationFlag>,
     ) -> (reqwest_middleware::ClientWithMiddleware, Arc<RecordedCosts>, Arc<PendingCostRecords>)
     {
         let tasks = Arc::new(RecordedCosts::default());
@@ -1152,6 +1447,7 @@ pub(crate) mod tests {
             frames: LoopFrames::default(),
             service: "testprov".into(),
             origin,
+            cancellation,
         };
         // The follow-up client of the rig: same signed-in shape the
         // production composition builds (auth-free here; the test meter
@@ -1193,16 +1489,6 @@ pub(crate) mod tests {
             .collect()
     }
 
-    async fn wait_recorded(tasks: &RecordedCosts, pending: &PendingCostRecords) {
-        pending.wait_zero().await;
-        for _ in 0..100 {
-            if !tasks.events.lock().unwrap().is_empty() {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    }
-
     // L1-shaped stress pin for the pending counter's wakeup: `end()` firing
     // concurrently with `wait_zero` arming must never be missed (a lost
     // wakeup HANGS the await; the explicit timeout turns that hang into a
@@ -1220,14 +1506,10 @@ pub(crate) mod tests {
             for i in 0..400usize {
                 let pending = PendingCostRecords::new();
                 let records = if i % 2 == 0 { 1 } else { 3 };
-                for _ in 0..records {
-                    pending.begin();
-                }
-                let enders: Vec<_> = (0..records)
-                    .map(|_| {
-                        let ender = pending.clone();
-                        tokio::spawn(async move { ender.end() })
-                    })
+                let held: Vec<_> = (0..records).map(|_| pending.hold()).collect();
+                let enders: Vec<_> = held
+                    .into_iter()
+                    .map(|token| tokio::spawn(async move { drop(token) }))
                     .collect();
                 tokio::time::timeout(std::time::Duration::from_secs(5), pending.wait_zero())
                     .await
@@ -1282,6 +1564,7 @@ pub(crate) mod tests {
                     frames: LoopFrames::default(),
                     service: "testprov".into(),
                     origin: weft_core::CredentialOwner::Author,
+                    cancellation: weft_core::cancellation::CancellationFlag::new_arc(),
                 };
                 // The exact production stack (metering outer, auth inner),
                 // with the meter injected directly since the global
@@ -1319,7 +1602,7 @@ pub(crate) mod tests {
             .expect("send");
         response.bytes().await.expect("body");
 
-        wait_recorded(&tasks, &pending).await;
+        pending.wait_zero().await;
         let payloads = recorded_payloads(&tasks);
         assert_eq!(payloads.len(), 1, "the sign-in call was measured");
         assert_eq!(payloads[0].amount_usd, Some(0.5));
@@ -1331,6 +1614,64 @@ pub(crate) mod tests {
         assert_eq!(received.lock().unwrap()[0]["usage"]["include"], true);
     }
 
+    // L3, the order a client library that reads the body on a task of its
+    // own produces (an LLM client parsing the SSE stream, say): the node has
+    // its answer once the usage chunk arrives and returns, while that task
+    // is still reading the stream's tail, so the tap finishes after the node
+    // is gone. The run's ending must still wait for the call's figure and
+    // find it on record once it opens. Stress-looped: the reader task, the
+    // tap and the gate meet on a shared multi-thread runtime.
+    weft_core::stress_test! {
+        name: a_body_read_after_the_node_returned_still_holds_the_runs_ending,
+        runs: 32,
+        worker_threads: 4,
+        async fn body() {
+            let (base, chunk_tx, _received) = spawn_sse_server().await;
+            let base: &'static str = Box::leak(base.into_boxed_str());
+            let (client, tasks, pending) = rig(base, None);
+
+            // The answer and its usage arrive; the stream's tail has not.
+            chunk_tx.send(Bytes::from("data: {\"usage\":{\"cost\":0.25}}\n\n")).unwrap();
+            let response = client
+                .post(format!("{base}/chat/completions"))
+                .json(&serde_json::json!({"model": "m", "messages": []}))
+                .send()
+                .await
+                .expect("send");
+            let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+            let reader = tokio::spawn(async move {
+                let mut body = response.bytes_stream();
+                let first = body.next().await.expect("a chunk").expect("readable");
+                let _ = answer_tx.send(first);
+                while let Some(chunk) = body.next().await {
+                    chunk.expect("readable");
+                }
+            });
+            let answer = answer_rx.await.expect("the node got its answer");
+            assert!(String::from_utf8_lossy(&answer).contains("0.25"));
+
+            // The node returned and the run ends: its gate stays shut while
+            // the tap still holds the call's spend.
+            let ending = pending.wait_zero();
+            tokio::pin!(ending);
+            assert!(
+                futures::poll!(&mut ending).is_pending(),
+                "the run's ending opened while its call's body was still being read"
+            );
+
+            // The tail arrives and the reader finishes the body.
+            chunk_tx.send(Bytes::from("data: [DONE]\n\n")).unwrap();
+            drop(chunk_tx);
+            tokio::time::timeout(std::time::Duration::from_secs(10), ending)
+                .await
+                .expect("the ending opens once the figure is on record");
+            let payloads = recorded_payloads(&tasks);
+            assert_eq!(payloads.len(), 1, "the figure is on record before the ending");
+            assert_eq!(payloads[0].amount_usd, Some(0.25));
+            reader.await.unwrap();
+        }
+    }
+
     /// A FIXED-price route still resolves THROUGH its meter (whether a
     /// fixed-priced call was charged is provider knowledge): the record
     /// carries the declared price and names the fixed resolution.
@@ -1339,7 +1680,7 @@ pub(crate) mod tests {
         let (base, chunk_tx, _received) = spawn_sse_server().await;
         let base: &'static str = Box::leak(base.into_boxed_str());
         let (client, tasks, pending) =
-            rig_owned(base, None, weft_core::CredentialOwner::Author, Some(0.001));
+            rig_owned(base, None, weft_core::CredentialOwner::Author, Some(0.001), weft_core::cancellation::CancellationFlag::new_arc());
 
         chunk_tx.send(Bytes::from("data: [DONE]\n\n")).unwrap();
         drop(chunk_tx);
@@ -1351,7 +1692,7 @@ pub(crate) mod tests {
             .expect("send");
         response.bytes().await.expect("body");
 
-        wait_recorded(&tasks, &pending).await;
+        pending.wait_zero().await;
         let payloads = recorded_payloads(&tasks);
         assert_eq!(payloads.len(), 1, "the fixed call was booked");
         assert_eq!(payloads[0].amount_usd, Some(0.001));
@@ -1384,6 +1725,7 @@ pub(crate) mod tests {
             frames: LoopFrames::default(),
             service: "no_such_meterless_service".into(),
             origin: weft_core::CredentialOwner::Author,
+            cancellation: weft_core::cancellation::CancellationFlag::new_arc(),
         };
         let client =
             connection_client("no_such_meterless_service", steps, None, Arc::new(sink), weft_core::shared::Shared::new(std::time::Duration::MAX))
@@ -1416,6 +1758,7 @@ pub(crate) mod tests {
             frames: LoopFrames::default(),
             service: "no_such_meterless_service".into(),
             origin: weft_core::CredentialOwner::Platform,
+            cancellation: weft_core::cancellation::CancellationFlag::new_arc(),
         };
         let err = connection_client(
             "no_such_meterless_service",
@@ -1470,7 +1813,7 @@ pub(crate) mod tests {
             chunk.expect("chunk ok");
         }
 
-        wait_recorded(&tasks, &pending).await;
+        pending.wait_zero().await;
         let payloads = recorded_payloads(&tasks);
         assert_eq!(payloads.len(), 1);
         assert_eq!(payloads[0].amount_usd, Some(0.000031));
@@ -1501,7 +1844,7 @@ pub(crate) mod tests {
         // Hang up before the usage chunk ever arrives.
         drop(stream);
 
-        wait_recorded(&tasks, &pending).await;
+        pending.wait_zero().await;
         let payloads = recorded_payloads(&tasks);
         assert_eq!(payloads.len(), 1, "an interrupted call still gets its record");
         assert_eq!(
@@ -1509,6 +1852,222 @@ pub(crate) mod tests {
             "an unresolvable cost is recorded as unknown, never booked as $0"
         );
         assert_eq!(payloads[0].metadata["interrupted"], true);
+    }
+
+    /// A tap over `body` for a call of the run whose cancel flag is
+    /// `cancellation`, as the middleware builds it once the answer started,
+    /// booking into the returned record.
+    fn tap_over(
+        body: impl Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
+        cancellation: Arc<weft_core::cancellation::CancellationFlag>,
+    ) -> (TapStream, Arc<RecordedCosts>, Arc<PendingCostRecords>, Arc<OpenCharges>) {
+        let tasks = Arc::new(RecordedCosts::default());
+        let pending = PendingCostRecords::new();
+        let open_charges = OpenCharges::new();
+        let sink = Arc::new(CostSink {
+            journal: tasks.clone(),
+            writer: test_writer(),
+            replica: "w".into(),
+            pending: pending.clone(),
+            open_charges: open_charges.clone(),
+            execution_id: uuid::Uuid::nil(),
+            node_id: "node-x".into(),
+            frames: LoopFrames::default(),
+            service: "testprov".into(),
+            origin: weft_core::CredentialOwner::Author,
+            cancellation,
+        });
+        let meter: &'static TestMeter = Box::leak(Box::new(TestMeter { base: "http://provider.test/api/v1", fixed_usd: None }));
+        let follow_up = FollowUpLane {
+            http: reqwest_middleware::ClientBuilder::new(reqwest::Client::new()).build(),
+            shared: weft_core::shared::Shared::new(Duration::MAX),
+        };
+        let tap = TapStream {
+            inner: Some(body.boxed()),
+            finalizer: Some(Finalizer {
+                observer: meter.observe("chat/completions", "", b""),
+                meter,
+                route: "chat/completions".into(),
+                class: RouteClass::Billable(weft_providers::Pricing::Metered),
+                open_charges: open_charges.clone(),
+                follow_up,
+                sink,
+                held: pending.hold(),
+            }),
+            host: "provider.test".into(),
+            watch: None,
+        };
+        (tap, tasks, pending, open_charges)
+    }
+
+    /// What a client library's own reading task does with an answer: read
+    /// it to its end or its first error, then drop it.
+    async fn read_to_end(mut tap: TapStream) -> Result<usize, String> {
+        let mut chunks = 0;
+        while let Some(chunk) = tap.next().await {
+            chunk.map_err(|e| e.to_string())?;
+            chunks += 1;
+        }
+        Ok(chunks)
+    }
+
+    const CONTENT: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+
+    /// A provider that stays connected and sends nothing: once the reader
+    /// waited the silence limit, the tap cuts the answer, the reader gets
+    /// the reason as an error (so the library's task ends), the call is
+    /// booked unknown with that reason, and the run's ending returns.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_answer_is_cut_after_the_silence_limit_and_the_run_ends() {
+        let body = futures::stream::iter([Ok(Bytes::from(CONTENT))]).chain(futures::stream::pending());
+        let (tap, tasks, pending, charges) = tap_over(body, weft_core::cancellation::CancellationFlag::new_arc());
+        let started = tokio::time::Instant::now();
+        let library = tokio::spawn(read_to_end(tap));
+
+        charges.close_execution_id(uuid::Uuid::nil(), &pending, "the run ended").await;
+        assert!(started.elapsed() >= ANSWER_SILENCE_LIMIT, "cut once the silence limit passed, not before");
+        assert_eq!(library.await.unwrap(), Err(Cut::Silent.to_string()), "the reader is told why");
+        let payloads = recorded_payloads(&tasks);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].amount_usd, None, "nothing stated the cost: unknown, never $0");
+        assert_eq!(payloads[0].metadata["cut"], "the provider sent nothing for 60s");
+        assert_eq!(payloads[0].metadata["interrupted"], true);
+    }
+
+    /// A cancel of the run cuts an answer still being read at once, on a
+    /// task the node's abort never reaches, and the run's ending returns.
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_runs_answer_is_cut_at_once_and_the_run_ends() {
+        let cancellation = weft_core::cancellation::CancellationFlag::new_arc();
+        let body = futures::stream::iter([Ok(Bytes::from(CONTENT))]).chain(futures::stream::pending());
+        let (tap, tasks, pending, charges) = tap_over(body, cancellation.clone());
+        let library = tokio::spawn(read_to_end(tap));
+        tokio::task::yield_now().await;
+
+        let started = tokio::time::Instant::now();
+        cancellation.cancel_because(weft_core::exec::CancelCause::User);
+        charges.close_execution_id(uuid::Uuid::nil(), &pending, "the run was cancelled").await;
+        assert!(started.elapsed() < ANSWER_SILENCE_LIMIT, "cut by the cancel, not by the silence limit");
+        assert_eq!(library.await.unwrap(), Err(Cut::Cancelled.to_string()));
+        let payloads = recorded_payloads(&tasks);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].amount_usd, None);
+        assert_eq!(payloads[0].metadata["cut"], "the run was cancelled before the call's answer finished");
+    }
+
+    /// A live answer whose gaps each stay under the limit (together far
+    /// over it), read by a reader that is then busy elsewhere for longer
+    /// than the limit, is never cut and books its stated cost.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_but_live_answer_is_never_cut() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<reqwest::Result<Bytes>>();
+        let (mut tap, tasks, pending, _charges) =
+            tap_over(tokio_stream::wrappers::UnboundedReceiverStream::new(rx), weft_core::cancellation::CancellationFlag::new_arc());
+        let gap = ANSWER_SILENCE_LIMIT - Duration::from_secs(1);
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                tokio::time::sleep(gap).await;
+                tx.send(Ok(Bytes::from(CONTENT))).unwrap();
+            }
+            // Sent while the reader is busy elsewhere.
+            tokio::time::sleep(ANSWER_SILENCE_LIMIT).await;
+            tx.send(Ok(Bytes::from("data: {\"usage\":{\"cost\":0.000031}}\n\n"))).unwrap();
+        });
+        for _ in 0..3 {
+            tap.next().await.expect("open").expect("a live chunk is never cut");
+        }
+        tokio::time::sleep(ANSWER_SILENCE_LIMIT * 2).await;
+        tap.next().await.expect("open").expect("the chunk that waited for the reader");
+        assert!(tap.next().await.is_none(), "the answer ends cleanly");
+
+        pending.wait_zero().await;
+        let payloads = recorded_payloads(&tasks);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].amount_usd, Some(0.000031));
+        assert!(payloads[0].metadata.get("cut").is_none(), "nothing was cut");
+    }
+
+    /// A call whose answer has not even started when its run is cancelled
+    /// is let go at once (its send may be on a task the node's abort does
+    /// not reach), and booked as an unknown spend.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancel_lets_go_of_a_call_still_waiting_for_its_answer() {
+        let app = axum::Router::new()
+            .route("/api/v1/chat/completions", axum::routing::post(std::future::pending::<&'static str>));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base: &'static str = Box::leak(format!("http://{}/api/v1", listener.local_addr().unwrap()).into_boxed_str());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let cancellation = weft_core::cancellation::CancellationFlag::new_arc();
+        let (client, tasks, pending) = rig_owned(base, None, weft_core::CredentialOwner::Author, None, cancellation.clone());
+
+        let send = tokio::spawn(async move {
+            client.post(format!("{base}/chat/completions")).json(&serde_json::json!({"model": "m", "messages": []})).send().await.map(drop)
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while pending.count() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the call went out");
+        cancellation.cancel_because(weft_core::exec::CancelCause::User);
+        let err = tokio::time::timeout(Duration::from_secs(5), send).await.expect("let go at once").unwrap().unwrap_err();
+        assert!(format!("{err:?}").contains(CANCELLED_BEFORE_ANSWER), "{err:?}");
+        tokio::time::timeout(Duration::from_secs(5), pending.wait_zero()).await.expect("the run's ending is not held");
+        let payloads = recorded_payloads(&tasks);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].amount_usd, None);
+        assert_eq!(payloads[0].metadata["resolution"], format!("unknown: {CANCELLED_BEFORE_ANSWER}"));
+    }
+
+    /// A billable call on a run already cancelled is refused before it is
+    /// sent: the provider never sees it, and nothing is booked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_call_on_a_cancelled_run_is_not_sent_and_books_nothing() {
+        let (base, _chunk_tx, received) = spawn_sse_server().await;
+        let base: &'static str = Box::leak(base.into_boxed_str());
+        let cancellation = weft_core::cancellation::CancellationFlag::new_arc();
+        cancellation.cancel_because(weft_core::exec::CancelCause::User);
+        let (client, tasks, pending) = rig_owned(base, None, weft_core::CredentialOwner::Author, None, cancellation);
+
+        let err = client.post(format!("{base}/chat/completions")).json(&serde_json::json!({"model": "m", "messages": []})).send().await.unwrap_err();
+        assert!(format!("{err:?}").contains("was not sent"), "{err:?}");
+        pending.wait_zero().await;
+        assert!(recorded_payloads(&tasks).is_empty(), "no call went out, so nothing is booked");
+        assert!(received.lock().unwrap().is_empty(), "the provider never saw it");
+    }
+
+    /// A send that never connected books nothing; one that failed once the
+    /// request reached the provider (here: it hung up without answering)
+    /// may have been billed, so it is booked as an unknown spend.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_send_books_unknown_only_once_the_provider_was_reached() {
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_base: &'static str = Box::leak(format!("http://{}/api/v1", closed.local_addr().unwrap()).into_boxed_str());
+        drop(closed);
+        let (client, tasks, pending) = rig(closed_base, None);
+        let err = client.post(format!("{closed_base}/chat/completions")).json(&serde_json::json!({"model": "m", "messages": []})).send().await.unwrap_err();
+        assert!(never_connected(&err), "{err:?}");
+        pending.wait_zero().await;
+        assert!(recorded_payloads(&tasks).is_empty(), "a call that never connected books nothing");
+
+        let hangs_up = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hangs_up_base: &'static str = Box::leak(format!("http://{}/api/v1", hangs_up.local_addr().unwrap()).into_boxed_str());
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+            let (mut socket, _) = hangs_up.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+        });
+        let (client, tasks, pending) = rig(hangs_up_base, None);
+        let err = client.post(format!("{hangs_up_base}/chat/completions")).json(&serde_json::json!({"model": "m", "messages": []})).send().await.unwrap_err();
+        assert!(!never_connected(&err), "{err:?}");
+        tokio::time::timeout(Duration::from_secs(5), pending.wait_zero()).await.expect("booked and released");
+        let payloads = recorded_payloads(&tasks);
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].amount_usd, None);
+        let resolution = payloads[0].metadata["resolution"].as_str().unwrap();
+        assert!(resolution.starts_with("unknown: the call failed before the provider answered"), "{resolution}");
     }
 
     /// The runtime-credential allowlist: on origin Ours, an UNKNOWN
@@ -1520,7 +2079,7 @@ pub(crate) mod tests {
         let (base, _chunk_tx, received) = spawn_sse_server().await;
         let leaked: &'static str = Box::leak(base.clone().into_boxed_str());
         let (ours, tasks, _pending) =
-            rig_owned(leaked, None, weft_core::CredentialOwner::Platform, None);
+            rig_owned(leaked, None, weft_core::CredentialOwner::Platform, None, weft_core::cancellation::CancellationFlag::new_arc());
 
         // Unknown route: refused, the server never sees it.
         let err = ours
@@ -1797,6 +2356,7 @@ mod open_charge_tests {
             frames: LoopFrames::default(),
             service: "queued".into(),
             origin: weft_core::CredentialOwner::Author,
+            cancellation: weft_core::cancellation::CancellationFlag::new_arc(),
         })
     }
 
@@ -1818,6 +2378,7 @@ mod open_charge_tests {
             frames: LoopFrames::default(),
             service: "queued".into(),
             origin: weft_core::CredentialOwner::Author,
+            cancellation: weft_core::cancellation::CancellationFlag::new_arc(),
         })
     }
 
@@ -1847,7 +2408,7 @@ mod open_charge_tests {
         let sink = sink(tasks.clone(), pending.clone());
         let charges = sink.open_charges.clone();
 
-        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, sink });
+        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, held: sink.pending.hold(), sink });
         assert_eq!(charges.count(), 1, "the charge is held between spend and figure");
         assert!(recorded_payloads(&tasks).is_empty(), "nothing is booked yet");
 
@@ -1876,7 +2437,7 @@ mod open_charge_tests {
         let pending = PendingCostRecords::new();
         let sink = sink(tasks.clone(), pending.clone());
         let charges = sink.open_charges.clone();
-        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, sink });
+        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, held: sink.pending.hold(), sink });
 
         // No `units`: the job is still running.
         let pending_report = ObservedCall {
@@ -1903,7 +2464,7 @@ mod open_charge_tests {
         let pending = PendingCostRecords::new();
         let execution_id = uuid::Uuid::new_v4();
         let sink = sink_on(tasks.clone(), pending.clone(), charges.clone(), execution_id);
-        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, sink });
+        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, held: sink.pending.hold(), sink });
 
         drop(charges.report(&QUEUED, "req-1", "requests/req-1", ObservedCall {
             interrupted: false, status: 200, data: serde_json::json!({"status": "IN_PROGRESS"}),
@@ -1911,8 +2472,7 @@ mod open_charge_tests {
         drop(charges.report(&QUEUED, "req-1", "requests/req-1", ObservedCall {
             interrupted: false, status: 200, data: serde_json::json!({"units": 3.0}),
         }, &lane()));
-        charges.flush_execution_id(execution_id, "the execution ended before the job was read back");
-        pending.wait_zero().await;
+        charges.close_execution_id(execution_id, &pending, "the execution ended before the job was read back").await;
 
         assert_eq!(charges.count(), 0);
         let booked = recorded_payloads(&tasks);
@@ -1936,7 +2496,7 @@ mod open_charge_tests {
         let pending = PendingCostRecords::new();
         let execution_id = weft_core::ExecutionId::new_v4();
         let sink = sink_on(tasks.clone(), pending.clone(), charges.clone(), execution_id);
-        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, sink: sink.clone() });
+        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, held: sink.pending.hold(), sink: sink.clone() });
         // The fake meter yields once inside `fold_report`; the displacing
         // open lands in that window.
         let read = charges.report(&QUEUED, "req-1", "requests/req-1", ObservedCall {
@@ -1944,15 +2504,80 @@ mod open_charge_tests {
         }, &lane());
         // Let the spawned read reach the meter's own await before displacing.
         tokio::task::yield_now().await;
-        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, sink });
+        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, held: sink.pending.hold(), sink });
         read.await;
-        charges.flush_execution_id(execution_id, "the execution ended");
-        pending.wait_zero().await;
+        charges.close_execution_id(execution_id, &pending, "the execution ended").await;
         assert_eq!(charges.count(), 0);
         let mut amounts: Vec<Option<f64>> = recorded_payloads(&tasks).iter().map(|record| record.amount_usd).collect();
         amounts.sort_by(|a, b| a.partial_cmp(b).unwrap());
         assert_eq!(amounts, vec![None, None, Some(6.0)],
             "the displaced charge as unknown, the second charge as unknown at close, and the figure the read produced");
+    }
+
+    /// A response body that finishes after its run began ending (a client
+    /// library reading the stream on its own task) opens its charge too
+    /// late for the close to see it. The charge carries the call's token,
+    /// taken when the call went out, so held open it would keep the ending
+    /// waiting forever; it is booked as unknown at once and the ending
+    /// completes.
+    #[tokio::test]
+    async fn a_charge_opened_after_its_run_began_ending_is_booked_and_the_ending_completes() {
+        let tasks = Arc::new(RecordedCosts::default());
+        let charges = OpenCharges::new();
+        let pending = PendingCostRecords::new();
+        let execution_id = weft_core::ExecutionId::new_v4();
+        let sink = sink_on(tasks.clone(), pending.clone(), charges.clone(), execution_id);
+        // The call went out: its token is taken, its body still streaming.
+        let held = sink.pending.hold();
+
+        let ending = charges.close_execution_id(execution_id, &pending, "the run ended before the job was read back");
+        tokio::pin!(ending);
+        assert!(futures::poll!(&mut ending).is_pending(), "the ending waits on the call still in flight");
+
+        // The body finishes now, and its meter opens a charge.
+        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, held, sink });
+        tokio::time::timeout(std::time::Duration::from_secs(5), ending)
+            .await
+            .expect("a charge opened after the close must not hold the ending open");
+
+        assert_eq!(charges.count(), 0, "nothing is left held for a run that ended");
+        let booked = recorded_payloads(&tasks);
+        assert_eq!(booked.len(), 1);
+        assert!(booked[0].amount_usd.is_none(), "spend with no figure is unknown, never zero");
+        assert!(charges.book().ending.is_empty(), "the mark goes once the ending's wait returned");
+    }
+
+    // The same late open racing the close from another thread: whichever
+    // side wins the lock, the charge is booked and the ending completes.
+    weft_core::stress_test! {
+        name: a_late_charge_racing_the_close_never_holds_the_ending,
+        runs: 200,
+        worker_threads: 4,
+        async fn body() {
+            let tasks = Arc::new(RecordedCosts::default());
+            let charges = OpenCharges::new();
+            let pending = PendingCostRecords::new();
+            let execution_id = weft_core::ExecutionId::new_v4();
+            let sink = sink_on(tasks.clone(), pending.clone(), charges.clone(), execution_id);
+            let held = sink.pending.hold();
+            let opener = {
+                let charges = charges.clone();
+                tokio::spawn(async move {
+                    charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, held, sink });
+                })
+            };
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                charges.close_execution_id(execution_id, &pending, "the run ended"),
+            )
+            .await
+            .expect("the ending completes whichever side won");
+            opener.await.unwrap();
+            assert_eq!(charges.count(), 0);
+            let booked = recorded_payloads(&tasks);
+            assert_eq!(booked.len(), 1);
+            assert!(booked[0].amount_usd.is_none());
+        }
     }
 
     /// A figure that arrives after its execution closed the charge has
@@ -1965,8 +2590,8 @@ mod open_charge_tests {
         let pending = PendingCostRecords::new();
         let execution_id = weft_core::ExecutionId::new_v4();
         let sink = sink_on(tasks.clone(), pending.clone(), charges.clone(), execution_id);
-        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, sink });
-        charges.flush_execution_id(execution_id, "the execution ended before the job was read back");
+        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, held: sink.pending.hold(), sink });
+        charges.close_execution_id(execution_id, &pending, "the execution ended before the job was read back").await;
         charges.report(&QUEUED, "req-1", "requests/req-1", ObservedCall {
             interrupted: false, status: 200, data: serde_json::json!({"units": 3.0}),
         }, &lane()).await;
@@ -1985,16 +2610,15 @@ mod open_charge_tests {
         let mine_pending = PendingCostRecords::new();
         let execution_id = uuid::Uuid::new_v4();
         let mine = sink_on(tasks.clone(), mine_pending.clone(), charges.clone(), execution_id);
-        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, sink: mine });
+        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, held: mine.pending.hold(), sink: mine });
 
         // Another execution on the same process, still going. Its own
         // pending tracker, so waiting for this execution's records does
         // not wait on a charge that is meant to stay open.
         let other = sink_on(tasks.clone(), PendingCostRecords::new(), charges.clone(), uuid::Uuid::new_v4());
-        charges.open(QUEUED.service(), "req-2".into(), OpenCharge { token: 0, scratch: submitted("req-2").data, sink: other });
+        charges.open(QUEUED.service(), "req-2".into(), OpenCharge { token: 0, scratch: submitted("req-2").data, held: other.pending.hold(), sink: other });
 
-        charges.flush_execution_id(execution_id, "the execution ended before the job was read back");
-        mine_pending.wait_zero().await;
+        charges.close_execution_id(execution_id, &mine_pending, "the execution ended before the job was read back").await;
 
         assert_eq!(charges.count(), 1, "the other execution's charge is untouched");
         let booked = recorded_payloads(&tasks);
@@ -2017,15 +2641,14 @@ mod open_charge_tests {
         let execution_id = uuid::Uuid::new_v4();
 
         let first = sink_on(tasks.clone(), pending.clone(), charges.clone(), execution_id);
-        charges.open("queued", "job-1".into(), OpenCharge { token: 0, scratch: submitted("job-1").data, sink: first });
+        charges.open("queued", "job-1".into(), OpenCharge { token: 0, scratch: submitted("job-1").data, held: first.pending.hold(), sink: first });
         let second = sink_on(tasks.clone(), pending.clone(), charges.clone(), execution_id);
-        charges.open("otherprov", "job-1".into(), OpenCharge { token: 0, scratch: submitted("job-1").data, sink: second });
+        charges.open("otherprov", "job-1".into(), OpenCharge { token: 0, scratch: submitted("job-1").data, held: second.pending.hold(), sink: second });
 
         assert_eq!(charges.count(), 2, "neither displaced the other");
         assert!(recorded_payloads(&tasks).is_empty(), "nothing was booked as displaced");
 
-        charges.flush_execution_id(execution_id, "the execution ended");
-        pending.wait_zero().await;
+        charges.close_execution_id(execution_id, &pending, "the execution ended").await;
         assert_eq!(recorded_payloads(&tasks).len(), 2, "both spends are written down");
     }
 
@@ -2037,7 +2660,7 @@ mod open_charge_tests {
         let pending = PendingCostRecords::new();
         let sink = sink(tasks.clone(), pending.clone());
         let charges = sink.open_charges.clone();
-        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, sink });
+        charges.open(QUEUED.service(), "req-1".into(), OpenCharge { token: 0, scratch: submitted("req-1").data, held: sink.pending.hold(), sink });
 
         charges.flush("the replica shut down");
         pending.wait_zero().await;

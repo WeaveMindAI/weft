@@ -275,9 +275,10 @@ pub(crate) async fn declare_project(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("empty program: {e}")))?;
     let summary = state
         .projects
-        .register_with_hashes(empty, name, "", tenant.as_str(), None, None, None, None, None, None)
+        .register_with_hashes(empty, name, "", tenant.as_str(), None, None, None, None, None, None, None)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("declare the project: {e}")))?;
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("declare the project: {e}")))?
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "declaring the project registered nothing".to_string()))?;
     state
         .events
         .publish(DispatcherEvent::ProjectRegistered {
@@ -289,11 +290,22 @@ pub(crate) async fn declare_project(
 }
 
 /// `POST /projects/{id}/builds`: build this version of the project inside
-/// the install (`crate::build`) and register what it produced: the
-/// compiled program, its three hashes, the implementations its worker
+/// the install (`crate::build`).
+///
+/// When every image the version needs is in the registry, register what
+/// it produced and answer it (200, [`weft_core::builds::BuiltProgram`]):
+/// the compiled program, its three hashes, the implementations its worker
 /// carries, the infra images every place runs, and the version's files as
 /// the program's source. The project's running pointers move to it in the
 /// same transaction, so the next verb acts on exactly this build.
+///
+/// When images are missing, start their builds (or join the ones already
+/// running for the same content), write the version down as waiting on
+/// them, and answer at once (202, [`weft_core::builds::BuildsUnderway`]),
+/// never after the minutes the builds take: a request held open that long
+/// with nothing on the wire is dropped by an idle network path. The
+/// install registers the version itself once they all ended
+/// (`crate::build::waiting`); the caller follows it (`version_build`).
 ///
 /// This is the ONE way a project's program and images come to exist on an
 /// install: nothing the client computed is believed.
@@ -302,69 +314,57 @@ pub async fn build(
     caller: CallerTenant,
     Path(id): Path<uuid::Uuid>,
     Json(req): Json<weft_core::builds::VersionBuildRequest>,
-) -> Result<Json<weft_core::builds::BuiltProgram>, (StatusCode, String)> {
-    declare_project(&state, id, &req.name, &caller.0).await?;
-    crate::api::versions::validate_manifest(&req.manifest)?;
+) -> Result<axum::response::Response, axum::response::Response> {
+    use axum::response::IntoResponse;
+    declare_project(&state, id, &req.name, &caller.0).await.map_err(IntoResponse::into_response)?;
+    crate::api::versions::validate_manifest(&req.manifest).map_err(IntoResponse::into_response)?;
+    // Taken as the ask arrives, before the minutes of compiling: a
+    // version registers only over an older ask, whichever finishes first
+    // (`crate::build::waiting`).
+    let ask = state
+        .projects
+        .next_build_ask(id)
+        .await
+        .map_err(|e| crate::api::unavailable_or_internal("take the build's place in the project's order", e).into_response())?;
     // Claims every image the build plans from its first look at the
-    // registry until the registration commits, so no prune deletes an
-    // image this build found or built before anything references it
+    // registry until the version registers, so no prune deletes an image
+    // this build found or built before anything references it
     // (`crate::build::prune::ImageHold`).
     let hold = crate::build::prune::ImageHold::new(&state.pg_pool, id);
-    let crate::build::Build { program: mut built, images } =
-        crate::transition::build_version_gated(&state, id, &caller.0, &req, &hold).await?;
-    hold.confirm().await.map_err(|e| (StatusCode::CONFLICT, format!("{e:#}")))?;
-    // Read before registering: which infra places this build moves onto
-    // another image, for the caller to say so.
-    let before = state
-        .projects
-        .running_infra_image_tags(id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read the registered infra images: {e:#}")))?
-        .unwrap_or_default();
-    built.replaced_infra_images = crate::build::replaced_infra_images(&before, &built.infra_images);
-    let infra_images: crate::project_store::InfraImageTags = built
-        .infra_images
-        .iter()
-        .map(|(place, images)| (place.clone(), images.iter().map(|(k, v)| (k.clone(), v.clone())).collect()))
-        .collect();
-    let summary = state
-        .projects
-        .register_with_hashes(
-            built.definition.clone(),
-            &req.name,
-            "",
-            caller.0.as_str(),
-            Some(&built.binary_hash),
-            Some(&built.definition_hash),
-            Some(&built.infra_hash),
-            Some(&infra_images),
-            Some(&built.implementations),
-            Some(&req.manifest),
+    let (version, hold) = match crate::transition::build_version_gated(&state, id, &caller.0, &req, ask, hold).await? {
+        crate::build::VersionBuild::Waiting(underway) => {
+            return Ok((StatusCode::ACCEPTED, Json(underway)).into_response());
+        }
+        crate::build::VersionBuild::Ready { version, hold } => (version, hold),
+    };
+    if let Err(e) = hold.confirm().await {
+        let released = hold.release().await;
+        let settled = crate::transition::settle(&state, Some(id)).await;
+        let also: Vec<String> = [released.err(), settled.err()].into_iter().flatten().map(|e| format!("{e:#}")).collect();
+        let mut message = format!("{e:#}");
+        if !also.is_empty() {
+            message.push_str(&format!("\n(and letting go of the build failed too: {})", also.join("; ")));
+        }
+        return Err((StatusCode::CONFLICT, message).into_response());
+    }
+    let registrar = crate::build::waiting::Registrar::Request { hold };
+    match crate::build::waiting::register(&state, id, caller.0.as_str(), &version, registrar).await {
+        Ok(Some(built)) => Ok(Json(built).into_response()),
+        Ok(None) => Err((
+            StatusCode::CONFLICT,
+            "a newer build of this project registered while this one was compiling, so this one was not registered; \
+             build again to run this version"
+                .to_string(),
         )
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("register the build: {e}")))?;
-    // Still under the hold: what the project now runs is how recent each
-    // of its images is when a prune picks what to reclaim.
-    crate::build::ledger::note_running(&state.pg_pool, id, &images, crate::lease::now_unix())
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    // Let go only now that the registration above has committed: a prune
-    // deciding about one of these images under its lock then sees either
-    // this claim or the committed `running_binary_hash` / infra tags
-    // (`crate::build::ledger::begin_reclaim`), never neither.
-    hold.release().await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    // The images this project's earlier builds left, bounded now rather
-    // than whenever somebody cleans: its current one and the one before
-    // stay (`crate::build::prune::AfterBuildPrunes`).
-    state.builder.prunes.request(&state, Some(id));
-    state
-        .events
-        .publish(DispatcherEvent::ProjectRegistered {
-            project_id: summary.id,
-            name: weft_core::truncate_user_string(&summary.name, 4096),
-        })
-        .await;
-    Ok(Json(built))
+            .into_response()),
+        Err(e) => {
+            let mut message = format!("register the build: {e:#}");
+            if let Err(settled) = crate::transition::settle(&state, Some(id)).await {
+                message.push_str(&format!("\n(and settling the project failed too: {settled:#})"));
+            }
+            Err((StatusCode::INTERNAL_SERVER_ERROR, message).into_response())
+        }
+    }
 }
 
 /// Answers through `StatusError` so "no project you may see under this
@@ -462,6 +462,10 @@ pub async fn remove(
     // project names become unused, and the pass asked for here reclaims
     // them (`crate::build::prune::AfterBuildPrunes`).
     crate::build::ledger::forget_project(&state.pg_pool, id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    // Its version builds go too, a waiting one's claim with it.
+    crate::build::waiting::forget_project(&state.pg_pool, id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     state.builder.prunes.request(&state, None);
@@ -2484,19 +2488,25 @@ async fn prepare_trigger_setup(
     }
 }
 
-/// Where one of the project's image builds is (`build`, the builder's id,
-/// as the status names it): what a person watching the build is told when
-/// an image stops building.
-pub async fn build_state(
+/// `GET /projects/{id}/builds/{build}`: where the version build a 202 from
+/// the build request named stands (`build`), with each image build it
+/// waits on and, once registered, what registered, or why it ended
+/// otherwise. What the caller following a build reads until it ends.
+pub async fn version_build(
     State(state): State<DispatcherState>,
     caller: CallerTenant,
-    Path((id, build)): Path<(uuid::Uuid, String)>,
-) -> Result<Json<weft_core::projects::BuildStateResponse>, (StatusCode, String)> {
+    Path((id, build)): Path<(uuid::Uuid, uuid::Uuid)>,
+) -> Result<Json<weft_core::builds::VersionBuildState>, (StatusCode, String)> {
     authorize_project(&state, &caller.0, id).await?;
-    let state = crate::build::ledger::state_of(&state.pg_pool, id, &build)
+    // The database out of reach is the install unable to serve this right
+    // now, never the build's state: a 503, which the caller following the
+    // build reads as "look again". Anything else (a row that no longer
+    // reads) is a 500 asking again would not fix.
+    crate::build::waiting::state(&state.pg_pool, id, build)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    Ok(Json(weft_core::projects::BuildStateResponse { state }))
+        .map_err(|e| crate::api::unavailable_or_internal("read where the build is", e))?
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, format!("no build {build} of this project")))
 }
 
 pub async fn activate(
@@ -3690,13 +3700,15 @@ pub async fn cancel_running(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `POST /projects/{id}/cancel-build`. Cancel the in-flight build
-/// transition: CAS `transition` building → cancelling_build, the
-/// durable, cross-process cancel signal the driving process's build gate polls
-/// between looks at its build processes (it stops them on seeing it).
-/// Cancel reconciles, never asserts: the response is 202 and the
-/// displayed state is whatever the backend reports next (the build
-/// may still complete if it beat the cancel).
+/// `POST /projects/{id}/cancel-build`. Cancel the in-flight build:
+/// `transition` → cancelling_build, then every image build the project
+/// started is stopped and its waiting version ends cancelled
+/// (`VersionBuilder::cancel_project`), and the transition lands at rest
+/// once nothing holds it (`crate::transition::settle`). A build request
+/// still starting its builds is refused its next claim, and stops what it
+/// started itself. Cancel reconciles, never asserts: the
+/// response is 202 and the displayed state is whatever the backend
+/// reports next (a build may still complete if it beat the cancel).
 ///
 /// 412 when no build is in flight (stale tab; the client refetches
 /// `/status` and reconciles).
@@ -3718,6 +3730,14 @@ pub async fn cancel_build(
         ));
     }
     crate::transition::publish_transition_changed(&state, id).await;
+    state
+        .builder
+        .cancel_project(id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("stop the project's builds: {e:#}")))?;
+    crate::transition::settle(&state, Some(id))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("settle the build transition: {e:#}")))?;
     Ok(StatusCode::ACCEPTED)
 }
 

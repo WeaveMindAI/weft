@@ -42,6 +42,12 @@ use weft_core::images::PruneReport;
 /// dispatcher that dies stops renewing
 /// and its claim stops protecting anything, with no connection held open
 /// and nothing to wait out.
+///
+/// The request owns the claim until it says what becomes of it: let go
+/// ([`Self::release`], once registered, or the request failed), or passed
+/// to the version build it became ([`Self::pass_to_version`], answered
+/// while its builds run), which keeps it alive while it waits. A hold
+/// dropped without either (the request was abandoned) lets go on its own.
 pub struct ImageHold {
     pool: sqlx::PgPool,
     id: uuid::Uuid,
@@ -50,6 +56,9 @@ pub struct ImageHold {
     /// The images the claim covers, to check none lapsed.
     held: std::sync::Mutex<BTreeSet<String>>,
     renewer: tokio::task::JoinHandle<()>,
+    /// Whether the claim is still this hold's to let go of: cleared once
+    /// released or passed to its version.
+    owned: bool,
 }
 
 impl ImageHold {
@@ -65,7 +74,12 @@ impl ImageHold {
                 }
             }
         });
-        Self { pool: pool.clone(), id, project, held: Default::default(), renewer }
+        Self { pool: pool.clone(), id, project, held: Default::default(), renewer, owned: true }
+    }
+
+    /// This claim's id: also the id of the version build it may become.
+    pub fn id(&self) -> uuid::Uuid {
+        self.id
     }
 
     /// Claim `images` before the build looks for any of them.
@@ -90,18 +104,46 @@ impl ImageHold {
         Ok(())
     }
 
-    /// Let go once the images are registered (or the build ended).
-    pub async fn release(self) -> Result<()> {
+    /// Let go once the images are registered, or the request failed.
+    pub async fn release(mut self) -> Result<()> {
+        self.owned = false;
         self.renewer.abort();
         super::ledger::drop_claim(&self.pool, self.id).await
+    }
+
+    /// Leave the claim in place for the waiting version build written
+    /// under this hold's id (`super::waiting::ask`), which keeps it alive
+    /// until it ends (`ledger::claim_live`) and lets go of it then.
+    pub fn pass_to_version(mut self) {
+        self.owned = false;
+    }
+}
+
+impl std::fmt::Debug for ImageHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageHold").field("id", &self.id).field("project", &self.project).finish_non_exhaustive()
     }
 }
 
 impl Drop for ImageHold {
-    /// A request abandoned midway: the claim stops being renewed, and
-    /// lapses on its own.
+    /// Stop renewing, and let go of a claim still owned (an abandoned
+    /// request), off the dropping thread. Without a runtime to do it on,
+    /// the claim lapses within its lease.
     fn drop(&mut self) {
         self.renewer.abort();
+        if !self.owned {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(target: "weft_dispatcher::build", claim = %self.id, "an abandoned build's claim on its images could not be let go of: no runtime");
+            return;
+        };
+        let (pool, id) = (self.pool.clone(), self.id);
+        runtime.spawn(async move {
+            if let Err(e) = super::ledger::drop_claim(&pool, id).await {
+                tracing::warn!(target: "weft_dispatcher::build", claim = %id, error = %format!("{e:#}"), "letting go of an abandoned build's claim on its images failed");
+            }
+        });
     }
 }
 

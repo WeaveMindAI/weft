@@ -203,9 +203,9 @@ pub trait Journal: Send + Sync {
         program: Option<&weft_core::ProjectDefinition>,
     ) -> anyhow::Result<Lost>;
 
-    /// Answer the wait `token` with `value` (`answer_in`, on a
+    /// Answer the wait `token` with `answer` (`answer_in`, on a
     /// transaction of its own).
-    async fn answer(&self, token: &str, value: &serde_json::Value) -> anyhow::Result<Answered>;
+    async fn answer(&self, token: &str, answer: &weft_core::primitive::WaitAnswer) -> anyhow::Result<Answered>;
 
     /// Persist a signal token (token-scoped enumeration credential).
     /// Record a freshly minted signal token. The api layer generates the token

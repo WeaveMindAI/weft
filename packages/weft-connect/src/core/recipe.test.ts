@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { canDo, displayLabel, needsConsent, ownFields, ownRegistration, permissionSummary } from './recipe';
+import { canDo, displayLabel, guideSteps, needsConsent, ownFields, ownRegistration, permissionSummary, requestedPermissions, tickablePermissions } from './recipe';
 import type { AccessSpecWire, GrantSummary } from './wire';
 
 const oauth: AccessSpecWire = {
@@ -30,6 +30,19 @@ describe('recipe', () => {
 		expect(needsConsent(key)).toBe(false);
 		expect(ownFields(key).map((f) => f.name)).toEqual(['api_key']);
 		expect(ownFields(oauth).map((f) => f.name)).toEqual(['client_id', 'client_secret']);
+	});
+
+	it('asks for what the service always needs on top of what is ticked, and never offers it to tick', () => {
+		const whoami: AccessSpecWire = {
+			...oauth,
+			permissions: [{ id: 'email', label: 'Your address', description: '', always: true }, ...(oauth.permissions ?? [])],
+			own_page: { guide: { steps: ['Allow {permissions}.'] } },
+		};
+		expect(requestedPermissions(whoami, ['mail'])).toEqual(['email', 'mail']);
+		expect(requestedPermissions(whoami, ['email', 'mail'])).toEqual(['email', 'mail']);
+		expect(tickablePermissions(whoami).map((p) => p.id)).toEqual(['mail', 'cal', 'drive', 'docs']);
+		expect(guideSteps(whoami, ['mail'])).toEqual(['Allow Your address, Read mail.']);
+		expect(permissionSummary(whoami, ['email', 'mail'])).toBe('Read mail');
 	});
 
 	it('reads a connection row the way the list shows it', () => {

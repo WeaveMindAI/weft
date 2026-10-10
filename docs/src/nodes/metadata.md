@@ -42,6 +42,7 @@ Three keys are required: `type`, `label` and `description`.
 | `name` | String | **required** | The port name, unique among inputs |
 | `type` | type string | **required** | What it takes |
 | `required` | Boolean | `false` | A firing with nothing here skips the node. Write it only when true |
+| `requiredWhenWired` | Boolean | `false` | For an input whose absence means something (no `instance`: the program's own copy). Unwired, the node runs without it; wired, a wire that delivers nothing skips the node instead of falling back to that meaning. Never with `required` |
 | `accepts` | List | both | `["wire"]` refuses a written value, `["literal"]` refuses an arrow. A `Bus` or `Generator` port is wire-only whatever you say |
 | `widget` | Object | from the type | The editor control |
 | `default` | any | none | What the runtime supplies when nothing drives the input. Never written into source |
@@ -181,13 +182,13 @@ one for everybody:
   "then": { "message": "Route '{id}' would exist once per instance, because {per_instance_reason}..." } }
 ```
 
-A node that starts an instance's copy of an infra node refuses a name that is
-no such node, and `SetInstanceValues` refuses a key that is no field an
-instance fills:
+A node that starts an instance's copy of an infra node, when it is given an
+instance, refuses a name that is no such node, and `SetInstanceValues` refuses
+a key that is no field an instance fills:
 
 ```json
-{ "when": { "kind": "not", "of": { "kind": "input_names", "port": "node", "names": { "node": { "role": "infra", "per_instance": true } } } },
-  "then": { "message": "StartInstanceInfra '{id}' names {names} in `node`...", "port": "node" } }
+{ "when": { "kind": "all", "of": [{ "kind": "input_satisfied", "port": "instance" }, { "kind": "not", "of": { "kind": "input_names", "port": "node", "names": { "node": { "role": "infra", "per_instance": true } } } }] },
+  "then": { "message": "StartInfra '{id}' names {names} in `node`...", "port": "node" } }
 { "when": { "kind": "not", "of": { "kind": "input_names", "port": "values", "names": { "field": { "instance_filled": true } } } },
   "then": { "message": "SetInstanceValues '{id}' gives {names} in `values`...", "port": "values" } }
 ```

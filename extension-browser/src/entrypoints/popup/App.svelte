@@ -156,8 +156,9 @@
   });
   const refresh = refreshFlight.join;
 
-  /// Skip = "I don't want to answer this one." Resume the lane
-  /// with null; the rest of the run keeps going.
+  /// Skip = "I don't want to answer this one." The step that asked
+  /// ends skipped, its outputs close and what reads them skips; the
+  /// rest of the run keeps going.
   async function handleSkipTask(task: PendingTask) {
     try {
       await skipTask(task);
@@ -598,10 +599,11 @@
 
 <!-- One card renderer for both sections. `isTrigger` gates the
      skip/cancel buttons (THE shared trigger test, same as the task
-     runner's): a RESUME task acts on a paused run (skip = answer null,
-     cancel = kill the run), so it shows them; a TRIGGER has no
-     in-flight run to skip or cancel, so opening it (to submit its form
-     and START a run) is the only action. -->
+     runner's): a RESUME task acts on a paused run (skip = end the
+     asking step as skipped, cancel = kill the run), so it shows them; a
+     TRIGGER has no question to skip (weft refuses it) and no in-flight
+     run to cancel, so opening it (to submit its form and START a run)
+     is the only action. -->
 {#snippet taskCard(task: PendingTask)}
   <div class="task-card-wrapper">
     <button class="task-card" onclick={() => openTaskInRunner(task)}>
@@ -617,7 +619,7 @@
       <button
         class="task-skip"
         onclick={() => handleSkipTask(task)}
-        title="Skip: answer this task with null. The rest of the run continues."
+        title="Skip: the step that asked ends skipped, and what reads its answer skips too. The rest of the run continues."
         aria-label="Skip task"
       >
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">

@@ -976,3 +976,24 @@ fn a_navigated_into_include_parses_under_the_ids_the_build_uses() {
         parsed.nodes.iter().map(|n| n.id.as_str()).collect::<Vec<_>>()
     );
 }
+
+/// An input required only once wired has its requiredness decided by its
+/// wiring, so a header line declaring it required is refused, naming the
+/// fix; declaring it optional says nothing new and stays legal.
+#[test]
+fn enrich_refuses_making_an_input_required_when_wired_always_required() {
+    let errors_for = |header: &str| {
+        let source = format!("\ns = StartInfra({header}) {{ node: \"svc\" }}\n");
+        let mut project = compile(&source, uuid::Uuid::new_v4(), CompileFs::none()).expect("compile");
+        weft_compiler::enrich::enrich_collecting(&mut project, &catalog(), weft_compiler::enrich::EnrichPolicy::Strict)
+            .into_iter()
+            .map(|e| e.message)
+            .collect::<Vec<_>>()
+    };
+    let refused = errors_for("instance: String");
+    assert!(
+        refused.iter().any(|m| m.contains("required only when wired") && m.contains("instance?")),
+        "{refused:?}"
+    );
+    assert!(errors_for("instance?: String").is_empty(), "optional is what it already is");
+}

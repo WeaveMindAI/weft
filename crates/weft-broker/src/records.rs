@@ -122,7 +122,7 @@ async fn run_answers(State(state): State<Arc<BrokerState>>, AuthedCaller(caller)
         if !answers.is_empty()
             || !heard.woken_before(deadline, parked).await.map_err(|e| unavailable_or_internal(e.context("wait for a run's answers")))?
         {
-            return Ok(Json(RunAnswersResponse { answers: answers.into_iter().map(|(token, value)| RunAnswer { token, value }).collect() }));
+            return Ok(Json(RunAnswersResponse { answers: answers.into_iter().map(|(token, answer)| RunAnswer { token, answer }).collect() }));
         }
     }
 }

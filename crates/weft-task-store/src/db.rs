@@ -34,6 +34,23 @@ pub const RECORD_POOL_CONNECTIONS: u32 = 8;
 /// broker, so its batches are counted apart from other brokers'.
 pub const RECORD_POOL_APPLICATION: &str = "weft-records";
 
+/// Whether a database error means the database could not be reached or
+/// is restarting, rather than that the statement itself failed: no
+/// connection to be had, a connection that broke, or the server refusing
+/// because it is shutting down or starting up (SQLSTATE class 08, and
+/// 57P01 to 57P03). Only that is worth asking again on; anything else
+/// fails the same way next time. The one reading, for every service that
+/// answers a caller who can wait.
+pub fn unreachable(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Io(_) | sqlx::Error::Protocol(_) => true,
+        sqlx::Error::Database(db) => db
+            .code()
+            .is_some_and(|code| code.starts_with("08") || matches!(&*code, "57P01" | "57P02" | "57P03")),
+        _ => false,
+    }
+}
+
 /// A pool on `url` of at most `max_connections`, each request for a
 /// connection waiting at most `acquire_timeout`. The database may still be
 /// starting: it is tried again for a minute before the error is answered.

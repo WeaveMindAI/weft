@@ -1,0 +1,97 @@
+{
+  "type": "ActivateTriggers",
+  "label": "Activate triggers",
+  "description": "Turn on triggers: the program's own, or with `instance` that instance's per-instance triggers. A trigger reading an infra copy needs that copy running first; triggers already on are left alone.",
+  "tags": [
+    "instances",
+    "triggers",
+    "activate"
+  ],
+  "icon": "Zap",
+  "color": "#0ea5e9",
+  "inputs": [
+    {
+      "name": "instance",
+      "type": "String",
+      "requiredWhenWired": true,
+      "description": "Whose triggers: an instance id your program gives it (`user-42`), for that instance's per-instance triggers. Unwired: the program's own triggers, the ones shared by every instance. Wired, and no id arrives (the step feeding it did not run): this node skips."
+    },
+    {
+      "name": "only",
+      "type": "List[String]",
+      "description": "Only these triggers, named as the program writes them. Unwired: all of them (every shared trigger, or every per-instance trigger of the instance)."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "done",
+      "type": "Boolean",
+      "description": "True once the triggers are on."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_satisfied",
+            "port": "instance"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_names",
+              "port": "only",
+              "names": {
+                "node": {
+                  "role": "trigger",
+                  "per_instance": true
+                }
+              }
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ActivateTriggers '{id}' names {names} in `only`, which is no per-instance trigger of this program. It is given an `instance`, so it acts on that instance's triggers: name each the way the program writes it (`inbox`, `work.inbox` inside a group, or `one.inbox` inside an included file), or leave `instance` unwired to act on the program's own triggers.",
+        "level": "structural",
+        "severity": "error",
+        "port": "only"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "instance"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_names",
+              "port": "only",
+              "names": {
+                "node": {
+                  "role": "trigger",
+                  "per_instance": false
+                }
+              }
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "ActivateTriggers '{id}' names {names} in `only`, which is no shared trigger of this program. It has no `instance`, so it acts on the program's own triggers: name each the way the program writes it (`inbox`, `work.inbox` inside a group, or `one.inbox` inside an included file), or wire `instance` to act on an instance's per-instance triggers.",
+        "level": "structural",
+        "severity": "error",
+        "port": "only"
+      }
+    }
+  ]
+}

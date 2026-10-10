@@ -471,9 +471,9 @@ the `instances` package of the standard catalog has a node for each step:
 
 | Node | What it does |
 |---|---|
-| `StartInstanceInfra` | Starts an instance's copy of an infra node, and fires once it runs (or, with `waitUntilRunning` off, once weft accepted the start) |
-| `StopInstanceInfra` | Stops it, keeping its disk |
-| `TerminateInstanceInfra` | Deletes it and its disk |
+| `StartInfra` | Starts an instance's copy of an infra node, and fires once it runs (or, with `waitUntilRunning` off, once weft accepted the start) |
+| `StopInfra` | Stops it, keeping its disk |
+| `TerminateInfra` | Deletes it and its disk |
 | `InstanceInfraStatus` | Reads the state of an instance's copy |
 | `ListInstanceInfra` | Lists every copy of an infra node, the shared one and each instance's |
 | `ListInstances` | Lists every instance weft holds anything for (values, connections, copies, tokens, triggers), with counts and states, and the events waiting on a field not yet filled |
@@ -481,20 +481,25 @@ the `instances` package of the standard catalog has a node for each step:
 | `InstanceCosts` | Lists what an instance's runs cost, with the total |
 | `GetInstanceValues` | Reads an instance's values for the `@instance_filled` fields, keyed `node.field` |
 | `SetInstanceValues` | Sets or clears an instance's `@instance_filled` values, and sets up again any of its triggers that read a changed one |
-| `ActivateInstanceTriggers` | Turns on an instance's triggers |
-| `DeactivateInstanceTriggers` | Turns them off |
+| `ActivateTriggers` | Turns on an instance's triggers |
+| `DeactivateTriggers` | Turns them off |
 | `MintInstanceToken` | Mints an instance token to hand to a browser |
 | `WipeInstance` | Removes everything attached to an instance |
 
+If you leave `instance` unwired on `StartInfra`, `StopInfra`, `TerminateInfra`,
+`ActivateTriggers` or `DeactivateTriggers`, it acts on the program's own copies
+instead: the shared copy of an infra node not marked `@per_instance`, or the
+triggers every instance shares.
+
 If your backend should create instances, put `MintInstanceToken`,
-`StartInstanceInfra` and `ActivateInstanceTriggers` behind a gated route, in
+`StartInfra` and `ActivateTriggers` behind a gated route, in
 that order. If you want the request to answer at once rather than wait
-minutes for the copy, turn `waitUntilRunning` off on `StartInstanceInfra` and
+minutes for the copy, turn `waitUntilRunning` off on `StartInfra` and
 reply with the token after it: the start is accepted by then, so a list read
 right after shows the copy as `provisioning`. A reply placed before the start
 leaves nothing for that list to show yet. If one of the instance's triggers reads a value with no
 fallback, activating it at creation is refused, so leave
-`ActivateInstanceTriggers` for a second call your website makes once the
+`ActivateTriggers` for a second call your website makes once the
 settings are saved. The same route can remove an instance with `WipeInstance`:
 weft cannot tell when an instance is no longer needed, so your backend says so.
 

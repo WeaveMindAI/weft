@@ -28,6 +28,7 @@ function snapshot(): ActionAvailability {
     orphanedInfra: false,
     mode: 'active',
     runningCount: 0,
+    triggersOff: [],
     infraRollup: 'none',
     infraNodes: [],
     preservation: { parked: 0, suspended: 0 },

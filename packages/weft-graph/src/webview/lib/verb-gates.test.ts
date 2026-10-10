@@ -133,6 +133,19 @@ describe('a registration older than the source', () => {
 	});
 });
 
+describe('an active project', () => {
+	// Every trigger on: the source has triggers, but nothing is left to
+	// turn on, so no second button (the bug was "Reactivate the rest"
+	// on every active project, which `activate` then refused).
+	it('offers no activate of its own, and reactivate only from the table', () => {
+		const on = inputs({ available: ['deactivate'], status: 'active', hasTriggers: true });
+		expect(isVerbOffered('activate', on)).toBe(false);
+		expect(isVerbOffered('reactivate', on)).toBe(false);
+		const partly = inputs({ available: ['deactivate', 'reactivate'], status: 'active', hasTriggers: true });
+		expect(isVerbOffered('reactivate', partly)).toBe(true);
+	});
+});
+
 describe('infra the user deleted from source', () => {
 	it('is never offered a start, because there is no spec to start from', () => {
 		// The live rows keep Stop and Terminate offered (the dispatcher

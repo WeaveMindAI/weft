@@ -304,8 +304,9 @@ impl LiveTestRunner {
         for handle in handles {
             failures.extend(handle.close_opened_accesses().await);
         }
-        self.clients.open_charges.flush_execution_id(self.execution_id, "the node test ended before the job was read back");
-        self.record.costs.wait_zero().await;
+        self.clients.open_charges
+            .close_execution_id(self.execution_id, &self.record.costs, "the node test ended before the job was read back")
+            .await;
         let ending = weft_journal::ExecEvent::ExecutionCompleted { execution_id: self.execution_id, at_unix: crate::now_unix() };
         let ended = match weft_journal::JournalClient::record_event(self.journal.as_ref(), &ending, Some(&self.replica)).await {
             Ok(()) => self.journal.leave(Leaving::Ended).await,

@@ -290,11 +290,26 @@ impl ExecutionProjector {
                     node: node_id.clone(),
                     frames: frames.clone(),
                     token: token.clone(),
-                    value: effects.resumed_value.clone(),
                     inherited_from,
                     project_id,
                 }]
             }
+            // A wait ends on the row that answers, skips or gives it up,
+            // or on its registration when that ending was on record first;
+            // the fold says which row ended it, and a row that came after
+            // the first ending paints nothing.
+            ExecEvent::SuspensionRegistered { .. }
+            | ExecEvent::SuspensionResolved { .. }
+            | ExecEvent::SuspensionSkipped { .. }
+            | ExecEvent::SuspensionGaveUp { .. } => effects.wait_ended.iter().map(|ended| DispatcherEvent::WaitEnded {
+                execution_id, at_unix,
+                node: ended.at.node_id.clone(),
+                frames: ended.at.frames.clone(),
+                token: ended.token.clone(),
+                ended: ended.end.clone(),
+                inherited_from,
+                project_id,
+            }).collect(),
             ExecEvent::NodeCancelled { node_id, frames, reason, .. } => {
                 vec![DispatcherEvent::NodeCancelled {
                     execution_id, at_unix,
@@ -513,8 +528,8 @@ impl ExecutionProjector {
                     reason: reason.clone(), at_unix,
                 }]
             }
-            // SuspensionRegistered / SuspensionResolved / LogLine /
-            // RunOutput / NodeKicked / PulsesConsumed / LoopStreamEnded:
+            // LogLine / RunOutput / NodeKicked / PulsesConsumed /
+            // LoopStreamEnded:
             // not surfaced through DispatcherEvent. SSE consumers don't
             // need them for live UI; they read the journal directly when
             // they want full detail. A kick can still fire a group
@@ -588,6 +603,7 @@ fn inherited_events(
                         DispatcherEvent::NodeStarted { execution_id, node, frames, inherited_from, .. }
                         | DispatcherEvent::NodeSuspended { execution_id, node, frames, inherited_from, .. }
                         | DispatcherEvent::NodeResumed { execution_id, node, frames, inherited_from, .. }
+                        | DispatcherEvent::WaitEnded { execution_id, node, frames, inherited_from, .. }
                         | DispatcherEvent::NodeCompleted { execution_id, node, frames, inherited_from, .. }
                         | DispatcherEvent::NodeSkipped { execution_id, node, frames, inherited_from, .. } => {
                             if seed.origins.get(&Located::at(node.as_str(), frames)) != Some(&ancestor.execution_id) { continue; }
@@ -1061,6 +1077,10 @@ mod tests {
             });
         }
         rows.splice(3..3, [
+            ExecEvent::SuspensionRegistered {
+                execution_id: execution_id(), node_id: "src".into(), frames: vec![], token: "answer".into(),
+                spec: wait_spec(), call_index: 0, at_unix: 1,
+            },
             ExecEvent::NodeSuspended {
                 execution_id: execution_id(), node_id: "src".into(), frames: vec![], token: "answer".into(), at_unix: 1,
             },
@@ -1085,18 +1105,47 @@ mod tests {
         assert_eq!(kinds(&events), vec![
             ("node_started".into(), "src".into()),
             ("node_suspended".into(), "src".into()),
+            ("wait_ended".into(), "src".into()),
             ("node_resumed".into(), "src".into()),
             ("node_completed".into(), "src".into()),
             ("cost_reported".into(), "".into()),
         ]);
-        assert_eq!(events[2]["value"], "approved");
-        assert_eq!(events[3]["output"]["out"], 9);
-        assert_eq!(events[4]["node_id"], "src");
-        assert_eq!(events[4]["amount_usd"], 0.25);
+        assert_eq!(events[2]["ended"], json!({ "type": "answered", "value": "approved" }));
+        assert_eq!(events[4]["output"]["out"], 9);
+        assert_eq!(events[5]["node_id"], "src");
+        assert_eq!(events[5]["amount_usd"], 0.25);
         for event in events {
             assert_eq!(event["execution_id"], child.to_string());
             assert_eq!(event["inherited_from"], execution_id().to_string());
         }
+    }
+
+    fn wait_spec() -> weft_core::primitive::SignalSpec {
+        weft_core::signal::to_spec(weft_core::signal::Form {
+            form_type: "human_query".into(), schema: weft_core::signal::FormSchema { fields: Vec::new() },
+            title: None, description: None, consumer_kind: None,
+        })
+    }
+
+    /// A wait the run held in its worker never suspends or resumes the
+    /// firing, so its ending is painted from the row that ended it: here
+    /// the give-up, and the answer that came after it paints nothing.
+    #[test]
+    fn a_held_wait_given_up_paints_its_ending_once() {
+        let mut rows: Vec<ExecEvent> = run_rows(false).into_iter().take(3).collect();
+        rows.extend([
+            ExecEvent::SuspensionRegistered {
+                execution_id: execution_id(), node_id: "src".into(), frames: vec![], token: "t".into(),
+                spec: wait_spec(), call_index: 0, at_unix: 2,
+            },
+            ExecEvent::SuspensionGaveUp { execution_id: execution_id(), token: "t".into(), error: "node 'src' gave up its wait: quiet".into(), at_unix: 3 },
+            ExecEvent::SuspensionResolved { execution_id: execution_id(), token: "t".into(), value: json!("late"), at_unix: 4 },
+        ]);
+        let ended: Vec<Value> = project_all(&rows).into_iter().filter(|e| e["kind"] == "wait_ended").collect();
+        assert_eq!(ended.len(), 1, "{ended:?}");
+        assert_eq!(ended[0]["node"], "src");
+        assert_eq!(ended[0]["token"], "t");
+        assert_eq!(ended[0]["ended"], json!({ "type": "gave_up", "error": "node 'src' gave up its wait: quiet" }));
     }
 
     #[test]

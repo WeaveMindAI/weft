@@ -637,6 +637,12 @@ pub struct InputDefinition {
     // SYNC: InputDefinition.accepts <-> packages/weft-graph/src/protocol.ts InputDefinition.accepts, packages/weft-connect/src/core/wire.ts InputDefinition.accepts
     #[serde(default = "Accepts::both")]
     pub accepts: Accepts,
+    /// Optional while unwired, required once wired (mirrored from the
+    /// metadata's `requiredWhenWired`): a wire into it that arrives
+    /// closed skips the node. [`Self::is_required`] is the one reading.
+    // SYNC: InputDefinition.required_when_wired <-> packages/weft-connect/src/core/wire.ts InputDefinition.requiredWhenWired
+    #[serde(default, rename = "requiredWhenWired", skip_serializing_if = "std::ops::Not::not")]
+    pub required_when_wired: bool,
     /// The input's effective editor widget (declared, else derived from
     /// the RESOLVED instance type after TypeVar substitution). Always
     /// present after enrich.
@@ -698,6 +704,13 @@ impl PortDefinition {
 }
 
 impl InputDefinition {
+    /// Whether a closed value on this input skips the node, given
+    /// whether a wire feeds it where the node fires: always for a
+    /// required input, and for a `requiredWhenWired` one only when wired.
+    pub fn is_required(&self, wired: bool) -> bool {
+        self.required || (wired && self.required_when_wired)
+    }
+
     /// An input for a pure WIRE port (a boundary passthrough side, a
     /// source-declared custom port): drivers from the type, no editor
     /// surface beyond what enrich later stamps.
@@ -705,6 +718,7 @@ impl InputDefinition {
         Self {
             accepts: Accepts::for_type(&port.port_type),
             port,
+            required_when_wired: false,
             widget: None,
             default: None,
             label: None,
@@ -1780,6 +1794,7 @@ mod project_wire_tests {
                 declared_type: None,
             },
             accepts: Accepts::wire_only(),
+            required_when_wired: false,
             widget: None,
             default: None,
             label: None,

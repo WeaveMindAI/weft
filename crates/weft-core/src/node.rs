@@ -1033,6 +1033,20 @@ impl NodeMetadata {
                     input.name
                 ));
             }
+            if input.required_when_wired {
+                let problem = if input.required {
+                    Some("is also `required`; pick one (`required` skips on a closed value wired or not)")
+                } else if input.input_type.as_generator().is_some() {
+                    Some("is a stream, and a stream input is always `required`")
+                } else if !input.effective_accepts(self.is_compiler_read(&input.name)).wire {
+                    Some("takes no wire, so it could never be wired")
+                } else {
+                    None
+                };
+                if let Some(problem) = problem {
+                    return Err(format!("input '{}': `requiredWhenWired` {problem}", input.name));
+                }
+            }
             // A widget implies the SHAPE of the value it edits. On an
             // input whose type cannot hold that shape, the widget's own
             // contract (a number widget's min/max, a checkbox's bool)
@@ -2769,6 +2783,16 @@ pub struct InputSpec {
     pub input_type: WeftType,
     #[serde(default)]
     pub required: bool,
+    /// Optional while nothing is wired here, required once something is:
+    /// an unwired input lets the node run without it (no compile error),
+    /// and a wired one that arrives closed skips the node exactly as a
+    /// required input does. For an input whose absence has a meaning of
+    /// its own (an `instance` left unwired acts on the program's own
+    /// copies) that a wire which never delivered must not fall back to.
+    /// Never together with `required`; the metadata check refuses it.
+    // SYNC: InputSpec.required_when_wired <-> packages/weft-graph/src/protocol.ts InputSpec.requiredWhenWired
+    #[serde(default, rename = "requiredWhenWired", skip_serializing_if = "std::ops::Not::not")]
+    pub required_when_wired: bool,
     /// Which drivers this input takes, when the author narrows it.
     /// Absent means both (a constant in the source, or a wire from
     /// another node); `["wire"]` refuses every written value, `["literal"]`
@@ -4438,7 +4462,35 @@ mod input_semantics_tests {
             description: None,
             requires_scopes: None,
             requires_values: None,
+            required_when_wired: false,
         }
+    }
+
+    /// `requiredWhenWired` is a third requiredness beside `required` and
+    /// optional, so it never sits with `required`, and it is refused where
+    /// it could never mean anything: a stream (always required) or an
+    /// input that takes no wire.
+    #[test]
+    fn required_when_wired_is_refused_where_it_cannot_apply() {
+        let string = || WeftType::primitive(WeftPrimitive::String);
+        let ok = metadata_with(vec![InputSpec { required_when_wired: true, ..input("instance", string()) }]);
+        assert!(ok.validate_semantics().is_ok());
+
+        let both = metadata_with(vec![InputSpec { required: true, required_when_wired: true, ..input("instance", string()) }]);
+        assert!(both.validate_semantics().unwrap_err().contains("also `required`"));
+
+        let stream = metadata_with(vec![InputSpec {
+            required_when_wired: true,
+            ..input("rows", WeftType::Generator(Box::new(string())))
+        }]);
+        assert!(stream.validate_semantics().unwrap_err().contains("stream"));
+
+        let literal_only = metadata_with(vec![InputSpec {
+            required_when_wired: true,
+            accepts: Some(Accepts::literal_only()),
+            ..input("instance", string())
+        }]);
+        assert!(literal_only.validate_semantics().unwrap_err().contains("takes no wire"));
     }
 
     /// Every input takes both drivers unless something narrows it: the

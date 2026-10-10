@@ -1,0 +1,185 @@
+{
+  "type": "TerminateInfra",
+  "label": "Terminate infra",
+  "description": "Delete a copy of an infra node and its disk: the program's own copy, or with `instance` that instance's copy of a `@per_instance` node. The triggers reading the copy go down per `triggers`; the runs using it follow `running`.",
+  "tags": [
+    "instances",
+    "infra",
+    "terminate",
+    "delete"
+  ],
+  "icon": "Trash2",
+  "color": "#0ea5e9",
+  "inputs": [
+    {
+      "name": "node",
+      "type": "String",
+      "required": true,
+      "description": "The infra node, named as the program writes it (`bridge`, `work.bridge` inside a group, or `one.bridge` inside an included file): a shared one when `instance` is unwired, one marked `@per_instance` when it is set."
+    },
+    {
+      "name": "instance",
+      "type": "String",
+      "requiredWhenWired": true,
+      "description": "Whose copy: an instance id your program gives it (`user-42`), for that instance's copy of a `@per_instance` node. Unwired: the program's own copy. Wired, and no id arrives (the step feeding it did not run): this node skips."
+    },
+    {
+      "name": "triggers",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "park",
+          "hibernate",
+          "wipe"
+        ]
+      },
+      "default": "park",
+      "label": "Triggers",
+      "description": "The triggers reading the copy: park keeps everything that arrives (answers, events, the trigger's own fires) and runs it once the trigger is back, while a caller on a route is told to try again in a moment; hibernate does the same for `graceMinutes` with its questions hidden, then takes nothing more; wipe drops it all."
+    },
+    {
+      "name": "running",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "wait",
+          "cancel"
+        ]
+      },
+      "default": "wait",
+      "label": "Running work",
+      "description": "The runs still going that use the copy: wait lets them finish, cancel stops them. `wipe` needs cancel."
+    },
+    {
+      "name": "graceMinutes",
+      "type": "Number",
+      "default": 15,
+      "label": "Grace minutes",
+      "description": "Hibernate only: how long it keeps accepting.",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "step": 1
+      }
+    },
+    {
+      "name": "includeSelf",
+      "type": "Boolean",
+      "default": false,
+      "label": "Stop this run too",
+      "description": "On: this run is cancelled too when it is one of the runs reached."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "done",
+      "type": "Boolean",
+      "description": "True once the triggers reading the copy are down and the delete is handed off (or the copy was already going); the copy is deleted afterwards."
+    },
+    {
+      "name": "noCopy",
+      "type": "Boolean",
+      "description": "True instead of `done` when the copy does not exist: it was never started or was terminated before, or the instance id names no instance that has one. Wire it to tell whoever asked."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_satisfied",
+            "port": "instance"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_names",
+              "port": "node",
+              "names": {
+                "node": {
+                  "role": "infra",
+                  "per_instance": true
+                }
+              }
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "TerminateInfra '{id}' names {names} in `node`, which is no infra node of this program marked `@per_instance`. It is given an `instance`, so it acts on that instance's copy: name one the way the program writes it (`bridge`, `work.bridge` inside a group, or `one.bridge` inside an included file), or leave `instance` unwired to act on the program's own copy of a shared one.",
+        "level": "structural",
+        "severity": "error",
+        "port": "node"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "instance"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_names",
+              "port": "node",
+              "names": {
+                "node": {
+                  "role": "infra",
+                  "per_instance": false
+                }
+              }
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "TerminateInfra '{id}' names {names} in `node`, which is no shared infra node of this program. It has no `instance`, so it acts on the program's own copy: name one the way the program writes it (`bridge`, `work.bridge` inside a group, or `one.bridge` inside an included file), or wire `instance` to act on an instance's copy of a `@per_instance` one.",
+        "level": "structural",
+        "severity": "error",
+        "port": "node"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_equals",
+            "field": "triggers",
+            "equals": "wipe"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_equals",
+              "field": "running",
+              "equals": "cancel"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "running"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "TerminateInfra '{id}' wipes the triggers but lets running work finish. Wiping drops what the runs still need, so set `running` to cancel, or pick park or hibernate for `triggers`.",
+        "level": "structural",
+        "severity": "error",
+        "field": "running"
+      }
+    }
+  ]
+}

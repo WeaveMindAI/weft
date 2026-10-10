@@ -36,7 +36,13 @@ pub trait ImageBuilder: Send + Sync {
     fn image_ref(&self, tag: &str) -> String;
 
     /// Launch the build of a staged context, producing `req.image_ref`.
-    /// Returns as soon as it runs; the build goes on on its own.
+    /// Returns as soon as it runs; the build goes on on its own. The
+    /// context stays on disk exactly as long as somebody holds
+    /// `req.staging`: the request that staged it answers without waiting
+    /// for the build and lets go of its own, so a builder that reads the
+    /// context after this returns keeps `req.staging` until it is done
+    /// reading (the build ended, or was stopped), and one that read it
+    /// all here lets go of it here.
     async fn start(&self, req: BuildRequest) -> anyhow::Result<BuildHandle>;
 
     /// How `handle`'s build is doing. Answers from the name alone, so a
@@ -67,9 +73,50 @@ pub struct BuildRequest {
     pub project_id: uuid::Uuid,
     pub tenant: String,
     pub context_dir: PathBuf,
+    /// What keeps `context_dir` on disk ([`Staging`]).
+    pub staging: Staging,
     pub image_ref: String,
     /// `ARG`s the Dockerfile declares (the worker's compile lane).
     pub build_args: Vec<(String, String)>,
+}
+
+/// What keeps a staged build context on disk: the context exists while
+/// any clone of this is held, and goes with the last one. Built from
+/// whatever owns the directory (the staging request's temp dir), so the
+/// files are never copied and keep the times they were staged with, which
+/// a compile cache relies on.
+///
+/// Dropping one never blocks the async runtime: the last one lets go of
+/// the directory on a blocking thread when a runtime is there to run it.
+#[derive(Clone)]
+pub struct Staging {
+    _owner: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+}
+
+impl Staging {
+    /// The context exists for as long as `owner` lives.
+    pub fn new(owner: impl std::any::Any + Send + Sync) -> Self {
+        Self { _owner: std::sync::Arc::new(OffThread(Some(owner))) }
+    }
+}
+
+impl std::fmt::Debug for Staging {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Staging")
+    }
+}
+
+/// A staging owner, dropped (by the last [`Staging`] clone) on a blocking
+/// thread when a runtime is there to run it.
+struct OffThread<T: Send + 'static>(Option<T>);
+
+impl<T: Send + 'static> Drop for OffThread<T> {
+    fn drop(&mut self) {
+        let Some(owner) = self.0.take() else { return };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn_blocking(move || drop(owner));
+        }
+    }
 }
 
 /// The builder's own id for a build, persisted on the `image_build` row
@@ -258,6 +305,7 @@ mod tests {
                 project_id: uuid::Uuid::from_u128(0x100),
                 tenant: "t".into(),
                 context_dir: PathBuf::from("/tmp/ctx"),
+                staging: Staging::new(()),
                 image_ref: "reg/weft-worker:x".into(),
                 build_args: Vec::new(),
             })

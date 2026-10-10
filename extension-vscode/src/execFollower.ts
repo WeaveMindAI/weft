@@ -42,6 +42,11 @@ import type {
 // data by bytes, since a single node result can be much larger than a status.
 export const MAX_REPLAY_BUFFER_BYTES = 8 * 1024 * 1024;
 
+/** How a wait ended: its answer, a person skipping it, or the run giving
+ *  it up (the waiting step failed with `error`). */
+// SYNC: AwaitEnd <-> crates/weft-core/src/primitive.rs AwaitEnd
+export type AwaitEnd = { type: 'answered'; value: unknown } | { type: 'skipped' } | { type: 'gave_up'; error: string };
+
 // SYNC: DispatcherEvent <-> crates/weft-core/src/live_event.rs DispatcherEvent, weavemind/website/src/lib/graph/dispatcher-host.ts translateDispatcherEvent
 // SYNC: event_id <-> crates/weft-core/src/live_event.rs IdentifiedEvent
 export type DispatcherEvent = { event_id: string } & (
@@ -54,7 +59,11 @@ export type DispatcherEvent = { event_id: string } & (
   // SYNC: input origins <-> crates/weft-core/src/live_event.rs DispatcherEvent, packages/weft-graph/src/protocol.ts NodeExecEvent, packages/weft-graph/src/webview/lib/types/index.ts NodeExecution
   | { kind: 'node_started'; execution_id: string; node: string; frames: Frame[]; input: unknown; closed_ports: string[]; provided_ports?: string[]; backup_ports?: string[]; inherited_ports?: Record<string, string>; inherited_from?: string; project_id: string; at_unix: number }
   | { kind: 'node_suspended'; execution_id: string; node: string; frames: Frame[]; token: string; inherited_from?: string; project_id: string; at_unix: number }
-  | { kind: 'node_resumed'; execution_id: string; node: string; frames: Frame[]; token: string | null; value: unknown; inherited_from?: string; project_id: string; at_unix: number }
+  | { kind: 'node_resumed'; execution_id: string; node: string; frames: Frame[]; token: string | null; inherited_from?: string; project_id: string; at_unix: number }
+  // A wait of the firing ended, the first ending on record. A wait the run
+  // holds in its worker never suspends or resumes the firing, so this is
+  // the one event that sees every wait's ending.
+  | { kind: 'wait_ended'; execution_id: string; node: string; frames: Frame[]; token: string; ended: AwaitEnd; inherited_from?: string; project_id: string; at_unix: number }
   | { kind: 'node_cancelled'; execution_id: string; node: string; frames: Frame[]; reason: string; inherited_from?: string; project_id: string; at_unix: number }
   | { kind: 'node_completed'; execution_id: string; node: string; frames: Frame[]; output: unknown; inherited_from?: string; project_id: string; at_unix: number }
   | { kind: 'node_failed'; execution_id: string; node: string; frames: Frame[]; error: string; inherited_from?: string; project_id: string; at_unix: number }
@@ -672,6 +681,10 @@ export class ExecutionFollower implements vscode.Disposable {
       case 'project_transition_changed':
       case 'trigger_url_changed':
       case 'infra_config_error':
+        break;
+      // How a wait ended is what `weft freeze` records; the graph paints
+      // the firing's own lifecycle, which the node events already carry.
+      case 'wait_ended':
         break;
       default: {
         // Exhaustiveness: if a new DispatcherEvent variant is

@@ -84,6 +84,9 @@ pub enum SkipReason {
     /// its `_should_flow` said no, or a loop's list never came. Every
     /// node inside a gated scope carries this, however deep.
     ScopeSkipped { scope: String },
+    /// A person skipped what the node was waiting for (a form's skip):
+    /// it ended there, with nothing to send on.
+    WaitSkipped,
 }
 
 impl SkipReason {
@@ -98,7 +101,7 @@ impl SkipReason {
     /// failure), so it carries none.
     pub fn inherited_failure(&self) -> Option<&Failure> {
         match self {
-            Self::DidNotFlow | Self::DidFlow | Self::ScopeSkipped { .. } => None,
+            Self::DidNotFlow | Self::DidFlow | Self::ScopeSkipped { .. } | Self::WaitSkipped => None,
             Self::WatchedNodeFailed { failure } => Some(failure),
             Self::FlowClosed { failure }
             | Self::RequiredInputClosed { failure, .. }
@@ -142,6 +145,7 @@ impl std::fmt::Display for SkipReason {
             Self::ScopeSkipped { scope } => {
                 write!(f, "the scope '{scope}' it lives in did not run")
             }
+            Self::WaitSkipped => write!(f, "a person skipped what it was waiting for"),
         }
     }
 }
@@ -262,6 +266,8 @@ pub fn check_should_skip(
     }
 
     // Rule 1: any wired required port that arrived as a closure -> skip.
+    // `required` is built by `ready::required_inputs`, which counts a
+    // `requiredWhenWired` input as required exactly where it is wired.
     // (`literal_filled` never overlaps `wired`: wires are authoritative
     // and config only fills unwired ports, so no config check here.)
     // Generator ports are exempt: their closure is the empty stream,

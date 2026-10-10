@@ -224,8 +224,10 @@ pub const NO_SUCH_PROJECT: &str = "this dispatcher holds no project under that i
 /// Authorize a caller against a project: the project must exist AND belong to
 /// the caller's tenant. Returns the same `NOT_FOUND` for "no such project" and
 /// "exists but belongs to another tenant" so a caller cannot probe which
-/// project ids exist in other tenants (no existence leak); `INTERNAL_SERVER_ERROR`
-/// only on a real store failure.
+/// project ids exist in other tenants (no existence leak); `SERVICE_UNAVAILABLE`
+/// only when the database is out of reach right now, which a caller may
+/// try again, and `INTERNAL_SERVER_ERROR` for any other failure
+/// (`crate::api::unavailable_or_internal`).
 ///
 /// This is the single gate every user-facing, project-scoped handler calls
 /// before acting. It builds on `ProjectStore::tenant_for` (the project to tenant
@@ -241,18 +243,7 @@ pub async fn authorize_project(
         Ok(Some(owner)) if owner == caller.as_str() => Ok(()),
         // Missing OR cross-tenant: indistinguishable to the caller.
         Ok(_) => Err((StatusCode::NOT_FOUND, NO_SUCH_PROJECT.to_string())),
-        Err(e) => {
-            tracing::warn!(
-                target: "weft_dispatcher::auth",
-                project_id = %id,
-                error = %e,
-                "tenant_for failed during authorization"
-            );
-            Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "authorization failed".to_string(),
-            ))
-        }
+        Err(e) => Err(crate::api::unavailable_or_internal("read who owns this project", e.context(format!("project {id}")))),
     }
 }
 
@@ -285,16 +276,10 @@ pub async fn authorize_execution(
         Ok(Some(o)) => o,
         Ok(None) => return Err((StatusCode::NOT_FOUND, "not found".to_string())),
         Err(e) => {
-            tracing::warn!(
-                target: "weft_dispatcher::auth",
-                execution_id = %execution_id,
-                error = %e,
-                "execution_owner failed during authorization"
-            );
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "authorization failed".to_string(),
-            ));
+            return Err(crate::api::unavailable_or_internal(
+                "read who owns this execution",
+                e.context(format!("execution {execution_id}")),
+            ))
         }
     };
     if owner.tenant != caller.as_str() {

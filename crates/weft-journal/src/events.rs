@@ -240,10 +240,10 @@ pub enum ExecEvent {
         node_id: String,
         frames: LoopFrames,
         /// Resume cause:
-        /// - `Some(token)`: the firing was Suspended and a
-        ///   `SuspensionResolved` for `token` arrived (its value is on
-        ///   that row). The fold clears the `suspensions` and
-        ///   `pending_deliveries` entries for `token`.
+        /// - `Some(token)`: the firing was Suspended and its wait ended
+        ///   by `SuspensionResolved` (the value is on that row) or
+        ///   `SuspensionSkipped`. The fold clears the `suspensions`
+        ///   entry for `token`.
         /// - `None`: a group boundary the worker was firing when it
         ///   went away, re-fired by the next worker (its state is all
         ///   journaled, so the re-fire is safe; a STEP a dead worker
@@ -456,6 +456,17 @@ pub enum ExecEvent {
         execution_id: ExecutionId,
         token: String,
         error: String,
+        at_unix: u64,
+    },
+
+    /// A person skipped the wait `token` (its `/skip` door): the waiting
+    /// `ctx` call ends its step skipped, and a replay of its body ends the
+    /// same call the same way. The wait's other ending, an answer, is
+    /// `SuspensionResolved`; the first one on record stands.
+    SuspensionSkipped {
+        #[serde(skip)]
+        execution_id: ExecutionId,
+        token: String,
         at_unix: u64,
     },
 
@@ -750,6 +761,7 @@ macro_rules! execution_id_of {
             | Self::TriggerCaptured { execution_id, .. }
             | Self::SuspensionResolved { execution_id, .. }
             | Self::SuspensionGaveUp { execution_id, .. }
+            | Self::SuspensionSkipped { execution_id, .. }
             | Self::RunOutput { execution_id, .. }
             | Self::CostReported { execution_id, .. }
             | Self::LogLine { execution_id, .. }
@@ -771,6 +783,17 @@ macro_rules! execution_id_of {
 }
 
 impl ExecEvent {
+    /// How the wait `token` of `execution_id` was answered, as its record
+    /// holds it: `SuspensionResolved` with the value, or
+    /// `SuspensionSkipped`. The one spelling every writer of an answer
+    /// uses.
+    pub fn wait_answered(execution_id: ExecutionId, token: String, answer: weft_core::primitive::WaitAnswer, at_unix: u64) -> Self {
+        match answer {
+            weft_core::primitive::WaitAnswer::Given { value } => Self::SuspensionResolved { execution_id, token, value, at_unix },
+            weft_core::primitive::WaitAnswer::Skipped => Self::SuspensionSkipped { execution_id, token, at_unix },
+        }
+    }
+
     /// Whether this event ends the execution: completed, failed, or
     /// cancelled. The ONE definition of the terminal set; the run's row
     /// keeps the ending it records (`crate::record::Ending`).
@@ -818,6 +841,7 @@ impl ExecEvent {
             | Self::TriggerCaptured { at_unix, .. }
             | Self::SuspensionResolved { at_unix, .. }
             | Self::SuspensionGaveUp { at_unix, .. }
+            | Self::SuspensionSkipped { at_unix, .. }
             | Self::RunOutput { at_unix, .. }
             | Self::CostReported { at_unix, .. }
             | Self::LogLine { at_unix, .. }
@@ -860,6 +884,7 @@ impl ExecEvent {
             Self::TriggerCaptured { .. } => "trigger_captured",
             Self::SuspensionResolved { .. } => "suspension_resolved",
             Self::SuspensionGaveUp { .. } => "suspension_gave_up",
+            Self::SuspensionSkipped { .. } => "suspension_skipped",
             Self::RunOutput { .. } => "run_output",
             Self::CostReported { .. } => "cost_reported",
             Self::LogLine { .. } => "log_line",
@@ -931,6 +956,7 @@ impl ExecEvent {
             Self::TriggerCaptured { node_id, port_snapshot, .. } => node_id.len() + value_bytes(port_snapshot),
             Self::SuspensionResolved { token, value, .. } => token.len() + value_bytes(value),
             Self::SuspensionGaveUp { token, error, .. } => token.len() + error.len(),
+            Self::SuspensionSkipped { token, .. } => token.len(),
             Self::RunOutput { node_id, frames: at, name, value, .. } => {
                 node_id.len() + frames(at) + name.len() + value_bytes(value)
             }

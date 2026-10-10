@@ -1554,16 +1554,15 @@ fn ticked_permissions(
     opts: &ConnectOpts,
     interactive: bool,
 ) -> Result<Vec<String>> {
-    // Own-account-only entries are capability declarations, never
-    // consent asks; they are set up in the provider's account and can
-    // never ride a consent URL, so they are not askable here either.
-    let tickable: Vec<_> = spec.permissions.iter().filter(|p| !p.own_only).collect();
+    let tickable = spec.tickable_permissions();
     let askable = |id: &str| tickable.iter().any(|p| p.id == id);
     if let Some(ids) = &opts.permissions {
         for id in ids {
             if !askable(id) {
                 let known: Vec<&str> = tickable.iter().map(|p| p.id.as_str()).collect();
-                let why = if spec.declares_permission(id) {
+                let why = if spec.permissions.iter().any(|p| p.id == *id && p.always) {
+                    format!("'{id}' is asked for on every connect already; leave it out")
+                } else if spec.declares_permission(id) {
                     format!(
                         "'{id}' is an own-account-only capability: it is set up inside \
                          the connected account, never asked for at connect"

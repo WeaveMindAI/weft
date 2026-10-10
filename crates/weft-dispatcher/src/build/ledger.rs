@@ -4,26 +4,25 @@
 //! The build runs on the platform's builder (a `docker build` on a local
 //! install, a Cloud Build on GCP). The row is how everybody finds it: a
 //! second verb needing the same image joins the running build instead of
-//! starting another, and every verb waiting on it reads its end here.
+//! starting another, and the version build waiting on it reads its end
+//! here (`super::waiting`, `image_states`).
 //!
 //! The row is the truth about a build, and anyone may move it forward:
 //! the dispatcher's build loop (`super::follow`) asks the builder how
 //! each running build is doing and records how it ended, on whichever
 //! dispatcher wakes next. No process has to stay up for a build to be
 //! seen through, which a dispatcher that scales to zero could not.
-//!
-//! A waiter follows the row, not one name: whatever ends there is the
-//! answer, since every build of one ref pushes the same content.
 
 use anyhow::{Context, Result};
 use sqlx::PgPool;
 
-/// How long a build just claimed may take to be made on the builder
-/// (`started` records its id there). Until it is, nobody can ask the
-/// builder about it; a start still not recorded after this is taken for
-/// one whose starter went away, and the build ends failed. Generous on
-/// purpose: a start stages the whole build context first.
-pub const START_HOLD_SECS: i64 = 1800;
+/// What a claim writes into `image_build.held_until`, for a dispatcher of
+/// an older release still up beside this one (a rollout): it ends a start
+/// not made on the builder by then. Nothing here reads the column any
+/// more: a start whose starter went away is noticed from its project's
+/// build heartbeat instead (`end_lost_starts`), within a minute. The column
+/// is dropped in a release after this one, once no older reader is left.
+const OLDER_READERS_START_HOLD_SECS: i64 = 1800;
 
 /// How long the builder may keep failing to answer about a build before
 /// it is given up on, ending failed with the last answer. An internal wait
@@ -36,7 +35,7 @@ pub const CLAIM_LEASE_SECS: i64 = 60;
 
 pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
     name: "image_build",
-    tables: &["image_build", "image_use", "image_claim"],
+    tables: &["image_build", "image_use", "image_claim", "version_build"],
     ddl: &[
         r#"CREATE TABLE IF NOT EXISTS image_build (
             -- The content-addressed ref the build pushes: one build per
@@ -57,7 +56,8 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
             -- SYNC: the statuses <-> weft_core::projects::BuildState
             status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed', 'cancelled')),
             reason TEXT,
-            -- Until when its start may still record `builder_id`.
+            -- Read only by dispatchers of an older release (see
+            -- OLDER_READERS_START_HOLD_SECS); dropped in a later release.
             held_until BIGINT NOT NULL,
             started_at BIGINT NOT NULL,
             finished_at BIGINT,
@@ -83,20 +83,23 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
         // One row per image a build in progress relies on before its
         // project's running version names it (`claim_images`): every image
         // it found in the registry or is building. A prune spares every
-        // ref with a live claim. A claim lives as long as the build request
-        // holding it renews it (`super::prune::ImageHold`), so one whose
-        // dispatcher is gone stops protecting anything.
+        // ref with a live claim (`claim_live`). A claim lives as long as
+        // the build request holding it renews it (`super::prune::ImageHold`),
+        // and, once the request answered while its builds ran, as long as
+        // the version build it became waits (`super::waiting`: the claim's
+        // id is that version's). One nobody keeps stops protecting anything.
         r#"CREATE TABLE IF NOT EXISTS image_claim (
             image_ref TEXT NOT NULL,
             claim_id UUID NOT NULL,
             -- The project whose build request holds the claim: what its
-            -- status lists while the build runs, whoever started it. NULL
-            -- only on a claim taken before claims named it, which lapses
-            -- within a minute.
+            -- status lists while the build runs, whoever started it. Every
+            -- claim names one (`claim_images`).
             project_id UUID,
             holder_until BIGINT NOT NULL,
             PRIMARY KEY (image_ref, claim_id)
         )"#,
+        super::waiting::VERSION_BUILD_TABLE,
+        super::waiting::ONE_WAITING_PER_PROJECT,
     ],
     seed: &[],
 };
@@ -108,7 +111,8 @@ pub enum Claim {
     /// none for an image that compiles nothing). The row is already
     /// written, so a sibling sees the build before it starts.
     Start { name: String, lane: Option<u32> },
-    /// A build is running for it, minted as `name`: wait on the row.
+    /// A build is running for it, minted as `name`: the project waits on
+    /// that one.
     /// `ours` when this same project started it, so a cancel of this
     /// project stops it (a build another project started is left to that
     /// project, and this one only stops waiting).
@@ -133,6 +137,10 @@ impl Claim {
 
 /// Decide, for one image, whether to start a build or join the running
 /// one, and record the decision, in one transaction serialized per image.
+/// Refused ([`super::BuildCancelled`]) once the project's build was
+/// cancelled, so an image claimed after a cancel never starts: the claim
+/// either commits before the cancel, which then finds the build and
+/// stops it, or sees it.
 ///
 /// A row that says the build succeeded is believed only while `images`
 /// still holds the image: a prune forgets the row when it deletes one,
@@ -171,6 +179,7 @@ pub async fn claim(
     };
     let mut tx = pool.begin().await.context("begin the build claim")?;
     lock_image(&mut tx, image_ref).await?;
+    refuse_once_cancelled(&mut tx, project_id).await?;
     let row: Option<(String, uuid::Uuid, String)> =
         sqlx::query_as("SELECT status, project_id, build_name FROM image_build WHERE image_ref = $1")
             .bind(image_ref)
@@ -204,6 +213,11 @@ pub async fn claim(
         None => None,
     };
     let name = build_name();
+    // Announced in the same statement (delivered when it commits), so the
+    // build loop watches the build from its first moment: one whose
+    // starter goes away before it is made on the builder is ended once
+    // its project's heartbeat goes stale (`end_lost_starts`), even on an
+    // install that was asleep.
     sqlx::query(
         "INSERT INTO image_build (image_ref, project_id, tenant_id, build_name, builder_id, lane, status, reason, \
                                   held_until, started_at, finished_at, log_url, failing_since) \
@@ -211,20 +225,38 @@ pub async fn claim(
          ON CONFLICT (image_ref) DO UPDATE SET project_id = EXCLUDED.project_id, tenant_id = EXCLUDED.tenant_id, \
              build_name = EXCLUDED.build_name, builder_id = NULL, lane = EXCLUDED.lane, status = 'running', \
              reason = NULL, held_until = EXCLUDED.held_until, started_at = EXCLUDED.started_at, \
-             finished_at = NULL, log_url = NULL, failing_since = NULL",
+             finished_at = NULL, log_url = NULL, failing_since = NULL \
+         RETURNING pg_notify($8, image_ref)",
     )
     .bind(image_ref)
     .bind(project_id)
     .bind(tenant)
     .bind(&name)
     .bind(lane.map(|l| l as i32))
-    .bind(now + START_HOLD_SECS)
+    .bind(now + OLDER_READERS_START_HOLD_SECS)
     .bind(now)
+    .bind(super::follow::BUILD_CLAIMED_CHANNEL)
     .execute(&mut *tx)
     .await
     .context("record the build")?;
     tx.commit().await.context("commit the build claim")?;
     Ok(Claim::Start { name, lane })
+}
+
+/// Refuse, inside `tx`, once `project`'s build was cancelled (its
+/// transition is `cancelling_build`). The project's row is read under a
+/// share lock, so a cancel landing meanwhile waits for `tx` to commit and
+/// then finds what it wrote.
+pub(crate) async fn refuse_once_cancelled(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, project: uuid::Uuid) -> Result<()> {
+    let transition: Option<String> = sqlx::query_scalar("SELECT transition FROM project WHERE id = $1 FOR SHARE")
+        .bind(project)
+        .fetch_optional(&mut **tx)
+        .await
+        .context("read whether the project's build was cancelled")?;
+    if transition.as_deref() == Some(weft_core::projects::ProjectTransition::CancellingBuild.as_str()) {
+        return Err(super::BuildCancelled.into());
+    }
+    Ok(())
 }
 
 /// The build `name` was made on the builder as `handle` (whose id the
@@ -233,18 +265,16 @@ pub async fn claim(
 /// longer this running build's (it was cancelled, or given up on, while
 /// it was being made): nobody will ask about it, so the caller frees it.
 pub async fn started(pool: &PgPool, image_ref: &str, name: &str, handle: &weft_platform_traits::BuildHandle) -> Result<bool> {
-    // Announced in the same statement, so the build loop watches it from
-    // the moment it is recorded.
+    // The build loop already watches it, woken by its claim.
     let recorded = sqlx::query(
         "UPDATE image_build SET builder_id = $3, log_url = $4 \
          WHERE image_ref = $1 AND build_name = $2 AND status = 'running' AND builder_id IS NULL \
-         RETURNING pg_notify($5, image_ref)",
+         RETURNING 1",
     )
     .bind(image_ref)
     .bind(name)
     .bind(&handle.external_build_id)
     .bind(&handle.log_url)
-    .bind(super::follow::BUILD_STARTED_CHANNEL)
     .fetch_optional(pool)
     .await
     .context("record the build's id on its builder")?;
@@ -361,35 +391,6 @@ pub async fn cancel(pool: &PgPool, image_ref: &str, name: &str, now: i64) -> Res
     .context("record the build as cancelled")
 }
 
-/// What the row of `image_ref` says now.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Seen {
-    Running,
-    /// Its build ended, recorded by whoever saw it end (`finish`).
-    Ended(Outcome),
-}
-
-/// How the build of `image_ref` stands. A build ends once however many
-/// verbs wait on it, and whoever saw it end recorded that before freeing
-/// its process, so every waiter reads the end here.
-pub async fn look(pool: &PgPool, image_ref: &str) -> Result<Seen> {
-    let row: Option<(String, Option<String>)> =
-        sqlx::query_as("SELECT status, reason FROM image_build WHERE image_ref = $1")
-            .bind(image_ref)
-            .fetch_optional(pool)
-            .await
-            .context("read how the build stands")?;
-    let Some((status, reason)) = row else {
-        return Ok(Seen::Ended(Outcome::Failed(format!("the build of {image_ref} is no longer recorded"))));
-    };
-    Ok(match status.as_str() {
-        "running" => Seen::Running,
-        "succeeded" => Seen::Ended(Outcome::Succeeded),
-        "cancelled" => Seen::Ended(Outcome::Cancelled),
-        _ => Seen::Ended(Outcome::Failed(reason.unwrap_or_else(|| "the build failed".into()))),
-    })
-}
-
 /// One build the ledger says runs.
 #[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
 pub struct RunningBuild {
@@ -399,48 +400,140 @@ pub struct RunningBuild {
     pub build_name: String,
     /// Its id on the builder, once its start recorded it (`started`).
     pub builder_id: Option<String>,
-    /// Until when its start may still record that id (`START_HOLD_SECS`).
-    pub held_until: i64,
     pub started_at: i64,
     pub log_url: Option<String>,
 }
 
-const RUNNING_COLUMNS: &str = "image_ref, project_id, build_name, builder_id, held_until, started_at, log_url";
+const RUNNING_COLUMNS: &str = "image_ref, project_id, build_name, builder_id, started_at, log_url";
 
-/// The build running for `image_ref`, if one does.
-pub async fn running_for(pool: &PgPool, image_ref: &str) -> Result<Option<RunningBuild>> {
-    sqlx::query_as(&format!("SELECT {RUNNING_COLUMNS} FROM image_build WHERE image_ref = $1 AND status = 'running'"))
-    .bind(image_ref)
-    .fetch_optional(pool)
-    .await
-    .context("read the running build")
+/// Which starts [`end_lost_starts`] ends: those still waiting to be made
+/// on the builder whose starter went away.
+#[derive(Debug, Clone, Copy)]
+pub enum LostStarts {
+    /// Every such start whose project no request drives any more
+    /// (`crate::project_store::build_driven`, against this cutoff): the
+    /// build loop's sweep. The starter's heartbeat beats from before its
+    /// first claim until its last start is recorded, on whichever
+    /// dispatcher it runs, so a live start is never ended.
+    Undriven { stale_before: i64 },
+    /// Every such start of this project: a request just took its build
+    /// transition over from one whose heartbeat went stale
+    /// (`crate::project_store::ProjectStoreOps::try_begin_building`), so
+    /// none of them is driven.
+    Of(uuid::Uuid),
 }
 
-/// Where the build the builder knows as `builder_id` is, when it is one
-/// `project` started or waits on (the same builds [`running`] lists for it).
-pub async fn state_of(pool: &PgPool, project: uuid::Uuid, builder_id: &str) -> Result<Option<weft_core::projects::BuildState>> {
-    let status: Option<String> = sqlx::query_scalar(
-        "SELECT b.status FROM image_build b WHERE b.builder_id = $2 AND (b.project_id = $1 \
-             OR EXISTS (SELECT 1 FROM image_claim c WHERE c.image_ref = b.image_ref AND c.project_id = $1))",
-    )
+/// End, failed, every build still waiting to be made on the builder whose
+/// starter went away between the claim and recording the builder's id:
+/// nothing will ever make it. Answers how many it ended.
+pub async fn end_lost_starts(conn: &mut sqlx::PgConnection, lost: LostStarts, now: i64) -> Result<u64> {
+    let (project, stale_before) = match lost {
+        LostStarts::Undriven { stale_before } => (None, stale_before),
+        LostStarts::Of(project) => (Some(project), 0),
+    };
+    let ended = sqlx::query(&format!(
+        "UPDATE image_build b SET status = 'failed', finished_at = $1, \
+             reason = 'the build ' || b.build_name || ' was never made on the builder: the dispatcher starting it went \
+                       away before recording it there. Build again' \
+         WHERE b.status = 'running' AND b.builder_id IS NULL \
+           AND CASE WHEN $2::UUID IS NULL \
+                    THEN NOT EXISTS (SELECT 1 FROM project p WHERE p.id = b.project_id AND {}) \
+                    ELSE b.project_id = $2 END",
+        crate::project_store::build_driven("p", "$3")
+    ))
+    .bind(now)
     .bind(project)
-    .bind(builder_id)
-    .fetch_optional(pool)
+    .bind(stale_before)
+    .execute(conn)
     .await
-    .context("read a build's state")?;
-    status.map(|s| serde_json::from_value(serde_json::Value::String(s)).context("a build state the ledger does not know")).transpose()
+    .context("end the starts whose starter went away")?;
+    Ok(ended.rows_affected())
+}
+
+/// The SQL condition "the claim row `c` still protects its image": its
+/// request renews it (`holder_until` not past `now`), or the version build
+/// its id names still waits (`super::waiting`), whatever its lease says.
+/// One definition for every reader of a claim: a prune deciding about an
+/// image, the sweep of lapsed claims, and which builds a project waits on.
+pub(crate) fn claim_live(c: &str, now: &str) -> String {
+    format!(
+        "({c}.holder_until >= {now} OR EXISTS (SELECT 1 FROM version_build v WHERE v.id = {c}.claim_id AND v.state = '{}'))",
+        super::waiting::WAITING
+    )
+}
+
+/// The SQL condition "the project bound at `project` waits on the build
+/// row `b`": it started the build, or a live claim of its names the image
+/// (a build another project started of the same content). What the
+/// project's status lists as its builds.
+pub(crate) fn waited_on_by(project: &str, now: &str) -> String {
+    format!(
+        "(b.project_id = {project} OR EXISTS (SELECT 1 FROM image_claim c WHERE c.image_ref = b.image_ref \
+             AND c.project_id = {project} AND {}))",
+        claim_live("c", now)
+    )
+}
+
+/// Where the build of each of `images` stands: the one the ledger holds for
+/// its image now, under the name it was minted with, which is a newer
+/// build than the one named when the image's build was started again
+/// since. An image with no row (forgotten) has no state.
+pub async fn image_states(
+    pool: &PgPool,
+    images: &[weft_core::builds::ImageBuild],
+) -> Result<Vec<weft_core::builds::ImageBuildState>> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        image_ref: String,
+        build_name: String,
+        status: String,
+        reason: Option<String>,
+        builder_id: Option<String>,
+        started_at: i64,
+        log_url: Option<String>,
+    }
+    let refs: Vec<&str> = images.iter().map(|image| image.image.as_str()).collect();
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT image_ref, build_name, status, reason, builder_id, started_at, log_url FROM image_build \
+         WHERE image_ref = ANY($1)",
+    )
+    .bind(&refs)
+    .fetch_all(pool)
+    .await
+    .context("read where the version's image builds are")?;
+    let mut out = Vec::with_capacity(images.len());
+    for image in images {
+        let state = match rows.iter().find(|row| row.image_ref == image.image) {
+            None => weft_core::builds::ImageBuildState { build: image.clone(), state: Default::default() },
+            Some(row) => weft_core::builds::ImageBuildState {
+                build: weft_core::builds::ImageBuild { image: image.image.clone(), name: row.build_name.clone() },
+                state: weft_core::projects::BuildStateResponse {
+                    state: Some(
+                        serde_json::from_value(serde_json::Value::String(row.status.clone()))
+                            .context("a build state the ledger does not know")?,
+                    ),
+                    reason: row.reason.clone(),
+                    build: row.builder_id.clone(),
+                    started_at_unix: Some(row.started_at),
+                    log_url: row.log_url.clone(),
+                },
+            },
+        };
+        out.push(state);
+    }
+    Ok(out)
 }
 
 /// Every build running, oldest first; when `project` is given, the ones it
-/// waits on: those it started, and those its build request claims (a
-/// build another project started of the same content).
+/// waits on ([`waited_on_by`]).
 pub async fn running(pool: &PgPool, project: Option<uuid::Uuid>) -> Result<Vec<RunningBuild>> {
     sqlx::query_as(&format!(
-        "SELECT {RUNNING_COLUMNS} FROM image_build b WHERE status = 'running' AND ($1::UUID IS NULL OR b.project_id = $1 \
-             OR EXISTS (SELECT 1 FROM image_claim c WHERE c.image_ref = b.image_ref AND c.project_id = $1)) \
-         ORDER BY started_at, image_ref"
+        "SELECT {RUNNING_COLUMNS} FROM image_build b WHERE status = 'running' AND ($1::UUID IS NULL OR {}) \
+         ORDER BY started_at, image_ref",
+        waited_on_by("$1", "$2")
     ))
     .bind(project)
+    .bind(crate::lease::now_unix())
     .fetch_all(pool)
     .await
     .context("list the running builds")
@@ -539,8 +632,9 @@ pub enum Reclaim {
 /// its deletion: a build that claims it afterwards finds it gone and
 /// builds it again.
 ///
-/// Both checks are needed because a build lets go of its claim only after
-/// its registration commits (`crate::api::project::build`): a reader
+/// Both checks are needed because a build lets go of its claim only once
+/// its registration commits, or in the same transaction
+/// (`super::waiting::register_version`): a reader
 /// holding the lock sees either the live claim or the committed reference,
 /// never neither. The prune's own keep-set was read before its loop and
 /// can predate that registration, so it cannot stand in for the reference
@@ -550,10 +644,11 @@ pub async fn begin_reclaim(pool: &PgPool, image_ref: &str, now: i64) -> Result<R
         .with_context(|| format!("{image_ref} is not an image a prune may reclaim"))?;
     let mut tx = pool.begin().await.context("begin reclaiming an image")?;
     lock_image(&mut tx, image_ref).await?;
-    let claimed: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM image_claim WHERE image_ref = $1 AND holder_until >= $2) \
+    let claimed: bool = sqlx::query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM image_claim c WHERE c.image_ref = $1 AND {}) \
              OR EXISTS (SELECT 1 FROM image_build WHERE image_ref = $1 AND status = 'running')",
-    )
+        claim_live("c", "$2")
+    ))
     .bind(image_ref)
     .bind(now)
     .fetch_one(&mut *tx)
@@ -618,10 +713,11 @@ pub async fn drop_claim(pool: &PgPool, claim: uuid::Uuid) -> Result<()> {
     Ok(())
 }
 
-/// Clear the claims whose holder stopped renewing them (its dispatcher is
-/// gone): they protect nothing any more.
+/// Clear the claims no longer live ([`claim_live`]: their holder stopped
+/// renewing them, its dispatcher gone, and no waiting version keeps them):
+/// they protect nothing any more.
 pub async fn drop_lapsed_claims(pool: &PgPool, now: i64) -> Result<()> {
-    sqlx::query("DELETE FROM image_claim WHERE holder_until < $1")
+    sqlx::query(&format!("DELETE FROM image_claim c WHERE NOT {}", claim_live("c", "$1")))
         .bind(now)
         .execute(pool)
         .await

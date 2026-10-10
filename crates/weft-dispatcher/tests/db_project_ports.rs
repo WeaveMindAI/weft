@@ -16,7 +16,7 @@ async fn project(projects: &weft_dispatcher::ProjectStore) -> Uuid {
     let id = Uuid::new_v4();
     let definition: ProjectDefinition = serde_json::from_value(json!({ "id": id, "nodes": [], "edges": [] })).unwrap();
     projects
-        .register_with_hashes(definition, "ports-rig", "", "tenant-1", Some("bin-A"), Some("def-1"), None, None, None, None)
+        .register_with_hashes(definition, "ports-rig", "", "tenant-1", Some("bin-A"), Some("def-1"), None, None, None, None, None)
         .await
         .expect("register project");
     id

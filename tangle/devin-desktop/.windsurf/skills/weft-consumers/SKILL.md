@@ -65,7 +65,7 @@ any kind: they list, fire, skip, cancel and link the same way whatever the
 |---|---|
 | `GET /signal-token/signals` | the [signal]s this [api token] may see and that render a consumer payload, one [entry] each (shape below) |
 | `POST /signal/{signal token}` | fire one [signal] with a JSON body: answer a question, start a trigger's run, deliver a webhook's payload. No bearer: the [signal token] is the credential |
-| `POST /signal/{signal token}/skip` | fire it with no payload: a parked question resumes unanswered (the node's outputs close and downstream skips). No bearer, same rule as firing |
+| `POST /signal/{signal token}/skip` | decline a question a waiting run asked: the step that asked ends skipped, its outputs close and what reads them skips. Refused (409) on a trigger's [signal], which asks nothing. No bearer, same rule as firing |
 | `GET /signal-token/signals/{signal token}/files/{field}` | a fresh link for a stored file a [signal]'s field shows, good for an hour. You ask every time you render and never store the link |
 
 Two more, for a [consumer] that manages [signal]s:

@@ -254,7 +254,10 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         .route("/projects/{id}/frontends/{name}/token/{token}", axum::routing::delete(crate::frontends::drop_token))
         .route("/projects", get(project::list).post(project::declare))
         // Build one version inside the install and register it: the one
-        // way a project's program and images come to exist.
+        // way a project's program and images come to exist. Answers at
+        // once with the version build waiting on the image builds it
+        // started (202) when images were missing; the install registers
+        // it when they end, and the caller follows it below.
         .route("/projects/{id}/builds", post(project::build))
         .route("/projects/{id}", get(project::get).delete(project::remove))
         // The version tree: checkpoint, the run that records itself
@@ -270,7 +273,7 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         .route("/projects/{id}/trigger-bakes", get(versions::trigger_bakes))
         .route("/projects/{id}/versions/{version}", axum::routing::delete(versions::prune))
         .route("/projects/{id}/status", get(project::status))
-        .route("/projects/{id}/builds/{build}", get(project::build_state))
+        .route("/projects/{id}/builds/{build}", get(project::version_build))
         // The connections the program's own access nodes use on this
         // install, never written in the source.
         .route("/projects/{id}/picks", get(picks::list).put(picks::change))
@@ -286,8 +289,8 @@ fn core_routes(cors: CorsLayer, state: DispatcherState) -> Router<DispatcherStat
         // TriggerSetup execution, CASes status to Inactive.
         .route("/projects/{id}/cancel-activate", post(project::cancel_activate))
         // Cancel an in-flight build (transition=building). CASes the
-        // transition to cancelling_build (the durable cross-process signal
-        // the build gate polls) + interrupts the local builder job.
+        // transition to cancelling_build and stops the project's image
+        // builds.
         .route("/projects/{id}/cancel-build", post(project::cancel_build))
         .route("/projects/{id}/deactivate", post(project::deactivate))
         .route("/projects/{id}/quiesce", post(project::quiesce))
@@ -566,6 +569,39 @@ pub fn router(state: DispatcherState, cors: CorsLayer) -> Router {
 pub fn outside_router(state: DispatcherState) -> Router {
     let hops = TrustedHops(state.edge.trusted_proxy_hops.outside);
     with_hops(outside_caller_routes(state.clone()), hops).with_state(state)
+}
+
+/// Whether `e` failed because the database is out of reach for now
+/// (`weft_task_store::db::unreachable`), anywhere in its chain.
+pub(crate) fn database_unreachable(e: &anyhow::Error) -> bool {
+    e.chain().filter_map(|cause| cause.downcast_ref::<sqlx::Error>()).any(weft_task_store::db::unreachable)
+}
+
+/// The answer to a read that failed doing `what`: a 503 the caller asks
+/// again on when the database is out of reach ([`database_unreachable`]),
+/// a 500 naming the failure otherwise, which asking again would not fix.
+pub(crate) fn unavailable_or_internal(what: &str, e: anyhow::Error) -> (axum::http::StatusCode, String) {
+    if database_unreachable(&e) {
+        tracing::warn!(target: "weft_dispatcher::api", error = %format!("{e:#}"), "could not {what}: the database is out of reach");
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, format!("the install could not {what} right now; try again shortly"));
+    }
+    tracing::error!(target: "weft_dispatcher::api", error = %format!("{e:#}"), "could not {what}");
+    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("could not {what}: {e:#}"))
+}
+
+#[cfg(test)]
+mod unavailable_tests {
+    use axum::http::StatusCode;
+
+    #[test]
+    fn only_an_unreachable_database_asks_the_caller_again() {
+        let pool_gone = anyhow::Error::from(sqlx::Error::PoolTimedOut).context("read the build");
+        assert_eq!(super::unavailable_or_internal("read the build", pool_gone).0, StatusCode::SERVICE_UNAVAILABLE);
+        let undecodable = anyhow::anyhow!("a version build state the ledger does not know: 'odd'");
+        assert_eq!(super::unavailable_or_internal("read the build", undecodable).0, StatusCode::INTERNAL_SERVER_ERROR);
+        let bad_row = anyhow::Error::from(sqlx::Error::RowNotFound);
+        assert_eq!(super::unavailable_or_internal("read the build", bad_row).0, StatusCode::INTERNAL_SERVER_ERROR);
+    }
 }
 
 #[cfg(test)]

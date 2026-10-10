@@ -18,7 +18,7 @@ pub mod traits;
 pub mod unrecorded;
 
 pub use events::{redacted, ExecEvent, Seed};
-pub use fold::{fold_to_snapshot, FiringView, Fold, FoldEffects};
+pub use fold::{fold_to_snapshot, EndedWait, FiringView, Fold, FoldEffects};
 pub use seed::{fold_seeded, seed_chain, LiveFold, SeedChain};
 pub use traits::{BatchError, JournalClient, JournalRow, NoopJournal, Position, RecordClient};
 

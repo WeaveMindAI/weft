@@ -225,7 +225,10 @@
         /// An answer to the wait `token`, as the install parks one for the
         /// run's worker to take.
         pub(crate) fn answer(&self, token: impl Into<String>, value: Value) {
-            self.waiting.lock().unwrap().push(weft_broker_client::protocol::RunAnswer { token: token.into(), value });
+            self.waiting.lock().unwrap().push(weft_broker_client::protocol::RunAnswer {
+                token: token.into(),
+                answer: weft_core::primitive::WaitAnswer::Given { value },
+            });
             self.came.notify_waiters();
         }
     }

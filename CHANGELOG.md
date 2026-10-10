@@ -3,7 +3,80 @@
 What changed between versions of weft that you need to know about when you
 update. To update, pull and run `./setup.sh` again.
 
-## Unreleased: weft no longer needs Kubernetes
+## Unreleased
+
+**Five instance nodes lost "Instance" from their names.**
+
+`StartInstanceInfra`, `StopInstanceInfra`, `TerminateInstanceInfra`,
+`ActivateInstanceTriggers` and `DeactivateInstanceTriggers` are now
+`StartInfra`, `StopInfra`, `TerminateInfra`, `ActivateTriggers` and
+`DeactivateTriggers`. Rename them in your `.weft` files. Their `instance`
+input is now optional: if you leave it unwired, the node acts on the
+program's own copies, the ones every instance shares.
+
+**GmailSend can send from another address.**
+
+The new optional `from` input sends from one of the account's "Send mail as"
+addresses set up in Gmail; any other address fails naming the ones that work.
+To read that list, the Google connection needs "Read mail" or "Organize mail"
+ticked. Replies are unchanged: they need one of those two or "Read mail
+headers".
+
+**A program built before this version needs one rebuild.**
+
+How a waiting step receives its answer changed, so a worker built before this
+version fails when a waiting step gets its answer. Resync each program once:
+`weft resync` if its triggers are on, `weft build` otherwise. Either one
+builds the worker again on this version of weft and moves the program to it.
+
+**Skipping a question ends the step that asked it.**
+
+When a person skips a waiting question (Skip in the browser extension, or
+`POST /signal/{token}/skip`), the step that asked now ends skipped: its
+outputs close and the steps reading them skip too. It used to answer the
+question with null, so if your program reads a null answer as "skipped", it
+now sees the step skipped instead. Skipping a trigger is refused with a `409`;
+it used to fire the trigger.
+
+**A Google connection can hold Gmail alone.**
+
+The connect check now asks Google who the account is, through two permissions
+every connection asks for ("Know who you are" and "See your email address"),
+instead of reading Drive. So a connection with only Gmail, or only Calendar,
+ticked now passes. If you run your own shared Google app, its `covers` does
+not need to list those two.
+
+**Node authors: inputs can be required only when wired.**
+
+`requiredWhenWired: true` on an input means: left unwired, the node runs
+without it; wired, a wire that delivers nothing skips the node. It is for an
+input whose absence means something, like the instance nodes' `instance`.
+
+**Builds no longer hold one request open.**
+
+`weft build`, `run`, `activate`, `resync` and `infra start` used to keep one
+request open to the install for the whole build. The install now answers as
+soon as the builds start, and the CLI follows each one to its end. If a cloud
+install does not answer, the error names that install instead of telling you
+to start the local daemon. Update the VS Code extension too: it needs this
+version.
+
+**A route's limits can overshoot briefly after a quiet spell.**
+
+When a worker copy wakes after a quiet spell, its first calls are decided on
+what it heard before it went quiet, until weft's broker answers it: under a
+second normally, a few seconds when the broker was asleep too. During that
+window, copies waking at the same moment can each let in up to the full
+`callsAtOnce`. We chose this so the first call after a pause never waits for
+the broker to start.
+
+**The editor's activate button names the triggers that are off.**
+
+When some triggers are off while the others run, the second button now says
+which ones ("Reactivate a, b" or "Reactivate a, b and 3 more") instead of
+"Reactivate the rest".
+
+## 2026-10-09 (extension 0.2.266): weft no longer needs Kubernetes
 
 **Breaking: your run history does not come along.**
 

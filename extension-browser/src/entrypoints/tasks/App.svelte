@@ -344,15 +344,16 @@
     }
   }
 
-  /// Skip = resume this lane with null. Sibling tasks of the
-  /// same run keep going. No confirmation: low blast radius.
+  /// Skip = decline the question: the step that asked ends skipped,
+  /// its outputs close and what reads them skips. Sibling tasks of
+  /// the same run keep going. No confirmation: low blast radius.
   async function handleSkip() {
     const t = currentTask;
     if (!t) return;
     if (isTrigger(t)) {
-      // "Skipping" a trigger would FIRE it (a null answer starts a
-      // run); the button is hidden for triggers, and this guard keeps
-      // any other path equally unable to do it by accident.
+      // A trigger has no question to skip (weft refuses it with a
+      // 409); the button is hidden for triggers, and this guard says
+      // so before the request instead of after it.
       error = 'A trigger has no run to skip; use Fire to start one.';
       return;
     }
@@ -688,15 +689,15 @@
                     {/if}
                   </button>
                   <!-- Skip and Cancel-run act on an IN-FLIGHT run,
-                       which a trigger does not have: "skipping" a
-                       trigger would fire it (starting a run) and
+                       which a trigger does not have: a trigger has no
+                       question to skip (weft refuses it) and
                        "cancelling" it would delete the project's
                        entry point. Same gate as the popup's. -->
                   {#if !isTrigger(currentTask)}
                     <button
                       class="btn btn-secondary"
                       onclick={handleSkip}
-                      title="Skip: answer this task with null. The rest of the run continues."
+                      title="Skip: the step that asked ends skipped, and what reads its answer skips too. The rest of the run continues."
                     >
                       Skip
                     </button>

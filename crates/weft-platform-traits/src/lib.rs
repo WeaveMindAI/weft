@@ -46,7 +46,7 @@ pub use identity::{CallerIdentity, FixedToken, IdentityRefused, IdentityTokens, 
 pub use domains::DomainHosting;
 pub use frontends::{FrontendHosting, FrontendSite, HostedFrontend};
 pub use holder_pool::HolderPool;
-pub use images::{BuildHandle, BuildRequest, BuildStatus, ImageBuilder, ImageDeleted};
+pub use images::{BuildHandle, BuildRequest, BuildStatus, ImageBuilder, ImageDeleted, Staging};
 pub use infra_host::{EndpointAt, InfraHost, UnitObservation, UnitRunState};
 pub use object_store::{
     object_store_for, ObjectEntry, ObjectStore, ObjectStoreConfig, PresignAudience,

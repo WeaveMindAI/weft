@@ -987,6 +987,10 @@ pub async fn begin_oauth(
     };
     let client_id = registration.client_id.clone();
 
+    // The ticked permissions, with what the service asks for always (what
+    // its test call reads the account by): a grant is checked against
+    // the whole of it once it lands.
+    let requested = spec.requested_permissions(&req.permissions);
     let state = uuid::Uuid::new_v4().simple().to_string();
     let verifier = pkce.then(|| {
         format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple())
@@ -1001,9 +1005,9 @@ pub async fn begin_oauth(
         q.append_pair("client_id", &client_id);
         q.append_pair("redirect_uri", redirect_uri);
         q.append_pair("state", &state);
-        if !req.permissions.is_empty() {
+        if !requested.is_empty() {
             let delim = scope_delimiter.as_deref().unwrap_or(" ");
-            q.append_pair("scope", &req.permissions.join(delim));
+            q.append_pair("scope", &requested.join(delim));
         }
         for (k, v) in auth_params {
             q.append_pair(k, v);
@@ -1028,7 +1032,7 @@ pub async fn begin_oauth(
     .bind(crate::seal_json(&serde_json::to_value(registration)?)?)
     .bind(req.project_id)
     .bind(serde_json::to_value(spec)?)
-    .bind(serde_json::to_value(&req.permissions)?)
+    .bind(serde_json::to_value(&requested)?)
     .bind(verifier.as_deref().map(crate::seal_str))
     .bind(door_str(req.door))
     .bind(req.upgrade_grant_id)

@@ -35,6 +35,20 @@ describe('parseStatusPayload', () => {
     expect(snap.preservation).toEqual({ parked: 2, suspended: 1 });
   });
 
+  it('names the program\'s own triggers that are off, never an instance\'s', () => {
+    const snap = parseStatusPayload({
+      status: 'active',
+      activations: [
+        { trigger: 'gmail.watch', status: 'inactive' },
+        { trigger: 'daily', status: 'active' },
+        { trigger: 'fresh', status: 'registered' },
+        { trigger: 'gmail.watch', instance: 'ada', status: 'inactive' },
+      ],
+    });
+    expect(snap.triggersOff).toEqual(['gmail.watch', 'fresh']);
+    expect(parseStatusPayload({}).triggersOff).toEqual([]);
+  });
+
   it('collapses unknown enum strings to their resting value (version skew, no crash)', () => {
     const snap = parseStatusPayload({
       status: 'some-future-status',

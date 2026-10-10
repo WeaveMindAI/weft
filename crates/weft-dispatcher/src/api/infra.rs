@@ -154,13 +154,19 @@ pub(crate) fn resolve_infra_nodes(
             (true, None) => {
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    format!("infra node '{node}' exists once per instance; name whose copy with --instance <id>"),
+                    format!(
+                        "infra node '{node}' exists once per instance; name the instance whose copy to act on \
+                         (`--instance <id>` on a command, the `instance` input on a node)"
+                    ),
                 ));
             }
             (false, Some(m)) => {
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    format!("infra node '{node}' is shared by every instance, so there is no copy of it for '{m}'; leave --instance out"),
+                    format!(
+                        "infra node '{node}' is shared by every instance, so there is no copy of it for '{m}'; name no \
+                         instance (leave out `--instance` on a command, leave the `instance` input unwired on a node)"
+                    ),
                 ));
             }
             _ => {

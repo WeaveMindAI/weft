@@ -297,7 +297,7 @@ out = Debug
 out.data = svc.status
 
 up = Route -> (instance: String) { path: "__E2E_PATH__/up", method: "POST" }
-start = StartInstanceInfra { node: "svc" }
+start = StartInfra { node: "svc" }
 start.instance = up.instance
 upReply = Reply
 upReply.body = start.done
@@ -334,7 +334,7 @@ wipeReply.body = gone.done
         }
     };
 
-    // `StartInstanceInfra` answers once the copy runs. Ada's copy is the
+    // `StartInfra` answers once the copy runs. Ada's copy is the
     // program's first, so the project's workers move next to it: the run
     // asking is on the worker being replaced, and its setup lands on the
     // new one while it waits, so the wait ends instead of holding the

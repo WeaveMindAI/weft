@@ -44,6 +44,10 @@ export interface Permission {
   label: string;
   description: string;
   default?: boolean;
+  /** Asked for on every consent, whatever is ticked, and never shown to
+   *  tick: what the service's test call needs to learn who the account
+   *  is. */
+  always?: boolean;
   /** This capability creates or reads things INSIDE the credential's
    *  own account, so a runtime-supplied (shared) credential can never
    *  serve it; the editor greys the shared option and resolution
@@ -400,6 +404,11 @@ export interface PortDefinition {
 export interface InputDefinition extends PortDefinition {
   // SYNC: InputDefinition.accepts <-> crates/weft-core/src/project.rs InputDefinition.accepts
   accepts?: Accepts;
+  /// Optional while unwired, required once wired: a wire into it that
+  /// arrives closed skips the node. Its wiring decides, so the editor
+  /// draws it required only while a wire feeds it.
+  // SYNC: InputDefinition.requiredWhenWired <-> crates/weft-core/src/project.rs InputDefinition.required_when_wired
+  requiredWhenWired?: boolean;
   // SYNC: InputDefinition.widget <-> crates/weft-core/src/project.rs InputDefinition.widget
   widget?: Widget;
   default?: unknown;

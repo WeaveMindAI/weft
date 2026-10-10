@@ -18,7 +18,7 @@ async fn project(pool: &PgPool) -> Uuid {
     let id = Uuid::new_v4();
     let definition = serde_json::from_value(serde_json::json!({ "id": id, "nodes": [], "edges": [] })).expect("a definition");
     store
-        .register_with_hashes(definition, "p", "", "tenant-1", Some("bin"), Some("def"), None, None, None, None)
+        .register_with_hashes(definition, "p", "", "tenant-1", Some("bin"), Some("def"), None, None, None, None, None)
         .await
         .expect("register");
     id

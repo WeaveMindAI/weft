@@ -962,6 +962,12 @@ export function activate(context: vscode.ExtensionContext) {
     return err instanceof WeftCliError && err.daemonUnreachable;
   }
 
+  /// A remote install (`--on <target>`) did not answer: nothing here
+  /// starts it, so it gets its own banner, never the daemon's.
+  function isRemoteUnreachable(err: unknown): err is WeftCliError {
+    return err instanceof WeftCliError && err.installUnreachable && !err.daemonUnreachable;
+  }
+
   interface StatusResult {
     snapshot: import('../../packages/weft-graph/src/protocol').ActionAvailability;
     /// Every execution running right now, per the dispatcher. The
@@ -1002,7 +1008,8 @@ export function activate(context: vscode.ExtensionContext) {
       // not running or was never installed on this machine. Every verb
       // will fail the same way, so the bar keeps its buttons and says
       // what is wrong above them instead of quietly looking like a
-      // project nobody has registered.
+      // project nobody has registered. A remote install that does not
+      // answer is said the same way, without the daemon's advice.
       if (isDaemonUnreachable(err)) {
         actionBar.setError(
           projectId,
@@ -1019,6 +1026,23 @@ export function activate(context: vscode.ExtensionContext) {
                   'Start it with `weft daemon start`. If this machine only has the editor ' +
                   'extension, install the daemon first: the install guide in the weft docs ' +
                   'walks through it.',
+              },
+            ],
+          },
+        );
+      } else if (isRemoteUnreachable(err)) {
+        actionBar.setError(
+          projectId,
+          'status',
+          'The install this project targets is not answering, so nothing here can run.',
+          {
+            what: 'Reading the project status',
+            stage: 'dispatch',
+            diagnostics: [
+              {
+                severity: 'error',
+                message: err.stderr.trim() || 'Nothing answered at the install.',
+                hint: 'Check the network, then try again.',
               },
             ],
           },

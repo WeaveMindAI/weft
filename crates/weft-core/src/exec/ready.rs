@@ -272,12 +272,7 @@ pub fn find_ready_among<'a>(
         for ((execution_id, frames), group_pulses) in groups {
             let out_of_scope = dispatchable.is_some_and(|s| !s.contains(&Located::at(&node.id, &frames)));
             let wired = wired_inputs(project, program_idx, &node.id, &frames);
-            let required: HashSet<&str> = node
-                .inputs
-                .iter()
-                .filter(|p| p.required && program_idx.includes_port(node, &frames, &p.name))
-                .map(|p| p.name.as_str())
-                .collect();
+            let required = required_inputs(node, &wired, &frames, program_idx);
             let literal_filled = literal_filled_ports(node, &wired, &frames, program_idx);
             if let Some(group) = ready_group_at(
                 node, &group_pulses, execution_id, &frames, &required, &wired, &literal_filled, out_of_scope, project, program_idx,
@@ -397,7 +392,7 @@ pub fn kicked_group(
         // gates still decide scope_permission before this kick dispatches.
         None if kick.firing => check_flow_permission(node, &[]),
         None => check_should_skip(node, &effective_refs,
-            &node.inputs.iter().filter(|p| p.required && program_idx.includes_port(node, frames, &p.name)).map(|p| p.name.as_str()).collect(),
+            &required_inputs(node, &wired, frames, program_idx),
             &wired, &literal_filled_ports(node, &wired, frames, program_idx)),
     };
     ReadyGroup {
@@ -492,7 +487,7 @@ pub fn firing_input(
     // (see `check_input`). A mismatch on a required port aggregates
     // into `type_errors` (the node fails loudly); a mismatch on an
     // optional port nulls the port and the node proceeds.
-    let type_errors = check_bag(node, &mut obj);
+    let type_errors = check_bag(node, wired, &mut obj);
 
     let mut closed_ports: Vec<String> = wired
         .iter()
@@ -533,13 +528,13 @@ pub fn firing_input(
 /// not data: `_should_flow` takes any value and only a `false` says
 /// no (`check_flow_permission` is its one rule), so it is never held
 /// to a type here.
-fn check_bag(node: &NodeDefinition, obj: &mut InputBag) -> Vec<String> {
+fn check_bag(node: &NodeDefinition, wired: &HashSet<&str>, obj: &mut InputBag) -> Vec<String> {
     let mut errors = Vec::new();
     for port in node.inputs.iter().filter(|p| !crate::exec::skip::is_gate_port(&p.name)) {
         let Some(value) = obj.get(&port.name) else {
             continue;
         };
-        match check_input(port, value) {
+        match check_input(port, value, wired.contains(port.name.as_str())) {
             InputCheck::Ok => {}
             InputCheck::Fail(err) => {
                 tracing::error!(target: "weft::exec::ready", node = %node.id, "{err}");
@@ -606,6 +601,23 @@ pub fn fill_input_from_literals(
         }
         obj.insert(name.clone(), Arc::new(value.clone()));
     }
+}
+
+/// The inputs whose closure skips `node` at this point (rule 1 of
+/// `check_should_skip`): the required ones, and those required only once
+/// wired (`requiredWhenWired`) that a wire feeds here. Only ports the
+/// run reads count.
+pub fn required_inputs<'a>(
+    node: &'a NodeDefinition,
+    wired: &HashSet<&str>,
+    frames: &LoopFrames,
+    program_idx: &ProgramIndex,
+) -> HashSet<&'a str> {
+    node.inputs
+        .iter()
+        .filter(|p| p.is_required(wired.contains(p.name.as_str())) && program_idx.includes_port(node, frames, &p.name))
+        .map(|p| p.name.as_str())
+        .collect()
 }
 
 /// The unwired ports a written constant fills at `frames`: what keeps a
@@ -685,13 +697,13 @@ pub fn build_kicked_input(
     // poll interval of zero, a fractional one that would truncate), and
     // skipping the check here meant those rules bound nothing on the
     // one path that uses them.
-    let errors = check_bag(node, &mut obj);
+    let errors = check_bag(node, &HashSet::new(), &mut obj);
     (obj, errors)
 }
 
 /// Check one incoming value against its input port type. THE single
 /// place input type enforcement lives.
-fn check_input(port: &crate::project::InputDefinition, value: &Value) -> InputCheck {
+fn check_input(port: &crate::project::InputDefinition, value: &Value, wired: bool) -> InputCheck {
     // A generator port's pulses carry ITEMS: each value is checked
     // against the ELEMENT type, never against `Generator[T]` itself
     // (the whole-port handle only exists in the consumer's bag, built
@@ -727,8 +739,9 @@ fn check_input(port: &crate::project::InputDefinition, value: &Value) -> InputCh
     }
     // The type does not fit. A null is data only where the type admits
     // it (accepted above); on an optional port a null means "nothing
-    // arrived" and the bag fills the default.
-    if value.is_null() && !port.required {
+    // arrived" and the bag fills the default. A port required once wired
+    // is not optional when a wire delivered the null.
+    if value.is_null() && !port.is_required(wired) {
         return InputCheck::Ok;
     }
     // A wrong-typed value is upstream sending something this port
@@ -819,6 +832,68 @@ mod tests {
         assert_eq!(out.dropped.len(), 1);
     }
 
+    /// An input required only once wired: wired and closed, the node
+    /// skips as for a required input; unwired, or wired with a value,
+    /// it runs. A wired null fails it, as on a required input, instead
+    /// of reading as "nothing arrived".
+    #[test]
+    fn an_input_required_when_wired_skips_only_when_its_wire_closes() {
+        let project = |wire_instance: bool| -> ProjectDefinition {
+            let mut edges = vec![json!({ "id": "e1", "source": "src", "target": "n",
+                "sourceHandle": "data", "targetHandle": "data" })];
+            if wire_instance {
+                edges.push(json!({ "id": "e2", "source": "src", "target": "n",
+                    "sourceHandle": "id", "targetHandle": "instance" }));
+            }
+            serde_json::from_value(json!({
+                "id": "00000000-0000-0000-0000-000000000000",
+                "name": "p", "description": null,
+                "nodes": [
+                    { "id": "src", "nodeType": "S", "label": null, "config": null, "position": { "x": 0.0, "y": 0.0 },
+                      "inputs": [], "outputs": [
+                          { "name": "id", "portType": "String", "required": true },
+                          { "name": "data", "portType": "String", "required": true }],
+                      "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": [] },
+                    { "id": "n", "nodeType": "N", "label": null, "config": null, "position": { "x": 0.0, "y": 0.0 },
+                      "inputs": [
+                          { "name": "instance", "portType": "String", "required": false, "requiredWhenWired": true },
+                          { "name": "data", "portType": "String", "required": false }],
+                      "outputs": [],
+                      "features": {}, "scope": [], "groupBoundary": null, "requiresInfra": false, "images": [] }
+                ],
+                "edges": edges, "groups": [],
+                "createdAt": "1970-01-01T00:00:00Z", "updatedAt": "1970-01-01T00:00:00Z"
+            }))
+            .unwrap()
+        };
+        let execution_id = uuid::Uuid::nil();
+        let ready = |project: &ProjectDefinition, instance: Option<Pulse>| {
+            let mut table = crate::pulse::PulseTable::default();
+            let bucket = table.entry("n".into()).or_default();
+            bucket.push(data(execution_id, vec![], "n", "data", json!("d")));
+            bucket.extend(instance);
+            let index = ProgramIndex::build(project);
+            let mut found = super::find_ready_nodes(project, &table, &index, None);
+            assert_eq!(found.len(), 1, "the node's group is formed");
+            found.remove(0).1
+        };
+        let wired = project(true);
+
+        let closed = ready(&wired, Some(Pulse::closure(uuid::Uuid::new_v4(), execution_id, vec![], "n", "instance")));
+        assert_eq!(closed.skip, Some(crate::exec::skip::SkipReason::RequiredInputClosed { port: "instance".into(), failure: None }));
+
+        let given = ready(&wired, Some(data(execution_id, vec![], "n", "instance", json!("ada"))));
+        assert_eq!(given.skip, None, "a value on the wire runs the node");
+        assert!(given.received.type_errors.is_empty());
+
+        let null = ready(&wired, Some(data(execution_id, vec![], "n", "instance", json!(null))));
+        assert_eq!(null.skip, None);
+        assert_eq!(null.received.type_errors.len(), 1, "a wired null is not 'nothing arrived': {:?}", null.received.type_errors);
+
+        let unwired = ready(&project(false), None);
+        assert_eq!(unwired.skip, None, "unwired, the node runs without it");
+    }
+
     /// A firing sees only the pulses at its own frame stack: the group
     /// is formed by exact `(execution_id, frames)`, so a shallower pulse is
     /// never in its view.
@@ -880,8 +955,8 @@ mod tests {
         // gate once had its own infer-based check beside
         // `accepts_runtime_value` and failed every Named input.
         let p = port("Profile={ name: String, age: Number, nickname?: String }", true);
-        assert_eq!(check_input(&p, &json!({"name": "Ada", "age": 36})), InputCheck::Ok);
-        match check_input(&p, &json!({"name": "Ada"})) {
+        assert_eq!(check_input(&p, &json!({"name": "Ada", "age": 36}), false), InputCheck::Ok);
+        match check_input(&p, &json!({"name": "Ada"}), false) {
             InputCheck::Fail(msg) => assert!(msg.contains("Profile"), "names the type: {msg}"),
             other => panic!("missing required field must fail, got {other:?}"),
         }
@@ -889,15 +964,15 @@ mod tests {
 
     #[test]
     fn matching_value_is_ok_regardless_of_required() {
-        assert_eq!(check_input(&port("String", true), &json!("ok")), InputCheck::Ok);
-        assert_eq!(check_input(&port("String", false), &json!("ok")), InputCheck::Ok);
+        assert_eq!(check_input(&port("String", true), &json!("ok"), false), InputCheck::Ok);
+        assert_eq!(check_input(&port("String", false), &json!("ok"), false), InputCheck::Ok);
     }
 
     #[test]
     fn null_is_data_only_where_the_type_admits_it() {
-        assert_eq!(check_input(&port("String | Null", true), &json!(null)), InputCheck::Ok);
-        assert_eq!(check_input(&port("String", false), &json!(null)), InputCheck::Ok, "optional: absent");
-        match check_input(&port("String", true), &json!(null)) {
+        assert_eq!(check_input(&port("String | Null", true), &json!(null), false), InputCheck::Ok);
+        assert_eq!(check_input(&port("String", false), &json!(null), false), InputCheck::Ok, "optional: absent");
+        match check_input(&port("String", true), &json!(null), false) {
             InputCheck::Fail(msg) => assert!(msg.contains("expected String, got Null"), "{msg}"),
             other => panic!("a required String has nothing to run with on null, got {other:?}"),
         }
@@ -921,9 +996,9 @@ mod tests {
             "name": "count", "portType": "Number", "required": true,
             "widget": { "kind": "number", "min": 1, "max": 8, "step": 1 }
         })).unwrap();
-        assert_eq!(check_input(&count, &json!(3)), InputCheck::Ok);
+        assert_eq!(check_input(&count, &json!(3), false), InputCheck::Ok);
         for bad in [json!(0), json!(9), json!(2.5)] {
-            match check_input(&count, &bad) {
+            match check_input(&count, &bad, false) {
                 InputCheck::Fail(msg) => assert!(msg.contains("'count'"), "{msg}"),
                 other => panic!("{bad} must be refused by the widget, got {other:?}"),
             }
@@ -934,8 +1009,8 @@ mod tests {
             "name": "mode", "portType": "String", "required": false,
             "widget": { "kind": "select", "options": ["added", "removed", "both"] }
         })).unwrap();
-        assert_eq!(check_input(&mode, &json!("both")), InputCheck::Ok);
-        match check_input(&mode, &json!("sideways")) {
+        assert_eq!(check_input(&mode, &json!("both"), false), InputCheck::Ok);
+        match check_input(&mode, &json!("sideways"), false) {
             InputCheck::Fail(msg) => assert!(msg.contains("'mode'") && msg.contains("'added'"), "{msg}"),
             other => panic!("a value outside the options must be refused, got {other:?}"),
         }
@@ -950,23 +1025,23 @@ mod tests {
             "name": "n", "portType": "Number", "required": true,
             "widget": { "kind": "number", "min": 1, "step": 2 }
         })).unwrap();
-        assert_eq!(check_input(&every_two, &json!(3)), InputCheck::Ok);
-        assert_eq!(check_input(&every_two, &json!(4)), InputCheck::Ok);
-        assert!(matches!(check_input(&every_two, &json!(2.5)), InputCheck::Fail(_)));
+        assert_eq!(check_input(&every_two, &json!(3), false), InputCheck::Ok);
+        assert_eq!(check_input(&every_two, &json!(4), false), InputCheck::Ok);
+        assert!(matches!(check_input(&every_two, &json!(2.5), false), InputCheck::Fail(_)));
         let tenths: InputDefinition = serde_json::from_value(json!({
             "name": "temperature", "portType": "Number", "required": false,
             "widget": { "kind": "number", "min": 0, "max": 2, "step": 0.1 }
         })).unwrap();
         for fine in [json!(0.85), json!(1.0), json!(0.07)] {
-            assert_eq!(check_input(&tenths, &fine), InputCheck::Ok, "{fine}");
+            assert_eq!(check_input(&tenths, &fine, false), InputCheck::Ok, "{fine}");
         }
-        assert!(matches!(check_input(&tenths, &json!(2.5)), InputCheck::Fail(_)), "the range still binds");
+        assert!(matches!(check_input(&tenths, &json!(2.5), false), InputCheck::Fail(_)), "the range still binds");
     }
 
     #[test]
     fn mismatch_on_required_fails() {
         let p = port("String", true);
-        match check_input(&p, &json!(42)) {
+        match check_input(&p, &json!(42), false) {
             InputCheck::Fail(msg) => assert!(msg.contains("expected")),
             other => panic!("expected Fail, got {other:?}"),
         }
@@ -977,11 +1052,11 @@ mod tests {
     /// bug on any port, and the firing fails.
     #[test]
     fn mismatch_on_optional_fails_too() {
-        match check_input(&port("String", false), &json!(42)) {
+        match check_input(&port("String", false), &json!(42), false) {
             InputCheck::Fail(msg) => assert!(msg.contains("type mismatch"), "{msg}"),
             other => panic!("expected Fail, got {other:?}"),
         }
-        assert_eq!(check_input(&port("String", false), &json!(null)), InputCheck::Ok, "a null on an optional port is nothing arrived");
+        assert_eq!(check_input(&port("String", false), &json!(null), false), InputCheck::Ok, "a null on an optional port is nothing arrived");
     }
 
     /// A required nullable port used to swallow a wrong-typed value as
@@ -989,12 +1064,12 @@ mod tests {
     /// "arrived wrong". Only an OPTIONAL port drops a value.
     #[test]
     fn a_wrong_type_on_a_required_nullable_port_fails() {
-        match check_input(&port("String | Null", true), &json!(42)) {
+        match check_input(&port("String | Null", true), &json!(42), false) {
             InputCheck::Fail(msg) => assert!(msg.contains("type mismatch"), "{msg}"),
             other => panic!("expected Fail, got {other:?}"),
         }
         // A null itself is still data there.
-        assert_eq!(check_input(&port("String | Null", true), &json!(null)), InputCheck::Ok);
+        assert_eq!(check_input(&port("String | Null", true), &json!(null), false), InputCheck::Ok);
     }
 
     /// A connection picked in the source is a stored handle until the
@@ -1008,7 +1083,7 @@ mod tests {
             "widget": { "kind": "access", "service": "slack" }
         })).unwrap();
         let handle = json!({ "id": "11111111-1111-1111-1111-111111111111", "identity": "someone" });
-        assert_eq!(check_input(&account, &handle), InputCheck::Ok);
+        assert_eq!(check_input(&account, &handle, false), InputCheck::Ok);
         // A resource pick is stored the same way, on a port typed for
         // the id the node ends up reading.
         let sheet: InputDefinition = serde_json::from_value(json!({
@@ -1016,12 +1091,12 @@ mod tests {
             "widget": { "kind": "remote_select", "access": "account", "sources": [] }
         })).unwrap();
         assert_eq!(
-            check_input(&sheet, &json!({ "id": "1AbC", "label": "Budget" })),
+            check_input(&sheet, &json!({ "id": "1AbC", "label": "Budget" }), false),
             InputCheck::Ok
         );
         // A pasted raw id is the port's own type and still checked.
-        assert_eq!(check_input(&sheet, &json!("1AbC")), InputCheck::Ok);
-        assert!(matches!(check_input(&sheet, &json!(7)), InputCheck::Fail(_)));
+        assert_eq!(check_input(&sheet, &json!("1AbC"), false), InputCheck::Ok);
+        assert!(matches!(check_input(&sheet, &json!(7), false), InputCheck::Fail(_)));
         let node = kicked_node("SlackAccess", vec![account], json!({ "account": handle.clone() }));
         let (input, refusals) = build_kicked_input(&node, None);
         assert!(refusals.is_empty(), "{refusals:?}");

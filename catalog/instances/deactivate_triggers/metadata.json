@@ -1,0 +1,178 @@
+{
+  "type": "DeactivateTriggers",
+  "label": "Deactivate triggers",
+  "description": "Turn off triggers (park, hibernate or wipe): the program's own, or with `instance` that instance's per-instance triggers, with `running` deciding what happens to the runs they fired that are still going.",
+  "tags": [
+    "instances",
+    "triggers",
+    "deactivate"
+  ],
+  "icon": "ZapOff",
+  "color": "#0ea5e9",
+  "inputs": [
+    {
+      "name": "instance",
+      "type": "String",
+      "requiredWhenWired": true,
+      "description": "Whose triggers: an instance id your program gives it (`user-42`), for that instance's per-instance triggers. Unwired: the program's own triggers, the ones shared by every instance. Wired, and no id arrives (the step feeding it did not run): this node skips."
+    },
+    {
+      "name": "only",
+      "type": "List[String]",
+      "description": "Only these triggers, named as the program writes them. Unwired: all of them (every shared trigger, or every per-instance trigger of the instance)."
+    },
+    {
+      "name": "triggers",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "park",
+          "hibernate",
+          "wipe"
+        ]
+      },
+      "default": "park",
+      "label": "Triggers",
+      "description": "Park keeps everything that arrives (answers, events, the trigger's own fires) and runs it once the trigger is back, while a caller on a route is told to try again in a moment; hibernate does the same for `graceMinutes` with its questions hidden, then takes nothing more; wipe drops it all."
+    },
+    {
+      "name": "running",
+      "type": "String",
+      "widget": {
+        "kind": "select",
+        "options": [
+          "wait",
+          "cancel"
+        ]
+      },
+      "default": "wait",
+      "label": "Running work",
+      "description": "The runs they fired that are still going: wait lets them finish, cancel stops them. `wipe` needs cancel."
+    },
+    {
+      "name": "graceMinutes",
+      "type": "Number",
+      "default": 15,
+      "label": "Grace minutes",
+      "description": "Hibernate only: how long it keeps accepting.",
+      "widget": {
+        "kind": "number",
+        "min": 0,
+        "step": 1
+      }
+    },
+    {
+      "name": "includeSelf",
+      "type": "Boolean",
+      "default": false,
+      "label": "Stop this run too",
+      "description": "On: this run is cancelled too when it is one of the runs reached."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "done",
+      "type": "Boolean",
+      "description": "True once the triggers are down; under `running: wait` their runs may still be finishing."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_satisfied",
+            "port": "instance"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_names",
+              "port": "only",
+              "names": {
+                "node": {
+                  "role": "trigger",
+                  "per_instance": true
+                }
+              }
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "DeactivateTriggers '{id}' names {names} in `only`, which is no per-instance trigger of this program. It is given an `instance`, so it acts on that instance's triggers: name each the way the program writes it (`inbox`, `work.inbox` inside a group, or `one.inbox` inside an included file), or leave `instance` unwired to act on the program's own triggers.",
+        "level": "structural",
+        "severity": "error",
+        "port": "only"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "instance"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_names",
+              "port": "only",
+              "names": {
+                "node": {
+                  "role": "trigger",
+                  "per_instance": false
+                }
+              }
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "DeactivateTriggers '{id}' names {names} in `only`, which is no shared trigger of this program. It has no `instance`, so it acts on the program's own triggers: name each the way the program writes it (`inbox`, `work.inbox` inside a group, or `one.inbox` inside an included file), or wire `instance` to act on an instance's per-instance triggers.",
+        "level": "structural",
+        "severity": "error",
+        "port": "only"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_equals",
+            "field": "triggers",
+            "equals": "wipe"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_equals",
+              "field": "running",
+              "equals": "cancel"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_wired",
+              "port": "running"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "DeactivateTriggers '{id}' wipes the triggers but lets running work finish. Wiping drops what the runs still need, so set `running` to cancel, or pick park or hibernate for `triggers`.",
+        "level": "structural",
+        "severity": "error",
+        "field": "running"
+      }
+    }
+  ]
+}

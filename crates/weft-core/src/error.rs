@@ -31,6 +31,14 @@ pub enum WeftError {
     #[error("{0}")]
     WaitGaveUp(String),
 
+    /// A person skipped what the waiting `ctx` call waited on (a form's
+    /// skip): the step does not run on, it ends skipped with every output
+    /// closed, the way a step whose input closed does. Returned by the
+    /// waiting call, so a body passing errors on with `?` needs no code
+    /// of its own for it.
+    #[error("{0}")]
+    WaitSkipped(String),
+
     #[error("cancelled")]
     Cancelled,
 

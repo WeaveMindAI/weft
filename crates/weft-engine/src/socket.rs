@@ -219,7 +219,7 @@ impl SocketDial for ConnectionSocketDial {
         Ok(ProviderSocket::new(Box::new(MeteredSocket {
             stream,
             finalizer: observation
-                .map(|observer| SessionFinalizer { observer, sink: self.sink.clone() }),
+                .map(|observer| SessionFinalizer { observer, held: self.sink.pending.hold(), sink: self.sink.clone() }),
         })))
     }
 }
@@ -238,6 +238,9 @@ struct MeteredSocket {
 struct SessionFinalizer {
     observer: Box<dyn SessionObservation>,
     sink: Arc<CostSink>,
+    /// The session's pending token, taken when it opened: a session held
+    /// past its node's return keeps the run's ending waiting for its figure.
+    held: weft_core::in_flight::InFlightToken,
 }
 
 impl SessionFinalizer {
@@ -247,7 +250,7 @@ impl SessionFinalizer {
     /// the whole measurement, so the cost is handed over ready).
     fn finish(self, interrupted: bool) {
         let cost = self.observer.end(interrupted);
-        self.sink.book(std::future::ready(cost));
+        self.sink.book(self.held, std::future::ready(cost));
     }
 }
 
@@ -548,6 +551,7 @@ mod tests {
             frames: weft_core::frames::LoopFrames::default(),
             service: "bytesvc".into(),
             origin: weft_core::CredentialOwner::Author,
+            cancellation: weft_core::cancellation::CancellationFlag::new_arc(),
         })
     }
 

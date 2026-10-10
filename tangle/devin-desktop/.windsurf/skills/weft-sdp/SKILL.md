@@ -263,13 +263,30 @@ output evidence together.
 
 ## Read outside interactions
 
-A [frozen example] records human questions and answers and incoming caller
-messages for inspection; the runtime does not replay them on its own. When
-a run waits on a person, you compare the current question with the
-recorded question and answer, answer the current token within the user's
-authority, and keep inspecting that same run. For live connections, you
-send the recorded messages through a new connection and review the new
-responses.
+A [frozen example] records how each wait of the run ended, with the
+question the node showed, and the incoming caller messages, for inspection;
+the runtime does not replay them on its own. When a run waits on a person,
+you compare the current question with the recorded one, end the wait the
+way the recorded entry says within the user's authority, and keep
+inspecting that same run. Each entry holds exactly one of these:
+
+- `payload`: the value the person answered with. Answer the current token
+  with it.
+- `"skipped": true`: the person skipped the question. Skip it the same way,
+  `POST /signal/{token}/skip`.
+- `gave_up`: nobody answered. The run could not pause, held the wait in its
+  worker until nothing had moved for its hold time, and gave the wait up;
+  the text is the error the waiting step failed with. Leave the current
+  one unanswered, so the new run gives up the same way when its own hold
+  runs out.
+
+The entries cover every wait that ended, including timers and nodes that
+poll a job, not only questions to a person. You answer only the waits that
+ask a person: timers and polls run on their own, and answering one by hand
+would cut a real wait short.
+
+For live connections, you send the recorded messages through a new
+connection and review the new responses.
 
 `weft wake <execution-id> <node>` resolves a pure time wait. A wait requiring a
 value must receive that value instead. Logs and inherited markers identify

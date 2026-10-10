@@ -124,7 +124,16 @@ pub enum DispatcherEvent {
         at_unix: u64,
     },
     NodeSuspended { execution_id: ExecutionId, node: String, frames: LoopFrames, token: String, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<ExecutionId>, project_id: uuid::Uuid, at_unix: u64 },
-    NodeResumed { execution_id: ExecutionId, node: String, frames: LoopFrames, token: Option<String>, value: Option<serde_json::Value>, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<ExecutionId>, project_id: uuid::Uuid, at_unix: u64 },
+    /// `token`: the wait the firing resumed from, `None` for a resume no
+    /// wait drove (a boundary fired again). How that wait ended is its
+    /// [`Self::WaitEnded`].
+    NodeResumed { execution_id: ExecutionId, node: String, frames: LoopFrames, token: Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<ExecutionId>, project_id: uuid::Uuid, at_unix: u64 },
+    /// A wait of the firing at `node` and `frames` ended, the first ending
+    /// on record: its answer, a person skipping it, or the run giving it
+    /// up. Its own event because a wait the run holds in its worker never
+    /// suspends or resumes the firing, so `NodeSuspended` and `NodeResumed`
+    /// see only the waits that paused the run.
+    WaitEnded { execution_id: ExecutionId, node: String, frames: LoopFrames, token: String, ended: crate::primitive::AwaitEnd, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<ExecutionId>, project_id: uuid::Uuid, at_unix: u64 },
     NodeCancelled { execution_id: ExecutionId, node: String, frames: LoopFrames, reason: String, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<ExecutionId>, project_id: uuid::Uuid, at_unix: u64 },
     NodeCompleted { execution_id: ExecutionId, node: String, frames: LoopFrames, output: serde_json::Value, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<ExecutionId>, project_id: uuid::Uuid, at_unix: u64 },
     NodeFailed { execution_id: ExecutionId, node: String, frames: LoopFrames, error: String, #[serde(default, skip_serializing_if = "Option::is_none")] inherited_from: Option<ExecutionId>, project_id: uuid::Uuid, at_unix: u64 },
@@ -376,6 +385,7 @@ impl DispatcherEvent {
             | Self::NodeStarted { project_id, .. }
             | Self::NodeSuspended { project_id, .. }
             | Self::NodeResumed { project_id, .. }
+            | Self::WaitEnded { project_id, .. }
             | Self::NodeCancelled { project_id, .. }
             | Self::NodeCompleted { project_id, .. }
             | Self::NodeFailed { project_id, .. }
@@ -418,6 +428,7 @@ impl DispatcherEvent {
             Self::NodeStarted { frames, .. }
             | Self::NodeSuspended { frames, .. }
             | Self::NodeResumed { frames, .. }
+            | Self::WaitEnded { frames, .. }
             | Self::NodeCancelled { frames, .. }
             | Self::NodeCompleted { frames, .. }
             | Self::NodeFailed { frames, .. }
@@ -477,6 +488,7 @@ impl DispatcherEvent {
             | Self::NodeStarted { execution_id, .. }
             | Self::NodeSuspended { execution_id, .. }
             | Self::NodeResumed { execution_id, .. }
+            | Self::WaitEnded { execution_id, .. }
             | Self::NodeCancelled { execution_id, .. }
             | Self::NodeCompleted { execution_id, .. }
             | Self::NodeFailed { execution_id, .. }

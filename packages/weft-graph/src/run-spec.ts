@@ -149,12 +149,23 @@ export function parseRunSpec(value: unknown): RunSpec {
     if (fire.length !== 2) throw new Error('fire: expected [trigger, payload]');
     string(fire[0], 'fire trigger');
   }
+  // SYNC: answer refusals <-> crates/weft-core/src/run_spec.rs Answer TryFrom<AnswerFile>
   if (spec.answers !== undefined) for (const value of array(spec.answers, 'answers')) {
     const answer = object(value, 'answer');
-    fields(answer, ['node', 'frames', 'payload', 'question'], 'answer');
+    fields(answer, ['node', 'frames', 'payload', 'skipped', 'gave_up', 'question'], 'answer');
     string(answer.node, 'answer node');
     frames(answer.frames, 'answer frames');
-    if (!('payload' in answer)) throw new Error('answer: missing payload');
+    if (answer.skipped !== undefined && typeof answer.skipped !== 'boolean') throw new Error('answer: skipped must be true or false');
+    // A null `gave_up` is left out, as the Rust side reads it.
+    if (answer.gave_up != null) string(answer.gave_up, 'answer gave_up');
+    // `payload: null` is a given null: only an absent payload is none.
+    const said = [
+      ...('payload' in answer ? ['a payload'] : []),
+      ...(answer.skipped === true ? ['"skipped": true'] : []),
+      ...(answer.gave_up != null ? ['"gave_up"'] : []),
+    ];
+    if (said.length > 1) throw new Error(`the answer to '${answer.node}' says its wait ended more than one way (${said.join(' and ')}); a wait ends once, so keep only one`);
+    if (said.length === 0) throw new Error(`the answer to '${answer.node}' says nothing about how its wait ended; give the value the person answered ("payload"), "skipped": true if they skipped it, or "gave_up" with the error if the run gave it up`);
   }
   if (spec.caller !== undefined) array(spec.caller, 'caller');
   if (spec.frozen_from != null) {
@@ -196,12 +207,20 @@ export function parseRunSpec(value: unknown): RunSpec {
   return normalized as unknown as RunSpec;
 }
 
-export interface Answer {
+/** How one wait ended, as a frozen example holds it: the value the person
+ *  gave as `payload` (`null` included), `skipped: true` for a person
+ *  skipping it, or `gave_up` with the error the waiting step failed with
+ *  when the run gave the wait up. Exactly one of the three. */
+// SYNC: Answer <-> crates/weft-core/src/run_spec.rs Answer
+export type Answer = {
   node: string;
   frames?: Array<{ index: number }>;
-  payload: JsonValue;
   question?: JsonValue;
-}
+} & (
+  | { payload: JsonValue; skipped?: false; gave_up?: never }
+  | { skipped: true; payload?: never; gave_up?: never }
+  | { gave_up: string; payload?: never; skipped?: false }
+);
 
 export interface FrozenFrom {
   version: string;

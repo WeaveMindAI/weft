@@ -17,7 +17,13 @@
       "requiresScopes": [
         "https://www.googleapis.com/auth/gmail.send"
       ],
-      "description": "Needs send-mail; a reply also needs read-headers to thread onto the original."
+      "description": "Needs Send mail. Sending from another address also needs Read mail or Organize mail; replying to a message needs one of those or Read mail headers. Without them the node fails before sending, naming what to tick."
+    },
+    {
+      "name": "from",
+      "type": "String",
+      "label": "From",
+      "description": "Send from this address instead of the account's own; it must be one of the account's Send mail as addresses set up in Gmail, and anything else fails naming the allowed ones. An address other than the account's own needs Read mail or Organize mail on the connection, to read that list."
     },
     {
       "name": "to",
@@ -56,7 +62,7 @@
       "name": "replyTo",
       "type": "String",
       "label": "Reply to message id",
-      "description": "Gmail message id to reply to in its thread (as a Gmail trigger or Get emits)."
+      "description": "Gmail message id to reply to in its thread (as a Gmail trigger or Get emits). Needs Read mail, Organize mail or Read mail headers on the connection, to read the original's headers."
     },
     {
       "name": "attachments",

@@ -41,6 +41,7 @@ describe('skipReasonText', () => {
 			'every input of the group (a, b) closed',
 		],
 		[{ kind: 'scope_skipped', scope: 'triage' }, "the scope 'triage' it lives in did not run"],
+		[{ kind: 'wait_skipped' }, 'a person skipped what it was waiting for'],
 	];
 
 	it.each(cases)('renders %j', (reason, expected) => {

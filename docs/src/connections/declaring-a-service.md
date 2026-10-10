@@ -19,7 +19,7 @@ weft::access_node!(SlackAccessNode);
 | `acquisition` | **required** | How a credential is obtained |
 | `auth` | `[]` | How a request through it is signed. Empty for something that signs nothing, like a database |
 | `doors` | `["own"]` | Which connect doors to offer |
-| `test` | none | A call made at connect time to check it works, and where identity usually comes from |
+| `test` | none | A call made at connect time to check it works, and where identity usually comes from. Whatever permission it needs must be granted on every connection (see `always` below) |
 | `identity` | none | The display name, assembled from stored values, like `"{team} / {user}"` |
 | `permissions` | `[]` | The permission catalogue people tick from |
 | `all_permissions_url` | none | Where the provider's full list is, when yours is a subset |
@@ -83,6 +83,17 @@ of scopes, list the ones your nodes actually need and point
 `default: true` starts it ticked. `own_only: true` means the runtime's own
 credential can never serve it, which greys out the shared option for anyone who
 ticks it.
+
+If your `test` call needs a permission of its own to learn who the account is,
+mark that permission `always: true`. It is then asked for on every connection,
+whatever the person ticks, and never shown to tick. Google does this with
+`openid` and `userinfo.email`, so a connection made for Gmail alone still
+passes its check against Google's "who is this" endpoint. Without it, a test
+call that reads Drive fails every connection that did not tick Drive. Only
+mark a permission `always` when the provider grants it without a review and an
+app allows it without being set up for it, because every app and every
+connection asks for it. An `always` permission cannot also be `default` or
+`own_only`.
 
 ## Verification
 

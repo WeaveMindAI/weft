@@ -302,8 +302,8 @@ pub struct BuildInFlight {
     pub log_url: Option<String>,
 }
 
-/// Where one image build of a project is: going on, or how it ended
-/// (`GET /projects/{id}/builds/{build}`, `build` the builder's id).
+/// Where one image build is: going on, or how it ended
+/// ([`crate::builds::ImageBuildState`]).
 // SYNC: BuildState <-> crates/weft-dispatcher/src/build/ledger.rs (image_build.status)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -314,11 +314,23 @@ pub enum BuildState {
     Cancelled,
 }
 
-/// The answer to `GET /projects/{id}/builds/{build}`: `None` when no such
-/// build of the project is on record.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Everything a caller following one image build is told about it.
+/// `state` is `None` when that build is no longer on record (a cleanup
+/// forgot its image, or another build of the same image replaced it).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildStateResponse {
     pub state: Option<BuildState>,
+    /// Why it failed, once it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The builder's own id for it, once the builder made it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
+    #[serde(default, rename = "startedAtUnix", skip_serializing_if = "Option::is_none")]
+    pub started_at_unix: Option<i64>,
+    /// Where its log is read, when the builder keeps one at an address.
+    #[serde(default, rename = "logUrl", skip_serializing_if = "Option::is_none")]
+    pub log_url: Option<String>,
 }
 
 /// One trigger's runs in the last minute or two (`ProjectStatusResponse::runs`).

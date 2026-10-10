@@ -1,0 +1,105 @@
+{
+  "type": "StartInfra",
+  "label": "Start infra",
+  "description": "Bring up a copy of an infra node: the program's own, or with `instance` that instance's copy of a `@per_instance` node. `done` fires once it answers, so the triggers reading it can be activated next. The run waits without holding a worker; a copy that fails to come up fails the node with the reason; an already-running copy is left as is. If you want to answer a caller fast (a route replying 202), turn `waitUntilRunning` off and reply after this node: it finishes as soon as weft accepts the start, and a status read right after shows the copy as `provisioning`.",
+  "tags": [
+    "instances",
+    "infra",
+    "start"
+  ],
+  "icon": "Play",
+  "color": "#0ea5e9",
+  "inputs": [
+    {
+      "name": "node",
+      "type": "String",
+      "required": true,
+      "description": "The infra node, named as the program writes it (`bridge`, `work.bridge` inside a group, or `one.bridge` inside an included file): a shared one when `instance` is unwired, one marked `@per_instance` when it is set."
+    },
+    {
+      "name": "instance",
+      "type": "String",
+      "requiredWhenWired": true,
+      "description": "Whose copy: an instance id your program gives it (`user-42`), for that instance's copy of a `@per_instance` node. Unwired: the program's own copy. Wired, and no id arrives (the step feeding it did not run): this node skips."
+    },
+    {
+      "name": "waitUntilRunning",
+      "type": "Boolean",
+      "default": true,
+      "label": "Wait until running",
+      "description": "On: `done` fires once the copy runs, and a copy that fails to come up fails the node. Off: `done` fires once weft accepts the start (a start refused for a passing reason, such as a build in progress, is asked again until it is), and whether the copy then comes up is for a status read to tell."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "done",
+      "type": "Boolean",
+      "description": "True once the copy is running, or once weft accepted the start when `waitUntilRunning` is off."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "input_satisfied",
+            "port": "instance"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_names",
+              "port": "node",
+              "names": {
+                "node": {
+                  "role": "infra",
+                  "per_instance": true
+                }
+              }
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "StartInfra '{id}' names {names} in `node`, which is no infra node of this program marked `@per_instance`. It is given an `instance`, so it acts on that instance's copy: name one the way the program writes it (`bridge`, `work.bridge` inside a group, or `one.bridge` inside an included file), or leave `instance` unwired to act on the program's own copy of a shared one.",
+        "level": "structural",
+        "severity": "error",
+        "port": "node"
+      }
+    },
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_satisfied",
+              "port": "instance"
+            }
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "input_names",
+              "port": "node",
+              "names": {
+                "node": {
+                  "role": "infra",
+                  "per_instance": false
+                }
+              }
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "StartInfra '{id}' names {names} in `node`, which is no shared infra node of this program. It has no `instance`, so it acts on the program's own copy: name one the way the program writes it (`bridge`, `work.bridge` inside a group, or `one.bridge` inside an included file), or wire `instance` to act on an instance's copy of a `@per_instance` one.",
+        "level": "structural",
+        "severity": "error",
+        "port": "node"
+      }
+    }
+  ]
+}

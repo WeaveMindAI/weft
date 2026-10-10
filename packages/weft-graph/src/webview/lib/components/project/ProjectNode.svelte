@@ -1918,12 +1918,14 @@
 			     live in the body as fields, never on the edge rail) -->
 			<div class="space-y-1 min-w-0 flex-1">
 				{#each wireableInputs as input}
-					{@const pMarker = portMarkerStyle(input, oneOfRequiredPorts, literalFilledPorts, getPortColor(input.portType), 'input')}
+					{@const pMarker = portMarkerStyle(input, oneOfRequiredPorts, literalFilledPorts, getPortColor(input.portType), 'input', '', wiredInputPorts.has(input.name))}
 					{@const inputDeleteAction = portDeleteAction(input, providedInputs, canAddInputPorts)}
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div
 						class="relative flex items-center gap-1 group pl-3"
-						title={!input.required && oneOfRequiredPorts.has(input.name) ? `At least one required: ${oneOfRequiredGroups.filter(g => g.includes(input.name)).map(g => g.join(' or ')).join('; ')}` : input.name}
+						title={input.requiredWhenWired
+							? `${input.name}: required when wired (if its wire delivers nothing, this node skips); optional while unwired`
+							: !input.required && oneOfRequiredPorts.has(input.name) ? `At least one required: ${oneOfRequiredGroups.filter(g => g.includes(input.name)).map(g => g.join(' or ')).join('; ')}` : input.name}
 						oncontextmenu={(e) => {
 							e.preventDefault();
 							e.stopPropagation();

@@ -225,17 +225,21 @@ weft never starts an instance's container by itself: the program does, or the
 user with `--instance` on the infra verbs. A container runs from images that
 `weft activate` builds and records for every node marked `@per_instance`, so
 activate the program before it starts any container; without that, the start
-fails naming `weft activate`. The instance nodes read the names of infra
-nodes and triggers you write in them at compile time (a name that is not an
-infra node, or not per instance, is refused then); a name arriving on a wire
-is checked only when the run reaches it.
+fails naming `weft activate`. `StartInfra`, `StopInfra`, `TerminateInfra`,
+`ActivateTriggers` and `DeactivateTriggers` act on the instance you give
+them in `instance`; left unwired, they act on the program's own copies (the
+shared container of a node not marked `@per_instance`, the shared triggers).
+The instance nodes read the names of infra nodes and triggers you write in
+them at compile time (a name that is not an infra node, or not the kind the
+`instance` input calls for, is refused then); a name arriving on a wire is
+checked only when the run reaches it.
 
 Creating an instance, from a gated route the backend calls:
 `MintInstanceToken` (if a browser will act inside it), then, if the program
-has a per-instance infra node, `StartInstanceInfra` with `waitUntilRunning`
+has a per-instance infra node, `StartInfra` with `waitUntilRunning`
 off (it fires `done` as soon as weft accepts the start), then `Reply` with the
-token so the request ends at once, then a second `StartInstanceInfra` left on
-(it fires `done` once the container runs), then `ActivateInstanceTriggers`.
+token so the request ends at once, then a second `StartInfra` left on
+(it fires `done` once the container runs), then `ActivateTriggers`.
 Never put the `Reply` before the first start: a caller that lists the
 instance's containers right after the answer would find nothing yet, while a
 start weft accepted already reads `provisioning`. A container can take minutes to come up, so the
@@ -254,8 +258,8 @@ every container it ever started keeps running and costing. The shape:
 1. every run for an instance writes a last-used time for it in the program's
    own database (one row per instance id);
 2. a `Cron` in the program reads the instances idle past a limit and stops
-   them (`StopInstanceInfra`, which keeps the disks) or removes them
-   (`TerminateInstanceInfra`, or `WipeInstance` for everything);
+   them (`StopInfra`, which keeps the disks) or removes them
+   (`TerminateInfra`, or `WipeInstance` for everything);
 3. the limit is the user's choice: ask them how long an idle instance lives
    before it is stopped, and whether it is then deleted, before you write it.
 
@@ -309,7 +313,7 @@ instance's triggers right after it. If the container never comes up,
 `start()` fails with the reason, and so it does if somebody stops the
 container while it waits (it never starts it again behind a pause).
 `request_start()` returns as soon as weft accepts the start, without waiting
-for the container (`StartInstanceInfra` with `waitUntilRunning` off); a start
+for the container (`StartInfra` with `waitUntilRunning` off); a start
 refused for a passing reason, such as a build in progress, is asked again
 until it is accepted. Every
 reader of a container's state (`weft status`, `weft infra status`,
@@ -347,7 +351,7 @@ started as `not started`), each instance's container under `instance infra:`,
 and each instance's triggers under `triggers:`, with the events a trigger
 holds for a missing field. A plain `weft activate` turns on the shared
 triggers and names the per-instance ones it left off; `weft activate
---instance <id>` (or `ActivateInstanceTriggers`) turns those on. `weft
+--instance <id>` (or `ActivateTriggers` given the instance) turns those on. `weft
 executions --instance <id>` lists an instance's runs. To try the per-instance
 path yourself, start a container (`weft infra start --instance test-1`), turn
 on its triggers (`weft activate --instance test-1`), and run with `--instance

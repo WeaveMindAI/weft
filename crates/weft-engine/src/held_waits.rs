@@ -24,7 +24,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
-use serde_json::Value;
+use weft_core::primitive::WaitAnswer;
 use tokio::sync::Notify;
 
 use weft_core::liveness::{wait_on, FiringLocation, WaitLiveness, WaitSource};
@@ -87,7 +87,8 @@ pub(crate) fn gave_up_because(why: Unsuspendable, hold_secs: u32) -> String {
 /// How a held wait ended.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum HeldEnd {
-    Answered(Value),
+    /// Its answer: a value, or a person skipping it.
+    Answered(WaitAnswer),
     /// Given up, and why.
     GaveUp(String),
     /// The run can pause now: the wait suspends.
@@ -112,7 +113,7 @@ struct HeldState {
     /// on it and is about to read as suspended (`Self::early_for` hands
     /// those to the drive's resume). Kept by token until one of those
     /// takes it.
-    early: HashMap<String, Value>,
+    early: HashMap<String, WaitAnswer>,
     /// Waits given up: an answer that comes for one after is dropped.
     given_up: HashSet<String>,
     /// Monotone generation of endings, for [`WaitSource`].
@@ -160,7 +161,7 @@ impl HeldWaits {
     /// The answer to the wait `token`, taken by the drive: to the call
     /// holding it, else kept for whoever takes it next (see `early`). One
     /// for a wait given up is dropped.
-    pub(crate) fn answer(&self, token: &str, value: Value) {
+    pub(crate) fn answer(&self, token: &str, value: WaitAnswer) {
         let mut state = self.lock();
         if state.given_up.contains(token) {
             return;
@@ -182,7 +183,7 @@ impl HeldWaits {
 
     /// The answers kept for waits that turned out to be suspended steps
     /// (their tokens in `suspended`), for the drive to resume them with.
-    pub(crate) fn early_for(&self, suspended: &HashSet<&str>) -> Vec<(String, Value)> {
+    pub(crate) fn early_for(&self, suspended: &HashSet<&str>) -> Vec<(String, WaitAnswer)> {
         let mut state = self.lock();
         let tokens: Vec<String> = state.early.keys().filter(|token| suspended.contains(token.as_str())).cloned().collect();
         tokens.into_iter().filter_map(|token| state.early.remove(&token).map(|value| (token, value))).collect()
@@ -267,6 +268,10 @@ impl WaitSource for HeldWaits {
 mod tests {
     use super::*;
 
+    fn given(value: serde_json::Value) -> WaitAnswer {
+        WaitAnswer::Given { value }
+    }
+
     fn here() -> FiringLocation {
         FiringLocation::new("form", Vec::new())
     }
@@ -282,8 +287,8 @@ mod tests {
     async fn an_answer_ends_its_wait_even_when_it_came_first() {
         let (_tracker, weak) = liveness();
         let held = HeldWaits::new();
-        held.answer("early", serde_json::json!(1));
-        assert_eq!(held.hold(&weak, here(), "early").await, HeldEnd::Answered(serde_json::json!(1)));
+        held.answer("early", given(serde_json::json!(1)));
+        assert_eq!(held.hold(&weak, here(), "early").await, HeldEnd::Answered(given(serde_json::json!(1))));
         let waiting = tokio::spawn({
             let held = held.clone();
             async move { held.hold(&weak, here(), "late").await }
@@ -291,8 +296,8 @@ mod tests {
         while !held.pending() {
             tokio::task::yield_now().await;
         }
-        held.answer("late", serde_json::json!(2));
-        assert_eq!(waiting.await.unwrap(), HeldEnd::Answered(serde_json::json!(2)));
+        held.answer("late", given(serde_json::json!(2)));
+        assert_eq!(waiting.await.unwrap(), HeldEnd::Answered(given(serde_json::json!(2))));
         assert!(!held.pending());
     }
 
@@ -310,7 +315,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(held.give_up("nothing moved"), 1);
-        held.answer("t", serde_json::json!("late"));
+        held.answer("t", given(serde_json::json!("late")));
         assert_eq!(waiting.await.unwrap(), HeldEnd::GaveUp("nothing moved".into()));
         {
             let state = held.lock();
@@ -325,12 +330,12 @@ mod tests {
     #[test]
     fn an_early_answer_waits_for_its_step() {
         let held = HeldWaits::new();
-        held.answer("suspends", serde_json::json!(1));
-        held.answer("zero", serde_json::json!(2));
+        held.answer("suspends", given(serde_json::json!(1)));
+        held.answer("zero", given(serde_json::json!(2)));
         held.gave_up("zero");
         assert!(held.early_for(&HashSet::from(["other"])).is_empty());
-        assert_eq!(held.early_for(&HashSet::from(["suspends", "zero"])), vec![("suspends".to_string(), serde_json::json!(1))]);
-        held.answer("zero", serde_json::json!(3));
+        assert_eq!(held.early_for(&HashSet::from(["suspends", "zero"])), vec![("suspends".to_string(), given(serde_json::json!(1)))]);
+        held.answer("zero", given(serde_json::json!(3)));
         assert!(held.lock().early.is_empty(), "a wait given up takes no answer");
     }
 
@@ -348,9 +353,9 @@ mod tests {
             tokio::task::yield_now().await;
         }
         held.pause();
-        held.answer("t", serde_json::json!("yes"));
+        held.answer("t", given(serde_json::json!("yes")));
         assert_eq!(waiting.await.unwrap(), HeldEnd::Pause);
-        assert_eq!(held.early_for(&HashSet::from(["t"])), vec![("t".to_string(), serde_json::json!("yes"))]);
+        assert_eq!(held.early_for(&HashSet::from(["t"])), vec![("t".to_string(), given(serde_json::json!("yes")))]);
     }
 
     /// A held wait is parked to the run's tracker: a run whose only step

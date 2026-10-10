@@ -212,7 +212,7 @@ async fn hand_answer(
             weft_task_store::parked_fires::remove_in(&mut tx, head).await?;
             None
         }
-        weft_core::arrival::Arrival::Live => match crate::journal::postgres::answer_in(&mut tx, &head.token, &head.waiting.payload, crate::journal::postgres::AnswerFrom::Queue).await? {
+        weft_core::arrival::Arrival::Live => match crate::journal::postgres::answer_in(&mut tx, &head.token, &head.waiting.answer(), crate::journal::postgres::AnswerFrom::Queue).await? {
             // The wait's signal went, and its queue with it.
             crate::journal::Answered::Reached { consumed } | crate::journal::Answered::RunEnded { consumed } => Some(consumed),
             crate::journal::Answered::Gone => {

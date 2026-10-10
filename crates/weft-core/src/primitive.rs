@@ -298,12 +298,11 @@ pub struct ExecutionSnapshot {
     /// the engine has consumed the kick (the node started at that
     /// location; further kicks at the same location are a no-op).
     pub kicked: HashMap<crate::frames::FiringLocation, KickedNode>,
-    /// Fires that arrived for live suspensions but haven't been
-    /// consumed by a worker's node completion yet. The worker
-    /// seeds these into its link on startup so every waiting node
-    /// finds its value when re-dispatched. Survives worker restarts
-    /// because it's derived from journal events, not slot queues.
-    pub pending_deliveries: HashMap<String, Value>,
+    /// Wait endings on record before their wait's registration (an
+    /// answer the dispatcher wrote while nobody drove the run): the
+    /// registration takes its ending from here, so the two rows fold the
+    /// same in either order.
+    pub pending_deliveries: HashMap<String, AwaitEnd>,
     /// Per-(node, frames) ordered sequence of past `await_signal`
     /// calls. Each entry has the call_index (0-based ordinal of
     /// the call within the body), the token, and either the
@@ -428,6 +427,7 @@ pub enum AwaitedEntryKind {
 
 /// How a past `ctx.await_signal` ended. The first ending on record
 /// stands: an answer that comes after a wait was given up is ignored.
+// SYNC: AwaitEnd <-> extension-vscode/src/execFollower.ts AwaitEnd
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AwaitEnd {
@@ -436,6 +436,34 @@ pub enum AwaitEnd {
     /// The run held it in its worker and gave it up
     /// (`SuspensionGaveUp`): the call failed with `error`.
     GaveUp { error: String },
+    /// A person skipped it (`SuspensionSkipped`): the call ends its step
+    /// skipped ([`crate::error::WeftError::WaitSkipped`]).
+    Skipped,
+}
+
+/// What answers a wait: a value, or a person skipping it (the `/skip`
+/// door). One type from the door to the waiting call, so a skip is never
+/// spelled as a value a real answer could also be.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WaitAnswer {
+    Given { value: Value },
+    Skipped,
+}
+
+impl WaitAnswer {
+    /// How the wait it answers ends.
+    pub fn end(&self) -> AwaitEnd {
+        match self {
+            Self::Given { value } => AwaitEnd::Answered { value: value.clone() },
+            Self::Skipped => AwaitEnd::Skipped,
+        }
+    }
+}
+
+/// The error a waiting call returns when a person skipped it.
+pub fn wait_skipped() -> crate::error::WeftError {
+    crate::error::WeftError::WaitSkipped("a person skipped what this step was waiting for".into())
 }
 
 /// What a body's `ctx.await_signal` finds in its journal at its call
@@ -474,6 +502,7 @@ pub fn replay_await(
         AwaitedEntryKind::Await { token, ended } => match ended {
             Some(AwaitEnd::Answered { value }) => Ok(Some(ReplayedAwait::Resolved(value))),
             Some(AwaitEnd::GaveUp { error }) => Err(crate::error::WeftError::WaitGaveUp(error)),
+            Some(AwaitEnd::Skipped) => Err(wait_skipped()),
             None => Ok(Some(ReplayedAwait::Pending { token })),
         },
         AwaitedEntryKind::Run { name, .. } => Err(crate::error::WeftError::NodeExecution(format!(

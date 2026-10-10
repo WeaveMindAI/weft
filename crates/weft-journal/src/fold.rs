@@ -55,6 +55,15 @@ use weft_core::ExecutionId;
 
 use crate::events::ExecEvent;
 
+/// A wait that ended: the firing that waited, the wait's token, and how
+/// it ended.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EndedWait {
+    pub at: FiringLocation,
+    pub token: String,
+    pub end: AwaitEnd,
+}
+
 /// What one applied row put in the world, beyond the snapshot: the
 /// live bridge turns these into the events the editor paints.
 #[derive(Default)]
@@ -65,9 +74,10 @@ pub struct FoldEffects {
     pub emissions: Vec<PulseEmission>,
     /// The group boundaries this row made ready, fired in order.
     pub boundaries: Vec<BoundaryDispatch>,
-    /// On a `NodeResumed` that resumed a suspension: the value the
-    /// fire delivered (read before the delivery is cleared).
-    pub resumed_value: Option<Value>,
+    /// The wait this row ended, the first ending on record: an answer, a
+    /// skip or a give-up row for a registered wait, or the registration
+    /// of a wait whose ending was already on record.
+    pub wait_ended: Option<EndedWait>,
     /// On a `LoopOutFired`: the body's `done` vote as the firing read
     /// it.
     pub loop_out_done: Option<Option<bool>>,
@@ -580,7 +590,6 @@ impl Fold {
                 // re-fired after a refold has no token to remove.
                 if let Some(t) = token {
                     self.snap.suspensions.remove(t);
-                    effects.resumed_value = self.snap.pending_deliveries.remove(t);
                 }
             }
             ExecEvent::NodeCompleted { node_id, frames, at_unix, .. } => {
@@ -765,16 +774,21 @@ impl Fold {
                 // (written while nobody drives the run), so nothing orders
                 // the two, and an answer can be on record first. If the
                 // resolution already landed, `pending_deliveries` holds its
-                // value; stamp it now so the entry is born resolved.
+                // value; stamp it now so the entry is born resolved, and
+                // this row is the one that ended the wait.
                 // Without this, the SuspensionResolved arm found no entry to
                 // mark (not registered yet), the entry lands `ended:
                 // None`, and the await never resumes (permanent hang, fire
                 // consumed). Making the fold order-insensitive for the
                 // Registered/Resolved pair is the right invariant.
-                let ended = self.snap.pending_deliveries.get(token).map(|value| AwaitEnd::Answered { value: value.clone() });
+                let ended = self.snap.pending_deliveries.remove(token);
+                let at = FiringLocation::new(node_id.clone(), frames.clone());
+                if let Some(end) = &ended {
+                    effects.wait_ended = Some(EndedWait { at: at.clone(), token: token.clone(), end: end.clone() });
+                }
                 self.snap
                     .awaited_sequences
-                    .entry(FiringLocation::new(node_id.clone(), frames.clone()))
+                    .entry(at)
                     .or_default()
                     .push(AwaitedEntry {
                         call_index: *call_index,
@@ -792,18 +806,13 @@ impl Fold {
                     });
             }
             ExecEvent::SuspensionResolved { token, value, .. } => {
-                // An answer to a wait already given up is ignored: the
-                // call it would have answered failed, and stays failed.
-                // One that comes before its registration waits in
-                // `pending_deliveries`, and there too the first one stands.
-                if self.end_await(token, AwaitEnd::Answered { value: value.clone() }) {
-                    self.snap.pending_deliveries.entry(token.clone()).or_insert_with(|| value.clone());
-                }
+                effects.wait_ended = self.end_await(token, AwaitEnd::Answered { value: value.clone() });
             }
+            ExecEvent::SuspensionSkipped { token, .. } => effects.wait_ended = self.end_await(token, AwaitEnd::Skipped),
             // Written by the worker that held the wait, after its
             // `SuspensionRegistered`, so the entry is always there.
             ExecEvent::SuspensionGaveUp { token, error, .. } => {
-                self.end_await(token, AwaitEnd::GaveUp { error: error.clone() });
+                effects.wait_ended = self.end_await(token, AwaitEnd::GaveUp { error: error.clone() });
             }
             // A metered call's cost record: the cost of a firing belongs on
             // its execution record. A record may already be terminal when
@@ -1147,9 +1156,12 @@ impl Fold {
         let Some(record_id) = self.firing_record_id(node_id, frames, CorruptionSite::NodeLifecycle, ev) else {
             return;
         };
-        // A skip is the whole group's consumption: whatever was left
-        // pending for its feeds (a stream's items) goes with it.
-        if status == NodeExecutionStatus::Skipped {
+        // A skip decided before the body ran is the whole group's
+        // consumption: whatever was left pending for its feeds (a
+        // stream's items) goes with it. A body that ran and ended
+        // skipped (a person skipped what it waited for) ends like one that
+        // completed: what arrived meanwhile stays for the next firing.
+        if status == NodeExecutionStatus::Skipped && skip_reason != Some(&SkipReason::WaitSkipped) {
             let more = self.absorb_pending(node_id, frames, true);
             if let Some(e) = self.record_mut(node_id, record_id) {
                 for id in more {
@@ -1263,25 +1275,30 @@ impl Fold {
         }
     }
 
-    /// End the wait `token` with `end`, unless it already ended: the first
-    /// ending on record stands. False when it had, so the caller drops
-    /// what it was about to apply; true too for a wait not registered yet
-    /// (an answer may land before its registration).
-    fn end_await(&mut self, token: &str, end: AwaitEnd) -> bool {
-        for entries in self.snap.awaited_sequences.values_mut() {
+    /// End the wait `token` with `end`, unless it already ended: the
+    /// first ending on record stands, so an answer to a wait already given
+    /// up is ignored (the call it would have answered failed, and stays
+    /// failed). Answers the wait it ended, `None` when it had already
+    /// ended or is not registered yet. An ending that comes before its
+    /// registration (an answer the dispatcher wrote while nobody drove the
+    /// run) waits in `pending_deliveries`, and there too the first one
+    /// stands.
+    fn end_await(&mut self, token: &str, end: AwaitEnd) -> Option<EndedWait> {
+        for (at, entries) in self.snap.awaited_sequences.iter_mut() {
             for entry in entries.iter_mut() {
                 if let AwaitedEntryKind::Await { token: t, ended } = &mut entry.kind {
                     if t == token {
                         if ended.is_some() {
-                            return false;
+                            return None;
                         }
-                        *ended = Some(end);
-                        return true;
+                        *ended = Some(end.clone());
+                        return Some(EndedWait { at: at.clone(), token: token.to_string(), end });
                     }
                 }
             }
         }
-        true
+        self.snap.pending_deliveries.entry(token.to_string()).or_insert(end);
+        None
     }
 
     /// The record a row about `(node, frames)` is about: the same
@@ -2490,8 +2507,8 @@ mod tests {
     }
 
     /// Suspend, resolve, resume, complete: one record the whole way,
-    /// the resume clears the suspension and hands the value to the
-    /// bridge.
+    /// the answer ends the wait for the bridge, and the resume clears the
+    /// suspension.
     #[test]
     fn lifecycle_one_record_per_frames() {
         let token = "tok-1".to_string();
@@ -2515,12 +2532,9 @@ mod tests {
             completed("a", vec![], 0),
         ];
         let mut fold = Fold::new(execution_id(), fan_out_project());
-        let mut resumed = None;
+        let mut ended = Vec::new();
         for ev in &events {
-            let effects = fold.apply(ev);
-            if let Some(v) = effects.resumed_value {
-                resumed = Some(v);
-            }
+            ended.extend(fold.apply(ev).wait_ended);
         }
         let snap = fold.into_snapshot();
         assert!(snap.corruptions.is_empty(), "{:?}", snap.corruptions);
@@ -2529,7 +2543,7 @@ mod tests {
         assert_eq!(execs[0].status, NodeExecutionStatus::Completed);
         assert!(snap.suspensions.is_empty(), "suspensions cleared after resume+complete");
         assert!(snap.pending_deliveries.is_empty());
-        assert_eq!(resumed, Some(json!("approved")));
+        assert_eq!(ended, vec![EndedWait { at: FiringLocation::new("a", vec![]), token, end: AwaitEnd::Answered { value: json!("approved") } }], "the answer ends the wait, once");
         let seq = &snap.awaited_sequences[&FiringLocation::new("a", vec![])];
         assert!(matches!(&seq[0].kind, AwaitedEntryKind::Await { ended: Some(AwaitEnd::Answered { value }), .. } if value == &json!("approved")));
     }
@@ -2625,7 +2639,7 @@ mod tests {
 
     #[test]
     fn suspension_resolved_before_registered_still_resolves() {
-        let events = vec![
+        let events = [
             ExecEvent::SuspensionResolved { execution_id: execution_id(), token: "t".into(), value: json!(5), at_unix: 0 },
             ExecEvent::SuspensionRegistered {
                 execution_id: execution_id(),
@@ -2637,16 +2651,21 @@ mod tests {
                 at_unix: 0,
             },
         ];
-        let snap = fold_to_snapshot(execution_id(), fan_out_project(), &events);
+        let mut fold = Fold::new(execution_id(), fan_out_project());
+        let ended: Vec<Option<EndedWait>> = events.iter().map(|ev| fold.apply(ev).wait_ended).collect();
+        assert_eq!(ended, vec![None, Some(EndedWait { at: FiringLocation::new("a", vec![]), token: "t".into(), end: AwaitEnd::Answered { value: json!(5) } })],
+            "an answer on record before its wait ends the wait at the registration");
+        let snap = fold.into_snapshot();
         let seq = &snap.awaited_sequences[&FiringLocation::new("a", vec![])];
         assert!(matches!(&seq[0].kind, AwaitedEntryKind::Await { ended: Some(AwaitEnd::Answered { value }), .. } if value == &json!(5)));
+        assert!(snap.pending_deliveries.is_empty(), "the registration took the answer");
     }
 
     /// A wait given up stays given up: the answer that comes after it is
     /// ignored, so a replay fails the call the way it failed live.
     #[test]
     fn an_answer_after_a_wait_was_given_up_is_ignored() {
-        let events = vec![
+        let events = [
             ExecEvent::SuspensionRegistered {
                 execution_id: execution_id(),
                 node_id: "a".into(),
@@ -2659,7 +2678,11 @@ mod tests {
             ExecEvent::SuspensionGaveUp { execution_id: execution_id(), token: "t".into(), error: "gave up".into(), at_unix: 0 },
             ExecEvent::SuspensionResolved { execution_id: execution_id(), token: "t".into(), value: json!(5), at_unix: 0 },
         ];
-        let snap = fold_to_snapshot(execution_id(), fan_out_project(), &events);
+        let mut fold = Fold::new(execution_id(), fan_out_project());
+        let ended: Vec<Option<EndedWait>> = events.iter().map(|ev| fold.apply(ev).wait_ended).collect();
+        assert_eq!(ended, vec![None, Some(EndedWait { at: FiringLocation::new("a", vec![]), token: "t".into(), end: AwaitEnd::GaveUp { error: "gave up".into() } }), None],
+            "the give-up ends the wait; the late answer ends nothing");
+        let snap = fold.into_snapshot();
         let seq = &snap.awaited_sequences[&FiringLocation::new("a", vec![])];
         assert!(matches!(&seq[0].kind, AwaitedEntryKind::Await { ended: Some(AwaitEnd::GaveUp { error }), .. } if error == "gave up"));
         assert!(snap.pending_deliveries.is_empty(), "nothing is left to deliver");

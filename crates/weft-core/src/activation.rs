@@ -130,13 +130,15 @@ impl ActivationScope {
                 match (&owner, per_instance) {
                     (Owner::Shared, true) => {
                         return Err(format!(
-                            "trigger '{trigger}' exists once per instance; name which with --instance <id>"
+                            "trigger '{trigger}' exists once per instance; name the instance (`--instance <id>` on a command, \
+                             the `instance` input on a node)"
                         ));
                     }
                     (Owner::Instance(instance), false) => {
                         return Err(format!(
                             "trigger '{trigger}' is shared by every instance, so it cannot be activated \
-                             for instance '{instance}'; leave --instance out"
+                             for instance '{instance}'; name no instance (leave out `--instance` on a command, \
+                             leave the `instance` input unwired on a node)"
                         ));
                     }
                     _ => keys.push(ActivationKey::new(trigger.clone(), owner.clone())),
@@ -396,11 +398,11 @@ mod tests {
     #[test]
     fn a_named_trigger_must_fit_the_owner() {
         let err = ActivationScope { triggers: vec!["receive".into()], instance: None }.resolve(&project()).unwrap_err();
-        assert!(err.contains("--instance"), "{err}");
+        assert!(err.contains("name the instance"), "{err}");
         let err = ActivationScope { triggers: vec!["cron".into()], instance: Some(InstanceId::new("m").unwrap()) }
             .resolve(&project())
             .unwrap_err();
-        assert!(err.contains("shared by every instance"), "{err}");
+        assert!(err.contains("name no instance"), "{err}");
         let err = ActivationScope { triggers: vec!["step".into()], instance: None }.resolve(&project()).unwrap_err();
         assert!(err.contains("not a trigger"), "{err}");
         let one = ActivationScope { triggers: vec!["cron".into()], instance: None }.resolve(&project()).unwrap();

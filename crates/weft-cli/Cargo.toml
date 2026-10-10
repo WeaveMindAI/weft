@@ -20,7 +20,8 @@ weft-compiler = { workspace = true }
 weft-catalog = { workspace = true }
 uuid = { workspace = true }
 futures = { workspace = true }
-eventsource-client = "0.13"
+# Reads the live updates (SSE) off an answer of the one HTTP client.
+eventsource-stream = "0.2"
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

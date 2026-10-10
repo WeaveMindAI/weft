@@ -43,7 +43,7 @@ A broken node or package never breaks the catalog: it is left out, and only a pr
 
 Top-level keys: `type`, `label`, `description`, `tags`, `icon`, `color`, `inputs`, `outputs`, `types`, `requires_infra`, `images`, `publishes`, `service`, `portsFromConfig`, `features`, `display`, `validate`.
 
-An input entry: `name`, `type`, `required`, `accepts`, `widget`, `default`, `label`, `placeholder`, `description`, and for `Access`-typed inputs `requiresScopes` / `requiresValues`. An output entry: `name`, `type`, `description`, and on an [infra node] `baked` (what that means is under the infra node shape below).
+An input entry: `name`, `type`, `required`, `requiredWhenWired` (optional unwired, required once wired), `accepts`, `widget`, `default`, `label`, `placeholder`, `description`, and for `Access`-typed inputs `requiresScopes` and `requiresValues`. An output entry: `name`, `type`, `description`, and on an [infra node] `baked` (what that means is under the infra node shape below).
 
 `accepts` lists the drivers the port takes: `literal` (a value written in the source, in the braces or on its own line, `@file`/`@asset` included) and `wire` (a value another node produces). Absent means both; `["wire"]` means only a real node fills it (an LLM's `provider`, `params`, `historyFile`, `tools`; a consumer's `Access` handle). The list named in `portsFromConfig` is compiler-read: an inline typed value only, never a wire, never a marker. The access picker holds nothing in the source at all: its connection is picked on the install (`weft connect`). Exactly one driver per port.
 

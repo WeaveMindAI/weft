@@ -2,8 +2,10 @@
 name = "instances"
 
 # Nodes for a program that runs several instances: separate running
-# copies of part of the program, each under its own id. Bringing an
-# instance's own infra up and down, turning its triggers on and off,
+# copies of part of the program, each under its own id. Bringing infra up
+# and down and turning triggers on and off (`StartInfra`, `StopInfra`,
+# `TerminateInfra`, `ActivateTriggers`, `DeactivateTriggers`: an
+# instance's copies when given one, the program's own copies otherwise),
 # handing a browser an instance token, reading and setting the values an
 # instance was given, reading which instance a run is for, what an
 # instance spent, which infra copies exist and every instance weft holds

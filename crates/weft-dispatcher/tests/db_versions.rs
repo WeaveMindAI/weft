@@ -42,7 +42,7 @@ fn rig_project(id: Uuid) -> ProjectDefinition {
 
 async fn seed_project(projects: &weft_dispatcher::ProjectStore, id: Uuid) {
     projects
-        .register_with_hashes(rig_project(id), "db-rig", "", TENANT, Some("bin-A"), Some("def-1"), None, None, None, None)
+        .register_with_hashes(rig_project(id), "db-rig", "", TENANT, Some("bin-A"), Some("def-1"), None, None, None, None, None)
         .await
         .expect("register project");
 }
@@ -179,7 +179,7 @@ async fn head_lives_on_the_project_row_and_activations_name_their_versions(pool:
     assert!(activations.try_begin_activating(project, &keys, setup_execution_id, None).await.unwrap().is_ok());
     assert!(activations.record_activation_source(project, setup_execution_id, &activated, "v1").await.unwrap());
     activations.end_activating(project, setup_execution_id, &ActivationLifecycle::active(), false, None).await.unwrap().expect("owned");
-    projects.register_with_hashes(rig_project(project), "db-rig", "", TENANT, Some("bin-B"), Some("def-2"), None, None, None, None).await.unwrap();
+    projects.register_with_hashes(rig_project(project), "db-rig", "", TENANT, Some("bin-B"), Some("def-2"), None, None, None, None, None).await.unwrap();
     let listed = activations.list(project).await.unwrap();
     assert_eq!(listed[0].program, Some(activated), "a build preserves the code activation used");
     let head = versions.head(project).await.unwrap();

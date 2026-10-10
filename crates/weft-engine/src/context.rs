@@ -1352,6 +1352,10 @@ pub enum NodeTaskOutcome {
     /// failure is caught (`weft_core::context::catchable_message`),
     /// `None` for a failure that never is.
     Failed { message: String, catchable: Option<String> },
+    /// The step ended skipped, for `reason`: what it waited on was
+    /// skipped by a person (`WeftError::WaitSkipped`). Every output it
+    /// did not emit closes, as for any skip.
+    Skipped(weft_core::exec::skip::SkipReason),
     /// The node called `await_signal` and is now waiting on a fired
     /// wake signal (carries the suspension token).
     Waiting(String),
@@ -1970,21 +1974,19 @@ impl RunnerHandle {
             }
         };
         let why = match end {
-            HeldEnd::Answered(value) => {
+            HeldEnd::Answered(answer) => {
                 self.record
                     .journal
                     .record_event(
-                        &ExecEvent::SuspensionResolved {
-                            execution_id: self.execution_id,
-                            token,
-                            value: value.clone(),
-                            at_unix: now_unix(),
-                        },
+                        &ExecEvent::wait_answered(self.execution_id, token, answer.clone(), now_unix()),
                         Some(&self.worker_replica),
                     )
                     .await
                     .map_err(|e| WeftError::Suspension(format!("recording the answer to a held wait failed: {e:#}")))?;
-                return Ok(value);
+                return match answer {
+                    weft_core::primitive::WaitAnswer::Given { value } => Ok(value),
+                    weft_core::primitive::WaitAnswer::Skipped => Err(weft_core::primitive::wait_skipped()),
+                };
             }
             HeldEnd::Pause => return Err(WeftError::Suspended { token }),
             HeldEnd::GaveUp(why) => why,
@@ -2886,6 +2888,7 @@ impl ContextHandle for RunnerHandle {
             frames: self.node_frames.clone(),
             service: service.clone(),
             origin: resp.owner.clone(),
+            cancellation: self.cancellation.clone(),
         });
         let client = crate::metering::connection_client(
             &service,
@@ -4311,7 +4314,7 @@ mod replay_tests {
         while !handle.waits.held().pending() {
             tokio::task::yield_now().await;
         }
-        handle.waits.held().answer("tok-pending", serde_json::json!("approved"));
+        handle.waits.held().answer("tok-pending", weft_core::primitive::WaitAnswer::Given { value: serde_json::json!("approved") });
         assert_eq!(waiting.await.unwrap().expect("the answer"), serde_json::json!("approved"));
         let events = journal.events.lock().unwrap();
         assert!(matches!(events.as_slice(), [ExecEvent::SuspensionResolved { token, value, .. }]

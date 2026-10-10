@@ -442,6 +442,27 @@ async fn a_poll_on_a_state_with_nothing_live_answers_gone(pool: PgPool) {
     assert!(take_connect_result(&pool, TENANT_A, &started.state).await.unwrap().is_none());
 }
 
+/// A permission the service marks `always` rides every consent on top
+/// of what was ticked, is recorded with it, and is held to the
+/// provider's echo like a ticked one.
+#[sqlx::test]
+async fn a_consent_asks_for_what_the_service_always_needs(pool: PgPool) {
+    weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();
+    let fake = FakeProvider::new();
+    let base = fake.serve().await;
+    let mut spec = oauth_spec(&base, "coexisting");
+    spec.permissions.insert(
+        0,
+        serde_json::from_value(json!({ "id": "whoami", "label": "Who", "description": "Know the account.", "always": true })).unwrap(),
+    );
+    let grant = full_consent(&pool, TENANT_A, &spec, &["write"], None).await.unwrap();
+    assert_eq!(grant.scopes, vec!["whoami", "write"], "asked for, and recorded, with the ticked one");
+
+    *fake.scope_echo.lock().unwrap() = Some("write".into());
+    let err = full_consent(&pool, TENANT_A, &spec, &["write"], None).await.unwrap_err();
+    assert!(err.to_string().contains("missing 'whoami'"), "{err}");
+}
+
 #[sqlx::test]
 async fn oauth_consent_records_granted_scopes_and_enforces_the_echo(pool: PgPool) {
     weft_task_store::apply_groups(&pool, &[&weft_access_store::GROUP]).await.unwrap();

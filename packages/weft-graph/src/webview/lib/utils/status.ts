@@ -66,6 +66,7 @@ export function skipReasonText(reason: SkipReason | undefined): string {
 		case 'one_of_group_closed':
 			return `every input of the group (${reason.ports.join(', ')}) closed${afterFailure(reason.failure)}`;
 		case 'scope_skipped': return `the scope '${reason.scope}' it lives in did not run`;
+		case 'wait_skipped': return 'a person skipped what it was waiting for';
 		default: {
 			// Compile-time exhaustiveness; at runtime (a dispatcher newer
 			// than this webview sending a new kind) say so honestly

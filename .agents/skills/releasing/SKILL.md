@@ -22,6 +22,16 @@ into `main` through a PR, and the merge is what publishes.
    to the stores. The `extension versions bumped` CI check refuses a
    PR that forgot; `scripts/check-extension-bump.sh origin/main` is the
    same check locally.
+   In the same PR, write what changed into `CHANGELOG.md`, for the
+   people who update their weft: what they will notice, what they have
+   to do (a `./setup.sh` that asks, a command to run again, a setting
+   that moved), and anything breaking first. Each release gets its own
+   section, newest first, headed with its date and its version, the VS
+   Code extension's version the PR bumped to (`## 2026-10-09 (0.2.267)`);
+   a release that bumps no extension names its merge's short commit
+   instead. Work not merged yet stays under `## Unreleased`, and the PR
+   that ships it renames that heading. Write it plainly, for a person
+   reading it before they run `./setup.sh`, never as a list of commits.
 2. `gh pr create --base main --head <branch>`.
 3. Never `--auto`. Wait for every check to finish (`gh pr checks <n>
    --watch`), then read what the PR collected besides the checks before

@@ -67,9 +67,9 @@ into that group through the group's inputs.
 2. **An admin route** the frontend's server calls, gated by `ApiKeyAuth` on
    the `Route`'s `auth`, its key only in that server's environment. It
    onboards a person: writes the row, `MintInstanceToken`, then, if there is
-   a per-instance infra node, `StartInstanceInfra` with `waitUntilRunning` off,
+   a per-instance infra node, `StartInfra` with `waitUntilRunning` off,
    then `Reply` with the token so the request ends at once, then a second
-   `StartInstanceInfra` left on and `ActivateInstanceTriggers`. A `Reply`
+   `StartInfra` left on and `ActivateTriggers`. A `Reply`
    before the start would leave the person's container out of a list read
    right after it. The same route
    (or siblings on the same gate) lists a person's instances, mints a token

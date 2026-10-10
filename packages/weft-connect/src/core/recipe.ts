@@ -32,8 +32,9 @@ export function ownFields(spec: AccessSpecWire): CredentialFieldWire[] {
 // SYNC: guideSteps <-> crates/weft-core/src/access/spec.rs AccessSpec::guide_steps
 export function guideSteps(spec: AccessSpecWire, ticked: string[]): string[] {
 	const steps = spec.own_page?.guide?.steps ?? [];
+	const requested = requestedPermissions(spec, ticked);
 	const labels = (spec.permissions ?? [])
-		.filter((p) => ticked.includes(p.id))
+		.filter((p) => requested.includes(p.id))
 		.map((p) => p.label)
 		.join(', ');
 	return steps.map((s) => s.replaceAll('{permissions}', labels));
@@ -50,7 +51,7 @@ export function guideLink(spec: AccessSpecWire, ticked: string[]): string | unde
 	// encodeURIComponent leaves !'()* bare; the Rust side encodes
 	// everything outside RFC 3986 unreserved. Encode them too so the
 	// two produce byte-identical URLs for every id.
-	const encoded = encodeURIComponent(ticked.join(',')).replace(
+	const encoded = encodeURIComponent(requestedPermissions(spec, ticked).join(',')).replace(
 		/[!'()*]/g,
 		(c) => '%' + c.charCodeAt(0).toString(16).toUpperCase(),
 	);
@@ -68,10 +69,20 @@ export function defaultPermissions(spec: AccessSpecWire): string[] {
 }
 
 // The catalogue entries the consent/tick surfaces show: everything
-// except own-account-only capabilities (those surface as their own
-// tutorial sections instead).
+// except what is asked for always, and own-account-only capabilities
+// (those surface as their own tutorial sections instead).
+// SYNC: tickablePermissions <-> crates/weft-core/src/access/spec.rs AccessSpec::tickable_permissions
 export function tickablePermissions(spec: AccessSpecWire) {
-	return (spec.permissions ?? []).filter((p) => !p.own_only);
+	return (spec.permissions ?? []).filter((p) => !p.always && !p.own_only);
+}
+
+// What a consent asks for when `ticked` is ticked: the permissions asked
+// for always, then the ticked ones, each once.
+// SYNC: requestedPermissions <-> crates/weft-core/src/access/spec.rs AccessSpec::requested_permissions
+export function requestedPermissions(spec: AccessSpecWire, ticked: string[]): string[] {
+	const out = (spec.permissions ?? []).filter((p) => p.always).map((p) => p.id);
+	for (const id of ticked) if (!out.includes(id)) out.push(id);
+	return out;
 }
 
 // The name a service is shown under.
@@ -94,9 +105,11 @@ export function permissionLabels(spec: AccessSpecWire, ids: string[]): string[] 
 }
 
 // A short "these permissions" summary: the first three labels, an
-// ellipsis past that.
+// ellipsis past that. What every connection of the service is asked for
+// (`always`) says nothing about this one, so it is left out.
 export function permissionSummary(spec: AccessSpecWire, ids: string[]): string {
-	const named = permissionLabels(spec, ids);
+	const always = (spec.permissions ?? []).filter((p) => p.always).map((p) => p.id);
+	const named = permissionLabels(spec, ids.filter((id) => !always.includes(id)));
 	return named.slice(0, 3).join(', ') + (named.length > 3 ? ', ...' : '');
 }
 

@@ -363,22 +363,14 @@ where
 ///   - an activation stuck `activating` -> the same wipe the activate
 ///     rollback / cancel-activate performs (end the claim + cancel the
 ///     leaked TriggerSetup execution + drop half-registered signals).
-///   - stuck `building` / `cancelling_build` -> clear the marker; the
-///     build died with its dispatcher (or keeps running harmlessly to
-///     a content-addressed tag); the next verb rebuilds or cache-hits.
+///   - `building` / `cancelling_build` with no live request and no
+///     waiting version -> back at rest (`crate::transition::settle`): a
+///     request that died before it wrote its version down, or an end
+///     whose settle was missed. A waiting version keeps the marker: the
+///     build loop sees it through and settles the project at its end.
 async fn sweep_stuck_transitions(state: DispatcherState) -> anyhow::Result<()> {
     let stale_before = crate::lease::now_unix() - crate::transition::heartbeat_stale_secs();
-    for stuck in state.projects.list_stuck_transitions(stale_before).await? {
-        tracing::warn!(
-            target: "weft_dispatcher::reaper",
-            project_id = %stuck.id,
-            transition = stuck.transition.as_str(),
-            "build transition orphaned (driver heartbeat stale); clearing marker"
-        );
-        if state.projects.finish_building(stuck.id).await? {
-            crate::transition::publish_transition_changed(&state, stuck.id).await;
-        }
-    }
+    crate::transition::settle(&state, None).await?;
     for stuck in state.activations.list_stuck(stale_before).await? {
         tracing::warn!(
             target: "weft_dispatcher::reaper",

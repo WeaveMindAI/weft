@@ -141,3 +141,9 @@ impl SignalScope {
 pub async fn fire_token(disp: &Dispatcher, token: &str, body: &Value) -> Result<()> {
     disp.post_empty(&format!("/signal/{token}"), body).await
 }
+
+/// Skip the waiting step behind `token` (its `/skip` door), as a person
+/// declining the question does.
+pub async fn skip_token(disp: &Dispatcher, token: &str) -> Result<()> {
+    disp.post_empty(&format!("/signal/{token}/skip"), &Value::Null).await
+}

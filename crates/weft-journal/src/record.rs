@@ -184,7 +184,9 @@ impl Written {
             match event {
                 ExecEvent::CostReported { amount_usd: Some(usd), .. } => self.cost_micro_usd += micro_usd(*usd),
                 ExecEvent::NodeSkipped { .. } => self.skipped += 1,
-                ExecEvent::SuspensionResolved { token, .. } => self.resolved.push(token.clone()),
+                ExecEvent::SuspensionResolved { token, .. } | ExecEvent::SuspensionSkipped { token, .. } => {
+                    self.resolved.push(token.clone())
+                }
                 _ => {}
             }
             if self.ended.is_none() {
@@ -670,7 +672,8 @@ pub async fn append_locked_in(
 
 /// Write the answers handed to `execution_id` while a worker drove it
 /// (`weft_task_store::parked_fires::hand_answer_in`) into its record, as
-/// `SuspensionResolved` at `last_seq + 1`, and queue it for a worker to
+/// `SuspensionResolved` (or `SuspensionSkipped` for a skip) at
+/// `last_seq + 1`, and queue it for a worker to
 /// carry on, on the caller's transaction with its row locked as `locked`
 /// and no owner left (its worker just let go of it, or went away). Answers
 /// whether any were waiting; with none, nothing is written.
@@ -682,7 +685,7 @@ pub async fn resolve_handed_in(conn: &mut PgConnection, execution_id: ExecutionI
     let at_unix = unix_now() as u64;
     let resolved: Vec<ExecEvent> = handed
         .into_iter()
-        .map(|(token, value)| ExecEvent::SuspensionResolved { execution_id, token, value, at_unix })
+        .map(|(token, answer)| ExecEvent::wait_answered(execution_id, token, answer, at_unix))
         .collect();
     match append_locked_in(conn, execution_id, locked, &resolved, writer, Then::Queued).await? {
         Appended::At(_) => Ok(true),

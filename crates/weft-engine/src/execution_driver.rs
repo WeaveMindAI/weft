@@ -299,9 +299,14 @@ pub(crate) async fn run_one_execution_observed(
     bus_coordinator.shutdown().await;
     drop(bus_coordinator);
     // Its spend: a charge still open is a call that spent and whose
-    // amount no response stated, booked as the unknown it is.
-    clients.open_charges.flush_execution_id(execution_id, "the run ended before the job was read back");
-    record.costs.wait_zero().await;
+    // amount no response stated, booked as the unknown it is, and every
+    // figure still being worked out lands before the ending. A call whose
+    // answer is still being read holds this wait, and the metering tap
+    // bounds it: it cuts an answer silent for its limit, or any answer once
+    // the run is cancelled (`crate::metering::ANSWER_SILENCE_LIMIT`).
+    clients.open_charges
+        .close_execution_id(execution_id, &record.costs, "the run ended before the job was read back")
+        .await;
     // Its caller's last words. A durable run's whole answer that waits
     // for its record leaves once the ending is on it too: one write holds
     // both.
@@ -512,7 +517,7 @@ async fn take_answers(
     let at_unix = now_unix();
     let resolved: Vec<ExecEvent> = answers
         .into_iter()
-        .map(|answer| ExecEvent::SuspensionResolved { execution_id, token: answer.token, value: answer.value, at_unix })
+        .map(|answer| ExecEvent::wait_answered(execution_id, answer.token, answer.answer, at_unix))
         .collect();
     JournalClient::record_events(journal, &resolved, Some(replica)).await?;
     journal.flush().await?;
@@ -1522,7 +1527,7 @@ async fn drive(
                 .held()
                 .early_for(&suspended_tokens(executions))
                 .into_iter()
-                .map(|(token, value)| weft_broker_client::protocol::RunAnswer { token, value })
+                .map(|(token, answer)| weft_broker_client::protocol::RunAnswer { token, answer })
                 .collect();
             resume_answered(
                 drive_journal, fold, execution_id, replica, early, executions, pulses, kicked, &mut awaited_sequences,
@@ -2435,6 +2440,9 @@ async fn drive(
                     Err(weft_core::error::WeftError::Suspended { token }) => {
                         NodeTaskOutcome::Waiting(token)
                     }
+                    Err(weft_core::error::WeftError::WaitSkipped(_)) => {
+                        NodeTaskOutcome::Skipped(weft_core::exec::skip::SkipReason::WaitSkipped)
+                    }
                     Err(e) => NodeTaskOutcome::Failed {
                         message: runner_for_bake.with_infra_hint(format!("{e}")),
                         catchable: weft_core::context::catchable_message(&e),
@@ -2742,7 +2750,7 @@ async fn drive(
                 let suspended_on = suspended_tokens(executions);
                 let (suspended, held): (Vec<_>, Vec<_>) = answers.into_iter().partition(|answer| suspended_on.contains(answer.token.as_str()));
                 for answer in held {
-                    waits.held().answer(&answer.token, answer.value);
+                    waits.held().answer(&answer.token, answer.answer);
                 }
                 resume_answered(
                     drive_journal, fold, execution_id, replica, suspended, executions, pulses, kicked, &mut awaited_sequences,
@@ -3718,7 +3726,7 @@ async fn handle_node_skip(
     journal: &dyn JournalClient,
     replica: &str,
 ) {
-    mark_skipped(executions, node_id, execution_id, frames);
+    mark_skipped(executions, node_id, execution_id, frames, reason);
     // A node inside a gated scope carries NO closures: every member of
     // that scope gets its own `ScopeSkipped` row from the scope's
     // sweep (nested scopes included), and the scope's outward closures
@@ -3842,10 +3850,12 @@ async fn cancel_cleanup(
     dispatchable: Option<&std::collections::HashSet<weft_core::frames::Located>>,
 ) {
     // An in-flight node's future is aborted immediately; it needs no window
-    // to wrap up first. A paid call's cost is measured by the metering tap
-    // BELOW the node's future, which finalizes on drop and resolves the
-    // figure detached (tracked by the process's pending-cost records), so an
-    // aborted node body never loses money bookkeeping.
+    // to wrap up first. A paid call's answer may be read on a task of a
+    // client library's own, which this abort does not reach: the metering
+    // tap watches the run's cancel flag, already tripped, and cuts such a
+    // call itself, booking it and releasing the run's ending
+    // (`crate::metering`). A call whose answer lives in the node's future
+    // is booked by the tap's drop.
     // 1. Stop every body.
     bodies.shutdown().await;
     // 2. Drain the task channel in one FIFO pass (see the doc above).
@@ -5031,6 +5041,24 @@ async fn apply_one_task_msg(
                 )
                 .await;
             }
+            NodeTaskOutcome::Skipped(reason) => {
+                retire_consumer_streams(project, &loc, task_execution_id, pulses, journal, replica, stream_rt)
+                    .await;
+                // Same stale-terminal guard as the Completed arm.
+                if firing_already_terminal(executions, &loc.node_id, task_execution_id, &loc.frames) {
+                    return;
+                }
+                // A body that ended skipped closes what it never emitted
+                // on, as a completed one does; the NodeSkipped row is the
+                // fact the fold sweeps the same ports from.
+                mark_skipped(executions, &loc.node_id, task_execution_id, &loc.frames, &reason);
+                let mentioned = mentioned_ports(executions, &loc.node_id, task_execution_id, &loc.frames);
+                build_unmentioned_closures(
+                    &loc.node_id, &mentioned, task_execution_id, &loc.frames,
+                    project, program_idx, pulses, executions, reason.inherited_failure(),
+                );
+                ship_node_skipped(journal, replica, task_execution_id, &loc.node_id, &loc.frames, &reason).await;
+            }
             NodeTaskOutcome::Waiting(token) => {
                 mark_waiting(executions, &loc.node_id, task_execution_id, &loc.frames, &token);
                 ship_node_suspended(journal, replica, task_execution_id, &loc.node_id, &loc.frames, &token)
@@ -5083,7 +5111,7 @@ async fn drain_task_msgs_for_cancel(
                 .await;
             }
             TaskMsg::Terminal { loc, execution_id: task_execution_id, outcome } => match outcome {
-                NodeTaskOutcome::Completed { .. } | NodeTaskOutcome::Failed { .. } => {
+                NodeTaskOutcome::Completed { .. } | NodeTaskOutcome::Failed { .. } | NodeTaskOutcome::Skipped(_) => {
                     tracing::debug!(
                         target: "weft_engine::execution_driver",
                         execution_id = %task_execution_id, node = %loc.node_id, frames = ?loc.frames,
@@ -5230,15 +5258,19 @@ fn mark_skipped(
     node_id: &str,
     execution_id: ExecutionId,
     frames: &weft_core::frames::LoopFrames,
+    reason: &weft_core::exec::skip::SkipReason,
 ) {
     if let Some(e) = latest_firing_mut(executions, node_id, execution_id, frames) {
         e.status = NodeExecutionStatus::Skipped;
         e.completed_at = Some(now_unix());
-        // A skip is the firing's whole outcome: the body never ran, so
-        // a port's refusal found at readiness is not a fact about it.
-        // The `NodeSkipped` row carries no error, and the fold reads
-        // none; the live record says the same.
+        // A skip is the firing's whole outcome (decided before the body
+        // ran, or the body's wait skipped by a person), so a port's
+        // refusal found at readiness is not a fact about it. The
+        // `NodeSkipped` row carries no error and the reason, and the fold
+        // reads them so; the live record says the same.
         e.error = None;
+        e.skip_reason = Some(reason.clone());
+        e.callback_id = None;
     }
 }
 

@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 /// What a build produced: the compiled program, its three hashes and the
 /// implementations its worker carries, and the infra image every infra
 /// place resolves to. The install registers all of it in one transaction
-/// and answers it; downstream verbs name the build by its hashes.
+/// and answers it (a 200) once every image the version needs is in the
+/// registry; downstream verbs name the build by its hashes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuiltProgram {
     pub definition: crate::ProjectDefinition,
@@ -27,10 +28,6 @@ pub struct BuiltProgram {
     /// place's row is (`one.db`), which is how the supervisor reads it.
     #[serde(rename = "infraImages")]
     pub infra_images: BTreeMap<String, BTreeMap<String, String>>,
-    /// The image refs this build had to build (absent from the registry
-    /// when it began); empty when every image was already there.
-    #[serde(rename = "builtImages")]
-    pub built_images: Vec<String>,
     /// The infra places whose images differ from the ones the build
     /// before registered: a new copy of one starts on the new image, while
     /// a copy already running keeps its own until it is upgraded (`weft
@@ -96,6 +93,81 @@ impl NodeSet {
     }
 }
 
+/// What `POST /projects/{id}/builds` answers, with a 202, when images of
+/// the version were missing: the version build now waiting on them, and
+/// the image builds it waits on, each one started by this request or
+/// already running for the same content. The request answers as soon as
+/// they run rather than when they end, so nothing is held open for the
+/// minutes a build takes. The install registers the version itself once
+/// every image is built; the caller follows it
+/// (`GET /projects/{id}/builds/{build}`, [`VersionBuildState`]) until it
+/// is registered or failed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuildsUnderway {
+    /// This version build, as `GET /projects/{id}/builds/{build}` names it.
+    pub build: uuid::Uuid,
+    pub images: Vec<ImageBuild>,
+}
+
+/// On the 409 `POST /projects/{id}/builds` answers when another ask of
+/// the project is starting its image builds right now: that ask lets go
+/// within moments, so a caller sending its ask again (one whose first
+/// ask's answer was lost on the way) may wait and send it again, and its
+/// ask then joins the version build the first one started.
+pub const BUILD_BUSY_HEADER: &str = "x-weft-build-busy";
+
+/// One image build a version waits on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageBuild {
+    /// The image ref it pushes.
+    pub image: String,
+    /// The name weft minted for it. Known from the moment the build is
+    /// decided, before the builder gives it an id of its own.
+    pub name: String,
+}
+
+/// Where a version build that waited on image builds stands.
+// SYNC: VersionBuildStatus <-> crates/weft-dispatcher/src/build/waiting.rs (version_build.state)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionBuildStatus {
+    /// Some image it needs is still building.
+    Waiting,
+    /// Every image was built and the version is the project's running one.
+    Registered,
+    /// An image's build failed, or the version could not be registered;
+    /// `reason` says which.
+    Failed,
+    /// The project's build was cancelled.
+    Cancelled,
+    /// A newer build of the project was asked for before this one was
+    /// registered, so this one never will be.
+    Superseded,
+}
+
+/// The answer to `GET /projects/{id}/builds/{build}`: where a version
+/// build stands, and each image build it waits on.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionBuildState {
+    pub state: VersionBuildStatus,
+    pub images: Vec<ImageBuildState>,
+    /// What registered, once it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<BuiltProgram>,
+    /// Why it failed, was cancelled or superseded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// One image build of a [`VersionBuildState`]: which, and how it stands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageBuildState {
+    #[serde(flatten)]
+    pub build: ImageBuild,
+    #[serde(flatten)]
+    pub state: crate::projects::BuildStateResponse,
+}
+
 /// `POST /projects/{id}/builds`: build this version of the project.
 /// What the CLI sends and the install reads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,11 +203,10 @@ mod tests {
             infra_hash: "i".into(),
             implementations: [("Llm".to_string(), "h".to_string())].into(),
             infra_images: [("one.db".to_string(), [("db".to_string(), "r/db:1".to_string())].into())].into(),
-            built_images: vec!["r/db:1".into()],
             replaced_infra_images: vec!["one.db".into()],
         };
         let wire = serde_json::to_value(&built).unwrap();
-        for key in ["binaryHash", "definitionHash", "infraHash", "infraImages", "builtImages", "replacedInfraImages"] {
+        for key in ["binaryHash", "definitionHash", "infraHash", "infraImages", "replacedInfraImages"] {
             assert!(wire.get(key).is_some(), "{key} missing from {wire}");
         }
         let back: BuiltProgram = serde_json::from_value(wire.clone()).unwrap();

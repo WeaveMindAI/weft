@@ -271,6 +271,7 @@ fn gate_inputs() -> [InputDefinition; 2] {
             // Both, and never switchable: `_should_flow` is the
             // language's gate, and validate types its constant itself.
             accepts: Accepts::both(),
+            required_when_wired: false,
             widget: None,
             default: None,
             label: None,
@@ -293,6 +294,7 @@ fn gate_inputs() -> [InputDefinition; 2] {
                 declared_type: None,
             },
             accepts: Accepts::both(),
+            required_when_wired: false,
             widget: None,
             default: None,
             label: None,
@@ -423,6 +425,7 @@ pub fn enrich_collecting(
                     declared_type: None,
                 },
                 accepts: spec.effective_accepts(meta.is_compiler_read(&spec.name)),
+                required_when_wired: spec.required_when_wired,
                 // The DECLARED widget only; the type-derived default is
                 // stamped after TypeVar resolution (see the final pass),
                 // so a `T` input resolved to Image gets a file picker.
@@ -526,6 +529,22 @@ pub fn enrich_collecting(
                     "node '{}': '{}?' marks a port optional, but '{}' is not a port this node \
                      creates. Declare optionality on the port itself (`{}?: Type`) instead",
                     node.id, key, key, key,
+                )});
+            }
+        }
+
+        // An input required only once wired has its requiredness decided
+        // by its wiring, so a header line making it required always would
+        // quietly turn "unwired: the node runs without it" into a compile
+        // error. Declaring it optional (`name?: Type`) says nothing new and
+        // stays legal.
+        for wp in &weft_inputs {
+            if wp.required && catalog_inputs.iter().any(|cp| cp.name == wp.name && cp.required_when_wired) {
+                errors.push(EnrichError { span: node_span, file: node.source_file.clone(), message: format!(
+                    "node '{}': input '{}' of node type {} is required only when wired, so its \
+                     wiring decides whether it is required; declare it `{}?` or drop it from \
+                     the node's inputs",
+                    node.id, wp.name, node.node_type, wp.name,
                 )});
             }
         }

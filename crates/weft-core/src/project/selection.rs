@@ -262,7 +262,8 @@ pub struct ShutGate {
 /// needed by, or `None` when nothing that needs it lies on its path.
 ///
 /// A node answers for itself: its input is needed when it is required
-/// with no default, or when it belongs to a `@require_one_of` set whose
+/// (or required once wired, which a port reached along a wire is) with
+/// no default, or when it belongs to a `@require_one_of` set whose
 /// every other member gets nothing (`fed(place, port)` says whether an
 /// input of the node at `place` gets a value some other way). A group, a
 /// call site or a body boundary requires nothing of its own (its only
@@ -294,7 +295,9 @@ pub fn required_consumer(
         let Some(node) = project.node(&place.id) else { continue };
         let start = start.or_else(|| is_start(&place).then(|| (place.clone(), port.clone())));
         let input = node.inputs.iter().find(|p| p.name == port);
-        if input.is_some_and(|input| input.required && input.default.is_none()) {
+        // The walk only ever reaches a port along a wire, so an input
+        // required once wired counts as required here.
+        if input.is_some_and(|input| input.is_required(true) && input.default.is_none()) {
             return Some(Need { needer: (place, port), start, one_of: None });
         }
         let last_of = node.features.one_of_required.iter()

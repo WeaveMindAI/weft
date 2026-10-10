@@ -41,9 +41,8 @@ pub enum ActionVerb {
     /// partial trigger registrations and flips the project back to
     /// Inactive.
     CancelActivate,
-    /// Cancel an in-flight build (transition=building).
-    /// Flips the transition to cancelling_build; the dispatcher driving
-    /// the build sees it and stops the build.
+    /// Cancel an in-flight build (transition=building): the install
+    /// stops the project's image builds.
     CancelBuild,
     Deactivate,
     /// Force-cancel running executions while a deactivate-with-wait
@@ -91,6 +90,12 @@ pub enum Phase {
     /// `{ "elapsedSeconds", "images": [...], "built": [...] }`: the images
     /// still building, and the ones this build has finished so far.
     BuildWait,
+    /// The install cannot be reached to see where the build is (no
+    /// answer, or its gateway says it is down); the command keeps looking.
+    /// Detail carries `{ "elapsedSeconds", "message" }`: since the build
+    /// began, and why the last look failed. The next `BuildWait` or
+    /// `BuildImage` says the install answers again.
+    BuildUnreachable,
     /// HTTP request to the dispatcher started.
     DispatcherCallStart,
     /// HTTP request to the dispatcher finished. Body in `detail`
@@ -141,15 +146,8 @@ struct Event<'a> {
     detail: Option<&'a Value>,
 }
 
-/// The one report for a failure that reached `main` unreported: a verb
-/// with no progress channel, or a failure before a channel existed.
-/// Same shape as a channel's own error, so every verb fails the same
-/// way: under `--json` one `phase: "error"` event on stdout, otherwise
-/// one lowercase `error:` line on stderr. The cause chain rides along
-/// in the message (`{e:#}`), since readers build their errors from
-/// context and the chain is where the "why" lives.
-/// What a failure that never reached the daemon says, first, before the
-/// transport noise.
+/// What a failure that never reached this machine's daemon says, first,
+/// before the transport noise.
 ///
 /// Worth its own sentence because the three reasons a request does not
 /// arrive (the daemon is not started, this machine only has the editor
@@ -162,17 +160,20 @@ struct Event<'a> {
 /// is a fact rather than wording, so this line is free to be rephrased.
 const DAEMON_UNREACHABLE: &str = "the weft daemon is not answering";
 
-/// True when the request never reached the daemon at all: nothing was
-/// refused, nothing answered. A status the daemon returns, however bad,
+/// The install a request never reached, when one did not: nothing was
+/// refused, nothing answered. A status the install returns, however bad,
 /// is not this.
-fn daemon_unreachable(e: &anyhow::Error) -> bool {
-    e.chain().any(|cause| {
-        cause
-            .downcast_ref::<reqwest::Error>()
-            .is_some_and(|r| r.is_connect() || r.is_timeout())
-    })
+fn unreachable_install(e: &anyhow::Error) -> Option<&crate::client::InstallUnreachable> {
+    e.chain().find_map(|cause| cause.downcast_ref::<crate::client::InstallUnreachable>())
 }
 
+/// The one report for a failure that reached `main` unreported: a verb
+/// with no progress channel, or a failure before a channel existed.
+/// Same shape as a channel's own error, so every verb fails the same
+/// way: under `--json` one `phase: "error"` event on stdout, otherwise
+/// one lowercase `error:` line on stderr. The cause chain rides along
+/// in the message (`{e:#}`), since readers build their errors from
+/// context and the chain is where the "why" lives.
 pub fn report_plain_error(json: bool, e: &anyhow::Error) {
     let detail = error_detail(e);
     if json {
@@ -187,21 +188,28 @@ pub fn report_plain_error(json: bool, e: &anyhow::Error) {
 /// that reports one: the message (with the cause chain, `{e:#}`, since
 /// that is where the "why" lives), plus the facts a host acts on
 /// without matching the wording.
-// SYNC: daemonUnreachable <-> extension-vscode/src/cli.ts CliFailure
+// SYNC: daemonUnreachable, installUnreachable <-> extension-vscode/src/cli.ts CliFailure
 // SYNC: needsTriggerChoice <-> extension-vscode/src/triggerChoice.ts isTriggerChoiceRefusal
 pub fn error_detail(e: &anyhow::Error) -> Value {
-    let unreachable = daemon_unreachable(e);
-    let message = if unreachable {
-        format!(
+    let unreachable = unreachable_install(e);
+    let local = unreachable.is_some_and(|install| install.is_local());
+    let message = match unreachable {
+        Some(_) if local => format!(
             "{DAEMON_UNREACHABLE}. Start it with `weft daemon start`, or install it if this \
              machine only has the editor extension. ({e:#})"
-        )
-    } else {
-        format!("{e:#}")
+        ),
+        // A remote install: nothing on this machine would start it, so
+        // the daemon's advice would send the person the wrong way. The
+        // chain names it (`InstallUnreachable`'s own words).
+        Some(_) => format!("{e:#}; check the network and run the command again"),
+        None => format!("{e:#}"),
     };
     serde_json::json!({
         "message": message,
-        "daemonUnreachable": unreachable,
+        // This machine's daemon did not answer: a host may offer to start it.
+        "daemonUnreachable": local,
+        // Any install did not answer, this machine's or a remote one.
+        "installUnreachable": unreachable.is_some(),
         // The dispatcher needs to know how triggers come down and
         // nobody could be asked: a host that can ask opens its picker
         // and sends the verb again with the choice.
@@ -316,6 +324,16 @@ impl Progress {
         self.emit(
             Phase::BuildWait,
             Some(serde_json::json!({ "elapsedSeconds": elapsed.as_secs(), "images": images, "built": built })),
+        );
+    }
+
+    /// The last look at the build could not reach the install, `why`;
+    /// `elapsed` since the build began.
+    /// SYNC: the build_unreachable detail <-> packages/weft-graph/src/webview/lib/components/project/ActionBar.svelte (build_unreachable)
+    pub fn build_unreachable(&self, elapsed: std::time::Duration, why: &str) {
+        self.emit(
+            Phase::BuildUnreachable,
+            Some(serde_json::json!({ "elapsedSeconds": elapsed.as_secs(), "message": why })),
         );
     }
 
@@ -506,6 +524,15 @@ fn human_line(ev: &Event<'_>) -> Option<String> {
             };
             build_wait_line(elapsed, &list("images"), &list("built"))
         }
+        Phase::BuildUnreachable => {
+            let elapsed = ev.detail.and_then(|d| d.get("elapsedSeconds")).and_then(|v| v.as_u64()).unwrap_or(0);
+            let why = ev.detail.and_then(|d| d.get("message")).and_then(|v| v.as_str()).unwrap_or("no answer");
+            format!(
+                "  cannot reach the install to see the build ({} so far): {why}\n  \
+                 the build may still be going on there; looking again (Ctrl+C to stop following)",
+                elapsed_text(elapsed)
+            )
+        }
         Phase::InfraProvisionStart => "provisioning infra".to_string(),
         Phase::DrainWait => {
             let cap = match ev.detail.and_then(|d| d.get("capSeconds")).and_then(|v| v.as_u64()) {
@@ -615,5 +642,40 @@ mod tests {
         let other = error_detail(&anyhow::anyhow!("project not registered"));
         assert_eq!(other["needsTriggerChoice"], false);
         assert_eq!(other["message"], "project not registered");
+    }
+
+    /// A request that never reached this machine's daemon says to start
+    /// it, and flags it for a host that can; one that never reached a
+    /// remote install names that install, says to check the network, and
+    /// never offers the daemon.
+    #[tokio::test]
+    async fn an_unreachable_install_is_named_by_where_it_is() {
+        // A port just let go of: nothing listens, the connection is refused.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let local = crate::client::DispatcherClient::new(format!("http://{closed}"), None);
+        let e = local.get_json("/install").await.unwrap_err().context("read the install");
+        let detail = error_detail(&e);
+        assert_eq!(detail["daemonUnreachable"], true);
+        assert_eq!(detail["installUnreachable"], true);
+        let message = detail["message"].as_str().unwrap();
+        assert!(message.starts_with("the weft daemon is not answering. Start it with `weft daemon start`"), "{message}");
+
+        let cause = reqwest::Client::new().get(format!("http://{closed}/")).send().await.unwrap_err();
+        let remote = crate::client::InstallUnreachable {
+            url: "https://weft-prod.example.run.app".into(),
+            target: Some("prod".into()),
+            cause,
+        };
+        let e = anyhow::Error::new(remote).context("POST https://weft-prod.example.run.app/projects/p/builds").context("ask the install to build");
+        let detail = error_detail(&e);
+        assert_eq!(detail["daemonUnreachable"], false, "nothing on this machine would start it");
+        assert_eq!(detail["installUnreachable"], true);
+        let message = detail["message"].as_str().unwrap();
+        assert!(
+            message.contains("the install `prod` (https://weft-prod.example.run.app) did not answer: "),
+            "{message}"
+        );
+        assert!(message.ends_with("; check the network and run the command again"), "{message}");
+        assert!(!message.contains("weft daemon"), "{message}");
     }
 }

@@ -44,8 +44,9 @@ pub struct OutAttachment {
 
 /// What one outgoing message carries, before assembly.
 pub struct OutMessage<'a> {
-    /// The account's own address: Gmail sends as the signed-in
-    /// account, and an RFC 5322 message must name its sender.
+    /// The sender: the account's own address or one of its Send mail
+    /// as aliases (Gmail rewrites any other From to the account's own),
+    /// and an RFC 5322 message must name it.
     pub from: &'a str,
     pub to: &'a [String],
     pub cc: &'a [String],
@@ -77,7 +78,7 @@ pub fn build_mime(m: &OutMessage<'_>) -> WeftResult<Vec<u8>> {
     }
 
     let mut builder = lettre::Message::builder()
-        .from(mailbox(m.from, "the account's own address")?)
+        .from(mailbox(m.from, "the From address")?)
         .subject(m.subject)
         .keep_bcc();
     for addr in m.to {

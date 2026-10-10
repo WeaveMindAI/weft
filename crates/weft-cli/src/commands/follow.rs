@@ -6,7 +6,6 @@
 use anyhow::Context;
 use std::collections::HashSet;
 use serde_json::Value;
-use eventsource_client::Client;
 use futures::StreamExt;
 use weft_core::live_event::LiveEvent;
 
@@ -70,48 +69,39 @@ async fn follow_sse(
     target: FollowTarget<'_>,
     mut emit: impl FnMut(&LiveEvent) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    let es = client
-        .event_stream(&target.path())?
-        // Reconnecting without recovering history would hide lost updates.
-        // A disconnected follower must tell the user it stopped watching.
-        .reconnect(eventsource_client::ReconnectOptions::reconnect(false).build())
-        .build();
-    let mut stream = es.stream();
+    let inspect = || {
+        format!(
+            "the run may still be running. Inspect it with `{}` and `{}`",
+            super::weft_on(on, "executions"),
+            super::weft_on(on, "events <execution_id>")
+        )
+    };
+    // Never reopened: reconnecting without recovering history would hide
+    // lost updates, so a follower that loses the stream says it stopped
+    // watching.
+    let mut stream = std::pin::pin!(client.event_stream(&target.path()).await.context("listen for live updates")?);
     // Only the finite initial history needs overlap detection. Do not grow
     // a seen-event cache for the lifetime of a potentially unbounded run.
     let mut history_ids = HashSet::new();
+    // The server is listening now. Recover everything that ran before
+    // attachment, including an already-finished run. New events remain
+    // buffered on the open stream meanwhile.
+    if let FollowTarget::Execution(execution_id) = target {
+        for event in super::versions::replay_rows(client, execution_id).await? {
+            if !history_ids.insert(event_identity(&event)?.to_owned()) { continue; }
+            emit(&event)?;
+            if target.finished(&event) {
+                return Ok(());
+            }
+        }
+    }
     while let Some(ev) = stream.next().await {
-        let inspect = || {
-            format!(
-                "the run may still be running. Inspect it with `{}` and `{}`",
-                super::weft_on(on, "executions"),
-                super::weft_on(on, "events <execution_id>")
-            )
-        };
-        match ev.with_context(|| format!("live updates interrupted; {}", inspect()))? {
-            eventsource_client::SSE::Event(event) => {
-                let event: LiveEvent = serde_json::from_str(&event.data).context("decode execution event")?;
-                if history_ids.contains(event_identity(&event)?) { continue; }
-                emit(&event)?;
-                if target.finished(&event) {
-                    return Ok(());
-                }
-            }
-            eventsource_client::SSE::Comment(_) => {}
-            eventsource_client::SSE::Connected(_) => {
-                // The server is listening now. Recover everything that ran
-                // before attachment, including an already-finished run.
-                // New events remain buffered on the open stream meanwhile.
-                if let FollowTarget::Execution(execution_id) = target {
-                    for event in super::versions::replay_rows(client, execution_id).await? {
-                        if !history_ids.insert(event_identity(&event)?.to_owned()) { continue; }
-                        emit(&event)?;
-                        if target.finished(&event) {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
+        let ev = ev.with_context(|| format!("live updates interrupted; {}", inspect()))?;
+        let event: LiveEvent = serde_json::from_str(&ev.data).context("decode execution event")?;
+        if history_ids.contains(event_identity(&event)?) { continue; }
+        emit(&event)?;
+        if target.finished(&event) {
+            return Ok(());
         }
     }
     anyhow::bail!(

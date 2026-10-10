@@ -61,9 +61,11 @@ and the buttons or boxes your other fields asked for. The primary button says
 **Submit** for a question inside a running program, and **Fire** for a trigger
 that starts one.
 
-Beside it, **Skip** answers with nothing and lets the run carry on, and
-**Cancel run** ends the whole execution. Neither shows up on a trigger, because
-skipping a trigger would fire it.
+Beside it, **Skip** declines the question: the step that asked ends skipped,
+every output of it closes, and the steps reading them skip in turn while the
+rest of the run carries on. **Cancel run** ends the whole execution. Neither
+shows up on a trigger, which has no question to decline: weft refuses a skip
+there.
 
 After a submit the card says `Submitted` and moves to the next one. Back in the
 graph, the cyan ring goes green and the rest of your program runs.

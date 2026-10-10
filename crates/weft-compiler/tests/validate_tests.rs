@@ -385,6 +385,7 @@ t = Text
             declared_type: None,
         },
         accepts: weft_core::node::Accepts::both(),
+        required_when_wired: false,
         widget: None,
         default: None,
         label: None,
@@ -417,6 +418,7 @@ t = Text { value: "ok" }
             declared_type: None,
         },
         accepts: weft_core::node::Accepts::wire_only(),
+        required_when_wired: false,
         widget: None,
         default: None,
         label: None,
@@ -3819,20 +3821,41 @@ fn a_second_response_head_after_a_stream_is_refused() {
 
 /// `input_names` with a node: a node naming an infra node by text is held to
 /// the program's infra nodes and their kind at compile time; a wired
-/// name is known only at run time and not checked.
+/// name is known only at run time and not checked. With an `instance` it
+/// names a `@per_instance` node, without one a shared node (the program's
+/// own copy).
 #[test]
 fn an_infra_name_is_held_to_the_programs_infra_nodes() {
     let base = "bridge = BaileyBridge {\n  @per_instance\n}\npg = PostgresDatabase { database: \"app\" }\n";
     let named = |node: &str| messages(&format!("{base}{node}\n"));
     let refused = |found: &[String], name: &str| found.iter().any(|m| m.contains(&format!("names '{name}'")));
-    assert!(!refused(&named("go = StartInstanceInfra { node: \"bridge\", instance: \"u1\" }"), "bridge"));
-    assert!(refused(&named("go = StartInstanceInfra { node: \"ghost\", instance: \"u1\" }"), "ghost"));
-    assert!(refused(&named("go = StopInstanceInfra { node: \"pg\", instance: \"u1\" }"), "pg"), "shared infra is no instance's");
+    assert!(!refused(&named("go = StartInfra { node: \"bridge\", instance: \"u1\" }"), "bridge"));
+    assert!(refused(&named("go = StartInfra { node: \"ghost\", instance: \"u1\" }"), "ghost"));
+    assert!(refused(&named("go = StopInfra { node: \"pg\", instance: \"u1\" }"), "pg"), "shared infra is no instance's");
+    assert!(!refused(&named("go = StopInfra { node: \"pg\" }"), "pg"), "no instance is the program's own copy");
+    assert!(refused(&named("go = TerminateInfra { node: \"bridge\" }"), "bridge"), "a per-instance node needs an instance");
+    assert!(refused(&named("go = StartInfra { node: \"ghost\" }"), "ghost"));
+    let given = named("pick = Text { value: \"u1\" }\ngo = StartInfra { node: \"bridge\" }\ngo.instance = pick.value");
+    assert!(!refused(&given, "bridge"), "a wired instance is one given: {given:?}");
     assert!(!refused(&named("ls = ListInstanceInfra { node: \"pg\" }"), "pg"), "listing takes a shared one");
     let wipe = named("w = WipeInstance { instance: \"u1\", infra: [\"bridge\", \"ghost\"] }");
     assert!(refused(&wipe, "ghost") && !refused(&wipe, "bridge"), "{wipe:?}");
-    let wired = named("pick = Text { value: \"ghost\" }\ngo = StartInstanceInfra { instance: \"u1\" }\ngo.node = pick.value");
+    let wired = named("pick = Text { value: \"ghost\" }\ngo = StartInfra { instance: \"u1\" }\ngo.node = pick.value");
     assert!(!refused(&wired, "ghost"), "{wired:?}");
+}
+
+/// `input_names` with a trigger: `only` names per-instance triggers when
+/// the node is given an `instance`, and shared ones (the program's own)
+/// when it is not.
+#[test]
+fn a_trigger_name_follows_whose_triggers_the_node_acts_on() {
+    let base = "mine = Cron { cron: @instance_filled }\ndaily = Cron { cron: \"0 0 7 * * *\" }\n";
+    let named = |node: &str| messages(&format!("{base}{node}\n"));
+    let refused = |found: &[String], name: &str| found.iter().any(|m| m.contains(&format!("names '{name}'")));
+    assert!(!refused(&named("on = ActivateTriggers { instance: \"u1\", only: [\"mine\"] }"), "mine"));
+    assert!(refused(&named("on = ActivateTriggers { instance: \"u1\", only: [\"daily\"] }"), "daily"), "a shared trigger is no instance's");
+    assert!(!refused(&named("off = DeactivateTriggers { only: [\"daily\"] }"), "daily"), "no instance is the program's own triggers");
+    assert!(refused(&named("off = DeactivateTriggers { only: [\"mine\"] }"), "mine"), "a per-instance trigger needs an instance");
 }
 
 /// `input_names` with a field: SetInstanceValues keys its `values` and
@@ -4680,4 +4703,19 @@ send = BaileySend { bridge: "http://bridge:8090", to: "49151", message: "hi" }
     let d = validate(&project, &catalog());
     let hit = d.iter().find(|e| e.code.as_deref() == Some("input-accepts"));
     assert!(hit.is_some_and(|e| e.message.contains("`bridge` accepts: wire")), "a written URL must be refused: {d:?}");
+}
+
+/// An input required only once wired is optional while unwired (no
+/// `required-port-unmet`), and counts as required once wired (no
+/// `no-required-skip`: a closed wire skips the node).
+#[test]
+fn an_input_required_when_wired_is_optional_unwired_and_required_wired() {
+    let unwired = parse_enrich("\nsvc = Text { value: \"x\" }\ns = StartInfra { node: \"svc\" }\n");
+    let d = validate(&unwired, &catalog());
+    assert!(!codes(&d).contains(&"required-port-unmet"), "{d:?}");
+
+    let wired = parse_enrich("\nid = Text { value: \"ada\" }\ns = StartInfra { node: \"svc\" }\ns.instance = id.value\n");
+    let d = validate(&wired, &catalog());
+    assert!(!codes(&d).contains(&"required-port-unmet"), "{d:?}");
+    assert!(!codes(&d).contains(&"no-required-skip"), "a closed wire on `instance` skips the node: {d:?}");
 }

@@ -86,9 +86,13 @@ function starterGate(verb: ActionVerb, inputs: VerbInputs): boolean | undefined 
 		// the dispatcher does and the editor does not. So the source only
 		// answers whether there is a trigger at all, and an activate with
 		// infra down is refused by the door, naming the nodes to start.
+		// Only while the project is not active: once it is, which of its
+		// triggers are off is the dispatcher's to say (a trigger written
+		// since shows as drift, which resync puts live). Reactivate is
+		// never the source's: it brings back the work kept for triggers
+		// that are off, which only the dispatcher knows of.
 		case 'activate':
-		case 'reactivate':
-			return inputs.hasTriggers;
+			return inputs.hasTriggers && inputs.status !== 'active';
 		default:
 			return undefined;
 	}

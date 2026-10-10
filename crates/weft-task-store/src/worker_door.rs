@@ -1,10 +1,12 @@
 //! Which worker processes are alive (`worker_lease`), the image each runs,
 //! what each drives right now per trigger (`worker_lease.in_flight`), and what each counted
 //! at its door this minute (`door_count`), all written once a second by
-//! every worker through the broker (`/v1/door/tick`). A worker's live
-//! lease is half of what says a run is being worked on
-//! ([`crate::in_flight_sql!`]), and what it drives is what a drain waits
-//! for.
+//! every worker that has work under way, through the broker
+//! (`/v1/door/tick`). A worker with nothing under way stops ticking after
+//! one last tick that says so, and its lease lapses: it owns no run then,
+//! and it ticks again before it takes one. A worker's live lease is half
+//! of what says a run is being worked on ([`crate::in_flight_sql!`]), and
+//! what it drives is what a drain waits for.
 
 /// How long a worker's lease (`worker_lease`) holds without a tick, at
 /// this install's pace: a few missed ticks, so a busy second never reads

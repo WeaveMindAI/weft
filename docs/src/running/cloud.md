@@ -504,7 +504,17 @@ which limit. If the
 program runs on several copies of its worker, each copy counts calls itself
 and hears the others' counts once a second, so a per-minute limit can let
 through about one second's worth of extra calls, and `callsAtOnce` is shared
-out between the copies that are up.
+out between the copies that are up. A copy with nothing to do stops listening
+so the install can sleep. When a call wakes it, that call is decided at once on
+what the copy heard before it went quiet, and so is every call until the copy
+hears back from weft's broker: under a second normally, a few seconds when the
+broker was asleep too and has to start. During that window the copy counts
+itself as the only copy, so if several copies wake at the same moment, each
+can let in up to the full `callsAtOnce`. The per-minute limits barely move:
+they can only overshoot by the calls that reach the copy in those few
+seconds. We chose this on purpose: the other way would make the first call
+after every pause wait for the broker, and on a sleeping install that means
+waiting for it to start.
 
 ## When something goes wrong
 

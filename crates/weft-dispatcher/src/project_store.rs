@@ -59,6 +59,14 @@ pub trait ProjectStoreOps: Send + Sync {
     /// passes it here so the runnable stamp and the infra tags land together
     /// (never a runnable project with missing/half-written tags); plain
     /// registration (no build) passes `None`.
+    ///
+    /// `settles`: what a build's registration settles about the project's
+    /// waiting version (`crate::build::waiting::Settles`), read and
+    /// written under the project's version lock in this same transaction,
+    /// so a registration and the waiting version's end commit together and
+    /// an older version never lands over a newer one. `Ok(None)` only when
+    /// it names a waiting version that no longer waits: nothing registered.
+    #[allow(clippy::too_many_arguments)]
     async fn register_with_hashes(
         &self,
         project: ProjectDefinition,
@@ -71,7 +79,8 @@ pub trait ProjectStoreOps: Send + Sync {
         infra_image_tags: Option<&InfraImageTags>,
         implementations: Option<&std::collections::BTreeMap<String, String>>,
         source: Option<&weft_core::project::hash::Manifest>,
-    ) -> anyhow::Result<StoredProjectSummary>;
+        settles: Option<&crate::build::waiting::Settles<'_>>,
+    ) -> anyhow::Result<Option<StoredProjectSummary>>;
 
     /// Sources registered with this exact running program. Refuse a concurrent build.
     async fn program_source(&self, id: uuid::Uuid, program: &weft_core::project::hash::ProgramIdentity) -> anyhow::Result<weft_core::project::hash::Manifest>;
@@ -171,45 +180,65 @@ pub trait ProjectStoreOps: Send + Sync {
     /// project.
     async fn running_infra_image_tags(&self, id: uuid::Uuid) -> anyhow::Result<Option<InfraImageTags>>;
 
+    /// The next number in the order of the project's build asks, taken by
+    /// a build request as it arrives (`build_asks`): a version registers
+    /// only over an older ask (`crate::build::waiting::Settles`). Errs on
+    /// no such project.
+    async fn next_build_ask(&self, id: uuid::Uuid) -> anyhow::Result<i64>;
+
     /// Read the project's verb-transition marker (the build axis,
     /// orthogonal to `status`). `Ok(None)` = no such project.
     async fn transition(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectTransition>>;
 
     /// Single-flight entry into the `building` transition. Atomically
-    /// flips `transition` none → building IFF no other transition is
-    /// in flight AND the trigger lifecycle is not mid-flip
-    /// (activating / deactivating). Stamps the transition heartbeat.
-    /// `Ok(false)` = lost: another verb is building, or the lifecycle
-    /// is transitional; the caller rejects (409).
-    async fn try_begin_building(&self, id: uuid::Uuid) -> anyhow::Result<bool>;
+    /// flips `transition` to building IFF no request is starting builds
+    /// for the project right now (the transition is none, or building held
+    /// only by its waiting version or by a request gone: its heartbeat is
+    /// older than `stale_before`) AND the trigger lifecycle is not mid-flip
+    /// (activating / deactivating). Stamps the transition heartbeat. Taking
+    /// over from a request gone ends, in the same transaction, the starts
+    /// it left waiting to be made on the builder
+    /// (`crate::build::ledger::LostStarts::Of`), so this request never
+    /// joins a start nothing will finish. A request entering while builds
+    /// run joins them (the ledger finds them running), which is how a
+    /// person who stopped following a build picks it up again.
+    /// `Ok(false)` = lost: another request is starting builds, a cancel is
+    /// under way, or the lifecycle is transitional; the caller rejects
+    /// (409).
+    async fn try_begin_building(&self, id: uuid::Uuid, stale_before: i64) -> anyhow::Result<bool>;
 
-    /// Request cancellation of the in-flight build: CAS `transition`
-    /// building → cancelling_build. The process driving the build polls
-    /// this (via `transition`) and interrupts the builder. `Ok(false)`
-    /// = no build in flight (already finished, or never started).
+    /// Request cancellation of the in-flight build: `transition` building
+    /// (or cancelling_build already, so a cancel asked twice is the same
+    /// cancel) → cancelling_build. From then on an image claim and a
+    /// version written down as waiting are refused
+    /// (`crate::build::ledger::refuse_once_cancelled`), and the cancel stops
+    /// the builds already running and ends the waiting version itself.
+    /// `Ok(false)` = no build in flight (already finished, or never
+    /// started).
     async fn request_cancel_build(&self, id: uuid::Uuid) -> anyhow::Result<bool>;
 
-    /// Land the build transition back at rest: `transition` → none
-    /// from either building or cancelling_build. Idempotent (a no-op
-    /// when already none, e.g. the stuck-transition reaper got there
-    /// first). `Ok(true)` iff this call performed the flip.
-    async fn finish_building(&self, id: uuid::Uuid) -> anyhow::Result<bool>;
+    /// The request that entered the build transition is done with it
+    /// (answered, or failed): from here the transition rests on the
+    /// project's waiting version alone, so [`Self::settle_building`] may
+    /// clear it as soon as none waits. Stamps the heartbeat to zero, which
+    /// no live driver ever leaves it at.
+    async fn release_build_driver(&self, id: uuid::Uuid) -> anyhow::Result<()>;
 
-    /// Bump the transition heartbeat. Called on an interval by the
-    /// process DRIVING an in-process transitional state (an activation
-    /// window, a build) so the stuck-transition reaper only repairs
-    /// transitions whose driver actually died.
+    /// Land at rest (`transition` → none) every project in a build
+    /// transition that nothing holds any more ([`build_held`]: no request
+    /// drives it and no version of it waits). `project` narrows it to one.
+    /// Answers the projects it landed, for the caller to announce. Called
+    /// by the build loop, by a request letting go, by a registration, by a
+    /// cancel, and by the stuck-transition reaper, so one definition of
+    /// "building" holds everywhere.
+    async fn settle_building(&self, project: Option<uuid::Uuid>, stale_before: i64) -> anyhow::Result<Vec<uuid::Uuid>>;
+
+    /// Bump the transition heartbeat of a build transition still driven
+    /// (never one released). Called on an interval by the process DRIVING
+    /// it (a build request starting its builds) so the
+    /// stuck-transition reaper only repairs transitions whose driver
+    /// actually died.
     async fn bump_transition_heartbeat(&self, id: uuid::Uuid) -> anyhow::Result<()>;
-
-    /// Projects stuck in a build transition whose heartbeat went stale
-    /// before `stale_before`: the driving process died mid-build. The
-    /// stuck-transition reaper lands each back at rest. (An activation
-    /// stuck the same way lives on its own row:
-    /// `ActivationStoreOps::list_stuck`.)
-    async fn list_stuck_transitions(
-        &self,
-        stale_before: i64,
-    ) -> anyhow::Result<Vec<StuckTransition>>;
 
     /// The project's own worker levers (`Ok(None)` when the project does
     /// not exist).
@@ -245,11 +274,24 @@ pub fn project_transition_from_str(s: &str) -> anyhow::Result<ProjectTransition>
         .ok_or_else(|| anyhow::anyhow!("unknown project.transition column value '{s}'"))
 }
 
-/// One project stuck in a build transition (stale heartbeat).
-#[derive(Debug, Clone)]
-pub struct StuckTransition {
-    pub id: uuid::Uuid,
-    pub transition: ProjectTransition,
+/// The SQL condition "a request drives the project row `p` through its
+/// build transition right now": the row is in one and its heartbeat is no
+/// older than `stale_before` (`crate::transition::heartbeat_stale_secs`).
+/// The heartbeat beats while the request's starts run
+/// (`crate::transition::ProjectBuildGate`), so a start-pending build of a
+/// project not driven has lost its starter
+/// (`crate::build::ledger::end_lost_starts`). One definition for every
+/// reader, so a settle and the build loop never disagree about whether a
+/// start is alive.
+pub(crate) fn build_driven(p: &str, stale_before: &str) -> String {
+    format!("({p}.transition IN ('building', 'cancelling_build') AND {p}.transition_heartbeat_unix >= {stale_before})")
+}
+
+/// The SQL condition "something holds the project row `p` in its build
+/// transition": a request drives it ([`build_driven`]), or a version of it
+/// waits on its builds (`crate::build::waiting`). What a settle reads.
+pub(crate) fn build_held(p: &str, stale_before: &str) -> String {
+    format!("({} OR {})", build_driven(p, stale_before), crate::build::waiting::has_waiting_version(&format!("{p}.id")))
 }
 
 /// Cloneable handle to whatever the dispatcher uses as project
@@ -358,16 +400,18 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 health_protocols_json JSONB,
                 -- Verb-transition marker, orthogonal to `status` (the
                 -- BUILD axis): 'none' | 'building' | 'cancelling_build'.
-                -- Written only by its own single-flight CAS methods
+                -- Written only by its own single-flight methods
                 -- (try_begin_building / request_cancel_build /
-                -- finish_building), never by lifecycle writes, so a
-                -- deactivate can't stomp an in-flight build marker.
+                -- settle_building), never by lifecycle writes, so a
+                -- deactivate can't stomp an in-flight build marker. Held
+                -- by the request starting the builds, then by the
+                -- project's waiting version until it ends.
                 transition TEXT NOT NULL DEFAULT 'none',
                 -- Heartbeat for the build transition
-                -- (transition='building'/'cancelling_build'): the replica
-                -- driving it bumps this on an interval; the stuck-transition
-                -- reaper repairs rows whose heartbeat went stale (the
-                -- driver died mid-transition).
+                -- (transition='building'/'cancelling_build'): the request
+                -- starting the builds bumps this on an interval and zeroes
+                -- it when it lets go; once it is stale, only a waiting
+                -- version holds the transition (settle_building).
                 transition_heartbeat_unix BIGINT NOT NULL DEFAULT 0,
                 -- The version tree's HEAD (`crate::versions`): the version
                 -- the next checkpoint or run parents on, the run the next
@@ -387,7 +431,16 @@ pub static GROUP: weft_task_store::SchemaGroup = weft_task_store::SchemaGroup {
                 -- `crate::front`): what `weft status` shows and where the
                 -- listener hands the project's events. NULL while nothing
                 -- of the project takes work.
-                api_address JSONB
+                api_address JSONB,
+                -- The order of the project's build asks: each build request
+                -- takes the next one as it arrives, before it compiles
+                -- (`next_build_ask`), from this row, so every replica
+                -- agrees on it.
+                build_asks BIGINT NOT NULL DEFAULT 0,
+                -- The ask whose version the project runs: a registration
+                -- lands only over an older ask
+                -- (`crate::build::waiting::settle`).
+                registered_ask BIGINT NOT NULL DEFAULT 0
             )"#,
         "CREATE INDEX IF NOT EXISTS idx_project_tenant ON project(tenant_id)",
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_project_api_port ON project(api_port) WHERE api_port IS NOT NULL",
@@ -572,7 +625,8 @@ impl ProjectStoreOps for PostgresProjectStore {
         infra_image_tags: Option<&InfraImageTags>,
         implementations: Option<&std::collections::BTreeMap<String, String>>,
         source: Option<&weft_core::project::hash::Manifest>,
-    ) -> anyhow::Result<StoredProjectSummary> {
+        settles: Option<&crate::build::waiting::Settles<'_>>,
+    ) -> anyhow::Result<Option<StoredProjectSummary>> {
         let id = project.id;
         let name = name.to_string();
         let description = description.to_string();
@@ -584,6 +638,12 @@ impl ProjectStoreOps for PostgresProjectStore {
         let project_json = serde_json::to_string(&project)?;
         let mut tx = self.pool.begin().await?;
         let now = crate::lease::now_unix();
+        if let Some(settles) = settles {
+            if !crate::build::waiting::settle(&mut tx, id, settles, now).await? {
+                tx.commit().await?;
+                return Ok(None);
+            }
+        }
         // The conflict arm is GUARDED by `WHERE project.tenant_id =
         // EXCLUDED.tenant_id`: a re-register may only update a row that already
         // belongs to the same tenant. Without this guard the upsert would let
@@ -668,7 +728,7 @@ impl ProjectStoreOps for PostgresProjectStore {
                 .execute(&mut *tx).await?;
         }
         tx.commit().await?;
-        Ok(StoredProjectSummary { id, name, description })
+        Ok(Some(StoredProjectSummary { id, name, description }))
     }
 
     async fn program_source(&self, id: uuid::Uuid, program: &weft_core::project::hash::ProgramIdentity) -> anyhow::Result<weft_core::project::hash::Manifest> {
@@ -870,6 +930,14 @@ impl ProjectStoreOps for PostgresProjectStore {
         .transpose()
     }
 
+    async fn next_build_ask(&self, id: uuid::Uuid) -> anyhow::Result<i64> {
+        sqlx::query_scalar("UPDATE project SET build_asks = build_asks + 1 WHERE id = $1 RETURNING build_asks")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("no project {id} to take a build ask of"))
+    }
+
     async fn transition(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectTransition>> {
         let row: Option<(String,)> =
             sqlx::query_as("SELECT transition FROM project WHERE id = $1")
@@ -879,36 +947,33 @@ impl ProjectStoreOps for PostgresProjectStore {
         row.map(|(t,)| project_transition_from_str(&t)).transpose()
     }
 
-    async fn try_begin_building(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
+    async fn try_begin_building(&self, id: uuid::Uuid, stale_before: i64) -> anyhow::Result<bool> {
+        let now = crate::lease::now_unix();
+        let mut tx = self.pool.begin().await?;
         let res = sqlx::query(
             "UPDATE project \
              SET transition = 'building', transition_heartbeat_unix = $1 \
              WHERE id = $2 \
-               AND transition = 'none' \
+               AND (transition = 'none' OR (transition = 'building' AND transition_heartbeat_unix < $3)) \
                AND NOT EXISTS (SELECT 1 FROM trigger_activation a \
                                WHERE a.project_id = $2 AND a.status IN ('activating', 'deactivating'))",
         )
-        .bind(crate::lease::now_unix())
+        .bind(now)
         .bind(id)
-        .execute(&self.pool)
+        .bind(stale_before)
+        .execute(&mut *tx)
         .await?;
-        Ok(res.rows_affected() > 0)
+        if res.rows_affected() == 0 {
+            return Ok(false);
+        }
+        crate::build::ledger::end_lost_starts(&mut tx, crate::build::ledger::LostStarts::Of(id), now).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     async fn request_cancel_build(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
         let res = sqlx::query(
             "UPDATE project SET transition = 'cancelling_build' \
-             WHERE id = $1 AND transition = 'building'",
-        )
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(res.rows_affected() > 0)
-    }
-
-    async fn finish_building(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
-        let res = sqlx::query(
-            "UPDATE project SET transition = 'none' \
              WHERE id = $1 AND transition IN ('building', 'cancelling_build')",
         )
         .bind(id)
@@ -917,36 +982,48 @@ impl ProjectStoreOps for PostgresProjectStore {
         Ok(res.rows_affected() > 0)
     }
 
-    async fn bump_transition_heartbeat(&self, id: uuid::Uuid) -> anyhow::Result<()> {
-        sqlx::query("UPDATE project SET transition_heartbeat_unix = $1 WHERE id = $2")
-            .bind(crate::lease::now_unix())
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+    async fn release_build_driver(&self, id: uuid::Uuid) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE project SET transition_heartbeat_unix = 0 \
+             WHERE id = $1 AND transition IN ('building', 'cancelling_build')",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
-    async fn list_stuck_transitions(
-        &self,
-        stale_before: i64,
-    ) -> anyhow::Result<Vec<StuckTransition>> {
+    async fn settle_building(&self, project: Option<uuid::Uuid>, stale_before: i64) -> anyhow::Result<Vec<uuid::Uuid>> {
         // NOTE (compiler-invisible status set): this WHERE names the
-        // driver-backed transitional states by string. Adding a new
-        // driver-backed transitional state means adding it HERE too;
-        // the Rust exhaustiveness checker cannot flag this SQL.
-        let rows: Vec<(uuid::Uuid, String)> = sqlx::query_as(
-            "SELECT id, transition FROM project \
-             WHERE transition IN ('building', 'cancelling_build') \
-               AND transition_heartbeat_unix < $1",
-        )
+        // build transition's states by string, like the CAS methods above.
+        Ok(sqlx::query_scalar(&format!(
+            "UPDATE project p SET transition = 'none' \
+             WHERE p.transition IN ('building', 'cancelling_build') \
+               AND NOT {} \
+               AND ($2::UUID IS NULL OR p.id = $2) \
+             RETURNING p.id",
+            build_held("p", "$1")
+        ))
         .bind(stale_before)
+        .bind(project)
         .fetch_all(&self.pool)
+        .await?)
+    }
+
+    async fn bump_transition_heartbeat(&self, id: uuid::Uuid) -> anyhow::Result<()> {
+        // A released heartbeat (0, `release_build_driver`) stays released:
+        // the beat's task is stopped without waiting for it, so a bump
+        // already on its way may land after the release, and must not make
+        // the project driven again.
+        sqlx::query(
+            "UPDATE project SET transition_heartbeat_unix = $1 \
+             WHERE id = $2 AND transition IN ('building', 'cancelling_build') AND transition_heartbeat_unix > 0",
+        )
+        .bind(crate::lease::now_unix())
+        .bind(id)
+        .execute(&self.pool)
         .await?;
-        rows.into_iter()
-            .map(|(id, transition)| {
-                Ok(StuckTransition { id, transition: project_transition_from_str(&transition)? })
-            })
-            .collect()
+        Ok(())
     }
 
     /// Read-only access to the full ProjectDefinition. JSON decode
@@ -1027,6 +1104,8 @@ pub struct FakeProjectStore {
     /// columns. Missing entry = (None, 0), matching the column
     /// defaults on a fresh row.
     transitions: RwLock<HashMap<uuid::Uuid, (ProjectTransition, i64)>>,
+    /// Mirror of `build_asks`.
+    build_asks: RwLock<HashMap<uuid::Uuid, i64>>,
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -1046,6 +1125,7 @@ impl FakeProjectStore {
             has_infra: RwLock::new(HashMap::new()),
             worker_overrides: RwLock::new(HashMap::new()),
             transitions: RwLock::new(HashMap::new()),
+            build_asks: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -1072,7 +1152,10 @@ impl ProjectStoreOps for FakeProjectStore {
         infra_image_tags: Option<&InfraImageTags>,
         implementations: Option<&std::collections::BTreeMap<String, String>>,
         source: Option<&weft_core::project::hash::Manifest>,
-    ) -> anyhow::Result<StoredProjectSummary> {
+        // The fake holds no version builds (they live in Postgres): a
+        // registration always lands.
+        _settles: Option<&crate::build::waiting::Settles<'_>>,
+    ) -> anyhow::Result<Option<StoredProjectSummary>> {
         let id = project.id;
         let name_owned = name.to_string();
         let description_owned = description.to_string();
@@ -1137,11 +1220,11 @@ impl ProjectStoreOps for FakeProjectStore {
                 None => { sources.remove(&id); }
             }
         }
-        Ok(StoredProjectSummary {
+        Ok(Some(StoredProjectSummary {
             id,
             name: name_owned,
             description: description_owned,
-        })
+        }))
     }
 
     async fn running_program_identity(&self, id: uuid::Uuid) -> anyhow::Result<Option<weft_core::project::hash::ProgramIdentity>> {
@@ -1228,6 +1311,7 @@ impl ProjectStoreOps for FakeProjectStore {
         self.has_infra.write().await.remove(&id);
         self.worker_overrides.write().await.remove(&id);
         self.transitions.write().await.remove(&id);
+        self.build_asks.write().await.remove(&id);
         Ok(was_present)
     }
 
@@ -1297,6 +1381,14 @@ impl ProjectStoreOps for FakeProjectStore {
         Ok(Some(self.infra_image_tags.read().await.get(&id).cloned().unwrap_or_default()))
     }
 
+    async fn next_build_ask(&self, id: uuid::Uuid) -> anyhow::Result<i64> {
+        anyhow::ensure!(self.inner.read().await.contains_key(&id), "no project {id} to take a build ask of");
+        let mut asks = self.build_asks.write().await;
+        let ask = asks.entry(id).or_insert(0);
+        *ask += 1;
+        Ok(*ask)
+    }
+
     async fn transition(&self, id: uuid::Uuid) -> anyhow::Result<Option<ProjectTransition>> {
         if !self.inner.read().await.contains_key(&id) {
             return Ok(None);
@@ -1311,7 +1403,7 @@ impl ProjectStoreOps for FakeProjectStore {
         ))
     }
 
-    async fn try_begin_building(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
+    async fn try_begin_building(&self, id: uuid::Uuid, stale_before: i64) -> anyhow::Result<bool> {
         // The half of the guard that reads activations lives in
         // Postgres (a build refuses while one is mid-flip); the fake
         // project store holds no activations, so it guards the build
@@ -1321,7 +1413,8 @@ impl ProjectStoreOps for FakeProjectStore {
             return Ok(false);
         }
         let entry = transitions.entry(id).or_insert((ProjectTransition::None, 0));
-        if entry.0 != ProjectTransition::None {
+        let at_rest = entry.0 == ProjectTransition::None || (entry.0 == ProjectTransition::Building && entry.1 < stale_before);
+        if !at_rest {
             return Ok(false);
         }
         *entry = (ProjectTransition::Building, crate::lease::now_unix());
@@ -1331,7 +1424,7 @@ impl ProjectStoreOps for FakeProjectStore {
     async fn request_cancel_build(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
         let mut transitions = self.transitions.write().await;
         match transitions.get_mut(&id) {
-            Some(entry) if entry.0 == ProjectTransition::Building => {
+            Some(entry) if entry.0.is_building() => {
                 entry.0 = ProjectTransition::CancellingBuild;
                 Ok(true)
             }
@@ -1339,39 +1432,36 @@ impl ProjectStoreOps for FakeProjectStore {
         }
     }
 
-    async fn finish_building(&self, id: uuid::Uuid) -> anyhow::Result<bool> {
-        let mut transitions = self.transitions.write().await;
-        match transitions.get_mut(&id) {
-            Some(entry) if entry.0.is_building() => {
-                entry.0 = ProjectTransition::None;
-                Ok(true)
+    async fn release_build_driver(&self, id: uuid::Uuid) -> anyhow::Result<()> {
+        if let Some(entry) = self.transitions.write().await.get_mut(&id) {
+            if entry.0.is_building() {
+                entry.1 = 0;
             }
-            _ => Ok(false),
         }
-    }
-
-    async fn bump_transition_heartbeat(&self, id: uuid::Uuid) -> anyhow::Result<()> {
-        self.transitions
-            .write()
-            .await
-            .entry(id)
-            .or_insert((ProjectTransition::None, 0))
-            .1 = crate::lease::now_unix();
         Ok(())
     }
 
-    async fn list_stuck_transitions(
-        &self,
-        stale_before: i64,
-    ) -> anyhow::Result<Vec<StuckTransition>> {
-        Ok(self
-            .transitions
-            .read()
-            .await
-            .iter()
-            .filter(|(_, (transition, hb))| transition.is_building() && *hb < stale_before)
-            .map(|(id, (transition, _))| StuckTransition { id: *id, transition: *transition })
-            .collect())
+    async fn settle_building(&self, project: Option<uuid::Uuid>, stale_before: i64) -> anyhow::Result<Vec<uuid::Uuid>> {
+        // The fake project store sees no version builds (they live in
+        // Postgres), so a transition nothing drives is at rest.
+        let mut settled = Vec::new();
+        for (id, entry) in self.transitions.write().await.iter_mut() {
+            if entry.0.is_building() && entry.1 < stale_before && project.is_none_or(|p| p == *id) {
+                entry.0 = ProjectTransition::None;
+                settled.push(*id);
+            }
+        }
+        Ok(settled)
+    }
+
+    async fn bump_transition_heartbeat(&self, id: uuid::Uuid) -> anyhow::Result<()> {
+        // As the real store: only a build transition still driven.
+        if let Some(entry) = self.transitions.write().await.get_mut(&id) {
+            if entry.0.is_building() && entry.1 > 0 {
+                entry.1 = crate::lease::now_unix();
+            }
+        }
+        Ok(())
     }
 
     async fn project_has_infra(&self, id: uuid::Uuid) -> anyhow::Result<Option<bool>> {

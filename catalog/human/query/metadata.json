@@ -1,7 +1,7 @@
 {
   "type": "HumanQuery",
   "label": "Human",
-  "description": "Pauses the run until a person submits a form, then continues with their answers; use it for review or approval mid-run. A run that cannot pause, such as a route still answering its caller, holds its worker instead, up to its trigger's `holdSecs`, then fails saying it gave up. Each form field adds input and/or output ports by its kind.",
+  "description": "Pauses the run until a person submits a form, then continues with their answers; use it for review or approval mid-run. A run that cannot pause, such as a route still answering its caller, holds its worker instead, up to its trigger's `holdSecs`, then fails saying it gave up. A person who skips the form ends this step skipped, with every output closed. Each form field adds input and/or output ports by its kind.",
   "tags": [
     "human",
     "form",

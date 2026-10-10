@@ -209,8 +209,17 @@ export function buildPortMenuItems(opts: BuildPortMenuOptions): PortMenuItem[] {
 	if (opts.instanceFilled) items.push(instanceFilledMenuItem(opts.instanceFilled));
 
 	// Required toggle (inputs only; outputs do not have runtime required
-	// semantics, and only an input caller hands over the writer).
-	if (opts.side === 'input') {
+	// semantics, and only an input caller hands over the writer). An input
+	// required only once wired has its requiredness decided by its wiring
+	// (the compiler refuses a header making it required), so it says so
+	// instead of offering the toggle.
+	if (opts.side === 'input' && port.requiredWhenWired) {
+		items.push({
+			label: 'Required when wired, optional while unwired: its wiring decides.',
+			note: true,
+			color: '#71717a',
+		});
+	} else if (opts.side === 'input') {
 		const setRequired = opts.onSetRequired;
 		items.push({
 			label: port.required ? '☐ Make optional' : '☑ Make required',

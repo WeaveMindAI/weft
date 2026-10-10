@@ -155,7 +155,7 @@ pub const DISPATCHER_CHANNELS: &[&str] = &[
     crate::held::WORKER_SETTINGS_CHANNEL,
     crate::held::INFRA_STATUS_CHANNEL,
     crate::held::ACCESS_CHANNEL,
-    crate::build::follow::BUILD_STARTED_CHANNEL,
+    crate::build::follow::BUILD_CLAIMED_CHANNEL,
 ];
 
 /// What the dispatcher is built from: the install's config and what the
@@ -222,7 +222,6 @@ pub async fn build_state(settings: DispatcherSettings<'_>, defaults: Defaults) -
         images,
         pool: pool.clone(),
         compile_lanes: config.build.compile_lanes,
-        poll_every: weft_core::time_scale::scaled(std::time::Duration::from_secs(2)),
         prunes: Default::default(),
         blobs: crate::build::blob_cache::BlobCache::in_temp_dir(),
     });

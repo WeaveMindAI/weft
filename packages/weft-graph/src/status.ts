@@ -46,6 +46,7 @@ export interface RawStatusPayload {
   };
   available_actions?: string[];
   preservation?: { parked?: number; suspended?: number };
+  activations?: Array<{ trigger?: string; instance?: string; status?: string }>;
   executions?: {
     last_status?: string;
     last_execution_id?: string;
@@ -103,6 +104,7 @@ export function emptyActionAvailability(): ActionAvailability {
     orphanedInfra: false,
     mode: 'unknown',
     runningCount: 0,
+    triggersOff: [],
     infraRollup: 'none',
     infraBusy: false,
     infraNodes: [],
@@ -150,6 +152,7 @@ export function parseStatusPayload(raw: RawStatusPayload): ActionAvailability {
     mode: String(raw.mode ?? 'unknown'),
     ...(firesDeadlineUnix !== undefined ? { firesDeadlineUnix } : {}),
     runningCount: Number(raw.running_count ?? 0),
+    triggersOff: triggersOff(raw),
     infraRollup,
     infraBusy: !!raw.infra_busy,
     infraNodes,
@@ -158,6 +161,17 @@ export function parseStatusPayload(raw: RawStatusPayload): ActionAvailability {
       suspended: Number(raw.preservation?.suspended ?? 0),
     },
   };
+}
+
+/// The program's own triggers that are off: registered and never
+/// switched on, or taken down. An instance's copies are its own and stay
+/// out of it, as the bar acts on the program's.
+// SYNC: triggersOff <-> crates/weft-dispatcher/src/api/project.rs is_down
+function triggersOff(raw: RawStatusPayload): string[] {
+  return (raw.activations ?? [])
+    .filter((a) => !a.instance && (a.status === 'registered' || a.status === 'inactive'))
+    .map((a) => a.trigger ?? '')
+    .filter((trigger) => trigger !== '');
 }
 
 /// One execution running right now, and what it is for.
@@ -202,6 +216,7 @@ export function backendFromSnapshot(snapshot: ActionAvailability): BackendSnapsh
     infraRollup: snapshot.infraRollup,
     infraBusy: snapshot.infraBusy,
     runningCount: snapshot.runningCount,
+    triggersOff: snapshot.triggersOff,
     ...(snapshot.firesDeadlineUnix !== undefined
       ? { firesDeadlineUnix: snapshot.firesDeadlineUnix }
       : {}),

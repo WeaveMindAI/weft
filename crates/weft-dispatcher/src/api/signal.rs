@@ -98,25 +98,33 @@ pub async fn fire_signal(
     fire_signal_inner(&state, &token, &caller, payload).await
 }
 
-/// `POST /signal/{token}/skip`. Resume the suspended firing with a
-/// null payload. Sibling firings of the same execution keep going; the
-/// skipped firing wakes, downstream null-propagation decides what
-/// happens (most nodes auto-skip on null inputs).
+/// `POST /signal/{token}/skip`. A person declines what a waiting run
+/// asked: the waiting step ends skipped, every output of it closed, and
+/// what reads them skips in turn. Sibling firings of the same execution
+/// keep going. Only a waiting run's question can be skipped; an entry
+/// has nothing to decline. The answer is weft's own
+/// (`WaitAnswer::Skipped`), never a value the signal's kind processes,
+/// so no kind can mistake it for an answer.
 ///
 /// Auth: signal token alone (knowing it = permission to skip).
 /// Same auth model as fire: a consumer that can answer the form
 /// can also refuse to answer it.
-///
-/// Implementation: thin wrapper around fire_signal with body=null.
-/// No special engine path; the engine sees a normal
-/// SuspensionResolved with value=null and unwinds via existing
-/// null-propagation rules.
 pub async fn skip_signal(
     State(state): State<DispatcherState>,
-    caller: crate::api::CallerAddress,
     Path(token): Path<String>,
 ) -> axum::response::Response {
-    fire_signal_inner(&state, &token, &caller, Value::Null).await
+    use axum::response::IntoResponse;
+    let routing = match lookup_signal_routing(&state, &token).await {
+        Ok(r) => r,
+        Err(e) => return e.into_response(),
+    };
+    if routing.surface_kind == "internal" {
+        return (StatusCode::NOT_FOUND, "internal signal kind has no public surface").into_response();
+    }
+    if !routing.is_resume {
+        return (StatusCode::CONFLICT, "only a question a waiting run asked can be skipped; this signal starts runs").into_response();
+    }
+    answer_run(&state, &token, &routing, weft_core::primitive::WaitAnswer::Skipped).await.into_response()
 }
 
 async fn fire_signal_inner(
@@ -241,7 +249,7 @@ pub(crate) async fn take_event(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("listener dispatch: {e:#}")))?;
     match outcome.target {
-        ProcessTarget::Resume { .. } => Ok(answer_run(state, token, routing, outcome.value).await?),
+        ProcessTarget::Resume { .. } => Ok(answer_run(state, token, routing, weft_core::primitive::WaitAnswer::Given { value: outcome.value }).await?),
         ProcessTarget::Entry => {
             let fire = weft_core::door_fire::DoorFire {
                 token: token.to_string(),
@@ -286,11 +294,11 @@ pub(crate) async fn answer_run(
     state: &DispatcherState,
     token: &str,
     routing: &FireGateInfo,
-    value: Value,
+    answer: weft_core::primitive::WaitAnswer,
 ) -> Result<StatusCode, (StatusCode, String)> {
     match routing.standing().arrival(crate::lease::now_unix()) {
         weft_core::arrival::Arrival::Live => {
-            let answered = state.journal.answer(token, &value).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("answer: {e:#}")))?;
+            let answered = state.journal.answer(token, &answer).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("answer: {e:#}")))?;
             match answered {
                 crate::journal::Answered::Reached { consumed } => {
                     // The row is gone now, so the listener only learns of
@@ -311,7 +319,7 @@ pub(crate) async fn answer_run(
         // there is no run to hand it to now, or later.
         weft_core::arrival::Arrival::Refused => Err((StatusCode::GONE, "This no longer takes answers.".into())),
         weft_core::arrival::Arrival::Wait => {
-            let waiting = weft_task_store::parked_fires::waiting(uuid::Uuid::new_v4(), value, None, 0, None);
+            let waiting = weft_task_store::parked_fires::waiting_answer(uuid::Uuid::new_v4(), answer);
             // The shared park names its refusal; never swallow one under a
             // 200.
             match park(&state.pg_pool, token, &waiting, None).await.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("park: {e}")))? {

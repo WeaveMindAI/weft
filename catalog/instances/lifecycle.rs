@@ -1,7 +1,9 @@
-//! Shared by the instance nodes that take something down: how they read
-//! what happens to the triggers and runs they reach, and whether the run
-//! doing it goes too. One reader, so every such node offers the same
-//! choices with the same defaults.
+//! Shared by the instance nodes: how they read an instance id (one they
+//! always need, or one that, left out, means the program's own copies),
+//! and, for the ones that take something down, what happens to the
+//! triggers and runs they reach and whether the run doing it goes too.
+//! One reader, so every such node offers the same choices with the same
+//! defaults.
 
 use weft::instance::InstanceId;
 use weft::node::NodeOutput;
@@ -16,6 +18,21 @@ pub fn instance(ctx: &ExecutionContext) -> WeftResult<InstanceId> {
     match InstanceId::new(instance) {
         Ok(id) => Ok(id),
         Err(why) => node_bail!("instance: {why}"),
+    }
+}
+
+/// The instance id a node acting on either kind of copy was handed, or
+/// `None` when `instance` is unwired, which means the program's own
+/// copies. A given id is checked like [`instance`], so an empty one (a
+/// value that never arrived) fails rather than reaching the program's
+/// own copies by accident.
+pub fn instance_if_given(ctx: &ExecutionContext) -> WeftResult<Option<InstanceId>> {
+    match ctx.inputs.opt::<String>("instance")? {
+        None => Ok(None),
+        Some(given) => match InstanceId::new(given) {
+            Ok(id) => Ok(Some(id)),
+            Err(why) => node_bail!("instance: {why}"),
+        },
     }
 }
 
@@ -49,10 +66,10 @@ pub fn stop_self(ctx: &ExecutionContext) -> WeftResult<StopSelf> {
     Ok(if ctx.inputs.get::<bool>("includeSelf")? { StopSelf::Include } else { StopSelf::Keep })
 }
 
-/// What a node that takes one instance's copy down sends on: `done` when
-/// the copy is down (taken down now, or already down), `noCopy` when that
-/// instance has no copy of the node (a mistyped id, or one terminated
-/// before), so a program answering a person can tell them which.
+/// What a node that takes a copy down sends on: `done` when the copy is
+/// down (taken down now, or already down), `noCopy` when there is no such
+/// copy (never started, terminated before, or a mistyped instance id), so
+/// a program answering a person can tell them which.
 pub fn taken_down(answer: InfraDownAnswer) -> NodeOutput {
     match answer {
         InfraDownAnswer::TakenDown | InfraDownAnswer::AlreadyDown => NodeOutput::new().set("done", true),

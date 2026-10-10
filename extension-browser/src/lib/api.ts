@@ -446,11 +446,10 @@ export async function submitTask(
   }
 }
 
-/// Skip ONE task: resume its lane with null. Sibling lanes of
-/// the same execution keep going. Most upstream code patterns
-/// auto-skip on null inputs (downstream null-propagation), so
-/// this is the "I don't want to answer this one, do whatever"
-/// action. Auth: signal token alone (knowing it = permission).
+/// Skip ONE task: decline the question. The step that asked ends
+/// skipped, its outputs close and what reads them skips; sibling lanes
+/// of the same execution keep going. Auth: signal token alone (knowing
+/// it = permission).
 export async function skipTask(task: PendingTask): Promise<void> {
   const tokenConfig = task._tokenConfig;
   if (!tokenConfig) throw new Error('Task missing token configuration');

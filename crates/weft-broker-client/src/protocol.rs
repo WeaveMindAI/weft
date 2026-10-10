@@ -182,11 +182,12 @@ pub struct RunAnswersResponse {
     pub answers: Vec<RunAnswer>,
 }
 
-/// One answer waiting for a run: the wait it resolves, and the value.
+/// One answer waiting for a run: the wait it resolves, and the answer (a
+/// value, or a person's skip).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunAnswer {
     pub token: String,
-    pub value: Value,
+    pub answer: weft_core::primitive::WaitAnswer,
 }
 
 /// `POST /v1/run/cancels`: the cancels waiting for the runs the calling
@@ -2218,10 +2219,11 @@ pub enum LetGo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DoorLetGo {}
 
-/// `POST /v1/door/tick`: once a second, a worker says it is alive (its
-/// `worker_lease`) and how many runs it drives per trigger, states what it
-/// counted at its door this minute, and hears what the project's other
-/// copies counted.
+/// `POST /v1/door/tick`: once a second while it has work under way, a
+/// worker says it is alive (its `worker_lease`) and how many runs it
+/// drives per trigger, states what it counted at its door this minute, and
+/// hears what the project's other copies counted. With nothing under way
+/// it sends none, and its lease lapses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DoorTickRequest {
     /// The image it runs (the program's binary hash): a drain of the runs

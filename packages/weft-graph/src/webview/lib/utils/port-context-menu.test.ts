@@ -54,6 +54,14 @@ describe('buildPortMenuItems', () => {
 		expect(labels(items)).toContain('an input of the same name conflicts');
 	});
 
+	it('an input required only once wired offers no required toggle, only why', () => {
+		const items = build({ port: { ...port, requiredWhenWired: true } });
+		expect(labels(items)).not.toContain('☑ Make required');
+		expect(labels(items)).not.toContain('☐ Make optional');
+		expect(notes(items).map((n) => n.label)).toEqual(['Required when wired, optional while unwired: its wiring decides.']);
+		expect(labels(items)).toContain('✎ Type: String');
+	});
+
 	it('an output has no required toggle', () => {
 		expect(labels(build({}, { side: 'output' }))).toEqual(['✎ Type: String']);
 	});

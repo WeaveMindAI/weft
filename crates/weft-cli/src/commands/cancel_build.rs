@@ -1,11 +1,11 @@
 //! `weft cancel-build [project]`. Cancel an in-flight build
-//! (transition=building). Flips the transition to cancelling_build;
-//! the dispatcher driving the build interrupts the builder job and
-//! the verb that was building errs "cancelled".
+//! (transition=building): the install stops every image build the
+//! project started, stops waiting on the ones another project started
+//! (they go on for it), and the verb following the build errs
+//! "cancelled". Ctrl+C on that verb only stops following: the builds go
+//! on, and running it again picks them up.
 //!
-//! 412 from the dispatcher when no build is in flight (which is the
-//! case when the build already ran locally before the verb; there,
-//! Ctrl+C the CLI to cancel a build).
+//! 412 from the dispatcher when no build is in flight.
 
 use super::Ctx;
 use crate::progress::ActionVerb;

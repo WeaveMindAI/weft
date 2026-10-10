@@ -55,7 +55,7 @@ fn rig_project(id: Uuid) -> ProjectDefinition {
 
 async fn seed_project(projects: &weft_dispatcher::ProjectStore, id: Uuid) {
     projects
-        .register_with_hashes(rig_project(id), "db-rig", "", TENANT, Some("bin-A"), Some("def-1"), None, None, None, None)
+        .register_with_hashes(rig_project(id), "db-rig", "", TENANT, Some("bin-A"), Some("def-1"), None, None, None, None, None)
         .await
         .expect("register project");
 }

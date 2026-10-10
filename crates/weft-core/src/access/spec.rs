@@ -297,6 +297,14 @@ pub struct Permission {
     /// Starts ticked on the picker.
     #[serde(default)]
     pub default: bool,
+    /// Asked for on every consent, whatever is ticked, and never shown to
+    /// tick: what the service's test call needs to learn who the account
+    /// is (Google's `userinfo.email`) when no tickable permission is sure
+    /// to cover it. Keep it to permissions the provider grants without
+    /// review and an app allows without setup, since every app and every
+    /// connection asks for it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub always: bool,
     /// This capability creates or reads things INSIDE the credential's
     /// own account (minted voices, configured agents, phone numbers),
     /// so a runtime-supplied credential can never serve it: the result
@@ -1576,6 +1584,20 @@ impl AccessSpec {
                         p.id
                     ));
                 }
+                if p.always && !self.needs_browser_consent() {
+                    return Err(format!(
+                        "permission '{}' is `always` (asked for on every consent), but this service \
+                         connects without a browser consent, so nothing would ever ask for it",
+                        p.id
+                    ));
+                }
+                if p.always && (p.default || p.own_only) {
+                    return Err(format!(
+                        "permission '{}' is `always` (asked for on every consent, never ticked), so it \
+                         cannot also be `default` or `own_only`",
+                        p.id
+                    ));
+                }
             }
         }
         crate::access::events::validate_topics(&self.service, &self.events)?;
@@ -1664,6 +1686,9 @@ impl AccessSpec {
         // The page is connect-time UI; a stored snapshot has no use for
         // it (and validation would rightly refuse static + paste).
         variant.own_page = None;
+        // A pasted credential is asked for nothing: what a consent asks
+        // for every time does not apply to it.
+        variant.permissions.retain(|p| !p.always);
         Some(variant)
     }
 
@@ -1708,6 +1733,28 @@ impl AccessSpec {
             .collect()
     }
 
+    /// The catalogue entries a person ticks: everything but what is asked
+    /// for always, and the own-account-only capabilities (set up inside
+    /// the provider's account, never asked for at connect).
+    // SYNC: AccessSpec::tickable_permissions <-> packages/weft-connect/src/core/recipe.ts tickablePermissions
+    pub fn tickable_permissions(&self) -> Vec<&Permission> {
+        self.permissions.iter().filter(|p| !p.always && !p.own_only).collect()
+    }
+
+    /// What a consent asks for when `ticked` is ticked: the permissions
+    /// asked for always ([`Permission::always`]), then the ticked ones,
+    /// each once.
+    // SYNC: AccessSpec::requested_permissions <-> packages/weft-connect/src/core/recipe.ts requestedPermissions
+    pub fn requested_permissions(&self, ticked: &[String]) -> Vec<String> {
+        let mut out: Vec<String> = self.permissions.iter().filter(|p| p.always).map(|p| p.id.clone()).collect();
+        for id in ticked {
+            if !out.contains(id) {
+                out.push(id.clone());
+            }
+        }
+        out
+    }
+
     /// Is `id` in the permission catalogue?
     pub fn declares_permission(&self, id: &str) -> bool {
         self.permissions.iter().any(|p| p.id == id)
@@ -1744,7 +1791,7 @@ impl AccessSpec {
         }
     }
 
-    /// The guide's steps with `{permissions}` replaced by the ticked
+    /// The guide's steps with `{permissions}` replaced by the requested
     /// permissions' labels (comma-joined), generated per pick rather
     /// than written as a static blob. Empty when no guide is declared.
     // SYNC: guide_steps <-> packages/weft-connect/src/core/recipe.ts guideSteps
@@ -1752,17 +1799,18 @@ impl AccessSpec {
         let Some(guide) = self.own_page.as_ref().and_then(|p| p.guide.as_ref()) else {
             return Vec::new();
         };
+        let requested = self.requested_permissions(ticked);
         let labels: Vec<&str> = self
             .permissions
             .iter()
-            .filter(|p| ticked.iter().any(|t| t == &p.id))
+            .filter(|p| requested.contains(&p.id))
             .map(|p| p.label.as_str())
             .collect();
         let joined = labels.join(", ");
         guide.steps.iter().map(|s| s.replace("{permissions}", &joined)).collect()
     }
 
-    /// The guide's link with `{permissions}` replaced by the ticked
+    /// The guide's link with `{permissions}` replaced by the requested
     /// permission IDS, urlencoded and comma-joined: a link goes to a
     /// provider console, which wants machine ids where the steps'
     /// prose wants labels. The ONE substitution, so no surface renders
@@ -1771,7 +1819,7 @@ impl AccessSpec {
     // SYNC: guide_link <-> packages/weft-connect/src/core/recipe.ts guideLink
     pub fn guide_link(&self, ticked: &[String]) -> Option<String> {
         let link = self.own_page.as_ref()?.guide.as_ref()?.link.as_ref()?;
-        Some(link.replace("{permissions}", &percent_encode(&ticked.join(","))))
+        Some(link.replace("{permissions}", &percent_encode(&self.requested_permissions(ticked).join(","))))
     }
 }
 
@@ -2316,6 +2364,45 @@ mod tests {
         assert!(spec.validate().unwrap_err().contains("no fields"));
     }
 
+    /// A consent asks for the permissions asked for always, then the
+    /// ticked ones, each once; the guide names them all, since the app
+    /// has to allow them all.
+    #[test]
+    fn a_consent_asks_for_the_always_permissions_and_the_ticked_ones() {
+        let mut spec = slack_spec();
+        spec.permissions[1].always = true;
+        spec.permissions[1].default = false;
+        let always = spec.permissions[1].id.clone();
+        let first = spec.permissions[0].id.clone();
+        assert_eq!(spec.requested_permissions(std::slice::from_ref(&first)), vec![always.clone(), first.clone()]);
+        assert_eq!(spec.requested_permissions(&[always.clone(), first.clone()]), vec![always.clone(), first]);
+        assert_eq!(spec.requested_permissions(&[]), vec![always]);
+        assert!(spec.validate().is_ok());
+    }
+
+    /// Only a browser consent asks for anything, so `always` is refused on
+    /// a service that connects any other way, and a consent service's
+    /// paste variant (a credential pasted, asked for nothing) drops it.
+    #[test]
+    fn always_belongs_to_a_browser_consent() {
+        let mut keyed: AccessSpec = serde_json::from_value(json!({
+            "service": "keyed",
+            "acquisition": { "kind": "static", "fields": [{ "name": "key", "secret": true }] },
+            "permissions": [{ "id": "who", "label": "Who", "description": "Know the account.", "always": true }]
+        }))
+        .unwrap();
+        assert!(keyed.validate().unwrap_err().contains("without a browser consent"));
+        keyed.permissions[0].always = false;
+        assert!(keyed.validate().is_ok());
+
+        let mut consent = slack_spec();
+        consent.permissions[1].always = true;
+        consent.permissions[1].default = false;
+        consent.own_page = Some(serde_json::from_value(json!({ "paste": { "fields": [{ "name": "token", "secret": true }] } })).unwrap());
+        let pasted = consent.paste_variant().expect("a paste section");
+        assert!(pasted.permissions.iter().all(|p| !p.always), "a paste asks for nothing");
+    }
+
     #[test]
     fn validate_rejects_bad_shapes() {
         let mut spec = slack_spec();
@@ -2328,10 +2415,16 @@ mod tests {
             label: "Again".into(),
             description: "Duplicate.".into(),
             default: false,
+            always: false,
             own_only: false,
             guide: None,
         });
         assert!(dup.validate().unwrap_err().contains("duplicate permission"));
+
+        let mut ticked_always = slack_spec();
+        ticked_always.permissions[0].always = true;
+        assert!(ticked_always.permissions[0].default, "slack's first permission starts ticked");
+        assert!(ticked_always.validate().unwrap_err().contains("`always`"));
 
         let mut undesc = slack_spec();
         undesc.permissions[0].description = String::new();

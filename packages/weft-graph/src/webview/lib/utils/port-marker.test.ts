@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { filledMarkerStyle, portMarkerStyle } from './port-marker';
+import { filledMarkerStyle, portLooksRequired, portMarkerStyle } from './port-marker';
 import type { PortDefinition } from '../types';
 
 const port = (over: Partial<PortDefinition> = {}): PortDefinition =>
@@ -45,5 +45,22 @@ describe('port markers', () => {
 	it('rings an output in its own colour, so it draws as wide as an input', () => {
 		const out = portMarkerStyle(port(), none, none, '#0af', 'output');
 		expect(out.style).toBe(filledMarkerStyle('#0af', 'port').style);
+	});
+});
+
+describe('portLooksRequired', () => {
+	it('draws a required input required and an optional one optional, wired or not', () => {
+		for (const wired of [false, true]) {
+			expect(portLooksRequired(port({ required: true }), wired)).toBe(true);
+			expect(portLooksRequired(port(), wired)).toBe(false);
+		}
+	});
+
+	it('draws an input required only once wired as optional unwired and required wired', () => {
+		const p = port({ requiredWhenWired: true });
+		expect(portLooksRequired(p, false)).toBe(false);
+		expect(portLooksRequired(p, true)).toBe(true);
+		expect(portMarkerStyle(p, none, none, '#0af', 'input', '', false)).toEqual(portMarkerStyle(port(), none, none, '#0af', 'input'));
+		expect(portMarkerStyle(p, none, none, '#0af', 'input', '', true)).toEqual(portMarkerStyle(port({ required: true }), none, none, '#0af', 'input'));
 	});
 });

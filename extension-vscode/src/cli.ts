@@ -15,11 +15,15 @@ import type * as vscode from 'vscode';
 /// side reads off it.
 interface CliFailure {
   message?: string;
-  /// The request never reached the daemon: it is not running, or was
-  /// never installed here. A FLAG rather than a sentence to match on,
-  /// because the sentence is wording and wording changes.
-  // SYNC: daemonUnreachable <-> crates/weft-cli/src/progress.rs report_plain_error
+  /// The request never reached this machine's daemon: it is not
+  /// running, or was never installed here. A FLAG rather than a sentence
+  /// to match on, because the sentence is wording and wording changes.
+  // SYNC: daemonUnreachable, installUnreachable <-> crates/weft-cli/src/progress.rs error_detail
   daemonUnreachable?: boolean;
+  /// The request never reached the install it went to, this machine's or
+  /// a remote one (`--on <target>`). Only `daemonUnreachable` means
+  /// something here could be started to fix it.
+  installUnreachable?: boolean;
 }
 
 function jsonFailure(value: unknown): CliFailure | undefined {
@@ -30,6 +34,7 @@ function jsonFailure(value: unknown): CliFailure | undefined {
   return {
     message: typeof detail?.message === 'string' ? detail.message : undefined,
     daemonUnreachable: detail?.daemonUnreachable === true,
+    installUnreachable: detail?.installUnreachable === true,
   };
 }
 
@@ -46,6 +51,10 @@ export class WeftCliError extends Error {
     /// somebody than "that project is not registered", so it travels as
     /// its own fact rather than as words inside `stderr`.
     public readonly daemonUnreachable: boolean = false,
+    /// True when the install the verb went to did not answer, this
+    /// machine's daemon or a remote install. A remote one is not
+    /// something to start from here: the person checks the network.
+    public readonly installUnreachable: boolean = false,
   ) {
     const reason = stderr.trim() ? stderr.trim() : `exited ${code}`;
     super(`weft ${args.join(' ')}: ${reason}`);
@@ -139,6 +148,7 @@ export function runWeftJson<T>(
             code,
             failure?.message ?? stderr,
             failure?.daemonUnreachable ?? false,
+            failure?.installUnreachable ?? false,
           ),
         );
         return;

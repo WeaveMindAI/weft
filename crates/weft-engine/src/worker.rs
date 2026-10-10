@@ -374,6 +374,10 @@ impl Worker {
             () = self.stopping.cancelled() => return Ok(None),
             registered = self.cancels.claim_once_left(execution_id) => registered,
         };
+        // The claim makes the run this worker's on record, which its lease
+        // keeps: the registration counts it where the door's tick looks, so
+        // the tick goes out now, and the claim does not wait for it.
+        self.door.wake();
         let Some(claimed) = self.clients.runs.claim(execution_id).await.context("claim the run")? else {
             return Ok(Some(RunAnswer::NothingToRun));
         };
@@ -1108,12 +1112,15 @@ pub async fn serve(catalog: Arc<dyn NodeCatalog>, clients: EngineClients, config
         config.secret.clone(),
         crate::door::RunPermits::from_env()?,
     );
-    door.start_ticks().await?;
     // The line is held open while runs are driven (the cancel watch) and
     // while records wait to be written (the writer's own calls); idle, it
     // closes as any line does, and the door's copy of its triggers reads
     // the broker until it is back (`weft_task_store::held_copy`).
     let worker = new_worker(catalog, clients, &config, door.clone());
+    // The door ticks while this worker owns anything on record: a run it
+    // drives, or a record still on its way.
+    let (cancels, writer) = (worker.cancels.clone(), worker.clients.writer.clone());
+    door.start_ticks(Box::new(move || cancels.count() > 0 || !writer.settled())).await?;
     spawn_cancel_watch(worker.clone());
     // What the runs share goes once nothing used it for the idle window.
     worker.clients.shared.sweep_every(std::time::Duration::from_secs(30));
@@ -1289,6 +1296,13 @@ impl Worker {
         if self.stopping.is_cancelled() {
             return Err(Turned::Stopping);
         }
+        // Everything the run reads from here on leans on this worker's
+        // lease: its plan and image (an image prune keeps what a live
+        // worker may be running, a run its door just bore included, before
+        // anything of it is on record), then its birth, which makes the run
+        // this worker's on record. The door woke its tick when it let the
+        // run in (`Limits::admit`), so the lease is being renewed behind
+        // this without the run waiting for it.
         let plan = self.plans.plan(&self.clients, self.door.broker().as_ref(), trigger, entry, instance, triggers_version).await.map_err(Turned::Unread)?;
         let startable = plan.start.as_ref().map_err(|unready| Turned::Unready(unready.clone()))?;
         let opening = startable.opening(execution_id, &payload).map_err(|e| Turned::Internal(format!("the run's first state: {e}")))?;

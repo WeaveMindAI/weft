@@ -101,6 +101,7 @@ pub fn catchable_message(error: &WeftError) -> Option<String> {
         | WeftError::Type(_)
         | WeftError::Suspended { .. }
         | WeftError::Suspension(_)
+        | WeftError::WaitSkipped(_)
         | WeftError::Cancelled => None,
     }
 }

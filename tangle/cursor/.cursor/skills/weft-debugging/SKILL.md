@@ -51,7 +51,9 @@ node and the wrong value.
   group. `scope_skipped` names the group or loop whose `_should_flow` said
   no, taking this node with it: walk to that container. (A group input
   arriving closed is not this: it passes through to the nodes inside that
-  read it, and they carry their own reason.)
+  read it, and they carry their own reason.) `wait_skipped`: the node was
+  waiting on a person (a form, a question) and they skipped it, so it
+  ends with nothing sent on and what reads it skips: not a bug to chase.
 - **If a `Debug` shows `output=` empty**: correct, a `Debug` has no
   outputs. Its value is on its `node_started` line as `input=`, or `weft
   events <execution-id> --node <debug id>`.

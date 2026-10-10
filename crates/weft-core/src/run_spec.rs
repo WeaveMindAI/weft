@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::frames::{Located, LoopFrames};
+use crate::primitive::AwaitEnd;
 use crate::project::selection::{source_place, RunSelection, SelectionBounds};
 use crate::project::ProjectDefinition;
 use crate::pulse::Failure;
@@ -191,19 +192,89 @@ impl<'de> Deserialize<'de> for UniqueValue {
     }
 }
 
-/// A person's answer to a human step, as recorded at freeze time:
+/// How one wait of a run ended, as recorded at freeze time: the
+/// person's answer, their skip, or the run giving the wait up.
 /// `question` is what the node showed the person, so whoever answers on
-/// a new run reads old question, old answer, new question. The runtime
-/// never replays answers; Tangle plays the person.
+/// a new run reads old question, old ending, new question. The runtime
+/// never replays answers; Tangle plays the person. The file spells a
+/// given answer `"payload": <value>`, a skip `"skipped": true`, and a
+/// wait given up `"gave_up": "<the error>"`, exactly one of the three
+/// ([`AnswerFile`]).
+// SYNC: Answer <-> packages/weft-graph/src/run-spec.ts Answer
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "AnswerFile", into = "AnswerFile")]
 pub struct Answer {
     pub node: String,
-    #[serde(default)]
     pub frames: LoopFrames,
-    pub payload: Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// How the wait ended: end it the same way on a new run.
+    pub ended: AwaitEnd,
     pub question: Option<Value>,
+}
+
+/// [`Answer`] as the file holds it, both ways. `payload` is the field
+/// every frozen example has had since the first; `skipped` came with
+/// skips and `gave_up` with waits given up, and exactly one of the
+/// three is present. `deny_unknown_fields` and the defaults live here,
+/// because with `try_from` serde never reads attributes on [`Answer`]
+/// itself.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnswerFile {
+    node: String,
+    #[serde(default)]
+    frames: LoopFrames,
+    /// `Some(Null)` is a given null; `None` is no payload at all.
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
+    payload: Option<Value>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    skipped: bool,
+    /// The error the waiting step failed with when the run gave the wait up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gave_up: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    question: Option<Value>,
+}
+
+/// A field that is there, `null` included.
+fn present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(deserializer).map(Some)
+}
+
+impl TryFrom<AnswerFile> for Answer {
+    type Error = String;
+
+    // SYNC: answer refusals <-> packages/weft-graph/src/run-spec.ts parseRunSpec answers
+    fn try_from(f: AnswerFile) -> Result<Self, String> {
+        let ended = match (f.payload, f.skipped, f.gave_up) {
+            (Some(value), false, None) => AwaitEnd::Answered { value },
+            (None, true, None) => AwaitEnd::Skipped,
+            (None, false, Some(error)) => AwaitEnd::GaveUp { error },
+            (None, false, None) => return Err(format!(
+                "the answer to '{}' says nothing about how its wait ended; give the value the person answered (\"payload\"), \"skipped\": true if they skipped it, or \"gave_up\" with the error if the run gave it up",
+                f.node
+            )),
+            (payload, skipped, gave_up) => {
+                let said: Vec<&str> = [(payload.is_some(), "a payload"), (skipped, "\"skipped\": true"), (gave_up.is_some(), "\"gave_up\"")]
+                    .into_iter().filter(|(present, _)| *present).map(|(_, name)| name).collect();
+                return Err(format!(
+                    "the answer to '{}' says its wait ended more than one way ({}); a wait ends once, so keep only one",
+                    f.node, said.join(" and ")
+                ));
+            }
+        };
+        Ok(Self { node: f.node, frames: f.frames, ended, question: f.question })
+    }
+}
+
+impl From<Answer> for AnswerFile {
+    fn from(a: Answer) -> Self {
+        let (payload, skipped, gave_up) = match a.ended {
+            AwaitEnd::Answered { value } => (Some(value), false, None),
+            AwaitEnd::Skipped => (None, true, None),
+            AwaitEnd::GaveUp { error } => (None, false, Some(error)),
+        };
+        Self { node: a.node, frames: a.frames, payload, skipped, gave_up, question: a.question }
+    }
 }
 
 /// Where a frozen example's `expected` came from.
@@ -1116,6 +1187,51 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A given answer is written `payload` (a null one included), a skip
+    /// `"skipped": true` and a wait given up `"gave_up": "<error>"`, each
+    /// with nothing else; each reads back as itself.
+    #[test]
+    fn a_wait_ending_is_a_payload_a_skip_or_a_give_up_on_disk() {
+        let cases = [
+            (AwaitEnd::Answered { value: json!({ "answer": "yes" }) }, json!({ "node": "review", "frames": [], "payload": { "answer": "yes" } })),
+            (AwaitEnd::Answered { value: Value::Null }, json!({ "node": "review", "frames": [], "payload": null })),
+            (AwaitEnd::Skipped, json!({ "node": "review", "frames": [], "skipped": true })),
+            (AwaitEnd::GaveUp { error: "node 'review' gave up its wait: quiet".into() }, json!({ "node": "review", "frames": [], "gave_up": "node 'review' gave up its wait: quiet" })),
+        ];
+        for (ended, file) in cases {
+            let answer = Answer { node: "review".into(), frames: vec![], ended, question: None };
+            assert_eq!(serde_json::to_value(&answer).unwrap(), file);
+            assert_eq!(serde_json::from_value::<Answer>(file).unwrap(), answer);
+        }
+    }
+
+    /// A file saying two endings at once, or none, is refused by name;
+    /// unknown fields still are.
+    #[test]
+    fn a_wait_ending_is_exactly_one_of_payload_skipped_or_gave_up() {
+        for (two, named) in [
+            (json!({ "node": "review", "payload": null, "skipped": true }), "a payload and \"skipped\": true"),
+            (json!({ "node": "review", "payload": 1, "gave_up": "quiet" }), "a payload and \"gave_up\""),
+            (json!({ "node": "review", "skipped": true, "gave_up": "quiet" }), "\"skipped\": true and \"gave_up\""),
+        ] {
+            let error = serde_json::from_value::<Answer>(two).unwrap_err().to_string();
+            assert!(error.contains("ended more than one way") && error.contains(named), "{error}");
+        }
+        for neither in [json!({ "node": "review" }), json!({ "node": "review", "skipped": false })] {
+            let error = serde_json::from_value::<Answer>(neither).unwrap_err();
+            assert!(error.to_string().contains("says nothing about how its wait ended"), "{error}");
+        }
+        assert!(serde_json::from_value::<Answer>(json!({ "node": "review", "payload": 1, "stray": 1 })).is_err(), "unknown fields still refused");
+    }
+
+    /// An answer frozen before skips and give-ups existed (`node`,
+    /// `frames`, `payload`, `question`) reads as the given answer it was.
+    #[test]
+    fn an_answer_frozen_with_only_a_payload_still_reads() {
+        let old: Answer = serde_json::from_str(r#"{"node":"review","frames":[],"payload":"yes","question":"Continue?"}"#).unwrap();
+        assert_eq!(old, Answer { node: "review".into(), frames: vec![], ended: AwaitEnd::Answered { value: json!("yes") }, question: Some(json!("Continue?")) });
+    }
+
     #[test]
     fn fire_bake_requires_full_identity_and_an_actual_capture() {
         let program = crate::project::hash::ProgramIdentity {
@@ -1405,7 +1521,7 @@ mod tests {
     fn flat_wire_shape_retains_frozen_evidence_and_rejects_old_fields() {
         let spec = RunSpec { from: BTreeMap::from([("b".into(), BTreeMap::new())]), before: vec!["c".into()],
             caller: vec![json!({"text": "hello"})],
-            answers: vec![Answer { node: "b".into(), frames: vec![], payload: json!("yes"), question: Some(json!("Continue?")) }],
+            answers: vec![Answer { node: "b".into(), frames: vec![], ended: AwaitEnd::Answered { value: json!("yes") }, question: Some(json!("Continue?")) }],
             ..RunSpec::whole("x") };
         assert_eq!(serde_json::from_value::<RunSpec>(serde_json::to_value(&spec).unwrap()).unwrap(), spec);
         for field in ["scope", "kicks", "provided", "emitted", "input", "bogus"] {

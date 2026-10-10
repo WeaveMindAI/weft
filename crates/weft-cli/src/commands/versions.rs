@@ -605,9 +605,9 @@ pub fn frames_key(frames: &weft_core::frames::LoopFrames) -> String {
     weft_core::frames::frames_text(frames)
 }
 
-/// The outside facts a replay shows: every kick payload, every answer
-/// a person gave (with the question the node showed them, which is
-/// its firing input), and every live caller message.
+/// The outside facts a replay shows: how every wait ended (a person's
+/// answer or skip, or the run giving it up, with the question the node
+/// showed, which is its firing input), and every live caller message.
 #[derive(Debug, Default, Clone)]
 pub struct OutsideFacts {
     pub answers: Vec<weft_core::run_spec::Answer>,
@@ -623,11 +623,13 @@ pub fn outside_facts(rows: &[LiveEvent]) -> Result<OutsideFacts> {
             DispatcherEvent::NodeStarted { node, frames, input, .. } => {
                 inputs.insert((node.clone(), frames_key(frames)), input.clone());
             }
-            // A resume with no token is a boundary re-fire, not an answer.
-            DispatcherEvent::NodeResumed { node, frames, token: Some(_), value, .. } => {
+            // Every wait, the ones held in the worker included (those
+            // never suspend or resume the node, so only this event sees
+            // them): a replay ends each the same way.
+            DispatcherEvent::WaitEnded { node, frames, ended, .. } => {
                 facts.answers.push(weft_core::run_spec::Answer {
                     node: node.clone(),
-                    payload: value.clone().unwrap_or(Value::Null),
+                    ended: ended.clone(),
                     question: inputs.get(&(node.clone(), frames_key(frames))).cloned(),
                     frames: frames.clone(),
                 });
@@ -807,6 +809,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use weft_core::versions::{Head, ManifestDiff};
+    use weft_core::primitive::AwaitEnd;
 
     #[test]
     fn a_renamed_example_is_run_and_listed_by_its_filename() {
@@ -1159,7 +1162,7 @@ mod tests {
     }
 
     #[test]
-    fn outside_facts_pair_each_answer_with_the_question_the_node_showed() {
+    fn outside_facts_record_how_each_wait_ended_with_the_question_the_node_showed() {
         // Each row as the replay answers it: the run's own fields around
         // the kind's.
         let row = |mut fields: Value| -> LiveEvent {
@@ -1173,8 +1176,15 @@ mod tests {
         let rows = vec![
             row(json!({ "kind": "node_started", "node": "review", "frames": [], "input": { "prompt": "ok?" }, "closed_ports": [] })),
             row(json!({ "kind": "node_suspended", "node": "review", "frames": [], "token": "t" })),
-            row(json!({ "kind": "node_resumed", "node": "review", "frames": [], "token": "t", "value": { "answer": "yes" } })),
-            row(json!({ "kind": "node_resumed", "node": "crashed", "frames": [], "token": null, "value": null })),
+            row(json!({ "kind": "wait_ended", "node": "review", "frames": [], "token": "t", "ended": { "type": "answered", "value": { "answer": "yes" } } })),
+            row(json!({ "kind": "node_resumed", "node": "review", "frames": [], "token": "t" })),
+            row(json!({ "kind": "node_resumed", "node": "crashed", "frames": [], "token": null })),
+            row(json!({ "kind": "wait_ended", "node": "skipped", "frames": [], "token": "t3", "ended": { "type": "skipped" } })),
+            // A wait held in the worker that gave up: no suspend, no
+            // resume, only its ending and the node failing with its error.
+            row(json!({ "kind": "node_started", "node": "held", "frames": [], "input": { "prompt": "still there?" }, "closed_ports": [] })),
+            row(json!({ "kind": "wait_ended", "node": "held", "frames": [], "token": "t2", "ended": { "type": "gave_up", "error": "node 'held' gave up its wait: quiet" } })),
+            row(json!({ "kind": "node_failed", "node": "held", "frames": [], "error": "node 'held' gave up its wait: quiet" })),
             // One window row carrying the whole short conversation,
             // which is how the journal writes it: the messages come out
             // of the row, not one row each.
@@ -1184,9 +1194,14 @@ mod tests {
             ], "totals": [] })),
         ];
         let facts = outside_facts(&rows).unwrap();
-        assert_eq!(facts.answers.len(), 1, "a boundary re-fire is not an answer");
-        assert_eq!(facts.answers[0].payload, json!({ "answer": "yes" }));
+        assert_eq!(facts.answers.len(), 3, "one per wait that ended; a boundary re-fire is none");
+        assert_eq!(facts.answers[0].ended, AwaitEnd::Answered { value: json!({ "answer": "yes" }) });
         assert_eq!(facts.answers[0].question, Some(json!({ "prompt": "ok?" })));
+        assert_eq!(facts.answers[1].node, "skipped");
+        assert_eq!(facts.answers[1].ended, AwaitEnd::Skipped);
+        assert_eq!(facts.answers[2].node, "held");
+        assert_eq!(facts.answers[2].ended, AwaitEnd::GaveUp { error: "node 'held' gave up its wait: quiet".into() });
+        assert_eq!(facts.answers[2].question, Some(json!({ "prompt": "still there?" })), "a wait given up keeps the question it asked");
         assert_eq!(facts.caller.len(), 2, "both halves of the exchange, request AND answer");
         let directions: Vec<&str> =
             facts.caller.iter().filter_map(|m| m["direction"].as_str()).collect();

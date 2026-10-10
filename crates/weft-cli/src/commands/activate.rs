@@ -140,7 +140,7 @@ fn left_out_note(left_out: &[String], on: Option<&str>) -> Option<String> {
     Some(format!(
         "left off: {} run once per instance, so they stay off until an instance is named. \
          Switch one instance's on with `{}`, or have the program switch \
-         them on itself once it knows the instance (a node like ActivateInstanceTriggers does it)",
+         them on itself once it knows the instance (an ActivateTriggers node given the instance does it)",
         left_out.iter().map(|t| format!("'{t}'")).collect::<Vec<_>>().join(", "),
         super::weft_on(on, "activate --instance <id>")
     ))

@@ -232,15 +232,19 @@ impl WorkerJournal {
                 let idle = lane.idle.notified();
                 tokio::pin!(idle);
                 idle.as_mut().enable();
-                {
-                    let queue = lane.queue.lock().expect("record writer");
-                    if queue.runs.is_empty() && !queue.in_flight {
-                        break;
-                    }
+                if lane.queue.lock().expect("record writer").idle() {
+                    break;
                 }
                 idle.await;
             }
         }
+    }
+
+    /// Whether every event handed so far, of every run, was written or
+    /// failed: until then a run's record may still be on its way, and the
+    /// worker keeps its lease (`crate::door::ticks`).
+    pub fn settled(&self) -> bool {
+        self.lanes.iter().all(|lane| lane.queue.lock().expect("record writer").idle())
     }
 
     /// End `execution_id`, a run this worker drives whose record it can no
@@ -446,6 +450,13 @@ struct LaneQueue {
     runs: VecDeque<Arc<RunLog>>,
     in_flight: bool,
     closed: bool,
+}
+
+impl LaneQueue {
+    /// Nothing queued, nothing on its way.
+    fn idle(&self) -> bool {
+        self.runs.is_empty() && !self.in_flight
+    }
 }
 
 /// One run's side of the writer. Locks are taken in the order: its lane's

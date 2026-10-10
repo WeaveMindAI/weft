@@ -3024,7 +3024,7 @@ fn check_warnings(project: &ProjectDefinition, d: &mut Vec<Diagnostic>) {
         if !gated
             && !wired.is_empty()
             && !node.outputs.is_empty()
-            && wired.iter().all(|p| !p.required)
+            && wired.iter().all(|p| !p.is_required(true))
             && !node.features.optional_custom_inputs
             && node.features.one_of_required.is_empty()
         {

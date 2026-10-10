@@ -12,6 +12,7 @@ pub fn tests() -> Vec<NodeTest> {
         NodeTest::fake("an_image_field_parks_the_stored_file_for_the_files_door", image_parked),
         NodeTest::fake("a_submission_resumes_and_maps_to_ports", submission_maps),
         NodeTest::fake("a_fields_label_and_placeholder_reach_the_form", label_and_placeholder),
+        NodeTest::fake("a_skipped_form_sends_nothing_on", skipped_form),
     ]
 }
 
@@ -74,6 +75,27 @@ async fn label_and_placeholder(rig: FakeRig) -> WeftResult<()> {
         field["config"].get("label").is_none(),
         "the label is its own column on the wire, never repeated in config"
     );
+    Ok(())
+}
+
+/// A person skipping the form: the wait ends skipped, which ends the step
+/// skipped with every output closed, whatever its fields are (an
+/// approve/reject one included).
+async fn skipped_form(rig: FakeRig) -> WeftResult<()> {
+    rig.output_type("decision_approved", WeftType::parse("Boolean").expect("Boolean parses"));
+    rig.output_type("decision_rejected", WeftType::parse("Boolean").expect("Boolean parses"));
+    rig.signal_skipped();
+    let outcome = rig
+        .run(
+            &HumanQueryNode,
+            json!({
+                "title": "Ship it?",
+                "fields": [{ "kind": "approve_reject", "key": "decision" }],
+            }),
+        )
+        .await;
+    assert!(matches!(outcome.result, Err(weft::WeftError::WaitSkipped(_))), "{:?}", outcome.result);
+    assert!(outcome.outputs.is_empty(), "nothing sent on: {:?}", outcome.outputs);
     Ok(())
 }
 
