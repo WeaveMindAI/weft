@@ -1,6 +1,7 @@
 {
   "$schema": "https://app.kilo.ai/config.json",
   "default_agent": "tangle",
+  "subagent_depth": 2,
   "permission": {
     "bash": {
       "weft validate*": "allow",
@@ -19,8 +20,8 @@
       "weft executions*": "allow",
       "weft events*": "allow",
       "weft logs*": "allow",
-      "weft status": "allow",
-      "weft ps": "allow",
+      "weft status*": "allow",
+      "weft ps*": "allow",
       "weft follow*": "allow",
       "weft daemon status": "allow",
       "weft daemon logs*": "allow",
@@ -33,7 +34,7 @@
       "weft infra start*": "allow",
       "weft infra stop*": "allow",
       "weft infra upgrade*": "allow",
-      "weft infra status": "allow",
+      "weft infra status*": "allow",
       "weft infra node-stop*": "allow",
       "weft infra show*": "allow",
       "weft options*": "allow",
@@ -44,14 +45,27 @@
       "weft node-test-hash*": "allow",
       "weft files ls*": "allow",
       "weft files inspect*": "allow",
-      "weft listener*": "allow",
       "weft connect*": "allow",
       "weft token*": "allow",
       "weft deactivate*": "allow",
       "weft resync*": "allow",
       "weft rm*": "allow",
       "weft clean*": "allow",
-      "weft prune*": "allow"
+      "weft prune*": "allow",
+      "weft new*": "allow",
+      "weft infra terminate*": "allow",
+      "weft connect-lib*": "allow",
+      "weft instance-values*": "allow",
+      "date": "allow",
+      "kilo export *": "allow",
+      "weft infra logs*": "allow",
+      "weft infra list-doors*": "allow",
+      "weft infra --json*": "allow",
+      "weft target list*": "allow",
+      "weft domain*": "allow",
+      "weft frontend ls*": "allow",
+      "find design-lab -mmin -10": "allow",
+      "python3 .kilo/scripts/specialist_quiet.py *": "allow"
     }
   }
 }

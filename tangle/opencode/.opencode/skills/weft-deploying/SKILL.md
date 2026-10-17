@@ -282,10 +282,11 @@ A connection prod does not hold yet is added one of two ways:
 
 - **A key the project issued itself**, kept in the project's own `.env`
   (the key that guards its own API, a webhook signing secret): the
-  deployer stores it without ever reading it, by loading `.env` into the
-  command's environment and naming the variable, so the value goes from
-  the file to the install and never through the chat:
-  `set -a; . ./.env; set +a; weft connect --on prod --node <node> --door own --set-env <field>=<VARIABLE>`.
+  deployer stores it without ever reading it, by naming the variable:
+  weft loads the project's `.env` into its own environment when it starts,
+  so the value goes from the file to the install and never through the
+  chat: `weft connect --on prod --node <node> --door own --set-env <field>=<VARIABLE>`,
+  run from the project folder.
 - **A person's own account** (a sign-in, a key a provider gave the user):
   the user adds it, with the command you hand them (`weft connect --on prod
   --node <node>`).

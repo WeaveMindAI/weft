@@ -622,8 +622,14 @@ carry the header.
 - An infra node's card (what `weft infra show` prints) is for the program's
   author. A page never parses its text for state and never shows its labels
   to people as they are: it asks the program, and chooses its own words.
-- Plain: shadcn-svelte components, little custom CSS, no design system the
-  request did not ask for.
+- The look is the `designer`'s, a specialist Tangle starts in the same
+  breath as the `frontend-builder` (or, when Tangle does the jobs itself,
+  just before it). It builds the tokens, the components and the motion
+  in `design-lab/`, a standalone app beside `front/` on the same stack, with
+  every page mocked on realistic data, and the real pages are built on what
+  it hands over (`design-lab/src/lib/design/` and its components, moved under
+  `front/src/lib/`). `design-lab/` is the design's source, kept in the
+  project; weft reads nothing in it.
 
 ## Proving the frontend is proving the frontend
 
@@ -632,7 +638,7 @@ whether a node returns the right value is the orchestrator's and the
 `node-smith`'s to establish before this work starts. A wrong value from
 [the program] is a finding in the report, never something to test around or
 fix in the page. For what the proof has to contain, and what a stand-in
-costs you, go and read the `frontend-builder` agent file.
+costs you, go and read the `frontend-builder` skill.
 
 [the frontend] is built from [the brief] alone and never waits on
 [the program]: you never poll a file, loop until a marker appears, or read

@@ -105,6 +105,7 @@ the type you wrote, so there is nothing to unpack and nothing to cast:
 
 ```weft
 look = PostgresExecuteQuery(id: String) -> (title: String, seen: Number) {
+  account: db.access
   query: "select title, seen from cards where id = $id"
 }
 ```
@@ -230,7 +231,7 @@ Those two are the only ways line order changes what a program does.
 ### Literals on a connection line
 
 ````weft
-post = SlackSendMessage { channel: "#alerts" }
+post = SlackSendMessage { account: slack.access, channel: "#alerts" }
 post.text = "deploy finished"
 ````
 
@@ -482,6 +483,7 @@ and id live in `weft.toml`, never in a source header.
 
 ````weft
 lookup = SlackFindUser {
+  account: slack.access
   @require_one_of(email, id)
 }
 ````
@@ -655,6 +657,7 @@ branch by itself:
 
 ```weft
 look = PostgresExecuteQuery(id: String) -> (card: JsonDict, missing: Boolean) {
+  account: db.access
   query: "select c.data as card, (c.id is null) as missing from ..."
 }
 ```
@@ -940,16 +943,32 @@ names:
 
 ```weft
 # src/triage.weft: sorts a message into a lane
-Group(text: String) -> (lane: String) {
+Group(text: String, provider: LlmProvider) -> (lane: String) {
   sort = LlmInference -> (lane: String) {
-    provider: model.provider
-    prompt: @file("assets/prompts/triage.md")
+    provider: self.provider
+    params: LlmParams { systemPrompt: @file("assets/prompts/triage.md") }.params
+    prompt: self.text
     parseJson: true
-    input: self.text
   }
   self.lane = sort.lane
 }
 ```
+
+The model comes in through a port. Every access node and every model
+provider sits at the top of `src/main.weft`, one per service, and is wired
+down into each group and included file that needs it:
+
+```weft
+smart = OpenRouterProvider { model: "z-ai/glm-5.3" }
+triage = @include("triage.weft")
+triage.provider = smart.provider
+triage.text = ask.text
+```
+
+A provider written inside the file instead would be one more connection to
+pick for every place the file is included. A value each instance fills in
+for itself goes on that top-level node too (`connection: @instance_filled`,
+the `weft-instances` skill), so each person is asked for it once.
 
 A trigger inside an included file works like a trigger inside a group: it
 registers when the including program activates, and it is addressed through
@@ -1028,6 +1047,63 @@ iteration is a `null` slot, and the loop goes on. So if one bad item must not
 end a fold, wire the failing node's `error` output (under Handling a failure)
 and write the carry on both branches.
 
+### Trying a step again
+
+If a step can fail for a passing reason (a model whose JSON does not fit the
+shape you asked for, a service that times out now and then), the retry is a
+sequential loop, and `max_iters` is its cap. The step's `error` goes into a
+carried value, which the next try reads and which comes out holding the last
+failure; `self.done` is written once the step's answer arrived, so a try
+that worked is the last one. A record type on the answer makes a reply with
+a missing key, a wrong type or an extra key a failure on `error`, which is
+what sends it round again:
+
+````weft
+type Verdict = { label: String, score: Number }
+
+grade = Loop(text: String, provider: LlmProvider) -> (problem: String, verdicts: List[Verdict | Null]) {
+  # Grades the text, asking again while the answer does not fit, three tries at most
+  carry: ["problem"]
+  max_iters: 3
+
+  ask = Format(text: String, problem: String) {
+    template: "Grade this text: {{text}}. Answer JSON with label and score. {{problem}}"
+    text: self.text
+    problem: self.problem
+  }
+  mark = LlmInference -> (response: Verdict) {
+    provider: self.provider
+    prompt: ask.text
+    parseJson: true
+  }
+  fits = All { verdict: mark.response }
+  self.verdicts = mark.response
+  self.problem = mark.error
+  self.done = fits.yes
+}
+grade.text = essay.text
+grade.provider = model.provider
+grade.problem = ""
+
+final = ExecPython(tries: List[Verdict | Null], problem: String) -> (verdict: Verdict) {
+  code: ```
+    good = [t for t in tries if t is not None]
+    if not good:
+        raise ValueError(f"no answer fit after every try; the last problem: {problem}")
+    return {'verdict': good[-1]}
+  ```
+  tries: grade.verdicts
+  problem: grade.problem
+}
+````
+
+Every try leaves a slot in `verdicts`, empty for the ones that failed, so
+`final` takes the one that fitted and fails loudly, naming the last problem,
+when none did. A carried value needs its first value wired from outside
+(`grade.problem = ""`); without it the build stops at
+`required-port-unmet`. A retry that calls a paid service pays for every try,
+so the cap is part of the price.
+
 A `Generator[T]` port in `over` pulls the stream (must be the only over
 port).
 
@@ -1105,7 +1181,8 @@ node's `service` declaration; `connection_optional: true` in the service
 block is the opt-out, for a node that runs with no connection picked). `weft
 validate` and the editor's pre-flight gate on Run, Activate and Resync report
 it; the Problems panel is structural only and never shows it; `weft build`
-skips it, so a half-wired program still compiles, and the rule fires at
-execution as a loud node failure. [the build tier] is `weft build`:
+skips it, so a half-wired program still compiles, and a run, an activate or
+a resync is refused before it starts while one is open, naming the `weft
+connect` that picks it. [the build tier] is `weft build`:
 structural errors plus the cargo and image build. The slug names the rule,
 the message names the fix.

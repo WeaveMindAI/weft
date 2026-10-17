@@ -283,8 +283,12 @@ pub async fn run(
         // persona is there, with no weft checkout to point at.
         // `.env` auto-loads next to a project and is where a key the
         // project MINTS lands (`weft connect --set-env`), so it holds
-        // secrets by the time anybody would commit it.
-        let gitignore = String::from("target/\n.weft/\nnode_modules/\n.env\n");
+        // secrets by the time anybody would commit it. `.scratch/` is
+        // where Tangle's specialists keep their throwaway files (a probe, a
+        // screenshot, a prompt trial's inputs): inside the project, so
+        // writing there never needs a permission the specialist cannot
+        // ask for, and hidden, so no version ever records it.
+        let gitignore = String::from("target/\n.weft/\nnode_modules/\n.env\n.scratch/\n");
 
         // Initialize git. Best-effort: skip quietly if git is missing.
         let git_init = Command::new("git")
@@ -410,9 +414,12 @@ const WITNESS: &str = "skills/weft-running/SKILL.md";
 
 /// Names an assistant writes into its own directory that are not ours
 /// to ship: dependency trees, lockfiles and scratch state that the
-/// checkout picks up from being used as a project itself. The templates
-/// track none of these.
+/// checkout picks up from being used as a project itself, and the
+/// person's own settings (Claude Code's `settings.local.json`, which
+/// Tangle tells the user survives an update). The templates track none
+/// of these.
 const TEMPLATE_EXCLUDE: &[&str] = &[
+    "settings.local.json",
     ".git",
     ".gitignore",
     "target",
@@ -425,6 +432,13 @@ const TEMPLATE_EXCLUDE: &[&str] = &[
     "agent-manager.json",
     "worktrees",
 ];
+
+/// Whether an entry of a template stays behind when it is copied: one of
+/// [`TEMPLATE_EXCLUDE`], or what Python writes beside a hook the checkout
+/// ran (`weft_catalog::is_python_cache`).
+fn left_out_of_template(name: &str) -> bool {
+    TEMPLATE_EXCLUDE.contains(&name) || weft_catalog::is_python_cache(name)
+}
 
 /// True when `root` already holds Tangle for `spec`.
 pub fn tangle_installed(root: &Path, spec: &AssistantSpec) -> bool {
@@ -516,7 +530,7 @@ fn merge_template(source: &Path, dest: &Path) -> anyhow::Result<()> {
     {
         let entry = entry.with_context(|| format!("read the tangle template at {}", source.display()))?;
         let name = entry.file_name();
-        if TEMPLATE_EXCLUDE.contains(&&*name.to_string_lossy()) {
+        if left_out_of_template(&name.to_string_lossy()) {
             continue;
         }
         replace_with_template(&entry.path(), &dest.join(&name))?;
@@ -538,7 +552,7 @@ fn replace_with_template(source: &Path, dest: &Path) -> anyhow::Result<()> {
         Err(error) => return Err(error).with_context(|| format!("inspect {}", dest.display())),
     }
     if source.is_dir() {
-        weft_compiler::build::copy_dir_filtered(source, dest, &|name| TEMPLATE_EXCLUDE.contains(&name))
+        weft_compiler::build::copy_dir_filtered(source, dest, &left_out_of_template)
             .map_err(|e| anyhow::anyhow!("copy {} into {}: {e}", source.display(), dest.display()))
     } else {
         std::fs::copy(source, dest)
@@ -643,12 +657,85 @@ mod tests {
     }
 
     #[test]
+    fn every_claude_code_hook_names_a_script_the_template_ships() {
+        // A hook whose script was renamed or dropped fails in the user's
+        // session on every tool call, long after `weft new` said it was
+        // fine. The install copies `.claude/` whole, so the script only has
+        // to be in the template, next to the settings that name it.
+        let template = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("checkout root")
+            .join("tangle/claude-code");
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(template.join(".claude/settings.json")).unwrap())
+                .unwrap();
+        let mut scripts = Vec::new();
+        for (event, groups) in settings["hooks"].as_object().expect("a hooks block") {
+            for group in groups.as_array().unwrap_or_else(|| panic!("{event} is not a list")) {
+                for hook in group["hooks"].as_array().unwrap_or_else(|| panic!("{event} has no hooks")) {
+                    let command = hook["command"].as_str().unwrap_or_else(|| panic!("{event} has no command"));
+                    let (_, rest) = command
+                        .split_once("$CLAUDE_PROJECT_DIR/")
+                        .unwrap_or_else(|| panic!("{event} runs `{command}`, outside the project"));
+                    scripts.push((event.clone(), rest.trim_end_matches('"').to_string()));
+                }
+            }
+        }
+        assert!(!scripts.is_empty(), "the template registers no hook at all");
+        for (event, script) in scripts {
+            assert!(template.join(&script).is_file(), "{event} runs {script}, which the template does not ship");
+        }
+    }
+
+    #[test]
+    fn every_claude_code_specialist_has_its_own_command_list() {
+        // The PreToolUse hook leaves an agent the list does not name to the
+        // shared allow list, which is Tangle's own: a specialist added
+        // without a list would quietly get Tangle's commands, and a list
+        // whose agent was renamed would guard nobody.
+        let template = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("checkout root")
+            .join("tangle/claude-code/.claude");
+        let lists: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(template.join("hooks/specialist_commands.json")).unwrap(),
+        )
+        .unwrap();
+        let lists = lists.as_object().expect("one object, keyed by agent name");
+        let mut agents = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(template.join("agents")).unwrap() {
+            let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+            let name = text
+                .lines()
+                .find_map(|line| line.strip_prefix("name: "))
+                .expect("an agent file names itself")
+                .trim()
+                .to_string();
+            let commands = lists
+                .get(&name)
+                .and_then(|list| list["commands"].as_array())
+                .unwrap_or_else(|| panic!("{name} has no command list"));
+            assert!(!commands.is_empty(), "{name}'s command list is empty");
+            agents.insert(name);
+        }
+        for name in lists.keys() {
+            assert!(agents.contains(name), "a command list names {name}, which is no agent");
+        }
+    }
+
+    #[test]
     fn a_refresh_replaces_what_tangle_owns_and_keeps_what_the_assistant_made() {
         let temp = tempfile::tempdir().unwrap();
         let template = temp.path().join("template");
         std::fs::create_dir_all(template.join("agent")).unwrap();
         std::fs::write(template.join("agent/tangle.md"), "new").unwrap();
         std::fs::write(template.join("node_modules"), "never copied").unwrap();
+        std::fs::create_dir_all(template.join("hooks/__pycache__")).unwrap();
+        std::fs::write(template.join("hooks/check.py"), "hook").unwrap();
+        std::fs::write(template.join("hooks/__pycache__/check.pyc"), "never copied").unwrap();
+        std::fs::write(template.join("settings.local.json"), "the checkout's own").unwrap();
 
         // A project whose last install left a stale agent behind, and
         // whose assistant keeps its own scratch state in the same tree.
@@ -658,12 +745,23 @@ mod tests {
         std::fs::write(dest.join("agent/tangle.md"), "old").unwrap();
         std::fs::write(dest.join("agent/dropped.md"), "gone after this").unwrap();
         std::fs::write(dest.join("worktrees/mine"), "the assistant's").unwrap();
+        std::fs::write(dest.join("settings.local.json"), "the user's").unwrap();
 
         merge_template(&template, &dest).unwrap();
 
         assert_eq!(std::fs::read_to_string(dest.join("agent/tangle.md")).unwrap(), "new");
         assert!(!dest.join("agent/dropped.md").exists(), "a dropped template file goes");
         assert!(!dest.join("node_modules").exists(), "an assistant's own tree never travels");
+        assert_eq!(std::fs::read_to_string(dest.join("hooks/check.py")).unwrap(), "hook");
+        assert!(
+            !dest.join("hooks/__pycache__").exists(),
+            "the bytecode a hook left in the checkout never travels"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("settings.local.json")).unwrap(),
+            "the user's",
+            "the person's own settings survive a refresh"
+        );
         assert_eq!(
             std::fs::read_to_string(dest.join("worktrees/mine")).unwrap(),
             "the assistant's",

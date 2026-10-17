@@ -43,7 +43,11 @@ command that asks anyway gets killed and reported with what it asked.
 A command that changes the deployed code and the thing you do next go in ONE
 line, joined by `&&`: `weft resync --mode wipe && curl ...`. Run them
 separately and a resync that failed leaves the next command talking to the
-old code, which reads as a bug in what you just wrote.
+old code, which reads as a bug in what you just wrote. Nothing goes between
+the weft command and the `&&`: no `| tail`, no `| grep`, no `2>&1 | head`. A
+pipe's exit status is its last command's, so `weft resync --mode wipe 2>&1 |
+tail -1 && curl ...` runs the `curl` after a resync that failed, because
+`tail` succeeded. If the output is long, let it be long and read it.
 
 **You never sit on a quiet command.** If a command can take more than a few
 seconds, you start it in the background (a long `weft run` gets

@@ -1,16 +1,42 @@
 # Tangle's Codex settings.
 
-# The working loop runs unimpeded, but Codex has no per-command allow list:
-# approval is a policy. `on-request` keeps the loop moving and leaves it to the
-# mode the user chose whether a call is put in front of them: the other
-# assistants keep no ask list either, and Tangle asks in prose before the two
-# things that are the user's alone (a live-tier test that spends their money,
-# and any secret).
+# The working loop runs unimpeded. config.toml holds no per-command allow
+# list: approval is a policy, and the commands Tangle and its specialists run
+# without asking are allowed in `rules/tangle.rules`, which runs them outside
+# the sandbox. In `workspace-write` the network is off, and every `weft`
+# command talks to the daemon, `weft test-node`'s cargo build fetches crates,
+# and `pnpm` fetches packages, so the rules cover the `weft` verbs of the
+# loop, the deployer's reads and domains, the `pnpm` forms the frontend work
+# uses, `node --env-file=.env build`, the script that stops a server and the
+# prompt-engineer's trial. `weft daemon start`, `stop` and
+# `restart` are forbidden there, since they re-run the weft install. A
+# specialist cannot answer an approval prompt (`hooks/refuse_specialist_prompts.py`
+# refuses it), so a command missing from those rules that needs more than the
+# sandbox gives is one it reports BLOCKED. `on-request` keeps the loop moving
+# and leaves it to the mode the user chose whether a call is put in front of
+# them: the other assistants keep no ask list either, and Tangle asks in prose
+# before the two things that are the user's alone (a live-tier test that
+# spends their money, and any secret).
 approval_policy = "on-request"
 sandbox_mode = "workspace-write"
 
-# The six specialists run side by side: Tangle dispatches one node-smith per
-# missing node and waits for all of them before wiring anything.
+# Codex reads the first 32 KiB of AGENTS.md unless told otherwise, and
+# Tangle's persona is longer than that: without this line its last third
+# (the specialists' briefs, how to write weft, working with the user) never
+# reaches the model.
+project_doc_max_bytes = 131072
+
+# The specialists run side by side: Tangle dispatches one node-smith per
+# missing node, or one group-builder per included file, at once, and the
+# frontend-builder starts its designer, which counts here too. The sandbox and
+# approval policy above hold for every specialist: an agent file cannot
+# change them.
+#
+# `max_depth` is how deep agents may start agents on a model whose
+# multi-agent version is `v1` (it defaults to 1, which leaves a specialist no
+# agent tools at all); 2 lets the frontend-builder start its designer there
+# too. Models on `v2` do not read it.
 [agents]
 enabled = true
 max_concurrent_threads_per_session = 5
+max_depth = 2

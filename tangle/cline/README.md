@@ -14,14 +14,34 @@ how a `/name` command reaches Cline now: type `/`, pick the skill, and Cline
 loads its `SKILL.md`. The `.clinerules/workflows/` directory older guides
 mention is gone from Cline's docs, so nothing here ships into it.
 
-**Cline has no way to define a specialist.** Its subagents are read-only
-research helpers it spawns on its own judgement, with no file where you could
-give one a prompt of its own, so the six specialists are skills that Tangle
-loads and becomes, one at a time, in the same conversation. For the two that
-only ever read, Tangle is told it can also ask for parallel research in a
-sentence and let Cline spread the search across its own subagents. Each one opens with a note saying exactly that: the scope
-limits and the refusals still bind, because they are what keeps the job honest
-when there is no second context to check it.
+**Cline has no way to define a specialist.** Its subagents exist only in the
+Cline CLI and Cline Desktop, not in the VS Code or JetBrains extensions, and
+the main agent waits for them before it carries on, so the eight specialists
+are skills that Tangle loads and becomes, one at a time, in the same
+conversation. The `designer` is the first step of the `frontend-builder` job
+rather than one Tangle loads on its own. For the `run-digger` and the `red-teamer`,
+which only ever read, Tangle is told it can also ask for parallel research in
+a sentence where subagents exist. Each specialist opens with a note saying exactly that:
+the scope limits and the refusals still bind, because they are what keeps
+the job honest when there is no second context to check it.
+
+Two things the Claude Code copy does with hooks and background agents are
+done by Tangle itself here. A declined command is never sent again: the
+specialist does it another way or reports BLOCKED with the exact command
+for the user. And since a specialist job is Tangle in the foreground, the
+twenty-minute look at a specialist is Tangle checking, at the start of a
+step, what moved in the job since it began. The prompt-engineer's trial runs
+through the stage's own model node (`weft run --from ... --feed ... --target`),
+because Cline offers no command that calls a model with no tools.
+
+What a job can do without a click is the user's own auto-approve settings
+in Cline, which a project cannot set, so the persona says which ones the jobs
+need: every write stays inside the project (throwaway files in
+`.scratch/<job>/`), so "Edit project files" covers them, and installs such as
+`pnpm install` need "Execute all commands" or the user's click.
+
+What a user asks Tangle to do differently goes into `.clinerules/memory.md`,
+which the template does not ship, so `weft tangle update` leaves it alone.
 
 The one thing that genuinely cannot survive the move is stated in the skills
 rather than hidden: [the review] is Tangle re-verifying a specialist's claims,
@@ -35,7 +55,7 @@ where the discipline is entirely the model's.
 
 ## What is here
 
-Tangle is one persona plus its reference skills, six specialists and seven commands.
+Tangle is one persona plus its reference skills, eight specialists and seven commands.
 The persona holds the program: the graph shape, the typed contracts, the weft
 source. The skills are the big knowledge, loaded only when the work calls for
 them. The specialists take the heavy scoped jobs. The commands are the loop's

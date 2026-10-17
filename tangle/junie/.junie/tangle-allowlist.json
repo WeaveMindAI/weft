@@ -1,0 +1,492 @@
+{
+  "rules": {
+    "executables": {
+      "rules": [
+        {
+          "pattern": "weft validate",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft validate ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft parse",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft parse ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft build",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft build ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft run",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft run ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft describe-nodes",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft describe-nodes ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft executions",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft executions ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft events",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft events ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft logs",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft logs ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft status",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft status ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft ps",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft ps ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft follow",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft follow ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft daemon status",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft daemon status ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft daemon logs",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft daemon logs ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft catalog update",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft catalog update ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft activate",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft activate ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft cancel-activate",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft cancel-activate ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft cancel-build",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft cancel-build ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft cancel-running",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft cancel-running ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft stop",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft stop ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft infra start",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft infra start ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft infra stop",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft infra stop ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft infra upgrade",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft infra upgrade ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft infra node-stop",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft infra node-stop ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft infra show",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft infra show ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft infra press",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft infra press ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft infra env",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft infra env ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft infra rebake",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft infra rebake ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft infra --json",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft infra --json ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft infra logs",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft infra logs ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft infra list-doors",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft infra list-doors ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft infra status",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft infra status ",
+          "action": "allow"
+        },
+        {
+          "prefix": "cd ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft test-node",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft test-node ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft node-test-hash",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft node-test-hash ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft files ls",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft files ls ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft files inspect",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft files inspect ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft connect",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft connect ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft token",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft token ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft checkpoint",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft checkpoint ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft branch",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft branch ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft tree",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft tree ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft diff",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft diff ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft freeze",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft freeze ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft examples",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft examples ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft bake",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft bake ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft wake",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft wake ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft deactivate",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft deactivate ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft resync",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft resync ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft rm",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft rm ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft clean",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft clean ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft prune",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft prune ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft options",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft options ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft new",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft new ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft infra terminate",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft infra terminate ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft connect-lib",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft connect-lib ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft instance-values",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft instance-values ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft target list",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft target list ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft domain",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft domain ",
+          "action": "allow"
+        },
+        {
+          "pattern": "weft frontend ls",
+          "action": "allow"
+        },
+        {
+          "prefix": "weft frontend ls ",
+          "action": "allow"
+        },
+        {
+          "prefix": "pnpm ",
+          "action": "allow"
+        },
+        {
+          "pattern": "node --env-file=.env build",
+          "action": "allow"
+        },
+        {
+          "prefix": "node --env-file=.env build ",
+          "action": "allow"
+        },
+        {
+          "prefix": "kill ",
+          "action": "allow"
+        }
+      ]
+    }
+  }
+}

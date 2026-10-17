@@ -1,0 +1,255 @@
+# Tangle's command rules. `weft tangle update` replaces this folder whole, so
+# a rule of the user's own goes in ~/.codex/rules/default.rules, where Codex
+# writes the commands you allow from its approval prompt.
+#
+# `allow` runs a matching command outside the sandbox with no approval
+# prompt. That includes code the agent wrote itself: `pnpm --dir ... run`,
+# `install` and `add` run the scripts of a `package.json` the agent edits,
+# `pnpm ... exec playwright test` runs its test files, and
+# `node --env-file=.env build` runs the site it built, all outside the
+# sandbox. They need the outside because in `workspace-write` the sandbox
+# turns the network off, even to 127.0.0.1: a `weft` command talks to the
+# daemon there, `weft test-node` also runs cargo, which fetches crates and
+# writes its build outside the project, and pnpm fetches packages. A command line runs
+# outside the sandbox only when every command in it is allowed here, so
+# `weft resync --mode wipe && curl ...` still goes to the sandbox and asks.
+# A rule matches the start of the command, so `weft build` also covers
+# `weft build --referenced`, and a verb also covers `--on <target>` written
+# after it (`weft status --on prod`); a flag written before the verb
+# (`weft --on prod status`) matches no rule, so the verb always comes first.
+# These rules hold for every agent alike: Codex cannot scope them to one.
+# What scopes them is `hooks/specialist_commands.py`, a PreToolUse hook that
+# refuses any shell command a specialist runs unless it starts with an entry
+# of that specialist's own list in `hooks/specialist_commands.json`. So the
+# rules decide only whether a command leaves the sandbox; which commands a
+# specialist may run at all is that list. A deleting verb here (`weft rm`,
+# `clean`, `prune`) is on no specialist's list, so only Tangle reaches it.
+# They mirror the Claude Code copy's allow list, so a verb a skill names that
+# is not on that list (`weft infra cancel`, `look`, `node-terminate`,
+# `weft workers`) is not here either: it asks, a specialist reports it
+# BLOCKED, and Tangle runs it where the approval reaches the user.
+
+# `weft test-node --tier live` calls the real service and spends the user's
+# money. A rule only sees how a command starts, so this catches the flag
+# written straight after the verb; written after the node's name
+# (`weft test-node Gmail --tier live`) it matches the allow rule below. For a
+# specialist the node-smith's command list refuses it in any position; for
+# Tangle only its instructions do.
+prefix_rule(
+    pattern = ["weft", "test-node", "--tier", "live"],
+    decision = "forbidden",
+    justification = "the live tier spends the user's money; the user runs it, with the weft-live-test command",
+    match = ["weft test-node --tier live Gmail"],
+)
+
+# Reads: the compiler, the catalog, and what runs and ran.
+prefix_rule(
+    pattern = ["weft", [
+        "validate", "parse", "describe-nodes", "status", "ps", "executions",
+        "events", "logs", "follow", "tree", "diff", "examples", "options",
+        "node-test-hash",
+    ]],
+    decision = "allow",
+    justification = "Tangle's reads: the compiler, the catalog, and what runs and ran",
+    match = [
+        "weft validate --file src/main.weft",
+        "weft describe-nodes --node Text --compact",
+        "weft events 0b1c --node lookup --full",
+    ],
+    not_match = ["weft daemon start"],
+)
+
+# The loop: building, running, versions, examples, stopping.
+prefix_rule(
+    pattern = ["weft", [
+        "build", "run", "test-node", "catalog", "activate", "cancel-activate",
+        "cancel-build", "cancel-running", "stop", "checkpoint", "branch",
+        "freeze", "bake", "wake", "deactivate", "resync", "new",
+    ]],
+    decision = "allow",
+    justification = "Tangle's loop: build, run, test a node, activate, resync, stop",
+    match = [
+        "weft run --group triage={\"text\":\"hi\"}",
+        "weft test-node Gmail",
+        "weft resync --mode wipe",
+        "weft catalog update",
+        "weft new my-project",
+    ],
+)
+
+# Connections, tokens, instance values and stored files.
+prefix_rule(
+    pattern = ["weft", ["connect", "token", "connect-lib", "instance-values"]],
+    decision = "allow",
+    justification = "picking a stored connection, minting a scoped token, copying the connect library into the frontend, an instance's own values",
+    match = [
+        "weft connect --node db --list",
+        "weft connect-lib",
+        "weft instance-values --instance alice",
+    ],
+)
+prefix_rule(
+    pattern = ["weft", "files", ["ls", "inspect"]],
+    decision = "allow",
+    justification = "reading the stored runtime files",
+    match = ["weft files ls"],
+)
+
+# Removing things. These delete for good, and Codex's rules cannot be scoped
+# to one agent (a custom agent file cannot change them), so they hold for
+# every specialist as much as for Tangle, as in the Claude Code copy:
+# `weft rm` unregisters the project, terminates its infrastructure and erases
+# its runs; `weft clean` deletes runs (every one with `--all`) or images and
+# caches; `weft prune` deletes a version, every version under it and their runs.
+prefix_rule(
+    pattern = ["weft", ["rm", "clean", "prune"]],
+    decision = "allow",
+    justification = "weft rm, clean and prune delete a project, runs, versions, images or caches for good",
+    match = ["weft clean --images --all", "weft prune 3fa2 --yes"],
+)
+
+# Infrastructure. `weft infra terminate` deletes every container of it and
+# its disks, except the disks a node keeps on terminate.
+prefix_rule(
+    pattern = ["weft", "infra", [
+        "start", "stop", "upgrade", "status", "node-stop", "show", "press",
+        "env", "rebake", "logs", "list-doors", "--json", "terminate",
+    ]],
+    decision = "allow",
+    justification = "starting, reading and stopping the program's infrastructure; terminate deletes its containers and their disks",
+    match = [
+        "weft infra start",
+        "weft infra env db --into front/.env",
+        "weft infra terminate --yes",
+    ],
+)
+
+# What the deployer reads and sets on a cloud install.
+prefix_rule(
+    pattern = ["weft", "target", "list"],
+    decision = "allow",
+    justification = "listing the project's targets and whether a key is stored",
+    match = ["weft target list"],
+    not_match = ["weft target export prod --github"],
+)
+prefix_rule(
+    pattern = ["weft", "domain"],
+    decision = "allow",
+    justification = "adding, listing and removing the install's domains (the first one is refused without --accept-cost)",
+    match = ["weft domain add app.example.com --on prod --no-wait"],
+)
+prefix_rule(
+    pattern = ["weft", "workers"],
+    decision = "allow",
+    justification = "reading how the install's workers are set",
+    match = ["weft workers --on prod"],
+)
+prefix_rule(
+    pattern = ["weft", "workers", "set"],
+    decision = "prompt",
+    justification = "changing the install's workers can keep machines up and billed",
+    match = ["weft workers set --min-instances 1 --on prod"],
+)
+prefix_rule(
+    pattern = ["weft", "frontend", ["add", "token"]],
+    decision = "allow",
+    justification = "making a frontend of the project, or a new token for one",
+    match = ["weft frontend add site --on prod", "weft frontend token site --on prod"],
+    not_match = ["weft frontend rm site"],
+)
+prefix_rule(
+    pattern = ["weft", "frontend", "ls"],
+    decision = "allow",
+    justification = "listing the project's frontends",
+    match = ["weft frontend ls --on prod"],
+    not_match = ["weft frontend add site"],
+)
+
+# The frontend-builder's and the designer's toolchain, in exactly the forms
+# the `weft-frontend` skill and their agent files use, each run from the
+# project root and naming `front/` or `design-lab/` with `--dir`. pnpm fetches packages,
+# which the sandbox's closed network would refuse, and keeps its store outside
+# the project. `pnpm dlx` and `pnpm exec` are allowed only for the tools the
+# skill names (a bare `pnpm dlx` would run any package outside the sandbox),
+# and the two `dlx` versions follow the skill: change them together.
+# `pnpm run` runs a script from the site's own `package.json`.
+prefix_rule(
+    pattern = ["pnpm", "--dir", ["front", "design-lab"], ["install", "add", "run"]],
+    decision = "allow",
+    justification = "installing the site's packages, building and serving it",
+    match = [
+        "pnpm --dir front install",
+        "pnpm --dir front add -D @sveltejs/adapter-node",
+        "pnpm --dir design-lab run dev --port 5174 --strictPort",
+    ],
+    not_match = ["pnpm install", "pnpm --dir /tmp/x run x", "pnpm dlx cowsay hi", "pnpm exec sh -c id"],
+)
+prefix_rule(
+    pattern = ["pnpm", "dlx", ["sv@0.17.0", "shadcn-svelte@1.6.1"]],
+    decision = "allow",
+    justification = "scaffolding the site and adding its components, at the versions the weft-frontend skill pins",
+    match = [
+        "pnpm dlx sv@0.17.0 create front --template minimal --types ts --no-add-ons --no-install",
+        "pnpm dlx shadcn-svelte@1.6.1 add button card input --yes --overwrite --no-deps-install",
+    ],
+    not_match = ["pnpm dlx sv create front", "pnpm dlx shadcn-svelte add button"],
+)
+prefix_rule(
+    pattern = ["pnpm", "--dir", ["front", "design-lab"], "exec", ["playwright", "auth"]],
+    decision = "allow",
+    justification = "driving the pages with Playwright, and BetterAuth's migration",
+    match = ["pnpm --dir design-lab exec playwright test", "pnpm --dir front exec auth migrate --yes"],
+    not_match = ["pnpm --dir front exec sh -c id", "pnpm exec playwright test"],
+)
+prefix_rule(
+    pattern = ["node", "--env-file=.env", "build"],
+    decision = "allow",
+    justification = "serving the built site",
+    match = ["node --env-file=.env build"],
+    not_match = ["node -e 1"],
+)
+# A server started outside the sandbox cannot be stopped from inside it (on
+# Linux the sandbox has a process namespace of its own), and a rule for `kill`
+# would let `kill -9 -1` out too. This script stops one process id, and only
+# one running in this project's folder, with what it started.
+prefix_rule(
+    pattern = ["python3", ".codex/scripts/stop_server.py"],
+    decision = "allow",
+    justification = "stopping a server this project started, by its pid",
+    match = ["python3 .codex/scripts/stop_server.py 4242", "python3 .codex/scripts/stop_server.py --port 5174"],
+    not_match = ["kill -9 -1"],
+)
+
+# The daemon: reading it is fine, its lifecycle is not Tangle's.
+prefix_rule(
+    pattern = ["weft", "daemon", ["status", "logs"]],
+    decision = "allow",
+    justification = "reading the daemon's state and logs",
+    match = ["weft daemon status", "weft daemon logs --tail 200"],
+)
+prefix_rule(
+    pattern = ["weft", "daemon", ["start", "stop", "restart"]],
+    decision = "forbidden",
+    justification = "weft daemon start, stop and restart re-run the weft install; say the symptom to the user instead",
+    match = ["weft daemon start", "weft daemon restart", "weft daemon stop"],
+)
+
+# `cd` has no rule. With one, `cd /tmp/x && python3 .codex/scripts/stop_server.py`
+# would run a script somebody else wrote outside the sandbox, so every
+# command names its folder with a flag instead (`pnpm --dir front ...`), and a
+# line that starts with `cd` stays in the sandbox. One gap stays open: Codex's
+# `exec_command` tool also takes a working folder (`workdir`), which no rule
+# sees, so a script path or `pnpm run` run with a working folder outside the
+# project still matches here.
+
+# The prompt-engineer's trial: one `codex exec` with no tools, on a prompt and
+# an input it wrote, which needs the network.
+prefix_rule(
+    pattern = ["python3", ".codex/scripts/try_prompt.py"],
+    decision = "allow",
+    justification = "Tangle's prompt trial: one codex exec with no tools and no project context",
+    match = [
+        "python3 .codex/scripts/try_prompt.py --model gpt-6-luna --prompt assets/prompts/triage.md --input .scratch/prompt-engineer/triage/input-1.txt",
+    ],
+    not_match = ["python3 .codex/scripts/other.py"],
+)

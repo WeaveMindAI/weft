@@ -1,0 +1,14 @@
+{
+  "autoRun": {
+    "allow_instructions": [
+      "These `weft` commands may run without approval, with any arguments: validate, parse, run, describe-nodes, executions, events, logs, status, ps, follow, activate, cancel-activate, cancel-build, cancel-running, stop, test-node, node-test-hash, connect, connect-lib, token, checkpoint, branch, tree, diff, freeze, examples, bake, wake, deactivate, resync, rm, clean, prune, options, new, instance-values, domain.",
+      "These `weft` commands may run without approval exactly as written, with no arguments: `weft build`, `weft daemon status`, `weft catalog update`.",
+      "These `weft` commands may run without approval, with any arguments after them: `weft daemon logs`, `weft infra start`, `weft infra stop`, `weft infra upgrade`, `weft infra node-stop`, `weft infra show`, `weft infra press`, `weft infra env`, `weft infra rebake`, `weft infra --json`, `weft infra logs`, `weft infra list-doors`, `weft infra status`, `weft infra terminate`, `weft files ls`, `weft files inspect`, `weft target list`, `weft frontend ls`.",
+      "`pnpm` commands, `node --env-file=.env build`, and `kill` on a process id the agent itself started may run without approval.",
+      "`date`, `ls`, `tail`, `find design-lab` and `cd` into a folder of the project may run without approval."
+    ],
+    "block_instructions": [
+      "Any `weft` command not named in the allow instructions goes through approval first, `weft daemon start`, `weft daemon stop` and `weft daemon restart` above all: they re-run the weft install."
+    ]
+  }
+}

@@ -268,10 +268,13 @@ values with `weft infra env`. The button's warning (`weft infra show` prints it)
 cuts off; if something already uses the old one, cutting it off is the user's
 call, so you ask the orchestrator before pressing.
 
-If the environment's permission checker refuses one of these commands, you
-stop that part and hand the user the exact command to run, then go on with the
-rest. You never go round it by reading the secret yourself or copying it onto
-a command line.
+Run each of these as one plain command from the project folder, exactly as
+written above: no `cd` in front, no `&&`, no pipe, and `--into front/.env`
+for the path. If one is refused and you are a specialist, put the exact
+command in your report and go on with the rest; Tangle runs it and tells you
+when the file is written. Nobody goes round a refusal by reading the secret or
+copying it onto a command line; if Tangle is refused too, it hands the user
+the exact command.
 
 **If you need a door that is not listed, you report it and stop on that part.**
 Whether a piece of infrastructure is reachable is part of what [the program]
@@ -622,8 +625,13 @@ carry the header.
 - An infra node's card (what `weft infra show` prints) is for the program's
   author. A page never parses its text for state and never shows its labels
   to people as they are: it asks the program, and chooses its own words.
-- Plain: shadcn-svelte components, little custom CSS, no design system the
-  request did not ask for.
+- The look is the `designer`'s, a specialist the `frontend-builder` starts
+  before anything else. It builds the tokens, the components and the motion
+  in `design-lab/`, a standalone app beside `front/` on the same stack, with
+  every page mocked on realistic data, and the real pages are built on what
+  it hands over (`design-lab/src/lib/design/` and its components, moved under
+  `front/src/lib/`). `design-lab/` is the design's source, kept in the
+  project; weft reads nothing in it.
 
 ## Proving the frontend is proving the frontend
 

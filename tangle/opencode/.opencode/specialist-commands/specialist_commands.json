@@ -1,0 +1,147 @@
+{
+  "run-digger": {
+    "commands": [
+      "weft status",
+      "weft ps",
+      "weft executions",
+      "weft events",
+      "weft logs",
+      "weft describe-nodes",
+      "weft validate",
+      "weft parse",
+      "weft daemon status",
+      "weft daemon logs",
+      "weft infra status",
+      "weft infra logs",
+      "weft infra show",
+      "weft files ls",
+      "weft files inspect",
+      "weft tree",
+      "weft diff",
+      "weft examples"
+    ]
+  },
+  "red-teamer": {
+    "commands": [
+      "weft describe-nodes",
+      "weft validate",
+      "weft parse",
+      "weft status",
+      "weft daemon logs"
+    ]
+  },
+  "group-builder": {
+    "commands": [
+      "weft validate",
+      "weft parse",
+      "weft describe-nodes",
+      "weft run",
+      "weft events",
+      "weft logs",
+      "weft executions",
+      "weft status",
+      "weft daemon logs"
+    ]
+  },
+  "node-smith": {
+    "commands": [
+      {"prefix": "weft test-node", "refuse": [["--tier", "live"], ["--tier=live"], ["--yes"]]},
+      "weft node-test-hash",
+      "weft describe-nodes",
+      "weft validate",
+      "weft parse",
+      "weft catalog update",
+      "weft new",
+      "weft run",
+      "weft bake",
+      "weft events",
+      "weft logs",
+      "weft executions",
+      "weft status",
+      "weft daemon logs",
+      "weft infra start",
+      "weft infra stop",
+      "weft infra status",
+      "weft infra logs",
+      "weft infra show",
+      "weft infra press",
+      "weft infra terminate",
+      "cd"
+    ]
+  },
+  "prompt-engineer": {
+    "commands": [
+      {"prefix": "OPENCODE_DISABLE_CLAUDE_CODE_PROMPT=1 opencode run --agent trial --title trial", "check": "opencode-trial"},
+      "opencode models",
+      "weft validate",
+      "weft run",
+      "weft events",
+      "weft status",
+      "weft daemon logs"
+    ]
+  },
+  "frontend-builder": {
+    "commands": [
+      "pnpm install",
+      "pnpm add",
+      "pnpm run",
+      "pnpm dlx sv@",
+      "pnpm dlx shadcn-svelte@",
+      "pnpm exec playwright",
+      "pnpm exec auth",
+      "pnpm exec node",
+      "node --env-file=.env build",
+      "openssl rand -base64 32",
+      {"prefix": "kill", "args": "pids"},
+      "weft infra env",
+      "weft infra show",
+      "weft infra press",
+      "weft infra list-doors",
+      "weft connect-lib",
+      "weft run",
+      "weft status",
+      "weft daemon logs",
+      "cd"
+    ]
+  },
+  "designer": {
+    "commands": [
+      "pnpm install",
+      "pnpm add",
+      "pnpm run",
+      "pnpm dlx sv@",
+      "pnpm dlx shadcn-svelte@",
+      "pnpm exec playwright",
+      "pnpm exec node",
+      {"prefix": "kill", "args": "pids"},
+      "cd"
+    ]
+  },
+  "deployer": {
+    "names_targets": true,
+    "commands": [
+      "weft status",
+      "weft daemon logs",
+      "weft activate",
+      "weft resync",
+      "weft deactivate",
+      "weft cancel-activate",
+      "weft infra start",
+      "weft infra stop",
+      "weft infra status",
+      "weft infra show",
+      "weft infra logs",
+      "weft infra list-doors",
+      "weft tree",
+      {"prefix": "weft branch", "refuse": [["--discard"]]},
+      "weft connect",
+      "weft domain add",
+      "weft domain list",
+      "weft frontend ls",
+      "weft frontend add",
+      "weft frontend token",
+      "weft target list",
+      {"prefix": "weft workers", "refuse": [["set"]]}
+    ]
+  }
+}

@@ -36,7 +36,7 @@ a time, each with a timeout of at most 60 seconds:
 ```bash
 pnpm dlx sv@0.17.0 create front --template minimal --types ts --no-add-ons --no-install
 pnpm dlx sv@0.17.0 add tailwindcss="plugins:none" --no-install --cwd front --no-git-check --no-download-check
-cd front && pnpm add clsx tailwind-merge && pnpm add -D tw-animate-css shadcn-svelte@1.6.1 && pnpm install
+pnpm --dir front add clsx tailwind-merge && pnpm --dir front add -D tw-animate-css shadcn-svelte@1.6.1 && pnpm --dir front install
 ```
 
 The Tailwind add-on writes `src/routes/layout.css`. `shadcn-svelte init`
@@ -206,12 +206,19 @@ block a destructive button renders with no colour at all:
 }
 ```
 
-Then, still in `front/`:
+Then, still from the project root (`--dir front` runs pnpm as if it started
+in `front/`; `pnpm dlx` does not take it, so shadcn-svelte gets its own
+`--cwd front`):
 
 ```bash
-pnpm dlx shadcn-svelte@1.6.1 add button card input --yes --overwrite --no-deps-install && pnpm install
-pnpm run build
+pnpm dlx shadcn-svelte@1.6.1 add button card input --yes --overwrite --no-deps-install --cwd front && pnpm --dir front install
+pnpm --dir front run build
 ```
+
+Every command here starts at the project root and names `front/` with a
+flag, never a `cd front && ...`: the project's command rules
+(`.codex/rules/tangle.rules`) do not allow `cd`, so a line that starts with
+one runs in the sandbox, where the network is closed and pnpm cannot fetch.
 
 If any command asks a question anyway, you kill it and report what it asked;
 you never answer it. A build takes seconds: you give it 30, and if it
@@ -268,10 +275,16 @@ values with `weft infra env`. The button's warning (`weft infra show` prints it)
 cuts off; if something already uses the old one, cutting it off is the user's
 call, so you ask the orchestrator before pressing.
 
-If the environment's permission checker refuses one of these commands, you
-stop that part and hand the user the exact command to run, then go on with the
-rest. You never go round it by reading the secret yourself or copying it onto
-a command line.
+Run each of these as one plain command from the project folder, exactly as
+written above: no pipe, no redirection, nothing joined to it but another
+allowed command, and `--into front/.env` for the path. The project's command
+rules (`.codex/rules/tangle.rules`) let `weft infra ...` run without asking
+only when every command on the line is one they allow. If one asks anyway,
+you are a subagent and the approval is refused: put the exact command in your
+report and go on with the rest, and the orchestrator runs it and tells you
+when the file is written. Nobody goes round a refusal by reading the secret
+or copying it onto a command line; if the orchestrator is refused too, it
+hands the user the exact command.
 
 **If you need a door that is not listed, you report it and stop on that part.**
 Whether a piece of infrastructure is reachable is part of what [the program]
@@ -306,11 +319,11 @@ without them it logs "Database schema mismatch ... Missing tables" and every
 call to it fails. You never write that SQL or startup code yourself, because
 BetterAuth's own CLI (the `auth` package; the older `@better-auth/cli` is
 deprecated) creates them. Once the database's values are in the server env
-file, from `front/`:
+file, from the project root:
 
 ```bash
-pnpm add better-auth@1.7.6 pg && pnpm add -D auth@1.7.6 @types/pg
-pnpm exec auth migrate --yes
+pnpm --dir front add better-auth@1.7.6 pg && pnpm --dir front add -D auth@1.7.6 @types/pg
+pnpm --dir front exec auth migrate --yes
 ```
 
 `migrate` finds the config at `src/lib/server/auth.ts`, reads `front/.env` the
@@ -594,10 +607,12 @@ carry the header.
   `node_modules`, its build output. You never put frontend files in the weft
   source tree, and never point a weft `@file` marker into `front/`.
 - The build is `pnpm install` then `pnpm run build`; the dev server is
-  `pnpm run dev`. You hand the user those exact commands in the report.
+  `pnpm run dev`. You run them from the project root as `pnpm --dir front
+  install` and so on, and hand the user the plain forms, to run in `front/`,
+  in the report.
 - `front/Dockerfile` builds the frontend into a server that listens on
   `$PORT`: that is what the deploy workflow runs on the cloud. For SvelteKit
-  that means `pnpm add -D @sveltejs/adapter-node`, then, in
+  that means `pnpm --dir front add -D @sveltejs/adapter-node`, then, in
   `front/vite.config.ts`, importing `adapter` from `@sveltejs/adapter-node`
   where the scaffold imports it from `@sveltejs/adapter-auto` (the scaffold
   writes no `svelte.config.js`: the adapter is set inside `sveltekit({ ... })`
@@ -622,8 +637,14 @@ carry the header.
 - An infra node's card (what `weft infra show` prints) is for the program's
   author. A page never parses its text for state and never shows its labels
   to people as they are: it asks the program, and chooses its own words.
-- Plain: shadcn-svelte components, little custom CSS, no design system the
-  request did not ask for.
+- The look is the `designer`'s, a specialist the `frontend-builder` starts
+  before anything else (on an older model that gives a specialist no tool to
+  start one, Tangle starts it instead, in the same breath). It builds the tokens, the components and the motion in `design-lab/`, a
+  standalone app beside `front/` on the same stack, with every page mocked on
+  realistic data, and the real pages are built on what it hands over
+  (`design-lab/src/lib/design/` and its components, moved under
+  `front/src/lib/`). `design-lab/` is the design's source, kept in the
+  project; weft reads nothing in it.
 
 ## Proving the frontend is proving the frontend
 

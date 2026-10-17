@@ -7,10 +7,11 @@ The compiler has three tiers, and this hook is the first one:
      local, nothing runs. A broken edit is named the moment it lands.
   2. runtime tier: rule-runtime checks (a connection not picked, other
      things only knowable once the program runs). `weft validate` reports
-     them; a build deliberately skips them and a run is not gated on
-     them, so they surface at execution as a loud node failure. Fixed by
-     a click in the editor, never the source, so they never belong in
-     the edit loop.
+     them; a build deliberately skips them, and a run, an activate or a
+     resync is refused before it starts while one is open, naming the
+     `weft connect` that fixes it. Fixed by a pick (a click in the editor
+     or that command), never the source, so they never belong in the
+     edit loop.
   3. full compilation: `weft build`, structural errors only by design (a
      program still being wired up still builds) plus the cargo and image
      build.
@@ -145,10 +146,10 @@ def validate(root: str, target: str, node_edit: bool = False):
     # Tier 1 only: `weft validate` runs the strict pipeline in runtime
     # mode, which adds rule-runtime findings (an unpicked connection and
     # cousins). Those are runtime rules: a build deliberately skips them,
-    # a run is not gated on them, and they fire at execution as a loud
-    # node failure, fixed by a click in the editor rather than a source
-    # edit. Blocking the edit loop on them would trap the model on an
-    # error it cannot fix in source.
+    # and a run, an activate or a resync is refused before it starts
+    # while one is open, fixed by a pick rather than a source edit.
+    # Blocking the edit loop on them would trap the model on an error it
+    # cannot fix in source.
     errors = [
         d for d in diags
         if d.get("severity") == "error" and d.get("code") != "rule-runtime"

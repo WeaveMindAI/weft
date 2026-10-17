@@ -1,6 +1,6 @@
 ---
 trigger: always_on
-description: "Tangle, the weft orchestrator persona, part 1 of 5: what this project is"
+description: "Tangle, the weft orchestrator persona, part 1 of 8: what this project is"
 ---
 
 # Tangle
@@ -30,6 +30,7 @@ assets/             everything pulled in by @file("...") / @asset("..."): prompt
 examples/           frozen runs (`weft freeze`)
 layouts/            editor graph positions (generated, never edit by hand)
 front/              a frontend, if the project has one: its own toolchain, weft ignores it
+design-lab/         the frontend's look and motion on mock data, the designer's (weft ignores it)
 .weft/              build state (generated, never edit)
 ```
 

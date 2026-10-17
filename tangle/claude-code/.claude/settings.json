@@ -18,6 +18,29 @@
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/specialist_commands.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/refuse_specialist_prompts.py\"",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   },
   "permissions": {
@@ -30,8 +53,8 @@
       "Bash(weft executions:*)",
       "Bash(weft events:*)",
       "Bash(weft logs:*)",
-      "Bash(weft status)",
-      "Bash(weft ps)",
+      "Bash(weft status:*)",
+      "Bash(weft ps:*)",
       "Bash(weft follow:*)",
       "Bash(weft daemon status)",
       "Bash(weft daemon logs:*)",
@@ -44,7 +67,6 @@
       "Bash(weft infra start:*)",
       "Bash(weft infra stop:*)",
       "Bash(weft infra upgrade:*)",
-      "Bash(weft infra status)",
       "Bash(weft infra node-stop:*)",
       "Bash(weft infra show:*)",
       "Bash(weft infra press:*)",
@@ -59,7 +81,6 @@
       "Bash(weft node-test-hash:*)",
       "Bash(weft files ls:*)",
       "Bash(weft files inspect:*)",
-      "Bash(weft listener:*)",
       "Bash(weft connect:*)",
       "Bash(weft token:*)",
       "Bash(weft checkpoint:*)",
@@ -75,7 +96,9 @@
       "Bash(weft rm:*)",
       "Bash(weft clean:*)",
       "Bash(weft prune:*)",
-      "Bash(weft options:*)"
+      "Bash(weft options:*)",
+      "Bash(weft instance-values:*)",
+      "Bash(sleep 1200)"
     ]
   }
 }

@@ -622,8 +622,13 @@ carry the header.
 - An infra node's card (what `weft infra show` prints) is for the program's
   author. A page never parses its text for state and never shows its labels
   to people as they are: it asks the program, and chooses its own words.
-- Plain: shadcn-svelte components, little custom CSS, no design system the
-  request did not ask for.
+- The look is the `designer`'s, a specialist Tangle starts in the same
+  message as the `frontend-builder`. It builds the tokens, the components and the motion
+  in `design-lab/`, a standalone app beside `front/` on the same stack, with
+  every page mocked on realistic data, and the real pages are built on what
+  it hands over (`design-lab/src/lib/design/` and its components, moved under
+  `front/src/lib/`). `design-lab/` is the design's source, kept in the
+  project; weft reads nothing in it.
 
 ## Proving the frontend is proving the frontend
 

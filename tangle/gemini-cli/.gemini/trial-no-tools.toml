@@ -1,0 +1,9 @@
+# The prompt-engineer's trial runs one prompt on one input through a headless
+# `gemini` call (its agent file, under The trial). The program's model gets
+# no tools, so the trial model should see only the prompt and the input:
+# this file, passed with `--policy`, refuses every tool call.
+[[rule]]
+toolName = "*"
+decision = "deny"
+priority = 999
+denyMessage = "this is a trial of a prompt: answer the message itself, with no tools"

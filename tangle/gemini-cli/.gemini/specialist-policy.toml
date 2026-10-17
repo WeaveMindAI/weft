@@ -1,0 +1,779 @@
+# A specialist never waits on a permission prompt.
+#
+# Tangle's specialists are Gemini subagents. When one of them makes a call
+# that needs approval, Gemini asks the user and the subagent waits, with its
+# `timeout_mins` clock stopped, until somebody answers, and nobody may be
+# looking. So these rules answer for the user, one block per specialist,
+# naming only what that specialist's job needs: the reads, the `weft` verbs
+# it runs, the exact frontend commands the two that build the site use, and,
+# for the five that write files, their edits, in `default` mode as well as
+# `autoEdit`. Every block refuses, above its allows, the daemon's lifecycle
+# (`weft daemon start`, its alias `restart`, `stop` and `remove`), any
+# command naming another install (`--on`, `--dispatcher`; the deployer's
+# block alone allows those), a quote or backslash glued to a flag name, any
+# redirection other than the validate run's stdin and the prompt-engineer's
+# trial, the live tier of `weft test-node`, and any edit under `.gemini/`.
+# Anything else that would have asked is refused at once, with a message
+# telling the specialist to do it another way or report BLOCKED with the
+# command. Tangle itself is not named here, so its own calls still ask the
+# user exactly as before.
+#
+# A rule's `subagent` takes one name, the `name` in an agent file, so the
+# reads every specialist shares are written out in each block, and a new
+# specialist needs a block of its own. The rules apply only in the
+# `default` and `autoEdit` approval modes: in `yolo` nothing asks.
+#
+# Loaded through `policyPaths` in `.gemini/settings.json`, as a user-tier
+# policy. Setting `policyPaths` stops Gemini reading `~/.gemini/policies/`
+# on its own, which is why the settings name it too.
+#
+# One question still gets through: Gemini asks before any edit to a build
+# file (`package.json`, a lockfile, a `Dockerfile`, `Cargo.toml`) after the
+# rules have answered, whatever they said.
+
+# ---- node-smith
+[[rule]]
+subagent = "node-smith"
+toolName = "run_shell_command"
+commandRegex = ".*--(on|dispatcher)[ ='\\\\]"
+decision = "deny"
+priority = 950
+denyMessage = "a cloud install is the deployer's alone: never pass --on or --dispatcher, report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+# A quote or a backslash glued to a flag name (`--o''n`) is how a flag hides from the rules above.
+[[rule]]
+subagent = "node-smith"
+toolName = "run_shell_command"
+commandRegex = ".*--[a-z-]*['\\\\]"
+decision = "deny"
+priority = 950
+denyMessage = "write every flag plainly, with no quote or backslash in its name"
+modes = ["default", "autoEdit"]
+
+# The live tier calls the real service and spends money: the user runs it, never a specialist.
+# Any `--tier` but a plain `basic` or `fake` is refused, and so is `--yes`.
+[[rule]]
+subagent = "node-smith"
+toolName = "run_shell_command"
+commandRegex = "weft test-node .*--tier(?![ =](basic|fake)[ \"])"
+decision = "deny"
+priority = 950
+denyMessage = "the live tier is the user's to run, through /weft-live-test: report it in your report"
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "node-smith"
+toolName = "run_shell_command"
+commandRegex = "weft test-node .*--yes"
+decision = "deny"
+priority = 950
+denyMessage = "the live tier is the user's to run, through /weft-live-test: report it in your report"
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "node-smith"
+toolName = "run_shell_command"
+commandPrefix = ["weft daemon start", "weft daemon stop", "weft daemon restart", "weft daemon remove"]
+decision = "deny"
+priority = 900
+denyMessage = "the daemon is never a specialist's to start, stop, restart or remove: report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+# The validate run reads its file on stdin, so this one form may redirect.
+[[rule]]
+subagent = "node-smith"
+toolName = "run_shell_command"
+commandRegex = "weft validate --file [^ ;&|<>\"]+ < [^ ;&|<>\"]+\""
+decision = "allow"
+priority = 850
+allowRedirection = true
+modes = ["default", "autoEdit"]
+
+# Any other redirection is refused rather than put to the user.
+[[rule]]
+subagent = "node-smith"
+toolName = "run_shell_command"
+commandRegex = ".*[<>]"
+decision = "deny"
+priority = 840
+denyMessage = "no redirection here: one plain command per call, or report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "node-smith"
+toolName = "run_shell_command"
+commandPrefix = ["cd", "weft validate", "weft parse", "weft describe-nodes", "weft status", "weft ps", "weft executions", "weft events", "weft logs", "weft follow", "weft daemon status", "weft daemon logs", "weft files ls", "weft files inspect", "weft infra status", "weft infra logs", "weft infra show", "weft infra list-doors", "weft tree", "weft examples", "weft diff", "weft test-node", "weft node-test-hash", "weft run", "weft bake", "weft stop", "weft cancel-running", "weft catalog update", "weft new", "weft infra start", "weft infra stop", "weft infra upgrade", "weft infra rebake", "weft infra terminate"]
+decision = "allow"
+priority = 800
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "node-smith"
+toolName = ["read_file", "read_many_files", "list_directory", "glob", "grep_search", "google_web_search", "activate_skill", "complete_task", "update_topic", "list_background_processes", "read_background_output"]
+decision = "allow"
+priority = 800
+modes = ["default", "autoEdit"]
+
+# Tangle's own files, this policy and the trial's included, are never a specialist's to edit.
+[[rule]]
+subagent = "node-smith"
+toolName = ["write_file", "replace"]
+argsPattern = "\"file_path\":\"[^\"]*\\.gemini/"
+decision = "deny"
+priority = 750
+denyMessage = "the files under .gemini/ belong to weft: never edit them"
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "node-smith"
+toolName = ["write_file", "replace", "web_fetch"]
+decision = "allow"
+priority = 700
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "node-smith"
+toolName = "*"
+decision = "deny"
+priority = 100
+denyMessage = "never wait on a permission prompt: do it another way, or report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+# ---- group-builder
+[[rule]]
+subagent = "group-builder"
+toolName = "run_shell_command"
+commandRegex = ".*--(on|dispatcher)[ ='\\\\]"
+decision = "deny"
+priority = 950
+denyMessage = "a cloud install is the deployer's alone: never pass --on or --dispatcher, report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+# A quote or a backslash glued to a flag name (`--o''n`) is how a flag hides from the rules above.
+[[rule]]
+subagent = "group-builder"
+toolName = "run_shell_command"
+commandRegex = ".*--[a-z-]*['\\\\]"
+decision = "deny"
+priority = 950
+denyMessage = "write every flag plainly, with no quote or backslash in its name"
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "group-builder"
+toolName = "run_shell_command"
+commandPrefix = ["weft daemon start", "weft daemon stop", "weft daemon restart", "weft daemon remove"]
+decision = "deny"
+priority = 900
+denyMessage = "the daemon is never a specialist's to start, stop, restart or remove: report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+# The validate run reads its file on stdin, so this one form may redirect.
+[[rule]]
+subagent = "group-builder"
+toolName = "run_shell_command"
+commandRegex = "weft validate --file [^ ;&|<>\"]+ < [^ ;&|<>\"]+\""
+decision = "allow"
+priority = 850
+allowRedirection = true
+modes = ["default", "autoEdit"]
+
+# Any other redirection is refused rather than put to the user.
+[[rule]]
+subagent = "group-builder"
+toolName = "run_shell_command"
+commandRegex = ".*[<>]"
+decision = "deny"
+priority = 840
+denyMessage = "no redirection here: one plain command per call, or report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "group-builder"
+toolName = "run_shell_command"
+commandPrefix = ["cd", "weft validate", "weft parse", "weft describe-nodes", "weft status", "weft ps", "weft executions", "weft events", "weft logs", "weft follow", "weft daemon status", "weft daemon logs", "weft files ls", "weft files inspect", "weft infra status", "weft infra logs", "weft infra show", "weft infra list-doors", "weft tree", "weft examples", "weft diff", "weft run", "weft stop", "weft cancel-running"]
+decision = "allow"
+priority = 800
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "group-builder"
+toolName = ["read_file", "read_many_files", "list_directory", "glob", "grep_search", "google_web_search", "activate_skill", "complete_task", "update_topic", "list_background_processes", "read_background_output"]
+decision = "allow"
+priority = 800
+modes = ["default", "autoEdit"]
+
+# Tangle's own files, this policy and the trial's included, are never a specialist's to edit.
+[[rule]]
+subagent = "group-builder"
+toolName = ["write_file", "replace"]
+argsPattern = "\"file_path\":\"[^\"]*\\.gemini/"
+decision = "deny"
+priority = 750
+denyMessage = "the files under .gemini/ belong to weft: never edit them"
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "group-builder"
+toolName = ["write_file", "replace"]
+decision = "allow"
+priority = 700
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "group-builder"
+toolName = "*"
+decision = "deny"
+priority = 100
+denyMessage = "never wait on a permission prompt: do it another way, or report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+# ---- frontend-builder
+[[rule]]
+subagent = "frontend-builder"
+toolName = "run_shell_command"
+commandRegex = ".*--(on|dispatcher)[ ='\\\\]"
+decision = "deny"
+priority = 950
+denyMessage = "a cloud install is the deployer's alone: never pass --on or --dispatcher, report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+# A quote or a backslash glued to a flag name (`--o''n`) is how a flag hides from the rules above.
+[[rule]]
+subagent = "frontend-builder"
+toolName = "run_shell_command"
+commandRegex = ".*--[a-z-]*['\\\\]"
+decision = "deny"
+priority = 950
+denyMessage = "write every flag plainly, with no quote or backslash in its name"
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "frontend-builder"
+toolName = "run_shell_command"
+commandPrefix = ["weft daemon start", "weft daemon stop", "weft daemon restart", "weft daemon remove"]
+decision = "deny"
+priority = 900
+denyMessage = "the daemon is never a specialist's to start, stop, restart or remove: report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+# The validate run reads its file on stdin, so this one form may redirect.
+[[rule]]
+subagent = "frontend-builder"
+toolName = "run_shell_command"
+commandRegex = "weft validate --file [^ ;&|<>\"]+ < [^ ;&|<>\"]+\""
+decision = "allow"
+priority = 850
+allowRedirection = true
+modes = ["default", "autoEdit"]
+
+# Any other redirection is refused rather than put to the user.
+[[rule]]
+subagent = "frontend-builder"
+toolName = "run_shell_command"
+commandRegex = ".*[<>]"
+decision = "deny"
+priority = 840
+denyMessage = "no redirection here: one plain command per call, or report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "frontend-builder"
+toolName = "run_shell_command"
+commandPrefix = ["cd", "weft validate", "weft parse", "weft describe-nodes", "weft status", "weft ps", "weft executions", "weft events", "weft logs", "weft follow", "weft daemon status", "weft daemon logs", "weft files ls", "weft files inspect", "weft infra status", "weft infra logs", "weft infra show", "weft infra list-doors", "weft tree", "weft examples", "weft diff", "weft run", "weft infra press", "weft infra env", "weft connect-lib", "node --env-file=.env build", "pnpm install", "pnpm add", "pnpm run", "pnpm exec playwright", "pnpm exec auth"]
+decision = "allow"
+priority = 800
+modes = ["default", "autoEdit"]
+
+# The two scaffold tools the weft-frontend skill runs, at a pinned version.
+[[rule]]
+subagent = "frontend-builder"
+toolName = "run_shell_command"
+commandRegex = "pnpm dlx (sv|shadcn-svelte)@[0-9.]+ "
+decision = "allow"
+priority = 800
+modes = ["default", "autoEdit"]
+
+# Stopping the dev server it started: `kill` and a process id, nothing else.
+[[rule]]
+subagent = "frontend-builder"
+toolName = "run_shell_command"
+commandRegex = "kill [0-9]+\""
+decision = "allow"
+priority = 800
+modes = ["default", "autoEdit"]
+
+# Its own screenshot and recording scripts, kept in its scratch folder.
+[[rule]]
+subagent = "frontend-builder"
+toolName = "run_shell_command"
+commandRegex = "node \\.scratch/frontend-builder/[^ ;&|<>\"]+\""
+decision = "allow"
+priority = 800
+modes = ["default", "autoEdit"]
+
+# The secret BetterAuth needs (the weft-frontend skill).
+[[rule]]
+subagent = "frontend-builder"
+toolName = "run_shell_command"
+commandRegex = "openssl rand -base64 32\""
+decision = "allow"
+priority = 800
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "frontend-builder"
+toolName = ["read_file", "read_many_files", "list_directory", "glob", "grep_search", "google_web_search", "activate_skill", "complete_task", "update_topic", "list_background_processes", "read_background_output"]
+decision = "allow"
+priority = 800
+modes = ["default", "autoEdit"]
+
+# Tangle's own files, this policy and the trial's included, are never a specialist's to edit.
+[[rule]]
+subagent = "frontend-builder"
+toolName = ["write_file", "replace"]
+argsPattern = "\"file_path\":\"[^\"]*\\.gemini/"
+decision = "deny"
+priority = 750
+denyMessage = "the files under .gemini/ belong to weft: never edit them"
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "frontend-builder"
+toolName = ["write_file", "replace", "web_fetch"]
+decision = "allow"
+priority = 700
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "frontend-builder"
+toolName = "*"
+decision = "deny"
+priority = 100
+denyMessage = "never wait on a permission prompt: do it another way, or report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+# ---- designer
+[[rule]]
+subagent = "designer"
+toolName = "run_shell_command"
+commandRegex = ".*--(on|dispatcher)[ ='\\\\]"
+decision = "deny"
+priority = 950
+denyMessage = "a cloud install is the deployer's alone: never pass --on or --dispatcher, report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+# A quote or a backslash glued to a flag name (`--o''n`) is how a flag hides from the rules above.
+[[rule]]
+subagent = "designer"
+toolName = "run_shell_command"
+commandRegex = ".*--[a-z-]*['\\\\]"
+decision = "deny"
+priority = 950
+denyMessage = "write every flag plainly, with no quote or backslash in its name"
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "designer"
+toolName = "run_shell_command"
+commandPrefix = ["weft daemon start", "weft daemon stop", "weft daemon restart", "weft daemon remove"]
+decision = "deny"
+priority = 900
+denyMessage = "the daemon is never a specialist's to start, stop, restart or remove: report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+# Any other redirection is refused rather than put to the user.
+[[rule]]
+subagent = "designer"
+toolName = "run_shell_command"
+commandRegex = ".*[<>]"
+decision = "deny"
+priority = 840
+denyMessage = "no redirection here: one plain command per call, or report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "designer"
+toolName = "run_shell_command"
+commandPrefix = ["cd", "pnpm install", "pnpm add", "pnpm run", "pnpm exec playwright", "pnpm exec auth"]
+decision = "allow"
+priority = 800
+modes = ["default", "autoEdit"]
+
+# The two scaffold tools the weft-frontend skill runs, at a pinned version.
+[[rule]]
+subagent = "designer"
+toolName = "run_shell_command"
+commandRegex = "pnpm dlx (sv|shadcn-svelte)@[0-9.]+ "
+decision = "allow"
+priority = 800
+modes = ["default", "autoEdit"]
+
+# Stopping the dev server it started: `kill` and a process id, nothing else.
+[[rule]]
+subagent = "designer"
+toolName = "run_shell_command"
+commandRegex = "kill [0-9]+\""
+decision = "allow"
+priority = 800
+modes = ["default", "autoEdit"]
+
+# Its own screenshot and recording scripts, kept in its scratch folder.
+[[rule]]
+subagent = "designer"
+toolName = "run_shell_command"
+commandRegex = "node \\.scratch/designer/[^ ;&|<>\"]+\""
+decision = "allow"
+priority = 800
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "designer"
+toolName = ["read_file", "read_many_files", "list_directory", "glob", "grep_search", "google_web_search", "activate_skill", "complete_task", "update_topic", "list_background_processes", "read_background_output"]
+decision = "allow"
+priority = 800
+modes = ["default", "autoEdit"]
+
+# Tangle's own files, this policy and the trial's included, are never a specialist's to edit.
+[[rule]]
+subagent = "designer"
+toolName = ["write_file", "replace"]
+argsPattern = "\"file_path\":\"[^\"]*\\.gemini/"
+decision = "deny"
+priority = 750
+denyMessage = "the files under .gemini/ belong to weft: never edit them"
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "designer"
+toolName = ["write_file", "replace", "web_fetch"]
+decision = "allow"
+priority = 700
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "designer"
+toolName = "*"
+decision = "deny"
+priority = 100
+denyMessage = "never wait on a permission prompt: do it another way, or report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+# ---- prompt-engineer
+[[rule]]
+subagent = "prompt-engineer"
+toolName = "run_shell_command"
+commandRegex = ".*--(on|dispatcher)[ ='\\\\]"
+decision = "deny"
+priority = 950
+denyMessage = "a cloud install is the deployer's alone: never pass --on or --dispatcher, report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+# A quote or a backslash glued to a flag name (`--o''n`) is how a flag hides from the rules above.
+[[rule]]
+subagent = "prompt-engineer"
+toolName = "run_shell_command"
+commandRegex = ".*--[a-z-]*['\\\\]"
+decision = "deny"
+priority = 950
+denyMessage = "write every flag plainly, with no quote or backslash in its name"
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "prompt-engineer"
+toolName = "run_shell_command"
+commandPrefix = ["weft daemon start", "weft daemon stop", "weft daemon restart", "weft daemon remove"]
+decision = "deny"
+priority = 900
+denyMessage = "the daemon is never a specialist's to start, stop, restart or remove: report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+# The validate run reads its file on stdin, so this one form may redirect.
+[[rule]]
+subagent = "prompt-engineer"
+toolName = "run_shell_command"
+commandRegex = "weft validate --file [^ ;&|<>\"]+ < [^ ;&|<>\"]+\""
+decision = "allow"
+priority = 850
+allowRedirection = true
+modes = ["default", "autoEdit"]
+
+# The trial of its prompt (its agent file, under The trial), in exactly this
+# shape: from an empty folder, a headless `gemini` with no tools, reading
+# its input from `.scratch/prompt-engineer/`. The first rule matches the
+# whole command, the second the part after `cd`.
+[[rule]]
+subagent = "prompt-engineer"
+toolName = "run_shell_command"
+commandRegex = "cd /[^ ;&|<>\"]+ && GEMINI_SYSTEM_MD=(?![^ ]*/(\\.scratch|tmp)/)(/[^ ;&|<>\"]+)/assets/prompts/[^ ;&|<>\"]+ gemini -m (flash-lite|flash|pro) --policy \\2/\\.gemini/trial-no-tools\\.toml --skip-trust < \\2/\\.scratch/prompt-engineer/[^ ;&|<>\"]+\""
+decision = "allow"
+priority = 850
+allowRedirection = true
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "prompt-engineer"
+toolName = "run_shell_command"
+commandRegex = "GEMINI_SYSTEM_MD=(?![^ ]*/(\\.scratch|tmp)/)(/[^ ;&|<>\"]+)/assets/prompts/[^ ;&|<>\"]+ gemini -m (flash-lite|flash|pro) --policy \\2/\\.gemini/trial-no-tools\\.toml --skip-trust\""
+decision = "allow"
+priority = 850
+allowRedirection = true
+modes = ["default", "autoEdit"]
+
+# Any other redirection is refused rather than put to the user.
+[[rule]]
+subagent = "prompt-engineer"
+toolName = "run_shell_command"
+commandRegex = ".*[<>]"
+decision = "deny"
+priority = 840
+denyMessage = "no redirection here: one plain command per call, or report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "prompt-engineer"
+toolName = "run_shell_command"
+commandPrefix = ["cd", "weft validate", "weft parse", "weft describe-nodes", "weft status", "weft ps", "weft executions", "weft events", "weft logs", "weft follow", "weft daemon status", "weft daemon logs", "weft files ls", "weft files inspect", "weft infra status", "weft infra logs", "weft infra show", "weft infra list-doors", "weft tree", "weft examples", "weft diff", "weft run", "mktemp -d"]
+decision = "allow"
+priority = 800
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "prompt-engineer"
+toolName = ["read_file", "read_many_files", "list_directory", "glob", "grep_search", "google_web_search", "activate_skill", "complete_task", "update_topic", "list_background_processes", "read_background_output"]
+decision = "allow"
+priority = 800
+modes = ["default", "autoEdit"]
+
+# Tangle's own files, this policy and the trial's included, are never a specialist's to edit.
+[[rule]]
+subagent = "prompt-engineer"
+toolName = ["write_file", "replace"]
+argsPattern = "\"file_path\":\"[^\"]*\\.gemini/"
+decision = "deny"
+priority = 750
+denyMessage = "the files under .gemini/ belong to weft: never edit them"
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "prompt-engineer"
+toolName = ["write_file", "replace", "web_fetch"]
+decision = "allow"
+priority = 700
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "prompt-engineer"
+toolName = "*"
+decision = "deny"
+priority = 100
+denyMessage = "never wait on a permission prompt: do it another way, or report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+# ---- run-digger
+[[rule]]
+subagent = "run-digger"
+toolName = "run_shell_command"
+commandRegex = ".*--(on|dispatcher)[ ='\\\\]"
+decision = "deny"
+priority = 950
+denyMessage = "a cloud install is the deployer's alone: never pass --on or --dispatcher, report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+# A quote or a backslash glued to a flag name (`--o''n`) is how a flag hides from the rules above.
+[[rule]]
+subagent = "run-digger"
+toolName = "run_shell_command"
+commandRegex = ".*--[a-z-]*['\\\\]"
+decision = "deny"
+priority = 950
+denyMessage = "write every flag plainly, with no quote or backslash in its name"
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "run-digger"
+toolName = "run_shell_command"
+commandPrefix = ["weft daemon start", "weft daemon stop", "weft daemon restart", "weft daemon remove"]
+decision = "deny"
+priority = 900
+denyMessage = "the daemon is never a specialist's to start, stop, restart or remove: report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+# The validate run reads its file on stdin, so this one form may redirect.
+[[rule]]
+subagent = "run-digger"
+toolName = "run_shell_command"
+commandRegex = "weft validate --file [^ ;&|<>\"]+ < [^ ;&|<>\"]+\""
+decision = "allow"
+priority = 850
+allowRedirection = true
+modes = ["default", "autoEdit"]
+
+# Any other redirection is refused rather than put to the user.
+[[rule]]
+subagent = "run-digger"
+toolName = "run_shell_command"
+commandRegex = ".*[<>]"
+decision = "deny"
+priority = 840
+denyMessage = "no redirection here: one plain command per call, or report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "run-digger"
+toolName = "run_shell_command"
+commandPrefix = ["cd", "weft validate", "weft parse", "weft describe-nodes", "weft status", "weft ps", "weft executions", "weft events", "weft logs", "weft follow", "weft daemon status", "weft daemon logs", "weft files ls", "weft files inspect", "weft infra status", "weft infra logs", "weft infra show", "weft infra list-doors", "weft tree", "weft examples", "weft diff"]
+decision = "allow"
+priority = 800
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "run-digger"
+toolName = ["read_file", "read_many_files", "list_directory", "glob", "grep_search", "google_web_search", "activate_skill", "complete_task", "update_topic", "list_background_processes", "read_background_output"]
+decision = "allow"
+priority = 800
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "run-digger"
+toolName = "*"
+decision = "deny"
+priority = 100
+denyMessage = "never wait on a permission prompt: do it another way, or report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+# ---- red-teamer
+[[rule]]
+subagent = "red-teamer"
+toolName = "run_shell_command"
+commandRegex = ".*--(on|dispatcher)[ ='\\\\]"
+decision = "deny"
+priority = 950
+denyMessage = "a cloud install is the deployer's alone: never pass --on or --dispatcher, report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+# A quote or a backslash glued to a flag name (`--o''n`) is how a flag hides from the rules above.
+[[rule]]
+subagent = "red-teamer"
+toolName = "run_shell_command"
+commandRegex = ".*--[a-z-]*['\\\\]"
+decision = "deny"
+priority = 950
+denyMessage = "write every flag plainly, with no quote or backslash in its name"
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "red-teamer"
+toolName = "run_shell_command"
+commandPrefix = ["weft daemon start", "weft daemon stop", "weft daemon restart", "weft daemon remove"]
+decision = "deny"
+priority = 900
+denyMessage = "the daemon is never a specialist's to start, stop, restart or remove: report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+# The validate run reads its file on stdin, so this one form may redirect.
+[[rule]]
+subagent = "red-teamer"
+toolName = "run_shell_command"
+commandRegex = "weft validate --file [^ ;&|<>\"]+ < [^ ;&|<>\"]+\""
+decision = "allow"
+priority = 850
+allowRedirection = true
+modes = ["default", "autoEdit"]
+
+# Any other redirection is refused rather than put to the user.
+[[rule]]
+subagent = "red-teamer"
+toolName = "run_shell_command"
+commandRegex = ".*[<>]"
+decision = "deny"
+priority = 840
+denyMessage = "no redirection here: one plain command per call, or report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "red-teamer"
+toolName = "run_shell_command"
+commandPrefix = ["cd", "weft validate", "weft parse", "weft describe-nodes", "weft status", "weft ps", "weft executions", "weft events", "weft logs", "weft follow", "weft daemon status", "weft daemon logs", "weft files ls", "weft files inspect", "weft infra status", "weft infra logs", "weft infra show", "weft infra list-doors", "weft tree", "weft examples", "weft diff"]
+decision = "allow"
+priority = 800
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "red-teamer"
+toolName = ["read_file", "read_many_files", "list_directory", "glob", "grep_search", "google_web_search", "activate_skill", "complete_task", "update_topic", "list_background_processes", "read_background_output"]
+decision = "allow"
+priority = 800
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "red-teamer"
+toolName = "*"
+decision = "deny"
+priority = 100
+denyMessage = "never wait on a permission prompt: do it another way, or report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+# ---- deployer
+# A quote or a backslash glued to a flag name (`--o''n`) is how a flag hides from the rules above.
+[[rule]]
+subagent = "deployer"
+toolName = "run_shell_command"
+commandRegex = ".*--[a-z-]*['\\\\]"
+decision = "deny"
+priority = 950
+denyMessage = "write every flag plainly, with no quote or backslash in its name"
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "deployer"
+toolName = "run_shell_command"
+commandPrefix = ["weft daemon start", "weft daemon stop", "weft daemon restart", "weft daemon remove"]
+decision = "deny"
+priority = 900
+denyMessage = "the daemon is never a specialist's to start, stop, restart or remove: report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+# The validate run reads its file on stdin, so this one form may redirect.
+[[rule]]
+subagent = "deployer"
+toolName = "run_shell_command"
+commandRegex = "weft validate --file [^ ;&|<>\"]+ < [^ ;&|<>\"]+\""
+decision = "allow"
+priority = 850
+allowRedirection = true
+modes = ["default", "autoEdit"]
+
+# Any other redirection is refused rather than put to the user.
+[[rule]]
+subagent = "deployer"
+toolName = "run_shell_command"
+commandRegex = ".*[<>]"
+decision = "deny"
+priority = 840
+denyMessage = "no redirection here: one plain command per call, or report BLOCKED with the command"
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "deployer"
+toolName = "run_shell_command"
+commandPrefix = ["cd", "weft validate", "weft parse", "weft describe-nodes", "weft status", "weft ps", "weft executions", "weft events", "weft logs", "weft follow", "weft daemon status", "weft daemon logs", "weft files ls", "weft files inspect", "weft infra status", "weft infra logs", "weft infra show", "weft infra list-doors", "weft tree", "weft examples", "weft diff", "weft activate", "weft resync", "weft deactivate", "weft cancel-activate", "weft infra start", "weft infra stop", "weft infra terminate", "weft infra env", "weft connect", "weft target list", "weft domain", "weft frontend ls"]
+decision = "allow"
+priority = 800
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "deployer"
+toolName = ["read_file", "read_many_files", "list_directory", "glob", "grep_search", "google_web_search", "activate_skill", "complete_task", "update_topic", "list_background_processes", "read_background_output"]
+decision = "allow"
+priority = 800
+modes = ["default", "autoEdit"]
+
+[[rule]]
+subagent = "deployer"
+toolName = "*"
+decision = "deny"
+priority = 100
+denyMessage = "never wait on a permission prompt: do it another way, or report BLOCKED with the command"
+modes = ["default", "autoEdit"]

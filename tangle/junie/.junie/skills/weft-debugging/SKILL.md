@@ -85,9 +85,10 @@ node and the wrong value.
    that is not enough, `weft events <execution-id> --node <that node>` shows the
    values that reached it, on its `node_started` line. For the compiler
    error slugs, go and read the `weft-language` skill. A node's own error
-   text is written by the node's author. A node error saying it has no
-   connection picked is [the runtime tier] firing at execution,
-   not a source bug: you pick a stored connection yourself (`weft connect
+   text is written by the node's author. A run, an activate or a resync is
+   refused before it starts while a connection it needs is not picked,
+   naming the `weft connect` that picks it, and a node error saying it has
+   no connection picked is the same [the runtime tier] gap, not a source bug: you pick a stored connection yourself (`weft connect
    --node <id> --grant <grant>`) or send the user to the node's Connect
    button / `weft connect` in their terminal, then run again. A failure saying `the worker running '<node>' went away while it was running` means the worker of a durable run died mid-step: weft does not run a step again once its start is on
    record, because the step may have partly happened. Check what it did outside (the email, the row, the post), then, if it has to happen again, start a run at that step by hand: `weft run --from <node>=<inputs>`, with the inputs from `weft events <execution-id> --node <node> --full`. If the message says `went away while it was reading a stream` instead, the items it read are gone from the stream, so `--from` cannot hand them back: check what it did, then run the whole execution again. A run that cannot pause and held a wait for the trigger's whole `holdSecs` fails too, with the waiting node saying it gave up; a caller still on the line was answered `504`. A queued run (a `weft run`, a resume) that ended with `its worker refused it 3 times: <error>`, `the platform refused weft's calls for it 3 times: <error>` or `its project's worker settings kept it from any worker 3 times: <error>` never got going. The `<error>` says why, and item 8 says whether the workers are still out of reach.

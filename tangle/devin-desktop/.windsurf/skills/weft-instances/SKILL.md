@@ -139,7 +139,8 @@ is the node and its routes side by side at the same level, in a group that
 receives no per-instance value. Only the groups and includes doing the work
 receive the node's output; the routes feed them and read nothing from them
 (a `Reply` inside such a group answers its route). A program where each chat
-session drives its own Blender container looks like this:
+session drives its own Blender container looks like this (`BlenderWorkstation`
+and `BlenderPreview` are that project's own nodes, not catalog ones):
 
 ```weft
 live = Group(keys: Access) {

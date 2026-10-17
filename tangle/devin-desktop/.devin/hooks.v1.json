@@ -1,0 +1,14 @@
+{
+  "PostToolUse": [
+    {
+      "matcher": "^(write|edit|apply_patch)$",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 \"$DEVIN_PROJECT_DIR/.devin/hooks/validate_weft.py\"",
+          "timeout": 120
+        }
+      ]
+    }
+  ]
+}

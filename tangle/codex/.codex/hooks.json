@@ -1,5 +1,18 @@
 {
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/specialist_commands.py\"",
+            "timeout": 10,
+            "statusMessage": "specialist command list"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "^(apply_patch|Edit|Write)$",
@@ -9,6 +22,17 @@
             "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/validate_weft.py\"",
             "timeout": 120,
             "statusMessage": "weft validate"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.codex/hooks/refuse_specialist_prompts.py\"",
+            "timeout": 10
           }
         ]
       }

@@ -54,6 +54,7 @@ You never trust a report you can re-verify for the cost of one command. If you c
 - **stale versions**: an API or dependency version taken from memory or an old example instead of the service's current docs, or one the service no longer serves; the rule is under deps.toml.
 - **empty rig**: `tests()` returns an empty vec, or `tests.rs` does not exist, and [the report] did not say so. An access node is the one exception: its body is the `access_node!` macro, there is nothing of the smith's to test, and it ships with no `tests.rs` at all.
 - **flaky-dismissed**: an intermittently failing test waved off as flaky instead of chased to its race. A race in the node is the node's bug; a test made tolerant of it (a retry, a sleep, a longer timeout) fails [the review] on both counts.
+- **an output with no bound**: a port whose value grows with what the service answers or what the node is given (a list of results, a page of text, a response body, a transcript) and nothing that keeps it under the 100 KB wire limit: no cap input or `LIMIT`, no paging, no stored file in its place. [the report] names each such port and its bound, and a `fake` test emits the largest value the bound allows; a port missing from that list is the finding. The rule is under The wire limit.
 - **body smells**: `.ok()` discarding an error, a default value standing in for a missing input, a retry loop, orchestration inside the node, a database client or a process opened fresh on every run where `ctx.shared` would hold one.
 - **an infra output left unbaked**: an infra node's output that holds as long as the infra does (an address, a connection, a handle) with no `"baked": true`, so every run that reads it runs the node to make it again.
 - **a dead end in an image**: a state an infra container can sit in (a dead pairing, a lost credential, a revoked session) with no button on its display that leaves it, so the user's only way out is restarting or terminating the infra. Every such state gets an action, offered in every state; the rule is under Infra node.
@@ -1007,7 +1008,7 @@ and you never run it. You write the tests in the same change as the node.
 An infra node gets no `live` test for now (a live test needs a service with
 a stored connection): its `basic` and `fake` tests cover the node's own code,
 and the container is proven inside a real program. Make a scratch project
-(`weft new` in your scratch folder), copy the node in under `nodes/`, use it
+(`weft new` in `.scratch/node-smith/`, inside the project), copy the node in under `nodes/`, use it
 in `src/main.weft`, then `weft infra start`, read `weft infra status` and
 `weft infra logs`, run through it (carved with `weft run --from` / `--emit`
 / `--target`, the `weft-sdp` skill), and finish with `weft infra terminate

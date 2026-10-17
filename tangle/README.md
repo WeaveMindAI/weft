@@ -1,7 +1,7 @@
 # Tangle
 
 Tangle is the AI builder that lives inside a weft project. It is not a
-product and not a plugin: it is a persona, its reference skills, six specialists
+product and not a plugin: it is a persona, its reference skills, eight specialists
 and seven commands, written as files that an AI coding assistant loads when
 the user opens the project.
 
@@ -67,9 +67,8 @@ that differently rather than pretending.
 
 | | Specialists | Compiler after an edit |
 |---|---|---|
-| Claude Code, Kilo, Cursor, Codex, Copilot, Gemini, OpenCode | real subagents | yes, straight into the context |
+| Claude Code, Kilo, Cursor, Codex, Copilot, Gemini, OpenCode, Devin Desktop | real subagents | yes, straight into the context |
 | Junie | real subagents, but it picks which one by description | no, the persona runs it |
-| Devin Desktop | skills Tangle loads and becomes | runs, but leaves its answer in a file |
 | Cline | skills Tangle loads and becomes | no, the persona runs it |
 
 Where a specialist cannot be a subagent, it is a skill that opens by saying so:
@@ -78,11 +77,9 @@ a second context reading the first has to become running the command again.
 
 The compiler column is the one that varies most, and the reasons are worth
 knowing. Junie ignores hooks configured inside a project on purpose, so nothing
-a template installs can register one. Devin's post-hooks cannot speak back into
-the model's context, so its hook writes findings to a file the persona reads.
-Cline's hooks are an SDK facility rather than something a plain project
-configures. In all three the persona says plainly that running `weft validate`
-is Tangle's own job.
+a template installs can register one. Cline's hooks are an SDK facility rather
+than something a plain project configures. In both the persona says plainly
+that running `weft validate` is Tangle's own job.
 
 Each folder's own README says what is different about it.
 

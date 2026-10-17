@@ -17,5 +17,9 @@
   },
   "general": {
     "defaultApprovalMode": "auto_edit"
-  }
+  },
+  "policyPaths": [
+    "~/.gemini/policies",
+    ".gemini/specialist-policy.toml"
+  ]
 }

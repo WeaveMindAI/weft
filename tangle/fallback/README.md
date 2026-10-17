@@ -20,18 +20,32 @@ disagree. `weft new --assistant agents` refuses to run alongside a named
 assistant for exactly that reason.
 
 Because it cannot know what the host supports, the persona is written to work
-either way. It says that if you can dispatch a subagent, the six specialists
-are dispatches, and if you cannot, they are six jobs you do yourself, one at
+either way. It says that if you can dispatch a subagent, the eight specialists
+are dispatches, and if you cannot, they are eight jobs you do yourself, one at
 a time, with the scope limits and refusals still binding. The skills
 are described as files to open at the moment they are needed, so they work
 with or without a skill loader.
 
 There is no hook, so the persona puts the compiler check in Tangle's own
-hands after every edit.
+hands after every edit. Nothing can refuse a specialist's permission prompt
+either, so each specialist's skill tells it to find another way or report
+BLOCKED with the exact command, and Tangle runs it. This folder ships no settings
+file that could pre-approve anything, so the persona names what the specialists need allowed (edits
+inside the project for the five that write files, the `weft` verbs, `pnpm`,
+`node --env-file=.env build` and `kill`) and tells the user to allow them in
+the assistant's own settings when those would ask. The twenty-minute look at
+a specialist that has not reported uses a background `sleep 1200` when the
+assistant can tell Tangle it ended, and a check at the start of each of
+Tangle's turns when it cannot.
+
+`weft tangle update` replaces `AGENTS.md` and `.agents/skills/` whole, and
+keeps anything else under `.agents/`. So what the user asks Tangle to keep
+doing goes into the assistant's own memory, or into `.agents/tangle-memory.md`
+when it has none, and the persona reads that file at the start of a session.
 
 ## What is here
 
-Tangle is one persona plus its reference skills, six specialists and seven commands.
+Tangle is one persona plus its reference skills, eight specialists and seven commands.
 The persona holds the program: the graph shape, the typed contracts, the weft
 source. The skills are the big knowledge, loaded only when the work calls for
 them. The specialists take the heavy scoped jobs. The commands are the loop's
