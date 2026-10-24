@@ -1,0 +1,78 @@
+{
+  "type": "KeenableFetchPage",
+  "label": "Keenable: Fetch Page",
+  "description": "Fetch one URL as clean markdown through Keenable, ready for an LLM node. Works without a key; wire a KeenableAccess node for higher rate limits. The markdown is cut at `maxChars` (50,000 by default), and shorter if it would still weigh more than the 100 KB a wire carries; `truncated` says when it was cut.",
+  "tags": [
+    "web",
+    "scrape"
+  ],
+  "icon": "FileDown",
+  "color": "#005CFF",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access", "accepts": ["wire"],
+      "description": "Optional: a KeenableAccess node, for an API key's higher rate limits. Leave unwired to fetch without a key, rate limited per IP."
+    },
+    {
+      "name": "url",
+      "type": "String",
+      "required": true,
+      "label": "URL"
+    },
+    {
+      "name": "maxChars",
+      "type": "Number",
+      "default": 50000,
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "step": 1
+      },
+      "label": "Max characters",
+      "description": "The most characters of markdown to keep; the rest of the page is cut off and `truncated` is true. Whatever you set, the markdown is also cut to fit the 100 KB a wire carries."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "markdown",
+      "type": "String"
+    },
+    {
+      "name": "title",
+      "type": "String"
+    },
+    {
+      "name": "truncated",
+      "type": "Boolean",
+      "description": "True when the page's markdown was longer than `maxChars` or than a wire carries, so `markdown` holds only its start."
+    }
+  ],
+  "validate": [
+    {
+      "when": {
+        "kind": "all",
+        "of": [
+          {
+            "kind": "config_present",
+            "field": "url"
+          },
+          {
+            "kind": "not",
+            "of": {
+              "kind": "config_matches",
+              "field": "url",
+              "regex": "(?i)^https?://"
+            }
+          }
+        ]
+      },
+      "then": {
+        "message": "KeenableFetchPage '{id}' has a `url` that is not a web address. Start it with http:// or https://.",
+        "level": "structural",
+        "severity": "error",
+        "port": "url"
+      }
+    }
+  ]
+}

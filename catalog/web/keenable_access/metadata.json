@@ -1,0 +1,69 @@
+{
+  "type": "KeenableAccess",
+  "label": "Keenable Access",
+  "description": "Connect Keenable, the web-search API behind Keenable: Web Search and Keenable: Fetch Page, with an API key. Optional: those nodes work without one, and a key lifts their rate limits.",
+  "tags": [
+    "web",
+    "search",
+    "access"
+  ],
+  "icon": "KeyRound",
+  "color": "#005CFF",
+  "service": {
+    "service": "keenable",
+    "label": "Keenable",
+    "acquisition": {
+      "kind": "static",
+      "fields": [
+        {
+          "name": "key",
+          "label": "API key",
+          "placeholder": "keen_..."
+        }
+      ]
+    },
+    "auth": [
+      {
+        "kind": "header",
+        "name": "X-API-Key",
+        "value": "{key}"
+      }
+    ],
+    "test": {
+      "url": "https://api.keenable.ai/v1/search",
+      "method": "POST",
+      "expectStatus": 400
+    },
+    "identity": "keenable",
+    "verification": {
+      "rung": "reports_validity",
+      "cost": "free"
+    },
+    "ownPage": {
+      "guide": {
+        "link": "https://app.keenable.ai/console",
+        "steps": [
+          "Open app.keenable.ai/console and create an API key.",
+          "Paste it below and name the connection."
+        ]
+      }
+    }
+  },
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access",
+      "widget": {
+        "kind": "access"
+      },
+      "label": "Account"
+    }
+  ],
+  "outputs": [
+    {
+      "name": "access",
+      "type": "Access",
+      "description": "Wire into Keenable: Web Search or Keenable: Fetch Page."
+    }
+  ]
+}

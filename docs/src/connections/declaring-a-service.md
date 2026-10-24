@@ -258,9 +258,9 @@ let weft block a node before it calls.
 `cost` is `free`, `ambiguous` or `paid`, and **only `free` runs on its own**. A
 check that might bill is never run without being asked.
 
-Today the shipped catalog has 22 services. Thirteen of them declare a
-verification, all `free`: three `reports_permissions`, nine `reports_validity`
-and one `silent`. The nine that declare none take the default, `silent` and
+Today the shipped catalog has 21 services. Fourteen of them declare a
+verification, all `free`: three `reports_permissions`, ten `reports_validity`
+and one `silent`. The seven that declare none take the default, `silent` and
 `free`. So in practice the only way a connection's *permissions* are verified
 right now is the OAuth scope echo, where the provider tells weft what it
 granted. A `probe` would only learn about the one call it makes, so like

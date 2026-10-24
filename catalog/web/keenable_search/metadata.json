@@ -1,0 +1,67 @@
+{
+  "type": "KeenableSearch",
+  "label": "Keenable: Web Search",
+  "description": "Search the web through Keenable and get results with their page text, ready for an LLM node. Works without a key; wire a KeenableAccess node for higher rate limits. Each text is cut at `maxTextChars`, and the longest ones shorter still when the results would weigh more than the 100 KB a wire carries.",
+  "tags": [
+    "web",
+    "search"
+  ],
+  "icon": "Globe",
+  "color": "#005CFF",
+  "inputs": [
+    {
+      "name": "account",
+      "type": "Access", "accepts": ["wire"],
+      "description": "Optional: a KeenableAccess node, for an API key's higher rate limits. Leave unwired to search without a key, rate limited per IP."
+    },
+    {
+      "name": "query",
+      "type": "String",
+      "required": true,
+      "label": "Query"
+    },
+    {
+      "name": "numResults",
+      "type": "Number",
+      "default": 10,
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "max": 50,
+        "step": 1
+      },
+      "label": "Results",
+      "description": "How many results (1-50)."
+    },
+    {
+      "name": "maxTextChars",
+      "type": "Number",
+      "default": 4000,
+      "widget": {
+        "kind": "number",
+        "min": 1,
+        "step": 1
+      },
+      "label": "Text per result",
+      "description": "Max page-text characters per result. When the results would still weigh more than the 100 KB a wire carries, the longest texts are cut shorter until they fit."
+    },
+    {
+      "name": "site",
+      "type": "String",
+      "label": "Site",
+      "placeholder": "docs.rs",
+      "description": "Only results from this one domain. Empty = the whole web."
+    }
+  ],
+  "outputs": [
+    {
+      "name": "results",
+      "type": "List[{ title: String | Null, url: String, text: String | Null }]",
+      "description": "Each result: title, url, text."
+    },
+    {
+      "name": "count",
+      "type": "Number"
+    }
+  ]
+}
