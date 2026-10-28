@@ -38,11 +38,10 @@
 #     declares a VOLUME, so a throwaway test database whose container
 #     was removed without -v strands one forever; named volumes are
 #     never touched),
-#   - a --cli install (the default includes it) bounds the two local
-#     build caches: the BuildKit cache to 20GB (LRU) and the workspace
-#     target/ (WEFT_TARGET_CAP_GB, default 30G; over it, the incremental
-#     dirs and the superseded executables go, and the tree is never
-#     wiped),
+#   - a --cli install (the default includes it) bounds the BuildKit
+#     cache to 20GB (LRU), and one that builds weft from source removes
+#     from the workspace target/ every compiled piece a newer build of
+#     the same piece replaced (`weft trim-cargo-target`),
 #   - the daemon start removes the worker containers and images a weft
 #     from before workers ran as processes left for this install (a
 #     local install's workers are programs compiled on this machine),
@@ -1679,104 +1678,11 @@ if [[ $build_cli -eq 1 ]]; then
 
   # ---- disk hygiene, BEFORE the build -------------------------------
   #
-  # The two BUILD caches are bounded on every --cli install (the
-  # default includes it):
-  #   - the cargo target/ dir (incremental artifacts accumulate across
-  #     dep bumps and crate renames and are never evicted; once grew to
-  #     ~100GB before anyone noticed), and
-  #   - docker's BuildKit layer cache (every runtime and infra image
-  #     build adds entries; nothing prunes them).
-  # (The anonymous-volume reap is NOT here: it runs on every install
-  # regardless of flags, in its own section above.)
-  # The target/ bound is a cap, and it never wipes the tree: a wiped
-  # tree makes the build that follows run cold. Under the cap nothing is
-  # touched. Over it, two things go, cheapest first, re-measuring after
-  # each:
-  #   1. the incremental dirs: they only speed up rebuilding a crate you
-  #      just edited, and they are the biggest line item (27G of a 57G
-  #      tree, measured), while deps/ is what makes a rebuild fast at all;
-  #   2. the superseded linked executables (test binaries above all): cargo
-  #      keeps every one it ever linked, one per hash, so an edit that
-  #      relinks a test binary leaves the old one behind for good. Of the
-  #      executables in a deps/ dir sharing a name, the newest stays and
-  #      the rest go with their dep-info, debug info and fingerprint. The
-  #      worst a wrong pick costs is a relink (an older one can still be
-  #      live, for another feature set): cargo rebuilds any unit whose
-  #      output or fingerprint is missing.
-  # Still over after both: said loudly, and left alone.
-  # The cap measures the WHOLE of target/ (debug + release + tmp). A
-  # routine tree, the whole workspace's tests, clippy and this script's
-  # release build, measured about 22G (18G debug, half of it incremental,
-  # and 4G release), so the default leaves room for a few edits' worth of
-  # superseded builds before anything is trimmed.
-  # Override with WEFT_TARGET_CAP_GB.
-  target_cap_gb="${WEFT_TARGET_CAP_GB:-30}"
-  if [[ ! "${target_cap_gb}" =~ ^[0-9]+$ ]]; then
-    fail "WEFT_TARGET_CAP_GB must be a whole number of gigabytes, got '${target_cap_gb}'"
-    exit 1
-  fi
-  # -L: a target/ symlinked onto a scratch disk (a normal cargo setup, and
-  # the case where the cap matters most) measures as 0 without it. -sk
-  # (POSIX kilobytes; GNU-only -BG never works on macOS, which would
-  # silently disable the cap there forever). Prints nothing on an
-  # unreadable measurement, which skips the cap (trimming on an unreadable
-  # measurement is the dangerous direction).
-  target_size_gb() {
-    local kb
-    kb="$(du -sk -L "${here}/target" 2>/dev/null | tail -n1 | cut -f1)" || true
-    if [[ "${kb}" =~ ^[0-9]+$ ]]; then
-      echo "$((kb / 1024 / 1024))"
-    fi
-  }
-  over_target_cap() {
-    [[ "${target_gb}" =~ ^[0-9]+$ && "${target_gb}" -gt "${target_cap_gb}" ]]
-  }
-  if [[ -d "${here}/target" ]]; then
-    target_gb="$(target_size_gb)"
-    if [[ ! "${target_gb}" =~ ^[0-9]+$ ]]; then
-      warn "could not measure target/; skipping the size cap"
-    elif over_target_cap; then
-      warn "target/ is ${target_gb}G (cap ${target_cap_gb}G); trimming before the build"
-      for inc in "${here}"/target/*/incremental; do
-        [[ -d "${inc}" ]] || continue
-        remove_dir_reporting "${inc}" "${C_DIM}${inc#"${here}"/}${C_RESET}" \
-          "" "; the cap may stay exceeded"
-      done
-      target_gb="$(target_size_gb)"
-      if over_target_cap; then
-        dropped=0
-        for deps_dir in "${here}"/target/*/deps; do
-          [[ -d "${deps_dir}" ]] || continue
-          fingerprint_dir="${deps_dir%/deps}/.fingerprint"
-          # Newest first, so the first of each name is the one that stays.
-          # A linked executable is a file with the execute bit and no
-          # extension, named `<name>-<16 hex>` (the hash every file of its
-          # unit carries, its fingerprint dir included); a library has an
-          # extension (.rlib, .so, .dylib), even an executable one.
-          seen=" "
-          while IFS= read -r entry; do
-            case "${entry}" in *.*) continue ;; esac
-            [[ -f "${deps_dir}/${entry}" && -x "${deps_dir}/${entry}" ]] || continue
-            unit_hash="${entry##*-}"
-            [[ "${unit_hash}" =~ ^[0-9a-f]{16}$ ]] || continue
-            unit_name="${entry%-*}"
-            case "${seen}" in
-              *" ${unit_name} "*) ;;
-              *) seen="${seen}${unit_name} "; continue ;;
-            esac
-            rm -rf "${deps_dir:?}/${entry}" "${deps_dir:?}/${entry}".* "${fingerprint_dir:?}"/*-"${unit_hash}"
-            dropped=$((dropped + 1))
-          done < <(ls -t "${deps_dir}")
-        done
-        target_gb="$(target_size_gb)"
-        ok "removed ${dropped} superseded executables from target/ (now ${target_gb:-?}G)"
-      fi
-      if over_target_cap; then
-        warn "target/ is still ${target_gb}G, over the ${target_cap_gb}G cap, after dropping the incremental dirs and the superseded executables; it is left as it is so this build stays warm"
-        hint "to clear it by hand: ${C_BOLD}cargo clean${C_RESET}${C_DIM} in ${here} (the next build then runs cold), or raise WEFT_TARGET_CAP_GB"
-      fi
-    fi
-  fi
+  # docker's BuildKit layer cache is bounded on every --cli install (the
+  # default includes it): every runtime and infra image build adds
+  # entries, and nothing prunes them. (The anonymous-volume reap is NOT
+  # here: it runs on every install regardless of flags, in its own
+  # section above. The cargo target/ is trimmed after the build, below.)
   # Gate on daemon REACHABILITY, not binary presence: a --cli install
   # on a machine whose docker isn't running must still produce a
   # binary. With a live daemon, a failed prune fails loud; with none,
@@ -1842,6 +1748,16 @@ if [[ $build_cli -eq 1 ]]; then
     with_build_slot build_cli_from_source
     new_cli="${target_dir}/weft"
     new_runtime="${target_dir}/weft-runtime"
+    # cargo never deletes what a newer build replaced, so target/ grows
+    # by a copy of every piece each dependency move or update touches.
+    # Each piece kept is the newest of its kind (one per way it is built:
+    # tests, clippy, this release build), so no build that follows
+    # compiles more than it would have. A failed trim costs only disk.
+    if trimmed="$("${new_cli}" trim-cargo-target "${here}/target" 2>&1)"; then
+      ok "${trimmed} from target/"
+    else
+      warn "could not trim target/: ${trimmed}"
+    fi
     # An unplaced binary (one in target/) answers for the checkout it
     # runs in, which is how this run learns where to install before
     # anything is installed.

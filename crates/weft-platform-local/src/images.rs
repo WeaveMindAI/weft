@@ -204,8 +204,18 @@ impl LocalImageBuilder {
                 || tracing::info!(target: "weft_platform_local::images", "every compile lane of this machine is busy; a build waits for one"),
             )
             .await;
-            // The context is read until the build ends.
+            // The context is read until the build ends, and with it goes
+            // the build's claim on the shared crates, which the reclaim
+            // waits for.
             drop(req.staging);
+            if matches!(built, Ok(HostBuilt::Built(_))) {
+                let reclaim = machine.clone();
+                match tokio::task::spawn_blocking(move || host_build::reclaim_shared_crates(&reclaim)).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::warn!(target: "weft_platform_local::images", error = %format!("{e:#}"), "could not remove the shared crates no program uses; the build is unaffected"),
+                    Err(e) => tracing::warn!(target: "weft_platform_local::images", error = %e, "the shared crates reclaim panicked; the build is unaffected"),
+                }
+            }
             let status = match built {
                 Ok(HostBuilt::Built(record)) => BuildStatus::Succeeded { result: Some(record) },
                 Ok(HostBuilt::Failed(why)) => {
@@ -905,9 +915,6 @@ mod tests {
                 left_out_record: ctx.join("crate/left-out.json"),
                 seed_lock: ctx.join("seed.lock"),
                 binary_name: "weft-worker".into(),
-                cache_gc_script: ctx.join("crate/weft-cache-gc.sh"),
-                cache_retention_days: 30,
-                cache_versions_kept: 3,
             };
             for dir in [&recipe.crate_dir, &recipe.isolate_dir] {
                 std::fs::create_dir_all(dir).unwrap();
@@ -936,7 +943,8 @@ mod tests {
     /// A worker is compiled on the machine: the helper first, then the
     /// worker through it, both in the worker crate with its lane's cache;
     /// the program and its record land in the machine's workers folder, the
-    /// record is the build's result, and the cache sweep runs after.
+    /// record is the build's result, with the units the build used beside
+    /// them.
     #[tokio::test]
     async fn a_worker_is_compiled_on_the_machine_into_its_folder() {
         let m = HostMachine::new();
@@ -950,24 +958,72 @@ mod tests {
         let calls = m.toolchain.calls.lock().clone();
         let programs: Vec<String> = calls.iter().map(|c| c.program.display().to_string()).collect();
         let target = m.layout().lane_cache(0);
-        assert_eq!(programs, ["cargo".to_string(), target.join("release/weft-isolate").display().to_string(), "sh".to_string(), "cp".to_string()]);
+        assert_eq!(programs, ["cargo".to_string(), target.join("release/weft-isolate").display().to_string(), "cp".to_string()]);
         // With no seed on the machine (its standard worker came prebuilt),
         // the first lane to finish becomes it.
-        assert_eq!(calls[3].args, ["-a".to_string(), format!("{}/.", target.display()), m.layout().seed_cache().display().to_string()]);
+        assert_eq!(calls[2].args, ["-a".to_string(), format!("{}/.", target.display()), m.layout().seed_cache().display().to_string()]);
         assert!(m.layout().seed_mark().is_file() && m.layout().lane_mark(0).is_file());
         assert!(!m.layout().seed_cache().join(".weft-seeded").exists() && !target.join(".weft-seeded").exists(), "the marks are beside the caches, never in them");
-        for c in &calls[..3] {
+        for c in &calls[..2] {
             assert_eq!(c.cwd, ctx.join("crate"));
             assert_eq!(c.env, vec![("CARGO_TARGET_DIR".to_string(), target.display().to_string())]);
         }
         assert_eq!(calls[0].args[..3], ["build", "--release", "--manifest-path"]);
         assert_eq!(calls[0].stdout, Some(ctx.join("cargo-messages.json")), "cargo's messages are what the sweep reads");
-        assert_eq!(calls[2].args[1..2], ["aged"]);
-        assert_eq!(calls[2].args[4..], ["weft-worker", "30", "3"]);
         assert_eq!(std::fs::read(m.program_dir("abc").join("worker")).unwrap(), b"\x7fELF");
         assert_eq!(std::fs::read(m.program_dir("abc").join("left-out.json")).unwrap(), br#"{"packages":[]}"#);
+        assert!(m.program_dir("abc").join(host_build::USED_FILE).is_file());
         assert!(b.image_exists(&image).await.unwrap());
         gone(&ctx).await;
+    }
+
+    /// After a build, its lane, the seed and the shared crates keep only
+    /// what some program on the machine was built from: another program's
+    /// stay, and what no program used goes.
+    #[tokio::test]
+    async fn a_build_leaves_its_caches_only_what_programs_on_the_machine_use() {
+        let m = HostMachine::new();
+        let (kept, dropped) = ("00000000000000a1", "00000000000000b2");
+        for cache in [m.layout().lane_cache(0), m.layout().seed_cache()] {
+            for hash in [kept, dropped] {
+                let rlib = cache.join(format!("release/deps/libpkg_x-{hash}.rlib"));
+                std::fs::create_dir_all(rlib.parent().unwrap()).unwrap();
+                std::fs::write(rlib, b"rlib").unwrap();
+            }
+        }
+        host_build::mark_seed(&m.layout()).unwrap();
+        host_build::mark_lane(&m.layout(), 0).unwrap();
+        std::fs::create_dir_all(m.program_dir("other")).unwrap();
+        let used = host_build::Used { units: [kept.to_string()].into(), crates: ["pkg_kept-1".to_string()].into() };
+        std::fs::write(m.program_dir("other").join(host_build::USED_FILE), serde_json::to_vec(&used).unwrap()).unwrap();
+        for name in ["pkg_kept-1", "pkg_dropped-2"] {
+            std::fs::create_dir_all(m.layout().shared_crates().join(name)).unwrap();
+        }
+        let b = m.builder("one");
+        let h = b.start(m.request(&b, "abc", b"{}")).await.unwrap();
+        assert_eq!(settled(&b, &h).await, BuildStatus::Succeeded { result: Some(b"{}".to_vec()) });
+        for cache in [m.layout().lane_cache(0), m.layout().seed_cache()] {
+            let deps = cache.join("release/deps");
+            assert!(deps.join(format!("libpkg_x-{kept}.rlib")).exists(), "{}: another program's piece stays", cache.display());
+            assert!(!deps.join(format!("libpkg_x-{dropped}.rlib")).exists(), "{}: a piece no program used goes", cache.display());
+        }
+        assert!(m.layout().shared_crates().join("pkg_kept-1").is_dir(), "another program's crate stays");
+        assert!(!m.layout().shared_crates().join("pkg_dropped-2").exists(), "a crate no program used goes");
+    }
+
+    /// While a build holds the shared crates (it staged into them and is
+    /// not compiled yet), a reclaim removes nothing: its crates are in no
+    /// program's record yet.
+    #[test]
+    fn a_reclaim_waits_for_no_build_to_hold_the_shared_crates() {
+        let m = HostMachine::new();
+        let crate_dir = m.layout().shared_crates().join("pkg_staged-1");
+        std::fs::create_dir_all(&crate_dir).unwrap();
+        let staging = weft_core::file_lock::hold_shared(&weft_core::builds::shared_crates_lock(&m.layout().shared_crates())).unwrap();
+        assert_eq!(host_build::reclaim_shared_crates(&m.layout()).unwrap(), None);
+        assert!(crate_dir.is_dir());
+        drop(staging);
+        assert_eq!(host_build::reclaim_shared_crates(&m.layout()).unwrap(), Some(vec!["pkg_staged-1".to_string()]));
     }
 
     /// A toolchain that, at every command, notes whether lane 0 and the
@@ -988,11 +1044,11 @@ mod tests {
         }
     }
 
-    /// A build holds its lane from the seed copy through the sweep, and
+    /// A build holds its lane from the seed copy through the compile, and
     /// the seed's lock while it copies the seed (never while it compiles);
     /// the lane is free once the build ended.
     #[tokio::test]
-    async fn a_host_build_holds_its_lane_through_the_seed_copy_the_compile_and_the_sweep() {
+    async fn a_host_build_holds_its_lane_through_the_seed_copy_and_the_compile() {
         let m = HostMachine::new();
         std::fs::create_dir_all(m.layout().seed_cache()).unwrap();
         host_build::mark_seed(&m.layout()).unwrap();
@@ -1002,9 +1058,9 @@ mod tests {
         assert_eq!(settled(&b, &h).await, BuildStatus::Succeeded { result: Some(b"{}".to_vec()) });
         let seen = watching.seen.lock().clone();
         let programs: Vec<&str> = seen.iter().map(|(p, _, _)| p.rsplit('/').next().unwrap()).collect();
-        assert_eq!(programs, ["cp", "cargo", "weft-isolate", "sh"], "the cold lane is seeded first");
+        assert_eq!(programs, ["cp", "cargo", "weft-isolate"], "the cold lane is seeded first");
         assert!(seen.iter().all(|(_, lane, _)| *lane), "the lane is held at every step: {seen:?}");
-        assert_eq!(seen.iter().map(|(_, _, seed)| *seed).collect::<Vec<_>>(), [true, false, false, false], "the seed only while it is copied");
+        assert_eq!(seen.iter().map(|(_, _, seed)| *seed).collect::<Vec<_>>(), [true, false, false], "the seed only while it is copied");
         assert!(crate::lanes::Lane::try_take(&m.layout(), 0).unwrap().is_some(), "let go once the build ended");
     }
 
@@ -1098,7 +1154,7 @@ mod tests {
             .unwrap();
         assert_eq!(built, HostBuilt::Built(b"{}".to_vec()));
         let seen = watching.seen.lock().clone();
-        assert_eq!(seen.iter().map(|(p, _, _)| p.rsplit('/').next().unwrap()).collect::<Vec<_>>(), ["cargo", "weft-isolate", "sh"], "the seed copies nothing");
+        assert_eq!(seen.iter().map(|(p, _, _)| p.rsplit('/').next().unwrap()).collect::<Vec<_>>(), ["cargo", "weft-isolate"], "the seed copies nothing");
         assert!(seen.iter().all(|(_, lane, seed)| !lane && *seed), "{seen:?}");
         assert!(m.layout().seed_mark().is_file(), "a seed that left nothing out is whole");
     }

@@ -256,8 +256,6 @@ pub fn emit(
         .replace("{{left_out_record_path}}", weft_core::builds::LEFT_OUT_RECORD_PATH)
         .replace("{{cache_gc_script}}", CACHE_GC_SCRIPT_NAME)
         .replace("{{cargo_messages}}", CARGO_MESSAGES_PATH)
-        .replace("{{cache_retention_days}}", &WORKER_CACHE_RETENTION_DAYS.to_string())
-        .replace("{{cache_versions_kept}}", &WORKER_CACHE_VERSIONS_KEPT.to_string())
         .replace(
             "{{install_builder_base}}",
             &render_builder_base(base.manager),
@@ -693,11 +691,9 @@ fn rhel_family_version(tag: &str) -> Option<&'static str> {
 ///   a slot of its own and can never be mistaken for the stock one) and
 ///   on every staged package file carrying the date its content gives it
 ///   (`build::package_source_mtime`), so a package compiled from another
-///   checkout still counts. Every distinct content compiled keeps its
-///   slot's artifacts until no build has used them for
-///   [`WORKER_CACHE_RETENTION_DAYS`] ([`CACHE_GC_SCRIPT`] runs after every
-///   such build); the mount is `sharing=locked`, so a second build waits
-///   for the first rather than race it;
+///   checkout still counts. After every such build, [`CACHE_GC_SCRIPT`]
+///   drops what that build did not use; the mount is `sharing=locked`, so
+///   a second build waits for the first rather than race it;
 /// - seeds the worker crate's `Cargo.lock` from `{{seed_lock}}`: on the
 ///   builder base, [`BASE_WORKER_LOCK`], the lock the stock worker
 ///   resolved to, so every crate the base compiled resolves to the SAME
@@ -747,7 +743,7 @@ const CARGO_BUILD_RUN_FRAGMENT: &str = concat!(
     "    && \"$CARGO_TARGET_DIR\"/release/weft-isolate /work/{{isolate_candidates}} /work/{{left_out_record}} {{cargo_messages}} \\\n",
     "    && cp \"$CARGO_TARGET_DIR\"/release/{{binary_name}} /worker \\\n",
     "    && ( [ \"$CARGO_TARGET_DIR\" != /cache/target ] \\\n",
-    "         || sh /work/{{cache_gc_script}} aged /cache/target/release {{cargo_messages}} {{binary_name}} {{cache_retention_days}} {{cache_versions_kept}} \\\n",
+    "         || sh /work/{{cache_gc_script}} this-build /cache/target/release {{cargo_messages}} \\\n",
     "         || echo 'weft: the compile cache sweep failed; the build is unaffected' >&2 )\n",
 );
 
@@ -772,19 +768,6 @@ const WORKSPACE_LOCK: &str = "/weft/Cargo.lock";
 /// look for.
 pub const WORKER_CACHE_MOUNT_ID_PREFIX: &str = "weft-worker-target-";
 
-/// How long a compiled node package stays in the shared cache after the
-/// last build that linked it. Every distinct content of a package keeps
-/// its own compiled copy (`codegen::write_package_crates`), so without
-/// this a host that edits nodes would keep every version it ever built.
-pub const WORKER_CACHE_RETENTION_DAYS: u32 = 30;
-
-/// How many compiled versions of one node package (and of the worker
-/// crate on top) stay in the cache, newest by last link: the current one
-/// and a couple of edits back, so going back an edit relinks instead of
-/// recompiling, while a node edited all day keeps three copies, not one
-/// per save.
-pub const WORKER_CACHE_VERSIONS_KEPT: u32 = 3;
-
 /// File name of [`CACHE_GC_SCRIPT`] inside the generated crate (`/work`
 /// in the builder stage).
 pub const CACHE_GC_SCRIPT_NAME: &str = "weft-cache-gc.sh";
@@ -795,33 +778,17 @@ pub const CACHE_GC_SCRIPT_NAME: &str = "weft-cache-gc.sh";
 /// change to it for a build script that watches the whole package.
 pub const CARGO_MESSAGES_PATH: &str = "/tmp/weft-cargo-messages.json";
 
-/// The compile-cache sweep, the one that bounds every cache weft compiles
-/// in: it reads what the build just used off cargo's JSON messages (every
-/// unit, the ones cargo reused untouched included), and either drops
-/// everything else (`this-build`, for a cache one build owns: the runtime
-/// image's, the builder base's) or marks the per-project crates used and
-/// expires the ones no build used for a while (`aged`, for a worker
-/// cache every project on a machine shares). Its own header says how.
-///
-/// Every worker compiled on a machine runs it in its lane's cache
-/// (`weft_platform_local::host_build`), and every built-in-template worker
-/// image build that keeps its cache runs it inside the mount, after the
-/// binary is copied out (a custom `dockerfile_template` writes its own RUN
-/// and gets none of this), with [`WORKER_CACHE_RETENTION_DAYS`] and
-/// [`WORKER_CACHE_VERSIONS_KEPT`]. It can never fail a build.
-///
-/// "Used" is stored, for `aged`, on the crate's own files: cargo rewrites
-/// them when it compiles the crate and leaves them alone when it reuses
-/// it, so touching them on every build makes their date "last used"
-/// rather than "last compiled". Two families are per project and expire:
-/// the `pkg_` package crates (every distinct content of a package keeps
-/// its own compiled copy, `codegen::write_package_crates`), and the top
-/// worker crate (its build-script units included), whose metadata hash
-/// folds in its package deps so every distinct project leaves its own
-/// copy. The `weft-isolate` helper is compiled again by each weft that
-/// changes its source, as a package named by that source
-/// (`codegen::isolate_dir_name`), so its compiled versions are bounded
-/// like a package's.
+/// The sweep of an image build's compile cache: it reads what the build
+/// just used off cargo's JSON messages (every unit, the ones cargo reused
+/// untouched included) and drops everything else, so a cache one build
+/// owns (the runtime image's, the builder base's, a worker image's kept by
+/// `weft build-images`) holds exactly one build's worth. Every
+/// built-in-template worker image build that keeps its cache runs it
+/// inside the mount, after the binary is copied out (a custom
+/// `dockerfile_template` writes its own RUN and gets none of this). It can
+/// never fail a build. A worker compiled on the machine is swept by
+/// `weft_platform_local::host_build` instead, by what the programs on the
+/// machine were built from.
 // SYNC: the script's path <-> deploy/docker/runtime.Dockerfile (the sweep after `cargo build`), hash::CACHE_GC_SCRIPT_PATH
 pub const CACHE_GC_SCRIPT: &str = include_str!("weft-cache-gc.sh");
 
@@ -1367,10 +1334,8 @@ mod tests {
         );
         assert!(out.writes_left_out_record);
         assert!(!out.body.contains("{{"), "every token is substituted: {}", out.body);
-        let sweep = format!(
-            "sh /work/{CACHE_GC_SCRIPT_NAME} aged /cache/target/release {CARGO_MESSAGES_PATH} worker_test {WORKER_CACHE_RETENTION_DAYS} {WORKER_CACHE_VERSIONS_KEPT}"
-        );
-        assert!(out.body.contains(&sweep), "every build expires unused per-project crates from the shared cache: {}", out.body);
+        let sweep = format!("sh /work/{CACHE_GC_SCRIPT_NAME} this-build /cache/target/release {CARGO_MESSAGES_PATH}");
+        assert!(out.body.contains(&sweep), "every build keeps only what it used in the cache: {}", out.body);
         assert!(
             out.body.find("/worker \\").unwrap() < out.body.find(&sweep).unwrap() && out.body.contains("|| echo 'weft: the compile cache sweep failed"),
             "the sweep runs after the binary is out and can never fail the build: {}",
@@ -1606,94 +1571,5 @@ mod tests {
         cache.sweep(&["this-build"]);
         assert!(cache.deps().join(format!("libserde-{}.rlib", H[1])).exists(), "an untraced binary: nothing goes");
         assert!(cache.deps().join(format!("weft_runtime-{}", H[4])).exists());
-    }
-
-    /// The aged sweep marks the per-project units this build used (even
-    /// when cargo reused them untouched, and never the shared ones),
-    /// expires per-project units no build used within the retention period
-    /// (an orphan without its dep-info included, and the top worker
-    /// crate's per-project copies), and never touches the shared crates.
-    #[test]
-    fn the_aged_sweep_expires_only_per_project_crates_no_build_used() {
-        let cache = FakeCache::new();
-        let (deps, fingerprints) = (cache.deps(), cache.fingerprints());
-        let age_unit = |krate: &str, hash: &str| {
-            for file in [format!("lib{krate}-{hash}.rlib"), format!("lib{krate}-{hash}.rmeta"), format!("{krate}-{hash}.d")] {
-                cache.age(&deps.join(file), 40);
-            }
-        };
-        cache.lib("pkg_basic", H[0]); // used by this build: kept and marked
-        age_unit("pkg_basic", H[0]);
-        cache.lib("pkg_basic", H[1]); // an earlier content, unused: expired
-        age_unit("pkg_basic", H[1]);
-        std::fs::write(deps.join(format!("libpkg_ai-{}.rlib", H[2])), b"orphan").unwrap(); // no dep-info left: expired
-        cache.age(&deps.join(format!("libpkg_ai-{}.rlib", H[2])), 40);
-        cache.lib("weft-engine", H[3]); // shared: never touched
-        age_unit("weft_engine", H[3]);
-        cache.bin("worker_test", H[4], Some("worker_test")); // this build's top crate
-        cache.bin("worker_test", H[5], None); // another project's, long unused
-        cache.age(&deps.join(format!("worker_test-{}", H[5])), 40);
-        cache.age(&deps.join(format!("worker_test-{}.d", H[5])), 40);
-        let scripts = cache.release.join("build");
-        for (dir, days) in [(format!("worker_test-{}", H[6]), 0), (format!("worker_test-{}", H[7]), 40)] {
-            std::fs::create_dir_all(scripts.join(&dir).join("out")).unwrap();
-            cache.age(&scripts.join(&dir), days);
-        }
-        cache.used(&[("pkg_basic", H[0]), ("weft_engine", H[3])], &[], "worker_test");
-
-        cache.sweep(&["aged", "worker_test", &WORKER_CACHE_RETENTION_DAYS.to_string(), &WORKER_CACHE_VERSIONS_KEPT.to_string()]);
-
-        for file in [format!("pkg_basic-{}.d", H[0]), format!("libpkg_basic-{}.rlib", H[0]), format!("libpkg_basic-{}.rmeta", H[0])] {
-            let marked = std::fs::metadata(deps.join(&file)).unwrap().modified().unwrap();
-            assert!(marked.elapsed().unwrap().as_secs() < 3600, "{file} is marked used now");
-        }
-        for gone in [format!("libpkg_basic-{}.rlib", H[1]), format!("pkg_basic-{}.d", H[1]), format!("libpkg_ai-{}.rlib", H[2]), format!("worker_test-{}", H[5])] {
-            assert!(!deps.join(&gone).exists(), "{gone} expired");
-        }
-        assert!(!fingerprints.join(format!("pkg_basic-{}", H[1])).exists() && !fingerprints.join(format!("worker_test-{}", H[5])).exists());
-        assert!(deps.join(format!("worker_test-{}", H[4])).exists(), "this build's worker crate stays");
-        let engine = std::fs::metadata(deps.join(format!("libweft_engine-{}.rlib", H[3]))).unwrap().modified().unwrap();
-        assert!(engine.elapsed().unwrap().as_secs() > 3600, "a shared unit is never marked, used or not");
-        assert!(scripts.join(format!("worker_test-{}", H[6])).exists(), "a fresh build-script unit stays");
-        assert!(!scripts.join(format!("worker_test-{}", H[7])).exists(), "an old build-script unit goes");
-    }
-
-    /// Of one package's compiled versions, only the newest few by last
-    /// use stay, however recent the others are; another package counts
-    /// on its own, and the `weft-isolate` helper's versions are bounded
-    /// the same way, its fingerprint (named by its package) included.
-    #[test]
-    fn the_aged_sweep_keeps_only_the_newest_versions_of_a_package() {
-        let cache = FakeCache::new();
-        let deps = cache.deps();
-        let version = |krate: &str, hash: &str, minutes_ago: i64| {
-            cache.lib(krate, hash);
-            let when = filetime::FileTime::from_unix_time(filetime::FileTime::now().unix_seconds() - minutes_ago * 60, 0);
-            for file in [format!("{krate}-{hash}.d"), format!("lib{krate}-{hash}.rlib")] {
-                filetime::set_file_mtime(deps.join(file), when).unwrap();
-            }
-        };
-        let mine = ["00000000000000b1", "00000000000000b2", "00000000000000b3", "00000000000000b4", "00000000000000b5"];
-        for (i, hash) in mine.iter().enumerate() {
-            version("pkg_mine", hash, i as i64 + 1); // b1 is the newest
-        }
-        version("pkg_other", "00000000000000c1", 10);
-        let helper = ["00000000000000d1", "00000000000000d2", "00000000000000d3", "00000000000000d4"];
-        for (i, hash) in helper.iter().enumerate() {
-            version("weft_isolate", hash, i as i64 + 1);
-            std::fs::create_dir_all(cache.fingerprints().join(format!("weft-isolate-0123-{hash}"))).unwrap();
-        }
-        cache.used(&[], &[], "worker_test");
-        cache.sweep(&["aged", "worker_test", &WORKER_CACHE_RETENTION_DAYS.to_string(), &WORKER_CACHE_VERSIONS_KEPT.to_string()]);
-        for kept in [mine[0], mine[1], mine[2]] {
-            assert!(deps.join(format!("libpkg_mine-{kept}.rlib")).exists(), "{kept} stays");
-        }
-        assert!(deps.join("libpkg_other-00000000000000c1.rlib").exists(), "another package counts on its own");
-        assert!(deps.join(format!("libweft_isolate-{}.rlib", helper[2])).exists(), "the newest helpers stay");
-        for gone in [mine[3], mine[4]] {
-            assert!(!deps.join(format!("libpkg_mine-{gone}.rlib")).exists() && !cache.fingerprints().join(format!("pkg_mine-{gone}")).exists(), "{gone} goes");
-        }
-        assert!(!deps.join(format!("libweft_isolate-{}.rlib", helper[3])).exists());
-        assert!(!cache.fingerprints().join(format!("weft-isolate-0123-{}", helper[3])).exists(), "the helper's fingerprint goes with it");
     }
 }

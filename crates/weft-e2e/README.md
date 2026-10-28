@@ -57,7 +57,7 @@ connections by the ledger every test writes them into while they live
 what a run on another kept. The `weft clean` step reaches past the suite: it removes
 every worker and infra image no project of the install references (yours too,
 once nothing runs them), the worker programs no install on the machine holds,
-and the shared build crates no build used for 30 days, and it drops every
+and the shared build crates no program on the machine was built from, and it drops every
 runtime image, and every builder base, node-test image, standard worker image
 and image compile cache an older weft left, that no install on the machine
 records using. While some install has no record yet, it removes nothing of

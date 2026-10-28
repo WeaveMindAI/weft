@@ -27,6 +27,15 @@ pub fn try_hold(path: &Path) -> io::Result<Option<File>> {
     }
 }
 
+/// Hold `path` together with every other shared holder, waiting while an
+/// exclusive one ([`hold`], [`try_hold`]) has it: many readers, one
+/// writer.
+pub fn hold_shared(path: &Path) -> io::Result<File> {
+    let file = open(path)?;
+    file.lock_shared()?;
+    Ok(file)
+}
+
 /// Hold the lock on `path` like [`hold`], but only if the file is there:
 /// `None` when it is not, and nothing is made. For a reader that must
 /// never bring back a folder another process just removed.

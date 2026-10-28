@@ -84,6 +84,10 @@ pub struct BuildPlan {
     /// on (`crate::build::StagedImageBuild::node_needs`), kept with the
     /// worker.
     pub node_needs: weft_core::needs::NodeNeeds,
+    /// A host build's claim on the shared crates it staged
+    /// (`crate::build::StagedImageBuild::hold`), kept until the worker is
+    /// compiled.
+    pub hold: Option<std::sync::Arc<crate::build::SharedCratesHold>>,
 }
 
 /// How image refs are NAMED (the platform's image builder answers it); every
@@ -143,6 +147,7 @@ pub fn plan_build_from(
     let staged =
         crate::build::build_project(project, definition, catalog, fs, packaging, node_set, fingerprints)?;
     let binary_hash = staged.content_hash.clone();
+    let hold = staged.hold.clone();
 
     let mut images = vec![PlannedImage {
         kind: ImageKind::Worker,
@@ -178,5 +183,6 @@ pub fn plan_build_from(
         infra_hash,
         infra_places,
         images,
+        hold,
     })
 }
