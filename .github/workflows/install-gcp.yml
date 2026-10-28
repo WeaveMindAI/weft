@@ -163,7 +163,7 @@ jobs:
           fi
       - if: steps.release.outputs.found != 'yes'
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         if: steps.release.outputs.found != 'yes'
       - name: build the weft CLI and runtime
         if: steps.release.outputs.found != 'yes'
