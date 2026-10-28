@@ -4,6 +4,20 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
+## 2026-10-28 (341192de)
+
+**The folders weft compiles in stop growing with every update.** Each
+program weft compiles for a project now notes which compiled pieces and
+source crates it used, and after every build weft keeps in its compile
+folders (`~/.local/share/weft/worker-target/` and
+`~/.local/share/weft/worker-crates/`) only what a program still on the
+machine was built from. Before, every update left a full copy of weft's
+libraries behind in each of them. The first project build after you update
+clears out what older versions left, which can free tens of gigabytes. If
+you build weft from source, `./setup.sh` now also removes from the
+checkout's `target/` every compiled piece a newer build of it replaced, and
+`WEFT_TARGET_CAP_GB` is gone.
+
 ## 2026-10-28 (0.2.277)
 
 **If a project has its own nodes, or its own copy of the standard nodes, it

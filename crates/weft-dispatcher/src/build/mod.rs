@@ -248,10 +248,6 @@ impl VersionBuilder {
             .tempdir()
             .context("create the build's working directory")?;
         let root = workdir.path().to_path_buf();
-        // The image contexts are staged under it, and a build started from
-        // one may read it after this request answered: every start keeps a
-        // clone, and the directory goes with the last (`Staging`).
-        let staging = Staging::new(workdir);
         source::materialize(storage.as_ref(), &self.blobs, tenant, &source.manifest, &root).await?;
         let files = Arc::new(source::VersionFiles::new(root.clone(), source.manifest.clone(), storage.clone(), tenant.to_string()));
 
@@ -319,6 +315,12 @@ impl VersionBuilder {
             images,
             ask,
         };
+        // The image contexts are staged under the working directory, and a
+        // build started from one may read it after this request answered:
+        // every start keeps a clone, and the directory goes with the last
+        // (`Staging`), and with it the claim on the shared crates the
+        // worker staged.
+        let staging = Staging::new((workdir, plan.hold.clone()));
         self.start_images(version, &plan.images, &staging, project_id, tenant, gate, hold).await
     }
 

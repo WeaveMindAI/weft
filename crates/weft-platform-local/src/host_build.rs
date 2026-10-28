@@ -12,6 +12,7 @@
 //! The commands run behind [`Toolchain`], so the steps are tested against
 //! a fake that records them; only [`MachineToolchain`] runs anything.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -93,7 +94,7 @@ pub(crate) fn mark_seed(machine: &MachineLayout) -> anyhow::Result<()> {
 /// copied whole into it, or a build finished in it. Written only once
 /// that is done, so a copy cut short leaves the lane unmarked and the next
 /// build copies the seed again over it.
-fn mark_lane(machine: &MachineLayout, number: u32) -> anyhow::Result<()> {
+pub(crate) fn mark_lane(machine: &MachineLayout, number: u32) -> anyhow::Result<()> {
     let mark = machine.lane_mark(number);
     std::fs::write(&mark, b"").map_err(|e| anyhow::anyhow!("mark compile lane {number} warm ({}): {e}", mark.display()))
 }
@@ -221,6 +222,82 @@ pub const PROGRAM_FILE: &str = "worker";
 /// The record of what the build left out, beside the program.
 pub const LEFT_OUT_FILE: &str = "left-out.json";
 
+/// What the program's build used ([`Used`]), beside the program.
+pub const USED_FILE: &str = "used.json";
+
+/// What a program's build used: everything here stays on the machine as
+/// long as the program does, so building it again compiles nothing new.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Used {
+    /// The compiled units, by the hash cargo names their files with: kept
+    /// in every compile cache ([`sweep`]).
+    pub units: BTreeSet<String>,
+    /// The folders of the shared crates it was compiled from
+    /// (`MachineLayout::shared_crates`): kept there ([`reclaim_shared_crates`]).
+    pub crates: BTreeSet<String>,
+}
+
+impl Used {
+    /// Everything the programs on `machine` were built from. A program from
+    /// before builds kept this record keeps nothing.
+    pub fn of_programs(machine: &MachineLayout) -> anyhow::Result<Self> {
+        let mut used = Self::default();
+        for programs in [machine.workers(), machine.node_test_servers()] {
+            let Ok(entries) = std::fs::read_dir(&programs) else { continue };
+            for entry in entries {
+                let dir = entry.map_err(|e| anyhow::anyhow!("read {}: {e}", programs.display()))?.path();
+                if !dir.is_dir() {
+                    continue;
+                }
+                let file = dir.join(USED_FILE);
+                let bytes = match std::fs::read(&file) {
+                    Ok(bytes) => bytes,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => anyhow::bail!("read {}: {e}", file.display()),
+                };
+                let one: Self = serde_json::from_slice(&bytes).map_err(|e| anyhow::anyhow!("{} is not a record of what a build used: {e}", file.display()))?;
+                used.units.extend(one.units);
+                used.crates.extend(one.crates);
+            }
+        }
+        Ok(used)
+    }
+}
+
+/// Remove from the machine's shared crates every folder no program on the
+/// machine was built from, and anything a stopped build left
+/// half-written; answers the names it removed. While any build holds the
+/// folder (`weft_core::builds::shared_crates_lock`) it removes nothing and
+/// answers `None`: that build's crates are in no program's record yet, and
+/// a later reclaim takes what is left.
+pub fn reclaim_shared_crates(machine: &MachineLayout) -> anyhow::Result<Option<Vec<String>>> {
+    let shared = machine.shared_crates();
+    let lock = weft_core::builds::shared_crates_lock(&shared);
+    let Some(_alone) = weft_core::file_lock::try_hold(&lock).map_err(|e| anyhow::anyhow!("lock {}: {e}", lock.display()))? else {
+        return Ok(None);
+    };
+    let kept = Used::of_programs(machine)?.crates;
+    let entries = match std::fs::read_dir(&shared) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Some(Vec::new())),
+        Err(e) => anyhow::bail!("read {}: {e}", shared.display()),
+    };
+    let mut removed = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| anyhow::anyhow!("read {}: {e}", shared.display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if kept.contains(&name) {
+            continue;
+        }
+        let path = entry.path();
+        let gone = if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+        gone.map_err(|e| anyhow::anyhow!("remove {}: {e}", path.display()))?;
+        removed.push(name);
+    }
+    removed.sort();
+    Ok(Some(removed))
+}
+
 /// What a host build needs to know besides its recipe and its cache.
 struct HostBuild<'a> {
     recipe: &'a HostRecipe,
@@ -292,28 +369,41 @@ async fn build(toolchain: &dyn Toolchain, machine: &MachineLayout, held: &Held, 
     let record = tokio::fs::read(&r.left_out_record)
         .await
         .map_err(|e| anyhow::anyhow!("the build ended without its record of what it left out at {}: {e}", r.left_out_record.display()))?;
+    let used = used(&messages, &release, &machine.shared_crates()).await?;
+    let used = serde_json::to_vec(&used).map_err(|e| anyhow::anyhow!("the record of what the build used: {e}"))?;
+    place_bytes(&b.out_dir, USED_FILE, &used).await?;
     place(&b.out_dir, LEFT_OUT_FILE, &r.left_out_record).await?;
     place(&b.out_dir, PROGRAM_FILE, &release.join(&r.binary_name)).await?;
-    let sweep = step(
-        "sh".into(),
-        vec![
-            r.cache_gc_script.display().to_string(),
-            "aged".into(),
-            release.display().to_string(),
-            messages.display().to_string(),
-            r.binary_name.clone(),
-            r.cache_retention_days.to_string(),
-            r.cache_versions_kept.to_string(),
-        ],
-        None,
-    );
     // The sweep only bounds the cache: the build is done whatever it did.
-    match toolchain.run(&sweep, b.log).await {
-        Ok(0) => {}
-        Ok(code) => tracing::warn!(target: "weft_platform_local::host_build", code, log = %b.log.display(), "the compile cache sweep failed; the build is unaffected"),
-        Err(e) => tracing::warn!(target: "weft_platform_local::host_build", error = %format!("{e:#}"), "the compile cache sweep could not run; the build is unaffected"),
+    if let Err(e) = sweep(machine, &release) {
+        tracing::warn!(target: "weft_platform_local::host_build", error = %format!("{e:#}"), "the compile cache sweep failed; the build is unaffected");
     }
     Ok(HostBuilt::Built(record))
+}
+
+/// What a build used, off the cargo messages it wrote: its units in
+/// `release`, and the folders of `shared` its units were compiled from.
+async fn used(messages: &Path, release: &Path, shared: &Path) -> anyhow::Result<Used> {
+    let bytes = tokio::fs::read(messages).await.map_err(|e| anyhow::anyhow!("read the build's cargo messages {}: {e}", messages.display()))?;
+    Ok(Used { units: crate::cargo_cache::used_units(&bytes, release)?, crates: crate::cargo_cache::source_folders(&bytes, shared) })
+}
+
+/// Keep in the cache `release` just built in, and in the seed when no
+/// build holds it, only the units some program on the machine was built
+/// from ([`Used`]): what any of them would reuse when built again. A
+/// program removed from the machine takes its units with it at the next
+/// build.
+fn sweep(machine: &MachineLayout, release: &Path) -> anyhow::Result<()> {
+    let kept = Used::of_programs(machine)?.units;
+    crate::cargo_cache::keep_used(release, &kept)?;
+    let lock_path = machine.seed_lock();
+    if let Some(_seed_lock) = weft_core::file_lock::try_hold(&lock_path).map_err(|e| anyhow::anyhow!("lock {}: {e}", lock_path.display()))? {
+        let seed = machine.seed_cache().join("release");
+        if seed.is_dir() {
+            crate::cargo_cache::keep_used(&seed, &kept)?;
+        }
+    }
+    Ok(())
 }
 
 /// Give lane `number`'s cache the seed's compiled tree, once: when the
@@ -344,6 +434,23 @@ async fn seed(toolchain: &dyn Toolchain, machine: &MachineLayout, number: u32, l
     let code = toolchain.run(&copy, log).await?;
     anyhow::ensure!(code == 0, "copy the compile cache's seed {} into {} failed with exit code {code}", seed.display(), target.display());
     mark_lane(machine, number)
+}
+
+/// Write `bytes` to `name` in `dir` the way [`place`] copies a file.
+async fn place_bytes(dir: &Path, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    tokio::fs::create_dir_all(dir).await.map_err(|e| anyhow::anyhow!("create {}: {e}", dir.display()))?;
+    let partial = dir.join(format!("{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
+    let to = dir.join(name);
+    let written = async {
+        tokio::fs::write(&partial, bytes).await?;
+        tokio::fs::rename(&partial, &to).await
+    }
+    .await;
+    if let Err(e) = written {
+        let _ = tokio::fs::remove_file(&partial).await;
+        anyhow::bail!("write {}: {e}", to.display());
+    }
+    Ok(())
 }
 
 /// Copy `from` to `name` in `dir`: to a file beside it first, then renamed
@@ -395,6 +502,9 @@ pub mod fake {
         async fn run(&self, cmd: &HostCommand, log: &Path) -> anyhow::Result<i32> {
             self.calls.lock().push(cmd.clone());
             std::fs::write(log, format!("ran {}\n", cmd.program.display()))?;
+            if let Some(stdout) = &cmd.stdout {
+                std::fs::write(stdout, b"")?;
+            }
             for (program, file, bytes) in self.makes.lock().iter() {
                 if *program == cmd.program {
                     std::fs::create_dir_all(file.parent().unwrap())?;

@@ -108,6 +108,12 @@ enum Cmd {
         #[arg(long)]
         out: std::path::PathBuf,
     },
+    /// For setup.sh: remove from a cargo build folder (a checkout's
+    /// `target/`) every compiled piece a newer build of the same piece
+    /// replaced, keeping one copy of each way it is built (tests, clippy,
+    /// release), so the next build of any of them compiles nothing more.
+    #[command(name = "trim-cargo-target", hide = true)]
+    TrimCargoTarget { dir: std::path::PathBuf },
     /// Make every image the release publishes exist locally: the runtime
     /// image (every role weft has, in one), and for the cloud the worker
     /// builder base and the full-library worker image, each under its
@@ -953,9 +959,9 @@ enum Cmd {
     ///                     behind)
     ///   --images --build-plane
     ///                     the worker programs no install on this machine
-    ///                     uses, the shared build crates no build staged
-    ///                     for 30 days, and the builder bases and node-test
-    ///                     images an older weft left
+    ///                     uses, the shared build crates no program on it
+    ///                     was built from, and the builder bases and
+    ///                     node-test images an older weft left
     ///   --build-cache     drop the docker buildkit cache, the node-test cache
     ///                     and the worker compile caches
     ///   --all             with the journal subject: nuke every run
@@ -1006,8 +1012,8 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         images: bool,
         /// With --images: only the build plane, the worker programs no
-        /// install on this machine uses, the shared build crates no build
-        /// staged for 30 days, and the builder bases and node-test images
+        /// install on this machine uses, the shared build crates no program
+        /// on it was built from, and the builder bases and node-test images
         /// an older weft left that no install uses (kept whole while an
         /// install has not recorded its own). Needs no running install;
         /// setup.sh runs it after every start.
@@ -2089,6 +2095,9 @@ async fn run(cli: Cli, wanted: Result<weft_core::infra::Wanted, String>) -> anyh
         Cmd::Ci { action: CiCmd::Add { cloud } } => commands::ci::add(ctx, cloud).await,
         Cmd::Build { referenced } => commands::build::run(ctx, node_set(referenced)).await,
         Cmd::BuildStandardWorker { out } => host_programs::pack_standard_program(&out).await,
+        Cmd::TrimCargoTarget { dir } => weft_platform_local::cargo_cache::drop_superseded(&dir).map(|swept| {
+            println!("removed {} superseded compiled pieces ({:.1}GB)", swept.units, swept.bytes as f64 / 1e9);
+        }),
         Cmd::BuildImages { push, push_suffix, print, runtime_binary } => {
             commands::build::run_build_images(push, push_suffix, print, runtime_binary.as_deref()).await
         }

@@ -25,6 +25,9 @@ use weft_catalog::FsCatalog;
 /// hash that NAMES what it builds, so the caller can build it or
 /// recognize it as already present.
 pub struct StagedImageBuild {
+    /// A host build's claim on the shared crates it staged, until it is
+    /// compiled: dropped with the staged build ([`SharedCratesHold`]).
+    pub hold: Option<std::sync::Arc<SharedCratesHold>>,
     /// Absolute path to the build context: the host recipe and the worker
     /// crate for a host build; for an image, the `Dockerfile`, `build/`
     /// (the generated cargo crate), `project-nodes/` and, when the
@@ -196,7 +199,7 @@ pub fn build_project(
         .map_err(|e| BuildError::Build(format!("compute binary hash: {e}")))?;
     let builder = match packaging {
         weft_core::builds::WorkerPackaging::Host { shared_crates } => {
-            let build_context = stage_host_build(
+            let (build_context, hold) = stage_host_build(
                 &project_root.join(".weft").join("target").join("worker-host"),
                 shared_crates,
                 definition,
@@ -204,6 +207,7 @@ pub fn build_project(
                 node_set,
             )?;
             return Ok(StagedImageBuild {
+                hold: Some(std::sync::Arc::new(hold)),
                 build_context,
                 content_hash,
                 recipe: weft_core::builds::BuildRecipe::Host,
@@ -257,6 +261,7 @@ pub fn build_project(
     )?;
 
     Ok(StagedImageBuild {
+        hold: None,
         build_context,
         content_hash,
         recipe: weft_core::builds::BuildRecipe::Dockerfile {
@@ -303,7 +308,7 @@ pub fn stage_host_build(
     definition: &weft_core::project::ProjectDefinition,
     catalog: &FsCatalog,
     node_set: weft_core::builds::NodeSet,
-) -> BuildResult<PathBuf> {
+) -> BuildResult<(PathBuf, SharedCratesHold)> {
     stage_host_crate(ctx, shared, catalog, &|crate_root, paths| {
         Ok(HostCrate {
             package_dirs: codegen::emit(definition, crate_root, catalog, WORKER_CRATE_NAME, node_set, paths)?,
@@ -318,7 +323,7 @@ pub fn stage_host_build(
 /// replaced by the package's test crate (`codegen::emit_test_crate`),
 /// whose package crate is the one a worker holding that package compiles
 /// (same folder under `shared`, compiled with its `node-tests` feature).
-pub fn stage_host_test_build(ctx: &Path, shared: &Path, catalog: &FsCatalog, package_name: &str) -> BuildResult<PathBuf> {
+pub fn stage_host_test_build(ctx: &Path, shared: &Path, catalog: &FsCatalog, package_name: &str) -> BuildResult<(PathBuf, SharedCratesHold)> {
     stage_host_crate(ctx, shared, catalog, &|crate_root, paths| {
         let test_crate = codegen::emit_test_crate(crate_root, catalog, package_name, paths)?;
         Ok(HostCrate {
@@ -347,7 +352,8 @@ fn stage_host_crate(
     shared: &Path,
     catalog: &FsCatalog,
     emit: &dyn Fn(&Path, &codegen::EmitPaths) -> BuildResult<HostCrate>,
-) -> BuildResult<PathBuf> {
+) -> BuildResult<(PathBuf, SharedCratesHold)> {
+    let hold = SharedCratesHold::of(shared)?;
     if ctx.exists() {
         std::fs::remove_dir_all(ctx).map_err(BuildError::Io)?;
     }
@@ -393,26 +399,35 @@ fn stage_host_crate(
         // image build without a base seeds from (`/weft/Cargo.lock`).
         seed_lock: slice.join("Cargo.lock"),
         binary_name: emitted.binary_name,
-        cache_gc_script: crate_root.join(worker_image::CACHE_GC_SCRIPT_NAME),
-        cache_retention_days: worker_image::WORKER_CACHE_RETENTION_DAYS,
-        cache_versions_kept: worker_image::WORKER_CACHE_VERSIONS_KEPT,
         crate_dir: crate_root,
     };
     let json = serde_json::to_vec_pretty(&recipe).map_err(|e| BuildError::Build(format!("the host recipe: {e}")))?;
     std::fs::write(ctx.join(weft_core::builds::HOST_RECIPE_FILE), json).map_err(BuildError::Io)?;
-    Ok(ctx.to_path_buf())
+    Ok((ctx.to_path_buf(), hold))
+}
+
+/// A build's claim on the crates it staged in the folder every host build
+/// on the machine shares, from before it stages them until it is compiled
+/// (`weft_core::builds::shared_crates_lock`).
+#[derive(Debug)]
+pub struct SharedCratesHold {
+    _lock: std::fs::File,
+}
+
+impl SharedCratesHold {
+    fn of(shared: &Path) -> BuildResult<Self> {
+        Ok(Self { _lock: weft_core::file_lock::hold_shared(&weft_core::builds::shared_crates_lock(shared)).map_err(BuildError::Io)? })
+    }
 }
 
 /// Make `dest` by `write` once and never again: a folder named by its
 /// content is whole as soon as it is there, and another build may be
 /// reading it. `write` fills a fresh folder beside it, which is then
 /// renamed into place, so `dest` is either whole or absent; when another
-/// writer got there first, its copy (the same content) stays. A folder
-/// already there has its time moved to now, which is how
-/// [`reclaim_shared_crates`] tells it is still used.
+/// writer got there first, its copy (the same content) stays.
 pub(crate) fn write_once(dest: &Path, write: &dyn Fn(&Path) -> BuildResult<()>) -> BuildResult<()> {
     if dest.is_dir() {
-        return std::fs::File::open(dest).and_then(|dir| dir.set_modified(std::time::SystemTime::now())).map_err(BuildError::Io);
+        return Ok(());
     }
     let parent = dest.parent().ok_or_else(|| BuildError::Build(format!("{} has no parent folder", dest.display())))?;
     std::fs::create_dir_all(parent).map_err(BuildError::Io)?;
@@ -427,37 +442,6 @@ pub(crate) fn write_once(dest: &Path, write: &dyn Fn(&Path) -> BuildResult<()>) 
         let _ = std::fs::remove_dir_all(&temp);
     }
     written
-}
-
-/// Remove what no build has used for `unused_for` from `shared` (the
-/// folder of crates every host build on the machine shares),
-/// answering the names it removed: a package crate of sources since
-/// edited, the workspace slice of a weft since updated, a half-written
-/// folder a stopped build left. Each is written once and touched by every
-/// build that uses it ([`write_once`]), so what goes is what nothing staged
-/// in that time; a build that wants one again writes it again.
-pub fn reclaim_shared_crates(shared: &Path, unused_for: std::time::Duration) -> BuildResult<Vec<String>> {
-    let entries = match std::fs::read_dir(shared) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(BuildError::Io(e)),
-    };
-    let now = std::time::SystemTime::now();
-    let mut removed = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(BuildError::Io)?;
-        let used = entry.metadata().and_then(|m| m.modified()).map_err(BuildError::Io)?;
-        if now.duration_since(used).is_ok_and(|idle| idle > unused_for) {
-            if entry.file_type().map_err(BuildError::Io)?.is_dir() {
-                std::fs::remove_dir_all(entry.path()).map_err(BuildError::Io)?;
-            } else {
-                std::fs::remove_file(entry.path()).map_err(BuildError::Io)?;
-            }
-            removed.push(entry.file_name().to_string_lossy().into_owned());
-        }
-    }
-    removed.sort();
-    Ok(removed)
 }
 
 /// Copy a package's sources to `dest` as a build compiles them: what
@@ -616,13 +600,14 @@ pub fn build_test_artifact(project: &Project, catalog: &FsCatalog, package_name:
     // servers side by side, so a shared path would have one package's
     // staging clobber another's mid-build.
     let stem = sanitize_crate_name(package_name);
-    let build_context = stage_host_test_build(
+    let (build_context, hold) = stage_host_test_build(
         &project.root.join(".weft").join("target").join("test-host").join(&stem),
         shared_crates,
         catalog,
         package_name,
     )?;
     Ok(StagedImageBuild {
+        hold: Some(std::sync::Arc::new(hold)),
         build_context,
         content_hash: node_test_content_hash(catalog, package_name)?,
         recipe: weft_core::builds::BuildRecipe::Host,
@@ -1454,25 +1439,6 @@ pub fn build_project_catalog(project_root: &Path) -> BuildResult<FsCatalog> {
 mod tests {
     use super::sanitize_crate_name;
 
-    /// A shared crate a build stages again is touched, so a reclaim takes
-    /// only what no build staged for longer than it keeps them.
-    #[test]
-    fn a_reclaim_takes_the_shared_crates_no_build_staged_lately() {
-        let shared = tempfile::tempdir().unwrap();
-        let write = |dir: &std::path::Path| std::fs::create_dir_all(dir).map_err(super::BuildError::Io);
-        for name in ["pkg_a-old", "pkg_a-new", "weft-k"] {
-            super::write_once(&shared.path().join(name), &write).unwrap();
-        }
-        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-        for name in ["pkg_a-old", "weft-k"] {
-            std::fs::File::open(shared.path().join(name)).unwrap().set_modified(long_ago).unwrap();
-        }
-        super::write_once(&shared.path().join("weft-k"), &write).unwrap();
-        let removed = super::reclaim_shared_crates(shared.path(), std::time::Duration::from_secs(60)).unwrap();
-        assert_eq!(removed, ["pkg_a-old"]);
-        assert!(shared.path().join("pkg_a-new").is_dir() && shared.path().join("weft-k").is_dir());
-    }
-
     /// Two installs on the same toolchain never share a compile cache, and
     /// each key says whose it is; an install keeps its cache across source
     /// edits and dependency bumps, and moves to a fresh one when its
@@ -1556,17 +1522,16 @@ mod tests {
                 "id": uuid::Uuid::nil(), "nodes": [{"id": "greet", "nodeType": "Run", "config": {}, "position": {"x": 0, "y": 0}}], "edges": []
             }))
             .unwrap();
-            let ctx = super::stage_host_build(&project.join("ctx"), &shared, &definition, &catalog, weft_core::builds::NodeSet::Referenced).expect("stage");
+            let (ctx, _hold) = super::stage_host_build(&project.join("ctx"), &shared, &definition, &catalog, weft_core::builds::NodeSet::Referenced).expect("stage");
             let recipe: weft_core::builds::HostRecipe =
                 serde_json::from_slice(&std::fs::read(ctx.join(weft_core::builds::HOST_RECIPE_FILE)).unwrap()).unwrap();
             assert_eq!(recipe.crate_dir, ctx.join(super::HOST_CRATE_DIR));
-            for file in [&recipe.isolate_candidates, &recipe.left_out_record, &recipe.seed_lock, &recipe.cache_gc_script] {
+            for file in [&recipe.isolate_candidates, &recipe.left_out_record, &recipe.seed_lock] {
                 assert!(file.is_file(), "{}", file.display());
             }
             assert!(recipe.isolate_dir.join("Cargo.toml").is_file());
             assert!(recipe.seed_lock.starts_with(&shared));
             assert_eq!(recipe.binary_name, super::sanitize_crate_name(super::WORKER_CRATE_NAME));
-            assert_eq!(recipe.cache_retention_days, crate::worker_image::WORKER_CACHE_RETENTION_DAYS);
             manifests.push(std::fs::read_to_string(recipe.crate_dir.join("Cargo.toml")).unwrap());
         }
         let package_dep = |manifest: &str| manifest.lines().find(|l| l.starts_with("pkg_run") && l.contains("path =")).expect("the package dep").to_string();
@@ -1598,9 +1563,9 @@ mod tests {
             "id": uuid::Uuid::nil(), "nodes": [{"id": "greet", "nodeType": "Run", "config": {}, "position": {"x": 0, "y": 0}}], "edges": []
         }))
         .unwrap();
-        let worker = super::stage_host_build(&project.join("worker"), &shared, &definition, &catalog, weft_core::builds::NodeSet::Referenced).expect("stage the worker");
+        let (worker, _worker_hold) = super::stage_host_build(&project.join("worker"), &shared, &definition, &catalog, weft_core::builds::NodeSet::Referenced).expect("stage the worker");
         let package = catalog.package_of("Run").unwrap().name.clone();
-        let tests = super::stage_host_test_build(&project.join("tests"), &shared, &catalog, &package).expect("stage the test server");
+        let (tests, _tests_hold) = super::stage_host_test_build(&project.join("tests"), &shared, &catalog, &package).expect("stage the test server");
         let recipe_of = |ctx: &std::path::Path| -> weft_core::builds::HostRecipe {
             serde_json::from_slice(&std::fs::read(ctx.join(weft_core::builds::HOST_RECIPE_FILE)).unwrap()).unwrap()
         };
@@ -1608,7 +1573,7 @@ mod tests {
         assert_eq!(recipe.crate_dir, tests.join(super::HOST_CRATE_DIR));
         assert_eq!(recipe.binary_name, format!("{}_tests", super::sanitize_crate_name(&package)));
         assert_eq!(recipe.seed_lock, recipe_of(&worker).seed_lock, "one workspace slice for both");
-        for file in [&recipe.isolate_candidates, &recipe.left_out_record, &recipe.cache_gc_script] {
+        for file in [&recipe.isolate_candidates, &recipe.left_out_record] {
             assert!(file.is_file(), "{}", file.display());
         }
         let candidates: serde_json::Value = serde_json::from_slice(&std::fs::read(&recipe.isolate_candidates).unwrap()).unwrap();
@@ -1642,7 +1607,7 @@ mod tests {
             "id": uuid::Uuid::nil(), "nodes": [{"id": "thumb", "nodeType": "Vips", "config": {}, "position": {"x": 0, "y": 0}}], "edges": []
         }))
         .unwrap();
-        let ctx = super::stage_host_build(&project.join("ctx"), &temp.path().join("shared"), &definition, &catalog, weft_core::builds::NodeSet::Referenced).expect("stage");
+        let (ctx, _hold) = super::stage_host_build(&project.join("ctx"), &temp.path().join("shared"), &definition, &catalog, weft_core::builds::NodeSet::Referenced).expect("stage");
         let config: toml::Table = std::fs::read_to_string(ctx.join(super::HOST_CRATE_DIR).join(".cargo/config.toml")).unwrap().parse().unwrap();
         let entry = config["env"]["PKG_CONFIG_PATH"].as_table().expect("a table entry");
         assert_eq!(entry["force"].as_bool(), Some(true));

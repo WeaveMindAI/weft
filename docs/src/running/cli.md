@@ -530,7 +530,7 @@ what no install on this machine uses: runtime images, the builder bases,
 node-test images, standard worker images and image compile caches an earlier
 weft or a `weft build-images` run left, and the worker programs (an earlier
 weft's standard worker among them). It also removes the crates your machine
-compiles workers from that no build used for 30 days
+compiles workers from that no worker program on it was built from
 (`~/.local/share/weft/worker-crates/`), and the images and build caches of
 installs no longer on your machine, along with the caches an older weft made
 before each install had its own (`weft daemon remove` drops an install's

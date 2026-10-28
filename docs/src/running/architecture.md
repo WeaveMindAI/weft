@@ -230,9 +230,13 @@ once, one compiles and the others wait for the lane, then compile only what
 the build before them did not already leave in it. A build of a program
 this machine already has takes no lane at all, and neither does a run, so
 running code is never held up. Two asks for the same build of one project
-are one build, which both wait on. After each build in a lane, weft keeps
-only the three newest compiled versions of each node package and of the
-worker, and drops any of them no build has used for 30 days.
+are one build, which both wait on. Each program weft compiles notes which
+compiled pieces and which source crates its build used, and after each
+build, weft keeps in that lane, in the seed and in the shared source crates
+(`~/.local/share/weft/worker-crates/`) only what some program still on this
+machine was built from. When a program goes (a project removed, a weft
+update replacing the standard worker), what only it used goes at the next
+build.
 
 On a cloud install the worker is an image instead, and the `[build.worker]`
 section of `weft.toml` says how that image is built:

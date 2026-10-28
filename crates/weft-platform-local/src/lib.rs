@@ -19,6 +19,7 @@
 //! - `folders`: every folder working copy kept in sync with its folder.
 
 pub mod alarm;
+pub mod cargo_cache;
 pub mod docker;
 pub mod domains;
 pub mod folders;

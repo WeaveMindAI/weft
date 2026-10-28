@@ -124,6 +124,14 @@ pub enum BuildRecipe {
 /// The file in a host build's context that says how to build it.
 pub const HOST_RECIPE_FILE: &str = "host-recipe.json";
 
+/// The lock beside `shared`, the folder of crates every host build on a
+/// machine shares: held shared by every build from before it stages into
+/// the folder until it is compiled, and alone by whatever removes from it,
+/// so nothing a build is about to compile is removed.
+pub fn shared_crates_lock(shared: &std::path::Path) -> std::path::PathBuf {
+    shared.with_extension("lock")
+}
+
 /// How a worker is compiled on the machine that runs it, written by the
 /// compiler (`weft_compiler::build`) into the build's context and run by
 /// the machine's image builder (`weft_platform_local::images`): the same
@@ -148,12 +156,6 @@ pub struct HostRecipe {
     pub seed_lock: std::path::PathBuf,
     /// The worker binary's name under `<target>/release/`.
     pub binary_name: String,
-    /// The compile cache sweep (`weft-cache-gc.sh`).
-    pub cache_gc_script: std::path::PathBuf,
-    /// How many days an unused compiled piece stays in the cache.
-    pub cache_retention_days: u32,
-    /// How many versions of one piece the cache keeps.
-    pub cache_versions_kept: u32,
 }
 
 /// Where a worker image (a cloud's) keeps the record of the node packages
