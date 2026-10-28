@@ -4,7 +4,7 @@ What changed between versions of weft that you need to know about when you
 update. To update, run `weft maintenance on`, pull and run `./setup.sh` again,
 then run `weft maintenance off`.
 
-## Unreleased
+## 2026-10-28 (341192de)
 
 **The folders weft compiles in stop growing with every update.** Each
 program weft compiles for a project now notes which compiled pieces and
